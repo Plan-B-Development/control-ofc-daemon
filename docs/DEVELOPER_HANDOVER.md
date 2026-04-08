@@ -4,7 +4,7 @@
 
 Control-OFC is a fan control system for Linux desktops, consisting of:
 - **Rust daemon** (`daemon/`) — hardware communication, safety logic, IPC server
-- **Python GUI** (`/home/mitch/Development/Control-OFC-GUI/`) — PySide6 fan curve editor and monitor
+- **Python GUI** (`control-ofc-gui` repo) — PySide6 fan curve editor and monitor
 
 The daemon owns all hardware access and exposes a stable HTTP-over-Unix-socket API.
 
@@ -67,15 +67,15 @@ cargo build --release
 
 ```bash
 # Default config location (optional — daemon uses defaults if missing)
-sudo mkdir -p /etc/control_ofc
-sudo cp daemon.toml.example /etc/control_ofc/daemon.toml
+sudo mkdir -p /etc/control-ofc
+sudo cp daemon.toml.example /etc/control-ofc/daemon.toml
 
-# Run directly (default config path: /etc/control_ofc/daemon.toml)
+# Run directly (default config path: /etc/control-ofc/daemon.toml)
 RUST_LOG=info cargo run
 
 # Override config path via CLI or env var
 cargo run -- --config ./dev-config.toml
-CONTROL-OFC_CONFIG=./dev-config.toml cargo run
+CONTROL_OFC_CONFIG=./dev-config.toml cargo run
 
 # Or install and run via systemd
 sudo cp target/release/control-ofc-daemon /usr/local/bin/
@@ -86,7 +86,7 @@ sudo systemctl enable --now control-ofc-daemon
 
 ## IPC socket
 
-- Default path: `/run/control_ofc/control_ofc.sock`
+- Default path: `/run/control-ofc/control-ofc.sock`
 - Configurable via `[ipc] socket_path` in TOML config
 - The daemon creates the parent directory and cleans up stale sockets on start
 - GUI discovers the socket via config or the default path

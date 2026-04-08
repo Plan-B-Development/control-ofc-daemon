@@ -90,16 +90,16 @@ profile_engine ──read──> StateCache
 3. **Stop timeout** (`controller.rs`): OpenFan 0% time limit
    - 8 seconds at 0% PWM, then rejects further 0% commands
 
-4. **ExecStopPost restore** (`packaging/control_ofc-restore-auto.sh`):
+4. **ExecStopPost restore** (`packaging/control-ofc-restore-auto.sh`):
    - Restores `pwm_enable=2` (auto) on ANY service stop (including SIGKILL)
    - Resets GPU fan curves to automatic
 
 ## Configuration
 
-- **Config file**: `/etc/control_ofc/daemon.toml` (override: `--config` or `$CONTROL-OFC_CONFIG`)
+- **Config file**: `/etc/control-ofc/daemon.toml` (override: `--config` or `$CONTROL_OFC_CONFIG`)
 - **Profile loading**: `--profile <name>` | `--profile-file <path>` | `$OPENFAN_PROFILE` | persisted state
-- **Socket**: `/run/control_ofc/control_ofc.sock` (configurable via `ipc.socket_path`)
-- **State**: `/var/lib/control_ofc/daemon_state.json` (configurable via `state.state_dir`)
+- **Socket**: `/run/control-ofc/control-ofc.sock` (configurable via `ipc.socket_path`)
+- **State**: `/var/lib/control-ofc/daemon_state.json` (configurable via `state.state_dir`)
 
 ## API Endpoints
 
