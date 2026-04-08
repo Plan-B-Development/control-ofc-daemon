@@ -16,3 +16,9 @@ Cargo.lock
 # OS
 .DS_Store
 Thumbs.db
+
+# makepkg build artifacts
+packaging/src/
+packaging/pkg/
+packaging/*.pkg.tar*
+packaging/*.tar.gz
