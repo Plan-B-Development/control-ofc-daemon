@@ -1,0 +1,28 @@
+# OnlyFans Daemon Configuration
+# Copy to /etc/onlyfans/daemon.toml and edit as needed.
+# All fields are optional — defaults are shown below.
+
+[serial]
+# Use stable /dev/serial/by-id/ path (survives USB re-enumeration)
+# port = "/dev/serial/by-id/usb-Karanovic_Research_OpenFan_...-if00"
+# timeout_ms = 500
+
+[polling]
+# poll_interval_ms = 1000
+
+[ipc]
+# socket_path = "/run/onlyfans/onlyfans.sock"
+
+[state]
+# state_dir = "/var/lib/onlyfans"
+
+[startup]
+# Delay in seconds before the daemon begins device detection after boot.
+# Useful for waiting for USB or hwmon devices to appear.
+# delay_secs = 0
+
+[profiles]
+# Directories where the daemon looks for profile JSON files.
+# The GUI stores profiles at ~/.config/onlyfans/profiles/ by default.
+# Add your user's profile directory for GUI profile activation to work.
+# search_dirs = ["/etc/onlyfans/profiles", "/home/yourusername/.config/onlyfans/profiles"]

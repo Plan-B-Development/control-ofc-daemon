@@ -1,0 +1,64 @@
+[Unit]
+Description=OnlyFans Fan Control Daemon
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/onlyfans-daemon
+ExecStopPost=/usr/local/bin/onlyfans-restore-auto
+ExecReload=/bin/kill -HUP $MAINPID
+RuntimeDirectory=onlyfans
+StateDirectory=onlyfans
+# Socket: /run/onlyfans/onlyfans.sock (created by daemon)
+# State: /var/lib/onlyfans/daemon_state.json (active profile pointer)
+# Override config: /etc/onlyfans/daemon.toml
+
+# Logging goes to journald by default (env_logger → stderr → journald)
+Environment=RUST_LOG=info
+# HOME is required for default profile search dirs (~/.config/onlyfans/profiles).
+# systemd does not set HOME when no User= is specified (systemd.exec(5)).
+Environment=HOME=/root
+
+# Restart on crash
+Restart=on-failure
+RestartSec=3
+
+# Privilege model: daemon runs as root (no User= directive).
+# Root is required for direct read/write to /sys/class/hwmon and /sys/class/drm
+# sysfs nodes (motherboard fan PWM headers and GPU PMFW fan curves). Serial
+# device access (/dev/ttyACM*) is handled via DeviceAllow below.
+# CapabilityBoundingSet is intentionally omitted: with NoNewPrivileges=true and
+# SystemCallFilter active, child-process capability escalation is already blocked.
+# Adding CapabilityBoundingSet provides marginal additional protection for a root
+# process and risks breaking sysfs writes if the wrong cap is dropped. Revisit
+# post-release with per-capability verification on real hardware.
+
+# Security hardening
+ProtectHome=read-only
+ProtectSystem=strict
+# /sys/class/hwmon is directory-level — hwmon indices are dynamic, finer restriction not practical (P2-S3)
+ReadWritePaths=/run/onlyfans /sys/class/hwmon /sys/class/drm /var/lib/onlyfans
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @reboot @swap @debug
+
+# Serial device access (OpenFanController)
+# Allow all ttyACM and ttyUSB devices (index varies across systems)
+DeviceAllow=char-usb_device rwm
+DeviceAllow=char-ttyACM rwm
+DeviceAllow=char-ttyUSB rwm
+# uucp (Arch/CachyOS) + dialout (Debian/Ubuntu) — systemd ignores missing groups
+SupplementaryGroups=uucp dialout
+
+[Install]
+WantedBy=multi-user.target

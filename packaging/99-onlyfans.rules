@@ -1,0 +1,23 @@
+# OnlyFans — Stable symlink for Karanovic Research OpenFanController
+#
+# Creates /dev/onlyfans-controller when the OpenFanController is plugged in.
+# The daemon can be configured to use this path instead of auto-detection:
+#   [serial]
+#   port = "/dev/onlyfans-controller"
+#
+# Installation:
+#   sudo cp 99-onlyfans.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger
+#
+# To find your device's VID/PID:
+#   udevadm info --attribute-walk --name=/dev/ttyACM0 | grep -E 'idVendor|idProduct'
+#
+# Replace XXXX and YYYY below with your actual VID and PID values.
+
+# Stable symlink for OpenFanController
+SUBSYSTEM=="tty", ATTRS{idVendor}=="XXXX", ATTRS{idProduct}=="YYYY", SYMLINK+="onlyfans-controller", MODE="0660", GROUP="uucp"
+
+# Optional: grant hwmon fan control to the daemon's supplementary group
+# This allows non-root daemons to write to hwmon PWM files.
+# SUBSYSTEM=="hwmon", ATTR{name}=="it8696", RUN+="/bin/chmod g+w /sys%p/pwm1 /sys%p/pwm1_enable"
