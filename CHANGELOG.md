@@ -1,5 +1,33 @@
 # Changelog
 
+## [1.0.0] — 2026-04-08
+
+### Project Rebrand — OnlyFans → Control-OFC
+
+**BREAKING CHANGE:** Complete project rebrand. All paths, service names, and identifiers have changed.
+
+- **Crate name:** `onlyfans-daemon` → `control-ofc-daemon`
+- **Binary name:** `onlyfans-daemon` → `control-ofc-daemon`
+- **systemd unit:** `onlyfans-daemon.service` → `control-ofc-daemon.service`
+- **Socket path:** `/run/onlyfans/onlyfans.sock` → `/run/control-ofc/control-ofc.sock`
+- **Config dir:** `/etc/onlyfans/` → `/etc/control-ofc/`
+- **State dir:** `/var/lib/onlyfans/` → `/var/lib/control-ofc/`
+- **Profile dirs:** `/etc/onlyfans/profiles/`, `~/.config/onlyfans/profiles/` → `/etc/control-ofc/profiles/`, `~/.config/control-ofc/profiles/`
+- **Runtime dir:** `/run/onlyfans/` → `/run/control-ofc/`
+- **Env var:** `ONLYFANS_CONFIG` → `CONTROL_OFC_CONFIG`
+- **udev rules:** `99-onlyfans.rules` → `99-control-ofc.rules`
+- **udev symlink:** `/dev/onlyfans-controller` → `/dev/control-ofc-controller`
+- **Restore script:** `onlyfans-restore-auto` → `control-ofc-restore-auto`
+
+**Migration:** Users upgrading from the OnlyFans-named installation must:
+1. Stop and disable the old service: `sudo systemctl disable --now onlyfans-daemon`
+2. Remove old service file: `sudo rm /etc/systemd/system/onlyfans-daemon.service`
+3. Rename config: `sudo mv /etc/onlyfans /etc/control-ofc`
+4. Rename state: `sudo mv /var/lib/onlyfans /var/lib/control-ofc`
+5. Update profile search dirs in `daemon.toml` (replace `onlyfans` with `control-ofc`)
+6. Install new binary, service, and udev rules
+7. `sudo systemctl enable --now control-ofc-daemon`
+
 ## [0.7.2] — 2026-04-08
 
 ### R70 — Pre-release Security Hardening (V5 Phase 6)
