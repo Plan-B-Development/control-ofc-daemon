@@ -4,8 +4,8 @@ After=local-fs.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/control-ofc-daemon
-ExecStopPost=/usr/local/bin/control-ofc-restore-auto
+ExecStart=/usr/bin/control-ofc-daemon
+ExecStopPost=/usr/bin/control-ofc-restore-auto
 ExecReload=/bin/kill -HUP $MAINPID
 RuntimeDirectory=control-ofc
 StateDirectory=control-ofc
@@ -57,8 +57,8 @@ SystemCallFilter=~@mount @reboot @swap @debug
 DeviceAllow=char-usb_device rwm
 DeviceAllow=char-ttyACM rwm
 DeviceAllow=char-ttyUSB rwm
-# uucp (Arch/CachyOS) + dialout (Debian/Ubuntu) — systemd ignores missing groups
-SupplementaryGroups=uucp dialout
+# uucp (Arch/CachyOS) — dialout (Debian/Ubuntu) omitted; systemd fails on missing groups
+SupplementaryGroups=uucp
 
 [Install]
 WantedBy=multi-user.target
