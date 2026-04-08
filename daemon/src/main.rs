@@ -211,8 +211,9 @@ async fn main() {
             match RealSerialTransport::open(port, serial_timeout) {
                 Ok(transport) => {
                     log::info!("OpenFanController connected on {port}");
-                    let boxed: Box<dyn control_ofc_daemon::serial::transport::SerialTransport + Send> =
-                        Box::new(transport);
+                    let boxed: Box<
+                        dyn control_ofc_daemon::serial::transport::SerialTransport + Send,
+                    > = Box::new(transport);
                     let shared = Arc::new(Mutex::new(boxed));
 
                     let ctrl =
@@ -292,8 +293,9 @@ async fn main() {
     let active_profile: Arc<Mutex<Option<DaemonProfile>>> = Arc::new(Mutex::new(initial_profile));
 
     // Detect AMD GPUs
-    let amd_gpus =
-        control_ofc_daemon::hwmon::gpu_detect::detect_amd_gpus(std::path::Path::new(HWMON_SYSFS_ROOT));
+    let amd_gpus = control_ofc_daemon::hwmon::gpu_detect::detect_amd_gpus(std::path::Path::new(
+        HWMON_SYSFS_ROOT,
+    ));
     if !amd_gpus.is_empty() {
         for gpu in &amd_gpus {
             log::info!(
