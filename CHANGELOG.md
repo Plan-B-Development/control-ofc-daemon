@@ -1,5 +1,33 @@
 # Changelog
 
+## [1.0.0] — 2026-04-08
+
+### Project Rebrand — Control-OFC → Control-OFC
+
+**BREAKING CHANGE:** Complete project rebrand. All paths, service names, and identifiers have changed.
+
+- **Crate name:** `control-ofc-daemon` → `control-ofc-daemon`
+- **Binary name:** `control-ofc-daemon` → `control-ofc-daemon`
+- **systemd unit:** `control-ofc-daemon.service` → `control-ofc-daemon.service`
+- **Socket path:** `/run/control_ofc/control_ofc.sock` → `/run/control-ofc/control-ofc.sock`
+- **Config dir:** `/etc/control_ofc/` → `/etc/control-ofc/`
+- **State dir:** `/var/lib/control_ofc/` → `/var/lib/control-ofc/`
+- **Profile dirs:** `/etc/control_ofc/profiles/`, `~/.config/control_ofc/profiles/` → `/etc/control-ofc/profiles/`, `~/.config/control-ofc/profiles/`
+- **Runtime dir:** `/run/control_ofc/` → `/run/control-ofc/`
+- **Env var:** `CONTROL-OFC_CONFIG` → `CONTROL_OFC_CONFIG`
+- **udev rules:** `99-control_ofc.rules` → `99-control-ofc.rules`
+- **udev symlink:** `/dev/control_ofc-controller` → `/dev/control-ofc-controller`
+- **Restore script:** `control_ofc-restore-auto` → `control-ofc-restore-auto`
+
+**Migration:** Users upgrading from the Control-OFC-named installation must:
+1. Stop and disable the old service: `sudo systemctl disable --now control-ofc-daemon`
+2. Remove old service file: `sudo rm /etc/systemd/system/control-ofc-daemon.service`
+3. Rename config: `sudo mv /etc/control_ofc /etc/control-ofc`
+4. Rename state: `sudo mv /var/lib/control_ofc /var/lib/control-ofc`
+5. Update profile search dirs in `daemon.toml` (replace `control_ofc` with `control-ofc`)
+6. Install new binary, service, and udev rules
+7. `sudo systemctl enable --now control-ofc-daemon`
+
 ## [0.7.2] — 2026-04-08
 
 ### R70 — Pre-release Security Hardening (V5 Phase 6)
