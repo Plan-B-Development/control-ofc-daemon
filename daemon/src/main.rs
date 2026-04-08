@@ -20,11 +20,11 @@ use control_ofc_daemon::serial::controller::FanController;
 use control_ofc_daemon::serial::real_transport::{auto_detect_port, RealSerialTransport};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const DEFAULT_CONFIG_PATH: &str = "/etc/onlyfans/daemon.toml";
+const DEFAULT_CONFIG_PATH: &str = "/etc/control-ofc/daemon.toml";
 
 /// Resolve the config file path.
 ///
-/// Precedence: `--config` CLI arg > `$ONLYFANS_CONFIG` env var > default.
+/// Precedence: `--config` CLI arg > `$CONTROL_OFC_CONFIG` env var > default.
 fn resolve_config_path() -> String {
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -34,7 +34,7 @@ fn resolve_config_path() -> String {
         }
         i += 1;
     }
-    if let Ok(val) = std::env::var("ONLYFANS_CONFIG") {
+    if let Ok(val) = std::env::var("CONTROL_OFC_CONFIG") {
         if !val.is_empty() {
             return val;
         }
@@ -134,7 +134,7 @@ fn resolve_initial_profile(search_dirs: &[std::path::PathBuf]) -> Option<DaemonP
 async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    log::info!("onlyfans-daemon v{VERSION} starting");
+    log::info!("control-ofc-daemon v{VERSION} starting");
 
     let config_path = resolve_config_path();
     log::info!("Config path: {config_path}");
@@ -466,5 +466,5 @@ async fn main() {
     let _ = shutdown_tx.send(());
     let _ = server_handle.await;
 
-    log::info!("onlyfans-daemon v{VERSION} stopped");
+    log::info!("control-ofc-daemon v{VERSION} stopped");
 }

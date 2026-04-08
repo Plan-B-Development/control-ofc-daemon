@@ -1,4 +1,4 @@
-//! Configuration scaffold for the OnlyFans daemon.
+//! Configuration scaffold for the Control-OFC daemon.
 
 use crate::error::ConfigError;
 use serde::Deserialize;
@@ -90,7 +90,7 @@ impl Default for IpcConfig {
 }
 
 fn default_socket_path() -> String {
-    "/run/onlyfans/onlyfans.sock".into()
+    "/run/control-ofc/control-ofc.sock".into()
 }
 
 /// Persistent state configuration.
@@ -111,7 +111,7 @@ impl Default for StateConfig {
 }
 
 fn default_state_dir() -> String {
-    "/var/lib/onlyfans".into()
+    "/var/lib/control-ofc".into()
 }
 
 /// Profile search directory configuration.
@@ -119,7 +119,7 @@ fn default_state_dir() -> String {
 #[serde(deny_unknown_fields)]
 pub struct ProfilesConfig {
     /// Directories where the daemon looks for profile JSON files.
-    /// The GUI stores profiles at `~/.config/onlyfans/profiles/` by default.
+    /// The GUI stores profiles at `~/.config/control-ofc/profiles/` by default.
     #[serde(default = "default_profile_search_dirs")]
     pub search_dirs: Vec<String>,
 }
@@ -133,15 +133,15 @@ impl Default for ProfilesConfig {
 }
 
 fn default_profile_search_dirs() -> Vec<String> {
-    let mut dirs = vec!["/etc/onlyfans/profiles".to_string()];
+    let mut dirs = vec!["/etc/control-ofc/profiles".to_string()];
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        dirs.push(format!("{xdg}/onlyfans/profiles"));
+        dirs.push(format!("{xdg}/control-ofc/profiles"));
     } else if let Ok(home) = std::env::var("HOME") {
-        dirs.push(format!("{home}/.config/onlyfans/profiles"));
+        dirs.push(format!("{home}/.config/control-ofc/profiles"));
     } else {
         // Fallback for systemd services where HOME is not set.
         // The daemon typically runs as root; /root is the standard home.
-        dirs.push("/root/.config/onlyfans/profiles".to_string());
+        dirs.push("/root/.config/control-ofc/profiles".to_string());
     }
     dirs
 }
@@ -319,7 +319,7 @@ mod tests {
         let config = DaemonConfig::from_toml("").unwrap();
         assert_eq!(config.polling.poll_interval_ms, 1000);
         assert_eq!(config.serial.timeout_ms, 500);
-        assert_eq!(config.ipc.socket_path, "/run/onlyfans/onlyfans.sock");
+        assert_eq!(config.ipc.socket_path, "/run/control-ofc/control-ofc.sock");
     }
 
     #[test]
@@ -333,13 +333,13 @@ timeout_ms = 1000
 poll_interval_ms = 500
 
 [ipc]
-socket_path = "/tmp/onlyfans.sock"
+socket_path = "/tmp/control-ofc.sock"
 "#;
         let config = DaemonConfig::from_toml(toml).unwrap();
         assert_eq!(config.serial.port.as_deref(), Some("/dev/ttyACM0"));
         assert_eq!(config.serial.timeout_ms, 1000);
         assert_eq!(config.polling.poll_interval_ms, 500);
-        assert_eq!(config.ipc.socket_path, "/tmp/onlyfans.sock");
+        assert_eq!(config.ipc.socket_path, "/tmp/control-ofc.sock");
         assert!(config.validate().is_ok());
     }
 
@@ -395,14 +395,14 @@ baud_rate = 9600
     fn parse_profiles_section() {
         let toml = r#"
 [profiles]
-search_dirs = ["/etc/onlyfans/profiles", "/home/user/.config/onlyfans/profiles"]
+search_dirs = ["/etc/control-ofc/profiles", "/home/user/.config/control-ofc/profiles"]
 "#;
         let config = DaemonConfig::from_toml(toml).unwrap();
         assert_eq!(config.profiles.search_dirs.len(), 2);
-        assert_eq!(config.profiles.search_dirs[0], "/etc/onlyfans/profiles");
+        assert_eq!(config.profiles.search_dirs[0], "/etc/control-ofc/profiles");
         assert_eq!(
             config.profiles.search_dirs[1],
-            "/home/user/.config/onlyfans/profiles"
+            "/home/user/.config/control-ofc/profiles"
         );
     }
 
@@ -413,8 +413,8 @@ search_dirs = ["/etc/onlyfans/profiles", "/home/user/.config/onlyfans/profiles"]
             config
                 .profiles
                 .search_dirs
-                .contains(&"/etc/onlyfans/profiles".to_string()),
-            "default search_dirs must include /etc/onlyfans/profiles"
+                .contains(&"/etc/control-ofc/profiles".to_string()),
+            "default search_dirs must include /etc/control-ofc/profiles"
         );
     }
 
@@ -429,7 +429,7 @@ poll_interval_ms = 500
             config
                 .profiles
                 .search_dirs
-                .contains(&"/etc/onlyfans/profiles".to_string()),
+                .contains(&"/etc/control-ofc/profiles".to_string()),
             "omitting [profiles] must still produce default search_dirs"
         );
     }
@@ -453,11 +453,11 @@ poll_interval_ms = 500
         }
 
         assert!(
-            dirs.contains(&"/etc/onlyfans/profiles".to_string()),
-            "must always include /etc/onlyfans/profiles"
+            dirs.contains(&"/etc/control-ofc/profiles".to_string()),
+            "must always include /etc/control-ofc/profiles"
         );
         assert!(
-            dirs.contains(&"/root/.config/onlyfans/profiles".to_string()),
+            dirs.contains(&"/root/.config/control-ofc/profiles".to_string()),
             "must include /root fallback when HOME is unset"
         );
     }
@@ -480,9 +480,9 @@ poll_interval_ms = 500
             std::env::set_var("XDG_CONFIG_HOME", x);
         }
 
-        assert!(dirs.contains(&"/home/testuser/.config/onlyfans/profiles".to_string()));
+        assert!(dirs.contains(&"/home/testuser/.config/control-ofc/profiles".to_string()));
         assert!(
-            !dirs.contains(&"/root/.config/onlyfans/profiles".to_string()),
+            !dirs.contains(&"/root/.config/control-ofc/profiles".to_string()),
             "/root fallback must not appear when HOME is set"
         );
     }
@@ -491,11 +491,11 @@ poll_interval_ms = 500
     fn persist_profile_search_dirs_creates_section() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.toml");
-        std::fs::write(&path, "[state]\nstate_dir = \"/var/lib/onlyfans\"\n").unwrap();
+        std::fs::write(&path, "[state]\nstate_dir = \"/var/lib/control-ofc\"\n").unwrap();
 
         let dirs = vec![
-            "/etc/onlyfans/profiles".to_string(),
-            "/home/user/.config/onlyfans/profiles".to_string(),
+            "/etc/control-ofc/profiles".to_string(),
+            "/home/user/.config/control-ofc/profiles".to_string(),
         ];
         persist_profile_search_dirs(path.to_str().unwrap(), &dirs).unwrap();
 
@@ -508,7 +508,10 @@ poll_interval_ms = 500
         let profiles = parsed["profiles"].as_table().unwrap();
         let search_dirs = profiles["search_dirs"].as_array().unwrap();
         assert_eq!(search_dirs.len(), 2);
-        assert_eq!(search_dirs[0].as_str().unwrap(), "/etc/onlyfans/profiles");
+        assert_eq!(
+            search_dirs[0].as_str().unwrap(),
+            "/etc/control-ofc/profiles"
+        );
     }
 
     #[test]
@@ -521,7 +524,7 @@ poll_interval_ms = 500
         )
         .unwrap();
 
-        let dirs = vec!["/etc/onlyfans/profiles".to_string()];
+        let dirs = vec!["/etc/control-ofc/profiles".to_string()];
         persist_profile_search_dirs(path.to_str().unwrap(), &dirs).unwrap();
 
         // Should still parse as valid DaemonConfig
@@ -531,7 +534,7 @@ poll_interval_ms = 500
         assert!(config
             .profiles
             .search_dirs
-            .contains(&"/etc/onlyfans/profiles".to_string()));
+            .contains(&"/etc/control-ofc/profiles".to_string()));
     }
 
     #[test]
@@ -568,7 +571,7 @@ delay_secs = 60
         // Write deliberately malformed TOML
         std::fs::write(&path, "this is not valid toml {{{{").unwrap();
 
-        let dirs = vec!["/etc/onlyfans/profiles".to_string()];
+        let dirs = vec!["/etc/control-ofc/profiles".to_string()];
         // Should succeed — malformed TOML gets overwritten with a clean table
         persist_profile_search_dirs(path.to_str().unwrap(), &dirs).unwrap();
 
@@ -577,6 +580,6 @@ delay_secs = 60
         assert!(config
             .profiles
             .search_dirs
-            .contains(&"/etc/onlyfans/profiles".to_string()));
+            .contains(&"/etc/control-ofc/profiles".to_string()));
     }
 }

@@ -1,14 +1,14 @@
 //! Daemon persistent state — survives restarts.
 //!
 //! Stores the active profile selection at `{state_dir}/daemon_state.json`.
-//! Default state_dir is `/var/lib/onlyfans` (configurable via `[state]` in
+//! Default state_dir is `/var/lib/control-ofc` (configurable via `[state]` in
 //! daemon.toml). Uses atomic write (tmp + rename) to avoid corruption on crash.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-const DEFAULT_STATE_DIR: &str = "/var/lib/onlyfans";
+const DEFAULT_STATE_DIR: &str = "/var/lib/control-ofc";
 const STATE_FILE: &str = "daemon_state.json";
 
 /// Configurable state directory — set once at startup from config.
@@ -165,7 +165,7 @@ mod tests {
         let state = DaemonState {
             version: 1,
             active_profile_id: Some("quiet".into()),
-            active_profile_path: Some("/etc/onlyfans/profiles/quiet.json".into()),
+            active_profile_path: Some("/etc/control-ofc/profiles/quiet.json".into()),
         };
         let json = serde_json::to_string(&state).unwrap();
         let loaded: DaemonState = serde_json::from_str(&json).unwrap();

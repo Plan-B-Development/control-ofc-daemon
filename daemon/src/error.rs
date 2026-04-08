@@ -1,4 +1,4 @@
-//! Structured error types for the OnlyFans daemon.
+//! Structured error types for the Control-OFC daemon.
 
 use std::fmt;
 
@@ -105,9 +105,9 @@ mod tests {
     #[test]
     fn config_not_found_display() {
         let err = ConfigError::NotFound {
-            path: "/etc/onlyfans.toml".into(),
+            path: "/etc/control-ofc.toml".into(),
         };
-        assert_eq!(err.to_string(), "file not found: /etc/onlyfans.toml");
+        assert_eq!(err.to_string(), "file not found: /etc/control-ofc.toml");
     }
 
     #[test]

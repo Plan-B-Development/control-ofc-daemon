@@ -1414,7 +1414,7 @@ pub async fn hwmon_rescan_handler(
 /// POST /config/profile-search-dirs — add directories to the profile search path.
 ///
 /// Accepts `{"add": ["/path/to/profiles"]}` — each directory must be an absolute path.
-/// The system directory `/etc/onlyfans/profiles` is always preserved.
+/// The system directory `/etc/control-ofc/profiles` is always preserved.
 /// Updates take effect immediately (in-memory) and are persisted to daemon.toml.
 pub async fn update_profile_search_dirs_handler(
     State(state): State<Arc<AppState>>,
@@ -1443,7 +1443,7 @@ pub async fn update_profile_search_dirs_handler(
         }
     }
 
-    // Merge with existing dirs (deduplicate, always keep /etc/onlyfans/profiles)
+    // Merge with existing dirs (deduplicate, always keep /etc/control-ofc/profiles)
     let mut merged: Vec<String> = {
         let current = state.profile_search_dirs.read();
         current.iter().map(|p| p.display().to_string()).collect()
