@@ -105,9 +105,9 @@ mod tests {
     #[test]
     fn config_not_found_display() {
         let err = ConfigError::NotFound {
-            path: "/etc/control_ofc.toml".into(),
+            path: "/etc/control-ofc.toml".into(),
         };
-        assert_eq!(err.to_string(), "file not found: /etc/control_ofc.toml");
+        assert_eq!(err.to_string(), "file not found: /etc/control-ofc.toml");
     }
 
     #[test]

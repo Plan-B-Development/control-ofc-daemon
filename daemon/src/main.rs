@@ -20,11 +20,11 @@ use control_ofc_daemon::serial::controller::FanController;
 use control_ofc_daemon::serial::real_transport::{auto_detect_port, RealSerialTransport};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const DEFAULT_CONFIG_PATH: &str = "/etc/control_ofc/daemon.toml";
+const DEFAULT_CONFIG_PATH: &str = "/etc/control-ofc/daemon.toml";
 
 /// Resolve the config file path.
 ///
-/// Precedence: `--config` CLI arg > `$CONTROL-OFC_CONFIG` env var > default.
+/// Precedence: `--config` CLI arg > `$CONTROL_OFC_CONFIG` env var > default.
 fn resolve_config_path() -> String {
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -34,7 +34,7 @@ fn resolve_config_path() -> String {
         }
         i += 1;
     }
-    if let Ok(val) = std::env::var("CONTROL-OFC_CONFIG") {
+    if let Ok(val) = std::env::var("CONTROL_OFC_CONFIG") {
         if !val.is_empty() {
             return val;
         }
