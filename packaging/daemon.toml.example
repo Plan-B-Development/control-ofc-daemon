@@ -1,5 +1,5 @@
-# OnlyFans Daemon Configuration
-# Copy to /etc/onlyfans/daemon.toml and edit as needed.
+# Control-OFC Daemon Configuration
+# Copy to /etc/control-ofc/daemon.toml and edit as needed.
 # All fields are optional — defaults are shown below.
 
 [serial]
@@ -11,10 +11,10 @@
 # poll_interval_ms = 1000
 
 [ipc]
-# socket_path = "/run/onlyfans/onlyfans.sock"
+# socket_path = "/run/control-ofc/control-ofc.sock"
 
 [state]
-# state_dir = "/var/lib/onlyfans"
+# state_dir = "/var/lib/control-ofc"
 
 [startup]
 # Delay in seconds before the daemon begins device detection after boot.
@@ -23,6 +23,6 @@
 
 [profiles]
 # Directories where the daemon looks for profile JSON files.
-# The GUI stores profiles at ~/.config/onlyfans/profiles/ by default.
+# The GUI stores profiles at ~/.config/control-ofc/profiles/ by default.
 # Add your user's profile directory for GUI profile activation to work.
-# search_dirs = ["/etc/onlyfans/profiles", "/home/yourusername/.config/onlyfans/profiles"]
+# search_dirs = ["/etc/control-ofc/profiles", "/home/yourusername/.config/control-ofc/profiles"]

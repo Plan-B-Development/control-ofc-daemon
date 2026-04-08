@@ -1,21 +1,21 @@
 [Unit]
-Description=OnlyFans Fan Control Daemon
+Description=Control-OFC Fan Control Daemon
 After=local-fs.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/onlyfans-daemon
-ExecStopPost=/usr/local/bin/onlyfans-restore-auto
+ExecStart=/usr/local/bin/control-ofc-daemon
+ExecStopPost=/usr/local/bin/control-ofc-restore-auto
 ExecReload=/bin/kill -HUP $MAINPID
-RuntimeDirectory=onlyfans
-StateDirectory=onlyfans
-# Socket: /run/onlyfans/onlyfans.sock (created by daemon)
-# State: /var/lib/onlyfans/daemon_state.json (active profile pointer)
-# Override config: /etc/onlyfans/daemon.toml
+RuntimeDirectory=control-ofc
+StateDirectory=control-ofc
+# Socket: /run/control-ofc/control-ofc.sock (created by daemon)
+# State: /var/lib/control-ofc/daemon_state.json (active profile pointer)
+# Override config: /etc/control-ofc/daemon.toml
 
 # Logging goes to journald by default (env_logger → stderr → journald)
 Environment=RUST_LOG=info
-# HOME is required for default profile search dirs (~/.config/onlyfans/profiles).
+# HOME is required for default profile search dirs (~/.config/control-ofc/profiles).
 # systemd does not set HOME when no User= is specified (systemd.exec(5)).
 Environment=HOME=/root
 
@@ -37,7 +37,7 @@ RestartSec=3
 ProtectHome=read-only
 ProtectSystem=strict
 # /sys/class/hwmon is directory-level — hwmon indices are dynamic, finer restriction not practical (P2-S3)
-ReadWritePaths=/run/onlyfans /sys/class/hwmon /sys/class/drm /var/lib/onlyfans
+ReadWritePaths=/run/control-ofc /sys/class/hwmon /sys/class/drm /var/lib/control-ofc
 PrivateTmp=true
 NoNewPrivileges=true
 ProtectKernelTunables=true

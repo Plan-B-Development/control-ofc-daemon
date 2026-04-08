@@ -1,12 +1,12 @@
-# OnlyFans — Stable symlink for Karanovic Research OpenFanController
+# Control-OFC — Stable symlink for Karanovic Research OpenFanController
 #
-# Creates /dev/onlyfans-controller when the OpenFanController is plugged in.
+# Creates /dev/control-ofc-controller when the OpenFanController is plugged in.
 # The daemon can be configured to use this path instead of auto-detection:
 #   [serial]
-#   port = "/dev/onlyfans-controller"
+#   port = "/dev/control-ofc-controller"
 #
 # Installation:
-#   sudo cp 99-onlyfans.rules /etc/udev/rules.d/
+#   sudo cp 99-control-ofc.rules /etc/udev/rules.d/
 #   sudo udevadm control --reload-rules
 #   sudo udevadm trigger
 #
@@ -16,7 +16,7 @@
 # Replace XXXX and YYYY below with your actual VID and PID values.
 
 # Stable symlink for OpenFanController
-SUBSYSTEM=="tty", ATTRS{idVendor}=="XXXX", ATTRS{idProduct}=="YYYY", SYMLINK+="onlyfans-controller", MODE="0660", GROUP="uucp"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="XXXX", ATTRS{idProduct}=="YYYY", SYMLINK+="control-ofc-controller", MODE="0660", GROUP="uucp"
 
 # Optional: grant hwmon fan control to the daemon's supplementary group
 # This allows non-root daemons to write to hwmon PWM files.
