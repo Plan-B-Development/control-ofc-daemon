@@ -1,8 +1,8 @@
-# OnlyFans Daemon — Architecture Overview
+# Control-OFC Daemon — Architecture Overview
 
 ## What this is
 
-A Rust daemon (`onlyfans-daemon`) that controls PC fans via three backends:
+A Rust daemon (`control-ofc-daemon`) that controls PC fans via three backends:
 - **OpenFan** — custom serial (USB) fan controller
 - **hwmon** — motherboard fans via Linux sysfs (`/sys/class/hwmon/`)
 - **AMD GPU** — RDNA3+ PMFW fan curves or legacy hwmon PWM
@@ -90,16 +90,16 @@ profile_engine ──read──> StateCache
 3. **Stop timeout** (`controller.rs`): OpenFan 0% time limit
    - 8 seconds at 0% PWM, then rejects further 0% commands
 
-4. **ExecStopPost restore** (`packaging/onlyfans-restore-auto.sh`):
+4. **ExecStopPost restore** (`packaging/control-ofc-restore-auto.sh`):
    - Restores `pwm_enable=2` (auto) on ANY service stop (including SIGKILL)
    - Resets GPU fan curves to automatic
 
 ## Configuration
 
-- **Config file**: `/etc/onlyfans/daemon.toml` (override: `--config` or `$ONLYFANS_CONFIG`)
+- **Config file**: `/etc/control-ofc/daemon.toml` (override: `--config` or `$CONTROL_OFC_CONFIG`)
 - **Profile loading**: `--profile <name>` | `--profile-file <path>` | `$OPENFAN_PROFILE` | persisted state
-- **Socket**: `/run/onlyfans/onlyfans.sock` (configurable via `ipc.socket_path`)
-- **State**: `/var/lib/onlyfans/daemon_state.json` (configurable via `state.state_dir`)
+- **Socket**: `/run/control-ofc/control-ofc.sock` (configurable via `ipc.socket_path`)
+- **State**: `/var/lib/control-ofc/daemon_state.json` (configurable via `state.state_dir`)
 
 ## API Endpoints
 

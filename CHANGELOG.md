@@ -7,7 +7,7 @@
 Addresses Rust daemon findings from the V5 Phase 6 security & dependencies audit.
 
 - **S3 (P2):** State file (`daemon_state.json`) now explicitly set to 0o600 (owner-only) before atomic rename. Defense-in-depth — parent dir is already 0o700 via systemd `StateDirectory=`. Added permission verification test.
-- **S4 (P3):** Documented why root is required and why `CapabilityBoundingSet` is intentionally deferred in `onlyfans-daemon.service`.
+- **S4 (P3):** Documented why root is required and why `CapabilityBoundingSet` is intentionally deferred in `control-ofc-daemon.service`.
 - **S5 (P3):** Documented that sysfs path inclusion in error responses is intentional (public paths, local-only socket, diagnostic value).
 
 ## [0.7.1] — 2026-04-08
@@ -67,9 +67,9 @@ Resolves all 17 findings from the V5 Phase 1 Rust daemon code review.
 ## [0.6.0] — 2026-04-07
 
 ### R64 — Runtime Config Reload + Profile Search Dirs API
-- **Feature:** SIGHUP config reload — daemon re-reads `daemon.toml` and updates profile search dirs in memory. Enables `systemctl reload onlyfans-daemon`.
+- **Feature:** SIGHUP config reload — daemon re-reads `daemon.toml` and updates profile search dirs in memory. Enables `systemctl reload control-ofc-daemon`.
 - **Feature:** `POST /config/profile-search-dirs` API endpoint — GUI (or any client) can add profile search directories at runtime. Daemon validates, updates in-memory state, and persists to `daemon.toml` atomically.
-- **Feature:** Multi-user support — each GUI user can register their profile directory via the API; the daemon merges all dirs and preserves `/etc/onlyfans/profiles`.
+- **Feature:** Multi-user support — each GUI user can register their profile directory via the API; the daemon merges all dirs and preserves `/etc/control-ofc/profiles`.
 - **Fix:** `profile_search_dirs` in AppState is now `RwLock<Vec<PathBuf>>` — safely mutable at runtime.
 - Added `ExecReload=/bin/kill -HUP $MAINPID` to systemd service file.
 - Added `config_path` to AppState so handlers can persist config changes.
@@ -78,7 +78,7 @@ Resolves all 17 findings from the V5 Phase 1 Rust daemon code review.
 ## [0.5.9] — 2026-04-07
 
 ### R63 — Fix Profile Activation Path Validation (completes R62)
-- **Fix:** `default_profile_search_dirs()` now falls back to `/root/.config/onlyfans/profiles` when neither `HOME` nor `XDG_CONFIG_HOME` is set (common for systemd services running as root without `User=`).
+- **Fix:** `default_profile_search_dirs()` now falls back to `/root/.config/control-ofc/profiles` when neither `HOME` nor `XDG_CONFIG_HOME` is set (common for systemd services running as root without `User=`).
 - **Fix:** systemd service file now sets `Environment=HOME=/root` so the daemon's environment always has HOME.
 - **Fix:** `activate_profile_handler` logs a warning when all configured search directories fail canonicalization (empty allowed list).
 - 2 new config tests (HOME unset fallback, HOME set preference), 279 total.
@@ -95,7 +95,7 @@ Resolves all 17 findings from the V5 Phase 1 Rust daemon code review.
 ## [0.3.0] — 2026-03-31
 
 ### Release Generalisation — Cross-System Readiness
-- **Config path override:** Daemon config path now overridable via `--config` CLI arg or `$ONLYFANS_CONFIG` env var (default: `/etc/onlyfans/daemon.toml`). Supports container deployments and dev testing.
+- **Config path override:** Daemon config path now overridable via `--config` CLI arg or `$CONTROL_OFC_CONFIG` env var (default: `/etc/control-ofc/daemon.toml`). Supports container deployments and dev testing.
 - **Serial fallback expanded:** Direct probe fallback now scans `/dev/ttyUSB0-9` in addition to `/dev/ttyACM0-9`, covering FTDI/CH340 adapters when libudev is unavailable.
 - **Service file portability:** `DeviceAllow` now uses `char-ttyACM` and `char-ttyUSB` class wildcards instead of hardcoded `/dev/ttyACM0-1`. `SupplementaryGroups` includes both `uucp` (Arch) and `dialout` (Debian) — systemd ignores missing groups.
 - **Documentation:** Added serial setup instructions, VID/PID discovery, udev rule configuration, and config override usage to USER_GUIDE and DEVELOPER_HANDOVER.
@@ -103,10 +103,10 @@ Resolves all 17 findings from the V5 Phase 1 Rust daemon code review.
 
 ### R50 — Daemon Persisted-State Hardening
 - **Fix:** `daemon_state.json` writes failed with `EROFS (Read-only file system, os error 30)` under systemd `ProtectSystem=strict` sandbox
-- **Root cause:** systemd service file was missing `StateDirectory=onlyfans` and `/var/lib/onlyfans` was not in `ReadWritePaths`
-- Added `StateDirectory=onlyfans` to systemd unit — systemd now creates and manages `/var/lib/onlyfans` with correct ownership
-- Added `/var/lib/onlyfans` to `ReadWritePaths` for belt-and-suspenders protection
-- State directory now configurable via `[state] state_dir` in `daemon.toml` (default: `/var/lib/onlyfans`)
+- **Root cause:** systemd service file was missing `StateDirectory=control-ofc` and `/var/lib/control-ofc` was not in `ReadWritePaths`
+- Added `StateDirectory=control-ofc` to systemd unit — systemd now creates and manages `/var/lib/control-ofc` with correct ownership
+- Added `/var/lib/control-ofc` to `ReadWritePaths` for belt-and-suspenders protection
+- State directory now configurable via `[state] state_dir` in `daemon.toml` (default: `/var/lib/control-ofc`)
 - `daemon_state.rs` rewritten to use `OnceLock<String>` for runtime-configurable state path
 - State directory initialized from config at startup before any load/save operations
 
@@ -163,7 +163,7 @@ Resolves all 17 findings from the V5 Phase 1 Rust daemon code review.
 - Added `POST /hwmon/lease/renew` — extend lease TTL without release/retake
 - Identity contract: all sensors/fans/headers include stable `id`, `label`, `source`, `kind`
 - Measured vs commanded: `rpm` (hardware) and `last_commanded_pwm` (daemon-tracked) always separate
-- Added systemd unit file (`packaging/onlyfans-daemon.service`) with security hardening
+- Added systemd unit file (`packaging/control-ofc-daemon.service`) with security hardening
 - Added `docs/DEVELOPER_HANDOVER.md` and `docs/USER_GUIDE.md`
 - 11 new tests (219 total, incl. 29 integration)
 

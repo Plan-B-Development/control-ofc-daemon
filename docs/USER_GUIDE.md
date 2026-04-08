@@ -1,8 +1,8 @@
 # User Guide
 
-## What is OnlyFans?
+## What is Control-OFC?
 
-OnlyFans is a fan control daemon for Linux desktops. It communicates with:
+Control-OFC is a fan control daemon for Linux desktops. It communicates with:
 - **OpenFanController** — a USB fan controller (up to 10 channels)
 - **Motherboard fan headers** — via the Linux hwmon sysfs interface (ITE, NCT Super I/O chips)
 
@@ -30,12 +30,12 @@ cd daemon
 cargo build --release
 
 # Install binary
-sudo cp target/release/onlyfans-daemon /usr/local/bin/
+sudo cp target/release/control-ofc-daemon /usr/local/bin/
 
 # Install systemd service
-sudo cp packaging/onlyfans-daemon.service /etc/systemd/system/
+sudo cp packaging/control-ofc-daemon.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now onlyfans-daemon
+sudo systemctl enable --now control-ofc-daemon
 ```
 
 ## Configuration
@@ -45,16 +45,16 @@ Configuration is optional. The daemon uses sensible defaults if no config file e
 The config file path can be overridden:
 ```bash
 # CLI argument (highest priority)
-onlyfans-daemon --config /path/to/daemon.toml
+control-ofc-daemon --config /path/to/daemon.toml
 
 # Environment variable
-ONLYFANS_CONFIG=/path/to/daemon.toml onlyfans-daemon
+CONTROL_OFC_CONFIG=/path/to/daemon.toml control-ofc-daemon
 
 # Default (used when neither is set)
-# /etc/onlyfans/daemon.toml
+# /etc/control-ofc/daemon.toml
 ```
 
-Create `/etc/onlyfans/daemon.toml`:
+Create `/etc/control-ofc/daemon.toml`:
 
 ```toml
 [serial]
@@ -65,26 +65,26 @@ Create `/etc/onlyfans/daemon.toml`:
 # poll_interval_ms = 1000
 
 [ipc]
-# socket_path = "/run/onlyfans/onlyfans.sock"
+# socket_path = "/run/control-ofc/control-ofc.sock"
 
 [state]
-# state_dir = "/var/lib/onlyfans"
+# state_dir = "/var/lib/control-ofc"
 ```
 
 ## Checking daemon status
 
 ```bash
 # Service status
-sudo systemctl status onlyfans-daemon
+sudo systemctl status control-ofc-daemon
 
 # Logs
-journalctl -u onlyfans-daemon -f
+journalctl -u control-ofc-daemon -f
 
 # Query the API (requires curl + jq)
-curl --unix-socket /run/onlyfans/onlyfans.sock http://localhost/status | jq .
-curl --unix-socket /run/onlyfans/onlyfans.sock http://localhost/capabilities | jq .
-curl --unix-socket /run/onlyfans/onlyfans.sock http://localhost/sensors | jq .
-curl --unix-socket /run/onlyfans/onlyfans.sock http://localhost/fans | jq .
+curl --unix-socket /run/control-ofc/control-ofc.sock http://localhost/status | jq .
+curl --unix-socket /run/control-ofc/control-ofc.sock http://localhost/capabilities | jq .
+curl --unix-socket /run/control-ofc/control-ofc.sock http://localhost/sensors | jq .
+curl --unix-socket /run/control-ofc/control-ofc.sock http://localhost/fans | jq .
 ```
 
 ## Setting fan speeds
@@ -93,13 +93,13 @@ curl --unix-socket /run/onlyfans/onlyfans.sock http://localhost/fans | jq .
 
 ```bash
 # Set channel 0 to 50% PWM
-curl --unix-socket /run/onlyfans/onlyfans.sock \
+curl --unix-socket /run/control-ofc/control-ofc.sock \
   -X POST -H "Content-Type: application/json" \
   -d '{"pwm_percent": 50}' \
   http://localhost/fans/openfan/0/pwm | jq .
 
 # Set all channels to 75%
-curl --unix-socket /run/onlyfans/onlyfans.sock \
+curl --unix-socket /run/control-ofc/control-ofc.sock \
   -X POST -H "Content-Type: application/json" \
   -d '{"pwm_percent": 75}' \
   http://localhost/fans/openfan/pwm | jq .
@@ -111,19 +111,19 @@ Hwmon writes require an exclusive lease:
 
 ```bash
 # 1. Take lease
-LEASE=$(curl -s --unix-socket /run/onlyfans/onlyfans.sock \
+LEASE=$(curl -s --unix-socket /run/control-ofc/control-ofc.sock \
   -X POST -H "Content-Type: application/json" \
   -d '{"owner_hint": "manual"}' \
   http://localhost/hwmon/lease/take | jq -r .lease_id)
 
 # 2. Set PWM (use header ID from /hwmon/headers)
-curl --unix-socket /run/onlyfans/onlyfans.sock \
+curl --unix-socket /run/control-ofc/control-ofc.sock \
   -X POST -H "Content-Type: application/json" \
   -d "{\"pwm_percent\": 60, \"lease_id\": \"$LEASE\"}" \
   http://localhost/hwmon/hwmon:it8696:0000:00:1f.0:pwm1:CHA_FAN1/pwm | jq .
 
 # 3. Release lease when done
-curl --unix-socket /run/onlyfans/onlyfans.sock \
+curl --unix-socket /run/control-ofc/control-ofc.sock \
   -X POST -H "Content-Type: application/json" \
   -d "{\"lease_id\": \"$LEASE\"}" \
   http://localhost/hwmon/lease/release | jq .
@@ -151,7 +151,7 @@ The daemon needs read/write access to the serial device. The systemd service fil
 
 For optional udev rules (stable symlink + permissions), copy and edit the template:
 ```bash
-sudo cp packaging/99-onlyfans.rules /etc/udev/rules.d/
+sudo cp packaging/99-control-ofc.rules /etc/udev/rules.d/
 
 # Edit the file and replace XXXX/YYYY with your device's VID/PID:
 # Find VID/PID with:
@@ -177,13 +177,13 @@ GPU fan writes do not require a lease. The daemon uses a 5% minimum change thres
 
 ```bash
 # Set GPU fan to 60%
-curl --unix-socket /run/onlyfans/onlyfans.sock \
+curl --unix-socket /run/control-ofc/control-ofc.sock \
   -X POST -H "Content-Type: application/json" \
   -d '{"speed_pct": 60}' \
   http://localhost/gpu/gpu:amd:0000:03:00.0/fan/pwm | jq .
 
 # Restore GPU fan to automatic
-curl --unix-socket /run/onlyfans/onlyfans.sock \
+curl --unix-socket /run/control-ofc/control-ofc.sock \
   -X POST http://localhost/gpu/gpu:amd:0000:03:00.0/fan/reset | jq .
 ```
 
@@ -197,7 +197,7 @@ The `publish_interval_ms` field under `[polling]` was a telemetry vestige that w
 
 **Fix:** Remove the `publish_interval_ms` line from your `daemon.toml`:
 ```bash
-sudo sed -i '/publish_interval_ms/d' /etc/onlyfans/daemon.toml
+sudo sed -i '/publish_interval_ms/d' /etc/control-ofc/daemon.toml
 ```
 
 ### v0.7.0 — Telemetry fully removed
@@ -208,20 +208,20 @@ Syslog/telemetry was de-scoped in R52 (v0.5.8). Remove any `[telemetry]` section
 
 ```bash
 # Stop and disable the service
-sudo systemctl stop onlyfans-daemon
-sudo systemctl disable onlyfans-daemon
+sudo systemctl stop control-ofc-daemon
+sudo systemctl disable control-ofc-daemon
 
 # Remove files
-sudo rm /etc/systemd/system/onlyfans-daemon.service
-sudo rm /usr/local/bin/onlyfans-daemon
-sudo rm /usr/local/bin/onlyfans-restore-auto  # if installed
+sudo rm /etc/systemd/system/control-ofc-daemon.service
+sudo rm /usr/local/bin/control-ofc-daemon
+sudo rm /usr/local/bin/control-ofc-restore-auto  # if installed
 
 # Remove config and state (optional — preserves your settings if omitted)
-sudo rm -rf /etc/onlyfans/
-sudo rm -rf /var/lib/onlyfans/
+sudo rm -rf /etc/control-ofc/
+sudo rm -rf /var/lib/control-ofc/
 
 # Remove udev rules if installed
-sudo rm -f /etc/udev/rules.d/99-onlyfans.rules
+sudo rm -f /etc/udev/rules.d/99-control-ofc.rules
 sudo udevadm control --reload-rules
 
 # Reload systemd

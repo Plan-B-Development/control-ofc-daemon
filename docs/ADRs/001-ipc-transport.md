@@ -20,10 +20,10 @@ The daemon needs a local-only IPC mechanism for the Python GUI to query state (h
 - Unix socket provides OS-level access control (file permissions)
 - axum is lightweight, tower-based, and has built-in UDS support
 - GUI can use any HTTP client (httpx in Python already proven in legacy codebase)
-- Easy to test with curl: `curl --unix-socket /run/onlyfans/onlyfans.sock http://localhost/status`
+- Easy to test with curl: `curl --unix-socket /run/control-ofc/control-ofc.sock http://localhost/status`
 
 ## Socket Path
-- Default: `/run/onlyfans/onlyfans.sock` (configurable via `ipc.socket_path` in config)
+- Default: `/run/control-ofc/control-ofc.sock` (configurable via `ipc.socket_path` in config)
 - Directory created on startup if missing
 - Stale socket file removed on startup
 - Socket file cleaned up on shutdown

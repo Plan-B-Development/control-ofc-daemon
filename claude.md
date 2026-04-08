@@ -1,4 +1,4 @@
-# claude.md — OnlyFans Daemon (Rust) Development Brief
+# claude.md — Control-OFC Daemon (Rust) Development Brief
 
 ## 1) Goal
 Build a Rust daemon that:
