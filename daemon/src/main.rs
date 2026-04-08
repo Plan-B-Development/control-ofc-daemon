@@ -3,21 +3,21 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use onlyfans_daemon::api::handlers::AppState;
-use onlyfans_daemon::api::server;
-use onlyfans_daemon::config::DaemonConfig;
-use onlyfans_daemon::daemon_state;
-use onlyfans_daemon::health::cache::StateCache;
-use onlyfans_daemon::health::history::HistoryRing;
-use onlyfans_daemon::health::staleness::StalenessConfig;
-use onlyfans_daemon::hwmon::lease::LeaseManager;
-use onlyfans_daemon::hwmon::pwm_control::{HwmonPwmController, RealSysfsWriter};
-use onlyfans_daemon::hwmon::pwm_discovery::discover_pwm_headers;
-use onlyfans_daemon::hwmon::HWMON_SYSFS_ROOT;
-use onlyfans_daemon::profile::{self, DaemonProfile};
-use onlyfans_daemon::safety::ThermalSafetyRule;
-use onlyfans_daemon::serial::controller::FanController;
-use onlyfans_daemon::serial::real_transport::{auto_detect_port, RealSerialTransport};
+use control_ofc_daemon::api::handlers::AppState;
+use control_ofc_daemon::api::server;
+use control_ofc_daemon::config::DaemonConfig;
+use control_ofc_daemon::daemon_state;
+use control_ofc_daemon::health::cache::StateCache;
+use control_ofc_daemon::health::history::HistoryRing;
+use control_ofc_daemon::health::staleness::StalenessConfig;
+use control_ofc_daemon::hwmon::lease::LeaseManager;
+use control_ofc_daemon::hwmon::pwm_control::{HwmonPwmController, RealSysfsWriter};
+use control_ofc_daemon::hwmon::pwm_discovery::discover_pwm_headers;
+use control_ofc_daemon::hwmon::HWMON_SYSFS_ROOT;
+use control_ofc_daemon::profile::{self, DaemonProfile};
+use control_ofc_daemon::safety::ThermalSafetyRule;
+use control_ofc_daemon::serial::controller::FanController;
+use control_ofc_daemon::serial::real_transport::{auto_detect_port, RealSerialTransport};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_CONFIG_PATH: &str = "/etc/onlyfans/daemon.toml";
@@ -181,14 +181,14 @@ async fn main() {
     // ── Initialize OpenFanController (with retry for USB enumeration timing) ──
     let fan_controller: Option<Arc<Mutex<FanController>>>;
     let openfan_transport: Option<
-        Arc<Mutex<Box<dyn onlyfans_daemon::serial::transport::SerialTransport + Send>>>,
+        Arc<Mutex<Box<dyn control_ofc_daemon::serial::transport::SerialTransport + Send>>>,
     >;
 
     let max_serial_retries = 5;
     let mut serial_connected = false;
     let mut fc: Option<Arc<Mutex<FanController>>> = None;
     let mut ot: Option<
-        Arc<Mutex<Box<dyn onlyfans_daemon::serial::transport::SerialTransport + Send>>>,
+        Arc<Mutex<Box<dyn control_ofc_daemon::serial::transport::SerialTransport + Send>>>,
     > = None;
 
     for attempt in 0..=max_serial_retries {
@@ -211,8 +211,9 @@ async fn main() {
             match RealSerialTransport::open(port, serial_timeout) {
                 Ok(transport) => {
                     log::info!("OpenFanController connected on {port}");
-                    let boxed: Box<dyn onlyfans_daemon::serial::transport::SerialTransport + Send> =
-                        Box::new(transport);
+                    let boxed: Box<
+                        dyn control_ofc_daemon::serial::transport::SerialTransport + Send,
+                    > = Box::new(transport);
                     let shared = Arc::new(Mutex::new(boxed));
 
                     let ctrl =
@@ -292,8 +293,9 @@ async fn main() {
     let active_profile: Arc<Mutex<Option<DaemonProfile>>> = Arc::new(Mutex::new(initial_profile));
 
     // Detect AMD GPUs
-    let amd_gpus =
-        onlyfans_daemon::hwmon::gpu_detect::detect_amd_gpus(std::path::Path::new(HWMON_SYSFS_ROOT));
+    let amd_gpus = control_ofc_daemon::hwmon::gpu_detect::detect_amd_gpus(std::path::Path::new(
+        HWMON_SYSFS_ROOT,
+    ));
     if !amd_gpus.is_empty() {
         for gpu in &amd_gpus {
             log::info!(
@@ -331,7 +333,7 @@ async fn main() {
     let hwmon_shutdown = poll_shutdown_rx.clone();
     let gpu_infos_for_poll = app_state.amd_gpus.clone();
     tokio::spawn(async move {
-        onlyfans_daemon::polling::hwmon_poll_loop(
+        control_ofc_daemon::polling::hwmon_poll_loop(
             hwmon_cache,
             hwmon_history,
             hwmon_headers_for_poll,
@@ -349,7 +351,7 @@ async fn main() {
         let openfan_interval = Duration::from_millis(config.polling.poll_interval_ms);
         let openfan_shutdown = poll_shutdown_rx.clone();
         tokio::spawn(async move {
-            onlyfans_daemon::polling::openfan_poll_loop(
+            control_ofc_daemon::polling::openfan_poll_loop(
                 openfan_cache,
                 transport,
                 serial_timeout,
@@ -373,7 +375,7 @@ async fn main() {
         let engine_shutdown = poll_shutdown_rx;
 
         tokio::spawn(async move {
-            onlyfans_daemon::profile_engine::profile_engine_loop(
+            control_ofc_daemon::profile_engine::profile_engine_loop(
                 engine_cache,
                 engine_profile,
                 engine_fc,
@@ -435,7 +437,7 @@ async fn main() {
     // Reset GPU fans to automatic before shutting down (re-enables zero-RPM)
     for gpu in &app_state.amd_gpus {
         if let Some(ref fan_curve_path) = gpu.fan_curve_path {
-            match onlyfans_daemon::hwmon::gpu_fan::reset_to_auto(
+            match control_ofc_daemon::hwmon::gpu_fan::reset_to_auto(
                 fan_curve_path,
                 gpu.fan_zero_rpm_path.as_deref(),
             ) {

@@ -9,19 +9,19 @@ use hyper::Request;
 use hyper_util::rt::TokioIo;
 use tokio::net::UnixStream;
 
-use onlyfans_daemon::api::handlers::AppState;
-use onlyfans_daemon::api::server;
-use onlyfans_daemon::error::SerialError;
-use onlyfans_daemon::health::cache::StateCache;
-use onlyfans_daemon::health::history::HistoryRing;
-use onlyfans_daemon::health::staleness::StalenessConfig;
-use onlyfans_daemon::health::state::{CachedSensorReading, DeviceLabel, OpenFanState};
-use onlyfans_daemon::hwmon::lease::LeaseManager;
-use onlyfans_daemon::hwmon::pwm_control::{HwmonPwmController, SysfsWriter};
-use onlyfans_daemon::hwmon::pwm_discovery::PwmHeaderDescriptor;
-use onlyfans_daemon::hwmon::types::SensorKind;
-use onlyfans_daemon::serial::controller::FanController;
-use onlyfans_daemon::serial::transport::SerialTransport;
+use control_ofc_daemon::api::handlers::AppState;
+use control_ofc_daemon::api::server;
+use control_ofc_daemon::error::SerialError;
+use control_ofc_daemon::health::cache::StateCache;
+use control_ofc_daemon::health::history::HistoryRing;
+use control_ofc_daemon::health::staleness::StalenessConfig;
+use control_ofc_daemon::health::state::{CachedSensorReading, DeviceLabel, OpenFanState};
+use control_ofc_daemon::hwmon::lease::LeaseManager;
+use control_ofc_daemon::hwmon::pwm_control::{HwmonPwmController, SysfsWriter};
+use control_ofc_daemon::hwmon::pwm_discovery::PwmHeaderDescriptor;
+use control_ofc_daemon::hwmon::types::SensorKind;
+use control_ofc_daemon::serial::controller::FanController;
+use control_ofc_daemon::serial::transport::SerialTransport;
 
 /// Helper: create AppState with a pre-populated cache.
 fn test_app_state() -> Arc<AppState> {
@@ -389,11 +389,11 @@ impl SysfsWriter for HwmonMockWriter {
         &mut self,
         _path: &str,
         _value: &str,
-    ) -> Result<(), onlyfans_daemon::error::HwmonError> {
+    ) -> Result<(), control_ofc_daemon::error::HwmonError> {
         Ok(())
     }
 
-    fn read_file(&self, _path: &str) -> Result<String, onlyfans_daemon::error::HwmonError> {
+    fn read_file(&self, _path: &str) -> Result<String, control_ofc_daemon::error::HwmonError> {
         Ok("1200\n".to_string())
     }
 }
