@@ -1,6 +1,13 @@
 [Unit]
 Description=Control-OFC Fan Control Daemon
 After=local-fs.target
+# Ensure cdc_acm is loaded before we start so that DeviceAllow=char-ttyACM
+# can resolve the device group from /proc/devices. Without this, starting
+# before cdc_acm loads (common on boot, before USB enumeration) leaves the
+# cgroup filter without a ttyACM rule, and the daemon gets EPERM when the
+# OpenFanController appears shortly after. See systemd.resource-control(5).
+Wants=modprobe@cdc_acm.service
+After=modprobe@cdc_acm.service
 
 [Service]
 Type=simple
