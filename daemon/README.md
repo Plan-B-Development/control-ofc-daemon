@@ -1,6 +1,6 @@
 # control-ofc-daemon
 
-Rust-based fan control daemon for the OnlyFans system. Manages hardware access (hwmon sysfs, OpenFanController serial), runs safety rules, serves an HTTP API over a Unix socket, and optionally evaluates fan curve profiles autonomously.
+Rust-based fan control daemon for the Control-OFC system. Manages hardware access (hwmon sysfs, OpenFanController serial, AMD GPU PMFW), runs safety rules, serves an HTTP API over a Unix socket, and optionally evaluates fan curve profiles autonomously.
 
 ## Build
 

@@ -103,16 +103,71 @@ profile_engine ──read──> StateCache
 
 ## API Endpoints
 
-See `daemon/src/api/server.rs` for the full route table. Key endpoints:
+Full route table (source of truth: `daemon/src/api/server.rs`).
+
+### Read endpoints
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/status` | Subsystem health |
+| GET | `/status` | Subsystem health + freshness |
+| GET | `/sensors` | All temperature readings |
+| GET | `/fans` | Fan RPM + last commanded PWM |
 | GET | `/poll` | Batch: status + sensors + fans |
+| GET | `/sensors/history` | Per-entity time-series (ring buffer) |
+| GET | `/events` | Server-Sent Events stream (`event: update`, 5s heartbeat) |
 | GET | `/capabilities` | Device list, feature flags, limits |
-| GET | `/sensors/history` | Per-entity time-series |
-| GET | `/events` | SSE real-time stream |
-| POST | `/fans/openfan/{ch}/pwm` | Set OpenFan PWM |
-| POST | `/gpu/{gpu_id}/fan/pwm` | Set GPU fan speed |
+| GET | `/hwmon/headers` | Controllable motherboard PWM outputs |
+| GET | `/hwmon/lease/status` | Lease holder + TTL |
+| GET | `/profile/active` | Current active profile or `{"active": false}` |
+
+### Write endpoints — OpenFan
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/fans/openfan/{channel}/pwm` | Set a single OpenFan channel PWM |
+| POST | `/fans/openfan/pwm` | Set all OpenFan channels in one call |
+| POST | `/fans/openfan/{channel}/target_rpm` | Closed-loop RPM target (not used by V1 GUI) |
+| POST | `/fans/openfan/{channel}/calibrate` | PWM→RPM sweep (long-running, thermal-aborting) |
+
+### Write endpoints — GPU
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/gpu/{gpu_id}/fan/pwm` | Set GPU fan to static speed (5% change threshold) |
+| POST | `/gpu/{gpu_id}/fan/reset` | Restore GPU fan to automatic / re-enable zero-RPM |
+
+### Write endpoints — hwmon
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/hwmon/lease/take` | Acquire exclusive write lease (60s TTL) |
+| POST | `/hwmon/lease/renew` | Renew held lease |
+| POST | `/hwmon/lease/release` | Release held lease |
 | POST | `/hwmon/{header_id}/pwm` | Set hwmon PWM (lease required) |
-| POST | `/profile/activate` | Switch active profile |
+| POST | `/hwmon/rescan` | Re-enumerate hwmon devices and return fresh header list |
+
+### Write endpoints — profile / config
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/profile/activate` | Switch active profile by id or path |
+| POST | `/config/profile-search-dirs` | Additively register profile search directories (persists to `daemon.toml`) |
+| POST | `/config/startup-delay` | Set startup delay seconds (persists to `daemon.toml`, takes effect on restart) |
+
+Error envelope (all errors):
+
+```json
+{
+  "error": {
+    "code": "string",
+    "message": "string",
+    "details": "any | omitted",
+    "retryable": true,
+    "source": "validation | internal | hardware"
+  }
+}
+```
+
+Codes: `validation_error` (400), `lease_required` (403), `not_found` (404),
+`lease_already_held` (409), `thermal_abort` (409), `internal_error` (500),
+`hardware_unavailable` (503).
