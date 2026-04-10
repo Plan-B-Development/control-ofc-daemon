@@ -1,5 +1,20 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **Boot-time OpenFanController detection race.** On cold boot the daemon could
+  start before the `cdc_acm` kernel module loaded, at which point systemd
+  silently dropped `DeviceAllow=char-ttyACM rwm` (class unresolved in
+  `/proc/devices`). The USB device then appeared shortly after, but every open
+  returned `Operation not permitted` because the cgroup device filter never
+  included a ttyACM rule. Manual `systemctl restart` masked the issue because
+  `cdc_acm` was loaded by then. Fixed by adding
+  `Wants=modprobe@cdc_acm.service` + `After=modprobe@cdc_acm.service` to the
+  unit's `[Unit]` section, per the workaround documented in
+  `systemd.resource-control(5)`. Reinstall the service file (or reinstall the
+  package) and run `systemctl daemon-reload` to pick up the change.
+
 ## [1.0.0] — 2026-04-08
 
 ### Project Rebrand — OnlyFans → Control-OFC
