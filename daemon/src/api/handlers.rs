@@ -1342,6 +1342,13 @@ pub async fn activate_profile_handler(
         *guard = Some(profile);
     }
 
+    // Treat activation as GUI activity so the profile engine defers writes
+    // for the next GUI_ACTIVITY_TIMEOUT window. This gives the GUI exclusive
+    // ownership of fan writes during a profile switch and prevents a dead
+    // zone where neither writer is pushing values (see DEC on profile
+    // activation deferral in CHANGELOG).
+    state.cache.record_gui_write();
+
     // Persist
     let new_state = crate::daemon_state::DaemonState {
         version: 1,
