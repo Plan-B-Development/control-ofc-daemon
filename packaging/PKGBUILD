@@ -16,7 +16,7 @@ source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
 # (.github/workflows/release-aur.yml) will fail until this matches the
 # GitHub tarball hash. Fix with a follow-up "fix: update PKGBUILD
 # checksum for v1.1.0" commit, same pattern as commit a1d2b7b.
-sha256sums=('SKIP')
+sha256sums=('e9ef3f8b7d0fbf954d97315d7d0fcdc5b33d7577cd19c048360bf0dfd4eca8cb')
 
 prepare() {
     cd "$pkgname-$pkgver"
