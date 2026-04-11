@@ -108,9 +108,14 @@ async fn start_test_server(
 
     let (tx, rx) = tokio::sync::oneshot::channel();
 
+    // Bind the listener here (mirrors what preflight_check does in main).
+    let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+
     let path_clone = socket_path.clone();
     tokio::spawn(async move {
-        server::serve(&path_clone, state, rx).await.unwrap();
+        server::serve(listener, path_clone, state, rx)
+            .await
+            .unwrap();
     });
 
     // Wait for the socket to become available

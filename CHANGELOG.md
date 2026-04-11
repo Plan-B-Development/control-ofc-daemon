@@ -1,5 +1,64 @@
 # Changelog
 
+## [1.1.1] — 2026-04-11
+
+### Fixed
+- **First-run failure when the binary is invoked directly.** A tester
+  reported that running `control-ofc-daemon` from a terminal as a regular
+  user produced `ERROR IPC server error: Permission denied (os error 13)`
+  but the daemon kept running, with the profile engine and polling loops
+  live but no way to reach them. Root cause: the IPC server task's
+  `create_dir_all("/run/control-ofc")` / `UnixListener::bind` both require
+  root and the systemd-managed `RuntimeDirectory=control-ofc`; the error
+  was logged and then ignored instead of terminating the daemon. Fix:
+  - New `preflight_check` in `main.rs` runs **before any subsystem
+    spawns**. It verifies `geteuid() == 0`, creates and probes the state
+    directory for writability, and binds the IPC socket (with stale-file
+    removal and the 0o666 chmod). Any failure prints an actionable
+    stderr message pointing to `sudo systemctl enable --now
+    control-ofc-daemon` and exits(1) — no more half-started zombie.
+  - `api::server::serve` now takes an already-bound `UnixListener`
+    instead of a path, so the bind happens once, synchronously, at
+    startup. The mkdir / stale-remove / bind / chmod dance moved out of
+    the async task.
+  - The main `tokio::select!` now watches an `ipc_dead_rx` channel; if
+    the IPC task ever exits with an error post-startup, the main loop
+    breaks and the daemon shuts down cleanly (GPU reset, hwmon restore,
+    socket cleanup) instead of running headless.
+  - Specific error messages for `PermissionDenied` (points to systemctl)
+    and `AddrInUse` (points to `systemctl status control-ofc-daemon`).
+
+### Added
+- **`--allow-non-root` hidden developer flag.** Skips the preflight EUID
+  check for devs who want to run the binary directly with overridden
+  `ipc.socket_path` and `state.state_dir`. Not listed in user-facing docs;
+  mentioned only in `daemon.md` under the Running section. Hwmon / GPU /
+  serial writes still require root regardless, so this is strictly for
+  local IPC experimentation.
+- **`libc` dependency** (0.2) for the `geteuid` call. Tiny, stable,
+  already transitively present.
+
+### Changed
+- **`post_install` hint reordered.** The "start via systemctl" line is
+  now the first thing users see, with an explicit "do NOT run the binary
+  directly" follow-up. Previously this hint sat fourth in the list and
+  was easy to skip.
+- **`daemon.md`** gained a "Running" section that explains systemd is the
+  only supported invocation path and what the preflight failure looks
+  like.
+- **Version bumped to 1.1.1** (`daemon/Cargo.toml`, `packaging/PKGBUILD`).
+  Per project policy: any change on top of a local 1.1.0 bumps to 1.1.1.
+
+### Risk notes
+- Pre-1.1.0 versions wrote `persist_profile_search_dirs` back to
+  `daemon.toml` under `ProtectSystem=strict`, which would also have
+  failed under systemd; the runtime.toml split in 1.1.0 already fixed
+  that. 1.1.1 only closes the remaining "binary run by hand" failure
+  mode.
+- No changes to thermal safety, sysfs writers, profile engine, or shutdown
+  cleanup paths. Scope is bounded to startup validation and IPC task
+  lifecycle.
+
 ## [1.1.0] — 2026-04-11
 
 ### Added

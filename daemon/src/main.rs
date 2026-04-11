@@ -19,9 +19,184 @@ use control_ofc_daemon::runtime_config::{RuntimeConfig, RUNTIME_CONFIG_FILE};
 use control_ofc_daemon::safety::ThermalSafetyRule;
 use control_ofc_daemon::serial::controller::FanController;
 use control_ofc_daemon::serial::real_transport::{auto_detect_port, RealSerialTransport};
+use tokio::net::UnixListener;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_CONFIG_PATH: &str = "/etc/control-ofc/daemon.toml";
+
+/// Hidden dev-only flag. When passed, the daemon skips its "must run as root"
+/// check. It does NOT skip any file/socket access checks — those still run
+/// and will fail with an actionable error if the dev hasn't also overridden
+/// the socket/state paths to user-writable locations. Not publicly documented.
+const ALLOW_NON_ROOT_FLAG: &str = "--allow-non-root";
+
+/// Return `true` if the current process is running as effective UID 0.
+fn running_as_root() -> bool {
+    // SAFETY: `geteuid` is thread-safe and always defined on Unix targets.
+    // It simply reads the calling process's EUID from the kernel.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// CLI flag parser for `--allow-non-root`. Separated from `parse_profile_arg`
+/// so preflight can consult it before any config/profile plumbing runs.
+fn parse_allow_non_root_flag() -> bool {
+    std::env::args().any(|a| a == ALLOW_NON_ROOT_FLAG)
+}
+
+/// Pre-flight validation that the daemon has the permissions it needs.
+///
+/// Runs *before* any subsystem (polling, profile engine, hardware probes)
+/// starts, so that a permission failure surfaces as one clear error instead
+/// of a half-started zombie daemon with silently-broken IPC.
+///
+/// Performs three checks, in order:
+/// 1. **EUID check** — bail out if not root, unless `--allow-non-root`.
+///    hwmon / GPU / serial writes all require root regardless of file
+///    permissions, so running as a regular user can't succeed anyway.
+/// 2. **State directory writability** — try to create a `.writable_probe`
+///    file inside `state_dir`. Catches the case where the daemon is running
+///    as root but without systemd having prepared `/var/lib/control-ofc`.
+/// 3. **IPC socket bind** — create the parent directory, remove any stale
+///    socket from a prior crash, bind a `UnixListener`, and chmod it to
+///    0o666 (DEC-049). The returned listener is handed straight to
+///    `server::serve`, so there is no bind/unbind/re-bind race.
+///
+/// Any failure prints an actionable error to stderr and exits(1). The hint
+/// always points back to `sudo systemctl enable --now control-ofc-daemon`,
+/// which is the only supported way to run the daemon.
+fn preflight_check(config: &DaemonConfig, allow_non_root: bool) -> UnixListener {
+    // ── 1. EUID check ───────────────────────────────────────────────────
+    if !running_as_root() && !allow_non_root {
+        eprintln!("error: control-ofc-daemon must be run as root.");
+        eprintln!();
+        eprintln!("The daemon writes PWM values to /sys/class/hwmon/ and GPU fan");
+        eprintln!("curves, and binds a Unix socket under /run/control-ofc/. All");
+        eprintln!("of these require root privileges and the systemd-managed");
+        eprintln!("runtime and state directories.");
+        eprintln!();
+        eprintln!("Start the daemon via systemd instead:");
+        eprintln!();
+        eprintln!("    sudo systemctl enable --now control-ofc-daemon");
+        eprintln!();
+        eprintln!("(Developers: pass {ALLOW_NON_ROOT_FLAG} and override");
+        eprintln!("ipc.socket_path / state.state_dir in your config to run the");
+        eprintln!("binary directly. This is not supported for end users.)");
+        std::process::exit(1);
+    }
+
+    // ── 2. State directory writability ─────────────────────────────────
+    let state_dir = Path::new(&config.state.state_dir);
+    if let Err(e) = std::fs::create_dir_all(state_dir) {
+        eprintln!(
+            "error: cannot create state directory '{}': {e}",
+            state_dir.display()
+        );
+        eprintln!();
+        eprintln!("This directory is normally created by systemd via");
+        eprintln!("StateDirectory=control-ofc in the unit file. Start the");
+        eprintln!("daemon via:");
+        eprintln!();
+        eprintln!("    sudo systemctl enable --now control-ofc-daemon");
+        std::process::exit(1);
+    }
+    let probe = state_dir.join(".writable_probe");
+    match std::fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!(
+                "error: permission denied writing to state directory '{}'.",
+                state_dir.display()
+            );
+            eprintln!();
+            eprintln!("The daemon must be able to persist its state file and");
+            eprintln!("runtime.toml. If you started the binary directly as a");
+            eprintln!("regular user, use systemd instead:");
+            eprintln!();
+            eprintln!("    sudo systemctl enable --now control-ofc-daemon");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!(
+                "error: state directory '{}' is not writable: {e}",
+                state_dir.display()
+            );
+            std::process::exit(1);
+        }
+    }
+
+    // ── 3. IPC socket bind ─────────────────────────────────────────────
+    let socket_path = Path::new(&config.ipc.socket_path);
+    if let Some(parent) = socket_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!(
+                "error: cannot create IPC socket directory '{}': {e}",
+                parent.display()
+            );
+            eprintln!();
+            eprintln!("This directory is normally created by systemd via");
+            eprintln!("RuntimeDirectory=control-ofc. Start the daemon via:");
+            eprintln!();
+            eprintln!("    sudo systemctl enable --now control-ofc-daemon");
+            std::process::exit(1);
+        }
+    }
+    if socket_path.exists() {
+        if let Err(e) = std::fs::remove_file(socket_path) {
+            eprintln!(
+                "error: failed to remove stale IPC socket '{}': {e}",
+                socket_path.display()
+            );
+            std::process::exit(1);
+        }
+        log::info!("Removed stale socket: {}", socket_path.display());
+    }
+    let listener = match UnixListener::bind(socket_path) {
+        Ok(l) => l,
+        Err(e) => {
+            let kind = e.kind();
+            eprintln!(
+                "error: failed to bind IPC socket '{}': {e}",
+                socket_path.display()
+            );
+            if kind == std::io::ErrorKind::PermissionDenied {
+                eprintln!();
+                eprintln!("The daemon cannot bind its IPC socket. Start it via");
+                eprintln!("systemd, which prepares the runtime directory:");
+                eprintln!();
+                eprintln!("    sudo systemctl enable --now control-ofc-daemon");
+            } else if kind == std::io::ErrorKind::AddrInUse {
+                eprintln!();
+                eprintln!("Another instance of control-ofc-daemon may already be");
+                eprintln!("running. Check with:");
+                eprintln!();
+                eprintln!("    systemctl status control-ofc-daemon");
+            }
+            std::process::exit(1);
+        }
+    };
+    // DEC-049: world-writable socket so non-root GUI clients can connect.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) =
+            std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o666))
+        {
+            eprintln!(
+                "error: failed to chmod 0o666 on IPC socket '{}': {e}",
+                socket_path.display()
+            );
+            std::process::exit(1);
+        }
+    }
+
+    log::info!(
+        "Preflight OK — state dir '{}' writable, IPC bound at '{}'",
+        state_dir.display(),
+        socket_path.display()
+    );
+    listener
+}
 
 /// Apply runtime.toml overrides onto the in-memory `DaemonConfig`.
 /// Any key present in runtime.toml shadows the admin-owned daemon.toml value.
@@ -155,6 +330,11 @@ fn parse_profile_arg(search_dirs: &[std::path::PathBuf]) -> Option<std::path::Pa
                 i += 2; // skip --config and its value
                 continue;
             }
+            "--allow-non-root" => {
+                // Handled by `parse_allow_non_root_flag` at preflight; skip here.
+                i += 1;
+                continue;
+            }
             "--profile" if i + 1 < args.len() => {
                 let name = &args[i + 1];
                 return profile::find_profile(name, search_dirs).or_else(|| {
@@ -267,6 +447,13 @@ async fn main() {
     let mut runtime_cfg = RuntimeConfig::load_from(&runtime_config_path);
     apply_runtime_overlay(&mut config, &runtime_cfg, &config_path);
     migrate_legacy_runtime_keys(&config_path, &runtime_config_path, &mut runtime_cfg);
+
+    // Pre-flight: verify we can bind the IPC socket and write to state_dir
+    // *before* starting any subsystem. A failure here is fatal — the daemon
+    // is useless without IPC, and a half-started daemon only confuses
+    // operators. preflight_check exits(1) itself on failure.
+    let allow_non_root = parse_allow_non_root_flag();
+    let listener = preflight_check(&config, allow_non_root);
 
     // Configurable startup delay — wait for hardware to appear after boot
     if config.startup.delay_secs > 0 {
@@ -502,21 +689,34 @@ async fn main() {
     }
 
     // ── Spawn IPC server ────────────────────────────────────────────
+    // Listener was bound in preflight_check, so we know IPC is healthy
+    // before any subsystem started. If the server task exits unexpectedly
+    // after this point, ipc_dead_rx fires and the main loop breaks so the
+    // daemon shuts down cleanly instead of running headless.
     let socket_path = config.ipc.socket_path.clone();
     let server_state = app_state.clone();
+    let (ipc_dead_tx, ipc_dead_rx) = tokio::sync::oneshot::channel::<String>();
     let server_handle = tokio::spawn(async move {
-        if let Err(e) = server::serve(&socket_path, server_state, shutdown_rx).await {
-            log::error!("IPC server error: {e}");
+        match server::serve(listener, socket_path, server_state, shutdown_rx).await {
+            Ok(()) => {
+                log::info!("IPC server exited cleanly");
+            }
+            Err(e) => {
+                log::error!("IPC server error: {e}");
+                let _ = ipc_dead_tx.send(e.to_string());
+            }
         }
     });
 
     log::info!("Daemon ready — waiting for shutdown signal");
 
-    // Handle SIGHUP (config reload) and SIGINT/SIGTERM (shutdown)
+    // Handle SIGHUP (config reload), SIGINT/SIGTERM (shutdown), and IPC task
+    // death (shutdown — daemon is useless without IPC).
     {
         use tokio::signal::unix::{signal, SignalKind};
 
         let mut sighup = signal(SignalKind::hangup()).expect("Failed to register SIGHUP handler");
+        tokio::pin!(ipc_dead_rx);
 
         loop {
             tokio::select! {
@@ -541,6 +741,17 @@ async fn main() {
                         }
                         Err(e) => log::error!("Config reload failed: {e}"),
                     }
+                }
+                res = &mut ipc_dead_rx => {
+                    match res {
+                        Ok(msg) => log::error!(
+                            "IPC server task died unexpectedly ({msg}) — shutting down"
+                        ),
+                        Err(_) => log::error!(
+                            "IPC server task dropped its dead-signal channel — shutting down"
+                        ),
+                    }
+                    break;
                 }
             }
         }

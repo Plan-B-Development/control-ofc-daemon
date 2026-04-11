@@ -10,6 +10,9 @@ use tokio::net::UnixListener;
 use super::handlers::{self, AppState};
 use super::sse;
 
+/// Error returned by [`serve`] when axum finishes unexpectedly.
+pub type ServeError = Box<dyn std::error::Error + Send + Sync>;
+
 /// Build the axum router with all endpoints.
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -86,45 +89,22 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-/// Start the IPC server on a Unix socket.
+/// Serve axum over an already-bound Unix listener.
 ///
-/// This function:
-/// 1. Creates the parent directory if needed
-/// 2. Removes any stale socket file
-/// 3. Binds and serves until the shutdown signal fires
+/// Binding, stale-socket removal, parent-dir creation, and the 0o666 chmod
+/// all happen in `main::preflight_check` *before* any subsystem is spawned,
+/// so that a bind failure is surfaced immediately as a fatal startup error
+/// (see ADR-002 for the rationale — we don't want a half-started daemon
+/// running polling loops with no one to talk to).
+///
+/// `socket_path` is kept around only for logging and for unlinking the
+/// socket file on clean shutdown.
 pub async fn serve(
-    socket_path: &str,
+    listener: UnixListener,
+    socket_path: String,
     state: Arc<AppState>,
     shutdown: tokio::sync::oneshot::Receiver<()>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let path = Path::new(socket_path);
-
-    // Create parent directory if needed
-    if let Some(parent) = path.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent)?;
-            log::info!("Created socket directory: {}", parent.display());
-        }
-    }
-
-    // Remove stale socket file
-    if path.exists() {
-        std::fs::remove_file(path)?;
-        log::info!("Removed stale socket: {socket_path}");
-    }
-
-    let listener = UnixListener::bind(path)?;
-
-    // DEC-049: World-writable (0o666) to allow non-root GUI connections.
-    // The daemon is local-only (Unix socket, not TCP-exposed). Any local user
-    // can connect and issue commands including fan writes. On multi-user systems,
-    // restrict to a dedicated group (0o660) and add GUI users to that group.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))?;
-    }
-
+) -> Result<(), ServeError> {
     log::info!("IPC server listening on {socket_path}");
 
     let app = build_router(state);
@@ -136,7 +116,8 @@ pub async fn serve(
         })
         .await?;
 
-    // Clean up socket file
+    // Clean up socket file on clean shutdown.
+    let path = Path::new(&socket_path);
     if path.exists() {
         let _ = std::fs::remove_file(path);
     }
