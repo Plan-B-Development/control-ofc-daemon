@@ -1,6 +1,11 @@
-# Control-OFC Daemon Configuration
+# Control-OFC Daemon — admin-owned configuration.
 # Copy to /etc/control-ofc/daemon.toml and edit as needed.
 # All fields are optional — defaults are shown below.
+#
+# NOTE: runtime-mutable settings (profile search directories, startup delay)
+# are stored separately in /var/lib/control-ofc/runtime.toml, which the
+# daemon manages itself via the API. This file is admin-owned and is never
+# rewritten by the daemon at runtime. See docs/ADRs/002-runtime-config-split.md.
 
 [serial]
 # Use stable /dev/serial/by-id/ path (survives USB re-enumeration)
@@ -15,14 +20,3 @@
 
 [state]
 # state_dir = "/var/lib/control-ofc"
-
-[startup]
-# Delay in seconds before the daemon begins device detection after boot.
-# Useful for waiting for USB or hwmon devices to appear.
-# delay_secs = 0
-
-[profiles]
-# Directories where the daemon looks for profile JSON files.
-# The GUI stores profiles at ~/.config/control-ofc/profiles/ by default.
-# Add your user's profile directory for GUI profile activation to work.
-# search_dirs = ["/etc/control-ofc/profiles", "/home/yourusername/.config/control-ofc/profiles"]

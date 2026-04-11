@@ -159,98 +159,6 @@ pub struct StartupConfig {
 // Default: delay_secs = 0 (no startup delay).
 // Derived rather than manual impl per clippy::derivable_impls.
 
-/// Persist profile search directories to daemon.toml.
-///
-/// Reads the existing file, updates the `[profiles]` section, and writes back
-/// atomically (temp file + rename). Preserves all other sections.
-pub fn persist_profile_search_dirs(config_path: &str, dirs: &[String]) -> Result<(), String> {
-    let existing = match std::fs::read_to_string(config_path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(format!("failed to read {config_path}: {e}")),
-    };
-
-    // Parse existing TOML as a generic table so we preserve all sections.
-    // If the file is malformed, warn and start from an empty table rather
-    // than propagating the error (the new value will overwrite cleanly).
-    let mut table: toml::Table = match toml::from_str(&existing) {
-        Ok(t) => t,
-        Err(e) => {
-            if !existing.is_empty() {
-                log::warn!("existing config at {config_path} failed to parse, will overwrite: {e}");
-            }
-            toml::Table::new()
-        }
-    };
-
-    // Build the search_dirs array as TOML values
-    let dirs_array: toml::Value = toml::Value::Array(
-        dirs.iter()
-            .map(|d| toml::Value::String(d.clone()))
-            .collect(),
-    );
-
-    // Update or create [profiles] section
-    let profiles = table
-        .entry("profiles")
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-    if let toml::Value::Table(ref mut t) = profiles {
-        t.insert("search_dirs".to_string(), dirs_array);
-    }
-
-    // Serialize and write atomically
-    let content =
-        toml::to_string_pretty(&table).map_err(|e| format!("failed to serialize config: {e}"))?;
-
-    let path = std::path::Path::new(config_path);
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, &content).map_err(|e| format!("failed to write temp config: {e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("failed to rename config: {e}"))?;
-
-    log::info!("Persisted profile search dirs to {config_path}");
-    Ok(())
-}
-
-/// Persist startup delay to daemon.toml.
-pub fn persist_startup_delay(config_path: &str, delay_secs: u64) -> Result<(), String> {
-    let existing = match std::fs::read_to_string(config_path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(format!("failed to read {config_path}: {e}")),
-    };
-
-    let mut table: toml::Table = match toml::from_str(&existing) {
-        Ok(t) => t,
-        Err(e) => {
-            if !existing.is_empty() {
-                log::warn!("existing config at {config_path} failed to parse, will overwrite: {e}");
-            }
-            toml::Table::new()
-        }
-    };
-
-    let startup = table
-        .entry("startup")
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-    if let toml::Value::Table(ref mut t) = startup {
-        t.insert(
-            "delay_secs".to_string(),
-            toml::Value::Integer(delay_secs as i64),
-        );
-    }
-
-    let content =
-        toml::to_string_pretty(&table).map_err(|e| format!("failed to serialize config: {e}"))?;
-
-    let path = std::path::Path::new(config_path);
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, &content).map_err(|e| format!("failed to write temp config: {e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("failed to rename config: {e}"))?;
-
-    log::info!("Persisted startup delay {delay_secs}s to {config_path}");
-    Ok(())
-}
-
 impl DaemonConfig {
     /// Parse configuration from a TOML string.
     pub fn from_toml(input: &str) -> Result<Self, ConfigError> {
@@ -488,56 +396,6 @@ poll_interval_ms = 500
     }
 
     #[test]
-    fn persist_profile_search_dirs_creates_section() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("test.toml");
-        std::fs::write(&path, "[state]\nstate_dir = \"/var/lib/control-ofc\"\n").unwrap();
-
-        let dirs = vec![
-            "/etc/control-ofc/profiles".to_string(),
-            "/home/user/.config/control-ofc/profiles".to_string(),
-        ];
-        persist_profile_search_dirs(path.to_str().unwrap(), &dirs).unwrap();
-
-        let content = std::fs::read_to_string(&path).unwrap();
-        let parsed: toml::Table = toml::from_str(&content).unwrap();
-
-        // [state] preserved
-        assert!(parsed.contains_key("state"));
-        // [profiles] created with search_dirs
-        let profiles = parsed["profiles"].as_table().unwrap();
-        let search_dirs = profiles["search_dirs"].as_array().unwrap();
-        assert_eq!(search_dirs.len(), 2);
-        assert_eq!(
-            search_dirs[0].as_str().unwrap(),
-            "/etc/control-ofc/profiles"
-        );
-    }
-
-    #[test]
-    fn persist_profile_search_dirs_roundtrip() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("roundtrip.toml");
-        std::fs::write(
-            &path,
-            "[serial]\nport = \"/dev/ttyACM0\"\n\n[polling]\npoll_interval_ms = 500\n",
-        )
-        .unwrap();
-
-        let dirs = vec!["/etc/control-ofc/profiles".to_string()];
-        persist_profile_search_dirs(path.to_str().unwrap(), &dirs).unwrap();
-
-        // Should still parse as valid DaemonConfig
-        let config = DaemonConfig::load(path.to_str().unwrap()).unwrap();
-        assert_eq!(config.serial.port.as_deref(), Some("/dev/ttyACM0"));
-        assert_eq!(config.polling.poll_interval_ms, 500);
-        assert!(config
-            .profiles
-            .search_dirs
-            .contains(&"/etc/control-ofc/profiles".to_string()));
-    }
-
-    #[test]
     fn parse_startup_delay_section() {
         let toml = r#"
 [startup]
@@ -562,24 +420,5 @@ delay_secs = 60
         let config = DaemonConfig::from_toml(toml).unwrap();
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("startup.delay_secs"));
-    }
-
-    #[test]
-    fn persist_profile_search_dirs_overwrites_malformed_toml() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("daemon.toml");
-        // Write deliberately malformed TOML
-        std::fs::write(&path, "this is not valid toml {{{{").unwrap();
-
-        let dirs = vec!["/etc/control-ofc/profiles".to_string()];
-        // Should succeed — malformed TOML gets overwritten with a clean table
-        persist_profile_search_dirs(path.to_str().unwrap(), &dirs).unwrap();
-
-        // The new file should be valid and contain our directory
-        let config = DaemonConfig::load(path.to_str().unwrap()).unwrap();
-        assert!(config
-            .profiles
-            .search_dirs
-            .contains(&"/etc/control-ofc/profiles".to_string()));
     }
 }

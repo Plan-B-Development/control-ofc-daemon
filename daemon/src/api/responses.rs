@@ -423,6 +423,21 @@ impl ErrorEnvelope {
             },
         }
     }
+
+    /// A runtime config write failed. Returned with HTTP 503 by
+    /// `POST /config/*` handlers so the caller knows the change did not
+    /// persist and can retry. See ADR-002.
+    pub fn persistence_failed(message: impl Into<String>) -> Self {
+        Self {
+            error: ErrorBody {
+                code: "persistence_failed".into(),
+                message: message.into(),
+                details: None,
+                retryable: true,
+                source: "internal".into(),
+            },
+        }
+    }
 }
 
 #[cfg(test)]

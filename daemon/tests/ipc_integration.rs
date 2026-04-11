@@ -70,6 +70,7 @@ fn test_app_state() -> Arc<AppState> {
         amd_gpus: Vec::new(),
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
         config_path: String::new(),
+        runtime_config_path: std::path::PathBuf::new(),
         sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     })
 }
@@ -276,6 +277,7 @@ fn test_app_state_with_controller(response_count: usize) -> Arc<AppState> {
         amd_gpus: Vec::new(),
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
         config_path: String::new(),
+        runtime_config_path: std::path::PathBuf::new(),
         sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     })
 }
@@ -439,6 +441,7 @@ fn test_app_state_with_hwmon() -> Arc<AppState> {
         amd_gpus: Vec::new(),
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
         config_path: String::new(),
+        runtime_config_path: std::path::PathBuf::new(),
         sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     })
 }
