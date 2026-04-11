@@ -1,11 +1,16 @@
 post_install() {
-    echo ":: Enable the control-ofc-daemon service:"
+    echo ":: Start control-ofc-daemon via systemd (this is the only supported way):"
     echo "   sudo systemctl enable --now control-ofc-daemon"
+    echo ""
+    echo ":: Do NOT run /usr/bin/control-ofc-daemon directly. The binary needs"
+    echo "   root and the runtime + state directories that systemd prepares via"
+    echo "   RuntimeDirectory= and StateDirectory= in the unit file."
     echo ""
     echo ":: For GPU fan control (AMD RDNA3+), ensure your kernel parameters include:"
     echo "   amdgpu.ppfeaturemask=0xffffffff"
     echo ""
-    echo ":: Configuration: /etc/control-ofc/daemon.toml"
+    echo ":: Configuration: /etc/control-ofc/daemon.toml (admin-owned, never rewritten)"
+    echo ":: Runtime state: /var/lib/control-ofc/runtime.toml (daemon-managed)"
     echo ":: udev rules: edit /usr/lib/udev/rules.d/99-control-ofc.rules"
     echo "   to set your OpenFan controller's USB VID/PID."
 }

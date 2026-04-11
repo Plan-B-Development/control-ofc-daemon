@@ -94,6 +94,24 @@ profile_engine ──read──> StateCache
    - Restores `pwm_enable=2` (auto) on ANY service stop (including SIGKILL)
    - Resets GPU fan curves to automatic
 
+## Running
+
+**Always start the daemon via systemd.** The binary under `/usr/bin/control-ofc-daemon`
+is not meant to be invoked directly — it requires root, and the runtime
+(`/run/control-ofc/`) and state (`/var/lib/control-ofc/`) directories are
+prepared by systemd via `RuntimeDirectory=` and `StateDirectory=` in the
+unit file. Running the binary by hand as a regular user hits `EACCES` on
+the IPC socket and exits immediately with an actionable message.
+
+```
+sudo systemctl enable --now control-ofc-daemon
+```
+
+Developers who need to run the binary out-of-band can pass the hidden
+`--allow-non-root` flag and override `ipc.socket_path` + `state.state_dir`
+in `daemon.toml` to user-writable locations. This is not supported for
+end users.
+
 ## Configuration
 
 Configuration lives in two files (see `docs/ADRs/002-runtime-config-split.md`):
