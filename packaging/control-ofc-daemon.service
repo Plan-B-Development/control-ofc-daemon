@@ -43,8 +43,11 @@ RestartSec=3
 # Security hardening
 ProtectHome=read-only
 ProtectSystem=strict
-# /sys/class/hwmon is directory-level — hwmon indices are dynamic, finer restriction not practical (P2-S3)
-ReadWritePaths=/run/control-ofc /sys/class/hwmon /sys/class/drm /var/lib/control-ofc
+# /sys/class/hwmon is directory-level — hwmon indices are dynamic, finer restriction not practical (P2-S3).
+# /run/control-ofc and /var/lib/control-ofc are provided by RuntimeDirectory= and StateDirectory=
+# above; systemd.exec(5) guarantees those are already writable under ProtectSystem=strict, so only
+# /sys paths need an explicit entry here.
+ReadWritePaths=/sys/class/hwmon /sys/class/drm
 PrivateTmp=true
 NoNewPrivileges=true
 ProtectKernelTunables=true

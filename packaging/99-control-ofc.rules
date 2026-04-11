@@ -1,23 +1,47 @@
-# Control-OFC — Stable symlink for Karanovic Research OpenFanController
+# Control-OFC — OPTIONAL udev rules example
 #
-# Creates /dev/control-ofc-controller when the OpenFanController is plugged in.
-# The daemon can be configured to use this path instead of auto-detection:
+# This file is NOT required for the daemon to function. control-ofc-daemon
+# already auto-detects the Karanovic Research OpenFanController by probing
+# /dev/ttyACM* and /dev/ttyUSB* at startup (serial/real_transport.rs::
+# auto_detect_port), and the service unit's DeviceAllow= directives cover
+# device-class access. Use this file only if you want a stable symlink
+# (/dev/control-ofc-controller) or a specific group/mode on the device node.
+#
+# Shipped location:
+#   /usr/share/doc/control-ofc-daemon/99-control-ofc.rules.example
+#   ^ pacman-owned. DO NOT EDIT — changes will be overwritten on upgrade.
+#
+# To customize:
+#
+#   1. Copy the example into the user-writable udev directory:
+#        sudo install -m644 \
+#          /usr/share/doc/control-ofc-daemon/99-control-ofc.rules.example \
+#          /etc/udev/rules.d/99-control-ofc.rules
+#
+#   2. Edit /etc/udev/rules.d/99-control-ofc.rules and replace XXXX/YYYY
+#      with your device's USB vendor and product ID. Find them with:
+#        udevadm info --attribute-walk --name=/dev/ttyACM0 \
+#          | grep -E 'idVendor|idProduct'
+#
+#   3. Reload and re-trigger udev so the rule applies without a reboot:
+#        sudo udevadm control --reload-rules
+#        sudo udevadm trigger --subsystem-match=tty
+#
+# Precedence (udev(7)): /etc/udev/rules.d/ > /run/udev/rules.d/ >
+# /usr/lib/udev/rules.d/. A file with the same name in /etc/ overrides any
+# package-supplied version; a symlink to /dev/null disables it entirely.
+# The shipped example lives in /usr/share/doc/, so there is nothing to
+# override — the /etc/ copy is simply the live rule.
+#
+# Once the stable symlink exists, point the daemon at it to skip auto-detect:
+#   # /etc/control-ofc/daemon.toml
 #   [serial]
 #   port = "/dev/control-ofc-controller"
-#
-# Installation:
-#   sudo cp 99-control-ofc.rules /etc/udev/rules.d/
-#   sudo udevadm control --reload-rules
-#   sudo udevadm trigger
-#
-# To find your device's VID/PID:
-#   udevadm info --attribute-walk --name=/dev/ttyACM0 | grep -E 'idVendor|idProduct'
-#
-# Replace XXXX and YYYY below with your actual VID and PID values.
 
-# Stable symlink for OpenFanController
+# Stable symlink for OpenFanController — EDIT VID/PID BEFORE USE
 SUBSYSTEM=="tty", ATTRS{idVendor}=="XXXX", ATTRS{idProduct}=="YYYY", SYMLINK+="control-ofc-controller", MODE="0660", GROUP="uucp"
 
 # Optional: grant hwmon fan control to the daemon's supplementary group
-# This allows non-root daemons to write to hwmon PWM files.
+# (uncomment and adjust chip name to match your motherboard — check
+#  /sys/class/hwmon/hwmon*/name). Lets a non-root daemon write PWM.
 # SUBSYSTEM=="hwmon", ATTR{name}=="it8696", RUN+="/bin/chmod g+w /sys%p/pwm1 /sys%p/pwm1_enable"

@@ -1,5 +1,78 @@
 # Changelog
 
+## [1.1.2] — 2026-04-11
+
+Packaging / installation cleanup pass. No daemon code changes — all quality
+gates (`fmt`, `clippy -D warnings`, `cargo test`) remain green at 305 tests.
+Addresses P1/P2 findings from the installation & systemd-config audit.
+
+### Changed
+- **udev rules are now documentation-only.** The shipped
+  `99-control-ofc.rules` moves from `/usr/lib/udev/rules.d/99-control-ofc.rules`
+  (where it was matching nothing because it still contained XXXX/YYYY
+  placeholders) to `/usr/share/doc/control-ofc-daemon/99-control-ofc.rules.example`.
+  The daemon already auto-detects the OpenFanController via
+  `serial/real_transport.rs::auto_detect_port`, so no udev rule is required
+  for normal operation. Users who want a stable `/dev/control-ofc-controller`
+  symlink can `install -m644` the example into `/etc/udev/rules.d/` and edit
+  there — following the canonical override pattern from `udev(7)`, so edits
+  survive package upgrades.
+- **Example profile shipped.** `/etc/control-ofc/profiles/quiet.json` now
+  exists on fresh installs as a schema-valid example with an intentionally
+  empty `members` array — safe to leave in place, drives no fans until the
+  user customises it. Added to `backup=()` so pacman preserves user edits
+  across upgrades via the standard `.pacnew`/`.pacsave` flow.
+- **Rewrote the udev rules file header** so it explicitly documents the
+  override path (`/etc/udev/rules.d/` overrides `/usr/lib/udev/rules.d/`
+  overrides `/usr/share/doc/...`), the VID/PID discovery command, and the
+  fact that the rule is optional. Previously the header told users to
+  `cp` a file that doesn't exist at the path it suggested.
+- **Service unit: dropped redundant `ReadWritePaths=/run/control-ofc
+  /var/lib/control-ofc`.** systemd.exec(5) guarantees `RuntimeDirectory=`
+  and `StateDirectory=` paths are writable under `ProtectSystem=strict`
+  without an explicit `ReadWritePaths=` entry
+  ([systemd#29798](https://github.com/systemd/systemd/issues/29798)).
+  Only the `/sys/class/hwmon` and `/sys/class/drm` paths still need
+  explicit allow-listing.
+- **`post_install` and `post_upgrade` echoes rewritten** to mention the
+  example profile, the auto-detect behaviour (no udev rule needed), and
+  the new docs-only rules path.
+
+### Added
+- **`post_upgrade` auto-strips legacy `[profiles]` / `[startup]`
+  sections from `/etc/control-ofc/daemon.toml`.** ADR-002 marks those
+  sections as hard parse errors in 1.2.0; previously users would hit a
+  startup crash the moment they upgraded past the shim window. The hook
+  now backs the original file up to `daemon.toml.pre-1.1.2.bak` and uses
+  a conservative `awk` script (top-of-line section headers only) to
+  rewrite it in place. Safe to re-run; no-op when the sections are
+  already absent. Preserves mode/owner from the original via
+  `chmod --reference=` / `chown --reference=`.
+
+### Not changed (flagged in audit, verified OK as-is)
+- `systemctl daemon-reload` and `udevadm control --reload-rules` on
+  upgrade are already provided by the base `systemd` package via
+  `/usr/share/libalpm/hooks/30-systemd-daemon-reload-system.hook` and
+  `/usr/share/libalpm/hooks/35-systemd-udev-reload.hook`, which trigger
+  on any file installed under `/usr/lib/systemd/system/*` or
+  `/usr/lib/udev/rules.d/*`. Our PKGBUILD uses those paths, so duplicating
+  the reload in our `.install` hook would fire the same hook twice per
+  transaction. Dismissed as a false positive from the audit.
+- `daemon_state.rs` and `main.rs::resolve_initial_profile` already log at
+  INFO / WARN when the persisted profile path or state file is missing
+  (`main.rs:406-408`, `daemon_state.rs:80-84`). The audit claim that
+  `daemon_state.rs:170` hardcoded a runtime reference to `quiet.json`
+  turned out to be a test string literal; no runtime fix needed.
+
+### Risk notes
+- The `post_upgrade` TOML rewrite touches admin-owned config, which the
+  ADR-002 "daemon never rewrites admin config" rule normally prohibits.
+  The rule is scoped to the daemon process; the pacman `.install` hook is
+  the packaging system performing a documented migration, which is an
+  established Arch pattern. The backup file makes the change reversible.
+- No changes to thermal safety, sysfs writes, serial reconnect, profile
+  engine, IPC server lifecycle, or any other safety-critical path.
+
 ## [1.1.1] — 2026-04-11
 
 ### Fixed

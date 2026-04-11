@@ -149,16 +149,20 @@ ls -la /dev/serial/by-id/
 
 The daemon needs read/write access to the serial device. The systemd service file includes `SupplementaryGroups=uucp dialout` to support both Arch-based (`uucp`) and Debian-based (`dialout`) distributions.
 
-For optional udev rules (stable symlink + permissions), copy and edit the template:
-```bash
-sudo cp packaging/99-control-ofc.rules /etc/udev/rules.d/
+A udev rule is **not required** — the daemon auto-detects the OpenFanController on `/dev/ttyACM*` and `/dev/ttyUSB*` at startup. Use this only if you want a stable `/dev/control-ofc-controller` symlink or a specific group/mode on the device node.
 
-# Edit the file and replace XXXX/YYYY with your device's VID/PID:
-# Find VID/PID with:
+The package installs the example as documentation-only at `/usr/share/doc/control-ofc-daemon/99-control-ofc.rules.example`. To enable it, copy into `/etc/udev/rules.d/` and edit there (do not edit the shipped example — pacman will overwrite it on upgrade):
+```bash
+sudo install -m644 \
+  /usr/share/doc/control-ofc-daemon/99-control-ofc.rules.example \
+  /etc/udev/rules.d/99-control-ofc.rules
+
+# Find VID/PID for your device:
 udevadm info --attribute-walk --name=/dev/ttyACM0 | grep -E "idVendor|idProduct"
 
+# Edit /etc/udev/rules.d/99-control-ofc.rules and replace XXXX/YYYY, then:
 sudo udevadm control --reload-rules
-sudo udevadm trigger
+sudo udevadm trigger --subsystem-match=tty
 ```
 
 ## GPU fan control
