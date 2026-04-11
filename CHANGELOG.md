@@ -1,5 +1,69 @@
 # Changelog
 
+## [1.1.0] — 2026-04-11
+
+### Added
+- **Runtime config split (ADR-002).** Daemon-mutable settings now live in
+  `/var/lib/control-ofc/runtime.toml`, separate from admin-owned
+  `/etc/control-ofc/daemon.toml`. The split mirrors the NetworkManager
+  `NetworkManager-intern.conf` pattern: admin config is loaded first, runtime
+  config is overlaid on top, and only the runtime file is ever rewritten by
+  the daemon. SIGHUP re-reads and re-applies both. Full rationale and
+  alternatives in `docs/ADRs/002-runtime-config-split.md`.
+- **`runtime_config.rs` module.** `RuntimeConfig` struct with
+  `#[serde(deny_unknown_fields)]`, atomic `save_to` (tmp+rename, 0600), and
+  11 unit tests covering load/save roundtrip, defaults, malformed handling,
+  missing parent dir creation, and owner-only permissions.
+- **`ErrorEnvelope::persistence_failed` constructor.** Returns the new
+  `persistence_failed` error code with `retryable: true` and
+  `source: "internal"` for handlers that cannot persist state to disk.
+- **Packaging: `/etc/control-ofc/profiles` directory.** PKGBUILD now
+  creates the admin profile drop-in directory so operators can deposit
+  curves without a `mkdir -p` dance on first install.
+
+### Fixed
+- **`POST /config/profile-search-dirs` and `POST /config/startup-delay`
+  were silently losing writes across restarts.** Under
+  `ProtectSystem=strict`, `/etc/control-ofc` is not in `ReadWritePaths=`,
+  so the previous handlers hit `EROFS` when rewriting `daemon.toml`. The
+  write failure was logged at WARN and the in-memory state updated anyway,
+  producing "daemon forgets my settings after reboot" reports. Handlers
+  now persist to `runtime.toml` inside the state directory (which *is*
+  a `StateDirectory=`-managed writable path), **persist before mutating
+  in-memory state**, and return `HTTP 503 persistence_failed` on any
+  write error so the GUI can surface the failure. State can no longer
+  diverge between RAM and disk.
+- **`daemon_state.rs` comment drift.** Stale comment claiming the parent
+  state dir was 0o700 replaced with an accurate description of
+  `StateDirectoryMode=` defaulting to 0o755 and the file's 0o600 bits
+  being the actual confidentiality boundary.
+
+### Changed
+- **`daemon.toml` is no longer rewritten by the daemon.** Admin-authored
+  comments and formatting are preserved across restarts and package
+  upgrades. The `persist_profile_search_dirs` and `persist_startup_delay`
+  functions (and their tests) have been deleted from `config.rs`.
+- **`packaging/daemon.toml.example`** now documents only the admin-static
+  keys and points to `runtime.toml` for the daemon-managed ones.
+- **Version bumped to 1.1.0** (`daemon/Cargo.toml`, `packaging/PKGBUILD`).
+
+### Migration (one-release shim; removed in 1.2.0)
+- `DaemonConfig` still parses `[profiles]` and `[startup]` from
+  `daemon.toml`. On first start after upgrade, `migrate_legacy_runtime_keys`
+  copies those sections into `runtime.toml` if the runtime file does not
+  already contain them. The legacy sections in `daemon.toml` are **not**
+  deleted (the daemon never rewrites admin-owned config) but are shadowed
+  from that point forward. An INFO line logs which keys were migrated.
+- **1.2.0 will make `[profiles]` / `[startup]` in `daemon.toml` a hard
+  parse error.** Operators should remove those sections at their leisure
+  during the 1.1.x window.
+
+### Future release candidate
+- Optional `200 OK + { persisted: false, advisory: "..." }` contract for
+  persistence failures, instead of 503. Documented in ADR-002 as deferred
+  work; revisit if users report disk-full / read-only `/var/lib` scenarios
+  where they still want the in-memory change to take effect.
+
 ## [1.0.1] — 2026-04-11
 
 ### Added

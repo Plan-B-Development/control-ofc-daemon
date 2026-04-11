@@ -129,8 +129,10 @@ pub fn save_state_to(dir: &Path, state: &DaemonState) -> Result<(), String> {
     std::fs::write(&tmp_path, &content)
         .map_err(|e| format!("failed to write tmp state file: {e}"))?;
 
-    // S3: Set owner-only permissions before atomic rename (defense-in-depth;
-    // parent dir is already 0o700 via systemd StateDirectory=).
+    // S3: Set owner-only permissions before atomic rename. systemd
+    // `StateDirectory=control-ofc` creates `/var/lib/control-ofc` with
+    // `StateDirectoryMode=` (default 0o755), so file perms are the
+    // actual confidentiality boundary for this file.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

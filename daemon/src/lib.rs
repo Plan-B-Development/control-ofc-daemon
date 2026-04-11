@@ -8,5 +8,6 @@ pub mod hwmon;
 pub mod polling;
 pub mod profile;
 pub mod profile_engine;
+pub mod runtime_config;
 pub mod safety;
 pub mod serial;

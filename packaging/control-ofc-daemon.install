@@ -13,6 +13,12 @@ post_install() {
 post_upgrade() {
     echo ":: If control-ofc-daemon is running, restart it to apply changes:"
     echo "   sudo systemctl restart control-ofc-daemon"
+    echo ""
+    echo ":: 1.1.0 — runtime-mutable settings moved out of /etc/control-ofc/daemon.toml"
+    echo "   into /var/lib/control-ofc/runtime.toml (daemon-managed). The daemon"
+    echo "   migrates [profiles] and [startup] from daemon.toml automatically on"
+    echo "   first start; those sections in daemon.toml are parsed for the 1.1.x"
+    echo "   migration window and will be removed in 1.2.0."
 }
 
 pre_remove() {

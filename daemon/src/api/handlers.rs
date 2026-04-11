@@ -124,8 +124,11 @@ pub struct AppState {
     /// Configured profile search directories (from daemon.toml [profiles] section).
     /// Wrapped in RwLock to allow runtime updates via SIGHUP reload or API endpoint.
     pub profile_search_dirs: parking_lot::RwLock<Vec<std::path::PathBuf>>,
-    /// Path to daemon.toml — stored so handlers can persist config changes.
+    /// Path to the admin-owned daemon.toml (read-only to handlers).
     pub config_path: String,
+    /// Path to the daemon-owned runtime.toml (read/write by handlers).
+    /// Lives at `{state_dir}/runtime.toml`. See ADR-002.
+    pub runtime_config_path: std::path::PathBuf,
     /// Number of active SSE client connections (for connection limiting).
     pub sse_clients: Arc<AtomicUsize>,
 }
@@ -1422,7 +1425,12 @@ pub async fn hwmon_rescan_handler(
 ///
 /// Accepts `{"add": ["/path/to/profiles"]}` — each directory must be an absolute path.
 /// The system directory `/etc/control-ofc/profiles` is always preserved.
-/// Updates take effect immediately (in-memory) and are persisted to daemon.toml.
+///
+/// Flow: persist runtime.toml first, then update in-memory state. If the
+/// persist fails, the in-memory state is left untouched and the handler
+/// returns 503 `persistence_failed` so the GUI can retry or surface the
+/// error to the user. See ADR-002 for the rationale behind the two-file
+/// config split.
 pub async fn update_profile_search_dirs_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
@@ -1440,7 +1448,6 @@ pub async fn update_profile_search_dirs_handler(
         );
     };
 
-    // Validate: each dir must be an absolute path
     for d in &new_dirs {
         if !d.starts_with('/') {
             return error_response(
@@ -1450,7 +1457,7 @@ pub async fn update_profile_search_dirs_handler(
         }
     }
 
-    // Merge with existing dirs (deduplicate, always keep /etc/control-ofc/profiles)
+    // Merge with existing dirs (dedup, always keep /etc/control-ofc/profiles)
     let mut merged: Vec<String> = {
         let current = state.profile_search_dirs.read();
         current.iter().map(|p| p.display().to_string()).collect()
@@ -1461,14 +1468,28 @@ pub async fn update_profile_search_dirs_handler(
         }
     }
 
-    // Update in-memory state
+    // Persist first. On failure, leave in-memory state alone and return 503
+    // so the caller sees a durable, actionable error rather than a silent
+    // drift between in-memory and on-disk state.
+    let mut runtime = crate::runtime_config::RuntimeConfig::load_from(&state.runtime_config_path);
+    runtime.set_profile_search_dirs(merged.clone());
+    if let Err(e) = runtime.save_to(&state.runtime_config_path) {
+        log::error!(
+            "Failed to persist profile search dirs to {}: {e}",
+            state.runtime_config_path.display()
+        );
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::persistence_failed(format!(
+                "failed to persist runtime config at {}: {e}",
+                state.runtime_config_path.display()
+            )),
+        );
+    }
+
+    // Persist succeeded — commit the in-memory update.
     let path_bufs: Vec<std::path::PathBuf> = merged.iter().map(std::path::PathBuf::from).collect();
     *state.profile_search_dirs.write() = path_bufs;
-
-    // Persist to daemon.toml (best-effort — in-memory update already succeeded)
-    if let Err(e) = crate::config::persist_profile_search_dirs(&state.config_path, &merged) {
-        log::warn!("Failed to persist search dirs to daemon.toml: {e}");
-    }
 
     log::info!("Profile search dirs updated: {:?}", merged);
 
@@ -1483,6 +1504,11 @@ pub async fn update_profile_search_dirs_handler(
 }
 
 /// POST /config/startup-delay — set the daemon startup delay (takes effect on restart).
+///
+/// Persists to runtime.toml. Returns 503 `persistence_failed` if the write
+/// fails, so the caller knows the setting did not stick. The daemon's live
+/// startup delay is only consulted at process start, so there is no
+/// in-memory state to roll back.
 pub async fn update_startup_delay_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
@@ -1503,9 +1529,20 @@ pub async fn update_startup_delay_handler(
         }
     };
 
-    // Persist to daemon.toml (best-effort)
-    if let Err(e) = crate::config::persist_startup_delay(&state.config_path, delay) {
-        log::warn!("Failed to persist startup delay: {e}");
+    let mut runtime = crate::runtime_config::RuntimeConfig::load_from(&state.runtime_config_path);
+    runtime.set_startup_delay_secs(delay);
+    if let Err(e) = runtime.save_to(&state.runtime_config_path) {
+        log::error!(
+            "Failed to persist startup delay to {}: {e}",
+            state.runtime_config_path.display()
+        );
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::persistence_failed(format!(
+                "failed to persist runtime config at {}: {e}",
+                state.runtime_config_path.display()
+            )),
+        );
     }
 
     log::info!("Startup delay set to {delay}s (takes effect on restart)");

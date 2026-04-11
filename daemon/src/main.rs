@@ -15,12 +15,115 @@ use control_ofc_daemon::hwmon::pwm_control::{HwmonPwmController, RealSysfsWriter
 use control_ofc_daemon::hwmon::pwm_discovery::discover_pwm_headers;
 use control_ofc_daemon::hwmon::HWMON_SYSFS_ROOT;
 use control_ofc_daemon::profile::{self, DaemonProfile};
+use control_ofc_daemon::runtime_config::{RuntimeConfig, RUNTIME_CONFIG_FILE};
 use control_ofc_daemon::safety::ThermalSafetyRule;
 use control_ofc_daemon::serial::controller::FanController;
 use control_ofc_daemon::serial::real_transport::{auto_detect_port, RealSerialTransport};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_CONFIG_PATH: &str = "/etc/control-ofc/daemon.toml";
+
+/// Apply runtime.toml overrides onto the in-memory `DaemonConfig`.
+/// Any key present in runtime.toml shadows the admin-owned daemon.toml value.
+fn apply_runtime_overlay(config: &mut DaemonConfig, runtime: &RuntimeConfig, admin_path: &str) {
+    if let Some(dirs) = runtime.profile_search_dirs() {
+        log::info!(
+            "runtime.toml overrides [profiles] search_dirs ({} dirs)",
+            dirs.len()
+        );
+        config.profiles.search_dirs = dirs.to_vec();
+    }
+    if let Some(delay) = runtime.startup_delay_secs() {
+        log::info!("runtime.toml overrides [startup] delay_secs = {delay}");
+        config.startup.delay_secs = delay;
+    }
+
+    // Sanity: if the admin config *also* has non-default runtime-mutable keys,
+    // the runtime values still win — but warn so the admin knows their edits
+    // are being shadowed. This catches the "admin edits daemon.toml but the
+    // daemon keeps using runtime.toml" failure mode.
+    if runtime.profile_search_dirs().is_some() || runtime.startup_delay_secs().is_some() {
+        log::info!(
+            "Runtime-mutable keys live in runtime.toml now; \
+             edits to [profiles]/[startup] in {admin_path} are ignored \
+             while runtime.toml exists. See docs/ADRs/002-runtime-config-split.md."
+        );
+    }
+}
+
+/// One-shot migration: if daemon.toml still carries legacy `[profiles]
+/// search_dirs` or `[startup] delay_secs` values (from installs made before
+/// the runtime.toml split), copy them into runtime.toml the first time we
+/// see them. Runtime.toml values already present win — this only fills gaps.
+///
+/// Scheduled for removal after 1.1.0 (one release window, per DEC-086).
+fn migrate_legacy_runtime_keys(
+    admin_path: &str,
+    runtime_path: &std::path::Path,
+    runtime: &mut RuntimeConfig,
+) {
+    // Re-read the raw admin TOML so we can detect keys that were explicitly
+    // set (not the serde defaults). This is the only way to distinguish
+    // "admin set it to [/etc/...]" from "we synthesised the default".
+    let raw = match std::fs::read_to_string(admin_path) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let table: toml::Table = match toml::from_str(&raw) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+
+    let mut changed = false;
+
+    if runtime.profile_search_dirs().is_none() {
+        if let Some(dirs) = table
+            .get("profiles")
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get("search_dirs"))
+            .and_then(|v| v.as_array())
+        {
+            let parsed: Vec<String> = dirs
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+            if !parsed.is_empty() {
+                log::warn!(
+                    "Migrating legacy [profiles] search_dirs from {admin_path} → {}. \
+                     Remove the [profiles] section from {admin_path} after confirming the daemon restarts cleanly.",
+                    runtime_path.display()
+                );
+                runtime.set_profile_search_dirs(parsed);
+                changed = true;
+            }
+        }
+    }
+
+    if runtime.startup_delay_secs().is_none() {
+        if let Some(delay) = table
+            .get("startup")
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get("delay_secs"))
+            .and_then(|v| v.as_integer())
+        {
+            if delay > 0 {
+                log::warn!(
+                    "Migrating legacy [startup] delay_secs={delay} from {admin_path} → {}. \
+                     Remove the [startup] section from {admin_path} after confirming the daemon restarts cleanly.",
+                    runtime_path.display()
+                );
+                runtime.set_startup_delay_secs(delay as u64);
+                changed = true;
+            }
+        }
+    }
+
+    if changed {
+        if let Err(e) = runtime.save_to(runtime_path) {
+            log::error!("Migration write to {} failed: {e}", runtime_path.display());
+        }
+    }
+}
 
 /// Resolve the config file path.
 ///
@@ -139,7 +242,7 @@ async fn main() {
     let config_path = resolve_config_path();
     log::info!("Config path: {config_path}");
 
-    let config = match DaemonConfig::load(&config_path) {
+    let mut config = match DaemonConfig::load(&config_path) {
         Ok(c) => c,
         Err(e) => {
             log::error!("Failed to load config: {e}");
@@ -157,12 +260,17 @@ async fn main() {
     daemon_state::init_state_dir(&config.state.state_dir);
     log::info!("State directory: {}", config.state.state_dir);
 
+    // Load runtime.toml from state_dir and merge. Keys present in runtime.toml
+    // shadow the admin-owned daemon.toml (NetworkManager-intern pattern — ADR-002).
+    let runtime_config_path =
+        std::path::PathBuf::from(&config.state.state_dir).join(RUNTIME_CONFIG_FILE);
+    let mut runtime_cfg = RuntimeConfig::load_from(&runtime_config_path);
+    apply_runtime_overlay(&mut config, &runtime_cfg, &config_path);
+    migrate_legacy_runtime_keys(&config_path, &runtime_config_path, &mut runtime_cfg);
+
     // Configurable startup delay — wait for hardware to appear after boot
     if config.startup.delay_secs > 0 {
-        log::info!(
-            "Startup delay: {}s (from daemon.toml)",
-            config.startup.delay_secs
-        );
+        log::info!("Startup delay: {}s", config.startup.delay_secs);
         std::thread::sleep(Duration::from_secs(config.startup.delay_secs));
     }
 
@@ -320,8 +428,13 @@ async fn main() {
         amd_gpus,
         profile_search_dirs: parking_lot::RwLock::new(profile_search_dirs),
         config_path: config_path.clone(),
+        runtime_config_path: runtime_config_path.clone(),
         sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     });
+
+    // Silence "assigned but not read" — runtime_cfg is consumed by the
+    // overlay/migration above; the variable itself is no longer needed.
+    drop(runtime_cfg);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let (poll_shutdown_tx, poll_shutdown_rx) = tokio::sync::watch::channel(false);
@@ -414,7 +527,9 @@ async fn main() {
                 _ = sighup.recv() => {
                     log::info!("Received SIGHUP — reloading config");
                     match DaemonConfig::load(&config_path) {
-                        Ok(new_config) => {
+                        Ok(mut new_config) => {
+                            let new_runtime = RuntimeConfig::load_from(&runtime_config_path);
+                            apply_runtime_overlay(&mut new_config, &new_runtime, &config_path);
                             let new_dirs: Vec<std::path::PathBuf> = new_config
                                 .profiles
                                 .search_dirs

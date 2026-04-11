@@ -96,10 +96,36 @@ profile_engine ──read──> StateCache
 
 ## Configuration
 
-- **Config file**: `/etc/control-ofc/daemon.toml` (override: `--config` or `$CONTROL_OFC_CONFIG`)
+Configuration lives in two files (see `docs/ADRs/002-runtime-config-split.md`):
+
+- **Admin config** — `/etc/control-ofc/daemon.toml`
+  (override: `--config` or `$CONTROL_OFC_CONFIG`).
+  Hand-edited by the operator. Never rewritten by the daemon. Holds static
+  topology: serial port, polling interval, socket path, state dir.
+- **Runtime config** — `{state_dir}/runtime.toml`
+  (default `/var/lib/control-ofc/runtime.toml`).
+  Managed by the daemon. Holds the keys that API endpoints mutate at
+  runtime: `[profiles] search_dirs`, `[startup] delay_secs`. Written with
+  0600 permissions via atomic tmp+rename.
+
+On startup the daemon loads `daemon.toml`, then overlays `runtime.toml` on
+top; runtime values win. SIGHUP re-reads both and re-applies the overlay.
+
+Other paths:
+
 - **Profile loading**: `--profile <name>` | `--profile-file <path>` | `$OPENFAN_PROFILE` | persisted state
 - **Socket**: `/run/control-ofc/control-ofc.sock` (configurable via `ipc.socket_path`)
-- **State**: `/var/lib/control-ofc/daemon_state.json` (configurable via `state.state_dir`)
+- **Persisted state**: `/var/lib/control-ofc/daemon_state.json` (configurable via `state.state_dir`)
+
+### Migration (1.0.x → 1.1.x)
+
+The 1.1.x release window still parses `[profiles]` and `[startup]` from
+`daemon.toml` for backward compatibility. On first start after upgrade the
+daemon copies those sections into `runtime.toml` if the runtime file does
+not already contain them. The legacy sections in `daemon.toml` are not
+deleted — the daemon never rewrites admin-owned config — but they are
+shadowed by `runtime.toml` from that point forward. In 1.2.0 parsing
+`[profiles]` / `[startup]` from `daemon.toml` becomes a hard error.
 
 ## API Endpoints
 
@@ -151,8 +177,8 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST | `/profile/activate` | Switch active profile by id or path |
-| POST | `/config/profile-search-dirs` | Additively register profile search directories (persists to `daemon.toml`) |
-| POST | `/config/startup-delay` | Set startup delay seconds (persists to `daemon.toml`, takes effect on restart) |
+| POST | `/config/profile-search-dirs` | Additively register profile search directories (persists to `runtime.toml`; 503 `persistence_failed` on write error) |
+| POST | `/config/startup-delay` | Set startup delay seconds (persists to `runtime.toml`, takes effect on restart; 503 `persistence_failed` on write error) |
 
 Error envelope (all errors):
 
