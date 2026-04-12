@@ -369,7 +369,9 @@ pub async fn profile_engine_loop(
                         }
                     }
                     // Renew to keep it alive for the next cycle
-                    let _ = guard.lease_manager_mut().renew_lease(lid);
+                    if let Err(e) = guard.lease_manager_mut().renew_lease(lid) {
+                        log::debug!("lease renewal failed (will re-acquire next cycle): {e}");
+                    }
                 }
             }
         }
@@ -787,6 +789,103 @@ mod tests {
                 "expected raw 0xFF (100%), got {hex_value} in command {cmd:?}"
             );
         }
+    }
+
+    /// Helper to build a profile with an `amd_gpu` member instead of `openfan`.
+    fn make_gpu_profile(mode: &str, curve_type: &str, flat_pct: f64) -> DaemonProfile {
+        DaemonProfile {
+            id: "gpu-test".into(),
+            name: "GPU Test".into(),
+            version: 3,
+            description: "".into(),
+            controls: vec![LogicalControl {
+                id: "gpu_ctrl".into(),
+                name: "GPU Fan".into(),
+                mode: mode.into(),
+                curve_id: "c1".into(),
+                manual_output_pct: 50.0,
+                members: vec![ControlMember {
+                    source: "amd_gpu".into(),
+                    member_id: "amd_gpu:0000:03:00.0".into(),
+                    member_label: "RX 9070 XT".into(),
+                }],
+                step_up_pct: 100.0,
+                step_down_pct: 100.0,
+                offset_pct: 0.0,
+                minimum_pct: 0.0,
+                start_pct: 0.0,
+                stop_pct: 0.0,
+            }],
+            curves: vec![CurveConfig {
+                id: "c1".into(),
+                name: "Curve".into(),
+                curve_type: curve_type.into(),
+                sensor_id: "cpu".into(),
+                points: vec![
+                    CurvePoint {
+                        temp_c: 30.0,
+                        output_pct: 20.0,
+                    },
+                    CurvePoint {
+                        temp_c: 80.0,
+                        output_pct: 100.0,
+                    },
+                ],
+                start_temp_c: None,
+                start_output_pct: None,
+                end_temp_c: None,
+                end_output_pct: None,
+                flat_output_pct: Some(flat_pct),
+            }],
+        }
+    }
+
+    #[test]
+    fn evaluate_gpu_member_produces_amd_gpu_command() {
+        // A profile with an amd_gpu member should produce PwmCommands with
+        // source="amd_gpu" and the correct member_id.
+        let profile = make_gpu_profile("curve", "graph", 50.0);
+        let cache = make_cache_with_sensor("cpu", 55.0);
+        let cmds = evaluate_profile(&profile, &cache);
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].source, "amd_gpu");
+        assert_eq!(cmds[0].member_id, "amd_gpu:0000:03:00.0");
+        // At 55C on (30->20%, 80->100%): (55-30)/(80-30)=0.5, 20+0.5*80=60%
+        assert_eq!(cmds[0].pwm_percent, 60);
+    }
+
+    #[test]
+    fn evaluate_gpu_manual_mode() {
+        let profile = make_gpu_profile("manual", "flat", 50.0);
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let cmds = evaluate_profile(&profile, &cache);
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].source, "amd_gpu");
+        assert_eq!(cmds[0].pwm_percent, 50); // manual_output_pct
+    }
+
+    #[test]
+    fn evaluate_mixed_openfan_and_gpu_members() {
+        // A profile with both openfan and amd_gpu members should produce
+        // commands for each source.
+        let mut profile = make_gpu_profile("curve", "graph", 50.0);
+        // Add an openfan member to the same control
+        profile.controls[0].members.push(ControlMember {
+            source: "openfan".into(),
+            member_id: "openfan:ch00".into(),
+            member_label: "".into(),
+        });
+        let cache = make_cache_with_sensor("cpu", 55.0);
+        let cmds = evaluate_profile(&profile, &cache);
+        assert_eq!(cmds.len(), 2);
+
+        let gpu_cmd = cmds.iter().find(|c| c.source == "amd_gpu").unwrap();
+        let ofc_cmd = cmds.iter().find(|c| c.source == "openfan").unwrap();
+        assert_eq!(gpu_cmd.member_id, "amd_gpu:0000:03:00.0");
+        assert_eq!(ofc_cmd.member_id, "openfan:ch00");
+        // Both should get the same output percentage
+        assert_eq!(gpu_cmd.pwm_percent, ofc_cmd.pwm_percent);
+        assert_eq!(gpu_cmd.pwm_percent, 60);
     }
 
     #[tokio::test(start_paused = true)]

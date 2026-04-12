@@ -41,6 +41,11 @@ pub const SSE_MAX_CLIENTS: usize = 5;
 /// accidental prolonged motor stop.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// Maximum bytes to read per serial line. Prevents unbounded memory growth
+/// if a malfunctioning device sends data without a newline terminator.
+/// The OpenFanController protocol uses short ASCII frames (< 200 bytes).
+pub const MAX_SERIAL_LINE_BYTES: u64 = 4096;
+
 /// Baud rate for the OpenFanController serial connection.
 pub const SERIAL_BAUD_RATE: u32 = 115_200;
 

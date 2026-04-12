@@ -68,7 +68,7 @@ impl FanController {
     /// Set PWM on a single channel. `pwm_percent` is 0–100.
     ///
     /// - 0% is allowed for up to `constants::STOP_TIMEOUT` (8s), after which it's rejected.
-    /// - Non-zero values below `MIN_PWM_PERCENT` are clamped up.
+    /// - Values are passed through as-is (0–100).
     /// - If the value equals the last commanded value, the write is coalesced (skipped).
     pub fn set_pwm(
         &mut self,
