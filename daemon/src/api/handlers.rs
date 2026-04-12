@@ -23,7 +23,7 @@ use super::responses::*;
 use crate::health::state::DaemonState;
 
 /// Build the sorted list of sensor entries from a cache snapshot.
-fn build_sensor_entries(snap: &DaemonState, now: Instant) -> Vec<SensorEntry> {
+pub(crate) fn build_sensor_entries(snap: &DaemonState, now: Instant) -> Vec<SensorEntry> {
     snap.sensors
         .values()
         .map(|s| {
@@ -44,7 +44,7 @@ fn build_sensor_entries(snap: &DaemonState, now: Instant) -> Vec<SensorEntry> {
 }
 
 /// Build the sorted list of fan entries from a cache snapshot.
-fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntry> {
+pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntry> {
     let mut fans: Vec<FanEntry> = Vec::new();
 
     // OpenFanController fans
@@ -250,17 +250,14 @@ pub async fn set_pwm_handler(
     match ctrl.set_pwm(channel, body.pwm_percent) {
         Ok(result) => {
             state.cache.record_gui_write();
-            (
+            json_ok(
                 StatusCode::OK,
-                Json(
-                    serde_json::to_value(SetPwmResponse {
-                        api_version: API_VERSION,
-                        channel: result.channel,
-                        pwm_percent: result.pwm_percent,
-                        coalesced: result.coalesced,
-                    })
-                    .unwrap(),
-                ),
+                SetPwmResponse {
+                    api_version: API_VERSION,
+                    channel: result.channel,
+                    pwm_percent: result.pwm_percent,
+                    coalesced: result.coalesced,
+                },
             )
         }
         Err(e) => fan_control_error_response(e),
@@ -284,16 +281,13 @@ pub async fn set_pwm_all_handler(
     match ctrl.set_pwm_all(body.pwm_percent) {
         Ok(result) => {
             state.cache.record_gui_write();
-            (
+            json_ok(
                 StatusCode::OK,
-                Json(
-                    serde_json::to_value(SetPwmAllResponse {
-                        api_version: API_VERSION,
-                        pwm_percent: result.pwm_percent,
-                        channels_affected: result.channels_affected,
-                    })
-                    .unwrap(),
-                ),
+                SetPwmAllResponse {
+                    api_version: API_VERSION,
+                    pwm_percent: result.pwm_percent,
+                    channels_affected: result.channels_affected,
+                },
             )
         }
         Err(e) => fan_control_error_response(e),
@@ -318,16 +312,13 @@ pub async fn set_target_rpm_handler(
     match ctrl.set_target_rpm(channel, body.target_rpm) {
         Ok(result) => {
             state.cache.record_gui_write();
-            (
+            json_ok(
                 StatusCode::OK,
-                Json(
-                    serde_json::to_value(SetRpmResponse {
-                        api_version: API_VERSION,
-                        channel: result.channel,
-                        target_rpm: result.target_rpm,
-                    })
-                    .unwrap(),
-                ),
+                SetRpmResponse {
+                    api_version: API_VERSION,
+                    channel: result.channel,
+                    target_rpm: result.target_rpm,
+                },
             )
         }
         Err(e) => fan_control_error_response(e),
@@ -555,38 +546,27 @@ pub async fn gpu_set_fan_handler(
                         .cache
                         .set_gpu_fan_commanded_pct(&fan_id, body.speed_pct);
                     state.cache.record_gui_write();
-                    (
+                    json_ok(
                         StatusCode::OK,
-                        Json(
-                            serde_json::to_value(GpuSetFanResponse {
-                                api_version: API_VERSION,
-                                gpu_id,
-                                speed_pct: body.speed_pct,
-                            })
-                            .unwrap(),
-                        ),
+                        GpuSetFanResponse {
+                            api_version: API_VERSION,
+                            gpu_id,
+                            speed_pct: body.speed_pct,
+                        },
                     )
                 }
-                _ => (
+                _ => error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(
-                        serde_json::to_value(ErrorEnvelope::hardware_unavailable(
-                            "Failed to write GPU fan PWM",
-                        ))
-                        .unwrap(),
-                    ),
+                    &ErrorEnvelope::hardware_unavailable("Failed to write GPU fan PWM"),
                 ),
             };
         }
         None => {
-            return (
+            return error_response(
                 StatusCode::BAD_REQUEST,
-                Json(
-                    serde_json::to_value(ErrorEnvelope::hardware_unavailable(format!(
-                        "GPU {gpu_id} does not support fan control"
-                    )))
-                    .unwrap(),
-                ),
+                &ErrorEnvelope::hardware_unavailable(format!(
+                    "GPU {gpu_id} does not support fan control"
+                )),
             );
         }
     };
@@ -611,35 +591,22 @@ pub async fn gpu_set_fan_handler(
                 .cache
                 .set_gpu_fan_commanded_pct(&fan_id, body.speed_pct);
             state.cache.record_gui_write();
-            (
+            json_ok(
                 StatusCode::OK,
-                Json(
-                    serde_json::to_value(GpuSetFanResponse {
-                        api_version: API_VERSION,
-                        gpu_id,
-                        speed_pct: body.speed_pct,
-                    })
-                    .unwrap(),
-                ),
+                GpuSetFanResponse {
+                    api_version: API_VERSION,
+                    gpu_id,
+                    speed_pct: body.speed_pct,
+                },
             )
         }
-        Ok(Err(e)) => (
+        Ok(Err(e)) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(
-                serde_json::to_value(ErrorEnvelope::hardware_unavailable(format!(
-                    "GPU fan write failed: {e}"
-                )))
-                .unwrap(),
-            ),
+            &ErrorEnvelope::hardware_unavailable(format!("GPU fan write failed: {e}")),
         ),
-        Err(e) => (
+        Err(e) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(
-                serde_json::to_value(ErrorEnvelope::internal(format!(
-                    "GPU fan write task failed: {e}"
-                )))
-                .unwrap(),
-            ),
+            &ErrorEnvelope::internal(format!("GPU fan write task failed: {e}")),
         ),
     }
 }
@@ -653,14 +620,9 @@ pub async fn gpu_reset_fan_handler(
     let gpu = match gpu {
         Some(g) => g,
         None => {
-            return (
+            return error_response(
                 StatusCode::NOT_FOUND,
-                Json(
-                    serde_json::to_value(ErrorEnvelope::validation(format!(
-                        "GPU not found: {gpu_id}"
-                    )))
-                    .unwrap(),
-                ),
+                &ErrorEnvelope::validation(format!("GPU not found: {gpu_id}")),
             );
         }
     };
@@ -678,35 +640,22 @@ pub async fn gpu_reset_fan_handler(
                 let fan_id = format!("amd_gpu:{gpu_id}");
                 state.cache.set_gpu_fan_commanded_pct(&fan_id, 0);
                 log::info!("GPU {gpu_id} fan reset to auto");
-                (
+                json_ok(
                     StatusCode::OK,
-                    Json(
-                        serde_json::to_value(serde_json::json!({
-                            "api_version": API_VERSION,
-                            "gpu_id": gpu_id,
-                            "reset": true,
-                        }))
-                        .unwrap(),
-                    ),
+                    serde_json::json!({
+                        "api_version": API_VERSION,
+                        "gpu_id": gpu_id,
+                        "reset": true,
+                    }),
                 )
             }
-            Ok(Err(e)) => (
+            Ok(Err(e)) => error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(
-                    serde_json::to_value(ErrorEnvelope::hardware_unavailable(format!(
-                        "GPU fan reset failed: {e}"
-                    )))
-                    .unwrap(),
-                ),
+                &ErrorEnvelope::hardware_unavailable(format!("GPU fan reset failed: {e}")),
             ),
-            Err(e) => (
+            Err(e) => error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(
-                    serde_json::to_value(ErrorEnvelope::internal(format!(
-                        "GPU fan reset task failed: {e}"
-                    )))
-                    .unwrap(),
-                ),
+                &ErrorEnvelope::internal(format!("GPU fan reset task failed: {e}")),
             ),
         }
     } else if gpu.has_pwm {
@@ -715,36 +664,25 @@ pub async fn gpu_reset_fan_handler(
         let result = tokio::task::spawn_blocking(move || std::fs::write(&enable_path, "2\n")).await;
 
         match result {
-            Ok(Ok(())) => (
+            Ok(Ok(())) => json_ok(
                 StatusCode::OK,
-                Json(
-                    serde_json::to_value(serde_json::json!({
-                        "api_version": API_VERSION,
-                        "gpu_id": gpu_id,
-                        "reset": true,
-                    }))
-                    .unwrap(),
-                ),
+                serde_json::json!({
+                    "api_version": API_VERSION,
+                    "gpu_id": gpu_id,
+                    "reset": true,
+                }),
             ),
-            _ => (
+            _ => error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(
-                    serde_json::to_value(ErrorEnvelope::hardware_unavailable(
-                        "Failed to reset GPU fan to auto",
-                    ))
-                    .unwrap(),
-                ),
+                &ErrorEnvelope::hardware_unavailable("Failed to reset GPU fan to auto"),
             ),
         }
     } else {
-        (
+        error_response(
             StatusCode::BAD_REQUEST,
-            Json(
-                serde_json::to_value(ErrorEnvelope::hardware_unavailable(format!(
-                    "GPU {gpu_id} does not support fan control"
-                )))
-                .unwrap(),
-            ),
+            &ErrorEnvelope::hardware_unavailable(format!(
+                "GPU {gpu_id} does not support fan control"
+            )),
         )
     }
 }
@@ -756,15 +694,12 @@ pub async fn hwmon_headers_handler(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let Some(ref controller) = state.hwmon_controller else {
-        return (
+        return json_ok(
             StatusCode::OK,
-            Json(
-                serde_json::to_value(PwmHeadersResponse {
-                    api_version: API_VERSION,
-                    headers: vec![],
-                })
-                .unwrap(),
-            ),
+            PwmHeadersResponse {
+                api_version: API_VERSION,
+                headers: vec![],
+            },
         );
     };
 
@@ -787,15 +722,12 @@ pub async fn hwmon_headers_handler(
         })
         .collect();
 
-    (
+    json_ok(
         StatusCode::OK,
-        Json(
-            serde_json::to_value(PwmHeadersResponse {
-                api_version: API_VERSION,
-                headers,
-            })
-            .unwrap(),
-        ),
+        PwmHeadersResponse {
+            api_version: API_VERSION,
+            headers,
+        },
     )
 }
 
@@ -815,35 +747,16 @@ pub async fn hwmon_lease_take_handler(
 
     // GUI always preempts internal holders (profile engine, thermal safety).
     // Use force_take to evict any current holder.
-    match Ok::<_, crate::hwmon::lease::LeaseError>(
-        ctrl.lease_manager_mut().force_take_lease(&body.owner_hint),
-    ) {
-        Ok(lease) => (
-            StatusCode::OK,
-            Json(
-                serde_json::to_value(LeaseResponse {
-                    api_version: API_VERSION,
-                    lease_id: lease.lease_id.clone(),
-                    owner_hint: lease.owner_hint.clone(),
-                    ttl_seconds: lease.ttl_seconds(),
-                })
-                .unwrap(),
-            ),
-        ),
-        Err(LeaseError::AlreadyHeld {
-            owner_hint,
-            ttl_seconds,
-        }) => error_response(
-            StatusCode::CONFLICT,
-            &ErrorEnvelope::lease_already_held(format!(
-                "lease held by '{owner_hint}' (expires in {ttl_seconds}s)"
-            )),
-        ),
-        Err(e) => error_response(
-            StatusCode::BAD_REQUEST,
-            &ErrorEnvelope::lease_error(e.to_string()),
-        ),
-    }
+    let lease = ctrl.lease_manager_mut().force_take_lease(&body.owner_hint);
+    json_ok(
+        StatusCode::OK,
+        LeaseResponse {
+            api_version: API_VERSION,
+            lease_id: lease.lease_id.clone(),
+            owner_hint: lease.owner_hint.clone(),
+            ttl_seconds: lease.ttl_seconds(),
+        },
+    )
 }
 
 /// POST /hwmon/lease/release — release the hwmon write lease.
@@ -863,15 +776,12 @@ pub async fn hwmon_lease_release_handler(
     match ctrl.lease_manager_mut().release_lease(&body.lease_id) {
         Ok(()) => {
             ctrl.on_lease_released();
-            (
+            json_ok(
                 StatusCode::OK,
-                Json(
-                    serde_json::to_value(LeaseReleasedResponse {
-                        api_version: API_VERSION,
-                        released: true,
-                    })
-                    .unwrap(),
-                ),
+                LeaseReleasedResponse {
+                    api_version: API_VERSION,
+                    released: true,
+                },
             )
         }
         Err(LeaseError::InvalidLease) => error_response(
@@ -944,17 +854,14 @@ pub async fn hwmon_lease_renew_handler(
     let mut ctrl = controller.lock();
 
     match ctrl.lease_manager_mut().renew_lease(&body.lease_id) {
-        Ok(lease) => (
+        Ok(lease) => json_ok(
             StatusCode::OK,
-            Json(
-                serde_json::to_value(LeaseResponse {
-                    api_version: API_VERSION,
-                    lease_id: lease.lease_id.clone(),
-                    owner_hint: lease.owner_hint.clone(),
-                    ttl_seconds: lease.ttl_seconds(),
-                })
-                .unwrap(),
-            ),
+            LeaseResponse {
+                api_version: API_VERSION,
+                lease_id: lease.lease_id.clone(),
+                owner_hint: lease.owner_hint.clone(),
+                ttl_seconds: lease.ttl_seconds(),
+            },
         ),
         Err(LeaseError::InvalidLease) => error_response(
             StatusCode::BAD_REQUEST,
@@ -985,17 +892,14 @@ pub async fn hwmon_set_pwm_handler(
     match ctrl.set_pwm(&header_id, body.pwm_percent, &body.lease_id) {
         Ok(result) => {
             state.cache.record_gui_write();
-            (
+            json_ok(
                 StatusCode::OK,
-                Json(
-                    serde_json::to_value(HwmonSetPwmResponse {
-                        api_version: API_VERSION,
-                        header_id: result.header_id,
-                        pwm_percent: result.pwm_percent,
-                        raw_value: result.raw_value,
-                    })
-                    .unwrap(),
-                ),
+                HwmonSetPwmResponse {
+                    api_version: API_VERSION,
+                    header_id: result.header_id,
+                    pwm_percent: result.pwm_percent,
+                    raw_value: result.raw_value,
+                },
             )
         }
         Err(e) => hwmon_control_error_response(e),
@@ -1114,7 +1018,9 @@ pub async fn calibrate_openfan_handler(
             if let (Some(restore), Some(ref ctrl)) = (pre_cal_pwm, &state.fan_controller) {
                 {
                     let mut guard = ctrl.lock(); // parking_lot — always succeeds
-                    let _ = guard.set_pwm(channel, restore);
+                    if let Err(e) = guard.set_pwm(channel, restore) {
+                        log::warn!("failed to restore pre-calibration PWM on ch{channel}: {e}");
+                    }
                 }
             }
             return match e {
@@ -1173,7 +1079,9 @@ pub async fn calibrate_openfan_handler(
     if let (Some(restore), Some(ref ctrl)) = (pre_cal_pwm, &state.fan_controller) {
         {
             let mut guard = ctrl.lock(); // parking_lot — always succeeds
-            let _ = guard.set_pwm(channel, restore);
+            if let Err(e) = guard.set_pwm(channel, restore) {
+                log::warn!("failed to restore pre-calibration PWM on ch{channel}: {e}");
+            }
         }
     }
 
@@ -1192,20 +1100,17 @@ pub async fn calibrate_openfan_handler(
         .unwrap_or(0);
     let max_rpm = points.iter().map(|p| p.rpm).max().unwrap_or(0);
 
-    (
+    json_ok(
         StatusCode::OK,
-        Json(
-            serde_json::to_value(CalibrationResponse {
-                api_version: API_VERSION,
-                fan_id,
-                points,
-                start_pwm,
-                stop_pwm,
-                min_rpm,
-                max_rpm,
-            })
-            .unwrap(),
-        ),
+        CalibrationResponse {
+            api_version: API_VERSION,
+            fan_id,
+            points,
+            start_pwm,
+            stop_pwm,
+            min_rpm,
+            max_rpm,
+        },
     )
 }
 
@@ -1230,16 +1135,13 @@ pub async fn history_handler(
         .min(1000);
 
     let points = state.history.get_last(&entity_id, last);
-    (
+    json_ok(
         StatusCode::OK,
-        Json(
-            serde_json::to_value(HistoryResponse {
-                api_version: API_VERSION,
-                entity_id,
-                points,
-            })
-            .unwrap(),
-        ),
+        HistoryResponse {
+            api_version: API_VERSION,
+            entity_id,
+            points,
+        },
     )
 }
 
@@ -1453,6 +1355,14 @@ pub async fn update_profile_search_dirs_handler(
             return error_response(
                 StatusCode::BAD_REQUEST,
                 &ErrorEnvelope::validation(format!("search dir must be absolute: {d}")),
+            );
+        }
+        if d.contains("..") {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(format!(
+                    "search dir must not contain path traversal (..): {d}"
+                )),
             );
         }
     }

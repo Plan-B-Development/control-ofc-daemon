@@ -26,7 +26,8 @@ pub const HWMON_SYSFS_ROOT: &str = "/sys/class/hwmon";
 /// Discover all temperature sensors and read their current values.
 ///
 /// This is the main entry point for sensor collection. It performs
-/// fresh discovery on each call (no caching — that's Milestone 3).
+/// fresh discovery on each call.
+/// Readings are cached in StateCache; discovery runs fresh each call.
 pub fn collect_sensors(
     hwmon_root: &Path,
 ) -> Result<(Vec<SensorDescriptor>, Vec<SensorReading>), HwmonError> {

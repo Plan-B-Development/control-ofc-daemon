@@ -27,7 +27,13 @@ const ALLOWED_SERIAL_PREFIXES: &[&str] = &[
 ];
 
 /// Check whether a serial port path starts with an allowed prefix.
+///
+/// Also rejects paths containing traversal components (`..`) or null bytes
+/// to prevent CWE-22 path traversal even if the prefix matches.
 fn is_allowed_serial_path(path: &str) -> bool {
+    if path.contains("..") || path.contains('\0') {
+        return false;
+    }
     ALLOWED_SERIAL_PREFIXES
         .iter()
         .any(|prefix| path.starts_with(prefix))
@@ -77,10 +83,13 @@ impl SerialTransport for RealSerialTransport {
     }
 
     fn read_line(&mut self, _timeout: Duration) -> Result<String, SerialError> {
+        use std::io::Read;
         let mut line = String::new();
         let timeout_ms = self.timeout.as_millis() as u64;
         let n = self
             .reader
+            .by_ref()
+            .take(constants::MAX_SERIAL_LINE_BYTES)
             .read_line(&mut line)
             .map_err(|e| match e.kind() {
                 std::io::ErrorKind::TimedOut => SerialError::Timeout { timeout_ms },
@@ -192,6 +201,10 @@ mod tests {
         assert!(!is_allowed_serial_path("/dev/null"));
         assert!(!is_allowed_serial_path("ttyACM0")); // no leading /dev/
         assert!(!is_allowed_serial_path(""));
+        // Path traversal attempts
+        assert!(!is_allowed_serial_path("/dev/ttyACM0/../sda1"));
+        assert!(!is_allowed_serial_path("/dev/ttyUSB0/../../etc/passwd"));
+        assert!(!is_allowed_serial_path("/dev/ttyACM0\0"));
     }
 
     #[test]

@@ -226,78 +226,29 @@ fn apply_runtime_overlay(config: &mut DaemonConfig, runtime: &RuntimeConfig, adm
     }
 }
 
-/// One-shot migration: if daemon.toml still carries legacy `[profiles]
-/// search_dirs` or `[startup] delay_secs` values (from installs made before
-/// the runtime.toml split), copy them into runtime.toml the first time we
-/// see them. Runtime.toml values already present win — this only fills gaps.
+/// Reload the daemon config and runtime overlay, updating the shared
+/// profile search dirs. Extracted from the SIGHUP handler so it can be
+/// unit-tested without a full AppState.
 ///
-/// Scheduled for removal after 1.1.0 (one release window, per DEC-086).
-fn migrate_legacy_runtime_keys(
-    admin_path: &str,
-    runtime_path: &std::path::Path,
-    runtime: &mut RuntimeConfig,
-) {
-    // Re-read the raw admin TOML so we can detect keys that were explicitly
-    // set (not the serde defaults). This is the only way to distinguish
-    // "admin set it to [/etc/...]" from "we synthesised the default".
-    let raw = match std::fs::read_to_string(admin_path) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let table: toml::Table = match toml::from_str(&raw) {
-        Ok(t) => t,
-        Err(_) => return,
-    };
-
-    let mut changed = false;
-
-    if runtime.profile_search_dirs().is_none() {
-        if let Some(dirs) = table
-            .get("profiles")
-            .and_then(|v| v.as_table())
-            .and_then(|t| t.get("search_dirs"))
-            .and_then(|v| v.as_array())
-        {
-            let parsed: Vec<String> = dirs
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-            if !parsed.is_empty() {
-                log::warn!(
-                    "Migrating legacy [profiles] search_dirs from {admin_path} → {}. \
-                     Remove the [profiles] section from {admin_path} after confirming the daemon restarts cleanly.",
-                    runtime_path.display()
-                );
-                runtime.set_profile_search_dirs(parsed);
-                changed = true;
-            }
-        }
-    }
-
-    if runtime.startup_delay_secs().is_none() {
-        if let Some(delay) = table
-            .get("startup")
-            .and_then(|v| v.as_table())
-            .and_then(|t| t.get("delay_secs"))
-            .and_then(|v| v.as_integer())
-        {
-            if delay > 0 {
-                log::warn!(
-                    "Migrating legacy [startup] delay_secs={delay} from {admin_path} → {}. \
-                     Remove the [startup] section from {admin_path} after confirming the daemon restarts cleanly.",
-                    runtime_path.display()
-                );
-                runtime.set_startup_delay_secs(delay as u64);
-                changed = true;
-            }
-        }
-    }
-
-    if changed {
-        if let Err(e) = runtime.save_to(runtime_path) {
-            log::error!("Migration write to {} failed: {e}", runtime_path.display());
-        }
-    }
+/// Returns the new search dirs on success, or an error string on failure.
+fn apply_config_reload(
+    config_path: &str,
+    runtime_config_path: &Path,
+    profile_search_dirs: &parking_lot::RwLock<Vec<std::path::PathBuf>>,
+) -> Result<Vec<std::path::PathBuf>, String> {
+    let mut new_config =
+        DaemonConfig::load(config_path).map_err(|e| format!("config reload failed: {e}"))?;
+    let new_runtime = RuntimeConfig::load_from(runtime_config_path);
+    apply_runtime_overlay(&mut new_config, &new_runtime, config_path);
+    let new_dirs: Vec<std::path::PathBuf> = new_config
+        .profiles
+        .search_dirs
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+    log::info!("Config reloaded — profile search dirs: {:?}", new_dirs);
+    *profile_search_dirs.write() = new_dirs.clone();
+    Ok(new_dirs)
 }
 
 /// Resolve the config file path.
@@ -444,9 +395,8 @@ async fn main() {
     // shadow the admin-owned daemon.toml (NetworkManager-intern pattern — ADR-002).
     let runtime_config_path =
         std::path::PathBuf::from(&config.state.state_dir).join(RUNTIME_CONFIG_FILE);
-    let mut runtime_cfg = RuntimeConfig::load_from(&runtime_config_path);
+    let runtime_cfg = RuntimeConfig::load_from(&runtime_config_path);
     apply_runtime_overlay(&mut config, &runtime_cfg, &config_path);
-    migrate_legacy_runtime_keys(&config_path, &runtime_config_path, &mut runtime_cfg);
 
     // Pre-flight: verify we can bind the IPC socket and write to state_dir
     // *before* starting any subsystem. A failure here is fatal — the daemon
@@ -713,45 +663,60 @@ async fn main() {
     // Handle SIGHUP (config reload), SIGINT/SIGTERM (shutdown), and IPC task
     // death (shutdown — daemon is useless without IPC).
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::SignalKind;
 
-        let mut sighup = signal(SignalKind::hangup()).expect("Failed to register SIGHUP handler");
-        tokio::pin!(ipc_dead_rx);
+        match tokio::signal::unix::signal(SignalKind::hangup()) {
+            Ok(mut sighup) => {
+                tokio::pin!(ipc_dead_rx);
 
-        loop {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    log::info!("Received SIGINT — shutting down");
-                    break;
-                }
-                _ = sighup.recv() => {
-                    log::info!("Received SIGHUP — reloading config");
-                    match DaemonConfig::load(&config_path) {
-                        Ok(mut new_config) => {
-                            let new_runtime = RuntimeConfig::load_from(&runtime_config_path);
-                            apply_runtime_overlay(&mut new_config, &new_runtime, &config_path);
-                            let new_dirs: Vec<std::path::PathBuf> = new_config
-                                .profiles
-                                .search_dirs
-                                .iter()
-                                .map(std::path::PathBuf::from)
-                                .collect();
-                            log::info!("Config reloaded — profile search dirs: {:?}", new_dirs);
-                            *app_state.profile_search_dirs.write() = new_dirs;
+                loop {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {
+                            log::info!("Received SIGINT — shutting down");
+                            break;
                         }
-                        Err(e) => log::error!("Config reload failed: {e}"),
+                        _ = sighup.recv() => {
+                            log::info!("Received SIGHUP — reloading config");
+                            if let Err(e) = apply_config_reload(
+                                &config_path,
+                                &runtime_config_path,
+                                &app_state.profile_search_dirs,
+                            ) {
+                                log::error!("{e}");
+                            }
+                        }
+                        res = &mut ipc_dead_rx => {
+                            match res {
+                                Ok(msg) => log::error!(
+                                    "IPC server task died unexpectedly ({msg}) — shutting down"
+                                ),
+                                Err(_) => log::error!(
+                                    "IPC server task dropped its dead-signal channel — shutting down"
+                                ),
+                            }
+                            break;
+                        }
                     }
                 }
-                res = &mut ipc_dead_rx => {
-                    match res {
-                        Ok(msg) => log::error!(
-                            "IPC server task died unexpectedly ({msg}) — shutting down"
-                        ),
-                        Err(_) => log::error!(
-                            "IPC server task dropped its dead-signal channel — shutting down"
-                        ),
+            }
+            Err(e) => {
+                log::warn!("Failed to register SIGHUP handler, config reload unavailable: {e}");
+                tokio::pin!(ipc_dead_rx);
+
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        log::info!("Received SIGINT — shutting down");
                     }
-                    break;
+                    res = &mut ipc_dead_rx => {
+                        match res {
+                            Ok(msg) => log::error!(
+                                "IPC server task died unexpectedly ({msg}) — shutting down"
+                            ),
+                            Err(_) => log::error!(
+                                "IPC server task dropped its dead-signal channel — shutting down"
+                            ),
+                        }
+                    }
                 }
             }
         }
@@ -793,4 +758,94 @@ async fn main() {
     let _ = server_handle.await;
 
     log::info!("control-ofc-daemon v{VERSION} stopped");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn config_reload_updates_profile_search_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Write a daemon.toml with custom search dirs
+        let config_path = tmp.path().join("daemon.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[profiles]
+search_dirs = ["/custom/profiles", "/other/profiles"]
+"#,
+        )
+        .unwrap();
+
+        // No runtime.toml — only daemon.toml should be consulted
+        let runtime_path = tmp.path().join("runtime.toml");
+
+        let search_dirs = parking_lot::RwLock::new(vec![PathBuf::from("/old/path")]);
+
+        let result =
+            apply_config_reload(config_path.to_str().unwrap(), &runtime_path, &search_dirs);
+        assert!(result.is_ok());
+
+        let dirs = search_dirs.read().clone();
+        assert_eq!(dirs.len(), 2);
+        assert_eq!(dirs[0], PathBuf::from("/custom/profiles"));
+        assert_eq!(dirs[1], PathBuf::from("/other/profiles"));
+    }
+
+    #[test]
+    fn config_reload_with_runtime_overlay() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // daemon.toml with one set of search dirs
+        let config_path = tmp.path().join("daemon.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[profiles]
+search_dirs = ["/etc/control-ofc/profiles"]
+"#,
+        )
+        .unwrap();
+
+        // runtime.toml overrides search_dirs
+        let runtime_path = tmp.path().join("runtime.toml");
+        let mut runtime_cfg = RuntimeConfig::default();
+        runtime_cfg
+            .set_profile_search_dirs(vec!["/runtime/profiles".into(), "/user/profiles".into()]);
+        runtime_cfg.save_to(&runtime_path).unwrap();
+
+        let search_dirs = parking_lot::RwLock::new(vec![]);
+
+        let result =
+            apply_config_reload(config_path.to_str().unwrap(), &runtime_path, &search_dirs);
+        assert!(result.is_ok());
+
+        let dirs = search_dirs.read().clone();
+        assert_eq!(dirs.len(), 2);
+        assert_eq!(dirs[0], PathBuf::from("/runtime/profiles"));
+        assert_eq!(dirs[1], PathBuf::from("/user/profiles"));
+    }
+
+    #[test]
+    fn config_reload_invalid_config_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Write invalid TOML
+        let config_path = tmp.path().join("bad.toml");
+        std::fs::write(&config_path, "not = valid = toml === {{{{").unwrap();
+
+        let runtime_path = tmp.path().join("runtime.toml");
+        let search_dirs = parking_lot::RwLock::new(vec![PathBuf::from("/should/stay")]);
+
+        let result =
+            apply_config_reload(config_path.to_str().unwrap(), &runtime_path, &search_dirs);
+        assert!(result.is_err());
+
+        // Original dirs should be untouched
+        let dirs = search_dirs.read().clone();
+        assert_eq!(dirs, vec![PathBuf::from("/should/stay")]);
+    }
 }

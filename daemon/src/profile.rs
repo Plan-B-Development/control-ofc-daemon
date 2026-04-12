@@ -195,7 +195,21 @@ pub fn load_profile(path: &Path) -> Result<DaemonProfile, String> {
 }
 
 /// Search for a profile by name in the given search directories.
+///
+/// The name must be a simple filename stem (no path separators or traversal
+/// components). Names containing `/`, `\`, `..`, or null bytes are rejected
+/// to prevent CWE-22 path traversal.
 pub fn find_profile(name: &str, search_dirs: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+    if name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || name.contains('\0')
+        || name.is_empty()
+    {
+        log::warn!("rejected profile name with path traversal characters: {name:?}");
+        return None;
+    }
+
     for dir in search_dirs {
         let file = dir.join(format!("{name}.json"));
         if file.exists() {
@@ -427,5 +441,21 @@ mod tests {
     fn find_profile_empty_dirs_returns_none() {
         let dirs: Vec<std::path::PathBuf> = vec![];
         assert!(find_profile("any", &dirs).is_none());
+    }
+
+    #[test]
+    fn find_profile_rejects_path_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create a file that would match if traversal were allowed
+        let target = dir.path().join("evil.json");
+        std::fs::write(&target, r#"{"id":"evil","name":"Evil"}"#).unwrap();
+
+        // These should all be rejected before the filesystem is consulted
+        assert!(find_profile("../evil", &[dir.path().to_path_buf()]).is_none());
+        assert!(find_profile("../../evil", &[dir.path().to_path_buf()]).is_none());
+        assert!(find_profile("foo/bar", &[dir.path().to_path_buf()]).is_none());
+        assert!(find_profile("foo\\bar", &[dir.path().to_path_buf()]).is_none());
+        assert!(find_profile("foo\0bar", &[dir.path().to_path_buf()]).is_none());
+        assert!(find_profile("", &[dir.path().to_path_buf()]).is_none());
     }
 }

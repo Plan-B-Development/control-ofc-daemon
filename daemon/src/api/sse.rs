@@ -20,28 +20,36 @@ use futures_util::stream::Stream;
 use crate::constants;
 
 use super::handlers::AppState;
-use super::responses::{FanEntry, SensorEntry, API_VERSION};
+use super::responses::API_VERSION;
 
 /// GET /events — SSE stream of sensor and fan updates.
 ///
 /// Returns 503 if the maximum number of concurrent SSE clients is reached.
 pub async fn events_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let prev = state.sse_clients.fetch_add(1, Ordering::SeqCst);
-    if prev >= constants::SSE_MAX_CLIENTS {
-        state.sse_clients.fetch_sub(1, Ordering::SeqCst);
-        log::warn!(
-            "SSE connection rejected: {prev} active clients (limit: {})",
-            constants::SSE_MAX_CLIENTS,
-        );
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(serde_json::json!({"error": {
-                "code": "too_many_clients",
-                "message": "maximum SSE connections reached",
-                "retryable": true,
-                "source": "validation"
-            }})),
-        ));
+    loop {
+        let current = state.sse_clients.load(Ordering::SeqCst);
+        if current >= constants::SSE_MAX_CLIENTS {
+            log::warn!(
+                "SSE connection rejected: {current} active clients (limit: {})",
+                constants::SSE_MAX_CLIENTS,
+            );
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(serde_json::json!({"error": {
+                    "code": "too_many_clients",
+                    "message": "maximum SSE connections reached",
+                    "retryable": true,
+                    "source": "validation"
+                }})),
+            ));
+        }
+        if state
+            .sse_clients
+            .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            break;
+        }
     }
 
     let started_at = Instant::now();
@@ -58,60 +66,8 @@ pub async fn events_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
             let snap = state.cache.snapshot();
             let now = Instant::now();
 
-            // Build sensors payload
-            let sensors: Vec<SensorEntry> = snap
-                .sensors
-                .values()
-                .map(|s| {
-                    let age_ms = now.duration_since(s.updated_at).as_millis() as u64;
-                    SensorEntry {
-                        id: s.id.clone(),
-                        kind: s.kind.to_string(),
-                        label: s.label.clone(),
-                        value_c: s.value_c,
-                        source: s.source.to_string(),
-                        age_ms,
-                        rate_c_per_s: s.rate_c_per_s,
-                        session_min_c: s.session_min_c,
-                        session_max_c: s.session_max_c,
-                    }
-                })
-                .collect();
-
-            // Build fans payload
-            let mut fans: Vec<FanEntry> = Vec::new();
-            for (ch, fan) in &snap.openfan_fans {
-                let age_ms = now.duration_since(fan.updated_at).as_millis() as u64;
-                let stall = fan
-                    .last_commanded_pwm
-                    .map(|pwm| fan.rpm == 0 && pwm > constants::STALL_PWM_THRESHOLD);
-                fans.push(FanEntry {
-                    id: format!("openfan:ch{ch:02}"),
-                    source: "openfan".into(),
-                    rpm: Some(fan.rpm),
-                    last_commanded_pwm: fan.last_commanded_pwm,
-                    age_ms,
-                    stall_detected: stall,
-                });
-            }
-            for (id, fan) in &snap.hwmon_fans {
-                let age_ms = now.duration_since(fan.updated_at).as_millis() as u64;
-                let stall = match (fan.rpm, fan.last_commanded_pwm) {
-                    (Some(rpm), Some(pwm)) => {
-                        Some(rpm == 0 && pwm > constants::STALL_PWM_THRESHOLD)
-                    }
-                    _ => None,
-                };
-                fans.push(FanEntry {
-                    id: id.clone(),
-                    source: "hwmon".into(),
-                    rpm: fan.rpm,
-                    last_commanded_pwm: fan.last_commanded_pwm,
-                    age_ms,
-                    stall_detected: stall,
-                });
-            }
-            fans.sort_by(|a, b| a.id.cmp(&b.id));
+            let sensors = super::handlers::build_sensor_entries(&snap, now);
+            let fans = super::handlers::build_fan_entries(&snap, now);
 
             // Wrap in an envelope with api_version
             let payload = serde_json::json!({
@@ -159,5 +115,63 @@ impl<S: Stream> Stream for GuardedStream<S> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         self.inner.as_mut().poll_next(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    use crate::constants::SSE_MAX_CLIENTS;
+
+    /// Verify the CAS client-limiting pattern: a compare_exchange from 0->1
+    /// succeeds, but once the counter reaches SSE_MAX_CLIENTS the next CAS
+    /// attempt correctly fails.
+    #[test]
+    fn cas_client_limit_rejects_at_max() {
+        let counter = AtomicUsize::new(0);
+
+        // First CAS: 0 -> 1 should succeed
+        let result = counter.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst);
+        assert!(result.is_ok(), "CAS from 0->1 should succeed");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        // Set counter to the maximum
+        counter.store(SSE_MAX_CLIENTS, Ordering::SeqCst);
+
+        // The handler's admission check: current >= SSE_MAX_CLIENTS means reject.
+        // This mirrors the `if current >= constants::SSE_MAX_CLIENTS` guard in
+        // events_handler.
+        let current = counter.load(Ordering::SeqCst);
+        assert!(
+            current >= SSE_MAX_CLIENTS,
+            "counter at max should trigger rejection"
+        );
+
+        // A CAS with a stale `current` (e.g. 0) also fails — simulates a
+        // concurrent increment race where the snapshot is outdated.
+        let result = counter.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst);
+        assert!(result.is_err(), "CAS with stale snapshot should fail");
+    }
+
+    /// Verify that GuardedStream decrements the client counter when dropped.
+    #[test]
+    fn guarded_stream_decrements_counter_on_drop() {
+        let counter = Arc::new(AtomicUsize::new(1));
+
+        // Wrap a no-op stream in GuardedStream
+        let stream: GuardedStream<futures_util::stream::Empty<()>> = GuardedStream {
+            inner: Box::pin(futures_util::stream::empty()),
+            counter: counter.clone(),
+        };
+
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        drop(stream);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "counter must be 0 after GuardedStream is dropped"
+        );
     }
 }

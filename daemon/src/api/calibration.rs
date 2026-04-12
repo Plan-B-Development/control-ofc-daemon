@@ -148,7 +148,9 @@ pub async fn calibrate_openfan_channel(
 
     // Restore pre-calibration PWM
     if let Some(restore) = pre_cal_pwm {
-        let _ = write_fn(channel, restore);
+        if let Err(e) = write_fn(channel, restore) {
+            log::warn!("failed to restore pre-calibration PWM on ch{channel}: {e}");
+        }
     }
 
     // Derive start_pwm and stop_pwm

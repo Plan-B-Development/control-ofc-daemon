@@ -4,31 +4,9 @@ use std::fmt;
 
 use thiserror::Error;
 
-/// Top-level daemon error type.
-#[derive(Debug, Error)]
-pub enum DaemonError {
-    #[error("configuration error: {0}")]
-    Config(#[from] ConfigError),
-
-    #[error("serial error: {0}")]
-    Serial(#[from] SerialError),
-
-    #[error("hwmon error: {0}")]
-    Hwmon(#[from] HwmonError),
-
-    #[error("ipc error: {0}")]
-    Ipc(#[from] IpcError),
-
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-}
-
 /// Configuration loading and validation errors.
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("file not found: {path}")]
-    NotFound { path: String },
-
     #[error("parse error: {message}")]
     Parse { message: String },
 
@@ -103,14 +81,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_not_found_display() {
-        let err = ConfigError::NotFound {
-            path: "/etc/control-ofc.toml".into(),
-        };
-        assert_eq!(err.to_string(), "file not found: /etc/control-ofc.toml");
-    }
-
-    #[test]
     fn config_validation_display() {
         let err = ConfigError::Validation {
             field: "poll_interval_ms".into(),
@@ -126,18 +96,6 @@ mod tests {
     fn serial_timeout_display() {
         let err = SerialError::Timeout { timeout_ms: 500 };
         assert_eq!(err.to_string(), "timeout after 500ms");
-    }
-
-    #[test]
-    fn daemon_error_from_config() {
-        let config_err = ConfigError::Parse {
-            message: "unexpected token".into(),
-        };
-        let daemon_err = DaemonError::from(config_err);
-        assert_eq!(
-            daemon_err.to_string(),
-            "configuration error: parse error: unexpected token"
-        );
     }
 
     #[test]
