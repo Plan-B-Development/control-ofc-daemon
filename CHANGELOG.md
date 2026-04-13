@@ -1,5 +1,51 @@
 # Changelog
 
+## [1.1.3] — 2026-04-12
+
+Security hardening, error handling cleanup, and test coverage pass.
+All quality gates remain green at 312 tests (290 unit + 22 integration).
+
+### Security
+- **SEC-1:** Reject path traversal (`..`) in profile name lookup (`find_profile`).
+- **SEC-2:** Bound serial `read_line` with `Read::take(4096)` to prevent OOM from
+  a malfunctioning device sending data without a newline terminator.
+- **SEC-4:** Reject `..` in profile search directory paths passed via API.
+- **SEC-7:** Reject `..` and null bytes in serial port path validation
+  (`real_transport.rs`).
+
+### Fixed
+- **SSE stream omitted GPU fans.** The SSE `events_handler` built fan entries
+  inline instead of using the shared `build_fan_entries()` helper, so GPU fan
+  state was missing from the real-time stream. Now shares the same builder as
+  `/fans` and `/poll`.
+- **SSE client limit had a TOCTOU race.** Replaced `fetch_add` counter with
+  `compare_exchange` CAS loop so two clients arriving simultaneously cannot
+  both pass the `SSE_MAX_CLIENTS` check.
+- Calibration PWM restore failures now logged instead of silently dropped.
+- Lease renewal failures now logged at WARN.
+- SIGHUP config reload failures now logged at ERROR (previously only returned
+  a string that was silently dropped in one branch).
+
+### Changed
+- **Removed stale `migrate_legacy_runtime_keys`.** The one-release migration
+  shim for `[profiles]`/`[startup]` from `daemon.toml` → `runtime.toml` was
+  past its v1.1.0 deadline. Removed dead code from `main.rs`.
+- **Removed dead `ConfigError::NotFound` variant and unused `DaemonError` enum**
+  from `error.rs`.
+- **Service unit: `SupplementaryGroups` reduced to `uucp` only.** `dialout`
+  (Debian/Ubuntu) was dropped because systemd rejects the entire directive if
+  any named group does not exist on the host. On Arch/CachyOS (the primary
+  target), only `uucp` exists. Debian/Ubuntu users should add `dialout` via
+  a systemd drop-in override.
+- Extracted `apply_config_reload()` from the SIGHUP handler for testability.
+- Shared `build_fan_entries` / `build_sensor_entries` between REST handlers
+  and SSE stream, eliminating ~60 lines of duplication.
+- Version bumped to 1.1.3 (`daemon/Cargo.toml`, `packaging/PKGBUILD`).
+
+### Added
+- 7 new tests: SSE CAS client limiting, `GuardedStream` counter drop,
+  config reload (3 unit tests), GPU fan profile engine member evaluation.
+
 ## [1.1.2] — 2026-04-11
 
 Packaging / installation cleanup pass. No daemon code changes — all quality

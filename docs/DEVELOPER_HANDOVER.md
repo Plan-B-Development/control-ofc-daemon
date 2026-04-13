@@ -16,16 +16,21 @@ daemon/                     Rust crate (control-ofc-daemon)
     main.rs                 Entrypoint (tokio async runtime)
     lib.rs                  Module exports
     config.rs               TOML config + validation (incl. [state] section)
+    runtime_config.rs       Daemon-mutable runtime.toml (ADR-002)
+    constants.rs            Centralized operational tuning values
     daemon_state.rs         Persistent state (configurable state_dir via OnceLock)
     error.rs                Structured error types
     api/
       handlers.rs           HTTP request handlers + AppState
       responses.rs          JSON response/request types (v1 schema)
       server.rs             Unix socket server lifecycle
+      sse.rs                Server-Sent Events stream
+      calibration.rs        OpenFan calibration sweep
     health/
       state.rs              Canonical state model (DaemonState)
       cache.rs              RwLock in-memory cache
       staleness.rs          Health computation (OK/Warn/Crit)
+      history.rs            Per-entity time-series ring buffer
     hwmon/
       discovery.rs          hwmon sysfs sensor discovery
       reader.rs             hwmon temp reads
@@ -35,8 +40,7 @@ daemon/                     Rust crate (control-ofc-daemon)
       lease.rs              Exclusive write lease (take/release/renew, 60s TTL)
       gpu_detect.rs         AMD GPU detection via sysfs/DRM
       gpu_fan.rs            PMFW fan curve read/write/reset (RDNA3+)
-    health/
-      history.rs            Per-entity time-series ring buffer
+      util.rs               Shared sysfs path helpers
     serial/
       protocol.rs           OpenFanController protocol encode/decode
       transport.rs          Serial transport trait
@@ -122,6 +126,8 @@ sudo systemctl enable --now control-ofc-daemon
 | `POST /gpu/{gpu_id}/fan/pwm` | Set GPU fan speed (PMFW or hwmon) |
 | `POST /gpu/{gpu_id}/fan/reset` | Reset GPU fan to automatic mode |
 | `POST /profile/activate` | Switch active profile at runtime |
+| `POST /config/profile-search-dirs` | Register additional profile search dirs (persists to `runtime.toml`) |
+| `POST /config/startup-delay` | Set startup delay seconds (persists to `runtime.toml`) |
 
 ## Identity contract
 
@@ -154,4 +160,4 @@ Every sensor/fan/header includes:
 
 ## Test counts
 
-262 total (240 unit + 22 integration). No tests require real hardware.
+312 total (290 unit + 22 integration). No tests require real hardware.

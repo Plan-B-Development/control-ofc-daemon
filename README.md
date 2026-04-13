@@ -4,9 +4,8 @@ Rust workspace for the Control-OFC fan control daemon.
 
 > A privileged Linux daemon that manages fan hardware (hwmon sysfs, OpenFanController
 > serial, AMD GPU PMFW) and serves an HTTP API over a Unix socket for the
-> [`control-ofc-gui`](https://github.com/your-org/control-ofc-gui) PySide6 desktop
-> application. Runs headless with autonomous profile evaluation, or as a passive
-> backend for the GUI.
+> `control-ofc-gui` PySide6 desktop application. Runs headless with autonomous
+> profile evaluation, or as a passive backend for the GUI.
 
 ## Workspace layout
 
@@ -36,6 +35,7 @@ cargo build --release
 # Install
 sudo cp target/release/control-ofc-daemon /usr/local/bin/
 sudo cp ../packaging/control-ofc-daemon.service /etc/systemd/system/
+sudo mkdir -p /etc/control-ofc
 sudo cp ../packaging/daemon.toml.example /etc/control-ofc/daemon.toml
 sudo systemctl daemon-reload
 sudo systemctl enable --now control-ofc-daemon
@@ -77,7 +77,7 @@ Full build / install / CLI / environment reference lives in
 
 ## Pairing with the GUI
 
-The GUI repo lives at [`control-ofc-gui`](https://github.com/your-org/control-ofc-gui).
+The GUI repo lives at `control-ofc-gui` (separate repository).
 GUI ↔ daemon is a strict client/server boundary: the GUI is **never** permitted to
 touch hardware directly. All reads and writes flow through this daemon's HTTP API.
 The full contract is documented in the GUI repo's `docs/08_API_Integration_Contract.md`.

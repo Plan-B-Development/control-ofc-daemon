@@ -16,6 +16,7 @@ Binary: `target/release/control-ofc-daemon`
 ```bash
 sudo cp target/release/control-ofc-daemon /usr/local/bin/
 sudo cp ../packaging/control-ofc-daemon.service /etc/systemd/system/
+sudo mkdir -p /etc/control-ofc
 sudo cp ../packaging/daemon.toml.example /etc/control-ofc/daemon.toml
 sudo systemctl daemon-reload
 sudo systemctl enable --now control-ofc-daemon

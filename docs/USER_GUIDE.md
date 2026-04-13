@@ -147,7 +147,14 @@ ls -la /dev/serial/by-id/
 
 ### Serial permissions
 
-The daemon needs read/write access to the serial device. The systemd service file includes `SupplementaryGroups=uucp dialout` to support both Arch-based (`uucp`) and Debian-based (`dialout`) distributions.
+The daemon needs read/write access to the serial device. The systemd service file includes `SupplementaryGroups=uucp` for Arch-based distributions. Debian/Ubuntu users (where the serial group is `dialout`) should add a systemd drop-in override:
+
+```bash
+sudo systemctl edit control-ofc-daemon
+# Add:
+#   [Service]
+#   SupplementaryGroups=uucp dialout
+```
 
 A udev rule is **not required** — the daemon auto-detects the OpenFanController on `/dev/ttyACM*` and `/dev/ttyUSB*` at startup. Use this only if you want a stable `/dev/control-ofc-controller` symlink or a specific group/mode on the device node.
 
@@ -193,6 +200,75 @@ curl --unix-socket /run/control-ofc/control-ofc.sock \
 
 The GPU ID is available from `GET /capabilities`.
 
+## Fan profiles
+
+The daemon can autonomously evaluate fan curve profiles at 1 Hz. Profiles are JSON files compatible with the GUI's Profile v3 format. An example ships at `/etc/control-ofc/profiles/quiet.json`.
+
+### Loading a profile
+
+```bash
+# Via CLI (highest priority)
+control-ofc-daemon --profile quiet
+control-ofc-daemon --profile-file /path/to/custom.json
+
+# Via environment variable
+OPENFAN_PROFILE=quiet control-ofc-daemon
+
+# Via API at runtime
+curl --unix-socket /run/control-ofc/control-ofc.sock \
+  -X POST -H "Content-Type: application/json" \
+  -d '{"profile_id": "quiet"}' \
+  http://localhost/profile/activate | jq .
+
+# Check active profile
+curl --unix-socket /run/control-ofc/control-ofc.sock \
+  http://localhost/profile/active | jq .
+```
+
+The daemon persists the active profile selection to `/var/lib/control-ofc/daemon_state.json`, so it survives restarts.
+
+### Profile search directories
+
+The daemon searches for profiles in:
+1. `/etc/control-ofc/profiles` (always included)
+2. `$HOME/.config/control-ofc/profiles` (or `$XDG_CONFIG_HOME/control-ofc/profiles`)
+
+Additional directories can be registered at runtime via the API:
+
+```bash
+curl --unix-socket /run/control-ofc/control-ofc.sock \
+  -X POST -H "Content-Type: application/json" \
+  -d '{"add": ["/home/user/.config/control-ofc/profiles"]}' \
+  http://localhost/config/profile-search-dirs | jq .
+```
+
+### Profile engine and GUI coexistence
+
+When the GUI has written a fan command within the last 30 seconds, the profile engine defers its writes to avoid dual-writer contention. The thermal safety override always takes priority over both the GUI and the profile engine.
+
+## Runtime configuration
+
+Configuration is split between two files (see `docs/ADRs/002-runtime-config-split.md`):
+
+- **`/etc/control-ofc/daemon.toml`** — admin-owned, hand-edited. Contains static topology: serial port, polling interval, socket path, state directory. Never rewritten by the daemon.
+- **`/var/lib/control-ofc/runtime.toml`** — daemon-managed. Contains settings that API endpoints mutate at runtime: profile search directories and startup delay. Written with 0600 permissions via atomic rename.
+
+On startup the daemon loads `daemon.toml`, then overlays `runtime.toml` on top (runtime values win). `SIGHUP` / `systemctl reload` re-reads both files.
+
+### Startup delay
+
+A configurable delay before the daemon begins device detection, useful for waiting for USB or hwmon devices to appear after boot:
+
+```bash
+# Set via API (takes effect on next restart, persists to runtime.toml)
+curl --unix-socket /run/control-ofc/control-ofc.sock \
+  -X POST -H "Content-Type: application/json" \
+  -d '{"delay_secs": 3}' \
+  http://localhost/config/startup-delay | jq .
+```
+
+The delay is capped at 30 seconds.
+
 ## Upgrade notes
 
 ### v0.7.1 — Breaking: `publish_interval_ms` removed
@@ -236,9 +312,11 @@ After stopping the daemon, hwmon fans are automatically restored to automatic mo
 
 ## Safety
 
-The daemon enforces safety floors to prevent hardware damage:
-- OpenFanController channels: minimum 20% PWM (0% allowed for max 8 seconds)
-- Motherboard chassis fans: minimum 20% PWM
-- Motherboard CPU/pump fans: minimum 30% PWM (0% never allowed)
+The daemon enforces the following safety rules:
 
-These floors are enforced by the daemon and cannot be bypassed by the GUI.
+- **Thermal emergency override** — if the hottest CPU temperature sensor reaches 105°C, all fans (OpenFan, hwmon, GPU) are forced to 100%. The override holds until CPU temperature drops to 80°C (25°C hysteresis), then applies a one-cycle 60% recovery floor before returning control to the active profile.
+- **Missing sensor fallback** — if no CPU temperature sensor reports for 5 consecutive polling cycles, all fans are forced to 40% as a defensive measure.
+- **OpenFanController stop timeout** — 0% PWM is allowed for a maximum of 8 seconds per channel, after which further 0% commands are rejected until a non-zero value is sent.
+- **Hwmon PWM headers** — the daemon does not enforce per-header minimum floors. Safety limits are expressed via the `/capabilities` endpoint and enforced by the GUI's profile constraints.
+- **GPU fan curves** are restored to automatic mode on daemon shutdown (via `ExecStopPost` in the systemd service file).
+- **Hwmon headers** are restored to automatic mode (`pwm_enable=2`) on daemon shutdown so the BIOS regains thermal control.
