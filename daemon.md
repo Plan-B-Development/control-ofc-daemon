@@ -15,6 +15,8 @@ Exposes an HTTP API over a Unix domain socket for the PySide6 GUI.
 daemon/src/
   main.rs              — startup, config, signal handling, shutdown
   config.rs            — TOML config parsing + validation
+  runtime_config.rs    — daemon-mutable runtime.toml (ADR-002)
+  constants.rs         — centralized operational tuning values
   lib.rs               — crate re-exports
 
   serial/
@@ -214,4 +216,4 @@ Error envelope (all errors):
 
 Codes: `validation_error` (400), `lease_required` (403), `not_found` (404),
 `lease_already_held` (409), `thermal_abort` (409), `internal_error` (500),
-`hardware_unavailable` (503).
+`hardware_unavailable` (503), `persistence_failed` (503).
