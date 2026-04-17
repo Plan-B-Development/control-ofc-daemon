@@ -175,6 +175,10 @@ pub fn read_fan_curve(fan_curve_path: &Path) -> Result<FanCurve, HwmonError> {
 /// Write a fan curve to the PMFW sysfs file and commit it.
 ///
 /// Each point is written as `"INDEX TEMP SPEED\n"`, followed by `"c\n"` to commit.
+///
+/// **Non-atomic:** if the process is killed between individual point writes
+/// and the final commit, the GPU retains a partial curve. The daemon panic
+/// hook resets to auto (`"r\n"` + `"c\n"`) to mitigate this.
 pub fn write_fan_curve(fan_curve_path: &Path, points: &[FanCurvePoint]) -> Result<(), HwmonError> {
     write_fan_curve_with(&RealFanCurveWriter, fan_curve_path, points)
 }
@@ -327,25 +331,30 @@ pub fn set_static_speed(
 ///
 /// Resets the curve via `"r\n"` + `"c\n"`, then re-enables zero-RPM if the path
 /// is provided (restoring firmware idle fan-stop behaviour).
+///
+/// Zero-RPM is re-enabled even if the curve reset fails, because a prior
+/// `set_static_speed` may have disabled it; leaving zero-RPM off means
+/// the fan runs continuously when it otherwise would stop at idle.
 pub fn reset_to_auto(
     fan_curve_path: &Path,
     zero_rpm_path: Option<&Path>,
 ) -> Result<(), HwmonError> {
-    std::fs::write(fan_curve_path, "r\n").map_err(|e| HwmonError::WriteError {
-        path: fan_curve_path.display().to_string(),
-        message: format!("failed to reset fan curve to auto: {e}"),
-    })?;
+    let reset_err = std::fs::write(fan_curve_path, "r\n")
+        .and_then(|()| std::fs::write(fan_curve_path, "c\n"))
+        .err();
 
-    std::fs::write(fan_curve_path, "c\n").map_err(|e| HwmonError::WriteError {
-        path: fan_curve_path.display().to_string(),
-        message: format!("failed to commit fan curve reset: {e}"),
-    })?;
-
-    // Re-enable zero-RPM so firmware can stop fans at idle
+    // Always attempt to re-enable zero-RPM, even if the curve reset failed.
     if let Some(zrp) = zero_rpm_path {
         if let Err(e) = enable_zero_rpm(zrp) {
             log::warn!("Could not re-enable zero-RPM (continuing): {e}");
         }
+    }
+
+    if let Some(io_err) = reset_err {
+        return Err(HwmonError::WriteError {
+            path: fan_curve_path.display().to_string(),
+            message: format!("failed to reset fan curve to auto: {io_err}"),
+        });
     }
 
     log::info!("Reset PMFW fan curve to auto: {}", fan_curve_path.display());
