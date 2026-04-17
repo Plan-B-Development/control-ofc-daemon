@@ -38,6 +38,34 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now control-ofc-daemon
 ```
 
+## Hardware sensor modules
+
+The daemon discovers sensors and fan headers by scanning `/sys/class/hwmon/`. For devices to appear there, the correct kernel modules must be loaded.
+
+**Automatically handled:** The package installs `/etc/modules-load.d/control-ofc.conf`, which loads common Super I/O chipset modules at boot:
+
+| Module | Chipset | Common boards |
+|--------|---------|---------------|
+| `nct6775` | Nuvoton NCT6775/6776/6779/6798 | ASUS, Gigabyte, MSI |
+| `it87` | ITE IT8686/8688/8689/8696 | Gigabyte, ASRock |
+| `w83627ehf` | Winbond W83627EHF/DHG | Older boards |
+| `drivetemp` | SATA/SAS drive temperature | All SATA drives |
+
+CPU temperature modules (`coretemp` for Intel, `k10temp` for AMD) and SMBus adapter modules (`i2c-i801`, `i2c-piix4`) auto-load via PCI/ACPI matching — no configuration needed.
+
+**If your hardware is not detected:** Install `lm_sensors` and run:
+```bash
+sudo sensors-detect
+```
+This interactively probes for additional sensor chips and persists the results. Then restart the daemon:
+```bash
+sudo systemctl restart control-ofc-daemon
+```
+
+**ACPI conflicts:** Some boards (particularly Gigabyte) require the `acpi_enforce_resources=lax` kernel parameter for Super I/O modules to bind. Add it to your bootloader kernel command line if you see `ACPI resource conflict` messages in `dmesg`.
+
+**Out-of-tree modules:** Some newer motherboard chipsets require DKMS modules not yet in mainline (e.g. `it87` for newer ITE chips, `nct6687` for some MSI/ASUS boards). These are available from the AUR and must be installed separately.
+
 ## Configuration
 
 Configuration is optional. The daemon uses sensible defaults if no config file exists.

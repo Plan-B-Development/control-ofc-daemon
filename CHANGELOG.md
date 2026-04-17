@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.1.3-2] — 2026-04-17
+
+Packaging-only change (pkgrel bump). No daemon code changes.
+
+### Added
+- **Automatic Super I/O module loading.** Ship
+  `/etc/modules-load.d/control-ofc.conf` that loads `nct6775`, `it87`,
+  `w83627ehf`, and `drivetemp` at boot via `systemd-modules-load`. These
+  are ISA-port-based chipset drivers that the kernel cannot auto-detect
+  — without them, motherboard fan headers and some sensors are invisible
+  to the daemon. Loading a module for absent hardware is harmless.
+- `lm_sensors` added as `optdepends` for users whose hardware requires
+  `sensors-detect` beyond the built-in module list.
+- Hardware sensor modules section added to `docs/USER_GUIDE.md`.
+
 ## [1.1.3] — 2026-04-12
 
 Security hardening, error handling cleanup, and test coverage pass.
