@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [1.1.6] — 2026-04-17
 
 Safety and robustness hardening from full audit pass.
 
@@ -581,7 +581,8 @@ Resolves all 17 findings from the V5 Phase 1 Rust daemon code review.
 - Structured error types
 - Module layout for all planned subsystems
 
-[Unreleased]: https://github.com/Plan-B-Development/control-ofc-daemon/compare/v1.1.5...HEAD
+[Unreleased]: https://github.com/Plan-B-Development/control-ofc-daemon/compare/v1.1.6...HEAD
+[1.1.6]: https://github.com/Plan-B-Development/control-ofc-daemon/compare/v1.1.5...v1.1.6
 [1.1.5]: https://github.com/Plan-B-Development/control-ofc-daemon/compare/v1.1.4...v1.1.5
 [1.1.4]: https://github.com/Plan-B-Development/control-ofc-daemon/compare/v1.1.3...v1.1.4
 [1.1.3]: https://github.com/Plan-B-Development/control-ofc-daemon/compare/v1.1.2...v1.1.3
