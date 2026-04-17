@@ -580,3 +580,12 @@ Resolves all 17 findings from the V5 Phase 1 Rust daemon code review.
 - Config scaffolding with TOML + validation
 - Structured error types
 - Module layout for all planned subsystems
+
+[Unreleased]: https://github.com/Plan-B-Development/control-ofc-daemon/compare/v1.1.5...HEAD
+[1.1.5]: https://github.com/Plan-B-Development/control-ofc-daemon/compare/v1.1.4...v1.1.5
+[1.1.4]: https://github.com/Plan-B-Development/control-ofc-daemon/compare/v1.1.3...v1.1.4
+[1.1.3]: https://github.com/Plan-B-Development/control-ofc-daemon/compare/v1.1.2...v1.1.3
+[1.1.2]: https://github.com/Plan-B-Development/control-ofc-daemon/compare/v1.1.1...v1.1.2
+[1.1.1]: https://github.com/Plan-B-Development/control-ofc-daemon/compare/v1.1.0...v1.1.1
+[1.1.0]: https://github.com/Plan-B-Development/control-ofc-daemon/compare/v1.0.1...v1.1.0
+[1.0.1]: https://github.com/Plan-B-Development/control-ofc-daemon/compare/v1.0.0...v1.0.1

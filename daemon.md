@@ -214,6 +214,6 @@ Error envelope (all errors):
 }
 ```
 
-Codes: `validation_error` (400), `lease_required` (403), `not_found` (404),
-`lease_already_held` (409), `thermal_abort` (409), `internal_error` (500),
-`hardware_unavailable` (503), `persistence_failed` (503).
+Codes: `validation_error` (400), `lease_required` (400 for invalid/expired lease, 403 for missing lease on write),
+`not_found` (404), `lease_already_held` (409), `thermal_abort` (409),
+`internal_error` (500), `hardware_unavailable` (503), `persistence_failed` (503).

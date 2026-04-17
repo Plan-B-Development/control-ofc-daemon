@@ -1,0 +1,11 @@
+#compdef control-ofc-daemon
+
+_control-ofc-daemon() {
+    _arguments \
+        '--config=[Path to daemon.toml]:config path:_files' \
+        '--profile=[Load a named profile from search paths]:profile name:' \
+        '--profile-file=[Load a profile from an absolute file path]:profile path:_files' \
+        '--allow-non-root[Skip root privilege check (dev only)]'
+}
+
+_control-ofc-daemon "$@"

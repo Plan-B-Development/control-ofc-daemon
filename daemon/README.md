@@ -13,6 +13,10 @@ Binary: `target/release/control-ofc-daemon`
 
 ## Install
 
+**AUR (recommended):** `paru -S control-ofc-daemon` — installs to `/usr/bin/`.
+
+**Manual:**
+
 ```bash
 sudo cp target/release/control-ofc-daemon /usr/local/bin/
 sudo cp ../packaging/control-ofc-daemon.service /etc/systemd/system/
@@ -21,6 +25,8 @@ sudo cp ../packaging/daemon.toml.example /etc/control-ofc/daemon.toml
 sudo systemctl daemon-reload
 sudo systemctl enable --now control-ofc-daemon
 ```
+
+> **Note:** The packaged AUR install places the binary at `/usr/bin/control-ofc-daemon`. Manual installs use `/usr/local/bin/`. The systemd service file references `/usr/bin/` — update `ExecStart` if you installed manually.
 
 ## CLI
 
@@ -31,6 +37,7 @@ Options:
   --config <path>         Path to daemon.toml (default: /etc/control-ofc/daemon.toml)
   --profile <name>        Load a named profile from search paths
   --profile-file <path>   Load a profile from an absolute file path
+  --allow-non-root        Skip root privilege check (dev/testing only)
 ```
 
 ## Environment variables
