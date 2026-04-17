@@ -133,11 +133,18 @@ impl Default for ProfilesConfig {
 }
 
 fn default_profile_search_dirs() -> Vec<String> {
+    profile_search_dirs_for(
+        std::env::var("HOME").ok().as_deref(),
+        std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
+    )
+}
+
+fn profile_search_dirs_for(home: Option<&str>, xdg_config: Option<&str>) -> Vec<String> {
     let mut dirs = vec!["/etc/control-ofc/profiles".to_string()];
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+    if let Some(xdg) = xdg_config {
         dirs.push(format!("{xdg}/control-ofc/profiles"));
-    } else if let Ok(home) = std::env::var("HOME") {
-        dirs.push(format!("{home}/.config/control-ofc/profiles"));
+    } else if let Some(h) = home {
+        dirs.push(format!("{h}/.config/control-ofc/profiles"));
     } else {
         // Fallback for systemd services where HOME is not set.
         // The daemon typically runs as root; /root is the standard home.
@@ -344,21 +351,7 @@ poll_interval_ms = 500
 
     #[test]
     fn defaults_include_root_fallback_when_home_unset() {
-        // Temporarily remove HOME and XDG_CONFIG_HOME to simulate systemd service
-        let saved_home = std::env::var("HOME").ok();
-        let saved_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-        std::env::remove_var("HOME");
-        std::env::remove_var("XDG_CONFIG_HOME");
-
-        let dirs = default_profile_search_dirs();
-
-        // Restore
-        if let Some(h) = saved_home {
-            std::env::set_var("HOME", h);
-        }
-        if let Some(x) = saved_xdg {
-            std::env::set_var("XDG_CONFIG_HOME", x);
-        }
+        let dirs = profile_search_dirs_for(None, None);
 
         assert!(
             dirs.contains(&"/etc/control-ofc/profiles".to_string()),
@@ -372,21 +365,7 @@ poll_interval_ms = 500
 
     #[test]
     fn defaults_use_home_when_set() {
-        let saved = std::env::var("HOME").ok();
-        let saved_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-        std::env::set_var("HOME", "/home/testuser");
-        std::env::remove_var("XDG_CONFIG_HOME");
-
-        let dirs = default_profile_search_dirs();
-
-        // Restore
-        match saved {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
-        if let Some(x) = saved_xdg {
-            std::env::set_var("XDG_CONFIG_HOME", x);
-        }
+        let dirs = profile_search_dirs_for(Some("/home/testuser"), None);
 
         assert!(dirs.contains(&"/home/testuser/.config/control-ofc/profiles".to_string()));
         assert!(

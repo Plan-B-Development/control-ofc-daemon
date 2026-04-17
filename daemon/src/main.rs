@@ -1,7 +1,37 @@
 use parking_lot::Mutex;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+
+/// Hardware paths that must be restored to automatic mode if the daemon panics.
+/// Populated after hardware discovery, read by the panic hook.
+struct PanicRestoreTargets {
+    gpu_curves: Vec<(PathBuf, Option<PathBuf>)>,
+    hwmon_enable_paths: Vec<String>,
+}
+
+static PANIC_RESTORE: OnceLock<PanicRestoreTargets> = OnceLock::new();
+
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(targets) = PANIC_RESTORE.get() {
+            eprintln!("PANIC: restoring fans to automatic mode before aborting");
+            for (curve_path, zero_rpm_path) in &targets.gpu_curves {
+                let _ = std::fs::write(curve_path, "r\n");
+                let _ = std::fs::write(curve_path, "c\n");
+                if let Some(zrp) = zero_rpm_path {
+                    let _ = std::fs::write(zrp, "1\n");
+                    let _ = std::fs::write(zrp, "c\n");
+                }
+            }
+            for enable_path in &targets.hwmon_enable_paths {
+                let _ = std::fs::write(enable_path, "2\n");
+            }
+        }
+        default_hook(info);
+    }));
+}
 
 use control_ofc_daemon::api::handlers::AppState;
 use control_ofc_daemon::api::server;
@@ -366,6 +396,7 @@ fn resolve_initial_profile(search_dirs: &[std::path::PathBuf]) -> Option<DaemonP
 
 #[tokio::main]
 async fn main() {
+    install_panic_hook();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     log::info!("control-ofc-daemon v{VERSION} starting");
@@ -572,6 +603,34 @@ async fn main() {
     // Silence "assigned but not read" — runtime_cfg is consumed by the
     // overlay/migration above; the variable itself is no longer needed.
     drop(runtime_cfg);
+
+    // Populate panic hook targets now that hardware is discovered.
+    {
+        let gpu_curves: Vec<_> = app_state
+            .amd_gpus
+            .iter()
+            .filter_map(|g| {
+                g.fan_curve_path
+                    .clone()
+                    .map(|p| (p, g.fan_zero_rpm_path.clone()))
+            })
+            .collect();
+        let hwmon_enable_paths: Vec<_> = app_state
+            .hwmon_controller
+            .as_ref()
+            .map(|ctrl| {
+                ctrl.lock()
+                    .headers()
+                    .iter()
+                    .filter_map(|h| h.enable_path.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let _ = PANIC_RESTORE.set(PanicRestoreTargets {
+            gpu_curves,
+            hwmon_enable_paths,
+        });
+    }
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let (poll_shutdown_tx, poll_shutdown_rx) = tokio::sync::watch::channel(false);

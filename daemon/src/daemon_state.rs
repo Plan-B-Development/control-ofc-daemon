@@ -68,8 +68,23 @@ pub fn load_state_from(dir: &Path) -> DaemonState {
         return DaemonState::default();
     }
     match std::fs::read_to_string(&path) {
-        Ok(content) => serde_json::from_str::<DaemonState>(&content).unwrap_or_default(),
-        Err(_) => DaemonState::default(),
+        Ok(content) => match serde_json::from_str::<DaemonState>(&content) {
+            Ok(state) => state,
+            Err(e) => {
+                log::warn!(
+                    "Corrupt state file {}, using defaults: {e}",
+                    path.display()
+                );
+                DaemonState::default()
+            }
+        },
+        Err(e) => {
+            log::warn!(
+                "Could not read state file {}: {e}",
+                path.display()
+            );
+            DaemonState::default()
+        }
     }
 }
 
