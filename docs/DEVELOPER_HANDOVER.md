@@ -56,6 +56,7 @@ docs/
   ADRs/                     Architecture decision records
 packaging/
   control-ofc-daemon.service   systemd unit file
+  modules-load.d/control-ofc.conf  Super I/O module loading at boot
 ```
 
 ## Build and test
