@@ -1,8 +1,8 @@
 # Changelog
 
-## [1.1.3-2] — 2026-04-17
+## [1.1.4] — 2026-04-17
 
-Packaging-only change (pkgrel bump). No daemon code changes.
+Packaging improvement. No daemon logic changes.
 
 ### Added
 - **Automatic Super I/O module loading.** Ship
@@ -14,6 +14,7 @@ Packaging-only change (pkgrel bump). No daemon code changes.
 - `lm_sensors` added as `optdepends` for users whose hardware requires
   `sensors-detect` beyond the built-in module list.
 - Hardware sensor modules section added to `docs/USER_GUIDE.md`.
+- Version bumped to 1.1.4 (`daemon/Cargo.toml`, `packaging/PKGBUILD`).
 
 ## [1.1.3] — 2026-04-12
 
