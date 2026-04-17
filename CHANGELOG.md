@@ -16,6 +16,15 @@ Packaging improvement. No daemon logic changes.
 - Hardware sensor modules section added to `docs/USER_GUIDE.md`.
 - Version bumped to 1.1.4 (`daemon/Cargo.toml`, `packaging/PKGBUILD`).
 
+### Changed
+- **Streamlined install messages.** `post_install` reduced from 31 lines to
+  10 — essential action first (enable service), sensor module loading,
+  next steps (install GUI, GPU kernel param, docs link). Niche content
+  (udev rules, config paths, profile details) moved to `USER_GUIDE.md`.
+- **`post_upgrade` trimmed.** Removed stale 1.1.0 migration message (shim
+  already removed in 1.1.3). Auto-strip function retained as safety net.
+- Cross-references between daemon and GUI packages in install messages.
+
 ## [1.1.3] — 2026-04-12
 
 Security hardening, error handling cleanup, and test coverage pass.
