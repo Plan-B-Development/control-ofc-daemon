@@ -1,5 +1,31 @@
 # Changelog
 
+## [Unreleased]
+
+Safety and robustness hardening from full audit pass.
+
+### Added
+- **Panic hook for hardware safety.** Installs a `std::panic::set_hook`
+  handler at startup that attempts to restore GPU fan curves (write `r\n` +
+  `c\n` to PMFW `fan_curve`) and reset hwmon `pwm_enable` to `2` (automatic)
+  on unrecoverable panic. Uses `OnceLock` to share restore targets with the
+  panic handler without locking.
+
+### Fixed
+- **GPU `reset_to_auto()` skips zero-RPM re-enable on curve reset failure.**
+  If `fan_curve` reset (`r\n` + `c\n`) failed, the function returned early
+  without re-enabling `fan_zero_rpm_enable`. Now always attempts zero-RPM
+  re-enable regardless of curve reset outcome, since PMFW writes are
+  non-atomic and partial failure is expected.
+- **Silent `daemon_state.json` load failures.** `load_state()` used
+  `unwrap_or_default()` which silently dropped parse and I/O errors. Now
+  logs explicit warnings for both corrupt JSON and unreadable files before
+  falling back to defaults.
+- **Config tests flaky under parallel execution.** `profiles_default_*` tests
+  mutated `HOME`/`XDG_CONFIG_HOME` env vars, causing races when tests ran
+  concurrently. Extracted a pure `profile_search_dirs_for(home, xdg_config)`
+  function and rewrote tests to call it directly without env var mutation.
+
 ## [1.1.5] — 2026-04-17
 
 Packaging improvement. No daemon logic changes.
