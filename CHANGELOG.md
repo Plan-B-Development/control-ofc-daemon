@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.1.4] — 2026-04-17
+## [1.1.5] — 2026-04-17
 
 Packaging improvement. No daemon logic changes.
 
@@ -14,7 +14,7 @@ Packaging improvement. No daemon logic changes.
 - `lm_sensors` added as `optdepends` for users whose hardware requires
   `sensors-detect` beyond the built-in module list.
 - Hardware sensor modules section added to `docs/USER_GUIDE.md`.
-- Version bumped to 1.1.4 (`daemon/Cargo.toml`, `packaging/PKGBUILD`).
+- Version bumped to 1.1.5 (`daemon/Cargo.toml`, `packaging/PKGBUILD`).
 
 ### Changed
 - **Streamlined install messages.** `post_install` reduced from 31 lines to
