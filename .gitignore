@@ -13,6 +13,9 @@ Cargo.lock
 # Claude Code
 .claude/
 
+# Local-only admin files (never push to GitHub)
+scripts/
+
 # OS
 .DS_Store
 Thumbs.db
