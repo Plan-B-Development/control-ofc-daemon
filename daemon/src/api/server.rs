@@ -70,6 +70,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         // Hwmon rescan
         .route("/hwmon/rescan", post(handlers::hwmon_rescan_handler))
+        // Hardware diagnostics
+        .route(
+            "/diagnostics/hardware",
+            get(handlers::hardware_diagnostics_handler),
+        )
         // Profile management
         .route("/profile/active", get(handlers::active_profile_handler))
         .route(

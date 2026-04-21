@@ -1,5 +1,32 @@
 # Changelog
 
+## [1.2.0] — 2026-04-21
+
+Hardware diagnostics API expansion for the GUI's new hardware readiness feature.
+
+### Added
+- **`GET /diagnostics/hardware` endpoint.** Returns comprehensive hardware
+  readiness data: detected hwmon chips with driver identification, kernel
+  module load status, ACPI I/O port conflict detection, GPU diagnostic
+  details (PCI device ID, revision, ppfeaturemask), and thermal safety
+  rule state. Enables the GUI to surface actionable guidance for hardware
+  that requires out-of-tree drivers or BIOS configuration.
+- **`device_id` field in `/hwmon/headers` response.** Each PWM header now
+  includes the stable device identifier (PCI BDF or platform device name)
+  used for chip instance disambiguation.
+- **GPU PCI details in `/capabilities` response.** `amd_gpu` section now
+  includes `pci_device_id`, `pci_revision`, and `gpu_zero_rpm_available`
+  fields for precise GPU identification and diagnostic display.
+- **Thermal safety state in cache.** Profile engine now reports thermal
+  override state ("normal", "emergency", "recovery") to the state cache,
+  surfaced via the new diagnostics endpoint.
+- **ACPI conflict detection.** Scans `/proc/ioports` at request time for
+  I/O port range overlaps between ACPI OperationRegions and known Super
+  I/O chip addresses (Nuvoton 0x0290–0x0299, ITE 0x0A40–0x0A4F, etc.).
+- **Kernel module detection.** Reads `/proc/modules` to check which hwmon
+  driver modules are loaded, cross-referenced against expected drivers for
+  detected chip names. Identifies out-of-tree vs mainline status.
+
 ## [1.1.6] — 2026-04-17
 
 Safety and robustness hardening from full audit pass.

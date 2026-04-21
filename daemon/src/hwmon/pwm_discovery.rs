@@ -16,6 +16,8 @@ pub struct PwmHeaderDescriptor {
     pub label: String,
     /// Chip name (e.g. `it8696`).
     pub chip_name: String,
+    /// Device identifier (PCI BDF or platform device name).
+    pub device_id: String,
     /// PWM index (the N in `pwmN`).
     pub pwm_index: u8,
     /// Whether `pwmN_enable` exists (needed for mode control).
@@ -135,6 +137,7 @@ fn discover_device_pwm(hwmon_dir: &Path) -> Result<Vec<PwmHeaderDescriptor>, Hwm
             id,
             label,
             chip_name: chip_name.clone(),
+            device_id: device_id.clone(),
             pwm_index,
             supports_enable,
             pwm_path: pwm_path.display().to_string(),

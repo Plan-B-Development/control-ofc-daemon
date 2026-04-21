@@ -97,6 +97,12 @@ impl StateCache {
         state.last_gui_write_at = Some(now);
     }
 
+    /// Update the thermal safety override state.
+    pub fn set_thermal_override_state(&self, state_str: &str) {
+        let mut state = self.inner.write();
+        state.thermal_override_state = Some(state_str.to_string());
+    }
+
     /// Update the last commanded PWM for a single OpenFanController channel.
     pub fn set_openfan_commanded_pwm(&self, channel: u8, pwm: u8) {
         let now = Instant::now();

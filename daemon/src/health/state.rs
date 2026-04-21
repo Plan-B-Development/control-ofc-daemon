@@ -146,6 +146,8 @@ pub struct DaemonState {
     pub subsystem_timestamps: SubsystemTimestamps,
     /// Last time a GUI-initiated write command was processed.
     pub last_gui_write_at: Option<Instant>,
+    /// Thermal safety override state: "normal", "emergency", or "recovery".
+    pub thermal_override_state: Option<String>,
 }
 
 impl Default for DaemonState {
@@ -159,6 +161,7 @@ impl Default for DaemonState {
             aio: AioPumpState::default(),
             subsystem_timestamps: SubsystemTimestamps::default(),
             last_gui_write_at: None,
+            thermal_override_state: None,
         }
     }
 }

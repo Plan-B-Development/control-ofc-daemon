@@ -329,6 +329,7 @@ mod tests {
             id: id.to_string(),
             label: label.to_string(),
             chip_name: "it8696".to_string(),
+            device_id: "it87.2624".to_string(),
             pwm_index: 1,
             supports_enable: true,
             pwm_path: "/sys/class/hwmon/hwmon0/pwm1".to_string(),

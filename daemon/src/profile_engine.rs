@@ -160,6 +160,16 @@ pub async fn profile_engine_loop(
             let mut safety_guard = safety.lock();
             let safety_pct = hottest_cpu_c.and_then(|temp| safety_guard.evaluate(temp));
 
+            // Report thermal safety state to cache for diagnostics
+            let thermal_state = if safety_guard.is_active() {
+                "emergency"
+            } else if safety_pct.is_some() {
+                "recovery"
+            } else {
+                "normal"
+            };
+            cache.set_thermal_override_state(thermal_state);
+
             // Determine if we need a forced override (thermal emergency OR missing sensor)
             let forced_pct = safety_pct.or(if forced_by_no_sensor {
                 Some(constants::NO_SENSOR_SAFE_PCT)
