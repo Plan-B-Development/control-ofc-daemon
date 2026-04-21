@@ -9,6 +9,20 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 
+/// Read CLOCK_BOOTTIME (monotonic clock that includes suspend time).
+/// Returns Duration::ZERO on failure.
+fn boottime_now() -> Duration {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime with CLOCK_BOOTTIME is always valid on Linux.
+    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) } != 0 {
+        return Duration::ZERO;
+    }
+    Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+}
+
 use crate::health::cache::StateCache;
 use crate::health::state::{
     AmdGpuFanState, CachedSensorReading, DeviceLabel, HwmonFanState, OpenFanState,
@@ -59,6 +73,8 @@ pub async fn hwmon_poll_loop(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut consecutive_errors: u32 = 0;
+    let mut prev_boot: Option<Duration> = None;
+    let mut prev_mono: Option<Instant> = None;
 
     loop {
         tokio::select! {
@@ -68,6 +84,26 @@ pub async fn hwmon_poll_loop(
                 return;
             }
         }
+
+        // Detect system suspend/resume via CLOCK_BOOTTIME vs CLOCK_MONOTONIC gap.
+        // CLOCK_MONOTONIC pauses during suspend; CLOCK_BOOTTIME does not.
+        let now_boot = boottime_now();
+        let now_mono = Instant::now();
+        if let (Some(pb), Some(pm)) = (prev_boot, prev_mono) {
+            let boot_delta = now_boot.saturating_sub(pb);
+            let mono_delta = now_mono.duration_since(pm);
+            let suspend_gap = boot_delta.saturating_sub(mono_delta);
+            if suspend_gap > Duration::from_secs(3) {
+                log::info!(
+                    "System resume detected (suspended ~{:.0}s). \
+                     Signalling hwmon manual mode reset.",
+                    suspend_gap.as_secs_f64()
+                );
+                cache.set_resume_detected();
+            }
+        }
+        prev_boot = Some(now_boot);
+        prev_mono = Some(now_mono);
 
         // Run blocking sysfs I/O on the blocking thread pool
         let root = hwmon_root.clone();

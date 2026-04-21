@@ -4,6 +4,7 @@
 //! Updates are atomic at the batch boundary.
 
 use parking_lot::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::serial::protocol::NUM_CHANNELS;
@@ -16,6 +17,10 @@ use crate::health::state::*;
 /// hardware directly.
 pub struct StateCache {
     inner: RwLock<DaemonState>,
+    /// Set by the polling loop when a system suspend/resume is detected
+    /// (CLOCK_BOOTTIME gap). Checked and cleared by HwmonPwmController
+    /// on the next set_pwm() call to force re-establishing manual mode.
+    pub resume_detected: AtomicBool,
 }
 
 impl StateCache {
@@ -23,6 +28,7 @@ impl StateCache {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(DaemonState::default()),
+            resume_detected: AtomicBool::new(false),
         }
     }
 
@@ -202,6 +208,18 @@ impl StateCache {
 impl Default for StateCache {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl StateCache {
+    /// Check if a system resume was detected and clear the flag atomically.
+    pub fn take_resume_flag(&self) -> bool {
+        self.resume_detected.swap(false, Ordering::Relaxed)
+    }
+
+    /// Signal that a system resume was detected.
+    pub fn set_resume_detected(&self) {
+        self.resume_detected.store(true, Ordering::Relaxed);
     }
 }
 

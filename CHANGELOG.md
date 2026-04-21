@@ -1,5 +1,34 @@
 # Changelog
 
+## [1.3.0] — 2026-04-21
+
+Motherboard PWM diagnostics: BIOS interference detection, board identification,
+and PWM effectiveness verification.
+
+### Added
+- **`pwm_enable` watchdog.** Every `set_pwm()` call now reads back `pwm_enable`
+  to detect BIOS/EC reclaim (Gigabyte SmartFan 5/6, MSI Smart Fan, etc.). If
+  the firmware has overridden manual mode, the daemon re-writes `pwm_enable=1`
+  and forces a full PWM re-write. Cumulative revert counts are tracked per
+  header and exposed in `/diagnostics/hardware`.
+- **DMI board identification.** `/diagnostics/hardware` now includes a `board`
+  object with `vendor`, `name`, and `bios_version` from SMBIOS/DMI sysfs.
+  Enables the GUI to provide vendor-specific guidance (e.g., Gigabyte SmartFan
+  degenerate-curve workaround instructions).
+- **`POST /hwmon/{header_id}/verify` endpoint.** Behavioural test that writes
+  a test PWM value, waits 3 seconds, then reads back `pwm_enable`, PWM, and
+  RPM to classify the result as `effective`, `pwm_enable_reverted`,
+  `pwm_value_clamped`, `no_rpm_effect`, or `rpm_unavailable`. Requires a
+  valid hwmon lease.
+- **System suspend/resume detection.** The polling loop compares
+  `CLOCK_BOOTTIME` vs `CLOCK_MONOTONIC` to detect resume events. On resume,
+  all per-header `manual_mode_set` flags are cleared, forcing the next
+  `set_pwm()` to re-establish manual mode. Combined with the watchdog, this
+  handles the common "fans revert after suspend" problem.
+- **`enable_revert_counts` in diagnostics.** The `hwmon` section of
+  `/diagnostics/hardware` now includes a per-header map of cumulative BIOS
+  reclaim events, allowing the GUI to surface interference warnings.
+
 ## [1.2.0] — 2026-04-21
 
 Hardware diagnostics API expansion for the GUI's new hardware readiness feature.

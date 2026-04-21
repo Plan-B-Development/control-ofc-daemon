@@ -4,6 +4,7 @@
 //! All writes go through this module — no direct sysfs access elsewhere.
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -105,6 +106,8 @@ pub struct HwmonPwmController {
     cache: Arc<StateCache>,
     /// Per-header write state for coalescing (reset on lease release).
     write_state: HashMap<String, HeaderWriteState>,
+    /// Cumulative BIOS pwm_enable reclaim events per header. Persists across leases.
+    enable_revert_counts: HashMap<String, u64>,
 }
 
 impl HwmonPwmController {
@@ -123,6 +126,7 @@ impl HwmonPwmController {
             writer,
             cache,
             write_state: HashMap::new(),
+            enable_revert_counts: HashMap::new(),
         }
     }
 
@@ -143,7 +147,16 @@ impl HwmonPwmController {
         &self.lease_manager
     }
 
+    /// Cumulative BIOS pwm_enable reclaim events per header (persists across leases).
+    pub fn enable_revert_counts(&self) -> &HashMap<String, u64> {
+        &self.enable_revert_counts
+    }
+
     /// Set PWM on a header. Requires a valid lease.
+    ///
+    /// Includes a pwm_enable watchdog: on every call where manual_mode_set is
+    /// true, reads back pwm_enable to detect BIOS/EC reclaim (SmartFan, etc.).
+    /// If reclaimed, re-writes pwm_enable=1 and forces a full PWM re-write.
     pub fn set_pwm(
         &mut self,
         header_id: &str,
@@ -155,9 +168,15 @@ impl HwmonPwmController {
             .validate_lease(lease_id)
             .map_err(HwmonControlError::Lease)?;
 
-        // Look up header — extract needed fields to avoid cloning the full descriptor
-        // (which includes PathBuf fields). The borrow can't be held across mutable self
-        // accesses below, so we copy the individual fields we need.
+        // Check for system resume — reset all manual mode flags
+        if self.cache.resume_detected.swap(false, Ordering::Relaxed) {
+            log::info!("Clearing manual mode flags after system resume");
+            for ws in self.write_state.values_mut() {
+                ws.manual_mode_set = false;
+            }
+        }
+
+        // Look up header — extract needed fields to avoid cloning the full descriptor.
         let (pwm_path, enable_path, supports_enable, rpm_path) = {
             let h = self.headers.get(header_id).ok_or_else(|| {
                 HwmonControlError::Validation(format!("unknown header: {header_id}"))
@@ -170,7 +189,6 @@ impl HwmonPwmController {
             )
         };
 
-        // No per-header minimum floor — thermal safety is centralized in ThermalSafetyRule (P2-S1)
         // Validate PWM range
         if pwm_percent > 100 {
             return Err(HwmonControlError::Validation(format!(
@@ -180,10 +198,54 @@ impl HwmonPwmController {
 
         let effective_pct = pwm_percent;
 
-        // Coalesce: skip if same as last commanded value and mode already set.
+        // ── pwm_enable watchdog ─────────────────────────────────────
+        // When we believe manual mode is already set, read back pwm_enable
+        // to detect BIOS/EC reclaim (Gigabyte SmartFan, MSI Smart Fan, etc.).
+        let enable_reclaimed = if supports_enable {
+            let mode_set = self
+                .write_state
+                .get(header_id)
+                .map_or(false, |ws| ws.manual_mode_set);
+            if mode_set {
+                enable_path
+                    .as_ref()
+                    .and_then(|ep| {
+                        self.writer
+                            .read_file(ep)
+                            .ok()
+                            .and_then(|s| s.trim().parse::<u8>().ok())
+                    })
+                    .map_or(false, |v| v != 1)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if enable_reclaimed {
+            *self
+                .enable_revert_counts
+                .entry(header_id.to_string())
+                .or_insert(0) += 1;
+            let count = self
+                .enable_revert_counts
+                .get(header_id)
+                .copied()
+                .unwrap_or(0);
+            log::warn!(
+                "pwm_enable for '{}' reclaimed by BIOS (count: {count})",
+                header_id
+            );
+        }
+
         let ws = self.write_state.entry(header_id.to_string()).or_default();
+        if enable_reclaimed {
+            ws.manual_mode_set = false;
+        }
+
+        // Coalesce: skip if same as last commanded value and mode still set.
         if ws.manual_mode_set && ws.last_commanded_pct == Some(effective_pct) {
-            // Update cache timestamp even on coalesced writes so staleness stays fresh.
             let now = Instant::now();
             let rpm = rpm_path.as_ref().and_then(|p| {
                 self.writer
@@ -204,7 +266,7 @@ impl HwmonPwmController {
             });
         }
 
-        // Write pwm_enable only if not yet set during this lease.
+        // Write pwm_enable if not yet set (or if BIOS reclaimed it).
         if !ws.manual_mode_set && supports_enable {
             if let Some(ref ep) = enable_path {
                 self.writer
@@ -837,5 +899,117 @@ mod tests {
         // Only the enable write was attempted — PWM write never reached
         let w = writes.lock();
         assert_eq!(w.len(), 1, "only enable write should be attempted");
+    }
+
+    // ── pwm_enable watchdog tests ────────────────────────────────────
+
+    fn setup_controller_with_enable(
+        headers: Vec<PwmHeaderDescriptor>,
+        enable_value: &str,
+    ) -> (HwmonPwmController, WriteLog, Arc<StateCache>) {
+        let cache = Arc::new(StateCache::new());
+        let (writer, writes) = MockSysfsWriter::new();
+        let writer = writer
+            .with_file("/sys/class/hwmon/hwmon0/fan1_input", "1200\n")
+            .with_file("/sys/class/hwmon/hwmon0/pwm1_enable", enable_value);
+        let lease_mgr = LeaseManager::new();
+        let ctrl = HwmonPwmController::new(headers, lease_mgr, Box::new(writer), cache.clone());
+        (ctrl, writes, cache)
+    }
+
+    #[test]
+    fn watchdog_detects_bios_reclaim() {
+        // Simulate BIOS reclaiming pwm_enable after first write.
+        // Mock always returns "2" for pwm_enable reads (BIOS auto mode).
+        let (mut ctrl, writes, _cache) =
+            setup_controller_with_enable(vec![make_header("h1", "CHA_FAN1", 0)], "2");
+
+        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+
+        // First write: manual_mode_set=false, watchdog skipped, sets enable+PWM
+        ctrl.set_pwm("h1", 50, &lease.lease_id).unwrap();
+        assert_eq!(ctrl.enable_revert_counts().get("h1"), None);
+
+        // Second write with different value: watchdog reads pwm_enable="2", detects revert
+        ctrl.set_pwm("h1", 60, &lease.lease_id).unwrap();
+        assert_eq!(ctrl.enable_revert_counts().get("h1"), Some(&1));
+
+        let w = writes.lock();
+        // First: enable(1) + pwm(50). Second: enable(1) + pwm(60) (re-wrote enable).
+        assert_eq!(w.len(), 4);
+        assert_eq!(w[0].1, "1"); // first enable
+        assert_eq!(w[2].1, "1"); // watchdog re-wrote enable
+    }
+
+    #[test]
+    fn watchdog_no_revert_when_enable_stays_manual() {
+        // pwm_enable reads "1" — no revert detected, normal coalescing.
+        let (mut ctrl, writes, _cache) =
+            setup_controller_with_enable(vec![make_header("h1", "CHA_FAN1", 0)], "1");
+
+        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        ctrl.set_pwm("h1", 50, &lease.lease_id).unwrap();
+        ctrl.set_pwm("h1", 50, &lease.lease_id).unwrap(); // coalesced
+
+        assert!(ctrl.enable_revert_counts().is_empty());
+        let w = writes.lock();
+        // enable(1) + pwm(50) = 2 writes; second call coalesced
+        assert_eq!(w.len(), 2);
+    }
+
+    #[test]
+    fn watchdog_revert_breaks_coalescing() {
+        // Same PWM value, but BIOS reclaimed → must re-write both enable and PWM.
+        let (mut ctrl, writes, _cache) =
+            setup_controller_with_enable(vec![make_header("h1", "CHA_FAN1", 0)], "2");
+
+        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        ctrl.set_pwm("h1", 50, &lease.lease_id).unwrap();
+        ctrl.set_pwm("h1", 50, &lease.lease_id).unwrap(); // would coalesce but BIOS reclaimed
+
+        assert_eq!(ctrl.enable_revert_counts().get("h1"), Some(&1));
+        let w = writes.lock();
+        // First: enable + pwm50. Second: enable + pwm50 (forced by reclaim).
+        assert_eq!(w.len(), 4);
+    }
+
+    #[test]
+    fn watchdog_revert_count_persists_across_leases() {
+        let (mut ctrl, _writes, _cache) =
+            setup_controller_with_enable(vec![make_header("h1", "CHA_FAN1", 0)], "2");
+
+        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lid = lease.lease_id.clone();
+        ctrl.set_pwm("h1", 50, &lid).unwrap();
+        ctrl.set_pwm("h1", 60, &lid).unwrap(); // triggers revert
+
+        ctrl.lease_manager_mut().release_lease(&lid).unwrap();
+        ctrl.on_lease_released();
+
+        let lease2 = ctrl.lease_manager_mut().take_lease("gui2").unwrap();
+        ctrl.set_pwm("h1", 70, &lease2.lease_id).unwrap();
+        ctrl.set_pwm("h1", 80, &lease2.lease_id).unwrap(); // triggers revert again
+
+        assert_eq!(ctrl.enable_revert_counts().get("h1"), Some(&2));
+    }
+
+    #[test]
+    fn resume_flag_resets_manual_mode() {
+        let (mut ctrl, writes, cache) =
+            setup_controller_with_enable(vec![make_header("h1", "CHA_FAN1", 0)], "1");
+
+        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        ctrl.set_pwm("h1", 50, &lease.lease_id).unwrap(); // enable + pwm
+
+        // Simulate system resume
+        cache.set_resume_detected();
+
+        // Same PWM — would normally coalesce, but resume cleared manual_mode_set
+        ctrl.set_pwm("h1", 50, &lease.lease_id).unwrap();
+
+        let w = writes.lock();
+        // First: enable(1) + pwm(50). After resume: enable(1) + pwm(50).
+        assert_eq!(w.len(), 4);
+        assert_eq!(w[2].1, "1"); // re-wrote enable after resume
     }
 }
