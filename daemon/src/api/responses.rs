@@ -3,6 +3,8 @@
 //! All types derive `Serialize` for JSON output. Field names are stable
 //! within API v1 — changes must be additive only.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 pub const API_VERSION: u32 = 1;
@@ -356,6 +358,7 @@ pub struct HardwareDiagnosticsResponse {
     pub thermal_safety: ThermalSafetyInfo,
     pub kernel_modules: Vec<KernelModuleInfo>,
     pub acpi_conflicts: Vec<AcpiConflictInfo>,
+    pub board: BoardInfo,
 }
 
 /// Hwmon chip diagnostics.
@@ -364,6 +367,9 @@ pub struct HwmonDiagnostics {
     pub chips_detected: Vec<HwmonChipInfo>,
     pub total_headers: usize,
     pub writable_headers: usize,
+    /// Cumulative BIOS pwm_enable reclaim events per header ID.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub enable_revert_counts: HashMap<String, u64>,
 }
 
 /// Per-chip identification and driver info.
@@ -413,6 +419,45 @@ pub struct AcpiConflictInfo {
     pub io_range: String,
     pub claimed_by: String,
     pub conflicts_with_driver: String,
+}
+
+/// Motherboard identification from DMI/SMBIOS.
+#[derive(Debug, Clone, Serialize)]
+pub struct BoardInfo {
+    pub vendor: String,
+    pub name: String,
+    pub bios_version: String,
+}
+
+// ── PWM verification ──────────────────────────────────────────────
+
+/// Request body for `POST /hwmon/{header_id}/verify`.
+#[derive(Debug, Deserialize)]
+pub struct HwmonVerifyRequest {
+    pub lease_id: String,
+}
+
+/// Response for `POST /hwmon/{header_id}/verify`.
+#[derive(Debug, Clone, Serialize)]
+pub struct HwmonVerifyResponse {
+    pub header_id: String,
+    /// "effective", "pwm_enable_reverted", "pwm_value_clamped",
+    /// "no_rpm_effect", or "rpm_unavailable"
+    pub result: String,
+    pub initial_state: HwmonVerifyState,
+    pub final_state: HwmonVerifyState,
+    pub test_pwm_percent: u8,
+    pub wait_seconds: u8,
+    pub details: String,
+}
+
+/// Snapshot of sysfs state during a PWM verify operation.
+#[derive(Debug, Clone, Serialize)]
+pub struct HwmonVerifyState {
+    pub pwm_enable: Option<u8>,
+    pub pwm_raw: Option<u8>,
+    pub pwm_percent: Option<u8>,
+    pub rpm: Option<u16>,
 }
 
 /// Standard error envelope for all error responses.

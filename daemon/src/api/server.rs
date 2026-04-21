@@ -68,6 +68,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/hwmon/{header_id}/pwm",
             post(handlers::hwmon_set_pwm_handler),
         )
+        .route(
+            "/hwmon/{header_id}/verify",
+            post(handlers::hwmon_verify_handler),
+        )
         // Hwmon rescan
         .route("/hwmon/rescan", post(handlers::hwmon_rescan_handler))
         // Hardware diagnostics

@@ -179,6 +179,29 @@ pub fn detect_acpi_conflicts_from(proc_ioports: &Path) -> Vec<AcpiConflictInfo> 
     conflicts
 }
 
+// ── DMI board identification ──────────────────────────────────────
+
+use super::responses::BoardInfo;
+
+/// Read motherboard identification from DMI sysfs (world-readable, no root required).
+pub fn read_board_info() -> BoardInfo {
+    read_board_info_from(Path::new("/sys/class/dmi/id"))
+}
+
+/// Testable variant with injectable path.
+pub fn read_board_info_from(dmi_dir: &Path) -> BoardInfo {
+    let read_field = |field: &str| -> String {
+        std::fs::read_to_string(dmi_dir.join(field))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    };
+    BoardInfo {
+        vendor: read_field("board_vendor"),
+        name: read_field("board_name"),
+        bios_version: read_field("bios_version"),
+    }
+}
+
 /// Read the raw ppfeaturemask value as a hex string.
 pub fn read_ppfeaturemask() -> Option<String> {
     read_ppfeaturemask_from(Path::new("/sys/module/amdgpu/parameters/ppfeaturemask"))
@@ -307,5 +330,27 @@ mod tests {
             read_ppfeaturemask_from(Path::new("/nonexistent")),
             None
         );
+    }
+
+    #[test]
+    fn read_board_info_from_sysfs() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("board_vendor"), "Gigabyte Technology Co., Ltd.\n").unwrap();
+        fs::write(tmp.path().join("board_name"), "X870E AORUS MASTER\n").unwrap();
+        fs::write(tmp.path().join("bios_version"), "F13a\n").unwrap();
+
+        let info = read_board_info_from(tmp.path());
+        assert_eq!(info.vendor, "Gigabyte Technology Co., Ltd.");
+        assert_eq!(info.name, "X870E AORUS MASTER");
+        assert_eq!(info.bios_version, "F13a");
+    }
+
+    #[test]
+    fn read_board_info_missing_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let info = read_board_info_from(tmp.path());
+        assert_eq!(info.vendor, "");
+        assert_eq!(info.name, "");
+        assert_eq!(info.bios_version, "");
     }
 }

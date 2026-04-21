@@ -1566,6 +1566,16 @@ pub async fn hardware_diagnostics_handler(
     // ACPI conflict detection
     let acpi_conflicts = diagnostics::detect_acpi_conflicts();
 
+    // Revert counts from pwm_enable watchdog
+    let enable_revert_counts = state
+        .hwmon_controller
+        .as_ref()
+        .map(|c| c.lock().enable_revert_counts().clone())
+        .unwrap_or_default();
+
+    // DMI board identification
+    let board = diagnostics::read_board_info();
+
     json_ok(
         StatusCode::OK,
         HardwareDiagnosticsResponse {
@@ -1574,13 +1584,192 @@ pub async fn hardware_diagnostics_handler(
                 chips_detected,
                 total_headers,
                 writable_headers,
+                enable_revert_counts,
             },
             gpu: gpu_diag,
             thermal_safety,
             kernel_modules,
             acpi_conflicts,
+            board,
         },
     )
+}
+
+const VERIFY_WAIT_SECONDS: u8 = 3;
+
+/// POST /hwmon/{header_id}/verify — behavioural test of PWM write effectiveness.
+///
+/// Writes a test PWM value, waits for hardware to respond, then reads back
+/// pwm_enable, PWM value, and RPM to classify the result. Requires a valid
+/// hwmon lease. Takes ~3 seconds.
+pub async fn hwmon_verify_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(header_id): axum::extract::Path<String>,
+    Json(body): Json<HwmonVerifyRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use super::responses::*;
+
+    let controller = match &state.hwmon_controller {
+        Some(c) => c,
+        None => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                &ErrorEnvelope::validation("hwmon controller not available"),
+            )
+        }
+    };
+
+    // Validate lease and extract header paths
+    let (pwm_path, enable_path, rpm_path) = {
+        let ctrl = controller.lock();
+        if let Err(e) = ctrl.lease_manager().validate_lease(&body.lease_id) {
+            return error_response(StatusCode::FORBIDDEN, &ErrorEnvelope::lease_error(e.to_string()));
+        }
+        match ctrl.headers().into_iter().find(|h| h.id == header_id) {
+            Some(h) => (
+                h.pwm_path.clone(),
+                h.enable_path.clone(),
+                h.rpm_path.clone(),
+            ),
+            None => {
+                return error_response(
+                    StatusCode::NOT_FOUND,
+                    &ErrorEnvelope::validation(format!("unknown header: {header_id}")),
+                )
+            }
+        }
+    };
+
+    let read_state = |pwm: &str, en: &Option<String>, rpm: &Option<String>| -> HwmonVerifyState {
+        let pwm_raw = std::fs::read_to_string(pwm)
+            .ok()
+            .and_then(|s| s.trim().parse::<u8>().ok());
+        let pwm_enable = en.as_ref().and_then(|p| {
+            std::fs::read_to_string(p)
+                .ok()
+                .and_then(|s| s.trim().parse::<u8>().ok())
+        });
+        let rpm_val = rpm.as_ref().and_then(|p| {
+            std::fs::read_to_string(p)
+                .ok()
+                .and_then(|s| s.trim().parse::<u16>().ok())
+        });
+        HwmonVerifyState {
+            pwm_enable,
+            pwm_raw,
+            pwm_percent: pwm_raw.map(|r| ((r as u16 * 100 + 127) / 255) as u8),
+            rpm: rpm_val,
+        }
+    };
+
+    // Read initial state
+    let initial = read_state(&pwm_path, &enable_path, &rpm_path);
+
+    // Calculate test PWM: ensure a significant delta from current
+    let current_pct = initial.pwm_percent.unwrap_or(50);
+    let test_pct: u8 = if current_pct > 50 { 20 } else { 80 };
+
+    // Write test value via controller (sets pwm_enable=1 + PWM)
+    {
+        let mut ctrl = controller.lock();
+        if let Err(e) = ctrl.set_pwm(&header_id, test_pct, &body.lease_id) {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorEnvelope::internal(format!("test write failed: {e}")),
+            );
+        }
+    }
+
+    // Wait for hardware to respond
+    tokio::time::sleep(std::time::Duration::from_secs(VERIFY_WAIT_SECONDS as u64)).await;
+
+    // Read back state after wait
+    let final_state = read_state(&pwm_path, &enable_path, &rpm_path);
+
+    // Restore original PWM
+    {
+        let mut ctrl = controller.lock();
+        let _ = ctrl.set_pwm(&header_id, current_pct, &body.lease_id);
+    }
+
+    // Classify result
+    let (result, details) = classify_verify_result(&initial, &final_state, test_pct);
+
+    json_ok(
+        StatusCode::OK,
+        HwmonVerifyResponse {
+            header_id,
+            result,
+            initial_state: initial,
+            final_state,
+            test_pwm_percent: test_pct,
+            wait_seconds: VERIFY_WAIT_SECONDS,
+            details,
+        },
+    )
+}
+
+fn classify_verify_result(
+    initial: &HwmonVerifyState,
+    final_state: &HwmonVerifyState,
+    test_pct: u8,
+) -> (String, String) {
+    // Check if pwm_enable was reclaimed
+    if let Some(final_enable) = final_state.pwm_enable {
+        if final_enable != 1 {
+            return (
+                "pwm_enable_reverted".into(),
+                format!(
+                    "pwm_enable changed from 1 to {final_enable} after write — \
+                     BIOS/EC is actively reclaiming fan control"
+                ),
+            );
+        }
+    }
+
+    // Check if PWM value was clamped/overridden
+    let test_raw = ((test_pct as u16 * 255 + 50) / 100) as u8;
+    if let Some(final_raw) = final_state.pwm_raw {
+        let delta = (final_raw as i16 - test_raw as i16).unsigned_abs();
+        if delta > 10 {
+            return (
+                "pwm_value_clamped".into(),
+                format!(
+                    "PWM value changed from test {test_raw} to {final_raw} — \
+                     BIOS/EC is overriding the PWM register"
+                ),
+            );
+        }
+    }
+
+    // Check RPM change (if available)
+    match (initial.rpm, final_state.rpm) {
+        (Some(init_rpm), Some(final_rpm)) if init_rpm > 100 => {
+            let expected_decrease = test_pct < initial.pwm_percent.unwrap_or(50);
+            let rpm_changed = if expected_decrease {
+                final_rpm < init_rpm.saturating_sub(init_rpm / 5)
+            } else {
+                final_rpm > init_rpm + init_rpm / 5
+            };
+            if !rpm_changed {
+                return (
+                    "no_rpm_effect".into(),
+                    format!(
+                        "RPM unchanged ({init_rpm} → {final_rpm}) despite PWM change — \
+                         PWM writes may be accepted but have no hardware effect"
+                    ),
+                );
+            }
+            (
+                "effective".into(),
+                format!("PWM control verified: RPM changed {init_rpm} → {final_rpm}"),
+            )
+        }
+        _ => (
+            "rpm_unavailable".into(),
+            "PWM values held but RPM sensor unavailable or too low to verify".into(),
+        ),
+    }
 }
 
 /// Fallback handler for unknown routes.
