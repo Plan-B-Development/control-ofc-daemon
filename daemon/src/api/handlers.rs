@@ -395,12 +395,15 @@ pub async fn capabilities_handler(
             model_name: gpu.marketing_name.clone(),
             display_label: gpu.display_label(),
             pci_id: Some(gpu.pci_bdf.clone()),
+            pci_device_id: Some(gpu.pci_device_id),
+            pci_revision: Some(gpu.pci_revision),
             fan_control_method: gpu.fan_control_method().to_string(),
             pmfw_supported: gpu.fan_curve_path.is_some(),
             fan_rpm_available: gpu.has_fan_rpm,
             fan_write_supported: fan_write,
             is_discrete: gpu.is_discrete,
             overdrive_enabled: gpu.overdrive_enabled,
+            gpu_zero_rpm_available: gpu.fan_zero_rpm_path.is_some(),
         }
     } else {
         AmdGpuCapability {
@@ -408,12 +411,15 @@ pub async fn capabilities_handler(
             model_name: None,
             display_label: "AMD D-GPU".to_string(),
             pci_id: None,
+            pci_device_id: None,
+            pci_revision: None,
             fan_control_method: "none".to_string(),
             pmfw_supported: false,
             fan_rpm_available: false,
             fan_write_supported: false,
             is_discrete: false,
             overdrive_enabled: false,
+            gpu_zero_rpm_available: false,
         }
     };
 
@@ -712,6 +718,7 @@ pub async fn hwmon_headers_handler(
             id: h.id.clone(),
             label: h.label.clone(),
             chip_name: h.chip_name.clone(),
+            device_id: h.device_id.clone(),
             pwm_index: h.pwm_index,
             supports_enable: h.supports_enable,
             rpm_available: h.rpm_available,
@@ -1296,6 +1303,7 @@ pub async fn hwmon_rescan_handler(
                     id: h.id.clone(),
                     label: h.label.clone(),
                     chip_name: h.chip_name.clone(),
+                    device_id: h.device_id.clone(),
                     pwm_index: h.pwm_index,
                     supports_enable: h.supports_enable,
                     rpm_available: h.rpm_available,
@@ -1465,6 +1473,113 @@ pub async fn update_startup_delay_handler(
             "delay_secs": delay,
             "note": "Takes effect on next daemon restart",
         })),
+    )
+}
+
+// ── Hardware diagnostics endpoint ──────────────────────────────────
+
+/// GET /diagnostics/hardware — comprehensive hardware readiness report.
+pub async fn hardware_diagnostics_handler(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use super::diagnostics;
+    use super::responses::*;
+    use std::collections::HashMap;
+
+    // Collect per-chip info from hwmon headers
+    let mut chip_map: HashMap<(String, String), usize> = HashMap::new();
+    if let Some(ref controller) = state.hwmon_controller {
+        let ctrl = controller.lock();
+        for h in ctrl.headers() {
+            let key = (h.chip_name.clone(), h.device_id.clone());
+            *chip_map.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    let total_headers = chip_map.values().sum::<usize>();
+    let writable_headers = state
+        .hwmon_controller
+        .as_ref()
+        .map(|c| c.lock().headers().iter().filter(|h| h.is_writable).count())
+        .unwrap_or(0);
+
+    let chips_detected: Vec<HwmonChipInfo> = chip_map
+        .into_iter()
+        .map(|((chip_name, device_id), count)| {
+            let driver = diagnostics::expected_driver(&chip_name);
+            let in_mainline = diagnostics::chip_driver_in_mainline(&chip_name);
+            HwmonChipInfo {
+                chip_name,
+                device_id,
+                expected_driver: driver.to_string(),
+                in_mainline_kernel: in_mainline,
+                header_count: count,
+            }
+        })
+        .collect();
+
+    // GPU diagnostics from detected GPUs
+    let gpu_diag = crate::hwmon::gpu_detect::select_primary_gpu(&state.amd_gpus).map(|gpu| {
+        let ppfeaturemask = diagnostics::read_ppfeaturemask();
+        let bit14_set = ppfeaturemask
+            .as_ref()
+            .map(|s| {
+                let trimmed = s.trim().strip_prefix("0x").unwrap_or(s.trim());
+                u32::from_str_radix(trimmed, 16)
+                    .map(|v| (v & 0x4000) != 0)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+
+        GpuDiagnostics {
+            pci_bdf: gpu.pci_bdf.clone(),
+            pci_device_id: gpu.pci_device_id,
+            pci_revision: gpu.pci_revision,
+            model_name: gpu.marketing_name.clone(),
+            fan_control_method: gpu.fan_control_method().to_string(),
+            overdrive_enabled: gpu.overdrive_enabled,
+            ppfeaturemask,
+            ppfeaturemask_bit14_set: bit14_set,
+            zero_rpm_available: gpu.fan_zero_rpm_path.is_some(),
+        }
+    });
+
+    // Thermal safety — report thresholds and whether CPU sensor is present
+    let snap = state.cache.snapshot();
+    let cpu_sensor_found = snap
+        .sensors
+        .values()
+        .any(|s| s.kind == crate::hwmon::types::SensorKind::CpuTemp);
+
+    let thermal_state = snap.thermal_override_state.as_deref().unwrap_or("normal");
+
+    let thermal_safety = ThermalSafetyInfo {
+        state: thermal_state.to_string(),
+        cpu_sensor_found,
+        emergency_threshold_c: 105.0,
+        release_threshold_c: 80.0,
+    };
+
+    // Kernel module detection
+    let kernel_modules = diagnostics::detect_loaded_modules();
+
+    // ACPI conflict detection
+    let acpi_conflicts = diagnostics::detect_acpi_conflicts();
+
+    json_ok(
+        StatusCode::OK,
+        HardwareDiagnosticsResponse {
+            api_version: API_VERSION,
+            hwmon: HwmonDiagnostics {
+                chips_detected,
+                total_headers,
+                writable_headers,
+            },
+            gpu: gpu_diag,
+            thermal_safety,
+            kernel_modules,
+            acpi_conflicts,
+        },
     )
 }
 

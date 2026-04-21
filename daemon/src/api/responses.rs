@@ -176,6 +176,8 @@ pub struct PwmHeaderEntry {
     pub id: String,
     pub label: String,
     pub chip_name: String,
+    /// Device identifier (PCI BDF or platform device name).
+    pub device_id: String,
     pub pwm_index: u8,
     pub supports_enable: bool,
     pub rpm_available: bool,
@@ -228,6 +230,12 @@ pub struct AmdGpuCapability {
     /// PCI Bus:Device.Function address.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pci_id: Option<String>,
+    /// PCI device ID (e.g. 0x7550 for Navi 48).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pci_device_id: Option<u16>,
+    /// PCI revision (e.g. 0xC0 for XT variant).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pci_revision: Option<u8>,
     /// Fan control method: "pmfw_curve", "hwmon_pwm", or "none".
     pub fan_control_method: String,
     /// Whether PMFW fan curve is supported (RDNA3+).
@@ -240,6 +248,8 @@ pub struct AmdGpuCapability {
     pub is_discrete: bool,
     /// Whether the amdgpu overdrive feature is enabled (ppfeaturemask bit 14).
     pub overdrive_enabled: bool,
+    /// Whether the PMFW zero-RPM sysfs file exists.
+    pub gpu_zero_rpm_available: bool,
 }
 
 /// OpenFanController capability details.
@@ -332,6 +342,77 @@ pub struct PollResponse {
     pub status: StatusResponse,
     pub sensors: Vec<SensorEntry>,
     pub fans: Vec<FanEntry>,
+}
+
+// ── Hardware diagnostics ────────────────────────────────────────────
+
+/// Response for `GET /diagnostics/hardware`.
+#[derive(Debug, Clone, Serialize)]
+pub struct HardwareDiagnosticsResponse {
+    pub api_version: u32,
+    pub hwmon: HwmonDiagnostics,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<GpuDiagnostics>,
+    pub thermal_safety: ThermalSafetyInfo,
+    pub kernel_modules: Vec<KernelModuleInfo>,
+    pub acpi_conflicts: Vec<AcpiConflictInfo>,
+}
+
+/// Hwmon chip diagnostics.
+#[derive(Debug, Clone, Serialize)]
+pub struct HwmonDiagnostics {
+    pub chips_detected: Vec<HwmonChipInfo>,
+    pub total_headers: usize,
+    pub writable_headers: usize,
+}
+
+/// Per-chip identification and driver info.
+#[derive(Debug, Clone, Serialize)]
+pub struct HwmonChipInfo {
+    pub chip_name: String,
+    pub device_id: String,
+    pub expected_driver: String,
+    pub in_mainline_kernel: bool,
+    pub header_count: usize,
+}
+
+/// GPU-specific diagnostics.
+#[derive(Debug, Clone, Serialize)]
+pub struct GpuDiagnostics {
+    pub pci_bdf: String,
+    pub pci_device_id: u16,
+    pub pci_revision: u8,
+    pub model_name: Option<String>,
+    pub fan_control_method: String,
+    pub overdrive_enabled: bool,
+    pub ppfeaturemask: Option<String>,
+    pub ppfeaturemask_bit14_set: bool,
+    pub zero_rpm_available: bool,
+}
+
+/// Thermal safety rule status.
+#[derive(Debug, Clone, Serialize)]
+pub struct ThermalSafetyInfo {
+    pub state: String,
+    pub cpu_sensor_found: bool,
+    pub emergency_threshold_c: f64,
+    pub release_threshold_c: f64,
+}
+
+/// Kernel module load status.
+#[derive(Debug, Clone, Serialize)]
+pub struct KernelModuleInfo {
+    pub name: String,
+    pub loaded: bool,
+    pub in_mainline: bool,
+}
+
+/// Detected ACPI I/O port conflict.
+#[derive(Debug, Clone, Serialize)]
+pub struct AcpiConflictInfo {
+    pub io_range: String,
+    pub claimed_by: String,
+    pub conflicts_with_driver: String,
 }
 
 /// Standard error envelope for all error responses.
@@ -537,12 +618,15 @@ mod tests {
                     model_name: Some("RX 9070 XT".into()),
                     display_label: "9070XT".into(),
                     pci_id: Some("0000:2d:00.0".into()),
+                    pci_device_id: Some(0x7550),
+                    pci_revision: Some(0xC0),
                     fan_control_method: "pmfw_curve".into(),
                     pmfw_supported: true,
                     fan_rpm_available: true,
                     fan_write_supported: true,
                     is_discrete: true,
                     overdrive_enabled: true,
+                    gpu_zero_rpm_available: true,
                 },
                 aio_hwmon: UnsupportedCapability {
                     present: false,
