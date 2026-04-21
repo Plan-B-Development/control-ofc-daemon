@@ -53,6 +53,10 @@ pub struct SensorReading {
     pub timestamp: SystemTime,
     /// Where the reading came from.
     pub source: SensorSource,
+    /// Hwmon chip name (e.g. "k10temp", "nct6683", "it8696").
+    pub chip_name: String,
+    /// Sysfs `tempN_type` value if present (3=diode, 4=thermistor, 5=AMD TSI, 6=Intel PECI).
+    pub temp_type: Option<u8>,
 }
 
 /// Metadata about a discovered temperature sensor (before reading a value).
@@ -68,4 +72,8 @@ pub struct SensorDescriptor {
     pub source: SensorSource,
     /// Path to the sysfs `temp*_input` file for reading.
     pub input_path: String,
+    /// Hwmon chip name (e.g. "k10temp", "nct6683", "it8696").
+    pub chip_name: String,
+    /// Sysfs `tempN_type` value if present (3=diode, 4=thermistor, 5=AMD TSI, 6=Intel PECI).
+    pub temp_type: Option<u8>,
 }

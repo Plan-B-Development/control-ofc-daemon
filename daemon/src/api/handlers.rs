@@ -38,6 +38,8 @@ pub(crate) fn build_sensor_entries(snap: &DaemonState, now: Instant) -> Vec<Sens
                 rate_c_per_s: s.rate_c_per_s,
                 session_min_c: s.session_min_c,
                 session_max_c: s.session_max_c,
+                chip_name: Some(s.chip_name.clone()),
+                temp_type: s.temp_type,
             }
         })
         .collect()
@@ -1867,5 +1869,71 @@ mod tests {
 
         let entries = build_fan_entries(&state, now);
         assert_eq!(entries[0].stall_detected, Some(true));
+    }
+
+    #[test]
+    fn build_sensor_entries_includes_chip_name_and_temp_type() {
+        let mut state = DaemonState::default();
+        let now = Instant::now();
+
+        state.sensors.insert(
+            "hwmon:nct6683:nodev:SYSTIN".into(),
+            crate::health::state::CachedSensorReading {
+                id: "hwmon:nct6683:nodev:SYSTIN".into(),
+                kind: crate::hwmon::types::SensorKind::MbTemp,
+                label: "SYSTIN".into(),
+                value_c: 42.0,
+                source: crate::health::state::DeviceLabel::Hwmon,
+                updated_at: now,
+                rate_c_per_s: None,
+                session_min_c: None,
+                session_max_c: None,
+                chip_name: "nct6683".into(),
+                temp_type: Some(3),
+            },
+        );
+
+        let entries = build_sensor_entries(&state, now);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].chip_name, Some("nct6683".into()));
+        assert_eq!(entries[0].temp_type, Some(3));
+
+        // Verify JSON serialization includes the fields
+        let json = serde_json::to_value(&entries[0]).unwrap();
+        assert_eq!(json["chip_name"], "nct6683");
+        assert_eq!(json["temp_type"], 3);
+    }
+
+    #[test]
+    fn build_sensor_entries_omits_temp_type_when_none() {
+        let mut state = DaemonState::default();
+        let now = Instant::now();
+
+        state.sensors.insert(
+            "hwmon:k10temp:nodev:Tctl".into(),
+            crate::health::state::CachedSensorReading {
+                id: "hwmon:k10temp:nodev:Tctl".into(),
+                kind: crate::hwmon::types::SensorKind::CpuTemp,
+                label: "Tctl".into(),
+                value_c: 55.0,
+                source: crate::health::state::DeviceLabel::Hwmon,
+                updated_at: now,
+                rate_c_per_s: None,
+                session_min_c: None,
+                session_max_c: None,
+                chip_name: "k10temp".into(),
+                temp_type: None,
+            },
+        );
+
+        let entries = build_sensor_entries(&state, now);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].chip_name, Some("k10temp".into()));
+        assert_eq!(entries[0].temp_type, None);
+
+        // Verify JSON serialization omits temp_type when None
+        let json = serde_json::to_value(&entries[0]).unwrap();
+        assert_eq!(json["chip_name"], "k10temp");
+        assert!(json.get("temp_type").is_none());
     }
 }

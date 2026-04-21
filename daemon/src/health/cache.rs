@@ -249,6 +249,8 @@ mod tests {
             rate_c_per_s: None,
             session_min_c: None,
             session_max_c: None,
+            chip_name: "k10temp".into(),
+            temp_type: None,
         }
     }
 

@@ -66,6 +66,12 @@ pub struct SensorEntry {
     /// Session maximum temperature since daemon start.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_max_c: Option<f64>,
+    /// Hwmon chip name (e.g. "k10temp", "nct6683", "it8696").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chip_name: Option<String>,
+    /// Sysfs `tempN_type` value if present (3=diode, 4=thermistor, 5=AMD TSI, 6=Intel PECI).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temp_type: Option<u8>,
 }
 
 /// Response for `/fans` endpoint.
@@ -632,11 +638,36 @@ mod tests {
             rate_c_per_s: Some(0.5),
             session_min_c: Some(32.0),
             session_max_c: Some(78.5),
+            chip_name: Some("k10temp".into()),
+            temp_type: None,
         };
         let json = serde_json::to_value(&entry).unwrap();
         assert_eq!(json["id"], "hwmon:k10temp:0000:00:18.3:Tctl");
         assert_eq!(json["kind"], "cpu_temp");
         assert_eq!(json["value_c"], 55.0);
+        assert_eq!(json["chip_name"], "k10temp");
+        // temp_type absent when None
+        assert!(json.get("temp_type").is_none());
+    }
+
+    #[test]
+    fn sensor_entry_with_temp_type() {
+        let entry = SensorEntry {
+            id: "hwmon:nct6683:nodev:AMD TSI Addr 98h".into(),
+            kind: "cpu_temp".into(),
+            label: "AMD TSI Addr 98h".into(),
+            value_c: 48.0,
+            source: "hwmon".into(),
+            age_ms: 50,
+            rate_c_per_s: None,
+            session_min_c: None,
+            session_max_c: None,
+            chip_name: Some("nct6683".into()),
+            temp_type: Some(5),
+        };
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["chip_name"], "nct6683");
+        assert_eq!(json["temp_type"], 5);
     }
 
     #[test]
