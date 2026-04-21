@@ -15,6 +15,7 @@ const KNOWN_MODULES: &[(&str, bool)] = &[
     ("it87", true),
     ("f71882fg", true),
     ("asus_ec_sensors", true),
+    ("asus_wmi_sensors", true),
     ("asus_wmi_ec_sensors", true),
     ("sch5627", true),
     ("sch5636", true),
