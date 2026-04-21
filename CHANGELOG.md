@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.4.0] — 2026-04-21
+
+Sensor metadata enrichment for GUI classification and tooltip support.
+
+### Added
+- **Sensor metadata enrichment.** `/sensors` and `/poll` API responses now
+  include `chip_name` (hwmon driver name from sysfs) and `temp_type`
+  (thermistor type code from `tempN_type` sysfs) fields for each sensor.
+  Enables the GUI to classify sensors with provenance-aware confidence levels.
+- **Expanded sensor classification coverage.** Daemon now reads and exposes
+  driver metadata for nct6775 family, nct6683/6686/6687, asus_ec_sensors,
+  asus_wmi_sensors, gigabyte_wmi, and sbtsi_temp drivers.
+- **`tempN_type` sysfs reading** during sensor discovery. Type codes: 3 =
+  thermal diode, 4 = thermistor, 5 = AMD TSI, 6 = Intel PECI. Absent when
+  the driver does not expose type information.
+- **Label-based heuristics** for sensor kind classification during discovery.
+  AMD TSI labels map to CpuTemp kind, Intel PECI labels map to CpuTemp kind,
+  improving automatic categorization without manual configuration.
+
 ## [1.3.0] — 2026-04-21
 
 Motherboard PWM diagnostics: BIOS interference detection, board identification,

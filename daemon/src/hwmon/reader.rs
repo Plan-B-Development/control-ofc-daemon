@@ -47,6 +47,8 @@ pub fn read_temp(descriptor: &SensorDescriptor) -> Result<SensorReading, HwmonEr
         value_c,
         timestamp: SystemTime::now(),
         source: descriptor.source,
+        chip_name: descriptor.chip_name.clone(),
+        temp_type: descriptor.temp_type,
     })
 }
 
@@ -70,6 +72,8 @@ mod tests {
             label: "Tctl".into(),
             source: SensorSource::Hwmon,
             input_path: input_path.into(),
+            chip_name: "k10temp".into(),
+            temp_type: None,
         }
     }
 

@@ -84,6 +84,10 @@ pub struct CachedSensorReading {
     pub session_min_c: Option<f64>,
     /// Session maximum temperature since daemon start.
     pub session_max_c: Option<f64>,
+    /// Hwmon chip name (e.g. "k10temp", "nct6683", "it8696").
+    pub chip_name: String,
+    /// Sysfs `tempN_type` value if present (3=diode, 4=thermistor, 5=AMD TSI, 6=Intel PECI).
+    pub temp_type: Option<u8>,
 }
 
 /// Cached state for an AMD GPU fan (one per GPU — hardware exposes a single aggregate).

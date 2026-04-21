@@ -11,15 +11,40 @@ use crate::hwmon::types::{SensorDescriptor, SensorKind, SensorSource};
 
 /// Known chip name → sensor kind classification.
 fn classify_chip(chip_name: &str, label: &str) -> SensorKind {
+    let lower = label.to_lowercase();
     match chip_name {
         "k10temp" => SensorKind::CpuTemp,
         "coretemp" => SensorKind::CpuTemp,
         "amdgpu" => SensorKind::GpuTemp,
         "nvme" => SensorKind::DiskTemp,
+        "sbtsi_temp" => SensorKind::CpuTemp,
         _ if chip_name.starts_with("it87") => SensorKind::MbTemp,
+        // Nuvoton Super I/O families: default MbTemp, but TSI/PECI labels indicate CPU
+        "nct6775" | "nct6683" | "nct6686" | "nct6687" => {
+            if lower.contains("amd tsi")
+                || lower.contains("tsi")
+                || lower.contains("peci")
+                || lower.contains("cpu")
+            {
+                SensorKind::CpuTemp
+            } else {
+                SensorKind::MbTemp
+            }
+        }
+        // ASUS EC/WMI sensors: classify by label
+        "asus_ec_sensors" | "asus_wmi_sensors" => {
+            if lower.contains("cpu") {
+                SensorKind::CpuTemp
+            } else if lower.contains("gpu") {
+                SensorKind::GpuTemp
+            } else {
+                SensorKind::MbTemp
+            }
+        }
+        // Gigabyte WMI sensors: labels are generic, default to MbTemp
+        "gigabyte_wmi" => SensorKind::MbTemp,
         _ => {
             // Fallback: try to guess from the label
-            let lower = label.to_lowercase();
             if lower.contains("cpu") || lower.contains("tctl") || lower.contains("tccd") {
                 SensorKind::CpuTemp
             } else if lower.contains("gpu") || lower.contains("edge") || lower.contains("junction")
@@ -148,6 +173,16 @@ fn discover_device_sensors(hwmon_dir: &Path) -> Result<Vec<SensorDescriptor>, Hw
             format!("temp{index}")
         };
 
+        // Try to read tempN_type (may not exist — that's fine)
+        let type_path = input_path.with_file_name(format!("temp{index}_type"));
+        let temp_type = if type_path.exists() {
+            read_sysfs_string(&type_path)
+                .ok()
+                .and_then(|s| s.trim().parse::<u8>().ok())
+        } else {
+            None
+        };
+
         let kind = classify_chip(&chip_name, &label);
         let id = build_stable_id(&chip_name, &device_id, &label);
         let source = if chip_name == "amdgpu" {
@@ -162,6 +197,8 @@ fn discover_device_sensors(hwmon_dir: &Path) -> Result<Vec<SensorDescriptor>, Hw
             label: label.clone(),
             source,
             input_path: input_path.display().to_string(),
+            chip_name: chip_name.clone(),
+            temp_type,
         });
     }
 
@@ -341,5 +378,197 @@ mod tests {
         let path = Path::new("/sys/devices/platform/it87.2624");
         let id = device_id_from_path(path);
         assert_eq!(id, "it87.2624");
+    }
+
+    // ── New driver classification tests ────────────────────────────────
+
+    #[test]
+    fn discover_nct6775_default_mbtemp() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_fixture_with_chip_name(
+            tmp.path(),
+            "hwmon0",
+            "nct6775",
+            &[("1", Some("SYSTIN")), ("2", Some("AUXTIN0"))],
+        );
+
+        let sensors = discover_sensors(tmp.path()).unwrap();
+        assert_eq!(sensors.len(), 2);
+        for s in &sensors {
+            assert_eq!(s.kind, SensorKind::MbTemp);
+            assert_eq!(s.chip_name, "nct6775");
+        }
+    }
+
+    #[test]
+    fn discover_nct6775_tsi_label_is_cpu() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_fixture_with_chip_name(
+            tmp.path(),
+            "hwmon0",
+            "nct6775",
+            &[("1", Some("AMD TSI Addr 98h")), ("2", Some("SYSTIN"))],
+        );
+
+        let sensors = discover_sensors(tmp.path()).unwrap();
+        assert_eq!(sensors.len(), 2);
+        assert_eq!(sensors[0].kind, SensorKind::CpuTemp);
+        assert_eq!(sensors[1].kind, SensorKind::MbTemp);
+    }
+
+    #[test]
+    fn discover_nct6683_peci_label_is_cpu() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_fixture_with_chip_name(
+            tmp.path(),
+            "hwmon0",
+            "nct6683",
+            &[("1", Some("PECI Agent 0")), ("2", Some("PCH_CHIP"))],
+        );
+
+        let sensors = discover_sensors(tmp.path()).unwrap();
+        assert_eq!(sensors.len(), 2);
+        assert_eq!(sensors[0].kind, SensorKind::CpuTemp);
+        assert_eq!(sensors[1].kind, SensorKind::MbTemp);
+    }
+
+    #[test]
+    fn discover_nct6687_family_handled() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_fixture_with_chip_name(
+            tmp.path(),
+            "hwmon0",
+            "nct6687",
+            &[("1", Some("CPU"))],
+        );
+
+        let sensors = discover_sensors(tmp.path()).unwrap();
+        assert_eq!(sensors.len(), 1);
+        assert_eq!(sensors[0].kind, SensorKind::CpuTemp);
+    }
+
+    #[test]
+    fn discover_asus_ec_sensors_classifies_by_label() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_fixture_with_chip_name(
+            tmp.path(),
+            "hwmon0",
+            "asus_ec_sensors",
+            &[
+                ("1", Some("CPU")),
+                ("2", Some("GPU")),
+                ("3", Some("Chipset")),
+                ("4", Some("Motherboard")),
+            ],
+        );
+
+        let sensors = discover_sensors(tmp.path()).unwrap();
+        assert_eq!(sensors.len(), 4);
+        assert_eq!(sensors[0].kind, SensorKind::CpuTemp);
+        assert_eq!(sensors[1].kind, SensorKind::GpuTemp);
+        assert_eq!(sensors[2].kind, SensorKind::MbTemp);
+        assert_eq!(sensors[3].kind, SensorKind::MbTemp);
+    }
+
+    #[test]
+    fn discover_asus_wmi_sensors_classifies_by_label() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_fixture_with_chip_name(
+            tmp.path(),
+            "hwmon0",
+            "asus_wmi_sensors",
+            &[("1", Some("CPU Package Temp")), ("2", Some("VRM"))],
+        );
+
+        let sensors = discover_sensors(tmp.path()).unwrap();
+        assert_eq!(sensors.len(), 2);
+        assert_eq!(sensors[0].kind, SensorKind::CpuTemp);
+        assert_eq!(sensors[1].kind, SensorKind::MbTemp);
+    }
+
+    #[test]
+    fn discover_gigabyte_wmi_is_mbtemp() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_fixture_with_chip_name(
+            tmp.path(),
+            "hwmon0",
+            "gigabyte_wmi",
+            &[("1", Some("temp1")), ("2", Some("temp2"))],
+        );
+
+        let sensors = discover_sensors(tmp.path()).unwrap();
+        assert_eq!(sensors.len(), 2);
+        for s in &sensors {
+            assert_eq!(s.kind, SensorKind::MbTemp);
+        }
+    }
+
+    #[test]
+    fn discover_sbtsi_temp_is_cpu() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_fixture_with_chip_name(
+            tmp.path(),
+            "hwmon0",
+            "sbtsi_temp",
+            &[("1", None)],
+        );
+
+        let sensors = discover_sensors(tmp.path()).unwrap();
+        assert_eq!(sensors.len(), 1);
+        assert_eq!(sensors[0].kind, SensorKind::CpuTemp);
+    }
+
+    #[test]
+    fn discover_reads_temp_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hwmon_dir = tmp.path().join("hwmon0");
+        fs::create_dir_all(&hwmon_dir).unwrap();
+        fs::write(hwmon_dir.join("name"), "nct6683\n").unwrap();
+        fs::write(hwmon_dir.join("temp1_input"), "45000\n").unwrap();
+        fs::write(hwmon_dir.join("temp1_label"), "SYSTIN\n").unwrap();
+        fs::write(hwmon_dir.join("temp1_type"), "3\n").unwrap(); // diode
+        fs::write(hwmon_dir.join("temp2_input"), "50000\n").unwrap();
+        fs::write(hwmon_dir.join("temp2_label"), "AMD TSI Addr 98h\n").unwrap();
+        fs::write(hwmon_dir.join("temp2_type"), "5\n").unwrap(); // AMD TSI
+
+        let sensors = discover_sensors(tmp.path()).unwrap();
+        assert_eq!(sensors.len(), 2);
+
+        assert_eq!(sensors[0].temp_type, Some(3));
+        assert_eq!(sensors[0].chip_name, "nct6683");
+        assert_eq!(sensors[0].kind, SensorKind::MbTemp);
+
+        assert_eq!(sensors[1].temp_type, Some(5));
+        assert_eq!(sensors[1].kind, SensorKind::CpuTemp);
+    }
+
+    #[test]
+    fn discover_missing_temp_type_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_fixture_with_chip_name(
+            tmp.path(),
+            "hwmon0",
+            "k10temp",
+            &[("1", Some("Tctl"))],
+        );
+
+        let sensors = discover_sensors(tmp.path()).unwrap();
+        assert_eq!(sensors.len(), 1);
+        assert_eq!(sensors[0].temp_type, None);
+    }
+
+    #[test]
+    fn chip_name_propagated_to_descriptor() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_fixture_with_chip_name(
+            tmp.path(),
+            "hwmon0",
+            "it8696",
+            &[("1", None)],
+        );
+
+        let sensors = discover_sensors(tmp.path()).unwrap();
+        assert_eq!(sensors.len(), 1);
+        assert_eq!(sensors[0].chip_name, "it8696");
     }
 }
