@@ -435,12 +435,7 @@ mod tests {
     #[test]
     fn discover_nct6687_family_handled() {
         let tmp = tempfile::tempdir().unwrap();
-        create_fixture_with_chip_name(
-            tmp.path(),
-            "hwmon0",
-            "nct6687",
-            &[("1", Some("CPU"))],
-        );
+        create_fixture_with_chip_name(tmp.path(), "hwmon0", "nct6687", &[("1", Some("CPU"))]);
 
         let sensors = discover_sensors(tmp.path()).unwrap();
         assert_eq!(sensors.len(), 1);
@@ -506,12 +501,7 @@ mod tests {
     #[test]
     fn discover_sbtsi_temp_is_cpu() {
         let tmp = tempfile::tempdir().unwrap();
-        create_fixture_with_chip_name(
-            tmp.path(),
-            "hwmon0",
-            "sbtsi_temp",
-            &[("1", None)],
-        );
+        create_fixture_with_chip_name(tmp.path(), "hwmon0", "sbtsi_temp", &[("1", None)]);
 
         let sensors = discover_sensors(tmp.path()).unwrap();
         assert_eq!(sensors.len(), 1);
@@ -545,12 +535,7 @@ mod tests {
     #[test]
     fn discover_missing_temp_type_is_none() {
         let tmp = tempfile::tempdir().unwrap();
-        create_fixture_with_chip_name(
-            tmp.path(),
-            "hwmon0",
-            "k10temp",
-            &[("1", Some("Tctl"))],
-        );
+        create_fixture_with_chip_name(tmp.path(), "hwmon0", "k10temp", &[("1", Some("Tctl"))]);
 
         let sensors = discover_sensors(tmp.path()).unwrap();
         assert_eq!(sensors.len(), 1);
@@ -560,12 +545,7 @@ mod tests {
     #[test]
     fn chip_name_propagated_to_descriptor() {
         let tmp = tempfile::tempdir().unwrap();
-        create_fixture_with_chip_name(
-            tmp.path(),
-            "hwmon0",
-            "it8696",
-            &[("1", None)],
-        );
+        create_fixture_with_chip_name(tmp.path(), "hwmon0", "it8696", &[("1", None)]);
 
         let sensors = discover_sensors(tmp.path()).unwrap();
         assert_eq!(sensors.len(), 1);

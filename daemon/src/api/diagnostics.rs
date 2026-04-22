@@ -33,8 +33,7 @@ fn expected_driver_for_chip(chip_name: &str) -> &'static str {
         "nct6775"
     } else if lower.starts_with("it8") {
         "it87"
-    } else if lower.starts_with("f718") || lower.starts_with("f8000") || lower.starts_with("f818")
-    {
+    } else if lower.starts_with("f718") || lower.starts_with("f8000") || lower.starts_with("f818") {
         "f71882fg"
     } else if lower.starts_with("sch5627") {
         "sch5627"
@@ -319,24 +318,22 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("ppfeaturemask");
         fs::write(&path, "4294967295\n").unwrap();
-        assert_eq!(
-            read_ppfeaturemask_from(&path),
-            Some("0xffffffff".into())
-        );
+        assert_eq!(read_ppfeaturemask_from(&path), Some("0xffffffff".into()));
     }
 
     #[test]
     fn ppfeaturemask_missing() {
-        assert_eq!(
-            read_ppfeaturemask_from(Path::new("/nonexistent")),
-            None
-        );
+        assert_eq!(read_ppfeaturemask_from(Path::new("/nonexistent")), None);
     }
 
     #[test]
     fn read_board_info_from_sysfs() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("board_vendor"), "Gigabyte Technology Co., Ltd.\n").unwrap();
+        fs::write(
+            tmp.path().join("board_vendor"),
+            "Gigabyte Technology Co., Ltd.\n",
+        )
+        .unwrap();
         fs::write(tmp.path().join("board_name"), "X870E AORUS MASTER\n").unwrap();
         fs::write(tmp.path().join("bios_version"), "F13a\n").unwrap();
 

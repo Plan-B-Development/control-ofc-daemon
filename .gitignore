@@ -25,3 +25,4 @@ packaging/src/
 packaging/pkg/
 packaging/*.pkg.tar*
 packaging/*.tar.gz
+packaging/.SRCINFO
