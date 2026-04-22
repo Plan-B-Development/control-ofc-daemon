@@ -205,7 +205,7 @@ impl HwmonPwmController {
             let mode_set = self
                 .write_state
                 .get(header_id)
-                .map_or(false, |ws| ws.manual_mode_set);
+                .is_some_and(|ws| ws.manual_mode_set);
             if mode_set {
                 enable_path
                     .as_ref()
@@ -215,7 +215,7 @@ impl HwmonPwmController {
                             .ok()
                             .and_then(|s| s.trim().parse::<u8>().ok())
                     })
-                    .map_or(false, |v| v != 1)
+                    .is_some_and(|v| v != 1)
             } else {
                 false
             }

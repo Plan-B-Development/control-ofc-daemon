@@ -19,17 +19,29 @@ fn install_panic_hook() {
             eprintln!("PANIC: restoring fans to automatic mode before aborting");
             for (curve_path, zero_rpm_path) in &targets.gpu_curves {
                 if let Err(e) = std::fs::write(curve_path, "r\n") {
-                    eprintln!("  WARNING: failed to reset GPU curve {}: {e}", curve_path.display());
+                    eprintln!(
+                        "  WARNING: failed to reset GPU curve {}: {e}",
+                        curve_path.display()
+                    );
                 }
                 if let Err(e) = std::fs::write(curve_path, "c\n") {
-                    eprintln!("  WARNING: failed to commit GPU curve {}: {e}", curve_path.display());
+                    eprintln!(
+                        "  WARNING: failed to commit GPU curve {}: {e}",
+                        curve_path.display()
+                    );
                 }
                 if let Some(zrp) = zero_rpm_path {
                     if let Err(e) = std::fs::write(zrp, "1\n") {
-                        eprintln!("  WARNING: failed to re-enable zero-RPM {}: {e}", zrp.display());
+                        eprintln!(
+                            "  WARNING: failed to re-enable zero-RPM {}: {e}",
+                            zrp.display()
+                        );
                     }
                     if let Err(e) = std::fs::write(zrp, "c\n") {
-                        eprintln!("  WARNING: failed to commit zero-RPM {}: {e}", zrp.display());
+                        eprintln!(
+                            "  WARNING: failed to commit zero-RPM {}: {e}",
+                            zrp.display()
+                        );
                     }
                 }
             }

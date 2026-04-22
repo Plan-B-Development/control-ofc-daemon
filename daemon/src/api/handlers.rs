@@ -1625,7 +1625,10 @@ pub async fn hwmon_verify_handler(
     let (pwm_path, enable_path, rpm_path) = {
         let ctrl = controller.lock();
         if let Err(e) = ctrl.lease_manager().validate_lease(&body.lease_id) {
-            return error_response(StatusCode::FORBIDDEN, &ErrorEnvelope::lease_error(e.to_string()));
+            return error_response(
+                StatusCode::FORBIDDEN,
+                &ErrorEnvelope::lease_error(e.to_string()),
+            );
         }
         match ctrl.headers().into_iter().find(|h| h.id == header_id) {
             Some(h) => (
