@@ -1,7 +1,5 @@
 //! Structured error types for the Control-OFC daemon.
 
-use std::fmt;
-
 use thiserror::Error;
 
 /// Configuration loading and validation errors.
@@ -45,37 +43,6 @@ pub enum HwmonError {
     WriteError { path: String, message: String },
 }
 
-/// IPC server errors.
-#[derive(Debug, Error)]
-pub enum IpcError {
-    #[error("bind failed: {path}: {message}")]
-    BindFailed { path: String, message: String },
-
-    #[error("request error: {message}")]
-    RequestError { message: String },
-}
-
-/// Error category for IPC error responses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ErrorKind {
-    /// Client sent an invalid request.
-    Validation,
-    /// Requested resource is not available.
-    Unavailable,
-    /// Internal daemon error.
-    Internal,
-}
-
-impl fmt::Display for ErrorKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Validation => write!(f, "validation"),
-            Self::Unavailable => write!(f, "unavailable"),
-            Self::Internal => write!(f, "internal"),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,12 +63,5 @@ mod tests {
     fn serial_timeout_display() {
         let err = SerialError::Timeout { timeout_ms: 500 };
         assert_eq!(err.to_string(), "timeout after 500ms");
-    }
-
-    #[test]
-    fn error_kind_display() {
-        assert_eq!(ErrorKind::Validation.to_string(), "validation");
-        assert_eq!(ErrorKind::Unavailable.to_string(), "unavailable");
-        assert_eq!(ErrorKind::Internal.to_string(), "internal");
     }
 }

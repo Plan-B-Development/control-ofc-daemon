@@ -48,11 +48,20 @@ daemon/src/
   api/
     mod.rs             — API subsystem re-exports
     server.rs          — Axum router + UDS listener
-    handlers.rs        — all endpoint handler functions
+    handlers/
+      mod.rs           — AppState, shared helpers, submodule re-exports
+      status.rs        — read endpoints (status, sensors, fans, poll, capabilities, history)
+      openfan.rs       — OpenFan serial write endpoints + calibration handler
+      gpu.rs           — AMD GPU fan set/reset endpoints
+      hwmon_ctl.rs     — hwmon lease, PWM, rescan, verify endpoints
+      profile.rs       — profile activation endpoints
+      config.rs        — runtime config endpoints (search dirs, startup delay)
+      hw_diagnostics.rs — hardware diagnostics endpoint
     responses.rs       — response structs (Serialize)
     sse.rs             — Server-Sent Events stream
     calibration.rs     — OpenFan calibration sweep
 
+  pwm.rs               — shared percent_to_raw / raw_to_percent conversion
   profile.rs           — profile JSON loading + curve evaluation
   profile_engine.rs    — headless 1Hz curve evaluation loop
   daemon_state.rs      — persistent state (active profile pointer)

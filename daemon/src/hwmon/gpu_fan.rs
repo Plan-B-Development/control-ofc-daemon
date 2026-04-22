@@ -21,6 +21,7 @@
 use std::path::Path;
 
 use crate::error::HwmonError;
+use crate::pwm::percent_to_raw;
 
 /// Trait for writing to sysfs fan curve files — allows test mocks to
 /// capture every intermediate write (each of which the kernel processes
@@ -361,6 +362,50 @@ pub fn reset_to_auto(
     Ok(())
 }
 
+// ── Pre-RDNA3 legacy PWM control ─────────────────────────────────────
+//
+// Pre-RDNA3 GPUs (RX 6000 and older) use the standard hwmon pwm1/pwm1_enable
+// interface. These functions encapsulate those raw sysfs writes.
+
+/// Set a legacy GPU fan speed via hwmon pwm1 (pre-RDNA3).
+///
+/// Writes `pwm1_enable=1` (manual mode) then the raw PWM value to `pwm1`.
+/// amdgpu rejects `pwm1` writes with EINVAL unless manual mode is active.
+pub fn set_legacy_pwm(hwmon_path: &Path, speed_pct: u8) -> Result<(), HwmonError> {
+    let enable_path = hwmon_path.join("pwm1_enable");
+    std::fs::write(&enable_path, "1\n").map_err(|e| HwmonError::WriteError {
+        path: enable_path.display().to_string(),
+        message: format!("failed to set manual mode: {e}"),
+    })?;
+
+    let pwm_path = hwmon_path.join("pwm1");
+    let raw = percent_to_raw(speed_pct);
+    std::fs::write(&pwm_path, format!("{raw}\n")).map_err(|e| HwmonError::WriteError {
+        path: pwm_path.display().to_string(),
+        message: format!("failed to write PWM value {raw}: {e}"),
+    })?;
+
+    log::info!(
+        "Set legacy GPU fan to {speed_pct}% (raw {raw}) via {}",
+        hwmon_path.display()
+    );
+    Ok(())
+}
+
+/// Reset a legacy GPU fan to automatic mode via hwmon pwm1_enable (pre-RDNA3).
+///
+/// Writes `pwm1_enable=2` to restore firmware-managed fan control.
+pub fn reset_legacy_to_auto(hwmon_path: &Path) -> Result<(), HwmonError> {
+    let enable_path = hwmon_path.join("pwm1_enable");
+    std::fs::write(&enable_path, "2\n").map_err(|e| HwmonError::WriteError {
+        path: enable_path.display().to_string(),
+        message: format!("failed to reset to auto mode: {e}"),
+    })?;
+
+    log::info!("Reset legacy GPU fan to auto via {}", hwmon_path.display());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,5 +625,58 @@ FAN_CURVE(fan speed): 15% 100%
         let content = "OD_FAN_CURVE:\n0: 40C 120%\n";
         let curve = parse_fan_curve(content).unwrap();
         assert_eq!(curve.points[0].speed_pct, 100);
+    }
+
+    // ── Legacy PWM tests ───────────────────────────────────────────
+
+    #[test]
+    fn set_legacy_pwm_writes_enable_and_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hwmon = tmp.path();
+        fs::write(hwmon.join("pwm1_enable"), "").unwrap();
+        fs::write(hwmon.join("pwm1"), "").unwrap();
+
+        set_legacy_pwm(hwmon, 50).unwrap();
+
+        let enable = fs::read_to_string(hwmon.join("pwm1_enable")).unwrap();
+        assert_eq!(enable, "1\n");
+        let pwm = fs::read_to_string(hwmon.join("pwm1")).unwrap();
+        assert_eq!(pwm, "128\n");
+    }
+
+    #[test]
+    fn set_legacy_pwm_full_speed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hwmon = tmp.path();
+        fs::write(hwmon.join("pwm1_enable"), "").unwrap();
+        fs::write(hwmon.join("pwm1"), "").unwrap();
+
+        set_legacy_pwm(hwmon, 100).unwrap();
+        let pwm = fs::read_to_string(hwmon.join("pwm1")).unwrap();
+        assert_eq!(pwm, "255\n");
+    }
+
+    #[test]
+    fn reset_legacy_to_auto_writes_enable_2() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hwmon = tmp.path();
+        fs::write(hwmon.join("pwm1_enable"), "1\n").unwrap();
+
+        reset_legacy_to_auto(hwmon).unwrap();
+
+        let enable = fs::read_to_string(hwmon.join("pwm1_enable")).unwrap();
+        assert_eq!(enable, "2\n");
+    }
+
+    #[test]
+    fn set_legacy_pwm_missing_path_returns_error() {
+        let result = set_legacy_pwm(Path::new("/nonexistent/hwmon99"), 50);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn reset_legacy_missing_path_returns_error() {
+        let result = reset_legacy_to_auto(Path::new("/nonexistent/hwmon99"));
+        assert!(result.is_err());
     }
 }

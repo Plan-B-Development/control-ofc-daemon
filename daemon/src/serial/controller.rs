@@ -17,10 +17,7 @@ use crate::constants;
 // Legacy MIN_PWM_PERCENT removed — thermal safety is now handled by
 // ThermalSafetyRule in safety.rs, not per-command clamping.
 
-/// Convert a PWM percent (0–100) to a raw PWM value (0–255).
-fn percent_to_raw(percent: u8) -> u8 {
-    ((percent as u16 * 255 + 50) / 100) as u8
-}
+use crate::pwm::percent_to_raw;
 
 /// Per-channel state for coalescing and stop tracking.
 #[derive(Debug, Clone, Default)]
@@ -323,15 +320,6 @@ mod tests {
             Arc::new(StateCache::new()),
             Duration::from_millis(500),
         )
-    }
-
-    // ── Percent to raw conversion ───────────────────────────────────
-
-    #[test]
-    fn percent_to_raw_boundaries() {
-        assert_eq!(percent_to_raw(0), 0);
-        assert_eq!(percent_to_raw(100), 255);
-        assert_eq!(percent_to_raw(50), 128); // (50*255+50)/100 = 12800/100 = 128
     }
 
     // ── Set PWM per channel ─────────────────────────────────────────

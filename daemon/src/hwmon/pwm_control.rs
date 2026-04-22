@@ -25,15 +25,7 @@ use crate::hwmon::pwm_discovery::PwmHeaderDescriptor;
 /// This daemon only writes value 1 (manual), which is safe across all drivers.
 const PWM_ENABLE_MANUAL: &str = "1";
 
-/// Convert a PWM percent (0–100) to raw sysfs value (0–255).
-fn percent_to_raw(percent: u8) -> u8 {
-    ((percent as u16 * 255 + 50) / 100) as u8
-}
-
-/// Convert a raw sysfs PWM value (0–255) back to percent (0–100).
-fn raw_to_percent(raw: u8) -> u8 {
-    ((raw as u16 * 100 + 127) / 255) as u8
-}
+use crate::pwm::{percent_to_raw, raw_to_percent};
 
 /// Result of a successful PWM write.
 #[derive(Debug, Clone)]
@@ -611,13 +603,6 @@ mod tests {
     }
 
     #[test]
-    fn percent_to_raw_conversion() {
-        assert_eq!(percent_to_raw(0), 0);
-        assert_eq!(percent_to_raw(100), 255);
-        assert_eq!(percent_to_raw(50), 128);
-    }
-
-    #[test]
     fn headers_returns_sorted_list() {
         let h1 = make_header("h2", "CHA_FAN2", 20);
         let mut h2 = make_header("h1", "CHA_FAN1", 20);
@@ -629,13 +614,6 @@ mod tests {
         // Sorted by (chip_name, pwm_index)
         assert_eq!(headers[0].pwm_index, 1);
         assert_eq!(headers[1].pwm_index, 2);
-    }
-
-    #[test]
-    fn raw_to_percent_conversion() {
-        assert_eq!(raw_to_percent(0), 0);
-        assert_eq!(raw_to_percent(255), 100);
-        assert_eq!(raw_to_percent(128), 50);
     }
 
     #[test]
