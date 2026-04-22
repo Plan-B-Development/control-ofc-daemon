@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.4.2] — 2026-04-22
+
+Audit remediation. Pairs with GUI v1.5.2.
+
+### Changed
+- **Profile engine's hwmon phase now also respects `gui_active`.** Previously
+  only OpenFan (DEC-074) and GPU (DEC-071) writes deferred when the GUI had
+  written via the API in the last 30s — hwmon writes only skipped based on
+  lease ownership, leaving a narrow race during GUI startup and lease
+  lapses. The three phases now share `DaemonState::gui_active()` and behave
+  uniformly (DEC-093).
+- **Comment on `ControlMember.source`** extended from `"openfan" or "hwmon"`
+  to also include `"amd_gpu"`, which the profile engine already dispatched on.
+
+### Added
+- **`DaemonState::gui_active()` helper** factored out of `profile_engine.rs`,
+  covered by three unit tests (fresh cache, post-write, post-timeout).
+- **Integration test for `GET /poll`** locking the top-level response shape
+  consumed by the GUI's 1 Hz polling loop (`api_version`, `status`,
+  `sensors`, `fans`).
+- **Daemon `DECISIONS.md`** summarising daemon-relevant ADRs (DEC-049,
+  DEC-053, DEC-070, DEC-071, DEC-073, DEC-074, DEC-093) and cross-referencing
+  the authoritative GUI file.
+
 ## [1.4.1] — 2026-04-22
 
 Code quality and maintainability improvements from comprehensive audit.

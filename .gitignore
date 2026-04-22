@@ -12,6 +12,8 @@ Cargo.lock
 
 # Claude Code
 .claude/
+CLAUDE.md
+DECISIONS.md
 
 # Local-only admin files (never push to GitHub)
 scripts/
