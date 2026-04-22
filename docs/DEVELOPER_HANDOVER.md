@@ -18,10 +18,19 @@ daemon/                     Rust crate (control-ofc-daemon)
     config.rs               TOML config + validation (incl. [state] section)
     runtime_config.rs       Daemon-mutable runtime.toml (ADR-002)
     constants.rs            Centralized operational tuning values
+    pwm.rs                  Shared PWM percent ↔ raw (0–255) conversion
     daemon_state.rs         Persistent state (configurable state_dir via OnceLock)
     error.rs                Structured error types
     api/
-      handlers.rs           HTTP request handlers + AppState
+      handlers/             HTTP request handlers (split by concern)
+        mod.rs              AppState, shared helpers, submodule re-exports
+        status.rs           Read endpoints (status, sensors, fans, poll, capabilities)
+        openfan.rs          OpenFan serial write + calibration handlers
+        gpu.rs              AMD GPU fan set/reset handlers
+        hwmon_ctl.rs        Hwmon lease, PWM, rescan, verify handlers
+        profile.rs          Profile activation handlers
+        config.rs           Runtime config handlers
+        hw_diagnostics.rs   Hardware diagnostics handler
       responses.rs          JSON response/request types (v1 schema)
       server.rs             Unix socket server lifecycle
       sse.rs                Server-Sent Events stream

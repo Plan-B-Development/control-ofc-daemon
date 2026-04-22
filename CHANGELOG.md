@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.4.1] — 2026-04-22
+
+Code quality and maintainability improvements from comprehensive audit.
+
+### Changed
+- **Split `handlers.rs` monolith** (1930 lines) into 8 focused submodules:
+  `status`, `openfan`, `gpu`, `hwmon_ctl`, `profile`, `config`,
+  `hw_diagnostics`, and shared helpers in `mod.rs`. All API paths unchanged.
+- **Deduplicated PWM conversion functions.** `percent_to_raw` and
+  `raw_to_percent` consolidated into new `pwm` module, replacing 4 duplicate
+  definitions across `serial/controller`, `hwmon/pwm_control`, `api/handlers`,
+  and `polling`.
+- **Extracted legacy GPU sysfs writes** from inline handler code into
+  `gpu_fan::set_legacy_pwm()` and `gpu_fan::reset_legacy_to_auto()`. Pre-RDNA3
+  GPU fan control is now testable and returns typed `HwmonError` instead of
+  swallowing IO errors.
+- **Deduplicated status-building logic.** `status_handler` and `poll_handler`
+  now share `build_status_response()` instead of duplicating 30 lines of
+  identical subsystem/uptime/GUI-last-seen construction.
+
+### Removed
+- **Dead code cleanup.** Removed unused `IpcError` and `ErrorKind` types from
+  `error.rs` (never referenced outside their own module).
+
 ## [1.4.0] — 2026-04-21
 
 Sensor metadata enrichment for GUI classification and tooltip support.

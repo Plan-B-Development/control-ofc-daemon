@@ -194,11 +194,7 @@ fn read_hwmon_fan_states(
 
             // Read current PWM raw value and convert to percent
             let pwm_pct = match std::fs::read_to_string(&h.pwm_path) {
-                Ok(s) => s
-                    .trim()
-                    .parse::<u8>()
-                    .ok()
-                    .map(|raw| ((raw as u16 * 100 + 127) / 255) as u8),
+                Ok(s) => s.trim().parse::<u8>().ok().map(crate::pwm::raw_to_percent),
                 Err(e) => {
                     log::debug!(
                         "hwmon header '{}': failed to read PWM from {}: {e}",
