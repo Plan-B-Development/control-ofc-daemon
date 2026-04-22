@@ -16,7 +16,10 @@ fn boottime_now() -> Duration {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    // SAFETY: clock_gettime with CLOCK_BOOTTIME is always valid on Linux.
+    // SAFETY: clock_gettime is signal-safe per POSIX. `ts` is a valid
+    // mutable reference to a stack-local timespec — the call writes only
+    // to this struct and touches no other memory. CLOCK_BOOTTIME is
+    // supported on all Linux kernels >= 2.6.39 (our minimum target).
     if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) } != 0 {
         return Duration::ZERO;
     }

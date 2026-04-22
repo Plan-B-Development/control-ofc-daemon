@@ -18,15 +18,25 @@ fn install_panic_hook() {
         if let Some(targets) = PANIC_RESTORE.get() {
             eprintln!("PANIC: restoring fans to automatic mode before aborting");
             for (curve_path, zero_rpm_path) in &targets.gpu_curves {
-                let _ = std::fs::write(curve_path, "r\n");
-                let _ = std::fs::write(curve_path, "c\n");
+                if let Err(e) = std::fs::write(curve_path, "r\n") {
+                    eprintln!("  WARNING: failed to reset GPU curve {}: {e}", curve_path.display());
+                }
+                if let Err(e) = std::fs::write(curve_path, "c\n") {
+                    eprintln!("  WARNING: failed to commit GPU curve {}: {e}", curve_path.display());
+                }
                 if let Some(zrp) = zero_rpm_path {
-                    let _ = std::fs::write(zrp, "1\n");
-                    let _ = std::fs::write(zrp, "c\n");
+                    if let Err(e) = std::fs::write(zrp, "1\n") {
+                        eprintln!("  WARNING: failed to re-enable zero-RPM {}: {e}", zrp.display());
+                    }
+                    if let Err(e) = std::fs::write(zrp, "c\n") {
+                        eprintln!("  WARNING: failed to commit zero-RPM {}: {e}", zrp.display());
+                    }
                 }
             }
             for enable_path in &targets.hwmon_enable_paths {
-                let _ = std::fs::write(enable_path, "2\n");
+                if let Err(e) = std::fs::write(enable_path, "2\n") {
+                    eprintln!("  WARNING: failed to restore hwmon auto mode {enable_path}: {e}");
+                }
             }
         }
         default_hook(info);
@@ -62,8 +72,10 @@ const ALLOW_NON_ROOT_FLAG: &str = "--allow-non-root";
 
 /// Return `true` if the current process is running as effective UID 0.
 fn running_as_root() -> bool {
-    // SAFETY: `geteuid` is thread-safe and always defined on Unix targets.
-    // It simply reads the calling process's EUID from the kernel.
+    // SAFETY: `geteuid` is thread-safe, reentrant, signal-safe, and always
+    // defined on Unix targets. It reads immutable per-process kernel state
+    // (effective UID) with no memory safety concerns — no pointers, no
+    // allocations, no mutable references involved.
     unsafe { libc::geteuid() == 0 }
 }
 
@@ -356,11 +368,13 @@ fn resolve_initial_profile(search_dirs: &[std::path::PathBuf]) -> Option<DaemonP
         return match profile::load_profile(&path) {
             Ok(p) => {
                 // Persist the CLI choice so it survives reboot
-                let _ = daemon_state::save_state(&daemon_state::DaemonState {
+                if let Err(e) = daemon_state::save_state(&daemon_state::DaemonState {
                     version: 1,
                     active_profile_id: Some(p.id.clone()),
                     active_profile_path: Some(path.display().to_string()),
-                });
+                }) {
+                    log::error!("Failed to persist CLI profile selection: {e}");
+                }
                 Some(p)
             }
             Err(e) => {

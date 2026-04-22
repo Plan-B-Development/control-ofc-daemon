@@ -165,6 +165,7 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 | GET | `/hwmon/headers` | Controllable motherboard PWM outputs |
 | GET | `/hwmon/lease/status` | Lease holder + TTL |
 | GET | `/profile/active` | Current active profile or `{"active": false}` |
+| GET | `/diagnostics/hardware` | Hardware readiness report (hwmon chips, GPU, thermal safety, kernel modules, ACPI conflicts, board info) |
 
 ### Write endpoints — OpenFan
 
@@ -190,6 +191,7 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 | POST | `/hwmon/lease/renew` | Renew held lease |
 | POST | `/hwmon/lease/release` | Release held lease |
 | POST | `/hwmon/{header_id}/pwm` | Set hwmon PWM (lease required) |
+| POST | `/hwmon/{header_id}/verify` | Test PWM write effectiveness (~3s, lease required, detects BIOS/EC interference) |
 | POST | `/hwmon/rescan` | Re-enumerate hwmon devices and return fresh header list |
 
 ### Write endpoints — profile / config
