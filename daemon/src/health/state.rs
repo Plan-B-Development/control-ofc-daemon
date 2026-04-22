@@ -169,3 +169,16 @@ impl Default for DaemonState {
         }
     }
 }
+
+impl DaemonState {
+    /// True when the GUI wrote via the API within the last
+    /// [`crate::constants::GUI_ACTIVITY_TIMEOUT`] window.
+    ///
+    /// Profile-engine fan phases skip writes while this is true so the GUI's
+    /// control loop has exclusive authority over fan outputs, avoiding
+    /// dual-writer conflicts (see DEC-071 / DEC-074 in the GUI repo).
+    pub fn gui_active(&self) -> bool {
+        self.last_gui_write_at
+            .is_some_and(|t| t.elapsed() < crate::constants::GUI_ACTIVITY_TIMEOUT)
+    }
+}

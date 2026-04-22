@@ -392,4 +392,36 @@ mod tests {
         let snap2 = cache.snapshot();
         assert_eq!(snap2.openfan_fans[&0].rpm, 9999);
     }
+
+    #[test]
+    fn gui_active_false_on_fresh_cache() {
+        // A newly-created cache has never seen a GUI write.
+        let cache = StateCache::new();
+        assert!(!cache.snapshot().gui_active());
+    }
+
+    #[test]
+    fn gui_active_true_after_record_gui_write() {
+        // record_gui_write() must flip gui_active() to true so profile-engine
+        // phases (openfan, hwmon, gpu) defer to the GUI's control loop.
+        let cache = StateCache::new();
+        cache.record_gui_write();
+        assert!(cache.snapshot().gui_active());
+    }
+
+    #[test]
+    fn gui_active_false_after_timeout() {
+        // A write older than GUI_ACTIVITY_TIMEOUT should NOT keep gui_active true.
+        use std::time::{Duration, Instant};
+        let cache = StateCache::new();
+        {
+            let mut state = cache.inner.write();
+            state.last_gui_write_at = Some(
+                Instant::now()
+                    .checked_sub(crate::constants::GUI_ACTIVITY_TIMEOUT + Duration::from_secs(1))
+                    .expect("timeout subtraction should succeed on a fresh Instant"),
+            );
+        }
+        assert!(!cache.snapshot().gui_active());
+    }
 }

@@ -65,8 +65,10 @@ fn default_step() -> f64 {
 /// A fan member within a logical control group.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlMember {
-    pub source: String,    // "openfan" or "hwmon"
-    pub member_id: String, // e.g. "openfan:ch00" or "hwmon:it8696:..."
+    // "openfan", "hwmon", or "amd_gpu" — matches the write phases in
+    // profile_engine.rs (apply_commands), which dispatches per-source.
+    pub source: String,
+    pub member_id: String, // e.g. "openfan:ch00", "hwmon:it8696:...", or "amd_gpu:<PCI_BDF>"
     #[serde(default)]
     pub member_label: String,
 }

@@ -234,9 +234,7 @@ pub async fn profile_engine_loop(
         // fan speed via the API, and both writing simultaneously causes
         // unnecessary serial traffic and potential PWM oscillation.
         let snap = cache.snapshot();
-        let gui_active = snap
-            .last_gui_write_at
-            .is_some_and(|t| t.elapsed() < constants::GUI_ACTIVITY_TIMEOUT);
+        let gui_active = snap.gui_active();
 
         if !gui_active {
             if let Some(ref ctrl) = fan_controller {
@@ -346,8 +344,14 @@ pub async fn profile_engine_loop(
         // Phase 3: hwmon writes (auto-lease for headless profile mode)
         // The profile engine auto-acquires the lease when writing hwmon members.
         // If the GUI holds the lease, hwmon writes are skipped (GUI has priority).
+        //
+        // Also skip when gui_active (last GUI write <30s) to close the startup
+        // race where the GUI has written via /fans/... but has not yet taken
+        // the hwmon lease, or the lease has briefly lapsed. Mirrors the
+        // OpenFan/GPU phases above for consistency (DEC-074 semantics extended
+        // to hwmon).
         let hwmon_cmds: Vec<_> = commands.iter().filter(|c| c.source == "hwmon").collect();
-        if !hwmon_cmds.is_empty() {
+        if !hwmon_cmds.is_empty() && !gui_active {
             if let Some(ref ctrl) = hwmon_controller {
                 let mut guard = ctrl.lock();
                 // Try to get or auto-acquire a lease for the profile engine

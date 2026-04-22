@@ -201,6 +201,52 @@ async fn fans_endpoint_returns_fan_state() {
     let _ = std::fs::remove_file(&path);
 }
 
+#[tokio::test]
+async fn poll_endpoint_returns_batched_shape() {
+    // Contract test for GET /poll — the GUI's primary 1 Hz read endpoint.
+    //
+    // Audit finding: /poll had no integration coverage, so a breaking schema
+    // change (renaming "status" to "overall", dropping "sensors", etc.) would
+    // not be caught here and the GUI's parser would silently fall back to
+    // defaults. This test locks in the top-level keys the GUI consumes in
+    // DaemonClient.poll() (see control-ofc-gui/src/control_ofc/api/client.py).
+    let state = test_app_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/poll").await;
+
+    assert_eq!(status, 200);
+    assert_eq!(json["api_version"], 1);
+
+    // Status block — same shape as /status.
+    let status_obj = json["status"]
+        .as_object()
+        .expect("/poll response must contain 'status' object (GUI consumes it)");
+    assert!(status_obj["overall_status"].is_string());
+    assert!(status_obj["subsystems"].is_array());
+    assert!(status_obj["counters"].is_object());
+
+    // Sensors block — same shape as /sensors.
+    let sensors = json["sensors"]
+        .as_array()
+        .expect("/poll response must contain 'sensors' array");
+    assert_eq!(sensors.len(), 1);
+    assert_eq!(sensors[0]["id"], "hwmon:k10temp:0000:00:18.3:Tctl");
+    assert_eq!(sensors[0]["kind"], "cpu_temp");
+    assert!(sensors[0]["age_ms"].is_number());
+
+    // Fans block — same shape as /fans.
+    let fans = json["fans"]
+        .as_array()
+        .expect("/poll response must contain 'fans' array");
+    assert_eq!(fans.len(), 2);
+    assert_eq!(fans[0]["id"], "openfan:ch00");
+    assert!(fans[0]["age_ms"].is_number());
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
 /// Helper: make an HTTP POST request over a Unix socket and return the JSON body.
 async fn uds_post(
     socket_path: &str,
