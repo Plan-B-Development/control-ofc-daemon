@@ -79,7 +79,9 @@ pub async fn capabilities_handler(
             present: true,
             model_name: gpu.marketing_name.clone(),
             display_label: gpu.display_label(),
+            // M11: emit both names during the transition. Same BDF string.
             pci_id: Some(gpu.pci_bdf.clone()),
+            pci_bdf: Some(gpu.pci_bdf.clone()),
             pci_device_id: Some(gpu.pci_device_id),
             pci_revision: Some(gpu.pci_revision),
             fan_control_method: gpu.fan_control_method().to_string(),
@@ -96,6 +98,7 @@ pub async fn capabilities_handler(
             model_name: None,
             display_label: "AMD D-GPU".to_string(),
             pci_id: None,
+            pci_bdf: None,
             pci_device_id: None,
             pci_revision: None,
             fan_control_method: "none".to_string(),

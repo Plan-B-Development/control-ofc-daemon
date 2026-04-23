@@ -1,5 +1,46 @@
 # Changelog
 
+## [1.5.0] — 2026-04-23
+
+Contract-mismatch remediation (15-item cross-stack sweep). Pairs with
+**GUI v1.6.0**. The headline change is M1 — the profile engine now applies
+the full per-control tuning pipeline, so headless profile-mode output is
+identical to GUI-driven output for the same profile. See the GUI's
+`docs/23_Contract_Mismatch_Backlog.md` for the full investigation.
+
+### Added
+- **M1: Full tuning pipeline in the profile engine.** `evaluate_profile`
+  previously applied only `offset_pct` and `minimum_pct`, silently ignoring
+  `step_up_pct`, `step_down_pct`, `start_pct`, and `stop_pct` even though
+  they were deserialised from the profile. The engine now applies all six
+  stages in the same order as the GUI's `ControlLoopService._apply_tuning`:
+  offset → minimum → step-rate limit → stop-snap → start-hysteresis →
+  clamp. A new task-local `ProfileEngineState` tracks pre-rounding `f64`
+  `last_output` per control across 1 Hz cycles, clears on profile-id
+  change, and clears on deactivation. The wire PWM uses round-to-nearest
+  so `49.6` becomes `50` (matches the GUI's `round(pwm_percent)`).
+  Ten new unit tests cover the pipeline stages and state lifecycle.
+- **M11: `/capabilities` and `/diagnostics/hardware` emit both `pci_id`
+  and `pci_bdf`.** Same BDF string under both names so callers aligned to
+  either convention keep working during the transition window. Legacy
+  names are documented as deprecated; will be removed in a future major
+  version. Three new serialization tests.
+- **Integration tests for status-code consistency** (`daemon/tests/ipc_integration.rs`):
+  `/hwmon/{id}/verify` returns 503 when no controller is present,
+  `/gpu/{id}/fan/pwm` and `/gpu/{id}/fan/reset` return 404 for unknown
+  GPU ids (validation, not hardware).
+
+### Changed
+- **M12: `/hwmon/{id}/verify` returns 503 `hardware_unavailable`** when
+  the controller is absent, matching every sibling hwmon handler.
+  Previously returned 404 `validation_error`, which implied the endpoint
+  itself was missing.
+- **M13: GPU fan write/reset `hardware_unavailable` now returns 503**,
+  not 500. Four match arms in `gpu.rs` (legacy + PMFW, set + reset) were
+  inconsistent with the documented contract. `spawn_blocking` task
+  failures correctly remain 500 (`internal_error`); unknown GPU id
+  correctly remains 404 (`validation_error`).
+
 ## [1.4.2] — 2026-04-22
 
 Audit remediation. Pairs with GUI v1.5.2.

@@ -5,12 +5,13 @@
 //! existing polling loops.
 
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::constants;
 use crate::health::cache::StateCache;
 use crate::hwmon::types::SensorKind;
-use crate::profile::{evaluate_curve, DaemonProfile};
+use crate::profile::{evaluate_curve, DaemonProfile, LogicalControl};
 use crate::serial::protocol::NUM_CHANNELS;
 
 /// A single PWM write command produced by the profile engine.
@@ -21,11 +22,110 @@ pub struct PwmCommand {
     pub pwm_percent: u8,
 }
 
+/// Cross-cycle state owned by the profile engine loop.
+///
+/// Required by the tuning pipeline (`step_up_pct`, `step_down_pct`,
+/// `start_pct`, `stop_pct`) so each cycle can rate-limit and hysteresis-gate
+/// against the previous cycle's tuned output. Matches the GUI's per-target
+/// `TargetState.last_output` in `control_loop.py`.
+///
+/// Cleared whenever the active profile id changes or no profile is loaded,
+/// mirroring the GUI's `_on_profile_changed` → `_reset_hysteresis()`.
+#[derive(Debug, Default)]
+pub struct ProfileEngineState {
+    /// Last tuned output (pre-rounding f64) per control id.
+    last_output: HashMap<String, f64>,
+    /// Id of the profile the current state belongs to.
+    active_profile_id: Option<String>,
+}
+
+impl ProfileEngineState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Current last-output for a control id (pre-rounding, pre-u8 conversion).
+    pub fn last_output(&self, control_id: &str) -> Option<f64> {
+        self.last_output.get(control_id).copied()
+    }
+
+    /// Reset state to a profile-less state (call when active profile is
+    /// cleared). The next `evaluate_profile` call starts fresh.
+    pub fn deactivate(&mut self) {
+        self.last_output.clear();
+        self.active_profile_id = None;
+    }
+
+    /// Clear last_output if the profile id changed since the previous call.
+    ///
+    /// Returns `true` when state was cleared. Used by `evaluate_profile` so
+    /// swapping between profiles doesn't carry control-specific tuning state
+    /// across unrelated curve definitions.
+    fn sync_profile_id(&mut self, new_id: &str) -> bool {
+        let changed = self.active_profile_id.as_deref() != Some(new_id);
+        if changed {
+            self.last_output.clear();
+            self.active_profile_id = Some(new_id.to_string());
+        }
+        changed
+    }
+}
+
+/// Apply the full per-control tuning pipeline.
+///
+/// Mirrors `ControlLoopService._apply_tuning` in the GUI so headless profile
+/// mode produces the same output as GUI-driven mode for identical inputs.
+/// Order matters: step-rate limiting runs AFTER offset/minimum so the
+/// delta tracked cycle-to-cycle is the final clamped output; stop-threshold
+/// comes after step-rate so a slow-falling curve can still snap to zero.
+fn apply_tuning(control: &LogicalControl, raw_output: f64, last_output: Option<f64>) -> f64 {
+    // 1. Offset
+    let mut output = raw_output + control.offset_pct;
+
+    // 2. Minimum floor (per-profile soft floor, distinct from daemon safety)
+    if output < control.minimum_pct {
+        output = control.minimum_pct;
+    }
+
+    // 3. Step-rate limiting — only bites when we have a previous cycle's output.
+    //    step_up_pct / step_down_pct are per-cycle caps (1Hz here).
+    if let Some(last) = last_output {
+        let max_up = last + control.step_up_pct;
+        let max_down = last - control.step_down_pct;
+        output = output.clamp(max_down, max_up);
+    }
+
+    // 4. Stop threshold — snap to zero below stop_pct so the fan actually
+    //    stops instead of spinning at a near-stall speed. `stop_pct == 0`
+    //    disables the feature (matches GUI semantics).
+    if control.stop_pct > 0.0 && output < control.stop_pct {
+        output = 0.0;
+    }
+
+    // 5. Start threshold — when transitioning from stopped (previous cycle = 0)
+    //    back to non-zero, jump up to at least `start_pct` so the fan actually
+    //    spins up instead of stalling at a too-low PWM. Matches the GUI's
+    //    guard: only triggers on the 0 → non-zero transition.
+    if output > 0.0 && matches!(last_output, Some(prev) if prev == 0.0) && control.start_pct > 0.0 {
+        output = output.max(control.start_pct);
+    }
+
+    // 6. Final clamp to the hardware range.
+    output.clamp(0.0, 100.0)
+}
+
 /// Evaluate the active profile against current sensor readings.
 ///
 /// Returns a list of PWM commands for each fan member in the profile.
-/// The caller is responsible for executing the writes.
-pub fn evaluate_profile(profile: &DaemonProfile, cache: &StateCache) -> Vec<PwmCommand> {
+/// The caller is responsible for executing the writes. `engine_state` holds
+/// per-control cross-cycle state required by the tuning pipeline.
+pub fn evaluate_profile(
+    profile: &DaemonProfile,
+    cache: &StateCache,
+    engine_state: &mut ProfileEngineState,
+) -> Vec<PwmCommand> {
+    engine_state.sync_profile_id(&profile.id);
+
     let snap = cache.snapshot();
     let mut commands = Vec::new();
 
@@ -35,7 +135,7 @@ pub fn evaluate_profile(profile: &DaemonProfile, cache: &StateCache) -> Vec<PwmC
         }
 
         // Determine target output percentage
-        let target_pct = if control.mode == "manual" {
+        let raw_output = if control.mode == "manual" {
             control.manual_output_pct
         } else {
             // Find the assigned curve
@@ -64,19 +164,23 @@ pub fn evaluate_profile(profile: &DaemonProfile, cache: &StateCache) -> Vec<PwmC
             evaluate_curve(curve, sensor.value_c)
         };
 
-        // Apply tuning: offset, minimum floor
-        let mut output = target_pct + control.offset_pct;
-        if output < control.minimum_pct {
-            output = control.minimum_pct;
-        }
-        let output = output.clamp(0.0, 100.0) as u8;
+        // Full tuning pipeline — tracks pre-rounding f64 across cycles so
+        // step_up_pct / step_down_pct don't drift from integer quantisation.
+        let prev = engine_state.last_output(&control.id);
+        let tuned = apply_tuning(control, raw_output, prev);
+        engine_state.last_output.insert(control.id.clone(), tuned);
+
+        // Round-to-nearest when converting to the wire PWM value so 49.6
+        // becomes 50 instead of being truncated to 49 — matches the GUI's
+        // `round(pwm_percent)` in `_write_target`.
+        let pwm_percent = tuned.round().clamp(0.0, 100.0) as u8;
 
         // Generate write commands for all members
         for member in &control.members {
             commands.push(PwmCommand {
                 member_id: member.member_id.clone(),
                 source: member.source.clone(),
-                pwm_percent: output,
+                pwm_percent,
             });
         }
     }
@@ -113,6 +217,11 @@ pub async fn profile_engine_loop(
     // Track consecutive cycles with no CPU temperature sensor (P0-R1).
     // If no CpuTemp sensor is found for N cycles, force fans to a safe minimum.
     let mut no_cpu_sensor_cycles: u32 = 0;
+
+    // Cross-cycle tuning state for `evaluate_profile`. Cleared when the active
+    // profile changes or is deactivated so step-rate limiting and start/stop
+    // hysteresis don't leak between unrelated profiles.
+    let mut engine_state = ProfileEngineState::new();
 
     loop {
         tokio::select! {
@@ -221,9 +330,12 @@ pub async fn profile_engine_loop(
         let commands = {
             let profile_guard = profile.lock();
             let Some(ref active_profile) = *profile_guard else {
-                continue; // No profile loaded
+                // No profile loaded — drop any leftover tuning state so a
+                // later activation doesn't pick up stale cross-cycle outputs.
+                engine_state.deactivate();
+                continue;
             };
-            evaluate_profile(active_profile, &cache)
+            evaluate_profile(active_profile, &cache, &mut engine_state)
         };
 
         // Execute write commands — split into sync (OpenFan) and async (GPU) phases
@@ -489,7 +601,7 @@ mod tests {
         // The safety sensor lookup must work with Intel "Package id 0" labels
         let cache = make_cache_with_cpu_sensor("cpu", "Package id 0", 55.0);
         let profile = make_profile("curve", "graph", 50.0);
-        let cmds = evaluate_profile(&profile, &cache);
+        let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
         assert_eq!(cmds.len(), 1);
         // At 55C with graph curve, should produce 60% (same as AMD Tctl test)
         assert_eq!(cmds[0].pwm_percent, 60);
@@ -617,7 +729,7 @@ mod tests {
     fn evaluate_manual_mode_returns_manual_pct() {
         let profile = make_profile("manual", "flat", 50.0);
         let cache = make_cache_with_sensor("cpu", 50.0);
-        let cmds = evaluate_profile(&profile, &cache);
+        let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].pwm_percent, 42); // manual_output_pct
     }
@@ -626,7 +738,7 @@ mod tests {
     fn evaluate_curve_mode_uses_sensor_temp() {
         let profile = make_profile("curve", "graph", 50.0);
         let cache = make_cache_with_sensor("cpu", 55.0);
-        let cmds = evaluate_profile(&profile, &cache);
+        let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
         assert_eq!(cmds.len(), 1);
         // At 55°C with 30→20%, 80→100%: (55-30)/(80-30) = 0.5, 20+0.5*80 = 60%
         assert_eq!(cmds[0].pwm_percent, 60);
@@ -637,7 +749,7 @@ mod tests {
     fn evaluate_missing_sensor_skips_control() {
         let profile = make_profile("curve", "graph", 50.0);
         let cache = make_cache_with_sensor("gpu", 50.0); // wrong sensor
-        let cmds = evaluate_profile(&profile, &cache);
+        let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
         assert!(cmds.is_empty()); // sensor "cpu" not found
     }
 
@@ -646,7 +758,7 @@ mod tests {
         let mut profile = make_profile("curve", "graph", 50.0);
         profile.controls[0].members.clear();
         let cache = make_cache_with_sensor("cpu", 50.0);
-        let cmds = evaluate_profile(&profile, &cache);
+        let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
         assert!(cmds.is_empty());
     }
 
@@ -656,7 +768,7 @@ mod tests {
         profile.controls[0].offset_pct = 10.0;
         profile.controls[0].minimum_pct = 35.0;
         let cache = make_cache_with_sensor("cpu", 50.0);
-        let cmds = evaluate_profile(&profile, &cache);
+        let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
         assert_eq!(cmds.len(), 1);
         // flat=20, +offset=10 → 30, but minimum=35 → clamped to 35
         assert_eq!(cmds[0].pwm_percent, 35);
@@ -667,8 +779,184 @@ mod tests {
         let mut profile = make_profile("curve", "flat", 95.0);
         profile.controls[0].offset_pct = 20.0;
         let cache = make_cache_with_sensor("cpu", 50.0);
-        let cmds = evaluate_profile(&profile, &cache);
+        let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
         assert_eq!(cmds[0].pwm_percent, 100); // 95+20=115, clamped to 100
+    }
+
+    // ── M1: full tuning pipeline — step rate, start/stop, cross-cycle state ──
+
+    #[test]
+    fn tuning_step_up_rate_limits_large_jump() {
+        // curve output jumps 30 → 80, step_up=10 → engine should only allow +10/cycle
+        let mut profile = make_profile("curve", "flat", 30.0);
+        profile.controls[0].step_up_pct = 10.0;
+        profile.controls[0].step_down_pct = 100.0;
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let mut state = ProfileEngineState::new();
+
+        // Cycle 1: no prior output → curve value passes through → 30
+        let cmds = evaluate_profile(&profile, &cache, &mut state);
+        assert_eq!(cmds[0].pwm_percent, 30);
+
+        // Curve jumps to 80 (simulate by rebuilding profile)
+        profile.curves[0].flat_output_pct = Some(80.0);
+
+        // Cycle 2: step_up caps the increase at +10 → 40
+        let cmds = evaluate_profile(&profile, &cache, &mut state);
+        assert_eq!(cmds[0].pwm_percent, 40);
+
+        // Cycle 3: another +10 → 50
+        let cmds = evaluate_profile(&profile, &cache, &mut state);
+        assert_eq!(cmds[0].pwm_percent, 50);
+    }
+
+    #[test]
+    fn tuning_step_down_rate_limits_large_drop() {
+        let mut profile = make_profile("curve", "flat", 80.0);
+        profile.controls[0].step_up_pct = 100.0;
+        profile.controls[0].step_down_pct = 15.0;
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let mut state = ProfileEngineState::new();
+
+        // Cycle 1: 80
+        let cmds = evaluate_profile(&profile, &cache, &mut state);
+        assert_eq!(cmds[0].pwm_percent, 80);
+
+        // Drop curve to 20
+        profile.curves[0].flat_output_pct = Some(20.0);
+
+        // Cycle 2: step_down caps at -15 → 65
+        let cmds = evaluate_profile(&profile, &cache, &mut state);
+        assert_eq!(cmds[0].pwm_percent, 65);
+    }
+
+    #[test]
+    fn tuning_stop_threshold_snaps_to_zero() {
+        // Flat curve at 15%, stop_pct=20 → snapped to 0
+        let mut profile = make_profile("curve", "flat", 15.0);
+        profile.controls[0].stop_pct = 20.0;
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let mut state = ProfileEngineState::new();
+
+        let cmds = evaluate_profile(&profile, &cache, &mut state);
+        assert_eq!(cmds[0].pwm_percent, 0);
+        assert_eq!(state.last_output("ctrl1"), Some(0.0));
+    }
+
+    #[test]
+    fn tuning_start_threshold_jumps_from_zero() {
+        // Previous cycle was stopped (below stop_pct). Next cycle curve says
+        // a small non-zero value → start_pct should kick the fan to spin-up.
+        let mut profile = make_profile("curve", "flat", 10.0);
+        profile.controls[0].stop_pct = 20.0;
+        profile.controls[0].start_pct = 35.0;
+        // Step rate must NOT bite on the 0→start transition, else start_pct
+        // gets clamped back down. GUI parity: start_pct applies after step-rate.
+        profile.controls[0].step_up_pct = 100.0;
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let mut state = ProfileEngineState::new();
+
+        // Cycle 1: 10% < stop_pct → snap to 0
+        let cmds = evaluate_profile(&profile, &cache, &mut state);
+        assert_eq!(cmds[0].pwm_percent, 0);
+
+        // Curve now says 25% (above stop_pct so not snapped; start hysteresis kicks in)
+        profile.curves[0].flat_output_pct = Some(25.0);
+        let cmds = evaluate_profile(&profile, &cache, &mut state);
+        // Without start_pct it would be 25; with start_pct=35 from 0 → clamped up to 35
+        assert_eq!(cmds[0].pwm_percent, 35);
+    }
+
+    #[test]
+    fn tuning_state_persists_across_cycles() {
+        let mut profile = make_profile("curve", "flat", 50.0);
+        profile.controls[0].step_up_pct = 5.0;
+        profile.controls[0].step_down_pct = 5.0;
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let mut state = ProfileEngineState::new();
+
+        // Three cycles on the same curve — output should be identical and
+        // state.last_output should reflect the tuned value.
+        for _ in 0..3 {
+            let cmds = evaluate_profile(&profile, &cache, &mut state);
+            assert_eq!(cmds[0].pwm_percent, 50);
+        }
+        assert_eq!(state.last_output("ctrl1"), Some(50.0));
+    }
+
+    #[test]
+    fn tuning_state_cleared_on_profile_id_change() {
+        // Profile A leaves last_output=80. Swapping to profile B with a
+        // different id should discard A's state so B's first cycle evaluates
+        // freely without A's rate-limit anchor.
+        let profile_a = make_profile("curve", "flat", 80.0);
+        let mut profile_b = make_profile("curve", "flat", 30.0);
+        profile_b.id = "other".into();
+        profile_b.controls[0].step_down_pct = 5.0; // would clamp if stale anchor persisted
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let mut state = ProfileEngineState::new();
+
+        let cmds = evaluate_profile(&profile_a, &cache, &mut state);
+        assert_eq!(cmds[0].pwm_percent, 80);
+        assert_eq!(state.last_output("ctrl1"), Some(80.0));
+
+        // Profile id changes → state cleared → step_down_pct no longer bites
+        let cmds = evaluate_profile(&profile_b, &cache, &mut state);
+        assert_eq!(cmds[0].pwm_percent, 30);
+    }
+
+    #[test]
+    fn tuning_state_cleared_on_deactivate() {
+        let profile = make_profile("curve", "flat", 60.0);
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let mut state = ProfileEngineState::new();
+
+        evaluate_profile(&profile, &cache, &mut state);
+        assert!(state.last_output("ctrl1").is_some());
+
+        state.deactivate();
+        assert!(state.last_output("ctrl1").is_none());
+    }
+
+    #[test]
+    fn tuning_step_rate_ignored_on_first_cycle() {
+        // With no prior last_output, step_up_pct must NOT cap the initial
+        // value — otherwise the engine would start every fan at 0 and climb
+        // 1%/s to the desired speed.
+        let mut profile = make_profile("curve", "flat", 75.0);
+        profile.controls[0].step_up_pct = 5.0;
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let mut state = ProfileEngineState::new();
+
+        let cmds = evaluate_profile(&profile, &cache, &mut state);
+        assert_eq!(cmds[0].pwm_percent, 75);
+    }
+
+    #[test]
+    fn tuning_rounds_to_nearest_not_truncates() {
+        // 49.6 should round to 50, not truncate to 49 (GUI parity, see
+        // `_write_target`'s `round(pwm_percent)`).
+        let mut profile = make_profile("curve", "flat", 49.6);
+        profile.controls[0].step_up_pct = 100.0;
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let mut state = ProfileEngineState::new();
+
+        let cmds = evaluate_profile(&profile, &cache, &mut state);
+        assert_eq!(cmds[0].pwm_percent, 50);
+    }
+
+    #[test]
+    fn tuning_tracks_float_not_rounded_value() {
+        // Step-rate limit should operate on the f64 pre-rounded output so
+        // 0.4 of a percent per cycle accumulates to a visible change instead
+        // of being flattened to 0 at each integer rounding boundary.
+        let mut profile = make_profile("curve", "flat", 10.2);
+        profile.controls[0].step_up_pct = 100.0;
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let mut state = ProfileEngineState::new();
+
+        evaluate_profile(&profile, &cache, &mut state);
+        assert_eq!(state.last_output("ctrl1"), Some(10.2));
     }
 
     // ── Profile engine loop integration tests (T2 audit finding) ───
@@ -874,7 +1162,7 @@ mod tests {
         // source="amd_gpu" and the correct member_id.
         let profile = make_gpu_profile("curve", "graph", 50.0);
         let cache = make_cache_with_sensor("cpu", 55.0);
-        let cmds = evaluate_profile(&profile, &cache);
+        let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].source, "amd_gpu");
         assert_eq!(cmds[0].member_id, "amd_gpu:0000:03:00.0");
@@ -886,7 +1174,7 @@ mod tests {
     fn evaluate_gpu_manual_mode() {
         let profile = make_gpu_profile("manual", "flat", 50.0);
         let cache = make_cache_with_sensor("cpu", 50.0);
-        let cmds = evaluate_profile(&profile, &cache);
+        let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].source, "amd_gpu");
         assert_eq!(cmds[0].pwm_percent, 50); // manual_output_pct
@@ -904,7 +1192,7 @@ mod tests {
             member_label: "".into(),
         });
         let cache = make_cache_with_sensor("cpu", 55.0);
-        let cmds = evaluate_profile(&profile, &cache);
+        let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
         assert_eq!(cmds.len(), 2);
 
         let gpu_cmd = cmds.iter().find(|c| c.source == "amd_gpu").unwrap();
