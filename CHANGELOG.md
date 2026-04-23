@@ -1,5 +1,44 @@
 # Changelog
 
+## [1.5.1] — 2026-04-23
+
+Follow-up audit remediation on v1.5.0. Pairs with **GUI v1.6.1**.
+Three small wire-contract fixes plus documentation hygiene — no behavioural
+change to the safety or control paths.
+
+### Fixed
+- **GPU "no fan path" error envelope.** `POST /gpu/{id}/fan/pwm` and
+  `POST /gpu/{id}/fan/reset` now return HTTP 400 `feature_unavailable`
+  (retryable:false, source:"validation") when the addressed GPU has
+  neither a PMFW `fan_curve` nor legacy `pwm1` write path. Previously
+  returned HTTP 400 with `hardware_unavailable` (retryable:true), which
+  contradicts the documented contract (`hardware_unavailable` is a 503
+  code and the condition is permanent for the device, not retryable).
+  Two new integration tests lock in the new shape.
+- **`POST /hwmon/{id}/verify` lease-expiry mapping.** The verify handler
+  re-issues a PWM write after its up-front `validate_lease` check. If the
+  lease TTL expired between those two points, the write error was being
+  mapped to HTTP 500 `internal_error` instead of HTTP 403 `lease_required`.
+  The handler now delegates to the shared `hwmon_control_error_response`
+  mapper used by every sibling hwmon handler. Two new unit tests cover the
+  mapping.
+- **SSE `too_many_clients` source field.** `GET /events` now reports
+  `source: "internal"` for the client-cap rejection (was `"validation"`,
+  which is wrong for a transport-level condition — the request shape is
+  fine, the server-side cap is the limiting factor).
+
+### Added
+- **`ErrorEnvelope::feature_unavailable`** — new helper for the "endpoint
+  exists, device exists, device lacks this capability" case. Distinct
+  from `hardware_unavailable` (transient / retryable) and
+  `validation_error` (malformed request shape).
+
+### Changed
+- **Docs: stale working-doc link removed.** `AmdGpuCapability.pci_id`
+  doc comment in `api/responses.rs` no longer points at the deleted
+  GUI-side `docs/23_Contract_Mismatch_Backlog.md`; replaced with a
+  reference to GUI `CHANGELOG.md` v1.6.0 and `DECISIONS.md` DEC-042.
+
 ## [1.5.0] — 2026-04-23
 
 Contract-mismatch remediation (15-item cross-stack sweep). Pairs with

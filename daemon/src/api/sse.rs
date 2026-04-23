@@ -33,13 +33,17 @@ pub async fn events_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
                 "SSE connection rejected: {current} active clients (limit: {})",
                 constants::SSE_MAX_CLIENTS,
             );
+            // Source is "internal" (transport / availability) rather than
+            // "validation": the request shape is fine, the server-side client
+            // cap is the limiting factor. retryable:true because the cap
+            // relaxes as existing clients disconnect.
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 axum::Json(serde_json::json!({"error": {
                     "code": "too_many_clients",
                     "message": "maximum SSE connections reached",
                     "retryable": true,
-                    "source": "validation"
+                    "source": "internal"
                 }})),
             ));
         }

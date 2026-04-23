@@ -383,14 +383,14 @@ pub async fn hwmon_verify_handler(
     let current_pct = initial.pwm_percent.unwrap_or(50);
     let test_pct: u8 = if current_pct > 50 { 20 } else { 80 };
 
-    // Write test value via controller (sets pwm_enable=1 + PWM)
+    // Write test value via controller (sets pwm_enable=1 + PWM).
+    // Route errors through the shared HwmonControlError mapper: a lease that
+    // expired between the up-front validate_lease check and this write must
+    // surface as 403 lease_required, not 500 internal_error.
     {
         let mut ctrl = controller.lock();
         if let Err(e) = ctrl.set_pwm(&header_id, test_pct, &body.lease_id) {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &ErrorEnvelope::internal(format!("test write failed: {e}")),
-            );
+            return hwmon_control_error_response(e);
         }
     }
 
@@ -483,5 +483,35 @@ fn classify_verify_result(
             "rpm_unavailable".into(),
             "PWM values held but RPM sensor unavailable or too low to verify".into(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hwmon::lease::LeaseError;
+    use crate::hwmon::pwm_control::HwmonControlError;
+
+    /// P1-2 regression: a `HwmonControlError::Lease(_)` — which is what
+    /// `set_pwm` returns when the lease expires mid-call — must map to
+    /// 403 `lease_required`, never 500 `internal_error`. The verify handler
+    /// previously hand-rolled a 500; it now delegates to this mapper.
+    #[test]
+    fn hwmon_control_error_response_maps_lease_to_403() {
+        let err = HwmonControlError::Lease(LeaseError::NoLease);
+        let (status, body) = hwmon_control_error_response(err);
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let json = body.0;
+        assert_eq!(json["error"]["code"], "lease_required");
+        assert_eq!(json["error"]["retryable"], false);
+    }
+
+    #[test]
+    fn hwmon_control_error_response_maps_invalid_lease_to_403() {
+        let err = HwmonControlError::Lease(LeaseError::InvalidLease);
+        let (status, body) = hwmon_control_error_response(err);
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let json = body.0;
+        assert_eq!(json["error"]["code"], "lease_required");
     }
 }

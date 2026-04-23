@@ -816,3 +816,90 @@ async fn gpu_reset_fan_unknown_gpu_returns_404() {
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
 }
+
+/// Construct an `AppState` with one GPU that has no write path at all.
+fn test_app_state_with_unsupported_gpu(pci_bdf: &str) -> Arc<AppState> {
+    use control_ofc_daemon::hwmon::gpu_detect::AmdGpuInfo;
+    use std::path::PathBuf;
+
+    let cache = Arc::new(StateCache::new());
+    let unsupported = AmdGpuInfo {
+        pci_bdf: pci_bdf.into(),
+        pci_device_id: 0x0000,
+        pci_revision: 0x00,
+        pci_class: 0x030000,
+        marketing_name: Some("Fake unsupported GPU".into()),
+        hwmon_path: PathBuf::from("/nonexistent/hwmon"),
+        fan_curve_path: None,
+        fan_zero_rpm_path: None,
+        is_discrete: true,
+        has_fan_rpm: false,
+        has_pwm: false,
+        has_pwm_enable: false,
+        overdrive_enabled: false,
+    };
+    Arc::new(AppState {
+        cache,
+        staleness_config: StalenessConfig::default(),
+        daemon_version: "0.1.0-test".into(),
+        fan_controller: None,
+        hwmon_controller: None,
+        start_time: std::time::Instant::now(),
+        history: Arc::new(HistoryRing::new(250)),
+        active_profile: Arc::new(parking_lot::Mutex::new(None)),
+        calibrating: std::sync::atomic::AtomicBool::new(false),
+        amd_gpus: vec![unsupported],
+        profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
+        config_path: String::new(),
+        runtime_config_path: std::path::PathBuf::new(),
+        sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    })
+}
+
+#[tokio::test]
+async fn gpu_set_fan_unsupported_returns_400_feature_unavailable() {
+    // P1-1: when a GPU exists but has no fan write path (no PMFW fan_curve,
+    // no legacy pwm1), the handler previously returned 400 hardware_unavailable
+    // + retryable:true — a contract violation (hardware_unavailable is a 503
+    // code, and the condition is permanent so not retryable).
+    //
+    // The fix is a dedicated `feature_unavailable` code (400, retryable:false,
+    // source "validation") to distinguish "this device can't do this" from
+    // "hardware failed transiently".
+    let bdf = "0000:99:00.0";
+    let state = test_app_state_with_unsupported_gpu(bdf);
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let body = serde_json::json!({ "speed_pct": 50 });
+    let (status, json) = uds_post(&path, &format!("/gpu/{bdf}/fan/pwm"), &body).await;
+
+    assert_eq!(status, 400);
+    assert_eq!(json["error"]["code"], "feature_unavailable");
+    assert_eq!(json["error"]["retryable"], false);
+    assert_eq!(json["error"]["source"], "validation");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn gpu_reset_fan_unsupported_returns_400_feature_unavailable() {
+    // P1-1 (reset path): mirror of the set-fan test for /gpu/{id}/fan/reset.
+    let bdf = "0000:99:00.1";
+    let state = test_app_state_with_unsupported_gpu(bdf);
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_post(
+        &path,
+        &format!("/gpu/{bdf}/fan/reset"),
+        &serde_json::json!({}),
+    )
+    .await;
+
+    assert_eq!(status, 400);
+    assert_eq!(json["error"]["code"], "feature_unavailable");
+    assert_eq!(json["error"]["retryable"], false);
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}

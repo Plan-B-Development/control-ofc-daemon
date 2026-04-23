@@ -116,7 +116,7 @@ pub async fn gpu_set_fan_handler(
         None => {
             return error_response(
                 StatusCode::BAD_REQUEST,
-                &ErrorEnvelope::hardware_unavailable(format!(
+                &ErrorEnvelope::feature_unavailable(format!(
                     "GPU {gpu_id} does not support fan control"
                 )),
             );
@@ -246,7 +246,7 @@ pub async fn gpu_reset_fan_handler(
     } else {
         error_response(
             StatusCode::BAD_REQUEST,
-            &ErrorEnvelope::hardware_unavailable(format!(
+            &ErrorEnvelope::feature_unavailable(format!(
                 "GPU {gpu_id} does not support fan control"
             )),
         )
