@@ -238,8 +238,8 @@ pub struct AmdGpuCapability {
     /// PCI Bus:Device.Function address (legacy field name).
     ///
     /// Deprecated alias for `pci_bdf` — both fields carry the same value
-    /// during the transition to canonical naming (M11 in
-    /// `docs/23_Contract_Mismatch_Backlog.md` on the GUI side). New callers
+    /// during the transition to canonical naming (M11 contract remediation,
+    /// see GUI `CHANGELOG.md` v1.6.0 and `DECISIONS.md` DEC-042). New callers
     /// should prefer `pci_bdf`; this field will be removed in a future
     /// major version.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -537,6 +537,24 @@ impl ErrorEnvelope {
         }
     }
 
+    /// The endpoint exists and the addressed device exists, but this device
+    /// lacks the capability the caller is trying to exercise (e.g. a GPU with
+    /// no PMFW `fan_curve` and no legacy `pwm1` write path). Distinct from
+    /// `hardware_unavailable` (transient / retryable hardware failure) and
+    /// `validation_error` (malformed request shape). Returned with HTTP 400
+    /// and `retryable: false` — the condition is permanent for this device.
+    pub fn feature_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            error: ErrorBody {
+                code: "feature_unavailable".into(),
+                message: message.into(),
+                details: None,
+                retryable: false,
+                source: "validation".into(),
+            },
+        }
+    }
+
     pub fn lease_error(message: impl Into<String>) -> Self {
         Self {
             error: ErrorBody {
@@ -614,6 +632,15 @@ mod tests {
         let json = serde_json::to_value(&env).unwrap();
         assert_eq!(json["error"]["code"], "internal_error");
         assert_eq!(json["error"]["retryable"], true);
+    }
+
+    #[test]
+    fn feature_unavailable_is_not_retryable() {
+        let env = ErrorEnvelope::feature_unavailable("GPU has no fan write path");
+        let json = serde_json::to_value(&env).unwrap();
+        assert_eq!(json["error"]["code"], "feature_unavailable");
+        assert_eq!(json["error"]["retryable"], false);
+        assert_eq!(json["error"]["source"], "validation");
     }
 
     #[test]
