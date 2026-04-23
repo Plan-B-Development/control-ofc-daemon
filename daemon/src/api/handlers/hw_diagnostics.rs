@@ -62,6 +62,9 @@ pub async fn hardware_diagnostics_handler(
 
         GpuDiagnostics {
             pci_bdf: gpu.pci_bdf.clone(),
+            // M11: emit the same BDF under both names so callers aligned to
+            // `/capabilities.amd_gpu.pci_id` can use the identical field here.
+            pci_id: gpu.pci_bdf.clone(),
             pci_device_id: gpu.pci_device_id,
             pci_revision: gpu.pci_revision,
             model_name: gpu.marketing_name.clone(),

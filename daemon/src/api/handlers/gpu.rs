@@ -98,12 +98,15 @@ pub async fn gpu_set_fan_handler(
                         },
                     )
                 }
+                // M13: hardware_unavailable is a 503, not a 500. Sibling
+                // hwmon handlers already use 503 for this case.
                 Ok(Err(e)) => error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    StatusCode::SERVICE_UNAVAILABLE,
                     &ErrorEnvelope::hardware_unavailable(format!(
                         "GPU legacy PWM write failed: {e}"
                     )),
                 ),
+                // spawn_blocking task failure — that IS an internal error.
                 Err(e) => error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     &ErrorEnvelope::internal(format!("GPU fan write task failed: {e}")),
@@ -149,8 +152,9 @@ pub async fn gpu_set_fan_handler(
                 },
             )
         }
+        // M13: hardware_unavailable is a 503.
         Ok(Err(e)) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
             &ErrorEnvelope::hardware_unavailable(format!("GPU fan write failed: {e}")),
         ),
         Err(e) => error_response(
@@ -198,8 +202,9 @@ pub async fn gpu_reset_fan_handler(
                     }),
                 )
             }
+            // M13: hardware_unavailable is a 503.
             Ok(Err(e)) => error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::SERVICE_UNAVAILABLE,
                 &ErrorEnvelope::hardware_unavailable(format!("GPU fan reset failed: {e}")),
             ),
             Err(e) => error_response(
@@ -228,8 +233,9 @@ pub async fn gpu_reset_fan_handler(
                     }),
                 )
             }
+            // M13: hardware_unavailable is a 503.
             Ok(Err(e)) => error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::SERVICE_UNAVAILABLE,
                 &ErrorEnvelope::hardware_unavailable(format!("GPU legacy fan reset failed: {e}")),
             ),
             Err(e) => error_response(

@@ -319,10 +319,14 @@ pub async fn hwmon_verify_handler(
     let controller = match &state.hwmon_controller {
         Some(c) => c,
         None => {
+            // M12: match sibling hwmon handlers which all return 503
+            // hardware_unavailable when the controller is absent. Returning
+            // 404 here implied the endpoint itself was missing, which it is
+            // not — the hardware is.
             return error_response(
-                StatusCode::NOT_FOUND,
-                &ErrorEnvelope::validation("hwmon controller not available"),
-            )
+                StatusCode::SERVICE_UNAVAILABLE,
+                &ErrorEnvelope::hardware_unavailable("no hwmon PWM headers available"),
+            );
         }
     };
 

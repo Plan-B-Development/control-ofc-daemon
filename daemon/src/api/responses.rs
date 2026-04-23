@@ -235,9 +235,21 @@ pub struct AmdGpuCapability {
     pub model_name: Option<String>,
     /// Compact display label (e.g. "9070XT" or "AMD D-GPU").
     pub display_label: String,
-    /// PCI Bus:Device.Function address.
+    /// PCI Bus:Device.Function address (legacy field name).
+    ///
+    /// Deprecated alias for `pci_bdf` — both fields carry the same value
+    /// during the transition to canonical naming (M11 in
+    /// `docs/23_Contract_Mismatch_Backlog.md` on the GUI side). New callers
+    /// should prefer `pci_bdf`; this field will be removed in a future
+    /// major version.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pci_id: Option<String>,
+    /// PCI Bus:Device.Function address (canonical).
+    ///
+    /// Matches the field name already used by `GpuDiagnostics`, eliminating
+    /// the `/capabilities` vs `/diagnostics/hardware` naming mismatch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pci_bdf: Option<String>,
     /// PCI device ID (e.g. 0x7550 for Navi 48).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pci_device_id: Option<u16>,
@@ -391,7 +403,12 @@ pub struct HwmonChipInfo {
 /// GPU-specific diagnostics.
 #[derive(Debug, Clone, Serialize)]
 pub struct GpuDiagnostics {
+    /// PCI Bus:Device.Function address (canonical).
     pub pci_bdf: String,
+    /// Alias for `pci_bdf` — emitted so callers that consumed
+    /// `/capabilities.amd_gpu.pci_id` can use the same field name here
+    /// during the transition window (M11). Same string as `pci_bdf`.
+    pub pci_id: String,
     pub pci_device_id: u16,
     pub pci_revision: u8,
     pub model_name: Option<String>,
@@ -694,6 +711,7 @@ mod tests {
                     model_name: Some("RX 9070 XT".into()),
                     display_label: "9070XT".into(),
                     pci_id: Some("0000:2d:00.0".into()),
+                    pci_bdf: Some("0000:2d:00.0".into()),
                     pci_device_id: Some(0x7550),
                     pci_revision: Some(0xC0),
                     fan_control_method: "pmfw_curve".into(),
@@ -731,6 +749,56 @@ mod tests {
         assert_eq!(json["devices"]["openfan"]["channels"], 10);
         assert_eq!(json["devices"]["hwmon"]["pwm_header_count"], 3);
         assert_eq!(json["features"]["lease_required_for_hwmon_writes"], true);
+        // M11: both pci_id (legacy) and pci_bdf (canonical) must be emitted
+        // with the same BDF string so clients on either name keep working.
+        assert_eq!(json["devices"]["amd_gpu"]["pci_id"], "0000:2d:00.0");
+        assert_eq!(json["devices"]["amd_gpu"]["pci_bdf"], "0000:2d:00.0");
+    }
+
+    #[test]
+    fn gpu_capability_absent_gpu_omits_both_pci_fields() {
+        // M11: when no GPU is present, both pci_id and pci_bdf should be
+        // absent from the JSON (skip_serializing_if = is_none).
+        let cap = AmdGpuCapability {
+            present: false,
+            model_name: None,
+            display_label: "AMD D-GPU".into(),
+            pci_id: None,
+            pci_bdf: None,
+            pci_device_id: None,
+            pci_revision: None,
+            fan_control_method: "none".into(),
+            pmfw_supported: false,
+            fan_rpm_available: false,
+            fan_write_supported: false,
+            is_discrete: false,
+            overdrive_enabled: false,
+            gpu_zero_rpm_available: false,
+        };
+        let json = serde_json::to_value(&cap).unwrap();
+        assert!(json.get("pci_id").is_none());
+        assert!(json.get("pci_bdf").is_none());
+    }
+
+    #[test]
+    fn gpu_diagnostics_emits_both_pci_names() {
+        // M11: GpuDiagnostics emits both pci_bdf (canonical) and pci_id
+        // (alias) with identical BDF strings during the transition.
+        let diag = GpuDiagnostics {
+            pci_bdf: "0000:03:00.0".into(),
+            pci_id: "0000:03:00.0".into(),
+            pci_device_id: 0x7550,
+            pci_revision: 0xC0,
+            model_name: Some("RX 9070 XT".into()),
+            fan_control_method: "pmfw_curve".into(),
+            overdrive_enabled: true,
+            ppfeaturemask: Some("0x4000".into()),
+            ppfeaturemask_bit14_set: true,
+            zero_rpm_available: true,
+        };
+        let json = serde_json::to_value(&diag).unwrap();
+        assert_eq!(json["pci_bdf"], "0000:03:00.0");
+        assert_eq!(json["pci_id"], "0000:03:00.0");
     }
 
     #[test]

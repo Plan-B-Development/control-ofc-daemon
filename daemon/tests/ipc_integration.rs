@@ -762,3 +762,57 @@ async fn unknown_endpoint_returns_error_envelope() {
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
 }
+
+// ── M12 / M13: hardware-unavailable status code consistency ─────────────
+
+#[tokio::test]
+async fn hwmon_verify_no_controller_returns_503() {
+    // M12: when no hwmon controller is present (OpenFan-only or GPU-only
+    // systems), /hwmon/{id}/verify must return 503 hardware_unavailable to
+    // match every sibling hwmon endpoint, not 404 validation_error.
+    let state = test_app_state(); // hwmon_controller = None
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let body = serde_json::json!({ "lease_id": "any" });
+    let (status, json) = uds_post(&path, "/hwmon/fake:header/verify", &body).await;
+
+    assert_eq!(status, 503);
+    assert_eq!(json["error"]["code"], "hardware_unavailable");
+    assert_eq!(json["error"]["retryable"], true);
+    assert_eq!(json["error"]["source"], "hardware");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn gpu_set_fan_unknown_gpu_returns_404() {
+    // Sanity: unknown GPU id remains 404 (that IS a validation error — the
+    // endpoint exists, the caller's id doesn't).
+    let state = test_app_state(); // amd_gpus empty
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let body = serde_json::json!({ "speed_pct": 50 });
+    let (status, json) = uds_post(&path, "/gpu/0000:99:00.0/fan/pwm", &body).await;
+
+    assert_eq!(status, 404);
+    assert_eq!(json["error"]["code"], "validation_error");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn gpu_reset_fan_unknown_gpu_returns_404() {
+    let state = test_app_state(); // amd_gpus empty
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) =
+        uds_post(&path, "/gpu/0000:99:00.0/fan/reset", &serde_json::json!({})).await;
+
+    assert_eq!(status, 404);
+    assert_eq!(json["error"]["code"], "validation_error");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
