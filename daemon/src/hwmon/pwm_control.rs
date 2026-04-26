@@ -6,7 +6,13 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Periodic INFO summary cadence for the pwm_enable watchdog log throttle.
+/// First reclaim per header is logged at WARN, subsequent reverts at DEBUG,
+/// and a single INFO line is emitted every `WATCHDOG_SUMMARY_INTERVAL`
+/// reporting the delta and cumulative count. See `decide_watchdog_log_action`.
+const WATCHDOG_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
 
 use crate::error::HwmonError;
 use crate::health::cache::StateCache;
@@ -90,6 +96,73 @@ struct HeaderWriteState {
     manual_mode_set: bool,
 }
 
+/// Per-header throttle state for the pwm_enable watchdog log.
+#[derive(Debug, Default, Clone)]
+struct WatchdogLogState {
+    /// Whether the first reclaim has been logged at WARN.
+    first_warn_emitted: bool,
+    /// Time of the last emitted WARN/INFO log line for this header.
+    last_emit_at: Option<Instant>,
+    /// Cumulative reclaim count at the last emitted summary.
+    count_at_last_summary: u64,
+}
+
+/// Decision returned by [`decide_watchdog_log_action`] — what (if anything)
+/// the watchdog should log on a given reclaim event.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum WatchdogLogAction {
+    /// First reclaim per header — emit at WARN so the operator notices.
+    Warn,
+    /// Subsequent reclaim within the summary interval — emit at DEBUG only.
+    Debug,
+    /// Summary interval elapsed — emit a single INFO with delta + cumulative.
+    Summary { delta: u64, cumulative: u64 },
+}
+
+/// Decide what the watchdog should log for this reclaim event.
+///
+/// Pure function over the per-header [`WatchdogLogState`]; mutates the state in
+/// place so the caller does not need to track the previous emission time. The
+/// throttle schedule:
+///
+/// * First reclaim per header → [`WatchdogLogAction::Warn`].
+/// * Reclaims within `summary_interval` of the last emission → [`Debug`].
+/// * Once the interval has elapsed → a single [`Summary`] with the delta count
+///   since the last summary and the running total.
+///
+/// The cumulative `enable_revert_counts` map is updated separately by the
+/// caller — this function only decides log-line emission, never gates the
+/// watchdog's remediation behaviour.
+fn decide_watchdog_log_action(
+    state: &mut WatchdogLogState,
+    now: Instant,
+    summary_interval: Duration,
+    count: u64,
+) -> WatchdogLogAction {
+    if !state.first_warn_emitted {
+        state.first_warn_emitted = true;
+        state.last_emit_at = Some(now);
+        state.count_at_last_summary = count;
+        return WatchdogLogAction::Warn;
+    }
+
+    let due_for_summary = state
+        .last_emit_at
+        .is_some_and(|t| now.duration_since(t) >= summary_interval);
+
+    if due_for_summary {
+        let delta = count.saturating_sub(state.count_at_last_summary);
+        state.last_emit_at = Some(now);
+        state.count_at_last_summary = count;
+        return WatchdogLogAction::Summary {
+            delta,
+            cumulative: count,
+        };
+    }
+
+    WatchdogLogAction::Debug
+}
+
 /// Controller for hwmon PWM writes with lease enforcement and write verification.
 pub struct HwmonPwmController {
     headers: HashMap<String, PwmHeaderDescriptor>,
@@ -100,6 +173,11 @@ pub struct HwmonPwmController {
     write_state: HashMap<String, HeaderWriteState>,
     /// Cumulative BIOS pwm_enable reclaim events per header. Persists across leases.
     enable_revert_counts: HashMap<String, u64>,
+    /// Per-header log throttle state for the pwm_enable watchdog. Persists
+    /// across leases so the first WARN is emitted at most once per controller
+    /// lifetime per header — subsequent reverts collapse into periodic INFO
+    /// summaries instead of one WARN per second.
+    watchdog_log_state: HashMap<String, WatchdogLogState>,
 }
 
 impl HwmonPwmController {
@@ -119,6 +197,7 @@ impl HwmonPwmController {
             cache,
             write_state: HashMap::new(),
             enable_revert_counts: HashMap::new(),
+            watchdog_log_state: HashMap::new(),
         }
     }
 
@@ -225,10 +304,41 @@ impl HwmonPwmController {
                 .get(header_id)
                 .copied()
                 .unwrap_or(0);
-            log::warn!(
-                "pwm_enable for '{}' reclaimed by BIOS (count: {count})",
-                header_id
+
+            // Throttle log emission: first reclaim WARN, subsequent DEBUG,
+            // single INFO summary every WATCHDOG_SUMMARY_INTERVAL. The
+            // cumulative count above is unaffected by throttling — it is the
+            // canonical figure surfaced via /diagnostics/hardware.
+            let log_state = self
+                .watchdog_log_state
+                .entry(header_id.to_string())
+                .or_default();
+            let action = decide_watchdog_log_action(
+                log_state,
+                Instant::now(),
+                WATCHDOG_SUMMARY_INTERVAL,
+                count,
             );
+            match action {
+                WatchdogLogAction::Warn => {
+                    log::warn!(
+                        "pwm_enable for '{header_id}' reclaimed by BIOS (count: {count}); \
+                         daemon watchdog is restoring manual mode. \
+                         Subsequent reverts logged at DEBUG; INFO summary every {}s.",
+                        WATCHDOG_SUMMARY_INTERVAL.as_secs(),
+                    );
+                }
+                WatchdogLogAction::Summary { delta, cumulative } => {
+                    log::info!(
+                        "pwm_enable for '{header_id}' reclaimed {delta} time(s) in last {}s \
+                         (cumulative: {cumulative}); watchdog still restoring manual mode.",
+                        WATCHDOG_SUMMARY_INTERVAL.as_secs(),
+                    );
+                }
+                WatchdogLogAction::Debug => {
+                    log::debug!("pwm_enable for '{header_id}' reclaimed by BIOS (count: {count})");
+                }
+            }
         }
 
         let ws = self.write_state.entry(header_id.to_string()).or_default();
@@ -989,5 +1099,202 @@ mod tests {
         // First: enable(1) + pwm(50). After resume: enable(1) + pwm(50).
         assert_eq!(w.len(), 4);
         assert_eq!(w[2].1, "1"); // re-wrote enable after resume
+    }
+
+    // ── Watchdog log throttle tests ─────────────────────────────────
+    //
+    // The watchdog still runs once per reclaim — these tests cover the
+    // *log-emission* throttle that turns 3,600 WARN/hr into roughly 60
+    // INFO/hr while preserving the per-event cumulative counter.
+
+    #[test]
+    fn watchdog_log_throttle_first_event_emits_warn() {
+        // Cold state: the very first reclaim per header must produce a WARN
+        // so the operator sees BIOS interference at least once.
+        let mut state = WatchdogLogState::default();
+        let now = Instant::now();
+        let action = decide_watchdog_log_action(&mut state, now, WATCHDOG_SUMMARY_INTERVAL, 1);
+
+        assert_eq!(action, WatchdogLogAction::Warn);
+        assert!(state.first_warn_emitted);
+        assert_eq!(state.last_emit_at, Some(now));
+        assert_eq!(state.count_at_last_summary, 1);
+    }
+
+    #[test]
+    fn watchdog_log_throttle_subsequent_within_interval_are_debug() {
+        // Within the summary interval, every reclaim after the first should
+        // collapse to DEBUG so journalctl is not spammed once per second.
+        let mut state = WatchdogLogState::default();
+        let t0 = Instant::now();
+
+        // First reclaim → WARN.
+        let _ = decide_watchdog_log_action(&mut state, t0, WATCHDOG_SUMMARY_INTERVAL, 1);
+
+        // 59 subsequent reclaims spaced one second apart, still inside the
+        // 60-second window: every action must be DEBUG.
+        for i in 1..60u64 {
+            let action = decide_watchdog_log_action(
+                &mut state,
+                t0 + Duration::from_secs(i),
+                WATCHDOG_SUMMARY_INTERVAL,
+                i + 1,
+            );
+            assert_eq!(
+                action,
+                WatchdogLogAction::Debug,
+                "expected Debug at offset {i}s, got {action:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn watchdog_log_throttle_summary_emits_once_per_interval() {
+        // After the summary interval elapses, the throttle must emit a single
+        // INFO summary with the delta and cumulative figure, then return to
+        // DEBUG for the next interval.
+        let mut state = WatchdogLogState::default();
+        let t0 = Instant::now();
+
+        // Minute 1: first reclaim WARN at count=1; then 59 DEBUG events.
+        let _ = decide_watchdog_log_action(&mut state, t0, WATCHDOG_SUMMARY_INTERVAL, 1);
+        for i in 1..60u64 {
+            let _ = decide_watchdog_log_action(
+                &mut state,
+                t0 + Duration::from_secs(i),
+                WATCHDOG_SUMMARY_INTERVAL,
+                i + 1,
+            );
+        }
+
+        // Minute 2 starts at exactly t+60s: a single INFO summary should
+        // fire reporting delta=60 (60 events since the last emit) and
+        // cumulative=61 (count at this moment).
+        let action = decide_watchdog_log_action(
+            &mut state,
+            t0 + Duration::from_secs(60),
+            WATCHDOG_SUMMARY_INTERVAL,
+            61,
+        );
+        assert_eq!(
+            action,
+            WatchdogLogAction::Summary {
+                delta: 60,
+                cumulative: 61,
+            }
+        );
+
+        // The next reclaim 1s later should drop back to DEBUG.
+        let action = decide_watchdog_log_action(
+            &mut state,
+            t0 + Duration::from_secs(61),
+            WATCHDOG_SUMMARY_INTERVAL,
+            62,
+        );
+        assert_eq!(action, WatchdogLogAction::Debug);
+    }
+
+    #[test]
+    fn watchdog_log_throttle_schedule_in_one_hour() {
+        // Steady-state spam scenario: 3600 reclaims, one per second, over one
+        // hour. The throttle must produce exactly:
+        //   - 1 Warn (the first event)
+        //   - 59 Summary (one at every minute boundary t=60, 120, ..., 3540)
+        //   - 3540 Debug (everything else)
+        // Total user-visible (Warn+Summary) emissions: 60 — one per minute,
+        // matching the documented "1 + N/60 per minute" budget.
+        let mut state = WatchdogLogState::default();
+        let t0 = Instant::now();
+
+        let mut warn_count = 0;
+        let mut info_count = 0;
+        let mut debug_count = 0;
+
+        for sec in 0..3600u64 {
+            let count = sec + 1;
+            let action = decide_watchdog_log_action(
+                &mut state,
+                t0 + Duration::from_secs(sec),
+                WATCHDOG_SUMMARY_INTERVAL,
+                count,
+            );
+            match action {
+                WatchdogLogAction::Warn => warn_count += 1,
+                WatchdogLogAction::Summary { .. } => info_count += 1,
+                WatchdogLogAction::Debug => debug_count += 1,
+            }
+        }
+
+        assert_eq!(
+            warn_count, 1,
+            "exactly one WARN per header per controller lifetime"
+        );
+        assert_eq!(
+            info_count, 59,
+            "one INFO summary at each 60s boundary after the initial WARN",
+        );
+        assert_eq!(debug_count, 3540, "everything else collapses to DEBUG",);
+        // Sanity: the three buckets sum to the total event count.
+        assert_eq!(warn_count + info_count + debug_count, 3600);
+    }
+
+    #[test]
+    fn watchdog_log_throttle_does_not_gate_revert_count() {
+        // Critical invariant: throttling the *log* must never throttle the
+        // *counter*. The cumulative enable_revert_counts must increment on
+        // every event so /diagnostics/hardware stays truthful regardless of
+        // log volume.
+        let (mut ctrl, _writes, _cache) =
+            setup_controller_with_enable(vec![make_header("h1", "CHA_FAN1", 0)], "2");
+
+        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lid = lease.lease_id.clone();
+
+        // First write seeds manual_mode_set; subsequent writes each hit the
+        // watchdog because the mock keeps returning pwm_enable="2".
+        ctrl.set_pwm("h1", 50, &lid).unwrap();
+        for pwm in 0..50u8 {
+            ctrl.set_pwm("h1", pwm, &lid).unwrap();
+        }
+
+        // 50 reclaim events expected (one per call after the first).
+        assert_eq!(ctrl.enable_revert_counts().get("h1"), Some(&50));
+    }
+
+    #[test]
+    fn watchdog_log_throttle_state_is_per_header() {
+        // Each header must have an independent first-WARN state — adding a
+        // second header late should still produce a WARN for that header,
+        // even after the first header has long since dropped to DEBUG.
+        let mut state_a = WatchdogLogState::default();
+        let mut state_b = WatchdogLogState::default();
+        let t0 = Instant::now();
+
+        // Header A: first reclaim at t=0 → WARN, then DEBUG at t=10s.
+        assert_eq!(
+            decide_watchdog_log_action(&mut state_a, t0, WATCHDOG_SUMMARY_INTERVAL, 1),
+            WatchdogLogAction::Warn,
+        );
+        assert_eq!(
+            decide_watchdog_log_action(
+                &mut state_a,
+                t0 + Duration::from_secs(10),
+                WATCHDOG_SUMMARY_INTERVAL,
+                2,
+            ),
+            WatchdogLogAction::Debug,
+        );
+
+        // Header B: first reclaim at t=10s → still its own WARN, regardless
+        // of header A's throttle clock.
+        assert_eq!(
+            decide_watchdog_log_action(
+                &mut state_b,
+                t0 + Duration::from_secs(10),
+                WATCHDOG_SUMMARY_INTERVAL,
+                1,
+            ),
+            WatchdogLogAction::Warn,
+        );
     }
 }
