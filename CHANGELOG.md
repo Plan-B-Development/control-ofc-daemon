@@ -1,5 +1,38 @@
 # Changelog
 
+## [1.5.2] — 2026-04-25
+
+Operator-experience patch: stop the journal-spam side effect of the
+pwm_enable watchdog without weakening the watchdog itself. Pairs with
+**GUI v1.7.1**.
+
+### Changed
+- **Throttled pwm_enable watchdog log emission.** `HwmonPwmController` no
+  longer emits one `WARN` line per second per affected header when the
+  BIOS/EC reclaims `pwm_enable`. Each header now produces a single `WARN`
+  on the first reclaim, subsequent reverts log at `DEBUG`, and a single
+  `INFO` summary fires every 60 s with the delta and cumulative count.
+  On a Gigabyte X870E AORUS MASTER (IT8696E) this drops journal volume
+  from ~3,600 entries/hour per active hwmon-controlled header to ~60/hr,
+  while preserving the existing remediation behaviour.
+
+### Unchanged (explicitly verified)
+- The watchdog still acts on **every** reclaim event — only the log
+  emission is throttled. Manual mode (`pwm_enable=1`) is re-written and
+  the PWM value re-issued exactly as before.
+- The cumulative `enable_revert_counts` figure exposed via
+  `GET /diagnostics/hardware` increments per event, regardless of
+  whether the event produced a `WARN`, `DEBUG`, or `INFO` line. Tests
+  pin this invariant.
+
+### Tests
+- Six new unit tests in `pwm_control.rs` covering: first-event WARN,
+  subsequent DEBUG within the 60 s window, single INFO summary at the
+  interval boundary with correct delta, full one-hour schedule
+  (`1 WARN + 59 INFO + 3540 DEBUG = 3600 events`), per-header state
+  isolation, and the load-bearing "throttling never gates the counter"
+  invariant.
+
 ## [1.5.1] — 2026-04-23
 
 Follow-up audit remediation on v1.5.0. Pairs with **GUI v1.6.1**.
