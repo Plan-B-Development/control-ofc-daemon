@@ -1,5 +1,51 @@
 # Changelog
 
+## [1.5.3] — 2026-04-28
+
+Truthfulness patch for `POST /hwmon/{header}/verify` — the `details`
+strings now acknowledge that a register change during the 3 s test
+window can come from another in-process writer (lease holder,
+thermal-safety override) and not only from BIOS/EC reclaim. Pairs with
+**GUI v1.8.0** which also pauses the GUI control loop during a verify
+call to eliminate the dominant racer (the GUI's own 1 Hz tick).
+
+### Changed
+- **`pwm_value_clamped` and `pwm_enable_reverted` `details` strings**
+  in `classify_verify_result` now name BIOS/EC firmware as the most
+  likely cause but call out the concurrent-writer alternative
+  explicitly, with a "Re-run with no profile active and no other
+  client writing" disambiguation hint. Wording-only — the response
+  shape, the `result` enum values (`effective` / `pwm_enable_reverted` /
+  `pwm_value_clamped` / `no_rpm_effect` / `rpm_unavailable`), HTTP
+  status codes, and error envelope are all unchanged. The GUI's
+  existing `hwmon_guidance.verification_guidance` lookup keeps
+  matching without coordinated GUI redeploys.
+
+### Unchanged (explicitly verified)
+- Verify wait duration (3 s), test PWM choice (20 % or 80 % depending
+  on initial), and classification thresholds (`delta > 10` raw for
+  clamped) are all preserved.
+- No new error-envelope variants. No schema changes.
+- The pre-existing `pwm_enable_reverted` BIOS/EC reclaim story
+  (DEC-074, AORUS Smart Fan watchdog) still applies — the wording
+  change just acknowledges the second possible cause.
+
+### Tests
+- Three new unit tests in `hwmon_ctl.rs::tests` covering the new
+  wording for both result variants and asserting the `result` enum
+  values are unchanged after the rewording.
+
+### Why
+A `/investigate-bug` pass on the X870E AORUS MASTER traced the user's
+"PWM control isn't working" report back to a misclassified verify
+result. The board controls correctly; the GUI's own control loop was
+racing the daemon's verify wait, and the classifier blamed BIOS/EC
+even though the racer was an internal Linux writer. GUI v1.8.0 fixes
+the race itself; this daemon patch fixes the wording so a residual
+race (e.g. an external CLI tool) does not produce a misleading verdict.
+See `PWM_VERIFY_REMEDIATION.md` in the GUI repo for the full
+investigation and approved plan.
+
 ## [1.5.2] — 2026-04-25
 
 Operator-experience patch: stop the journal-spam side effect of the

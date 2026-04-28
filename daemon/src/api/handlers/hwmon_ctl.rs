@@ -434,8 +434,13 @@ fn classify_verify_result(
             return (
                 "pwm_enable_reverted".into(),
                 format!(
-                    "pwm_enable changed from 1 to {final_enable} after write — \
-                     BIOS/EC is actively reclaiming fan control"
+                    "pwm_enable changed from 1 to {final_enable} after write. \
+                     Most likely cause: BIOS/EC firmware reasserting automatic \
+                     mode (e.g. AORUS Smart Fan reclaim). Less likely: another \
+                     in-process writer (lease holder, thermal-safety override) \
+                     flipped pwm_enable during the {VERIFY_WAIT_SECONDS}s test \
+                     window. Re-run with no profile active and no other client \
+                     writing to disambiguate."
                 ),
             );
         }
@@ -449,8 +454,13 @@ fn classify_verify_result(
             return (
                 "pwm_value_clamped".into(),
                 format!(
-                    "PWM value changed from test {test_raw} to {final_raw} — \
-                     BIOS/EC is overriding the PWM register"
+                    "PWM value changed from test {test_raw} to {final_raw} during \
+                     the {VERIFY_WAIT_SECONDS}s verify window. Most likely cause: \
+                     BIOS/EC firmware overriding the PWM register. Less likely: \
+                     another writer (lease holder, thermal-safety override, or a \
+                     CLI tool poking sysfs directly) wrote to the same header \
+                     during the test. Re-run with no profile active and no other \
+                     client writing to confirm BIOS/EC reclaim."
                 ),
             );
         }
@@ -513,5 +523,99 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
         let json = body.0;
         assert_eq!(json["error"]["code"], "lease_required");
+    }
+
+    /// B1: classify_verify_result `details` must acknowledge that an
+    /// in-process concurrent writer is a possible cause of a register
+    /// change during the verify wait. Before B1 the wording named BIOS/EC
+    /// as the only cause, which produced false `pwm_value_clamped`
+    /// verdicts on the X870E AORUS MASTER where the GUI's own control
+    /// loop was the racer.
+    #[test]
+    fn pwm_value_clamped_details_acknowledges_concurrent_writers() {
+        let initial = HwmonVerifyState {
+            pwm_enable: Some(1),
+            pwm_raw: Some(128),
+            pwm_percent: Some(50),
+            rpm: Some(1000),
+        };
+        // pwm_raw drifted significantly from the test value — should
+        // produce pwm_value_clamped.
+        let final_state = HwmonVerifyState {
+            pwm_enable: Some(1),
+            pwm_raw: Some(200),
+            pwm_percent: Some(78),
+            rpm: Some(1500),
+        };
+        let (result, details) = classify_verify_result(&initial, &final_state, 20);
+        assert_eq!(result, "pwm_value_clamped");
+        // Headline cause is still BIOS/EC — the most common case in the wild.
+        assert!(details.contains("BIOS/EC"), "details: {details:?}");
+        // But the wording must also call out the concurrent-writer alternative.
+        assert!(details.contains("another writer"), "details: {details:?}");
+        // The disambiguation hint must be present so users know how to confirm.
+        assert!(
+            details.contains("Re-run with no profile active"),
+            "details: {details:?}"
+        );
+    }
+
+    #[test]
+    fn pwm_enable_reverted_details_acknowledges_concurrent_writers() {
+        let initial = HwmonVerifyState {
+            pwm_enable: Some(1),
+            pwm_raw: Some(128),
+            pwm_percent: Some(50),
+            rpm: Some(1000),
+        };
+        // pwm_enable flipped back to 2 (auto/cruise) — pwm_enable_reverted.
+        let final_state = HwmonVerifyState {
+            pwm_enable: Some(2),
+            pwm_raw: Some(128),
+            pwm_percent: Some(50),
+            rpm: Some(1000),
+        };
+        let (result, details) = classify_verify_result(&initial, &final_state, 20);
+        assert_eq!(result, "pwm_enable_reverted");
+        assert!(details.contains("BIOS/EC"), "details: {details:?}");
+        assert!(
+            details.contains("another in-process writer"),
+            "details: {details:?}"
+        );
+        assert!(
+            details.contains("Re-run with no profile active"),
+            "details: {details:?}"
+        );
+    }
+
+    /// B1: result enum values must remain unchanged so the GUI's
+    /// `hwmon_guidance.verification_guidance` lookup still finds the right
+    /// keys without coordinated GUI redeploys. The wording change is
+    /// limited to the `details` field.
+    #[test]
+    fn b1_result_enum_values_unchanged() {
+        let initial = HwmonVerifyState {
+            pwm_enable: Some(1),
+            pwm_raw: Some(128),
+            pwm_percent: Some(50),
+            rpm: None,
+        };
+        let reverted = HwmonVerifyState {
+            pwm_enable: Some(2),
+            pwm_raw: Some(128),
+            pwm_percent: Some(50),
+            rpm: None,
+        };
+        let (result, _) = classify_verify_result(&initial, &reverted, 20);
+        assert_eq!(result, "pwm_enable_reverted");
+
+        let clamped = HwmonVerifyState {
+            pwm_enable: Some(1),
+            pwm_raw: Some(200),
+            pwm_percent: Some(78),
+            rpm: None,
+        };
+        let (result, _) = classify_verify_result(&initial, &clamped, 20);
+        assert_eq!(result, "pwm_value_clamped");
     }
 }
