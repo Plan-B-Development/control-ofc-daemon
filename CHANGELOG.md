@@ -1,5 +1,34 @@
 # Changelog
 
+## [1.5.6] — 2026-04-30
+
+Packaging hygiene release. No code, contract, or behaviour changes.
+
+### Fixed
+- **`depends=` now declares `libgcc` directly.** The release binary's
+  ELF `NEEDED` entries include `libgcc_s.so.1`, which was previously
+  satisfied only transitively through `systemd-libs → libgcc`. Declaring
+  it directly is namcap best practice and removes the implicit-dependency
+  warning. No effect on already-installed users (the resolver already
+  pulled `libgcc` in via the chain), but the chain is no longer fragile
+  if `systemd-libs` ever drops it.
+- **`packaging/.SRCINFO` is now tracked in-repo.** Was previously in
+  `.gitignore` and only maintained inside the AUR clone. The
+  `.gitignore` entry is removed and the file is regenerated against
+  the current PKGBUILD; the new pre-commit hook keeps it in sync going
+  forward (see Tooling).
+
+### Changed
+- **`makedepends=` no longer lists `cargo`.** The `rust` package
+  provides `cargo`; listing both is redundant.
+
+### Tooling
+- **New `.githooks/pre-commit`** that auto-regenerates
+  `packaging/.SRCINFO` whenever `packaging/PKGBUILD` is staged for
+  commit, so the in-repo file cannot drift again. Opt-in via:
+  `git config core.hooksPath .githooks`. The hook is a no-op when
+  `makepkg` is not on PATH (e.g. on non-Arch CI).
+
 ## [1.5.5] — 2026-04-30
 
 Patch release fixing a man-page rendering bug. No code changes.

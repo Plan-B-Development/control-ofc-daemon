@@ -27,4 +27,4 @@ packaging/src/
 packaging/pkg/
 packaging/*.pkg.tar*
 packaging/*.tar.gz
-packaging/.SRCINFO
+# packaging/.SRCINFO is now tracked and kept in sync via .githooks/pre-commit.
