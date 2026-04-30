@@ -76,8 +76,8 @@ _/run/control-ofc/control-ofc.sock_
 
 The daemon controls AMD GPU fans via one of two sysfs interfaces:
 
-. PMFW *fan_curve* — required for RDNA3+ cards (RX 7000 / RX 9000 series).
-. Legacy *pwm1_enable* + *pwm1* pair — used on RDNA2 and older
+. PMFW *fan_curve* -- required for RDNA3+ cards (RX 7000 / RX 9000 series).
+. Legacy *pwm1_enable* + *pwm1* pair -- used on RDNA2 and older
   (RX 6000 series and earlier).
 
 RDNA3+ cards do *not* accept *pwm1_enable=1* and must use the PMFW path.
@@ -89,24 +89,24 @@ parameter:
 amdgpu.ppfeaturemask=0xffffffff
 ```
 
-Without this, RDNA3+ fan control is read-only — the GUI displays RPM
+Without this, RDNA3+ fan control is read-only -- the GUI displays RPM
 but cannot write a curve. Pre-RDNA3 cards do not require this parameter.
 
 To set the kernel parameter:
 
-. *GRUB* — append to *GRUB_CMDLINE_LINUX_DEFAULT* in
+. *GRUB* -- append to *GRUB_CMDLINE_LINUX_DEFAULT* in
   _/etc/default/grub_, then run
   *sudo grub-mkconfig -o /boot/grub/grub.cfg*.
-. *systemd-boot* — append to the *options* line in the active loader
+. *systemd-boot* -- append to the *options* line in the active loader
   entry under _/boot/loader/entries/_.
-. *rEFInd* — append to the *options* line in _/boot/refind_linux.conf_
+. *rEFInd* -- append to the *options* line in _/boot/refind_linux.conf_
   or to the kernel argument list in _refind.conf_.
-. *Limine* — append to *KERNEL_CMDLINE* in _/etc/default/limine_,
+. *Limine* -- append to *KERNEL_CMDLINE* in _/etc/default/limine_,
   then run *sudo limine-mkinitcpio*.
 
 A reboot is required for kernel parameter changes to take effect.
 
-Verify with *cat /proc/cmdline* — the parameter must appear in the
+Verify with *cat /proc/cmdline* -- the parameter must appear in the
 output. The GUI's Diagnostics page also reports whether the PMFW
 fan_curve interface is reachable.
 

@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.5.5] — 2026-04-30
+
+Patch release fixing a man-page rendering bug. No code changes.
+
+### Fixed
+- **Man page em-dash rendering.** `man control-ofc-daemon` rendered every
+  em-dash (U+2014) as a doubled `——` on systems with groff 1.24+ (current
+  Arch). The groff 1.24 `tty.tmac` defines `.char \[em] \[em]\[em]` for
+  UTF-8 output to approximate the typographic em-quad width on a
+  half-width cell grid; passing literal U+2014 through scdoc therefore
+  emits `——`. Replaced em-dashes in `man/control-ofc-daemon.1.scd`
+  (NAME, AMD GPU SUPPORT, and bootloader sections) with the canonical
+  man-page convention `--`. `man control-ofc-daemon` now reads
+  correctly, including the bootloader checklist. Verified with
+  `groff -man -K utf8 -Tutf8 -ww` (zero warnings) and `man -l`.
+  Degree-sign rendering (`105°C`, `80°C`) is unaffected and continues
+  to render as a single character.
+
 ## [1.5.4] — 2026-04-30
 
 Install-experience and documentation packaging release. No changes to the
