@@ -18,7 +18,7 @@ options=(!lto)
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
 # Placeholder — recomputed post-tag-push. Fix with a follow-up
 # "fix: update PKGBUILD checksum for v1.5.6" commit.
-sha256sums=('SKIP')
+sha256sums=('076f2c8d3e0a0815e3e89393cf16889fe0724ee0afc3aa83788635ca55bac365')
 
 prepare() {
     cd "$pkgname-$pkgver"
