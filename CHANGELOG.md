@@ -1,5 +1,67 @@
 # Changelog
 
+## [1.5.4] — 2026-04-30
+
+Install-experience and documentation packaging release. No changes to the
+daemon binary's runtime behaviour, IPC contract, or persistence format.
+Existing operator config (`/etc/control-ofc/daemon.toml`) and runtime
+config (`/var/lib/control-ofc/runtime.toml`) load unchanged.
+
+### Added
+- **Man page ships.** `man control-ofc-daemon` now renders a manual that
+  documents CLI flags, environment variables, files, signals, and a new
+  AMD GPU section covering `amdgpu.ppfeaturemask=0xffffffff` per
+  bootloader (GRUB, systemd-boot, rEFInd, Limine).
+- **Shell completions ship** for bash, zsh, and fish under
+  `/usr/share/{bash-completion,zsh/site-functions,fish/vendor_completions.d}/`.
+  Tab-completion of `control-ofc-daemon --` works after install.
+- **User documentation ships in `/usr/share/doc/control-ofc-daemon/`:**
+  `README.md`, `CHANGELOG.md`, `daemon.md`, `USER_GUIDE.md`,
+  `DEVELOPER_HANDOVER.md`, and the new `ADRs/` directory.
+- **`docs/ADRs/001-ipc-transport.md`** and
+  **`docs/ADRs/002-runtime-config-split.md`.** The codebase had eight
+  outstanding cross-references to these ADRs; they are now written and
+  the references resolve.
+- **`SECURITY.md`** at the repo root, listing the supported version
+  range, contact, and the daemon's privilege/sysfs/socket boundaries.
+
+### Changed
+- **`post_install` message is rewritten to remove the dead-end "Install
+  the GUI: yay -S control-ofc-gui" line.** A user installing both
+  packages via `paru -S control-ofc-daemon control-ofc-gui` previously
+  saw a self-referential nudge to install the GUI they were already
+  installing, with a different AUR helper. The new message focuses on
+  the three things the daemon's installer can usefully tell the user:
+  enable command, modules-load hint, and where to find the man page
+  and USER_GUIDE.
+- **AMD GPU kernel-parameter advice in `post_install` is narrower and
+  pointed at the man page** rather than embedding bootloader-specific
+  steps in the install transcript. The man page's new AMD GPU section
+  now carries the per-bootloader detail.
+- **Man page recovery wording corrected:** the daemon's safety floor
+  is a 60 % PWM recovery floor applied for one cycle, not a "recover
+  at 60°C" temperature threshold (which was never the implementation).
+  Matches the wording in `daemon.md`, `USER_GUIDE.md`, and the
+  daemon's `safety.rs`.
+
+### Packaging
+- Adds `scdoc` to `makedepends`. Builds the man page via
+  `scdoc < man/control-ofc-daemon.1.scd` in `build()` and installs
+  to `/usr/share/man/man1/control-ofc-daemon.1`.
+- `sha256sums` switched to `SKIP` pending the post-tag-push checksum
+  refresh — same pattern as previous releases.
+
+### Why
+A `/audit documentation` pass on both repos plus a fresh
+`paru -S control-ofc-daemon control-ofc-gui` test surfaced eight
+install-experience defects, of which four were on the daemon side:
+no man page despite the source being checked in, no shell completions,
+a `/usr/share/doc/control-ofc-daemon/` directory with only a udev
+rules example (the `post_install` message advertised a "Full setup
+guide" there), and a self-referential `yay -S control-ofc-gui` line.
+This release fixes all four. See the GUI repo v1.9.1 entry for the
+matching client-side changes.
+
 ## [1.5.3] — 2026-04-28
 
 Truthfulness patch for `POST /hwmon/{header}/verify` — the `details`

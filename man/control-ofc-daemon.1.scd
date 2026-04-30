@@ -17,8 +17,9 @@ It serves an HTTP API over a Unix domain socket for client applications
 autonomously.
 
 The daemon owns thermal safety: 105°C triggers 100% PWM on all fans, holds
-until 80°C, recovers at 60°C. Forces 40% if no CPU sensor is found for 5
-consecutive poll cycles.
+until temperature falls below 80°C, then applies a 60% PWM recovery floor
+for one cycle before returning to active control. Forces 40% if no CPU
+sensor is reachable for 5 consecutive poll cycles.
 
 # OPTIONS
 
@@ -70,6 +71,44 @@ _/run/control-ofc/control-ofc.sock_
 	Reload configuration from daemon.toml and runtime.toml without
 	restarting. Profile search directories and polling intervals are
 	refreshed.
+
+# AMD GPU SUPPORT
+
+The daemon controls AMD GPU fans via one of two sysfs interfaces:
+
+. PMFW *fan_curve* — required for RDNA3+ cards (RX 7000 / RX 9000 series).
+. Legacy *pwm1_enable* + *pwm1* pair — used on RDNA2 and older
+  (RX 6000 series and earlier).
+
+RDNA3+ cards do *not* accept *pwm1_enable=1* and must use the PMFW path.
+
+The PMFW *fan_curve* sysfs node is gated behind the kernel command-line
+parameter:
+
+```
+amdgpu.ppfeaturemask=0xffffffff
+```
+
+Without this, RDNA3+ fan control is read-only — the GUI displays RPM
+but cannot write a curve. Pre-RDNA3 cards do not require this parameter.
+
+To set the kernel parameter:
+
+. *GRUB* — append to *GRUB_CMDLINE_LINUX_DEFAULT* in
+  _/etc/default/grub_, then run
+  *sudo grub-mkconfig -o /boot/grub/grub.cfg*.
+. *systemd-boot* — append to the *options* line in the active loader
+  entry under _/boot/loader/entries/_.
+. *rEFInd* — append to the *options* line in _/boot/refind_linux.conf_
+  or to the kernel argument list in _refind.conf_.
+. *Limine* — append to *KERNEL_CMDLINE* in _/etc/default/limine_,
+  then run *sudo limine-mkinitcpio*.
+
+A reboot is required for kernel parameter changes to take effect.
+
+Verify with *cat /proc/cmdline* — the parameter must appear in the
+output. The GUI's Diagnostics page also reports whether the PMFW
+fan_curve interface is reachable.
 
 # SEE ALSO
 
