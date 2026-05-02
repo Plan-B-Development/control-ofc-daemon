@@ -208,6 +208,7 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST | `/profile/activate` | Switch active profile by id or path |
+| POST | `/profile/deactivate` | Clear active profile (DEC-097); idempotent; releases the `profile-engine` lease but preserves any GUI lease |
 | POST | `/config/profile-search-dirs` | Additively register profile search directories (persists to `runtime.toml`; 503 `persistence_failed` on write error) |
 | POST | `/config/startup-delay` | Set startup delay seconds (persists to `runtime.toml`, takes effect on restart; 503 `persistence_failed` on write error) |
 

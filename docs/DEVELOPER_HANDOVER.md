@@ -136,6 +136,7 @@ sudo systemctl enable --now control-ofc-daemon
 | `POST /gpu/{gpu_id}/fan/pwm` | Set GPU fan speed (PMFW or hwmon) |
 | `POST /gpu/{gpu_id}/fan/reset` | Reset GPU fan to automatic mode |
 | `POST /profile/activate` | Switch active profile at runtime |
+| `POST /profile/deactivate` | Clear active profile (DEC-097); idempotent; releases the profile-engine lease but preserves any GUI lease |
 | `POST /config/profile-search-dirs` | Register additional profile search dirs (persists to `runtime.toml`) |
 | `POST /config/startup-delay` | Set startup delay seconds (persists to `runtime.toml`) |
 

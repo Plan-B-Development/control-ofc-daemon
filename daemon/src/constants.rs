@@ -73,6 +73,13 @@ pub const GPU_FAIL_COOLDOWN: Duration = Duration::from_secs(60);
 /// defer writes (dual-writer guard — DEC-071/DEC-074).
 pub const GUI_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Temperature deadband (°C) that the profile engine holds the previous
+/// curve output across when temperature is falling. Closes the audible
+/// parity gap between GUI-driven and headless evaluation. Mirrors the
+/// GUI's ``HYSTERESIS_DEADBAND_C`` in ``services/control_loop.py``.
+/// See DEC-096.
+pub const HYSTERESIS_DEADBAND_C: f64 = 2.0;
+
 // ── Profile engine — no-sensor safety ────────────────────────────────
 
 /// If no CPU temperature sensor is found for this many consecutive

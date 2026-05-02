@@ -85,6 +85,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/profile/activate",
             post(handlers::activate_profile_handler),
         )
+        .route(
+            "/profile/deactivate",
+            post(handlers::deactivate_profile_handler),
+        )
         // Config management
         .route(
             "/config/profile-search-dirs",

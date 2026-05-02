@@ -1,7 +1,9 @@
 //! Profile model — loads and evaluates GUI-created fan curve profiles.
 //!
-//! Compatible with the GUI's Profile v3 JSON format. Supports graph (piecewise
-//! linear), linear (2-point), and flat curve types.
+//! Compatible with the GUI's Profile v4 JSON format. v4 adds the per-GPU
+//! ``fan_zero_rpm`` flag on ``ControlMember`` (DEC-095). v3 profiles
+//! deserialise unchanged because the new field uses ``#[serde(default)]``.
+//! Supports graph (piecewise linear), linear (2-point), and flat curve types.
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -22,7 +24,7 @@ pub struct DaemonProfile {
 }
 
 fn default_version() -> u32 {
-    3
+    4
 }
 
 /// A logical fan control group with curve assignment and member fans.
@@ -71,6 +73,13 @@ pub struct ControlMember {
     pub member_id: String, // e.g. "openfan:ch00", "hwmon:it8696:...", or "amd_gpu:<PCI_BDF>"
     #[serde(default)]
     pub member_label: String,
+    /// Per-GPU-member zero-RPM toggle (v4). When true, the daemon preserves
+    /// the PMFW ``fan_zero_rpm_enable`` setting while writing the curve so
+    /// the GPU's idle fan-stop behaviour is honoured. Defaults to false to
+    /// match the pre-v4 behaviour (zero-RPM disabled before every PMFW
+    /// write). Ignored for non-GPU sources. See DEC-095.
+    #[serde(default)]
+    pub fan_zero_rpm: bool,
 }
 
 /// A fan curve configuration (graph, linear, or flat).
@@ -182,7 +191,7 @@ pub fn load_profile(path: &Path) -> Result<DaemonProfile, String> {
         .map_err(|e| format!("failed to parse profile '{}': {e}", path.display()))?;
     if profile.version < 3 {
         log::warn!(
-            "Profile '{}' has version {}, expected 3+",
+            "Profile '{}' has version {}, expected 3+ (v4 introduces fan_zero_rpm)",
             profile.name,
             profile.version
         );
@@ -388,7 +397,73 @@ mod tests {
         assert_eq!(profile.name, "Minimal");
         assert!(profile.controls.is_empty());
         assert!(profile.curves.is_empty());
-        assert_eq!(profile.version, 3); // default
+        assert_eq!(profile.version, 4); // default — v4 (DEC-095)
+    }
+
+    #[test]
+    fn load_v3_profile_uses_fan_zero_rpm_default_false() {
+        // A v3 profile predates the fan_zero_rpm field. Loading it must
+        // succeed (forward-compatible) and the missing field must default
+        // to false so the existing zero-RPM-disabled behaviour is preserved.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("v3.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "id": "legacy",
+                "name": "Legacy V3",
+                "version": 3,
+                "controls": [{
+                    "id": "g",
+                    "name": "GPU",
+                    "mode": "manual",
+                    "manual_output_pct": 60,
+                    "members": [{
+                        "source": "amd_gpu",
+                        "member_id": "amd_gpu:0000:03:00.0",
+                        "member_label": "9070XT"
+                    }]
+                }],
+                "curves": []
+            }"#,
+        )
+        .unwrap();
+
+        let profile = load_profile(&path).unwrap();
+        assert_eq!(profile.controls.len(), 1);
+        assert_eq!(profile.controls[0].members.len(), 1);
+        assert!(!profile.controls[0].members[0].fan_zero_rpm);
+    }
+
+    #[test]
+    fn load_v4_profile_honours_fan_zero_rpm_true() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("v4.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "id": "modern",
+                "name": "Modern V4",
+                "version": 4,
+                "controls": [{
+                    "id": "g",
+                    "name": "GPU",
+                    "mode": "manual",
+                    "manual_output_pct": 60,
+                    "members": [{
+                        "source": "amd_gpu",
+                        "member_id": "amd_gpu:0000:03:00.0",
+                        "member_label": "9070XT",
+                        "fan_zero_rpm": true
+                    }]
+                }],
+                "curves": []
+            }"#,
+        )
+        .unwrap();
+
+        let profile = load_profile(&path).unwrap();
+        assert!(profile.controls[0].members[0].fan_zero_rpm);
     }
 
     #[test]

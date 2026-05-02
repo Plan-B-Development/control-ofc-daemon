@@ -903,3 +903,150 @@ async fn gpu_reset_fan_unsupported_returns_400_feature_unavailable() {
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
 }
+
+// ── /profile/deactivate (DEC-097) ───────────────────────────────────────
+
+/// Helper: test_app_state with an active profile pre-populated.
+fn test_app_state_with_active_profile() -> Arc<AppState> {
+    let state = test_app_state();
+    {
+        let mut guard = state.active_profile.lock();
+        *guard = Some(control_ofc_daemon::profile::DaemonProfile {
+            id: "balanced".into(),
+            name: "Balanced".into(),
+            version: 4,
+            description: String::new(),
+            controls: Vec::new(),
+            curves: Vec::new(),
+        });
+    }
+    state
+}
+
+#[tokio::test]
+async fn deactivate_profile_clears_active_profile() {
+    let state = test_app_state_with_active_profile();
+    assert!(state.active_profile.lock().is_some(), "precondition");
+
+    let (path, shutdown, _dir) = start_test_server(state.clone()).await;
+
+    let (status, json) = uds_post(&path, "/profile/deactivate", &serde_json::json!({})).await;
+
+    assert_eq!(status, 200);
+    assert_eq!(json["api_version"], 1);
+    assert_eq!(json["deactivated"], true);
+    assert_eq!(json["previous_profile_id"], "balanced");
+    assert_eq!(json["previous_profile_name"], "Balanced");
+
+    // In-memory state must be cleared.
+    assert!(
+        state.active_profile.lock().is_none(),
+        "active_profile must be None after deactivation"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn deactivate_profile_idempotent_when_no_active() {
+    let state = test_app_state();
+    assert!(state.active_profile.lock().is_none(), "precondition");
+
+    let (path, shutdown, _dir) = start_test_server(state.clone()).await;
+
+    let (status, json) = uds_post(&path, "/profile/deactivate", &serde_json::json!({})).await;
+
+    assert_eq!(status, 200);
+    assert_eq!(json["deactivated"], true);
+    // No previous profile → fields are JSON null
+    assert!(
+        json["previous_profile_id"].is_null(),
+        "previous_profile_id must be null when no profile was active"
+    );
+    assert!(json["previous_profile_name"].is_null());
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn deactivate_profile_releases_profile_engine_lease() {
+    // Build the same hwmon-equipped state the lease tests use, take a
+    // "profile-engine" lease, and verify deactivation releases it.
+    let state = test_app_state_with_hwmon();
+    {
+        let mut active = state.active_profile.lock();
+        *active = Some(control_ofc_daemon::profile::DaemonProfile {
+            id: "balanced".into(),
+            name: "Balanced".into(),
+            version: 4,
+            description: String::new(),
+            controls: Vec::new(),
+            curves: Vec::new(),
+        });
+    }
+    {
+        let ctrl = state.hwmon_controller.as_ref().unwrap();
+        let mut guard = ctrl.lock();
+        guard
+            .lease_manager_mut()
+            .take_lease("profile-engine")
+            .expect("take should succeed");
+        assert_eq!(
+            guard.lease_manager().active_lease().unwrap().owner_hint,
+            "profile-engine"
+        );
+    }
+
+    let (path, shutdown, _dir) = start_test_server(state.clone()).await;
+
+    let (status, _json) = uds_post(&path, "/profile/deactivate", &serde_json::json!({})).await;
+    assert_eq!(status, 200);
+
+    // Profile-engine lease should now be released — leaving the controller
+    // free for a fresh GUI lease without a force-take.
+    let ctrl = state.hwmon_controller.as_ref().unwrap();
+    let guard = ctrl.lock();
+    assert!(
+        guard.lease_manager().active_lease().is_none(),
+        "profile-engine lease must be released after deactivation"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn deactivate_profile_preserves_gui_lease() {
+    // A non-profile-engine lease (e.g. GUI's own lease for manual writes)
+    // must NOT be touched by deactivation — the GUI is still in control of
+    // hwmon and may want to keep writing PWM directly.
+    let state = test_app_state_with_hwmon();
+    let gui_lease_id = {
+        let ctrl = state.hwmon_controller.as_ref().unwrap();
+        let mut guard = ctrl.lock();
+        guard
+            .lease_manager_mut()
+            .take_lease("gui")
+            .expect("take should succeed")
+            .lease_id
+    };
+
+    let (path, shutdown, _dir) = start_test_server(state.clone()).await;
+    let (status, _json) = uds_post(&path, "/profile/deactivate", &serde_json::json!({})).await;
+    assert_eq!(status, 200);
+
+    // GUI lease unchanged.
+    let ctrl = state.hwmon_controller.as_ref().unwrap();
+    let guard = ctrl.lock();
+    let active = guard
+        .lease_manager()
+        .active_lease()
+        .expect("GUI lease should still be active");
+    assert_eq!(active.owner_hint, "gui");
+    assert_eq!(active.lease_id, gui_lease_id);
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}

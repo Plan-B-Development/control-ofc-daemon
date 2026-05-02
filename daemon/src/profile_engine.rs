@@ -18,8 +18,13 @@ use crate::serial::protocol::NUM_CHANNELS;
 #[derive(Debug, Clone)]
 pub struct PwmCommand {
     pub member_id: String,
-    pub source: String, // "openfan" or "hwmon"
+    pub source: String, // "openfan", "hwmon", or "amd_gpu"
     pub pwm_percent: u8,
+    /// For ``amd_gpu`` members only: when true, the GPU's PMFW
+    /// ``fan_zero_rpm_enable`` flag is preserved while writing the curve.
+    /// Comes from ``ControlMember.fan_zero_rpm`` (DEC-095). Always false
+    /// for non-GPU members.
+    pub gpu_fan_zero_rpm: bool,
 }
 
 /// Cross-cycle state owned by the profile engine loop.
@@ -29,12 +34,25 @@ pub struct PwmCommand {
 /// against the previous cycle's tuned output. Matches the GUI's per-target
 /// `TargetState.last_output` in `control_loop.py`.
 ///
+/// Also holds the per-control 2°C temperature deadband state so headless
+/// profile mode behaves like GUI-driven mode at curve transitions
+/// (DEC-096). The deadband fields mirror the GUI's
+/// ``TargetState.last_commanded_pwm`` / ``last_transition_temp``.
+///
 /// Cleared whenever the active profile id changes or no profile is loaded,
 /// mirroring the GUI's `_on_profile_changed` → `_reset_hysteresis()`.
 #[derive(Debug, Default)]
 pub struct ProfileEngineState {
     /// Last tuned output (pre-rounding f64) per control id.
     last_output: HashMap<String, f64>,
+    /// Last raw curve output returned for the control (post-deadband).
+    /// Used by the deadband to hold a stable value while temperature is
+    /// drifting within ±deadband below the last transition.
+    last_curve_output: HashMap<String, f64>,
+    /// Temperature at which the last meaningful curve transition occurred.
+    /// The deadband keeps the cached output as long as the current
+    /// temperature falls within ``[t - HYSTERESIS_DEADBAND_C, t]``.
+    last_transition_temp: HashMap<String, f64>,
     /// Id of the profile the current state belongs to.
     active_profile_id: Option<String>,
 }
@@ -49,10 +67,24 @@ impl ProfileEngineState {
         self.last_output.get(control_id).copied()
     }
 
+    /// Last curve output (post-deadband, pre-tuning) for a control id.
+    /// Exposed for tests so the deadband behaviour can be inspected.
+    pub fn last_curve_output(&self, control_id: &str) -> Option<f64> {
+        self.last_curve_output.get(control_id).copied()
+    }
+
+    /// Last temperature at which a curve transition was recorded for the
+    /// control. Useful to verify the deadband anchor moves correctly.
+    pub fn last_transition_temp(&self, control_id: &str) -> Option<f64> {
+        self.last_transition_temp.get(control_id).copied()
+    }
+
     /// Reset state to a profile-less state (call when active profile is
     /// cleared). The next `evaluate_profile` call starts fresh.
     pub fn deactivate(&mut self) {
         self.last_output.clear();
+        self.last_curve_output.clear();
+        self.last_transition_temp.clear();
         self.active_profile_id = None;
     }
 
@@ -65,10 +97,61 @@ impl ProfileEngineState {
         let changed = self.active_profile_id.as_deref() != Some(new_id);
         if changed {
             self.last_output.clear();
+            self.last_curve_output.clear();
+            self.last_transition_temp.clear();
             self.active_profile_id = Some(new_id.to_string());
         }
         changed
     }
+}
+
+/// Threshold (percent) below which a curve-output change does not move the
+/// deadband transition anchor. Matches the GUI's `0.5` constant in
+/// ``_evaluate_curve_with_hysteresis``.
+const DEADBAND_ANCHOR_DELTA_PCT: f64 = 0.5;
+
+/// Evaluate a curve with the 2°C falling-temperature deadband applied.
+///
+/// Returns the cached previous curve output when current temperature has
+/// fallen within the deadband below the last transition anchor; otherwise
+/// re-interpolates the curve and updates the anchor. Side-effects on
+/// ``ProfileEngineState`` are scoped to per-control state so unrelated
+/// controls are unaffected.
+fn evaluate_curve_with_deadband(
+    control: &LogicalControl,
+    curve: &crate::profile::CurveConfig,
+    current_temp: f64,
+    state: &mut ProfileEngineState,
+) -> f64 {
+    let prev_pwm = state.last_curve_output.get(&control.id).copied();
+    let prev_transition = state.last_transition_temp.get(&control.id).copied();
+
+    if let (Some(prev_out), Some(anchor)) = (prev_pwm, prev_transition) {
+        if current_temp <= anchor && current_temp >= anchor - constants::HYSTERESIS_DEADBAND_C {
+            // Inside the deadband — hold the previously commanded output.
+            // Do not move the anchor; do not update last_curve_output.
+            return prev_out;
+        }
+    }
+
+    let curve_output = evaluate_curve(curve, current_temp).clamp(0.0, 100.0);
+
+    // Move the transition anchor only when the new curve output meaningfully
+    // differs from the last one — keeps the deadband stationary as the curve
+    // glides through small interpolation deltas (matches GUI parity).
+    let move_anchor = prev_pwm
+        .map(|p| (curve_output - p).abs() >= DEADBAND_ANCHOR_DELTA_PCT)
+        .unwrap_or(true);
+    if move_anchor {
+        state
+            .last_transition_temp
+            .insert(control.id.clone(), current_temp);
+    }
+    state
+        .last_curve_output
+        .insert(control.id.clone(), curve_output);
+
+    curve_output
 }
 
 /// Apply the full per-control tuning pipeline.
@@ -160,8 +243,12 @@ pub fn evaluate_profile(
                 continue;
             };
 
-            // Evaluate the curve at the current temperature
-            evaluate_curve(curve, sensor.value_c)
+            // 2°C hysteresis deadband — DEC-096. While current temperature
+            // has fallen ≤ HYSTERESIS_DEADBAND_C below the last transition
+            // anchor, hold the previous curve output. Mirrors the GUI's
+            // ``_evaluate_curve_with_hysteresis`` (control_loop.py) so
+            // headless behaviour matches GUI-driven behaviour.
+            evaluate_curve_with_deadband(control, curve, sensor.value_c, engine_state)
         };
 
         // Full tuning pipeline — tracks pre-rounding f64 across cycles so
@@ -177,10 +264,12 @@ pub fn evaluate_profile(
 
         // Generate write commands for all members
         for member in &control.members {
+            let gpu_fan_zero_rpm = member.source == "amd_gpu" && member.fan_zero_rpm;
             commands.push(PwmCommand {
                 member_id: member.member_id.clone(),
                 source: member.source.clone(),
                 pwm_percent,
+                gpu_fan_zero_rpm,
             });
         }
     }
@@ -417,15 +506,17 @@ pub async fn profile_engine_loop(
                         let path = curve_path.clone();
                         let zero_rpm = gpu.fan_zero_rpm_path.clone();
                         let pct = cmd.pwm_percent;
+                        let preserve_zero_rpm = cmd.gpu_fan_zero_rpm;
                         let cache_ref = cache.clone();
                         let fan_id = cmd.member_id.clone();
                         let fan_id_inner = fan_id.clone();
                         let result = tokio::task::spawn_blocking(move || {
-                            match crate::hwmon::gpu_fan::set_static_speed(
+                            match crate::hwmon::gpu_fan::set_static_speed_with_zero_rpm(
                                 &path,
                                 zero_rpm.as_deref(),
                                 pct,
                                 constants::GPU_PMFW_WRITE_RETRIES,
+                                preserve_zero_rpm,
                             ) {
                                 Ok(()) => {
                                     cache_ref.set_gpu_fan_commanded_pct(&fan_id_inner, pct);
@@ -528,6 +619,7 @@ mod tests {
                     source: "openfan".into(),
                     member_id: "openfan:ch00".into(),
                     member_label: "".into(),
+                    fan_zero_rpm: false,
                 }],
                 step_up_pct: 100.0,
                 step_down_pct: 100.0,
@@ -787,26 +879,27 @@ mod tests {
 
     #[test]
     fn tuning_step_up_rate_limits_large_jump() {
-        // curve output jumps 30 → 80, step_up=10 → engine should only allow +10/cycle
+        // curve output jumps 30 → 80, step_up=10 → engine should only allow +10/cycle.
+        // Bump temperature each cycle so the 2°C deadband releases — real
+        // operation always has temperature drift.
         let mut profile = make_profile("curve", "flat", 30.0);
         profile.controls[0].step_up_pct = 10.0;
         profile.controls[0].step_down_pct = 100.0;
-        let cache = make_cache_with_sensor("cpu", 50.0);
         let mut state = ProfileEngineState::new();
 
         // Cycle 1: no prior output → curve value passes through → 30
-        let cmds = evaluate_profile(&profile, &cache, &mut state);
+        let cmds = evaluate_profile(&profile, &make_cache_with_sensor("cpu", 50.0), &mut state);
         assert_eq!(cmds[0].pwm_percent, 30);
 
         // Curve jumps to 80 (simulate by rebuilding profile)
         profile.curves[0].flat_output_pct = Some(80.0);
 
-        // Cycle 2: step_up caps the increase at +10 → 40
-        let cmds = evaluate_profile(&profile, &cache, &mut state);
+        // Cycle 2: temp rose, deadband releases, step_up caps the increase at +10 → 40
+        let cmds = evaluate_profile(&profile, &make_cache_with_sensor("cpu", 51.0), &mut state);
         assert_eq!(cmds[0].pwm_percent, 40);
 
         // Cycle 3: another +10 → 50
-        let cmds = evaluate_profile(&profile, &cache, &mut state);
+        let cmds = evaluate_profile(&profile, &make_cache_with_sensor("cpu", 52.0), &mut state);
         assert_eq!(cmds[0].pwm_percent, 50);
     }
 
@@ -815,18 +908,17 @@ mod tests {
         let mut profile = make_profile("curve", "flat", 80.0);
         profile.controls[0].step_up_pct = 100.0;
         profile.controls[0].step_down_pct = 15.0;
-        let cache = make_cache_with_sensor("cpu", 50.0);
         let mut state = ProfileEngineState::new();
 
         // Cycle 1: 80
-        let cmds = evaluate_profile(&profile, &cache, &mut state);
+        let cmds = evaluate_profile(&profile, &make_cache_with_sensor("cpu", 50.0), &mut state);
         assert_eq!(cmds[0].pwm_percent, 80);
 
         // Drop curve to 20
         profile.curves[0].flat_output_pct = Some(20.0);
 
-        // Cycle 2: step_down caps at -15 → 65
-        let cmds = evaluate_profile(&profile, &cache, &mut state);
+        // Cycle 2: temp rose so the deadband releases — step_down caps at -15 → 65
+        let cmds = evaluate_profile(&profile, &make_cache_with_sensor("cpu", 53.0), &mut state);
         assert_eq!(cmds[0].pwm_percent, 65);
     }
 
@@ -853,16 +945,16 @@ mod tests {
         // Step rate must NOT bite on the 0→start transition, else start_pct
         // gets clamped back down. GUI parity: start_pct applies after step-rate.
         profile.controls[0].step_up_pct = 100.0;
-        let cache = make_cache_with_sensor("cpu", 50.0);
         let mut state = ProfileEngineState::new();
 
         // Cycle 1: 10% < stop_pct → snap to 0
-        let cmds = evaluate_profile(&profile, &cache, &mut state);
+        let cmds = evaluate_profile(&profile, &make_cache_with_sensor("cpu", 50.0), &mut state);
         assert_eq!(cmds[0].pwm_percent, 0);
 
-        // Curve now says 25% (above stop_pct so not snapped; start hysteresis kicks in)
+        // Curve now says 25% (above stop_pct so not snapped; start hysteresis kicks in).
+        // Bump temperature so the deadband releases and the new curve output is seen.
         profile.curves[0].flat_output_pct = Some(25.0);
-        let cmds = evaluate_profile(&profile, &cache, &mut state);
+        let cmds = evaluate_profile(&profile, &make_cache_with_sensor("cpu", 51.0), &mut state);
         // Without start_pct it would be 25; with start_pct=35 from 0 → clamped up to 35
         assert_eq!(cmds[0].pwm_percent, 35);
     }
@@ -957,6 +1049,220 @@ mod tests {
 
         evaluate_profile(&profile, &cache, &mut state);
         assert_eq!(state.last_output("ctrl1"), Some(10.2));
+    }
+
+    // ── 2°C temperature deadband (DEC-096) ───────────────────────────
+
+    /// Helper: build a profile whose curve evaluates to a different output
+    /// at each test temperature so deadband HOLDS are detectable.
+    fn make_graph_profile_for_deadband() -> DaemonProfile {
+        // Graph: (60, 30%), (70, 50%) → linear interpolation between.
+        // Step-rate limits disabled so they don't mask deadband behaviour.
+        DaemonProfile {
+            id: "deadband-test".into(),
+            name: "Deadband".into(),
+            version: 4,
+            description: "".into(),
+            controls: vec![LogicalControl {
+                id: "ctrl1".into(),
+                name: "Test".into(),
+                mode: "curve".into(),
+                curve_id: "c1".into(),
+                manual_output_pct: 0.0,
+                members: vec![ControlMember {
+                    source: "openfan".into(),
+                    member_id: "openfan:ch00".into(),
+                    member_label: "".into(),
+                    fan_zero_rpm: false,
+                }],
+                step_up_pct: 100.0,
+                step_down_pct: 100.0,
+                offset_pct: 0.0,
+                minimum_pct: 0.0,
+                start_pct: 0.0,
+                stop_pct: 0.0,
+            }],
+            curves: vec![CurveConfig {
+                id: "c1".into(),
+                name: "Curve".into(),
+                curve_type: "graph".into(),
+                sensor_id: "cpu".into(),
+                points: vec![
+                    CurvePoint {
+                        temp_c: 60.0,
+                        output_pct: 30.0,
+                    },
+                    CurvePoint {
+                        temp_c: 70.0,
+                        output_pct: 50.0,
+                    },
+                ],
+                start_temp_c: None,
+                start_output_pct: None,
+                end_temp_c: None,
+                end_output_pct: None,
+                flat_output_pct: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn deadband_holds_within_2c_below_anchor() {
+        // Cycle 1 at 70°C → curve output 50%, anchor=70.
+        // Cycle 2 at 69°C is within the 2°C deadband below 70 → HOLD 50%.
+        let profile = make_graph_profile_for_deadband();
+        let mut state = ProfileEngineState::new();
+
+        let cmds = evaluate_profile(&profile, &make_cache_with_sensor("cpu", 70.0), &mut state);
+        assert_eq!(cmds[0].pwm_percent, 50);
+        assert_eq!(state.last_transition_temp("ctrl1"), Some(70.0));
+
+        // Falling to 69°C — inside the deadband below 70.
+        let cmds = evaluate_profile(&profile, &make_cache_with_sensor("cpu", 69.0), &mut state);
+        assert_eq!(cmds[0].pwm_percent, 50, "deadband should hold at 50%");
+        assert_eq!(
+            state.last_transition_temp("ctrl1"),
+            Some(70.0),
+            "anchor must not move while held"
+        );
+    }
+
+    #[test]
+    fn deadband_releases_below_2c_threshold() {
+        // Cycle 1 at 70°C → 50%, anchor=70.
+        // Cycle 2 at 67.5°C is below 70-2=68 → re-evaluate curve.
+        let profile = make_graph_profile_for_deadband();
+        let mut state = ProfileEngineState::new();
+
+        evaluate_profile(&profile, &make_cache_with_sensor("cpu", 70.0), &mut state);
+
+        let cmds = evaluate_profile(&profile, &make_cache_with_sensor("cpu", 67.5), &mut state);
+        // curve(67.5) = 30 + (67.5-60)/10 * 20 = 45.0 → rounded to 45
+        assert_eq!(
+            cmds[0].pwm_percent, 45,
+            "below the deadband, curve must re-evaluate"
+        );
+        assert_eq!(state.last_transition_temp("ctrl1"), Some(67.5));
+    }
+
+    #[test]
+    fn deadband_anchor_moves_on_rising_temperature() {
+        // Rising temperature should move the anchor each cycle (output
+        // changes meaningfully) so the deadband applies relative to the
+        // current peak temperature rather than the original 70°C.
+        let profile = make_graph_profile_for_deadband();
+        let mut state = ProfileEngineState::new();
+
+        evaluate_profile(&profile, &make_cache_with_sensor("cpu", 65.0), &mut state);
+        assert_eq!(state.last_transition_temp("ctrl1"), Some(65.0));
+
+        evaluate_profile(&profile, &make_cache_with_sensor("cpu", 68.0), &mut state);
+        assert_eq!(state.last_transition_temp("ctrl1"), Some(68.0));
+
+        evaluate_profile(&profile, &make_cache_with_sensor("cpu", 70.0), &mut state);
+        assert_eq!(state.last_transition_temp("ctrl1"), Some(70.0));
+    }
+
+    #[test]
+    fn deadband_anchor_does_not_move_for_tiny_curve_delta() {
+        // When the curve output changes by < 0.5% between two evaluations,
+        // the deadband anchor must NOT advance — preventing a slowly-rising
+        // temperature from "dragging" the deadband forward and starving
+        // hysteresis on a subsequent fall.
+        // Use a near-flat curve segment: (60, 50%), (80, 50.4%) so
+        // 60→61°C gives a delta of 0.02% (< 0.5%).
+        let profile = DaemonProfile {
+            id: "tiny-delta".into(),
+            name: "Tiny".into(),
+            version: 4,
+            description: "".into(),
+            controls: vec![LogicalControl {
+                id: "ctrl1".into(),
+                name: "Test".into(),
+                mode: "curve".into(),
+                curve_id: "c1".into(),
+                manual_output_pct: 0.0,
+                members: vec![ControlMember {
+                    source: "openfan".into(),
+                    member_id: "openfan:ch00".into(),
+                    member_label: "".into(),
+                    fan_zero_rpm: false,
+                }],
+                step_up_pct: 100.0,
+                step_down_pct: 100.0,
+                offset_pct: 0.0,
+                minimum_pct: 0.0,
+                start_pct: 0.0,
+                stop_pct: 0.0,
+            }],
+            curves: vec![CurveConfig {
+                id: "c1".into(),
+                name: "Curve".into(),
+                curve_type: "graph".into(),
+                sensor_id: "cpu".into(),
+                points: vec![
+                    CurvePoint {
+                        temp_c: 60.0,
+                        output_pct: 50.0,
+                    },
+                    CurvePoint {
+                        temp_c: 80.0,
+                        output_pct: 50.4,
+                    },
+                ],
+                start_temp_c: None,
+                start_output_pct: None,
+                end_temp_c: None,
+                end_output_pct: None,
+                flat_output_pct: None,
+            }],
+        };
+        let mut state = ProfileEngineState::new();
+
+        evaluate_profile(&profile, &make_cache_with_sensor("cpu", 60.0), &mut state);
+        assert_eq!(state.last_transition_temp("ctrl1"), Some(60.0));
+
+        // Rise to 61°C: curve delta 0.02% < 0.5%, anchor must stay at 60.
+        evaluate_profile(&profile, &make_cache_with_sensor("cpu", 61.0), &mut state);
+        assert_eq!(
+            state.last_transition_temp("ctrl1"),
+            Some(60.0),
+            "tiny output delta must not move the anchor"
+        );
+    }
+
+    #[test]
+    fn deadband_state_cleared_on_profile_change() {
+        // Switching profile id must clear the deadband state so it doesn't
+        // bleed into the new profile's evaluations.
+        let profile_a = make_graph_profile_for_deadband();
+        let mut profile_b = make_graph_profile_for_deadband();
+        profile_b.id = "other".into();
+
+        let mut state = ProfileEngineState::new();
+        evaluate_profile(&profile_a, &make_cache_with_sensor("cpu", 70.0), &mut state);
+        assert!(state.last_transition_temp("ctrl1").is_some());
+
+        evaluate_profile(&profile_b, &make_cache_with_sensor("cpu", 60.0), &mut state);
+        // After profile swap + new evaluation, anchor should be from new
+        // profile's first cycle, not the prior 70°C from profile_a.
+        assert_eq!(state.last_transition_temp("ctrl1"), Some(60.0));
+    }
+
+    #[test]
+    fn deadband_does_not_apply_to_manual_mode() {
+        // Manual mode bypasses the curve, so manual_output_pct is the only
+        // thing the engine should look at — the deadband is curve-only.
+        let mut profile = make_graph_profile_for_deadband();
+        profile.controls[0].mode = "manual".into();
+        profile.controls[0].manual_output_pct = 42.0;
+
+        let mut state = ProfileEngineState::new();
+        let cmds = evaluate_profile(&profile, &make_cache_with_sensor("cpu", 70.0), &mut state);
+        assert_eq!(cmds[0].pwm_percent, 42);
+        // No curve evaluation happened → no deadband state recorded.
+        assert!(state.last_transition_temp("ctrl1").is_none());
+        assert!(state.last_curve_output("ctrl1").is_none());
     }
 
     // ── Profile engine loop integration tests (T2 audit finding) ───
@@ -1124,6 +1430,7 @@ mod tests {
                     source: "amd_gpu".into(),
                     member_id: "amd_gpu:0000:03:00.0".into(),
                     member_label: "RX 9070 XT".into(),
+                    fan_zero_rpm: false,
                 }],
                 step_up_pct: 100.0,
                 step_down_pct: 100.0,
@@ -1190,6 +1497,7 @@ mod tests {
             source: "openfan".into(),
             member_id: "openfan:ch00".into(),
             member_label: "".into(),
+            fan_zero_rpm: false,
         });
         let cache = make_cache_with_sensor("cpu", 55.0);
         let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());

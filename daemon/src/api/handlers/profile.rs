@@ -140,3 +140,71 @@ pub async fn activate_profile_handler(
         })),
     )
 }
+
+/// POST /profile/deactivate — clear the active profile so the daemon stops
+/// driving fans from a curve. Idempotent: deactivating when no profile is
+/// active is a success no-op. After deactivation, the daemon falls back to
+/// imperative-only behaviour — manual API writes from the GUI still work,
+/// but the headless evaluation loop will not push new PWM values until a
+/// new profile is activated.
+pub async fn deactivate_profile_handler(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let previous = {
+        let mut guard = state.active_profile.lock();
+        guard.take().map(|p| (p.id, p.name))
+    };
+
+    // Persist the cleared state so a daemon restart doesn't resurrect the
+    // profile from disk. Best-effort — log on failure but still return
+    // success so the caller knows the in-memory state is clean.
+    let new_state = crate::daemon_state::DaemonState {
+        version: 1,
+        active_profile_id: None,
+        active_profile_path: None,
+    };
+    if let Err(e) = crate::daemon_state::save_state(&new_state) {
+        log::warn!("Failed to persist deactivation: {e}");
+    }
+
+    // Release any lease held by the profile engine so a fresh GUI lease
+    // can be granted without a force-take. Manual GUI leases are
+    // unaffected — only the "profile-engine" owner is released.
+    if let Some(ref ctrl) = state.hwmon_controller {
+        let mut guard = ctrl.lock();
+        let release_id = guard
+            .lease_manager()
+            .active_lease()
+            .filter(|l| l.owner_hint == "profile-engine")
+            .map(|l| l.lease_id.clone());
+        if let Some(id) = release_id {
+            if let Err(e) = guard.lease_manager_mut().release_lease(&id) {
+                log::debug!("profile-engine lease release after deactivate failed: {e}");
+            }
+        }
+    }
+
+    // Treat deactivation as GUI activity so the engine doesn't immediately
+    // try to take a new lease and reassert old curves while the GUI is
+    // still in the loop reconfiguring fans.
+    state.cache.record_gui_write();
+
+    let (deactivated_id, deactivated_name) = previous
+        .map(|(id, name)| (Some(id), Some(name)))
+        .unwrap_or((None, None));
+
+    log::info!(
+        "Profile deactivated (previous: {:?})",
+        deactivated_id.as_deref()
+    );
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "api_version": API_VERSION,
+            "deactivated": true,
+            "previous_profile_id": deactivated_id,
+            "previous_profile_name": deactivated_name,
+        })),
+    )
+}

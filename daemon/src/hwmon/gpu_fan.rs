@@ -281,16 +281,41 @@ pub fn enable_zero_rpm(zero_rpm_path: &Path) -> Result<(), HwmonError> {
 ///
 /// If `zero_rpm_path` is provided, disables zero-RPM first so the fan actually
 /// spins at low temperatures. This effectively gives "manual" control via the PMFW curve.
+///
+/// This is a thin convenience wrapper around
+/// [`set_static_speed_with_zero_rpm`] with ``preserve_zero_rpm = false``,
+/// preserving pre-v4 behaviour for callers that haven't opted in.
 pub fn set_static_speed(
     fan_curve_path: &Path,
     zero_rpm_path: Option<&Path>,
     speed_pct: u8,
     num_points: u8,
 ) -> Result<(), HwmonError> {
-    // Disable zero-RPM so the fan spins at any temperature
-    if let Some(zrp) = zero_rpm_path {
-        if let Err(e) = disable_zero_rpm(zrp) {
-            log::warn!("Could not disable zero-RPM (continuing): {e}");
+    set_static_speed_with_zero_rpm(fan_curve_path, zero_rpm_path, speed_pct, num_points, false)
+}
+
+/// Set a static fan speed, with explicit control over zero-RPM handling.
+///
+/// When ``preserve_zero_rpm`` is ``false`` (default for manual API writes),
+/// the daemon disables ``fan_zero_rpm_enable`` before writing the curve so
+/// the fan spins continuously at the commanded speed. When ``true``
+/// (profile-driven write where the user opted into idle stop, see DEC-095
+/// and ``ControlMember.fan_zero_rpm``), the existing zero-RPM state is
+/// preserved — the GPU firmware decides when to stop the fan based on the
+/// curve and its idle threshold.
+pub fn set_static_speed_with_zero_rpm(
+    fan_curve_path: &Path,
+    zero_rpm_path: Option<&Path>,
+    speed_pct: u8,
+    num_points: u8,
+    preserve_zero_rpm: bool,
+) -> Result<(), HwmonError> {
+    if !preserve_zero_rpm {
+        // Disable zero-RPM so the fan spins at any temperature
+        if let Some(zrp) = zero_rpm_path {
+            if let Err(e) = disable_zero_rpm(zrp) {
+                log::warn!("Could not disable zero-RPM (continuing): {e}");
+            }
         }
     }
 
@@ -585,6 +610,43 @@ FAN_CURVE(fan speed): 15% 100%
 
         set_static_speed(&curve_path, Some(&zrp_path), 50, 5).unwrap();
         // zero-RPM file should contain the commit "c\n" (last write)
+        let zrp_content = fs::read_to_string(&zrp_path).unwrap();
+        assert_eq!(zrp_content, "c\n");
+    }
+
+    #[test]
+    fn set_static_speed_with_preserve_zero_rpm_skips_disable() {
+        // Profile-driven path with ControlMember.fan_zero_rpm = true must
+        // not touch fan_zero_rpm_enable so the GPU's idle behaviour is
+        // honoured. The original sysfs contents must be left untouched.
+        let tmp = tempfile::tempdir().unwrap();
+        let curve_path = tmp.path().join("fan_curve");
+        let zrp_path = tmp.path().join("fan_zero_rpm_enable");
+        fs::write(&curve_path, SAMPLE_CURVE).unwrap();
+        fs::write(&zrp_path, "1\n").unwrap();
+
+        set_static_speed_with_zero_rpm(&curve_path, Some(&zrp_path), 50, 5, true).unwrap();
+
+        // zero-RPM file untouched by the daemon — still contains the
+        // pre-existing "1\n", not the "c\n" the disable path would write.
+        let zrp_content = fs::read_to_string(&zrp_path).unwrap();
+        assert_eq!(zrp_content, "1\n");
+        // Curve was still written and committed.
+        let curve_content = fs::read_to_string(&curve_path).unwrap();
+        assert_eq!(curve_content, "c\n");
+    }
+
+    #[test]
+    fn set_static_speed_with_preserve_zero_rpm_false_matches_legacy() {
+        // preserve_zero_rpm = false must behave exactly like the legacy
+        // set_static_speed wrapper (regression guard for DEC-053).
+        let tmp = tempfile::tempdir().unwrap();
+        let curve_path = tmp.path().join("fan_curve");
+        let zrp_path = tmp.path().join("fan_zero_rpm_enable");
+        fs::write(&curve_path, SAMPLE_CURVE).unwrap();
+        fs::write(&zrp_path, "1\n").unwrap();
+
+        set_static_speed_with_zero_rpm(&curve_path, Some(&zrp_path), 50, 5, false).unwrap();
         let zrp_content = fs::read_to_string(&zrp_path).unwrap();
         assert_eq!(zrp_content, "c\n");
     }

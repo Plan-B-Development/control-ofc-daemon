@@ -1,5 +1,94 @@
 # Changelog
 
+## [1.6.0] — 2026-05-02
+
+Headless profile-mode parity and per-GPU zero-RPM control. Pairs with
+**GUI v1.10.0**. The daemon can now drive fans autonomously per a
+GUI-authored profile with the same audible behaviour as GUI-driven mode,
+honour each GPU's user-chosen idle-fan-stop preference, and surface a
+clean `/profile/deactivate` endpoint so the GUI can stop curve writes
+without restarting the daemon.
+
+### Added
+- **`POST /profile/deactivate` endpoint (DEC-097).** Clears the active
+  profile, persists the cleared state to `daemon_state.json`, releases
+  any held `profile-engine` hwmon lease, and refreshes the GUI-activity
+  marker so the engine doesn't immediately re-take a lease. Idempotent —
+  calling on an already-deactivated daemon returns 200 with both
+  `previous_profile_id` and `previous_profile_name` set to `null`.
+  Distinct from `/profile/activate` with a missing path (which 404s).
+  GUI leases (any owner other than `profile-engine`) are explicitly
+  preserved so manual GUI writes continue uninterrupted.
+- **2 °C falling-temperature deadband in the profile engine (DEC-096).**
+  `evaluate_profile` now mirrors the GUI's
+  `_evaluate_curve_with_hysteresis` (`HYSTERESIS_DEADBAND_C = 2.0`):
+  when the current temperature has fallen ≤ 2 °C below the last
+  transition anchor, the previous curve output is held instead of
+  re-interpolated. Closes the audible parity gap where headless mode
+  oscillated at curve transitions while GUI-driven mode behaved
+  smoothly with the same profile. Per-control state lives in
+  `ProfileEngineState` alongside the existing tuning state and is
+  cleared on profile change or deactivation. Five new unit tests cover
+  hold-on-fall, release below threshold, anchor advance on rise, anchor
+  stationary for sub-0.5% deltas, and clearing on profile swap.
+- **Per-GPU `fan_zero_rpm` flag in profile schema v4 (DEC-095).**
+  `ControlMember` now carries an optional `fan_zero_rpm` boolean
+  (default false). When true on an `amd_gpu` member, the daemon
+  preserves PMFW `fan_zero_rpm_enable` while writing the curve so the
+  GPU honours its idle fan-stop threshold. When false (or omitted on a
+  legacy v3 profile), the daemon disables zero-RPM as before — the
+  pre-1.6.0 behaviour is exactly preserved by the safe default.
+- **`hwmon::gpu_fan::set_static_speed_with_zero_rpm` helper** with an
+  explicit `preserve_zero_rpm: bool` parameter. The legacy
+  `set_static_speed` is now a thin wrapper that hard-codes
+  `preserve_zero_rpm=false`, so the manual-write path through
+  `/gpu/{id}/fan/pwm` is unchanged. Two new unit tests cover the new
+  path (preserve=true skips the disable; preserve=false matches
+  legacy behaviour).
+
+### Changed
+- **Profile schema default version is now 4.** v3 profiles deserialise
+  unchanged because all v4 fields use `#[serde(default)]`. The version
+  warning still fires below 3 to flag truly legacy profiles. Two new
+  unit tests in `profile.rs` verify that v3 profiles default
+  `fan_zero_rpm` to false and v4 profiles round-trip the user's
+  explicit choice.
+
+### Profile engine state — new fields
+`ProfileEngineState` gains `last_curve_output` and
+`last_transition_temp` maps (per control id) to back the deadband.
+`deactivate()` and `sync_profile_id()` clear them alongside the
+existing `last_output` so the deadband doesn't leak across profile
+swaps. New public read-only accessors (`last_curve_output`,
+`last_transition_temp`) expose the state for tests.
+
+### Tests
+- Daemon test count: 357 unit + 32 integration + 3 doc = 392 (was
+  347 + 28 + 3 = 378). +14 tests covering deadband behaviour,
+  fan_zero_rpm round-tripping in `set_static_speed_with_zero_rpm`,
+  v3-vs-v4 profile loading, and the four new `/profile/deactivate`
+  integration scenarios (clears state, idempotent, releases the
+  profile-engine lease, preserves GUI leases).
+- The three existing tuning tests
+  (`tuning_step_up_rate_limits_large_jump`,
+  `tuning_step_down_rate_limits_large_drop`,
+  `tuning_start_threshold_jumps_from_zero`) now bump the sensor
+  temperature each cycle so the new deadband releases — they
+  exercised the tuning pipeline at a fixed temperature, which the
+  deadband would otherwise hold across.
+
+### Why
+Cross-stack audit found that headless profile-mode was technically
+correct but audibly different from GUI-driven mode (no deadband),
+that profile deletion left a phantom profile driving fans until
+daemon restart, and that the daemon couldn't honour a user's choice
+to keep zero-RPM idle on a GPU governed by a curve. This release
+closes all three gaps. The role-aware safety floor decision (option B
+from the audit) is GUI-side and lives in **GUI v1.10.0**; the daemon
+intentionally does not enforce a per-role floor, preserving the
+established "GUI owns curve safety policy, daemon owns thermal
+emergency" architectural split (CLAUDE.md, DEC-022).
+
 ## [1.5.6] — 2026-04-30
 
 Packaging hygiene release. No code, contract, or behaviour changes.
