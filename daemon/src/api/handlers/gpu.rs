@@ -74,7 +74,12 @@ pub async fn gpu_set_fan_handler(
 
     let fan_curve_path = match &gpu.fan_curve_path {
         Some(p) => p.clone(),
-        None if gpu.has_pwm => {
+        // Legacy hwmon write path requires BOTH `pwm1` and `pwm1_enable` —
+        // a read-only RDNA3/RDNA4 GPU (no `amdgpu.ppfeaturemask`) exposes
+        // `pwm1` alone and used to surface a misleading 503 hardware_unavailable
+        // here when `set_legacy_pwm` failed with ENOENT. DEC-098 narrows this
+        // arm to the canonical capability check.
+        None if gpu.can_write_legacy_pwm() => {
             let hwmon_path = gpu.hwmon_path.clone();
             let speed_pct = body.speed_pct;
             let result = tokio::task::spawn_blocking(move || {
@@ -116,9 +121,7 @@ pub async fn gpu_set_fan_handler(
         None => {
             return error_response(
                 StatusCode::BAD_REQUEST,
-                &ErrorEnvelope::feature_unavailable(format!(
-                    "GPU {gpu_id} does not support fan control"
-                )),
+                &ErrorEnvelope::feature_unavailable(unsupported_fan_control_message(gpu)),
             );
         }
     };
@@ -212,7 +215,7 @@ pub async fn gpu_reset_fan_handler(
                 &ErrorEnvelope::internal(format!("GPU fan reset task failed: {e}")),
             ),
         }
-    } else if gpu.has_pwm {
+    } else if gpu.can_write_legacy_pwm() {
         let hwmon_path = gpu.hwmon_path.clone();
         let result = tokio::task::spawn_blocking(move || {
             crate::hwmon::gpu_fan::reset_legacy_to_auto(&hwmon_path)
@@ -246,9 +249,35 @@ pub async fn gpu_reset_fan_handler(
     } else {
         error_response(
             StatusCode::BAD_REQUEST,
-            &ErrorEnvelope::feature_unavailable(format!(
-                "GPU {gpu_id} does not support fan control"
-            )),
+            &ErrorEnvelope::feature_unavailable(unsupported_fan_control_message(gpu)),
         )
     }
+}
+
+/// Build a `feature_unavailable` message tailored to *why* the GPU has no
+/// write path. Distinguishes the "RDNA3+ without overdrive" case (we know
+/// the kernel parameter that would unlock PMFW) from the generic "no fan
+/// hardware" case so the error includes an actionable hint.
+fn unsupported_fan_control_message(gpu: &crate::hwmon::gpu_detect::AmdGpuInfo) -> String {
+    // RDNA3/RDNA4 shape: `pwm1` exists read-only, no `pwm1_enable`, no
+    // PMFW `fan_curve`. The fix is `amdgpu.ppfeaturemask=0xffffffff`.
+    if gpu.has_pwm
+        && !gpu.has_pwm_enable
+        && gpu.fan_curve_path.is_none()
+        && crate::hwmon::gpu_detect::is_rdna3_or_rdna4(gpu.pci_device_id)
+    {
+        return format!(
+            "GPU {} fan control is read-only on this kernel/firmware: \
+             pwm1_enable is missing and PMFW fan_curve is not exposed. \
+             Add 'amdgpu.ppfeaturemask=0xffffffff' to the kernel parameters \
+             and reboot to enable PMFW fan control.",
+            gpu.pci_bdf
+        );
+    }
+    format!(
+        "GPU {} fan control is read-only ({}); manual fan writes are not \
+         supported in this hardware/firmware mode.",
+        gpu.pci_bdf,
+        gpu.fan_control_method()
+    )
 }

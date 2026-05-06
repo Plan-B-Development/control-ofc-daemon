@@ -78,10 +78,41 @@ impl AmdGpuInfo {
         }
     }
 
+    /// Whether the legacy hwmon `pwm1` write path is functional on this GPU.
+    ///
+    /// `pwm1` existing alone is not sufficient — RDNA3/RDNA4 GPUs without
+    /// `amdgpu.ppfeaturemask=0xffffffff` expose `pwm1` as read-only and lack
+    /// `pwm1_enable`. Writing to `pwm1_enable` on those GPUs returns `ENOENT`
+    /// and surfaces a misleading 503 hardware_unavailable. Capability scoring
+    /// at `status.rs` and the GPU set/reset handlers must agree on this rule
+    /// to avoid drift between `/capabilities` and the actual handler outcome.
+    pub fn can_write_legacy_pwm(&self) -> bool {
+        self.has_pwm && self.has_pwm_enable
+    }
+
     /// Whether this GPU has any fan-related sysfs files (fan or PWM).
     pub fn has_any_fan_interface(&self) -> bool {
         self.has_fan_rpm || self.has_pwm || self.fan_curve_path.is_some()
     }
+}
+
+/// Whether a PCI device ID is RDNA3 or RDNA4 (for kernel-regression warnings).
+///
+/// Used by `kernel_warnings::detect_kernel_warnings` to scope warnings to GPU
+/// architectures actually affected by the regression. RDNA2 and earlier are
+/// not affected by the 6.19 hard-hang or the SMU mismatch on 7.0.
+pub fn is_rdna3_or_rdna4(device_id: u16) -> bool {
+    matches!(
+        device_id,
+        // RDNA4 — Navi 48 and related
+        0x7550 | 0x7551
+        // RDNA3 — Navi 31 (RX 7900 series)
+        | 0x744C | 0x7448 | 0x7480
+        // RDNA3 — Navi 32 (RX 7800/7700)
+        | 0x7470 | 0x747E
+        // RDNA3 — Navi 33 (RX 7600)
+        | 0x7460 | 0x7461
+    )
 }
 
 /// Discover all AMD GPUs by scanning hwmon devices.

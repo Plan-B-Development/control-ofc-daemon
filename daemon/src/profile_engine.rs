@@ -382,28 +382,47 @@ pub async fn profile_engine_loop(
                     "no CPU temp sensor".to_string()
                 };
 
-                // Emergency override — force ALL fan backends to safety PWM
+                // Emergency override — force ALL fan backends to safety PWM.
+                //
+                // DEC-099: lock per-channel/per-header rather than holding the
+                // controller mutex across the whole scan. Previously the
+                // FanController lock was held for ~5s (10 channels × 500ms
+                // serial timeout cap), which serialised every concurrent GUI
+                // PWM request behind the safety scan. With per-channel
+                // re-locking a GUI write can interleave; if the GUI overrides
+                // a safety value briefly the next 1Hz tick re-asserts the
+                // forced value, so safety integrity is preserved.
 
-                // OpenFan channels
+                // OpenFan channels — drop the lock between channels so GUI
+                // requests can interleave during a long emergency scan.
                 if let Some(ref ctrl) = fan_controller {
-                    let mut guard = ctrl.lock();
                     for ch in 0..NUM_CHANNELS {
+                        let mut guard = ctrl.lock();
                         if let Err(e) = guard.set_pwm(ch, forced_pct) {
                             log::error!("THERMAL SAFETY: OpenFan ch{ch} write FAILED: {e}");
                         }
                     }
                 }
 
-                // hwmon fans (auto-lease for safety writes)
+                // hwmon fans (auto-lease for safety writes). Take the lease
+                // once, then re-lock per-header so concurrent GUI activity
+                // can proceed between writes. If a GUI request force-takes
+                // the lease mid-scan, our writes will fail with InvalidLease
+                // until the next 1Hz tick re-acquires it — same safety net
+                // as the OpenFan path.
                 if let Some(ref ctrl) = hwmon_controller {
-                    let mut guard = ctrl.lock();
-                    let hdr_ids: Vec<String> =
-                        guard.headers().iter().map(|h| h.id.clone()).collect();
-                    let lease_id = guard
-                        .lease_manager_mut()
-                        .force_take_lease("thermal-safety")
-                        .lease_id;
+                    let (hdr_ids, lease_id) = {
+                        let mut guard = ctrl.lock();
+                        let hdr_ids: Vec<String> =
+                            guard.headers().iter().map(|h| h.id.clone()).collect();
+                        let lease_id = guard
+                            .lease_manager_mut()
+                            .force_take_lease("thermal-safety")
+                            .lease_id;
+                        (hdr_ids, lease_id)
+                    };
                     for hdr_id in &hdr_ids {
+                        let mut guard = ctrl.lock();
                         if let Err(e) = guard.set_pwm(hdr_id, forced_pct, &lease_id) {
                             log::error!("THERMAL SAFETY: hwmon {hdr_id} write FAILED: {e}");
                         }

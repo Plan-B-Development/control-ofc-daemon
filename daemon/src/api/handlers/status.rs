@@ -73,8 +73,14 @@ pub async fn capabilities_handler(
     // AMD GPU detection
     let primary_gpu = crate::hwmon::gpu_detect::select_primary_gpu(&state.amd_gpus);
     let amd_gpu_cap = if let Some(gpu) = primary_gpu {
-        // Fan write requires either PMFW fan_curve or legacy hwmon pwm1+enable
-        let fan_write = gpu.fan_curve_path.is_some() || (gpu.has_pwm && gpu.has_pwm_enable);
+        // Fan write requires either PMFW fan_curve or legacy hwmon pwm1+enable.
+        // The legacy half is canonicalised in `AmdGpuInfo::can_write_legacy_pwm`
+        // so handlers and capability scoring agree on the same rule (DEC-098).
+        let fan_write = gpu.fan_curve_path.is_some() || gpu.can_write_legacy_pwm();
+        let kernel_warnings = match crate::hwmon::kernel_warnings::read_kernel_release() {
+            Some(release) => crate::hwmon::kernel_warnings::detect_kernel_warnings(&release, gpu),
+            None => Vec::new(),
+        };
         AmdGpuCapability {
             present: true,
             model_name: gpu.marketing_name.clone(),
@@ -91,6 +97,7 @@ pub async fn capabilities_handler(
             is_discrete: gpu.is_discrete,
             overdrive_enabled: gpu.overdrive_enabled,
             gpu_zero_rpm_available: gpu.fan_zero_rpm_path.is_some(),
+            kernel_warnings,
         }
     } else {
         AmdGpuCapability {
@@ -108,6 +115,7 @@ pub async fn capabilities_handler(
             is_discrete: false,
             overdrive_enabled: false,
             gpu_zero_rpm_available: false,
+            kernel_warnings: Vec::new(),
         }
     };
 

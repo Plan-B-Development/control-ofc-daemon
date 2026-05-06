@@ -200,34 +200,52 @@ pub async fn hwmon_lease_renew_handler(
 }
 
 /// POST /hwmon/{header_id}/pwm — set PWM on an hwmon header (requires lease).
+///
+/// DEC-099: dispatched on `spawn_blocking` to keep tokio worker threads
+/// available while the (parking_lot) controller mutex is held by another
+/// task. Hwmon writes are typically sub-millisecond, but contention with
+/// the verify endpoint or the thermal-emergency scan can extend the
+/// critical section by seconds.
 pub async fn hwmon_set_pwm_handler(
     State(state): State<Arc<AppState>>,
     Path(header_id): Path<String>,
     Json(body): Json<HwmonSetPwmRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let Some(ref controller) = state.hwmon_controller else {
+    let Some(controller) = state.hwmon_controller.clone() else {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             &ErrorEnvelope::hardware_unavailable("no hwmon PWM headers available"),
         );
     };
 
-    let mut ctrl = controller.lock();
+    let pwm_percent = body.pwm_percent;
+    let lease_id = body.lease_id.clone();
+    let header_id_clone = header_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        controller
+            .lock()
+            .set_pwm(&header_id_clone, pwm_percent, &lease_id)
+    })
+    .await;
 
-    match ctrl.set_pwm(&header_id, body.pwm_percent, &body.lease_id) {
-        Ok(result) => {
+    match result {
+        Ok(Ok(set_result)) => {
             state.cache.record_gui_write();
             json_ok(
                 StatusCode::OK,
                 HwmonSetPwmResponse {
                     api_version: API_VERSION,
-                    header_id: result.header_id,
-                    pwm_percent: result.pwm_percent,
-                    raw_value: result.raw_value,
+                    header_id: set_result.header_id,
+                    pwm_percent: set_result.pwm_percent,
+                    raw_value: set_result.raw_value,
                 },
             )
         }
-        Err(e) => hwmon_control_error_response(e),
+        Ok(Err(e)) => hwmon_control_error_response(e),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &ErrorEnvelope::internal(format!("hwmon write task failed: {e}")),
+        ),
     }
 }
 

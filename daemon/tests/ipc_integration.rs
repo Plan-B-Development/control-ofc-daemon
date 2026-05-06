@@ -904,6 +904,103 @@ async fn gpu_reset_fan_unsupported_returns_400_feature_unavailable() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Construct an `AppState` with one read-only RDNA3/4 GPU: `pwm1` exists but
+/// `pwm1_enable` does NOT, and there is no PMFW `fan_curve` either. This is
+/// the bare-RDNA4 shape on a kernel without `amdgpu.ppfeaturemask=0xffffffff`.
+/// Before DEC-098 the handlers fell through to `set_legacy_pwm` here and
+/// returned a misleading 503 hardware_unavailable when the `pwm1_enable`
+/// write hit ENOENT; the canonical answer is 400 feature_unavailable.
+fn test_app_state_with_read_only_gpu(pci_bdf: &str, pci_device_id: u16) -> Arc<AppState> {
+    use control_ofc_daemon::hwmon::gpu_detect::AmdGpuInfo;
+    use std::path::PathBuf;
+
+    let cache = Arc::new(StateCache::new());
+    let read_only = AmdGpuInfo {
+        pci_bdf: pci_bdf.into(),
+        pci_device_id,
+        pci_revision: 0xC0,
+        pci_class: 0x030000,
+        marketing_name: Some("RX 9070 XT".into()),
+        hwmon_path: PathBuf::from("/nonexistent/hwmon"),
+        fan_curve_path: None,
+        fan_zero_rpm_path: None,
+        is_discrete: true,
+        has_fan_rpm: true,
+        has_pwm: true,         // pwm1 exists
+        has_pwm_enable: false, // but pwm1_enable does NOT — this is the bug shape
+        overdrive_enabled: false,
+    };
+    Arc::new(AppState {
+        cache,
+        staleness_config: StalenessConfig::default(),
+        daemon_version: "0.1.0-test".into(),
+        fan_controller: None,
+        hwmon_controller: None,
+        start_time: std::time::Instant::now(),
+        history: Arc::new(HistoryRing::new(250)),
+        active_profile: Arc::new(parking_lot::Mutex::new(None)),
+        calibrating: std::sync::atomic::AtomicBool::new(false),
+        amd_gpus: vec![read_only],
+        profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
+        config_path: String::new(),
+        runtime_config_path: std::path::PathBuf::new(),
+        sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    })
+}
+
+#[tokio::test]
+async fn gpu_set_fan_read_only_rdna_returns_400_feature_unavailable() {
+    // DEC-098: the legacy-PWM dispatch arm previously gated on `gpu.has_pwm`
+    // alone. RDNA3/RDNA4 GPUs without overdrive expose `pwm1` read-only and
+    // lack `pwm1_enable`, so the handler would attempt to write `pwm1_enable`,
+    // fail with ENOENT, and surface 503 hardware_unavailable + retryable:true.
+    // The canonical answer is 400 feature_unavailable + retryable:false (DEC-094)
+    // and the message must include the `amdgpu.ppfeaturemask=0xffffffff` hint
+    // so users on bare RDNA3/4 know how to unlock PMFW.
+    let bdf = "0000:03:00.0";
+    let state = test_app_state_with_read_only_gpu(bdf, 0x7550); // RX 9070 XT device id
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let body = serde_json::json!({ "speed_pct": 50 });
+    let (status, json) = uds_post(&path, &format!("/gpu/{bdf}/fan/pwm"), &body).await;
+
+    assert_eq!(status, 400);
+    assert_eq!(json["error"]["code"], "feature_unavailable");
+    assert_eq!(json["error"]["retryable"], false);
+    assert_eq!(json["error"]["source"], "validation");
+    let msg = json["error"]["message"].as_str().expect("message string");
+    assert!(
+        msg.contains("amdgpu.ppfeaturemask=0xffffffff"),
+        "expected ppfeaturemask hint in message, got: {msg}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn gpu_reset_fan_read_only_rdna_returns_400_feature_unavailable() {
+    // DEC-098 mirror for the reset path.
+    let bdf = "0000:03:00.0";
+    let state = test_app_state_with_read_only_gpu(bdf, 0x7550);
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_post(
+        &path,
+        &format!("/gpu/{bdf}/fan/reset"),
+        &serde_json::json!({}),
+    )
+    .await;
+
+    assert_eq!(status, 400);
+    assert_eq!(json["error"]["code"], "feature_unavailable");
+    assert_eq!(json["error"]["retryable"], false);
+    assert_eq!(json["error"]["source"], "validation");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
 // ── /profile/deactivate (DEC-097) ───────────────────────────────────────
 
 /// Helper: test_app_state with an active profile pre-populated.

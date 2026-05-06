@@ -12,95 +12,124 @@ use crate::api::responses::*;
 use crate::serial::controller::FanControlError;
 
 /// POST /fans/openfan/{channel}/pwm — set PWM on a single channel.
+///
+/// DEC-099: dispatched on `spawn_blocking` so the serial-write critical
+/// section (parking_lot mutex + USB-CDC turnaround, up to ~500ms) does not
+/// pin a tokio worker thread. The polling loop already follows this rule;
+/// matching it here lets the runtime keep accepting requests while the
+/// FanController lock is held by another task.
 pub async fn set_pwm_handler(
     State(state): State<Arc<AppState>>,
     Path(channel): Path<u8>,
     Json(body): Json<SetPwmRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let Some(ref controller) = state.fan_controller else {
+    let Some(controller) = state.fan_controller.clone() else {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             &ErrorEnvelope::hardware_unavailable("OpenFanController not connected"),
         );
     };
 
-    let mut ctrl = controller.lock();
+    let pwm_percent = body.pwm_percent;
+    let result =
+        tokio::task::spawn_blocking(move || controller.lock().set_pwm(channel, pwm_percent)).await;
 
-    match ctrl.set_pwm(channel, body.pwm_percent) {
-        Ok(result) => {
+    match result {
+        Ok(Ok(set_result)) => {
             state.cache.record_gui_write();
             json_ok(
                 StatusCode::OK,
                 SetPwmResponse {
                     api_version: API_VERSION,
-                    channel: result.channel,
-                    pwm_percent: result.pwm_percent,
-                    coalesced: result.coalesced,
+                    channel: set_result.channel,
+                    pwm_percent: set_result.pwm_percent,
+                    coalesced: set_result.coalesced,
                 },
             )
         }
-        Err(e) => fan_control_error_response(e),
+        Ok(Err(e)) => fan_control_error_response(e),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &ErrorEnvelope::internal(format!("openfan write task failed: {e}")),
+        ),
     }
 }
 
 /// POST /fans/openfan/pwm — set PWM on all channels.
+///
+/// DEC-099: dispatched on `spawn_blocking` (see `set_pwm_handler`).
 pub async fn set_pwm_all_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<SetPwmRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let Some(ref controller) = state.fan_controller else {
+    let Some(controller) = state.fan_controller.clone() else {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             &ErrorEnvelope::hardware_unavailable("OpenFanController not connected"),
         );
     };
 
-    let mut ctrl = controller.lock();
+    let pwm_percent = body.pwm_percent;
+    let result =
+        tokio::task::spawn_blocking(move || controller.lock().set_pwm_all(pwm_percent)).await;
 
-    match ctrl.set_pwm_all(body.pwm_percent) {
-        Ok(result) => {
+    match result {
+        Ok(Ok(set_result)) => {
             state.cache.record_gui_write();
             json_ok(
                 StatusCode::OK,
                 SetPwmAllResponse {
                     api_version: API_VERSION,
-                    pwm_percent: result.pwm_percent,
-                    channels_affected: result.channels_affected,
+                    pwm_percent: set_result.pwm_percent,
+                    channels_affected: set_result.channels_affected,
                 },
             )
         }
-        Err(e) => fan_control_error_response(e),
+        Ok(Err(e)) => fan_control_error_response(e),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &ErrorEnvelope::internal(format!("openfan write-all task failed: {e}")),
+        ),
     }
 }
 
 /// POST /fans/openfan/{channel}/target_rpm — set target RPM on a single channel.
+///
+/// DEC-099: dispatched on `spawn_blocking` (see `set_pwm_handler`).
 pub async fn set_target_rpm_handler(
     State(state): State<Arc<AppState>>,
     Path(channel): Path<u8>,
     Json(body): Json<SetRpmRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let Some(ref controller) = state.fan_controller else {
+    let Some(controller) = state.fan_controller.clone() else {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             &ErrorEnvelope::hardware_unavailable("OpenFanController not connected"),
         );
     };
 
-    let mut ctrl = controller.lock();
+    let target_rpm = body.target_rpm;
+    let result =
+        tokio::task::spawn_blocking(move || controller.lock().set_target_rpm(channel, target_rpm))
+            .await;
 
-    match ctrl.set_target_rpm(channel, body.target_rpm) {
-        Ok(result) => {
+    match result {
+        Ok(Ok(set_result)) => {
             state.cache.record_gui_write();
             json_ok(
                 StatusCode::OK,
                 SetRpmResponse {
                     api_version: API_VERSION,
-                    channel: result.channel,
-                    target_rpm: result.target_rpm,
+                    channel: set_result.channel,
+                    target_rpm: set_result.target_rpm,
                 },
             )
         }
-        Err(e) => fan_control_error_response(e),
+        Ok(Err(e)) => fan_control_error_response(e),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &ErrorEnvelope::internal(format!("openfan target_rpm task failed: {e}")),
+        ),
     }
 }
 

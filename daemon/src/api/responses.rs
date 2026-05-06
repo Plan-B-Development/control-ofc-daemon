@@ -270,6 +270,14 @@ pub struct AmdGpuCapability {
     pub overdrive_enabled: bool,
     /// Whether the PMFW zero-RPM sysfs file exists.
     pub gpu_zero_rpm_available: bool,
+    /// Kernel-version advisories applicable to this GPU.
+    ///
+    /// Empty in normal operation. Populated when the running kernel matches a
+    /// known amdgpu regression (e.g. RDNA3/RDNA4 hard-hang on 6.19, R9700 SMU
+    /// mismatch on 7.0). The GUI surfaces high/critical entries as a one-time
+    /// popup. See `crate::hwmon::kernel_warnings` for the catalog.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kernel_warnings: Vec<crate::hwmon::kernel_warnings::KernelWarning>,
 }
 
 /// OpenFanController capability details.
@@ -748,6 +756,7 @@ mod tests {
                     is_discrete: true,
                     overdrive_enabled: true,
                     gpu_zero_rpm_available: true,
+                    kernel_warnings: Vec::new(),
                 },
                 aio_hwmon: UnsupportedCapability {
                     present: false,
@@ -801,10 +810,14 @@ mod tests {
             is_discrete: false,
             overdrive_enabled: false,
             gpu_zero_rpm_available: false,
+            kernel_warnings: Vec::new(),
         };
         let json = serde_json::to_value(&cap).unwrap();
         assert!(json.get("pci_id").is_none());
         assert!(json.get("pci_bdf").is_none());
+        // DEC-098: kernel_warnings is omitted when empty so older clients
+        // without the field don't see an unexpected null/array.
+        assert!(json.get("kernel_warnings").is_none());
     }
 
     #[test]

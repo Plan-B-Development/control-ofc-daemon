@@ -1,5 +1,84 @@
 # Changelog
 
+## [1.6.1] — 2026-05-06
+
+Audit-driven correctness fixes. Pairs with **GUI v1.10.1**. No new user-
+visible features — every change is either a contract correction or an
+internal change that improves runtime fairness under load.
+
+### Fixed
+- **GPU `feature_unavailable` now actually fires for read-only RDNA3/4
+  hardware (DEC-098).** The legacy hwmon dispatch arm in
+  `gpu_set_fan_handler` and `gpu_reset_fan_handler` previously gated on
+  `gpu.has_pwm` alone. RDNA3/RDNA4 GPUs booted without
+  `amdgpu.ppfeaturemask=0xffffffff` expose `pwm1` read-only and lack
+  `pwm1_enable`, so `set_legacy_pwm` would attempt to write
+  `pwm1_enable`, fail with ENOENT, and surface
+  `503 hardware_unavailable + retryable: true` — wrong code (capability
+  gap, not transient hardware fault) and wrong retry semantics
+  (permanent, not retryable). Both handlers now consult a canonical
+  helper `AmdGpuInfo::can_write_legacy_pwm()` and return
+  `400 feature_unavailable + retryable: false`. The capability scoring
+  in `status::capabilities_handler` consumes the same helper so
+  `/capabilities` and the actual handler outcome cannot disagree.
+  When the GPU shape matches RDNA3/4 without overdrive, the error
+  message includes the `amdgpu.ppfeaturemask=0xffffffff` hint that
+  unlocks PMFW.
+- **OpenFan and hwmon API write handlers now run on `spawn_blocking`
+  (DEC-099).** `set_pwm_handler`, `set_pwm_all_handler`,
+  `set_target_rpm_handler`, and `hwmon_set_pwm_handler` previously held
+  their parking_lot locks on a tokio worker thread directly, pinning
+  runtime workers for hundreds of milliseconds per write. They now
+  match the convention already used by the GPU handlers and the
+  polling loop. Callers see no behavioural change; the runtime stays
+  responsive for other tasks while a serial or sysfs write is in
+  flight.
+- **Thermal-emergency override scan releases the `FanController` mutex
+  between channels (DEC-099).** The scan previously held the mutex
+  across all 10 OpenFan channels (~5 s upper bound) plus the hwmon
+  headers, serialising every concurrent GUI write request behind it.
+  Per-channel re-locking lets GUI requests interleave; if a GUI write
+  briefly defeats safety, the next 1 Hz tick re-asserts the forced
+  value, so the safety net still holds.
+
+### Added
+- **`amd_gpu.kernel_warnings` capability field (DEC-098).** Populated
+  from a new `crate::hwmon::kernel_warnings` module that reads
+  `/proc/sys/kernel/osrelease` and matches the running kernel against
+  published amdgpu regressions:
+  - `rdna_hang_kernel_6_19_x` (Critical) — kernel 6.19.x on any RDNA3
+    or RDNA4 GPU; Phoronix-confirmed hard hang (Dec 2025).
+  - `smu_mismatch_navi48_r9700_kernel_7_0` (Critical) — kernel 7.0.x
+    on R9700 (PCI 0x7551) with PMFW exposed; ROCm Issue #6101 silent
+    fan_curve write failure. Scoped narrowly to 0x7551; RX 9070 XT
+    (0x7550) on the same kernel is not affected.
+
+  The field uses `#[serde(skip_serializing_if = "Vec::is_empty")]`,
+  so older clients that don't know about it see no change in
+  `/capabilities` output.
+
+### Tests
+- Two new integration tests pin the read-only-RDNA case:
+  `gpu_set_fan_read_only_rdna_returns_400_feature_unavailable` and
+  `gpu_reset_fan_read_only_rdna_returns_400_feature_unavailable`,
+  plus a new `test_app_state_with_read_only_gpu` fixture in
+  `daemon/tests/ipc_integration.rs`. The fixture covers the
+  `has_pwm=true, has_pwm_enable=false, fan_curve_path=None` shape that
+  RDNA3/4 hardware without overdrive presents.
+- 17 new unit tests cover `kernel_warnings` parsing, severity, and
+  device-id scoping (positive cases for 6.19 + RDNA3/4, negative for
+  RDNA2; positive for R9700 0x7551 on 7.0, negative for RX 9070 XT
+  0x7550 on the same kernel).
+- 374 lib + 34 integration + doc tests pass.
+
+### Documentation
+- `DECISIONS.md`: DEC-098 (legacy-PWM gate + kernel_warnings),
+  DEC-099 (`spawn_blocking` + per-channel mutex).
+- `CLAUDE.md` cross-stack updates land in the GUI repo (DEC-098 and
+  DEC-099 are mirrored there as authoritative).
+
+---
+
 ## [1.6.0] — 2026-05-02
 
 Headless profile-mode parity and per-GPU zero-RPM control. Pairs with
