@@ -1,6 +1,6 @@
 # Maintainer: Plan-B-Development <https://github.com/Plan-B-Development>
 pkgname=control-ofc-daemon
-pkgver=1.6.0
+pkgver=1.6.1
 pkgrel=1
 pkgdesc="Hardware fan control daemon for Linux (OpenFan, hwmon, GPU)"
 arch=('x86_64')
@@ -17,8 +17,8 @@ install=control-ofc-daemon.install
 options=(!lto)
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
 # Placeholder — recomputed post-tag-push. Fix with a follow-up
-# "fix: update PKGBUILD checksum for v1.6.0" commit.
-sha256sums=('bb7ee10e5e862bbeb45494e34b3b80ab38a502d1a848ded9b1887a9d066b5b55')
+# "fix: update PKGBUILD checksum for v1.6.1" commit.
+sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
 
 prepare() {
     cd "$pkgname-$pkgver"
