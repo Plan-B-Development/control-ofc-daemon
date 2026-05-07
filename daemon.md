@@ -36,6 +36,9 @@ daemon/src/
     lease.rs           — LeaseManager (exclusive write access)
     gpu_detect.rs      — AMD GPU detection via sysfs/DRM
     gpu_fan.rs         — PMFW fan curve read/write/reset
+    kernel_warnings.rs — kernel-version regression catalog
+                          (RDNA3/4 hard hang on 6.19, R9700 SMU on 7.0)
+                          surfaced via /capabilities.amd_gpu.kernel_warnings
     util.rs            — shared sysfs path helpers
 
   health/
@@ -104,6 +107,15 @@ profile_engine ──read──> StateCache
 4. **ExecStopPost restore** (`packaging/control-ofc-restore-auto.sh`):
    - Restores `pwm_enable=2` (auto) on ANY service stop (including SIGKILL)
    - Resets GPU fan curves to automatic
+   - Re-enables `fan_zero_rpm_enable=1` for every GPU exposing it (DEC-100 — closes the SIGKILL/OOM path the panic hook can't cover)
+
+5. **Kernel-version regression catalogue** (`hwmon/kernel_warnings.rs`, DEC-098):
+   - Curated list of published amdgpu regressions keyed by kernel version + GPU PCI device ID
+   - Currently flags `rdna_hang_kernel_6_19_x` (RDNA3/4 hard hang on 6.19.x, Phoronix-confirmed) and `smu_mismatch_navi48_r9700_kernel_7_0` (R9700-only fan_curve write failure on 7.0.x, ROCm Issue #6101)
+   - Surfaced via `GET /capabilities` (`devices.amd_gpu.kernel_warnings`); each entry carries `id`, `severity` (`info` / `warn` / `high` / `critical`), `summary`, and an optional `reference_url`
+   - The field uses `#[serde(skip_serializing_if = "Vec::is_empty")]` so older clients that don't know about it see no change in the wire shape
+   - The GUI raises a one-time `QMessageBox` for `high` and `critical` warnings; the user's acknowledgement is persisted in `app_settings.acknowledged_kernel_warnings` so the popup does not re-fire on every reconnect
+   - Adding a new regression entry is a 30-line PR against `kernel_warnings.rs`; no schema or contract change required
 
 ## Running
 
@@ -170,7 +182,7 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 | GET | `/poll` | Batch: status + sensors + fans |
 | GET | `/sensors/history` | Per-entity time-series (ring buffer) |
 | GET | `/events` | Server-Sent Events stream (`event: update`, 5s heartbeat) |
-| GET | `/capabilities` | Device list, feature flags, limits |
+| GET | `/capabilities` | Device list, feature flags, limits, `amd_gpu.kernel_warnings` (kernel-version regression catalogue, DEC-098) |
 | GET | `/hwmon/headers` | Controllable motherboard PWM outputs |
 | GET | `/hwmon/lease/status` | Lease holder + TTL |
 | GET | `/profile/active` | Current active profile or `{"active": false}` |

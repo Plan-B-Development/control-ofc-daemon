@@ -49,6 +49,10 @@ daemon/                     Rust crate (control-ofc-daemon)
       lease.rs              Exclusive write lease (take/release/renew, 60s TTL)
       gpu_detect.rs         AMD GPU detection via sysfs/DRM
       gpu_fan.rs            PMFW fan curve read/write/reset (RDNA3+)
+      kernel_warnings.rs    Kernel-version regression catalog (DEC-098).
+                            Matches running kernel against published amdgpu
+                            regressions; surfaced via
+                            /capabilities.amd_gpu.kernel_warnings.
       util.rs               Shared sysfs path helpers
     serial/
       protocol.rs           OpenFanController protocol encode/decode
@@ -60,7 +64,7 @@ daemon/                     Rust crate (control-ofc-daemon)
     safety.rs               ThermalSafetyRule (CPU emergency override)
     polling.rs              hwmon + OpenFan polling loops
   tests/
-    ipc_integration.rs      22 integration tests (UDS)
+    ipc_integration.rs      Integration tests over the UDS HTTP server
 docs/
   ADRs/                     Architecture decision records
 packaging/
@@ -110,16 +114,17 @@ sudo systemctl enable --now control-ofc-daemon
 ### Read-only
 | Endpoint | Description |
 |---|---|
-| `GET /capabilities` | Device capabilities, feature flags, safety limits |
+| `GET /capabilities` | Device capabilities, feature flags, safety limits, `amd_gpu.kernel_warnings` (DEC-098) |
 | `GET /status` | Health status + subsystem freshness |
 | `GET /sensors` | Cached temperature readings |
 | `GET /fans` | Fan RPM + last commanded PWM |
 | `GET /poll` | Batch: status + sensors + fans in one call |
 | `GET /sensors/history` | Per-entity time-series history |
-| `GET /events` | SSE real-time sensor/fan stream |
+| `GET /events` | SSE real-time sensor/fan stream (max `SSE_MAX_CLIENTS` concurrent; bounded admission retries) |
 | `GET /hwmon/headers` | Discovered controllable PWM headers |
 | `GET /hwmon/lease/status` | Lease held/TTL/owner |
 | `GET /profile/active` | Currently active profile info |
+| `GET /diagnostics/hardware` | Hardware readiness: hwmon chips, GPU detection, thermal-safety state, kernel modules, ACPI conflicts, board info, kernel warnings |
 
 ### Write
 | Endpoint | Description |
@@ -128,13 +133,14 @@ sudo systemctl enable --now control-ofc-daemon
 | `POST /fans/openfan/pwm` | Set PWM on all channels |
 | `POST /fans/openfan/{ch}/target_rpm` | Set target RPM (closed-loop) |
 | `POST /fans/openfan/{ch}/calibrate` | Run a PWM-to-RPM calibration sweep |
-| `POST /hwmon/lease/take` | Acquire exclusive hwmon write lease |
+| `POST /hwmon/lease/take` | Acquire exclusive hwmon write lease (force-take per DEC-049) |
 | `POST /hwmon/lease/release` | Release lease |
 | `POST /hwmon/lease/renew` | Extend lease TTL |
 | `POST /hwmon/{header_id}/pwm` | Set hwmon PWM (requires lease) |
+| `POST /hwmon/{header_id}/verify` | Behavioural test of PWM write effectiveness (~3 s); returns `restore_failed: bool` per DEC-100 |
 | `POST /hwmon/rescan` | Re-enumerate hwmon devices |
-| `POST /gpu/{gpu_id}/fan/pwm` | Set GPU fan speed (PMFW or hwmon) |
-| `POST /gpu/{gpu_id}/fan/reset` | Reset GPU fan to automatic mode |
+| `POST /gpu/{gpu_id}/fan/pwm` | Set GPU fan speed (PMFW or legacy pwm1); records GUI activity |
+| `POST /gpu/{gpu_id}/fan/reset` | Reset GPU fan to automatic; records GUI activity (DEC-100) so the profile engine defers for `GUI_ACTIVITY_TIMEOUT` |
 | `POST /profile/activate` | Switch active profile at runtime |
 | `POST /profile/deactivate` | Clear active profile (DEC-097); idempotent; releases the profile-engine lease but preserves any GUI lease |
 | `POST /config/profile-search-dirs` | Register additional profile search dirs (persists to `runtime.toml`) |
@@ -171,4 +177,9 @@ Every sensor/fan/header includes:
 
 ## Test counts
 
-312 total (290 unit + 22 integration). No tests require real hardware.
+The suite is comprehensive and grows release-by-release; no test
+requires real hardware (everything is mocked or driven against tempdirs).
+For the current count consult the most recent `CHANGELOG.md` entry —
+release notes record the exact `cargo test` totals for the matching
+daemon version. Run `cargo test --all-targets --all-features` to see
+the live count locally.

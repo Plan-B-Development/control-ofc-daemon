@@ -1,8 +1,16 @@
 # ADR-002: Runtime config split — `daemon.toml` vs `runtime.toml`
 
 **Status:** Accepted (v1.1.0; legacy parsing removed in v1.2.0).
-**Last reviewed:** 2026-04 (no change; PKGBUILD `post_upgrade` strips
+**Last reviewed:** 2026-05 (no change; PKGBUILD `post_upgrade` strips
 remaining legacy sections automatically).
+
+> **Status as of v1.6.x:** This ADR is now historical for migration
+> purposes — the v1.0 → v1.1 → v1.2 transition has been baked into the
+> codebase for years of release cycles. The split it documents (admin-owned
+> `daemon.toml` vs daemon-managed `runtime.toml`) is the current
+> architecture. The migration sections below describe what *happened* once,
+> not what an operator upgrading from v1.5 → v1.6 needs to do (nothing).
+> Pre-1.0 operators see the daemon `README.md` § Upgrade notes.
 
 ## Context
 

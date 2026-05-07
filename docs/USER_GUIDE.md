@@ -115,6 +115,52 @@ curl --unix-socket /run/control-ofc/control-ofc.sock http://localhost/sensors | 
 curl --unix-socket /run/control-ofc/control-ofc.sock http://localhost/fans | jq .
 ```
 
+## API quick reference
+
+The `/status`, `/capabilities`, `/sensors`, `/fans` examples above are the
+read endpoints most operators reach for. The full operator-relevant
+surface is below; see `daemon.md` § API Endpoints for the complete contract
+including request/response shapes.
+
+### Read
+
+| Endpoint | Use |
+|---|---|
+| `GET /status` | Subsystem health + counters; one-line answer to "is the daemon happy?" |
+| `GET /capabilities` | Device list, feature flags, safety limits, kernel-warning catalogue (`amd_gpu.kernel_warnings`) |
+| `GET /sensors` | All temperature readings |
+| `GET /fans` | Fan RPM + last-commanded PWM |
+| `GET /poll` | Combined status + sensors + fans in one round-trip (the GUI's primary 1 Hz read path) |
+| `GET /events` | Server-Sent Events stream of sensor/fan updates (max 5 concurrent clients; the GUI does not consume this — for integration tooling) |
+| `GET /sensors/history?id=...&last=N` | Time-series history for a sensor entity |
+| `GET /hwmon/headers` | Controllable motherboard PWM outputs |
+| `GET /hwmon/lease/status` | Active lease holder + TTL |
+| `GET /profile/active` | Current active profile or `{"active": false}` |
+| `GET /diagnostics/hardware` | **The central troubleshooting endpoint.** Hardware readiness report — hwmon chips, GPU detection, thermal-safety state, kernel modules, ACPI conflicts, board info, kernel warnings. Use this first when something looks wrong. |
+
+### Write
+
+| Endpoint | Use |
+|---|---|
+| `POST /fans/openfan/{ch}/pwm` | Set OpenFan channel PWM (no lease required) |
+| `POST /fans/openfan/pwm` | Set all OpenFan channels |
+| `POST /fans/openfan/{ch}/calibrate` | Long-running calibration sweep (~315 s upper bound) |
+| `POST /fans/openfan/{ch}/target_rpm` | Closed-loop RPM target (no lease) |
+| `POST /hwmon/{header}/pwm` | Set hwmon PWM (lease required) |
+| `POST /hwmon/{header}/verify` | Behavioural test of PWM write effectiveness; ~3 s; detects BIOS/EC reclaim. Returns `restore_failed: true` if the post-test restore-to-original-PWM write fails (DEC-100). |
+| `POST /hwmon/lease/take` | Force-take the hwmon lease (DEC-049) |
+| `POST /hwmon/lease/release` | Release the lease |
+| `POST /hwmon/lease/renew` | Renew the lease (60 s TTL) |
+| `POST /hwmon/rescan` | Re-enumerate hwmon devices and return fresh header list |
+| `POST /gpu/{gpu_id}/fan/pwm` | Set GPU fan speed (PMFW or legacy pwm1) |
+| `POST /gpu/{gpu_id}/fan/reset` | Restore GPU fan to firmware automatic (records gui_active per DEC-100) |
+| `POST /profile/activate` | Activate a profile by id or path |
+| `POST /profile/deactivate` | Clear active profile, release the `profile-engine` lease (DEC-097) |
+| `POST /config/profile-search-dirs` | Add directories to the profile search path (immediate) |
+| `POST /config/startup-delay` | Set startup-delay seconds (persisted to `runtime.toml`, takes effect on restart) |
+
+All errors use a nested envelope: `{"error": {"code": "...", "message": "...", "retryable": bool, "source": "...", "details": ...}}`. See `daemon.md` § Error Envelope for the full code list.
+
 ## Setting fan speeds
 
 ### OpenFanController
@@ -204,11 +250,10 @@ sudo udevadm trigger --subsystem-match=tty
 
 AMD discrete GPU fans are supported. The control method depends on GPU generation:
 
-- **RDNA3+ (RX 7000/9000 series):** Uses PMFW `fan_curve` sysfs interface. Requires `amdgpu.ppfeaturemask` kernel parameter with bit 14 set (0x4000). Add to your kernel command line:
+- **RDNA3+ (RX 7000/9000 series):** Uses PMFW `fan_curve` sysfs interface. Requires `amdgpu.ppfeaturemask` kernel parameter with bit 14 set (`0x4000`, `PP_OVERDRIVE_MASK`). The recommended value enables every PP feature flag — narrower masks are also valid as long as bit 14 is set, but `0xffffffff` is what the daemon's diagnostics and GUI suggest, what most distros document, and what the daemon's runtime error message points users at:
   ```
-  amdgpu.ppfeaturemask=0xfffd7fff
+  amdgpu.ppfeaturemask=0xffffffff
   ```
-  Or the common permissive value: `amdgpu.ppfeaturemask=0xffffffff`
 
 - **Pre-RDNA3 (RX 6000 and older):** Uses traditional `pwm1_enable=1` + `pwm1` control.
 
