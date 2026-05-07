@@ -16,3 +16,15 @@ for fan_curve in /sys/class/drm/card*/device/gpu_od/fan_ctrl/fan_curve; do
         echo c > "$fan_curve" 2>/dev/null
     fi
 done
+
+# Re-enable PMFW fan zero-RPM (firmware idle fan-stop) on every GPU that
+# exposes the sysfs file. The daemon disables zero-RPM before writing a
+# manual curve and re-enables it on graceful shutdown / panic; this is the
+# SIGKILL/OOM fallback. If we don't restore this, a fan that previously
+# stopped at idle will run continuously after a daemon crash.
+for zero_rpm in /sys/class/drm/card*/device/gpu_od/fan_ctrl/fan_zero_rpm_enable; do
+    if [ -w "$zero_rpm" ]; then
+        echo 1 > "$zero_rpm" 2>/dev/null
+        echo c > "$zero_rpm" 2>/dev/null
+    fi
+done

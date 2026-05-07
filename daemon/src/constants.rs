@@ -60,8 +60,13 @@ pub const SERIAL_PROBE_RANGE: std::ops::Range<u8> = 0..10;
 /// SMU firmware churn (DEC-070).
 pub const GPU_COALESCE_DELTA_PCT: u16 = 5;
 
-/// Number of PMFW write retries before giving up on a GPU fan write.
-pub const GPU_PMFW_WRITE_RETRIES: u8 = 5;
+/// Number of curve points written when emulating a static fan speed via the
+/// PMFW `fan_curve` interface. The fan_curve sysfs file accepts up to 5 indexed
+/// `INDEX TEMP SPEED` entries; we write the same speed at every index so the
+/// effective curve is flat. **This is not a retry count** — there is no retry
+/// logic in the GPU PMFW write path. Reducing this value shortens the curve
+/// rather than disabling retries.
+pub const GPU_PMFW_NUM_CURVE_POINTS: u8 = 5;
 
 /// Cooldown duration after a GPU fan write failure before retrying
 /// the same fan at the same speed.

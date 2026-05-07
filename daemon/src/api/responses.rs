@@ -480,6 +480,17 @@ pub struct HwmonVerifyResponse {
     pub test_pwm_percent: u8,
     pub wait_seconds: u8,
     pub details: String,
+    /// True if the post-verify restore-to-original-PWM write failed. Older
+    /// clients that don't know the field default to ``false`` on the GUI side.
+    /// When true, the header is left at the verify test value rather than the
+    /// caller's prior PWM — the caller may want to write the desired PWM
+    /// explicitly instead of trusting the verify endpoint to have done so.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub restore_failed: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Snapshot of sysfs state during a PWM verify operation.

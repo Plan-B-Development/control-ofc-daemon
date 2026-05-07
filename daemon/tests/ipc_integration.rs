@@ -1147,3 +1147,169 @@ async fn deactivate_profile_preserves_gui_lease() {
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
 }
+
+// ── Audit P2.7: GPU reset records gui_active ────────────────────────────
+
+/// Construct an `AppState` with a fully-writable PMFW GPU pointing at real
+/// files in a tempdir. The caller must keep the returned ``TempDir`` alive
+/// for the duration of the test (drop deletes the files).
+fn test_app_state_with_writable_pmfw_gpu(pci_bdf: &str) -> (Arc<AppState>, tempfile::TempDir) {
+    use control_ofc_daemon::hwmon::gpu_detect::AmdGpuInfo;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let fan_curve_path = tmp.path().join("fan_curve");
+    let zero_rpm_path = tmp.path().join("fan_zero_rpm_enable");
+
+    // Pre-populate with the multi-line PMFW format the daemon parses.
+    std::fs::write(
+        &fan_curve_path,
+        "OD_FAN_CURVE:\n0: 25C 30%\n1: 50C 50%\n2: 70C 70%\n3: 85C 85%\n4: 100C 100%\n\
+         OD_RANGE:\nFAN_CURVE(hotspot temp): 25C 100C\nFAN_CURVE(fan speed): 15% 100%\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &zero_rpm_path,
+        "FAN_ZERO_RPM_ENABLE:\n1\nOD_RANGE:\nZERO_RPM_ENABLE: 0 1\n",
+    )
+    .unwrap();
+
+    let cache = Arc::new(StateCache::new());
+    let pmfw = AmdGpuInfo {
+        pci_bdf: pci_bdf.into(),
+        pci_device_id: 0x7550,
+        pci_revision: 0xC0,
+        pci_class: 0x030000,
+        marketing_name: Some("RX 9070 XT (test)".into()),
+        hwmon_path: tmp.path().to_path_buf(),
+        fan_curve_path: Some(fan_curve_path),
+        fan_zero_rpm_path: Some(zero_rpm_path),
+        is_discrete: true,
+        has_fan_rpm: true,
+        has_pwm: true,
+        has_pwm_enable: false,
+        overdrive_enabled: true,
+    };
+
+    let state = Arc::new(AppState {
+        cache,
+        staleness_config: StalenessConfig::default(),
+        daemon_version: "0.1.0-test".into(),
+        fan_controller: None,
+        hwmon_controller: None,
+        start_time: std::time::Instant::now(),
+        history: Arc::new(HistoryRing::new(250)),
+        active_profile: Arc::new(parking_lot::Mutex::new(None)),
+        calibrating: std::sync::atomic::AtomicBool::new(false),
+        amd_gpus: vec![pmfw],
+        profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
+        config_path: String::new(),
+        runtime_config_path: std::path::PathBuf::new(),
+        sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    });
+    (state, tmp)
+}
+
+#[tokio::test]
+async fn gpu_reset_fan_records_gui_write() {
+    // Audit P2.7 regression: a successful POST /gpu/{id}/fan/reset must
+    // call record_gui_write() so the profile engine defers for the
+    // GUI_ACTIVITY_TIMEOUT window. Without this, the next 1 Hz profile-engine
+    // tick re-asserts the curve and silently undoes the user's reset.
+    let bdf = "0000:03:00.0";
+    let (state, _tmp) = test_app_state_with_writable_pmfw_gpu(bdf);
+
+    // Pre-condition: gui_active() is false (no prior writes).
+    assert!(
+        !state.cache.snapshot().gui_active(),
+        "precondition: gui_active should start false"
+    );
+
+    let (path, shutdown, _dir) = start_test_server(state.clone()).await;
+    let (status, json) = uds_post(
+        &path,
+        &format!("/gpu/{bdf}/fan/reset"),
+        &serde_json::json!({}),
+    )
+    .await;
+
+    assert_eq!(status, 200, "body: {json}");
+    assert_eq!(json["reset"], true);
+
+    // Post-condition: gui_active() is now true. The profile engine will
+    // skip GPU writes until GUI_ACTIVITY_TIMEOUT (30 s) elapses.
+    assert!(
+        state.cache.snapshot().gui_active(),
+        "reset must record a GUI write so the profile engine defers"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+// ── Audit P2.5: HwmonVerifyResponse.restore_failed wire format ──────────
+
+#[tokio::test]
+async fn hwmon_verify_response_omits_restore_failed_when_false() {
+    // skip_serializing_if = "is_false" means a successful restore yields a
+    // response without the field — older clients that don't know about it
+    // see exactly the same wire shape as before. The GUI dataclass defaults
+    // to ``False`` when the field is missing.
+    use control_ofc_daemon::api::responses::{HwmonVerifyResponse, HwmonVerifyState};
+
+    let resp = HwmonVerifyResponse {
+        header_id: "h1".into(),
+        result: "effective".into(),
+        initial_state: HwmonVerifyState {
+            pwm_enable: Some(1),
+            pwm_raw: Some(128),
+            pwm_percent: Some(50),
+            rpm: Some(1200),
+        },
+        final_state: HwmonVerifyState {
+            pwm_enable: Some(1),
+            pwm_raw: Some(178),
+            pwm_percent: Some(70),
+            rpm: Some(900),
+        },
+        test_pwm_percent: 70,
+        wait_seconds: 3,
+        details: "ok".into(),
+        restore_failed: false,
+    };
+    let json = serde_json::to_value(&resp).unwrap();
+    assert!(
+        json.get("restore_failed").is_none(),
+        "restore_failed must be omitted when false (skip_serializing_if): {json}"
+    );
+}
+
+#[tokio::test]
+async fn hwmon_verify_response_includes_restore_failed_when_true() {
+    use control_ofc_daemon::api::responses::{HwmonVerifyResponse, HwmonVerifyState};
+
+    let resp = HwmonVerifyResponse {
+        header_id: "h1".into(),
+        result: "effective".into(),
+        initial_state: HwmonVerifyState {
+            pwm_enable: Some(1),
+            pwm_raw: Some(128),
+            pwm_percent: Some(50),
+            rpm: Some(1200),
+        },
+        final_state: HwmonVerifyState {
+            pwm_enable: Some(1),
+            pwm_raw: Some(51),
+            pwm_percent: Some(20),
+            rpm: Some(700),
+        },
+        test_pwm_percent: 20,
+        wait_seconds: 3,
+        details: "ok".into(),
+        restore_failed: true,
+    };
+    let json = serde_json::to_value(&resp).unwrap();
+    assert_eq!(
+        json["restore_failed"], true,
+        "restore_failed must be present and true so GUI can warn the operator"
+    );
+}

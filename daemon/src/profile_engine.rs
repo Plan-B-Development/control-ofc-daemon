@@ -534,7 +534,7 @@ pub async fn profile_engine_loop(
                                 &path,
                                 zero_rpm.as_deref(),
                                 pct,
-                                constants::GPU_PMFW_WRITE_RETRIES,
+                                constants::GPU_PMFW_NUM_CURVE_POINTS,
                                 preserve_zero_rpm,
                             ) {
                                 Ok(()) => {

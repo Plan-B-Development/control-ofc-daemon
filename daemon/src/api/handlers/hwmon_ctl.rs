@@ -418,11 +418,24 @@ pub async fn hwmon_verify_handler(
     // Read back state after wait
     let final_state = read_state(&pwm_path, &enable_path, &rpm_path);
 
-    // Restore original PWM
-    {
+    // Restore original PWM. Failures here are surfaced via
+    // ``restore_failed`` rather than overwriting the diagnostic verify
+    // outcome — a successful verify with a failed restore is its own
+    // condition the caller can act on (typically: re-write the desired
+    // PWM). Previously the error was silently swallowed.
+    let restore_failed = {
         let mut ctrl = controller.lock();
-        let _ = ctrl.set_pwm(&header_id, current_pct, &body.lease_id);
-    }
+        match ctrl.set_pwm(&header_id, current_pct, &body.lease_id) {
+            Ok(_) => false,
+            Err(e) => {
+                log::warn!(
+                    "verify: restore PWM to {current_pct}% on {header_id} \
+                     failed (header left at test value {test_pct}%): {e}"
+                );
+                true
+            }
+        }
+    };
 
     // Classify result
     let (result, details) = classify_verify_result(&initial, &final_state, test_pct);
@@ -437,6 +450,7 @@ pub async fn hwmon_verify_handler(
             test_pwm_percent: test_pct,
             wait_seconds: VERIFY_WAIT_SECONDS,
             details,
+            restore_failed,
         },
     )
 }

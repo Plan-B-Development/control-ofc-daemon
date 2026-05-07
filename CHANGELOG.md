@@ -1,5 +1,98 @@
 # Changelog
 
+## [1.6.2] — 2026-05-07
+
+Audit-driven hygiene pass. Pairs with **GUI v1.10.2**. Three behavioural
+fixes (one wire-contract addition, one safety-restore gap, one
+dual-writer-guard bug) plus internal cleanup of misleading naming and
+unused dependencies.
+
+### Fixed
+- **GPU `POST /gpu/{id}/fan/reset` now records GUI activity (DEC-100).**
+  All other GPU/OpenFan/hwmon write handlers call `record_gui_write()`
+  on success; the reset path was the lone exception. With a profile
+  active, the next 1 Hz profile-engine tick (~1 s after the reset call)
+  re-asserts the profile's commanded curve and silently undoes the
+  user's reset. Both the PMFW reset arm and the legacy-pwm1 reset arm
+  now call `record_gui_write()` so the profile engine defers for the
+  same 30 s window it gives to a `set` call.
+- **`POST /hwmon/{id}/verify` surfaces a failed restore-PWM write
+  (DEC-100).** The handler previously did `let _ = ctrl.set_pwm(...)`
+  on the post-verify restore — a `HwmonControlError` (lease expired
+  mid-call, EINVAL, etc.) was silently swallowed and the header was
+  left at the test value (20 % or 80 %) without any caller-visible
+  signal. The handler now logs at warn-level and returns
+  `restore_failed: true` in the response body so the GUI can prompt
+  the operator to re-set the desired PWM. The new field is
+  `#[serde(skip_serializing_if = "is_false")]`, so older clients see
+  the same wire shape they always have.
+- **`packaging/control-ofc-restore-auto.sh` now restores
+  `fan_zero_rpm_enable=1` (DEC-100).** The graceful-shutdown panic hook
+  already re-enables PMFW zero-RPM on SIGTERM and panic, but
+  `ExecStopPost` runs even when the process was SIGKILLed or OOM-killed
+  before any userspace code ran. Without this, a daemon crash that
+  occurred while zero-RPM was disabled (i.e. between a `set_static_speed`
+  and the next `reset_to_auto`) would leave the GPU fan running
+  continuously at idle. The script now writes `1\n` + `c\n` to every
+  `fan_zero_rpm_enable` sysfs file alongside the existing `r\n` + `c\n`
+  curve restore.
+- **`SSE_MAX_CLIENTS` admission survives tight CAS contention
+  (DEC-100).** `events_handler` now bounds admission to
+  `SSE_ADMISSION_ATTEMPTS = 4` with a `tokio::task::yield_now()`
+  between failures (whether the CAS lost to a concurrent change or the
+  counter was at the limit). Concurrent disconnects and CAS losers can
+  settle before we surface 503 to the caller. Single-client load and
+  cold-start admission are unaffected.
+
+### Renamed
+- **`GPU_PMFW_WRITE_RETRIES` → `GPU_PMFW_NUM_CURVE_POINTS` (DEC-100).**
+  Audit found the constant's doc comment described "PMFW write retries
+  before giving up" — but the constant is the `num_points: u8` argument
+  to `set_static_speed` / `set_static_speed_with_zero_rpm`, controlling
+  how many curve-point indices are written. There is no retry logic in
+  the GPU PMFW write path. A maintainer who reduces this to "suppress
+  retries" would silently shrink the curve. The new name and doc
+  comment reflect what it actually does.
+
+### Documentation
+- **`docs/USER_GUIDE.md`** now references the current v4 profile schema
+  (was v3); the migration sentence makes clear that v3 and earlier
+  profiles auto-migrate on load.
+- **`packaging/profiles/quiet.json`** bumped to `version: 4`. The
+  `members: []` shape is unchanged so the role-aware `minimum_pct`
+  migration is a no-op for the example profile.
+
+### Removed
+- **Unused dependencies** — `ctrlc`, `tokio-stream`, `tower`. All three
+  were declared in `daemon/Cargo.toml` but never imported. Confirmed
+  via `cargo machete` and `grep`. Drops one dependency per
+  `cargo audit` and shaves a small amount of build time / binary mass.
+
+### Tests
+- 4 new tests:
+  - `gpu_reset_fan_records_gui_write` — integration test that exercises
+    the full reset handler against a tempdir-backed PMFW GPU and
+    asserts `cache.snapshot().gui_active()` becomes true.
+  - `hwmon_verify_response_omits_restore_failed_when_false` — wire
+    contract: older clients see no extra field.
+  - `hwmon_verify_response_includes_restore_failed_when_true` — wire
+    contract: newer clients see the flag and can warn the operator.
+  - `test_app_state_with_writable_pmfw_gpu` (helper) — reusable test
+    fixture for future PMFW-write-path coverage.
+- 374 lib + 3 (config) + 37 IPC = **414 tests pass** (was 411 before
+  this pass).
+- `cargo clippy --all-targets --all-features -- -D warnings` clean.
+- `cargo machete` reports no unused dependencies.
+
+### Decisions
+- **DEC-100 (cross-repo):** audit-pass-2 remediations covering
+  warning-signal immediacy, verify `restore_failed` contract addition,
+  GPU reset records `gui_active`, lease retry-timer suspend, GPU ZRP
+  restore script, SSE admission retry, and the
+  `GPU_PMFW_NUM_CURVE_POINTS` rename.
+
+---
+
 ## [1.6.1] — 2026-05-06
 
 Audit-driven correctness fixes. Pairs with **GUI v1.10.1**. No new user-

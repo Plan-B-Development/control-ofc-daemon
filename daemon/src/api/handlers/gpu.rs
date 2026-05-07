@@ -134,7 +134,7 @@ pub async fn gpu_set_fan_handler(
             &fan_curve_path,
             zero_rpm_path.as_deref(),
             speed_pct,
-            constants::GPU_PMFW_WRITE_RETRIES,
+            constants::GPU_PMFW_NUM_CURVE_POINTS,
         )
     })
     .await;
@@ -195,6 +195,11 @@ pub async fn gpu_reset_fan_handler(
             Ok(Ok(())) => {
                 let fan_id = format!("amd_gpu:{gpu_id}");
                 state.cache.set_gpu_fan_commanded_pct(&fan_id, 0);
+                // Record this as a GUI write so the profile engine defers for
+                // the GUI_ACTIVITY_TIMEOUT window. Without this, a profile-
+                // engine tick within ~1 s of the reset re-asserts the curve's
+                // commanded speed and silently undoes the user's reset.
+                state.cache.record_gui_write();
                 log::info!("GPU {gpu_id} fan reset to auto");
                 json_ok(
                     StatusCode::OK,
@@ -226,6 +231,9 @@ pub async fn gpu_reset_fan_handler(
             Ok(Ok(())) => {
                 let fan_id = format!("amd_gpu:{gpu_id}");
                 state.cache.set_gpu_fan_commanded_pct(&fan_id, 0);
+                // Same dual-writer guard as the PMFW reset arm above —
+                // see comment there.
+                state.cache.record_gui_write();
                 log::info!("GPU {gpu_id} legacy fan reset to auto");
                 json_ok(
                     StatusCode::OK,

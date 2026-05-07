@@ -230,7 +230,7 @@ The GPU ID is available from `GET /capabilities`.
 
 ## Fan profiles
 
-The daemon can autonomously evaluate fan curve profiles at 1 Hz. Profiles are JSON files compatible with the GUI's Profile v3 format. An example ships at `/etc/control-ofc/profiles/quiet.json`.
+The daemon can autonomously evaluate fan curve profiles at 1 Hz. Profiles are JSON files in the v4 schema (GUI v1.10.0 / daemon v1.6.0 and later). v3 and earlier profiles auto-migrate on load. An example ships at `/etc/control-ofc/profiles/quiet.json`.
 
 ### Loading a profile
 

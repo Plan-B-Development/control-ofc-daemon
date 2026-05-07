@@ -22,38 +22,57 @@ use crate::constants;
 use super::handlers::AppState;
 use super::responses::API_VERSION;
 
+/// Maximum admission attempts before rejecting an SSE connection. One initial
+/// attempt plus a few retries with a brief yield between them lets concurrent
+/// CAS losers and disconnects settle before we surface ``503 too_many_clients``
+/// to the caller — without this, a tight contention burst can spuriously
+/// reject a connection that would have admitted a microsecond later.
+const SSE_ADMISSION_ATTEMPTS: usize = 4;
+
 /// GET /events — SSE stream of sensor and fan updates.
 ///
 /// Returns 503 if the maximum number of concurrent SSE clients is reached.
 pub async fn events_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    loop {
+    let mut admitted = false;
+    for attempt in 0..SSE_ADMISSION_ATTEMPTS {
         let current = state.sse_clients.load(Ordering::SeqCst);
-        if current >= constants::SSE_MAX_CLIENTS {
-            log::warn!(
-                "SSE connection rejected: {current} active clients (limit: {})",
-                constants::SSE_MAX_CLIENTS,
-            );
-            // Source is "internal" (transport / availability) rather than
-            // "validation": the request shape is fine, the server-side client
-            // cap is the limiting factor. retryable:true because the cap
-            // relaxes as existing clients disconnect.
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                axum::Json(serde_json::json!({"error": {
-                    "code": "too_many_clients",
-                    "message": "maximum SSE connections reached",
-                    "retryable": true,
-                    "source": "internal"
-                }})),
-            ));
-        }
-        if state
-            .sse_clients
-            .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
+        if current < constants::SSE_MAX_CLIENTS
+            && state
+                .sse_clients
+                .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
         {
+            admitted = true;
             break;
         }
+        // Either at limit, or lost the CAS race to a concurrent change.
+        // Yield once so concurrent disconnects (which decrement the counter)
+        // and CAS losers can settle before we try again.
+        if attempt + 1 < SSE_ADMISSION_ATTEMPTS {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    if !admitted {
+        let current = state.sse_clients.load(Ordering::SeqCst);
+        log::warn!(
+            "SSE connection rejected: {current} active clients after {SSE_ADMISSION_ATTEMPTS} \
+             admission attempts (limit: {})",
+            constants::SSE_MAX_CLIENTS,
+        );
+        // Source is "internal" (transport / availability) rather than
+        // "validation": the request shape is fine, the server-side client
+        // cap is the limiting factor. retryable:true because the cap
+        // relaxes as existing clients disconnect.
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": {
+                "code": "too_many_clients",
+                "message": "maximum SSE connections reached",
+                "retryable": true,
+                "source": "internal"
+            }})),
+        ));
     }
 
     let started_at = Instant::now();
