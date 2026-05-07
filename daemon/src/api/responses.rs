@@ -385,6 +385,27 @@ pub struct HardwareDiagnosticsResponse {
     pub kernel_modules: Vec<KernelModuleInfo>,
     pub acpi_conflicts: Vec<AcpiConflictInfo>,
     pub board: BoardInfo,
+    /// Chip names this DMI board is *expected* to expose, sourced from a
+    /// curated dual-chip board lookup (`it87.c` DMI table + community
+    /// reports). Empty when the board is not in the lookup. The GUI
+    /// compares this against `hwmon.chips_detected[].chip_name` to detect
+    /// missing chips that the driver failed to enumerate (DEC-101 — most
+    /// commonly: the secondary IT87952E on Gigabyte X670/X870/Z790 boards
+    /// that needs explicit `mmio=on` modparam to bind reliably).
+    /// Older clients that don't know this field default to an empty list
+    /// because the field is `skip_serializing_if = "Vec::is_empty"` on
+    /// the wire and the GUI's `_filter_fields` parser tolerates it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expected_chips: Vec<String>,
+    /// Best-effort kernel-level chip detection — chip names parsed out of
+    /// `/dev/kmsg` `it87:` log lines (DEC-101). Populated when the daemon
+    /// can read the kernel ring buffer (Arch default: `dmesg_restrict=0`).
+    /// Empty when kmsg is not readable or no matches were found. Useful
+    /// for the "kernel found chip but driver did not bind" diagnostic;
+    /// not authoritative — the hwmon-bound chips in `chips_detected` are
+    /// the source of truth for which PWM headers actually work.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kernel_detected_chips: Vec<String>,
 }
 
 /// Hwmon chip diagnostics.

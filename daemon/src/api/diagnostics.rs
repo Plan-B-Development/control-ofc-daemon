@@ -1,18 +1,28 @@
 //! Hardware diagnostics: kernel module detection and ACPI conflict scanning.
 
 use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use super::responses::{AcpiConflictInfo, KernelModuleInfo};
 
 /// Known hwmon driver modules and whether they're in the mainline kernel.
+///
+/// Note on `it87`: the *module name* exists in the mainline tree, but every
+/// AM5/Z790-class chip we actually care about (IT8625E/IT8686E/IT8688E/
+/// IT8689E/IT8696E/IT87952E) requires the out-of-tree frankcrawford/it87
+/// fork. Marking the module as `false` keeps the modules table honest for
+/// users running the DKMS build — the chip-level mainline column
+/// (`chip_driver_in_mainline`) still reports per-chip accuracy for the
+/// few legacy IT87xx chips that genuinely are upstream.
 const KNOWN_MODULES: &[(&str, bool)] = &[
     ("nct6775", true),
     ("nct6775_core", true),
     ("nct6775_platform", true),
     ("nct6683", true),
     ("nct6687", false),
-    ("it87", true),
+    ("it87", false),
     ("f71882fg", true),
     ("asus_ec_sensors", true),
     ("asus_wmi_sensors", true),
@@ -202,6 +212,277 @@ pub fn read_board_info_from(dmi_dir: &Path) -> BoardInfo {
     }
 }
 
+// ── DMI → expected-chips lookup (DEC-101) ─────────────────────────
+//
+// Some Gigabyte boards expose two ITE Super-IO chips on a single PCB. The
+// upstream frankcrawford/it87 driver scans both 0x2E and 0x4E SuperIO base
+// addresses, but a stale SuperIO state (e.g. left in config-mode by a prior
+// `sensors-detect` run) or a missing `mmio=on` modparam on PR-#77-era code
+// can cause the secondary chip's DEVID read to return 0xFFFF and the driver
+// silently gives up on the second chip. Result: only N of M expected PWM
+// headers reach hwmon.
+//
+// We expose the expected chip-list to the GUI so it can render a dual-chip
+// warning when `expected_chips - chips_detected` is non-empty. The list is
+// sourced from the it87.c DMI table (see linux source) plus community
+// reports — chip names are normalised to the same format hwmon reports
+// (lowercased, no `E` suffix). When a board is not in the table we return
+// an empty Vec, the GUI does nothing and the rest of diagnostics keep
+// working unchanged.
+//
+// Updates to this table are board-by-board; do not encode "any X870E
+// Aorus" globs because Gigabyte ships single-chip variants with similar
+// names. Each entry is a deliberate match.
+
+/// One entry in the dual-chip board lookup. `board_name` is matched
+/// case-insensitively as a substring (or exact, if more specific
+/// matching is needed) against DMI `board_name`. `chips` lists the
+/// hwmon chip names expected — usually two, occasionally three.
+struct DualChipEntry {
+    /// DMI board_name (case-insensitive substring match).
+    board_name: &'static str,
+    /// Expected chip names in `chip_name` format (e.g. "it8696", "it87952").
+    chips: &'static [&'static str],
+}
+
+const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
+    // ── X870E AORUS family (IT8696E + IT87952E) ────────────────
+    DualChipEntry {
+        board_name: "X870E AORUS MASTER",
+        chips: &["it8696", "it87952"],
+    },
+    DualChipEntry {
+        board_name: "X870E AORUS PRO",
+        chips: &["it8696", "it87952"],
+    },
+    DualChipEntry {
+        board_name: "X870 AORUS ELITE WIFI7",
+        chips: &["it8696", "it87952"],
+    },
+    DualChipEntry {
+        board_name: "X870 AORUS ELITE WIFI7 ICE",
+        chips: &["it8696", "it87952"],
+    },
+    // ── X670E AORUS family (IT8689E + IT87952E) ────────────────
+    DualChipEntry {
+        board_name: "X670E AORUS MASTER",
+        chips: &["it8689", "it87952"],
+    },
+    DualChipEntry {
+        board_name: "X670E AORUS PRO X",
+        chips: &["it8689", "it87952"],
+    },
+    // ── Z690 / Z790 AORUS family (IT8689E + IT87952E) ──────────
+    DualChipEntry {
+        board_name: "Z690 AORUS PRO",
+        chips: &["it8689", "it87952"],
+    },
+    DualChipEntry {
+        board_name: "Z790 AORUS ELITE AX",
+        chips: &["it8689", "it87952"],
+    },
+    DualChipEntry {
+        board_name: "Z790 AORUS MASTER",
+        chips: &["it8689", "it87952"],
+    },
+    DualChipEntry {
+        board_name: "Z790 AORUS XTREME",
+        chips: &["it8689", "it87952"],
+    },
+    // ── X570 AORUS family (IT8688E + IT8792E/IT8795E) ──────────
+    // The driver source comments group IT8792E and IT8795E together; on
+    // the X570 generation the secondary chip is `it8792` in hwmon.
+    DualChipEntry {
+        board_name: "X570 AORUS MASTER",
+        chips: &["it8688", "it8792"],
+    },
+    DualChipEntry {
+        board_name: "X570 AORUS PRO",
+        chips: &["it8688", "it8792"],
+    },
+    DualChipEntry {
+        board_name: "X570 AORUS PRO WIFI",
+        chips: &["it8688", "it8792"],
+    },
+    DualChipEntry {
+        board_name: "X570 AORUS ULTRA",
+        chips: &["it8688", "it8792"],
+    },
+    DualChipEntry {
+        board_name: "TRX40 AORUS XTREME",
+        chips: &["it8688", "it8792"],
+    },
+    // ── Older dual-chip boards ──────────────────────────────────
+    DualChipEntry {
+        board_name: "X399 DESIGNARE EX-CF",
+        chips: &["it8686", "it8792"],
+    },
+    DualChipEntry {
+        board_name: "B450 AORUS PRO-CF",
+        chips: &["it8686", "it8792"],
+    },
+];
+
+/// Look up the chip names a known Gigabyte dual-chip board is expected to
+/// expose. Returns an empty Vec if the board is not in the table or
+/// `board_name` is empty — i.e. callers can treat empty as "no info" and
+/// the GUI will skip the warning UI.
+pub fn expected_chips_for_board(board_vendor: &str, board_name: &str) -> Vec<String> {
+    if board_name.is_empty() {
+        return Vec::new();
+    }
+    // Cheap vendor sanity check — only Gigabyte boards are in the table at
+    // present, so other vendors short-circuit. Empty vendor string still
+    // matches (some firmwares omit the field).
+    let vendor_lower = board_vendor.to_lowercase();
+    if !vendor_lower.is_empty() && !vendor_lower.contains("gigabyte") {
+        return Vec::new();
+    }
+    let board_upper = board_name.to_uppercase();
+    for entry in GIGABYTE_DUAL_CHIP_BOARDS {
+        if board_upper.contains(entry.board_name) {
+            return entry.chips.iter().map(|s| (*s).to_string()).collect();
+        }
+    }
+    Vec::new()
+}
+
+// ── Kernel-level chip detection (DEC-101) ──────────────────────────
+//
+// Best-effort signal of "what the kernel saw" before/independent of the
+// hwmon binding step. When kernel logs are accessible (Arch default has
+// `kernel.dmesg_restrict=0`), parsing dmesg for `it87:` lines surfaces
+// the exact chip family the SuperIO scan returned. When logs are not
+// readable (privileged-restricted distro, daemon running unprivileged
+// without CAP_SYSLOG), we return an empty Vec and the GUI falls back
+// to expected_chips alone.
+//
+// We do NOT shell out to `dmesg` or `journalctl` — both would add a
+// runtime dependency and add another failure mode. Instead we read
+// `/dev/kmsg` directly with O_NONBLOCK and parse a small ring of bytes.
+// Each /dev/kmsg record is one line, so a partial read can only cut
+// between records, not within one — making the parser robust without a
+// full reader stack.
+
+/// Parse chip names out of dmesg-style `it87:` lines.
+///
+/// Returns lowercased chip-name strings ("it8696", "it87952", …) for
+/// any "Found IT8XXXX chip" line in the input. Lines that don't match
+/// the pattern are skipped. Duplicates are de-duplicated (preserving
+/// order of first appearance) so the GUI can compare against
+/// `chips_detected` directly.
+pub fn parse_kmsg_for_it87_chips(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        // Look for "it87:" or "it87 " (some kernels print with comma/space)
+        // and a "Found IT" word boundary in the same line. Anchoring to
+        // "it87" (driver name) keeps unrelated module messages out.
+        let lower = line.to_lowercase();
+        if !lower.contains("it87") {
+            continue;
+        }
+        // Pull the IT8xxxx chip token.
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            // Match "IT" or "it" followed by '8' and 3-5 digits.
+            if i + 2 < bytes.len()
+                && (bytes[i] == b'I' || bytes[i] == b'i')
+                && (bytes[i + 1] == b'T' || bytes[i + 1] == b't')
+                && bytes[i + 2] == b'8'
+            {
+                let mut j = i + 3;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+                let digits = j - (i + 3);
+                if (3..=5).contains(&digits) {
+                    let chip_lower = std::str::from_utf8(&bytes[i..j])
+                        .unwrap_or_default()
+                        .to_lowercase();
+                    if !chip_lower.is_empty() && !out.contains(&chip_lower) {
+                        out.push(chip_lower);
+                    }
+                }
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Read kernel ring buffer and extract ITE chip names that the kernel
+/// reported via `it87:` log lines.
+///
+/// Best-effort: returns an empty Vec when `/dev/kmsg` is not readable
+/// (typical when `kernel.dmesg_restrict=1` and the daemon lacks
+/// CAP_SYSLOG). Caller treats empty as "no info" and falls back to
+/// `expected_chips`.
+pub fn read_kernel_detected_chips() -> Vec<String> {
+    read_kernel_detected_chips_from(Path::new("/dev/kmsg"))
+}
+
+/// Testable variant. Accepts a path so tests can supply a fixture with
+/// canned kmsg records (each newline-terminated record exactly mirrors
+/// the wire format, just without the leading priority/sequence prefix
+/// — the parser is permissive about prefixes).
+pub fn read_kernel_detected_chips_from(path: &Path) -> Vec<String> {
+    // Open with O_NONBLOCK so we never block waiting for new records.
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            log::debug!("kernel chip detect: cannot open {}: {e}", path.display());
+            return Vec::new();
+        }
+    };
+    // SEEK_DATA (constant 3) on /dev/kmsg seeks to the first record after
+    // the most recent dmesg --clear. On regular files SEEK_DATA also seeks
+    // to the next data block, which is usually the start — both behaviours
+    // are acceptable for our purposes. Fall back to SeekFrom::Start(0) on
+    // EINVAL.
+    if let Err(e) = file.seek(SeekFrom::Start(0)) {
+        log::debug!("kernel chip detect: seek failed: {e}");
+        return Vec::new();
+    }
+
+    // Cap at 1 MiB so a runaway log buffer cannot OOM us. The buffer is
+    // read in non-blocking mode, so EAGAIN (no more records) is the loop
+    // termination signal.
+    const MAX_BYTES: usize = 1024 * 1024;
+    let mut buf = Vec::with_capacity(64 * 1024);
+    let mut chunk = [0u8; 8192];
+    loop {
+        match file.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if buf.len() + n > MAX_BYTES {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) if e.raw_os_error() == Some(libc::EPIPE) => {
+                // EPIPE on /dev/kmsg means a record was overwritten while
+                // we were reading — we've drained the available history.
+                break;
+            }
+            Err(e) => {
+                log::debug!("kernel chip detect: read failed: {e}");
+                break;
+            }
+        }
+    }
+
+    let text = String::from_utf8_lossy(&buf);
+    parse_kmsg_for_it87_chips(&text)
+}
+
 /// Read the raw ppfeaturemask value as a hex string.
 pub fn read_ppfeaturemask() -> Option<String> {
     read_ppfeaturemask_from(Path::new("/sys/module/amdgpu/parameters/ppfeaturemask"))
@@ -350,5 +631,157 @@ mod tests {
         assert_eq!(info.vendor, "");
         assert_eq!(info.name, "");
         assert_eq!(info.bios_version, "");
+    }
+
+    // ── DEC-101: dual-chip board lookup ────────────────────────
+
+    #[test]
+    fn expected_chips_x870e_aorus_master() {
+        // The reference case — the user's reported board, has IT8696E +
+        // IT87952E. If this regresses the dual-chip warning never fires.
+        let chips = expected_chips_for_board("Gigabyte Technology Co., Ltd.", "X870E AORUS MASTER");
+        assert!(chips.contains(&"it8696".to_string()));
+        assert!(chips.contains(&"it87952".to_string()));
+        assert_eq!(chips.len(), 2);
+    }
+
+    #[test]
+    fn expected_chips_handles_empty_board_name() {
+        // Older firmwares with empty DMI must not panic and must return
+        // empty so the GUI hides the dual-chip warning.
+        assert!(expected_chips_for_board("Gigabyte", "").is_empty());
+        assert!(expected_chips_for_board("", "").is_empty());
+    }
+
+    #[test]
+    fn expected_chips_skips_non_gigabyte_vendor() {
+        // ASUS/MSI boards aren't in the dual-chip table; even if a board
+        // name happened to match, vendor mismatch should suppress the
+        // lookup so we don't false-positive other vendors.
+        assert!(expected_chips_for_board("ASUSTeK COMPUTER INC.", "X870E AORUS MASTER").is_empty());
+    }
+
+    #[test]
+    fn expected_chips_unknown_board_returns_empty() {
+        // Single-chip boards or unknown boards return empty so the GUI
+        // treats them as "no info" and hides the warning.
+        assert!(
+            expected_chips_for_board("Gigabyte Technology Co., Ltd.", "B650 AORUS ELITE AX")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn expected_chips_substring_match_tolerates_dmi_suffix() {
+        // Some firmwares append "  Rev 1.0" or trailing whitespace —
+        // substring match must still succeed.
+        let chips = expected_chips_for_board(
+            "Gigabyte Technology Co., Ltd.",
+            "Z790 AORUS MASTER  Rev 1.0",
+        );
+        assert_eq!(chips, vec!["it8689".to_string(), "it87952".to_string()]);
+    }
+
+    #[test]
+    fn expected_chips_x570_aorus_master_secondary_is_it8792() {
+        // Older X570 generation pairs the primary IT8688E with the smaller
+        // IT8792E (or 8795E, same hwmon name). Regression: do not confuse
+        // X570 with X670/X870 chip pairings.
+        let chips = expected_chips_for_board("Gigabyte Technology Co., Ltd.", "X570 AORUS MASTER");
+        assert_eq!(chips, vec!["it8688".to_string(), "it8792".to_string()]);
+    }
+
+    // ── DEC-101: kmsg parser ─────────────────────────────────
+
+    #[test]
+    fn parse_kmsg_extracts_it87_chip_names() {
+        // Realistic kmsg-style line. The driver emits both "Found IT8696E"
+        // and the chip name in title case; the parser must lowercase.
+        let text = "\
+            6,1234,5,-;it87: Found IT8696E chip at 0xa40 [MMIO at 0x00000000fe100000], revision 0\n\
+            6,1235,5,-;it87: Found IT87952E chip at 0xa60, revision 0\n";
+        let chips = parse_kmsg_for_it87_chips(text);
+        assert!(chips.contains(&"it8696".to_string()));
+        assert!(chips.contains(&"it87952".to_string()));
+        assert_eq!(chips.len(), 2);
+    }
+
+    #[test]
+    fn parse_kmsg_dedupes_repeated_lines() {
+        // The same chip may be logged twice during reload — must not
+        // appear twice in the output.
+        let text = "\
+            it87: Found IT8696E chip at 0xa40\n\
+            it87: Found IT8696E chip at 0xa40 (re-init)\n";
+        let chips = parse_kmsg_for_it87_chips(text);
+        assert_eq!(chips, vec!["it8696".to_string()]);
+    }
+
+    #[test]
+    fn parse_kmsg_skips_lines_without_it87_module_tag() {
+        // A user-space `IT8696` mention in some other dmesg line (e.g. a
+        // udev rule script logging) must NOT be picked up — the line must
+        // mention "it87" too. This avoids false positives.
+        let text = "udev: detected IT8696E reference in /etc/something\n";
+        assert!(parse_kmsg_for_it87_chips(text).is_empty());
+    }
+
+    #[test]
+    fn parse_kmsg_handles_empty_input() {
+        assert!(parse_kmsg_for_it87_chips("").is_empty());
+    }
+
+    #[test]
+    fn parse_kmsg_rejects_short_chip_codes() {
+        // "IT8" alone or "IT82" is too short — only IT8 followed by
+        // 3-5 digits is a real chip code.
+        let text = "it87: nonsense IT8 partial match IT82\n";
+        assert!(parse_kmsg_for_it87_chips(text).is_empty());
+    }
+
+    #[test]
+    fn read_kernel_detected_chips_returns_empty_when_path_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Point at a path that definitely doesn't exist — open should
+        // fail and we should get an empty Vec, not a panic.
+        let result = read_kernel_detected_chips_from(&tmp.path().join("nonexistent_kmsg"));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn read_kernel_detected_chips_parses_fixture_file() {
+        // Use a regular file as a kmsg fixture — the function reads
+        // bytes generically, so this exercises the parser path even
+        // though the seek behaviour differs from real /dev/kmsg.
+        let tmp = tempfile::tempdir().unwrap();
+        let kmsg = tmp.path().join("kmsg_fixture");
+        std::fs::write(
+            &kmsg,
+            "it87 driver version foo\n\
+             it87: Found IT8696E chip at 0xa40, revision 0\n\
+             it87: Found IT87952E chip at 0xa60, revision 0\n",
+        )
+        .unwrap();
+        let chips = read_kernel_detected_chips_from(&kmsg);
+        assert!(chips.contains(&"it8696".to_string()));
+        assert!(chips.contains(&"it87952".to_string()));
+    }
+
+    // ── DEC-101: it87 module mainline flag ───────────────────
+
+    #[test]
+    fn it87_module_marked_out_of_tree() {
+        // The `it87` module name does exist in mainline, but every chip we
+        // care about (IT8625E+) requires the out-of-tree DKMS build. The
+        // KNOWN_MODULES table lies if it claims mainline=true here — the
+        // GUI's modules-table column would falsely advertise upstream
+        // support to users running the DKMS build.
+        let entry = KNOWN_MODULES.iter().find(|(n, _)| *n == "it87");
+        assert!(entry.is_some(), "it87 must remain in KNOWN_MODULES");
+        assert!(
+            !entry.unwrap().1,
+            "it87 KNOWN_MODULES mainline flag must be false (DEC-101) — every \
+             chip we care about needs frankcrawford/it87 DKMS"
+        );
     }
 }

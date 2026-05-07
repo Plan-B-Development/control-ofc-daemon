@@ -1272,7 +1272,7 @@ async fn hwmon_verify_response_omits_restore_failed_when_false() {
             rpm: Some(900),
         },
         test_pwm_percent: 70,
-        wait_seconds: 3,
+        wait_seconds: 6,
         details: "ok".into(),
         restore_failed: false,
     };
@@ -1303,7 +1303,7 @@ async fn hwmon_verify_response_includes_restore_failed_when_true() {
             rpm: Some(700),
         },
         test_pwm_percent: 20,
-        wait_seconds: 3,
+        wait_seconds: 6,
         details: "ok".into(),
         restore_failed: true,
     };

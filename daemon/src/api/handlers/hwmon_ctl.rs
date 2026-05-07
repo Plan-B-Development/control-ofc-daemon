@@ -322,13 +322,17 @@ pub async fn hwmon_rescan_handler(
     }
 }
 
-const VERIFY_WAIT_SECONDS: u8 = 3;
+const VERIFY_WAIT_SECONDS: u8 = 6;
 
 /// POST /hwmon/{header_id}/verify — behavioural test of PWM write effectiveness.
 ///
 /// Writes a test PWM value, waits for hardware to respond, then reads back
 /// pwm_enable, PWM value, and RPM to classify the result. Requires a valid
-/// hwmon lease. Takes ~3 seconds.
+/// hwmon lease. Takes ~6 seconds — slow-spinning fans (pumps, large 140mm
+/// chassis fans) need >3s to settle, and a too-short wait produced false
+/// `no_rpm_effect` verdicts. The GUI's `VERIFY_PAUSE_SAFETY_MS` and the
+/// per-call HTTP timeout in `client.py::verify_hwmon_pwm` must stay above
+/// this value (≥9 s and ≥12 s respectively).
 pub async fn hwmon_verify_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(header_id): axum::extract::Path<String>,

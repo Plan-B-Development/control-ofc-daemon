@@ -108,6 +108,14 @@ pub async fn hardware_diagnostics_handler(
     // DMI board identification
     let board = diagnostics::read_board_info();
 
+    // DEC-101: dual-chip detection support. `expected_chips` is the
+    // deterministic DMI-board lookup; `kernel_detected_chips` is the
+    // best-effort kmsg parse. Both fields default to empty Vec on
+    // failure paths and are skipped from the wire when empty so older
+    // clients ignore them.
+    let expected_chips = diagnostics::expected_chips_for_board(&board.vendor, &board.name);
+    let kernel_detected_chips = diagnostics::read_kernel_detected_chips();
+
     json_ok(
         StatusCode::OK,
         HardwareDiagnosticsResponse {
@@ -123,6 +131,8 @@ pub async fn hardware_diagnostics_handler(
             kernel_modules,
             acpi_conflicts,
             board,
+            expected_chips,
+            kernel_detected_chips,
         },
     )
 }

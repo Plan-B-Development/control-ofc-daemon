@@ -1,5 +1,49 @@
 # Changelog
 
+## [1.6.3] — 2026-05-07
+
+Pairs with **GUI v1.11.0**. PWM verify timing fix and dual-chip
+diagnostics support, plus a corrected `it87` mainline flag for the
+Diagnostics modules table.
+
+### Changed
+- **PWM verify wait raised from 3 s to 6 s (DEC-101).** The
+  `hwmon_ctl::VERIFY_WAIT_SECONDS` constant doubles so slow-spinning
+  fans (pumps, large 140 mm chassis fans) settle their RPM in time to
+  be classified correctly. Previous 3 s wait produced false
+  `no_rpm_effect` verdicts. Worst-case round-trip is now ~7.5 s; the
+  GUI's verify HTTP timeout (12 s) and pause-safety auto-resume (9 s)
+  must stay above this value.
+- **`KNOWN_MODULES` `it87` flag flipped from `true` to `false`
+  (DEC-101).** The *module name* exists in mainline but every chip we
+  target (IT8625E / IT8686E / IT8688E / IT8689E / IT8696E /
+  IT87952E) requires the out-of-tree `frankcrawford/it87` DKMS build.
+  Marking the module as not-mainline keeps the GUI's modules-table
+  column truthful. The chip-level `chip_driver_in_mainline` is
+  unchanged and still per-chip accurate.
+
+### Added
+- **`/diagnostics/hardware.expected_chips` (DEC-101).** Curated
+  DMI-board → chip-list lookup covering known dual-IO Gigabyte boards
+  (X570/X670/X870/Z690/Z790 AORUS series and TRX40). When a board is
+  in the table, the field lists the chip names that should appear in
+  hwmon. Empty for unknown boards. Skipped from the wire when empty
+  so older clients see no shape change.
+- **`/diagnostics/hardware.kernel_detected_chips` (DEC-101).** Best-
+  effort chip names parsed from `/dev/kmsg` `it87:` log lines.
+  Populated when the kernel ring buffer is readable
+  (default Arch `kernel.dmesg_restrict=0`); empty otherwise. Useful
+  for distinguishing "kernel saw the chip but driver did not bind"
+  from "kernel never saw the chip"; not authoritative.
+
+### Tests
+- 11 new unit tests in `api::diagnostics::tests` covering the
+  curated lookup table, the kmsg parser (deduplication, false-positive
+  rejection, short-code rejection, empty input), the file-fixture
+  driver, and the `it87` mainline flag.
+- Two `ipc_integration.rs` HwmonVerifyResponse fixtures bumped from
+  `wait_seconds: 3` to `6`.
+
 ## [1.6.2] — 2026-05-07
 
 Audit-driven hygiene pass. Pairs with **GUI v1.10.2**. Three behavioural
