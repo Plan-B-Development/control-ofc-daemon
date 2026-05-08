@@ -1313,3 +1313,215 @@ async fn hwmon_verify_response_includes_restore_failed_when_true() {
         "restore_failed must be present and true so GUI can warn the operator"
     );
 }
+
+// ── DEC-102: read-only hwmon header gating ───────────────────────────
+
+/// Build a synthetic AppState whose hwmon controller advertises a single
+/// header with `is_writable=false`. Mimics the post-DEC-102 state when an
+/// unforeseen chip exposes a read-only `pwmN`. (The canonical case —
+/// `chip_name="amdgpu"` — is excluded one layer earlier in
+/// `pwm_discovery::discover_device_pwm`, so no header reaches this point;
+/// this fixture pins the defense-in-depth handler check.)
+fn test_app_state_with_read_only_hwmon_header() -> Arc<AppState> {
+    let cache = Arc::new(StateCache::new());
+    let mut header = make_test_header("ro1", "ReadOnlyFan", 0);
+    header.is_writable = false;
+    let lease_mgr = LeaseManager::new();
+    let ctrl = HwmonPwmController::new(
+        vec![header],
+        lease_mgr,
+        Box::new(HwmonMockWriter),
+        cache.clone(),
+    );
+
+    Arc::new(AppState {
+        cache,
+        staleness_config: StalenessConfig::default(),
+        daemon_version: "0.1.0-test".into(),
+        fan_controller: None,
+        hwmon_controller: Some(Arc::new(Mutex::new(ctrl))),
+        start_time: std::time::Instant::now(),
+        history: Arc::new(HistoryRing::new(250)),
+        active_profile: Arc::new(parking_lot::Mutex::new(None)),
+        calibrating: std::sync::atomic::AtomicBool::new(false),
+        amd_gpus: Vec::new(),
+        profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
+        config_path: String::new(),
+        runtime_config_path: std::path::PathBuf::new(),
+        sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    })
+}
+
+/// DEC-102: a write to a header whose discovered `is_writable=false` must
+/// short-circuit with `400 feature_unavailable`, never with `503`. Without
+/// the gate the controller attempts the sysfs write, the kernel returns
+/// `EACCES`, and the controller surfaces `503 hardware_unavailable +
+/// retryable: true` — which is both wrong (the condition is permanent) and
+/// triggers a 1 Hz retry storm in clients with retry policies.
+#[tokio::test]
+async fn hwmon_set_pwm_read_only_header_returns_400_feature_unavailable() {
+    let state = test_app_state_with_read_only_hwmon_header();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    // Take a valid lease — the failure must not be lease-shaped.
+    let body = serde_json::json!({ "owner_hint": "gui" });
+    let (status, lease_json) = uds_post(&path, "/hwmon/lease/take", &body).await;
+    assert_eq!(status, 200);
+    let lease_id = lease_json["lease_id"].as_str().unwrap();
+
+    let body = serde_json::json!({ "pwm_percent": 50, "lease_id": lease_id });
+    let (status, json) = uds_post(&path, "/hwmon/ro1/pwm", &body).await;
+
+    assert_eq!(
+        status, 400,
+        "read-only header must yield 400, never 503: {json}"
+    );
+    assert_eq!(json["error"]["code"], "feature_unavailable");
+    assert_eq!(json["error"]["retryable"], false);
+    let msg = json["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("read-only"),
+        "message missing 'read-only': {msg}"
+    );
+    assert!(
+        msg.contains("ro1"),
+        "message must name the header id: {msg}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// DEC-102 sibling check: the writability gate must take precedence over
+/// the lease check, so a stale or invalid lease still yields the
+/// `feature_unavailable` verdict for a permanently read-only header.
+/// Without this ordering, a client could mistakenly conclude the header is
+/// writable and that only the lease is wrong.
+#[tokio::test]
+async fn hwmon_set_pwm_read_only_header_takes_precedence_over_lease() {
+    let state = test_app_state_with_read_only_hwmon_header();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let body = serde_json::json!({ "pwm_percent": 50, "lease_id": "definitely-not-a-real-lease" });
+    let (status, json) = uds_post(&path, "/hwmon/ro1/pwm", &body).await;
+
+    assert_eq!(status, 400, "must be 400 even with a bogus lease: {json}");
+    assert_eq!(json["error"]["code"], "feature_unavailable");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// DEC-102 integration: discovery + IPC. Build a fake hwmon root with one
+/// motherboard chip (`it8696` with `pwm1`/`pwm1_enable`) and one amdgpu
+/// chip (RDNA3+ shape: `pwm1` + `fan1_input`, no `pwm1_enable`). Run real
+/// `discover_pwm_headers` over it, hand the result to `HwmonPwmController`,
+/// then call `GET /hwmon/headers` over the IPC socket. The amdgpu header
+/// must not appear on the wire — this is the canonical pre-DEC-102
+/// failure mode (the GUI used to surface `hwmon:amdgpu:.../pwm1:pwm1` and
+/// the user could bind it to a profile, producing 1 Hz EACCES storms).
+#[tokio::test]
+async fn hwmon_discovery_excludes_amdgpu_end_to_end_via_ipc() {
+    use control_ofc_daemon::hwmon::pwm_discovery::discover_pwm_headers;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+
+    // Motherboard chip — fully writable.
+    {
+        let dir = root.join("hwmon0");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("name"), "it8696").unwrap();
+        std::fs::write(dir.join("pwm1"), "128\n").unwrap();
+        std::fs::write(dir.join("pwm1_enable"), "2\n").unwrap();
+        std::fs::write(dir.join("fan1_input"), "1200\n").unwrap();
+        std::fs::write(dir.join("fan1_label"), "CPU_FAN\n").unwrap();
+    }
+    // AMD GPU — RDNA3+ shape. pwm1 present, pwm1_enable absent.
+    {
+        let dir = root.join("hwmon1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("name"), "amdgpu").unwrap();
+        std::fs::write(dir.join("pwm1"), "0\n").unwrap();
+        std::fs::write(dir.join("fan1_input"), "0\n").unwrap();
+    }
+
+    let descriptors = discover_pwm_headers(root).expect("discovery succeeds");
+    assert_eq!(
+        descriptors.len(),
+        1,
+        "discovery must drop amdgpu before the IPC layer ever sees it: {descriptors:#?}"
+    );
+    assert_eq!(descriptors[0].chip_name, "it8696");
+
+    // Hand the discovery result to a real controller and serve over IPC.
+    let cache = Arc::new(StateCache::new());
+    let lease_mgr = LeaseManager::new();
+    let ctrl = HwmonPwmController::new(
+        descriptors,
+        lease_mgr,
+        Box::new(HwmonMockWriter),
+        cache.clone(),
+    );
+    let state = Arc::new(AppState {
+        cache,
+        staleness_config: StalenessConfig::default(),
+        daemon_version: "0.1.0-test".into(),
+        fan_controller: None,
+        hwmon_controller: Some(Arc::new(Mutex::new(ctrl))),
+        start_time: std::time::Instant::now(),
+        history: Arc::new(HistoryRing::new(250)),
+        active_profile: Arc::new(parking_lot::Mutex::new(None)),
+        calibrating: std::sync::atomic::AtomicBool::new(false),
+        amd_gpus: Vec::new(),
+        profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
+        config_path: String::new(),
+        runtime_config_path: std::path::PathBuf::new(),
+        sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    });
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/hwmon/headers").await;
+    assert_eq!(status, 200);
+    let headers = json["headers"].as_array().unwrap();
+    assert_eq!(headers.len(), 1, "amdgpu must not appear: {headers:#?}");
+    assert_eq!(headers[0]["chip_name"], "it8696");
+    // Sanity: no header id contains "amdgpu" anywhere.
+    for h in headers {
+        let id = h["id"].as_str().unwrap_or_default();
+        assert!(
+            !id.contains("amdgpu"),
+            "header id must not reference amdgpu: {id}"
+        );
+    }
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// DEC-102: writes targeted at a header that was never discovered must
+/// continue to return 404 — discovery dropping the amdgpu header (Option A)
+/// shifts the failure mode from 503/EACCES to a clean 404.
+#[tokio::test]
+async fn hwmon_set_pwm_unknown_header_returns_404() {
+    let state = test_app_state_with_hwmon();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let body = serde_json::json!({ "owner_hint": "gui" });
+    let (_, lease_json) = uds_post(&path, "/hwmon/lease/take", &body).await;
+    let lease_id = lease_json["lease_id"].as_str().unwrap();
+
+    let body = serde_json::json!({ "pwm_percent": 50, "lease_id": lease_id });
+    let (status, json) = uds_post(
+        &path,
+        "/hwmon/hwmon:amdgpu:0000:03:00.0:pwm1:pwm1/pwm",
+        &body,
+    )
+    .await;
+
+    assert_eq!(status, 404, "unknown header must yield 404: {json}");
+    assert_eq!(json["error"]["code"], "validation_error");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}

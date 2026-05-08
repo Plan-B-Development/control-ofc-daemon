@@ -206,6 +206,16 @@ pub async fn hwmon_lease_renew_handler(
 /// task. Hwmon writes are typically sub-millisecond, but contention with
 /// the verify endpoint or the thermal-emergency scan can extend the
 /// critical section by seconds.
+///
+/// DEC-102: short-circuit with `400 feature_unavailable` when the header's
+/// discovered `is_writable` flag is `false`. Without this guard the kernel
+/// returns `EACCES`, which the controller surfaces as `503 hardware_unavailable`
+/// with `retryable: true` — a misclassification that traps GUI clients with
+/// retry policies into a 1 Hz storm. The condition (a read-only sysfs file)
+/// is permanent for this header, so the correct envelope is the same one
+/// DEC-094/DEC-098 chose for capability gaps. Defense-in-depth: discovery
+/// already drops `chip_name == "amdgpu"` (the canonical case), so this path
+/// only fires when an unforeseen chip exposes a read-only `pwmN`.
 pub async fn hwmon_set_pwm_handler(
     State(state): State<Arc<AppState>>,
     Path(header_id): Path<String>,
@@ -217,6 +227,33 @@ pub async fn hwmon_set_pwm_handler(
             &ErrorEnvelope::hardware_unavailable("no hwmon PWM headers available"),
         );
     };
+
+    // Pre-flight writability check (DEC-102). Mirrors the GPU handlers'
+    // `feature_unavailable` shape from DEC-098 so a single-prefix client
+    // (the GUI control loop) can treat the response as "drop this member"
+    // rather than "retry next cycle".
+    {
+        let ctrl = controller.lock();
+        match ctrl.headers().into_iter().find(|h| h.id == header_id) {
+            Some(h) if !h.is_writable => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    &ErrorEnvelope::feature_unavailable(format!(
+                        "hwmon header '{header_id}' is read-only \
+                         (sysfs pwm file lacks write permission); \
+                         this header cannot accept PWM writes"
+                    )),
+                );
+            }
+            Some(_) => {}
+            None => {
+                return error_response(
+                    StatusCode::NOT_FOUND,
+                    &ErrorEnvelope::validation(format!("unknown header: {header_id}")),
+                );
+            }
+        }
+    }
 
     let pwm_percent = body.pwm_percent;
     let lease_id = body.lease_id.clone();

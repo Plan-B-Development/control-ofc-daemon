@@ -81,6 +81,20 @@ fn discover_device_pwm(hwmon_dir: &Path) -> Result<Vec<PwmHeaderDescriptor>, Hwm
         .trim()
         .to_string();
 
+    // DEC-102: AMD GPU `pwm1` is owned by the GPU subsystem, not by hwmon.
+    // RDNA3+ exposes `pwm1` read-only with no `pwm1_enable`, so any write
+    // attempt fails with EACCES. Surfacing it as an hwmon header lets the
+    // GUI bind it to a profile and produces a 1 Hz 503/EACCES storm. GPU
+    // fans are addressed exclusively via the `amd_gpu:` prefix and the
+    // `/gpu/{id}/fan/...` endpoints.
+    if chip_name == "amdgpu" {
+        log::debug!(
+            "Skipping amdgpu hwmon at {} — GPU fans are owned by the GPU subsystem (DEC-102)",
+            hwmon_dir.display()
+        );
+        return Ok(Vec::new());
+    }
+
     let device_id = resolve_device_id(hwmon_dir);
 
     // Find all pwmN files (pwm1, pwm2, ...)
@@ -304,13 +318,72 @@ mod tests {
 
     #[test]
     fn discover_without_enable_file() {
+        // Non-amdgpu chip without `pwmN_enable`. Some legacy hwmon drivers
+        // (e.g. older nct67xx revisions) expose `pwm1` without
+        // `pwm1_enable`; those headers are still discoverable so the GUI can
+        // attempt direct PWM writes (the kernel may accept them depending on
+        // chip behaviour). The chip name is what gates inclusion, not the
+        // presence of `pwm1_enable` — see `discover_amdgpu_excluded`.
         let tmp = tempfile::tempdir().unwrap();
-        create_pwm_fixture(tmp.path(), "hwmon0", "amdgpu", &[(1, None, false, true)]);
+        create_pwm_fixture(tmp.path(), "hwmon0", "nct6798", &[(1, None, false, true)]);
 
         let headers = discover_pwm_headers(tmp.path()).unwrap();
         assert_eq!(headers.len(), 1);
         assert!(!headers[0].supports_enable);
         assert!(headers[0].enable_path.is_none());
+    }
+
+    /// DEC-102: `amdgpu` chips must never appear in hwmon PWM discovery,
+    /// regardless of how their `pwm1` file looks. RDNA3+ exposes a
+    /// read-only `pwm1` (no `pwm1_enable`); RDNA2 and older expose a
+    /// writable `pwm1` + `pwm1_enable`. Both shapes are GPU-subsystem
+    /// concerns and must be addressed via `amd_gpu:` prefix endpoints,
+    /// not via `/hwmon/{header_id}/pwm`. Pre-DEC-102, the read-only RDNA3+
+    /// shape produced a 1 Hz 503/EACCES storm whenever a GUI profile bound
+    /// it; this test pins the bug fix.
+    #[test]
+    fn discover_amdgpu_excluded() {
+        let tmp = tempfile::tempdir().unwrap();
+        // RDNA3/4 shape: pwm1 + fan1_input, no pwm1_enable.
+        create_pwm_fixture(tmp.path(), "hwmon0", "amdgpu", &[(1, None, false, true)]);
+
+        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        assert!(
+            headers.is_empty(),
+            "amdgpu hwmon (no pwm1_enable shape) must not be advertised: {headers:#?}"
+        );
+    }
+
+    #[test]
+    fn discover_amdgpu_excluded_even_with_enable_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        // RDNA2-and-older shape: pwm1 + pwm1_enable + fan1_input.
+        // Still excluded — GPU fans are owned by the GPU subsystem.
+        create_pwm_fixture(tmp.path(), "hwmon0", "amdgpu", &[(1, None, true, true)]);
+
+        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        assert!(
+            headers.is_empty(),
+            "amdgpu hwmon (RDNA2-style writable shape) must not be advertised: {headers:#?}"
+        );
+    }
+
+    #[test]
+    fn discover_amdgpu_excluded_alongside_motherboard_chip() {
+        // Mixed system: motherboard PWM chip and amdgpu both present.
+        // Discovery returns only the motherboard chip's headers.
+        let tmp = tempfile::tempdir().unwrap();
+        create_pwm_fixture(
+            tmp.path(),
+            "hwmon0",
+            "it8696",
+            &[(1, Some("CPU_FAN"), true, true)],
+        );
+        create_pwm_fixture(tmp.path(), "hwmon1", "amdgpu", &[(1, None, false, true)]);
+
+        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        assert_eq!(headers.len(), 1, "headers: {headers:#?}");
+        assert_eq!(headers[0].chip_name, "it8696");
     }
 
     #[test]

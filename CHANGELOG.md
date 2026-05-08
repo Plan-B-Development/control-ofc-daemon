@@ -1,5 +1,48 @@
 # Changelog
 
+## [1.6.4] — 2026-05-08
+
+Bug-fix release. Pairs with **GUI v1.11.1**. Stops a 1 Hz error storm
+on RDNA3+ AMD GPU systems where the GPU's read-only hwmon `pwm1` shadow
+was being treated as a controllable fan header.
+
+### Fixed
+- **AMD GPU `pwm1` excluded from hwmon discovery (DEC-102).**
+  `hwmon::pwm_discovery::discover_device_pwm` skips entries whose
+  `chip_name == "amdgpu"` early — before any `pwmN` enumeration. Pre-fix,
+  the daemon advertised `hwmon:amdgpu:0000:XX:XX.X:pwm1:pwm1` in
+  `GET /hwmon/headers`; clients (the GUI in particular) could bind it to
+  a profile control and the resulting 1 Hz `POST /hwmon/.../pwm` flood
+  produced a 503/`Permission denied (os error 13)` storm in the journal.
+  RDNA3+ kernels expose that file read-only without `pwm1_enable`, so
+  the write can never succeed; GPU fan control belongs on
+  `/gpu/{id}/fan/...` with the `amd_gpu:` member prefix exclusively.
+- **`POST /hwmon/{header_id}/pwm` returns `400 feature_unavailable`
+  when the targeted header's discovered `is_writable=false` (DEC-102).**
+  Defense-in-depth: any future chip exposing a read-only `pwmN`
+  (BIOS-locked motherboard headers, etc.) now produces a clean
+  non-retryable error envelope (DEC-094 shape, mirroring DEC-098's
+  GPU handler) instead of mis-classifying kernel `EACCES` as
+  `503 hardware_unavailable + retryable: true`. Lease-validation order
+  preserves precedence so a permanently read-only header reports
+  `feature_unavailable` even when the caller's lease is invalid.
+
+### Tests
+- 4 new integration tests in `daemon/tests/ipc_integration.rs`:
+  `hwmon_set_pwm_read_only_header_returns_400_feature_unavailable`,
+  `hwmon_set_pwm_read_only_header_takes_precedence_over_lease`,
+  `hwmon_set_pwm_unknown_header_returns_404`, and
+  `hwmon_discovery_excludes_amdgpu_end_to_end_via_ipc` (which builds a
+  fake hwmon root with both `it8696` and `amdgpu` chips, runs real
+  `discover_pwm_headers` against it, hands the result to a real
+  `HwmonPwmController`, and confirms `GET /hwmon/headers` over the
+  IPC socket returns only the motherboard chip).
+- 3 new unit tests in `pwm_discovery::tests` —
+  `discover_amdgpu_excluded`, `discover_amdgpu_excluded_even_with_enable_file`,
+  `discover_amdgpu_excluded_alongside_motherboard_chip` — and
+  `discover_without_enable_file` reworked against `nct6798` (the
+  legitimate non-amdgpu case the test was meant to cover).
+
 ## [1.6.3] — 2026-05-07
 
 Pairs with **GUI v1.11.0**. PWM verify timing fix and dual-chip
