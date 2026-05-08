@@ -23,7 +23,7 @@ backup=('etc/control-ofc/daemon.toml'
 install=control-ofc-daemon.install
 options=(!lto)
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-sha256sums=('a65c2edb0d4470e48f5153a02c30d0f14d76c91d056dd382b598b106769b341c')
+sha256sums=('ebf65fb172fdcfc64ba041bdc753446809a8efe46c7abbcf9c3adefb3d9b71dc')
 
 prepare() {
     cd "$pkgname-$pkgver"
