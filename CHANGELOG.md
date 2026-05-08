@@ -1,24 +1,60 @@
 # Changelog
 
-## [Unreleased]
+## [1.6.5] — 2026-05-08
 
-Build-hygiene only — no user-visible behavioural changes. Will batch
-into the next user-visible daemon release.
+Packaging-UX release. Pairs with **GUI v1.11.3**. Cuts the daemon's
+post-install message from 106 lines to ~31 and removes a long-stale
+v1.1.2 awk migration so paru's PKGBUILD-review pager has materially
+less to show on a fresh install. No daemon behavioural changes — same
+binary, same API, same systemd integration.
 
 ### Changed
+- **`packaging/control-ofc-daemon.install` slimmed (DEC-104).**
+  Post-install message is now four lines (start command, modules-load
+  hint, pointer to `man control-ofc-daemon`, pointer to the GUI's
+  Diagnostics → Fans → Hardware Readiness card) instead of the previous
+  4-step walkthrough. The 30-line per-bootloader kernel-parameter guide
+  was duplicated content — the man page already covers it. Pacman's
+  install-script invocation is unchanged; only the user-facing text is
+  shorter.
 - **`hyper-util` moved from `[dependencies]` to `[dev-dependencies]`.**
   The crate is consumed solely by `daemon/tests/ipc_integration.rs`
   (`use hyper_util::rt::TokioIo;`). Pre-fix, the production binary
   linked it for nothing. No runtime impact; `cargo build --release`
   output is marginally smaller.
 
+### Removed
+- **`_strip_legacy_runtime_sections` awk migration (DEC-104).** The
+  helper auto-stripped `[profiles]` and `[startup]` sections from
+  `/etc/control-ofc/daemon.toml` on `post_upgrade` to protect users
+  upgrading from <1.1.2 directly. With v1.6.5 five minor releases past
+  v1.1.2, every upgrader has had the migration applied long ago, and
+  the 50-line shell helper was dead weight in paru's review pager.
+  Anyone leapfrogging from <1.1.2 → 1.6.5 (vanishingly rare in practice)
+  will need to remove those sections manually if present.
+
 ### Added
+- **Install-UX tip in `daemon/README.md` (DEC-104).** Footnote-style
+  note describing paru's PKGBUILD-review pager (the "press `q`"
+  prompt new users see on first install) and how to opt out via
+  `paru -S --skipreview` or `SkipReview` in `~/.config/paru/paru.conf`.
+  Phrased as a tip, not the canonical install command — paru's review
+  is a security feature and we are not normalising "skip review by
+  default" for an Arch audience.
 - **`daemon/Cargo.toml` `[package]` metadata.** Added `license = "MIT"`,
   `description`, `repository`, and `authors` fields. Pre-fix, `cargo
   metadata` reported the daemon as `UNSPECIFIED` license, and SBOM
   tooling / `cargo-deny` / `cargo publish` would surface it as an
   unidentified package. Aligns the daemon crate with the `[package]`
   hygiene the AUR PKGBUILD already enforces externally.
+
+### Documentation
+- **DEC-104 added** in this repo and mirrored in the GUI repo. Records
+  the investigation that traced the "press `q`" complaint to paru's
+  default review pager (not a SHA256 issue), the alternatives considered
+  (custom signed pacman repo rejected as disproportionate for a
+  single-author project), and why the in-package fix is limited to
+  cutting our own pager content + documenting paru's opt-out.
 
 ## [1.6.4] — 2026-05-08
 

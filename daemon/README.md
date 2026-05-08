@@ -13,7 +13,21 @@ Binary: `target/release/control-ofc-daemon`
 
 ## Install
 
+> **Before installing manually**, verify the host has the kernel modules,
+> DKMS drivers, BIOS settings, and (for RDNA3+ AMD GPUs) the kernel
+> parameter described in the [Prerequisites section of the top-level
+> README](../README.md#prerequisites). The AUR package declares the
+> common DKMS drivers as `optdepends`, but the user action items
+> (BIOS / kernel command line) cannot be automated.
+
 **AUR (recommended):** `paru -S control-ofc-daemon` — installs to `/usr/bin/`.
+
+> **Tip — first-time AUR install UX:** paru pages the `PKGBUILD` and `.install`
+> through `less` and asks you to confirm before building. That is paru's default
+> security review (press `q` to exit the pager, then `y` to proceed), not
+> specific to this package. To install non-interactively, pass `--skipreview`
+> to paru (`paru -S --skipreview control-ofc-daemon`), or add `SkipReview` to
+> the `[options]` section of `~/.config/paru/paru.conf`.
 
 **Manual:**
 

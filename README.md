@@ -27,6 +27,33 @@ Rust workspace for the Control-OFC fan control daemon.
 └── LICENSE                   # MIT
 ```
 
+## Prerequisites
+
+Before installing, work through the table below. The AUR package handles
+most items via `depends`, `optdepends`, and a shipped
+`/etc/modules-load.d/control-ofc.conf`. A few rows remain user actions
+that no package can perform safely (BIOS settings, kernel command line).
+
+| Prerequisite | Required for | How it is satisfied |
+|---|---|---|
+| Linux kernel ≥ 5.10, hwmon sysfs, `cdc_acm` module | All operation | Standard on every supported distro; the systemd unit pulls `cdc_acm` for OpenFan |
+| Super I/O kernel module loaded — `nct6775`, `it87`, `w83627ehf`, `drivetemp` | Motherboard fan / sensor control | The package ships `/etc/modules-load.d/control-ofc.conf`. Loaded at next boot, or immediately via `sudo systemctl start systemd-modules-load` |
+| Out-of-tree DKMS driver — `it87-dkms-git`, `nct6687d-dkms-git`, `nct6686d-dkms-git` | Most newer (2022+) Gigabyte / MSI / ASRock boards — fan control is read-only without these | Install the matching AUR package; declared as `optdepends`. The GUI's Diagnostics → Fans → Hardware Readiness card identifies the chip and recommends the exact package |
+| `dkms` + `linux-headers` matching the running kernel | Building any of the DKMS drivers above | Pulled in transitively via the DKMS packages, but `linux-headers` must match the kernel you actually boot |
+| BIOS configured for Linux fan control | Most Gigabyte / MSI boards, some ASRock | "Smart Fan" disabled or set to a degenerate (max) curve. See the [vendor-by-vendor BIOS guide][vendor-bios] |
+| `amdgpu.ppfeaturemask=0xffffffff` on the kernel command line | RDNA3+ (RX 7000 / RX 9000) GPU fan-curve writes | Add to your bootloader; see `man control-ofc-daemon` for per-bootloader instructions. Pre-RDNA3 cards do not require this |
+| `acpi_enforce_resources=lax` (or `it87 ignore_resource_conflict=1`) | Some Gigabyte / ASUS boards with ACPI OpRegion conflicts | The daemon's `/diagnostics/hardware` endpoint and the GUI's Hardware Readiness card detect the conflict and surface the remediation |
+| `/etc/modprobe.d/it87.conf` with `options it87 mmio=on` | Some dual-IT-chip Gigabyte boards (e.g. X870E AORUS MASTER, DEC-101) | User action; the GUI surfaces the exact remediation when the dual-chip case is detected |
+
+If your board is already working under any other Linux fan control tool
+(fancontrol, lm_sensors with pwmconfig, CoolerControl, CoreCtrl), the
+right driver is almost certainly already loaded and the daemon will
+inherit that configuration. After installation, **Diagnostics → Fans →
+Hardware Readiness** in the GUI is the most reliable way to discover
+what your specific system needs without trial and error.
+
+[vendor-bios]: https://github.com/Plan-B-Development/control-ofc-gui/blob/main/docs/21_AMD_Motherboard_Fan_Control_Guide.md
+
 ## Quick start
 
 ```bash
