@@ -1,5 +1,25 @@
 # Changelog
 
+## [Unreleased]
+
+Build-hygiene only — no user-visible behavioural changes. Will batch
+into the next user-visible daemon release.
+
+### Changed
+- **`hyper-util` moved from `[dependencies]` to `[dev-dependencies]`.**
+  The crate is consumed solely by `daemon/tests/ipc_integration.rs`
+  (`use hyper_util::rt::TokioIo;`). Pre-fix, the production binary
+  linked it for nothing. No runtime impact; `cargo build --release`
+  output is marginally smaller.
+
+### Added
+- **`daemon/Cargo.toml` `[package]` metadata.** Added `license = "MIT"`,
+  `description`, `repository`, and `authors` fields. Pre-fix, `cargo
+  metadata` reported the daemon as `UNSPECIFIED` license, and SBOM
+  tooling / `cargo-deny` / `cargo publish` would surface it as an
+  unidentified package. Aligns the daemon crate with the `[package]`
+  hygiene the AUR PKGBUILD already enforces externally.
+
 ## [1.6.4] — 2026-05-08
 
 Bug-fix release. Pairs with **GUI v1.11.1**. Stops a 1 Hz error storm
