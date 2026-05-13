@@ -406,6 +406,16 @@ pub struct HardwareDiagnosticsResponse {
     /// the source of truth for which PWM headers actually work.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kernel_detected_chips: Vec<String>,
+    /// Pairs of currently loaded driver modules that are known to race for
+    /// the same chip — distinct from `acpi_conflicts` (which is about I/O
+    /// port ranges) and from the GUI's `CONFLICTING_MODULE_SETS` (which is
+    /// a static name-pair table the GUI applies after the fact). Reported
+    /// as CRITICAL severity for the canonical `(nct6687, nct6775)` case
+    /// because writing PWM can corrupt the chip's non-volatile state — see
+    /// `ModuleCollisionInfo` doc comment for the upstream incident.
+    /// Empty (and omitted from the wire) on healthy systems.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub module_collisions: Vec<ModuleCollisionInfo>,
 }
 
 /// Hwmon chip diagnostics.
@@ -471,6 +481,32 @@ pub struct AcpiConflictInfo {
     pub io_range: String,
     pub claimed_by: String,
     pub conflicts_with_driver: String,
+}
+
+/// Detected pair of simultaneously loaded driver modules that are known to
+/// race for the same chip and can corrupt the chip's non-volatile fan
+/// control state.
+///
+/// The flagship case (DEC-105) is `(nct6687, nct6775)` — the out-of-tree
+/// `nct6687` module declares chip ID 0xd450, which is also the legitimate
+/// chip ID of the upstream-supported NCT6797D. When both modules load,
+/// whichever binds first claims the chip and the other may scribble into
+/// the wrong registers. The original Bazzite report (ublue-os/bazzite
+/// #4498) documents a CPU fan header being bricked by this exact load
+/// ordering on MSI MAG X570 TOMAHAWK WIFI. The same chip family (NCT6797D)
+/// appears on AM4 400-series MSI boards (e.g. B450M MORTAR, X470 GAMING
+/// PRO CARBON) so the trap is not 500-series-only.
+///
+/// Severity is reported as a string (`"critical" | "high" | "medium"`)
+/// so the GUI can render the appropriate banner without translating
+/// numeric levels.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModuleCollisionInfo {
+    pub module_a: String,
+    pub module_b: String,
+    pub severity: String,
+    pub summary: String,
+    pub remediation: String,
 }
 
 /// Motherboard identification from DMI/SMBIOS.

@@ -116,6 +116,23 @@ pub async fn hardware_diagnostics_handler(
     let expected_chips = diagnostics::expected_chips_for_board(&board.vendor, &board.name);
     let kernel_detected_chips = diagnostics::read_kernel_detected_chips();
 
+    // DEC-105 / DEC-106: known-bad simultaneous-load detection. The
+    // flagship case is (nct6687, nct6775) — both must never be loaded at
+    // the same time on a SINGLE-chip board with NCT6797D because they
+    // overlap on chip ID 0xd450 and either can corrupt the chip's
+    // non-volatile fan registers. DEC-106 refinement: when chips_detected
+    // contains two distinct nct6 chips (e.g. ASRock X870E Taichi Lite
+    // has NCT6686 + NCT6799 at separate addresses), each driver legitimately
+    // owns its chip and the collision is suppressed.
+    let chip_bindings: Vec<diagnostics::ChipBinding<'_>> = chips_detected
+        .iter()
+        .map(|c| diagnostics::ChipBinding {
+            chip_name: c.chip_name.as_str(),
+            device_id: c.device_id.as_str(),
+        })
+        .collect();
+    let module_collisions = diagnostics::detect_module_collisions(&chip_bindings);
+
     json_ok(
         StatusCode::OK,
         HardwareDiagnosticsResponse {
@@ -133,6 +150,7 @@ pub async fn hardware_diagnostics_handler(
             board,
             expected_chips,
             kernel_detected_chips,
+            module_collisions,
         },
     )
 }

@@ -1,5 +1,115 @@
 # Changelog
 
+## [1.7.0] — 2026-05-13
+
+Pairs with **GUI v1.12.0**. Coordinated AMD-board-support hardening
+release covering AM4 400-series (DEC-105) and AM4 500 / AM5 600 / AM5
+800 (DEC-106) in one minor bump. Adds one new optional field on
+`/diagnostics/hardware` (`module_collisions`); the rest is additive
+chip-detection data and detector refinement. Older GUIs silently
+ignore the new field; the daemon emits the same field shape regardless
+of whether the suppression refinement is in effect.
+
+### DEC-106 — AM4 500 / AM5 600 / AM5 800 dual-Nuvoton refinement
+
+The wire shape of `/diagnostics/hardware.module_collisions` is
+unchanged; the daemon behaviour is refined to emit FEWER entries on
+legitimate dual-Nuvoton boards. Older daemons that predate this work
+continue to emit the broader (sometimes false-positive) result on
+boards like the ASRock X870E Taichi Lite.
+
+#### Features
+- **`detect_module_collisions` now accepts a `chips: &[ChipBinding]`
+  slice.** When the canonical `(nct6687, nct6775)` pair is loaded AND
+  `chips` shows two distinct nct6 chips at distinct `device_id`s, the
+  collision is suppressed — each driver legitimately owns its own
+  physical chip and no chip-ID overlap can occur. The original
+  brick-risk detection (single chip + both modules loaded) is
+  unchanged. Defensive: empty `chips` still emits CRITICAL (no
+  evidence of separation → assume the brick shape).
+- **Two new AM4 500-series & AM5 800-series Gigabyte AORUS dual-chip
+  entries** in `GIGABYTE_DUAL_CHIP_BOARDS`: **B550 VISION D**
+  (it8688 + it8792, verified against upstream lm-sensors config
+  `configs/Gigabyte/GA-B550-VISION-D.conf`) and **B850-AI-TOP**
+  (it8696 + it87952, per frankcrawford/it87 issue #93). The X870
+  AORUS STEALTH ICE board is deliberately not in this table — its
+  IT8883 secondary chip has no Linux driver and a permanent
+  missing-chip warning would be useless.
+
+#### Tests
+- `api::diagnostics::tests` gains seven new tests:
+  - `detect_module_collisions_suppressed_on_legitimate_dual_nuvoton_board`
+    — Taichi Lite shape (NCT6686 + NCT6799 at distinct IDs) is
+    silent.
+  - `detect_module_collisions_still_critical_for_single_chip_collision`
+    — single nct6 chip with both modules loaded still surfaces
+    CRITICAL.
+  - `detect_module_collisions_critical_when_chips_unknown` — empty
+    `chips` defensively keeps the CRITICAL behaviour.
+  - `detect_module_collisions_non_nct6_chips_ignored_for_suppression`
+    — k10temp / amdgpu / other non-nct6 entries cannot satisfy the
+    "two distinct nct6 chips" suppression rule.
+  - `expected_chips_b550_vision_d_pairs_it8688_with_it8792`,
+    `expected_chips_b850_ai_top_pairs_it8696_with_it87952`, and
+    `expected_chips_x870_aorus_stealth_ice_not_in_table` cover the
+    dual-chip table edits.
+
+### DEC-105 — AM4 400-series hardening + new `module_collisions` field
+
+Adds one new optional field on `/diagnostics/hardware` plus AM4
+400-series additions to the chip-detection data tables. Older GUIs
+silently ignore the new field; older daemons (without this work) just
+return no key for it and the GUI defaults to `[]`. No breaking
+contract change.
+
+#### Features
+- **`module_collisions: Vec<ModuleCollisionInfo>` on
+  `GET /diagnostics/hardware` (DEC-105).** The daemon now scans
+  `/proc/modules` for known-bad simultaneous-load pairs and reports
+  any matches as a CRITICAL severity entry with a remediation string.
+  The seed entry is `(nct6687, nct6775)` — the out-of-tree `nct6687`
+  driver declares chip ID `0xd450`, the same ID assigned to legitimate
+  NCT6797D by `drivers/hwmon/nct6775-platform.c`. When both modules
+  are loaded the wrong driver can claim the chip and write into
+  non-volatile fan registers, with at least one upstream report
+  (ublue-os/bazzite #4498) documenting a permanently bricked CPU_FAN
+  header on MSI hardware. NCT6797D is common on AM4 400-series MSI
+  boards (B450M MORTAR, X470 GAMING PRO CARBON, MAG B450 TOMAHAWK
+  MAX). The field is emitted only when non-empty
+  (`skip_serializing_if = "Vec::is_empty"`).
+- **AM4 400-series Gigabyte AORUS dual-chip lookups (DEC-105).**
+  Added X470 AORUS ULTRA GAMING (verified against upstream lm-sensors
+  config), X470 AORUS GAMING 5 WIFI, X470 AORUS GAMING 7 WIFI, and
+  B450 AORUS PRO (substring covers PRO WIFI). All IT8686E + IT8792E.
+  Pre-existing B450 AORUS PRO-CF entry preserved.
+- **`asus_atk0110` recognised in `KNOWN_MODULES` (DEC-105).** Closes a
+  real ASUS diagnostic gap — the diagnostics page can now report this
+  driver as loaded and the GUI's chip-guidance entry advises that it
+  is a read-only ACPI sensor path, not a PWM-write path.
+
+#### Tests
+- `api::diagnostics::tests` gains:
+  - `detect_module_collisions_flags_nct6687_with_nct6775` /
+    `_silent_when_only_*_loaded` / `_returns_empty_on_unreadable_path`
+    covering the new helper.
+  - `expected_chips_x470_aorus_ultra_gaming_pairs_it8686_with_it8792`
+    confirming the AM4 chip pairing matches the upstream lm-sensors
+    config.
+  - `expected_chips_b450_aorus_pro_uses_am4_400_chip_pair` and
+    `expected_chips_b450_aorus_pro_wifi_resolves_via_substring` for
+    the B450 generation.
+  - `asus_atk0110_recognised_in_known_modules` regression test.
+
+#### Safety / framing
+- **Remediation string for the `(nct6687, nct6775)` collision now
+  requires chip-ID verification first.** The string emitted in
+  `module_collisions[].remediation` instructs the user to run
+  `cat /sys/class/hwmon/hwmon*/name` BEFORE any blacklist command, and
+  shows both the `blacklist nct6775` (for genuine NCT6687-R boards) and
+  `blacklist nct6687` (for NCT6797D / NCT6798D boards) paths as
+  parallel alternatives. Protects users from blindly following the
+  banner and inadvertently removing their working driver.
+
 ## [1.6.5] — 2026-05-08
 
 Packaging-UX release. Pairs with **GUI v1.11.3**. Cuts the daemon's

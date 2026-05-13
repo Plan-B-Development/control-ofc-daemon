@@ -5,7 +5,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
-use super::responses::{AcpiConflictInfo, KernelModuleInfo};
+use super::responses::{AcpiConflictInfo, KernelModuleInfo, ModuleCollisionInfo};
 
 /// Known hwmon driver modules and whether they're in the mainline kernel.
 ///
@@ -27,6 +27,10 @@ const KNOWN_MODULES: &[(&str, bool)] = &[
     ("asus_ec_sensors", true),
     ("asus_wmi_sensors", true),
     ("asus_wmi_ec_sensors", true),
+    // ASUS ATK0110 ACPI hwmon — read-only sensors only. Mainline since
+    // ~2.6.something. Tracked here so diagnostics can advise "this is a
+    // sensor-read driver, not a PWM control path" when present.
+    ("asus_atk0110", true),
     ("sch5627", true),
     ("sch5636", true),
     ("k10temp", true),
@@ -115,6 +119,156 @@ pub fn detect_loaded_modules_from(proc_modules: &Path) -> Vec<KernelModuleInfo> 
             in_mainline: *mainline,
         })
         .collect()
+}
+
+/// One entry in the known-bad simultaneous-load lookup. See
+/// `ModuleCollisionInfo` for why these matter (chip-ID overlap → wrong
+/// driver can scribble into another chip's non-volatile state).
+///
+/// Kept as a small static table because the failure modes are rare,
+/// well-documented, and the remediation in each case is identical
+/// regardless of which module ended up binding first (blacklist one of
+/// them).
+struct ModuleCollisionEntry {
+    module_a: &'static str,
+    module_b: &'static str,
+    severity: &'static str,
+    summary: &'static str,
+    remediation: &'static str,
+}
+
+const MODULE_COLLISIONS: &[ModuleCollisionEntry] = &[ModuleCollisionEntry {
+    module_a: "nct6687",
+    module_b: "nct6775",
+    severity: "critical",
+    summary: "nct6687 (out-of-tree) and nct6775 (in-kernel) are both loaded. \
+             They race for the same Super I/O chip on MSI AM4/AM5 boards. \
+             nct6687 declares chip ID 0xd450 which overlaps the legitimate \
+             NCT6797D ID, so the wrong driver can write into the chip's \
+             non-volatile fan control state and brick the affected header \
+             (CPU_FAN is the most common casualty).",
+    remediation: "(1) Identify the chip FIRST: run `cat /sys/class/hwmon/hwmon*/name` \
+             to see which driver actually bound on this boot. \
+             (2) If the chip is NCT6687-R (genuine MSI 500/600-series chip), \
+             blacklist nct6775 instead: `echo 'blacklist nct6775' | sudo tee \
+             /etc/modprobe.d/blacklist-nct6775.conf`. \
+             (3) If the chip is NCT6797D or NCT6798D (common on AM4 400/500 MSI \
+             boards e.g. B450M MORTAR, X470 GAMING PRO CARBON, MAG B450 TOMAHAWK \
+             MAX), blacklist nct6687: `echo 'blacklist nct6687' | sudo tee \
+             /etc/modprobe.d/blacklist-nct6687.conf`. \
+             (4) Reboot. Do NOT write PWM until you have verified the chip and \
+             blacklisted the OTHER driver — blacklisting the wrong one will \
+             leave you with no fan control.",
+}];
+
+/// Minimal chip-binding record passed into the collision detector so it
+/// can distinguish legitimate dual-Nuvoton boards from the brick scenario.
+///
+/// `chip_name` is the hwmon-reported name (e.g. `"nct6686"`, `"nct6798"`,
+/// `"nct6799"`) — i.e. what the bound driver actually claimed. `device_id`
+/// is the chip's stable platform identifier from the headers list
+/// (typically the SuperIO I/O address segment such as `"nodev"`,
+/// `"isa-0290"`, or a fully-qualified platform string). What matters for
+/// the refinement (DEC-106) is whether multiple distinct nct6 chips exist
+/// at distinct identifiers — the actual format does not need to be parsed.
+pub struct ChipBinding<'a> {
+    pub chip_name: &'a str,
+    pub device_id: &'a str,
+}
+
+/// Detect pairs of loaded driver modules that are known to race for the
+/// same chip. Returns one entry per detected collision; empty Vec when
+/// none are present (the common case).
+///
+/// `chips` carries the currently-bound hwmon chips so the detector can
+/// distinguish legitimate dual-Nuvoton boards (DEC-106). Pass `&[]` to
+/// disable that refinement (every (nct6687, nct6775) load is then flagged).
+pub fn detect_module_collisions(chips: &[ChipBinding<'_>]) -> Vec<ModuleCollisionInfo> {
+    detect_module_collisions_from(Path::new("/proc/modules"), chips)
+}
+
+/// Testable variant. Reads loaded-module names from the supplied path,
+/// compares against the static `MODULE_COLLISIONS` table, and returns
+/// every pair that is concurrently present. Order of `module_a` and
+/// `module_b` in the response mirrors the static table so the GUI
+/// renders a deterministic banner.
+///
+/// DEC-106 refinement: when both modules of a pair are loaded but `chips`
+/// shows multiple distinct nct6 chips at distinct `device_id`s (i.e. the
+/// board has separate physical Super-I/O chips, one bound by nct6687d and
+/// the other by nct6775), the collision is suppressed. This avoids a
+/// false CRITICAL banner on legitimate dual-Nuvoton boards such as the
+/// ASRock X870E Taichi Lite (NCT6686 at 0x0a20 + NCT6799 at 0x0290) while
+/// keeping the original brick-risk detection intact for single-chip
+/// boards where chip ID 0xd450 (NCT6797D) is the contested address.
+pub fn detect_module_collisions_from(
+    proc_modules: &Path,
+    chips: &[ChipBinding<'_>],
+) -> Vec<ModuleCollisionInfo> {
+    let content = match std::fs::read_to_string(proc_modules) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!(
+                "detect_module_collisions: cannot read {}: {e}",
+                proc_modules.display()
+            );
+            return Vec::new();
+        }
+    };
+    let loaded: std::collections::HashSet<&str> = content
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    MODULE_COLLISIONS
+        .iter()
+        .filter(|entry| loaded.contains(entry.module_a) && loaded.contains(entry.module_b))
+        .filter(|entry| !is_dual_nuvoton_safe_pair(entry, chips))
+        .map(|entry| ModuleCollisionInfo {
+            module_a: entry.module_a.to_string(),
+            module_b: entry.module_b.to_string(),
+            severity: entry.severity.to_string(),
+            summary: entry.summary.to_string(),
+            remediation: entry.remediation.to_string(),
+        })
+        .collect()
+}
+
+/// DEC-106: a `(nct6687, nct6775)` simultaneous load is benign on boards
+/// that actually have TWO distinct nct6 chips (different `device_id`s),
+/// because each driver binds to its own physical chip. The brick scenario
+/// requires a single chip whose ID overlaps both drivers' tables — that
+/// only happens on boards with one nct6 chip and the canonical 0xd450
+/// (NCT6797D) ID.
+///
+/// Rule: suppress only the canonical `(nct6687, nct6775)` pair, and only
+/// when `chips` shows at least two distinct nct6-family `device_id`s
+/// (different physical chips). Any other entry in `MODULE_COLLISIONS` is
+/// emitted unchanged.
+fn is_dual_nuvoton_safe_pair(entry: &ModuleCollisionEntry, chips: &[ChipBinding<'_>]) -> bool {
+    if entry.module_a != "nct6687" || entry.module_b != "nct6775" {
+        return false;
+    }
+    // Distinct device_ids among nct6-family chips. We deliberately match
+    // any chip name starting with "nct6" — the bound driver may report
+    // the chip by family name (e.g. "nct6686", "nct6798", "nct6799")
+    // and we do not need to parse the I/O address out of `device_id`.
+    //
+    // Closed-family assumption: every hwmon chip name in the wild that
+    // starts with `nct6` belongs to the Nuvoton NCT6xxx Super-I/O family
+    // (NCT6683/6686/6687/6775/6776/6779/6791/6792/6795/6796/6797/6798/
+    // 6799). The kernel `nct6775-platform.c` chip table and Fred78290/
+    // nct6687d source both enumerate this family explicitly, and no
+    // non-Nuvoton hwmon driver claims the `nct6` prefix. If a future
+    // hwmon family ever uses this prefix, the assumption would need to
+    // be revisited; the `expected_driver_for_chip` function in the same
+    // module already relies on the identical assumption for the
+    // `nct6775` driver mapping.
+    let distinct: std::collections::HashSet<&str> = chips
+        .iter()
+        .filter(|c| c.chip_name.to_lowercase().starts_with("nct6"))
+        .map(|c| c.device_id)
+        .collect();
+    distinct.len() >= 2
 }
 
 /// I/O port ranges used by common Super I/O chips.
@@ -312,6 +466,31 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "TRX40 AORUS XTREME",
         chips: &["it8688", "it8792"],
     },
+    // ── AM4 400-series AORUS boards (IT8686E + IT8792E) ────────
+    // Same chip pairing as the X399 generation. Confirmed for X470 AORUS
+    // ULTRA GAMING by the upstream lm-sensors config (`configs/Gigabyte/
+    // X470-AORUS-ULTRA-GAMING.conf`). Other AM4 400-series AORUS boards
+    // share the same SuperIO topology per vendor service manuals and the
+    // frankcrawford/it87 driver's DMI table.
+    DualChipEntry {
+        board_name: "X470 AORUS ULTRA GAMING",
+        chips: &["it8686", "it8792"],
+    },
+    DualChipEntry {
+        board_name: "X470 AORUS GAMING 7 WIFI",
+        chips: &["it8686", "it8792"],
+    },
+    DualChipEntry {
+        board_name: "X470 AORUS GAMING 5 WIFI",
+        chips: &["it8686", "it8792"],
+    },
+    // "B450 AORUS PRO" matches both the plain board and the WIFI variant via
+    // substring match. The -CF variant is listed separately below for
+    // legacy documentation continuity (same chips, identical behaviour).
+    DualChipEntry {
+        board_name: "B450 AORUS PRO",
+        chips: &["it8686", "it8792"],
+    },
     // ── Older dual-chip boards ──────────────────────────────────
     DualChipEntry {
         board_name: "X399 DESIGNARE EX-CF",
@@ -321,6 +500,26 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "B450 AORUS PRO-CF",
         chips: &["it8686", "it8792"],
     },
+    // ── DEC-106: AM4 500-series & AM5 800-series dual-chip AORUS ─
+    // B550 VISION D — verified against upstream lm-sensors config
+    // (`configs/Gigabyte/GA-B550-VISION-D.conf`): primary IT8688E at
+    // 0x0a40, secondary IT8792E at 0x0a60.
+    DualChipEntry {
+        board_name: "B550 VISION D",
+        chips: &["it8688", "it8792"],
+    },
+    // B850-AI-TOP — verified against frankcrawford/it87 issue #93:
+    // primary IT8696E + secondary IT87952E. Same dual-chip topology as
+    // the X870E AORUS MASTER above.
+    DualChipEntry {
+        board_name: "B850 AI TOP",
+        chips: &["it8696", "it87952"],
+    },
+    // X870 AORUS STEALTH ICE (frankcrawford/it87 issue #81) deliberately
+    // NOT in this table — its secondary chip is IT8883, which has no
+    // Linux driver as of 2026-Q2, so a "missing secondary chip" warning
+    // would be permanent and useless. The chip is recognised in the GUI
+    // chip-guidance DB with a "no driver available" note instead.
 ];
 
 /// Look up the chip names a known Gigabyte dual-chip board is expected to
@@ -689,6 +888,272 @@ mod tests {
         // X570 with X670/X870 chip pairings.
         let chips = expected_chips_for_board("Gigabyte Technology Co., Ltd.", "X570 AORUS MASTER");
         assert_eq!(chips, vec!["it8688".to_string(), "it8792".to_string()]);
+    }
+
+    // ── DEC-105: AM4 400-series dual-chip coverage ───────────
+
+    #[test]
+    fn expected_chips_x470_aorus_ultra_gaming_pairs_it8686_with_it8792() {
+        // Verified against upstream lm-sensors config (configs/Gigabyte/
+        // X470-AORUS-ULTRA-GAMING.conf): primary it8686-isa-0a40 +
+        // secondary it8792-isa-0a60. If the chip pairing regresses, the
+        // dual-chip missing-PWM warning either misfires or never fires
+        // on this board generation.
+        let chips =
+            expected_chips_for_board("Gigabyte Technology Co., Ltd.", "X470 AORUS ULTRA GAMING");
+        assert_eq!(chips, vec!["it8686".to_string(), "it8792".to_string()]);
+    }
+
+    #[test]
+    fn expected_chips_b450_aorus_pro_uses_am4_400_chip_pair() {
+        // The B450 generation uses IT8686E (not IT8688E — that's X570).
+        // Matches the existing B450 AORUS PRO-CF entry's chip list.
+        let chips = expected_chips_for_board("Gigabyte Technology Co., Ltd.", "B450 AORUS PRO");
+        assert_eq!(chips, vec!["it8686".to_string(), "it8792".to_string()]);
+    }
+
+    #[test]
+    fn expected_chips_b450_aorus_pro_wifi_resolves_via_substring() {
+        // The WIFI variant DMI name "B450 AORUS PRO WIFI" must match the
+        // generic "B450 AORUS PRO" substring entry — keeping that
+        // consolidation deliberate so adding new WIFI/CF variants does
+        // not require a new entry per SKU.
+        let chips =
+            expected_chips_for_board("Gigabyte Technology Co., Ltd.", "B450 AORUS PRO WIFI");
+        assert_eq!(chips, vec!["it8686".to_string(), "it8792".to_string()]);
+    }
+
+    #[test]
+    fn expected_chips_b550_vision_d_pairs_it8688_with_it8792() {
+        // DEC-106: AM4 500-series Gigabyte AORUS topology — verified
+        // against upstream lm-sensors GA-B550-VISION-D.conf
+        // (primary it8688-isa-0a40 + secondary it8792-isa-0a60).
+        let chips = expected_chips_for_board("Gigabyte Technology Co., Ltd.", "B550 VISION D");
+        assert_eq!(chips, vec!["it8688".to_string(), "it8792".to_string()]);
+    }
+
+    #[test]
+    fn expected_chips_b850_ai_top_pairs_it8696_with_it87952() {
+        // DEC-106: AM5 800-series Gigabyte AI-TOP variant — confirmed by
+        // frankcrawford/it87 issue #93. Same dual-chip topology as the
+        // X870E AORUS MASTER family.
+        let chips = expected_chips_for_board("Gigabyte Technology Co., Ltd.", "B850 AI TOP");
+        assert_eq!(chips, vec!["it8696".to_string(), "it87952".to_string()]);
+    }
+
+    #[test]
+    fn expected_chips_x870_aorus_stealth_ice_not_in_table() {
+        // DEC-106: X870 AORUS STEALTH ICE has IT8883 as secondary
+        // (frankcrawford/it87 issue #81). IT8883 has no Linux driver, so
+        // listing it in `expected_chips` would permanently mis-flag the
+        // board as missing a chip. The chip is documented in the GUI
+        // chip-guidance DB instead.
+        let chips =
+            expected_chips_for_board("Gigabyte Technology Co., Ltd.", "X870 AORUS STEALTH ICE");
+        assert!(chips.is_empty());
+    }
+
+    #[test]
+    fn expected_chips_x470_aorus_gaming_7_wifi_pairs_match() {
+        // X470 AORUS GAMING 7 WIFI uses the same it8686+it8792 topology
+        // per the it87.c DMI table and vendor service manual.
+        let chips =
+            expected_chips_for_board("Gigabyte Technology Co., Ltd.", "X470 AORUS GAMING 7 WIFI");
+        assert_eq!(chips, vec!["it8686".to_string(), "it8792".to_string()]);
+    }
+
+    // ── DEC-105: module-collision detector ───────────────────
+
+    #[test]
+    fn detect_module_collisions_flags_nct6687_with_nct6775() {
+        // Canonical brick scenario (DEC-105): both modules loaded on a
+        // single-chip MSI board with NCT6797D — chip ID 0xd450 overlap
+        // can corrupt non-volatile fan state. CRITICAL banner expected.
+        let tmp = tempfile::tempdir().unwrap();
+        let modules_path = tmp.path().join("modules");
+        fs::write(
+            &modules_path,
+            "nct6775 28672 0 - Live 0xffffffffc0a00000\n\
+             nct6687 32768 0 - Live 0xffffffffc0b00000\n\
+             k10temp 16384 0 - Live 0xffffffffc0980000\n",
+        )
+        .unwrap();
+
+        // Single nct6 chip detected → cannot prove legitimate dual-Nuvoton.
+        let chips = [ChipBinding {
+            chip_name: "nct6797",
+            device_id: "isa-0290",
+        }];
+        let collisions = detect_module_collisions_from(&modules_path, &chips);
+        assert_eq!(collisions.len(), 1);
+        let entry = &collisions[0];
+        assert_eq!(entry.module_a, "nct6687");
+        assert_eq!(entry.module_b, "nct6775");
+        assert_eq!(entry.severity, "critical");
+        assert!(entry.summary.contains("0xd450"));
+        assert!(entry.remediation.contains("blacklist"));
+    }
+
+    #[test]
+    fn detect_module_collisions_silent_when_only_nct6687_loaded() {
+        // Lone nct6687 is fine — many MSI users intentionally run only
+        // the out-of-tree driver. No false-positive collision banner.
+        let tmp = tempfile::tempdir().unwrap();
+        let modules_path = tmp.path().join("modules");
+        fs::write(
+            &modules_path,
+            "nct6687 32768 0 - Live 0xffffffffc0b00000\n\
+             k10temp 16384 0 - Live 0xffffffffc0980000\n",
+        )
+        .unwrap();
+
+        assert!(detect_module_collisions_from(&modules_path, &[]).is_empty());
+    }
+
+    #[test]
+    fn detect_module_collisions_silent_when_only_nct6775_loaded() {
+        // Lone nct6775 — the kernel-only setup. No collision.
+        let tmp = tempfile::tempdir().unwrap();
+        let modules_path = tmp.path().join("modules");
+        fs::write(
+            &modules_path,
+            "nct6775 28672 0 - Live 0xffffffffc0a00000\n\
+             nct6775_core 16384 1 nct6775, Live 0xffffffffc0a01000\n",
+        )
+        .unwrap();
+
+        assert!(detect_module_collisions_from(&modules_path, &[]).is_empty());
+    }
+
+    #[test]
+    fn detect_module_collisions_returns_empty_on_unreadable_path() {
+        // Daemon must never panic if /proc/modules is missing.
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(detect_module_collisions_from(&tmp.path().join("nonexistent"), &[]).is_empty());
+    }
+
+    // ── DEC-106: dual-Nuvoton refinement ─────────────────────────
+
+    #[test]
+    fn detect_module_collisions_suppressed_on_legitimate_dual_nuvoton_board() {
+        // ASRock X870E Taichi Lite: NCT6686 at one address handled by
+        // nct6687d + NCT6799 at another address handled by nct6775. Both
+        // modules legitimately coexist; suppress the CRITICAL banner.
+        let tmp = tempfile::tempdir().unwrap();
+        let modules_path = tmp.path().join("modules");
+        fs::write(
+            &modules_path,
+            "nct6775 28672 0 - Live 0xffffffffc0a00000\n\
+             nct6687 32768 0 - Live 0xffffffffc0b00000\n",
+        )
+        .unwrap();
+
+        let chips = [
+            ChipBinding {
+                chip_name: "nct6686",
+                device_id: "isa-0a20",
+            },
+            ChipBinding {
+                chip_name: "nct6799",
+                device_id: "isa-0290",
+            },
+        ];
+        assert!(
+            detect_module_collisions_from(&modules_path, &chips).is_empty(),
+            "Legitimate dual-Nuvoton board (two distinct nct6 chips at \
+             distinct device_ids) must not surface the CRITICAL collision"
+        );
+    }
+
+    #[test]
+    fn detect_module_collisions_still_critical_for_single_chip_collision() {
+        // Even when the bound chip is reported as nct6798 (i.e. nct6775
+        // appears to have won the race), a single nct6 chip with both
+        // modules loaded is still the brick-risk shape — emit CRITICAL.
+        let tmp = tempfile::tempdir().unwrap();
+        let modules_path = tmp.path().join("modules");
+        fs::write(
+            &modules_path,
+            "nct6775 28672 0 - Live 0xffffffffc0a00000\n\
+             nct6687 32768 0 - Live 0xffffffffc0b00000\n",
+        )
+        .unwrap();
+        let chips = [ChipBinding {
+            chip_name: "nct6798",
+            device_id: "isa-0290",
+        }];
+        let collisions = detect_module_collisions_from(&modules_path, &chips);
+        assert_eq!(collisions.len(), 1);
+        assert_eq!(collisions[0].severity, "critical");
+    }
+
+    #[test]
+    fn detect_module_collisions_critical_when_chips_unknown() {
+        // Defensive: when chips_detected is empty (early boot, or daemon
+        // running with no hwmon controller), fall back to the original
+        // behaviour and surface the CRITICAL banner. Suppressing on no
+        // evidence would be the dangerous direction.
+        let tmp = tempfile::tempdir().unwrap();
+        let modules_path = tmp.path().join("modules");
+        fs::write(
+            &modules_path,
+            "nct6775 28672 0 - Live 0xffffffffc0a00000\n\
+             nct6687 32768 0 - Live 0xffffffffc0b00000\n",
+        )
+        .unwrap();
+        let collisions = detect_module_collisions_from(&modules_path, &[]);
+        assert_eq!(collisions.len(), 1);
+        assert_eq!(collisions[0].severity, "critical");
+    }
+
+    #[test]
+    fn detect_module_collisions_non_nct6_chips_ignored_for_suppression() {
+        // Same chip name but only one nct6 entry — a coincidental k10temp
+        // or amdgpu hwmon node must not satisfy the "two distinct nct6
+        // chips" suppression rule.
+        let tmp = tempfile::tempdir().unwrap();
+        let modules_path = tmp.path().join("modules");
+        fs::write(
+            &modules_path,
+            "nct6775 28672 0 - Live 0xffffffffc0a00000\n\
+             nct6687 32768 0 - Live 0xffffffffc0b00000\n",
+        )
+        .unwrap();
+        let chips = [
+            ChipBinding {
+                chip_name: "nct6798",
+                device_id: "isa-0290",
+            },
+            ChipBinding {
+                chip_name: "k10temp",
+                device_id: "pci-00c3",
+            },
+            ChipBinding {
+                chip_name: "amdgpu",
+                device_id: "pci-0300",
+            },
+        ];
+        let collisions = detect_module_collisions_from(&modules_path, &chips);
+        assert_eq!(
+            collisions.len(),
+            1,
+            "Non-nct6 chips must not count toward the dual-Nuvoton \
+             suppression — only one nct6 chip present, so still CRITICAL"
+        );
+    }
+
+    #[test]
+    fn asus_atk0110_recognised_in_known_modules() {
+        // DEC-105: asus_atk0110 must appear in the modules table so
+        // diagnostics can advise that this driver is sensor-read-only and
+        // never the PWM-write path. Skipping it leaves ASUS users with a
+        // mystery "I see sensors but no headers" diagnostic gap.
+        let entry = KNOWN_MODULES.iter().find(|(n, _)| *n == "asus_atk0110");
+        assert!(entry.is_some(), "asus_atk0110 must be in KNOWN_MODULES");
+        assert!(
+            entry.unwrap().1,
+            "asus_atk0110 is in mainline — flag must be true"
+        );
     }
 
     // ── DEC-101: kmsg parser ─────────────────────────────────
