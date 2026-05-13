@@ -1531,6 +1531,58 @@ mod tests {
         assert_eq!(gpu_cmd.pwm_percent, 60);
     }
 
+    /// T2 (test-tests audit): when `cache.gui_active()` is true (the GUI has
+    /// written via the API within the last 30s) the profile-engine loop must
+    /// skip its OpenFan write phase. Without this deferral, the GUI's control
+    /// loop and the headless engine would race for the same fan, producing
+    /// serial chatter and PWM oscillation. Mirrors DEC-074.
+    #[tokio::test(start_paused = true)]
+    async fn loop_defers_openfan_writes_when_gui_active() {
+        let cache = make_cache_with_sensor("cpu", 55.0);
+        // Mark the GUI as active — record_gui_write() flips gui_active() to true.
+        cache.record_gui_write();
+        assert!(cache.snapshot().gui_active(), "test precondition");
+
+        let profile = make_profile("curve", "graph", 50.0);
+        let profile_arc = Arc::new(Mutex::new(Some(profile)));
+        let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
+
+        // Allocate plenty of mock responses in case the engine does try to write.
+        let (transport, written) = LoopTestTransport::new(10);
+        let fan_ctrl = crate::serial::controller::FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            std::time::Duration::from_millis(500),
+        );
+        let fan_ctrl = Some(Arc::new(Mutex::new(fan_ctrl)));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(profile_engine_loop(
+            cache,
+            profile_arc,
+            fan_ctrl,
+            None,
+            vec![],
+            safety,
+            shutdown_rx,
+        ));
+
+        // Let the loop run one cycle.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        shutdown_tx.send(true).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let _ = handle.await;
+
+        // No SetPwm (>02) commands should have been issued — the engine
+        // deferred to the active GUI.
+        let cmds = written.lock();
+        let set_pwm_cmds: Vec<_> = cmds.iter().filter(|c| c.starts_with(">02")).collect();
+        assert!(
+            set_pwm_cmds.is_empty(),
+            "profile engine must NOT write OpenFan PWM while gui_active is true; got: {set_pwm_cmds:?}",
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn shutdown_exits_cleanly() {
         let cache = make_cache_with_sensor("cpu", 50.0);

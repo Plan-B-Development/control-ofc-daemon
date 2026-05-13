@@ -268,6 +268,96 @@ mod tests {
         assert!((evaluate_curve(&curve, 90.0) - 100.0).abs() < 0.01); // above range
     }
 
+    /// T2 (test-tests audit): mid-segment interpolation with an asymmetric
+    /// temperature so the `-` and `*` operators in the interpolation formula
+    /// (line ~159) actually matter. A clean halfway point like 45°C on the
+    /// 30→60 segment masks `+`/`-` mutations because of x+y == y+x symmetry.
+    /// Picks two non-halfway samples on different segments to lock down the
+    /// linear-interpolation arithmetic.
+    #[test]
+    fn evaluate_graph_interpolation_asymmetric_mid_segment() {
+        let curve = CurveConfig {
+            id: "asym".into(),
+            name: "Asymmetric".into(),
+            curve_type: "graph".into(),
+            sensor_id: "".into(),
+            points: vec![
+                CurvePoint {
+                    temp_c: 30.0,
+                    output_pct: 20.0,
+                },
+                CurvePoint {
+                    temp_c: 80.0,
+                    output_pct: 100.0,
+                },
+            ],
+            start_temp_c: None,
+            start_output_pct: None,
+            end_temp_c: None,
+            end_output_pct: None,
+            flat_output_pct: None,
+        };
+        // 47°C: t = (47-30)/(80-30) = 0.34; output = 20 + 0.34*80 = 47.2.
+        // A `+` ↔ `-` mutation on either subtraction would shift the result
+        // away from 47.2 to a value that fails the strict tolerance below.
+        let v = evaluate_curve(&curve, 47.0);
+        assert!(
+            (v - 47.2).abs() < 0.01,
+            "evaluate_curve(47°C) on 30→20, 80→100 expected 47.2, got {v}"
+        );
+
+        // 73°C: t = (73-30)/(80-30) = 0.86; output = 20 + 0.86*80 = 88.8.
+        // A second asymmetric sample on the same segment catches mutations
+        // that happen to be invariant at one specific temperature.
+        let v = evaluate_curve(&curve, 73.0);
+        assert!(
+            (v - 88.8).abs() < 0.01,
+            "evaluate_curve(73°C) on 30→20, 80→100 expected 88.8, got {v}"
+        );
+    }
+
+    /// Multi-segment curve mid-segment interpolation. The 3-knot test above
+    /// only checks the 45°C symmetric midpoint; this verifies that the loop
+    /// over segments at line ~151 picks the correct segment and uses its
+    /// endpoints (not the wrong segment's, not the first/last segment's).
+    #[test]
+    fn evaluate_graph_picks_correct_segment_for_mid_curve_temp() {
+        let curve = CurveConfig {
+            id: "multi".into(),
+            name: "Multi".into(),
+            curve_type: "graph".into(),
+            sensor_id: "".into(),
+            points: vec![
+                CurvePoint {
+                    temp_c: 30.0,
+                    output_pct: 20.0,
+                },
+                CurvePoint {
+                    temp_c: 60.0,
+                    output_pct: 50.0,
+                },
+                CurvePoint {
+                    temp_c: 80.0,
+                    output_pct: 100.0,
+                },
+            ],
+            start_temp_c: None,
+            start_output_pct: None,
+            end_temp_c: None,
+            end_output_pct: None,
+            flat_output_pct: None,
+        };
+        // 67°C lives on the second segment (60→80, 50→100).
+        // t = (67-60)/(80-60) = 0.35; output = 50 + 0.35*50 = 67.5.
+        // If the loop accidentally evaluated the first segment, the answer
+        // would be 50 + (67-30)/(60-30)*(50-20) = 50 + 37 = 87 — not 67.5.
+        let v = evaluate_curve(&curve, 67.0);
+        assert!(
+            (v - 67.5).abs() < 0.01,
+            "evaluate_curve(67°C) must pick segment (60,80) and yield 67.5, got {v}"
+        );
+    }
+
     #[test]
     fn evaluate_linear() {
         let curve = CurveConfig {

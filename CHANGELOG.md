@@ -1,5 +1,77 @@
 # Changelog
 
+## [Unreleased]
+
+Test-tests audit hardening pass. A `/test-tests` mutation-driven audit
+identified equivalent-mutant survivors in several core modules; this
+pass closes the highest-value gaps with 16 new daemon tests and two
+small ergonomic additions to the controller's observable surface. Pairs
+with **GUI Unreleased** (see GUI DEC-107 for the cross-stack rationale).
+
+### Added (non-breaking, internal-API)
+- **`LeaseError::Expired` variant.** Previously `validate_lease` and
+  `renew_lease` returned `LeaseError::InvalidLease` for both "wrong
+  lease id" and "matched id but TTL expired"; mutation testing showed
+  the match guard at `hwmon/lease.rs:140` (the `==` ↔ `!=` flip) was
+  observationally invisible. Now: `InvalidLease` for id mismatch,
+  `Expired` for TTL elapsed. HTTP wire shape unchanged — both still
+  map to `403 lease_required` via the `_` wildcard in
+  `hwmon_control_error_response`. Internal callers can now
+  distinguish renew-vs-reacquire without log parsing.
+- **`HwmonPwmController::verify_mismatch_counts()` accessor.** Mirrors
+  the existing `enable_revert_counts()` pattern. Returns a
+  `&HashMap<String, u64>` of cumulative PWM verify-after-write
+  mismatches per header (write N, readback ≠ N). Strong signal of
+  BIOS clamping, EC interference, or an in-process concurrent writer.
+  No HTTP exposure yet — added primarily to make the existing
+  mismatch path observable in unit tests; future
+  `/diagnostics/hardware` work may surface it.
+
+### Tests
+- **9 new lease tests** in `hwmon::lease::tests` pinning the wrong-id
+  vs expired distinction (`validate_lease_distinguishes_wrong_id_from_expired`,
+  `renew_lease_distinguishes_wrong_id_from_expired`) plus updates to
+  the prior `*_fails_when_expired` tests to assert the new variant.
+- **4 new boundary tests** in `health::cache::tests` for `gui_active()`
+  at the 30s deferral window: 1s inside, 29s inside, exactly at 30s
+  (the strict `<` predicate makes this *inactive*), and 31s past.
+  Catches `<` ↔ `<=` mutations on the deferral predicate.
+- **1 new integration test** in `profile_engine::tests`
+  (`loop_defers_openfan_writes_when_gui_active`) running the loop
+  with `record_gui_write()` called beforehand and asserting that
+  zero SetPwm commands reach the mock transport.
+- **2 new interpolation tests** in `profile::tests`
+  (`evaluate_graph_interpolation_asymmetric_mid_segment`,
+  `evaluate_graph_picks_correct_segment_for_mid_curve_temp`) using
+  asymmetric temperatures (47°C, 73°C, 67°C) so the formula's `+` and
+  `-` operators can't be mutated invariantly via halfway-point symmetry.
+- **2 new chip-classification tests** in `hwmon::discovery::tests`:
+  a single table-driven test covering every chip-name arm and every
+  label-keyword sub-branch (37 rows), plus a precedence test pinning
+  "cpu wins over gpu" in the fallback heuristic.
+- **1 new range-boundary test** in `hwmon::pwm_control::tests`
+  (`set_pwm_boundary_100_accepted_101_rejected`) explicitly
+  asserting `pwm_percent=100` succeeds and `=101` raises
+  `Validation` with the expected message.
+- **3 new verify-mismatch tests** in `hwmon::pwm_control::tests`
+  (`verify_mismatch_increments_counter`,
+  `verify_no_mismatch_when_readback_matches_write`,
+  `verify_mismatch_accumulates_across_writes`) using a new
+  `ClampingSysfsWriter` mock whose `read_file` returns a value
+  different from the last write. Catches mutations to the
+  `actual_raw != raw` predicate at `pwm_control.rs:390`.
+- **1 new API-mapping test** in `api::handlers::hwmon_ctl::tests`
+  (`hwmon_control_error_response_maps_expired_lease_to_403`)
+  confirming the new variant preserves the existing HTTP contract.
+- **Total: 451 → 467 tests pass** (407 unit + 41 IPC integration + 3 main
+  → 423 unit + 41 IPC integration + 3 main).
+
+### Documentation
+- Cross-stack rationale recorded in GUI **DEC-107**. Daemon
+  `DECISIONS.md` carries a daemon-specific mirror of the same DEC-ID.
+
+---
+
 ## [1.7.0] — 2026-05-13
 
 Pairs with **GUI v1.12.0**. Coordinated AMD-board-support hardening

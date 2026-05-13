@@ -178,6 +178,11 @@ pub struct HwmonPwmController {
     /// lifetime per header — subsequent reverts collapse into periodic INFO
     /// summaries instead of one WARN per second.
     watchdog_log_state: HashMap<String, WatchdogLogState>,
+    /// Cumulative count of PWM verify-after-write mismatches per header.
+    /// Persists across leases. A non-zero value here means the daemon wrote
+    /// PWM=N but read back PWM≠N — a strong signal of BIOS/EC interference,
+    /// clamping, or a concurrent in-process writer.
+    verify_mismatch_counts: HashMap<String, u64>,
 }
 
 impl HwmonPwmController {
@@ -198,7 +203,16 @@ impl HwmonPwmController {
             write_state: HashMap::new(),
             enable_revert_counts: HashMap::new(),
             watchdog_log_state: HashMap::new(),
+            verify_mismatch_counts: HashMap::new(),
         }
+    }
+
+    /// Cumulative PWM verify-after-write mismatch events per header.
+    /// A non-zero value indicates that a write of N was followed by a read
+    /// of !N — likely BIOS clamping, EC interference, or a concurrent
+    /// in-process writer. Persists across leases.
+    pub fn verify_mismatch_counts(&self) -> &HashMap<String, u64> {
+        &self.verify_mismatch_counts
     }
 
     /// Get the list of discovered PWM headers.
@@ -383,11 +397,17 @@ impl HwmonPwmController {
             .write_file(&pwm_path, &raw.to_string())
             .map_err(HwmonControlError::Hardware)?;
 
-        // Verify write: read back and compare (best-effort)
+        // Verify write: read back and compare (best-effort). On mismatch,
+        // increment a per-header counter so the discrepancy is observable
+        // beyond the log line (DEC log signal can be lost under throttling).
         match self.writer.read_file(&pwm_path) {
             Ok(raw_str) => {
                 if let Ok(actual_raw) = raw_str.trim().parse::<u8>() {
                     if actual_raw != raw {
+                        *self
+                            .verify_mismatch_counts
+                            .entry(header_id.to_string())
+                            .or_insert(0) += 1;
                         log::warn!(
                             "PWM write verification mismatch for '{}': wrote {} ({}%), read back {} ({}%)",
                             header_id, raw, effective_pct, actual_raw, raw_to_percent(actual_raw)
@@ -623,6 +643,40 @@ mod tests {
                 assert!(msg.contains("out of range"));
             }
             _ => panic!("expected validation error"),
+        }
+    }
+
+    /// T2 (test-tests audit): boundary pair for the `pwm_percent > 100` guard.
+    /// Catches `>` ↔ `>=` mutations. 100 must be accepted (hardware allows
+    /// full speed); 101 must be rejected. Far-outside values (200, etc.) are
+    /// already covered by `set_pwm_invalid_percent` but don't distinguish
+    /// strict vs non-strict comparison.
+    #[test]
+    fn set_pwm_boundary_100_accepted_101_rejected() {
+        let (mut ctrl, _writes, _cache) = setup_controller(vec![make_header("h1", "CHA_FAN1", 0)]);
+        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lid = lease.lease_id.clone();
+
+        // 100 — exact boundary, must succeed (full speed is a legal value).
+        let ok_result = ctrl.set_pwm("h1", 100, &lid).expect("pwm_percent=100 must be accepted");
+        assert_eq!(ok_result.pwm_percent, 100);
+
+        // 101 — one past the boundary, must be rejected with validation error.
+        let err = ctrl
+            .set_pwm("h1", 101, &lid)
+            .expect_err("pwm_percent=101 must be rejected");
+        match err {
+            HwmonControlError::Validation(msg) => {
+                assert!(
+                    msg.contains("out of range"),
+                    "expected 'out of range' in error message, got: {msg}",
+                );
+                assert!(
+                    msg.contains("101"),
+                    "error message should mention the offending value, got: {msg}",
+                );
+            }
+            other => panic!("expected Validation error for 101, got: {other:?}"),
         }
     }
 
@@ -1259,6 +1313,147 @@ mod tests {
 
         // 50 reclaim events expected (one per call after the first).
         assert_eq!(ctrl.enable_revert_counts().get("h1"), Some(&50));
+    }
+
+    // ── PWM verify-after-write mismatch tests ───────────────────────
+    //
+    // T2 (test-tests audit): exercise the path at the bottom of set_pwm()
+    // where the daemon reads back the PWM sysfs file and compares against
+    // the value it just wrote. Without these, mutating `actual_raw != raw`
+    // to `==` survives every existing test.
+
+    /// Mock writer where read_file returns a *different* value than what was
+    /// written for the pwm sysfs path. Simulates BIOS clamping or EC
+    /// interference where our write was overridden.
+    struct ClampingSysfsWriter {
+        writes: WriteLog,
+        readbacks: StdHashMap<String, String>,
+    }
+
+    impl ClampingSysfsWriter {
+        fn new() -> (Self, WriteLog) {
+            let writes: WriteLog = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    writes: writes.clone(),
+                    readbacks: StdHashMap::new(),
+                },
+                writes,
+            )
+        }
+
+        fn returns_readback(mut self, path: &str, value: &str) -> Self {
+            self.readbacks.insert(path.to_string(), value.to_string());
+            self
+        }
+    }
+
+    impl SysfsWriter for ClampingSysfsWriter {
+        fn write_file(&mut self, path: &str, value: &str) -> Result<(), HwmonError> {
+            self.writes
+                .lock()
+                .push((path.to_string(), value.to_string()));
+            Ok(())
+        }
+
+        fn read_file(&self, path: &str) -> Result<String, HwmonError> {
+            self.readbacks
+                .get(path)
+                .cloned()
+                .ok_or(HwmonError::ReadError {
+                    path: path.to_string(),
+                    message: "not stubbed".to_string(),
+                })
+        }
+    }
+
+    #[test]
+    fn verify_mismatch_increments_counter() {
+        // Caller writes 50% (raw 128) but the BIOS/EC clamps it to 60%
+        // (raw 153). The read-back fires the mismatch path, which must
+        // increment verify_mismatch_counts so the divergence is observable.
+        let cache = Arc::new(StateCache::new());
+        let (writer, _writes) = ClampingSysfsWriter::new();
+        // pwm sysfs file reports raw=153 (60%) regardless of what we wrote.
+        let writer = writer
+            .returns_readback("/sys/class/hwmon/hwmon0/pwm1", "153")
+            .returns_readback("/sys/class/hwmon/hwmon0/fan1_input", "1200");
+        let lease_mgr = LeaseManager::new();
+        let mut ctrl = HwmonPwmController::new(
+            vec![make_header("h1", "CHA_FAN1", 0)],
+            lease_mgr,
+            Box::new(writer),
+            cache.clone(),
+        );
+
+        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        // 50% → raw 128. The mock reports back 153, triggering the mismatch.
+        ctrl.set_pwm("h1", 50, &lease.lease_id).unwrap();
+
+        assert_eq!(
+            ctrl.verify_mismatch_counts().get("h1"),
+            Some(&1),
+            "verify mismatch must be recorded when readback differs from write",
+        );
+    }
+
+    #[test]
+    fn verify_no_mismatch_when_readback_matches_write() {
+        // Sanity test: when the readback matches the value we wrote, the
+        // counter must NOT increment. Catches a mutation flipping `!=` to
+        // `==` which would otherwise increment on every successful write.
+        let cache = Arc::new(StateCache::new());
+        let (writer, _writes) = ClampingSysfsWriter::new();
+        // Writing 50 → raw 128. Readback returns the same value.
+        let writer = writer
+            .returns_readback("/sys/class/hwmon/hwmon0/pwm1", "128")
+            .returns_readback("/sys/class/hwmon/hwmon0/fan1_input", "1200");
+        let lease_mgr = LeaseManager::new();
+        let mut ctrl = HwmonPwmController::new(
+            vec![make_header("h1", "CHA_FAN1", 0)],
+            lease_mgr,
+            Box::new(writer),
+            cache.clone(),
+        );
+
+        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        ctrl.set_pwm("h1", 50, &lease.lease_id).unwrap();
+
+        assert!(
+            ctrl.verify_mismatch_counts().is_empty(),
+            "no mismatch must be recorded when readback equals write, got: {:?}",
+            ctrl.verify_mismatch_counts(),
+        );
+    }
+
+    #[test]
+    fn verify_mismatch_accumulates_across_writes() {
+        // Persistent BIOS clamping: the counter should keep climbing on
+        // each subsequent write (not be reset, not cap at 1).
+        let cache = Arc::new(StateCache::new());
+        let (writer, _writes) = ClampingSysfsWriter::new();
+        let writer = writer
+            .returns_readback("/sys/class/hwmon/hwmon0/pwm1", "200")
+            .returns_readback("/sys/class/hwmon/hwmon0/fan1_input", "1200");
+        let lease_mgr = LeaseManager::new();
+        let mut ctrl = HwmonPwmController::new(
+            vec![make_header("h1", "CHA_FAN1", 0)],
+            lease_mgr,
+            Box::new(writer),
+            cache.clone(),
+        );
+
+        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lid = lease.lease_id.clone();
+        ctrl.set_pwm("h1", 30, &lid).unwrap();
+        ctrl.set_pwm("h1", 40, &lid).unwrap();
+        ctrl.set_pwm("h1", 50, &lid).unwrap();
+
+        assert_eq!(
+            ctrl.verify_mismatch_counts().get("h1"),
+            Some(&3),
+            "verify mismatch counter must accumulate across writes",
+        );
     }
 
     #[test]

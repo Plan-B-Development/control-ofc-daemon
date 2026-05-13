@@ -45,6 +45,11 @@ pub enum LeaseError {
     },
     /// The provided lease ID does not match the active lease.
     InvalidLease,
+    /// The provided lease ID matches the active lease, but the lease's TTL
+    /// has elapsed. Distinct from `InvalidLease` (id mismatch) so callers
+    /// can tell "you sent the wrong id" from "your id is right but stale"
+    /// — important for renew-vs-reacquire decision logic in clients.
+    Expired,
     /// No lease is currently held (for release).
     NoLease,
 }
@@ -59,7 +64,8 @@ impl std::fmt::Display for LeaseError {
                 f,
                 "lease already held by '{owner_hint}' (expires in {ttl_seconds}s)"
             ),
-            Self::InvalidLease => write!(f, "invalid or expired lease"),
+            Self::InvalidLease => write!(f, "invalid lease id"),
+            Self::Expired => write!(f, "lease expired"),
             Self::NoLease => write!(f, "no active lease to release"),
         }
     }
@@ -137,10 +143,7 @@ impl LeaseManager {
     pub fn validate_lease(&self, lease_id: &str) -> Result<(), LeaseError> {
         match &self.active {
             Some(lease) if lease.lease_id == lease_id && !lease.is_expired() => Ok(()),
-            Some(lease) if lease.lease_id == lease_id => {
-                // Lease matched but expired
-                Err(LeaseError::InvalidLease)
-            }
+            Some(lease) if lease.lease_id == lease_id => Err(LeaseError::Expired),
             _ => Err(LeaseError::InvalidLease),
         }
     }
@@ -152,7 +155,7 @@ impl LeaseManager {
                 lease.expires_at = Instant::now() + self.ttl;
                 Ok(lease.clone())
             }
-            Some(lease) if lease.lease_id == lease_id => Err(LeaseError::InvalidLease),
+            Some(lease) if lease.lease_id == lease_id => Err(LeaseError::Expired),
             _ => Err(LeaseError::InvalidLease),
         }
     }
@@ -276,7 +279,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
 
         let err = mgr.validate_lease(&lease.lease_id).unwrap_err();
-        assert_eq!(err, LeaseError::InvalidLease);
+        assert_eq!(err, LeaseError::Expired);
     }
 
     #[test]
@@ -286,6 +289,44 @@ mod tests {
 
         let err = mgr.validate_lease("wrong-id").unwrap_err();
         assert_eq!(err, LeaseError::InvalidLease);
+    }
+
+    #[test]
+    fn validate_lease_distinguishes_wrong_id_from_expired() {
+        // T2 (test-tests audit): wrong-id and expired must be observably distinct.
+        // Previously both returned LeaseError::InvalidLease, so the match guard at
+        // line 140 could be flipped (== ↔ !=) without any test noticing.
+        let mut mgr = LeaseManager::with_ttl(Duration::from_millis(5));
+        let lease = mgr.take_lease("gui").unwrap();
+        let valid_id = lease.lease_id.clone();
+
+        // Path A: lease still valid, but caller sends the wrong id.
+        let wrong_err = mgr.validate_lease("not-the-real-id").unwrap_err();
+        assert_eq!(wrong_err, LeaseError::InvalidLease);
+
+        // Path B: caller sends the right id, but TTL has elapsed.
+        std::thread::sleep(Duration::from_millis(15));
+        let expired_err = mgr.validate_lease(&valid_id).unwrap_err();
+        assert_eq!(expired_err, LeaseError::Expired);
+
+        // The two paths must yield distinct variants — locks down the guard.
+        assert_ne!(wrong_err, expired_err);
+    }
+
+    #[test]
+    fn renew_lease_distinguishes_wrong_id_from_expired() {
+        let mut mgr = LeaseManager::with_ttl(Duration::from_millis(5));
+        let lease = mgr.take_lease("gui").unwrap();
+        let valid_id = lease.lease_id.clone();
+
+        let wrong_err = mgr.renew_lease("not-the-real-id").unwrap_err();
+        assert_eq!(wrong_err, LeaseError::InvalidLease);
+
+        std::thread::sleep(Duration::from_millis(15));
+        let expired_err = mgr.renew_lease(&valid_id).unwrap_err();
+        assert_eq!(expired_err, LeaseError::Expired);
+
+        assert_ne!(wrong_err, expired_err);
     }
 
     #[test]
@@ -337,7 +378,7 @@ mod tests {
         let id = lease.lease_id.clone();
         std::thread::sleep(Duration::from_millis(5));
         let err = mgr.renew_lease(&id).unwrap_err();
-        assert_eq!(err, LeaseError::InvalidLease);
+        assert_eq!(err, LeaseError::Expired);
     }
 
     #[test]

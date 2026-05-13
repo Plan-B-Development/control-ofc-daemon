@@ -111,7 +111,11 @@ pub async fn hwmon_lease_release_handler(
         }
         Err(LeaseError::InvalidLease) => error_response(
             StatusCode::BAD_REQUEST,
-            &ErrorEnvelope::lease_error("invalid or expired lease"),
+            &ErrorEnvelope::lease_error("invalid lease id"),
+        ),
+        Err(LeaseError::Expired) => error_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorEnvelope::lease_error("lease expired"),
         ),
         Err(LeaseError::NoLease) => error_response(
             StatusCode::BAD_REQUEST,
@@ -190,7 +194,11 @@ pub async fn hwmon_lease_renew_handler(
         ),
         Err(LeaseError::InvalidLease) => error_response(
             StatusCode::BAD_REQUEST,
-            &ErrorEnvelope::lease_error("invalid or expired lease"),
+            &ErrorEnvelope::lease_error("invalid lease id"),
+        ),
+        Err(LeaseError::Expired) => error_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorEnvelope::lease_error("lease expired"),
         ),
         Err(e) => error_response(
             StatusCode::BAD_REQUEST,
@@ -596,6 +604,19 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
         let json = body.0;
         assert_eq!(json["error"]["code"], "lease_required");
+    }
+
+    #[test]
+    fn hwmon_control_error_response_maps_expired_lease_to_403() {
+        // T2 (test-tests audit): Expired joined LeaseError as a distinct
+        // variant. The HTTP shape must remain 403 lease_required so existing
+        // GUI retry policies (re-acquire on 403) keep working.
+        let err = HwmonControlError::Lease(LeaseError::Expired);
+        let (status, body) = hwmon_control_error_response(err);
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let json = body.0;
+        assert_eq!(json["error"]["code"], "lease_required");
+        assert_eq!(json["error"]["retryable"], false);
     }
 
     /// B1: classify_verify_result `details` must acknowledge that an

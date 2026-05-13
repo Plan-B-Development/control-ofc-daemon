@@ -424,4 +424,86 @@ mod tests {
         }
         assert!(!cache.snapshot().gui_active());
     }
+
+    /// T2 (test-tests audit): the profile-engine deferral window is the
+    /// "GUI active within 30s" check. Lock the boundary at:
+    ///   - well-inside (1s elapsed) → active
+    ///   - just-inside (TIMEOUT - 1s elapsed) → active
+    ///   - exactly at the boundary (TIMEOUT elapsed) → inactive
+    ///   - just-outside (TIMEOUT + 1s elapsed) → inactive
+    ///
+    /// Catches `<` ↔ `<=` mutations on the predicate.
+    #[test]
+    fn gui_active_boundary_inside_timeout_is_true() {
+        use std::time::{Duration, Instant};
+        let cache = StateCache::new();
+        {
+            let mut state = cache.inner.write();
+            state.last_gui_write_at = Some(
+                Instant::now()
+                    .checked_sub(Duration::from_secs(1))
+                    .expect("subtraction should succeed"),
+            );
+        }
+        assert!(
+            cache.snapshot().gui_active(),
+            "1s elapsed must be active (< 30s)"
+        );
+    }
+
+    #[test]
+    fn gui_active_boundary_one_second_before_timeout_is_true() {
+        use std::time::{Duration, Instant};
+        let cache = StateCache::new();
+        {
+            let mut state = cache.inner.write();
+            state.last_gui_write_at = Some(
+                Instant::now()
+                    .checked_sub(crate::constants::GUI_ACTIVITY_TIMEOUT - Duration::from_secs(1))
+                    .expect("subtraction should succeed"),
+            );
+        }
+        assert!(
+            cache.snapshot().gui_active(),
+            "29s elapsed must still be active"
+        );
+    }
+
+    #[test]
+    fn gui_active_boundary_exactly_at_timeout_is_false() {
+        // The predicate is `elapsed < TIMEOUT`, so elapsed == TIMEOUT is
+        // inactive. This locks down the strict `<` vs `<=` semantics.
+        use std::time::Instant;
+        let cache = StateCache::new();
+        {
+            let mut state = cache.inner.write();
+            state.last_gui_write_at = Some(
+                Instant::now()
+                    .checked_sub(crate::constants::GUI_ACTIVITY_TIMEOUT)
+                    .expect("subtraction should succeed"),
+            );
+        }
+        assert!(
+            !cache.snapshot().gui_active(),
+            "exactly at timeout must be inactive"
+        );
+    }
+
+    #[test]
+    fn gui_active_boundary_one_second_past_timeout_is_false() {
+        use std::time::{Duration, Instant};
+        let cache = StateCache::new();
+        {
+            let mut state = cache.inner.write();
+            state.last_gui_write_at = Some(
+                Instant::now()
+                    .checked_sub(crate::constants::GUI_ACTIVITY_TIMEOUT + Duration::from_secs(1))
+                    .expect("subtraction should succeed"),
+            );
+        }
+        assert!(
+            !cache.snapshot().gui_active(),
+            "31s elapsed must be inactive"
+        );
+    }
 }

@@ -551,4 +551,86 @@ mod tests {
         assert_eq!(sensors.len(), 1);
         assert_eq!(sensors[0].chip_name, "it8696");
     }
+
+    /// T2 (test-tests audit): table-driven classification for every arm and
+    /// label sub-branch in `classify_chip`. Each row represents one mutually
+    /// independent decision; if any of these rows drift the test will fail,
+    /// blocking accidental removal of a chip arm or label keyword. Pure
+    /// function — no sysfs fixtures needed.
+    #[test]
+    fn classify_chip_table_driven_all_arms_and_subbranches() {
+        let cases: &[(&str, &str, SensorKind)] = &[
+            // ── Direct chip-name arms ──
+            ("k10temp", "Tctl", SensorKind::CpuTemp),
+            ("k10temp", "anything", SensorKind::CpuTemp), // label ignored for k10temp
+            ("coretemp", "Package id 0", SensorKind::CpuTemp),
+            ("coretemp", "Core 3", SensorKind::CpuTemp),
+            ("amdgpu", "edge", SensorKind::GpuTemp),
+            ("amdgpu", "junction", SensorKind::GpuTemp),
+            ("amdgpu", "mem", SensorKind::GpuTemp),
+            ("nvme", "Composite", SensorKind::DiskTemp),
+            ("nvme", "Sensor 1", SensorKind::DiskTemp),
+            ("sbtsi_temp", "", SensorKind::CpuTemp),
+            // ── it87* prefix arm ──
+            ("it8696", "AUXTIN0", SensorKind::MbTemp),
+            ("it8772", "anything", SensorKind::MbTemp),
+            ("it8728", "", SensorKind::MbTemp),
+            // ── NCT family default + each label sub-branch ──
+            ("nct6775", "SYSTIN", SensorKind::MbTemp),  // no keyword → MB
+            ("nct6683", "AUXTIN0", SensorKind::MbTemp), // no keyword → MB
+            ("nct6686", "PCH_CHIP", SensorKind::MbTemp),
+            ("nct6687", "VRM", SensorKind::MbTemp),
+            ("nct6775", "AMD TSI Addr 98h", SensorKind::CpuTemp), // amd tsi
+            ("nct6683", "TSI", SensorKind::CpuTemp),              // tsi keyword
+            ("nct6686", "PECI Agent 0", SensorKind::CpuTemp),     // peci keyword
+            ("nct6687", "CPU", SensorKind::CpuTemp),              // cpu keyword
+            ("nct6775", "cpu temp", SensorKind::CpuTemp),         // case-insensitive
+            // ── ASUS EC / WMI arms ──
+            ("asus_ec_sensors", "CPU", SensorKind::CpuTemp),
+            ("asus_ec_sensors", "GPU", SensorKind::GpuTemp),
+            ("asus_ec_sensors", "Chipset", SensorKind::MbTemp),
+            ("asus_wmi_sensors", "CPU Package Temp", SensorKind::CpuTemp),
+            ("asus_wmi_sensors", "GPU Hotspot", SensorKind::GpuTemp),
+            ("asus_wmi_sensors", "VRM", SensorKind::MbTemp),
+            // ── Gigabyte WMI arm (always MB) ──
+            ("gigabyte_wmi", "temp1", SensorKind::MbTemp),
+            ("gigabyte_wmi", "anything", SensorKind::MbTemp),
+            // ── Fallback heuristic: each label keyword ──
+            ("unknown_chip", "CPU package", SensorKind::CpuTemp),
+            ("unknown_chip", "Tctl", SensorKind::CpuTemp),
+            ("unknown_chip", "Tccd1", SensorKind::CpuTemp),
+            ("unknown_chip", "GPU edge", SensorKind::GpuTemp),
+            ("unknown_chip", "edge", SensorKind::GpuTemp),
+            ("unknown_chip", "junction", SensorKind::GpuTemp),
+            ("unknown_chip", "VRM", SensorKind::MbTemp), // no keyword match
+            ("unknown_chip", "", SensorKind::MbTemp),    // empty label
+        ];
+
+        for (chip, label, expected) in cases {
+            let got = classify_chip(chip, label);
+            assert_eq!(
+                got, *expected,
+                "classify_chip({chip:?}, {label:?}) expected {expected:?}, got {got:?}",
+            );
+        }
+    }
+
+    /// CPU keywords must take precedence over GPU keywords in the fallback
+    /// heuristic when both are present in the label — the arm-order at
+    /// `_ => { if cpu || tctl || tccd ... else if gpu || edge || junction }`
+    /// makes this an observable ordering choice. Locks the precedence so a
+    /// future refactor doesn't silently flip it.
+    #[test]
+    fn classify_chip_fallback_cpu_keyword_wins_over_gpu_keyword() {
+        // "cpu" wins over "gpu" by appearing first in the if-chain.
+        assert_eq!(
+            classify_chip("unknown_chip", "CPU and GPU combined sensor"),
+            SensorKind::CpuTemp,
+        );
+        // Same precedence test using Tctl + edge.
+        assert_eq!(
+            classify_chip("unknown_chip", "Tctl-edge"),
+            SensorKind::CpuTemp,
+        );
+    }
 }
