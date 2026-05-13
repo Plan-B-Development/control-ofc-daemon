@@ -658,7 +658,9 @@ mod tests {
         let lid = lease.lease_id.clone();
 
         // 100 — exact boundary, must succeed (full speed is a legal value).
-        let ok_result = ctrl.set_pwm("h1", 100, &lid).expect("pwm_percent=100 must be accepted");
+        let ok_result = ctrl
+            .set_pwm("h1", 100, &lid)
+            .expect("pwm_percent=100 must be accepted");
         assert_eq!(ok_result.pwm_percent, 100);
 
         // 101 — one past the boundary, must be rejected with validation error.

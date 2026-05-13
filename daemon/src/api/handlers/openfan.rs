@@ -82,6 +82,7 @@ pub async fn set_pwm_all_handler(
                     api_version: API_VERSION,
                     pwm_percent: set_result.pwm_percent,
                     channels_affected: set_result.channels_affected,
+                    coalesced: set_result.coalesced,
                 },
             )
         }

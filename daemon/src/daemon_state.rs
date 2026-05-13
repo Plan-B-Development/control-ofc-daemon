@@ -2,8 +2,12 @@
 //!
 //! Stores the active profile selection at `{state_dir}/daemon_state.json`.
 //! Default state_dir is `/var/lib/control-ofc` (configurable via `[state]` in
-//! daemon.toml). Uses atomic write (tmp + rename) to avoid corruption on crash.
+//! daemon.toml). Writes go through [`crate::atomic_io::write_atomic`], which
+//! does tmp + fsync + rename + parent-dir fsync — so a process crash, kernel
+//! panic, or power loss mid-write leaves either the previous complete file or
+//! the new complete file, never a zero-length file.
 
+use crate::atomic_io::write_atomic;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -125,6 +129,11 @@ pub fn save_state(state: &DaemonState) -> Result<(), String> {
 }
 
 /// Persist state to a specific directory (testable without global OnceLock).
+///
+/// Confidentiality note: systemd `StateDirectory=control-ofc` creates
+/// `/var/lib/control-ofc` with `StateDirectoryMode=` (default 0o755), so the
+/// file's 0o600 mode (applied by `write_atomic`) is the actual confidentiality
+/// boundary for this file.
 pub fn save_state_to(dir: &Path, state: &DaemonState) -> Result<(), String> {
     if !dir.exists() {
         std::fs::create_dir_all(dir)
@@ -132,24 +141,9 @@ pub fn save_state_to(dir: &Path, state: &DaemonState) -> Result<(), String> {
     }
 
     let path = dir.join(STATE_FILE);
-    let tmp_path = path.with_extension("json.tmp");
     let content = serde_json::to_string_pretty(state)
         .map_err(|e| format!("failed to serialize state: {e}"))?;
-    std::fs::write(&tmp_path, &content)
-        .map_err(|e| format!("failed to write tmp state file: {e}"))?;
-
-    // S3: Set owner-only permissions before atomic rename. systemd
-    // `StateDirectory=control-ofc` creates `/var/lib/control-ofc` with
-    // `StateDirectoryMode=` (default 0o755), so file perms are the
-    // actual confidentiality boundary for this file.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("failed to set permissions on tmp state file: {e}"))?;
-    }
-
-    std::fs::rename(&tmp_path, &path).map_err(|e| format!("failed to rename state file: {e}"))?;
+    write_atomic(&path, content.as_bytes())?;
 
     log::debug!(
         "State saved to {}: profile={:?}",

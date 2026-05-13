@@ -14,8 +14,12 @@
 //!   2. `RuntimeConfig` is loaded from `{state_dir}/runtime.toml`
 //!   3. Any key present in both is resolved to the runtime value
 //!
-//! Writes go through atomic tmp+rename with 0o600 permissions.
+//! Writes go through [`crate::atomic_io::write_atomic`], which does
+//! tmp + fsync + rename + parent-dir fsync at 0o600 permissions — so a
+//! process crash, kernel panic, or power loss mid-write leaves either the
+//! previous complete file or the new complete file, never a zero-length file.
 
+use crate::atomic_io::write_atomic;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -105,19 +109,7 @@ impl RuntimeConfig {
              {content}"
         );
 
-        let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, &body)
-            .map_err(|e| format!("write tmp runtime config at {}: {e}", tmp.display()))?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| format!("set permissions on tmp runtime config: {e}"))?;
-        }
-
-        std::fs::rename(&tmp, path)
-            .map_err(|e| format!("rename runtime config to {}: {e}", path.display()))?;
+        write_atomic(path, body.as_bytes())?;
 
         log::info!("Persisted runtime config to {}", path.display());
         Ok(())
@@ -272,7 +264,9 @@ mod tests {
 
     #[test]
     fn save_to_readonly_path_returns_err() {
-        // Use a path whose parent is a regular file — mkdir_all will fail.
+        // Use a path whose parent is a regular file — every plausible failure
+        // mode (mkdir, tmp-file create) must surface as an Err rather than
+        // silently succeeding or panicking.
         let tmp = tempfile::tempdir().unwrap();
         let blocker = tmp.path().join("blocker");
         std::fs::write(&blocker, "not a directory").unwrap();
@@ -282,7 +276,9 @@ mod tests {
         cfg.set_startup_delay_secs(1);
         let err = cfg.save_to(&path).unwrap_err();
         assert!(
-            err.contains("failed to create") || err.contains("write tmp"),
+            err.contains("failed to create")
+                || err.contains("write tmp")
+                || err.contains("create tmp file"),
             "expected mkdir/write error, got: {err}"
         );
     }

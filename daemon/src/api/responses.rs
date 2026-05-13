@@ -123,6 +123,10 @@ pub struct SetPwmAllResponse {
     pub api_version: u32,
     pub pwm_percent: u8,
     pub channels_affected: u8,
+    /// True when the controller short-circuited the serial command because
+    /// every channel already held this value. Lets the GUI distinguish
+    /// "no-op" from "wrote and cache fresh".
+    pub coalesced: bool,
 }
 
 /// Response for successful target RPM set.

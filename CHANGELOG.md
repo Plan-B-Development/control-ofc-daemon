@@ -72,6 +72,64 @@ with **GUI Unreleased** (see GUI DEC-107 for the cross-stack rationale).
 
 ---
 
+### `/audit` follow-up hardening pass (DEC-108)
+
+A post-v1.7.0 `/audit` of both repos surfaced multiple issues; this
+section captures the daemon-side fixes. See DEC-108 for the full
+rationale.
+
+#### Fixed (daemon)
+- **`cargo fmt --check` failure on `main` resolved.** DEC-107
+  committed two files (`hwmon/discovery.rs` table-driven test row
+  and `hwmon/pwm_control.rs` boundary test) without running
+  `cargo fmt`. The next release's gate would have blocked. Fixed
+  by `cargo fmt --all`. (P1-A)
+- **Atomic writes are now crash-safe.** Both
+  `daemon_state::save_state_to` and `RuntimeConfig::save_to` did
+  `std::fs::write(tmp) + rename` — atomic against process crash
+  but not against power loss (the rename can land in the journal
+  while data is still in the page cache, leaving a zero-length
+  file on next mount). New `daemon::atomic_io::write_atomic`
+  helper does `File::create → write_all → sync_all →
+  set_permissions(0o600) → rename → parent-dir fsync`. Both call
+  sites now use it. (P1-B)
+
+#### Added (daemon)
+- **`pub mod atomic_io`** — new module with `write_atomic(path:
+  &Path, bytes: &[u8]) -> Result<(), String>`. Mirrors the GUI's
+  `paths.atomic_write` shape. 9 unit tests cover content,
+  permissions, tmp-cleanup on rename failure, large payloads, and
+  empty content.
+- **`SetPwmAllResult.coalesced: bool`** (controller-internal) and
+  **`SetPwmAllResponse.coalesced: bool`** (wire-visible). When
+  every channel already holds the requested value, `set_pwm_all`
+  returns `coalesced: true` with no serial write and no cache
+  update. Mirrors the single-channel `SetPwmResult` pattern.
+  Additive on the wire — older GUIs ignore the field. (P2-B)
+
+#### Tests (daemon)
+- **+9 atomic_io unit tests** locking the write/fsync/rename
+  sequence, owner-only permissions, tmp-cleanup-on-rename-failure,
+  empty/large-content correctness, and the tmp-path naming
+  convention.
+- **+3 controller tests** for the new `set_pwm_all` coalescing
+  behaviour (`set_pwm_all_coalesces_when_all_channels_already_at_value`,
+  `set_pwm_all_does_not_coalesce_when_value_changes`,
+  `set_pwm_all_does_not_coalesce_when_one_channel_diverges`).
+- **+3 IPC integration tests** for `POST /profile/activate`
+  path-traversal protection (P2-A): outside any search dir → 400,
+  symlink chained outside → 400 (post-canonicalize check), inside
+  search dir → 200 + state mutation.
+- **Total: 467 → 482 tests pass** (423 → 435 unit + 41 → 44 IPC
+  + 3 main).
+
+#### Documentation
+- Cross-stack rationale recorded in GUI **DEC-108** (authoritative
+  full log). This `CHANGELOG.md` and daemon `DECISIONS.md` carry
+  the daemon-relevant subset.
+
+---
+
 ## [1.7.0] — 2026-05-13
 
 Pairs with **GUI v1.12.0**. Coordinated AMD-board-support hardening

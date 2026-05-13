@@ -576,7 +576,7 @@ mod tests {
             ("it8772", "anything", SensorKind::MbTemp),
             ("it8728", "", SensorKind::MbTemp),
             // ── NCT family default + each label sub-branch ──
-            ("nct6775", "SYSTIN", SensorKind::MbTemp),  // no keyword → MB
+            ("nct6775", "SYSTIN", SensorKind::MbTemp), // no keyword → MB
             ("nct6683", "AUXTIN0", SensorKind::MbTemp), // no keyword → MB
             ("nct6686", "PCH_CHIP", SensorKind::MbTemp),
             ("nct6687", "VRM", SensorKind::MbTemp),

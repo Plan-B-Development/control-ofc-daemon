@@ -127,6 +127,13 @@ impl FanController {
     }
 
     /// Set PWM on all channels. `pwm_percent` is 0–100.
+    ///
+    /// Coalesces (returns `coalesced: true`, no serial write, no cache update)
+    /// when every channel already shows `last_commanded_pct == Some(pwm_percent)`.
+    /// This mirrors the per-channel `set_pwm` coalesce behaviour and matters
+    /// for the GUI's 1 Hz control loop in profiles that hold all openfan
+    /// channels at the same value — repeated `set_pwm_all(N)` calls would
+    /// otherwise pin the serial transport mutex every cycle for no effect.
     pub fn set_pwm_all(&mut self, pwm_percent: u8) -> Result<SetPwmAllResult, FanControlError> {
         if pwm_percent > 100 {
             return Err(FanControlError::Validation(format!(
@@ -141,6 +148,22 @@ impl FanController {
             }
         }
         let effective_pct = pwm_percent;
+
+        // Coalesce: skip when every channel is already at this value. We
+        // require all channels to match because a `set_pwm_all` command goes
+        // to the transport as a single broadcast — if even one channel is
+        // stale we have to send the frame.
+        let all_match = self
+            .channels
+            .iter()
+            .all(|c| c.last_commanded_pct == Some(effective_pct));
+        if all_match {
+            return Ok(SetPwmAllResult {
+                pwm_percent: effective_pct,
+                channels_affected: NUM_CHANNELS,
+                coalesced: true,
+            });
+        }
 
         let raw = percent_to_raw(effective_pct);
         let cmd = Command::SetAllPwm(raw);
@@ -170,6 +193,7 @@ impl FanController {
         Ok(SetPwmAllResult {
             pwm_percent: effective_pct,
             channels_affected: NUM_CHANNELS,
+            coalesced: false,
         })
     }
 
@@ -241,6 +265,9 @@ pub struct SetPwmResult {
 pub struct SetPwmAllResult {
     pub pwm_percent: u8,
     pub channels_affected: u8,
+    /// True when the controller skipped the serial command because every
+    /// channel already showed this value. Mirrors `SetPwmResult.coalesced`.
+    pub coalesced: bool,
 }
 
 /// Result of a target RPM set operation.
@@ -481,6 +508,75 @@ mod tests {
         let result = ctrl.set_pwm_all(75).unwrap();
         assert_eq!(result.pwm_percent, 75);
         assert_eq!(result.channels_affected, 10);
+        assert!(
+            !result.coalesced,
+            "first set_pwm_all on a fresh controller must transmit, not coalesce"
+        );
+    }
+
+    #[test]
+    fn set_pwm_all_coalesces_when_all_channels_already_at_value() {
+        // Second identical `set_pwm_all` must short-circuit: same percent on
+        // every channel means there is nothing for the OpenFan to apply,
+        // and the test owns budget 1 response — a non-coalesced retransmit
+        // would block on the missing second response.
+        let (transport, written) = MockTransport::with_ok_responses(1);
+        let mut ctrl = make_controller(transport);
+
+        let r1 = ctrl.set_pwm_all(60).unwrap();
+        assert!(!r1.coalesced);
+
+        let r2 = ctrl.set_pwm_all(60).unwrap();
+        assert!(
+            r2.coalesced,
+            "identical follow-up set_pwm_all must coalesce: got {r2:?}"
+        );
+        assert_eq!(r2.pwm_percent, 60);
+        assert_eq!(r2.channels_affected, 10);
+
+        // Confirm only one frame went down the wire.
+        let written = written.lock();
+        assert_eq!(
+            written.len(),
+            1,
+            "coalesced call must NOT retransmit; transport saw {:?}",
+            *written
+        );
+    }
+
+    #[test]
+    fn set_pwm_all_does_not_coalesce_when_value_changes() {
+        // Two distinct values: both must transmit.
+        let (transport, written) = MockTransport::with_ok_responses(2);
+        let mut ctrl = make_controller(transport);
+
+        ctrl.set_pwm_all(40).unwrap();
+        let r2 = ctrl.set_pwm_all(60).unwrap();
+        assert!(!r2.coalesced, "value change must transmit");
+
+        let written = written.lock();
+        assert_eq!(written.len(), 2);
+    }
+
+    #[test]
+    fn set_pwm_all_does_not_coalesce_when_one_channel_diverges() {
+        // Mixed prior state: nine channels at 50, one at 30. set_pwm_all(50)
+        // must transmit so the divergent channel catches up — the broadcast
+        // frame is the only way to set every channel uniformly.
+        let (transport, written) = MockTransport::with_ok_responses(2);
+        let mut ctrl = make_controller(transport);
+
+        // Seed: per-channel write moves channel 0 to 30, leaves others unset.
+        // Then a set_pwm_all(50) brings everyone to 50.
+        ctrl.set_pwm(0, 30).unwrap();
+        let r_seed = ctrl.set_pwm_all(50).unwrap();
+        assert!(
+            !r_seed.coalesced,
+            "channel 0 was at 30, others None — must transmit"
+        );
+
+        let written = written.lock();
+        assert_eq!(written.len(), 2);
     }
 
     #[test]

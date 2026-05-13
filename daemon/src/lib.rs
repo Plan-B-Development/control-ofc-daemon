@@ -1,4 +1,5 @@
 pub mod api;
+pub mod atomic_io;
 pub mod config;
 pub mod constants;
 pub mod daemon_state;

@@ -1525,3 +1525,157 @@ async fn hwmon_set_pwm_unknown_header_returns_404() {
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
 }
+
+// ---------------------------------------------------------------------------
+// POST /profile/activate — path-traversal protection (P2-A from /audit)
+//
+// `profile_path` is the canonical CWE-22 surface for the daemon: a caller
+// supplies a filesystem path which the daemon then opens. The handler
+// canonicalises both the candidate path and every configured search
+// directory, then requires `candidate.starts_with(dir)` for at least one
+// `dir`. Unit tests in `profile.rs::find_profile` cover the lookup-by-id
+// side; the next three tests lock the `profile_path`-by-direct-path side
+// at the IPC layer so a regression in the canonicalise/starts_with logic
+// would fail CI rather than wait to be caught in production.
+// ---------------------------------------------------------------------------
+
+/// Build an AppState whose `profile_search_dirs` points at `dirs`. No fan or
+/// hwmon controllers are wired in — these tests only need the profile
+/// activation handler to run.
+fn test_app_state_with_profile_dirs(dirs: Vec<std::path::PathBuf>) -> Arc<AppState> {
+    Arc::new(AppState {
+        cache: Arc::new(StateCache::new()),
+        staleness_config: StalenessConfig::default(),
+        daemon_version: "0.1.0-test".into(),
+        fan_controller: None,
+        hwmon_controller: None,
+        start_time: std::time::Instant::now(),
+        history: Arc::new(HistoryRing::new(250)),
+        active_profile: Arc::new(parking_lot::Mutex::new(None)),
+        calibrating: std::sync::atomic::AtomicBool::new(false),
+        amd_gpus: Vec::new(),
+        profile_search_dirs: parking_lot::RwLock::new(dirs),
+        config_path: String::new(),
+        runtime_config_path: std::path::PathBuf::new(),
+        sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    })
+}
+
+#[tokio::test]
+async fn profile_activate_rejects_path_outside_search_dirs() {
+    // Set up: search dir at /tmp/.X/search, profile placed at /tmp/.X/outside.
+    // The candidate path is fully outside the search dir, so the handler must
+    // reject it with 400 validation_error — never load the file.
+    let tmp = tempfile::tempdir().unwrap();
+    let search_dir = tmp.path().join("search");
+    let outside_dir = tmp.path().join("outside");
+    std::fs::create_dir_all(&search_dir).unwrap();
+    std::fs::create_dir_all(&outside_dir).unwrap();
+
+    let outside_profile = outside_dir.join("evil.json");
+    std::fs::write(&outside_profile, r#"{"id": "evil", "name": "Outside"}"#).unwrap();
+
+    let state = test_app_state_with_profile_dirs(vec![search_dir.clone()]);
+    let (path, shutdown, _dir) = start_test_server(state.clone()).await;
+
+    let body = serde_json::json!({
+        "profile_path": outside_profile.display().to_string(),
+    });
+    let (status, json) = uds_post(&path, "/profile/activate", &body).await;
+
+    assert_eq!(
+        status, 400,
+        "profile_path outside any search dir must be 400, got {status}: {json}"
+    );
+    assert_eq!(json["error"]["code"], "validation_error");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("search directory"),
+        "error must mention search directory restriction: {json}"
+    );
+    // Crucially: no profile was activated.
+    assert!(state.active_profile.lock().is_none());
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn profile_activate_rejects_symlink_chained_outside_search_dirs() {
+    // Set up: search dir at /tmp/.X/search, real profile at /tmp/.X/outside.
+    // Place a symlink INSIDE the search dir that points OUT to the real file.
+    // `starts_with` on the raw path would let this past, but `canonicalize`
+    // resolves the symlink to its real location, which is outside — the
+    // handler must reject. This is the TOCTOU-resistant CWE-22 check.
+    let tmp = tempfile::tempdir().unwrap();
+    let search_dir = tmp.path().join("search");
+    let outside_dir = tmp.path().join("outside");
+    std::fs::create_dir_all(&search_dir).unwrap();
+    std::fs::create_dir_all(&outside_dir).unwrap();
+
+    let real_profile = outside_dir.join("real.json");
+    std::fs::write(&real_profile, r#"{"id": "real", "name": "Real"}"#).unwrap();
+
+    let symlink_path = search_dir.join("link.json");
+    std::os::unix::fs::symlink(&real_profile, &symlink_path).unwrap();
+
+    let state = test_app_state_with_profile_dirs(vec![search_dir.clone()]);
+    let (path, shutdown, _dir) = start_test_server(state.clone()).await;
+
+    let body = serde_json::json!({
+        "profile_path": symlink_path.display().to_string(),
+    });
+    let (status, json) = uds_post(&path, "/profile/activate", &body).await;
+
+    assert_eq!(
+        status, 400,
+        "symlink pointing outside search dir must be 400, got {status}: {json}"
+    );
+    assert_eq!(json["error"]["code"], "validation_error");
+    assert!(state.active_profile.lock().is_none());
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn profile_activate_accepts_path_inside_search_dir() {
+    // Positive control: a profile_path that canonicalizes to a path inside
+    // a configured search dir must load and activate. Without this, the
+    // two rejection tests above would also pass if the handler accidentally
+    // rejected every path.
+    let tmp = tempfile::tempdir().unwrap();
+    let search_dir = tmp.path().join("search");
+    std::fs::create_dir_all(&search_dir).unwrap();
+
+    let profile_path = search_dir.join("ok.json");
+    std::fs::write(&profile_path, r#"{"id": "ok", "name": "OK", "version": 4}"#).unwrap();
+
+    let state = test_app_state_with_profile_dirs(vec![search_dir.clone()]);
+    let (path, shutdown, _dir) = start_test_server(state.clone()).await;
+
+    let body = serde_json::json!({
+        "profile_path": profile_path.display().to_string(),
+    });
+    let (status, json) = uds_post(&path, "/profile/activate", &body).await;
+
+    assert_eq!(
+        status, 200,
+        "profile inside search dir must activate, got {status}: {json}"
+    );
+    assert_eq!(json["activated"], true);
+    assert_eq!(json["profile_id"], "ok");
+    assert_eq!(json["profile_name"], "OK");
+    let guard = state.active_profile.lock();
+    assert_eq!(
+        guard.as_ref().map(|p| p.id.as_str()),
+        Some("ok"),
+        "in-memory active profile must reflect the activation"
+    );
+    drop(guard);
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
