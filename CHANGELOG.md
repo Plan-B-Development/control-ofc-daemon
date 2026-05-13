@@ -1,12 +1,25 @@
 # Changelog
 
-## [Unreleased]
+## [1.8.0] — 2026-05-13
+
+Pairs with **GUI v1.13.0**. Combined release of two prior `[Unreleased]`
+waves: the DEC-107 mutation-driven test-tests hardening pass (+16 daemon
+tests, two non-breaking internal-API additions) and the DEC-108 `/audit`
+follow-up hardening pass (`cargo fmt` fix, crash-safe atomic writes,
+`set_pwm_all` broadcast coalescing, and 3 new IPC integration tests for
+`POST /profile/activate` path-traversal protection). All additions are
+backward-compatible on the wire and the internal API; older GUIs
+interoperate with the new daemon and the new GUI interoperates with
+older daemons without behavioural change. Total daemon tests: 482
+passing (435 unit + 44 IPC integration + 3 main).
+
+### Wave 1 — DEC-107 test-tests audit hardening
 
 Test-tests audit hardening pass. A `/test-tests` mutation-driven audit
 identified equivalent-mutant survivors in several core modules; this
 pass closes the highest-value gaps with 16 new daemon tests and two
 small ergonomic additions to the controller's observable surface. Pairs
-with **GUI Unreleased** (see GUI DEC-107 for the cross-stack rationale).
+with **GUI v1.13.0 Wave 1** (see GUI DEC-107 for the cross-stack rationale).
 
 ### Added (non-breaking, internal-API)
 - **`LeaseError::Expired` variant.** Previously `validate_lease` and
@@ -72,7 +85,7 @@ with **GUI Unreleased** (see GUI DEC-107 for the cross-stack rationale).
 
 ---
 
-### `/audit` follow-up hardening pass (DEC-108)
+### Wave 2 — DEC-108 `/audit` follow-up hardening pass
 
 A post-v1.7.0 `/audit` of both repos surfaced multiple issues; this
 section captures the daemon-side fixes. See DEC-108 for the full
