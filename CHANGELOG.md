@@ -1,5 +1,54 @@
 # Changelog
 
+## [1.8.1] — 2026-06-01
+
+Audit remediation pass following a cross-stack `/audit effort=max` sweep
+on 2026-06-01. One safety-relevant signal-handling fix and three
+documentation corrections. No new features, no wire-shape changes.
+Pairs with **GUI v1.14.1**, which lands the matching `paths.atomic_write`
+parity backport and dead-code sweep on the Python side.
+
+### Fixed
+- **Daemon now handles SIGTERM as a graceful-shutdown signal**
+  (`daemon/src/main.rs`). Previously the `tokio::select!` block only
+  registered `tokio::signal::ctrl_c()` (SIGINT), so `systemctl stop` —
+  which sends SIGTERM by default — terminated the process before the
+  in-process graceful path could run: `shutdown_tx.send`, GPU
+  fan-curve reset, hwmon `pwm_enable=2` restore, and the IPC server
+  join were all silently skipped. External safety was preserved by
+  `ExecStopPost=control-ofc-restore-auto`, so this was a *cleanliness*
+  bug rather than a *safety* bug, but the inline comment claiming
+  "SIGINT/SIGTERM" was misleading. SIGTERM registration is fail-soft:
+  if the handler cannot register (rare — unusual sandbox policies),
+  the daemon logs a warning and falls back to SIGINT-only behaviour.
+- A new integration test in `daemon/tests/signal_handling.rs` pins the
+  SIGTERM dispatch behaviour: register the stream, self-deliver SIGTERM
+  via `libc::kill(getpid(), SIGTERM)`, verify the stream wakes within
+  5 s. Each integration-test file is its own binary, so the signal
+  cannot leak into other tests.
+
+### Documentation
+- **`daemon.md` KernelWarning schema corrected**. The doc previously
+  claimed the entry carried four fields — `id`, `severity` (with values
+  `info / warn / high / critical`), `summary`, and `reference_url`. The
+  actual wire shape per `daemon/src/hwmon/kernel_warnings.rs` is
+  three fields — `id`, `severity` (values `info / medium / high /
+  critical` — no `warn` variant), `message`. The GUI's contract spec
+  (`08_API_Integration_Contract.md`) already had the correct shape;
+  only `daemon.md` had drifted.
+- **`docs/USER_GUIDE.md` verify-duration corrected** to ~6 s (was
+  ~3 s). DEC-101 raised the verify wait to 6 s — slow-spinning fans
+  need more settle time — and the GUI's per-call timeout was already
+  bumped to 12 s in lockstep. The daemon's USER_GUIDE missed the
+  update.
+- **README "Latest release" line** refreshed to v1.8.1 (was 2 minor
+  versions stale).
+
+### Tests
+- 485 tests passing (was 482; +3 new signal-handling integration tests).
+- `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- `cargo audit` reports 0 vulnerabilities across 143 crates.
+
 ## [1.8.0] — 2026-05-13
 
 Pairs with **GUI v1.13.0**. Combined release of two prior `[Unreleased]`

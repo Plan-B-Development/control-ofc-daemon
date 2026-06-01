@@ -112,7 +112,7 @@ profile_engine ──read──> StateCache
 5. **Kernel-version regression catalogue** (`hwmon/kernel_warnings.rs`, DEC-098):
    - Curated list of published amdgpu regressions keyed by kernel version + GPU PCI device ID
    - Currently flags `rdna_hang_kernel_6_19_x` (RDNA3/4 hard hang on 6.19.x, Phoronix-confirmed) and `smu_mismatch_navi48_r9700_kernel_7_0` (R9700-only fan_curve write failure on 7.0.x, ROCm Issue #6101)
-   - Surfaced via `GET /capabilities` (`devices.amd_gpu.kernel_warnings`); each entry carries `id`, `severity` (`info` / `warn` / `high` / `critical`), `summary`, and an optional `reference_url`
+   - Surfaced via `GET /capabilities` (`devices.amd_gpu.kernel_warnings`); each entry carries `id` (stable knowledge-base key), `severity` (`info` / `medium` / `high` / `critical`), and `message` (pre-formatted user-visible text). The daemon owns the wording so a message update doesn't require coordinated GUI redeploys.
    - The field uses `#[serde(skip_serializing_if = "Vec::is_empty")]` so older clients that don't know about it see no change in the wire shape
    - The GUI raises a one-time `QMessageBox` for `high` and `critical` warnings; the user's acknowledgement is persisted in `app_settings.acknowledged_kernel_warnings` so the popup does not re-fire on every reconnect
    - Adding a new regression entry is a 30-line PR against `kernel_warnings.rs`; no schema or contract change required

@@ -747,61 +747,68 @@ async fn main() {
 
     // Handle SIGHUP (config reload), SIGINT/SIGTERM (shutdown), and IPC task
     // death (shutdown — daemon is useless without IPC).
+    //
+    // SIGTERM is what systemd sends on `systemctl stop` by default. Without
+    // a handler the kernel terminates the process before the in-process
+    // graceful path below (`shutdown_tx.send`, GPU reset, hwmon restore,
+    // server join) can run; external safety still works via the
+    // ExecStopPost restore script, but the in-line cleanup is silently
+    // skipped. SIGHUP and SIGTERM registrations are both fail-soft: if the
+    // kernel refuses (rare — typically only happens under unusual sandbox
+    // policies), the daemon still terminates cleanly on SIGINT.
     {
         use tokio::signal::unix::SignalKind;
 
-        match tokio::signal::unix::signal(SignalKind::hangup()) {
-            Ok(mut sighup) => {
-                tokio::pin!(ipc_dead_rx);
-
-                loop {
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {
-                            log::info!("Received SIGINT — shutting down");
-                            break;
-                        }
-                        _ = sighup.recv() => {
-                            log::info!("Received SIGHUP — reloading config");
-                            if let Err(e) = apply_config_reload(
-                                &config_path,
-                                &runtime_config_path,
-                                &app_state.profile_search_dirs,
-                            ) {
-                                log::error!("{e}");
-                            }
-                        }
-                        res = &mut ipc_dead_rx => {
-                            match res {
-                                Ok(msg) => log::error!(
-                                    "IPC server task died unexpectedly ({msg}) — shutting down"
-                                ),
-                                Err(_) => log::error!(
-                                    "IPC server task dropped its dead-signal channel — shutting down"
-                                ),
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
+        let mut sighup = match tokio::signal::unix::signal(SignalKind::hangup()) {
+            Ok(stream) => Some(stream),
             Err(e) => {
                 log::warn!("Failed to register SIGHUP handler, config reload unavailable: {e}");
-                tokio::pin!(ipc_dead_rx);
+                None
+            }
+        };
+        let mut sigterm = match tokio::signal::unix::signal(SignalKind::terminate()) {
+            Ok(stream) => Some(stream),
+            Err(e) => {
+                log::warn!(
+                    "Failed to register SIGTERM handler, only SIGINT will trigger graceful \
+                     shutdown: {e}"
+                );
+                None
+            }
+        };
 
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {
-                        log::info!("Received SIGINT — shutting down");
+        tokio::pin!(ipc_dead_rx);
+
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    log::info!("Received SIGINT — shutting down");
+                    break;
+                }
+                _ = async { sigterm.as_mut().expect("guarded by if predicate").recv().await }, if sigterm.is_some() => {
+                    log::info!("Received SIGTERM — shutting down");
+                    break;
+                }
+                _ = async { sighup.as_mut().expect("guarded by if predicate").recv().await }, if sighup.is_some() => {
+                    log::info!("Received SIGHUP — reloading config");
+                    if let Err(e) = apply_config_reload(
+                        &config_path,
+                        &runtime_config_path,
+                        &app_state.profile_search_dirs,
+                    ) {
+                        log::error!("{e}");
                     }
-                    res = &mut ipc_dead_rx => {
-                        match res {
-                            Ok(msg) => log::error!(
-                                "IPC server task died unexpectedly ({msg}) — shutting down"
-                            ),
-                            Err(_) => log::error!(
-                                "IPC server task dropped its dead-signal channel — shutting down"
-                            ),
-                        }
+                }
+                res = &mut ipc_dead_rx => {
+                    match res {
+                        Ok(msg) => log::error!(
+                            "IPC server task died unexpectedly ({msg}) — shutting down"
+                        ),
+                        Err(_) => log::error!(
+                            "IPC server task dropped its dead-signal channel — shutting down"
+                        ),
                     }
+                    break;
                 }
             }
         }

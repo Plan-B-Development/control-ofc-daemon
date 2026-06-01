@@ -147,7 +147,7 @@ including request/response shapes.
 | `POST /fans/openfan/{ch}/calibrate` | Long-running calibration sweep (~315 s upper bound) |
 | `POST /fans/openfan/{ch}/target_rpm` | Closed-loop RPM target (no lease) |
 | `POST /hwmon/{header}/pwm` | Set hwmon PWM (lease required) |
-| `POST /hwmon/{header}/verify` | Behavioural test of PWM write effectiveness; ~3 s; detects BIOS/EC reclaim. Returns `restore_failed: true` if the post-test restore-to-original-PWM write fails (DEC-100). |
+| `POST /hwmon/{header}/verify` | Behavioural test of PWM write effectiveness; ~6 s (raised from 3 s in DEC-101 — slow-spinning fans need more settle time); detects BIOS/EC reclaim. Returns `restore_failed: true` if the post-test restore-to-original-PWM write fails (DEC-100). |
 | `POST /hwmon/lease/take` | Force-take the hwmon lease (DEC-049) |
 | `POST /hwmon/lease/release` | Release the lease |
 | `POST /hwmon/lease/renew` | Renew the lease (60 s TTL) |

@@ -1,6 +1,6 @@
 # control-ofc-daemon
 
-**Latest release:** v1.6.2 — 2026-05-07. Pairs with `control-ofc-gui` ≥ v1.10.2. See [`CHANGELOG.md`](CHANGELOG.md) for the full history.
+**Latest release:** v1.8.1 — 2026-06-01. Pairs with `control-ofc-gui` ≥ v1.14.1. See [`CHANGELOG.md`](CHANGELOG.md) for the full history.
 
 Rust workspace for the Control-OFC fan control daemon.
 
