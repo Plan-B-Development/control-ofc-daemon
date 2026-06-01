@@ -420,6 +420,15 @@ pub struct HardwareDiagnosticsResponse {
     /// Empty (and omitted from the wire) on healthy systems.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub module_collisions: Vec<ModuleCollisionInfo>,
+    /// CPU vendor read from `/proc/cpuinfo` `vendor_id` — `"Intel"`,
+    /// `"AMD"`, or `""` (empty) when unknown. DEC-110: lets the GUI scope
+    /// vendor-platform quirks (e.g. "this BIOS quirk applies on MSI Intel
+    /// Z890 boards, not on MSI AMD X870E") without having to infer the
+    /// platform from board name. Empty on hypervisors or when `/proc/cpuinfo`
+    /// is unreadable; older clients that don't know the field skip it via
+    /// `skip_serializing_if = "String::is_empty"`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cpu_vendor: String,
 }
 
 /// Hwmon chip diagnostics.

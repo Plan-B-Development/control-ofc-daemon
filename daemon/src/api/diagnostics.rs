@@ -36,6 +36,18 @@ const KNOWN_MODULES: &[(&str, bool)] = &[
     ("k10temp", true),
     ("coretemp", true),
     ("amdgpu", true),
+    // DEC-110: intel_pch_thermal registers a hwmon device exposing
+    // `temp1_input` (PCH temperature) on Intel platforms. It is sensor
+    // enrichment only, NOT a PWM control path. Tracked so diagnostics can
+    // honestly say "intel_pch_thermal: loaded (mainline)" on Intel boxes
+    // rather than silently dropping it from the modules table.
+    ("intel_pch_thermal", true),
+    // x86_pkg_temp is intentionally NOT listed. Per the kernel
+    // `x86_pkg_temp_thermal` driver, it registers with `.no_hwmon = true`,
+    // so it appears only as a thermal_zone — never under
+    // `/sys/class/hwmon`. Listing it would falsely advertise a hwmon
+    // source we cannot read. Use `coretemp` for per-core / package CPU
+    // temperatures on Intel.
 ];
 
 /// Map chip_name prefix → expected kernel driver module name.
@@ -682,6 +694,53 @@ pub fn read_kernel_detected_chips_from(path: &Path) -> Vec<String> {
     parse_kmsg_for_it87_chips(&text)
 }
 
+// ── CPU vendor identification (DEC-110) ────────────────────────────
+//
+// Reads the `vendor_id` line from /proc/cpuinfo and normalises the canonical
+// CPUID strings to "Intel" / "AMD". Exposed in HardwareDiagnosticsResponse so
+// the GUI can scope platform-specific quirks (Intel-only or AMD-only BIOS
+// quirks on boards from vendors that ship both, e.g. MSI Z890 vs MSI X870E).
+//
+// We deliberately do not parse model_name, family, model, or stepping here —
+// those are downstream of vendor for the GUI's purposes and would inflate the
+// API surface for no current consumer. Add a CpuInfo struct later if more
+// fields become useful.
+
+/// Read CPU vendor from `/proc/cpuinfo` and normalise to `"Intel"`,
+/// `"AMD"`, or `""` (empty when neither matches or the file cannot be read).
+pub fn read_cpu_vendor() -> String {
+    read_cpu_vendor_from(Path::new("/proc/cpuinfo"))
+}
+
+/// Testable variant with injectable path.
+pub fn read_cpu_vendor_from(proc_cpuinfo: &Path) -> String {
+    let content = match std::fs::read_to_string(proc_cpuinfo) {
+        Ok(c) => c,
+        Err(e) => {
+            log::debug!(
+                "read_cpu_vendor: cannot read {}: {e}",
+                proc_cpuinfo.display()
+            );
+            return String::new();
+        }
+    };
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("vendor_id") {
+            continue;
+        }
+        let Some(value) = trimmed.split(':').nth(1) else {
+            continue;
+        };
+        return match value.trim() {
+            "GenuineIntel" => "Intel".to_string(),
+            "AuthenticAMD" | "HygonGenuine" => "AMD".to_string(),
+            _ => String::new(),
+        };
+    }
+    String::new()
+}
+
 /// Read the raw ppfeaturemask value as a hex string.
 pub fn read_ppfeaturemask() -> Option<String> {
     read_ppfeaturemask_from(Path::new("/sys/module/amdgpu/parameters/ppfeaturemask"))
@@ -1233,6 +1292,134 @@ mod tests {
     }
 
     // ── DEC-101: it87 module mainline flag ───────────────────
+
+    // ── DEC-110: Intel CPU vendor & intel_pch_thermal ────────
+
+    #[test]
+    fn read_cpu_vendor_genuineintel_maps_to_intel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cpuinfo");
+        fs::write(
+            &path,
+            "processor\t: 0\n\
+             vendor_id\t: GenuineIntel\n\
+             cpu family\t: 6\n\
+             model\t\t: 183\n\
+             model name\t: 13th Gen Intel(R) Core(TM) i7-13700K\n",
+        )
+        .unwrap();
+        assert_eq!(read_cpu_vendor_from(&path), "Intel");
+    }
+
+    #[test]
+    fn read_cpu_vendor_authenticamd_maps_to_amd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cpuinfo");
+        fs::write(
+            &path,
+            "processor\t: 0\n\
+             vendor_id\t: AuthenticAMD\n\
+             cpu family\t: 25\n\
+             model\t\t: 116\n\
+             model name\t: AMD Ryzen 9 7950X 16-Core Processor\n",
+        )
+        .unwrap();
+        assert_eq!(read_cpu_vendor_from(&path), "AMD");
+    }
+
+    #[test]
+    fn read_cpu_vendor_hygon_maps_to_amd() {
+        // Hygon Dhyana is an AMD Zen 1 derivative — same /proc/cpuinfo
+        // shape and same vendor-quirk surface for our purposes.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cpuinfo");
+        fs::write(&path, "vendor_id\t: HygonGenuine\n").unwrap();
+        assert_eq!(read_cpu_vendor_from(&path), "AMD");
+    }
+
+    #[test]
+    fn read_cpu_vendor_unknown_returns_empty() {
+        // KVM hypervisor strings or anything we don't explicitly map
+        // must surface as empty so the GUI falls back to non-platform
+        // matching. Suppressing unknown vendors avoids false-positive
+        // quirk hits on bare-metal CPUs we haven't classified yet.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cpuinfo");
+        fs::write(&path, "vendor_id\t: KVMKVMKVM\n").unwrap();
+        assert_eq!(read_cpu_vendor_from(&path), "");
+    }
+
+    #[test]
+    fn read_cpu_vendor_missing_vendor_id_returns_empty() {
+        // Some virtualized environments omit vendor_id entirely — must
+        // not panic, must return empty.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cpuinfo");
+        fs::write(&path, "processor\t: 0\nmodel name\t: Generic CPU\n").unwrap();
+        assert_eq!(read_cpu_vendor_from(&path), "");
+    }
+
+    #[test]
+    fn read_cpu_vendor_unreadable_file_returns_empty() {
+        // /proc/cpuinfo guaranteed present on Linux, but tests must
+        // tolerate missing fixtures rather than panicking.
+        assert_eq!(
+            read_cpu_vendor_from(Path::new("/nonexistent_proc_cpuinfo")),
+            ""
+        );
+    }
+
+    #[test]
+    fn read_cpu_vendor_picks_first_vendor_id_line() {
+        // SMP systems repeat the block per logical CPU — picking the
+        // first match is correct because all logical CPUs share the
+        // same vendor_id on real hardware.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cpuinfo");
+        fs::write(
+            &path,
+            "processor\t: 0\n\
+             vendor_id\t: GenuineIntel\n\
+             processor\t: 1\n\
+             vendor_id\t: GenuineIntel\n",
+        )
+        .unwrap();
+        assert_eq!(read_cpu_vendor_from(&path), "Intel");
+    }
+
+    #[test]
+    fn intel_pch_thermal_in_known_modules() {
+        // DEC-110: intel_pch_thermal must surface in the modules table
+        // so Intel users see it honestly reported as a sensor-enrichment
+        // driver (not a PWM control path). Mainline since the driver's
+        // introduction.
+        let entry = KNOWN_MODULES
+            .iter()
+            .find(|(n, _)| *n == "intel_pch_thermal");
+        assert!(
+            entry.is_some(),
+            "intel_pch_thermal must be in KNOWN_MODULES (DEC-110)"
+        );
+        assert!(
+            entry.unwrap().1,
+            "intel_pch_thermal is in mainline — flag must be true"
+        );
+    }
+
+    #[test]
+    fn x86_pkg_temp_intentionally_excluded() {
+        // The kernel x86_pkg_temp_thermal driver registers with
+        // .no_hwmon = true and only appears as a thermal_zone. Listing
+        // it in KNOWN_MODULES would falsely advertise a hwmon source we
+        // cannot read. coretemp covers the same physical CPU package
+        // temperature with a real hwmon device.
+        let entry = KNOWN_MODULES.iter().find(|(n, _)| *n == "x86_pkg_temp");
+        assert!(
+            entry.is_none(),
+            "x86_pkg_temp must NOT be in KNOWN_MODULES — it is thermal_zone-only \
+             (no_hwmon=true). coretemp is the correct hwmon source for Intel CPU package."
+        );
+    }
 
     #[test]
     fn it87_module_marked_out_of_tree() {

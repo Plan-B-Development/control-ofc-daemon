@@ -1,5 +1,43 @@
 # Changelog
 
+## [1.8.2] — 2026-06-01
+
+Intel platform foundation (DEC-110): adds CPU vendor detection on
+`/diagnostics/hardware` and registers `intel_pch_thermal` in
+`KNOWN_MODULES`. No control-loop, lease, or write-path behaviour
+changes; additive wire-shape only. Pairs with **GUI v1.15.0**, which
+consumes the new field for platform-scoped vendor quirks and ships
+the Intel motherboard fan-control guide.
+
+### Added
+- **`cpu_vendor: String` field on `HardwareDiagnosticsResponse`**,
+  populated by a new `read_cpu_vendor()` helper that parses the
+  first `vendor_id` line from `/proc/cpuinfo`. Normalises
+  `"GenuineIntel"` → `"Intel"`, `"AuthenticAMD"` and
+  `"HygonGenuine"` → `"AMD"`, anything else → `""`. Serialised
+  with `skip_serializing_if = "String::is_empty"` so the wire is
+  unchanged when detection fails (hypervisors, unreadable file).
+- **`intel_pch_thermal` row in `KNOWN_MODULES`** (`in_mainline =
+  true`). The driver registers a hwmon device exposing the PCH
+  temperature as `temp1_input`; it is sensor enrichment only, not
+  a fan-control path. Adding it lets the diagnostics modules table
+  honestly report the loaded module on Intel systems.
+
+### Documented (in-code rationale)
+- **`x86_pkg_temp` deliberately excluded** from `KNOWN_MODULES` with
+  an inline comment. The kernel `x86_pkg_temp_thermal` driver
+  registers with `.no_hwmon = true` and only appears as a thermal
+  zone, never under `/sys/class/hwmon`. `coretemp` is the correct
+  hwmon source for Intel CPU package temperature.
+
+### Tested
+- Nine new diagnostics unit tests (`api/diagnostics.rs` test
+  module): GenuineIntel → "Intel", AuthenticAMD → "AMD",
+  HygonGenuine → "AMD", KVM hypervisor → "", missing vendor_id →
+  "", unreadable file → "", multi-CPU first-match selection,
+  `intel_pch_thermal` present in `KNOWN_MODULES` with mainline=true,
+  `x86_pkg_temp` confirmed absent from `KNOWN_MODULES`.
+
 ## [1.8.1] — 2026-06-01
 
 Audit remediation pass following a cross-stack `/audit effort=max` sweep

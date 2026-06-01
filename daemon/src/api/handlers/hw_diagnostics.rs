@@ -108,6 +108,12 @@ pub async fn hardware_diagnostics_handler(
     // DMI board identification
     let board = diagnostics::read_board_info();
 
+    // DEC-110: CPU vendor — lets the GUI scope Intel-vs-AMD platform
+    // quirks on boards from vendors that ship both (MSI, ASUS, ASRock,
+    // Gigabyte). Empty string when /proc/cpuinfo is unreadable or the
+    // vendor_id is unknown (hypervisors etc.).
+    let cpu_vendor = diagnostics::read_cpu_vendor();
+
     // DEC-101: dual-chip detection support. `expected_chips` is the
     // deterministic DMI-board lookup; `kernel_detected_chips` is the
     // best-effort kmsg parse. Both fields default to empty Vec on
@@ -151,6 +157,7 @@ pub async fn hardware_diagnostics_handler(
             expected_chips,
             kernel_detected_chips,
             module_collisions,
+            cpu_vendor,
         },
     )
 }
