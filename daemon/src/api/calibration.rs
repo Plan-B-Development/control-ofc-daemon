@@ -201,6 +201,7 @@ mod tests {
             session_max_c: None,
             chip_name: "k10temp".into(),
             temp_type: None,
+            thresholds: None,
         }]);
         cache.update_openfan_fans(vec![OpenFanState {
             channel,

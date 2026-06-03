@@ -689,6 +689,7 @@ mod tests {
             session_max_c: None,
             chip_name: "k10temp".into(),
             temp_type: None,
+            thresholds: None,
         }]);
         cache
     }
@@ -707,6 +708,7 @@ mod tests {
             session_max_c: None,
             chip_name: "k10temp".into(),
             temp_type: None,
+            thresholds: None,
         }]);
         cache
     }
@@ -741,6 +743,7 @@ mod tests {
                 session_max_c: None,
                 chip_name: "k10temp".into(),
                 temp_type: None,
+                thresholds: None,
             },
             CachedSensorReading {
                 id: "cpu_tccd1".into(),
@@ -754,6 +757,7 @@ mod tests {
                 session_max_c: None,
                 chip_name: "k10temp".into(),
                 temp_type: None,
+                thresholds: None,
             },
         ]);
         let snap = cache.snapshot();
@@ -784,6 +788,7 @@ mod tests {
                 session_max_c: None,
                 chip_name: "k10temp".into(),
                 temp_type: None,
+                thresholds: None,
             },
             CachedSensorReading {
                 id: "cpu_tccd1".into(),
@@ -797,6 +802,7 @@ mod tests {
                 session_max_c: None,
                 chip_name: "k10temp".into(),
                 temp_type: None,
+                thresholds: None,
             },
         ]);
         let snap = cache.snapshot();
@@ -829,6 +835,7 @@ mod tests {
             session_max_c: None,
             chip_name: "k10temp".into(),
             temp_type: None,
+            thresholds: None,
         }]);
         let snap = cache.snapshot();
         let hottest: Option<f64> = snap

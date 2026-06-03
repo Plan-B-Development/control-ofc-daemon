@@ -57,6 +57,7 @@ fn test_app_state() -> Arc<AppState> {
         session_max_c: None,
         chip_name: "k10temp".into(),
         temp_type: None,
+        thresholds: None,
     }]);
 
     Arc::new(AppState {

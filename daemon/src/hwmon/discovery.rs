@@ -7,7 +7,86 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::HwmonError;
-use crate::hwmon::types::{SensorDescriptor, SensorKind, SensorSource};
+use crate::hwmon::types::{SensorDescriptor, SensorKind, SensorSource, SensorThresholds};
+
+/// Plausible kernel range for temperature-threshold values in °C.
+///
+/// Many drivers report INT_MIN / INT_MAX (≈ ±2.1e6 °C after the /1000 div)
+/// or `0` as placeholders for "register not configured". We discard anything
+/// outside this range as garbage rather than confuse the UI with bogus values.
+const THRESHOLD_MIN_C: f64 = -50.0;
+const THRESHOLD_MAX_C: f64 = 200.0;
+
+/// Read a `tempN_<attr>` temperature attribute as Celsius, applying the
+/// daemon's plausibility filter (DEC-117).
+///
+/// Returns `None` when the file does not exist, the parse fails, or the
+/// value is outside the plausibility window. Also drops `tempN_max == 0.0`
+/// for it87-family chips, which uses 0 as a placeholder on uninitialised
+/// channels.
+fn read_temp_attr_c(
+    hwmon_dir: &Path,
+    index: &str,
+    attr: &str,
+    chip_name: &str,
+) -> Option<f64> {
+    let path = hwmon_dir.join(format!("temp{index}_{attr}"));
+    if !path.exists() {
+        return None;
+    }
+    let raw = read_sysfs_string(&path).ok()?;
+    let millidegrees: i64 = raw.trim().parse().ok()?;
+    let value_c = millidegrees as f64 / 1000.0;
+    if !(THRESHOLD_MIN_C..=THRESHOLD_MAX_C).contains(&value_c) {
+        return None;
+    }
+    // it87-family quirk: temp_max=0 is a placeholder for "no value configured".
+    if attr == "max" && chip_name.starts_with("it8") && value_c == 0.0 {
+        return None;
+    }
+    Some(value_c)
+}
+
+/// Read a `tempN_<attr>` alarm/fault bit. Sysfs convention is a "0" or "1"
+/// trimmed-decimal string. Anything else is treated as None.
+fn read_temp_attr_bool(hwmon_dir: &Path, index: &str, attr: &str) -> Option<bool> {
+    let path = hwmon_dir.join(format!("temp{index}_{attr}"));
+    if !path.exists() {
+        return None;
+    }
+    let raw = read_sysfs_string(&path).ok()?;
+    match raw.trim() {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    }
+}
+
+/// Read the curated threshold attribute set for a single sensor (DEC-117).
+///
+/// Returns `None` when no attribute was readable, so the API layer can skip
+/// emitting an empty `thresholds` object on the wire.
+fn read_thresholds(hwmon_dir: &Path, index: &str, chip_name: &str) -> Option<SensorThresholds> {
+    let t = SensorThresholds {
+        max_c: read_temp_attr_c(hwmon_dir, index, "max", chip_name),
+        min_c: read_temp_attr_c(hwmon_dir, index, "min", chip_name),
+        crit_c: read_temp_attr_c(hwmon_dir, index, "crit", chip_name),
+        crit_hyst_c: read_temp_attr_c(hwmon_dir, index, "crit_hyst", chip_name),
+        emergency_c: read_temp_attr_c(hwmon_dir, index, "emergency", chip_name),
+        emergency_hyst_c: read_temp_attr_c(hwmon_dir, index, "emergency_hyst", chip_name),
+        lcrit_c: read_temp_attr_c(hwmon_dir, index, "lcrit", chip_name),
+        offset_c: read_temp_attr_c(hwmon_dir, index, "offset", chip_name),
+        alarm: read_temp_attr_bool(hwmon_dir, index, "alarm"),
+        max_alarm: read_temp_attr_bool(hwmon_dir, index, "max_alarm"),
+        crit_alarm: read_temp_attr_bool(hwmon_dir, index, "crit_alarm"),
+        fault: read_temp_attr_bool(hwmon_dir, index, "fault"),
+    };
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
+}
 
 /// Known chip name → sensor kind classification.
 fn classify_chip(chip_name: &str, label: &str) -> SensorKind {
@@ -183,6 +262,11 @@ fn discover_device_sensors(hwmon_dir: &Path) -> Result<Vec<SensorDescriptor>, Hw
             None
         };
 
+        // DEC-117: snapshot the curated hwmon threshold attribute set once
+        // at discovery. /hwmon/rescan re-runs discovery so the values stay
+        // fresh after BIOS update + reboot.
+        let thresholds = read_thresholds(hwmon_dir, index, &chip_name);
+
         let kind = classify_chip(&chip_name, &label);
         let id = build_stable_id(&chip_name, &device_id, &label);
         let source = if chip_name == "amdgpu" {
@@ -199,6 +283,7 @@ fn discover_device_sensors(hwmon_dir: &Path) -> Result<Vec<SensorDescriptor>, Hw
             input_path: input_path.display().to_string(),
             chip_name: chip_name.clone(),
             temp_type,
+            thresholds,
         });
     }
 
@@ -540,6 +625,151 @@ mod tests {
         let sensors = discover_sensors(tmp.path()).unwrap();
         assert_eq!(sensors.len(), 1);
         assert_eq!(sensors[0].temp_type, None);
+    }
+
+    // ── DEC-117: threshold attribute discovery ────────────────────────────
+
+    #[test]
+    fn discover_reads_curated_threshold_attributes() {
+        // Set up a fixture exposing the high-value attributes: max/crit and
+        // their alarms. Mirrors what nct6798 and coretemp typically expose.
+        let tmp = tempfile::tempdir().unwrap();
+        let hwmon_dir = tmp.path().join("hwmon0");
+        fs::create_dir_all(&hwmon_dir).unwrap();
+        fs::write(hwmon_dir.join("name"), "nct6798\n").unwrap();
+        fs::write(hwmon_dir.join("temp1_input"), "55000\n").unwrap();
+        fs::write(hwmon_dir.join("temp1_label"), "CPUTIN\n").unwrap();
+        fs::write(hwmon_dir.join("temp1_max"), "95000\n").unwrap();
+        fs::write(hwmon_dir.join("temp1_crit"), "105000\n").unwrap();
+        fs::write(hwmon_dir.join("temp1_crit_hyst"), "100000\n").unwrap();
+        fs::write(hwmon_dir.join("temp1_max_alarm"), "0\n").unwrap();
+        fs::write(hwmon_dir.join("temp1_crit_alarm"), "0\n").unwrap();
+
+        let sensors = discover_sensors(tmp.path()).unwrap();
+        assert_eq!(sensors.len(), 1);
+        let t = sensors[0].thresholds.as_ref().expect("thresholds populated");
+        assert_eq!(t.max_c, Some(95.0));
+        assert_eq!(t.crit_c, Some(105.0));
+        assert_eq!(t.crit_hyst_c, Some(100.0));
+        assert_eq!(t.max_alarm, Some(false));
+        assert_eq!(t.crit_alarm, Some(false));
+        // Attributes with no sysfs file remain None.
+        assert!(t.emergency_c.is_none());
+        assert!(t.lcrit_c.is_none());
+        assert!(t.alarm.is_none());
+        assert!(t.fault.is_none());
+    }
+
+    #[test]
+    fn discover_thresholds_none_when_chip_exposes_nothing() {
+        // k10temp typically exposes no thresholds — verify we set the field
+        // to None rather than an all-None struct (so the API layer skips
+        // emitting an empty object on the wire).
+        let tmp = tempfile::tempdir().unwrap();
+        create_fixture_with_chip_name(tmp.path(), "hwmon0", "k10temp", &[("1", Some("Tctl"))]);
+        let sensors = discover_sensors(tmp.path()).unwrap();
+        assert_eq!(sensors.len(), 1);
+        assert!(sensors[0].thresholds.is_none());
+    }
+
+    #[test]
+    fn discover_filters_implausible_threshold_values() {
+        // Some kernel drivers report INT_MIN/INT_MAX or other absurd
+        // placeholders when the register is unset. Daemon must drop those.
+        let tmp = tempfile::tempdir().unwrap();
+        let hwmon_dir = tmp.path().join("hwmon0");
+        fs::create_dir_all(&hwmon_dir).unwrap();
+        fs::write(hwmon_dir.join("name"), "nct6798\n").unwrap();
+        fs::write(hwmon_dir.join("temp1_input"), "45000\n").unwrap();
+        fs::write(hwmon_dir.join("temp1_label"), "CPUTIN\n").unwrap();
+        // -2147 °C — kernel placeholder
+        fs::write(hwmon_dir.join("temp1_max"), "-2147000000\n").unwrap();
+        // 250 °C — above the plausibility ceiling
+        fs::write(hwmon_dir.join("temp1_crit"), "250000\n").unwrap();
+        // Plausible value should still come through.
+        fs::write(hwmon_dir.join("temp1_emergency"), "115000\n").unwrap();
+
+        let sensors = discover_sensors(tmp.path()).unwrap();
+        let t = sensors[0]
+            .thresholds
+            .as_ref()
+            .expect("emergency keeps thresholds non-empty");
+        assert!(t.max_c.is_none(), "INT_MIN-scale value should be dropped");
+        assert!(t.crit_c.is_none(), "out-of-range value should be dropped");
+        assert_eq!(t.emergency_c, Some(115.0));
+    }
+
+    #[test]
+    fn discover_drops_it87_max_zero_placeholder() {
+        // it87-family chips use 0 as "register not configured" for tempN_max.
+        // Other thresholds at 0 °C are still legal (cold-side); only `max`
+        // gets the special-case drop, and only for it87-* chips.
+        let tmp = tempfile::tempdir().unwrap();
+        let hwmon_dir = tmp.path().join("hwmon0");
+        fs::create_dir_all(&hwmon_dir).unwrap();
+        fs::write(hwmon_dir.join("name"), "it8689\n").unwrap();
+        fs::write(hwmon_dir.join("temp1_input"), "40000\n").unwrap();
+        fs::write(hwmon_dir.join("temp1_label"), "temp1\n").unwrap();
+        fs::write(hwmon_dir.join("temp1_max"), "0\n").unwrap();
+        fs::write(hwmon_dir.join("temp1_crit"), "100000\n").unwrap();
+
+        let sensors = discover_sensors(tmp.path()).unwrap();
+        let t = sensors[0].thresholds.as_ref().expect("crit keeps non-empty");
+        assert!(t.max_c.is_none(), "it87 max=0 must be dropped as placeholder");
+        assert_eq!(t.crit_c, Some(100.0));
+    }
+
+    #[test]
+    fn discover_keeps_zero_max_for_non_it87_chips() {
+        // Quirk is scoped to it87 — a 0°C max on nct6798 should be kept
+        // (unusual, but not the known-placeholder pattern).
+        let tmp = tempfile::tempdir().unwrap();
+        let hwmon_dir = tmp.path().join("hwmon0");
+        fs::create_dir_all(&hwmon_dir).unwrap();
+        fs::write(hwmon_dir.join("name"), "nct6798\n").unwrap();
+        fs::write(hwmon_dir.join("temp1_input"), "30000\n").unwrap();
+        fs::write(hwmon_dir.join("temp1_label"), "AUXTIN0\n").unwrap();
+        fs::write(hwmon_dir.join("temp1_max"), "0\n").unwrap();
+
+        let sensors = discover_sensors(tmp.path()).unwrap();
+        let t = sensors[0].thresholds.as_ref().unwrap();
+        assert_eq!(t.max_c, Some(0.0));
+    }
+
+    #[test]
+    fn discover_reads_alarm_bits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hwmon_dir = tmp.path().join("hwmon0");
+        fs::create_dir_all(&hwmon_dir).unwrap();
+        fs::write(hwmon_dir.join("name"), "amdgpu\n").unwrap();
+        fs::write(hwmon_dir.join("temp1_input"), "85000\n").unwrap();
+        fs::write(hwmon_dir.join("temp1_label"), "edge\n").unwrap();
+        fs::write(hwmon_dir.join("temp1_alarm"), "1\n").unwrap();
+        fs::write(hwmon_dir.join("temp1_fault"), "0\n").unwrap();
+
+        let sensors = discover_sensors(tmp.path()).unwrap();
+        let t = sensors[0].thresholds.as_ref().unwrap();
+        assert_eq!(t.alarm, Some(true));
+        assert_eq!(t.fault, Some(false));
+    }
+
+    #[test]
+    fn discover_ignores_malformed_alarm_bit() {
+        // Some drivers return values outside {0,1} for these files — treat
+        // unparseable content as None rather than panic / misclassify.
+        let tmp = tempfile::tempdir().unwrap();
+        let hwmon_dir = tmp.path().join("hwmon0");
+        fs::create_dir_all(&hwmon_dir).unwrap();
+        fs::write(hwmon_dir.join("name"), "nct6798\n").unwrap();
+        fs::write(hwmon_dir.join("temp1_input"), "40000\n").unwrap();
+        fs::write(hwmon_dir.join("temp1_label"), "CPUTIN\n").unwrap();
+        fs::write(hwmon_dir.join("temp1_alarm"), "garbage\n").unwrap();
+        fs::write(hwmon_dir.join("temp1_max"), "95000\n").unwrap();
+
+        let sensors = discover_sensors(tmp.path()).unwrap();
+        let t = sensors[0].thresholds.as_ref().unwrap();
+        assert!(t.alarm.is_none());
+        assert_eq!(t.max_c, Some(95.0));
     }
 
     #[test]

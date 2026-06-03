@@ -55,6 +55,7 @@ fn to_cached(reading: &SensorReading) -> CachedSensorReading {
         session_max_c: None,
         chip_name: reading.chip_name.clone(),
         temp_type: reading.temp_type,
+        thresholds: reading.thresholds.clone(),
     }
 }
 

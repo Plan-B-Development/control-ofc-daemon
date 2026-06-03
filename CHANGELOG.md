@@ -1,5 +1,44 @@
 # Changelog
 
+## [1.9.0] — 2026-06-03
+
+Curated hwmon temperature-threshold attributes on `SensorEntry` (**DEC-117**).
+Pairs with **GUI v1.20.0**, which surfaces the new fields in the
+Diagnostics > Sensors detail dialog and the inline alarm chip. Additive
+wire-contract change — older GUIs ignore the new key.
+
+### Added
+- **`thresholds: Option<SensorThresholdsResponse>` on every `SensorEntry`**
+  in `/sensors` and `/poll`. The daemon reads a curated subset of
+  hwmon temperature-threshold sysfs attributes once at discovery time and
+  on every `POST /hwmon/rescan`:
+  - `tempN_max`, `tempN_min`, `tempN_crit`, `tempN_crit_hyst`,
+    `tempN_emergency`, `tempN_emergency_hyst`, `tempN_lcrit`,
+    `tempN_offset` — temperature thresholds in °C.
+  - `tempN_alarm`, `tempN_max_alarm`, `tempN_crit_alarm`,
+    `tempN_fault` — alarm/fault bits (sampled at discovery, not refreshed
+    per poll cycle).
+- **Daemon-side plausibility filter** for threshold values. Anything
+  outside `[-50, 200] °C` is dropped (catches kernel INT_MIN/INT_MAX
+  placeholders), and the `it87`-family `tempN_max == 0` "register not
+  configured" sentinel is dropped specifically for `it8*` chips. Every
+  threshold sub-field uses `#[serde(skip_serializing_if = "Option::is_none")]`
+  so the wire shape is the minimal honest set — a sensor with only `crit`
+  configured emits `{"thresholds": {"crit_c": 105.0}}`, not 12 null fields.
+- New `SensorThresholds` struct in `hwmon::types` + serialisation twin
+  `SensorThresholdsResponse` in `api::responses`. The values propagate
+  through `SensorReading` → `polling::to_cached` → `CachedSensorReading`
+  → `build_sensor_entries` → `SensorEntry`.
+
+### Tested
+- 6 new unit tests in `hwmon::discovery` covering the curated attribute
+  set, k10temp-empty handling, garbage-value filtering, the `it87`
+  `max=0` quirk (and that the filter is scoped to `it87`-family chips
+  only), alarm-bit reading, and graceful handling of a malformed alarm
+  bit. 1 new schema test in `api::responses` verifying the JSON shape
+  with and without thresholds.
+- All 458 daemon unit tests pass.
+
 ## [1.8.4] — 2026-06-03
 
 Internal efficiency and code-health fixes from a full cross-stack audit. No

@@ -72,6 +72,64 @@ pub struct SensorEntry {
     /// Sysfs `tempN_type` value if present (3=diode, 4=thermistor, 5=AMD TSI, 6=Intel PECI).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temp_type: Option<u8>,
+    /// Curated hwmon temperature-threshold sysfs attributes (DEC-117). Omitted
+    /// from the JSON when the driver exposes none of the attributes for this
+    /// sensor. Alarm flags are sampled at discovery time only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thresholds: Option<SensorThresholdsResponse>,
+}
+
+/// JSON serialization shape for the curated hwmon threshold attributes
+/// exposed on `SensorEntry` (DEC-117).
+///
+/// Every field is omitted from the JSON when `None`, so a sensor with only
+/// `crit` available emits `{"thresholds": {"crit_c": 105.0}}` rather than
+/// twelve null fields. Mirrors `crate::hwmon::types::SensorThresholds`.
+#[derive(Debug, Clone, Serialize)]
+pub struct SensorThresholdsResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_c: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_c: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crit_c: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crit_hyst_c: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emergency_c: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emergency_hyst_c: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lcrit_c: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset_c: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alarm: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_alarm: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crit_alarm: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fault: Option<bool>,
+}
+
+impl From<&crate::hwmon::types::SensorThresholds> for SensorThresholdsResponse {
+    fn from(t: &crate::hwmon::types::SensorThresholds) -> Self {
+        Self {
+            max_c: t.max_c,
+            min_c: t.min_c,
+            crit_c: t.crit_c,
+            crit_hyst_c: t.crit_hyst_c,
+            emergency_c: t.emergency_c,
+            emergency_hyst_c: t.emergency_hyst_c,
+            lcrit_c: t.lcrit_c,
+            offset_c: t.offset_c,
+            alarm: t.alarm,
+            max_alarm: t.max_alarm,
+            crit_alarm: t.crit_alarm,
+            fault: t.fault,
+        }
+    }
 }
 
 /// Response for `/fans` endpoint.
@@ -776,6 +834,7 @@ mod tests {
             session_max_c: Some(78.5),
             chip_name: Some("k10temp".into()),
             temp_type: None,
+            thresholds: None,
         };
         let json = serde_json::to_value(&entry).unwrap();
         assert_eq!(json["id"], "hwmon:k10temp:0000:00:18.3:Tctl");
@@ -784,6 +843,8 @@ mod tests {
         assert_eq!(json["chip_name"], "k10temp");
         // temp_type absent when None
         assert!(json.get("temp_type").is_none());
+        // DEC-117: thresholds omitted entirely when None
+        assert!(json.get("thresholds").is_none());
     }
 
     #[test]
@@ -800,10 +861,56 @@ mod tests {
             session_max_c: None,
             chip_name: Some("nct6683".into()),
             temp_type: Some(5),
+            thresholds: None,
         };
         let json = serde_json::to_value(&entry).unwrap();
         assert_eq!(json["chip_name"], "nct6683");
         assert_eq!(json["temp_type"], 5);
+    }
+
+    #[test]
+    fn sensor_entry_serializes_thresholds_when_present() {
+        // DEC-117: when the daemon reads at least one threshold attribute,
+        // the JSON includes a `thresholds` object holding ONLY the
+        // attributes that were actually readable (others omitted).
+        let entry = SensorEntry {
+            id: "hwmon:amdgpu:0000:03:00.0:edge".into(),
+            kind: "gpu_temp".into(),
+            label: "edge".into(),
+            value_c: 42.0,
+            source: "hwmon".into(),
+            age_ms: 12,
+            rate_c_per_s: None,
+            session_min_c: None,
+            session_max_c: None,
+            chip_name: Some("amdgpu".into()),
+            temp_type: None,
+            thresholds: Some(SensorThresholdsResponse {
+                max_c: None,
+                min_c: None,
+                crit_c: Some(110.0),
+                crit_hyst_c: Some(100.0),
+                emergency_c: Some(115.0),
+                emergency_hyst_c: None,
+                lcrit_c: None,
+                offset_c: None,
+                alarm: None,
+                max_alarm: None,
+                crit_alarm: Some(false),
+                fault: None,
+            }),
+        };
+        let json = serde_json::to_value(&entry).unwrap();
+        let thresholds = &json["thresholds"];
+        assert_eq!(thresholds["crit_c"], 110.0);
+        assert_eq!(thresholds["crit_hyst_c"], 100.0);
+        assert_eq!(thresholds["emergency_c"], 115.0);
+        assert_eq!(thresholds["crit_alarm"], false);
+        // Unset fields are omitted, not null.
+        assert!(thresholds.get("max_c").is_none());
+        assert!(thresholds.get("min_c").is_none());
+        assert!(thresholds.get("alarm").is_none());
+        assert!(thresholds.get("fault").is_none());
     }
 
     #[test]

@@ -54,6 +54,7 @@ pub(crate) fn build_sensor_entries(snap: &DaemonState, now: Instant) -> Vec<Sens
                 session_max_c: s.session_max_c,
                 chip_name: Some(s.chip_name.clone()),
                 temp_type: s.temp_type,
+                thresholds: s.thresholds.as_ref().map(SensorThresholdsResponse::from),
             }
         })
         .collect()
@@ -325,6 +326,7 @@ mod tests {
                 session_max_c: None,
                 chip_name: "nct6683".into(),
                 temp_type: Some(3),
+                thresholds: None,
             },
         );
 
@@ -358,6 +360,7 @@ mod tests {
                 session_max_c: None,
                 chip_name: "k10temp".into(),
                 temp_type: None,
+                thresholds: None,
             },
         );
 

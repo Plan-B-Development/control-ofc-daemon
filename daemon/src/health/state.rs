@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use crate::hwmon::types::SensorKind;
+use crate::hwmon::types::{SensorKind, SensorThresholds};
 
 /// Device/source label identifying where a reading originates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -88,6 +88,8 @@ pub struct CachedSensorReading {
     pub chip_name: String,
     /// Sysfs `tempN_type` value if present (3=diode, 4=thermistor, 5=AMD TSI, 6=Intel PECI).
     pub temp_type: Option<u8>,
+    /// Curated hwmon threshold attribute snapshot from discovery (DEC-117).
+    pub thresholds: Option<SensorThresholds>,
 }
 
 /// Cached state for an AMD GPU fan (one per GPU — hardware exposes a single aggregate).

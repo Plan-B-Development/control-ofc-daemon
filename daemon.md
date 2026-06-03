@@ -177,7 +177,7 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 | Method | Path | Purpose |
 |--------|------|---------|
 | GET | `/status` | Subsystem health + freshness |
-| GET | `/sensors` | All temperature readings |
+| GET | `/sensors` | All temperature readings (each entry optionally carries a curated hwmon `thresholds` object — DEC-117) |
 | GET | `/fans` | Fan RPM + last commanded PWM |
 | GET | `/poll` | Batch: status + sensors + fans |
 | GET | `/sensors/history` | Per-entity time-series (ring buffer) |
