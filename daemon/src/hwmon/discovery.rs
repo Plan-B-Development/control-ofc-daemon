@@ -22,8 +22,8 @@ const THRESHOLD_MAX_C: f64 = 200.0;
 ///
 /// Returns `None` when the file does not exist, the parse fails, or the
 /// value is outside the plausibility window. Also drops `tempN_max == 0.0`
-/// for it87-family chips, which uses 0 as a placeholder on uninitialised
-/// channels.
+/// for it87-family chips — see `read_temp_attr_c` below for the empirical
+/// rationale.
 fn read_temp_attr_c(
     hwmon_dir: &Path,
     index: &str,
@@ -40,7 +40,22 @@ fn read_temp_attr_c(
     if !(THRESHOLD_MIN_C..=THRESHOLD_MAX_C).contains(&value_c) {
         return None;
     }
-    // it87-family quirk: temp_max=0 is a placeholder for "no value configured".
+    // it87-family `temp_max=0` empirical observation: many ITE chips
+    // expose `tempN_max` even on channels the BIOS never configured, and
+    // those channels read 0 °C at the sysfs surface. The driver itself
+    // (drivers/hwmon/it87.c — mainline — and the frankcrawford/it87
+    // out-of-tree fork) does NOT synthesise 0; it returns whatever the
+    // chip register holds. A 0 °C upper-warning threshold is implausible
+    // by hardware standards (sensors don't sit at 0 °C in any realistic
+    // environment), so we treat it as "register uninitialised" and drop
+    // it. Scoped to `it8*` chip names so legitimate cold-side thresholds
+    // on other chips are preserved.
+    //
+    // References:
+    //   - https://docs.kernel.org/hwmon/it87.html (mainline driver doc,
+    //     does not document the register-default behaviour)
+    //   - https://github.com/frankcrawford/it87 (out-of-tree driver
+    //     covering newer IT86xx/IT89xx/IT96xx chips; same surface)
     if attr == "max" && chip_name.starts_with("it8") && value_c == 0.0 {
         return None;
     }
