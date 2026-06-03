@@ -1,5 +1,46 @@
 # Changelog
 
+## [1.8.3] — 2026-06-02
+
+Kernel-warning catalogue correctness fix (**DEC-114**), from a cross-repo
+documentation audit that re-verified every externally-sourced hardware
+claim against primary sources. Safety-relevant: the RDNA3/RDNA4 hard-hang
+warning was too narrow and recommended an also-affected kernel. Pairs with
+**GUI v1.19.0** (which bundles the never-separately-released v1.18.1), landing
+the matching guidance text, a device-ID fix, and the doc corrections + citations.
+
+### Fixed
+- **RDNA3/RDNA4 hard-hang warning now covers kernel 6.18 _and_ 6.19.** The
+  regression affects both series (Phoronix EOY 2025; ROCm #6101 reports
+  kernel panics on 6.18.20 and 6.19.10), but `detect_kernel_warnings` only
+  fired on 6.19.x and the message recommended "roll back to 6.18 LTS" — an
+  also-affected kernel. It now fires on 6.18.x and 6.19.x and recommends a
+  verified-safe **6.15–6.17** longterm kernel. The id was renamed
+  `rdna_hang_kernel_6_19_x` → `rdna_hang_kernel_6_18_6_19` so the GUI
+  re-prompts users who acknowledged the earlier, unsafe advice.
+- **R9700 SMU-mismatch warning re-characterised and de-scoped from 7.0.x.**
+  ROCm #6101 is an SMU interface-version mismatch (firmware v50 vs driver
+  v46) that leaves no working fan-control path — `pwm1` is read-only and
+  commanded changes have no effect — and it persists across every tested
+  kernel (6.14, 6.17, 7.0), not just 7.0.x. The warning is now scoped by PCI
+  device ID (`0x7551`) rather than kernel version (suppressed only inside the
+  6.18/6.19 hang range, where the hang warning dominates), the "accepts
+  writes but silently ignores them" wording is corrected, and the id was
+  renamed `smu_mismatch_navi48_r9700_kernel_7_0` → `smu_mismatch_navi48_r9700`.
+- **nct6687/nct6775 collision wording.** The diagnostics banner and the
+  `ModuleCollisionInfo` doc now state that the out-of-tree driver's `0xd450`
+  claim was _historical_ and was removed upstream in Fred78290/nct6687d
+  PR #164 (2026); the detector still fires (already-loaded modules and
+  not-yet-updated packages remain at risk) and the remediation now points to
+  updating the driver as the durable fix.
+
+### Tested
+- `kernel_warnings` tests updated for the new ranges and ids: `rdna4_on_6_18`
+  now asserts the hang warning fires (was: asserts empty — this is the
+  unsafe-regression guard), `r9700_on_7_1` now asserts the SMU warning
+  persists, and new `r9700_on_6_18_warns_hang_only` / `r9700_on_6_17_warns_smu`
+  cover hang-vs-SMU precedence and the broadened device scope.
+
 ## [1.8.2] — 2026-06-01
 
 Intel platform foundation (DEC-110): adds CPU vendor detection on

@@ -2,20 +2,26 @@
 //!
 //! Surfaces warnings to GUI clients when the running kernel matches a
 //! published amdgpu regression that the daemon cannot fix at runtime. Two
-//! risks were called out by external research (Phoronix, ROCm GitHub) at
-//! audit time:
+//! risks were called out by external research (Phoronix, ROCm GitHub) and
+//! re-verified against primary sources during the DEC-114 docs audit:
 //!
-//! 1. **Linux 6.19 RDNA3/RDNA4 hard hang** (Valve / Phoronix-confirmed,
-//!    Dec 2025). RDNA3 + RDNA4 GPUs hard-hang on kernel 6.19.x. Not
-//!    bisected at audit time; CachyOS users explicitly fall back to 6.18 LTS.
-//!    See <https://www.phoronix.com/review/old-amdgpu-eoy2025>.
+//! 1. **Linux 6.18/6.19 RDNA3/RDNA4 hard hang** (Phoronix EOY 2025). RDNA3 +
+//!    RDNA4 GPUs hard-hang under load on **both** kernel 6.18.x and 6.19.x —
+//!    not 6.19 alone. Not bisected and no upstream fix or revert confirmed.
+//!    The verified-safe fallback is a 6.15–6.17 longterm kernel; rolling back
+//!    to 6.18 is NOT safe because 6.18 is also affected (ROCm #6101 reports
+//!    kernel panics on both 6.18.20 and 6.19.10).
+//!    See <https://www.phoronix.com/review/old-amdgpu-eoy2025> and
+//!    <https://github.com/ROCm/ROCm/issues/6101>.
 //!
-//! 2. **R9700 / Navi 48 (PCI 0x7551) SMU interface mismatch** on kernel 7.0
-//!    (ROCm Issue #6101). The PMFW `fan_curve` file accepts writes but the
-//!    SMU silently ignores them — fan stays at 0 RPM, GPU thermals reach
-//!    109°C, no dmesg "fan failed" error. The user's RX 9070 XT (PCI 0x7550)
-//!    on the same kernel has working `fan_curve`, so the warning is scoped
-//!    by PCI device ID. See <https://github.com/ROCm/ROCm/issues/6101>.
+//! 2. **R9700 / Navi 48 (PCI 0x7551) SMU interface-version mismatch**
+//!    (ROCm Issue #6101). The board firmware reports SMU interface v50 while
+//!    the amdgpu driver supports v46, so there is no working fan-control path:
+//!    `pwm1` is read-only, commanded fan changes have no effect, and the GPU
+//!    can reach 109 °C under load with no dmesg "fan failed" line. Reported
+//!    across every tested kernel (6.14, 6.17, 7.0), so it is scoped by PCI
+//!    device ID rather than kernel version. The RX 9070 XT (PCI 0x7550) is
+//!    unaffected. See <https://github.com/ROCm/ROCm/issues/6101>.
 //!
 //! These are *advisory* warnings. The daemon does not refuse writes — the
 //! GUI surfaces a one-time popup, the support bundle records the kernel
@@ -69,7 +75,10 @@ pub enum KernelWarningSeverity {
 ///
 /// Fields:
 /// - `id`: stable identifier the GUI can key knowledge-base entries off (e.g.
-///   `"rdna_hang_kernel_6_19_x"`). Stable across releases.
+///   `"rdna_hang_kernel_6_18_6_19"`). Stable across releases, EXCEPT when the
+///   underlying advice materially changes — then the id is deliberately
+///   renamed so acknowledged-warning state is invalidated and the GUI
+///   re-prompts the user with the corrected guidance (see DEC-114).
 /// - `severity`: drives whether the GUI shows a popup vs. logs only.
 /// - `message`: pre-formatted user-visible text. The daemon owns the wording
 ///   so a single message update doesn't require coordinated GUI redeploys.
@@ -92,37 +101,46 @@ pub fn detect_kernel_warnings(kernel_release: &str, gpu: &AmdGpuInfo) -> Vec<Ker
         return warnings;
     };
 
-    // Risk 1: Linux 6.19.x hard-hang on RDNA3/RDNA4
-    // (Phoronix EOY 2025; Valve confirmed; CachyOS forum reports).
-    if major == 6 && minor == 19 && is_rdna3_or_rdna4(gpu.pci_device_id) {
+    // Risk 1: Linux 6.18.x / 6.19.x hard-hang on RDNA3/RDNA4
+    // (Phoronix EOY 2025). Both 6.18 and 6.19 are affected — re-verified
+    // against the Phoronix article and ROCm #6101 (panics on 6.18.20 and
+    // 6.19.10). The id was renamed from `rdna_hang_kernel_6_19_x` so the
+    // GUI re-prompts users who acknowledged the earlier, narrower (and
+    // unsafe — it recommended 6.18) advice. See DEC-114.
+    if major == 6 && (minor == 18 || minor == 19) && is_rdna3_or_rdna4(gpu.pci_device_id) {
         warnings.push(KernelWarning {
-            id: "rdna_hang_kernel_6_19_x".into(),
+            id: "rdna_hang_kernel_6_18_6_19".into(),
             severity: KernelWarningSeverity::Critical,
             message: format!(
                 "Kernel {kernel_release} is affected by an RDNA3/RDNA4 hard-hang \
-                 regression (Phoronix EOY 2025, Valve-confirmed). \
-                 Recommend rolling back to 6.18 LTS or moving forward to 7.0+ \
-                 before continuing fan control on this GPU."
+                 regression that hits both 6.18.x and 6.19.x under load \
+                 (Phoronix EOY 2025; ROCm #6101). Pin to a 6.15–6.17 longterm \
+                 kernel before continuing fan control on this GPU — do NOT roll \
+                 back to 6.18, which is also affected."
             ),
         });
     }
 
-    // Risk 2: R9700 / Navi 48 (PCI 0x7551) SMU mismatch on kernel 7.0.x
-    // (ROCm Issue #6101). PMFW writes silently ignored — fan stays at 0 RPM,
-    // GPU thermals reach 109°C with no dmesg error. The user's RX 9070 XT
-    // (0x7550) on the same kernel has working fan_curve, so this is scoped
-    // narrowly by PCI device ID and revision.
-    if major == 7 && minor == 0 && gpu.pci_device_id == 0x7551 && gpu.fan_curve_path.is_some() {
+    // Risk 2: R9700 / Navi 48 (PCI 0x7551) SMU interface-version mismatch
+    // (ROCm Issue #6101). Firmware SMU iface v50 vs driver v46 → no working
+    // fan-control path: pwm1 is read-only and commanded changes have no
+    // effect, while the GPU can reach 109 °C with no dmesg error. Reported
+    // across 6.14 / 6.17 / 7.0, so it is scoped by PCI device ID, not kernel
+    // version. Suppressed inside the 6.18/6.19 hang range, where Risk 1 is
+    // the dominant warning. The RX 9070 XT (0x7550) is unaffected. Narrow
+    // this once the amdgpu driver ships the matching SMU interface.
+    let in_hang_range = major == 6 && (minor == 18 || minor == 19);
+    if gpu.pci_device_id == 0x7551 && gpu.fan_curve_path.is_some() && !in_hang_range {
         warnings.push(KernelWarning {
-            id: "smu_mismatch_navi48_r9700_kernel_7_0".into(),
+            id: "smu_mismatch_navi48_r9700".into(),
             severity: KernelWarningSeverity::Critical,
             message: format!(
-                "Kernel {kernel_release} on R9700 (Navi 48 0x7551) has a known \
-                 SMU interface mismatch (ROCm #6101). The PMFW fan_curve file \
-                 accepts writes but the SMU may silently ignore them — verify \
-                 that the GPU fan responds to commanded speed changes. If the \
-                 fan stays at 0 RPM under load, fall back to automatic mode \
-                 via /gpu/{{bdf}}/fan/reset and report the issue upstream."
+                "Kernel {kernel_release} on the R9700 (Navi 48 0x7551) has no \
+                 working PMFW fan-control path: an SMU interface-version mismatch \
+                 (firmware v50 vs driver v46, ROCm #6101) means commanded fan \
+                 changes have no effect and the GPU can overheat. Use automatic \
+                 mode (POST /gpu/{{bdf}}/fan/reset) until the amdgpu driver ships \
+                 the matching SMU interface."
             ),
         });
     }
@@ -210,7 +228,7 @@ mod tests {
         let gpu = make_gpu(0x7550, true);
         let warnings = detect_kernel_warnings("6.19.7", &gpu);
         assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].id, "rdna_hang_kernel_6_19_x");
+        assert_eq!(warnings[0].id, "rdna_hang_kernel_6_18_6_19");
         assert_eq!(warnings[0].severity, KernelWarningSeverity::Critical);
     }
 
@@ -219,7 +237,7 @@ mod tests {
         let gpu = make_gpu(0x744C, true); // RX 7900 XTX
         let warnings = detect_kernel_warnings("6.19.0-2-cachyos", &gpu);
         assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].id, "rdna_hang_kernel_6_19_x");
+        assert_eq!(warnings[0].id, "rdna_hang_kernel_6_18_6_19");
     }
 
     #[test]
@@ -230,10 +248,15 @@ mod tests {
     }
 
     #[test]
-    fn rdna4_on_6_18_does_not_warn() {
+    fn rdna4_on_6_18_warns() {
+        // 6.18 is ALSO affected by the hard-hang regression (DEC-114). The
+        // earlier code wrongly cleared 6.18 and even recommended it as the
+        // rollback target; this test guards against that unsafe regression.
         let gpu = make_gpu(0x7550, true);
         let warnings = detect_kernel_warnings("6.18.0", &gpu);
-        assert!(warnings.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].id, "rdna_hang_kernel_6_18_6_19");
+        assert_eq!(warnings[0].severity, KernelWarningSeverity::Critical);
     }
 
     #[test]
@@ -255,7 +278,7 @@ mod tests {
         let gpu = make_gpu(0x7551, true);
         let warnings = detect_kernel_warnings("7.0.3-1-cachyos", &gpu);
         assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].id, "smu_mismatch_navi48_r9700_kernel_7_0");
+        assert_eq!(warnings[0].id, "smu_mismatch_navi48_r9700");
         assert_eq!(warnings[0].severity, KernelWarningSeverity::Critical);
     }
 
@@ -269,12 +292,14 @@ mod tests {
     }
 
     #[test]
-    fn r9700_on_7_1_does_not_warn() {
+    fn r9700_on_7_1_still_warns_smu() {
+        // The SMU mismatch is device-scoped, not kernel-7.0-scoped (DEC-114):
+        // ROCm #6101 reports it persisting across every tested kernel, so we
+        // keep warning until the amdgpu driver ships the matching SMU iface.
         let gpu = make_gpu(0x7551, true);
         let warnings = detect_kernel_warnings("7.1.0", &gpu);
-        // Future kernels assumed to fix the mismatch — be conservative and
-        // only warn for the documented 7.0.x range.
-        assert!(warnings.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].id, "smu_mismatch_navi48_r9700");
     }
 
     #[test]
@@ -284,6 +309,25 @@ mod tests {
         let gpu = make_gpu(0x7550, true);
         let warnings = detect_kernel_warnings("7.0.3-1-cachyos", &gpu);
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn r9700_on_6_18_warns_hang_only() {
+        // On the hang range the R9700 (RDNA4) gets the dominant hang warning
+        // and the SMU warning is suppressed — exactly one warning, the hang.
+        let gpu = make_gpu(0x7551, true);
+        let warnings = detect_kernel_warnings("6.18.5", &gpu);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].id, "rdna_hang_kernel_6_18_6_19");
+    }
+
+    #[test]
+    fn r9700_on_6_17_warns_smu() {
+        // 6.17 is outside the hang range but still has the SMU mismatch.
+        let gpu = make_gpu(0x7551, true);
+        let warnings = detect_kernel_warnings("6.17.9", &gpu);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].id, "smu_mismatch_navi48_r9700");
     }
 
     // ── read_kernel_release_at ──────────────────────────────────────

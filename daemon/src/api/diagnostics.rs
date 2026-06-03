@@ -155,10 +155,13 @@ const MODULE_COLLISIONS: &[ModuleCollisionEntry] = &[ModuleCollisionEntry {
     severity: "critical",
     summary: "nct6687 (out-of-tree) and nct6775 (in-kernel) are both loaded. \
              They race for the same Super I/O chip on MSI AM4/AM5 boards. \
-             nct6687 declares chip ID 0xd450 which overlaps the legitimate \
-             NCT6797D ID, so the wrong driver can write into the chip's \
+             Older nct6687 builds declare chip ID 0xd450 — the legitimate \
+             NCT6797D ID — so the wrong driver can write into the chip's \
              non-volatile fan control state and brick the affected header \
-             (CPU_FAN is the most common casualty).",
+             (CPU_FAN is the most common casualty). The 0xd450 claim was \
+             removed upstream in Fred78290/nct6687d PR #164 (2026); updating \
+             the driver removes the brick mechanism, but already-loaded \
+             modules and not-yet-updated packages remain at risk.",
     remediation: "(1) Identify the chip FIRST: run `cat /sys/class/hwmon/hwmon*/name` \
              to see which driver actually bound on this boot. \
              (2) If the chip is NCT6687-R (genuine MSI 500/600-series chip), \
@@ -170,7 +173,9 @@ const MODULE_COLLISIONS: &[ModuleCollisionEntry] = &[ModuleCollisionEntry {
              /etc/modprobe.d/blacklist-nct6687.conf`. \
              (4) Reboot. Do NOT write PWM until you have verified the chip and \
              blacklisted the OTHER driver — blacklisting the wrong one will \
-             leave you with no fan control.",
+             leave you with no fan control. \
+             (Prevention: a current nct6687d build, post-PR #164, no longer \
+             claims 0xd450 — updating the package is the durable fix.)",
 }];
 
 /// Minimal chip-binding record passed into the collision detector so it

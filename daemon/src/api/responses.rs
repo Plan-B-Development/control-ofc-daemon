@@ -500,9 +500,12 @@ pub struct AcpiConflictInfo {
 /// race for the same chip and can corrupt the chip's non-volatile fan
 /// control state.
 ///
-/// The flagship case (DEC-105) is `(nct6687, nct6775)` — the out-of-tree
-/// `nct6687` module declares chip ID 0xd450, which is also the legitimate
-/// chip ID of the upstream-supported NCT6797D. When both modules load,
+/// The flagship case (DEC-105) is `(nct6687, nct6775)` — older out-of-tree
+/// `nct6687` builds declare chip ID 0xd450, which is also the legitimate
+/// chip ID of the upstream-supported NCT6797D. (The 0xd450 claim was removed
+/// upstream in Fred78290/nct6687d PR #164, 2026 — see DEC-114 — but
+/// already-loaded modules and not-yet-updated packages remain at risk.)
+/// When both modules load,
 /// whichever binds first claims the chip and the other may scribble into
 /// the wrong registers. The original Bazzite report (ublue-os/bazzite
 /// #4498) documents a CPU fan header being bricked by this exact load
