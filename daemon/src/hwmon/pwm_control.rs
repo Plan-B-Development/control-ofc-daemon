@@ -4,7 +4,6 @@
 //! All writes go through this module — no direct sysfs access elsewhere.
 
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -254,7 +253,7 @@ impl HwmonPwmController {
             .map_err(HwmonControlError::Lease)?;
 
         // Check for system resume — reset all manual mode flags
-        if self.cache.resume_detected.swap(false, Ordering::Relaxed) {
+        if self.cache.take_resume_flag() {
             log::info!("Clearing manual mode flags after system resume");
             for ws in self.write_state.values_mut() {
                 ws.manual_mode_set = false;

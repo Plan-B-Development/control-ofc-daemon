@@ -209,7 +209,7 @@ pub fn evaluate_profile(
 ) -> Vec<PwmCommand> {
     engine_state.sync_profile_id(&profile.id);
 
-    let snap = cache.snapshot();
+    let sensors = cache.sensors_snapshot();
     let mut commands = Vec::new();
 
     for control in &profile.controls {
@@ -233,7 +233,7 @@ pub fn evaluate_profile(
             };
 
             // Find the sensor reading
-            let sensor = snap.sensors.values().find(|s| s.id == curve.sensor_id);
+            let sensor = sensors.values().find(|s| s.id == curve.sensor_id);
             let Some(sensor) = sensor else {
                 log::debug!(
                     "Control '{}': sensor '{}' not available, skipping",
@@ -327,9 +327,8 @@ pub async fn profile_engine_loop(
         // Uses the max across ALL CpuTemp sensors (AMD Tctl, Intel Package id,
         // etc.) so the safety rule works on any platform — not just AMD.
         {
-            let snap = cache.snapshot();
-            let hottest_cpu_c: Option<f64> = snap
-                .sensors
+            let sensors = cache.sensors_snapshot();
+            let hottest_cpu_c: Option<f64> = sensors
                 .values()
                 .filter(|s| s.kind == SensorKind::CpuTemp)
                 .map(|s| s.value_c)
@@ -453,8 +452,13 @@ pub async fn profile_engine_loop(
         // Skip when GUI is actively connected — the GUI's control loop drives
         // fan speed via the API, and both writing simultaneously causes
         // unnecessary serial traffic and potential PWM oscillation.
-        let snap = cache.snapshot();
-        let gui_active = snap.gui_active();
+        // Cheap reads instead of a full snapshot: this site needs only
+        // gui_active() (a bool) and the GPU-fan map (write-suppression in the
+        // amd_gpu phase below) — not the sensor/openfan/hwmon maps a full
+        // snapshot would clone every tick. A torn read between the two is
+        // harmless: both are advisory gates, not correctness-critical state.
+        let gui_active = cache.gui_active();
+        let gpu_fans = cache.gpu_fans_snapshot();
 
         if !gui_active {
             if let Some(ref ctrl) = fan_controller {
@@ -503,7 +507,7 @@ pub async fn profile_engine_loop(
             }
 
             // Write suppression: skip if speed matches last commanded value
-            if let Some(cached) = snap.gpu_fans.get(&cmd.member_id) {
+            if let Some(cached) = gpu_fans.get(&cmd.member_id) {
                 if cached.last_commanded_pct == Some(cmd.pwm_percent) {
                     continue;
                 }

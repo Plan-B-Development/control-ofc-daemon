@@ -1,5 +1,28 @@
 # Changelog
 
+## [1.8.4] — 2026-06-03
+
+Internal efficiency and code-health fixes from a full cross-stack audit. No
+behaviour or wire-contract changes; pairs with **GUI v1.19.1**.
+
+### Changed
+- **`/diagnostics/hardware` no longer blocks the async runtime.** The handler's
+  ~6 blocking sysfs/procfs reads (`/proc/modules`, `/proc/ioports`, DMI,
+  `/proc/cpuinfo`, kmsg, `ppfeaturemask`) now run on `spawn_blocking`, mirroring
+  the OpenFan write handlers (DEC-099), so a slow read can't stall a Tokio worker.
+- **Profile-engine 1 Hz loop trims per-tick state clones.** Added cheap
+  `StateCache::gui_active()` / `sensors_snapshot()` / `gpu_fans_snapshot()`
+  accessors; the GUI-active + GPU-write-suppression site no longer deep-clones
+  the full sensor map every tick just to read a bool and the GPU-fan map.
+- **`take_resume_flag()` is now the single resume-flag consumer.** The hwmon PWM
+  controller calls it instead of an inline `resume_detected.swap()`, removing the
+  duplicated atomic incantation.
+
+### Tested
+- New unit tests for the three `StateCache` accessors and `take_resume_flag`'s
+  swap-and-clear semantics, plus an end-to-end IPC test for
+  `GET /diagnostics/hardware`.
+
 ## [1.8.3] — 2026-06-02
 
 Kernel-warning catalogue correctness fix (**DEC-114**), from a cross-repo

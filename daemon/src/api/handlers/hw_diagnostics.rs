@@ -7,14 +7,30 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Json;
 
-use super::{json_ok, AppState};
+use super::{error_response, json_ok, AppState};
 use crate::api::diagnostics;
 use crate::api::responses::*;
 
 /// GET /diagnostics/hardware — comprehensive hardware readiness report.
+///
+/// The report performs ~6 blocking sysfs/procfs reads (modules, ioports, DMI,
+/// cpuinfo, kmsg, ppfeaturemask), so it runs on the blocking pool rather than
+/// stalling a Tokio worker — mirroring the OpenFan write handlers (DEC-099).
 pub async fn hardware_diagnostics_handler(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    match tokio::task::spawn_blocking(move || build_hardware_diagnostics(&state)).await {
+        Ok(resp) => resp,
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &ErrorEnvelope::internal(format!("hardware diagnostics task failed: {e}")),
+        ),
+    }
+}
+
+/// Build the hardware-readiness report. Synchronous and blocking — invoked via
+/// `spawn_blocking` from the handler above.
+fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json::Value>) {
     // Collect per-chip info from hwmon headers
     let mut chip_map: HashMap<(String, String), usize> = HashMap::new();
     if let Some(ref controller) = state.hwmon_controller {

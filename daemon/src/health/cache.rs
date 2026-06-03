@@ -4,6 +4,7 @@
 //! Updates are atomic at the batch boundary.
 
 use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -38,6 +39,28 @@ impl StateCache {
     pub fn snapshot(&self) -> DaemonState {
         let state = self.inner.read();
         state.clone()
+    }
+
+    /// Cheap read of GUI-active status without cloning the whole state.
+    ///
+    /// The 1 Hz profile engine checks this every tick; a full `snapshot()`
+    /// would deep-clone four HashMaps just to read one `Option<Instant>`.
+    pub fn gui_active(&self) -> bool {
+        self.inner.read().gui_active()
+    }
+
+    /// Clone only the sensor map. The profile engine's curve evaluation and
+    /// thermal-safety scan read sensors but none of the fan/AIO state, so this
+    /// avoids cloning the rest of `DaemonState` on every tick.
+    pub fn sensors_snapshot(&self) -> HashMap<String, CachedSensorReading> {
+        self.inner.read().sensors.clone()
+    }
+
+    /// Clone only the GPU-fan map, used by the profile engine's GPU
+    /// write-suppression check. Typically 0–1 entries — far cheaper than a
+    /// full snapshot.
+    pub fn gpu_fans_snapshot(&self) -> HashMap<String, AmdGpuFanState> {
+        self.inner.read().gpu_fans.clone()
     }
 
     /// Update all OpenFanController fan readings as a batch.
@@ -505,5 +528,55 @@ mod tests {
             !cache.snapshot().gui_active(),
             "31s elapsed must be inactive"
         );
+    }
+
+    #[test]
+    fn gui_active_accessor_matches_snapshot() {
+        // The cheap cache-level accessor must agree with the snapshot-based
+        // path profile_engine previously used (per-tick clone trim).
+        let cache = StateCache::new();
+        assert!(!cache.gui_active());
+        assert_eq!(cache.gui_active(), cache.snapshot().gui_active());
+        cache.record_gui_write();
+        assert!(cache.gui_active());
+        assert_eq!(cache.gui_active(), cache.snapshot().gui_active());
+    }
+
+    #[test]
+    fn sensors_snapshot_returns_sensor_map() {
+        let cache = StateCache::new();
+        cache.update_sensors(vec![
+            make_sensor("hwmon:k10temp:0000:00:18.3:Tctl", 55.0),
+            make_sensor("hwmon:nct6799:isa:fan", 30.0),
+        ]);
+        let sensors = cache.sensors_snapshot();
+        assert_eq!(sensors.len(), 2);
+        assert_eq!(sensors.len(), cache.snapshot().sensors.len());
+        assert!((sensors["hwmon:k10temp:0000:00:18.3:Tctl"].value_c - 55.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn gpu_fans_snapshot_returns_gpu_fan_map() {
+        let cache = StateCache::new();
+        assert!(cache.gpu_fans_snapshot().is_empty());
+        cache.set_gpu_fan_commanded_pct("amd_gpu:0000:2d:00.0", 75);
+        let gpu_fans = cache.gpu_fans_snapshot();
+        assert_eq!(gpu_fans.len(), 1);
+        assert_eq!(
+            gpu_fans["amd_gpu:0000:2d:00.0"].last_commanded_pct,
+            Some(75)
+        );
+    }
+
+    #[test]
+    fn take_resume_flag_swaps_and_clears() {
+        // pwm_control calls take_resume_flag() once per set_pwm; it must return
+        // true exactly once after a resume is signalled, then false until the
+        // next resume. Locks the swap-and-clear semantics.
+        let cache = StateCache::new();
+        assert!(!cache.take_resume_flag(), "fresh cache: no resume pending");
+        cache.set_resume_detected();
+        assert!(cache.take_resume_flag(), "first take after resume is true");
+        assert!(!cache.take_resume_flag(), "flag cleared after take");
     }
 }

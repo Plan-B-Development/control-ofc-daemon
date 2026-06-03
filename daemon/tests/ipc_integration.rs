@@ -152,6 +152,29 @@ async fn status_endpoint_returns_health() {
 }
 
 #[tokio::test]
+async fn hardware_diagnostics_endpoint_returns_report() {
+    // Exercises the spawn_blocking offload path: the handler performs blocking
+    // sysfs/procfs reads on the blocking pool and serializes the report. The
+    // thermal thresholds are hardcoded constants, so they're machine-independent
+    // and safe to assert regardless of the host's actual hardware.
+    let state = test_app_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/diagnostics/hardware").await;
+
+    assert_eq!(status, 200);
+    assert_eq!(json["api_version"], 1);
+    assert!(json["hwmon"].is_object());
+    assert!(json["thermal_safety"].is_object());
+    assert_eq!(json["thermal_safety"]["emergency_threshold_c"], 105.0);
+    assert_eq!(json["thermal_safety"]["release_threshold_c"], 80.0);
+    assert!(json["kernel_modules"].is_array());
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
 async fn sensors_endpoint_returns_readings() {
     let state = test_app_state();
     let (path, shutdown, _dir) = start_test_server(state).await;
