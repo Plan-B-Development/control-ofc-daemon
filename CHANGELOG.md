@@ -1,5 +1,31 @@
 # Changelog
 
+## [1.12.0] — 2026-06-04
+
+Intel discrete GPU (Arc) monitoring (**DEC-121**, daemon-relevant subset). Pairs
+with **GUI v1.24.0**. Additive wire-contract change — older GUIs ignore the new
+fields.
+
+### Added
+- **Intel discrete GPU detection** (`hwmon::intel_gpu_detect`) for the `xe`
+  (Battlemage / Arc B-series) and `i915` (Alchemist / Arc A-series) drivers.
+  Detection keys on the hwmon chip name, which both drivers register **only for
+  discrete GPUs** — an unambiguous discrete-GPU signal.
+- New sensor `source: "intel_gpu"` (kind `gpu_temp`) for `xe`/`i915` temps;
+  `SensorSource::IntelGpu` / `DeviceLabel::IntelGpu`.
+- New read-only GPU fan entities `intel_gpu:{pci_bdf}` in `GET /fans` (RPM from
+  `fan1_input`; never a commanded PWM).
+- Additive `intel_gpu` object on `GET /capabilities` and an `intel_gpu` block on
+  `GET /diagnostics/hardware` (with a truthful firmware-managed explanation).
+
+### Notes
+- **Read-only by design.** The kernel `xe`/`i915` hwmon interface exposes fan
+  RPM and temperature only — there is no PWM/write path (fan control is
+  firmware-managed). `fan_control_method` is always `"read_only"` or `"none"`;
+  no lease, PMFW curve, ppfeaturemask, overdrive, or shutdown reset apply.
+- Only device ID `0xE20B` (Arc B580) maps to a marketing name; other IDs report
+  the generic "Intel D-GPU".
+
 ## [1.11.0] — 2026-06-04
 
 GPU fan active verification endpoint (**DEC-120**, daemon-relevant subset).

@@ -35,6 +35,7 @@ daemon/src/
     pwm_control.rs     — HwmonPwmController + SysfsWriter trait
     lease.rs           — LeaseManager (exclusive write access)
     gpu_detect.rs      — AMD GPU detection via sysfs/DRM
+    intel_gpu_detect.rs— Intel discrete GPU (Arc) detection, read-only (DEC-121)
     gpu_fan.rs         — PMFW fan curve read/write/reset
     kernel_warnings.rs — kernel-version regression catalog
                           (RDNA3/4 hard hang on 6.19, R9700 SMU on 7.0)

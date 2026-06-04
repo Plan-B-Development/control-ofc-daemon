@@ -16,6 +16,9 @@ pub enum DeviceLabel {
     Hwmon,
     /// AMD discrete GPU via amdgpu hwmon/PMFW.
     AmdGpu,
+    /// Intel discrete GPU (Arc) via the `xe`/`i915` hwmon node. Read-only
+    /// telemetry — no fan write path exists in the kernel (DEC-121).
+    IntelGpu,
     /// AIO cooler exposed via hwmon (future).
     AioHwmon,
     /// AIO cooler exposed via USB/HID (future).
@@ -28,6 +31,7 @@ impl std::fmt::Display for DeviceLabel {
             Self::OpenFan => write!(f, "openfan"),
             Self::Hwmon => write!(f, "hwmon"),
             Self::AmdGpu => write!(f, "amd_gpu"),
+            Self::IntelGpu => write!(f, "intel_gpu"),
             Self::AioHwmon => write!(f, "aio_hwmon"),
             Self::AioUsb => write!(f, "aio_usb"),
         }
@@ -92,14 +96,21 @@ pub struct CachedSensorReading {
     pub thresholds: Option<SensorThresholds>,
 }
 
-/// Cached state for an AMD GPU fan (one per GPU — hardware exposes a single aggregate).
+/// Cached state for a discrete GPU fan (one per GPU — hardware exposes a
+/// single aggregate fan1_input).
+///
+/// Shared by both AMD and Intel discrete GPUs, distinguished by the ID prefix:
+/// `amd_gpu:<PCI_BDF>` or `intel_gpu:<PCI_BDF>`. For Intel GPUs
+/// `last_commanded_pct` is always `None` — Intel fan control is firmware-managed
+/// and has no userspace write path (DEC-121).
 #[derive(Debug, Clone)]
 pub struct AmdGpuFanState {
-    /// Stable fan ID: `amd_gpu:<PCI_BDF>` (e.g. `amd_gpu:0000:2d:00.0`).
+    /// Stable fan ID: `amd_gpu:<PCI_BDF>` or `intel_gpu:<PCI_BDF>`.
     pub id: String,
     /// Current fan RPM if available (from fan1_input).
     pub rpm: Option<u16>,
     /// Last speed percentage commanded by the daemon via PMFW flat curve.
+    /// Always `None` for Intel GPUs (read-only).
     pub last_commanded_pct: Option<u8>,
     /// When this reading was taken.
     pub updated_at: Instant,

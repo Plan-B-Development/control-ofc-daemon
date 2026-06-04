@@ -119,6 +119,35 @@ pub async fn capabilities_handler(
         }
     };
 
+    // Intel discrete GPU detection (DEC-121) — read-only monitoring only.
+    let intel_gpu_cap =
+        match crate::hwmon::intel_gpu_detect::select_primary_intel_gpu(&state.intel_gpus) {
+            Some(gpu) => IntelGpuCapability {
+                present: true,
+                model_name: gpu.marketing_name.clone(),
+                display_label: gpu.display_label(),
+                pci_id: Some(gpu.pci_bdf.clone()),
+                pci_bdf: Some(gpu.pci_bdf.clone()),
+                pci_device_id: Some(gpu.pci_device_id),
+                driver: Some(gpu.driver.clone()),
+                fan_control_method: gpu.fan_control_method().to_string(),
+                fan_rpm_available: gpu.has_fan_rpm,
+                is_discrete: gpu.is_discrete,
+            },
+            None => IntelGpuCapability {
+                present: false,
+                model_name: None,
+                display_label: "Intel D-GPU".to_string(),
+                pci_id: None,
+                pci_bdf: None,
+                pci_device_id: None,
+                driver: None,
+                fan_control_method: "none".to_string(),
+                fan_rpm_available: false,
+                is_discrete: false,
+            },
+        };
+
     Json(CapabilitiesResponse {
         api_version: API_VERSION,
         daemon_version: state.daemon_version.clone(),
@@ -137,6 +166,7 @@ pub async fn capabilities_handler(
                 write_support: hwmon_present,
             },
             amd_gpu: amd_gpu_cap,
+            intel_gpu: intel_gpu_cap,
             aio_hwmon: UnsupportedCapability {
                 present: false,
                 status: "unsupported",

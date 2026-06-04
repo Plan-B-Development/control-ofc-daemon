@@ -90,6 +90,11 @@ impl std::fmt::Display for SensorKind {
 pub enum SensorSource {
     Hwmon,
     AmdGpu,
+    /// Intel discrete GPU (Arc), via the `xe` or `i915` hwmon node. Both
+    /// kernel drivers register their hwmon device only for discrete GPUs
+    /// (`if (!IS_DGFX) return;`), so this source is always a discrete card.
+    /// Read-only: temperature + fan RPM only, no PWM/write path (DEC-121).
+    IntelGpu,
 }
 
 impl std::fmt::Display for SensorSource {
@@ -97,6 +102,7 @@ impl std::fmt::Display for SensorSource {
         match self {
             Self::Hwmon => write!(f, "hwmon"),
             Self::AmdGpu => write!(f, "amd_gpu"),
+            Self::IntelGpu => write!(f, "intel_gpu"),
         }
     }
 }

@@ -148,6 +148,27 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
         }
     });
 
+    // Intel discrete GPU diagnostics (DEC-121). Read-only — the note explains
+    // why fan control is unavailable, grounded in the kernel ABI / firmware.
+    let intel_gpu_diag =
+        crate::hwmon::intel_gpu_detect::select_primary_intel_gpu(&state.intel_gpus).map(|gpu| {
+            IntelGpuDiagnostics {
+                pci_bdf: gpu.pci_bdf.clone(),
+                pci_id: gpu.pci_bdf.clone(),
+                pci_device_id: gpu.pci_device_id,
+                pci_revision: gpu.pci_revision,
+                model_name: gpu.marketing_name.clone(),
+                driver: gpu.driver.clone(),
+                fan_control_method: gpu.fan_control_method().to_string(),
+                fan_rpm_available: gpu.has_fan_rpm,
+                fan_control_note:
+                    "Intel GPU fan control is managed autonomously by on-card firmware and is \
+                     not exposed to Linux userspace (the xe/i915 drivers register no PWM \
+                     interface). Temperature and fan RPM are read-only."
+                        .to_string(),
+            }
+        });
+
     // Thermal safety — report thresholds and whether CPU sensor is present
     let snap = state.cache.snapshot();
     let cpu_sensor_found = snap
@@ -222,6 +243,7 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
                 enable_revert_counts,
             },
             gpu: gpu_diag,
+            intel_gpu: intel_gpu_diag,
             thermal_safety,
             kernel_modules,
             acpi_conflicts,

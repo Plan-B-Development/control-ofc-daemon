@@ -8,6 +8,7 @@
 pub mod discovery;
 pub mod gpu_detect;
 pub mod gpu_fan;
+pub mod intel_gpu_detect;
 pub mod kernel_warnings;
 pub mod lease;
 pub mod pwm_control;

@@ -105,6 +105,9 @@ fn classify_chip(chip_name: &str, label: &str) -> SensorKind {
         "k10temp" => SensorKind::CpuTemp,
         "coretemp" => SensorKind::CpuTemp,
         "amdgpu" => SensorKind::GpuTemp,
+        // Intel discrete GPU (Arc). Both drivers register hwmon only for
+        // discrete cards, so any "xe"/"i915" chip is a dGPU temp (DEC-121).
+        "xe" | "i915" => SensorKind::GpuTemp,
         "nvme" => SensorKind::DiskTemp,
         "sbtsi_temp" => SensorKind::CpuTemp,
         _ if chip_name.starts_with("it87") => SensorKind::MbTemp,
@@ -279,10 +282,13 @@ fn discover_device_sensors(hwmon_dir: &Path) -> Result<Vec<SensorDescriptor>, Hw
 
         let kind = classify_chip(&chip_name, &label);
         let id = build_stable_id(&chip_name, &device_id, &label);
-        let source = if chip_name == "amdgpu" {
-            SensorSource::AmdGpu
-        } else {
-            SensorSource::Hwmon
+        let source = match chip_name.as_str() {
+            "amdgpu" => SensorSource::AmdGpu,
+            // The kernel registers the "xe"/"i915" hwmon node only for
+            // discrete Intel GPUs (DGFX-gated), so these are always dGPU
+            // temps (DEC-121).
+            "xe" | "i915" => SensorSource::IntelGpu,
+            _ => SensorSource::Hwmon,
         };
 
         sensors.push(SensorDescriptor {
@@ -371,6 +377,45 @@ mod tests {
             assert_eq!(s.kind, SensorKind::GpuTemp);
         }
         assert_eq!(sensors[0].label, "edge");
+    }
+
+    #[test]
+    fn discover_intel_gpu_xe_source_and_kind() {
+        // Intel Arc (Battlemage) via the xe driver: temps start at temp2
+        // (no temp1), classified as GpuTemp with source IntelGpu (DEC-121).
+        let tmp = tempfile::tempdir().unwrap();
+        create_fixture_with_chip_name(tmp.path(), "hwmon0", "xe", &[("2", None), ("3", None)]);
+
+        let sensors = discover_sensors(tmp.path()).unwrap();
+        assert_eq!(sensors.len(), 2);
+        for s in &sensors {
+            assert_eq!(s.kind, SensorKind::GpuTemp);
+            assert_eq!(s.source, SensorSource::IntelGpu);
+            assert_eq!(s.chip_name, "xe");
+        }
+        assert_eq!(sensors[0].label, "temp2");
+    }
+
+    #[test]
+    fn discover_intel_gpu_i915_source_and_kind() {
+        // Intel Arc A-series (Alchemist) via the i915 driver: temp1 only.
+        let tmp = tempfile::tempdir().unwrap();
+        create_fixture_with_chip_name(tmp.path(), "hwmon0", "i915", &[("1", None)]);
+
+        let sensors = discover_sensors(tmp.path()).unwrap();
+        assert_eq!(sensors.len(), 1);
+        assert_eq!(sensors[0].kind, SensorKind::GpuTemp);
+        assert_eq!(sensors[0].source, SensorSource::IntelGpu);
+    }
+
+    #[test]
+    fn discover_amdgpu_source_is_amd_not_intel() {
+        // Regression: ensure the new Intel arm did not change amdgpu tagging.
+        let tmp = tempfile::tempdir().unwrap();
+        create_fixture_with_chip_name(tmp.path(), "hwmon0", "amdgpu", &[("1", Some("edge"))]);
+
+        let sensors = discover_sensors(tmp.path()).unwrap();
+        assert_eq!(sensors[0].source, SensorSource::AmdGpu);
     }
 
     #[test]
@@ -817,6 +862,12 @@ mod tests {
             ("amdgpu", "edge", SensorKind::GpuTemp),
             ("amdgpu", "junction", SensorKind::GpuTemp),
             ("amdgpu", "mem", SensorKind::GpuTemp),
+            // Intel discrete GPU drivers (DEC-121) — always GPU regardless of
+            // label; xe exposes unlabelled temp2+, i915 exposes temp1.
+            ("xe", "", SensorKind::GpuTemp),
+            ("xe", "temp2", SensorKind::GpuTemp),
+            ("i915", "", SensorKind::GpuTemp),
+            ("i915", "temp1", SensorKind::GpuTemp),
             ("nvme", "Composite", SensorKind::DiskTemp),
             ("nvme", "Sensor 1", SensorKind::DiskTemp),
             ("sbtsi_temp", "", SensorKind::CpuTemp),

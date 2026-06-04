@@ -284,6 +284,9 @@ pub struct DeviceCapabilities {
     pub openfan: OpenfanCapability,
     pub hwmon: HwmonCapability,
     pub amd_gpu: AmdGpuCapability,
+    /// Intel discrete GPU (Arc) capability. Additive field (DEC-121) — older
+    /// GUIs ignore it; read-only monitoring only, never fan-writable.
+    pub intel_gpu: IntelGpuCapability,
     pub aio_hwmon: UnsupportedCapability,
     pub aio_usb: UnsupportedCapability,
 }
@@ -340,6 +343,43 @@ pub struct AmdGpuCapability {
     /// popup. See `crate::hwmon::kernel_warnings` for the catalog.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kernel_warnings: Vec<crate::hwmon::kernel_warnings::KernelWarning>,
+}
+
+/// Intel discrete GPU (Arc) capability details (DEC-121).
+///
+/// Monitoring-only: Intel GPU fan control is firmware-managed and has no
+/// userspace write path, so `fan_control_method` is always `"read_only"` (or
+/// `"none"` when no fan is exposed) and there is no `fan_write_supported`
+/// field — writes are never offered. Mirrors the read-only subset of
+/// `AmdGpuCapability` without any of the PMFW/overdrive/zero-RPM fields.
+#[derive(Debug, Clone, Serialize)]
+pub struct IntelGpuCapability {
+    pub present: bool,
+    /// Marketing name (e.g. "Arc B580") or null if the device ID is unmapped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
+    /// Compact display label (e.g. "Arc B580" or "Intel D-GPU").
+    pub display_label: String,
+    /// PCI Bus:Device.Function address (legacy alias, kept symmetric with
+    /// `amd_gpu` for the GUI's `_coalesce_pci_bdf` tolerance).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pci_id: Option<String>,
+    /// PCI Bus:Device.Function address (canonical).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pci_bdf: Option<String>,
+    /// PCI device ID (e.g. 0xE20B for Arc B580).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pci_device_id: Option<u16>,
+    /// Kernel driver backing the GPU: "xe" or "i915".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+    /// Fan control method: always "read_only" (fan present) or "none".
+    pub fan_control_method: String,
+    /// Whether fan RPM reading is available (`fan1_input`).
+    pub fan_rpm_available: bool,
+    /// Whether this is a discrete (VGA) GPU. Always true for a detected Intel
+    /// GPU (the hwmon node is DGFX-gated), emitted for symmetry.
+    pub is_discrete: bool,
 }
 
 /// OpenFanController capability details.
@@ -443,6 +483,10 @@ pub struct HardwareDiagnosticsResponse {
     pub hwmon: HwmonDiagnostics,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu: Option<GpuDiagnostics>,
+    /// Intel discrete GPU diagnostics (DEC-121). Additive — omitted when no
+    /// Intel GPU is present; older clients ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intel_gpu: Option<IntelGpuDiagnostics>,
     pub thermal_safety: ThermalSafetyInfo,
     pub kernel_modules: Vec<KernelModuleInfo>,
     pub acpi_conflicts: Vec<AcpiConflictInfo>,
@@ -570,6 +614,31 @@ pub struct GpuDiagnostics {
     /// nothing applies.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kernel_warnings: Vec<crate::hwmon::kernel_warnings::KernelWarning>,
+}
+
+/// Intel discrete GPU diagnostics (DEC-121).
+///
+/// Read-only by nature — there is no fan write path, ppfeaturemask, overdrive,
+/// or PMFW curve, so this carries only identity, the backing driver, and a
+/// fixed truthful explanation of why fan control is unavailable.
+#[derive(Debug, Clone, Serialize)]
+pub struct IntelGpuDiagnostics {
+    /// PCI Bus:Device.Function address (canonical).
+    pub pci_bdf: String,
+    /// Alias for `pci_bdf`, emitted for symmetry with `GpuDiagnostics`.
+    pub pci_id: String,
+    pub pci_device_id: u16,
+    pub pci_revision: u8,
+    pub model_name: Option<String>,
+    /// Kernel driver backing the GPU: "xe" or "i915".
+    pub driver: String,
+    /// Always "read_only" (fan present) or "none" — Intel never writable.
+    pub fan_control_method: String,
+    /// Whether `fan1_input` RPM reading is available.
+    pub fan_rpm_available: bool,
+    /// Truthful, user-facing explanation of why fan control is unavailable,
+    /// suitable for direct display in the GUI Diagnostics page.
+    pub fan_control_note: String,
 }
 
 /// An AMD VGA-class PCI device and the driver bound to it (DEC-119).
@@ -1055,6 +1124,18 @@ mod tests {
                     overdrive_enabled: true,
                     gpu_zero_rpm_available: true,
                     kernel_warnings: Vec::new(),
+                },
+                intel_gpu: IntelGpuCapability {
+                    present: false,
+                    model_name: None,
+                    display_label: "Intel D-GPU".into(),
+                    pci_id: None,
+                    pci_bdf: None,
+                    pci_device_id: None,
+                    driver: None,
+                    fan_control_method: "none".into(),
+                    fan_rpm_available: false,
+                    is_discrete: false,
                 },
                 aio_hwmon: UnsupportedCapability {
                     present: false,

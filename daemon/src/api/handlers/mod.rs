@@ -100,12 +100,18 @@ pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntr
         });
     }
 
-    // AMD GPU fans
+    // Discrete GPU fans (AMD + Intel share the gpu_fans map; the vendor is
+    // encoded in the ID prefix — `amd_gpu:` / `intel_gpu:` — DEC-121).
     for (id, fan) in &snap.gpu_fans {
         let age_ms = now.duration_since(fan.updated_at).as_millis() as u64;
+        let source = if id.starts_with("intel_gpu:") {
+            "intel_gpu"
+        } else {
+            "amd_gpu"
+        };
         fans.push(FanEntry {
             id: id.clone(),
-            source: "amd_gpu".into(),
+            source: source.into(),
             rpm: fan.rpm,
             last_commanded_pwm: fan.last_commanded_pct,
             age_ms,
@@ -138,6 +144,9 @@ pub struct AppState {
     pub calibrating: AtomicBool,
     /// Detected AMD GPU info (populated at startup). Empty if no AMD GPU found.
     pub amd_gpus: Vec<crate::hwmon::gpu_detect::AmdGpuInfo>,
+    /// Detected Intel discrete GPU info (populated at startup). Empty if none
+    /// found. Read-only telemetry — no fan write path (DEC-121).
+    pub intel_gpus: Vec<crate::hwmon::intel_gpu_detect::IntelGpuInfo>,
     /// Configured profile search directories (from daemon.toml [profiles] section).
     /// Wrapped in RwLock to allow runtime updates via SIGHUP reload or API endpoint.
     pub profile_search_dirs: parking_lot::RwLock<Vec<std::path::PathBuf>>,

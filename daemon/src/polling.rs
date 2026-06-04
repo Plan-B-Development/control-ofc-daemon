@@ -31,6 +31,7 @@ use crate::health::state::{
     AmdGpuFanState, CachedSensorReading, DeviceLabel, HwmonFanState, OpenFanState,
 };
 use crate::hwmon::gpu_detect::AmdGpuInfo;
+use crate::hwmon::intel_gpu_detect::IntelGpuInfo;
 use crate::hwmon::types::SensorReading;
 use crate::serial::protocol::Command;
 use crate::serial::transport::{send_command, SerialTransport};
@@ -40,6 +41,7 @@ fn to_cached(reading: &SensorReading) -> CachedSensorReading {
     use crate::hwmon::types::SensorSource;
     let source = match reading.source {
         SensorSource::AmdGpu => DeviceLabel::AmdGpu,
+        SensorSource::IntelGpu => DeviceLabel::IntelGpu,
         SensorSource::Hwmon => DeviceLabel::Hwmon,
     };
     CachedSensorReading {
@@ -63,11 +65,13 @@ fn to_cached(reading: &SensorReading) -> CachedSensorReading {
 ///
 /// Discovers and reads all hwmon temperature sensors every `interval`,
 /// and reads RPM/PWM for all discovered PWM headers, pushing results into the cache.
+#[allow(clippy::too_many_arguments)]
 pub async fn hwmon_poll_loop(
     cache: Arc<StateCache>,
     history: Arc<crate::health::history::HistoryRing>,
     headers: Vec<crate::hwmon::pwm_discovery::PwmHeaderDescriptor>,
     gpu_infos: Vec<AmdGpuInfo>,
+    intel_gpu_infos: Vec<IntelGpuInfo>,
     hwmon_root: &Path,
     interval: Duration,
     mut shutdown: watch::Receiver<bool>,
@@ -75,6 +79,7 @@ pub async fn hwmon_poll_loop(
     let hwmon_root = hwmon_root.to_path_buf();
     let headers = Arc::new(headers);
     let gpu_infos = Arc::new(gpu_infos);
+    let intel_gpu_infos = Arc::new(intel_gpu_infos);
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -115,10 +120,14 @@ pub async fn hwmon_poll_loop(
         let root = hwmon_root.clone();
         let hdrs = headers.clone();
         let gpus = gpu_infos.clone();
+        let intel_gpus = intel_gpu_infos.clone();
         let result: Result<_, tokio::task::JoinError> = tokio::task::spawn_blocking(move || {
             let sensors = crate::hwmon::collect_sensors(&root);
             let fan_states: Vec<HwmonFanState> = read_hwmon_fan_states(&hdrs);
-            let gpu_fan_states: Vec<AmdGpuFanState> = read_gpu_fan_states(&gpus);
+            // AMD + Intel discrete GPU fans share the cache `gpu_fans` map,
+            // distinguished by their ID prefix (`amd_gpu:` / `intel_gpu:`).
+            let mut gpu_fan_states: Vec<AmdGpuFanState> = read_gpu_fan_states(&gpus);
+            gpu_fan_states.extend(read_intel_fan_states(&intel_gpus));
             (sensors, fan_states, gpu_fan_states)
         })
         .await;
@@ -237,6 +246,31 @@ fn read_gpu_fan_states(gpus: &[AmdGpuInfo]) -> Vec<AmdGpuFanState> {
                 id: format!("amd_gpu:{}", g.pci_bdf),
                 rpm,
                 last_commanded_pct: None, // Preserved from cache by the caller
+                updated_at: now,
+            }
+        })
+        .collect()
+}
+
+/// Read fan RPM for all detected Intel discrete GPUs (DEC-121).
+///
+/// Read-only: `last_commanded_pct` is always `None` because Intel fan control
+/// is firmware-managed with no userspace write path. Only GPUs that actually
+/// expose `fan1_input` produce a fan entity (a fanless/blower SKU yields none).
+fn read_intel_fan_states(gpus: &[IntelGpuInfo]) -> Vec<AmdGpuFanState> {
+    let now = Instant::now();
+    gpus.iter()
+        .filter(|g| g.has_fan_rpm)
+        .map(|g| {
+            let fan_input = g.hwmon_path.join("fan1_input");
+            let rpm = std::fs::read_to_string(&fan_input)
+                .ok()
+                .and_then(|s| s.trim().parse::<u16>().ok());
+
+            AmdGpuFanState {
+                id: format!("intel_gpu:{}", g.pci_bdf),
+                rpm,
+                last_commanded_pct: None, // Always None — read-only.
                 updated_at: now,
             }
         })
@@ -365,5 +399,69 @@ pub async fn openfan_poll_loop(
                 log::error!("openfan poll task panicked: {e}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn fake_intel_gpu(
+        hwmon_path: std::path::PathBuf,
+        bdf: &str,
+        has_fan_rpm: bool,
+    ) -> IntelGpuInfo {
+        IntelGpuInfo {
+            pci_bdf: bdf.to_string(),
+            pci_device_id: 0xE20B,
+            pci_revision: 0,
+            pci_class: 0x030000,
+            marketing_name: Some("Arc B580".into()),
+            driver: "xe".into(),
+            hwmon_path,
+            is_discrete: true,
+            has_fan_rpm,
+        }
+    }
+
+    #[test]
+    fn read_intel_fan_states_reads_rpm_with_intel_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hwmon = tmp.path().join("hwmon3");
+        fs::create_dir_all(&hwmon).unwrap();
+        fs::write(hwmon.join("fan1_input"), "1234\n").unwrap();
+
+        let gpus = [fake_intel_gpu(hwmon, "0000:03:00.0", true)];
+        let states = read_intel_fan_states(&gpus);
+
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].id, "intel_gpu:0000:03:00.0");
+        assert_eq!(states[0].rpm, Some(1234));
+        // Read-only: never a commanded percentage.
+        assert_eq!(states[0].last_commanded_pct, None);
+    }
+
+    #[test]
+    fn read_intel_fan_states_skips_fanless_gpu() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hwmon = tmp.path().join("hwmon3");
+        fs::create_dir_all(&hwmon).unwrap();
+
+        let gpus = [fake_intel_gpu(hwmon, "0000:03:00.0", false)];
+        assert!(read_intel_fan_states(&gpus).is_empty());
+    }
+
+    #[test]
+    fn read_intel_fan_states_missing_file_yields_none_rpm() {
+        // has_fan_rpm true at detection, but the file vanished by poll time.
+        let tmp = tempfile::tempdir().unwrap();
+        let hwmon = tmp.path().join("hwmon3");
+        fs::create_dir_all(&hwmon).unwrap();
+
+        let gpus = [fake_intel_gpu(hwmon, "0000:03:00.0", true)];
+        let states = read_intel_fan_states(&gpus);
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].rpm, None);
     }
 }

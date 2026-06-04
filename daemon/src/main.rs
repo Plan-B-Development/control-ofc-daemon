@@ -609,6 +609,22 @@ async fn main() {
         }
     }
 
+    // Detect Intel discrete GPUs (DEC-121). Read-only monitoring — temps +
+    // fan RPM; no fan write path exists in the kernel.
+    let intel_gpus = control_ofc_daemon::hwmon::intel_gpu_detect::detect_intel_gpus(
+        std::path::Path::new(HWMON_SYSFS_ROOT),
+    );
+    for gpu in &intel_gpus {
+        log::info!(
+            "Intel GPU detected: {} (driver {}, PCI {}, fan control: {} [firmware-managed])",
+            gpu.display_label(),
+            gpu.driver,
+            gpu.pci_bdf,
+            gpu.fan_control_method(),
+        );
+    }
+    let intel_gpus_for_poll = intel_gpus.clone();
+
     let app_state = Arc::new(AppState {
         cache: cache.clone(),
         staleness_config,
@@ -620,6 +636,7 @@ async fn main() {
         active_profile: active_profile.clone(),
         calibrating: std::sync::atomic::AtomicBool::new(false),
         amd_gpus,
+        intel_gpus,
         profile_search_dirs: parking_lot::RwLock::new(profile_search_dirs),
         config_path: config_path.clone(),
         runtime_config_path: runtime_config_path.clone(),
@@ -673,6 +690,7 @@ async fn main() {
             hwmon_history,
             hwmon_headers_for_poll,
             gpu_infos_for_poll,
+            intel_gpus_for_poll,
             hwmon_root,
             hwmon_interval,
             hwmon_shutdown,

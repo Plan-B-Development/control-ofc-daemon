@@ -15,7 +15,9 @@ use control_ofc_daemon::error::SerialError;
 use control_ofc_daemon::health::cache::StateCache;
 use control_ofc_daemon::health::history::HistoryRing;
 use control_ofc_daemon::health::staleness::StalenessConfig;
-use control_ofc_daemon::health::state::{CachedSensorReading, DeviceLabel, OpenFanState};
+use control_ofc_daemon::health::state::{
+    AmdGpuFanState, CachedSensorReading, DeviceLabel, OpenFanState,
+};
 use control_ofc_daemon::hwmon::lease::LeaseManager;
 use control_ofc_daemon::hwmon::pwm_control::{HwmonPwmController, SysfsWriter};
 use control_ofc_daemon::hwmon::pwm_discovery::PwmHeaderDescriptor;
@@ -71,6 +73,7 @@ fn test_app_state() -> Arc<AppState> {
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: Vec::new(),
+        intel_gpus: Vec::new(),
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
@@ -226,6 +229,87 @@ async fn fans_endpoint_returns_fan_state() {
 }
 
 #[tokio::test]
+async fn fans_endpoint_tags_intel_gpu_source_by_id_prefix() {
+    // DEC-121: AMD and Intel discrete GPU fans share the cache `gpu_fans` map.
+    // `build_fan_entries` must derive the wire `source` from the ID prefix so an
+    // Intel fan reports "intel_gpu", not "amd_gpu". A regression here would
+    // scatter Intel telemetry in the GUI (it groups/dedups by source).
+    let cache = Arc::new(StateCache::new());
+    cache.update_gpu_fans(vec![
+        AmdGpuFanState {
+            id: "amd_gpu:0000:2d:00.0".into(),
+            rpm: Some(900),
+            last_commanded_pct: Some(40),
+            updated_at: Instant::now(),
+        },
+        AmdGpuFanState {
+            id: "intel_gpu:0000:03:00.0".into(),
+            rpm: Some(1500),
+            last_commanded_pct: None,
+            updated_at: Instant::now(),
+        },
+    ]);
+
+    let state = Arc::new(AppState {
+        cache,
+        staleness_config: StalenessConfig::default(),
+        daemon_version: "0.1.0-test".into(),
+        fan_controller: None,
+        hwmon_controller: None,
+        start_time: std::time::Instant::now(),
+        history: Arc::new(HistoryRing::new(250)),
+        active_profile: Arc::new(parking_lot::Mutex::new(None)),
+        calibrating: std::sync::atomic::AtomicBool::new(false),
+        amd_gpus: Vec::new(),
+        intel_gpus: Vec::new(),
+        profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
+        config_path: String::new(),
+        runtime_config_path: std::path::PathBuf::new(),
+        sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    });
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/fans").await;
+    assert_eq!(status, 200);
+    let fans = json["fans"].as_array().unwrap();
+    // Sorted by ID: amd_gpu:* before intel_gpu:*
+    let amd = fans
+        .iter()
+        .find(|f| f["id"] == "amd_gpu:0000:2d:00.0")
+        .unwrap();
+    let intel = fans
+        .iter()
+        .find(|f| f["id"] == "intel_gpu:0000:03:00.0")
+        .unwrap();
+    assert_eq!(amd["source"], "amd_gpu");
+    assert_eq!(intel["source"], "intel_gpu");
+    assert_eq!(intel["rpm"], 1500);
+    // Read-only: Intel never has a commanded PWM.
+    assert!(intel.get("last_commanded_pwm").is_none());
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn capabilities_includes_intel_gpu_absent_by_default() {
+    // The additive `intel_gpu` capability object must always be present (the
+    // GUI parser reads it); with no Intel GPU it reports present:false.
+    let state = test_app_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/capabilities").await;
+    assert_eq!(status, 200);
+    let intel = &json["devices"]["intel_gpu"];
+    assert_eq!(intel["present"], false);
+    assert_eq!(intel["fan_control_method"], "none");
+    assert_eq!(intel["display_label"], "Intel D-GPU");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
 async fn poll_endpoint_returns_batched_shape() {
     // Contract test for GET /poll — the GUI's primary 1 Hz read endpoint.
     //
@@ -352,6 +436,7 @@ fn test_app_state_with_controller(response_count: usize) -> Arc<AppState> {
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: Vec::new(),
+        intel_gpus: Vec::new(),
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
@@ -517,6 +602,7 @@ fn test_app_state_with_hwmon() -> Arc<AppState> {
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: Vec::new(),
+        intel_gpus: Vec::new(),
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
@@ -873,6 +959,7 @@ fn test_app_state_with_unsupported_gpu(pci_bdf: &str) -> Arc<AppState> {
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: vec![unsupported],
+        intel_gpus: Vec::new(),
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
@@ -965,6 +1052,7 @@ fn test_app_state_with_read_only_gpu(pci_bdf: &str, pci_device_id: u16) -> Arc<A
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: vec![read_only],
+        intel_gpus: Vec::new(),
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
@@ -1225,6 +1313,7 @@ fn test_app_state_with_writable_pmfw_gpu(pci_bdf: &str) -> (Arc<AppState>, tempf
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: vec![pmfw],
+        intel_gpus: Vec::new(),
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
@@ -1369,6 +1458,7 @@ fn test_app_state_with_read_only_hwmon_header() -> Arc<AppState> {
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: Vec::new(),
+        intel_gpus: Vec::new(),
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
@@ -1498,6 +1588,7 @@ async fn hwmon_discovery_excludes_amdgpu_end_to_end_via_ipc() {
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: Vec::new(),
+        intel_gpus: Vec::new(),
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
@@ -1578,6 +1669,7 @@ fn test_app_state_with_profile_dirs(dirs: Vec<std::path::PathBuf>) -> Arc<AppSta
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: Vec::new(),
+        intel_gpus: Vec::new(),
         profile_search_dirs: parking_lot::RwLock::new(dirs),
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
