@@ -203,6 +203,7 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 |--------|------|---------|
 | POST | `/gpu/{gpu_id}/fan/pwm` | Set GPU fan to static speed (5% change threshold) |
 | POST | `/gpu/{gpu_id}/fan/reset` | Restore GPU fan to automatic / re-enable zero-RPM |
+| POST | `/gpu/{gpu_id}/fan/verify` | Test GPU fan-control effectiveness (~6s, no lease; detects ppfeaturemask/SMU/BIOS silent failures) |
 
 ### Write endpoints — hwmon
 
@@ -212,7 +213,7 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 | POST | `/hwmon/lease/renew` | Renew held lease |
 | POST | `/hwmon/lease/release` | Release held lease |
 | POST | `/hwmon/{header_id}/pwm` | Set hwmon PWM (lease required) |
-| POST | `/hwmon/{header_id}/verify` | Test PWM write effectiveness (~3s, lease required, detects BIOS/EC interference) |
+| POST | `/hwmon/{header_id}/verify` | Test PWM write effectiveness (~6s, lease required, detects BIOS/EC interference) |
 | POST | `/hwmon/rescan` | Re-enumerate hwmon devices and return fresh header list |
 
 ### Write endpoints — profile / config

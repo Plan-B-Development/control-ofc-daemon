@@ -46,6 +46,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/gpu/{gpu_id}/fan/reset",
             post(handlers::gpu_reset_fan_handler),
         )
+        .route(
+            "/gpu/{gpu_id}/fan/verify",
+            post(handlers::gpu_verify_handler),
+        )
         // Hwmon PWM endpoints
         .route("/hwmon/headers", get(handlers::hwmon_headers_handler))
         .route(

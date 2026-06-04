@@ -173,6 +173,22 @@ pub fn read_fan_curve(fan_curve_path: &Path) -> Result<FanCurve, HwmonError> {
     parse_fan_curve(&content)
 }
 
+/// The flat speed of a curve where every point shares the same fan speed %,
+/// i.e. a "static" curve as written by [`set_static_speed`]. Returns `None` for
+/// an empty curve or a varying (firmware-default / auto) curve.
+///
+/// Used by the GPU fan verify to (a) confirm a static-speed write took effect
+/// (read-back flat speed == requested) and (b) decide whether the GPU was being
+/// driven at a static speed before the test (so it can be restored).
+pub fn flat_speed_pct(curve: &FanCurve) -> Option<u8> {
+    let first = curve.points.first()?.speed_pct;
+    curve
+        .points
+        .iter()
+        .all(|p| p.speed_pct == first)
+        .then_some(first)
+}
+
 /// Best-effort parse of the PMFW `fan_minimum_pwm` sysfs attribute into a
 /// percentage (0..=100).
 ///
@@ -307,6 +323,43 @@ pub fn disable_zero_rpm(zero_rpm_path: &Path) -> Result<(), HwmonError> {
     })?;
     log::info!("Disabled GPU fan zero-RPM: {}", zero_rpm_path.display());
     Ok(())
+}
+
+/// Parse the multi-line `fan_zero_rpm_enable` sysfs output to its current bool.
+///
+/// The file is formatted like `fan_curve` — a labelled current-value section
+/// followed by an `OD_RANGE:` block:
+/// ```text
+/// FAN_ZERO_RPM_ENABLE:
+/// 0
+/// OD_RANGE:
+/// ZERO_RPM_ENABLE: 0 1
+/// ```
+/// We read the value line immediately after the `FAN_ZERO_RPM_ENABLE:` header.
+/// Returns `None` when nothing parseable is found.
+pub fn parse_zero_rpm_enabled(content: &str) -> Option<bool> {
+    let mut found_header = false;
+    for line in content.lines() {
+        if line.contains("FAN_ZERO_RPM_ENABLE:") && !line.contains("OD_RANGE") {
+            found_header = true;
+            continue;
+        }
+        if found_header {
+            return match line.trim() {
+                "0" => Some(false),
+                "1" => Some(true),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+/// Read the current `fan_zero_rpm_enable` state. Diagnostics-only (used by the
+/// GPU fan verify to distinguish a legitimately idle/stopped fan from a broken
+/// one). Returns `None` on any read or parse failure.
+pub fn read_zero_rpm_enabled(zero_rpm_path: &Path) -> Option<bool> {
+    parse_zero_rpm_enabled(&std::fs::read_to_string(zero_rpm_path).ok()?)
 }
 
 /// Re-enable fan zero-RPM mode (restore firmware idle fan-stop behaviour).
@@ -520,6 +573,65 @@ OD_RANGE:
 FAN_CURVE(hotspot temp): 25C 100C
 FAN_CURVE(fan speed): 15% 100%
 ";
+
+    const FLAT_CURVE: &str = "\
+OD_FAN_CURVE:
+0: 40C 75%
+1: 50C 75%
+2: 60C 75%
+3: 70C 75%
+4: 80C 75%
+OD_RANGE:
+FAN_CURVE(hotspot temp): 25C 100C
+FAN_CURVE(fan speed): 15% 100%
+";
+
+    const ZERO_RPM_ENABLED: &str = "\
+FAN_ZERO_RPM_ENABLE:
+1
+OD_RANGE:
+ZERO_RPM_ENABLE: 0 1
+";
+
+    const ZERO_RPM_DISABLED: &str = "\
+FAN_ZERO_RPM_ENABLE:
+0
+OD_RANGE:
+ZERO_RPM_ENABLE: 0 1
+";
+
+    #[test]
+    fn flat_speed_detects_static_curve() {
+        let flat = parse_fan_curve(FLAT_CURVE).unwrap();
+        assert_eq!(flat_speed_pct(&flat), Some(75));
+    }
+
+    #[test]
+    fn flat_speed_none_for_varying_curve() {
+        let varying = parse_fan_curve(SAMPLE_CURVE).unwrap();
+        assert_eq!(flat_speed_pct(&varying), None);
+    }
+
+    #[test]
+    fn flat_speed_none_for_empty_curve() {
+        let empty = FanCurve {
+            points: vec![],
+            temp_range: None,
+            speed_range: None,
+        };
+        assert_eq!(flat_speed_pct(&empty), None);
+    }
+
+    #[test]
+    fn parse_zero_rpm_enabled_reads_value_line() {
+        assert_eq!(parse_zero_rpm_enabled(ZERO_RPM_ENABLED), Some(true));
+        assert_eq!(parse_zero_rpm_enabled(ZERO_RPM_DISABLED), Some(false));
+    }
+
+    #[test]
+    fn parse_zero_rpm_enabled_none_when_absent() {
+        assert_eq!(parse_zero_rpm_enabled("garbage\nmore garbage\n"), None);
+    }
 
     #[test]
     fn parse_standard_curve() {

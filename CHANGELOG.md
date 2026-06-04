@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.11.0] — 2026-06-04
+
+GPU fan active verification endpoint (**DEC-120**, daemon-relevant subset).
+Pairs with **GUI v1.23.0**. Additive wire-contract change — older GUIs ignore
+the new route.
+
+### Added
+- `POST /gpu/{gpu_id}/fan/verify` (no lease) — drives a test speed biased
+  upward (so cooling is never reduced on a hot GPU), waits
+  `GPU_VERIFY_WAIT_SECONDS = 6 s`, reads back the applied PMFW `fan_curve` (or
+  legacy `pwm1`) plus `fan1_input` RPM and `fan_zero_rpm_enable`, restores the
+  prior state, and classifies the outcome: `effective`, `curve_not_applied`,
+  `no_rpm_effect`, `zero_rpm_suppressed`, `rpm_unavailable`, `write_failed`, or
+  (legacy path) `pwm_enable_reverted`. Catches the silent GPU failures static
+  diagnostics miss (`ppfeaturemask` bit 14 unset, SMU mismatch, BIOS overdrive
+  lock) without flagging a healthy zero-RPM idle or the OD_RANGE clamp as a
+  fault.
+- `hwmon::gpu_fan` helpers `flat_speed_pct`, `parse_zero_rpm_enabled` /
+  `read_zero_rpm_enabled`; constant `GPU_VERIFY_WAIT_SECONDS`.
+
 ## [1.10.0] — 2026-06-04
 
 GPU detection/diagnostics hardening + headless per-member GPU floor

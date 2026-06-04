@@ -699,6 +699,47 @@ pub struct HwmonVerifyState {
     pub rpm: Option<u16>,
 }
 
+// ── GPU fan verification ──────────────────────────────────────────
+
+/// Response for `POST /gpu/{gpu_id}/fan/verify`. No `api_version` field —
+/// symmetric with [`HwmonVerifyResponse`], its sibling verify endpoint.
+#[derive(Debug, Clone, Serialize)]
+pub struct GpuVerifyResponse {
+    pub gpu_id: String,
+    /// One of: "effective", "curve_not_applied", "no_rpm_effect",
+    /// "zero_rpm_suppressed", "rpm_unavailable", "write_failed",
+    /// "pwm_enable_reverted" (legacy pwm1 path only).
+    pub result: String,
+    pub initial_state: GpuVerifyState,
+    pub final_state: GpuVerifyState,
+    /// The (OD_RANGE-clamped) speed the verify drove the fan to.
+    pub test_speed_pct: u8,
+    pub wait_seconds: u8,
+    /// "pmfw_curve" or "hwmon_pwm" — which write path was exercised.
+    pub fan_control_method: String,
+    pub details: String,
+    /// True if restoring the pre-verify fan state failed (the fan may be left
+    /// at the test speed). Older clients default to `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub restore_failed: bool,
+}
+
+/// Snapshot of GPU fan state during a verify operation. Fields are optional and
+/// path-dependent: `zero_rpm_enabled` is populated on the PMFW path, `pwm_enable`
+/// on the legacy `pwm1` path. `applied_speed_pct` is the read-back commanded
+/// speed (flat curve value for PMFW, `pwm1` percent for legacy).
+#[derive(Debug, Clone, Serialize)]
+pub struct GpuVerifyState {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_speed_pct: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpm: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pwm_enable: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zero_rpm_enabled: Option<bool>,
+}
+
 /// Standard error envelope for all error responses.
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorEnvelope {
