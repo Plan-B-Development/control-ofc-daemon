@@ -63,6 +63,26 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
         })
         .collect();
 
+    // DEC-119: PCI-space scan for AMD VGA devices + driver binding. Done
+    // independently of the hwmon scan so a GPU whose amdgpu driver did not
+    // bind (blacklist, KMS failure, vfio-pci passthrough) is still reported —
+    // such a device has no hwmon node and is absent from `gpu` below.
+    let amd_pci_raw = crate::hwmon::gpu_detect::detect_amd_pci_devices();
+    let amdgpu_module_loaded = crate::hwmon::gpu_detect::amdgpu_module_loaded();
+    let amd_pci_devices: Vec<AmdPciDeviceInfo> = amd_pci_raw
+        .iter()
+        .map(|d| AmdPciDeviceInfo {
+            pci_bdf: d.pci_bdf.clone(),
+            pci_device_id: d.pci_device_id,
+            driver: d.driver.clone(),
+            amdgpu_bound: d.amdgpu_bound(),
+            hwmon_present: state.amd_gpus.iter().any(|g| g.pci_bdf == d.pci_bdf),
+        })
+        .collect();
+
+    // Kernel release read once and reused for the primary GPU's advisories.
+    let kernel_release = crate::hwmon::kernel_warnings::read_kernel_release();
+
     // GPU diagnostics from detected GPUs
     let gpu_diag = crate::hwmon::gpu_detect::select_primary_gpu(&state.amd_gpus).map(|gpu| {
         let ppfeaturemask = diagnostics::read_ppfeaturemask();
@@ -75,6 +95,37 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
                     .unwrap_or(false)
             })
             .unwrap_or(false);
+
+        // DEC-119: firmware-enforced OD_RANGE fan-speed bounds (the ~15% min
+        // on RDNA3+ that the user perceives as a "minimum"). Read on demand —
+        // diagnostics already runs on the blocking pool.
+        let (fan_speed_min_pct, fan_speed_max_pct) = gpu
+            .fan_curve_path
+            .as_ref()
+            .and_then(|p| crate::hwmon::gpu_fan::read_fan_curve(p).ok())
+            .and_then(|c| c.speed_range)
+            .map_or((None, None), |(lo, hi)| (Some(lo), Some(hi)));
+
+        // Best-effort PMFW fan_minimum_pwm (optional attribute).
+        let fan_minimum_pwm = gpu
+            .fan_minimum_pwm_path()
+            .as_deref()
+            .and_then(crate::hwmon::gpu_fan::read_fan_minimum_pwm);
+
+        // Kernel-regression advisories for this GPU (same catalog as
+        // /capabilities.amd_gpu.kernel_warnings, duplicated for the bundle).
+        let kernel_warnings = kernel_release
+            .as_deref()
+            .map(|r| crate::hwmon::kernel_warnings::detect_kernel_warnings(r, gpu))
+            .unwrap_or_default();
+
+        // Driver-bound status cross-referenced from the PCI scan; an hwmon
+        // node implies a bound driver, so default to true if the BDF is
+        // somehow absent from the PCI listing.
+        let amdgpu_driver_bound = amd_pci_raw
+            .iter()
+            .find(|d| d.pci_bdf == gpu.pci_bdf)
+            .is_none_or(|d| d.amdgpu_bound());
 
         GpuDiagnostics {
             pci_bdf: gpu.pci_bdf.clone(),
@@ -89,6 +140,11 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
             ppfeaturemask,
             ppfeaturemask_bit14_set: bit14_set,
             zero_rpm_available: gpu.fan_zero_rpm_path.is_some(),
+            fan_speed_min_pct,
+            fan_speed_max_pct,
+            fan_minimum_pwm,
+            amdgpu_driver_bound,
+            kernel_warnings,
         }
     });
 
@@ -174,6 +230,8 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
             kernel_detected_chips,
             module_collisions,
             cpu_vendor,
+            amd_pci_devices,
+            amdgpu_module_loaded,
         },
     )
 }

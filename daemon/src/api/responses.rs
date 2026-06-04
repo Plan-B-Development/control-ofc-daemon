@@ -487,6 +487,20 @@ pub struct HardwareDiagnosticsResponse {
     /// `skip_serializing_if = "String::is_empty"`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cpu_vendor: String,
+    /// AMD VGA-class PCI devices and their driver binding (DEC-119). Detected
+    /// independently of hwmon so a GPU whose `amdgpu` driver failed to bind
+    /// (blacklist, KMS failure, vfio-pci passthrough) is still reported —
+    /// such a device produces no hwmon node and is absent from `gpu`. Empty
+    /// (and omitted) when no AMD VGA device exists; older clients skip it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub amd_pci_devices: Vec<AmdPciDeviceInfo>,
+    /// Whether the `amdgpu` kernel module is loaded (`/sys/module/amdgpu`).
+    /// Paired with `amd_pci_devices`: a device present with the module *not*
+    /// loaded points at a blacklist or missing module; module loaded but
+    /// device unbound points at a bind failure. Defaults to `false` for
+    /// older clients that don't send the field.
+    #[serde(default)]
+    pub amdgpu_module_loaded: bool,
 }
 
 /// Hwmon chip diagnostics.
@@ -527,6 +541,58 @@ pub struct GpuDiagnostics {
     pub ppfeaturemask: Option<String>,
     pub ppfeaturemask_bit14_set: bool,
     pub zero_rpm_available: bool,
+    /// PMFW OD_RANGE fan-speed minimum (percent), parsed from the device's
+    /// `fan_curve` `FAN_CURVE(fan speed)` range. The amdgpu driver rejects
+    /// curve points below this with `EINVAL`, so it is the firmware-enforced
+    /// reason a PMFW GPU fan cannot be driven to 0% via the curve (typically
+    /// 15% on RDNA3+). `None` for non-PMFW GPUs. Additive field — older
+    /// clients skip it (`skip_serializing_if`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fan_speed_min_pct: Option<u8>,
+    /// PMFW OD_RANGE fan-speed maximum (percent), companion to
+    /// `fan_speed_min_pct` (typically 100%). `None` for non-PMFW GPUs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fan_speed_max_pct: Option<u8>,
+    /// PMFW `fan_minimum_pwm` setting (percent), best-effort parse of the
+    /// `gpu_od/fan_ctrl/fan_minimum_pwm` sysfs attribute. `None` when the
+    /// attribute is absent or unparseable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fan_minimum_pwm: Option<u8>,
+    /// Whether the `amdgpu` driver is bound to this GPU's PCI device. Always
+    /// `true` here in practice (this struct is only built from an hwmon node,
+    /// which requires a bound driver), but emitted for symmetry with
+    /// `HardwareDiagnosticsResponse.amd_pci_devices` and forward-proofing.
+    #[serde(default)]
+    pub amdgpu_driver_bound: bool,
+    /// Kernel-regression advisories for this GPU — the same catalog surfaced
+    /// in `/capabilities.amd_gpu.kernel_warnings`, duplicated here so the
+    /// diagnostics support bundle is self-contained. Empty (and omitted) when
+    /// nothing applies.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kernel_warnings: Vec<crate::hwmon::kernel_warnings::KernelWarning>,
+}
+
+/// An AMD VGA-class PCI device and the driver bound to it (DEC-119).
+///
+/// Detected by scanning PCI space directly, independent of hwmon. Lets the
+/// GUI distinguish "no AMD GPU installed" from "AMD GPU present but the
+/// amdgpu driver is not bound" (blacklist, failed KMS, or vfio-pci
+/// passthrough) — the latter produces no hwmon node, so the `gpu` field is
+/// `None` and the GPU would otherwise be invisible.
+#[derive(Debug, Clone, Serialize)]
+pub struct AmdPciDeviceInfo {
+    pub pci_bdf: String,
+    pub pci_device_id: u16,
+    /// Basename of the bound kernel driver, or `None` when unbound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+    /// Whether `amdgpu` is the bound driver.
+    pub amdgpu_bound: bool,
+    /// Whether this PCI device also surfaced an `amdgpu` hwmon node (i.e. it
+    /// appears in the `gpu` field / fan-control path). `false` here while
+    /// `amdgpu_bound` is `true` can indicate a very early-boot race or a
+    /// render-only node without sensors.
+    pub hwmon_present: bool,
 }
 
 /// Thermal safety rule status.
@@ -1026,10 +1092,22 @@ mod tests {
             ppfeaturemask: Some("0x4000".into()),
             ppfeaturemask_bit14_set: true,
             zero_rpm_available: true,
+            fan_speed_min_pct: Some(15),
+            fan_speed_max_pct: Some(100),
+            fan_minimum_pwm: None,
+            amdgpu_driver_bound: true,
+            kernel_warnings: Vec::new(),
         };
         let json = serde_json::to_value(&diag).unwrap();
         assert_eq!(json["pci_bdf"], "0000:03:00.0");
         assert_eq!(json["pci_id"], "0000:03:00.0");
+        // DEC-119: OD_RANGE bounds are surfaced; the unparsed fan_minimum_pwm
+        // and empty advisory list are omitted from the wire so older GUIs
+        // don't see unexpected nulls.
+        assert_eq!(json["fan_speed_min_pct"], 15);
+        assert_eq!(json["amdgpu_driver_bound"], true);
+        assert!(json.get("fan_minimum_pwm").is_none());
+        assert!(json.get("kernel_warnings").is_none());
     }
 
     #[test]

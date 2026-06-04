@@ -1,5 +1,41 @@
 # Changelog
 
+## [1.10.0] — 2026-06-04
+
+GPU detection/diagnostics hardening + headless per-member GPU floor
+(**DEC-119**, daemon-relevant subset). Pairs with **GUI v1.22.0**. The
+diagnostics additions are an additive wire-contract change — older GUIs ignore
+the new keys.
+
+### Changed
+- **The profile engine no longer soft-floors GPU fans in a mixed control.**
+  When a profile runs headless, a GPU member grouped with chassis/CPU fans now
+  idles to its own 0% floor while the non-GPU members keep the control's
+  `minimum_pct` — the same per-member flooring the GUI does, so headless and
+  GUI-driven evaluation stay consistent (DEC-096). The PMFW write path still
+  clamps to the firmware OD_RANGE (~15%) and honours `fan_zero_rpm`.
+
+### Added
+- **`/diagnostics/hardware` now reports AMD GPUs that exist in PCI space but
+  have no `amdgpu` driver bound.** New top-level `amd_pci_devices` (per-device
+  `pci_bdf` / `pci_device_id` / `driver` / `amdgpu_bound` / `hwmon_present`)
+  scans `/sys/bus/pci/devices` independently of hwmon, so a blacklisted /
+  KMS-failed / vfio-pci-passed-through GPU — which produces no hwmon node and
+  was previously invisible — is now surfaced. New top-level
+  `amdgpu_module_loaded` (`/sys/module/amdgpu`) distinguishes "module not
+  loaded" from "loaded but unbound".
+- **`GpuDiagnostics` gains firmware-context fields:** `fan_speed_min_pct` /
+  `fan_speed_max_pct` (the PMFW `fan_curve` `OD_RANGE` fan-speed bounds — the
+  firmware-enforced ~15% minimum), `fan_minimum_pwm` (best-effort parse of
+  `gpu_od/fan_ctrl/fan_minimum_pwm`), `amdgpu_driver_bound`, and
+  `kernel_warnings` (the same advisory catalogue as
+  `/capabilities.amd_gpu.kernel_warnings`, duplicated so the support bundle is
+  self-contained).
+
+All new fields use `#[serde(default)]` / `skip_serializing_if`, so the change
+is additive and non-breaking. No new dependencies; the daemon never writes
+`fan_minimum_pwm`.
+
 ## [1.9.0] — 2026-06-03
 
 Curated hwmon temperature-threshold attributes on `SensorEntry` (**DEC-117**).

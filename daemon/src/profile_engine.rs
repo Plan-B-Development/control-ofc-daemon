@@ -162,12 +162,29 @@ fn evaluate_curve_with_deadband(
 /// delta tracked cycle-to-cycle is the final clamped output; stop-threshold
 /// comes after step-rate so a slow-falling curve can still snap to zero.
 fn apply_tuning(control: &LogicalControl, raw_output: f64, last_output: Option<f64>) -> f64 {
+    apply_tuning_with_floor(control, raw_output, last_output, control.minimum_pct)
+}
+
+/// `apply_tuning` with an explicit minimum-floor override.
+///
+/// DEC-119: GPU members carry no soft floor (`floor == 0.0`) even inside a
+/// mixed control whose `minimum_pct` is non-zero, mirroring the GUI's
+/// `member_minimum_pct`. Every other member passes `control.minimum_pct`, so
+/// the public `apply_tuning` (and its tests) is unchanged. Keeping this a
+/// floor parameter — rather than special-casing GPU inside the pipeline —
+/// preserves the exact offset → floor → step → stop/start order for both.
+fn apply_tuning_with_floor(
+    control: &LogicalControl,
+    raw_output: f64,
+    last_output: Option<f64>,
+    floor: f64,
+) -> f64 {
     // 1. Offset
     let mut output = raw_output + control.offset_pct;
 
     // 2. Minimum floor (per-profile soft floor, distinct from daemon safety)
-    if output < control.minimum_pct {
-        output = control.minimum_pct;
+    if output < floor {
+        output = floor;
     }
 
     // 3. Step-rate limiting — only bites when we have a previous cycle's output.
@@ -265,10 +282,25 @@ pub fn evaluate_profile(
         // Generate write commands for all members
         for member in &control.members {
             let gpu_fan_zero_rpm = member.source == "amd_gpu" && member.fan_zero_rpm;
+            // DEC-119: GPU members are never soft-floored. In a mixed control
+            // (non-zero `minimum_pct`) recompute the GPU member's output with a
+            // 0% floor and its own namespaced step-rate tracker, so headless
+            // mode matches the GUI's per-member flooring (the DEC-096
+            // GUI/headless consistency guarantee). Every non-GPU member, and
+            // any member of a 0-floor control, uses the control-wide value.
+            let member_pwm = if member.source == "amd_gpu" && control.minimum_pct > 0.0 {
+                let key = format!("{}::m::{}", control.id, member.member_id);
+                let prev_member = engine_state.last_output(&key);
+                let tuned_member = apply_tuning_with_floor(control, raw_output, prev_member, 0.0);
+                engine_state.last_output.insert(key, tuned_member);
+                tuned_member.round().clamp(0.0, 100.0) as u8
+            } else {
+                pwm_percent
+            };
             commands.push(PwmCommand {
                 member_id: member.member_id.clone(),
                 source: member.source.clone(),
-                pwm_percent,
+                pwm_percent: member_pwm,
                 gpu_fan_zero_rpm,
             });
         }
@@ -903,6 +935,89 @@ mod tests {
         let cache = make_cache_with_sensor("cpu", 50.0);
         let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
         assert_eq!(cmds[0].pwm_percent, 100); // 95+20=115, clamped to 100
+    }
+
+    // ── DEC-119: per-member GPU floor (headless ⇄ GUI consistency) ──────
+
+    fn push_gpu_member(profile: &mut DaemonProfile) {
+        profile.controls[0].members.push(ControlMember {
+            source: "amd_gpu".into(),
+            member_id: "amd_gpu:0000:03:00.0".into(),
+            member_label: "9070XT Fan".into(),
+            fan_zero_rpm: false,
+        });
+    }
+
+    #[test]
+    fn evaluate_gpu_member_not_floored_in_mixed_control() {
+        // A GPU fan grouped with a chassis fan in one control. The chassis
+        // member keeps the 20% control floor; the GPU member idles to its own
+        // 0% floor in the same cycle. Mirrors the GUI control loop (DEC-096
+        // consistency).
+        let mut profile = make_profile("manual", "flat", 0.0);
+        profile.controls[0].manual_output_pct = 10.0;
+        profile.controls[0].minimum_pct = 20.0;
+        push_gpu_member(&mut profile);
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
+
+        let openfan = cmds.iter().find(|c| c.source == "openfan").unwrap();
+        let gpu = cmds.iter().find(|c| c.source == "amd_gpu").unwrap();
+        assert_eq!(openfan.pwm_percent, 20); // floored at the control minimum
+        assert_eq!(gpu.pwm_percent, 10); // GPU follows the value down past 20
+    }
+
+    #[test]
+    fn evaluate_gpu_member_reaches_zero_in_mixed_control() {
+        let mut profile = make_profile("manual", "flat", 0.0);
+        profile.controls[0].manual_output_pct = 0.0;
+        profile.controls[0].minimum_pct = 30.0;
+        push_gpu_member(&mut profile);
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
+
+        let gpu = cmds.iter().find(|c| c.source == "amd_gpu").unwrap();
+        let openfan = cmds.iter().find(|c| c.source == "openfan").unwrap();
+        assert_eq!(gpu.pwm_percent, 0);
+        assert_eq!(openfan.pwm_percent, 30);
+    }
+
+    #[test]
+    fn evaluate_gpu_only_control_uses_control_output() {
+        // A GPU-only control has minimum_pct 0, so the per-member branch is not
+        // taken and the (already 0-floored) control-wide value is used.
+        let mut profile = make_profile("manual", "flat", 0.0);
+        profile.controls[0].manual_output_pct = 5.0;
+        profile.controls[0].minimum_pct = 0.0;
+        profile.controls[0].members = vec![ControlMember {
+            source: "amd_gpu".into(),
+            member_id: "amd_gpu:0000:03:00.0".into(),
+            member_label: "".into(),
+            fan_zero_rpm: false,
+        }];
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].pwm_percent, 5);
+    }
+
+    #[test]
+    fn evaluate_non_gpu_mixed_members_share_control_floor() {
+        // Regression guard: a control with no GPU member is wholly unchanged —
+        // every member gets the single control-wide floored output.
+        let mut profile = make_profile("manual", "flat", 0.0);
+        profile.controls[0].manual_output_pct = 10.0;
+        profile.controls[0].minimum_pct = 20.0;
+        profile.controls[0].members.push(ControlMember {
+            source: "hwmon".into(),
+            member_id: "hwmon:nct6799:0000:pwm2:Chassis".into(),
+            member_label: "Chassis".into(),
+            fan_zero_rpm: false,
+        });
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
+        assert_eq!(cmds.len(), 2);
+        assert!(cmds.iter().all(|c| c.pwm_percent == 20));
     }
 
     // ── M1: full tuning pipeline — step rate, start/stop, cross-cycle state ──

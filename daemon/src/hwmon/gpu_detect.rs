@@ -11,8 +11,17 @@ use super::util::read_sysfs_string;
 /// PCI base class for VGA compatible controller (discrete GPU).
 const PCI_CLASS_VGA: u32 = 0x030000;
 
+/// PCI vendor ID for AMD/ATI.
+const PCI_VENDOR_AMD: u16 = 0x1002;
+
 /// Path to the amdgpu ppfeaturemask kernel parameter.
 const PPFEATUREMASK_PATH: &str = "/sys/module/amdgpu/parameters/ppfeaturemask";
+
+/// Sysfs directory that exists when the amdgpu kernel module is loaded.
+const AMDGPU_MODULE_PATH: &str = "/sys/module/amdgpu";
+
+/// Sysfs root listing all PCI devices (each entry is a BDF symlink).
+const PCI_DEVICES_ROOT: &str = "/sys/bus/pci/devices";
 
 /// Bit 14 in ppfeaturemask enables overdrive (required for gpu_od/ sysfs tree).
 const PP_OVERDRIVE_MASK: u32 = 0x4000;
@@ -93,6 +102,18 @@ impl AmdGpuInfo {
     /// Whether this GPU has any fan-related sysfs files (fan or PWM).
     pub fn has_any_fan_interface(&self) -> bool {
         self.has_fan_rpm || self.has_pwm || self.fan_curve_path.is_some()
+    }
+
+    /// Path to the PMFW `fan_minimum_pwm` sysfs attribute, if PMFW is present.
+    ///
+    /// Derived from `fan_curve_path` (both live in `gpu_od/fan_ctrl/`), so it
+    /// is `Some` only when a PMFW fan_curve was found. The attribute is a
+    /// diagnostics-only read — the daemon never writes it.
+    pub fn fan_minimum_pwm_path(&self) -> Option<PathBuf> {
+        self.fan_curve_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|dir| dir.join("fan_minimum_pwm"))
     }
 }
 
@@ -373,6 +394,101 @@ fn lookup_marketing_name(device_id: u16, revision: u8) -> Option<String> {
 pub fn select_primary_gpu(gpus: &[AmdGpuInfo]) -> Option<&AmdGpuInfo> {
     // Already sorted by detect_amd_gpus: fan interface > discrete > PCI BDF
     gpus.first()
+}
+
+/// An AMD VGA-class PCI device and the driver currently bound to it.
+///
+/// This is detected independently of the hwmon scan in [`detect_amd_gpus`].
+/// Hwmon-based detection only sees a GPU once `amdgpu` has bound and created
+/// an `hwmon` node; if the module is blacklisted, failed early KMS, or the
+/// device is bound to `vfio-pci` for passthrough, no hwmon node exists and the
+/// GPU is otherwise invisible. Scanning PCI space and reading the `driver`
+/// symlink lets the daemon report "GPU present but amdgpu not bound" — the
+/// single most common reason GPU fan control silently does nothing.
+#[derive(Debug, Clone)]
+pub struct AmdPciDevice {
+    /// PCI Bus:Device.Function address (e.g. `0000:03:00.0`).
+    pub pci_bdf: String,
+    /// PCI device ID (e.g. `0x7550`).
+    pub pci_device_id: u16,
+    /// Basename of the bound kernel driver (e.g. `"amdgpu"`, `"vfio-pci"`),
+    /// or `None` when the device has no `driver` symlink (unbound).
+    pub driver: Option<String>,
+}
+
+impl AmdPciDevice {
+    /// Whether the `amdgpu` driver is bound to this device.
+    pub fn amdgpu_bound(&self) -> bool {
+        self.driver.as_deref() == Some("amdgpu")
+    }
+}
+
+/// Whether the `amdgpu` kernel module is loaded (`/sys/module/amdgpu` exists).
+pub fn amdgpu_module_loaded() -> bool {
+    amdgpu_module_loaded_at(Path::new(AMDGPU_MODULE_PATH))
+}
+
+/// Internal: module-loaded check against an injectable path (test seam).
+pub fn amdgpu_module_loaded_at(module_path: &Path) -> bool {
+    module_path.exists()
+}
+
+/// Scan PCI space for AMD VGA-class devices and report their driver binding.
+///
+/// Uses the production `/sys/bus/pci/devices` root. See
+/// [`detect_amd_pci_devices_at`] for the test-injectable variant.
+pub fn detect_amd_pci_devices() -> Vec<AmdPciDevice> {
+    detect_amd_pci_devices_at(Path::new(PCI_DEVICES_ROOT))
+}
+
+/// Internal: PCI scan against an injectable devices root (test seam).
+///
+/// Each entry in the devices root is a BDF-named symlink to the device dir.
+/// We read `vendor`/`class`/`device` (following the symlink) and the optional
+/// `driver` symlink to determine binding. Non-AMD and non-VGA devices are
+/// skipped. Fail-soft: an unreadable root yields an empty Vec.
+pub fn detect_amd_pci_devices_at(pci_devices_root: &Path) -> Vec<AmdPciDevice> {
+    let mut devices = Vec::new();
+    let entries = match std::fs::read_dir(pci_devices_root) {
+        Ok(e) => e,
+        Err(_) => return devices,
+    };
+
+    for entry in entries.filter_map(|e| e.ok()) {
+        let dev_path = entry.path();
+        let Some(bdf) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !is_pci_bdf(&bdf) {
+            continue;
+        }
+        // Vendor + class gate: AMD VGA-class controllers only.
+        if read_pci_hex16(&dev_path.join("vendor")) != Some(PCI_VENDOR_AMD) {
+            continue;
+        }
+        let class = read_pci_hex32(&dev_path.join("class")).unwrap_or(0);
+        if (class & 0xFFFF00) != PCI_CLASS_VGA {
+            continue;
+        }
+        let pci_device_id = read_pci_hex16(&dev_path.join("device")).unwrap_or(0);
+        // The `driver` symlink basename names the bound driver, if any.
+        let driver = std::fs::read_link(dev_path.join("driver"))
+            .ok()
+            .and_then(|target| {
+                target
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(str::to_string)
+            });
+        devices.push(AmdPciDevice {
+            pci_bdf: bdf,
+            pci_device_id,
+            driver,
+        });
+    }
+
+    devices.sort_by(|a, b| a.pci_bdf.cmp(&b.pci_bdf));
+    devices
 }
 
 #[cfg(test)]
@@ -753,5 +869,135 @@ mod tests {
         assert!(is_pci_bdf("0000:00:18.3"));
         assert!(!is_pci_bdf("it87.2624"));
         assert!(!is_pci_bdf("short"));
+    }
+
+    // ── DEC-119: PCI driver-bound scan ──────────────────────────────
+
+    /// Create a fake `/sys/bus/pci/devices/<bdf>` entry with vendor/device/
+    /// class attributes and an optional `driver` symlink.
+    fn create_fake_pci_dev(
+        root: &Path,
+        bdf: &str,
+        vendor: &str,
+        device: &str,
+        class: &str,
+        driver: Option<&str>,
+    ) {
+        let dev = root.join(bdf);
+        fs::create_dir_all(&dev).unwrap();
+        fs::write(dev.join("vendor"), format!("{vendor}\n")).unwrap();
+        fs::write(dev.join("device"), format!("{device}\n")).unwrap();
+        fs::write(dev.join("class"), format!("{class}\n")).unwrap();
+        if let Some(drv) = driver {
+            let drv_dir = root.join("drivers").join(drv);
+            fs::create_dir_all(&drv_dir).unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&drv_dir, dev.join("driver")).unwrap();
+        }
+    }
+
+    #[test]
+    fn pci_scan_reports_amdgpu_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_fake_pci_dev(
+            tmp.path(),
+            "0000:03:00.0",
+            "0x1002",
+            "0x7550",
+            "0x030000",
+            Some("amdgpu"),
+        );
+        let devs = detect_amd_pci_devices_at(tmp.path());
+        assert_eq!(devs.len(), 1);
+        assert_eq!(devs[0].pci_bdf, "0000:03:00.0");
+        assert_eq!(devs[0].pci_device_id, 0x7550);
+        assert_eq!(devs[0].driver.as_deref(), Some("amdgpu"));
+        assert!(devs[0].amdgpu_bound());
+    }
+
+    #[test]
+    fn pci_scan_reports_unbound_gpu() {
+        // The flagship gap-(a) case: AMD VGA present, no driver symlink → the
+        // driver did not bind, so no hwmon node exists and the GPU would
+        // otherwise be invisible.
+        let tmp = tempfile::tempdir().unwrap();
+        create_fake_pci_dev(
+            tmp.path(),
+            "0000:03:00.0",
+            "0x1002",
+            "0x7550",
+            "0x030000",
+            None,
+        );
+        let devs = detect_amd_pci_devices_at(tmp.path());
+        assert_eq!(devs.len(), 1);
+        assert!(devs[0].driver.is_none());
+        assert!(!devs[0].amdgpu_bound());
+    }
+
+    #[test]
+    fn pci_scan_reports_vfio_passthrough() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_fake_pci_dev(
+            tmp.path(),
+            "0000:03:00.0",
+            "0x1002",
+            "0x7550",
+            "0x030000",
+            Some("vfio-pci"),
+        );
+        let devs = detect_amd_pci_devices_at(tmp.path());
+        assert_eq!(devs.len(), 1);
+        assert_eq!(devs[0].driver.as_deref(), Some("vfio-pci"));
+        assert!(!devs[0].amdgpu_bound());
+    }
+
+    #[test]
+    fn pci_scan_skips_non_amd_and_non_vga() {
+        let tmp = tempfile::tempdir().unwrap();
+        // NVIDIA VGA — wrong vendor.
+        create_fake_pci_dev(
+            tmp.path(),
+            "0000:01:00.0",
+            "0x10de",
+            "0x2684",
+            "0x030000",
+            Some("nvidia"),
+        );
+        // AMD HD-audio function — right vendor, wrong class.
+        create_fake_pci_dev(
+            tmp.path(),
+            "0000:03:00.1",
+            "0x1002",
+            "0xab30",
+            "0x040300",
+            Some("snd_hda_intel"),
+        );
+        // AMD VGA — the only one that should be reported.
+        create_fake_pci_dev(
+            tmp.path(),
+            "0000:03:00.0",
+            "0x1002",
+            "0x7550",
+            "0x030000",
+            Some("amdgpu"),
+        );
+        let devs = detect_amd_pci_devices_at(tmp.path());
+        assert_eq!(devs.len(), 1);
+        assert_eq!(devs[0].pci_bdf, "0000:03:00.0");
+    }
+
+    #[test]
+    fn pci_scan_missing_root_is_empty() {
+        assert!(detect_amd_pci_devices_at(Path::new("/nonexistent/pci/devices")).is_empty());
+    }
+
+    #[test]
+    fn amdgpu_module_loaded_detects_presence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let module = tmp.path().join("amdgpu");
+        assert!(!amdgpu_module_loaded_at(&module));
+        fs::create_dir_all(&module).unwrap();
+        assert!(amdgpu_module_loaded_at(&module));
     }
 }

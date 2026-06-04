@@ -3,6 +3,10 @@
 **/*.rs.bk
 Cargo.lock
 
+# cargo-mutants output (regenerable mutation-testing artifacts, never committed)
+mutants.out/
+mutants.out.old/
+
 # IDE
 .idea/
 .vscode/

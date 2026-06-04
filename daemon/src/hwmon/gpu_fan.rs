@@ -173,6 +173,52 @@ pub fn read_fan_curve(fan_curve_path: &Path) -> Result<FanCurve, HwmonError> {
     parse_fan_curve(&content)
 }
 
+/// Best-effort parse of the PMFW `fan_minimum_pwm` sysfs attribute into a
+/// percentage (0..=100).
+///
+/// The exact format is not documented upstream ("Reading back the file shows
+/// you the current setting and the permitted ranges if changable"), but it
+/// follows the same `fan_ctrl` convention as `fan_curve`: a current-value
+/// section followed by an `OD_RANGE:` block, with fan speeds written as
+/// `NN%`. We read the **current setting** only (everything before `OD_RANGE`)
+/// and return the first plausible 0..=100 value, ignoring header labels.
+///
+/// Returns `None` when nothing parseable is found — diagnostics treat the
+/// attribute as optional, so a fail-soft `None` is preferable to a guess.
+pub fn parse_fan_minimum_pwm(content: &str) -> Option<u8> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Stop at the range section — we want the active setting, not the
+        // permitted `OD_RANGE` bounds.
+        if trimmed.to_ascii_uppercase().starts_with("OD_RANGE") {
+            break;
+        }
+        // Tokens may include a "FAN_MINIMUM_PWM:" label prefix; skip any token
+        // that isn't a bare/`%`-suffixed integer in range.
+        for tok in trimmed.split_whitespace() {
+            let stripped = tok.trim_end_matches('%').trim_end_matches(':');
+            if let Ok(v) = stripped.parse::<u32>() {
+                if v <= 100 {
+                    return Some(v as u8);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Read and parse the current PMFW `fan_minimum_pwm` setting (percent).
+///
+/// Diagnostics-only; never written by the daemon. Returns `None` on any read
+/// or parse failure (the attribute is absent on many GPUs).
+pub fn read_fan_minimum_pwm(path: &Path) -> Option<u8> {
+    let content = std::fs::read_to_string(path).ok()?;
+    parse_fan_minimum_pwm(&content)
+}
+
 /// Write a fan curve to the PMFW sysfs file and commit it.
 ///
 /// Each point is written as `"INDEX TEMP SPEED\n"`, followed by `"c\n"` to commit.
@@ -512,6 +558,52 @@ FAN_CURVE(fan speed): 15% 100%
         assert_eq!(curve.points.len(), 2);
         assert_eq!(curve.points[0].index, 0);
         assert_eq!(curve.points[1].index, 2);
+    }
+
+    // ── DEC-119: fan_minimum_pwm parsing ────────────────────────────
+
+    #[test]
+    fn parse_fmp_value_on_own_line() {
+        let content = "FAN_MINIMUM_PWM:\n20%\nOD_RANGE:\nFAN_MINIMUM_PWM: 0% 100%\n";
+        assert_eq!(parse_fan_minimum_pwm(content), Some(20));
+    }
+
+    #[test]
+    fn parse_fmp_inline_label() {
+        assert_eq!(parse_fan_minimum_pwm("FAN_MINIMUM_PWM: 35%\n"), Some(35));
+    }
+
+    #[test]
+    fn parse_fmp_bare_integer() {
+        assert_eq!(parse_fan_minimum_pwm("15\n"), Some(15));
+    }
+
+    #[test]
+    fn parse_fmp_stops_before_range_bounds() {
+        // The current setting (20%) must win over the OD_RANGE lower bound (0).
+        let content = "FAN_MINIMUM_PWM:\n20%\nOD_RANGE:\nFAN_MINIMUM_PWM: 0 100\n";
+        assert_eq!(parse_fan_minimum_pwm(content), Some(20));
+    }
+
+    #[test]
+    fn parse_fmp_out_of_range_token_skipped() {
+        // A bare value above 100 (e.g. a raw 0-255 PWM with no '%') is NOT
+        // mistaken for a percentage — fail-soft to None rather than mislabel.
+        assert_eq!(parse_fan_minimum_pwm("FAN_MINIMUM_PWM: 255\n"), None);
+    }
+
+    #[test]
+    fn parse_fmp_garbage_is_none() {
+        assert_eq!(parse_fan_minimum_pwm("no numbers here\n"), None);
+        assert_eq!(parse_fan_minimum_pwm(""), None);
+    }
+
+    #[test]
+    fn read_fan_minimum_pwm_missing_file_is_none() {
+        assert_eq!(
+            read_fan_minimum_pwm(Path::new("/nonexistent/fan_minimum_pwm")),
+            None
+        );
     }
 
     #[test]
