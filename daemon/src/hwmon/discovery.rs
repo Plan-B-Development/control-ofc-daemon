@@ -24,12 +24,7 @@ const THRESHOLD_MAX_C: f64 = 200.0;
 /// value is outside the plausibility window. Also drops `tempN_max == 0.0`
 /// for it87-family chips — see `read_temp_attr_c` below for the empirical
 /// rationale.
-fn read_temp_attr_c(
-    hwmon_dir: &Path,
-    index: &str,
-    attr: &str,
-    chip_name: &str,
-) -> Option<f64> {
+fn read_temp_attr_c(hwmon_dir: &Path, index: &str, attr: &str, chip_name: &str) -> Option<f64> {
     let path = hwmon_dir.join(format!("temp{index}_{attr}"));
     if !path.exists() {
         return None;
@@ -662,7 +657,10 @@ mod tests {
 
         let sensors = discover_sensors(tmp.path()).unwrap();
         assert_eq!(sensors.len(), 1);
-        let t = sensors[0].thresholds.as_ref().expect("thresholds populated");
+        let t = sensors[0]
+            .thresholds
+            .as_ref()
+            .expect("thresholds populated");
         assert_eq!(t.max_c, Some(95.0));
         assert_eq!(t.crit_c, Some(105.0));
         assert_eq!(t.crit_hyst_c, Some(100.0));
@@ -729,8 +727,14 @@ mod tests {
         fs::write(hwmon_dir.join("temp1_crit"), "100000\n").unwrap();
 
         let sensors = discover_sensors(tmp.path()).unwrap();
-        let t = sensors[0].thresholds.as_ref().expect("crit keeps non-empty");
-        assert!(t.max_c.is_none(), "it87 max=0 must be dropped as placeholder");
+        let t = sensors[0]
+            .thresholds
+            .as_ref()
+            .expect("crit keeps non-empty");
+        assert!(
+            t.max_c.is_none(),
+            "it87 max=0 must be dropped as placeholder"
+        );
         assert_eq!(t.crit_c, Some(100.0));
     }
 
