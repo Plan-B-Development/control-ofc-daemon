@@ -367,7 +367,11 @@ pub async fn hwmon_rescan_handler(
     }
 }
 
-const VERIFY_WAIT_SECONDS: u8 = 6;
+/// Settle window for `hwmon_verify_handler`, aliased from the single source
+/// of truth in `constants.rs` so the hwmon and GPU verify paths cannot drift
+/// apart (DEC-101). See `constants::VERIFY_WAIT_SECONDS` for the rationale and
+/// the cross-repo GUI coupling (`VERIFY_PAUSE_SAFETY_MS`).
+const VERIFY_WAIT_SECONDS: u8 = crate::constants::VERIFY_WAIT_SECONDS;
 
 /// POST /hwmon/{header_id}/verify — behavioural test of PWM write effectiveness.
 ///

@@ -72,16 +72,19 @@ pub const GPU_PMFW_NUM_CURVE_POINTS: u8 = 5;
 /// the same fan at the same speed.
 pub const GPU_FAIL_COOLDOWN: Duration = Duration::from_secs(60);
 
-/// How long `POST /gpu/{gpu_id}/fan/verify` drives a test speed before
-/// reading back the applied curve + RPM. Matches the hwmon verify wait
-/// (`VERIFY_WAIT_SECONDS` in `api/handlers/hwmon_ctl.rs`): GPU fans spin up
-/// quickly, but the tachometer (`fan1_input`) needs several seconds to settle
-/// and the firmware needs time to commit the curve, so a shorter wait produced
-/// false `no_rpm_effect` verdicts (DEC-101 rationale, applied to GPUs in
-/// DEC-120). The GUI must keep its per-call HTTP timeout
-/// (`client.py::verify_gpu_fan`) and its `VERIFY_PAUSE_SAFETY_MS` strictly
-/// above this value (≥12 s and ≥9 s respectively).
-pub const GPU_VERIFY_WAIT_SECONDS: u8 = 6;
+/// Settle window (seconds) shared by **both** verify endpoints —
+/// `POST /hwmon/{header_id}/verify` and `POST /gpu/{gpu_id}/fan/verify` —
+/// between driving a test value and reading the hardware back. This is the
+/// single source of truth for that wait; `api/handlers/hwmon_ctl.rs` aliases
+/// it locally so the two paths can never drift (DEC-101). Slow-spinning
+/// fans/pumps and GPU tachometers (`fan1_input`) need several seconds to
+/// settle, and PMFW needs time to commit the curve, so a shorter wait produced
+/// false `no_rpm_effect` / `no_rpm_change` verdicts (DEC-101, extended to GPUs
+/// in DEC-120). The GUI must keep its per-call HTTP timeouts
+/// (`client.py::verify_hwmon_pwm` / `verify_gpu_fan`) and its
+/// `VERIFY_PAUSE_SAFETY_MS` strictly above this value (≥12 s and ≥9 s
+/// respectively).
+pub const VERIFY_WAIT_SECONDS: u8 = 6;
 
 // ── Profile engine ───────────────────────────────────────────────────
 
@@ -120,6 +123,7 @@ const _: () = assert!(CALIBRATION_MAX_TEMP_C < 105.0);
 const _: () = assert!(NO_SENSOR_SAFE_PCT > 0);
 const _: () = assert!(SSE_MAX_CLIENTS > 0);
 const _: () = assert!(GPU_COALESCE_DELTA_PCT > 0);
-// Slow-spinning GPU tachometers need a multi-second settle window; a too-short
-// wait re-introduces the false `no_rpm_effect` verdicts DEC-101/DEC-120 fixed.
-const _: () = assert!(GPU_VERIFY_WAIT_SECONDS >= 4);
+// Slow-spinning fans/pumps and GPU tachometers need a multi-second settle
+// window; a too-short wait re-introduces the false `no_rpm_effect` verdicts
+// DEC-101/DEC-120 fixed.
+const _: () = assert!(VERIFY_WAIT_SECONDS >= 4);

@@ -265,7 +265,7 @@ pub async fn gpu_reset_fan_handler(
 /// POST /gpu/{gpu_id}/fan/verify — behavioural test of GPU fan-control
 /// effectiveness (the GPU analogue of `hwmon_verify_handler`). Drives a test
 /// speed (biased *upward* so cooling is never reduced), waits
-/// `GPU_VERIFY_WAIT_SECONDS`, reads back the applied curve + `fan1_input` RPM,
+/// `VERIFY_WAIT_SECONDS`, reads back the applied curve + `fan1_input` RPM,
 /// restores the prior state, and classifies the outcome. No lease — GPU writes
 /// never require one (DEC-045). See DEC-120.
 pub async fn gpu_verify_handler(
@@ -370,7 +370,7 @@ pub async fn gpu_verify_handler(
         }
 
         tokio::time::sleep(std::time::Duration::from_secs(
-            constants::GPU_VERIFY_WAIT_SECONDS as u64,
+            constants::VERIFY_WAIT_SECONDS as u64,
         ))
         .await;
 
@@ -398,7 +398,7 @@ pub async fn gpu_verify_handler(
                 initial_state,
                 final_state,
                 test_speed_pct: test_speed,
-                wait_seconds: constants::GPU_VERIFY_WAIT_SECONDS,
+                wait_seconds: constants::VERIFY_WAIT_SECONDS,
                 fan_control_method: method.into(),
                 details,
                 restore_failed,
@@ -456,7 +456,7 @@ pub async fn gpu_verify_handler(
         }
 
         tokio::time::sleep(std::time::Duration::from_secs(
-            constants::GPU_VERIFY_WAIT_SECONDS as u64,
+            constants::VERIFY_WAIT_SECONDS as u64,
         ))
         .await;
 
@@ -479,7 +479,7 @@ pub async fn gpu_verify_handler(
                 initial_state,
                 final_state,
                 test_speed_pct: test_speed,
-                wait_seconds: constants::GPU_VERIFY_WAIT_SECONDS,
+                wait_seconds: constants::VERIFY_WAIT_SECONDS,
                 fan_control_method: method.into(),
                 details,
                 restore_failed,

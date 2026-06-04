@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.12.1] — 2026-06-05
+
+### Internal
+- Deduplicated the verify-wait constant. The hwmon and GPU verify endpoints now
+  share a single `constants::VERIFY_WAIT_SECONDS` (6 s) — `api/handlers/hwmon_ctl.rs`
+  aliases it instead of defining a parallel `6` literal, and `gpu.rs` references
+  the same constant — so the two settle windows can no longer silently drift
+  apart (which would have violated the GUI's `VERIFY_PAUSE_SAFETY_MS` ≥9 s
+  headroom). Behaviour is unchanged (still 6 s); the compile-time
+  `assert!(VERIFY_WAIT_SECONDS >= 4)` floor is retained. (DEC-101)
+
 ## [1.12.0] — 2026-06-04
 
 Intel discrete GPU (Arc) monitoring (**DEC-121**, daemon-relevant subset). Pairs
