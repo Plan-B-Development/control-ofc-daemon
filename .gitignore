@@ -31,4 +31,6 @@ packaging/src/
 packaging/pkg/
 packaging/*.pkg.tar*
 packaging/*.tar.gz
-# packaging/.SRCINFO is now tracked and kept in sync via .githooks/pre-commit.
+# .SRCINFO is regenerated in-CI for the AUR clone (.github/workflows/release.yml);
+# never tracked here.
+packaging/.SRCINFO
