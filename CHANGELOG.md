@@ -1,5 +1,59 @@
 # Changelog
 
+## [1.13.0] — 2026-06-06
+
+2026-06-05 audit remediation. Pairs with **GUI v1.30.0**. Additive wire-contract
+change (`thermal_state` in `GET /status`) — older GUIs ignore the new field.
+
+### Added
+- **`thermal_state` in `GET /status`** (`"normal" | "recovery" | "emergency" |
+  "no_sensor_fallback"`) — surfaces the profile engine's thermal override state
+  (previously visible only via `/diagnostics/hardware`) so the GUI can stand
+  its control loop down while the daemon forces safety PWM. `API_VERSION`
+  unchanged. (DEC-132)
+- **Sensor descriptor cache.** The hwmon polling loop discovers sensors once
+  and re-reads only `temp*_input` per tick (~25 sysfs ops/s instead of ~340 on
+  a typical board). Re-discovery runs on `POST /hwmon/rescan`, on a 5-tick
+  read-failure streak (device unbound), and on every tick while no CpuTemp
+  sensor is cached (late `k10temp`/`coretemp` modprobe keeps the 40% fallback
+  releasable). Kindest to `asus_wmi_sensors` boards, whose kernel doc warns
+  against frequent WMI polling. `/hwmon/rescan` now also refreshes the cached
+  sensor descriptors (labels, types, DEC-117 threshold snapshot). (DEC-133)
+
+### Fixed
+- **GPU GUI-priority arbitration.** The 5%-coalesced early return in
+  `POST /gpu/{id}/fan/pwm` now records GUI liveness, and the profile engine's
+  GPU write suppression uses the shared 5% threshold (`GPU_COALESCE_DELTA_PCT`)
+  instead of exact-match. Previously a slow temperature ramp (1–4% deltas) let
+  `gui_active()` lapse mid-session and the engine then committed a full PMFW
+  curve (an SMU transaction) on every 1% change while the GUI believed it was
+  in control. (DEC-131)
+- **Calibration restores on every exit path.** The calibrate handler now
+  delegates to the single tested sweep implementation, which restores the
+  pre-calibration PWM on success, thermal abort, **and** failed PWM writes
+  mid-sweep — previously a write failure returned early and could park a fan
+  at a sweep step (including 0%). (DEC-134)
+- **Forced overrides reset engine tuning state.** Post-emergency evaluation
+  starts from a fresh anchor instead of step-rate-clamping against the
+  pre-emergency `last_output` the hardware no longer holds.
+
+### Changed
+- **Docs/comments/logs no longer claim GPU fans are forced during thermal
+  emergencies.** The 105°C emergency and 40% no-sensor fallback force all
+  OpenFan channels and writable hwmon headers only; GPU fans are deliberately
+  excluded — AMD PMFW firmware owns GPU thermal protection (junction-temp
+  throttling, firmware fan ramp) independently of OS fan control. There is no
+  GPU emergency threshold. (DEC-130)
+
+### Internal
+- **Profile engine decomposed** (DEC-135): pure `evaluate_safety_tick` (unit
+  tests cover the full 105/80/60/no-sensor ladder) + a `WriteBackend` trait
+  with `OpenFanBackend`/`GpuBackend`/`HwmonBackend` owning all per-backend
+  gating. `SafetyWriteBackend` is implemented only by OpenFan/hwmon, making
+  the DEC-130 GPU exclusion structural. Behaviour-preserving — all
+  pre-existing loop tests pass unchanged; 28 tests added across the audit
+  fixes (daemon total 593).
+
 ## [1.12.2] — 2026-06-05
 
 ### Fixed
