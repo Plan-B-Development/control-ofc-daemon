@@ -641,6 +641,7 @@ async fn main() {
         config_path: config_path.clone(),
         runtime_config_path: runtime_config_path.clone(),
         sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
 
     // Silence "assigned but not read" — runtime_cfg is consumed by the
@@ -684,6 +685,7 @@ async fn main() {
     let hwmon_interval = Duration::from_millis(config.polling.poll_interval_ms);
     let hwmon_shutdown = poll_shutdown_rx.clone();
     let gpu_infos_for_poll = app_state.amd_gpus.clone();
+    let sensor_rescan_for_poll = app_state.sensor_rescan_requested.clone();
     tokio::spawn(async move {
         control_ofc_daemon::polling::hwmon_poll_loop(
             hwmon_cache,
@@ -693,6 +695,7 @@ async fn main() {
             intel_gpus_for_poll,
             hwmon_root,
             hwmon_interval,
+            sensor_rescan_for_poll,
             hwmon_shutdown,
         )
         .await;

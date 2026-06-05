@@ -322,13 +322,23 @@ fn hwmon_control_error_response(err: HwmonControlError) -> (StatusCode, Json<ser
 
 /// POST /hwmon/rescan — re-enumerate hwmon devices and return fresh header list.
 ///
-/// Does not replace the running controller — returns discovery results for the
-/// GUI to refresh its view. A daemon restart is needed to pick up truly new hardware.
+/// Also flags the sensor polling loop to rebuild its cached descriptor set
+/// (labels, types, DEC-117 threshold snapshot) on its next tick (DEC-133) —
+/// this is how newly loaded sensor chips appear without a daemon restart.
+/// Does not replace the running PWM controller — header discovery results
+/// are returned for the GUI to refresh its view; a daemon restart is needed
+/// to pick up truly new PWM-control hardware.
 pub async fn hwmon_rescan_handler(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     use crate::hwmon::pwm_discovery::discover_pwm_headers;
     use crate::hwmon::HWMON_SYSFS_ROOT;
+
+    // DEC-133: the polling loop owns the descriptor cache; it swap-checks
+    // this flag each tick and re-runs sensor discovery when set.
+    state
+        .sensor_rescan_requested
+        .store(true, std::sync::atomic::Ordering::SeqCst);
 
     let hwmon_root = std::path::Path::new(HWMON_SYSFS_ROOT);
     match discover_pwm_headers(hwmon_root) {

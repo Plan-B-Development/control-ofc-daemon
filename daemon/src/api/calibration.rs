@@ -1,8 +1,9 @@
 //! Fan RPM-to-PWM calibration sweep.
 //!
 //! Sweeps a fan from low to high PWM, recording RPM at each step.
-//! Safety: aborts if any sensor exceeds the thermal limit, and
-//! restores the pre-calibration PWM when done (or on abort).
+//! Safety: aborts if any sensor exceeds the thermal limit, and restores
+//! the pre-calibration PWM on every exit path — completion, thermal
+//! abort, or a failed PWM write mid-sweep (DEC-134).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -79,12 +80,16 @@ pub fn check_thermal_safety(cache: &StateCache) -> Result<(), CalibrationError> 
 
 /// Run an OpenFan calibration sweep on a single channel.
 ///
-/// This is a long-running async function (steps × hold_seconds). It:
+/// The single sweep implementation — the `/fans/openfan/{ch}/calibrate`
+/// handler delegates here (DEC-134; it previously kept a diverged inline
+/// copy). This is a long-running async function (steps × hold_seconds). It:
 /// 1. Reads the current PWM (for restore)
 /// 2. Sweeps from 0% to 100% in `steps` increments
 /// 3. Holds each step for `hold_seconds`, then reads RPM from cache
-/// 4. Derives start_pwm (lowest PWM with RPM > 0) and stop_pwm
-/// 5. Restores the pre-calibration PWM
+/// 4. Restores the pre-calibration PWM on EVERY exit path — success,
+///    thermal abort, or a failed PWM write mid-sweep (DEC-134; previously
+///    an early `?` could park the fan at a sweep step)
+/// 5. Derives start_pwm (lowest PWM with RPM > 0) and stop_pwm
 ///
 /// # Safety
 /// - Checks thermal limit before each step
@@ -94,7 +99,7 @@ pub async fn calibrate_openfan_channel(
     channel: u8,
     steps: u8,
     hold_seconds: u64,
-    write_fn: impl Fn(u8, u8) -> Result<(), String>,
+    write_fn: impl Fn(u8, u8) -> Result<(), CalibrationError>,
 ) -> Result<CalibrationResult, CalibrationError> {
     let clamped_steps = steps.clamp(2, 20);
     if clamped_steps != steps {
@@ -119,39 +124,46 @@ pub async fn calibrate_openfan_channel(
         .and_then(|f| f.last_commanded_pwm);
 
     let fan_id = format!("openfan:ch{channel:02}");
-    let mut points = Vec::with_capacity(steps as usize + 1);
-
     let step_size = 100.0 / steps as f64;
 
-    // Sweep from 0% to 100%
-    for i in 0..=steps {
-        let pwm = (i as f64 * step_size).round().min(100.0) as u8;
+    // Sweep from 0% to 100%. Runs as an inner block so every exit —
+    // success, thermal abort, write failure — flows through the restore
+    // below instead of leaving the fan parked at a sweep step (DEC-134).
+    let sweep = async {
+        let mut points = Vec::with_capacity(steps as usize + 1);
+        for i in 0..=steps {
+            let pwm = (i as f64 * step_size).round().min(100.0) as u8;
 
-        // Thermal check before each step
-        check_thermal_safety(&cache)?;
+            // Thermal check before each step
+            check_thermal_safety(&cache)?;
 
-        // Set PWM
-        write_fn(channel, pwm).map_err(CalibrationError::Hardware)?;
+            // Set PWM
+            write_fn(channel, pwm)?;
 
-        // Wait for fan to settle
-        tokio::time::sleep(hold).await;
+            // Wait for fan to settle
+            tokio::time::sleep(hold).await;
 
-        // Read RPM from cache
-        let snap = cache.snapshot();
-        let rpm = snap.openfan_fans.get(&channel).map(|f| f.rpm).unwrap_or(0);
+            // Read RPM from cache
+            let snap = cache.snapshot();
+            let rpm = snap.openfan_fans.get(&channel).map(|f| f.rpm).unwrap_or(0);
 
-        points.push(CalPoint {
-            pwm_percent: pwm,
-            rpm,
-        });
-    }
+            points.push(CalPoint {
+                pwm_percent: pwm,
+                rpm,
+            });
+        }
+        Ok::<Vec<CalPoint>, CalibrationError>(points)
+    };
+    let sweep_result = sweep.await;
 
-    // Restore pre-calibration PWM
+    // Restore pre-calibration PWM — best-effort, on every exit path.
     if let Some(restore) = pre_cal_pwm {
         if let Err(e) = write_fn(channel, restore) {
             log::warn!("failed to restore pre-calibration PWM on ch{channel}: {e}");
         }
     }
+
+    let points = sweep_result?;
 
     // Derive start_pwm and stop_pwm
     let start_pwm = points.iter().find(|p| p.rpm > 0).map(|p| p.pwm_percent);
@@ -226,14 +238,36 @@ mod tests {
         assert!(matches!(err, CalibrationError::ThermalAbort { .. }));
     }
 
-    #[tokio::test]
+    /// Log of (channel, pwm) writes issued through the recording closure.
+    type WriteLog = Arc<std::sync::Mutex<Vec<(u8, u8)>>>;
+
+    /// Recording write closure: collects every (channel, pwm) write, with an
+    /// optional PWM value that fails the write when commanded.
+    fn recording_write_fn(
+        fail_at_pwm: Option<u8>,
+    ) -> (impl Fn(u8, u8) -> Result<(), CalibrationError>, WriteLog) {
+        let writes: WriteLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writes2 = writes.clone();
+        let f = move |ch: u8, pwm: u8| -> Result<(), CalibrationError> {
+            if fail_at_pwm == Some(pwm) {
+                return Err(CalibrationError::Hardware(format!(
+                    "mock write failure at {pwm}%"
+                )));
+            }
+            writes2.lock().unwrap().push((ch, pwm));
+            Ok(())
+        };
+        (f, writes)
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn calibration_sweep_basic() {
         let cache = make_cache(50.0, 0, 800);
         let result = calibrate_openfan_channel(
             cache,
             0,
             3, // 3 steps: 0%, 33%, 67%, 100%
-            0, // 0s hold (test speed)
+            0, // 0s hold (clamped to 2s; paused-time test — sleeps are instant)
             |_ch, _pwm| Ok(()),
         )
         .await
@@ -244,7 +278,7 @@ mod tests {
         assert_eq!(result.max_rpm, 800);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn calibration_aborts_on_thermal() {
         let cache = make_cache(90.0, 0, 800); // over limit
         let result = calibrate_openfan_channel(cache, 0, 3, 0, |_ch, _pwm| Ok(())).await;
@@ -254,5 +288,101 @@ mod tests {
             result.unwrap_err(),
             CalibrationError::ThermalAbort { .. }
         ));
+    }
+
+    /// DEC-134: a successful sweep ends with the pre-calibration PWM restored
+    /// (the cache's `last_commanded_pwm` is 50 in `make_cache`).
+    #[tokio::test(start_paused = true)]
+    async fn calibration_restores_pre_cal_pwm_on_success() {
+        let cache = make_cache(50.0, 0, 800);
+        let (write_fn, writes) = recording_write_fn(None);
+
+        calibrate_openfan_channel(cache, 0, 3, 0, write_fn)
+            .await
+            .unwrap();
+
+        let w = writes.lock().unwrap();
+        assert_eq!(
+            w.last(),
+            Some(&(0u8, 50u8)),
+            "last write must restore the pre-calibration PWM; writes: {w:?}"
+        );
+    }
+
+    /// DEC-134: a thermal abort must still restore the pre-calibration PWM.
+    #[tokio::test(start_paused = true)]
+    async fn calibration_restores_pre_cal_pwm_on_thermal_abort() {
+        let cache = make_cache(90.0, 0, 800); // over limit — aborts before any sweep write
+        let (write_fn, writes) = recording_write_fn(None);
+
+        let result = calibrate_openfan_channel(cache, 0, 3, 0, write_fn).await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            CalibrationError::ThermalAbort { .. }
+        ));
+        let w = writes.lock().unwrap();
+        assert_eq!(
+            w.as_slice(),
+            &[(0u8, 50u8)],
+            "abort must restore (and nothing else was written)"
+        );
+    }
+
+    /// DEC-134 regression: a failed PWM write mid-sweep previously returned
+    /// early WITHOUT restoring — parking the fan at the last sweep step.
+    /// The restore must run even when the sweep errors out.
+    #[tokio::test(start_paused = true)]
+    async fn calibration_restores_pre_cal_pwm_on_write_failure() {
+        let cache = make_cache(50.0, 0, 800);
+        // 3 steps → 0%, 33%, 67%, 100%; fail the 67% write.
+        let (write_fn, writes) = recording_write_fn(Some(67));
+
+        let result = calibrate_openfan_channel(cache, 0, 3, 0, write_fn).await;
+
+        assert!(matches!(result.unwrap_err(), CalibrationError::Hardware(_)));
+        let w = writes.lock().unwrap();
+        assert_eq!(
+            w.last(),
+            Some(&(0u8, 50u8)),
+            "write failure mid-sweep must still restore; writes: {w:?}"
+        );
+    }
+
+    /// No pre-calibration PWM in the cache → nothing to restore (the sweep's
+    /// own writes are the only ones issued).
+    #[tokio::test(start_paused = true)]
+    async fn calibration_skips_restore_without_pre_cal_pwm() {
+        let cache = Arc::new(StateCache::new());
+        cache.update_sensors(vec![CachedSensorReading {
+            id: "cpu".into(),
+            kind: SensorKind::CpuTemp,
+            label: "Tctl".into(),
+            value_c: 50.0,
+            source: DeviceLabel::Hwmon,
+            updated_at: Instant::now(),
+            rate_c_per_s: None,
+            session_min_c: None,
+            session_max_c: None,
+            chip_name: "k10temp".into(),
+            temp_type: None,
+            thresholds: None,
+        }]);
+        cache.update_openfan_fans(vec![OpenFanState {
+            channel: 0,
+            rpm: 800,
+            last_commanded_pwm: None, // never commanded
+            updated_at: Instant::now(),
+            rpm_polled: true,
+        }]);
+        let (write_fn, writes) = recording_write_fn(None);
+
+        calibrate_openfan_channel(cache, 0, 3, 0, write_fn)
+            .await
+            .unwrap();
+
+        let w = writes.lock().unwrap();
+        assert_eq!(w.len(), 4, "sweep writes only — no restore; writes: {w:?}");
+        assert_eq!(w.last(), Some(&(0u8, 100u8)));
     }
 }

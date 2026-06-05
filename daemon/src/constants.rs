@@ -102,12 +102,21 @@ pub const HYSTERESIS_DEADBAND_C: f64 = 2.0;
 // ── Profile engine — no-sensor safety ────────────────────────────────
 
 /// If no CPU temperature sensor is found for this many consecutive
-/// cycles, force all fans to `NO_SENSOR_SAFE_PCT`.
+/// cycles, force all OpenFan+hwmon fans to `NO_SENSOR_SAFE_PCT`
+/// (GPU fans excluded — DEC-130).
 pub const NO_SENSOR_CYCLE_THRESHOLD: u32 = 5;
 
-/// PWM percent forced on all fans when no CPU temperature sensor is
-/// found for `NO_SENSOR_CYCLE_THRESHOLD` consecutive cycles.
+/// PWM percent forced on all OpenFan+hwmon fans when no CPU temperature
+/// sensor is found for `NO_SENSOR_CYCLE_THRESHOLD` consecutive cycles.
 pub const NO_SENSOR_SAFE_PCT: u8 = 40;
+
+// ── Sensor polling — descriptor cache (DEC-133) ──────────────────────
+
+/// Consecutive failed value-reads for a single cached sensor descriptor
+/// before the polling loop re-runs discovery. Catches devices unbound
+/// mid-session (driver unload, USB detach) without re-enumerating sysfs
+/// every tick.
+pub const SENSOR_READ_FAIL_REDISCOVER_STREAK: u32 = 5;
 
 // ── Calibration ──────────────────────────────────────────────────────
 

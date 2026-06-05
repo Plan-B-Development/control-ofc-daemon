@@ -67,7 +67,9 @@ daemon/src/
 
   pwm.rs               — shared percent_to_raw / raw_to_percent conversion
   profile.rs           — profile JSON loading + curve evaluation
-  profile_engine.rs    — headless 1Hz curve evaluation loop
+  profile_engine/      — headless 1Hz curve evaluation loop (DEC-135)
+    mod.rs             — safety tick + profile evaluation + loop
+    backends.rs        — WriteBackend per fan backend (gating/coalescing)
   daemon_state.rs      — persistent state (active profile pointer)
   safety.rs            — ThermalSafetyRule (CPU emergency override)
   polling.rs           — hwmon + OpenFan polling loops
@@ -93,10 +95,18 @@ profile_engine ──read──> StateCache
 ## Safety Model
 
 1. **ThermalSafetyRule** (`safety.rs`): Emergency CPU override
-   - Triggers at hottest CpuTemp >= 105C, forces ALL fans to 100%
+   - Triggers at hottest CpuTemp >= 105C, forces all OpenFan channels and
+     writable hwmon headers to 100%
+   - GPU fans are deliberately excluded (DEC-130) — there is no GPU emergency
+     threshold; AMD PMFW firmware owns GPU thermal protection (junction-temp
+     throttling, firmware fan ramp) independently of OS fan control
    - Holds until CpuTemp <= 80C (25C hysteresis)
    - One-cycle 60% recovery floor after release
-   - If no CpuTemp sensor found for 5 consecutive cycles, forces fans to 40%
+   - If no CpuTemp sensor found for 5 consecutive cycles, forces all
+     OpenFan+hwmon fans to 40%
+   - Override state is surfaced as `thermal_state` in `GET /status`
+     (`normal` | `recovery` | `emergency` | `no_sensor_fallback`, DEC-132)
+     so the GUI stands its control loop down while the override runs
 
 2. **Lease system** (`lease.rs`): Exclusive hwmon write access
    - 60s TTL, holder must renew periodically

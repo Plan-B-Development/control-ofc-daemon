@@ -23,6 +23,12 @@ pub struct StatusResponse {
     /// Seconds since last GUI write command (None if no writes received).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gui_last_seen_seconds_ago: Option<u64>,
+    /// Thermal safety override state: `"normal"` | `"recovery"` | `"emergency"`.
+    /// Mirrors the value the profile engine reports each tick (the same string
+    /// `/diagnostics/hardware` exposes) so the GUI can stand its control loop
+    /// down while the daemon is forcing safety PWM (DEC-132). Additive field —
+    /// API_VERSION unchanged.
+    pub thermal_state: String,
 }
 
 /// Per-subsystem health status.
@@ -986,6 +992,7 @@ mod tests {
             },
             uptime_seconds: Some(3600),
             gui_last_seen_seconds_ago: None,
+            thermal_state: "normal".into(),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["api_version"], 1);
@@ -994,6 +1001,8 @@ mod tests {
         assert_eq!(json["subsystems"][0]["age_ms"], 500);
         // last_error_summary absent when None
         assert!(json["counters"].get("last_error_summary").is_none());
+        // DEC-132: thermal_state is always serialized (additive field).
+        assert_eq!(json["thermal_state"], "normal");
     }
 
     #[test]

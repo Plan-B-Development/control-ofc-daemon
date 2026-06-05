@@ -60,6 +60,15 @@ pub async fn gpu_set_fan_handler(
         if let Some(last_pct) = cached_fan.last_commanded_pct {
             let delta = (body.speed_pct as i16 - last_pct as i16).unsigned_abs();
             if delta < constants::GPU_COALESCE_DELTA_PCT {
+                // DEC-131: a coalesced write is still GUI liveness. The
+                // OpenFan/hwmon handlers record on every OK because their
+                // coalescing lives below the handler (serial controller /
+                // pwm_control); skipping the record here let `gui_active()`
+                // lapse during a slow temperature ramp (1-4% deltas), handing
+                // GPU control to the profile engine while the GUI believed it
+                // was in control — exactly the dual-writer churn DEC-070/071
+                // exist to prevent.
+                state.cache.record_gui_write();
                 return json_ok(
                     StatusCode::OK,
                     GpuSetFanResponse {

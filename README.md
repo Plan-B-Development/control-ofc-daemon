@@ -93,8 +93,10 @@ Full build / install / CLI / environment reference lives in
   PWM), and AMD GPU (RDNA3+ PMFW fan curves, legacy hwmon PWM for pre-RDNA3).
 - **HTTP over Unix domain socket** at `/run/control-ofc/control-ofc.sock`, exposing
   both snapshot reads (`/poll`) and a real-time SSE stream (`/events`).
-- **Thermal safety** is daemon-enforced: 105°C CPU trigger → 100% fans, 25°C
-  hysteresis, 40% fallback when no CPU sensor reports for 5 cycles.
+- **Thermal safety** is daemon-enforced: 105°C CPU trigger → all OpenFan and
+  motherboard (hwmon) fans to 100%, 25°C hysteresis, 40% fallback when no CPU
+  sensor reports for 5 cycles. GPU fans are excluded — AMD PMFW firmware owns
+  GPU thermal protection independently of OS fan control (DEC-130).
 - **Headless profile engine** (`profile_engine.rs`) evaluates fan curves autonomously
   on a 1 Hz loop; defers to the GUI when the GUI has written in the last 30 seconds
   (DEC-071, DEC-074).

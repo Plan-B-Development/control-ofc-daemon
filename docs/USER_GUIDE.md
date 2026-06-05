@@ -390,8 +390,9 @@ After stopping the daemon, hwmon fans are automatically restored to automatic mo
 
 The daemon enforces the following safety rules:
 
-- **Thermal emergency override** — if the hottest CPU temperature sensor reaches 105°C, all fans (OpenFan, hwmon, GPU) are forced to 100%. The override holds until CPU temperature drops to 80°C (25°C hysteresis), then applies a one-cycle 60% recovery floor before returning control to the active profile.
-- **Missing sensor fallback** — if no CPU temperature sensor reports for 5 consecutive polling cycles, all fans are forced to 40% as a defensive measure.
+- **Thermal emergency override** — if the hottest CPU temperature sensor reaches 105°C, all OpenFan channels and writable motherboard (hwmon) fan headers are forced to 100%. The override holds until CPU temperature drops to 80°C (25°C hysteresis), then applies a one-cycle 60% recovery floor before returning control to the active profile. GPU fans are deliberately excluded: there is no GPU emergency threshold — AMD's PMFW firmware protects the GPU itself (junction-temperature throttling and its own fan ramp) independently of any OS fan control.
+- **Missing sensor fallback** — if no CPU temperature sensor reports for 5 consecutive polling cycles, all OpenFan and hwmon fans are forced to 40% as a defensive measure (GPU fans excluded, as above).
+- **Override visibility** — the current override state is reported as `thermal_state` in `GET /status` (`normal`, `recovery`, `emergency`, or `no_sensor_fallback`); the GUI pauses its own fan control while any override is active.
 - **OpenFanController stop timeout** — 0% PWM is allowed for a maximum of 8 seconds per channel, after which further 0% commands are rejected until a non-zero value is sent.
 - **Hwmon PWM headers** — the daemon does not enforce per-header minimum floors. Safety limits are expressed via the `/capabilities` endpoint and enforced by the GUI's profile constraints.
 - **GPU fan curves** are restored to automatic mode on daemon shutdown (via `ExecStopPost` in the systemd service file).

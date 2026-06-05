@@ -78,6 +78,7 @@ fn test_app_state() -> Arc<AppState> {
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
         sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
 }
 
@@ -149,9 +150,38 @@ async fn status_endpoint_returns_health() {
     assert!(json["overall_status"].is_string());
     assert!(json["subsystems"].is_array());
     assert!(json["counters"].is_object());
+    // DEC-132: thermal_state defaults to "normal" before the profile engine's
+    // first tick reports anything.
+    assert_eq!(json["thermal_state"], "normal");
 
     let _ = shutdown.send(());
     // Clean up socket
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn status_endpoint_reflects_thermal_override_state() {
+    // DEC-132: /status must surface the profile engine's thermal override
+    // state so the GUI can stand its control loop down during an emergency
+    // (previously only /diagnostics/hardware exposed it).
+    let state = test_app_state();
+    let cache = state.cache.clone();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    cache.set_thermal_override_state("emergency");
+    let (status, json) = uds_get(&path, "/status").await;
+    assert_eq!(status, 200);
+    assert_eq!(json["thermal_state"], "emergency");
+
+    cache.set_thermal_override_state("recovery");
+    let (_, json) = uds_get(&path, "/status").await;
+    assert_eq!(json["thermal_state"], "recovery");
+
+    cache.set_thermal_override_state("normal");
+    let (_, json) = uds_get(&path, "/status").await;
+    assert_eq!(json["thermal_state"], "normal");
+
+    let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
 }
 
@@ -266,6 +296,7 @@ async fn fans_endpoint_tags_intel_gpu_source_by_id_prefix() {
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
         sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     let (path, shutdown, _dir) = start_test_server(state).await;
 
@@ -441,6 +472,7 @@ fn test_app_state_with_controller(response_count: usize) -> Arc<AppState> {
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
         sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
 }
 
@@ -607,6 +639,7 @@ fn test_app_state_with_hwmon() -> Arc<AppState> {
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
         sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
 }
 
@@ -964,6 +997,7 @@ fn test_app_state_with_unsupported_gpu(pci_bdf: &str) -> Arc<AppState> {
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
         sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
 }
 
@@ -988,6 +1022,37 @@ async fn gpu_set_fan_unsupported_returns_400_feature_unavailable() {
     assert_eq!(json["error"]["code"], "feature_unavailable");
     assert_eq!(json["error"]["retryable"], false);
     assert_eq!(json["error"]["source"], "validation");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn gpu_set_fan_coalesced_write_still_records_gui_activity() {
+    // DEC-131: the 5% coalesced early-return must still call
+    // record_gui_write(). Every other write handler records on every OK
+    // (their coalescing lives below the handler); skipping it here let
+    // gui_active() lapse during slow temperature ramps (1-4% deltas), handing
+    // GPU control to the profile engine while the GUI believed it was in
+    // control. The coalesce check runs before the write-path dispatch, so a
+    // GPU without a write path exercises it fine once the cache is seeded.
+    let bdf = "0000:99:00.5";
+    let state = test_app_state_with_unsupported_gpu(bdf);
+    let cache = state.cache.clone();
+    cache.set_gpu_fan_commanded_pct(&format!("amd_gpu:{bdf}"), 50);
+    assert!(!cache.gui_active(), "test precondition: GUI not yet active");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    // delta = |52 - 50| = 2 < GPU_COALESCE_DELTA_PCT (5) → coalesced 200 OK.
+    let body = serde_json::json!({ "speed_pct": 52 });
+    let (status, json) = uds_post(&path, &format!("/gpu/{bdf}/fan/pwm"), &body).await;
+
+    assert_eq!(status, 200);
+    assert_eq!(json["speed_pct"], 52);
+    assert!(
+        cache.gui_active(),
+        "coalesced GPU write must record GUI liveness (DEC-131)"
+    );
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
@@ -1057,6 +1122,7 @@ fn test_app_state_with_read_only_gpu(pci_bdf: &str, pci_device_id: u16) -> Arc<A
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
         sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
 }
 
@@ -1318,6 +1384,7 @@ fn test_app_state_with_writable_pmfw_gpu(pci_bdf: &str) -> (Arc<AppState>, tempf
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
         sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     (state, tmp)
 }
@@ -1463,6 +1530,7 @@ fn test_app_state_with_read_only_hwmon_header() -> Arc<AppState> {
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
         sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
 }
 
@@ -1593,6 +1661,7 @@ async fn hwmon_discovery_excludes_amdgpu_end_to_end_via_ipc() {
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
         sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     let (path, shutdown, _dir) = start_test_server(state).await;
 
@@ -1674,6 +1743,7 @@ fn test_app_state_with_profile_dirs(dirs: Vec<std::path::PathBuf>) -> Arc<AppSta
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
         sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
 }
 

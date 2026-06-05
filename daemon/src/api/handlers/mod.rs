@@ -157,6 +157,10 @@ pub struct AppState {
     pub runtime_config_path: std::path::PathBuf,
     /// Number of active SSE client connections (for connection limiting).
     pub sse_clients: Arc<AtomicUsize>,
+    /// Set by `POST /hwmon/rescan` to ask the sensor polling loop to refresh
+    /// its cached descriptor set (labels, types, DEC-117 threshold snapshot)
+    /// on its next tick. Swap-checked (and cleared) by the loop (DEC-133).
+    pub sensor_rescan_requested: Arc<AtomicBool>,
 }
 
 pub(crate) fn build_status_response(
@@ -191,6 +195,12 @@ pub(crate) fn build_status_response(
         },
         uptime_seconds: Some(uptime),
         gui_last_seen_seconds_ago: gui_last_seen,
+        // DEC-132: surface the profile engine's thermal override state.
+        // `None` only before the engine's first tick — report "normal".
+        thermal_state: snap
+            .thermal_override_state
+            .clone()
+            .unwrap_or_else(|| "normal".to_string()),
     }
 }
 

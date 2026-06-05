@@ -60,7 +60,9 @@ daemon/                     Rust crate (control-ofc-daemon)
       real_transport.rs     serialport impl + auto-detect
       controller.rs         Fan control logic (PWM, target RPM, coalescing)
     profile.rs              Profile JSON loading + curve evaluation
-    profile_engine.rs       Headless 1Hz curve evaluation loop
+    profile_engine/         Headless 1Hz curve evaluation loop (DEC-135)
+      mod.rs                  Safety tick + profile evaluation + loop body
+      backends.rs             WriteBackend impls (OpenFan/GPU/hwmon gating)
     safety.rs               ThermalSafetyRule (CPU emergency override)
     polling.rs              hwmon + OpenFan polling loops
   tests/
@@ -162,7 +164,7 @@ Every sensor/fan/header includes:
 
 ## Safety invariants
 
-- **Thermal safety** (`safety.rs`): hottest CpuTemp sensor triggers at 105°C → force all fans to 100%. Hold until 80°C (hysteresis), one-cycle 60% recovery floor. Forces 40% if no CpuTemp sensor found for 5 consecutive cycles.
+- **Thermal safety** (`safety.rs`): hottest CpuTemp sensor triggers at 105°C → force all OpenFan channels and writable hwmon headers to 100%. Hold until 80°C (hysteresis), one-cycle 60% recovery floor. Forces 40% if no CpuTemp sensor found for 5 consecutive cycles. GPU fans are excluded by design (DEC-130) — PMFW firmware owns GPU thermal protection; the exclusion is structural (`GpuBackend` does not implement `SafetyWriteBackend`).
 - **OpenFan stop timeout**: 0% PWM allowed for max 8s, then rejected
 - **hwmon PWM**: no daemon-enforced per-header floors (`min_pwm_percent: 0` for all). Safety floors are GUI-side profile constraints via `/capabilities` limits.
 - **PWM enable mode** (`pwmN_enable=1`) set on first write per lease, reset on release

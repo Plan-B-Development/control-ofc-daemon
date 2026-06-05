@@ -63,8 +63,27 @@ fn to_cached(reading: &SensorReading) -> CachedSensorReading {
 
 /// Run the hwmon sensor polling loop.
 ///
-/// Discovers and reads all hwmon temperature sensors every `interval`,
-/// and reads RPM/PWM for all discovered PWM headers, pushing results into the cache.
+/// Reads all hwmon temperature sensors every `interval`, and RPM/PWM for
+/// all discovered PWM headers, pushing results into the cache.
+///
+/// Sensor descriptors are discovered once and cached (DEC-133); per-tick
+/// work touches only `temp*_input` value files. Re-discovery (which
+/// re-reads labels, types, and the DEC-117 threshold/alarm snapshot) runs
+/// only on explicit triggers:
+/// 1. `sensor_rescan` flag — set by `POST /hwmon/rescan`;
+/// 2. a cached descriptor failing value-reads for
+///    `SENSOR_READ_FAIL_REDISCOVER_STREAK` consecutive ticks (device
+///    unbound mid-session);
+/// 3. no `CpuTemp` descriptor in the cache — re-discover every tick so a
+///    late-loading `k10temp`/`coretemp` is picked up immediately and the
+///    no-sensor 40% fallback can release (this also covers the empty set).
+///
+/// Rationale: per-tick full discovery re-read ~12 threshold attributes per
+/// sensor plus chip names/labels every second. Kernel drivers cache chip
+/// registers (it87/nct6775 re-sweep at most every 1.5s) so most of that
+/// was wasted syscalls, but on `asus_wmi_sensors` boards the kernel docs
+/// warn that polling the WMI interface more frequently increases the risk
+/// of fan/sensor misbehaviour — so the daemon now polls the minimum set.
 #[allow(clippy::too_many_arguments)]
 pub async fn hwmon_poll_loop(
     cache: Arc<StateCache>,
@@ -74,8 +93,13 @@ pub async fn hwmon_poll_loop(
     intel_gpu_infos: Vec<IntelGpuInfo>,
     hwmon_root: &Path,
     interval: Duration,
+    sensor_rescan: Arc<std::sync::atomic::AtomicBool>,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    use crate::hwmon::types::{SensorDescriptor, SensorKind};
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
+
     let hwmon_root = hwmon_root.to_path_buf();
     let headers = Arc::new(headers);
     let gpu_infos = Arc::new(gpu_infos);
@@ -86,6 +110,13 @@ pub async fn hwmon_poll_loop(
     let mut consecutive_errors: u32 = 0;
     let mut prev_boot: Option<Duration> = None;
     let mut prev_mono: Option<Instant> = None;
+
+    // DEC-133: cached sensor descriptor set + per-descriptor read-failure
+    // streaks. `Arc` so each tick's spawn_blocking can borrow the set
+    // without cloning descriptor contents.
+    let mut descriptors: Arc<Vec<SensorDescriptor>> = Arc::new(Vec::new());
+    let mut discovered_once = false;
+    let mut read_fail_streaks: HashMap<String, u32> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -116,13 +147,43 @@ pub async fn hwmon_poll_loop(
         prev_boot = Some(now_boot);
         prev_mono = Some(now_mono);
 
+        // DEC-133: decide whether this tick re-runs sensor discovery.
+        let rescan_requested = sensor_rescan.swap(false, Ordering::SeqCst);
+        let streak_exceeded = read_fail_streaks
+            .values()
+            .any(|&n| n >= crate::constants::SENSOR_READ_FAIL_REDISCOVER_STREAK);
+        let cpu_temp_missing = descriptors.iter().all(|d| d.kind != SensorKind::CpuTemp);
+        let needs_discovery =
+            !discovered_once || rescan_requested || streak_exceeded || cpu_temp_missing;
+        if rescan_requested {
+            log::info!("Sensor descriptor refresh requested via /hwmon/rescan");
+        } else if streak_exceeded && discovered_once {
+            let failing: Vec<&str> = read_fail_streaks
+                .iter()
+                .filter(|(_, &n)| n >= crate::constants::SENSOR_READ_FAIL_REDISCOVER_STREAK)
+                .map(|(id, _)| id.as_str())
+                .collect();
+            log::warn!("Re-discovering sensors after persistent read failures on {failing:?}");
+        }
+
         // Run blocking sysfs I/O on the blocking thread pool
         let root = hwmon_root.clone();
         let hdrs = headers.clone();
         let gpus = gpu_infos.clone();
         let intel_gpus = intel_gpu_infos.clone();
+        let descs = descriptors.clone();
         let result: Result<_, tokio::task::JoinError> = tokio::task::spawn_blocking(move || {
-            let sensors = crate::hwmon::collect_sensors(&root);
+            // Sensor leg: full discovery only when triggered; otherwise the
+            // hot path reads each cached descriptor's temp*_input file only.
+            let sensors: Result<(Option<Vec<SensorDescriptor>>, Vec<_>), crate::error::HwmonError> =
+                if needs_discovery {
+                    crate::hwmon::discovery::discover_sensors(&root).map(|fresh| {
+                        let readings = crate::hwmon::read_sensor_values(&fresh);
+                        (Some(fresh), readings)
+                    })
+                } else {
+                    Ok((None, crate::hwmon::read_sensor_values(&descs)))
+                };
             let fan_states: Vec<HwmonFanState> = read_hwmon_fan_states(&hdrs);
             // AMD + Intel discrete GPU fans share the cache `gpu_fans` map,
             // distinguished by their ID prefix (`amd_gpu:` / `intel_gpu:`).
@@ -133,8 +194,29 @@ pub async fn hwmon_poll_loop(
         .await;
 
         match result {
-            Ok((Ok((_descriptors, readings)), fan_states, gpu_fan_states)) => {
+            Ok((Ok((fresh_descriptors, readings)), fan_states, gpu_fan_states)) => {
                 consecutive_errors = 0;
+                if let Some(fresh) = fresh_descriptors {
+                    if !discovered_once || rescan_requested {
+                        log::info!("Sensor discovery: {} sensor(s) cached", fresh.len());
+                    }
+                    descriptors = Arc::new(fresh);
+                    discovered_once = true;
+                    read_fail_streaks.clear();
+                }
+
+                // Track per-descriptor read failures: a descriptor present in
+                // the cache but absent from this tick's readings failed.
+                let read_ids: std::collections::HashSet<&str> =
+                    readings.iter().map(|r| r.id.as_str()).collect();
+                for d in descriptors.iter() {
+                    if read_ids.contains(d.id.as_str()) {
+                        read_fail_streaks.remove(&d.id);
+                    } else {
+                        *read_fail_streaks.entry(d.id.clone()).or_insert(0) += 1;
+                    }
+                }
+
                 let cached: Vec<CachedSensorReading> = readings.iter().map(to_cached).collect();
                 let count = cached.len();
                 // Record to history ring buffer before cache update
@@ -406,6 +488,193 @@ pub async fn openfan_poll_loop(
 mod tests {
     use super::*;
     use std::fs;
+
+    // ── DEC-133: sensor descriptor cache ─────────────────────────────
+
+    /// Write a fake k10temp device (CpuTemp) into the tempdir sysfs root.
+    fn write_k10temp(root: &std::path::Path, temp_c: f64) {
+        let dir = root.join("hwmon0");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("name"), "k10temp\n").unwrap();
+        fs::write(
+            dir.join("temp1_input"),
+            format!("{}\n", (temp_c * 1000.0) as i64),
+        )
+        .unwrap();
+        fs::write(dir.join("temp1_label"), "Tctl\n").unwrap();
+    }
+
+    /// Write a fake nvme device (non-CPU) into the tempdir sysfs root.
+    fn write_nvme(root: &std::path::Path) {
+        let dir = root.join("hwmon1");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("name"), "nvme\n").unwrap();
+        fs::write(dir.join("temp1_input"), "38000\n").unwrap();
+        fs::write(dir.join("temp1_label"), "Composite\n").unwrap();
+    }
+
+    struct PollHarness {
+        cache: Arc<StateCache>,
+        rescan: Arc<std::sync::atomic::AtomicBool>,
+        shutdown_tx: watch::Sender<bool>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    fn spawn_poll_loop(root: std::path::PathBuf) -> PollHarness {
+        let cache = Arc::new(StateCache::new());
+        let rescan = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let history = Arc::new(crate::health::history::HistoryRing::new(16));
+        let (cache2, rescan2) = (cache.clone(), rescan.clone());
+        let handle = tokio::spawn(async move {
+            hwmon_poll_loop(
+                cache2,
+                history,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                &root,
+                Duration::from_secs(1),
+                rescan2,
+                shutdown_rx,
+            )
+            .await;
+        });
+        PollHarness {
+            cache,
+            rescan,
+            shutdown_tx,
+            handle,
+        }
+    }
+
+    async fn stop(h: PollHarness) {
+        let _ = h.shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), h.handle).await;
+    }
+
+    fn sensor_by_label(
+        cache: &StateCache,
+        label: &str,
+    ) -> Option<crate::health::state::CachedSensorReading> {
+        cache
+            .sensors_snapshot()
+            .values()
+            .find(|s| s.label == label)
+            .cloned()
+    }
+
+    /// Per-tick reads must use the cached descriptor set: changing a label
+    /// file after discovery is invisible until a refresh trigger, while
+    /// values stay fresh.
+    #[tokio::test(start_paused = true)]
+    async fn poll_loop_uses_cached_descriptors_between_ticks() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_k10temp(tmp.path(), 55.0);
+        let h = spawn_poll_loop(tmp.path().to_path_buf());
+
+        // Tick 1 fires immediately (interval semantics) — wait past it.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            sensor_by_label(&h.cache, "Tctl").is_some(),
+            "initial discovery"
+        );
+
+        // Mutate the label (descriptor metadata) AND the value.
+        fs::write(tmp.path().join("hwmon0/temp1_label"), "Changed\n").unwrap();
+        fs::write(tmp.path().join("hwmon0/temp1_input"), "65000\n").unwrap();
+        tokio::time::sleep(Duration::from_millis(1000)).await; // tick 2
+
+        let s = sensor_by_label(&h.cache, "Tctl")
+            .expect("label must come from the cached descriptor, not a re-read");
+        assert!(
+            (s.value_c - 65.0).abs() < f64::EPSILON,
+            "values must stay fresh"
+        );
+        assert!(
+            sensor_by_label(&h.cache, "Changed").is_none(),
+            "no re-discovery without a trigger (DEC-133)"
+        );
+
+        stop(h).await;
+    }
+
+    /// The /hwmon/rescan flag forces a descriptor refresh on the next tick
+    /// and is consumed by the loop.
+    #[tokio::test(start_paused = true)]
+    async fn poll_loop_rediscovers_on_rescan_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_k10temp(tmp.path(), 55.0);
+        let h = spawn_poll_loop(tmp.path().to_path_buf());
+
+        tokio::time::sleep(Duration::from_millis(500)).await; // tick 1
+        fs::write(tmp.path().join("hwmon0/temp1_label"), "Renamed\n").unwrap();
+        h.rescan.store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(1000)).await; // tick 2
+
+        assert!(
+            sensor_by_label(&h.cache, "Renamed").is_some(),
+            "rescan flag must trigger re-discovery"
+        );
+        assert!(
+            !h.rescan.load(std::sync::atomic::Ordering::SeqCst),
+            "flag must be consumed"
+        );
+
+        stop(h).await;
+    }
+
+    /// A descriptor failing value-reads for the configured streak triggers
+    /// one re-discovery (device unbound mid-session).
+    #[tokio::test(start_paused = true)]
+    async fn poll_loop_rediscovers_after_read_failure_streak() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_k10temp(tmp.path(), 55.0);
+        let h = spawn_poll_loop(tmp.path().to_path_buf());
+
+        tokio::time::sleep(Duration::from_millis(500)).await; // tick 1
+                                                              // Device vanishes; a different chip appears (not yet discovered).
+        fs::remove_file(tmp.path().join("hwmon0/temp1_input")).unwrap();
+        write_nvme(tmp.path());
+
+        // Streak builds one failed tick at a time, then the next tick
+        // re-discovers: STREAK ticks + 1 + margin.
+        let ticks = crate::constants::SENSOR_READ_FAIL_REDISCOVER_STREAK + 2;
+        for _ in 0..ticks {
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+        }
+
+        assert!(
+            sensor_by_label(&h.cache, "Composite").is_some(),
+            "read-failure streak must trigger re-discovery and pick up the new chip"
+        );
+
+        stop(h).await;
+    }
+
+    /// While no CpuTemp descriptor is cached, the loop re-discovers every
+    /// tick — a late-loading k10temp must appear without any flag, so the
+    /// no-sensor 40% fallback can release (P0-R1).
+    #[tokio::test(start_paused = true)]
+    async fn poll_loop_rediscovers_while_no_cpu_sensor_cached() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_nvme(tmp.path()); // non-CPU only
+        let h = spawn_poll_loop(tmp.path().to_path_buf());
+
+        tokio::time::sleep(Duration::from_millis(500)).await; // tick 1
+        assert!(sensor_by_label(&h.cache, "Composite").is_some());
+
+        // CPU sensor module loads late.
+        write_k10temp(tmp.path(), 60.0);
+        tokio::time::sleep(Duration::from_millis(1000)).await; // tick 2
+
+        assert!(
+            sensor_by_label(&h.cache, "Tctl").is_some(),
+            "missing-CpuTemp trigger must re-discover every tick"
+        );
+
+        stop(h).await;
+    }
 
     fn fake_intel_gpu(
         hwmon_path: std::path::PathBuf,

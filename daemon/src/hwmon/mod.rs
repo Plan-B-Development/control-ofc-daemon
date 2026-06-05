@@ -27,15 +27,26 @@ pub const HWMON_SYSFS_ROOT: &str = "/sys/class/hwmon";
 
 /// Discover all temperature sensors and read their current values.
 ///
-/// This is the main entry point for sensor collection. It performs
-/// fresh discovery on each call.
-/// Readings are cached in StateCache; discovery runs fresh each call.
+/// Performs fresh discovery on each call. The polling loop does NOT call
+/// this per tick — it caches descriptors and calls [`read_sensor_values`]
+/// instead, re-discovering only on explicit triggers (DEC-133). This
+/// remains the one-shot entry point for discovery + first read.
 pub fn collect_sensors(
     hwmon_root: &Path,
 ) -> Result<(Vec<SensorDescriptor>, Vec<SensorReading>), HwmonError> {
     let descriptors = discovery::discover_sensors(hwmon_root)?;
+    let readings = read_sensor_values(&descriptors);
+    Ok((descriptors, readings))
+}
 
-    let readings: Vec<SensorReading> = descriptors
+/// Read current values for an already-discovered descriptor set.
+///
+/// The per-tick hot path (DEC-133): touches only each sensor's
+/// `temp*_input` file — no directory enumeration, no label/type reads, no
+/// threshold/alarm snapshot. Sensors that fail to read are dropped from
+/// the result (the caller tracks failure streaks to trigger re-discovery).
+pub fn read_sensor_values(descriptors: &[SensorDescriptor]) -> Vec<SensorReading> {
+    descriptors
         .iter()
         .filter_map(|d| match reader::read_temp(d) {
             Ok(r) => Some(r),
@@ -44,9 +55,7 @@ pub fn collect_sensors(
                 None
             }
         })
-        .collect();
-
-    Ok((descriptors, readings))
+        .collect()
 }
 
 #[cfg(test)]

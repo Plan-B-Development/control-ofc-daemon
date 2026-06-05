@@ -276,8 +276,10 @@ fn discover_device_sensors(hwmon_dir: &Path) -> Result<Vec<SensorDescriptor>, Hw
         };
 
         // DEC-117: snapshot the curated hwmon threshold attribute set once
-        // at discovery. /hwmon/rescan re-runs discovery so the values stay
-        // fresh after BIOS update + reboot.
+        // at discovery. Since DEC-133 the polling loop caches descriptors,
+        // so this snapshot is genuinely once-per-discovery: it refreshes
+        // only when discovery re-runs — on /hwmon/rescan, on a read-failure
+        // streak, or while no CpuTemp sensor is cached.
         let thresholds = read_thresholds(hwmon_dir, index, &chip_name);
 
         let kind = classify_chip(&chip_name, &label);

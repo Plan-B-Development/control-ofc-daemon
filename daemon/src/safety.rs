@@ -1,8 +1,14 @@
 //! CPU Tctl emergency thermal safety rule.
 //!
-//! Single latched rule: if CPU Tctl reaches 105°C, force all fans to 100%.
-//! Hold until Tctl drops to 80°C, then apply a one-cycle 60% recovery floor
-//! before returning control to the active profile.
+//! Single latched rule: if CPU Tctl reaches 105°C, force all OpenFan channels
+//! and writable hwmon headers to 100%. Hold until Tctl drops to 80°C, then
+//! apply a one-cycle 60% recovery floor before returning control to the
+//! active profile.
+//!
+//! GPU fans are deliberately excluded from this rule (DEC-130): there is no
+//! GPU emergency threshold. AMD PMFW firmware owns GPU thermal protection
+//! (junction-temp throttling and firmware fan ramp) independently of OS fan
+//! control.
 
 /// Emergency thermal safety override for CPU temperature.
 ///
@@ -40,7 +46,7 @@ impl ThermalSafetyRule {
             self.active = true;
             self.recovery = false;
             log::warn!(
-                "THERMAL EMERGENCY: CPU Tctl {:.1}°C >= {}°C — forcing all fans to {}%",
+                "THERMAL EMERGENCY: CPU Tctl {:.1}°C >= {}°C — forcing all OpenFan+hwmon fans to {}%",
                 tctl_c,
                 self.trigger_temp_c,
                 self.forced_output_pct

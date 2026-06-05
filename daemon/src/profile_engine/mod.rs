@@ -4,15 +4,18 @@
 //! profile, and returns PWM write commands. Runs at 1Hz alongside the
 //! existing polling loops.
 
+mod backends;
+
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use backends::{GpuBackend, HwmonBackend, OpenFanBackend, SafetyWriteBackend, WriteBackend};
 
 use crate::constants;
 use crate::health::cache::StateCache;
 use crate::hwmon::types::SensorKind;
 use crate::profile::{evaluate_curve, DaemonProfile, LogicalControl};
-use crate::serial::protocol::NUM_CHANNELS;
 
 /// A single PWM write command produced by the profile engine.
 #[derive(Debug, Clone)]
@@ -309,12 +312,82 @@ pub fn evaluate_profile(
     commands
 }
 
+/// Outcome of one safety-tick evaluation (pure decision, unit-testable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SafetyDecision {
+    /// `"normal"` | `"recovery"` | `"emergency"` | `"no_sensor_fallback"` —
+    /// reported to the cache and surfaced via `GET /status` (DEC-132) and
+    /// `/diagnostics/hardware`.
+    pub(crate) thermal_state: &'static str,
+    /// When `Some`, every OpenFan channel + hwmon header is forced to this
+    /// PWM this tick. GPU fans are excluded by design (DEC-130).
+    pub(crate) forced_pct: Option<u8>,
+}
+
+/// Evaluate the thermal safety rule + no-CPU-sensor fallback for one tick.
+///
+/// Owns the no-sensor counter transitions (threshold-edge logging included)
+/// and the thermal-state classification, separated from controller I/O so
+/// the 105/80/60 ladder and the 5-cycle fallback are unit-testable (DEC-135).
+fn evaluate_safety_tick(
+    hottest_cpu_c: Option<f64>,
+    no_cpu_sensor_cycles: &mut u32,
+    safety: &mut crate::safety::ThermalSafetyRule,
+) -> SafetyDecision {
+    // Track cycles with no CPU temp sensor. If missing for too long, force
+    // fans to a safe minimum as a defensive fallback (P0-R1).
+    let forced_by_no_sensor = if hottest_cpu_c.is_none() {
+        *no_cpu_sensor_cycles += 1;
+        let n = *no_cpu_sensor_cycles;
+        if n == constants::NO_SENSOR_CYCLE_THRESHOLD {
+            let safe_pct = constants::NO_SENSOR_SAFE_PCT;
+            log::error!(
+                "SAFETY: No CPU temperature sensor found for {n} \
+                 consecutive cycles — forcing all OpenFan+hwmon fans to {safe_pct}%"
+            );
+        }
+        n >= constants::NO_SENSOR_CYCLE_THRESHOLD
+    } else {
+        let n = *no_cpu_sensor_cycles;
+        if n >= constants::NO_SENSOR_CYCLE_THRESHOLD {
+            log::info!("CPU temperature sensor recovered after {n} missing cycles");
+        }
+        *no_cpu_sensor_cycles = 0;
+        false
+    };
+
+    let safety_pct = hottest_cpu_c.and_then(|temp| safety.evaluate(temp));
+
+    let thermal_state = if safety.is_active() {
+        "emergency"
+    } else if safety_pct.is_some() {
+        "recovery"
+    } else if forced_by_no_sensor {
+        // DEC-132: the no-sensor fallback also forces PWM (and force-takes
+        // the hwmon lease), so the GUI must stand down here too — surface a
+        // distinct state rather than claiming "normal".
+        "no_sensor_fallback"
+    } else {
+        "normal"
+    };
+
+    let forced_pct = safety_pct.or(if forced_by_no_sensor {
+        Some(constants::NO_SENSOR_SAFE_PCT)
+    } else {
+        None
+    });
+
+    SafetyDecision {
+        thermal_state,
+        forced_pct,
+    }
+}
+
 /// Run the profile engine loop as an async task.
 ///
-/// Evaluates the active profile at 1Hz and writes PWM commands via the
-/// serial and hwmon controllers. The safety rule has already been evaluated
-/// by the time this runs — if safety override is active, this loop's
-/// commands will be overridden.
+/// One tick per second: safety evaluation (forced overrides short-circuit
+/// the tick) → profile evaluation → one `apply` per write backend. All
+/// per-backend gating lives in [`backends`] (DEC-135).
 pub async fn profile_engine_loop(
     cache: Arc<StateCache>,
     profile: Arc<Mutex<Option<DaemonProfile>>>,
@@ -324,16 +397,16 @@ pub async fn profile_engine_loop(
     safety: Arc<Mutex<crate::safety::ThermalSafetyRule>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    let gpu_infos = Arc::new(gpu_infos);
     let interval = std::time::Duration::from_secs(1);
     log::info!("Profile engine started (1Hz)");
 
-    // Track GPU writes that failed — skip retry until speed changes or cooldown elapses.
-    // Key: fan_id, Value: (failed_speed_pct, failure_instant)
-    let mut gpu_fail_cache: std::collections::HashMap<String, (u8, std::time::Instant)> =
-        std::collections::HashMap::new();
-    // Track consecutive OpenFan serial write failures for P0-R2 safety alerting.
-    let mut openfan_consecutive_failures: u32 = 0;
+    // Per-backend write paths (DEC-135). Each backend owns its own gating —
+    // GUI deferral, coalescing thresholds, failure caching, lease handling.
+    // GpuBackend is deliberately NOT a SafetyWriteBackend (DEC-130): there
+    // is no GPU emergency threshold.
+    let mut openfan_be = fan_controller.map(OpenFanBackend::new);
+    let mut gpu_be = GpuBackend::new(cache.clone(), Arc::new(gpu_infos));
+    let mut hwmon_be = hwmon_controller.map(HwmonBackend::new);
 
     // Track consecutive cycles with no CPU temperature sensor (P0-R1).
     // If no CpuTemp sensor is found for N cycles, force fans to a safe minimum.
@@ -355,10 +428,11 @@ pub async fn profile_engine_loop(
             }
         }
 
-        // Evaluate thermal safety rule against the hottest CpuTemp sensor.
-        // Uses the max across ALL CpuTemp sensors (AMD Tctl, Intel Package id,
-        // etc.) so the safety rule works on any platform — not just AMD.
-        {
+        // Evaluate thermal safety against the hottest CpuTemp sensor — the
+        // max across ALL CpuTemp sensors (AMD Tctl, Intel Package id, etc.)
+        // so the rule works on any platform, not just AMD — plus the
+        // no-CPU-sensor fallback.
+        let (decision, hottest_cpu_c) = {
             let sensors = cache.sensors_snapshot();
             let hottest_cpu_c: Option<f64> = sensors
                 .values()
@@ -366,103 +440,45 @@ pub async fn profile_engine_loop(
                 .map(|s| s.value_c)
                 .reduce(f64::max);
 
-            // Track cycles with no CPU temp sensor. If missing for too long,
-            // force fans to a safe minimum as a defensive fallback.
-            let forced_by_no_sensor = if hottest_cpu_c.is_none() {
-                no_cpu_sensor_cycles += 1;
-                if no_cpu_sensor_cycles == constants::NO_SENSOR_CYCLE_THRESHOLD {
-                    let safe_pct = constants::NO_SENSOR_SAFE_PCT;
-                    log::error!(
-                        "SAFETY: No CPU temperature sensor found for {no_cpu_sensor_cycles} \
-                         consecutive cycles — forcing all fans to {safe_pct}%"
-                    );
-                }
-                no_cpu_sensor_cycles >= constants::NO_SENSOR_CYCLE_THRESHOLD
-            } else {
-                if no_cpu_sensor_cycles >= constants::NO_SENSOR_CYCLE_THRESHOLD {
-                    log::info!("CPU temperature sensor recovered after {no_cpu_sensor_cycles} missing cycles");
-                }
-                no_cpu_sensor_cycles = 0;
-                false
-            };
-
             let mut safety_guard = safety.lock();
-            let safety_pct = hottest_cpu_c.and_then(|temp| safety_guard.evaluate(temp));
+            let decision =
+                evaluate_safety_tick(hottest_cpu_c, &mut no_cpu_sensor_cycles, &mut safety_guard);
+            (decision, hottest_cpu_c)
+        };
 
-            // Report thermal safety state to cache for diagnostics
-            let thermal_state = if safety_guard.is_active() {
-                "emergency"
-            } else if safety_pct.is_some() {
-                "recovery"
-            } else {
-                "normal"
-            };
-            cache.set_thermal_override_state(thermal_state);
+        // Report thermal safety state for /status (DEC-132) + /diagnostics.
+        cache.set_thermal_override_state(decision.thermal_state);
 
-            // Determine if we need a forced override (thermal emergency OR missing sensor)
-            let forced_pct = safety_pct.or(if forced_by_no_sensor {
-                Some(constants::NO_SENSOR_SAFE_PCT)
-            } else {
-                None
-            });
-
-            if let Some(forced_pct) = forced_pct {
-                let reason = if let Some(temp) = hottest_cpu_c {
-                    format!("CPU temp {temp:.1}°C")
-                } else {
-                    "no CPU temp sensor".to_string()
-                };
-
-                // Emergency override — force ALL fan backends to safety PWM.
-                //
-                // DEC-099: lock per-channel/per-header rather than holding the
-                // controller mutex across the whole scan. Previously the
-                // FanController lock was held for ~5s (10 channels × 500ms
-                // serial timeout cap), which serialised every concurrent GUI
-                // PWM request behind the safety scan. With per-channel
-                // re-locking a GUI write can interleave; if the GUI overrides
-                // a safety value briefly the next 1Hz tick re-asserts the
-                // forced value, so safety integrity is preserved.
-
-                // OpenFan channels — drop the lock between channels so GUI
-                // requests can interleave during a long emergency scan.
-                if let Some(ref ctrl) = fan_controller {
-                    for ch in 0..NUM_CHANNELS {
-                        let mut guard = ctrl.lock();
-                        if let Err(e) = guard.set_pwm(ch, forced_pct) {
-                            log::error!("THERMAL SAFETY: OpenFan ch{ch} write FAILED: {e}");
-                        }
-                    }
-                }
-
-                // hwmon fans (auto-lease for safety writes). Take the lease
-                // once, then re-lock per-header so concurrent GUI activity
-                // can proceed between writes. If a GUI request force-takes
-                // the lease mid-scan, our writes will fail with InvalidLease
-                // until the next 1Hz tick re-acquires it — same safety net
-                // as the OpenFan path.
-                if let Some(ref ctrl) = hwmon_controller {
-                    let (hdr_ids, lease_id) = {
-                        let mut guard = ctrl.lock();
-                        let hdr_ids: Vec<String> =
-                            guard.headers().iter().map(|h| h.id.clone()).collect();
-                        let lease_id = guard
-                            .lease_manager_mut()
-                            .force_take_lease("thermal-safety")
-                            .lease_id;
-                        (hdr_ids, lease_id)
-                    };
-                    for hdr_id in &hdr_ids {
-                        let mut guard = ctrl.lock();
-                        if let Err(e) = guard.set_pwm(hdr_id, forced_pct, &lease_id) {
-                            log::error!("THERMAL SAFETY: hwmon {hdr_id} write FAILED: {e}");
-                        }
-                    }
-                }
-
-                log::warn!("Thermal safety override: forcing all fans to {forced_pct}% ({reason})");
-                continue;
+        if let Some(forced_pct) = decision.forced_pct {
+            // Forced safety override — all OpenFan channels and writable
+            // hwmon headers. GPU fans are deliberately excluded (DEC-130):
+            // AMD PMFW firmware owns GPU thermal protection (junction-temp
+            // throttle, firmware fan ramp) independently of OS fan control,
+            // and forcing PMFW curve commits from a CPU emergency would add
+            // SMU churn without improving GPU safety. There is no GPU
+            // emergency threshold; the exclusion is structural — GpuBackend
+            // does not implement SafetyWriteBackend.
+            if let Some(be) = openfan_be.as_mut() {
+                be.force_all(forced_pct);
             }
+            if let Some(be) = hwmon_be.as_mut() {
+                be.force_all(forced_pct);
+            }
+
+            let reason = match hottest_cpu_c {
+                Some(temp) => format!("CPU temp {temp:.1}°C"),
+                None => "no CPU temp sensor".to_string(),
+            };
+            log::warn!(
+                "Thermal safety override: forcing all OpenFan+hwmon fans to \
+                 {forced_pct}% ({reason})"
+            );
+            // P3-2: drop cross-cycle tuning state so post-override
+            // evaluation starts fresh instead of step-rate-clamping from a
+            // pre-emergency anchor — the fans are physically at
+            // `forced_pct`, not at the stale `last_output`.
+            engine_state.deactivate();
+            continue;
         }
 
         // Get active profile — scope guard strictly to avoid !Send across .await
@@ -477,175 +493,17 @@ pub async fn profile_engine_loop(
             evaluate_profile(active_profile, &cache, &mut engine_state)
         };
 
-        // Execute write commands — split into sync (OpenFan) and async (GPU) phases
-        // to avoid holding MutexGuards across .await points.
-
-        // Phase 1: OpenFan writes (sync, uses parking_lot mutex)
-        // Skip when GUI is actively connected — the GUI's control loop drives
-        // fan speed via the API, and both writing simultaneously causes
-        // unnecessary serial traffic and potential PWM oscillation.
-        // Cheap reads instead of a full snapshot: this site needs only
-        // gui_active() (a bool) and the GPU-fan map (write-suppression in the
-        // amd_gpu phase below) — not the sensor/openfan/hwmon maps a full
-        // snapshot would clone every tick. A torn read between the two is
-        // harmless: both are advisory gates, not correctness-critical state.
+        // Apply per backend (DEC-135). Each backend owns its own gating and
+        // none holds a controller guard across an .await. `gui_active` is
+        // read once per tick — a cheap bool instead of the full snapshot the
+        // old inline phases cloned every cycle.
         let gui_active = cache.gui_active();
-        let gpu_fans = cache.gpu_fans_snapshot();
-
-        if !gui_active {
-            if let Some(ref ctrl) = fan_controller {
-                for cmd in commands.iter().filter(|c| c.source == "openfan") {
-                    let Some(ch_str) = cmd.member_id.strip_prefix("openfan:ch") else {
-                        log::warn!(
-                            "Profile engine: dropping openfan command with malformed member_id: {:?}",
-                            cmd.member_id
-                        );
-                        continue;
-                    };
-                    let Ok(ch) = ch_str.parse::<u8>() else {
-                        log::warn!(
-                            "Profile engine: dropping openfan command with unparseable channel: {:?}",
-                            cmd.member_id
-                        );
-                        continue;
-                    };
-                    let mut guard = ctrl.lock();
-                    if let Err(e) = guard.set_pwm(ch, cmd.pwm_percent) {
-                        openfan_consecutive_failures += 1;
-                        log::warn!(
-                            "Profile engine: OpenFan ch{ch} write failed \
-                             ({openfan_consecutive_failures} consecutive): {e}"
-                        );
-                        if openfan_consecutive_failures == 5 {
-                            log::error!(
-                                "SAFETY: OpenFan serial link appears down \
-                                 ({openfan_consecutive_failures} consecutive write failures)"
-                            );
-                        }
-                    } else {
-                        openfan_consecutive_failures = 0;
-                    }
-                }
-            }
+        if let Some(be) = openfan_be.as_mut() {
+            be.apply(&commands, gui_active).await;
         }
-
-        // Phase 2: GPU fan writes (async via spawn_blocking, no lease required)
-        // gui_active check computed above — GUI's control loop drives fan speed
-        // via the API, and both writing simultaneously causes SMU firmware churn.
-        for cmd in commands.iter().filter(|c| c.source == "amd_gpu") {
-            // GUI takes priority — skip profile engine GPU writes
-            if gui_active {
-                continue;
-            }
-
-            // Write suppression: skip if speed matches last commanded value
-            if let Some(cached) = gpu_fans.get(&cmd.member_id) {
-                if cached.last_commanded_pct == Some(cmd.pwm_percent) {
-                    continue;
-                }
-            }
-
-            // Failure suppression: skip if the same speed already failed recently.
-            // Prevents 1/sec journal spam when PMFW rejects the value.
-            if let Some((failed_pct, failed_at)) = gpu_fail_cache.get(&cmd.member_id) {
-                if *failed_pct == cmd.pwm_percent
-                    && failed_at.elapsed() < constants::GPU_FAIL_COOLDOWN
-                {
-                    continue;
-                }
-            }
-
-            if let Some(bdf) = cmd.member_id.strip_prefix("amd_gpu:") {
-                if let Some(gpu) = gpu_infos.iter().find(|g| g.pci_bdf == bdf) {
-                    if let Some(ref curve_path) = gpu.fan_curve_path {
-                        let path = curve_path.clone();
-                        let zero_rpm = gpu.fan_zero_rpm_path.clone();
-                        let pct = cmd.pwm_percent;
-                        let preserve_zero_rpm = cmd.gpu_fan_zero_rpm;
-                        let cache_ref = cache.clone();
-                        let fan_id = cmd.member_id.clone();
-                        let fan_id_inner = fan_id.clone();
-                        let result = tokio::task::spawn_blocking(move || {
-                            match crate::hwmon::gpu_fan::set_static_speed_with_zero_rpm(
-                                &path,
-                                zero_rpm.as_deref(),
-                                pct,
-                                constants::GPU_PMFW_NUM_CURVE_POINTS,
-                                preserve_zero_rpm,
-                            ) {
-                                Ok(()) => {
-                                    cache_ref.set_gpu_fan_commanded_pct(&fan_id_inner, pct);
-                                    Ok(())
-                                }
-                                Err(e) => {
-                                    log::warn!("GPU fan write failed: {e}");
-                                    Err(())
-                                }
-                            }
-                        })
-                        .await;
-
-                        match result {
-                            Ok(Ok(())) => {
-                                gpu_fail_cache.remove(&fan_id);
-                            }
-                            _ => {
-                                gpu_fail_cache
-                                    .insert(fan_id, (cmd.pwm_percent, std::time::Instant::now()));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Phase 3: hwmon writes (auto-lease for headless profile mode)
-        // The profile engine auto-acquires the lease when writing hwmon members.
-        // If the GUI holds the lease, hwmon writes are skipped (GUI has priority).
-        //
-        // Also skip when gui_active (last GUI write <30s) to close the startup
-        // race where the GUI has written via /fans/... but has not yet taken
-        // the hwmon lease, or the lease has briefly lapsed. Mirrors the
-        // OpenFan/GPU phases above for consistency (DEC-074 semantics extended
-        // to hwmon).
-        let hwmon_cmds: Vec<_> = commands.iter().filter(|c| c.source == "hwmon").collect();
-        if !hwmon_cmds.is_empty() && !gui_active {
-            if let Some(ref ctrl) = hwmon_controller {
-                let mut guard = ctrl.lock();
-                // Try to get or auto-acquire a lease for the profile engine
-                let lease_id = {
-                    let mgr = guard.lease_manager();
-                    match mgr.active_lease() {
-                        Some(lease) if lease.owner_hint == "gui" => {
-                            // GUI has priority — skip hwmon writes
-                            None
-                        }
-                        Some(lease) => Some(lease.lease_id.clone()),
-                        None => None, // Need to acquire
-                    }
-                };
-                let lease_id = lease_id.or_else(|| {
-                    guard
-                        .lease_manager_mut()
-                        .take_lease("profile-engine")
-                        .ok()
-                        .map(|l| l.lease_id)
-                });
-                if let Some(ref lid) = lease_id {
-                    for cmd in hwmon_cmds {
-                        match guard.set_pwm(&cmd.member_id, cmd.pwm_percent, lid) {
-                            Ok(_) => {}
-                            Err(e) => {
-                                log::warn!("hwmon write failed for {}: {e}", cmd.member_id);
-                            }
-                        }
-                    }
-                    // Renew to keep it alive for the next cycle
-                    if let Err(e) = guard.lease_manager_mut().renew_lease(lid) {
-                        log::debug!("lease renewal failed (will re-acquire next cycle): {e}");
-                    }
-                }
-            }
+        gpu_be.apply(&commands, gui_active).await;
+        if let Some(be) = hwmon_be.as_mut() {
+            be.apply(&commands, gui_active).await;
         }
     }
 }
@@ -1777,6 +1635,322 @@ mod tests {
             set_pwm_cmds.is_empty(),
             "profile engine must NOT write OpenFan PWM while gui_active is true; got: {set_pwm_cmds:?}",
         );
+    }
+
+    /// Build a fake AMD GPU whose PMFW fan_curve path points into a tempdir.
+    /// The engine's GPU phase writes curve points + a commit to that file via
+    /// `std::fs::write` (truncating), so "file still empty" == "no write
+    /// attempted" and "file non-empty" == "PMFW commit happened".
+    fn make_fake_gpu(
+        dir: &tempfile::TempDir,
+    ) -> (crate::hwmon::gpu_detect::AmdGpuInfo, std::path::PathBuf) {
+        let curve_path = dir.path().join("fan_curve");
+        std::fs::write(&curve_path, "").unwrap();
+        let gpu = crate::hwmon::gpu_detect::AmdGpuInfo {
+            pci_bdf: "0000:03:00.0".into(),
+            pci_device_id: 0x7550,
+            pci_revision: 0xC0,
+            pci_class: 0x030000,
+            marketing_name: Some("RX 9070 XT".into()),
+            hwmon_path: dir.path().to_path_buf(),
+            fan_curve_path: Some(curve_path.clone()),
+            fan_zero_rpm_path: None,
+            is_discrete: true,
+            has_fan_rpm: false,
+            has_pwm: false,
+            has_pwm_enable: false,
+            overdrive_enabled: true,
+        };
+        (gpu, curve_path)
+    }
+
+    /// DEC-131: the engine's GPU write suppression must use the shared 5%
+    /// PMFW coalesce threshold (GPU_COALESCE_DELTA_PCT), not exact-match.
+    /// At 55°C the curve outputs 60%; with last_commanded 62% the delta is
+    /// 2% < 5%, so the engine must skip the PMFW write entirely.
+    #[tokio::test(start_paused = true)]
+    async fn loop_suppresses_gpu_write_below_coalesce_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let (gpu, curve_path) = make_fake_gpu(&dir);
+
+        let cache = make_cache_with_sensor("cpu", 55.0);
+        cache.set_gpu_fan_commanded_pct("amd_gpu:0000:03:00.0", 62);
+
+        let profile = make_gpu_profile("curve", "graph", 50.0);
+        let profile_arc = Arc::new(Mutex::new(Some(profile)));
+        let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let handle = tokio::spawn(profile_engine_loop(
+            cache,
+            profile_arc,
+            None, // no openfan
+            None, // no hwmon
+            vec![gpu],
+            safety,
+            shutdown_rx,
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        shutdown_tx.send(true).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let _ = handle.await;
+
+        let content = std::fs::read_to_string(&curve_path).unwrap();
+        assert!(
+            content.is_empty(),
+            "engine must suppress GPU writes below the 5% coalesce threshold \
+             (DEC-131); fan_curve received: {content:?}"
+        );
+    }
+
+    /// Companion to the suppression test: at a delta of exactly the
+    /// threshold (curve 60% vs last_commanded 55% → 5%), the engine must
+    /// write the PMFW curve.
+    #[tokio::test(start_paused = true)]
+    async fn loop_writes_gpu_when_delta_reaches_coalesce_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let (gpu, curve_path) = make_fake_gpu(&dir);
+
+        let cache = make_cache_with_sensor("cpu", 55.0);
+        cache.set_gpu_fan_commanded_pct("amd_gpu:0000:03:00.0", 55);
+
+        let profile = make_gpu_profile("curve", "graph", 50.0);
+        let profile_arc = Arc::new(Mutex::new(Some(profile)));
+        let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let handle = tokio::spawn(profile_engine_loop(
+            cache.clone(),
+            profile_arc,
+            None,
+            None,
+            vec![gpu],
+            safety,
+            shutdown_rx,
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        shutdown_tx.send(true).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let _ = handle.await;
+
+        let content = std::fs::read_to_string(&curve_path).unwrap();
+        assert!(
+            !content.is_empty(),
+            "engine must write the PMFW curve once the delta reaches the 5% \
+             coalesce threshold (DEC-131)"
+        );
+        // The cache must reflect the new commanded value (60%).
+        let snap = cache.gpu_fans_snapshot();
+        assert_eq!(
+            snap.get("amd_gpu:0000:03:00.0")
+                .and_then(|f| f.last_commanded_pct),
+            Some(60)
+        );
+    }
+
+    /// P3-2: a forced safety override must clear the engine's cross-cycle
+    /// tuning state. The fans are physically at the forced PWM, so resuming
+    /// normal evaluation from the pre-emergency `last_output` anchor would
+    /// step-rate-clamp against a value the hardware no longer holds.
+    ///
+    /// Timeline (1 tick/s, paused time):
+    ///   t1: 79°C → curve 98.4% → writes 98%   (anchor now 98.4)
+    ///   t2: 106°C → EMERGENCY, all 10 ch → 100%, state cleared
+    ///   t3: 60°C → release + recovery floor → all ch → 60%
+    ///   t4: recovery floor (one extra cycle) → 60% (coalesced, no writes)
+    ///   t5: normal eval at 60°C → curve 68%.
+    ///       Fixed: fresh state → writes 68% (raw 0xAD).
+    ///       Bug: stale anchor 98.4 with step_down 2%/cycle → 96% (raw 0xF5).
+    #[tokio::test(start_paused = true)]
+    async fn forced_override_resets_engine_tuning_state() {
+        fn cpu_reading(temp_c: f64) -> CachedSensorReading {
+            CachedSensorReading {
+                id: "cpu".into(),
+                kind: SensorKind::CpuTemp,
+                label: "Tctl".into(),
+                value_c: temp_c,
+                source: DeviceLabel::Hwmon,
+                updated_at: Instant::now(),
+                rate_c_per_s: None,
+                session_min_c: None,
+                session_max_c: None,
+                chip_name: "k10temp".into(),
+                temp_type: None,
+                thresholds: None,
+            }
+        }
+
+        let cache = make_cache_with_sensor("cpu", 79.0);
+        let mut profile = make_profile("curve", "graph", 50.0);
+        // Tight step-down so a stale anchor is observable: from 98.4% the
+        // engine could only descend 2%/cycle.
+        profile.controls[0].step_down_pct = 2.0;
+        let profile_arc = Arc::new(Mutex::new(Some(profile)));
+        let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
+
+        // 1 (t1) + 10 (t2) + 10 (t3) + 0 (t4 coalesced) + 1 (t5) = 22 writes.
+        let (transport, written) = LoopTestTransport::new(30);
+        let fan_ctrl = crate::serial::controller::FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            std::time::Duration::from_millis(500),
+        );
+        let fan_ctrl = Some(Arc::new(Mutex::new(fan_ctrl)));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(profile_engine_loop(
+            cache.clone(),
+            profile_arc,
+            fan_ctrl,
+            None,
+            vec![],
+            safety,
+            shutdown_rx,
+        ));
+
+        // t1 @1.0s: normal evaluation at 79°C.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        // t2 @2.0s: thermal emergency.
+        cache.update_sensors(vec![cpu_reading(106.0)]);
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        // t3 @3.0s: release + recovery floor.
+        cache.update_sensors(vec![cpu_reading(60.0)]);
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        // t4 @4.0s: one-cycle recovery floor (writes coalesce at 60%).
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        // t5 @5.0s: normal evaluation resumes at 60°C.
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let _ = handle.await;
+
+        let cmds = written.lock();
+        let set_pwm_cmds: Vec<_> = cmds.iter().filter(|c| c.starts_with(">02")).collect();
+        let last = set_pwm_cmds.last().expect("expected SetPwm commands");
+        let hex_value = &last[last.len() - 3..last.len() - 1];
+        let expected = format!("{:02X}", crate::pwm::percent_to_raw(68));
+        let stale = format!("{:02X}", crate::pwm::percent_to_raw(96));
+        assert_eq!(
+            hex_value, expected,
+            "post-override evaluation must start from a fresh anchor \
+             (expected 68% = 0x{expected}, stale-anchor bug yields 96% = 0x{stale}); \
+             commands: {set_pwm_cmds:?}"
+        );
+    }
+
+    /// DEC-135: the extracted safety step must walk the full 105/80/60
+    /// ladder — trigger, hold, release-with-recovery, one extra recovery
+    /// cycle, then normal.
+    #[test]
+    fn safety_tick_emergency_recovery_ladder() {
+        let mut rule = crate::safety::ThermalSafetyRule::new();
+        let mut cycles = 0u32;
+
+        let d = evaluate_safety_tick(Some(106.0), &mut cycles, &mut rule);
+        assert_eq!(
+            d,
+            SafetyDecision {
+                thermal_state: "emergency",
+                forced_pct: Some(100)
+            }
+        );
+
+        // Still above release threshold — hold at 100%.
+        let d = evaluate_safety_tick(Some(90.0), &mut cycles, &mut rule);
+        assert_eq!(
+            d,
+            SafetyDecision {
+                thermal_state: "emergency",
+                forced_pct: Some(100)
+            }
+        );
+
+        // Release at ≤80°C → recovery floor.
+        let d = evaluate_safety_tick(Some(60.0), &mut cycles, &mut rule);
+        assert_eq!(
+            d,
+            SafetyDecision {
+                thermal_state: "recovery",
+                forced_pct: Some(60)
+            }
+        );
+
+        // One extra recovery cycle.
+        let d = evaluate_safety_tick(Some(60.0), &mut cycles, &mut rule);
+        assert_eq!(
+            d,
+            SafetyDecision {
+                thermal_state: "recovery",
+                forced_pct: Some(60)
+            }
+        );
+
+        let d = evaluate_safety_tick(Some(60.0), &mut cycles, &mut rule);
+        assert_eq!(
+            d,
+            SafetyDecision {
+                thermal_state: "normal",
+                forced_pct: None
+            }
+        );
+    }
+
+    /// P0-R1 + DEC-132: the no-CPU-sensor fallback forces the safe minimum
+    /// after the cycle threshold and surfaces a distinct thermal state
+    /// (it forces PWM and force-takes the lease, so "normal" would lie to
+    /// the GUI's stand-down logic).
+    #[test]
+    fn safety_tick_no_sensor_fallback_after_threshold() {
+        let mut rule = crate::safety::ThermalSafetyRule::new();
+        let mut cycles = 0u32;
+
+        for i in 1..constants::NO_SENSOR_CYCLE_THRESHOLD {
+            let d = evaluate_safety_tick(None, &mut cycles, &mut rule);
+            assert_eq!(d.forced_pct, None, "cycle {i}: below threshold");
+            assert_eq!(d.thermal_state, "normal", "cycle {i}: below threshold");
+        }
+
+        let d = evaluate_safety_tick(None, &mut cycles, &mut rule);
+        assert_eq!(
+            d,
+            SafetyDecision {
+                thermal_state: "no_sensor_fallback",
+                forced_pct: Some(constants::NO_SENSOR_SAFE_PCT)
+            }
+        );
+
+        // Sensor recovers → counter resets, normal control resumes.
+        let d = evaluate_safety_tick(Some(50.0), &mut cycles, &mut rule);
+        assert_eq!(
+            d,
+            SafetyDecision {
+                thermal_state: "normal",
+                forced_pct: None
+            }
+        );
+        assert_eq!(cycles, 0);
+    }
+
+    /// A sensor returning mid-streak (before the threshold) resets the
+    /// counter — the fallback only fires on N *consecutive* missing cycles.
+    #[test]
+    fn safety_tick_counter_resets_on_sensor_return_mid_streak() {
+        let mut rule = crate::safety::ThermalSafetyRule::new();
+        let mut cycles = 0u32;
+
+        for _ in 0..constants::NO_SENSOR_CYCLE_THRESHOLD - 1 {
+            evaluate_safety_tick(None, &mut cycles, &mut rule);
+        }
+        evaluate_safety_tick(Some(50.0), &mut cycles, &mut rule);
+        assert_eq!(cycles, 0);
+
+        // A fresh streak must count from zero again.
+        let d = evaluate_safety_tick(None, &mut cycles, &mut rule);
+        assert_eq!(d.forced_pct, None);
+        assert_eq!(cycles, 1);
     }
 
     #[tokio::test(start_paused = true)]

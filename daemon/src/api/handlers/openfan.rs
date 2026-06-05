@@ -159,17 +159,26 @@ impl Drop for CalibrationGuard<'_> {
 }
 
 /// POST /fans/openfan/{channel}/calibrate — run a PWM-to-RPM calibration sweep.
+///
+/// Delegates the sweep to [`crate::api::calibration::calibrate_openfan_channel`]
+/// (DEC-134) — the handler owns only HTTP mapping, the concurrency flag, and
+/// the controller-backed write closure. The helper restores the
+/// pre-calibration PWM on every exit path, including a failed write
+/// mid-sweep (previously the inline copy returned early without restoring,
+/// which could park a fan at a sweep step).
 pub async fn calibrate_openfan_handler(
     State(state): State<Arc<AppState>>,
     Path(channel): Path<u8>,
     Json(body): Json<crate::api::calibration::CalibrationRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if state.fan_controller.is_none() {
+    use crate::api::calibration::CalibrationError;
+
+    let Some(ctrl) = state.fan_controller.clone() else {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             &ErrorEnvelope::hardware_unavailable("OpenFanController not connected"),
         );
-    }
+    };
 
     if channel > 9 {
         return error_response(
@@ -195,136 +204,59 @@ pub async fn calibrate_openfan_handler(
         flag: &state.calibrating,
     };
 
-    let steps = body.steps.clamp(2, 20);
-    if steps != body.steps {
-        log::info!(
-            "Calibration API: steps clamped from {} to {steps}",
-            body.steps
-        );
-    }
-    let clamped_hold = body.hold_seconds.clamp(2, 15);
-    if clamped_hold != body.hold_seconds {
-        log::info!(
-            "Calibration API: hold_seconds clamped from {} to {clamped_hold}",
-            body.hold_seconds
-        );
-    }
-    let hold = std::time::Duration::from_secs(clamped_hold);
-    let cache = state.cache.clone();
-    let fan_id = format!("openfan:ch{channel:02}");
-
-    // Read pre-calibration PWM
-    let pre_cal_pwm = {
-        let snap = cache.snapshot();
-        snap.openfan_fans
-            .get(&channel)
-            .and_then(|f| f.last_commanded_pwm)
+    // Controller-backed write closure. Preserves the pre-DEC-134 status
+    // mapping: serial faults surface as Hardware (503), controller-side
+    // validation (e.g. stop-timeout safety) as Validation (400).
+    let write_fn = move |ch: u8, pwm: u8| -> Result<(), CalibrationError> {
+        let mut guard = ctrl.lock(); // parking_lot — always succeeds
+        match guard.set_pwm(ch, pwm) {
+            Ok(_) => Ok(()),
+            Err(FanControlError::Validation(msg)) => Err(CalibrationError::Validation(msg)),
+            Err(e @ FanControlError::Serial(_)) => Err(CalibrationError::Hardware(e.to_string())),
+        }
     };
 
-    let step_size = 100.0 / steps as f64;
-    let mut points = Vec::with_capacity(steps as usize + 1);
-
-    for i in 0..=steps {
-        let pwm = (i as f64 * step_size).round().min(100.0) as u8;
-
-        // Thermal check
-        if let Err(e) = crate::api::calibration::check_thermal_safety(&cache) {
-            // Restore pre-cal PWM before returning
-            if let (Some(restore), Some(ref ctrl)) = (pre_cal_pwm, &state.fan_controller) {
-                {
-                    let mut guard = ctrl.lock(); // parking_lot — always succeeds
-                    if let Err(e) = guard.set_pwm(channel, restore) {
-                        log::warn!("failed to restore pre-calibration PWM on ch{channel}: {e}");
-                    }
-                }
-            }
-            return match e {
-                crate::api::calibration::CalibrationError::ThermalAbort {
-                    sensor_id,
-                    temp_c,
-                    ..
-                } => error_response(
-                    StatusCode::CONFLICT,
-                    &ErrorEnvelope {
-                        error: ErrorBody {
-                            code: "thermal_abort".into(),
-                            message: format!("Thermal abort: {sensor_id} at {temp_c:.1}\u{00B0}C"),
-                            retryable: true,
-                            source: "hardware".into(),
-                            details: None,
-                        },
-                    },
-                ),
-                _ => error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &ErrorEnvelope::internal("calibration check failed"),
-                ),
-            };
-        }
-
-        // Set PWM via controller
-        {
-            let Some(ref ctrl) = state.fan_controller else {
-                return error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &ErrorEnvelope::hardware_unavailable(
-                        "OpenFanController disconnected during calibration",
-                    ),
-                );
-            };
-            let mut guard = ctrl.lock();
-            if let Err(e) = guard.set_pwm(channel, pwm) {
-                return fan_control_error_response(e);
-            }
-        }
-
-        tokio::time::sleep(hold).await;
-
-        // Read RPM from cache
-        let snap = cache.snapshot();
-        let rpm = snap.openfan_fans.get(&channel).map(|f| f.rpm).unwrap_or(0);
-
-        points.push(crate::api::calibration::CalPoint {
-            pwm_percent: pwm,
-            rpm,
-        });
-    }
-
-    // Restore pre-calibration PWM
-    if let (Some(restore), Some(ref ctrl)) = (pre_cal_pwm, &state.fan_controller) {
-        {
-            let mut guard = ctrl.lock(); // parking_lot — always succeeds
-            if let Err(e) = guard.set_pwm(channel, restore) {
-                log::warn!("failed to restore pre-calibration PWM on ch{channel}: {e}");
-            }
-        }
-    }
-
-    // Derive start_pwm and stop_pwm
-    let start_pwm = points.iter().find(|p| p.rpm > 0).map(|p| p.pwm_percent);
-    let stop_pwm = points
-        .iter()
-        .rev()
-        .find(|p| p.rpm == 0)
-        .map(|p| p.pwm_percent);
-    let min_rpm = points
-        .iter()
-        .map(|p| p.rpm)
-        .filter(|&r| r > 0)
-        .min()
-        .unwrap_or(0);
-    let max_rpm = points.iter().map(|p| p.rpm).max().unwrap_or(0);
-
-    json_ok(
-        StatusCode::OK,
-        CalibrationResponse {
-            api_version: API_VERSION,
-            fan_id,
-            points,
-            start_pwm,
-            stop_pwm,
-            min_rpm,
-            max_rpm,
-        },
+    match crate::api::calibration::calibrate_openfan_channel(
+        state.cache.clone(),
+        channel,
+        body.steps,
+        body.hold_seconds,
+        write_fn,
     )
+    .await
+    {
+        Ok(result) => json_ok(
+            StatusCode::OK,
+            CalibrationResponse {
+                api_version: API_VERSION,
+                fan_id: result.fan_id,
+                points: result.points,
+                start_pwm: result.start_pwm,
+                stop_pwm: result.stop_pwm,
+                min_rpm: result.min_rpm,
+                max_rpm: result.max_rpm,
+            },
+        ),
+        Err(CalibrationError::ThermalAbort {
+            sensor_id, temp_c, ..
+        }) => error_response(
+            StatusCode::CONFLICT,
+            &ErrorEnvelope {
+                error: ErrorBody {
+                    code: "thermal_abort".into(),
+                    message: format!("Thermal abort: {sensor_id} at {temp_c:.1}\u{00B0}C"),
+                    retryable: true,
+                    source: "hardware".into(),
+                    details: None,
+                },
+            },
+        ),
+        Err(CalibrationError::Validation(msg)) => {
+            error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(msg))
+        }
+        Err(CalibrationError::Hardware(msg)) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::hardware_unavailable(msg),
+        ),
+    }
 }
