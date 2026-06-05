@@ -13,13 +13,15 @@ The daemon provides a local API that a GUI (or scripts) can use to monitor tempe
 | Device | Read | Write |
 |---|---|---|
 | CPU temperature (k10temp, coretemp) | Yes | N/A |
-| GPU temperature (amdgpu) | Yes | N/A |
+| AMD GPU temperature (amdgpu) | Yes | N/A |
+| Intel Arc discrete GPU temperature (`xe` / `i915`) | Yes | N/A |
 | Disk temperature (NVMe) | Yes | N/A |
 | Motherboard temperature (ITE, NCT) | Yes | N/A |
 | OpenFanController fans (RPM) | Yes | Yes (PWM, target RPM) |
 | Motherboard fan headers (hwmon) | Yes | Yes (PWM, requires lease) |
 | AMD GPU fans (RDNA3+, PMFW) | Yes | Yes (static speed, no lease) |
 | AMD GPU fans (pre-RDNA3) | Yes | Yes (pwm1, no lease) |
+| Intel Arc discrete GPU fans (`xe` / `i915`) | Yes (RPM) | No — firmware-managed, no kernel PWM interface (DEC-121) |
 | AIO coolers | Not yet | Not yet |
 
 ## Installation
@@ -154,6 +156,7 @@ including request/response shapes.
 | `POST /hwmon/rescan` | Re-enumerate hwmon devices and return fresh header list |
 | `POST /gpu/{gpu_id}/fan/pwm` | Set GPU fan speed (PMFW or legacy pwm1) |
 | `POST /gpu/{gpu_id}/fan/reset` | Restore GPU fan to firmware automatic (records gui_active per DEC-100) |
+| `POST /gpu/{gpu_id}/fan/verify` | Behavioural test of GPU fan-control effectiveness; ~6 s, no lease (DEC-120). Drives a test speed biased upward, reads back the applied PMFW `fan_curve`/`pwm1` + RPM, then restores. Detects the silent failures static checks miss (`ppfeaturemask` bit 14 unset, SMU mismatch, BIOS overdrive lock). |
 | `POST /profile/activate` | Activate a profile by id or path |
 | `POST /profile/deactivate` | Clear active profile, release the `profile-engine` lease (DEC-097) |
 | `POST /config/profile-search-dirs` | Add directories to the profile search path (immediate) |
