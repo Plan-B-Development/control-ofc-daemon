@@ -160,7 +160,11 @@ fn evaluate_graph(curve: &CurveConfig, temp_c: f64) -> f64 {
             return p0.output_pct + t * (p1.output_pct - p0.output_pct);
         }
     }
-    50.0
+    // Fallthrough (only reachable for non-monotonic temps in a hand-edited
+    // profile): mirror the GUI's `_interpolate_graph`, which returns the last
+    // point's output, so headless evaluation matches the GUI preview. Pinned by
+    // the cross-stack parity harness (DEC-126).
+    points[points.len() - 1].output_pct
 }
 
 fn evaluate_linear(curve: &CurveConfig, temp_c: f64) -> f64 {

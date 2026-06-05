@@ -745,6 +745,76 @@ mod tests {
         cache
     }
 
+    // ─── Cross-stack evaluator parity (DEC-126) ──────────────────────────
+    // Loads the canonical fixture shared byte-identically with the GUI
+    // (control-ofc-gui/tests/fixtures/parity_vectors.json) and asserts the same
+    // hand-authored oracle the GUI checks in tests/test_evaluator_parity.py.
+    // Agreement on both sides pins headless and GUI-driven evaluation together.
+    fn load_parity_vectors() -> serde_json::Value {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/parity_vectors.json"
+        );
+        let text =
+            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read parity fixture: {e}"));
+        serde_json::from_str(&text).expect("parse parity fixture")
+    }
+
+    #[test]
+    fn parity_curve_eval_matches_oracle() {
+        let vectors = load_parity_vectors();
+        for case in vectors["curve_eval"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let curve: CurveConfig = serde_json::from_value(case["curve"].clone()).expect("curve");
+            let temp = case["temp"].as_f64().unwrap();
+            let expected = case["expected_pct"].as_f64().unwrap();
+            let got = evaluate_curve(&curve, temp);
+            assert!(
+                (got - expected).abs() < 0.01,
+                "curve_eval[{name}]: got {got}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn parity_tuning_sequence_matches_oracle() {
+        use std::collections::HashMap;
+        let vectors = load_parity_vectors();
+        for vector in vectors["tuning_sequence"].as_array().unwrap() {
+            let name = vector["name"].as_str().unwrap();
+            let sensor_id = vector["sensor_id"].as_str().unwrap();
+            let profile: DaemonProfile =
+                serde_json::from_value(vector["profile"].clone()).expect("profile");
+            let mut state = ProfileEngineState::new();
+
+            let mut produced: HashMap<String, Vec<u8>> = HashMap::new();
+            for temp in vector["temps"].as_array().unwrap() {
+                let cache = make_cache_with_sensor(sensor_id, temp.as_f64().unwrap());
+                for cmd in evaluate_profile(&profile, &cache, &mut state) {
+                    produced
+                        .entry(cmd.member_id)
+                        .or_default()
+                        .push(cmd.pwm_percent);
+                }
+            }
+
+            for member in vector["expected"].as_array().unwrap() {
+                let mid = member["member_id"].as_str().unwrap();
+                let expected: Vec<u8> = member["pwm"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_u64().unwrap() as u8)
+                    .collect();
+                assert_eq!(
+                    produced.get(mid).map(|v| v.as_slice()),
+                    Some(expected.as_slice()),
+                    "tuning_sequence[{name}] / {mid}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn evaluate_uses_intel_cpu_sensor() {
         // The safety sensor lookup must work with Intel "Package id 0" labels

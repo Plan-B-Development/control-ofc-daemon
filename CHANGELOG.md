@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.12.2] — 2026-06-05
+
+### Fixed
+- **Graph-curve fallthrough aligned with the GUI.** `evaluate_graph` returned a
+  hardcoded `50%` for the (effectively unreachable) non-monotonic fallthrough
+  case; it now returns the last point's output, matching the GUI's
+  `_interpolate_graph`. Defensive — no behaviour change for any editor-authored
+  profile. (DEC-126)
+
+### Internal
+- **Cross-stack evaluator parity harness.** Added `daemon/tests/fixtures/parity_vectors.json`
+  (byte-identical to the GUI's canonical copy) and two `profile_engine.rs` tests
+  that assert the same hand-authored oracle the GUI checks — pinning headless
+  evaluation (curve interpolation + deadband/step/start-stop/mixed-GPU tuning) to
+  GUI-driven evaluation. (DEC-126)
+
 ## [1.12.1] — 2026-06-05
 
 ### Internal
