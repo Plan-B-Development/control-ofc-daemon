@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- **Supply-chain integrity: `Cargo.lock` is now committed** and the PKGBUILD
+  fetches `--locked`, so the dependency set `cargo audit` scans at release
+  time is exactly the set the clean-room CI build compiles and ships.
+  Previously the lock was gitignored, the tag tarball contained none, and the
+  AUR build freshly re-resolved every dependency at build time — the audited
+  set and the shipped set could differ, and builds were not reproducible.
+  AUR delivery starts with this release: CI regenerates the published
+  PKGBUILD from `packaging/PKGBUILD` at tag push (`release.yml` aur-publish),
+  and earlier tag tarballs contain no lock for `--locked` to apply to.
+  No runtime behaviour change. (DEC-143)
+
 ## [1.13.0] — 2026-06-06
 
 2026-06-05 audit remediation. Pairs with **GUI v1.30.0**. Additive wire-contract

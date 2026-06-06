@@ -1,7 +1,8 @@
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock is COMMITTED (DEC-143): cargo audit must scan the exact dependency
+# set CI builds and ships (PKGBUILD: cargo fetch --locked, build/test --frozen).
 
 # cargo-mutants output (regenerable mutation-testing artifacts, never committed)
 mutants.out/
