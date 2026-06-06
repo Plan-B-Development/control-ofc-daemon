@@ -71,15 +71,27 @@ fn expected_driver_for_chip(chip_name: &str) -> &'static str {
 }
 
 /// Whether a chip's driver is in the mainline kernel.
+///
+/// The ITE list mirrors the `enum chips` in mainline
+/// `drivers/hwmon/it87.c` (verified against v6.17). `it8622` added in
+/// DEC-144 — it has been in the mainline enum for years but was missing
+/// here. `it8689` is deliberately NOT listed (DEC-144): mainline gains
+/// IT8689E *sensor* support in kernel 7.1 (commit 66b8eaf), but no
+/// released stable kernel ships it yet and fan *control* on the Gigabyte
+/// boards that carry this chip still requires the out-of-tree DKMS
+/// build's MMIO path — reporting "mainline: yes" would steer users away
+/// from the driver they actually need. Revisit once 7.1+ is the common
+/// floor AND upstream control is proven on these boards.
 pub fn chip_driver_in_mainline(chip_name: &str) -> bool {
     let driver = expected_driver_for_chip(chip_name);
     // ITE chips IT8625E+ require out-of-tree frankcrawford/it87
     if driver == "it87" {
         let lower = chip_name.to_lowercase();
         let mainline_chips = [
-            "it8603", "it8620", "it8623", "it8628", "it8705", "it8712", "it8716", "it8718",
-            "it8720", "it8721", "it8726", "it8728", "it8732", "it8758", "it8771", "it8772",
-            "it8781", "it8782", "it8783", "it8786", "it8790", "it8792", "it8795", "it87952",
+            "it8603", "it8620", "it8622", "it8623", "it8628", "it8705", "it8712", "it8716",
+            "it8718", "it8720", "it8721", "it8726", "it8728", "it8732", "it8758", "it8771",
+            "it8772", "it8781", "it8782", "it8783", "it8786", "it8790", "it8792", "it8795",
+            "it87952",
         ];
         return mainline_chips.iter().any(|c| lower.starts_with(c));
     }
@@ -426,10 +438,26 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "X870E AORUS PRO",
         chips: &["it8696", "it87952"],
     },
+    // DEC-144: owner-confirmed dual-chip per frankcrawford/it87 issue
+    // #89 (`it8696-isa-0a40` 5 fans + `it87952-isa-0a60` 3 fans,
+    // control working). Substring match also covers the 2026 "X870E
+    // AORUS ELITE X3D" refresh.
+    DualChipEntry {
+        board_name: "X870E AORUS ELITE",
+        chips: &["it8696", "it87952"],
+    },
     DualChipEntry {
         board_name: "X870 AORUS ELITE WIFI7",
         chips: &["it8696", "it87952"],
     },
+    // DEC-144 caveat: the frankcrawford/it87 DMI table annotates the
+    // ICE variant as a SINGLE-chip IT8696E board, conflicting with this
+    // dual-chip expectation. Driver comments are contributor notes, not
+    // authoritative, and removing this entry would not change behaviour
+    // anyway (the plain "X870 AORUS ELITE WIFI7" entry above substring-
+    // matches the ICE name). Resolving it properly needs exact-match
+    // lookup support — deferred until an ICE owner report settles the
+    // topology.
     DualChipEntry {
         board_name: "X870 AORUS ELITE WIFI7 ICE",
         chips: &["it8696", "it87952"],
@@ -441,6 +469,14 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
     },
     DualChipEntry {
         board_name: "X670E AORUS PRO X",
+        chips: &["it8689", "it87952"],
+    },
+    // DEC-144: plain X670 (non-E) ELITE AX — annotated "IT8689E +
+    // IT87952E" in the frankcrawford/it87 DMI table (master, 2026-04).
+    // The substring cannot false-match the X670E boards above ("X670 "
+    // with a space is not a substring of "X670E ...").
+    DualChipEntry {
+        board_name: "X670 AORUS ELITE AX",
         chips: &["it8689", "it87952"],
     },
     // ── Z690 / Z790 AORUS family (IT8689E + IT87952E) ──────────
@@ -532,9 +568,10 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "B850 AI TOP",
         chips: &["it8696", "it87952"],
     },
-    // X870 AORUS STEALTH ICE (frankcrawford/it87 issue #81) deliberately
-    // NOT in this table — its secondary chip is IT8883, which has no
-    // Linux driver as of 2026-Q2, so a "missing secondary chip" warning
+    // X870 AORUS STEALTH ICE (frankcrawford/it87 issue #81, still open)
+    // deliberately NOT in this table — its secondary chip is IT8883,
+    // which has no Linux driver (re-checked 2026-06: zero matches in
+    // frankcrawford/it87 master), so a "missing secondary chip" warning
     // would be permanent and useless. The chip is recognised in the GUI
     // chip-guidance DB with a "no driver available" note instead.
 ];
@@ -791,6 +828,35 @@ mod tests {
     }
 
     #[test]
+    fn it8622_is_mainline() {
+        // DEC-144: it8622 is in the mainline it87 `enum chips` (verified
+        // against torvalds/linux drivers/hwmon/it87.c v6.17) but was
+        // missing from our list — the chips table falsely told IT8622E
+        // owners they needed the DKMS build.
+        assert!(chip_driver_in_mainline("it8622"));
+    }
+
+    #[test]
+    fn it8689_stays_out_of_mainline_until_stable_control_exists() {
+        // DEC-144 intent lock: mainline gains IT8689E *sensor* support in
+        // kernel 7.1 (commit 66b8eaf), but no released stable kernel ships
+        // it yet and Gigabyte fan *control* still needs the out-of-tree
+        // DKMS MMIO path. Flipping this to true would steer users away
+        // from the driver they actually need — do not change it without
+        // revisiting DEC-144.
+        assert!(!chip_driver_in_mainline("it8689"));
+    }
+
+    #[test]
+    fn it8665_not_in_mainline() {
+        // DEC-144: IT8665E (X399 ROG Zenith Extreme era) is NOT in the
+        // mainline it87 enum — it must keep reporting out-of-tree so the
+        // GUI's chip guidance (DKMS + `mmio=off` regression note, issue
+        // #106) lines up with the modules table.
+        assert!(!chip_driver_in_mainline("it8665"));
+    }
+
+    #[test]
     fn detect_modules_from_proc() {
         let tmp = tempfile::tempdir().unwrap();
         let modules_path = tmp.path().join("modules");
@@ -1003,6 +1069,47 @@ mod tests {
         // X870E AORUS MASTER family.
         let chips = expected_chips_for_board("Gigabyte Technology Co., Ltd.", "B850 AI TOP");
         assert_eq!(chips, vec!["it8696".to_string(), "it87952".to_string()]);
+    }
+
+    #[test]
+    fn expected_chips_x870e_aorus_elite_pairs_it8696_with_it87952() {
+        // DEC-144: owner-confirmed dual-chip per frankcrawford/it87
+        // issue #89 (it8696-isa-0a40 + it87952-isa-0a60, control
+        // working on current driver builds).
+        let chips = expected_chips_for_board("Gigabyte Technology Co., Ltd.", "X870E AORUS ELITE");
+        assert_eq!(chips, vec!["it8696".to_string(), "it87952".to_string()]);
+    }
+
+    #[test]
+    fn expected_chips_x870e_aorus_elite_x3d_resolves_via_substring() {
+        // DEC-144: the 2026 X3D refresh must resolve through the plain
+        // "X870E AORUS ELITE" substring entry — issue #89's report is
+        // from this exact SKU.
+        let chips =
+            expected_chips_for_board("Gigabyte Technology Co., Ltd.", "X870E AORUS ELITE X3D");
+        assert_eq!(chips, vec!["it8696".to_string(), "it87952".to_string()]);
+    }
+
+    #[test]
+    fn expected_chips_x670_aorus_elite_ax_pairs_it8689_with_it87952() {
+        // DEC-144: plain X670 (non-E) ELITE AX — annotated IT8689E +
+        // IT87952E in the frankcrawford/it87 DMI table. Must not be
+        // shadowed by (or shadow) the X670E entries.
+        let chips =
+            expected_chips_for_board("Gigabyte Technology Co., Ltd.", "X670 AORUS ELITE AX");
+        assert_eq!(chips, vec!["it8689".to_string(), "it87952".to_string()]);
+    }
+
+    #[test]
+    fn expected_chips_x670_elite_entry_does_not_claim_x670e_skus() {
+        // DEC-144 regression guard: the "X670 AORUS ELITE AX" needle
+        // (note: no E after X670) must not substring-match unverified
+        // X670E SKUs — "X670E AORUS ELITE AX" is deliberately NOT in the
+        // table and must return empty, not inherit the X670 pairing.
+        assert!(
+            expected_chips_for_board("Gigabyte Technology Co., Ltd.", "X670E AORUS ELITE AX")
+                .is_empty()
+        );
     }
 
     #[test]

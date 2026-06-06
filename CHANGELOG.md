@@ -2,7 +2,31 @@
 
 ## [Unreleased]
 
+### Added
+- **Dual-chip board coverage (DEC-144):** `GIGABYTE_DUAL_CHIP_BOARDS` gains
+  **X870E AORUS ELITE** (it8696+it87952 — owner-confirmed in
+  frankcrawford/it87 #89; the substring also covers the 2026 ELITE X3D
+  refresh) and **X670 AORUS ELITE AX** (it8689+it87952 — driver DMI table
+  annotation). The X870 AORUS ELITE WIFI7 ICE single-chip ambiguity is
+  documented in-code (no behavioural change; exact-match lookup deferred
+  pending owner evidence).
+
+### Fixed
+- **`chip_driver_in_mainline` reports IT8622E as mainline (DEC-144)** — the
+  chip is in the mainline it87 `enum chips` (verified against
+  torvalds/linux v6.17) but was missing from the list, so the diagnostics
+  chips table falsely told IT8622E owners they needed the DKMS build.
+  `it8689` deliberately stays out-of-tree (mainline 7.1 support is
+  sensors-only and unreleased; Gigabyte fan control still needs the DKMS
+  MMIO path) — guarded by an intent-lock test.
+
 ### Changed
+- **README dual-chip prerequisite row (DEC-144):** "update `it87-dkms-git`"
+  is now the headline remediation — 2026-03+ upstream builds default
+  `mmio=on` (PR #95) and merge the ISA-bridge MMIO/H2RAM path (PR #102), so
+  current builds enumerate *and control* the secondary chip by default;
+  `mmio=on` is the pre-2026-03 fallback. Counter-case: IT8665E boards need
+  `mmio=off` (frankcrawford/it87 #106 regression).
 - **Supply-chain integrity: `Cargo.lock` is now committed** and the PKGBUILD
   fetches `--locked`, so the dependency set `cargo audit` scans at release
   time is exactly the set the clean-room CI build compiles and ships.

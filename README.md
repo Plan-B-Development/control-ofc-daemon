@@ -43,7 +43,7 @@ that no package can perform safely (BIOS settings, kernel command line).
 | BIOS configured for Linux fan control | Most Gigabyte / MSI boards, some ASRock | "Smart Fan" disabled or set to a degenerate (max) curve. See the [vendor-by-vendor BIOS guide][vendor-bios] |
 | `amdgpu.ppfeaturemask=0xffffffff` on the kernel command line | RDNA3+ (RX 7000 / RX 9000) GPU fan-curve writes | Add to your bootloader; see `man control-ofc-daemon` for per-bootloader instructions. Pre-RDNA3 cards do not require this |
 | `acpi_enforce_resources=lax` (or `it87 ignore_resource_conflict=1`) | Some Gigabyte / ASUS boards with ACPI OpRegion conflicts | The daemon's `/diagnostics/hardware` endpoint and the GUI's Hardware Readiness card detect the conflict and surface the remediation |
-| `/etc/modprobe.d/it87.conf` with `options it87 mmio=on` | Some dual-IT-chip Gigabyte boards (e.g. X870E AORUS MASTER, DEC-101) | User action; the GUI surfaces the exact remediation when the dual-chip case is detected |
+| Current `it87-dkms-git` build (2026-03+; older builds need `/etc/modprobe.d/it87.conf` with `options it87 mmio=on`) | Dual-IT-chip Gigabyte boards (e.g. X870E AORUS MASTER, DEC-101/DEC-144) — current builds enumerate and control the secondary chip by default | User action; the GUI surfaces the exact remediation when the dual-chip case is detected. (One counter-case: IT8665E boards need `mmio=off` on current builds — frankcrawford/it87 issue #106) |
 
 If your board is already working under any other Linux fan control tool
 (fancontrol, lm_sensors with pwmconfig, CoolerControl, CoreCtrl), the
