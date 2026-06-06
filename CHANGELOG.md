@@ -1,6 +1,10 @@
 # Changelog
 
-## [Unreleased]
+## [1.14.0] — 2026-06-07
+
+2026-Q2 it87/SIO knowledgebase refresh (DEC-144) + the DEC-143 supply-chain
+integrity change. Pairs with **GUI v1.32.0**. Diagnostics data tables and
+packaging only — no wire-shape, control-loop, lease, or safety-path changes.
 
 ### Added
 - **Dual-chip board coverage (DEC-144):** `GIGABYTE_DUAL_CHIP_BOARDS` gains
