@@ -34,25 +34,39 @@ most items via `depends`, `optdepends`, and a shipped
 `/etc/modules-load.d/control-ofc.conf`. A few rows remain user actions
 that no package can perform safely (BIOS settings, kernel command line).
 
+These prerequisites change kernel modules, firmware (UEFI/BIOS) settings,
+and boot parameters. They are informational, provided as-is without
+warranty, and applied at your own risk — the project accepts no liability
+(MIT License). For guided, sourced walkthroughs see the GUI manual's
+[Setup Checklist][setup-checklist] and [Driver Setup][gui-driver-setup]
+pages.
+
 | Prerequisite | Required for | How it is satisfied |
 |---|---|---|
 | Linux kernel ≥ 5.10, hwmon sysfs, `cdc_acm` module | All operation | Standard on every supported distro; the systemd unit pulls `cdc_acm` for OpenFan |
 | Super I/O kernel module loaded — `nct6775`, `it87`, `w83627ehf`, `drivetemp` | Motherboard fan / sensor control | The package ships `/etc/modules-load.d/control-ofc.conf`. Loaded at next boot, or immediately via `sudo systemctl start systemd-modules-load` |
-| Out-of-tree DKMS driver — `it87-dkms-git`, `nct6687d-dkms-git`, `nct6686d-dkms-git` | Most newer (2022+) Gigabyte / MSI / ASRock boards — fan control is read-only without these | Install the matching AUR package; declared as `optdepends`. The GUI's Diagnostics → Fans → Hardware Readiness card identifies the chip and recommends the exact package |
+| Out-of-tree DKMS driver — `it87-dkms-git`, `nct6687d-dkms-git`, `nct6686d-dkms-git` | Most newer (2022+) Gigabyte / MSI / ASRock boards — fan control is read-only without these | Install the matching AUR package; declared as `optdepends`. The GUI's Diagnostics → Troubleshooting readiness report identifies the chip and recommends the exact package |
 | `dkms` + `linux-headers` matching the running kernel | Building any of the DKMS drivers above | Pulled in transitively via the DKMS packages, but `linux-headers` must match the kernel you actually boot |
+| UEFI Secure Boot disabled, or DKMS modules signed | Loading any `*-dkms-git` driver with Secure Boot enabled | Unsigned out-of-tree modules build but fail to load (`Key was rejected by service`). Detection and options (disable vs sign, CachyOS caveat): [GUI manual — Driver Setup § Secure Boot][gui-secure-boot] |
 | BIOS configured for Linux fan control | Most Gigabyte / MSI boards, some ASRock | "Smart Fan" disabled or set to a degenerate (max) curve. See the [vendor-by-vendor BIOS guide][vendor-bios] |
 | `amdgpu.ppfeaturemask=0xffffffff` on the kernel command line | RDNA3+ (RX 7000 / RX 9000) GPU fan-curve writes | Add to your bootloader; see `man control-ofc-daemon` for per-bootloader instructions. Pre-RDNA3 cards do not require this |
 | `acpi_enforce_resources=lax` (or `it87 ignore_resource_conflict=1`) | Some Gigabyte / ASUS boards with ACPI OpRegion conflicts | The daemon's `/diagnostics/hardware` endpoint and the GUI's Hardware Readiness card detect the conflict and surface the remediation |
 | Current `it87-dkms-git` build (2026-03+; older builds need `/etc/modprobe.d/it87.conf` with `options it87 mmio=on`) | Dual-IT-chip Gigabyte boards (e.g. X870E AORUS MASTER, DEC-101/DEC-144) — current builds enumerate and control the secondary chip by default | User action; the GUI surfaces the exact remediation when the dual-chip case is detected. (One counter-case: IT8665E boards need `mmio=off` on current builds — frankcrawford/it87 issue #106) |
 
 If your board is already working under any other Linux fan control tool
-(fancontrol, lm_sensors with pwmconfig, CoolerControl, CoreCtrl), the
-right driver is almost certainly already loaded and the daemon will
-inherit that configuration. After installation, **Diagnostics → Fans →
-Hardware Readiness** in the GUI is the most reliable way to discover
-what your specific system needs without trial and error.
+(fancontrol, lm_sensors with pwmconfig, CoolerControl, CoreCtrl, fan2go),
+the right driver is almost certainly already loaded and the daemon will
+inherit that configuration — but **stop and disable those tools before
+the daemon takes over the same headers**: PWM sysfs values have one
+writer at a time, and two controllers fight each other (see the GUI
+manual's [Setup Checklist][setup-checklist], step 5). After installation,
+**Diagnostics → Troubleshooting** in the GUI is the most reliable way to
+discover what your specific system needs without trial and error.
 
 [vendor-bios]: https://github.com/Plan-B-Development/control-ofc-gui/blob/main/docs/21_AMD_Motherboard_Fan_Control_Guide.md
+[setup-checklist]: https://github.com/Plan-B-Development/control-ofc-gui/blob/main/manual/setup-checklist.md
+[gui-driver-setup]: https://github.com/Plan-B-Development/control-ofc-gui/blob/main/manual/driver-setup.md
+[gui-secure-boot]: https://github.com/Plan-B-Development/control-ofc-gui/blob/main/manual/driver-setup.md#secure-boot-and-dkms-modules
 
 ## Quick start
 

@@ -55,11 +55,11 @@ The daemon discovers sensors and fan headers by scanning `/sys/class/hwmon/`. Fo
 
 CPU temperature modules (`coretemp` for Intel, `k10temp` for AMD) and SMBus adapter modules (`i2c-i801`, `i2c-piix4`) auto-load via PCI/ACPI matching — no configuration needed.
 
-**If your hardware is not detected:** Install `lm_sensors` and run:
+**If your hardware is not detected:** check the GUI's readiness report first (**Diagnostics → Troubleshooting**) — it identifies your board's chips and the exact module or AUR package needed **without probing the hardware**. As a **last resort**, install `lm_sensors` and run:
 ```bash
 sudo sensors-detect
 ```
-This interactively probes for additional sensor chips and persists the results. Then restart the daemon:
+This interactively probes for additional sensor chips and persists the results. Probing is at your own risk: it "can access chips in a way these chips do not like, causing problems ranging from SMBus lockup to permanent hardware damage (a rare case, thankfully)" — [sensors-detect(8)](https://man.archlinux.org/man/extra/lm_sensors/sensors-detect.8.en). Accept the conservative defaults, and never run it after boot on a dual-chip Gigabyte board (it can wedge the Super-I/O bridge so the secondary chip vanishes until reboot). Then restart the daemon:
 ```bash
 sudo systemctl restart control-ofc-daemon
 ```

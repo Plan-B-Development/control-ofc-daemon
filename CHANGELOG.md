@@ -1,5 +1,38 @@
 # Changelog
 
+## [1.14.1] — 2026-06-07
+
+DEC-145 guidance pass. Pairs with **GUI v1.33.0**. Documentation and
+packaging text only — no code, wire-shape, control-loop, lease, or
+safety-path changes.
+
+### Added
+- README Prerequisites: **UEFI Secure Boot row** — unsigned `*-dkms-git`
+  modules build but fail to load under Secure Boot (`Key was rejected by
+  service`); links the GUI manual's new Driver Setup § Secure Boot
+  walkthrough (detection, disable-vs-sign, CachyOS IMA caveat).
+- README Prerequisites: explicit informational / as-is / at-your-own-risk /
+  no-liability note — the first user-facing risk language daemon-side
+  (previously only the MIT LICENSE carried it).
+
+### Changed
+- **sensors-detect stance unified with the GUI (DEC-145):** USER_GUIDE,
+  the modules-load.d comment, and the lm_sensors optdepends now present
+  `sensors-detect` as a last resort behind the GUI readiness report, with
+  the sensors-detect(8) risk quote ("SMBus lockup to permanent hardware
+  damage") and the dual-chip Gigabyte warning.
+- README coexistence note now names fan2go and instructs stopping other
+  fan controllers before the daemon drives the same headers (PWM sysfs is
+  single-writer; last writer wins), linking the GUI Setup Checklist.
+
+### Fixed
+- Stale GUI path "Diagnostics → Fans → Hardware Readiness" in README (×2)
+  and the post-install message — the readiness report lives at
+  **Diagnostics → Troubleshooting** since GUI v1.26.0 (DEC-124).
+- aur-publish now ships `packaging/*.install` via the deploy action's
+  `assets` input — post-install message fixes previously never reached the
+  AUR (only PKGBUILD + .SRCINFO were pushed).
+
 ## [1.14.0] — 2026-06-07
 
 2026-Q2 it87/SIO knowledgebase refresh (DEC-144) + the DEC-143 supply-chain
