@@ -221,6 +221,15 @@ impl HwmonPwmController {
         headers
     }
 
+    /// Look up a single header by id — O(1) against the internal map.
+    ///
+    /// Prefer this over scanning `headers()` (which allocates and sorts a
+    /// Vec on every call) on per-write hot paths: the GUI control loop hits
+    /// the PWM-write handler once per fan per second (DEC-146 P3-13).
+    pub fn header(&self, id: &str) -> Option<&PwmHeaderDescriptor> {
+        self.headers.get(id)
+    }
+
     /// Get the lease manager (for take/release operations).
     pub fn lease_manager_mut(&mut self) -> &mut LeaseManager {
         &mut self.lease_manager
@@ -535,6 +544,25 @@ mod tests {
         let lease_mgr = LeaseManager::new();
         let ctrl = HwmonPwmController::new(headers, lease_mgr, Box::new(writer), cache.clone());
         (ctrl, writes, cache)
+    }
+
+    #[test]
+    fn header_lookup_matches_headers_scan() {
+        // DEC-146 P3-13: the O(1) accessor must agree with the sorted scan
+        // and return None for unknown ids.
+        let (ctrl, _writes, _cache) = setup_controller(vec![
+            make_header("h1", "CHA_FAN1", 20),
+            make_header("h2", "CHA_FAN2", 20),
+        ]);
+        assert_eq!(
+            ctrl.header("h1").map(|h| h.label.as_str()),
+            Some("CHA_FAN1")
+        );
+        assert_eq!(
+            ctrl.header("h2").map(|h| h.label.as_str()),
+            Some("CHA_FAN2")
+        );
+        assert!(ctrl.header("missing").is_none());
     }
 
     #[test]

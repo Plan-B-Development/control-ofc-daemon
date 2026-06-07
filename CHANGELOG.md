@@ -7,6 +7,25 @@
   GitHub's 2026-06-16 forced default), and all release-workflow actions
   are now pinned to full commit SHAs with version comments (immutable
   supply-chain posture; the AUR deploy action holds the publishing key).
+- Profile-engine hot path (DEC-146 P2): curve sensor lookup is now O(1)
+  against the id-keyed map (was a per-control linear scan every tick),
+  and one sensors snapshot per tick is shared by the thermal-safety leg
+  and curve evaluation (was two full map clones per second — and the two
+  legs could observe different snapshots within a single tick).
+- OpenFan poll no longer clones the entire daemon state every second to
+  preserve `last_commanded_pwm` — the cache preserves it on update,
+  mirroring the GPU-fan path, with a regression test (DEC-146 P2).
+- hwmon PWM-write/verify handlers look headers up O(1) via the new
+  `header(id)` accessor instead of building and sorting the full header
+  Vec per request, and the descriptor→wire mapping is a single
+  `From<&PwmHeaderDescriptor>` impl (was duplicated field-for-field in
+  two handlers) (DEC-146 P2).
+
+### Fixed
+- `/sensors`, `/poll`, and SSE sensor arrays are now actually sorted by
+  id, as `build_sensor_entries`' doc comment always claimed —
+  deterministic wire order across restarts/rescans, sparing the GUI
+  sensor panel spurious rebuilds (DEC-146 P2).
 
 ### Fixed
 - aur-publish: ship an AUR-side `.gitignore` (tarballs, `src/`, `pkg/`) via

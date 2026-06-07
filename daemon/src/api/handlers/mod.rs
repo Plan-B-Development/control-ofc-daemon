@@ -38,7 +38,8 @@ use crate::health::state::DaemonState;
 
 /// Build the sorted list of sensor entries from a cache snapshot.
 pub(crate) fn build_sensor_entries(snap: &DaemonState, now: Instant) -> Vec<SensorEntry> {
-    snap.sensors
+    let mut entries: Vec<SensorEntry> = snap
+        .sensors
         .values()
         .map(|s| {
             let age_ms = now.duration_since(s.updated_at).as_millis() as u64;
@@ -57,7 +58,11 @@ pub(crate) fn build_sensor_entries(snap: &DaemonState, now: Instant) -> Vec<Sens
                 thresholds: s.thresholds.as_ref().map(SensorThresholdsResponse::from),
             }
         })
-        .collect()
+        .collect();
+    // DEC-146 P3-11: deterministic wire order, matching build_fan_entries —
+    // and this function's doc comment, which promised "sorted" all along.
+    entries.sort_by(|a, b| a.id.cmp(&b.id));
+    entries
 }
 
 /// Build the sorted list of fan entries from a cache snapshot.
@@ -263,6 +268,37 @@ mod tests {
         let state = DaemonState::default();
         let entries = build_fan_entries(&state, Instant::now());
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn build_sensor_entries_sorts_by_id() {
+        // DEC-146 P3-11: deterministic wire order across restarts/rescans.
+        let mut state = DaemonState::default();
+        let now = Instant::now();
+        for id in ["z_temp", "a_temp", "m_temp"] {
+            state.sensors.insert(
+                id.into(),
+                crate::health::state::CachedSensorReading {
+                    id: id.into(),
+                    kind: crate::hwmon::types::SensorKind::CpuTemp,
+                    label: "t".into(),
+                    value_c: 40.0,
+                    source: crate::health::state::DeviceLabel::Hwmon,
+                    updated_at: now,
+                    rate_c_per_s: None,
+                    session_min_c: None,
+                    session_max_c: None,
+                    chip_name: "k10temp".into(),
+                    temp_type: None,
+                    thresholds: None,
+                },
+            );
+        }
+        let ids: Vec<String> = build_sensor_entries(&state, now)
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(ids, ["a_temp", "m_temp", "z_temp"]);
     }
 
     #[test]

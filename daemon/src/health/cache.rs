@@ -64,10 +64,21 @@ impl StateCache {
     }
 
     /// Update all OpenFanController fan readings as a batch.
+    ///
+    /// Preserves `last_commanded_pwm` from existing entries when the incoming
+    /// state doesn't carry one (the RPM poll can't read the commanded value
+    /// from the controller) — mirroring `update_gpu_fans`, so the poll loop
+    /// no longer needs a full `snapshot()` clone every second just to copy
+    /// this one field forward (DEC-146 P3-7).
     pub fn update_openfan_fans(&self, fans: Vec<OpenFanState>) {
         let now = Instant::now();
         let mut state = self.inner.write();
-        for fan in fans {
+        for mut fan in fans {
+            if fan.last_commanded_pwm.is_none() {
+                if let Some(existing) = state.openfan_fans.get(&fan.channel) {
+                    fan.last_commanded_pwm = existing.last_commanded_pwm;
+                }
+            }
             state.openfan_fans.insert(fan.channel, fan);
         }
         state.subsystem_timestamps.openfan = Some(now);
@@ -286,6 +297,30 @@ mod tests {
         assert!(snap.hwmon_fans.is_empty());
         assert!(snap.sensors.is_empty());
         assert!(!snap.aio.detected);
+    }
+
+    #[test]
+    fn update_openfan_fans_preserves_commanded_pwm_on_none() {
+        // DEC-146 P3-7: the RPM poll can't read the commanded value from the
+        // controller, so a poll update carrying None must not erase what a
+        // write recorded — mirroring update_gpu_fans.
+        let cache = StateCache::new();
+        let mut written = make_openfan(0, 800);
+        written.last_commanded_pwm = Some(40);
+        cache.update_openfan_fans(vec![written]);
+
+        // Poll cycle: rpm refreshed, commanded value unknown (None).
+        cache.update_openfan_fans(vec![make_openfan(0, 820)]);
+        let snap = cache.snapshot();
+        assert_eq!(snap.openfan_fans[&0].last_commanded_pwm, Some(40));
+        assert_eq!(snap.openfan_fans[&0].rpm, 820);
+
+        // A new write overrides the preserved value.
+        let mut rewritten = make_openfan(0, 830);
+        rewritten.last_commanded_pwm = Some(60);
+        cache.update_openfan_fans(vec![rewritten]);
+        let snap = cache.snapshot();
+        assert_eq!(snap.openfan_fans[&0].last_commanded_pwm, Some(60));
     }
 
     #[test]

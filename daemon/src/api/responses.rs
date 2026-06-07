@@ -266,6 +266,28 @@ pub struct PwmHeaderEntry {
     pub pwm_mode: Option<u8>,
 }
 
+impl From<&crate::hwmon::pwm_discovery::PwmHeaderDescriptor> for PwmHeaderEntry {
+    /// Single source of truth for the descriptor → wire-entry mapping
+    /// (DEC-146 P3-12). Previously duplicated field-for-field in the
+    /// headers and rescan handlers, which drifts when fields are added —
+    /// this contract recently grew `pwm_mode` and `is_writable`.
+    fn from(h: &crate::hwmon::pwm_discovery::PwmHeaderDescriptor) -> Self {
+        PwmHeaderEntry {
+            id: h.id.clone(),
+            label: h.label.clone(),
+            chip_name: h.chip_name.clone(),
+            device_id: h.device_id.clone(),
+            pwm_index: h.pwm_index,
+            supports_enable: h.supports_enable,
+            rpm_available: h.rpm_available,
+            min_pwm_percent: h.min_pwm_percent,
+            max_pwm_percent: h.max_pwm_percent,
+            is_writable: h.is_writable,
+            pwm_mode: h.pwm_mode,
+        }
+    }
+}
+
 /// Response for `GET /hwmon/headers`.
 #[derive(Debug, Clone, Serialize)]
 pub struct PwmHeadersResponse {

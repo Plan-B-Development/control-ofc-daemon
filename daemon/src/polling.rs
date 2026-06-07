@@ -441,22 +441,18 @@ pub async fn openfan_poll_loop(
                 let now = Instant::now();
                 match response {
                     crate::serial::protocol::Response::Rpm { readings, .. } => {
-                        // Preserve last_commanded_pwm from existing cache entries
-                        let snap = cache.snapshot();
                         let fans: Vec<OpenFanState> = readings
                             .iter()
-                            .map(|r| {
-                                let existing_pwm = snap
-                                    .openfan_fans
-                                    .get(&r.channel)
-                                    .and_then(|f| f.last_commanded_pwm);
-                                OpenFanState {
-                                    channel: r.channel,
-                                    rpm: r.rpm,
-                                    last_commanded_pwm: existing_pwm,
-                                    updated_at: now,
-                                    rpm_polled: true,
-                                }
+                            .map(|r| OpenFanState {
+                                channel: r.channel,
+                                rpm: r.rpm,
+                                // None → update_openfan_fans preserves the
+                                // cached value (DEC-146 P3-7). Previously this
+                                // loop cloned the entire DaemonState every
+                                // second just to copy this one field forward.
+                                last_commanded_pwm: None,
+                                updated_at: now,
+                                rpm_polled: true,
                             })
                             .collect();
                         let count = fans.len();

@@ -29,22 +29,11 @@ pub async fn hwmon_headers_handler(
 
     let ctrl = controller.lock();
 
+    // DEC-146 P3-12: single mapping source — From<&PwmHeaderDescriptor>.
     let headers = ctrl
         .headers()
-        .iter()
-        .map(|h| PwmHeaderEntry {
-            id: h.id.clone(),
-            label: h.label.clone(),
-            chip_name: h.chip_name.clone(),
-            device_id: h.device_id.clone(),
-            pwm_index: h.pwm_index,
-            supports_enable: h.supports_enable,
-            rpm_available: h.rpm_available,
-            min_pwm_percent: h.min_pwm_percent,
-            max_pwm_percent: h.max_pwm_percent,
-            is_writable: h.is_writable,
-            pwm_mode: h.pwm_mode,
-        })
+        .into_iter()
+        .map(PwmHeaderEntry::from)
         .collect();
 
     json_ok(
@@ -242,7 +231,7 @@ pub async fn hwmon_set_pwm_handler(
     // rather than "retry next cycle".
     {
         let ctrl = controller.lock();
-        match ctrl.headers().into_iter().find(|h| h.id == header_id) {
+        match ctrl.header(&header_id) {
             Some(h) if !h.is_writable => {
                 return error_response(
                     StatusCode::BAD_REQUEST,
@@ -343,22 +332,8 @@ pub async fn hwmon_rescan_handler(
     let hwmon_root = std::path::Path::new(HWMON_SYSFS_ROOT);
     match discover_pwm_headers(hwmon_root) {
         Ok(headers) => {
-            let entries: Vec<PwmHeaderEntry> = headers
-                .iter()
-                .map(|h| PwmHeaderEntry {
-                    id: h.id.clone(),
-                    label: h.label.clone(),
-                    chip_name: h.chip_name.clone(),
-                    device_id: h.device_id.clone(),
-                    pwm_index: h.pwm_index,
-                    supports_enable: h.supports_enable,
-                    rpm_available: h.rpm_available,
-                    min_pwm_percent: h.min_pwm_percent,
-                    max_pwm_percent: h.max_pwm_percent,
-                    is_writable: h.is_writable,
-                    pwm_mode: h.pwm_mode,
-                })
-                .collect();
+            // DEC-146 P3-12: single mapping source — From<&PwmHeaderDescriptor>.
+            let entries: Vec<PwmHeaderEntry> = headers.iter().map(PwmHeaderEntry::from).collect();
             log::info!("Hwmon rescan: found {} PWM header(s)", entries.len());
             let count = entries.len();
             json_ok(
@@ -420,7 +395,7 @@ pub async fn hwmon_verify_handler(
                 &ErrorEnvelope::lease_error(e.to_string()),
             );
         }
-        match ctrl.headers().into_iter().find(|h| h.id == header_id) {
+        match ctrl.header(&header_id) {
             Some(h) => (
                 h.pwm_path.clone(),
                 h.enable_path.clone(),

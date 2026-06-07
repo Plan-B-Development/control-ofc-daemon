@@ -14,6 +14,7 @@ use backends::{GpuBackend, HwmonBackend, OpenFanBackend, SafetyWriteBackend, Wri
 
 use crate::constants;
 use crate::health::cache::StateCache;
+use crate::health::state::CachedSensorReading;
 use crate::hwmon::types::SensorKind;
 use crate::profile::{evaluate_curve, DaemonProfile, LogicalControl};
 
@@ -224,12 +225,11 @@ fn apply_tuning_with_floor(
 /// per-control cross-cycle state required by the tuning pipeline.
 pub fn evaluate_profile(
     profile: &DaemonProfile,
-    cache: &StateCache,
+    sensors: &HashMap<String, CachedSensorReading>,
     engine_state: &mut ProfileEngineState,
 ) -> Vec<PwmCommand> {
     engine_state.sync_profile_id(&profile.id);
 
-    let sensors = cache.sensors_snapshot();
     let mut commands = Vec::new();
 
     for control in &profile.controls {
@@ -252,8 +252,10 @@ pub fn evaluate_profile(
                 continue;
             };
 
-            // Find the sensor reading
-            let sensor = sensors.values().find(|s| s.id == curve.sensor_id);
+            // Find the sensor reading — the map is keyed by sensor id, so
+            // this is an O(1) lookup instead of the per-control linear scan
+            // it used to be (DEC-146 P3-5).
+            let sensor = sensors.get(&curve.sensor_id);
             let Some(sensor) = sensor else {
                 log::debug!(
                     "Control '{}': sensor '{}' not available, skipping",
@@ -432,8 +434,11 @@ pub async fn profile_engine_loop(
         // max across ALL CpuTemp sensors (AMD Tctl, Intel Package id, etc.)
         // so the rule works on any platform, not just AMD — plus the
         // no-CPU-sensor fallback.
+        // DEC-146 P3-6: one sensors snapshot per tick, shared by the safety
+        // leg and curve evaluation — halves the per-second map clone and
+        // makes the tick internally consistent (both legs see one snapshot).
+        let sensors = cache.sensors_snapshot();
         let (decision, hottest_cpu_c) = {
-            let sensors = cache.sensors_snapshot();
             let hottest_cpu_c: Option<f64> = sensors
                 .values()
                 .filter(|s| s.kind == SensorKind::CpuTemp)
@@ -490,7 +495,7 @@ pub async fn profile_engine_loop(
                 engine_state.deactivate();
                 continue;
             };
-            evaluate_profile(active_profile, &cache, &mut engine_state)
+            evaluate_profile(active_profile, &sensors, &mut engine_state)
         };
 
         // Apply per backend (DEC-135). Each backend owns its own gating and
@@ -648,7 +653,7 @@ mod tests {
             let mut produced: HashMap<String, Vec<u8>> = HashMap::new();
             for temp in vector["temps"].as_array().unwrap() {
                 let cache = make_cache_with_sensor(sensor_id, temp.as_f64().unwrap());
-                for cmd in evaluate_profile(&profile, &cache, &mut state) {
+                for cmd in evaluate_profile(&profile, &cache.sensors_snapshot(), &mut state) {
                     produced
                         .entry(cmd.member_id)
                         .or_default()
@@ -678,7 +683,11 @@ mod tests {
         // The safety sensor lookup must work with Intel "Package id 0" labels
         let cache = make_cache_with_cpu_sensor("cpu", "Package id 0", 55.0);
         let profile = make_profile("curve", "graph", 50.0);
-        let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
+        let cmds = evaluate_profile(
+            &profile,
+            &cache.sensors_snapshot(),
+            &mut ProfileEngineState::new(),
+        );
         assert_eq!(cmds.len(), 1);
         // At 55C with graph curve, should produce 60% (same as AMD Tctl test)
         assert_eq!(cmds[0].pwm_percent, 60);
@@ -811,7 +820,11 @@ mod tests {
     fn evaluate_manual_mode_returns_manual_pct() {
         let profile = make_profile("manual", "flat", 50.0);
         let cache = make_cache_with_sensor("cpu", 50.0);
-        let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
+        let cmds = evaluate_profile(
+            &profile,
+            &cache.sensors_snapshot(),
+            &mut ProfileEngineState::new(),
+        );
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].pwm_percent, 42); // manual_output_pct
     }
@@ -820,7 +833,11 @@ mod tests {
     fn evaluate_curve_mode_uses_sensor_temp() {
         let profile = make_profile("curve", "graph", 50.0);
         let cache = make_cache_with_sensor("cpu", 55.0);
-        let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
+        let cmds = evaluate_profile(
+            &profile,
+            &cache.sensors_snapshot(),
+            &mut ProfileEngineState::new(),
+        );
         assert_eq!(cmds.len(), 1);
         // At 55°C with 30→20%, 80→100%: (55-30)/(80-30) = 0.5, 20+0.5*80 = 60%
         assert_eq!(cmds[0].pwm_percent, 60);
@@ -831,7 +848,11 @@ mod tests {
     fn evaluate_missing_sensor_skips_control() {
         let profile = make_profile("curve", "graph", 50.0);
         let cache = make_cache_with_sensor("gpu", 50.0); // wrong sensor
-        let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
+        let cmds = evaluate_profile(
+            &profile,
+            &cache.sensors_snapshot(),
+            &mut ProfileEngineState::new(),
+        );
         assert!(cmds.is_empty()); // sensor "cpu" not found
     }
 
@@ -840,7 +861,11 @@ mod tests {
         let mut profile = make_profile("curve", "graph", 50.0);
         profile.controls[0].members.clear();
         let cache = make_cache_with_sensor("cpu", 50.0);
-        let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
+        let cmds = evaluate_profile(
+            &profile,
+            &cache.sensors_snapshot(),
+            &mut ProfileEngineState::new(),
+        );
         assert!(cmds.is_empty());
     }
 
@@ -850,7 +875,11 @@ mod tests {
         profile.controls[0].offset_pct = 10.0;
         profile.controls[0].minimum_pct = 35.0;
         let cache = make_cache_with_sensor("cpu", 50.0);
-        let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
+        let cmds = evaluate_profile(
+            &profile,
+            &cache.sensors_snapshot(),
+            &mut ProfileEngineState::new(),
+        );
         assert_eq!(cmds.len(), 1);
         // flat=20, +offset=10 → 30, but minimum=35 → clamped to 35
         assert_eq!(cmds[0].pwm_percent, 35);
@@ -861,7 +890,11 @@ mod tests {
         let mut profile = make_profile("curve", "flat", 95.0);
         profile.controls[0].offset_pct = 20.0;
         let cache = make_cache_with_sensor("cpu", 50.0);
-        let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
+        let cmds = evaluate_profile(
+            &profile,
+            &cache.sensors_snapshot(),
+            &mut ProfileEngineState::new(),
+        );
         assert_eq!(cmds[0].pwm_percent, 100); // 95+20=115, clamped to 100
     }
 
@@ -887,7 +920,11 @@ mod tests {
         profile.controls[0].minimum_pct = 20.0;
         push_gpu_member(&mut profile);
         let cache = make_cache_with_sensor("cpu", 50.0);
-        let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
+        let cmds = evaluate_profile(
+            &profile,
+            &cache.sensors_snapshot(),
+            &mut ProfileEngineState::new(),
+        );
 
         let openfan = cmds.iter().find(|c| c.source == "openfan").unwrap();
         let gpu = cmds.iter().find(|c| c.source == "amd_gpu").unwrap();
@@ -902,7 +939,11 @@ mod tests {
         profile.controls[0].minimum_pct = 30.0;
         push_gpu_member(&mut profile);
         let cache = make_cache_with_sensor("cpu", 50.0);
-        let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
+        let cmds = evaluate_profile(
+            &profile,
+            &cache.sensors_snapshot(),
+            &mut ProfileEngineState::new(),
+        );
 
         let gpu = cmds.iter().find(|c| c.source == "amd_gpu").unwrap();
         let openfan = cmds.iter().find(|c| c.source == "openfan").unwrap();
@@ -924,7 +965,11 @@ mod tests {
             fan_zero_rpm: false,
         }];
         let cache = make_cache_with_sensor("cpu", 50.0);
-        let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
+        let cmds = evaluate_profile(
+            &profile,
+            &cache.sensors_snapshot(),
+            &mut ProfileEngineState::new(),
+        );
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].pwm_percent, 5);
     }
@@ -943,7 +988,11 @@ mod tests {
             fan_zero_rpm: false,
         });
         let cache = make_cache_with_sensor("cpu", 50.0);
-        let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
+        let cmds = evaluate_profile(
+            &profile,
+            &cache.sensors_snapshot(),
+            &mut ProfileEngineState::new(),
+        );
         assert_eq!(cmds.len(), 2);
         assert!(cmds.iter().all(|c| c.pwm_percent == 20));
     }
@@ -961,18 +1010,30 @@ mod tests {
         let mut state = ProfileEngineState::new();
 
         // Cycle 1: no prior output → curve value passes through → 30
-        let cmds = evaluate_profile(&profile, &make_cache_with_sensor("cpu", 50.0), &mut state);
+        let cmds = evaluate_profile(
+            &profile,
+            &make_cache_with_sensor("cpu", 50.0).sensors_snapshot(),
+            &mut state,
+        );
         assert_eq!(cmds[0].pwm_percent, 30);
 
         // Curve jumps to 80 (simulate by rebuilding profile)
         profile.curves[0].flat_output_pct = Some(80.0);
 
         // Cycle 2: temp rose, deadband releases, step_up caps the increase at +10 → 40
-        let cmds = evaluate_profile(&profile, &make_cache_with_sensor("cpu", 51.0), &mut state);
+        let cmds = evaluate_profile(
+            &profile,
+            &make_cache_with_sensor("cpu", 51.0).sensors_snapshot(),
+            &mut state,
+        );
         assert_eq!(cmds[0].pwm_percent, 40);
 
         // Cycle 3: another +10 → 50
-        let cmds = evaluate_profile(&profile, &make_cache_with_sensor("cpu", 52.0), &mut state);
+        let cmds = evaluate_profile(
+            &profile,
+            &make_cache_with_sensor("cpu", 52.0).sensors_snapshot(),
+            &mut state,
+        );
         assert_eq!(cmds[0].pwm_percent, 50);
     }
 
@@ -984,14 +1045,22 @@ mod tests {
         let mut state = ProfileEngineState::new();
 
         // Cycle 1: 80
-        let cmds = evaluate_profile(&profile, &make_cache_with_sensor("cpu", 50.0), &mut state);
+        let cmds = evaluate_profile(
+            &profile,
+            &make_cache_with_sensor("cpu", 50.0).sensors_snapshot(),
+            &mut state,
+        );
         assert_eq!(cmds[0].pwm_percent, 80);
 
         // Drop curve to 20
         profile.curves[0].flat_output_pct = Some(20.0);
 
         // Cycle 2: temp rose so the deadband releases — step_down caps at -15 → 65
-        let cmds = evaluate_profile(&profile, &make_cache_with_sensor("cpu", 53.0), &mut state);
+        let cmds = evaluate_profile(
+            &profile,
+            &make_cache_with_sensor("cpu", 53.0).sensors_snapshot(),
+            &mut state,
+        );
         assert_eq!(cmds[0].pwm_percent, 65);
     }
 
@@ -1003,7 +1072,7 @@ mod tests {
         let cache = make_cache_with_sensor("cpu", 50.0);
         let mut state = ProfileEngineState::new();
 
-        let cmds = evaluate_profile(&profile, &cache, &mut state);
+        let cmds = evaluate_profile(&profile, &cache.sensors_snapshot(), &mut state);
         assert_eq!(cmds[0].pwm_percent, 0);
         assert_eq!(state.last_output("ctrl1"), Some(0.0));
     }
@@ -1021,13 +1090,21 @@ mod tests {
         let mut state = ProfileEngineState::new();
 
         // Cycle 1: 10% < stop_pct → snap to 0
-        let cmds = evaluate_profile(&profile, &make_cache_with_sensor("cpu", 50.0), &mut state);
+        let cmds = evaluate_profile(
+            &profile,
+            &make_cache_with_sensor("cpu", 50.0).sensors_snapshot(),
+            &mut state,
+        );
         assert_eq!(cmds[0].pwm_percent, 0);
 
         // Curve now says 25% (above stop_pct so not snapped; start hysteresis kicks in).
         // Bump temperature so the deadband releases and the new curve output is seen.
         profile.curves[0].flat_output_pct = Some(25.0);
-        let cmds = evaluate_profile(&profile, &make_cache_with_sensor("cpu", 51.0), &mut state);
+        let cmds = evaluate_profile(
+            &profile,
+            &make_cache_with_sensor("cpu", 51.0).sensors_snapshot(),
+            &mut state,
+        );
         // Without start_pct it would be 25; with start_pct=35 from 0 → clamped up to 35
         assert_eq!(cmds[0].pwm_percent, 35);
     }
@@ -1043,7 +1120,7 @@ mod tests {
         // Three cycles on the same curve — output should be identical and
         // state.last_output should reflect the tuned value.
         for _ in 0..3 {
-            let cmds = evaluate_profile(&profile, &cache, &mut state);
+            let cmds = evaluate_profile(&profile, &cache.sensors_snapshot(), &mut state);
             assert_eq!(cmds[0].pwm_percent, 50);
         }
         assert_eq!(state.last_output("ctrl1"), Some(50.0));
@@ -1061,12 +1138,12 @@ mod tests {
         let cache = make_cache_with_sensor("cpu", 50.0);
         let mut state = ProfileEngineState::new();
 
-        let cmds = evaluate_profile(&profile_a, &cache, &mut state);
+        let cmds = evaluate_profile(&profile_a, &cache.sensors_snapshot(), &mut state);
         assert_eq!(cmds[0].pwm_percent, 80);
         assert_eq!(state.last_output("ctrl1"), Some(80.0));
 
         // Profile id changes → state cleared → step_down_pct no longer bites
-        let cmds = evaluate_profile(&profile_b, &cache, &mut state);
+        let cmds = evaluate_profile(&profile_b, &cache.sensors_snapshot(), &mut state);
         assert_eq!(cmds[0].pwm_percent, 30);
     }
 
@@ -1076,7 +1153,7 @@ mod tests {
         let cache = make_cache_with_sensor("cpu", 50.0);
         let mut state = ProfileEngineState::new();
 
-        evaluate_profile(&profile, &cache, &mut state);
+        evaluate_profile(&profile, &cache.sensors_snapshot(), &mut state);
         assert!(state.last_output("ctrl1").is_some());
 
         state.deactivate();
@@ -1093,7 +1170,7 @@ mod tests {
         let cache = make_cache_with_sensor("cpu", 50.0);
         let mut state = ProfileEngineState::new();
 
-        let cmds = evaluate_profile(&profile, &cache, &mut state);
+        let cmds = evaluate_profile(&profile, &cache.sensors_snapshot(), &mut state);
         assert_eq!(cmds[0].pwm_percent, 75);
     }
 
@@ -1106,7 +1183,7 @@ mod tests {
         let cache = make_cache_with_sensor("cpu", 50.0);
         let mut state = ProfileEngineState::new();
 
-        let cmds = evaluate_profile(&profile, &cache, &mut state);
+        let cmds = evaluate_profile(&profile, &cache.sensors_snapshot(), &mut state);
         assert_eq!(cmds[0].pwm_percent, 50);
     }
 
@@ -1120,7 +1197,7 @@ mod tests {
         let cache = make_cache_with_sensor("cpu", 50.0);
         let mut state = ProfileEngineState::new();
 
-        evaluate_profile(&profile, &cache, &mut state);
+        evaluate_profile(&profile, &cache.sensors_snapshot(), &mut state);
         assert_eq!(state.last_output("ctrl1"), Some(10.2));
     }
 
@@ -1186,12 +1263,20 @@ mod tests {
         let profile = make_graph_profile_for_deadband();
         let mut state = ProfileEngineState::new();
 
-        let cmds = evaluate_profile(&profile, &make_cache_with_sensor("cpu", 70.0), &mut state);
+        let cmds = evaluate_profile(
+            &profile,
+            &make_cache_with_sensor("cpu", 70.0).sensors_snapshot(),
+            &mut state,
+        );
         assert_eq!(cmds[0].pwm_percent, 50);
         assert_eq!(state.last_transition_temp("ctrl1"), Some(70.0));
 
         // Falling to 69°C — inside the deadband below 70.
-        let cmds = evaluate_profile(&profile, &make_cache_with_sensor("cpu", 69.0), &mut state);
+        let cmds = evaluate_profile(
+            &profile,
+            &make_cache_with_sensor("cpu", 69.0).sensors_snapshot(),
+            &mut state,
+        );
         assert_eq!(cmds[0].pwm_percent, 50, "deadband should hold at 50%");
         assert_eq!(
             state.last_transition_temp("ctrl1"),
@@ -1207,9 +1292,17 @@ mod tests {
         let profile = make_graph_profile_for_deadband();
         let mut state = ProfileEngineState::new();
 
-        evaluate_profile(&profile, &make_cache_with_sensor("cpu", 70.0), &mut state);
+        evaluate_profile(
+            &profile,
+            &make_cache_with_sensor("cpu", 70.0).sensors_snapshot(),
+            &mut state,
+        );
 
-        let cmds = evaluate_profile(&profile, &make_cache_with_sensor("cpu", 67.5), &mut state);
+        let cmds = evaluate_profile(
+            &profile,
+            &make_cache_with_sensor("cpu", 67.5).sensors_snapshot(),
+            &mut state,
+        );
         // curve(67.5) = 30 + (67.5-60)/10 * 20 = 45.0 → rounded to 45
         assert_eq!(
             cmds[0].pwm_percent, 45,
@@ -1226,13 +1319,25 @@ mod tests {
         let profile = make_graph_profile_for_deadband();
         let mut state = ProfileEngineState::new();
 
-        evaluate_profile(&profile, &make_cache_with_sensor("cpu", 65.0), &mut state);
+        evaluate_profile(
+            &profile,
+            &make_cache_with_sensor("cpu", 65.0).sensors_snapshot(),
+            &mut state,
+        );
         assert_eq!(state.last_transition_temp("ctrl1"), Some(65.0));
 
-        evaluate_profile(&profile, &make_cache_with_sensor("cpu", 68.0), &mut state);
+        evaluate_profile(
+            &profile,
+            &make_cache_with_sensor("cpu", 68.0).sensors_snapshot(),
+            &mut state,
+        );
         assert_eq!(state.last_transition_temp("ctrl1"), Some(68.0));
 
-        evaluate_profile(&profile, &make_cache_with_sensor("cpu", 70.0), &mut state);
+        evaluate_profile(
+            &profile,
+            &make_cache_with_sensor("cpu", 70.0).sensors_snapshot(),
+            &mut state,
+        );
         assert_eq!(state.last_transition_temp("ctrl1"), Some(70.0));
     }
 
@@ -1292,11 +1397,19 @@ mod tests {
         };
         let mut state = ProfileEngineState::new();
 
-        evaluate_profile(&profile, &make_cache_with_sensor("cpu", 60.0), &mut state);
+        evaluate_profile(
+            &profile,
+            &make_cache_with_sensor("cpu", 60.0).sensors_snapshot(),
+            &mut state,
+        );
         assert_eq!(state.last_transition_temp("ctrl1"), Some(60.0));
 
         // Rise to 61°C: curve delta 0.02% < 0.5%, anchor must stay at 60.
-        evaluate_profile(&profile, &make_cache_with_sensor("cpu", 61.0), &mut state);
+        evaluate_profile(
+            &profile,
+            &make_cache_with_sensor("cpu", 61.0).sensors_snapshot(),
+            &mut state,
+        );
         assert_eq!(
             state.last_transition_temp("ctrl1"),
             Some(60.0),
@@ -1313,10 +1426,18 @@ mod tests {
         profile_b.id = "other".into();
 
         let mut state = ProfileEngineState::new();
-        evaluate_profile(&profile_a, &make_cache_with_sensor("cpu", 70.0), &mut state);
+        evaluate_profile(
+            &profile_a,
+            &make_cache_with_sensor("cpu", 70.0).sensors_snapshot(),
+            &mut state,
+        );
         assert!(state.last_transition_temp("ctrl1").is_some());
 
-        evaluate_profile(&profile_b, &make_cache_with_sensor("cpu", 60.0), &mut state);
+        evaluate_profile(
+            &profile_b,
+            &make_cache_with_sensor("cpu", 60.0).sensors_snapshot(),
+            &mut state,
+        );
         // After profile swap + new evaluation, anchor should be from new
         // profile's first cycle, not the prior 70°C from profile_a.
         assert_eq!(state.last_transition_temp("ctrl1"), Some(60.0));
@@ -1331,7 +1452,11 @@ mod tests {
         profile.controls[0].manual_output_pct = 42.0;
 
         let mut state = ProfileEngineState::new();
-        let cmds = evaluate_profile(&profile, &make_cache_with_sensor("cpu", 70.0), &mut state);
+        let cmds = evaluate_profile(
+            &profile,
+            &make_cache_with_sensor("cpu", 70.0).sensors_snapshot(),
+            &mut state,
+        );
         assert_eq!(cmds[0].pwm_percent, 42);
         // No curve evaluation happened → no deadband state recorded.
         assert!(state.last_transition_temp("ctrl1").is_none());
@@ -1542,7 +1667,11 @@ mod tests {
         // source="amd_gpu" and the correct member_id.
         let profile = make_gpu_profile("curve", "graph", 50.0);
         let cache = make_cache_with_sensor("cpu", 55.0);
-        let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
+        let cmds = evaluate_profile(
+            &profile,
+            &cache.sensors_snapshot(),
+            &mut ProfileEngineState::new(),
+        );
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].source, "amd_gpu");
         assert_eq!(cmds[0].member_id, "amd_gpu:0000:03:00.0");
@@ -1554,7 +1683,11 @@ mod tests {
     fn evaluate_gpu_manual_mode() {
         let profile = make_gpu_profile("manual", "flat", 50.0);
         let cache = make_cache_with_sensor("cpu", 50.0);
-        let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
+        let cmds = evaluate_profile(
+            &profile,
+            &cache.sensors_snapshot(),
+            &mut ProfileEngineState::new(),
+        );
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].source, "amd_gpu");
         assert_eq!(cmds[0].pwm_percent, 50); // manual_output_pct
@@ -1573,7 +1706,11 @@ mod tests {
             fan_zero_rpm: false,
         });
         let cache = make_cache_with_sensor("cpu", 55.0);
-        let cmds = evaluate_profile(&profile, &cache, &mut ProfileEngineState::new());
+        let cmds = evaluate_profile(
+            &profile,
+            &cache.sensors_snapshot(),
+            &mut ProfileEngineState::new(),
+        );
         assert_eq!(cmds.len(), 2);
 
         let gpu_cmd = cmds.iter().find(|c| c.source == "amd_gpu").unwrap();
