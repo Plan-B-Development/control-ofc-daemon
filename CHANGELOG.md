@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- aur-publish: ship an AUR-side `.gitignore` (tarballs, `src/`, `pkg/`) via
+  the deploy action's `assets` input. With `assets` set the action stages
+  `git add --all`, so updpkgsums' downloaded source tarball was committed
+  to the AUR repo (the v1.14.1 tarball slipped under aurweb's ~488 KiB
+  blob cap; the GUI's 2 MB tarball was rejected outright). The
+  `.gitignore` keeps source blobs out of AUR commits from the next
+  release onward.
+
 ## [1.14.1] — 2026-06-07
 
 DEC-145 guidance pass. Pairs with **GUI v1.33.0**. Documentation and
