@@ -464,10 +464,10 @@ pub async fn profile_engine_loop(
             // emergency threshold; the exclusion is structural — GpuBackend
             // does not implement SafetyWriteBackend.
             if let Some(be) = openfan_be.as_mut() {
-                be.force_all(forced_pct);
+                be.force_all(forced_pct).await;
             }
             if let Some(be) = hwmon_be.as_mut() {
-                be.force_all(forced_pct);
+                be.force_all(forced_pct).await;
             }
 
             let reason = match hottest_cpu_c {

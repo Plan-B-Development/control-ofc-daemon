@@ -48,7 +48,10 @@ pub(crate) trait WriteBackend {
 /// unconditionally — no GUI deferral, no coalescing shortcuts beyond the
 /// controller's own exact-match skip.
 pub(crate) trait SafetyWriteBackend: WriteBackend {
-    fn force_all(&mut self, pct: u8);
+    /// Async since DEC-146 P3-8: implementations run their blocking
+    /// serial/sysfs writes on the blocking pool instead of pinning a tokio
+    /// worker for up to `channels × serial-timeout` during an emergency.
+    async fn force_all(&mut self, pct: u8);
 }
 
 // ─── OpenFan (serial) ────────────────────────────────────────────────────
@@ -73,34 +76,82 @@ impl WriteBackend for OpenFanBackend {
         "openfan"
     }
 
-    /// OpenFan writes (sync, parking_lot mutex — lock per command).
+    /// OpenFan writes (serial I/O on the blocking pool — lock per command).
     ///
     /// Skipped entirely when the GUI is actively connected: the GUI's
     /// control loop drives fan speed via the API, and both writing
     /// simultaneously causes unnecessary serial traffic and potential PWM
     /// oscillation (DEC-074). Exact-match coalescing lives below this in
     /// `serial::controller`.
+    ///
+    /// DEC-146 P3-8: serial writes block up to the configured timeout
+    /// (500 ms default) per channel, so the batch runs on `spawn_blocking`
+    /// (matching `GpuBackend::apply` and both poll loops) instead of pinning
+    /// a tokio worker. The mutex is still taken per command (DEC-099) so
+    /// GUI API requests interleave exactly as before.
     async fn apply(&mut self, commands: &[PwmCommand], gui_active: bool) {
         if gui_active {
             return;
         }
-        for cmd in commands.iter().filter(|c| c.source == "openfan") {
-            let Some(ch_str) = cmd.member_id.strip_prefix("openfan:ch") else {
-                log::warn!(
-                    "Profile engine: dropping openfan command with malformed member_id: {:?}",
-                    cmd.member_id
+        let chans: Vec<(u8, u8)> = commands
+            .iter()
+            .filter(|c| c.source == "openfan")
+            .filter_map(|cmd| {
+                let Some(ch_str) = cmd.member_id.strip_prefix("openfan:ch") else {
+                    log::warn!(
+                        "Profile engine: dropping openfan command with malformed member_id: {:?}",
+                        cmd.member_id
+                    );
+                    return None;
+                };
+                let Ok(ch) = ch_str.parse::<u8>() else {
+                    log::warn!(
+                        "Profile engine: dropping openfan command with unparseable channel: {:?}",
+                        cmd.member_id
+                    );
+                    return None;
+                };
+                Some((ch, cmd.pwm_percent))
+            })
+            .collect();
+        if chans.is_empty() {
+            return;
+        }
+        let ctrl = self.ctrl.clone();
+        let join = tokio::task::spawn_blocking(move || {
+            chans
+                .into_iter()
+                .map(|(ch, pct)| {
+                    // Lock per command (DEC-099) so GUI API requests can
+                    // interleave between channel writes.
+                    let mut guard = ctrl.lock();
+                    let res = guard
+                        .set_pwm(ch, pct)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string());
+                    (ch, res)
+                })
+                .collect::<Vec<(u8, Result<(), String>)>>()
+        })
+        .await;
+        let results = match join {
+            Ok(results) => results,
+            Err(e) => {
+                // Concurrency review D3: a panic inside the blocking task
+                // must not be silent — count it and alert immediately.
+                self.consecutive_failures += 1;
+                log::error!(
+                    "SAFETY: Profile engine OpenFan write task panicked: {e} \
+                     ({} consecutive failures)",
+                    self.consecutive_failures
                 );
-                continue;
-            };
-            let Ok(ch) = ch_str.parse::<u8>() else {
-                log::warn!(
-                    "Profile engine: dropping openfan command with unparseable channel: {:?}",
-                    cmd.member_id
-                );
-                continue;
-            };
-            let mut guard = self.ctrl.lock();
-            if let Err(e) = guard.set_pwm(ch, cmd.pwm_percent) {
+                return;
+            }
+        };
+        // `&mut self` state can't cross into the 'static closure — apply the
+        // failure bookkeeping to the returned results instead.
+        for (ch, res) in results {
+            if let Err(e) = res {
                 self.consecutive_failures += 1;
                 let n = self.consecutive_failures;
                 log::warn!("Profile engine: OpenFan ch{ch} write failed ({n} consecutive): {e}");
@@ -122,12 +173,25 @@ impl SafetyWriteBackend for OpenFanBackend {
     /// DEC-099: drop the lock between channels so GUI requests can
     /// interleave during a long emergency scan; if the GUI overrides a
     /// safety value briefly, the next 1Hz tick re-asserts the forced value.
-    fn force_all(&mut self, pct: u8) {
-        for ch in 0..NUM_CHANNELS {
-            let mut guard = self.ctrl.lock();
-            if let Err(e) = guard.set_pwm(ch, pct) {
-                log::error!("THERMAL SAFETY: OpenFan ch{ch} write FAILED: {e}");
+    ///
+    /// DEC-146 P3-8: runs on the blocking pool — worst case is
+    /// `NUM_CHANNELS × serial-timeout` (10 × 500 ms default), far too long
+    /// to pin a tokio worker during a thermal emergency.
+    async fn force_all(&mut self, pct: u8) {
+        let ctrl = self.ctrl.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            for ch in 0..NUM_CHANNELS {
+                let mut guard = ctrl.lock();
+                if let Err(e) = guard.set_pwm(ch, pct) {
+                    log::error!("THERMAL SAFETY: OpenFan ch{ch} write FAILED: {e}");
+                }
             }
+        })
+        .await
+        {
+            // Concurrency review D3: never swallow a panicked safety write —
+            // the next 1 Hz tick retries, but the operator must see this.
+            log::error!("THERMAL SAFETY: OpenFan force_all task panicked: {e}");
         }
     }
 }
@@ -281,44 +345,61 @@ impl WriteBackend for HwmonBackend {
     /// to close the startup race where the GUI has written via /fans/...
     /// but has not yet taken the hwmon lease, or the lease has briefly
     /// lapsed — DEC-074 semantics extended to hwmon.
+    /// DEC-146 P3-8: the lease-check → write → renew sequence does sysfs
+    /// I/O under the controller mutex, so the whole (already
+    /// lock-per-batch) body moves onto the blocking pool unchanged —
+    /// matching the hwmon poll loop. DEC-099's lock-per-write applies to
+    /// `force_all`, not `apply`; semantics here are identical to before.
     async fn apply(&mut self, commands: &[PwmCommand], gui_active: bool) {
-        let hwmon_cmds: Vec<_> = commands.iter().filter(|c| c.source == "hwmon").collect();
+        let hwmon_cmds: Vec<(String, u8)> = commands
+            .iter()
+            .filter(|c| c.source == "hwmon")
+            .map(|c| (c.member_id.clone(), c.pwm_percent))
+            .collect();
         if hwmon_cmds.is_empty() || gui_active {
             return;
         }
-        let mut guard = self.ctrl.lock();
-        // Try to get or auto-acquire a lease for the profile engine.
-        let lease_id = {
-            let mgr = guard.lease_manager();
-            match mgr.active_lease() {
-                Some(lease) if lease.owner_hint == "gui" => {
-                    // GUI has priority — skip hwmon writes.
-                    None
+        let ctrl = self.ctrl.clone();
+        let join = tokio::task::spawn_blocking(move || {
+            let mut guard = ctrl.lock();
+            // Try to get or auto-acquire a lease for the profile engine.
+            let lease_id = {
+                let mgr = guard.lease_manager();
+                match mgr.active_lease() {
+                    Some(lease) if lease.owner_hint == "gui" => {
+                        // GUI has priority — skip hwmon writes.
+                        None
+                    }
+                    Some(lease) => Some(lease.lease_id.clone()),
+                    None => None, // Need to acquire
                 }
-                Some(lease) => Some(lease.lease_id.clone()),
-                None => None, // Need to acquire
-            }
-        };
-        let lease_id = lease_id.or_else(|| {
-            guard
-                .lease_manager_mut()
-                .take_lease("profile-engine")
-                .ok()
-                .map(|l| l.lease_id)
-        });
-        if let Some(ref lid) = lease_id {
-            for cmd in hwmon_cmds {
-                match guard.set_pwm(&cmd.member_id, cmd.pwm_percent, lid) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        log::warn!("hwmon write failed for {}: {e}", cmd.member_id);
+            };
+            let lease_id = lease_id.or_else(|| {
+                guard
+                    .lease_manager_mut()
+                    .take_lease("profile-engine")
+                    .ok()
+                    .map(|l| l.lease_id)
+            });
+            if let Some(ref lid) = lease_id {
+                for (member_id, pwm_percent) in &hwmon_cmds {
+                    match guard.set_pwm(member_id, *pwm_percent, lid) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            log::warn!("hwmon write failed for {member_id}: {e}");
+                        }
                     }
                 }
+                // Renew to keep it alive for the next cycle.
+                if let Err(e) = guard.lease_manager_mut().renew_lease(lid) {
+                    log::debug!("lease renewal failed (will re-acquire next cycle): {e}");
+                }
             }
-            // Renew to keep it alive for the next cycle.
-            if let Err(e) = guard.lease_manager_mut().renew_lease(lid) {
-                log::debug!("lease renewal failed (will re-acquire next cycle): {e}");
-            }
+        })
+        .await;
+        if let Err(e) = join {
+            // Concurrency review D3: surface panicked write tasks.
+            log::error!("Profile engine: hwmon write task panicked: {e}");
         }
     }
 }
@@ -331,21 +412,32 @@ impl SafetyWriteBackend for HwmonBackend {
     /// (DEC-099). If a GUI request force-takes the lease mid-scan, writes
     /// fail with InvalidLease until the next 1Hz tick re-acquires it — same
     /// safety net as the OpenFan path.
-    fn force_all(&mut self, pct: u8) {
-        let (hdr_ids, lease_id) = {
-            let mut guard = self.ctrl.lock();
-            let hdr_ids: Vec<String> = guard.headers().iter().map(|h| h.id.clone()).collect();
-            let lease_id = guard
-                .lease_manager_mut()
-                .force_take_lease("thermal-safety")
-                .lease_id;
-            (hdr_ids, lease_id)
-        };
-        for hdr_id in &hdr_ids {
-            let mut guard = self.ctrl.lock();
-            if let Err(e) = guard.set_pwm(hdr_id, pct, &lease_id) {
-                log::error!("THERMAL SAFETY: hwmon {hdr_id} write FAILED: {e}");
+    /// DEC-146 P3-8: runs on the blocking pool; the take-once /
+    /// re-lock-per-header structure (DEC-099) is preserved verbatim inside
+    /// the closure.
+    async fn force_all(&mut self, pct: u8) {
+        let ctrl = self.ctrl.clone();
+        let join = tokio::task::spawn_blocking(move || {
+            let (hdr_ids, lease_id) = {
+                let mut guard = ctrl.lock();
+                let hdr_ids: Vec<String> = guard.headers().iter().map(|h| h.id.clone()).collect();
+                let lease_id = guard
+                    .lease_manager_mut()
+                    .force_take_lease("thermal-safety")
+                    .lease_id;
+                (hdr_ids, lease_id)
+            };
+            for hdr_id in &hdr_ids {
+                let mut guard = ctrl.lock();
+                if let Err(e) = guard.set_pwm(hdr_id, pct, &lease_id) {
+                    log::error!("THERMAL SAFETY: hwmon {hdr_id} write FAILED: {e}");
+                }
             }
+        })
+        .await;
+        if let Err(e) = join {
+            // Concurrency review D3: never swallow a panicked safety write.
+            log::error!("THERMAL SAFETY: hwmon force_all task panicked: {e}");
         }
     }
 }
@@ -556,8 +648,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn hwmon_force_all_takes_thermal_safety_lease_and_writes_every_header() {
+    #[tokio::test]
+    async fn hwmon_force_all_takes_thermal_safety_lease_and_writes_every_header() {
         let (mut be, writes) = hwmon_backend(vec![
             make_header("hwmon:it8696:pwm1"),
             make_header("hwmon:it8696:pwm2"),
@@ -565,7 +657,7 @@ mod tests {
         // Even a GUI-held lease is force-taken for safety writes.
         be.ctrl.lock().lease_manager_mut().force_take_lease("gui");
 
-        be.force_all(100);
+        be.force_all(100).await;
 
         let lease = be.ctrl.lock().lease_manager().active_lease().cloned();
         assert_eq!(lease.map(|l| l.owner_hint), Some("thermal-safety".into()));
@@ -651,11 +743,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn openfan_force_all_writes_every_channel() {
+    #[tokio::test]
+    async fn openfan_force_all_writes_every_channel() {
         let (mut be, written) = openfan_backend();
 
-        be.force_all(100);
+        be.force_all(100).await;
 
         let w = written.lock();
         let set_pwm: Vec<_> = w.iter().filter(|c| c.starts_with(">02")).collect();

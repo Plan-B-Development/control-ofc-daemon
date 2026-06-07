@@ -686,7 +686,9 @@ async fn main() {
     let hwmon_shutdown = poll_shutdown_rx.clone();
     let gpu_infos_for_poll = app_state.amd_gpus.clone();
     let sensor_rescan_for_poll = app_state.sensor_rescan_requested.clone();
-    tokio::spawn(async move {
+    // DEC-146 P3-9: keep the JoinHandles for the poll/engine tasks so
+    // shutdown can await them before restoring hardware to automatic.
+    let hwmon_poll_handle = tokio::spawn(async move {
         control_ofc_daemon::polling::hwmon_poll_loop(
             hwmon_cache,
             hwmon_history,
@@ -702,11 +704,11 @@ async fn main() {
     });
 
     // ── Spawn OpenFanController polling loop ────────────────────────
-    if let Some(transport) = openfan_transport {
+    let openfan_poll_handle = if let Some(transport) = openfan_transport {
         let openfan_cache = cache.clone();
         let openfan_interval = Duration::from_millis(config.polling.poll_interval_ms);
         let openfan_shutdown = poll_shutdown_rx.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             control_ofc_daemon::polling::openfan_poll_loop(
                 openfan_cache,
                 transport,
@@ -715,13 +717,15 @@ async fn main() {
                 openfan_shutdown,
             )
             .await;
-        });
-    }
+        }))
+    } else {
+        None
+    };
 
     // ── Spawn profile engine ─────────────────────────────────────────
     // Evaluates curves and writes PWM headlessly at 1Hz.
     // In imperative mode (no profile), the GUI drives PWM writes instead.
-    {
+    let engine_handle = {
         let engine_cache = cache.clone();
         let engine_profile = active_profile.clone();
         let engine_safety = safety_rule.clone();
@@ -741,8 +745,8 @@ async fn main() {
                 engine_shutdown,
             )
             .await;
-        });
-    }
+        })
+    };
 
     // ── Spawn IPC server ────────────────────────────────────────────
     // Listener was bound in preflight_check, so we know IPC is healthy
@@ -837,6 +841,29 @@ async fn main() {
 
     // Signal all tasks to stop
     let _ = poll_shutdown_tx.send(true);
+
+    // DEC-146 P3-9: join the poll + engine tasks BEFORE restoring hardware
+    // to automatic, mirroring the awaited server_handle below (tokio
+    // shutdown guidance: signal, then await tasks). Without this, an
+    // in-flight engine tick's spawn_blocking write could land AFTER the
+    // GPU/hwmon restore and leave hardware in manual mode at process exit.
+    // Timeout-bounded so a hung loop cannot block shutdown — on timeout the
+    // restore below still runs last-writer. Production is additionally
+    // covered by ExecStopPost; this closes the non-systemd dev-run gap.
+    for (name, handle) in [
+        ("hwmon-poll", Some(hwmon_poll_handle)),
+        ("openfan-poll", openfan_poll_handle),
+        ("profile-engine", Some(engine_handle)),
+    ] {
+        if let Some(h) = handle {
+            if tokio::time::timeout(Duration::from_secs(3), h)
+                .await
+                .is_err()
+            {
+                log::warn!("{name} task did not stop within 3 s; proceeding with hardware restore");
+            }
+        }
+    }
 
     // Reset GPU fans to automatic before shutting down (re-enables zero-RPM)
     for gpu in &app_state.amd_gpus {

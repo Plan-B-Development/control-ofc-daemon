@@ -20,8 +20,18 @@
   Vec per request, and the descriptor→wire mapping is a single
   `From<&PwmHeaderDescriptor>` impl (was duplicated field-for-field in
   two handlers) (DEC-146 P2).
+- Profile-engine OpenFan/hwmon writes (and both thermal-safety
+  `force_all` paths) now run on the blocking pool via `spawn_blocking`,
+  matching the GPU backend and both poll loops (DEC-146 P3-8) — a
+  thermal-emergency serial sweep could previously pin a tokio worker for
+  up to 10 × 500 ms. Lock-per-command (DEC-099) semantics unchanged.
 
 ### Fixed
+- Graceful (non-systemd) shutdown joins the poll and profile-engine
+  tasks — timeout-bounded — BEFORE restoring GPU/hwmon fans to automatic
+  (DEC-146 P3-9), closing the race where an in-flight engine write could
+  land after the restore and leave hardware in manual mode at process
+  exit. Production systemd runs were already covered by ExecStopPost.
 - `/sensors`, `/poll`, and SSE sensor arrays are now actually sorted by
   id, as `build_sensor_entries`' doc comment always claimed —
   deterministic wire order across restarts/rescans, sparing the GUI
