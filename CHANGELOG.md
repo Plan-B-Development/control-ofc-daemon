@@ -1,6 +1,12 @@
 # Changelog
 
-## [Unreleased]
+## [1.14.2] — 2026-06-07
+
+2026-06 function/efficiency audit remediation (DEC-146 P2/P3) plus
+release-workflow hardening. Pairs with **GUI v1.34.0**. Hot-path
+efficiency, deterministic sensor wire ordering, blocking-pool backend
+writes, and joined shutdown — no wire-shape, control-loop-semantics, or
+safety-path changes.
 
 ### Changed
 - Release workflow: `actions/checkout` bumped v4 → v6 (Node 24, ahead of
