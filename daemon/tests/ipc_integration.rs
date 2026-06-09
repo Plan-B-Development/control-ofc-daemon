@@ -147,8 +147,12 @@ async fn status_endpoint_returns_health() {
     assert_eq!(status, 200);
     assert_eq!(json["api_version"], 1);
     assert_eq!(json["daemon_version"], "0.1.0-test");
-    assert!(json["overall_status"].is_string());
+    // Pin the exact wire string, not just `is_string()` — the fixture's fresh
+    // timestamps make every subsystem (and thus overall) "ok", and the GUI's
+    // severity display depends on these literals (/test-tests audit P2).
+    assert_eq!(json["overall_status"], "ok");
     assert!(json["subsystems"].is_array());
+    assert_eq!(json["subsystems"][0]["status"], "ok");
     assert!(json["counters"].is_object());
     // DEC-132: thermal_state defaults to "normal" before the profile engine's
     // first tick reports anything.
@@ -361,7 +365,8 @@ async fn poll_endpoint_returns_batched_shape() {
     let status_obj = json["status"]
         .as_object()
         .expect("/poll response must contain 'status' object (GUI consumes it)");
-    assert!(status_obj["overall_status"].is_string());
+    // Exact wire string — fresh fixture timestamps yield "ok" (audit P2).
+    assert_eq!(status_obj["overall_status"], "ok");
     assert!(status_obj["subsystems"].is_array());
     assert!(status_obj["counters"].is_object());
 

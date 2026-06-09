@@ -351,6 +351,45 @@ mod tests {
     }
 
     #[test]
+    fn force_take_lease_ids_are_unique() {
+        // `lease_ids_are_unique` only exercises take_lease's counter; the
+        // increment inside force_take_lease was untested, so `next_id += 1`
+        // could become a no-op and hand out duplicate ids undetected
+        // (/test-tests audit P2). force_take_lease is time-independent — it
+        // always succeeds and evicts — so no sleeps are needed.
+        let mut mgr = LeaseManager::new();
+        let l1 = mgr.force_take_lease("gui");
+        let l2 = mgr.force_take_lease("profile-engine");
+        assert_ne!(l1.lease_id, l2.lease_id);
+        // Counter is shared with take_lease — a third id must differ from both.
+        let l3 = mgr.force_take_lease("gui").lease_id;
+        assert_ne!(l3, l1.lease_id);
+        assert_ne!(l3, l2.lease_id);
+    }
+
+    #[test]
+    fn lease_error_display_strings() {
+        // Only AlreadyHeld reaches the HTTP envelope via `e.to_string()` (the
+        // other variants use hardcoded handler messages), so its Display format
+        // was unpinned (/test-tests audit P3). Assert all four to keep Display
+        // and the handler strings in lockstep.
+        assert_eq!(
+            LeaseError::AlreadyHeld {
+                owner_hint: "gui".into(),
+                ttl_seconds: 42,
+            }
+            .to_string(),
+            "lease already held by 'gui' (expires in 42s)",
+        );
+        assert_eq!(LeaseError::InvalidLease.to_string(), "invalid lease id");
+        assert_eq!(LeaseError::Expired.to_string(), "lease expired");
+        assert_eq!(
+            LeaseError::NoLease.to_string(),
+            "no active lease to release"
+        );
+    }
+
+    #[test]
     fn renew_lease_extends_ttl() {
         let mut mgr = LeaseManager::with_ttl(Duration::from_secs(60));
         let lease = mgr.take_lease("gui").unwrap();

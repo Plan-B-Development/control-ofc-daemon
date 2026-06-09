@@ -561,6 +561,28 @@ mod tests {
     }
 
     #[test]
+    fn load_control_uses_serde_defaults() {
+        // A control with only `id`+`name` must materialise the custom serde
+        // defaults: mode="curve", manual=50%, step=100%. Pins default_mode /
+        // default_manual / default_step (profile.rs), whose mutants otherwise
+        // survive because no test exercises a control with these fields absent.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("p.json");
+        std::fs::write(
+            &path,
+            r#"{"id":"p","name":"P","controls":[{"id":"c","name":"C"}]}"#,
+        )
+        .unwrap();
+
+        let profile = load_profile(&path).unwrap();
+        let c = &profile.controls[0];
+        assert_eq!(c.mode, "curve"); // default_mode
+        assert_eq!(c.manual_output_pct, 50.0); // default_manual
+        assert_eq!(c.step_up_pct, 100.0); // default_step
+        assert_eq!(c.step_down_pct, 100.0); // default_step
+    }
+
+    #[test]
     fn find_profile_returns_first_match() {
         let dir1 = tempfile::tempdir().unwrap();
         let dir2 = tempfile::tempdir().unwrap();
@@ -616,17 +638,44 @@ mod tests {
 
     #[test]
     fn find_profile_rejects_path_traversal() {
-        let dir = tempfile::tempdir().unwrap();
-        // Create a file that would match if traversal were allowed
-        let target = dir.path().join("evil.json");
-        std::fs::write(&target, r#"{"id":"evil","name":"Evil"}"#).unwrap();
+        // Security regression test (CWE-22). Each rejected input has a REAL file
+        // planted at the exact path `find_profile` would compute if its guard
+        // clause were removed, so a bypass returns `Some(..)` and this test
+        // FAILS. (The earlier version planted the decoy inside the search dir,
+        // where no traversal input ever resolved — so the whole guard could be
+        // deleted and the test still passed. See /test-tests audit P1.)
+        //
+        // Layout: <root>/secret.json is the escape target; <root>/profiles is
+        // the search dir. Linux filename rules let us make 4 of the 5 clauses
+        // discriminating; NUL cannot be a real filename, so it stays defensive.
+        let root = tempfile::tempdir().unwrap();
+        let profiles = root.path().join("profiles");
+        std::fs::create_dir(&profiles).unwrap();
+        let dirs = [profiles.clone()];
 
-        // These should all be rejected before the filesystem is consulted
-        assert!(find_profile("../evil", &[dir.path().to_path_buf()]).is_none());
-        assert!(find_profile("../../evil", &[dir.path().to_path_buf()]).is_none());
-        assert!(find_profile("foo/bar", &[dir.path().to_path_buf()]).is_none());
-        assert!(find_profile("foo\\bar", &[dir.path().to_path_buf()]).is_none());
-        assert!(find_profile("foo\0bar", &[dir.path().to_path_buf()]).is_none());
-        assert!(find_profile("", &[dir.path().to_path_buf()]).is_none());
+        // `..` clause: profiles/../secret.json == root/secret.json (exists).
+        std::fs::write(root.path().join("secret.json"), "{}").unwrap();
+        assert!(find_profile("../secret", &dirs).is_none());
+        // `..` substring without a separator — pins the `..` clause on its own,
+        // independently of the `/` clause that also rejects "../secret".
+        std::fs::write(profiles.join("a..b.json"), "{}").unwrap();
+        assert!(find_profile("a..b", &dirs).is_none());
+        // `/` clause: profiles/sub/nested.json (exists).
+        std::fs::create_dir(profiles.join("sub")).unwrap();
+        std::fs::write(profiles.join("sub/nested.json"), "{}").unwrap();
+        assert!(find_profile("sub/nested", &dirs).is_none());
+        // `\` clause: on Linux a backslash is a literal filename character.
+        std::fs::write(profiles.join("a\\b.json"), "{}").unwrap();
+        assert!(find_profile("a\\b", &dirs).is_none());
+        // empty clause: profiles/.json (exists).
+        std::fs::write(profiles.join(".json"), "{}").unwrap();
+        assert!(find_profile("", &dirs).is_none());
+        // NUL clause: cannot be a real filename; defense-in-depth assertion.
+        assert!(find_profile("foo\0bar", &dirs).is_none());
+
+        // Positive control: a legitimate name IS found, so a mutant that makes
+        // the guard reject everything is caught here too.
+        std::fs::write(profiles.join("quiet.json"), "{}").unwrap();
+        assert!(find_profile("quiet", &dirs).is_some());
     }
 }

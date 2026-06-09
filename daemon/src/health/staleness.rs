@@ -315,4 +315,16 @@ mod tests {
         assert!(HealthStatus::Ok < HealthStatus::Warn);
         assert!(HealthStatus::Warn < HealthStatus::Crit);
     }
+
+    #[test]
+    fn health_status_display_wire_strings() {
+        // These exact strings are the API contract: handlers serialise
+        // `to_string()` into `overall_status` / `subsystems[].status`, which the
+        // GUI consumes (control-ofc-gui parse_status + diagnostics severity).
+        // Existing tests only assert the enum variant, so a Warn->"warn" rename
+        // would break the GUI undetected (/test-tests audit P2).
+        assert_eq!(HealthStatus::Ok.to_string(), "ok");
+        assert_eq!(HealthStatus::Warn.to_string(), "warn");
+        assert_eq!(HealthStatus::Crit.to_string(), "crit");
+    }
 }
