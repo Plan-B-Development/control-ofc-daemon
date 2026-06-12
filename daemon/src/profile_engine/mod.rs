@@ -7,7 +7,7 @@
 mod backends;
 
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use backends::{GpuBackend, HwmonBackend, OpenFanBackend, SafetyWriteBackend, WriteBackend};
@@ -254,6 +254,216 @@ fn apply_tuning_with_floor(
     output.clamp(0.0, 100.0)
 }
 
+/// Combine child-curve outputs for a Mix curve (DEC-150), clamped 0–100.
+///
+/// `values` is non-empty (the caller drops unresolved children and skips the
+/// Mix entirely when nothing resolves). Must stay byte-for-byte identical to
+/// the GUI's `_combine_mix` (parity `tuning_sequence`). `subtract` is the first
+/// input minus the sum of the rest, matching the ordered `mix_curve_ids`.
+fn combine_mix(function: &str, values: &[f64]) -> f64 {
+    let result = match function {
+        "min" => values.iter().copied().fold(f64::INFINITY, f64::min),
+        "average" => values.iter().sum::<f64>() / values.len() as f64,
+        "sum" => values.iter().sum::<f64>(),
+        "subtract" => values[0] - values[1..].iter().sum::<f64>(),
+        // "max" — also the default for an unrecognised function
+        _ => values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+    };
+    result.clamp(0.0, 100.0)
+}
+
+/// Resolve a curve's raw output in the Mix evaluation context (DEC-150).
+///
+/// Mix recurses over its children (combining raw outputs); `visited` carries
+/// the current resolution path so a curve reappearing on its own path drops out
+/// (cycle → safe fallback). Sync is not a valid Mix child (Mix does not nest
+/// Sync; the editor prevents it). Every single-temperature type uses the pure
+/// `evaluate_curve` at its own sensor, clamped 0–100 — the "raw child-curve
+/// output" the Mix combines. Returns None when the value cannot be resolved
+/// (missing sensor, unresolvable/cyclic Mix). Must stay byte-for-byte identical
+/// to the GUI's `_resolve_curve_output`.
+fn resolve_curve_output(
+    curve: &crate::profile::CurveConfig,
+    profile: &DaemonProfile,
+    sensors: &HashMap<String, CachedSensorReading>,
+    visited: &mut HashSet<String>,
+) -> Option<f64> {
+    match curve.curve_type.as_str() {
+        "mix" => resolve_mix(curve, profile, sensors, visited),
+        "sync" => None, // Mix does not nest Sync (editor-prevented)
+        _ => {
+            let sensor = sensors.get(&curve.sensor_id)?;
+            Some(evaluate_curve(curve, sensor.value_c).clamp(0.0, 100.0))
+        }
+    }
+}
+
+/// Combine a Mix curve's children (DEC-150). Each child is evaluated at its own
+/// sensor; unresolved children are dropped; surviving values are combined by
+/// `mix_function` and clamped 0–100. Returns None when the curve is part of a
+/// cycle or no child resolves (control skipped — fan holds). Path-based
+/// `visited` (insert on entry, remove on exit) matches the GUI's per-branch set
+/// union so diamonds re-evaluate and only true cycles drop out.
+fn resolve_mix(
+    curve: &crate::profile::CurveConfig,
+    profile: &DaemonProfile,
+    sensors: &HashMap<String, CachedSensorReading>,
+    visited: &mut HashSet<String>,
+) -> Option<f64> {
+    if visited.contains(&curve.id) {
+        log::warn!(
+            "Mix curve '{}' has a dependency cycle — skipping",
+            curve.name
+        );
+        return None;
+    }
+    visited.insert(curve.id.clone());
+    let mut values: Vec<f64> = Vec::new();
+    for child_id in &curve.mix_curve_ids {
+        if let Some(child) = profile.curves.iter().find(|c| &c.id == child_id) {
+            if let Some(v) = resolve_curve_output(child, profile, sensors, visited) {
+                values.push(v);
+            }
+        }
+    }
+    visited.remove(&curve.id);
+    if values.is_empty() {
+        return None;
+    }
+    let function = curve.mix_function.as_deref().unwrap_or("max");
+    Some(combine_mix(function, &values))
+}
+
+/// Mirror another control's current-tick tuned output (DEC-151).
+///
+/// Reads `tick_outputs[target]` — populated for every control already evaluated
+/// this tick, which the topological ordering guarantees is the Sync's target on
+/// an acyclic graph. Adds `sync_offset_pct` and clamps 0–100; the Sync control's
+/// own tuning is applied afterwards by the caller. Returns None (control skipped)
+/// for an unset/self target or one not yet computed (cycle / skipped / missing).
+/// Must match the GUI's `_resolve_sync_output` byte-for-byte.
+fn resolve_sync_output(
+    control: &LogicalControl,
+    curve: &crate::profile::CurveConfig,
+    tick_outputs: &HashMap<String, f64>,
+) -> Option<f64> {
+    let target_id = curve.sync_control_id.as_str();
+    if target_id.is_empty() || target_id == control.id {
+        return None;
+    }
+    let target_output = tick_outputs.get(target_id)?;
+    let offset = curve.sync_offset_pct.unwrap_or(0.0);
+    Some((target_output + offset).clamp(0.0, 100.0))
+}
+
+/// Resolve the raw curve output for one control, before the tuning pipeline.
+///
+/// Routes trigger to the latch, mix/sync to the context resolvers, and every
+/// single-temperature type to the 2°C deadband path — mirroring the GUI's
+/// `_curve_output_for_control`. Returns None when the control must be skipped
+/// this tick (missing sensor, unresolvable composite).
+fn curve_output_for_control(
+    control: &LogicalControl,
+    curve: &crate::profile::CurveConfig,
+    profile: &DaemonProfile,
+    sensors: &HashMap<String, CachedSensorReading>,
+    tick_outputs: &HashMap<String, f64>,
+    state: &mut ProfileEngineState,
+) -> Option<f64> {
+    match curve.curve_type.as_str() {
+        "mix" => resolve_curve_output(curve, profile, sensors, &mut HashSet::new()),
+        "sync" => resolve_sync_output(control, curve, tick_outputs),
+        "trigger" => {
+            let sensor = sensors.get(&curve.sensor_id)?;
+            Some(evaluate_trigger(control, curve, sensor.value_c, state))
+        }
+        _ => {
+            let sensor = sensors.get(&curve.sensor_id)?;
+            Some(evaluate_curve_with_deadband(
+                control,
+                curve,
+                sensor.value_c,
+                state,
+            ))
+        }
+    }
+}
+
+/// The control id a Sync-driven control depends on, else None. Mirrors the GUI's
+/// `_sync_dependency`.
+fn sync_dependency<'a>(control: &'a LogicalControl, profile: &'a DaemonProfile) -> Option<&'a str> {
+    if control.mode != "curve" {
+        return None;
+    }
+    let curve = profile.curves.iter().find(|c| c.id == control.curve_id)?;
+    if curve.curve_type != "sync" {
+        return None;
+    }
+    let target = curve.sync_control_id.as_str();
+    if target.is_empty() {
+        None
+    } else {
+        Some(target)
+    }
+}
+
+/// Stable topological order of control indices for Sync dependency resolution
+/// (DEC-151). A control whose curve is a `sync` depends on the control it
+/// targets, so the target is emitted first; independent controls keep their
+/// profile order (stable). A cycle is broken deterministically (the closing
+/// Sync reads a not-yet-computed target and falls back at eval time). Mirrors
+/// the GUI's `_ordered_controls` DFS so both evaluators order controls
+/// identically (parity-critical). Sync-free profiles emit `[0, 1, …, n-1]`.
+fn topological_control_order(profile: &DaemonProfile) -> Vec<usize> {
+    let id_to_idx: HashMap<&str, usize> = profile
+        .controls
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.id.as_str(), i))
+        .collect();
+    let n = profile.controls.len();
+    let mut ordered = Vec::with_capacity(n);
+    let mut emitted = vec![false; n];
+    let mut on_path = vec![false; n];
+    for start in 0..n {
+        topo_visit(
+            start,
+            profile,
+            &id_to_idx,
+            &mut ordered,
+            &mut emitted,
+            &mut on_path,
+        );
+    }
+    ordered
+}
+
+fn topo_visit(
+    idx: usize,
+    profile: &DaemonProfile,
+    id_to_idx: &HashMap<&str, usize>,
+    ordered: &mut Vec<usize>,
+    emitted: &mut [bool],
+    on_path: &mut [bool],
+) {
+    if emitted[idx] || on_path[idx] {
+        return;
+    }
+    on_path[idx] = true;
+    if let Some(dep_id) = sync_dependency(&profile.controls[idx], profile) {
+        if let Some(&dep_idx) = id_to_idx.get(dep_id) {
+            if dep_idx != idx {
+                topo_visit(dep_idx, profile, id_to_idx, ordered, emitted, on_path);
+            }
+        }
+    }
+    on_path[idx] = false;
+    if !emitted[idx] {
+        emitted[idx] = true;
+        ordered.push(idx);
+    }
+}
+
 /// Evaluate the active profile against current sensor readings.
 ///
 /// Returns a list of PWM commands for each fan member in the profile.
@@ -267,50 +477,50 @@ pub fn evaluate_profile(
     engine_state.sync_profile_id(&profile.id);
 
     let mut commands = Vec::new();
+    // Per-tick control outputs (post-tuning), consumed by Sync curves mirroring
+    // an already-evaluated control. Fresh each tick — distinct from
+    // `engine_state.last_output`, which is the PREVIOUS tick and entangled with
+    // step-rate limiting, so it must not be reused for Sync (DEC-151). Mirrors
+    // the GUI's `status.control_outputs`.
+    let mut tick_outputs: HashMap<String, f64> = HashMap::new();
 
-    for control in &profile.controls {
-        if control.members.is_empty() {
-            continue;
-        }
+    // Evaluate in stable topological order so a Sync control's target is already
+    // in `tick_outputs` when the Sync mirrors it (DEC-151). Sync-free profiles
+    // keep their natural profile order.
+    for idx in topological_control_order(profile) {
+        let control = &profile.controls[idx];
 
-        // Determine target output percentage
+        // Determine target output percentage. None → skip this control this tick
+        // (manual mode always resolves; curve mode skips on missing curve /
+        // sensor / unresolvable composite). The fan then holds its last value.
         let raw_output = if control.mode == "manual" {
-            control.manual_output_pct
+            Some(control.manual_output_pct)
         } else {
-            // Find the assigned curve
-            let curve = profile.curves.iter().find(|c| c.id == control.curve_id);
-            let Some(curve) = curve else {
-                log::debug!(
-                    "Control '{}': curve '{}' not found, skipping",
-                    control.name,
-                    control.curve_id
-                );
-                continue;
-            };
-
-            // Find the sensor reading — the map is keyed by sensor id, so
-            // this is an O(1) lookup instead of the per-control linear scan
-            // it used to be (DEC-146 P3-5).
-            let sensor = sensors.get(&curve.sensor_id);
-            let Some(sensor) = sensor else {
-                log::debug!(
-                    "Control '{}': sensor '{}' not available, skipping",
-                    control.name,
-                    curve.sensor_id
-                );
-                continue;
-            };
-
-            // Trigger curves use a stateful two-state latch and bypass the 2°C
-            // deadband (DEC-149) — they own their idle..load hysteresis band;
-            // every other type goes through the deadband path (DEC-096). Mirrors
-            // the GUI's ``_curve_output_for_control`` (control_loop.py) so
-            // headless behaviour matches GUI-driven behaviour.
-            if curve.curve_type == "trigger" {
-                evaluate_trigger(control, curve, sensor.value_c, engine_state)
-            } else {
-                evaluate_curve_with_deadband(control, curve, sensor.value_c, engine_state)
+            // Find the assigned curve, then resolve via the shared dispatcher
+            // (deadband / trigger latch / mix / sync) — mirrors the GUI's
+            // `_curve_output_for_control` so headless behaviour matches
+            // GUI-driven behaviour.
+            match profile.curves.iter().find(|c| c.id == control.curve_id) {
+                None => {
+                    log::debug!(
+                        "Control '{}': curve '{}' not found, skipping",
+                        control.name,
+                        control.curve_id
+                    );
+                    None
+                }
+                Some(curve) => curve_output_for_control(
+                    control,
+                    curve,
+                    profile,
+                    sensors,
+                    &tick_outputs,
+                    engine_state,
+                ),
             }
+        };
+        let Some(raw_output) = raw_output else {
+            continue;
         };
 
         // Full tuning pipeline — tracks pre-rounding f64 across cycles so
@@ -318,6 +528,17 @@ pub fn evaluate_profile(
         let prev = engine_state.last_output(&control.id);
         let tuned = apply_tuning(control, raw_output, prev);
         engine_state.last_output.insert(control.id.clone(), tuned);
+        // Record the control's current-tick output BEFORE the members check so a
+        // Sync can mirror even a member-less control — matches the GUI, which
+        // sets `status.control_outputs` for every evaluated control regardless
+        // of members (DEC-151).
+        tick_outputs.insert(control.id.clone(), tuned);
+
+        // Skip the write phase for member-less controls (they still publish a
+        // tick output above for any Sync that mirrors them).
+        if control.members.is_empty() {
+            continue;
+        }
 
         // Round-to-nearest when converting to the wire PWM value so 49.6
         // becomes 50 instead of being truncated to 49 — matches the GUI's
@@ -586,6 +807,204 @@ mod tests {
         assert_eq!(pwm(60.0, &mut state), 80); // re-enter load
     }
 
+    // ── DEC-150 Mix / DEC-151 Sync (composite curves) ───────────────────
+
+    fn openfan_control(id: &str, curve_id: &str, member: &str) -> LogicalControl {
+        LogicalControl {
+            id: id.into(),
+            name: id.into(),
+            mode: "curve".into(),
+            curve_id: curve_id.into(),
+            manual_output_pct: 0.0,
+            members: vec![ControlMember {
+                source: "openfan".into(),
+                member_id: member.into(),
+                member_label: "".into(),
+                fan_zero_rpm: false,
+            }],
+            step_up_pct: 100.0,
+            step_down_pct: 100.0,
+            offset_pct: 0.0,
+            minimum_pct: 0.0,
+            start_pct: 0.0,
+            stop_pct: 0.0,
+        }
+    }
+
+    fn linear_curve(id: &str, sensor: &str) -> CurveConfig {
+        CurveConfig {
+            id: id.into(),
+            name: id.into(),
+            curve_type: "linear".into(),
+            sensor_id: sensor.into(),
+            start_temp_c: Some(30.0),
+            start_output_pct: Some(20.0),
+            end_temp_c: Some(80.0),
+            end_output_pct: Some(100.0),
+            ..Default::default()
+        }
+    }
+
+    fn mix_curve(id: &str, function: &str, children: &[&str]) -> CurveConfig {
+        CurveConfig {
+            id: id.into(),
+            name: id.into(),
+            curve_type: "mix".into(),
+            mix_function: Some(function.into()),
+            mix_curve_ids: children.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn sync_curve(id: &str, target: &str, offset: f64) -> CurveConfig {
+        CurveConfig {
+            id: id.into(),
+            name: id.into(),
+            curve_type: "sync".into(),
+            sync_control_id: target.into(),
+            sync_offset_pct: Some(offset),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn combine_mix_functions_and_clamp() {
+        // Must match the GUI's `_combine_mix` exactly (parity tuning_sequence).
+        assert_eq!(combine_mix("max", &[60.0, 40.0, 20.0]), 60.0);
+        assert_eq!(combine_mix("min", &[60.0, 40.0, 20.0]), 20.0);
+        assert_eq!(combine_mix("average", &[60.0, 40.0, 20.0]), 40.0);
+        assert_eq!(combine_mix("sum", &[60.0, 40.0, 20.0]), 100.0); // 120 clamps to 100
+        assert_eq!(combine_mix("subtract", &[60.0, 40.0, 20.0]), 0.0); // 60-40-20
+        assert_eq!(combine_mix("bogus", &[10.0, 90.0]), 90.0); // unknown → max
+    }
+
+    #[test]
+    fn mix_combines_children_at_own_sensors() {
+        let profile = DaemonProfile {
+            id: "mix".into(),
+            name: "Mix".into(),
+            version: 7,
+            description: "".into(),
+            controls: vec![openfan_control("c", "mx", "openfan:ch00")],
+            curves: vec![
+                linear_curve("cpu", "cpu"), // at 50 → 52
+                linear_curve("gpu", "gpu"), // at 70 → 84
+                mix_curve("mx", "max", &["cpu", "gpu"]),
+            ],
+        };
+        let cache = make_cache_with_sensors(&[("cpu".into(), 50.0), ("gpu".into(), 70.0)]);
+        let cmds = evaluate_profile(
+            &profile,
+            &cache.sensors_snapshot(),
+            &mut ProfileEngineState::new(),
+        );
+        assert_eq!(cmds[0].pwm_percent, 84); // max(52, 84)
+    }
+
+    #[test]
+    fn mix_self_cycle_skips_control() {
+        let profile = DaemonProfile {
+            id: "mix".into(),
+            name: "Mix".into(),
+            version: 7,
+            description: "".into(),
+            controls: vec![openfan_control("c", "mx", "openfan:ch00")],
+            curves: vec![mix_curve("mx", "max", &["mx"])], // references itself
+        };
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let cmds = evaluate_profile(
+            &profile,
+            &cache.sensors_snapshot(),
+            &mut ProfileEngineState::new(),
+        );
+        assert!(cmds.is_empty()); // cycle → skipped, no command
+    }
+
+    #[test]
+    fn sync_mirrors_target_with_offset_and_ordering() {
+        // Mirror is listed BEFORE its target — the topological order must still
+        // evaluate the target first so the mirror reads its current-tick output.
+        let profile = DaemonProfile {
+            id: "sync".into(),
+            name: "Sync".into(),
+            version: 7,
+            description: "".into(),
+            controls: vec![
+                openfan_control("cmir", "sy", "openfan:ch01"),
+                openfan_control("ctgt", "cv", "openfan:ch00"),
+            ],
+            curves: vec![linear_curve("cv", "cpu"), sync_curve("sy", "ctgt", 10.0)],
+        };
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let cmds = evaluate_profile(
+            &profile,
+            &cache.sensors_snapshot(),
+            &mut ProfileEngineState::new(),
+        );
+        let tgt = cmds.iter().find(|c| c.member_id == "openfan:ch00").unwrap();
+        let mir = cmds.iter().find(|c| c.member_id == "openfan:ch01").unwrap();
+        assert_eq!(tgt.pwm_percent, 52);
+        assert_eq!(mir.pwm_percent, 62); // 52 + 10
+    }
+
+    #[test]
+    fn sync_two_cycle_both_skip() {
+        // A mirrors B, B mirrors A. The sort breaks the cycle; both read a
+        // not-yet-computed target and skip — no panic, no command.
+        let profile = DaemonProfile {
+            id: "cyc".into(),
+            name: "Cyc".into(),
+            version: 7,
+            description: "".into(),
+            controls: vec![
+                openfan_control("ca", "sa", "openfan:ch00"),
+                openfan_control("cb", "sb", "openfan:ch01"),
+            ],
+            curves: vec![sync_curve("sa", "cb", 0.0), sync_curve("sb", "ca", 0.0)],
+        };
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let cmds = evaluate_profile(
+            &profile,
+            &cache.sensors_snapshot(),
+            &mut ProfileEngineState::new(),
+        );
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn topological_order_sync_free_is_profile_order() {
+        let profile = DaemonProfile {
+            id: "p".into(),
+            name: "P".into(),
+            version: 7,
+            description: "".into(),
+            controls: vec![
+                openfan_control("c0", "x", "openfan:ch00"),
+                openfan_control("c1", "x", "openfan:ch01"),
+                openfan_control("c2", "x", "openfan:ch02"),
+            ],
+            curves: vec![],
+        };
+        assert_eq!(topological_control_order(&profile), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn topological_order_puts_sync_target_first() {
+        // controls [mirror(0)→target, target(1)] must order as [target, mirror].
+        let profile = DaemonProfile {
+            id: "p".into(),
+            name: "P".into(),
+            version: 7,
+            description: "".into(),
+            controls: vec![
+                openfan_control("cmir", "sy", "openfan:ch01"),
+                openfan_control("ctgt", "cv", "openfan:ch00"),
+            ],
+            curves: vec![linear_curve("cv", "cpu"), sync_curve("sy", "ctgt", 0.0)],
+        };
+        assert_eq!(topological_control_order(&profile), vec![1, 0]);
+    }
+
     fn make_profile(mode: &str, curve_type: &str, flat_pct: f64) -> DaemonProfile {
         DaemonProfile {
             id: "test".into(),
@@ -655,6 +1074,33 @@ mod tests {
         cache
     }
 
+    /// Build a cache holding several sensors at once (parity multi-sensor Mix
+    /// cases). All are tagged ``CpuTemp`` — curve evaluation looks sensors up by
+    /// id, so the kind is irrelevant here; only the id→value mapping matters.
+    fn make_cache_with_sensors(sensors: &[(String, f64)]) -> Arc<StateCache> {
+        let cache = Arc::new(StateCache::new());
+        cache.update_sensors(
+            sensors
+                .iter()
+                .map(|(id, temp)| CachedSensorReading {
+                    id: id.clone(),
+                    kind: SensorKind::CpuTemp,
+                    label: id.clone(),
+                    value_c: *temp,
+                    source: DeviceLabel::Hwmon,
+                    updated_at: Instant::now(),
+                    rate_c_per_s: None,
+                    session_min_c: None,
+                    session_max_c: None,
+                    chip_name: "k10temp".into(),
+                    temp_type: None,
+                    thresholds: None,
+                })
+                .collect(),
+        );
+        cache
+    }
+
     fn make_cache_with_cpu_sensor(sensor_id: &str, label: &str, temp_c: f64) -> Arc<StateCache> {
         let cache = Arc::new(StateCache::new());
         cache.update_sensors(vec![CachedSensorReading {
@@ -711,14 +1157,38 @@ mod tests {
         let vectors = load_parity_vectors();
         for vector in vectors["tuning_sequence"].as_array().unwrap() {
             let name = vector["name"].as_str().unwrap();
-            let sensor_id = vector["sensor_id"].as_str().unwrap();
             let profile: DaemonProfile =
                 serde_json::from_value(vector["profile"].clone()).expect("profile");
             let mut state = ProfileEngineState::new();
 
+            // Per-step sensor snapshots from either fixture shape: a single
+            // `sensor_id` + `temps`, or a multi-sensor `sensor_temps` map
+            // ({id:[temp_per_step]}, equal length — multi-sensor Mix cases).
+            let steps: Vec<Vec<(String, f64)>> = if let Some(map) = vector.get("sensor_temps") {
+                let map = map.as_object().unwrap();
+                let n = map.values().next().unwrap().as_array().unwrap().len();
+                (0..n)
+                    .map(|i| {
+                        map.iter()
+                            .map(|(id, arr)| {
+                                (id.clone(), arr.as_array().unwrap()[i].as_f64().unwrap())
+                            })
+                            .collect()
+                    })
+                    .collect()
+            } else {
+                let sensor_id = vector["sensor_id"].as_str().unwrap();
+                vector["temps"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|t| vec![(sensor_id.to_string(), t.as_f64().unwrap())])
+                    .collect()
+            };
+
             let mut produced: HashMap<String, Vec<u8>> = HashMap::new();
-            for temp in vector["temps"].as_array().unwrap() {
-                let cache = make_cache_with_sensor(sensor_id, temp.as_f64().unwrap());
+            for step in &steps {
+                let cache = make_cache_with_sensors(step);
                 for cmd in evaluate_profile(&profile, &cache.sensors_snapshot(), &mut state) {
                     produced
                         .entry(cmd.member_id)
@@ -1240,7 +1710,7 @@ mod tests {
         assert_eq!(state.trigger_latch.get("ctrl1"), Some(&true));
 
         state.deactivate();
-        assert!(state.trigger_latch.get("ctrl1").is_none());
+        assert!(!state.trigger_latch.contains_key("ctrl1"));
     }
 
     #[test]

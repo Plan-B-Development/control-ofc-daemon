@@ -1,5 +1,33 @@
 # Changelog
 
+## [1.17.0] — 2026-06-12
+
+Mix and Sync composite curve types (DEC-150/151) — the final phase of the
+curve-library expansion, retiring the single-sensor rule (DEC-014 → DEC-152).
+Pairs with **GUI v1.38.0**; both evaluators learn dependency-graph evaluation with
+cycle detection in lockstep and the DEC-126 parity fixture stays byte-identical.
+
+### Added
+- `"mix"` curve type — combines other curves' raw outputs (each at its own sensor)
+  via `max`/`min`/`average`/`sum`/`subtract`, clamped 0–100. Evaluated by a
+  recursive `resolve_curve_output` + `combine_mix` with a path-based visited-set
+  cycle guard. Bypasses the 2°C deadband. Mirrors the GUI's `_resolve_curve_output`
+  / `_combine_mix`.
+- `"sync"` curve type — mirrors another control's current-tick tuned output +
+  offset. `evaluate_profile` now evaluates controls in a stable topological order
+  (`topological_control_order`, byte-identical to the GUI's `_ordered_controls`)
+  and reads the target from a new per-tick `tick_outputs` map (not the
+  previous-tick, step-rate-entangled `last_output`). Bypasses the deadband; the
+  ordering is a no-op for Sync-free profiles.
+- Mix/Sync parity vectors (multi-sensor Mix, mirror-before-target Sync) plus
+  profile-engine unit tests for the combine functions, topological order, and
+  cycle fallback.
+
+### Changed
+- Profile `default_version` → **7**. New optional `CurveConfig` fields
+  (`mix_function`, `mix_curve_ids`, `sync_control_id`, `sync_offset_pct`).
+  Additive and backward-compatible (unknown curve types still fall back to 50%).
+
 ## [1.16.0] — 2026-06-12
 
 Trigger (two-state latch) curve type (DEC-149) — second of three phased

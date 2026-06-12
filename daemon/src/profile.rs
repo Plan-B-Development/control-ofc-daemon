@@ -1,13 +1,17 @@
 //! Profile model — loads and evaluates GUI-created fan curve profiles.
 //!
-//! Compatible with the GUI's Profile v6 JSON format. v4 adds the per-GPU
+//! Compatible with the GUI's Profile v7 JSON format. v4 adds the per-GPU
 //! ``fan_zero_rpm`` flag on ``ControlMember`` (DEC-095); v5 adds the
 //! ``stepped`` (staircase) curve type (DEC-148); v6 adds the ``trigger``
-//! (two-state latch) curve type (DEC-149). Older profiles deserialise
-//! unchanged because new fields use ``#[serde(default)]`` and unknown curve
-//! types fall back to 50%.
+//! (two-state latch) curve type (DEC-149); v7 adds the composite ``mix``
+//! (combine other curves) and ``sync`` (mirror a control's output) curve types
+//! (DEC-150/151, retiring DEC-014). Older profiles deserialise unchanged
+//! because new fields use ``#[serde(default)]`` and unknown curve types fall
+//! back to 50%.
 //! Supports graph (piecewise linear), stepped (staircase), linear (2-point),
-//! flat, and trigger curve types.
+//! flat, trigger, mix, and sync curve types. The pure `evaluate_curve` serves
+//! the single-temperature types; the composite mix/sync types are resolved with
+//! an evaluation context inside the profile engine.
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -28,7 +32,7 @@ pub struct DaemonProfile {
 }
 
 fn default_version() -> u32 {
-    6
+    7
 }
 
 /// A logical fan control group with curve assignment and member fans.
@@ -118,6 +122,21 @@ pub struct CurveConfig {
     pub trigger_idle_pct: Option<f64>,
     #[serde(default)]
     pub trigger_load_pct: Option<f64>,
+    // Mix fields (combine other curves — DEC-150). `mix_function` is one of
+    // max/min/average/sum/subtract (default max); `mix_curve_ids` references
+    // other CurveConfig ids in the same profile, each evaluated at its own
+    // sensor and combined.
+    #[serde(default)]
+    pub mix_function: Option<String>,
+    #[serde(default)]
+    pub mix_curve_ids: Vec<String>,
+    // Sync fields (mirror a control's tuned output — DEC-151). `sync_control_id`
+    // references a LogicalControl id; `sync_offset_pct` is added to that
+    // control's current-tick output.
+    #[serde(default)]
+    pub sync_control_id: String,
+    #[serde(default)]
+    pub sync_offset_pct: Option<f64>,
 }
 
 /// A single point on a graph curve.
@@ -531,6 +550,45 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_mix_and_sync_curves() {
+        // v7 (DEC-150/151): mix/sync curve fields round-trip through serde. The
+        // pure `evaluate_curve` never drives them (they need an evaluation
+        // context), so this pins the wire shape the profile engine's resolvers
+        // consume.
+        let json = r#"{
+            "id": "p", "name": "P", "version": 7,
+            "controls": [],
+            "curves": [
+                {"id": "mx", "name": "Mix", "type": "mix", "mix_function": "average", "mix_curve_ids": ["a", "b"]},
+                {"id": "sy", "name": "Sync", "type": "sync", "sync_control_id": "ctrl", "sync_offset_pct": 12.5}
+            ]
+        }"#;
+        let profile: DaemonProfile = serde_json::from_str(json).unwrap();
+        let mx = &profile.curves[0];
+        assert_eq!(mx.curve_type, "mix");
+        assert_eq!(mx.mix_function.as_deref(), Some("average"));
+        assert_eq!(mx.mix_curve_ids, vec!["a".to_string(), "b".to_string()]);
+        let sy = &profile.curves[1];
+        assert_eq!(sy.curve_type, "sync");
+        assert_eq!(sy.sync_control_id, "ctrl");
+        assert_eq!(sy.sync_offset_pct, Some(12.5));
+    }
+
+    #[test]
+    fn mix_sync_fields_default_when_absent() {
+        // A non-composite curve leaves the new fields at their serde defaults,
+        // so older profiles deserialise unchanged.
+        let curve = CurveConfig {
+            curve_type: "flat".into(),
+            ..Default::default()
+        };
+        assert!(curve.mix_function.is_none());
+        assert!(curve.mix_curve_ids.is_empty());
+        assert_eq!(curve.sync_control_id, "");
+        assert!(curve.sync_offset_pct.is_none());
+    }
+
+    #[test]
     fn unknown_curve_type_returns_50() {
         let curve = CurveConfig {
             id: "unk".into(),
@@ -617,7 +675,7 @@ mod tests {
         assert_eq!(profile.name, "Minimal");
         assert!(profile.controls.is_empty());
         assert!(profile.curves.is_empty());
-        assert_eq!(profile.version, 6); // default — v6 (DEC-149)
+        assert_eq!(profile.version, 7); // default — v7 (DEC-150/151)
     }
 
     #[test]
