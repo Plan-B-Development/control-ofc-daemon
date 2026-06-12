@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.15.0] — 2026-06-12
+
+Stepped (staircase) curve type (DEC-148) — first of three phased curve-library
+additions. Pairs with **GUI v1.36.0**; both evaluators learn `stepped` in
+lockstep and the DEC-126 parity fixture stays byte-identical.
+
+### Added
+- `evaluate_stepped` in `profile.rs`: a `"stepped"` curve holds each point's
+  output until the next point's temperature is reached (lower-point-wins,
+  half-open segments), clamping below-first / at-or-above-last, empty → 50%.
+  Mirrors the GUI's `_interpolate_stepped`; pinned by new `curve_eval` parity
+  vectors.
+
+### Changed
+- Profile `default_version` → **5**. Additive and backward-compatible: older
+  profiles deserialise unchanged and unknown curve types still fall back to 50%.
+
 ## [1.14.2] — 2026-06-07
 
 2026-06 function/efficiency audit remediation (DEC-146 P2/P3) plus

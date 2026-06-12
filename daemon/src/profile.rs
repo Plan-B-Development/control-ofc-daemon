@@ -1,9 +1,12 @@
 //! Profile model — loads and evaluates GUI-created fan curve profiles.
 //!
-//! Compatible with the GUI's Profile v4 JSON format. v4 adds the per-GPU
-//! ``fan_zero_rpm`` flag on ``ControlMember`` (DEC-095). v3 profiles
-//! deserialise unchanged because the new field uses ``#[serde(default)]``.
-//! Supports graph (piecewise linear), linear (2-point), and flat curve types.
+//! Compatible with the GUI's Profile v5 JSON format. v4 adds the per-GPU
+//! ``fan_zero_rpm`` flag on ``ControlMember`` (DEC-095); v5 adds the
+//! ``stepped`` (staircase) curve type (DEC-148). Older profiles deserialise
+//! unchanged because new fields use ``#[serde(default)]`` and unknown curve
+//! types fall back to 50%.
+//! Supports graph (piecewise linear), stepped (staircase), linear (2-point),
+//! and flat curve types.
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -24,7 +27,7 @@ pub struct DaemonProfile {
 }
 
 fn default_version() -> u32 {
-    4
+    5
 }
 
 /// A logical fan control group with curve assignment and member fans.
@@ -82,7 +85,7 @@ pub struct ControlMember {
     pub fan_zero_rpm: bool,
 }
 
-/// A fan curve configuration (graph, linear, or flat).
+/// A fan curve configuration (graph, stepped, linear, or flat).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurveConfig {
     pub id: String,
@@ -118,6 +121,7 @@ pub struct CurvePoint {
 pub fn evaluate_curve(curve: &CurveConfig, temp_c: f64) -> f64 {
     match curve.curve_type.as_str() {
         "graph" => evaluate_graph(curve, temp_c),
+        "stepped" => evaluate_stepped(curve, temp_c),
         "linear" => evaluate_linear(curve, temp_c),
         "flat" => curve.flat_output_pct.unwrap_or(50.0),
         _ => {
@@ -165,6 +169,32 @@ fn evaluate_graph(curve: &CurveConfig, temp_c: f64) -> f64 {
     // point's output, so headless evaluation matches the GUI preview. Pinned by
     // the cross-stack parity harness (DEC-126).
     points[points.len() - 1].output_pct
+}
+
+/// Evaluate a stepped (staircase) curve: hold each point's output until the
+/// next point's temperature is reached (lower-point-wins). Shares the graph
+/// point model; only the fill rule differs. Below the first point clamps to
+/// the first output; at/above the last point clamps to the last output. Must
+/// stay byte-for-byte identical to the GUI's ``_interpolate_stepped``
+/// (DEC-126 / DEC-148).
+fn evaluate_stepped(curve: &CurveConfig, temp_c: f64) -> f64 {
+    let points = &curve.points;
+    if points.is_empty() {
+        return 50.0;
+    }
+    let last = points.len() - 1;
+    if temp_c <= points[0].temp_c {
+        return points[0].output_pct;
+    }
+    if temp_c >= points[last].temp_c {
+        return points[last].output_pct;
+    }
+    for i in 0..last {
+        if temp_c >= points[i].temp_c && temp_c < points[i + 1].temp_c {
+            return points[i].output_pct;
+        }
+    }
+    points[last].output_pct
 }
 
 fn evaluate_linear(curve: &CurveConfig, temp_c: f64) -> f64 {
@@ -397,6 +427,68 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_stepped_staircase() {
+        // DEC-148: stepped holds the lower point's output until the next
+        // point's temperature is reached (no ramp). Mirrors the GUI's
+        // `_interpolate_stepped`; pinned by the DEC-126 parity harness.
+        let curve = CurveConfig {
+            id: "step".into(),
+            name: "Stepped".into(),
+            curve_type: "stepped".into(),
+            sensor_id: "".into(),
+            points: vec![
+                CurvePoint {
+                    temp_c: 30.0,
+                    output_pct: 20.0,
+                },
+                CurvePoint {
+                    temp_c: 60.0,
+                    output_pct: 50.0,
+                },
+                CurvePoint {
+                    temp_c: 80.0,
+                    output_pct: 100.0,
+                },
+            ],
+            start_temp_c: None,
+            start_output_pct: None,
+            end_temp_c: None,
+            end_output_pct: None,
+            flat_output_pct: None,
+        };
+        // Below the first point clamps to the first output.
+        assert!((evaluate_curve(&curve, 20.0) - 20.0).abs() < 0.01);
+        // Exactly on a node returns that node's output.
+        assert!((evaluate_curve(&curve, 30.0) - 20.0).abs() < 0.01);
+        // Anywhere in [30,60) holds the lower point's output — no interpolation.
+        assert!((evaluate_curve(&curve, 45.0) - 20.0).abs() < 0.01);
+        assert!((evaluate_curve(&curve, 59.9) - 20.0).abs() < 0.01);
+        // At the next node the step transitions up (half-open boundary).
+        assert!((evaluate_curve(&curve, 60.0) - 50.0).abs() < 0.01);
+        assert!((evaluate_curve(&curve, 79.9) - 50.0).abs() < 0.01);
+        // At/above the last point clamps to the last output.
+        assert!((evaluate_curve(&curve, 80.0) - 100.0).abs() < 0.01);
+        assert!((evaluate_curve(&curve, 95.0) - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn evaluate_stepped_empty_points_defaults_to_50() {
+        let curve = CurveConfig {
+            id: "step_empty".into(),
+            name: "Empty".into(),
+            curve_type: "stepped".into(),
+            sensor_id: "".into(),
+            points: vec![],
+            start_temp_c: None,
+            start_output_pct: None,
+            end_temp_c: None,
+            end_output_pct: None,
+            flat_output_pct: None,
+        };
+        assert!((evaluate_curve(&curve, 50.0) - 50.0).abs() < 0.01);
+    }
+
+    #[test]
     fn unknown_curve_type_returns_50() {
         let curve = CurveConfig {
             id: "unk".into(),
@@ -491,7 +583,7 @@ mod tests {
         assert_eq!(profile.name, "Minimal");
         assert!(profile.controls.is_empty());
         assert!(profile.curves.is_empty());
-        assert_eq!(profile.version, 4); // default — v4 (DEC-095)
+        assert_eq!(profile.version, 5); // default — v5 (DEC-148)
     }
 
     #[test]
