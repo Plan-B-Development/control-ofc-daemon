@@ -716,12 +716,21 @@ async fn hwmon_lease_take_conflict() {
 #[tokio::test]
 async fn hwmon_set_pwm_with_lease() {
     let state = test_app_state_with_hwmon();
+    let cache = state.cache.clone();
+    // DEC-131: a hwmon PWM write must record GUI liveness so the profile engine
+    // defers to the GUI. A regression dropping record_gui_write() on this path
+    // would silently hand hwmon control back to the engine while the GUI writes.
+    assert!(!cache.gui_active(), "test precondition: GUI not yet active");
     let (path, shutdown, _dir) = start_test_server(state).await;
 
-    // Take lease
+    // Take lease (a lease op — must NOT itself mark the GUI active).
     let body = serde_json::json!({ "owner_hint": "gui" });
     let (_, lease_json) = uds_post(&path, "/hwmon/lease/take", &body).await;
     let lease_id = lease_json["lease_id"].as_str().unwrap();
+    assert!(
+        !cache.gui_active(),
+        "taking a lease must not mark the GUI active; only a write does"
+    );
 
     // Set PWM
     let body = serde_json::json!({ "pwm_percent": 60, "lease_id": lease_id });
@@ -731,6 +740,10 @@ async fn hwmon_set_pwm_with_lease() {
     assert_eq!(json["api_version"], 1);
     assert_eq!(json["header_id"], "h1");
     assert_eq!(json["pwm_percent"], 60);
+    assert!(
+        cache.gui_active(),
+        "hwmon PWM write must record GUI liveness (DEC-131)"
+    );
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
