@@ -345,11 +345,13 @@ impl WriteBackend for HwmonBackend {
     /// to close the startup race where the GUI has written via /fans/...
     /// but has not yet taken the hwmon lease, or the lease has briefly
     /// lapsed — DEC-074 semantics extended to hwmon.
-    /// DEC-146 P3-8: the lease-check → write → renew sequence does sysfs
-    /// I/O under the controller mutex, so the whole (already
-    /// lock-per-batch) body moves onto the blocking pool unchanged —
-    /// matching the hwmon poll loop. DEC-099's lock-per-write applies to
-    /// `force_all`, not `apply`; semantics here are identical to before.
+    /// DEC-146 P3-8: the body runs on the blocking pool (matching the hwmon
+    /// poll loop). DEC-154: the lease-acquire → per-header write → renew
+    /// sequence now locks the controller mutex PER COMMAND (like `force_all`
+    /// and `OpenFanBackend`), not once for the whole batch, so concurrent API
+    /// requests are not starved for the duration of a multi-header tick. A
+    /// GUI/thermal force-take mid-scan fails the remaining writes with
+    /// InvalidLease; the next 1 Hz tick re-acquires.
     async fn apply(&mut self, commands: &[PwmCommand], gui_active: bool) {
         let hwmon_cmds: Vec<(String, u8)> = commands
             .iter()
@@ -361,39 +363,44 @@ impl WriteBackend for HwmonBackend {
         }
         let ctrl = self.ctrl.clone();
         let join = tokio::task::spawn_blocking(move || {
-            let mut guard = ctrl.lock();
-            // Try to get or auto-acquire a lease for the profile engine.
-            let lease_id = {
-                let mgr = guard.lease_manager();
-                match mgr.active_lease() {
-                    Some(lease) if lease.owner_hint == "gui" => {
+            // Phase 1: acquire (or reuse) the profile-engine lease under a brief
+            // lock, then release it so concurrent API requests can interleave
+            // with the per-header writes below.
+            let lease_id: Option<String> = {
+                let mut guard = ctrl.lock();
+                let existing = {
+                    let mgr = guard.lease_manager();
+                    match mgr.active_lease() {
                         // GUI has priority — skip hwmon writes.
-                        None
+                        Some(lease) if lease.owner_hint == "gui" => None,
+                        Some(lease) => Some(lease.lease_id.clone()),
+                        None => None, // Need to acquire
                     }
-                    Some(lease) => Some(lease.lease_id.clone()),
-                    None => None, // Need to acquire
-                }
+                };
+                existing.or_else(|| {
+                    guard
+                        .lease_manager_mut()
+                        .take_lease("profile-engine")
+                        .ok()
+                        .map(|l| l.lease_id)
+                })
             };
-            let lease_id = lease_id.or_else(|| {
-                guard
-                    .lease_manager_mut()
-                    .take_lease("profile-engine")
-                    .ok()
-                    .map(|l| l.lease_id)
-            });
-            if let Some(ref lid) = lease_id {
-                for (member_id, pwm_percent) in &hwmon_cmds {
-                    match guard.set_pwm(member_id, *pwm_percent, lid) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            log::warn!("hwmon write failed for {member_id}: {e}");
-                        }
-                    }
+            let Some(lease_id) = lease_id else { return };
+
+            // Phase 2: one lock per header (DEC-154) so a concurrent reader or
+            // lease op is not starved for the whole batch. A GUI/thermal
+            // force-take mid-scan fails the remaining writes with InvalidLease;
+            // the next 1 Hz tick re-acquires.
+            for (member_id, pwm_percent) in &hwmon_cmds {
+                let mut guard = ctrl.lock();
+                if let Err(e) = guard.set_pwm(member_id, *pwm_percent, &lease_id) {
+                    log::warn!("hwmon write failed for {member_id}: {e}");
                 }
-                // Renew to keep it alive for the next cycle.
-                if let Err(e) = guard.lease_manager_mut().renew_lease(lid) {
-                    log::debug!("lease renewal failed (will re-acquire next cycle): {e}");
-                }
+            }
+
+            // Phase 3: renew under a brief lock to keep it alive for next cycle.
+            if let Err(e) = ctrl.lock().lease_manager_mut().renew_lease(&lease_id) {
+                log::debug!("lease renewal failed (will re-acquire next cycle): {e}");
             }
         })
         .await;
@@ -631,6 +638,64 @@ mod tests {
                 Ok("128\n".into())
             }
         }
+    }
+
+    /// Like `make_header`, but at a distinct sysfs path per `index` so each
+    /// header's write is independently observable in the write log.
+    fn make_header_idx(id: &str, index: u8) -> PwmHeaderDescriptor {
+        PwmHeaderDescriptor {
+            id: id.to_string(),
+            label: "CHA_FAN1".to_string(),
+            chip_name: "it8696".to_string(),
+            device_id: "it87.2624".to_string(),
+            pwm_index: index,
+            supports_enable: true,
+            pwm_path: format!("/sys/class/hwmon/hwmon0/pwm{index}"),
+            enable_path: Some(format!("/sys/class/hwmon/hwmon0/pwm{index}_enable")),
+            rpm_available: false,
+            rpm_path: None,
+            min_pwm_percent: 0,
+            max_pwm_percent: 100,
+            is_writable: true,
+            pwm_mode: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn hwmon_apply_writes_every_header_in_batch() {
+        // DEC-154 per-command locking must still write EVERY header in a batch
+        // (none dropped by the per-header re-lock) and auto-acquire the lease.
+        let (mut be, writes) = hwmon_backend(vec![
+            make_header_idx("hwmon:it8696:pwm1", 1),
+            make_header_idx("hwmon:it8696:pwm2", 2),
+            make_header_idx("hwmon:it8696:pwm3", 3),
+        ]);
+
+        be.apply(
+            &[
+                cmd("hwmon:it8696:pwm1", "hwmon", 40),
+                cmd("hwmon:it8696:pwm2", "hwmon", 55),
+                cmd("hwmon:it8696:pwm3", "hwmon", 70),
+            ],
+            false,
+        )
+        .await;
+
+        let w = writes.lock();
+        for pwm in ["pwm1", "pwm2", "pwm3"] {
+            assert!(
+                w.iter().any(|(p, _)| p.ends_with(pwm)),
+                "per-command apply must write header {pwm}; got {w:?}"
+            );
+        }
+        drop(w);
+
+        // The profile engine auto-acquired the lease and still holds it.
+        let lease = be.ctrl.lock().lease_manager().active_lease().cloned();
+        assert!(
+            lease.is_some_and(|l| l.owner_hint == "profile-engine"),
+            "profile-engine lease must be active after apply"
+        );
     }
 
     #[tokio::test]

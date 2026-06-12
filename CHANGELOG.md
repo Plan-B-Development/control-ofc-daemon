@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.17.2] — 2026-06-12
+
+Concurrency fix (from the 2026-06-12 code audit). Daemon-only — pairs with the existing
+**GUI v1.38.0**.
+
+### Changed
+- **Profile-engine hwmon writes lock per command, not per batch.** `HwmonBackend::apply`
+  previously held the controller mutex across the whole multi-header tick (lease-acquire + every
+  `set_pwm` + renew), starving concurrent API requests (`GET /hwmon/headers`, lease ops) for the
+  duration of the batch. It now locks once per header — matching the sibling `force_all` and
+  OpenFan paths (DEC-099) — so requests interleave between writes. A force-take mid-tick fails the
+  remaining writes with `InvalidLease` and the next 1 Hz tick re-applies (audit P1-D / DEC-154).
+
 ## [1.17.1] — 2026-06-12
 
 Shutdown-ordering and thermal-safety hardening (from the 2026-06-12 code audit).

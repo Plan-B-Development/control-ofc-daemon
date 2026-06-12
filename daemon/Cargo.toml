@@ -1,6 +1,6 @@
 [package]
 name = "control-ofc-daemon"
-version = "1.17.1"
+version = "1.17.2"
 edition = "2021"
 license = "MIT"
 description = "Hardware fan control daemon for Linux (OpenFan, hwmon, AMD GPU)"
