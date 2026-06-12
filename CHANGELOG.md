@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.16.0] — 2026-06-12
+
+Trigger (two-state latch) curve type (DEC-149) — second of three phased
+curve-library additions. Pairs with **GUI v1.37.0**; both evaluators learn the
+stateful latch in lockstep and the DEC-126 parity fixture stays byte-identical.
+
+### Added
+- `"trigger"` curve type. The pure `evaluate_curve` returns the cold-start value
+  (load at/above the load temp, else idle); the latch lives in the profile engine
+  (`evaluate_trigger` + `ProfileEngineState::trigger_latch`), which **bypasses the
+  2°C deadband** since the trigger owns its idle..load hysteresis. Mirrors the
+  GUI's `_evaluate_trigger`; pinned by a new `tuning_sequence` parity vector.
+
+### Changed
+- Profile `default_version` → **6**. `CurveConfig` now derives `Default` to absorb
+  new curve-type fields cleanly. Additive and backward-compatible.
+
 ## [1.15.0] — 2026-06-12
 
 Stepped (staircase) curve type (DEC-148) — first of three phased curve-library

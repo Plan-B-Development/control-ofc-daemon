@@ -1,12 +1,13 @@
 //! Profile model — loads and evaluates GUI-created fan curve profiles.
 //!
-//! Compatible with the GUI's Profile v5 JSON format. v4 adds the per-GPU
+//! Compatible with the GUI's Profile v6 JSON format. v4 adds the per-GPU
 //! ``fan_zero_rpm`` flag on ``ControlMember`` (DEC-095); v5 adds the
-//! ``stepped`` (staircase) curve type (DEC-148). Older profiles deserialise
+//! ``stepped`` (staircase) curve type (DEC-148); v6 adds the ``trigger``
+//! (two-state latch) curve type (DEC-149). Older profiles deserialise
 //! unchanged because new fields use ``#[serde(default)]`` and unknown curve
 //! types fall back to 50%.
 //! Supports graph (piecewise linear), stepped (staircase), linear (2-point),
-//! and flat curve types.
+//! flat, and trigger curve types.
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -27,7 +28,7 @@ pub struct DaemonProfile {
 }
 
 fn default_version() -> u32 {
-    5
+    6
 }
 
 /// A logical fan control group with curve assignment and member fans.
@@ -85,8 +86,8 @@ pub struct ControlMember {
     pub fan_zero_rpm: bool,
 }
 
-/// A fan curve configuration (graph, stepped, linear, or flat).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A fan curve configuration (graph, stepped, linear, flat, or trigger).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CurveConfig {
     pub id: String,
     pub name: String,
@@ -108,6 +109,15 @@ pub struct CurveConfig {
     // Flat field
     #[serde(default)]
     pub flat_output_pct: Option<f64>,
+    // Trigger fields (two-state latch)
+    #[serde(default)]
+    pub trigger_idle_temp_c: Option<f64>,
+    #[serde(default)]
+    pub trigger_load_temp_c: Option<f64>,
+    #[serde(default)]
+    pub trigger_idle_pct: Option<f64>,
+    #[serde(default)]
+    pub trigger_load_pct: Option<f64>,
 }
 
 /// A single point on a graph curve.
@@ -124,6 +134,7 @@ pub fn evaluate_curve(curve: &CurveConfig, temp_c: f64) -> f64 {
         "stepped" => evaluate_stepped(curve, temp_c),
         "linear" => evaluate_linear(curve, temp_c),
         "flat" => curve.flat_output_pct.unwrap_or(50.0),
+        "trigger" => evaluate_trigger_stateless(curve, temp_c),
         _ => {
             log::warn!(
                 "Unknown curve type '{}' for curve '{}', defaulting to 50%",
@@ -217,6 +228,23 @@ fn evaluate_linear(curve: &CurveConfig, temp_c: f64) -> f64 {
     start_o + t * (end_o - start_o)
 }
 
+/// Stateless (cold-start) trigger value: the load speed at/above the load
+/// temperature, else the idle speed. The latching hysteresis — holding the load
+/// state down through the idle..load band — is applied per-control by the
+/// profile engine, NOT here, so `evaluate_curve` stays a pure function for the
+/// `curve_eval` parity tier. Must match the GUI's `_interpolate_trigger`
+/// (DEC-126 / DEC-149).
+fn evaluate_trigger_stateless(curve: &CurveConfig, temp_c: f64) -> f64 {
+    let load_temp = curve.trigger_load_temp_c.unwrap_or(60.0);
+    let load_pct = curve.trigger_load_pct.unwrap_or(80.0);
+    let idle_pct = curve.trigger_idle_pct.unwrap_or(30.0);
+    if temp_c >= load_temp {
+        load_pct
+    } else {
+        idle_pct
+    }
+}
+
 /// Load a profile from a JSON file.
 pub fn load_profile(path: &Path) -> Result<DaemonProfile, String> {
     let content = std::fs::read_to_string(path)
@@ -289,11 +317,7 @@ mod tests {
                     output_pct: 100.0,
                 },
             ],
-            start_temp_c: None,
-            start_output_pct: None,
-            end_temp_c: None,
-            end_output_pct: None,
-            flat_output_pct: None,
+            ..Default::default()
         };
         assert!((evaluate_curve(&curve, 30.0) - 20.0).abs() < 0.01);
         assert!((evaluate_curve(&curve, 45.0) - 35.0).abs() < 0.01);
@@ -325,11 +349,7 @@ mod tests {
                     output_pct: 100.0,
                 },
             ],
-            start_temp_c: None,
-            start_output_pct: None,
-            end_temp_c: None,
-            end_output_pct: None,
-            flat_output_pct: None,
+            ..Default::default()
         };
         // 47°C: t = (47-30)/(80-30) = 0.34; output = 20 + 0.34*80 = 47.2.
         // A `+` ↔ `-` mutation on either subtraction would shift the result
@@ -375,11 +395,7 @@ mod tests {
                     output_pct: 100.0,
                 },
             ],
-            start_temp_c: None,
-            start_output_pct: None,
-            end_temp_c: None,
-            end_output_pct: None,
-            flat_output_pct: None,
+            ..Default::default()
         };
         // 67°C lives on the second segment (60→80, 50→100).
         // t = (67-60)/(80-60) = 0.35; output = 50 + 0.35*50 = 67.5.
@@ -405,6 +421,7 @@ mod tests {
             end_temp_c: Some(80.0),
             end_output_pct: Some(100.0),
             flat_output_pct: None,
+            ..Default::default()
         };
         assert!((evaluate_curve(&curve, 55.0) - 60.0).abs() < 0.01);
     }
@@ -417,11 +434,8 @@ mod tests {
             curve_type: "flat".into(),
             sensor_id: "".into(),
             points: vec![],
-            start_temp_c: None,
-            start_output_pct: None,
-            end_temp_c: None,
-            end_output_pct: None,
             flat_output_pct: Some(42.0),
+            ..Default::default()
         };
         assert!((evaluate_curve(&curve, 50.0) - 42.0).abs() < 0.01);
     }
@@ -450,11 +464,7 @@ mod tests {
                     output_pct: 100.0,
                 },
             ],
-            start_temp_c: None,
-            start_output_pct: None,
-            end_temp_c: None,
-            end_output_pct: None,
-            flat_output_pct: None,
+            ..Default::default()
         };
         // Below the first point clamps to the first output.
         assert!((evaluate_curve(&curve, 20.0) - 20.0).abs() < 0.01);
@@ -479,13 +489,45 @@ mod tests {
             curve_type: "stepped".into(),
             sensor_id: "".into(),
             points: vec![],
-            start_temp_c: None,
-            start_output_pct: None,
-            end_temp_c: None,
-            end_output_pct: None,
-            flat_output_pct: None,
+            ..Default::default()
         };
         assert!((evaluate_curve(&curve, 50.0) - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn evaluate_trigger_stateless_coldstart() {
+        // DEC-149: the pure `evaluate_curve` returns the cold-start value — load
+        // at/above the load temp, else idle. The latching behaviour is applied
+        // statefully by the profile engine (see its latch test + the parity
+        // tuning_sequence), not here. Mirrors the GUI's `_interpolate_trigger`.
+        let curve = CurveConfig {
+            id: "trg".into(),
+            name: "Trigger".into(),
+            curve_type: "trigger".into(),
+            sensor_id: "".into(),
+            trigger_idle_temp_c: Some(40.0),
+            trigger_load_temp_c: Some(60.0),
+            trigger_idle_pct: Some(30.0),
+            trigger_load_pct: Some(80.0),
+            ..Default::default()
+        };
+        assert!((evaluate_curve(&curve, 35.0) - 30.0).abs() < 0.01); // below idle
+        assert!((evaluate_curve(&curve, 50.0) - 30.0).abs() < 0.01); // in band, cold = idle
+        assert!((evaluate_curve(&curve, 60.0) - 80.0).abs() < 0.01); // at load temp (inclusive)
+        assert!((evaluate_curve(&curve, 70.0) - 80.0).abs() < 0.01); // above load
+    }
+
+    #[test]
+    fn evaluate_trigger_stateless_uses_defaults_when_fields_missing() {
+        let curve = CurveConfig {
+            id: "trg".into(),
+            name: "Trigger".into(),
+            curve_type: "trigger".into(),
+            ..Default::default()
+        };
+        // Defaults: idle 40°/30%, load 60°/80% — must match the GUI dataclass.
+        assert!((evaluate_curve(&curve, 30.0) - 30.0).abs() < 0.01);
+        assert!((evaluate_curve(&curve, 65.0) - 80.0).abs() < 0.01);
     }
 
     #[test]
@@ -496,11 +538,7 @@ mod tests {
             curve_type: "mystery".into(),
             sensor_id: "".into(),
             points: vec![],
-            start_temp_c: None,
-            start_output_pct: None,
-            end_temp_c: None,
-            end_output_pct: None,
-            flat_output_pct: None,
+            ..Default::default()
         };
         assert!((evaluate_curve(&curve, 50.0) - 50.0).abs() < 0.01);
     }
@@ -513,11 +551,7 @@ mod tests {
             curve_type: "graph".into(),
             sensor_id: "".into(),
             points: vec![],
-            start_temp_c: None,
-            start_output_pct: None,
-            end_temp_c: None,
-            end_output_pct: None,
-            flat_output_pct: None,
+            ..Default::default()
         };
         assert!((evaluate_curve(&curve, 50.0) - 50.0).abs() < 0.01);
     }
@@ -583,7 +617,7 @@ mod tests {
         assert_eq!(profile.name, "Minimal");
         assert!(profile.controls.is_empty());
         assert!(profile.curves.is_empty());
-        assert_eq!(profile.version, 5); // default — v5 (DEC-148)
+        assert_eq!(profile.version, 6); // default — v6 (DEC-149)
     }
 
     #[test]

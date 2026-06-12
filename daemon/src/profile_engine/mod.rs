@@ -57,6 +57,11 @@ pub struct ProfileEngineState {
     /// The deadband keeps the cached output as long as the current
     /// temperature falls within ``[t - HYSTERESIS_DEADBAND_C, t]``.
     last_transition_temp: HashMap<String, f64>,
+    /// DEC-149 two-state trigger latch per control id (`true` = load state).
+    /// Trigger curves own their idle..load hysteresis and bypass the 2°C
+    /// deadband; this holds the latch across cycles. Mirrors the GUI's
+    /// ``TargetState.trigger_latch``.
+    trigger_latch: HashMap<String, bool>,
     /// Id of the profile the current state belongs to.
     active_profile_id: Option<String>,
 }
@@ -89,6 +94,7 @@ impl ProfileEngineState {
         self.last_output.clear();
         self.last_curve_output.clear();
         self.last_transition_temp.clear();
+        self.trigger_latch.clear();
         self.active_profile_id = None;
     }
 
@@ -103,6 +109,7 @@ impl ProfileEngineState {
             self.last_output.clear();
             self.last_curve_output.clear();
             self.last_transition_temp.clear();
+            self.trigger_latch.clear();
             self.active_profile_id = Some(new_id.to_string());
         }
         changed
@@ -156,6 +163,35 @@ fn evaluate_curve_with_deadband(
         .insert(control.id.clone(), curve_output);
 
     curve_output
+}
+
+/// Two-state latch (DEC-149): below the idle temp run idle speed; at/above the
+/// load temp run load speed; within the idle..load band hold the current state.
+/// Owns its own hysteresis, so it bypasses the 2°C deadband. Latch state lives
+/// in `ProfileEngineState::trigger_latch` (`true` = load) keyed by control id.
+/// Must match the GUI's `_evaluate_trigger` byte-for-byte (parity tuning_sequence).
+fn evaluate_trigger(
+    control: &LogicalControl,
+    curve: &crate::profile::CurveConfig,
+    current_temp: f64,
+    state: &mut ProfileEngineState,
+) -> f64 {
+    let idle_temp = curve.trigger_idle_temp_c.unwrap_or(40.0);
+    let load_temp = curve.trigger_load_temp_c.unwrap_or(60.0);
+    let idle_pct = curve.trigger_idle_pct.unwrap_or(30.0);
+    let load_pct = curve.trigger_load_pct.unwrap_or(80.0);
+    let is_load = match state.trigger_latch.get(&control.id).copied() {
+        // In the load state: fall back to idle only once temp reaches the idle temp.
+        Some(true) => current_temp > idle_temp,
+        // Idle or cold-start: enter the load state at/above the load temp.
+        _ => current_temp >= load_temp,
+    };
+    state.trigger_latch.insert(control.id.clone(), is_load);
+    if is_load {
+        load_pct
+    } else {
+        idle_pct
+    }
 }
 
 /// Apply the full per-control tuning pipeline.
@@ -265,12 +301,16 @@ pub fn evaluate_profile(
                 continue;
             };
 
-            // 2°C hysteresis deadband — DEC-096. While current temperature
-            // has fallen ≤ HYSTERESIS_DEADBAND_C below the last transition
-            // anchor, hold the previous curve output. Mirrors the GUI's
-            // ``_evaluate_curve_with_hysteresis`` (control_loop.py) so
+            // Trigger curves use a stateful two-state latch and bypass the 2°C
+            // deadband (DEC-149) — they own their idle..load hysteresis band;
+            // every other type goes through the deadband path (DEC-096). Mirrors
+            // the GUI's ``_curve_output_for_control`` (control_loop.py) so
             // headless behaviour matches GUI-driven behaviour.
-            evaluate_curve_with_deadband(control, curve, sensor.value_c, engine_state)
+            if curve.curve_type == "trigger" {
+                evaluate_trigger(control, curve, sensor.value_c, engine_state)
+            } else {
+                evaluate_curve_with_deadband(control, curve, sensor.value_c, engine_state)
+            }
         };
 
         // Full tuning pipeline — tracks pre-rounding f64 across cycles so
@@ -521,6 +561,31 @@ mod tests {
     use crate::profile::{ControlMember, CurveConfig, CurvePoint, LogicalControl};
     use std::time::Instant;
 
+    #[test]
+    fn trigger_latch_holds_load_across_band_and_bypasses_deadband() {
+        // DEC-149: a trigger curve latches — once in the load state it holds
+        // load while temperature falls through the idle..load band, dropping to
+        // idle only at the idle temp. The 55°C hold also proves the 2°C deadband
+        // is bypassed (the deadband path would re-evaluate to idle at 55°C).
+        let mut profile = make_profile("curve", "trigger", 0.0);
+        profile.curves[0].trigger_idle_temp_c = Some(40.0);
+        profile.curves[0].trigger_load_temp_c = Some(60.0);
+        profile.curves[0].trigger_idle_pct = Some(30.0);
+        profile.curves[0].trigger_load_pct = Some(80.0);
+        let mut state = ProfileEngineState::new();
+        let pwm = |t: f64, st: &mut ProfileEngineState| -> u8 {
+            let cache = make_cache_with_sensor("cpu", t);
+            evaluate_profile(&profile, &cache.sensors_snapshot(), st)[0].pwm_percent
+        };
+        assert_eq!(pwm(50.0, &mut state), 30); // cold-start in band -> idle
+        assert_eq!(pwm(65.0, &mut state), 80); // enter load at/above load temp
+        assert_eq!(pwm(55.0, &mut state), 80); // HOLD load (deadband would give 30)
+        assert_eq!(pwm(45.0, &mut state), 80); // still holding load in the band
+        assert_eq!(pwm(40.0, &mut state), 30); // drop to idle at the idle temp
+        assert_eq!(pwm(50.0, &mut state), 30); // HOLD idle climbing through band
+        assert_eq!(pwm(60.0, &mut state), 80); // re-enter load
+    }
+
     fn make_profile(mode: &str, curve_type: &str, flat_pct: f64) -> DaemonProfile {
         DaemonProfile {
             id: "test".into(),
@@ -566,6 +631,7 @@ mod tests {
                 end_temp_c: None,
                 end_output_pct: None,
                 flat_output_pct: Some(flat_pct),
+                ..Default::default()
             }],
         }
     }
@@ -1161,6 +1227,23 @@ mod tests {
     }
 
     #[test]
+    fn deactivate_clears_trigger_latch() {
+        // DEC-149: the trigger latch must not leak across profiles — deactivate
+        // clears it alongside the deadband/step-rate state.
+        let mut profile = make_profile("curve", "trigger", 0.0);
+        profile.curves[0].trigger_idle_temp_c = Some(40.0);
+        profile.curves[0].trigger_load_temp_c = Some(60.0);
+        let cache = make_cache_with_sensor("cpu", 65.0);
+        let mut state = ProfileEngineState::new();
+
+        evaluate_profile(&profile, &cache.sensors_snapshot(), &mut state);
+        assert_eq!(state.trigger_latch.get("ctrl1"), Some(&true));
+
+        state.deactivate();
+        assert!(state.trigger_latch.get("ctrl1").is_none());
+    }
+
+    #[test]
     fn tuning_step_rate_ignored_on_first_cycle() {
         // With no prior last_output, step_up_pct must NOT cap the initial
         // value — otherwise the engine would start every fan at 0 and climb
@@ -1252,6 +1335,7 @@ mod tests {
                 end_temp_c: None,
                 end_output_pct: None,
                 flat_output_pct: None,
+                ..Default::default()
             }],
         }
     }
@@ -1393,6 +1477,7 @@ mod tests {
                 end_temp_c: None,
                 end_output_pct: None,
                 flat_output_pct: None,
+                ..Default::default()
             }],
         };
         let mut state = ProfileEngineState::new();
@@ -1657,6 +1742,7 @@ mod tests {
                 end_temp_c: None,
                 end_output_pct: None,
                 flat_output_pct: Some(flat_pct),
+                ..Default::default()
             }],
         }
     }
