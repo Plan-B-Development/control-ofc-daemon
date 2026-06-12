@@ -53,7 +53,7 @@ pub(crate) fn build_sensor_entries(snap: &DaemonState, now: Instant) -> Vec<Sens
                 rate_c_per_s: s.rate_c_per_s,
                 session_min_c: s.session_min_c,
                 session_max_c: s.session_max_c,
-                chip_name: Some(s.chip_name.clone()),
+                chip_name: s.chip_name.clone(),
                 temp_type: s.temp_type,
                 thresholds: s.thresholds.as_ref().map(SensorThresholdsResponse::from),
             }
@@ -387,7 +387,7 @@ mod tests {
 
         let entries = build_sensor_entries(&state, now);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].chip_name, Some("nct6683".into()));
+        assert_eq!(entries[0].chip_name, "nct6683");
         assert_eq!(entries[0].temp_type, Some(3));
 
         // Verify JSON serialization includes the fields
@@ -421,7 +421,7 @@ mod tests {
 
         let entries = build_sensor_entries(&state, now);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].chip_name, Some("k10temp".into()));
+        assert_eq!(entries[0].chip_name, "k10temp");
         assert_eq!(entries[0].temp_type, None);
 
         // Verify JSON serialization omits temp_type when None

@@ -3,10 +3,27 @@
 //! At most one active lease exists at a time. Reads and discovery
 //! do not require a lease. Leases expire after a configurable TTL.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Default lease TTL (60 seconds).
 const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(60);
+
+/// Monotonic clock source, injectable so lease-expiry tests can advance time
+/// deterministically instead of sleeping (audit P2-F). Production uses
+/// `SystemClock` (real `Instant::now()`); only tests inject a fake clock.
+pub trait Clock: Send + Sync {
+    fn now(&self) -> Instant;
+}
+
+/// Real monotonic clock — the production default.
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
 
 /// A lease granting exclusive write permission for hwmon PWM outputs.
 #[derive(Debug, Clone)]
@@ -76,24 +93,28 @@ pub struct LeaseManager {
     active: Option<HwmonLease>,
     ttl: Duration,
     next_id: u64,
+    clock: Arc<dyn Clock>,
 }
 
 impl LeaseManager {
-    /// Create a new lease manager with default TTL.
+    /// Create a new lease manager with default TTL and the real system clock.
     pub fn new() -> Self {
-        Self {
-            active: None,
-            ttl: DEFAULT_LEASE_TTL,
-            next_id: 1,
-        }
+        Self::with_clock(DEFAULT_LEASE_TTL, Arc::new(SystemClock))
     }
 
-    /// Create a lease manager with a custom TTL.
+    /// Create a lease manager with a custom TTL and the real system clock.
     pub fn with_ttl(ttl: Duration) -> Self {
+        Self::with_clock(ttl, Arc::new(SystemClock))
+    }
+
+    /// Create a lease manager with an injected clock (tests use a fake,
+    /// advanceable clock to exercise expiry deterministically — audit P2-F).
+    pub fn with_clock(ttl: Duration, clock: Arc<dyn Clock>) -> Self {
         Self {
             active: None,
             ttl,
             next_id: 1,
+            clock,
         }
     }
 
@@ -102,17 +123,17 @@ impl LeaseManager {
     /// Returns the new lease on success, or `LeaseError::AlreadyHeld` if
     /// a valid (non-expired) lease already exists.
     pub fn take_lease(&mut self, owner_hint: &str) -> Result<HwmonLease, LeaseError> {
+        let now = self.clock.now();
         // Clean up expired lease first
         if let Some(ref lease) = self.active {
-            if !lease.is_expired() {
+            if now < lease.expires_at {
                 return Err(LeaseError::AlreadyHeld {
                     owner_hint: lease.owner_hint.clone(),
-                    ttl_seconds: lease.ttl_seconds(),
+                    ttl_seconds: lease.expires_at.saturating_duration_since(now).as_secs(),
                 });
             }
         }
 
-        let now = Instant::now();
         let lease_id = format!("lease-{}", self.next_id);
         self.next_id += 1;
 
@@ -141,8 +162,9 @@ impl LeaseManager {
 
     /// Validate that the provided `lease_id` matches the active, non-expired lease.
     pub fn validate_lease(&self, lease_id: &str) -> Result<(), LeaseError> {
+        let now = self.clock.now();
         match &self.active {
-            Some(lease) if lease.lease_id == lease_id && !lease.is_expired() => Ok(()),
+            Some(lease) if lease.lease_id == lease_id && now < lease.expires_at => Ok(()),
             Some(lease) if lease.lease_id == lease_id => Err(LeaseError::Expired),
             _ => Err(LeaseError::InvalidLease),
         }
@@ -150,9 +172,10 @@ impl LeaseManager {
 
     /// Renew the lease, extending the TTL. The provided `lease_id` must match.
     pub fn renew_lease(&mut self, lease_id: &str) -> Result<HwmonLease, LeaseError> {
+        let now = self.clock.now();
         match &mut self.active {
-            Some(lease) if lease.lease_id == lease_id && !lease.is_expired() => {
-                lease.expires_at = Instant::now() + self.ttl;
+            Some(lease) if lease.lease_id == lease_id && now < lease.expires_at => {
+                lease.expires_at = now + self.ttl;
                 Ok(lease.clone())
             }
             Some(lease) if lease.lease_id == lease_id => Err(LeaseError::Expired),
@@ -165,7 +188,7 @@ impl LeaseManager {
     /// Used when a higher-priority client (e.g. GUI) needs the lease and
     /// the current holder (e.g. profile engine) must yield. Always succeeds.
     pub fn force_take_lease(&mut self, owner_hint: &str) -> HwmonLease {
-        let now = Instant::now();
+        let now = self.clock.now();
         let lease_id = format!("lease-{}", self.next_id);
         self.next_id += 1;
 
@@ -190,7 +213,8 @@ impl LeaseManager {
 
     /// Get the current active lease (if any and non-expired).
     pub fn active_lease(&self) -> Option<&HwmonLease> {
-        self.active.as_ref().filter(|lease| !lease.is_expired())
+        let now = self.clock.now();
+        self.active.as_ref().filter(|lease| now < lease.expires_at)
     }
 }
 
@@ -203,6 +227,29 @@ impl Default for LeaseManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fake clock for deterministic expiry tests (audit P2-F): advance virtual
+    /// time instead of `thread::sleep`.
+    struct TestClock {
+        now: std::sync::Mutex<Instant>,
+    }
+
+    impl TestClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                now: std::sync::Mutex::new(Instant::now()),
+            })
+        }
+        fn advance(&self, d: Duration) {
+            *self.now.lock().expect("clock mutex") += d;
+        }
+    }
+
+    impl Clock for TestClock {
+        fn now(&self) -> Instant {
+            *self.now.lock().expect("clock mutex")
+        }
+    }
 
     #[test]
     fn take_lease_succeeds_when_no_lease() {
@@ -228,11 +275,11 @@ mod tests {
 
     #[test]
     fn take_lease_succeeds_after_expiry() {
-        let mut mgr = LeaseManager::with_ttl(Duration::from_millis(1));
+        let clock = TestClock::new();
+        let mut mgr = LeaseManager::with_clock(Duration::from_secs(60), clock.clone());
         mgr.take_lease("gui").unwrap();
 
-        // Wait for lease to expire
-        std::thread::sleep(Duration::from_millis(5));
+        clock.advance(Duration::from_secs(61)); // past TTL
 
         let lease = mgr.take_lease("new-gui").unwrap();
         assert_eq!(lease.owner_hint, "new-gui");
@@ -273,10 +320,11 @@ mod tests {
 
     #[test]
     fn validate_lease_fails_when_expired() {
-        let mut mgr = LeaseManager::with_ttl(Duration::from_millis(1));
+        let clock = TestClock::new();
+        let mut mgr = LeaseManager::with_clock(Duration::from_secs(60), clock.clone());
         let lease = mgr.take_lease("gui").unwrap();
 
-        std::thread::sleep(Duration::from_millis(5));
+        clock.advance(Duration::from_secs(61));
 
         let err = mgr.validate_lease(&lease.lease_id).unwrap_err();
         assert_eq!(err, LeaseError::Expired);
@@ -296,7 +344,8 @@ mod tests {
         // T2 (test-tests audit): wrong-id and expired must be observably distinct.
         // Previously both returned LeaseError::InvalidLease, so the match guard at
         // line 140 could be flipped (== ↔ !=) without any test noticing.
-        let mut mgr = LeaseManager::with_ttl(Duration::from_millis(5));
+        let clock = TestClock::new();
+        let mut mgr = LeaseManager::with_clock(Duration::from_secs(60), clock.clone());
         let lease = mgr.take_lease("gui").unwrap();
         let valid_id = lease.lease_id.clone();
 
@@ -305,7 +354,7 @@ mod tests {
         assert_eq!(wrong_err, LeaseError::InvalidLease);
 
         // Path B: caller sends the right id, but TTL has elapsed.
-        std::thread::sleep(Duration::from_millis(15));
+        clock.advance(Duration::from_secs(61));
         let expired_err = mgr.validate_lease(&valid_id).unwrap_err();
         assert_eq!(expired_err, LeaseError::Expired);
 
@@ -315,14 +364,15 @@ mod tests {
 
     #[test]
     fn renew_lease_distinguishes_wrong_id_from_expired() {
-        let mut mgr = LeaseManager::with_ttl(Duration::from_millis(5));
+        let clock = TestClock::new();
+        let mut mgr = LeaseManager::with_clock(Duration::from_secs(60), clock.clone());
         let lease = mgr.take_lease("gui").unwrap();
         let valid_id = lease.lease_id.clone();
 
         let wrong_err = mgr.renew_lease("not-the-real-id").unwrap_err();
         assert_eq!(wrong_err, LeaseError::InvalidLease);
 
-        std::thread::sleep(Duration::from_millis(15));
+        clock.advance(Duration::from_secs(61));
         let expired_err = mgr.renew_lease(&valid_id).unwrap_err();
         assert_eq!(expired_err, LeaseError::Expired);
 
@@ -331,20 +381,22 @@ mod tests {
 
     #[test]
     fn active_lease_returns_none_when_expired() {
-        let mut mgr = LeaseManager::with_ttl(Duration::from_millis(1));
+        let clock = TestClock::new();
+        let mut mgr = LeaseManager::with_clock(Duration::from_secs(60), clock.clone());
         mgr.take_lease("gui").unwrap();
 
-        std::thread::sleep(Duration::from_millis(5));
+        clock.advance(Duration::from_secs(61));
 
         assert!(mgr.active_lease().is_none());
     }
 
     #[test]
     fn lease_ids_are_unique() {
-        let mut mgr = LeaseManager::with_ttl(Duration::from_millis(1));
+        let clock = TestClock::new();
+        let mut mgr = LeaseManager::with_clock(Duration::from_secs(60), clock.clone());
         let l1 = mgr.take_lease("a").unwrap();
 
-        std::thread::sleep(Duration::from_millis(5));
+        clock.advance(Duration::from_secs(61)); // expire so the second take succeeds
 
         let l2 = mgr.take_lease("b").unwrap();
         assert_ne!(l1.lease_id, l2.lease_id);
@@ -391,15 +443,18 @@ mod tests {
 
     #[test]
     fn renew_lease_extends_ttl() {
-        let mut mgr = LeaseManager::with_ttl(Duration::from_secs(60));
+        let clock = TestClock::new();
+        let mut mgr = LeaseManager::with_clock(Duration::from_secs(60), clock.clone());
         let lease = mgr.take_lease("gui").unwrap();
         let id = lease.lease_id.clone();
 
-        std::thread::sleep(Duration::from_millis(10));
+        // Advance almost to the original expiry, then renew → the window resets.
+        clock.advance(Duration::from_secs(59));
+        mgr.renew_lease(&id).unwrap();
 
-        let renewed = mgr.renew_lease(&id).unwrap();
-        // TTL should be close to full again
-        assert!(renewed.ttl_seconds() >= 58);
+        // Past the ORIGINAL 60 s expiry the lease is still valid (renew extended it).
+        clock.advance(Duration::from_secs(10));
+        assert!(mgr.validate_lease(&id).is_ok());
     }
 
     #[test]
@@ -412,10 +467,11 @@ mod tests {
 
     #[test]
     fn renew_lease_fails_when_expired() {
-        let mut mgr = LeaseManager::with_ttl(Duration::from_millis(1));
+        let clock = TestClock::new();
+        let mut mgr = LeaseManager::with_clock(Duration::from_secs(60), clock.clone());
         let lease = mgr.take_lease("gui").unwrap();
         let id = lease.lease_id.clone();
-        std::thread::sleep(Duration::from_millis(5));
+        clock.advance(Duration::from_secs(61));
         let err = mgr.renew_lease(&id).unwrap_err();
         assert_eq!(err, LeaseError::Expired);
     }

@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.17.3] — 2026-06-12
+
+Cleanups from the 2026-06-12 code audit. Daemon-only; pairs with the existing **GUI v1.38.0**.
+
+### Changed
+- **`chip_name` is non-optional in the sensors API (P2-D).** Hwmon/GPU discovery always yields
+  a chip name (or skips the device), so the response field is now `String` instead of
+  `Option<String>` — the wire format is unchanged (it was always present).
+
+### Fixed
+- **Deterministic lease-expiry tests (P2-F).** `LeaseManager` accepts an injectable clock; the
+  expiry/renewal tests advance a fake clock instead of `thread::sleep`, removing
+  CI-load-dependent flakiness. No production behaviour change (production uses the real clock).
+
+### Other
+- Added `NOTICE.md` acknowledging the MPL-2.0 `serialport` dependency (P2-H / DEC-155).
+
 ## [1.17.2] — 2026-06-12
 
 Concurrency fix (from the 2026-06-12 code audit). Daemon-only — pairs with the existing

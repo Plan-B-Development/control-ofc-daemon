@@ -72,9 +72,10 @@ pub struct SensorEntry {
     /// Session maximum temperature since daemon start.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_max_c: Option<f64>,
-    /// Hwmon chip name (e.g. "k10temp", "nct6683", "it8696").
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chip_name: Option<String>,
+    /// Hwmon chip name (e.g. "k10temp", "nct6683", "it8696"). Always present —
+    /// discovery requires a readable `name` attribute or the device is skipped
+    /// ("amdgpu" for AMD GPU sources, "xe"/"i915" for Intel GPU). (audit P2-D)
+    pub chip_name: String,
     /// Sysfs `tempN_type` value if present (3=diode, 4=thermistor, 5=AMD TSI, 6=Intel PECI).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temp_type: Option<u8>,
@@ -1039,7 +1040,7 @@ mod tests {
             rate_c_per_s: Some(0.5),
             session_min_c: Some(32.0),
             session_max_c: Some(78.5),
-            chip_name: Some("k10temp".into()),
+            chip_name: "k10temp".into(),
             temp_type: None,
             thresholds: None,
         };
@@ -1066,7 +1067,7 @@ mod tests {
             rate_c_per_s: None,
             session_min_c: None,
             session_max_c: None,
-            chip_name: Some("nct6683".into()),
+            chip_name: "nct6683".into(),
             temp_type: Some(5),
             thresholds: None,
         };
@@ -1090,7 +1091,7 @@ mod tests {
             rate_c_per_s: None,
             session_min_c: None,
             session_max_c: None,
-            chip_name: Some("amdgpu".into()),
+            chip_name: "amdgpu".into(),
             temp_type: None,
             thresholds: Some(SensorThresholdsResponse {
                 max_c: None,
