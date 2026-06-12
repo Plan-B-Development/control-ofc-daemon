@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.17.1] — 2026-06-12
+
+Shutdown-ordering and thermal-safety hardening (from the 2026-06-12 code audit).
+Daemon-only — pairs with the existing **GUI v1.38.0**.
+
+### Fixed
+- **Graceful shutdown stops the IPC server before restoring hardware.** Shutdown now stops
+  accepting IPC connections and drains in-flight requests, then drains the poll/engine tasks,
+  and only then restores fans to automatic (`pwm_enable=2`) — so a late client write can no
+  longer re-enter manual mode after the restore. Each wait is timeout-bounded, so a lingering
+  connection can never block the safety restore (extends DEC-146; audit P1-A).
+
+### Changed
+- **Thermal safety re-asserts manual mode on force-take.** When thermal safety force-takes the
+  hwmon lease it now resets the per-header write-coalescing state, so it unconditionally
+  re-writes `pwm_enable=1` on its first forced write — defense in depth alongside the existing
+  per-write readback watchdog (audit P1-E).
+
 ## [1.17.0] — 2026-06-12
 
 Mix and Sync composite curve types (DEC-150/151) — the final phase of the

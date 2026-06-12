@@ -425,6 +425,13 @@ impl SafetyWriteBackend for HwmonBackend {
                     .lease_manager_mut()
                     .force_take_lease("thermal-safety")
                     .lease_id;
+                // Audit P1-E: a force-take is an ownership change the previous
+                // holder was never notified of, so its coalescing state
+                // (manual_mode_set) is stale. Reset it so thermal safety
+                // unconditionally re-asserts pwm_enable=1 on its first forced
+                // write — defense in depth alongside the per-write readback
+                // watchdog in HwmonPwmController::set_pwm.
+                guard.on_lease_released();
                 (hdr_ids, lease_id)
             };
             for hdr_id in &hdr_ids {
@@ -602,6 +609,66 @@ mod tests {
         let cache = Arc::new(StateCache::new());
         let ctrl = HwmonPwmController::new(headers, LeaseManager::new(), Box::new(writer), cache);
         (HwmonBackend::new(Arc::new(Mutex::new(ctrl))), writes)
+    }
+
+    /// Like `TestWriter`, but reports `pwm_enable` as already manual (`1`) so the
+    /// per-write readback watchdog in `set_pwm` does NOT fire. This isolates the
+    /// thermal force-take coalescing reset (audit P1-E) from the watchdog, which
+    /// would otherwise re-assert manual mode regardless.
+    struct EnableManualWriter {
+        writes: WriteLog,
+    }
+
+    impl SysfsWriter for EnableManualWriter {
+        fn write_file(&mut self, path: &str, value: &str) -> Result<(), HwmonError> {
+            self.writes.lock().push((path.into(), value.into()));
+            Ok(())
+        }
+        fn read_file(&self, path: &str) -> Result<String, HwmonError> {
+            if path.ends_with("_enable") {
+                Ok("1\n".into())
+            } else {
+                Ok("128\n".into())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn force_all_reasserts_manual_mode_after_engine_write() {
+        // Engine controls a header first (manual_mode_set = true), then thermal
+        // safety force-takes the lease. The readback watchdog is held off (enable
+        // reads back as 1), so WITHOUT the P1-E reset the stale manual_mode_set
+        // would make thermal safety SKIP the pwm_enable write. With the reset it
+        // must re-assert pwm_enable=1 on the forced write.
+        let writes: WriteLog = Arc::new(Mutex::new(Vec::new()));
+        let writer = EnableManualWriter {
+            writes: writes.clone(),
+        };
+        let cache = Arc::new(StateCache::new());
+        let ctrl = HwmonPwmController::new(
+            vec![make_header("hwmon:it8696:pwm1")],
+            LeaseManager::new(),
+            Box::new(writer),
+            cache,
+        );
+        let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl)));
+
+        // 1. Engine controls the header → first pwm_enable=1 write.
+        be.apply(&[cmd("hwmon:it8696:pwm1", "hwmon", 40)], false)
+            .await;
+        // 2. Thermal safety force-takes the lease and forces 100%.
+        be.force_all(100).await;
+
+        let enable_writes = writes
+            .lock()
+            .iter()
+            .filter(|(p, v)| p.ends_with("_enable") && v.trim() == "1")
+            .count();
+        assert_eq!(
+            enable_writes, 2,
+            "thermal force-take must reset coalescing so pwm_enable=1 is \
+             re-asserted on the forced write (audit P1-E)"
+        );
     }
 
     #[tokio::test]

@@ -420,6 +420,63 @@ fn resolve_initial_profile(search_dirs: &[std::path::PathBuf]) -> Option<DaemonP
     None
 }
 
+/// Maximum time to wait for the IPC server or a poll/engine task to stop during
+/// shutdown before proceeding with the hardware restore anyway.
+const SHUTDOWN_TASK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Ordered graceful shutdown (DEC-146 P3-9 + audit P1-A).
+///
+/// Stops accepting IPC connections and drains in-flight requests FIRST, then
+/// drains the poll/engine tasks, then restores hardware to automatic — so
+/// neither a late client write (via the IPC server) nor an in-flight engine
+/// write can land after the restore and leave fans stuck in manual mode. Every
+/// await is bounded by `task_timeout` so a hung task or a lingering connection
+/// (e.g. an SSE `/events` stream) can never block the safety restore; on timeout
+/// we log and proceed, and `ExecStopPost=control-ofc-restore-auto` backstops
+/// production regardless.
+async fn shutdown_sequence<F>(
+    poll_shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    server_shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    server_handle: tokio::task::JoinHandle<()>,
+    task_handles: Vec<(&'static str, tokio::task::JoinHandle<()>)>,
+    task_timeout: Duration,
+    restore_hardware: F,
+) where
+    F: FnOnce(),
+{
+    // Tell the poll/engine tasks to stop.
+    let _ = poll_shutdown_tx.send(true);
+
+    // Stop the IPC server FIRST (audit P1-A). axum's graceful shutdown stops
+    // accepting new connections immediately and drains in-flight requests, so no
+    // client write can re-enter manual mode after the restore below. Bounded so a
+    // lingering long-lived connection cannot block the safety restore.
+    let _ = server_shutdown_tx.send(());
+    if tokio::time::timeout(task_timeout, server_handle)
+        .await
+        .is_err()
+    {
+        log::warn!(
+            "IPC server did not stop within {}s; proceeding with hardware restore",
+            task_timeout.as_secs()
+        );
+    }
+
+    // Drain the poll/engine tasks (DEC-146 P3-9) so an in-flight engine
+    // spawn_blocking write cannot land after the restore.
+    for (name, handle) in task_handles {
+        if tokio::time::timeout(task_timeout, handle).await.is_err() {
+            log::warn!(
+                "{name} task did not stop within {}s; proceeding with hardware restore",
+                task_timeout.as_secs()
+            );
+        }
+    }
+
+    // Restore hardware to automatic — guaranteed last writer.
+    restore_hardware();
+}
+
 #[tokio::main]
 async fn main() {
     install_panic_hook();
@@ -839,63 +896,56 @@ async fn main() {
         }
     }
 
-    // Signal all tasks to stop
-    let _ = poll_shutdown_tx.send(true);
-
-    // DEC-146 P3-9: join the poll + engine tasks BEFORE restoring hardware
-    // to automatic, mirroring the awaited server_handle below (tokio
-    // shutdown guidance: signal, then await tasks). Without this, an
-    // in-flight engine tick's spawn_blocking write could land AFTER the
-    // GPU/hwmon restore and leave hardware in manual mode at process exit.
-    // Timeout-bounded so a hung loop cannot block shutdown — on timeout the
-    // restore below still runs last-writer. Production is additionally
-    // covered by ExecStopPost; this closes the non-systemd dev-run gap.
-    for (name, handle) in [
+    // Ordered graceful shutdown (DEC-146 P3-9 + audit P1-A) — see
+    // `shutdown_sequence`: stop the IPC server and drain the poll/engine tasks
+    // BEFORE restoring hardware to automatic, so neither a late client write nor
+    // an in-flight engine write can land after the restore.
+    let task_handles: Vec<(&'static str, tokio::task::JoinHandle<()>)> = [
         ("hwmon-poll", Some(hwmon_poll_handle)),
         ("openfan-poll", openfan_poll_handle),
         ("profile-engine", Some(engine_handle)),
-    ] {
-        if let Some(h) = handle {
-            if tokio::time::timeout(Duration::from_secs(3), h)
-                .await
-                .is_err()
-            {
-                log::warn!("{name} task did not stop within 3 s; proceeding with hardware restore");
-            }
-        }
-    }
+    ]
+    .into_iter()
+    .filter_map(|(name, handle)| handle.map(|h| (name, h)))
+    .collect();
 
-    // Reset GPU fans to automatic before shutting down (re-enables zero-RPM)
-    for gpu in &app_state.amd_gpus {
-        if let Some(ref fan_curve_path) = gpu.fan_curve_path {
-            match control_ofc_daemon::hwmon::gpu_fan::reset_to_auto(
-                fan_curve_path,
-                gpu.fan_zero_rpm_path.as_deref(),
-            ) {
-                Ok(()) => log::info!("GPU {} fan reset to auto", gpu.pci_bdf),
-                Err(e) => log::warn!("GPU {} fan reset failed: {e}", gpu.pci_bdf),
-            }
-        }
-    }
-
-    // Restore hwmon headers to automatic mode (pwm_enable=2) so BIOS
-    // regains thermal control. Without this, a daemon crash leaves
-    // motherboard fans stuck in manual mode with no thermal management.
-    if let Some(ref hwmon_ctrl) = app_state.hwmon_controller {
-        let ctrl = hwmon_ctrl.lock();
-        for header in ctrl.headers() {
-            if let Some(ref enable_path) = header.enable_path {
-                match std::fs::write(enable_path, "2\n") {
-                    Ok(()) => log::info!("hwmon {} restored to auto mode", header.id),
-                    Err(e) => log::warn!("hwmon {} auto restore failed: {e}", header.id),
+    shutdown_sequence(
+        &poll_shutdown_tx,
+        shutdown_tx,
+        server_handle,
+        task_handles,
+        SHUTDOWN_TASK_TIMEOUT,
+        || {
+            // Reset GPU fans to automatic before shutting down (re-enables zero-RPM)
+            for gpu in &app_state.amd_gpus {
+                if let Some(ref fan_curve_path) = gpu.fan_curve_path {
+                    match control_ofc_daemon::hwmon::gpu_fan::reset_to_auto(
+                        fan_curve_path,
+                        gpu.fan_zero_rpm_path.as_deref(),
+                    ) {
+                        Ok(()) => log::info!("GPU {} fan reset to auto", gpu.pci_bdf),
+                        Err(e) => log::warn!("GPU {} fan reset failed: {e}", gpu.pci_bdf),
+                    }
                 }
             }
-        }
-    }
 
-    // Signal the IPC server to stop
-    let _ = shutdown_tx.send(());
-    let _ = server_handle.await;
+            // Restore hwmon headers to automatic mode (pwm_enable=2) so BIOS
+            // regains thermal control. Without this, a daemon crash leaves
+            // motherboard fans stuck in manual mode with no thermal management.
+            if let Some(ref hwmon_ctrl) = app_state.hwmon_controller {
+                let ctrl = hwmon_ctrl.lock();
+                for header in ctrl.headers() {
+                    if let Some(ref enable_path) = header.enable_path {
+                        match std::fs::write(enable_path, "2\n") {
+                            Ok(()) => log::info!("hwmon {} restored to auto mode", header.id),
+                            Err(e) => log::warn!("hwmon {} auto restore failed: {e}", header.id),
+                        }
+                    }
+                }
+            }
+        },
+    )
+    .await;
 
     log::info!("control-ofc-daemon v{VERSION} stopped");
 }
@@ -904,6 +954,73 @@ async fn main() {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn shutdown_stops_ipc_server_before_restoring_hardware() {
+        // audit P1-A: the IPC server must stop accepting writes before the
+        // hardware is restored to automatic, else a late client write re-enters
+        // manual mode after the restore.
+        let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let (poll_tx, _poll_rx) = tokio::sync::watch::channel(false);
+        let (server_tx, server_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // Fake IPC server: records when it stops, only after the signal arrives.
+        let order_srv = order.clone();
+        let server_handle = tokio::spawn(async move {
+            let _ = server_rx.await;
+            order_srv.lock().unwrap().push("server_stopped");
+        });
+
+        let order_restore = order.clone();
+        shutdown_sequence(
+            &poll_tx,
+            server_tx,
+            server_handle,
+            vec![],
+            Duration::from_secs(3),
+            move || order_restore.lock().unwrap().push("hardware_restored"),
+        )
+        .await;
+
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["server_stopped", "hardware_restored"],
+            "the IPC server must stop before hardware is restored to auto"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_restores_hardware_even_if_ipc_server_hangs() {
+        // The bounded wait must elapse and the restore must still run, so a
+        // lingering connection (e.g. an SSE stream) can never block the safety
+        // restore.
+        let restored = Arc::new(Mutex::new(false));
+        let (poll_tx, _poll_rx) = tokio::sync::watch::channel(false);
+        let (server_tx, server_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // Fake IPC server that never finishes: it ignores the shutdown signal.
+        let server_handle = tokio::spawn(async move {
+            let _hold = server_rx;
+            std::future::pending::<()>().await;
+        });
+
+        let restored_c = restored.clone();
+        shutdown_sequence(
+            &poll_tx,
+            server_tx,
+            server_handle,
+            vec![],
+            Duration::from_millis(50),
+            move || *restored_c.lock().unwrap() = true,
+        )
+        .await;
+
+        assert!(
+            *restored.lock().unwrap(),
+            "the hardware restore must run even if the IPC server fails to stop in time"
+        );
+    }
 
     #[test]
     fn config_reload_updates_profile_search_dirs() {
