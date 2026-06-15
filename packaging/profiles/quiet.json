@@ -1,7 +1,7 @@
 {
   "id": "quiet",
   "name": "Quiet (example)",
-  "version": 4,
+  "version": 7,
   "description": "Example profile shipped with control-ofc-daemon. Drives no fans as-is — the `members` list is intentionally empty so a fresh install is safe. Copy this file, add your fan members, and point at it via the GUI or /profile/activate.",
   "controls": [
     {

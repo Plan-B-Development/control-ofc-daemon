@@ -23,7 +23,8 @@ pub struct StatusResponse {
     /// Seconds since last GUI write command (None if no writes received).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gui_last_seen_seconds_ago: Option<u64>,
-    /// Thermal safety override state: `"normal"` | `"recovery"` | `"emergency"`.
+    /// Thermal safety override state: `"normal"` | `"recovery"` | `"emergency"`
+    /// | `"no_sensor_fallback"` (forced 40% when no CPU sensor is reachable).
     /// Mirrors the value the profile engine reports each tick (the same string
     /// `/diagnostics/hardware` exposes) so the GUI can stand its control loop
     /// down while the daemon is forcing safety PWM (DEC-132). Additive field —

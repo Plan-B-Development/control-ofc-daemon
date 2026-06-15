@@ -51,8 +51,11 @@ Options:
   --config <path>         Path to daemon.toml (default: /etc/control-ofc/daemon.toml)
   --profile <name>        Load a named profile from search paths
   --profile-file <path>   Load a profile from an absolute file path
-  --allow-non-root        Skip root privilege check (dev/testing only)
 ```
+
+(A hidden `--allow-non-root` flag exists for development only — it skips the
+root-privilege check but not file/socket access checks. It is intentionally
+undocumented for production use.)
 
 ## Environment variables
 
@@ -79,6 +82,8 @@ See `docs/DEVELOPER_HANDOVER.md` for the full API reference.
 ## Upgrade notes
 
 For routine upgrades, the daemon reads forward-compatible config and migrates state in place. The notes below cover changes that require an operator action.
+
+**v1.15.0–v1.17.0 (profile schema v5 → v7):** Each step only *adds* a curve type — v5 Stepped, v6 Trigger, v7 Mix/Sync composites. They are purely additive: the daemon reads older profiles unchanged, and the GUI re-stamps a profile to v7 the next time it is saved. **No operator action required.**
 
 **v1.6.0 (profile schema v4):** Profiles authored before v4 auto-migrate on load (role-aware `minimum_pct` floor lifted to 30 % for CPU/pump-labelled hwmon members, 20 % for chassis/openfan, 0 % for GPU-only). No file edit required; the migrated profile is re-saved when the user next persists it.
 

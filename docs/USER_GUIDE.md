@@ -278,7 +278,7 @@ The GPU ID is available from `GET /capabilities`.
 
 ## Fan profiles
 
-The daemon can autonomously evaluate fan curve profiles at 1 Hz. Profiles are JSON files in the v4 schema (GUI v1.10.0 / daemon v1.6.0 and later). v3 and earlier profiles auto-migrate on load. An example ships at `/etc/control-ofc/profiles/quiet.json`.
+The daemon can autonomously evaluate fan curve profiles at 1 Hz. Profiles use the **v7** schema (GUI v1.38.0 / daemon v1.17.0 and later). The GUI authors and upgrades profiles; the daemon reads them forward-compatibly — newer fields are accepted and missing fields are defaulted — so you do not need a matching daemon version to load a newer profile. The daemon logs a warning only for profiles older than v3 (v4 introduced the `fan_zero_rpm` member flag the daemon relies on). An example ships at `/etc/control-ofc/profiles/quiet.json`.
 
 ### Loading a profile
 
@@ -329,7 +329,7 @@ Configuration is split between two files (see `docs/ADRs/002-runtime-config-spli
 - **`/etc/control-ofc/daemon.toml`** — admin-owned, hand-edited. Contains static topology: serial port, polling interval, socket path, state directory. Never rewritten by the daemon.
 - **`/var/lib/control-ofc/runtime.toml`** — daemon-managed. Contains settings that API endpoints mutate at runtime: profile search directories and startup delay. Written with 0600 permissions via atomic rename.
 
-On startup the daemon loads `daemon.toml`, then overlays `runtime.toml` on top (runtime values win). `SIGHUP` / `systemctl reload` re-reads both files.
+On startup the daemon loads `daemon.toml`, then overlays `runtime.toml` on top (runtime values win). `SIGHUP` / `systemctl reload` re-reads both files, but only the **profile search directories** are applied live — changes to the startup delay, serial port, polling interval, or socket path are read but take effect only on the next restart.
 
 ### Startup delay
 
