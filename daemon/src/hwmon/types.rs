@@ -72,6 +72,12 @@ pub enum SensorKind {
     MbTemp,
     DiskTemp,
     GpuTemp,
+    /// Liquid-cooler coolant temperature (AIO / custom loop) — e.g. an NZXT
+    /// Kraken `temp1` or an Aquacomputer "Coolant temp" channel. Display/
+    /// classification only: it carries **no** safety semantics (there is no
+    /// coolant emergency threshold; the CPU-only `safety.rs` rule is
+    /// unchanged).
+    CoolantTemp,
 }
 
 impl std::fmt::Display for SensorKind {
@@ -81,6 +87,7 @@ impl std::fmt::Display for SensorKind {
             Self::MbTemp => write!(f, "mb_temp"),
             Self::DiskTemp => write!(f, "disk_temp"),
             Self::GpuTemp => write!(f, "gpu_temp"),
+            Self::CoolantTemp => write!(f, "coolant_temp"),
         }
     }
 }

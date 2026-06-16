@@ -148,6 +148,31 @@ pub async fn capabilities_handler(
             },
         };
 
+    // AIO (liquid cooler) hwmon capability — dynamic since 1.18.0 (DEC-156).
+    // Pump writability is header-driven (available immediately at startup);
+    // coolant sensing is read from the cache. USB-only coolers stay out of
+    // scope and are reported via `aio_usb` (always unsupported).
+    let (aio_total, aio_writable) = state
+        .hwmon_controller
+        .as_ref()
+        .map(|c| {
+            c.lock()
+                .headers()
+                .iter()
+                .filter(|h| h.is_aio)
+                .fold((0usize, 0usize), |(total, writable), h| {
+                    (total + 1, writable + usize::from(h.is_writable))
+                })
+        })
+        .unwrap_or((0, 0));
+    let coolant_available = state
+        .cache
+        .sensors_snapshot()
+        .values()
+        .any(|s| s.kind == crate::hwmon::types::SensorKind::CoolantTemp);
+    let aio_hwmon_cap =
+        AioHwmonCapability::from_discovery(aio_total, aio_writable, coolant_available);
+
     Json(CapabilitiesResponse {
         api_version: API_VERSION,
         daemon_version: state.daemon_version.clone(),
@@ -167,10 +192,7 @@ pub async fn capabilities_handler(
             },
             amd_gpu: amd_gpu_cap,
             intel_gpu: intel_gpu_cap,
-            aio_hwmon: UnsupportedCapability {
-                present: false,
-                status: "unsupported",
-            },
+            aio_hwmon: aio_hwmon_cap,
             aio_usb: UnsupportedCapability {
                 present: false,
                 status: "unsupported",

@@ -100,6 +100,14 @@ fn read_thresholds(hwmon_dir: &Path, index: &str, chip_name: &str) -> Option<Sen
 
 /// Known chip name → sensor kind classification.
 fn classify_chip(chip_name: &str, label: &str) -> SensorKind {
+    // Liquid-cooler coolant temperature takes priority over the generic
+    // chip/label heuristics below: an NZXT Kraken `temp1` is coolant, and any
+    // sensor a vendor labels coolant/water/liquid is coolant regardless of chip
+    // (covers Aquacomputer "Coolant temp" and ASUS-EC "Water In"/"Water Out").
+    // No safety semantics — see `safety.rs` (CPU-only) and `aio.rs`.
+    if crate::hwmon::aio::is_coolant_sensor(chip_name, label) {
+        return SensorKind::CoolantTemp;
+    }
     let lower = label.to_lowercase();
     match chip_name {
         "k10temp" => SensorKind::CpuTemp,
@@ -648,6 +656,76 @@ mod tests {
         let sensors = discover_sensors(tmp.path()).unwrap();
         assert_eq!(sensors.len(), 1);
         assert_eq!(sensors[0].kind, SensorKind::CpuTemp);
+    }
+
+    // ── Coolant / liquid-cooler classification (AIO Phase 1) ──────────────
+
+    #[test]
+    fn discover_kraken3_coolant_from_chip_name() {
+        // NZXT Kraken3 (Z53) exposes a single temp1 = coolant; the chip name
+        // alone classifies it (no coolant label needed).
+        let tmp = tempfile::tempdir().unwrap();
+        create_fixture_with_chip_name(tmp.path(), "hwmon0", "z53", &[("1", None)]);
+
+        let sensors = discover_sensors(tmp.path()).unwrap();
+        assert_eq!(sensors.len(), 1);
+        assert_eq!(sensors[0].kind, SensorKind::CoolantTemp);
+        // Contract: the new kind serialises as "coolant_temp".
+        assert_eq!(sensors[0].kind.to_string(), "coolant_temp");
+    }
+
+    #[test]
+    fn discover_kraken2_coolant_from_chip_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_fixture_with_chip_name(tmp.path(), "hwmon0", "kraken2", &[("1", None)]);
+
+        let sensors = discover_sensors(tmp.path()).unwrap();
+        assert_eq!(sensors[0].kind, SensorKind::CoolantTemp);
+    }
+
+    #[test]
+    fn discover_aquacomputer_coolant_by_label_not_external_probe() {
+        // Aquacomputer devices expose multiple labelled temp channels. Only the
+        // labelled coolant channel classifies as coolant; an external probe
+        // must NOT be force-classified (avoids false positives).
+        let tmp = tempfile::tempdir().unwrap();
+        create_fixture_with_chip_name(
+            tmp.path(),
+            "hwmon0",
+            "d5next",
+            &[
+                ("1", Some("Coolant temp")),
+                ("2", Some("External sensor 1")),
+            ],
+        );
+
+        let sensors = discover_sensors(tmp.path()).unwrap();
+        assert_eq!(sensors.len(), 2);
+        assert_eq!(sensors[0].kind, SensorKind::CoolantTemp);
+        assert_eq!(sensors[1].kind, SensorKind::MbTemp);
+    }
+
+    #[test]
+    fn discover_asus_ec_water_now_classifies_coolant() {
+        // Previously ASUS-EC "Water In"/"Water Out" fell through to MbTemp; the
+        // coolant label hint now classifies them correctly.
+        let tmp = tempfile::tempdir().unwrap();
+        create_fixture_with_chip_name(
+            tmp.path(),
+            "hwmon0",
+            "asus_ec_sensors",
+            &[
+                ("1", Some("Water In")),
+                ("2", Some("Water Out")),
+                ("3", Some("CPU")),
+            ],
+        );
+
+        let sensors = discover_sensors(tmp.path()).unwrap();
+        assert_eq!(sensors[0].kind, SensorKind::CoolantTemp);
+        assert_eq!(sensors[1].kind, SensorKind::CoolantTemp);
+        // Non-coolant labels on the same chip are unaffected.
+        assert_eq!(sensors[2].kind, SensorKind::CpuTemp);
     }
 
     #[test]

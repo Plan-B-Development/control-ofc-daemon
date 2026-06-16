@@ -266,6 +266,10 @@ pub struct PwmHeaderEntry {
     /// PWM/DC mode from pwmN_mode (0=DC, 1=PWM), absent if file not exposed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pwm_mode: Option<u8>,
+    /// Whether this header belongs to a liquid cooler (NZXT Kraken /
+    /// Aquacomputer) — daemon-authoritative AIO hint for the GUI (AIO Phase 1).
+    /// Pre-1.18.0 daemons omit this; consumers default it to `false`.
+    pub is_aio: bool,
 }
 
 impl From<&crate::hwmon::pwm_discovery::PwmHeaderDescriptor> for PwmHeaderEntry {
@@ -286,6 +290,7 @@ impl From<&crate::hwmon::pwm_discovery::PwmHeaderDescriptor> for PwmHeaderEntry 
             max_pwm_percent: h.max_pwm_percent,
             is_writable: h.is_writable,
             pwm_mode: h.pwm_mode,
+            is_aio: h.is_aio,
         }
     }
 }
@@ -317,7 +322,10 @@ pub struct DeviceCapabilities {
     /// Intel discrete GPU (Arc) capability. Additive field (DEC-121) — older
     /// GUIs ignore it; read-only monitoring only, never fan-writable.
     pub intel_gpu: IntelGpuCapability,
-    pub aio_hwmon: UnsupportedCapability,
+    /// Liquid-cooler (AIO) hwmon capability — dynamic since 1.18.0 (DEC-156).
+    pub aio_hwmon: AioHwmonCapability,
+    /// USB-only coolers (liquidctl/USB-HID) are out of scope — always
+    /// unsupported.
     pub aio_usb: UnsupportedCapability,
 }
 
@@ -428,6 +436,67 @@ pub struct HwmonCapability {
     pub pwm_header_count: usize,
     pub lease_required: bool,
     pub write_support: bool,
+}
+
+/// AIO (all-in-one / liquid cooler) hwmon capability (AIO Phase 1, DEC-156).
+///
+/// A backward-compatible superset of [`UnsupportedCapability`]: `present` and
+/// `status` are retained (pre-1.18.0 GUIs read only those), with
+/// `pump_writable` / `coolant_available` added. Scope is hwmon-only — USB-only
+/// coolers are out of scope and reported via the separate `aio_usb`, which
+/// stays `unsupported` permanently.
+///
+/// `status` is honest about controllability: `"supported"` (a writable AIO
+/// pump/fan header is present), `"monitor_only"` (a liquid cooler or coolant
+/// sensor is detected but no writable AIO header exists — e.g. NZXT Kraken2, or
+/// coolant sensing only; never presented as controllable), or `"unsupported"`
+/// (nothing detected).
+#[derive(Debug, Clone, Serialize)]
+pub struct AioHwmonCapability {
+    pub present: bool,
+    pub status: &'static str,
+    /// Whether at least one AIO header is writable (pump/fan controllable).
+    pub pump_writable: bool,
+    /// Whether a coolant-temperature sensor is available.
+    pub coolant_available: bool,
+}
+
+impl AioHwmonCapability {
+    /// Build the dynamic capability from discovered AIO headers + coolant
+    /// sensing. `aio_total_headers` counts `is_aio` headers; `aio_writable`
+    /// counts those that are also `is_writable`; `coolant_available` is whether
+    /// any `CoolantTemp` sensor is cached.
+    pub fn from_discovery(
+        aio_total_headers: usize,
+        aio_writable: usize,
+        coolant_available: bool,
+    ) -> Self {
+        let present = aio_total_headers > 0 || coolant_available;
+        let pump_writable = aio_writable > 0;
+        let status = if !present {
+            "unsupported"
+        } else if pump_writable {
+            "supported"
+        } else {
+            "monitor_only"
+        };
+        AioHwmonCapability {
+            present,
+            status,
+            pump_writable,
+            coolant_available,
+        }
+    }
+
+    /// The "nothing detected" baseline (also the pre-discovery default).
+    pub fn unsupported() -> Self {
+        AioHwmonCapability {
+            present: false,
+            status: "unsupported",
+            pump_writable: false,
+            coolant_available: false,
+        }
+    }
 }
 
 /// Placeholder for unsupported device groups.
@@ -1170,10 +1239,7 @@ mod tests {
                     fan_rpm_available: false,
                     is_discrete: false,
                 },
-                aio_hwmon: UnsupportedCapability {
-                    present: false,
-                    status: "unsupported",
-                },
+                aio_hwmon: AioHwmonCapability::unsupported(),
                 aio_usb: UnsupportedCapability {
                     present: false,
                     status: "unsupported",
@@ -1201,6 +1267,40 @@ mod tests {
         // with the same BDF string so clients on either name keep working.
         assert_eq!(json["devices"]["amd_gpu"]["pci_id"], "0000:2d:00.0");
         assert_eq!(json["devices"]["amd_gpu"]["pci_bdf"], "0000:2d:00.0");
+        // AIO Phase 1 (DEC-156): aio_hwmon is the dynamic capability — the
+        // back-compat present+status plus pump_writable/coolant_available.
+        assert_eq!(json["devices"]["aio_hwmon"]["present"], false);
+        assert_eq!(json["devices"]["aio_hwmon"]["status"], "unsupported");
+        assert_eq!(json["devices"]["aio_hwmon"]["pump_writable"], false);
+        assert_eq!(json["devices"]["aio_hwmon"]["coolant_available"], false);
+        // USB-only coolers remain out of scope.
+        assert_eq!(json["devices"]["aio_usb"]["status"], "unsupported");
+    }
+
+    #[test]
+    fn aio_hwmon_capability_from_discovery_status() {
+        // Nothing detected → unsupported.
+        let none = AioHwmonCapability::from_discovery(0, 0, false);
+        assert!(!none.present);
+        assert_eq!(none.status, "unsupported");
+
+        // Coolant sensing only, no writable AIO header → monitor_only.
+        let mon = AioHwmonCapability::from_discovery(0, 0, true);
+        assert!(mon.present);
+        assert!(!mon.pump_writable);
+        assert!(mon.coolant_available);
+        assert_eq!(mon.status, "monitor_only");
+
+        // AIO header present but none writable → monitor_only (honest).
+        let ro = AioHwmonCapability::from_discovery(1, 0, true);
+        assert_eq!(ro.status, "monitor_only");
+        assert!(!ro.pump_writable);
+
+        // A writable AIO pump/fan header → supported.
+        let sup = AioHwmonCapability::from_discovery(2, 2, true);
+        assert!(sup.present);
+        assert!(sup.pump_writable);
+        assert_eq!(sup.status, "supported");
     }
 
     #[test]

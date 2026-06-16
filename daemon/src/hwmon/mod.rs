@@ -5,6 +5,7 @@
 //! - Discovery of controllable PWM outputs with stable IDs
 //! - Lease-protected PWM writes with safety floors
 
+pub mod aio;
 pub mod discovery;
 pub mod gpu_detect;
 pub mod gpu_fan;

@@ -615,6 +615,7 @@ fn make_test_header(id: &str, label: &str, min_pwm: u8) -> PwmHeaderDescriptor {
         max_pwm_percent: 100,
         is_writable: true,
         pwm_mode: None,
+        is_aio: false,
     }
 }
 

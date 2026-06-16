@@ -1,5 +1,30 @@
 # Changelog
 
+## [1.18.0] — 2026-06-16
+
+First-class **liquid-cooler (AIO) support — Phase 1** (hwmon-only). Pairs with **GUI v1.39.0**
+(DEC-156).
+
+### Added
+- **`SensorKind::CoolantTemp`** (serialised `"coolant_temp"`) and a centralized `hwmon::aio`
+  module that recognises NZXT Kraken (`x53`/`z53`/`kraken2023`/`kraken2023elite`/`kraken2`) and
+  Aquacomputer (`d5next`/`highflownext`/`leakshield`) coolers, classifying coolant by cooler chip
+  or `coolant`/`water`/`liquid` label.
+- **`is_aio`** flag on each PWM header (`GET /hwmon/headers`), so the GUI can cluster and floor
+  pumps without re-deriving hardware knowledge.
+- **Dynamic `aio_hwmon` capability** — `{present, status, pump_writable, coolant_available}`
+  (additive superset of the old `{present, status}`); `aio_usb` stays `unsupported` (USB-only
+  coolers are out of scope — the daemon never opens USB-HID).
+
+### Changed
+- The poll loop now populates `AioPumpState` + the `aio` subsystem freshness timestamp when a
+  coolant sensor is present (wires the previously-dead `cache.update_aio()`).
+
+### Notes
+- **No coolant safety rule** — `safety.rs` is unchanged (CPU-only); pump writability rides the
+  existing per-channel `is_writable` permission bit (the kernel exposes a writable `pwmN` only for
+  controllable channels). No profile-schema bump.
+
 ## [1.17.3] — 2026-06-12
 
 Cleanups from the 2026-06-12 code audit. Daemon-only; pairs with the existing **GUI v1.38.0**.

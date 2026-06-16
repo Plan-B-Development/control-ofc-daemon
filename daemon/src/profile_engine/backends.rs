@@ -605,6 +605,7 @@ mod tests {
             max_pwm_percent: 100,
             is_writable: true,
             pwm_mode: None,
+            is_aio: false,
         }
     }
 
@@ -658,6 +659,7 @@ mod tests {
             max_pwm_percent: 100,
             is_writable: true,
             pwm_mode: None,
+            is_aio: false,
         }
     }
 

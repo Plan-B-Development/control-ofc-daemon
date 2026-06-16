@@ -35,9 +35,20 @@ pub struct PwmHeaderDescriptor {
     /// Maximum PWM percent (policy ceiling).
     pub max_pwm_percent: u8,
     /// Whether the `pwmN` file is writable (checked at discovery time).
+    ///
+    /// This is the kernel sysfs permission bit and is authoritative per-channel:
+    /// liquid-cooler drivers expose a writable `pwmN` only for genuinely
+    /// controllable channels (e.g. NZXT Kraken `pwm1`=pump). Monitor-only
+    /// devices (NZXT Kraken2, an Aquacomputer pump duty) simply expose no
+    /// `pwmN`, so no writable header is produced. See `aio.rs`.
     pub is_writable: bool,
     /// PWM/DC mode from `pwmN_mode` (0=DC, 1=PWM, None if file absent).
     pub pwm_mode: Option<u8>,
+    /// Whether this header belongs to a liquid cooler (NZXT Kraken /
+    /// Aquacomputer) — a daemon-authoritative AIO hint so the GUI can cluster
+    /// and floor pumps without re-deriving hardware knowledge. Writability
+    /// still rides `is_writable`. See `aio.rs`.
+    pub is_aio: bool,
 }
 
 /// Discover all controllable PWM outputs under a given hwmon root.
@@ -96,6 +107,12 @@ fn discover_device_pwm(hwmon_dir: &Path) -> Result<Vec<PwmHeaderDescriptor>, Hwm
     }
 
     let device_id = resolve_device_id(hwmon_dir);
+
+    // Daemon-authoritative AIO hint (per chip, not per channel). NZXT Kraken /
+    // Aquacomputer pumps + radiator fans flow through the normal hwmon path;
+    // this flag lets the GUI cluster and floor them without re-deriving the
+    // chip-name list. Writability is still the kernel permission bit below.
+    let is_aio = crate::hwmon::aio::is_liquid_cooler_chip(&chip_name);
 
     // Find all pwmN files (pwm1, pwm2, ...)
     let entries = std::fs::read_dir(hwmon_dir).map_err(|e| HwmonError::ReadError {
@@ -170,6 +187,7 @@ fn discover_device_pwm(hwmon_dir: &Path) -> Result<Vec<PwmHeaderDescriptor>, Hwm
             max_pwm_percent: 100,
             is_writable,
             pwm_mode,
+            is_aio,
         });
     }
 
@@ -488,5 +506,85 @@ mod tests {
 
         let headers = discover_pwm_headers(tmp.path()).unwrap();
         assert_eq!(headers[0].label, "PWM_LABEL");
+    }
+
+    // ── AIO header flag + per-channel writability (AIO Phase 1) ───────────
+
+    #[test]
+    fn kraken3_headers_flagged_aio_and_writable() {
+        // NZXT Kraken3 (Z53): pwm1=pump, pwm2=fan, both writable (0644 in the
+        // kernel; tempdir files are writable, mirroring that).
+        let tmp = tempfile::tempdir().unwrap();
+        create_pwm_fixture(
+            tmp.path(),
+            "hwmon0",
+            "z53",
+            &[(1, None, true, true), (2, None, true, true)],
+        );
+
+        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        assert_eq!(headers.len(), 2);
+        for h in &headers {
+            assert!(h.is_aio, "Kraken header should be flagged AIO: {h:#?}");
+            assert!(h.is_writable);
+        }
+    }
+
+    #[test]
+    fn corsair_cpro_writable_but_not_aio() {
+        // Commander Pro is a fan hub, not a liquid cooler: writable pwm, NOT AIO.
+        let tmp = tempfile::tempdir().unwrap();
+        create_pwm_fixture(
+            tmp.path(),
+            "hwmon0",
+            "corsaircpro",
+            &[(1, None, false, true), (2, None, false, true)],
+        );
+
+        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        assert_eq!(headers.len(), 2);
+        for h in &headers {
+            assert!(!h.is_aio, "a fan hub must not be flagged AIO: {h:#?}");
+            assert!(h.is_writable);
+        }
+    }
+
+    #[test]
+    fn ordinary_motherboard_header_not_aio() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_pwm_fixture(
+            tmp.path(),
+            "hwmon0",
+            "it8696",
+            &[(1, Some("CPU_FAN"), true, true)],
+        );
+        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        assert!(!headers[0].is_aio);
+    }
+
+    #[test]
+    fn readonly_pwm_reports_not_writable() {
+        // The monitor-only mechanism: `is_writable` mirrors the sysfs
+        // permission bit. A read-only `pwmN` reports `is_writable=false`, so
+        // the GUI degrades rather than faking control. (This is a pure mode
+        // check, so it holds even when tests run as root.)
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let hwmon_dir = tmp.path().join("hwmon0");
+        fs::create_dir_all(&hwmon_dir).unwrap();
+        fs::write(hwmon_dir.join("name"), "z53").unwrap();
+        let pwm = hwmon_dir.join("pwm1");
+        fs::write(&pwm, "128\n").unwrap();
+        let mut perms = fs::metadata(&pwm).unwrap().permissions();
+        perms.set_mode(0o444);
+        fs::set_permissions(&pwm, perms).unwrap();
+
+        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        assert_eq!(headers.len(), 1);
+        assert!(
+            !headers[0].is_writable,
+            "read-only pwm must report not writable"
+        );
+        assert!(headers[0].is_aio);
     }
 }

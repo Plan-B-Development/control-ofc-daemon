@@ -28,11 +28,11 @@ fn boottime_now() -> Duration {
 
 use crate::health::cache::StateCache;
 use crate::health::state::{
-    AmdGpuFanState, CachedSensorReading, DeviceLabel, HwmonFanState, OpenFanState,
+    AioPumpState, AmdGpuFanState, CachedSensorReading, DeviceLabel, HwmonFanState, OpenFanState,
 };
 use crate::hwmon::gpu_detect::AmdGpuInfo;
 use crate::hwmon::intel_gpu_detect::IntelGpuInfo;
-use crate::hwmon::types::SensorReading;
+use crate::hwmon::types::{SensorKind, SensorReading};
 use crate::serial::protocol::Command;
 use crate::serial::transport::{send_command, SerialTransport};
 
@@ -59,6 +59,29 @@ fn to_cached(reading: &SensorReading) -> CachedSensorReading {
         temp_type: reading.temp_type,
         thresholds: reading.thresholds.clone(),
     }
+}
+
+/// Derive a lightweight AIO summary from this tick's cached sensors (DEC-156).
+///
+/// Returns `None` when no coolant sensor is present — there is no AIO subsystem
+/// to report, so the poll loop leaves `subsystem_timestamps.aio` unset. When a
+/// coolant sensor exists, the summary carries the hottest coolant reading; pump
+/// duty/RPM are surfaced through the normal fan table, so they stay `None` here.
+/// No safety semantics (there is no coolant threshold — see `safety.rs`).
+fn derive_aio_state(sensors: &[CachedSensorReading], now: Instant) -> Option<AioPumpState> {
+    let coolant_temp_c = sensors
+        .iter()
+        .filter(|s| s.kind == SensorKind::CoolantTemp)
+        .map(|s| s.value_c)
+        .reduce(f64::max)?;
+    Some(AioPumpState {
+        detected: true,
+        pump_rpm: None,
+        coolant_temp_c: Some(coolant_temp_c),
+        pump_duty_pct: None,
+        last_commanded_pct: None,
+        updated_at: Some(now),
+    })
 }
 
 /// Run the hwmon sensor polling loop.
@@ -223,7 +246,14 @@ pub async fn hwmon_poll_loop(
                 for r in &readings {
                     history.record(&r.id, r.value_c);
                 }
+                // Derive the AIO summary before `cached` is moved into the
+                // cache (DEC-156): keeps `subsystem_timestamps.aio` fresh and
+                // surfaces coolant temp on /status + /poll when a cooler exists.
+                let aio_state = derive_aio_state(&cached, Instant::now());
                 cache.update_sensors(cached);
+                if let Some(aio) = aio_state {
+                    cache.update_aio(aio);
+                }
 
                 // Update hwmon fan state in cache
                 if !fan_states.is_empty() {
@@ -509,6 +539,57 @@ mod tests {
         fs::write(dir.join("temp1_label"), "Composite\n").unwrap();
     }
 
+    /// Write a fake NZXT Kraken (z53) into the tempdir sysfs root: a single
+    /// `temp1` = coolant (no label needed — chip name classifies it).
+    fn write_kraken(root: &std::path::Path, coolant_c: f64) {
+        let dir = root.join("hwmon2");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("name"), "z53\n").unwrap();
+        fs::write(
+            dir.join("temp1_input"),
+            format!("{}\n", (coolant_c * 1000.0) as i64),
+        )
+        .unwrap();
+    }
+
+    fn cached_temp(label: &str, kind: SensorKind, value_c: f64) -> CachedSensorReading {
+        CachedSensorReading {
+            id: format!("hwmon:test:{label}"),
+            kind,
+            label: label.to_string(),
+            value_c,
+            source: DeviceLabel::Hwmon,
+            updated_at: Instant::now(),
+            rate_c_per_s: None,
+            session_min_c: None,
+            session_max_c: None,
+            chip_name: "z53".to_string(),
+            temp_type: None,
+            thresholds: None,
+        }
+    }
+
+    #[test]
+    fn derive_aio_state_none_without_coolant() {
+        let now = Instant::now();
+        let sensors = [cached_temp("Tctl", SensorKind::CpuTemp, 60.0)];
+        assert!(derive_aio_state(&sensors, now).is_none());
+    }
+
+    #[test]
+    fn derive_aio_state_reports_hottest_coolant() {
+        let now = Instant::now();
+        let sensors = [
+            cached_temp("Tctl", SensorKind::CpuTemp, 80.0),
+            cached_temp("Coolant", SensorKind::CoolantTemp, 34.0),
+            cached_temp("Coolant2", SensorKind::CoolantTemp, 37.5),
+        ];
+        let aio = derive_aio_state(&sensors, now).expect("coolant present");
+        assert!(aio.detected);
+        assert_eq!(aio.coolant_temp_c, Some(37.5));
+        assert!(aio.updated_at.is_some());
+    }
+
     struct PollHarness {
         cache: Arc<StateCache>,
         rescan: Arc<std::sync::atomic::AtomicBool>,
@@ -591,6 +672,45 @@ mod tests {
             sensor_by_label(&h.cache, "Changed").is_none(),
             "no re-discovery without a trigger (DEC-133)"
         );
+
+        stop(h).await;
+    }
+
+    /// DEC-156: a discovered coolant sensor populates `AioPumpState` and sets
+    /// the `aio` subsystem freshness timestamp via the live poll loop (wires the
+    /// previously-dead `update_aio`).
+    #[tokio::test(start_paused = true)]
+    async fn poll_loop_populates_aio_state_for_kraken() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_k10temp(tmp.path(), 55.0); // CPU sensor present
+        write_kraken(tmp.path(), 33.0); // NZXT Kraken coolant
+        let h = spawn_poll_loop(tmp.path().to_path_buf());
+
+        tokio::time::sleep(Duration::from_millis(500)).await; // tick 1
+
+        let snap = h.cache.snapshot();
+        assert!(snap.aio.detected, "kraken coolant must mark AIO detected");
+        assert_eq!(snap.aio.coolant_temp_c, Some(33.0));
+        assert!(
+            snap.subsystem_timestamps.aio.is_some(),
+            "aio subsystem freshness must be set"
+        );
+
+        stop(h).await;
+    }
+
+    /// Without a coolant sensor, the loop must NOT fabricate AIO freshness.
+    #[tokio::test(start_paused = true)]
+    async fn poll_loop_leaves_aio_unset_without_coolant() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_k10temp(tmp.path(), 55.0);
+        let h = spawn_poll_loop(tmp.path().to_path_buf());
+
+        tokio::time::sleep(Duration::from_millis(500)).await; // tick 1
+
+        let snap = h.cache.snapshot();
+        assert!(!snap.aio.detected);
+        assert!(snap.subsystem_timestamps.aio.is_none());
 
         stop(h).await;
     }
