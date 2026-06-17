@@ -1,5 +1,46 @@
 # Changelog
 
+## [1.21.0] — 2026-06-18
+
+Daemon-owned **manual-override + fan-identify API** (DEC-163 / DEC-166) — Phase 4 of the GUI→daemon
+control migration. Additive and backward-compatible: the daemon gains an expiring, fencing-guarded
+override subsystem, but it is **dormant until the 2.0.0 cutover** — the current GUI does not call these
+endpoints, and while the GUI is the active writer the engine defers, so the override overlay is computed
+but never written to hardware. **No runtime behaviour change.** Pairs with `control-ofc-gui` ≥ v1.39.0.
+
+### Added
+- **Manual override API** — `POST /control/{id}/override` pins a control's members to a fixed PWM;
+  `POST /control/{id}/override/renew` extends it; `DELETE /control/{id}/override` reverts immediately.
+  Each grant is a renewable, **expiring lease** (15 s TTL, renew ~5 s) judged on the daemon's own
+  monotonic clock, so a frozen/crashed/slept GUI cannot strand fans — the override **fails safe to
+  autonomous curve control** on expiry. A single monotonically increasing `override_token` is both the
+  grant identity and the fencing token, so a thawed GUI holding a stale token cannot silently re-pin
+  fans (Kleppmann fencing; the daemon is both lock service and resource).
+- **Fan-identify API** — `POST /fans/{fan_id}/identify` (`action: "stop" | "restore"`) stops or restores
+  a single fan for physical identification, **auto-restoring** after a short deadman TTL.
+- **`/capabilities`** — `control.manual_override` and `control.fan_identify` now advertise `true`.
+- **`/status`** — surfaces active overrides and fan-identify holds with their remaining TTL (each array
+  is omitted when empty, so the common-case wire shape is unchanged).
+- **Error codes** — `stale_fencing_token` (HTTP 409) and `override_expired` (HTTP 404) within the
+  existing error envelope.
+
+### Safety
+- Strict precedence is preserved: **105 °C thermal force > identify-stop (floor-exempt) > override
+  (floor-clamped) > curve**. An override's PWM is still clamped by the hard pump/CPU floor (~30 %,
+  DEC-162) and the GPU 0 % floor (DEC-119) — a stuck or fat-fingered override can never strand a pump
+  or CPU below its safety minimum; identify-stop is deliberately floor-exempt (you must be able to stop
+  a pump to physically find it) and bounded by its deadman.
+- Expiry is swept on the daemon's monotonic clock every tick with **no client cooperation**; the
+  per-grant TTL is capped (a client extends an override by renewing, never by one long grant). There is
+  no absolute max-duration cap — a live renewing GUI proves the user is present, and the 105 °C force
+  remains the ultimate backstop.
+
+### Notes
+- No schema bump (still v7). The override/identify table is in-memory and intentionally dropped on
+  daemon restart (fail-safe to curve). The override handlers do **not** mark the engine `gui_active`.
+- The monotonic `Clock` seam used by the hwmon lease was promoted to a shared module and reused by the
+  override deadman.
+
 ## [1.20.0] — 2026-06-17
 
 Daemon-enforced **role-aware minimum-PWM floor backstop** (DEC-162) — Phase 3 of the GUI→daemon
