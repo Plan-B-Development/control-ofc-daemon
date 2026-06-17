@@ -16,7 +16,10 @@ use crate::constants;
 use crate::health::cache::StateCache;
 use crate::health::state::CachedSensorReading;
 use crate::hwmon::types::SensorKind;
-use crate::profile::{evaluate_curve, DaemonProfile, LogicalControl};
+use crate::profile::{
+    evaluate_curve, member_is_gpu, member_is_pump_or_cpu, DaemonProfile, LogicalControl,
+    HARD_PUMP_CPU_FLOOR_PCT,
+};
 
 /// A single PWM write command produced by the profile engine.
 #[derive(Debug, Clone)]
@@ -548,16 +551,33 @@ pub fn evaluate_profile(
         // Generate write commands for all members
         for member in &control.members {
             let gpu_fan_zero_rpm = member.source == "amd_gpu" && member.fan_zero_rpm;
-            // DEC-119: GPU members are never soft-floored. In a mixed control
-            // (non-zero `minimum_pct`) recompute the GPU member's output with a
-            // 0% floor and its own namespaced step-rate tracker, so headless
-            // mode matches the GUI's per-member flooring (the DEC-096
-            // GUI/headless consistency guarantee). Every non-GPU member, and
-            // any member of a 0-floor control, uses the control-wide value.
-            let member_pwm = if member.source == "amd_gpu" && control.minimum_pct > 0.0 {
+            // DEC-119 + DEC-162: each member's effective minimum-PWM floor.
+            // GPU members carry no floor (0% — PMFW enforces its own OD_RANGE
+            // minimum). A pump/CPU header is hard-floored to at least
+            // HARD_PUMP_CPU_FLOOR_PCT even when the control declares a lower
+            // `minimum_pct`: validate() rejects such a profile at the API
+            // boundary, but a persisted or hand-edited profile reaches the engine
+            // un-validated via `resolve_initial_profile`, so this clamp is the
+            // load-bearing safety net. Every other member uses the control-wide
+            // floor. Recompute with a namespaced per-member step-rate tracker
+            // only when the effective floor differs from the control-wide one
+            // (covers both the GPU lower-to-0 and the pump raise-to-floor cases),
+            // so headless mode matches the GUI's per-member flooring (the DEC-096
+            // consistency guarantee); otherwise reuse the control-wide value so
+            // the common path stays byte-identical and the parity oracle is
+            // unperturbed. `!=` compares the same source value — no float hazard.
+            let effective_floor = if member_is_gpu(member) {
+                0.0
+            } else if member_is_pump_or_cpu(member) {
+                control.minimum_pct.max(HARD_PUMP_CPU_FLOOR_PCT)
+            } else {
+                control.minimum_pct
+            };
+            let member_pwm = if effective_floor != control.minimum_pct {
                 let key = format!("{}::m::{}", control.id, member.member_id);
                 let prev_member = engine_state.last_output(&key);
-                let tuned_member = apply_tuning_with_floor(control, raw_output, prev_member, 0.0);
+                let tuned_member =
+                    apply_tuning_with_floor(control, raw_output, prev_member, effective_floor);
                 engine_state.last_output.insert(key, tuned_member);
                 tuned_member.round().clamp(0.0, 100.0) as u8
             } else {
@@ -1531,6 +1551,108 @@ mod tests {
         );
         assert_eq!(cmds.len(), 2);
         assert!(cmds.iter().all(|c| c.pwm_percent == 20));
+    }
+
+    // ── DEC-162: pump/CPU hard-floor clamp (the un-validated-path safety net) ──
+
+    fn push_pump_member(profile: &mut DaemonProfile) {
+        profile.controls[0].members.push(ControlMember {
+            source: "hwmon".into(),
+            member_id: "hwmon:z53:0000:pwm1:pwm1".into(),
+            member_label: "AIO_PUMP".into(),
+            fan_zero_rpm: false,
+        });
+    }
+
+    #[test]
+    fn evaluate_pump_member_clamped_to_floor_when_declared_too_low() {
+        // The engine independently raises a pump member to the hard floor even
+        // when the profile declares a lower minimum_pct (the boot-load / hand-edit
+        // path that bypasses validate()). stop_pct=0 so the stop threshold cannot
+        // mask the floor. Held across ticks incl. the first (no prior output → no
+        // step-rate limiting → jumps straight to the floor, as a pump must).
+        let mut profile = make_profile("manual", "flat", 0.0);
+        profile.controls[0].members.clear();
+        push_pump_member(&mut profile);
+        profile.controls[0].manual_output_pct = 5.0;
+        profile.controls[0].minimum_pct = 0.0;
+        profile.controls[0].stop_pct = 0.0;
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let mut state = ProfileEngineState::new();
+        for _ in 0..3 {
+            let cmds = evaluate_profile(&profile, &cache.sensors_snapshot(), &mut state);
+            let pump = cmds.iter().find(|c| c.source == "hwmon").unwrap();
+            assert_eq!(
+                pump.pwm_percent, 30,
+                "pump must clamp to the hard floor every tick"
+            );
+        }
+    }
+
+    #[test]
+    fn evaluate_pump_member_uses_higher_declared_floor() {
+        // max(declared, hard floor): a stricter declared floor wins over 30.
+        let mut profile = make_profile("manual", "flat", 0.0);
+        profile.controls[0].members.clear();
+        push_pump_member(&mut profile);
+        profile.controls[0].manual_output_pct = 5.0;
+        profile.controls[0].minimum_pct = 45.0;
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let cmds = evaluate_profile(
+            &profile,
+            &cache.sensors_snapshot(),
+            &mut ProfileEngineState::new(),
+        );
+        let pump = cmds.iter().find(|c| c.source == "hwmon").unwrap();
+        assert_eq!(pump.pwm_percent, 45);
+    }
+
+    #[test]
+    fn evaluate_mixed_pump_gpu_chassis_each_member_own_floor() {
+        // One control, three members at manual 10% / control floor 20%: the pump
+        // is hard-raised to 30, the openfan honours the control floor 20, and the
+        // GPU runs at its natural 10 (no floor — DEC-119). Three distinct floors.
+        let mut profile = make_profile("manual", "flat", 0.0);
+        profile.controls[0].manual_output_pct = 10.0;
+        profile.controls[0].minimum_pct = 20.0;
+        push_pump_member(&mut profile);
+        push_gpu_member(&mut profile);
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let cmds = evaluate_profile(
+            &profile,
+            &cache.sensors_snapshot(),
+            &mut ProfileEngineState::new(),
+        );
+        let pump = cmds.iter().find(|c| c.source == "hwmon").unwrap();
+        let gpu = cmds.iter().find(|c| c.source == "amd_gpu").unwrap();
+        let openfan = cmds.iter().find(|c| c.source == "openfan").unwrap();
+        assert_eq!(pump.pwm_percent, 30, "pump hard-raised");
+        assert_eq!(openfan.pwm_percent, 20, "openfan honours control floor");
+        assert_eq!(gpu.pwm_percent, 10, "GPU runs at natural output (no floor)");
+    }
+
+    #[test]
+    fn evaluate_chassis_member_not_hard_raised() {
+        // DEC-162 scope is pump/CPU only — a chassis/radiator fan is never
+        // hard-raised by the engine; it honours the control-wide floor verbatim.
+        let mut profile = make_profile("manual", "flat", 0.0);
+        profile.controls[0].members.clear();
+        profile.controls[0].members.push(ControlMember {
+            source: "hwmon".into(),
+            member_id: "hwmon:it8696:0000:pwm2:CHA_FAN".into(),
+            member_label: "Radiator Top".into(),
+            fan_zero_rpm: false,
+        });
+        profile.controls[0].manual_output_pct = 5.0;
+        profile.controls[0].minimum_pct = 5.0;
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let cmds = evaluate_profile(
+            &profile,
+            &cache.sensors_snapshot(),
+            &mut ProfileEngineState::new(),
+        );
+        let cha = cmds.iter().find(|c| c.source == "hwmon").unwrap();
+        assert_eq!(cha.pwm_percent, 5);
     }
 
     // ── M1: full tuning pipeline — step rate, start/stop, cross-cycle state ──

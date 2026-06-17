@@ -333,6 +333,50 @@ const KNOWN_CURVE_TYPES: [&str; 7] = [
 const KNOWN_MIX_FUNCTIONS: [&str; 5] = ["max", "min", "average", "sum", "subtract"];
 const KNOWN_MEMBER_SOURCES: [&str; 4] = ["openfan", "hwmon", "amd_gpu", "intel_gpu"];
 
+// ──────────────────── Role classification + floor (DEC-162) ────────────────────
+
+/// Hard minimum-PWM floor for pump / CPU headers. Mirror of the GUI's
+/// `ROLE_MINIMUM_PCT[CPU_PUMP]` (profile_service.py). A pump driven below this
+/// can stall — coolant-flow loss leads to rapid thermal runaway — so the daemon
+/// enforces it independently of the GUI-stamped `minimum_pct`, both at validate
+/// time (reject, see [`validate`]) and at eval time (clamp, see `profile_engine`).
+pub(crate) const HARD_PUMP_CPU_FLOOR_PCT: f64 = 30.0;
+
+/// Header-label keywords (case-insensitive substring) marking a hwmon member as a
+/// CPU or pump header. Mirror of the GUI's `_CPU_PUMP_LABEL_HINTS`. Distinct from
+/// `hwmon::aio` `COOLANT_LABEL_HINTS`, which classifies temperature *sensors*.
+const CPU_PUMP_LABEL_HINTS: &[&str] = &["cpu", "pump", "aio"];
+
+/// True when a control member is a GPU fan (`amd_gpu` or `intel_gpu`). GPU fans
+/// carry no daemon floor — PMFW enforces its own OD_RANGE minimum (DEC-119).
+/// Mirrors the GUI's `infer_member_role` GPU branch.
+pub(crate) fn member_is_gpu(member: &ControlMember) -> bool {
+    member.source == "amd_gpu" || member.source == "intel_gpu"
+}
+
+/// True when a control member is a pump/CPU header that needs the hard floor.
+///
+/// Document-only classification (no live hardware): a `hwmon` member whose label
+/// hints "cpu"/"pump"/"aio", or whose stable id embeds a known liquid-cooler chip
+/// (`hwmon:<chip>:<device>:pwmN:<label>`). Mirrors the GUI's `infer_member_role`
+/// CPU/pump branch (`_label_indicates_cpu_or_pump` + `_member_is_aio_header`), so
+/// a profile the GUI bakes always agrees with the daemon backstop. The shared
+/// `role_classification.json` fixture pins that agreement. OpenFan and GPU members
+/// are never pump/CPU.
+pub(crate) fn member_is_pump_or_cpu(member: &ControlMember) -> bool {
+    if member.source != "hwmon" {
+        return false;
+    }
+    let label = member.member_label.to_lowercase();
+    if CPU_PUMP_LABEL_HINTS.iter().any(|hint| label.contains(hint)) {
+        return true;
+    }
+    // Chip name is the 2nd colon-delimited field of the stable hwmon id; a
+    // malformed id yields "" → not a cooler (matches the GUI's split fallback).
+    let chip = member.member_id.split(':').nth(1).unwrap_or("");
+    crate::hwmon::aio::is_liquid_cooler_chip(chip)
+}
+
 /// Severity of a [`FieldViolation`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -418,8 +462,10 @@ impl ValidationReport {
 /// `known_sensor_ids` is the set of sensor entity ids currently discovered on
 /// this machine (the keys of `cache.sensors_snapshot()`).
 ///
-/// The role-aware minimum-PWM floor backstop (DEC-162) layers onto this in a
-/// later phase; the signature is intentionally left extensible for it.
+/// The role-aware minimum-PWM floor backstop (DEC-162) is folded in below: a
+/// control with a pump/CPU member declaring `minimum_pct` below
+/// [`HARD_PUMP_CPU_FLOOR_PCT`] is a hard `FLOOR_TOO_LOW` error. Classification is
+/// document-only (`member_is_pump_or_cpu`), so this needed no signature change.
 pub fn validate(profile: &DaemonProfile, known_sensor_ids: &HashSet<String>) -> ValidationReport {
     let mut report = ValidationReport::default();
 
@@ -590,6 +636,25 @@ pub fn validate(profile: &DaemonProfile, known_sensor_ids: &HashSet<String>) -> 
                     format!("member source '{}' is unrecognised", m.source),
                 );
             }
+        }
+
+        // DEC-162: a control with a pump/CPU member must declare a floor at least
+        // as high as the hard pump floor, or the pump can stall. Reject so a
+        // too-low floor never persists; the engine also clamps at eval time for
+        // any profile that reaches it un-validated (boot-load / hand-edit). GPU
+        // and chassis-only controls never trigger this.
+        if ctrl.minimum_pct < HARD_PUMP_CPU_FLOOR_PCT
+            && ctrl.members.iter().any(member_is_pump_or_cpu)
+        {
+            report.error(
+                format!("{p}.minimum_pct"),
+                "FLOOR_TOO_LOW",
+                format!(
+                    "control has a pump/CPU member but minimum_pct {} is below the \
+                     required {HARD_PUMP_CPU_FLOOR_PCT}% pump floor",
+                    ctrl.minimum_pct
+                ),
+            );
         }
     }
 
@@ -1333,6 +1398,192 @@ mod tests {
 
     fn sset(ids: &[&str]) -> HashSet<String> {
         ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn member(source: &str, id: &str, label: &str) -> ControlMember {
+        ControlMember {
+            source: source.into(),
+            member_id: id.into(),
+            member_label: label.into(),
+            fan_zero_rpm: false,
+        }
+    }
+
+    /// A manual control carrying `members` with the given floor (DEC-162 tests).
+    fn control_with_members(min_pct: f64, members: Vec<ControlMember>) -> LogicalControl {
+        LogicalControl {
+            id: "ctl".into(),
+            name: "ctl".into(),
+            mode: "manual".into(),
+            curve_id: String::new(),
+            manual_output_pct: 50.0,
+            members,
+            step_up_pct: 100.0,
+            step_down_pct: 100.0,
+            offset_pct: 0.0,
+            minimum_pct: min_pct,
+            start_pct: 0.0,
+            stop_pct: 0.0,
+        }
+    }
+
+    // ───────────────────── DEC-162 role classification ──────────────────────
+
+    #[test]
+    fn classify_pump_by_label_hint() {
+        for label in ["AIO_PUMP", "CPU_FAN", "Pump", "cpu_opt"] {
+            let m = member("hwmon", "hwmon:nct6798:dev:pwm1:x", label);
+            assert!(
+                member_is_pump_or_cpu(&m),
+                "{label} should classify pump/CPU"
+            );
+            assert!(!member_is_gpu(&m));
+        }
+    }
+
+    #[test]
+    fn classify_pump_by_aio_chip_even_with_bare_label() {
+        // Kraken / Aquacomputer pump headers are often labelled only "pwm1"; the
+        // chip embedded in the stable id is the schema-free signal (DEC-156).
+        for chip in ["z53", "kraken2023", "d5next"] {
+            let id = format!("hwmon:{chip}:nodev:pwm1:pwm1");
+            let m = member("hwmon", &id, "pwm1");
+            assert!(member_is_pump_or_cpu(&m), "{chip} pump should classify");
+        }
+    }
+
+    #[test]
+    fn classify_radiator_and_openfan_are_not_pump() {
+        let rad = member("hwmon", "hwmon:it8696:dev:pwm2:CHA_FAN", "Radiator Top");
+        assert!(!member_is_pump_or_cpu(&rad));
+        let of = member("openfan", "openfan:ch00", "");
+        assert!(!member_is_pump_or_cpu(&of));
+    }
+
+    #[test]
+    fn classify_gpu_is_gpu_not_pump() {
+        for src in ["amd_gpu", "intel_gpu"] {
+            let m = member(src, "amd_gpu:0000:03:00.0", "9070XT Fan");
+            assert!(member_is_gpu(&m));
+            assert!(!member_is_pump_or_cpu(&m));
+        }
+    }
+
+    #[test]
+    fn classify_empty_label_non_cooler_is_not_pump() {
+        let m = member("hwmon", "hwmon:nct6798:dev:pwm4:", "");
+        assert!(!member_is_pump_or_cpu(&m));
+    }
+
+    // ────────────────── DEC-162 validate() FLOOR_TOO_LOW backstop ────────────
+
+    fn floor_violation(report: &ValidationReport) -> bool {
+        report.errors.iter().any(|e| e.reason == "FLOOR_TOO_LOW")
+    }
+
+    #[test]
+    fn validate_rejects_pump_control_below_floor() {
+        for min in [0.0, 25.0, 29.0] {
+            let pump = member("hwmon", "hwmon:z53:n:pwm1:pwm1", "AIO_PUMP");
+            let report = validate(
+                &mk_profile(vec![], vec![control_with_members(min, vec![pump])]),
+                &sset(&[]),
+            );
+            assert!(!report.is_valid(), "min {min} must reject");
+            assert!(floor_violation(&report), "min {min} must be FLOOR_TOO_LOW");
+            assert!(report
+                .errors
+                .iter()
+                .any(|e| e.field == "controls[0].minimum_pct"));
+        }
+    }
+
+    #[test]
+    fn validate_accepts_pump_control_at_or_above_floor() {
+        for min in [30.0, 45.0, 100.0] {
+            let pump = member("hwmon", "hwmon:z53:n:pwm1:pwm1", "AIO_PUMP");
+            let report = validate(
+                &mk_profile(vec![], vec![control_with_members(min, vec![pump])]),
+                &sset(&[]),
+            );
+            assert!(
+                !floor_violation(&report),
+                "min {min} must NOT be FLOOR_TOO_LOW"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_gpu_only_control_at_zero_passes() {
+        let gpu = member("amd_gpu", "amd_gpu:0000:03:00.0", "GPU Fan");
+        let report = validate(
+            &mk_profile(vec![], vec![control_with_members(0.0, vec![gpu])]),
+            &sset(&[]),
+        );
+        assert!(
+            !floor_violation(&report),
+            "GPU at 0% must pass: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn validate_chassis_control_at_twenty_passes() {
+        // Chassis is GUI-baked advisory; the daemon hard backstop is pump/CPU only.
+        let cha = member("hwmon", "hwmon:it8696:d:pwm2:CHA_FAN", "Radiator Top");
+        let report = validate(
+            &mk_profile(vec![], vec![control_with_members(20.0, vec![cha])]),
+            &sset(&[]),
+        );
+        assert!(!floor_violation(&report), "chassis at 20% must pass");
+    }
+
+    #[test]
+    fn validate_mixed_pump_below_floor_rejects_once() {
+        // A pump + chassis in one control still trips on the pump; one error.
+        let members = vec![
+            member("hwmon", "hwmon:it8696:d:pwm2:CHA_FAN", "Radiator Top"),
+            member("hwmon", "hwmon:z53:n:pwm1:pwm1", "AIO_PUMP"),
+        ];
+        let report = validate(
+            &mk_profile(vec![], vec![control_with_members(10.0, members)]),
+            &sset(&[]),
+        );
+        let n = report
+            .errors
+            .iter()
+            .filter(|e| e.reason == "FLOOR_TOO_LOW")
+            .count();
+        assert_eq!(n, 1, "exactly one FLOOR_TOO_LOW per control");
+    }
+
+    #[test]
+    fn role_classification_matches_oracle() {
+        // DEC-162 cross-stack agreement: the daemon classifiers must produce the
+        // same role as the GUI's `infer_member_role` for every shared vector, or
+        // a GUI-baked profile could be wrongly rejected by the FLOOR_TOO_LOW
+        // backstop. The GUI half lives in tests/test_role_classification_parity.py
+        // against a byte-identical copy of this fixture.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/role_classification.json"
+        );
+        let text =
+            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read role fixture: {e}"));
+        let vectors: serde_json::Value = serde_json::from_str(&text).expect("parse role fixture");
+        for case in vectors["cases"].as_array().unwrap() {
+            let m: ControlMember =
+                serde_json::from_value(case.clone()).expect("deserialize member");
+            let got = if member_is_gpu(&m) {
+                "gpu"
+            } else if member_is_pump_or_cpu(&m) {
+                "cpu_or_pump"
+            } else {
+                "chassis"
+            };
+            let expected = case["role"].as_str().unwrap();
+            assert_eq!(got, expected, "role[{}]", case["name"]);
+        }
     }
 
     #[test]
