@@ -1,5 +1,34 @@
 # Changelog
 
+## [1.20.0] — 2026-06-17
+
+Daemon-enforced **role-aware minimum-PWM floor backstop** (DEC-162) — Phase 3 of the GUI→daemon
+control migration. Additive and backward-compatible: the pump/CPU floor is now independently validated
+and enforced by the daemon, but the behaviour is **dormant until the 2.0.0 cutover** (it is reached
+only via the profile CRUD/activate path the current GUI does not call, and the eval-time clamp only
+emits while the daemon engine is the writer). **No runtime behaviour change.** Pairs with
+`control-ofc-gui` ≥ v1.39.0.
+
+### Added
+- **Role-floor validation backstop** — `DaemonProfile::validate()` now rejects a profile whose control
+  has a pump/CPU member declaring `minimum_pct` below the 30 % hard pump floor, as a `FLOOR_TOO_LOW`
+  field violation (HTTP 400). The daemon classifies pump/CPU members **independently** (document-only:
+  a `cpu`/`pump`/`aio` label hint, or a known liquid-cooler chip embedded in the member id) rather than
+  trusting the GUI-stamped number — defense-in-depth for a safety-critical value.
+- **Eval-time floor clamp** — the profile engine independently raises a pump/CPU member to at least the
+  30 % floor on every tick regardless of the declared `minimum_pct`, generalising the existing DEC-119
+  per-member GPU flooring into one effective-floor rule. This protects a profile that reaches the
+  engine **un-validated** (loaded at boot via `resolve_initial_profile`, or hand-edited on disk), so a
+  too-low floor can never strand a pump.
+
+### Notes
+- Pump/CPU only; GPU members stay floored at 0 % (DEC-119 — PMFW owns the minimum); chassis fans keep
+  the GUI-baked advisory floor. The per-control `stop_pct` still takes precedence over the floor
+  (unchanged tuning-pipeline order), and the 105 °C thermal force still overrides everything.
+- No schema bump (still v7); no new endpoint — `FLOOR_TOO_LOW` is a new `reason` within the existing
+  `field_violations`. GUI↔daemon role classification is pinned byte-for-byte by a shared
+  `role_classification.json` test fixture.
+
 ## [1.19.0] — 2026-06-17
 
 Daemon-owned **profile storage + CRUD/validation API** — Phase 1 of the GUI→daemon control
