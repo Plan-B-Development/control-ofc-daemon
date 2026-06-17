@@ -1,7 +1,9 @@
 pub mod api;
 pub mod atomic_io;
+pub mod clock;
 pub mod config;
 pub mod constants;
+pub mod control_override;
 pub mod daemon_state;
 pub mod error;
 pub mod health;

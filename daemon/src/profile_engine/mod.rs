@@ -13,12 +13,13 @@ use std::sync::Arc;
 use backends::{GpuBackend, HwmonBackend, OpenFanBackend, SafetyWriteBackend, WriteBackend};
 
 use crate::constants;
+use crate::control_override::OverrideSnapshot;
 use crate::health::cache::StateCache;
 use crate::health::state::CachedSensorReading;
 use crate::hwmon::types::SensorKind;
 use crate::profile::{
-    evaluate_curve, member_is_gpu, member_is_pump_or_cpu, DaemonProfile, LogicalControl,
-    HARD_PUMP_CPU_FLOOR_PCT,
+    evaluate_curve, member_is_gpu, member_is_pump_or_cpu, ControlMember, DaemonProfile,
+    LogicalControl, HARD_PUMP_CPU_FLOOR_PCT,
 };
 
 /// A single PWM write command produced by the profile engine.
@@ -99,6 +100,22 @@ impl ProfileEngineState {
         self.last_transition_temp.clear();
         self.trigger_latch.clear();
         self.active_profile_id = None;
+    }
+
+    /// Drop all cross-tick state for a single control so its next evaluation
+    /// re-anchors fresh. Called when a manual override clears (release or
+    /// expiry) — the override paused this control's eval, so without a reset the
+    /// resumed curve would step-rate-clamp from the pinned value. Mirrors the
+    /// GUI's `clear_control_manual`, which drops the control's own state plus
+    /// its per-member step-rate keys (`{control_id}::m::{member_id}`).
+    pub fn reset_control(&mut self, control_id: &str) {
+        self.last_output.remove(control_id);
+        self.last_curve_output.remove(control_id);
+        self.last_transition_temp.remove(control_id);
+        self.trigger_latch.remove(control_id);
+        // Per-member step-rate trackers live only in `last_output`.
+        let prefix = format!("{control_id}::m::");
+        self.last_output.retain(|k, _| !k.starts_with(&prefix));
     }
 
     /// Clear last_output if the profile id changed since the previous call.
@@ -472,10 +489,44 @@ fn topo_visit(
 /// Returns a list of PWM commands for each fan member in the profile.
 /// The caller is responsible for executing the writes. `engine_state` holds
 /// per-control cross-cycle state required by the tuning pipeline.
+/// Per-member minimum-PWM floor (DEC-119 + DEC-162). GPU members carry no
+/// floor (PMFW enforces its own OD_RANGE minimum); a pump/CPU header is hard-
+/// floored to at least [`HARD_PUMP_CPU_FLOOR_PCT`] even when the control
+/// declares a lower `minimum_pct`; every other member uses the control-wide
+/// floor. Shared by the curve path and the override path so the safety floor
+/// is computed in exactly one place.
+fn member_effective_floor(control: &LogicalControl, member: &ControlMember) -> f64 {
+    if member_is_gpu(member) {
+        0.0
+    } else if member_is_pump_or_cpu(member) {
+        control.minimum_pct.max(HARD_PUMP_CPU_FLOOR_PCT)
+    } else {
+        control.minimum_pct
+    }
+}
+
 pub fn evaluate_profile(
     profile: &DaemonProfile,
     sensors: &HashMap<String, CachedSensorReading>,
     engine_state: &mut ProfileEngineState,
+) -> Vec<PwmCommand> {
+    evaluate_profile_with_overrides(profile, sensors, engine_state, &OverrideSnapshot::default())
+}
+
+/// Like [`evaluate_profile`] but with a transient override/identify overlay
+/// (DEC-163 / DEC-166). A control named in `overrides.controls` is pinned to its
+/// fixed PWM — curve + tuning skipped, only the per-member hard safety floor
+/// applied — and its cross-tick state is left untouched (the engine resets it
+/// when the override clears, via [`ProfileEngineState::reset_control`]). Any fan
+/// in `overrides.identify_stop` is forced to 0 after all other resolution,
+/// floor-exempt. With an empty snapshot this is byte-identical to the
+/// pre-override evaluator, so the 3-arg `evaluate_profile` (used by the parity
+/// oracle) is unperturbed.
+pub fn evaluate_profile_with_overrides(
+    profile: &DaemonProfile,
+    sensors: &HashMap<String, CachedSensorReading>,
+    engine_state: &mut ProfileEngineState,
+    overrides: &OverrideSnapshot,
 ) -> Vec<PwmCommand> {
     engine_state.sync_profile_id(&profile.id);
 
@@ -492,6 +543,34 @@ pub fn evaluate_profile(
     // keep their natural profile order.
     for idx in topological_control_order(profile) {
         let control = &profile.controls[idx];
+
+        // Transient manual override (DEC-163): pin this control's members to a
+        // fixed PWM, skipping curve evaluation AND the tuning pipeline — only
+        // the per-member hard safety floor still applies, so a stuck override
+        // can never strand a pump/CPU below its minimum. Mirrors the GUI's
+        // `_manual_controls` check at the top of `_evaluate_control`. Curve eval
+        // is paused, so this control's cross-tick state does not advance; the
+        // engine resets it when the override clears so the resumed curve
+        // re-anchors instead of step-rate-clamping from the pin.
+        if let Some(&override_pwm) = overrides.controls.get(&control.id) {
+            // Publish the raw override intent as this control's tick output so a
+            // Sync mirroring it sees the pinned value — matches the GUI, which
+            // sets control_outputs = manual_pct (member-less controls still
+            // publish for a downstream Sync).
+            tick_outputs.insert(control.id.clone(), f64::from(override_pwm));
+            for member in &control.members {
+                let gpu_fan_zero_rpm = member.source == "amd_gpu" && member.fan_zero_rpm;
+                let floor = member_effective_floor(control, member);
+                let member_pwm = f64::from(override_pwm).max(floor).round().clamp(0.0, 100.0) as u8;
+                commands.push(PwmCommand {
+                    member_id: member.member_id.clone(),
+                    source: member.source.clone(),
+                    pwm_percent: member_pwm,
+                    gpu_fan_zero_rpm,
+                });
+            }
+            continue;
+        }
 
         // Determine target output percentage. None → skip this control this tick
         // (manual mode always resolves; curve mode skips on missing curve /
@@ -566,13 +645,7 @@ pub fn evaluate_profile(
             // consistency guarantee); otherwise reuse the control-wide value so
             // the common path stays byte-identical and the parity oracle is
             // unperturbed. `!=` compares the same source value — no float hazard.
-            let effective_floor = if member_is_gpu(member) {
-                0.0
-            } else if member_is_pump_or_cpu(member) {
-                control.minimum_pct.max(HARD_PUMP_CPU_FLOOR_PCT)
-            } else {
-                control.minimum_pct
-            };
+            let effective_floor = member_effective_floor(control, member);
             let member_pwm = if effective_floor != control.minimum_pct {
                 let key = format!("{}::m::{}", control.id, member.member_id);
                 let prev_member = engine_state.last_output(&key);
@@ -589,6 +662,21 @@ pub fn evaluate_profile(
                 pwm_percent: member_pwm,
                 gpu_fan_zero_rpm,
             });
+        }
+    }
+
+    // Fan-identify (DEC-166): force identified fans to 0 AFTER curve/override
+    // resolution and FLOOR-EXEMPT — you must be able to stop a pump to find it.
+    // Subordinate only to the 105°C thermal force, which short-circuits the
+    // whole tick before this function is reached. Restore is the entry's
+    // removal: the member resumes its curve command next tick (no prior PWM
+    // remembered), and its per-member state stayed current (the control kept
+    // evaluating; only the final command was zeroed), so no reset is needed.
+    if !overrides.identify_stop.is_empty() {
+        for cmd in &mut commands {
+            if overrides.identify_stop.contains(&cmd.member_id) {
+                cmd.pwm_percent = 0;
+            }
         }
     }
 
@@ -669,8 +757,12 @@ fn evaluate_safety_tick(
 /// Run the profile engine loop as an async task.
 ///
 /// One tick per second: safety evaluation (forced overrides short-circuit
-/// the tick) → profile evaluation → one `apply` per write backend. All
-/// per-backend gating lives in [`backends`] (DEC-135).
+/// the tick) → override/identify sweep → profile evaluation (+ override
+/// overlay) → one `apply` per write backend. All per-backend gating lives in
+/// [`backends`] (DEC-135).
+// Wiring entrypoint: every argument is a distinct shared handle the loop owns
+// for its lifetime; bundling them into a struct would only add indirection.
+#[allow(clippy::too_many_arguments)]
 pub async fn profile_engine_loop(
     cache: Arc<StateCache>,
     profile: Arc<Mutex<Option<DaemonProfile>>>,
@@ -678,6 +770,7 @@ pub async fn profile_engine_loop(
     hwmon_controller: Option<Arc<Mutex<crate::hwmon::pwm_control::HwmonPwmController>>>,
     gpu_infos: Vec<crate::hwmon::gpu_detect::AmdGpuInfo>,
     safety: Arc<Mutex<crate::safety::ThermalSafetyRule>>,
+    override_table: Arc<Mutex<crate::control_override::OverrideTable>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let interval = std::time::Duration::from_secs(1);
@@ -767,6 +860,21 @@ pub async fn profile_engine_loop(
             continue;
         }
 
+        // Sweep expired override/identify entries on the daemon's own monotonic
+        // clock (never a client timestamp) and reset the cross-tick state of any
+        // control whose override just lapsed, so it re-anchors to its curve
+        // instead of step-rate-clamping from the pin. Then snapshot the live
+        // overlay to apply this tick. (While the GUI is the active writer this
+        // overlay is computed but not written — the backends defer on
+        // `gui_active`; it takes effect once the engine is primary.)
+        let override_snapshot = {
+            let mut table = override_table.lock();
+            for control_id in table.sweep().controls {
+                engine_state.reset_control(&control_id);
+            }
+            table.snapshot()
+        };
+
         // Get active profile — scope guard strictly to avoid !Send across .await
         let commands = {
             let profile_guard = profile.lock();
@@ -776,7 +884,12 @@ pub async fn profile_engine_loop(
                 engine_state.deactivate();
                 continue;
             };
-            evaluate_profile(active_profile, &sensors, &mut engine_state)
+            evaluate_profile_with_overrides(
+                active_profile,
+                &sensors,
+                &mut engine_state,
+                &override_snapshot,
+            )
         };
 
         // Apply per backend (DEC-135). Each backend owns its own gating and
@@ -2212,6 +2325,7 @@ mod tests {
             None,   // no hwmon
             vec![], // no GPU
             safety,
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
             shutdown_rx,
         ));
 
@@ -2259,6 +2373,7 @@ mod tests {
             None,
             vec![],
             safety,
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
             shutdown_rx,
         ));
 
@@ -2433,6 +2548,7 @@ mod tests {
             None,
             vec![],
             safety,
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
             shutdown_rx,
         ));
 
@@ -2503,6 +2619,7 @@ mod tests {
             None, // no hwmon
             vec![gpu],
             safety,
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
             shutdown_rx,
         ));
 
@@ -2542,6 +2659,7 @@ mod tests {
             None,
             vec![gpu],
             safety,
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
             shutdown_rx,
         ));
 
@@ -2622,6 +2740,7 @@ mod tests {
             None,
             vec![],
             safety,
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
             shutdown_rx,
         ));
 
@@ -2783,6 +2902,7 @@ mod tests {
             None,
             vec![],
             safety,
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
             shutdown_rx,
         ));
 
@@ -2796,5 +2916,268 @@ mod tests {
             result.is_ok(),
             "profile engine loop did not exit on shutdown"
         );
+    }
+
+    // ── DEC-163 manual override + DEC-166 fan identify ──────────────────
+
+    fn override_snapshot(control_id: &str, pwm: u8) -> OverrideSnapshot {
+        let mut controls = HashMap::new();
+        controls.insert(control_id.to_string(), pwm);
+        OverrideSnapshot {
+            controls,
+            identify_stop: HashSet::new(),
+        }
+    }
+
+    fn identify_snapshot(fan_id: &str) -> OverrideSnapshot {
+        let mut identify_stop = HashSet::new();
+        identify_stop.insert(fan_id.to_string());
+        OverrideSnapshot {
+            controls: HashMap::new(),
+            identify_stop,
+        }
+    }
+
+    #[test]
+    fn empty_overlay_matches_plain_evaluate_profile() {
+        // Parity guard: the override-aware path with an empty snapshot must be
+        // byte-identical to the 3-arg evaluator the parity oracle uses.
+        let profile = make_profile("curve", "graph", 50.0);
+        let sensors = make_cache_with_sensor("cpu", 55.0).sensors_snapshot();
+        let mut s1 = ProfileEngineState::new();
+        let mut s2 = ProfileEngineState::new();
+        let plain = evaluate_profile(&profile, &sensors, &mut s1);
+        let overlaid = evaluate_profile_with_overrides(
+            &profile,
+            &sensors,
+            &mut s2,
+            &OverrideSnapshot::default(),
+        );
+        assert_eq!(plain.len(), overlaid.len());
+        for (a, b) in plain.iter().zip(&overlaid) {
+            assert_eq!(a.member_id, b.member_id);
+            assert_eq!(a.pwm_percent, b.pwm_percent);
+        }
+    }
+
+    #[test]
+    fn override_pins_pwm_skipping_curve() {
+        let profile = make_profile("curve", "graph", 50.0);
+        let sensors = make_cache_with_sensor("cpu", 55.0).sensors_snapshot();
+
+        // Curve at 55°C on (30→20, 80→100) = 60%.
+        let mut state = ProfileEngineState::new();
+        assert_eq!(
+            evaluate_profile(&profile, &sensors, &mut state)[0].pwm_percent,
+            60
+        );
+
+        // Override pins 85%, ignoring the curve.
+        let mut state = ProfileEngineState::new();
+        let cmds = evaluate_profile_with_overrides(
+            &profile,
+            &sensors,
+            &mut state,
+            &override_snapshot("ctrl1", 85),
+        );
+        assert_eq!(cmds[0].pwm_percent, 85);
+        // Curve eval was skipped → no cross-tick state advanced for the control.
+        assert_eq!(state.last_output("ctrl1"), None);
+    }
+
+    #[test]
+    fn override_respects_hard_pump_floor() {
+        // A pump member overridden to 0% is clamped up to the hard 30% floor — a
+        // stuck/fat-fingered override can never strand a pump (DEC-162).
+        let mut profile = make_profile("curve", "graph", 50.0);
+        profile.controls[0].members = vec![ControlMember {
+            source: "hwmon".into(),
+            member_id: "hwmon:nct6775:pwm1".into(),
+            member_label: "Pump".into(),
+            fan_zero_rpm: false,
+        }];
+        profile.controls[0].minimum_pct = 0.0;
+        let sensors = make_cache_with_sensor("cpu", 55.0).sensors_snapshot();
+
+        let mut state = ProfileEngineState::new();
+        let cmds = evaluate_profile_with_overrides(
+            &profile,
+            &sensors,
+            &mut state,
+            &override_snapshot("ctrl1", 0),
+        );
+        assert_eq!(cmds[0].pwm_percent, 30, "pump override floored to 30%");
+
+        // Above the floor the override value passes through unchanged.
+        let mut state = ProfileEngineState::new();
+        let cmds = evaluate_profile_with_overrides(
+            &profile,
+            &sensors,
+            &mut state,
+            &override_snapshot("ctrl1", 70),
+        );
+        assert_eq!(cmds[0].pwm_percent, 70);
+    }
+
+    #[test]
+    fn override_gpu_member_floors_at_zero() {
+        // A GPU member carries no daemon floor even when the control floor is
+        // 30%, so an override may idle it to 0% (PMFW owns the minimum, DEC-119).
+        let mut profile = make_profile("curve", "graph", 50.0);
+        profile.controls[0].members = vec![ControlMember {
+            source: "amd_gpu".into(),
+            member_id: "amd_gpu:card0".into(),
+            member_label: "".into(),
+            fan_zero_rpm: false,
+        }];
+        profile.controls[0].minimum_pct = 30.0;
+        let sensors = make_cache_with_sensor("cpu", 55.0).sensors_snapshot();
+
+        let mut state = ProfileEngineState::new();
+        let cmds = evaluate_profile_with_overrides(
+            &profile,
+            &sensors,
+            &mut state,
+            &override_snapshot("ctrl1", 0),
+        );
+        assert_eq!(cmds[0].pwm_percent, 0);
+    }
+
+    #[test]
+    fn reset_control_reverts_to_fresh_curve() {
+        // Warm the step-rate anchor to 100%, then prove reset_control drops it so
+        // the resumed curve re-anchors fresh instead of step-rate-clamping from
+        // the pin (mirrors the GUI's clear_control_manual).
+        let mut profile = make_profile("curve", "graph", 50.0);
+        profile.controls[0].step_down_pct = 10.0; // slow ramp-down
+        let hot = make_cache_with_sensor("cpu", 80.0).sensors_snapshot(); // curve = 100
+        let cold = make_cache_with_sensor("cpu", 30.0).sensors_snapshot(); // curve = 20
+
+        let mut state = ProfileEngineState::new();
+        assert_eq!(
+            evaluate_profile(&profile, &hot, &mut state)[0].pwm_percent,
+            100
+        );
+
+        // Contrast: without a reset, dropping to 30°C step-limits 100 → 90.
+        let mut stepped = ProfileEngineState::new();
+        evaluate_profile(&profile, &hot, &mut stepped);
+        assert_eq!(
+            evaluate_profile(&profile, &cold, &mut stepped)[0].pwm_percent,
+            90
+        );
+
+        // With reset, the cold curve value (20%) is produced directly.
+        state.reset_control("ctrl1");
+        assert_eq!(
+            evaluate_profile(&profile, &cold, &mut state)[0].pwm_percent,
+            20
+        );
+    }
+
+    #[test]
+    fn identify_stop_forces_fan_to_zero_floor_exempt() {
+        // identify-stop zeroes a pump fan despite its 30% floor — you must be
+        // able to stop a pump to physically find it (DEC-166).
+        let mut profile = make_profile("curve", "graph", 50.0);
+        profile.controls[0].members = vec![ControlMember {
+            source: "hwmon".into(),
+            member_id: "hwmon:nct6775:pwm1".into(),
+            member_label: "Pump".into(),
+            fan_zero_rpm: false,
+        }];
+        let sensors = make_cache_with_sensor("cpu", 55.0).sensors_snapshot();
+        let mut state = ProfileEngineState::new();
+        let cmds = evaluate_profile_with_overrides(
+            &profile,
+            &sensors,
+            &mut state,
+            &identify_snapshot("hwmon:nct6775:pwm1"),
+        );
+        assert_eq!(cmds[0].pwm_percent, 0);
+    }
+
+    #[test]
+    fn identify_stop_only_affects_the_named_fan() {
+        let mut profile = make_profile("curve", "graph", 50.0);
+        profile.controls[0].members = vec![
+            ControlMember {
+                source: "openfan".into(),
+                member_id: "openfan:ch00".into(),
+                member_label: "".into(),
+                fan_zero_rpm: false,
+            },
+            ControlMember {
+                source: "openfan".into(),
+                member_id: "openfan:ch01".into(),
+                member_label: "".into(),
+                fan_zero_rpm: false,
+            },
+        ];
+        let sensors = make_cache_with_sensor("cpu", 55.0).sensors_snapshot();
+        let mut state = ProfileEngineState::new();
+        let cmds = evaluate_profile_with_overrides(
+            &profile,
+            &sensors,
+            &mut state,
+            &identify_snapshot("openfan:ch00"),
+        );
+        let by_id = |id: &str| cmds.iter().find(|c| c.member_id == id).unwrap().pwm_percent;
+        assert_eq!(by_id("openfan:ch00"), 0, "identified fan stopped");
+        assert_eq!(by_id("openfan:ch01"), 60, "other fan keeps its curve value");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn safety_force_supersedes_active_override() {
+        // 106°C forces every channel to 100% even with an override pinning 30% —
+        // the safety tick short-circuits before the override overlay is applied.
+        let cache = make_cache_with_sensor("cpu", 106.0);
+        let profile_arc = Arc::new(Mutex::new(Some(make_profile("curve", "graph", 50.0))));
+        let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
+
+        let overrides = Arc::new(Mutex::new(crate::control_override::OverrideTable::new()));
+        overrides
+            .lock()
+            .take_override("ctrl1", 30, std::time::Duration::from_secs(15));
+
+        let (transport, written) = LoopTestTransport::new(10);
+        let fan_ctrl = crate::serial::controller::FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            std::time::Duration::from_millis(500),
+        );
+        let fan_ctrl = Some(Arc::new(Mutex::new(fan_ctrl)));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(profile_engine_loop(
+            cache,
+            profile_arc,
+            fan_ctrl,
+            None,
+            vec![],
+            safety,
+            overrides,
+            shutdown_rx,
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        shutdown_tx.send(true).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let _ = handle.await;
+
+        let cmds = written.lock();
+        let set_pwm_cmds: Vec<_> = cmds.iter().filter(|c| c.starts_with(">02")).collect();
+        assert_eq!(
+            set_pwm_cmds.len(),
+            10,
+            "forced all channels, got {set_pwm_cmds:?}"
+        );
+        for cmd in &set_pwm_cmds {
+            let hex_value = &cmd[cmd.len() - 3..cmd.len() - 1];
+            assert_eq!(
+                hex_value, "FF",
+                "expected forced 100% (FF), not the 30% override: {cmd:?}"
+            );
+        }
     }
 }

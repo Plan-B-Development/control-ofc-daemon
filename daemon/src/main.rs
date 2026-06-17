@@ -725,6 +725,9 @@ async fn main() {
         runtime_config_path: runtime_config_path.clone(),
         sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        override_table: Arc::new(parking_lot::Mutex::new(
+            control_ofc_daemon::control_override::OverrideTable::new(),
+        )),
     });
 
     // Silence "assigned but not read" — runtime_cfg is consumed by the
@@ -815,6 +818,7 @@ async fn main() {
         let engine_fc = app_state.fan_controller.clone();
         let engine_hwmon = app_state.hwmon_controller.clone();
         let engine_gpus = app_state.amd_gpus.clone();
+        let engine_overrides = app_state.override_table.clone();
         let engine_shutdown = poll_shutdown_rx;
 
         tokio::spawn(async move {
@@ -825,6 +829,7 @@ async fn main() {
                 engine_hwmon,
                 engine_gpus,
                 engine_safety,
+                engine_overrides,
                 engine_shutdown,
             )
             .await;

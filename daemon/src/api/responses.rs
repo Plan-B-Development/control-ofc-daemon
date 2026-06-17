@@ -30,6 +30,30 @@ pub struct StatusResponse {
     /// down while the daemon is forcing safety PWM (DEC-132). Additive field —
     /// API_VERSION unchanged.
     pub thermal_state: String,
+    /// Active manual overrides (DEC-163), each with remaining TTL. Omitted when
+    /// none are active so the common-case `/status` wire shape is unchanged
+    /// (additive). Poll-authoritative surface for the GUI's override UI.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub overrides: Vec<OverrideStatusEntry>,
+    /// Active fan-identify holds (DEC-166), each with remaining deadman TTL.
+    /// Omitted when none are active.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub fan_identify: Vec<IdentifyStatusEntry>,
+}
+
+/// One active manual override on the `/status` poll surface (DEC-163).
+#[derive(Debug, Clone, Serialize)]
+pub struct OverrideStatusEntry {
+    pub control_id: String,
+    pub pwm_percent: u8,
+    pub expires_in_secs: u64,
+}
+
+/// One active fan-identify hold on the `/status` poll surface (DEC-166).
+#[derive(Debug, Clone, Serialize)]
+pub struct IdentifyStatusEntry {
+    pub fan_id: String,
+    pub expires_in_secs: u64,
 }
 
 /// Per-subsystem health status.
@@ -951,6 +975,77 @@ pub struct GpuVerifyState {
     pub zero_rpm_enabled: Option<bool>,
 }
 
+/// Body of `POST /control/{id}/override` (DEC-163). `ttl_secs` is an optional
+/// per-grant deadman, clamped server-side to `[1, OVERRIDE_TTL_SECS]` so a
+/// client cannot request a long single TTL that would defeat the deadman — it
+/// extends an override by renewing, not by a long initial grant.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OverrideTakeRequest {
+    pub pwm_percent: u8,
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
+}
+
+/// Body of `POST /control/{id}/override/renew` and `DELETE /control/{id}/override`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OverrideTokenRequest {
+    pub override_token: u64,
+}
+
+/// Body of `POST /fans/{fan_id}/identify` (DEC-166). `action` is `"stop"` or
+/// `"restore"`; `ttl_secs` (stop only) is the deadman, clamped as above.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IdentifyRequest {
+    pub action: String,
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
+}
+
+/// Response to `POST /control/{id}/override` — a fresh grant. `override_token`
+/// is the monotonic identity+fence the caller presents on renew/release
+/// (DEC-163). `renew_secs` is the advisory interval at which the GUI should
+/// renew (~⅓ TTL).
+#[derive(Debug, Clone, Serialize)]
+pub struct OverrideGrantResponse {
+    pub api_version: u32,
+    pub control_id: String,
+    pub override_token: u64,
+    pub pwm_percent: u8,
+    pub ttl_secs: u64,
+    pub renew_secs: u64,
+    pub expires_in_secs: u64,
+}
+
+/// Response to `POST /control/{id}/override/renew` — extended TTL.
+#[derive(Debug, Clone, Serialize)]
+pub struct OverrideRenewResponse {
+    pub api_version: u32,
+    pub control_id: String,
+    pub override_token: u64,
+    pub ttl_secs: u64,
+    pub expires_in_secs: u64,
+}
+
+/// Response to `DELETE /control/{id}/override` — reverted to curve control.
+/// `released` is `false` when nothing live was held (idempotent no-op).
+#[derive(Debug, Clone, Serialize)]
+pub struct OverrideReleaseResponse {
+    pub api_version: u32,
+    pub control_id: String,
+    pub released: bool,
+}
+
+/// Response to `POST /fans/{fan_id}/identify` (DEC-166). `expires_in_secs` is
+/// present only for `action: "stop"` (the deadman); `"restore"` omits it.
+#[derive(Debug, Clone, Serialize)]
+pub struct IdentifyResponse {
+    pub api_version: u32,
+    pub fan_id: String,
+    pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_in_secs: Option<u64>,
+}
+
 /// Standard error envelope for all error responses.
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorEnvelope {
@@ -1027,6 +1122,36 @@ impl ErrorEnvelope {
         Self {
             error: ErrorBody {
                 code: "lease_required".into(),
+                message: message.into(),
+                details: None,
+                retryable: false,
+                source: "validation".into(),
+            },
+        }
+    }
+
+    /// A renew/release presented a stale or superseded override token — a
+    /// thawed/resumed GUI cannot re-pin fans it no longer owns (Kleppmann
+    /// fencing, DEC-163). HTTP 409 Conflict, `retryable: false`.
+    pub fn stale_fencing_token(message: impl Into<String>) -> Self {
+        Self {
+            error: ErrorBody {
+                code: "stale_fencing_token".into(),
+                message: message.into(),
+                details: None,
+                retryable: false,
+                source: "validation".into(),
+            },
+        }
+    }
+
+    /// A renew/release targeted an override that has expired (its deadman fired)
+    /// or was never taken — the caller should re-take, not renew (DEC-163).
+    /// HTTP 404 Not Found, `retryable: false`.
+    pub fn override_expired(message: impl Into<String>) -> Self {
+        Self {
+            error: ErrorBody {
+                code: "override_expired".into(),
                 message: message.into(),
                 details: None,
                 retryable: false,
@@ -1178,6 +1303,8 @@ mod tests {
             uptime_seconds: Some(3600),
             gui_last_seen_seconds_ago: None,
             thermal_state: "normal".into(),
+            overrides: Vec::new(),
+            fan_identify: Vec::new(),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["api_version"], 1);
@@ -1188,6 +1315,9 @@ mod tests {
         assert!(json["counters"].get("last_error_summary").is_none());
         // DEC-132: thermal_state is always serialized (additive field).
         assert_eq!(json["thermal_state"], "normal");
+        // DEC-163/166: override + identify arrays omitted when empty (additive).
+        assert!(json.get("overrides").is_none());
+        assert!(json.get("fan_identify").is_none());
     }
 
     #[test]

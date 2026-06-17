@@ -99,6 +99,22 @@ pub const GUI_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
 /// See DEC-096.
 pub const HYSTERESIS_DEADBAND_C: f64 = 2.0;
 
+// ── Manual override + fan-identify deadman (DEC-163 / DEC-166) ────────
+
+/// Time-to-live for a daemon-owned manual override before it reverts to
+/// autonomous curve control. Judged on the daemon's monotonic clock — never a
+/// client timestamp — so a frozen/crashed/slept GUI cannot strand fans. The
+/// GUI renews well inside this window (see `OVERRIDE_RENEW_SECS`); the 105°C
+/// thermal force backstops regardless. K8s-leader-election-aligned (15 s
+/// lease, renewed well within it). No absolute max-duration cap: a live
+/// renewing GUI proves the user is present, so deliberate long sessions are
+/// not force-reverted.
+pub const OVERRIDE_TTL_SECS: u64 = 15;
+
+/// Advisory renewal interval surfaced to the GUI: renew at ~⅓ TTL so ~3
+/// attempts land before expiry, robust against transient Qt event-loop stalls.
+pub const OVERRIDE_RENEW_SECS: u64 = 5;
+
 // ── Profile engine — no-sensor safety ────────────────────────────────
 
 /// If no CPU temperature sensor is found for this many consecutive
@@ -130,6 +146,10 @@ pub const CALIBRATION_MAX_TEMP_C: f64 = 85.0;
 // constant to an unsafe value.
 const _: () = assert!(CALIBRATION_MAX_TEMP_C < 105.0);
 const _: () = assert!(NO_SENSOR_SAFE_PCT > 0);
+// The renew interval must leave room for ~3 attempts inside the TTL, and the
+// TTL must be non-trivial — a too-tight window would drop legitimate overrides.
+const _: () = assert!(OVERRIDE_RENEW_SECS > 0);
+const _: () = assert!(OVERRIDE_RENEW_SECS * 3 <= OVERRIDE_TTL_SECS);
 const _: () = assert!(SSE_MAX_CLIENTS > 0);
 const _: () = assert!(GPU_COALESCE_DELTA_PCT > 0);
 // Slow-spinning fans/pumps and GPU tachometers need a multi-second settle

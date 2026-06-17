@@ -83,6 +83,20 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/diagnostics/hardware",
             get(handlers::hardware_diagnostics_handler),
         )
+        // Manual override + fan identify (DEC-163 / DEC-166). axum 0.8 needs
+        // method-chaining on a single route per path (duplicate paths panic).
+        .route(
+            "/control/{control_id}/override",
+            post(handlers::override_take_handler).delete(handlers::override_release_handler),
+        )
+        .route(
+            "/control/{control_id}/override/renew",
+            post(handlers::override_renew_handler),
+        )
+        .route(
+            "/fans/{fan_id}/identify",
+            post(handlers::fan_identify_handler),
+        )
         // Profile management
         .route("/profile/active", get(handlers::active_profile_handler))
         .route(

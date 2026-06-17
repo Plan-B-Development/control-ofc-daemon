@@ -4,6 +4,7 @@
 //! Write handlers dispatch through the `FanController`.
 
 mod config;
+mod control;
 mod gpu;
 mod hw_diagnostics;
 mod hwmon_ctl;
@@ -12,6 +13,7 @@ mod profile;
 mod status;
 
 pub use config::*;
+pub use control::*;
 pub use gpu::*;
 pub use hw_diagnostics::*;
 pub use hwmon_ctl::*;
@@ -166,6 +168,10 @@ pub struct AppState {
     /// its cached descriptor set (labels, types, DEC-117 threshold snapshot)
     /// on its next tick. Swap-checked (and cleared) by the loop (DEC-133).
     pub sensor_rescan_requested: Arc<AtomicBool>,
+    /// Daemon-owned manual-override + fan-identify state (DEC-163 / DEC-166).
+    /// Mutated by the `/control/*/override` + `/fans/*/identify` handlers and
+    /// swept + applied by the profile engine tick (both hold this same `Arc`).
+    pub override_table: Arc<Mutex<crate::control_override::OverrideTable>>,
 }
 
 pub(crate) fn build_status_response(
@@ -190,6 +196,24 @@ pub(crate) fn build_status_response(
         .last_gui_write_at
         .map(|t| now.duration_since(t).as_secs());
 
+    // Daemon-owned override + identify state (DEC-163/DEC-166) — poll surface.
+    let (override_rows, identify_rows) = state.override_table.lock().status_rows();
+    let overrides = override_rows
+        .into_iter()
+        .map(|r| OverrideStatusEntry {
+            control_id: r.control_id,
+            pwm_percent: r.pwm_percent,
+            expires_in_secs: r.expires_in_secs,
+        })
+        .collect();
+    let fan_identify = identify_rows
+        .into_iter()
+        .map(|r| IdentifyStatusEntry {
+            fan_id: r.fan_id,
+            expires_in_secs: r.expires_in_secs,
+        })
+        .collect();
+
     StatusResponse {
         api_version: API_VERSION,
         daemon_version: state.daemon_version.clone(),
@@ -206,6 +230,8 @@ pub(crate) fn build_status_response(
             .thermal_override_state
             .clone()
             .unwrap_or_else(|| "normal".to_string()),
+        overrides,
+        fan_identify,
     }
 }
 

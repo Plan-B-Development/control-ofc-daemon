@@ -80,6 +80,9 @@ fn test_app_state() -> Arc<AppState> {
         runtime_config_path: std::path::PathBuf::new(),
         sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        override_table: Arc::new(parking_lot::Mutex::new(
+            control_ofc_daemon::control_override::OverrideTable::new(),
+        )),
     })
 }
 
@@ -302,6 +305,9 @@ async fn fans_endpoint_tags_intel_gpu_source_by_id_prefix() {
         runtime_config_path: std::path::PathBuf::new(),
         sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        override_table: Arc::new(parking_lot::Mutex::new(
+            control_ofc_daemon::control_override::OverrideTable::new(),
+        )),
     });
     let (path, shutdown, _dir) = start_test_server(state).await;
 
@@ -479,6 +485,9 @@ fn test_app_state_with_controller(response_count: usize) -> Arc<AppState> {
         runtime_config_path: std::path::PathBuf::new(),
         sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        override_table: Arc::new(parking_lot::Mutex::new(
+            control_ofc_daemon::control_override::OverrideTable::new(),
+        )),
     })
 }
 
@@ -647,6 +656,9 @@ fn test_app_state_with_hwmon() -> Arc<AppState> {
         runtime_config_path: std::path::PathBuf::new(),
         sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        override_table: Arc::new(parking_lot::Mutex::new(
+            control_ofc_daemon::control_override::OverrideTable::new(),
+        )),
     })
 }
 
@@ -1018,6 +1030,9 @@ fn test_app_state_with_unsupported_gpu(pci_bdf: &str) -> Arc<AppState> {
         runtime_config_path: std::path::PathBuf::new(),
         sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        override_table: Arc::new(parking_lot::Mutex::new(
+            control_ofc_daemon::control_override::OverrideTable::new(),
+        )),
     })
 }
 
@@ -1143,6 +1158,9 @@ fn test_app_state_with_read_only_gpu(pci_bdf: &str, pci_device_id: u16) -> Arc<A
         runtime_config_path: std::path::PathBuf::new(),
         sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        override_table: Arc::new(parking_lot::Mutex::new(
+            control_ofc_daemon::control_override::OverrideTable::new(),
+        )),
     })
 }
 
@@ -1405,6 +1423,9 @@ fn test_app_state_with_writable_pmfw_gpu(pci_bdf: &str) -> (Arc<AppState>, tempf
         runtime_config_path: std::path::PathBuf::new(),
         sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        override_table: Arc::new(parking_lot::Mutex::new(
+            control_ofc_daemon::control_override::OverrideTable::new(),
+        )),
     });
     (state, tmp)
 }
@@ -1551,6 +1572,9 @@ fn test_app_state_with_read_only_hwmon_header() -> Arc<AppState> {
         runtime_config_path: std::path::PathBuf::new(),
         sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        override_table: Arc::new(parking_lot::Mutex::new(
+            control_ofc_daemon::control_override::OverrideTable::new(),
+        )),
     })
 }
 
@@ -1682,6 +1706,9 @@ async fn hwmon_discovery_excludes_amdgpu_end_to_end_via_ipc() {
         runtime_config_path: std::path::PathBuf::new(),
         sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        override_table: Arc::new(parking_lot::Mutex::new(
+            control_ofc_daemon::control_override::OverrideTable::new(),
+        )),
     });
     let (path, shutdown, _dir) = start_test_server(state).await;
 
@@ -1764,6 +1791,9 @@ fn test_app_state_with_profile_dirs(dirs: Vec<std::path::PathBuf>) -> Arc<AppSta
         runtime_config_path: std::path::PathBuf::new(),
         sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        override_table: Arc::new(parking_lot::Mutex::new(
+            control_ofc_daemon::control_override::OverrideTable::new(),
+        )),
     })
 }
 
@@ -2133,4 +2163,222 @@ async fn capabilities_advertises_profile_storage() {
     assert_eq!(st, 200);
     assert_eq!(body["control"]["profile_storage"], true);
     assert_eq!(body["control"]["curve_evaluation"], true);
+    // DEC-163 / DEC-166: the override + identify APIs land in 1.21.0.
+    assert_eq!(body["control"]["manual_override"], true);
+    assert_eq!(body["control"]["fan_identify"], true);
+}
+
+// ── Manual override + fan identify API (DEC-163 / DEC-166) ──────────────
+
+/// `test_app_state()` plus an active profile carrying one (member-less) control,
+/// which is all the override take-path needs to validate the control id.
+fn app_state_with_control(control_id: &str) -> Arc<AppState> {
+    let state = test_app_state();
+    {
+        let mut guard = state.active_profile.lock();
+        *guard = Some(control_ofc_daemon::profile::DaemonProfile {
+            id: "p".into(),
+            name: "P".into(),
+            version: 7,
+            description: String::new(),
+            controls: vec![control_ofc_daemon::profile::LogicalControl {
+                id: control_id.into(),
+                name: control_id.into(),
+                mode: "curve".into(),
+                curve_id: "c".into(),
+                manual_output_pct: 0.0,
+                members: Vec::new(),
+                step_up_pct: 100.0,
+                step_down_pct: 100.0,
+                offset_pct: 0.0,
+                minimum_pct: 0.0,
+                start_pct: 0.0,
+                stop_pct: 0.0,
+            }],
+            curves: Vec::new(),
+        });
+    }
+    state
+}
+
+#[tokio::test]
+async fn override_take_renew_release_roundtrip() {
+    let (sock, _tx, _d) = start_test_server(app_state_with_control("ctrl1")).await;
+
+    // Take
+    let (st, body) = uds_post(
+        &sock,
+        "/control/ctrl1/override",
+        &serde_json::json!({"pwm_percent": 80}),
+    )
+    .await;
+    assert_eq!(st, 200, "take: {body}");
+    assert_eq!(body["pwm_percent"], 80);
+    assert_eq!(body["ttl_secs"], 15);
+    assert_eq!(body["renew_secs"], 5);
+    let token = body["override_token"].as_u64().unwrap();
+
+    // /status surfaces it (poll-authoritative).
+    let (_st, status) = uds_get(&sock, "/status").await;
+    assert_eq!(status["overrides"][0]["control_id"], "ctrl1");
+    assert_eq!(status["overrides"][0]["pwm_percent"], 80);
+
+    // Renew with the current token extends the deadman.
+    let (st, body) = uds_post(
+        &sock,
+        "/control/ctrl1/override/renew",
+        &serde_json::json!({"override_token": token}),
+    )
+    .await;
+    assert_eq!(st, 200, "renew: {body}");
+    assert_eq!(body["override_token"], token);
+
+    // Release reverts to curve immediately.
+    let (st, body) = uds_send(
+        &sock,
+        "DELETE",
+        "/control/ctrl1/override",
+        Some(&serde_json::json!({"override_token": token})),
+    )
+    .await;
+    assert_eq!(st, 200, "release: {body}");
+    assert_eq!(body["released"], true);
+
+    // Gone from /status (omitted when empty).
+    let (_st, status) = uds_get(&sock, "/status").await;
+    assert!(status.get("overrides").is_none());
+}
+
+#[tokio::test]
+async fn override_stale_token_rejected_with_409() {
+    let (sock, _tx, _d) = start_test_server(app_state_with_control("ctrl1")).await;
+    let (_s, b1) = uds_post(
+        &sock,
+        "/control/ctrl1/override",
+        &serde_json::json!({"pwm_percent": 50}),
+    )
+    .await;
+    let stale = b1["override_token"].as_u64().unwrap();
+    // A second take supersedes the first token.
+    let _ = uds_post(
+        &sock,
+        "/control/ctrl1/override",
+        &serde_json::json!({"pwm_percent": 60}),
+    )
+    .await;
+
+    let (st, body) = uds_post(
+        &sock,
+        "/control/ctrl1/override/renew",
+        &serde_json::json!({"override_token": stale}),
+    )
+    .await;
+    assert_eq!(st, 409, "stale renew must be rejected: {body}");
+    assert_eq!(body["error"]["code"], "stale_fencing_token");
+
+    let (st, body) = uds_send(
+        &sock,
+        "DELETE",
+        "/control/ctrl1/override",
+        Some(&serde_json::json!({"override_token": stale})),
+    )
+    .await;
+    assert_eq!(st, 409, "stale release must be rejected: {body}");
+    assert_eq!(body["error"]["code"], "stale_fencing_token");
+}
+
+#[tokio::test]
+async fn override_unknown_control_is_404() {
+    let (sock, _tx, _d) = start_test_server(app_state_with_control("ctrl1")).await;
+    let (st, body) = uds_post(
+        &sock,
+        "/control/nope/override",
+        &serde_json::json!({"pwm_percent": 50}),
+    )
+    .await;
+    assert_eq!(st, 404, "{body}");
+    assert_eq!(body["error"]["code"], "validation_error");
+}
+
+#[tokio::test]
+async fn override_pwm_out_of_range_is_400() {
+    let (sock, _tx, _d) = start_test_server(app_state_with_control("ctrl1")).await;
+    let (st, body) = uds_post(
+        &sock,
+        "/control/ctrl1/override",
+        &serde_json::json!({"pwm_percent": 150}),
+    )
+    .await;
+    assert_eq!(st, 400, "{body}");
+    assert_eq!(body["error"]["code"], "validation_error");
+}
+
+#[tokio::test]
+async fn override_renew_unknown_control_is_404() {
+    let (sock, _tx, _d) = start_test_server(app_state_with_control("ctrl1")).await;
+    let (st, body) = uds_post(
+        &sock,
+        "/control/ctrl1/override/renew",
+        &serde_json::json!({"override_token": 999}),
+    )
+    .await;
+    assert_eq!(st, 404, "{body}");
+    assert_eq!(body["error"]["code"], "override_expired");
+}
+
+#[tokio::test]
+async fn fan_identify_stop_then_restore() {
+    let (sock, _tx, _d) = start_test_server(test_app_state()).await;
+
+    // Stop a known fan (openfan:ch00 is populated by test_app_state).
+    let (st, body) = uds_post(
+        &sock,
+        "/fans/openfan:ch00/identify",
+        &serde_json::json!({"action": "stop"}),
+    )
+    .await;
+    assert_eq!(st, 200, "stop: {body}");
+    assert_eq!(body["action"], "stop");
+    assert!(body["expires_in_secs"].as_u64().unwrap() <= 15);
+
+    let (_st, status) = uds_get(&sock, "/status").await;
+    assert_eq!(status["fan_identify"][0]["fan_id"], "openfan:ch00");
+
+    // Restore.
+    let (st, body) = uds_post(
+        &sock,
+        "/fans/openfan:ch00/identify",
+        &serde_json::json!({"action": "restore"}),
+    )
+    .await;
+    assert_eq!(st, 200, "restore: {body}");
+    assert_eq!(body["action"], "restore");
+
+    let (_st, status) = uds_get(&sock, "/status").await;
+    assert!(status.get("fan_identify").is_none());
+}
+
+#[tokio::test]
+async fn fan_identify_unknown_fan_is_404() {
+    let (sock, _tx, _d) = start_test_server(test_app_state()).await;
+    let (st, body) = uds_post(
+        &sock,
+        "/fans/nope:fan/identify",
+        &serde_json::json!({"action": "stop"}),
+    )
+    .await;
+    assert_eq!(st, 404, "{body}");
+}
+
+#[tokio::test]
+async fn fan_identify_bad_action_is_400() {
+    let (sock, _tx, _d) = start_test_server(test_app_state()).await;
+    let (st, body) = uds_post(
+        &sock,
+        "/fans/openfan:ch00/identify",
+        &serde_json::json!({"action": "wiggle"}),
+    )
+    .await;
+    assert_eq!(st, 400, "{body}");
+    assert_eq!(body["error"]["code"], "validation_error");
 }

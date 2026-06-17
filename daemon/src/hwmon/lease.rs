@@ -9,21 +9,11 @@ use std::time::{Duration, Instant};
 /// Default lease TTL (60 seconds).
 const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(60);
 
-/// Monotonic clock source, injectable so lease-expiry tests can advance time
-/// deterministically instead of sleeping (audit P2-F). Production uses
-/// `SystemClock` (real `Instant::now()`); only tests inject a fake clock.
-pub trait Clock: Send + Sync {
-    fn now(&self) -> Instant;
-}
-
-/// Real monotonic clock — the production default.
-pub struct SystemClock;
-
-impl Clock for SystemClock {
-    fn now(&self) -> Instant {
-        Instant::now()
-    }
-}
+// Monotonic clock seam, injectable so lease-expiry tests can advance time
+// deterministically instead of sleeping (audit P2-F). Promoted to the shared
+// `crate::clock` module so the manual-override deadman reuses the same
+// abstraction; re-exported here to keep `hwmon::lease::Clock` referencing intact.
+pub use crate::clock::{Clock, SystemClock};
 
 /// A lease granting exclusive write permission for hwmon PWM outputs.
 #[derive(Debug, Clone)]
