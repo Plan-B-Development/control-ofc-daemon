@@ -1,5 +1,43 @@
 # Changelog
 
+## [1.19.0] — 2026-06-17
+
+Daemon-owned **profile storage + CRUD/validation API** — Phase 1 of the GUI→daemon control
+migration (DEC-160). Additive and backward-compatible: the daemon becomes the store of record for
+profiles but still defers to the GUI's control loop, so there is **no runtime behaviour change**.
+Pairs with the existing **GUI v1.41.0** — the GUI does not yet use these endpoints.
+
+### Added
+- **Profile CRUD API** — `GET /profiles`, `GET /profiles/{id}`, `POST /profiles`,
+  `PUT /profiles/{id}`, `DELETE /profiles/{id}`. `POST`/`PUT` accept `?validate_only=true` to
+  validate without persisting. Profiles are stored as `{state_dir}/profiles/{id}.json`
+  (`/var/lib/control-ofc/profiles/`) — the daemon-owned store, prepended as the primary profile
+  search dir so a stored profile is activatable by id and shadows a same-id read-only preset.
+- **`DaemonProfile::validate()`** — structural + intra-profile referential validation returning
+  hard `errors` and soft `warnings`. Hard errors: non-finite numbers, out-of-range percentages,
+  >256 curve points, trigger idle ≥ load, dangling `curve_id`/`mix_curve_ids`/`sync_control_id`,
+  and Mix/Sync dependency cycles. An unknown `sensor_id` is a **warning, not an error**, so a
+  profile authored on another machine still stores, validates, and activates (the engine tolerates
+  a missing sensor at eval time, and the 105 °C thermal force backstops).
+- **`control` capability block** on `GET /capabilities`
+  (`{profile_storage, curve_evaluation, manual_override, fan_identify, min_supported_gui}`) so a
+  client can detect daemon-owned-control support. `profile_storage` and `curve_evaluation` are
+  `true`; the rest are reserved for later migration phases.
+- Structured **`field_violations`** in the error-envelope `details` (additive), plus error codes
+  `already_exists` (409, duplicate create) and `profile_in_use` (409, deleting the active profile).
+
+### Changed
+- `POST /profile/activate` now **validates** the loaded profile and rejects a hard-invalid one,
+  leaving the previously active profile running.
+
+### Notes
+- The store persists the uploaded profile document verbatim (lossless / forward-compatible) — it
+  does not re-serialise the daemon model. Writes reuse the crash-safe atomic writer (0600).
+- `PUT /profiles/{id}` updates stored desired-state only; it does not hot-reload a running active
+  profile — re-activate to apply.
+- No profile-schema bump (still v7); no systemd/packaging change (the store lives under the
+  existing `StateDirectory`).
+
 ## [1.18.0] — 2026-06-16
 
 First-class **liquid-cooler (AIO) support — Phase 1** (hwmon-only). Pairs with **GUI v1.39.0**
