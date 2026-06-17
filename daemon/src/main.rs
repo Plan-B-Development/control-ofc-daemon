@@ -285,6 +285,18 @@ fn apply_runtime_overlay(config: &mut DaemonConfig, runtime: &RuntimeConfig, adm
 /// unit-tested without a full AppState.
 ///
 /// Returns the new search dirs on success, or an error string on failure.
+/// Prepend the daemon-owned profile store (`{state_dir}/profiles`, DEC-160) to
+/// the configured search dirs so CRUD-created profiles are always discoverable
+/// by id and the store is the primary location — regardless of admin config or
+/// a SIGHUP reload. Dedup-safe; otherwise order-preserving.
+fn with_store_dir(mut dirs: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
+    let store = daemon_state::profiles_dir();
+    if !dirs.contains(&store) {
+        dirs.insert(0, store);
+    }
+    dirs
+}
+
 fn apply_config_reload(
     config_path: &str,
     runtime_config_path: &Path,
@@ -294,12 +306,14 @@ fn apply_config_reload(
         DaemonConfig::load(config_path).map_err(|e| format!("config reload failed: {e}"))?;
     let new_runtime = RuntimeConfig::load_from(runtime_config_path);
     apply_runtime_overlay(&mut new_config, &new_runtime, config_path);
-    let new_dirs: Vec<std::path::PathBuf> = new_config
-        .profiles
-        .search_dirs
-        .iter()
-        .map(std::path::PathBuf::from)
-        .collect();
+    let new_dirs = with_store_dir(
+        new_config
+            .profiles
+            .search_dirs
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect(),
+    );
     log::info!("Config reloaded — profile search dirs: {:?}", new_dirs);
     *profile_search_dirs.write() = new_dirs.clone();
     Ok(new_dirs)
@@ -525,13 +539,25 @@ async fn main() {
         std::thread::sleep(Duration::from_secs(config.startup.delay_secs));
     }
 
-    // Build profile search dirs from config
-    let profile_search_dirs: Vec<std::path::PathBuf> = config
-        .profiles
-        .search_dirs
-        .iter()
-        .map(std::path::PathBuf::from)
-        .collect();
+    // Build profile search dirs from config, with the daemon-owned profile
+    // store ({state_dir}/profiles) prepended as the primary location (DEC-160).
+    let profile_search_dirs = with_store_dir(
+        config
+            .profiles
+            .search_dirs
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect(),
+    );
+    // Ensure the store dir exists so listing/activation work immediately — the
+    // systemd StateDirectory= creates {state_dir} but not the profiles/ subdir.
+    let profile_store_dir = daemon_state::profiles_dir();
+    if let Err(e) = std::fs::create_dir_all(&profile_store_dir) {
+        log::warn!(
+            "could not create profile store dir '{}': {e}",
+            profile_store_dir.display()
+        );
+    }
     log::info!("Profile search dirs: {:?}", profile_search_dirs);
 
     let cache = Arc::new(StateCache::new());
@@ -1047,9 +1073,16 @@ search_dirs = ["/custom/profiles", "/other/profiles"]
         assert!(result.is_ok());
 
         let dirs = search_dirs.read().clone();
-        assert_eq!(dirs.len(), 2);
-        assert_eq!(dirs[0], PathBuf::from("/custom/profiles"));
-        assert_eq!(dirs[1], PathBuf::from("/other/profiles"));
+        // The daemon-owned store ({state_dir}/profiles) is prepended first
+        // (DEC-160); the configured dirs follow in order.
+        assert_eq!(dirs[0], daemon_state::profiles_dir());
+        assert_eq!(
+            &dirs[1..],
+            &[
+                PathBuf::from("/custom/profiles"),
+                PathBuf::from("/other/profiles"),
+            ]
+        );
     }
 
     #[test]
@@ -1081,9 +1114,14 @@ search_dirs = ["/etc/control-ofc/profiles"]
         assert!(result.is_ok());
 
         let dirs = search_dirs.read().clone();
-        assert_eq!(dirs.len(), 2);
-        assert_eq!(dirs[0], PathBuf::from("/runtime/profiles"));
-        assert_eq!(dirs[1], PathBuf::from("/user/profiles"));
+        assert_eq!(dirs[0], daemon_state::profiles_dir());
+        assert_eq!(
+            &dirs[1..],
+            &[
+                PathBuf::from("/runtime/profiles"),
+                PathBuf::from("/user/profiles"),
+            ]
+        );
     }
 
     #[test]

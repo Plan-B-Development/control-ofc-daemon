@@ -93,6 +93,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/profile/deactivate",
             post(handlers::deactivate_profile_handler),
         )
+        // Profile CRUD (DEC-160) — daemon-owned profile store. axum 0.8 needs
+        // method-chaining on a single route per path (duplicate paths panic).
+        .route(
+            "/profiles",
+            get(handlers::list_profiles_handler).post(handlers::create_profile_handler),
+        )
+        .route(
+            "/profiles/{id}",
+            get(handlers::get_profile_handler)
+                .put(handlers::update_profile_handler)
+                .delete(handlers::delete_profile_handler),
+        )
         // Config management
         .route(
             "/config/profile-search-dirs",

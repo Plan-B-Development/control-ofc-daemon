@@ -209,6 +209,17 @@ pub async fn capabilities_handler(
             // Legacy floor fields removed — thermal safety centralized
             openfan_stop_timeout_s: 8,
         },
+        // Control-execution capability (DEC-159/160). 1.20.0 delivers daemon-
+        // owned profile storage; manual_override / fan_identify arrive in a
+        // later phase, and min_supported_gui stays empty until the 2.0.0
+        // cutover enforces a floor.
+        control: ControlCapability {
+            profile_storage: true,
+            curve_evaluation: true,
+            manual_override: false,
+            fan_identify: false,
+            min_supported_gui: String::new(),
+        },
     })
 }
 

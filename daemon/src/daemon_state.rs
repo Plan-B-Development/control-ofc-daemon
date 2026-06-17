@@ -65,6 +65,14 @@ pub fn state_file_path() -> PathBuf {
     PathBuf::from(state_dir()).join(STATE_FILE)
 }
 
+/// Directory where daemon-owned profiles are stored: `{state_dir}/profiles`
+/// (DEC-160). This is the daemon's authoritative profile write location;
+/// `main` prepends it to the profile search dirs (see `with_store_dir`) so it
+/// is also the primary resolution source for activation-by-id.
+pub fn profiles_dir() -> PathBuf {
+    PathBuf::from(state_dir()).join("profiles")
+}
+
 /// Load persisted state from a specific directory (testable without global OnceLock).
 pub fn load_state_from(dir: &Path) -> DaemonState {
     let path = dir.join(STATE_FILE);

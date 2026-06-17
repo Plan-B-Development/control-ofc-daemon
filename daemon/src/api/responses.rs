@@ -302,6 +302,23 @@ pub struct PwmHeadersResponse {
     pub headers: Vec<PwmHeaderEntry>,
 }
 
+/// One entry in the `GET /profiles` listing — a lightweight summary parsed from
+/// each stored/preset profile (the full document is fetched via
+/// `GET /profiles/{id}`).
+#[derive(Debug, Clone, Serialize)]
+pub struct ProfileSummary {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+}
+
+/// Response for `GET /profiles`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProfileListResponse {
+    pub api_version: u32,
+    pub profiles: Vec<ProfileSummary>,
+}
+
 /// Response for `GET /capabilities`.
 #[derive(Debug, Clone, Serialize)]
 pub struct CapabilitiesResponse {
@@ -311,6 +328,32 @@ pub struct CapabilitiesResponse {
     pub devices: DeviceCapabilities,
     pub features: FeatureFlags,
     pub limits: Limits,
+    /// Control-execution capability (GUI→daemon control migration). Additive
+    /// top-level field (DEC-159/160) — pre-1.20 daemons omit it, and the GUI
+    /// must treat its absence as "all false" (old behaviour). The GUI keys its
+    /// daemon-owned-control startup gate on this block.
+    pub control: ControlCapability,
+}
+
+/// Control-execution capability flags. The daemon advertises which control
+/// responsibilities it can own. Each flag defaults to the pre-migration
+/// behaviour when read by a client that doesn't understand it (AIP-180).
+#[derive(Debug, Clone, Serialize)]
+pub struct ControlCapability {
+    /// Daemon can store, validate, list, and delete GUI-authored profiles via
+    /// the `/profiles` CRUD API. True since 1.20.0 (DEC-160).
+    pub profile_storage: bool,
+    /// Daemon can evaluate fan curves headlessly (always true — the engine has
+    /// done this since the profile engine landed; see DEC-096).
+    pub curve_evaluation: bool,
+    /// Daemon exposes a manual-override API. False until the override API lands
+    /// (DEC-163).
+    pub manual_override: bool,
+    /// Daemon exposes a fan-identify API. False until that API lands (DEC-166).
+    pub fan_identify: bool,
+    /// Minimum GUI version this daemon supports for daemon-owned control, or
+    /// empty when no floor is enforced yet (set at the 2.0.0 cutover).
+    pub min_supported_gui: String,
 }
 
 /// Per-device-group capability info.
@@ -1030,6 +1073,55 @@ impl ErrorEnvelope {
             },
         }
     }
+
+    /// A profile with the requested id already exists in the daemon store.
+    /// Returned with HTTP 409 by `POST /profiles` so the caller distinguishes
+    /// a duplicate create from a malformed request (DEC-160). The check is
+    /// store-scoped — a read-only preset of the same id is shadowable, not a
+    /// conflict.
+    pub fn already_exists(message: impl Into<String>) -> Self {
+        Self {
+            error: ErrorBody {
+                code: "already_exists".into(),
+                message: message.into(),
+                details: None,
+                retryable: false,
+                source: "validation".into(),
+            },
+        }
+    }
+
+    /// The profile is currently active and so cannot be deleted. Returned with
+    /// HTTP 409 by `DELETE /profiles/{id}` (DEC-160). Deactivate or activate a
+    /// different profile first.
+    pub fn profile_in_use(message: impl Into<String>) -> Self {
+        Self {
+            error: ErrorBody {
+                code: "profile_in_use".into(),
+                message: message.into(),
+                details: None,
+                retryable: false,
+                source: "validation".into(),
+            },
+        }
+    }
+
+    /// A `validation_error` carrying structured per-field violations in
+    /// `details` (DEC-160). The envelope shape is unchanged — `details` is the
+    /// existing free-form field — so older clients that read only
+    /// `code`/`message` keep working while newer clients read
+    /// `details.field_violations[]`.
+    pub fn validation_with_details(message: impl Into<String>, details: serde_json::Value) -> Self {
+        Self {
+            error: ErrorBody {
+                code: "validation_error".into(),
+                message: message.into(),
+                details: Some(details),
+                retryable: false,
+                source: "validation".into(),
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1255,10 +1347,21 @@ mod tests {
                 pwm_percent_max: 100,
                 openfan_stop_timeout_s: 8,
             },
+            control: ControlCapability {
+                profile_storage: true,
+                curve_evaluation: true,
+                manual_override: false,
+                fan_identify: false,
+                min_supported_gui: String::new(),
+            },
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["api_version"], 1);
         assert_eq!(json["ipc_transport"], "uds/http");
+        // Control-execution capability block (DEC-159/160).
+        assert_eq!(json["control"]["profile_storage"], true);
+        assert_eq!(json["control"]["curve_evaluation"], true);
+        assert_eq!(json["control"]["manual_override"], false);
         assert_eq!(json["devices"]["openfan"]["present"], true);
         assert_eq!(json["devices"]["openfan"]["channels"], 10);
         assert_eq!(json["devices"]["hwmon"]["pwm_header_count"], 3);

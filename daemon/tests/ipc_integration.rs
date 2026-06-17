@@ -22,6 +22,7 @@ use control_ofc_daemon::hwmon::lease::LeaseManager;
 use control_ofc_daemon::hwmon::pwm_control::{HwmonPwmController, SysfsWriter};
 use control_ofc_daemon::hwmon::pwm_discovery::PwmHeaderDescriptor;
 use control_ofc_daemon::hwmon::types::SensorKind;
+use control_ofc_daemon::profile::DaemonProfile;
 use control_ofc_daemon::serial::controller::FanController;
 use control_ofc_daemon::serial::transport::SerialTransport;
 
@@ -1883,4 +1884,253 @@ async fn profile_activate_accepts_path_inside_search_dir() {
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
+}
+
+// ───────────────────── Profile CRUD (DEC-160) ─────────────────────
+
+/// Send an arbitrary-method request (optionally with a JSON body) over the UDS.
+async fn uds_send(
+    socket_path: &str,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> (u16, serde_json::Value) {
+    let stream = UnixStream::connect(socket_path).await.unwrap();
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let body_bytes = body
+        .map(|b| serde_json::to_vec(b).unwrap())
+        .unwrap_or_default();
+    let req = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .body(http_body_util::Full::new(bytes::Bytes::from(body_bytes)))
+        .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
+    let status = resp.status().as_u16();
+    let resp_body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json = serde_json::from_slice(&resp_body).unwrap_or(serde_json::Value::Null);
+    (status, json)
+}
+
+/// A minimal, valid v7 profile: one curve-mode control bound to a flat curve.
+/// Flat curves carry no `sensor_id`, so this validates clean on any machine.
+fn valid_profile(id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "name": id,
+        "description": "",
+        "version": 7,
+        "controls": [{"id": "c", "name": "C", "mode": "curve", "curve_id": "fc", "members": []}],
+        "curves": [{"id": "fc", "name": "Flat", "type": "flat", "flat_output_pct": 40.0}],
+    })
+}
+
+/// AppState whose profile store is an isolated temp dir (never `/var/lib`).
+/// Returns the state plus the TempDir, which the caller must keep alive.
+fn state_with_temp_store() -> (Arc<AppState>, tempfile::TempDir) {
+    let store = tempfile::tempdir().unwrap();
+    let state = test_app_state();
+    state
+        .profile_search_dirs
+        .write()
+        .push(store.path().to_path_buf());
+    (state, store)
+}
+
+#[tokio::test]
+async fn profiles_crud_roundtrip() {
+    let (state, store) = state_with_temp_store();
+    let (sock, _tx, _sock_tmp) = start_test_server(state).await;
+
+    // Create.
+    let (st, body) = uds_send(&sock, "POST", "/profiles", Some(&valid_profile("p1"))).await;
+    assert_eq!(st, 201, "create: {body}");
+    assert_eq!(body["created"], true);
+    assert!(
+        store.path().join("p1.json").exists(),
+        "profile must be persisted to the store"
+    );
+
+    // Get (lossless).
+    let (st, body) = uds_get(&sock, "/profiles/p1").await;
+    assert_eq!(st, 200);
+    assert_eq!(body["id"], "p1");
+    assert_eq!(body["curves"][0]["type"], "flat");
+
+    // List includes it.
+    let (st, body) = uds_get(&sock, "/profiles").await;
+    assert_eq!(st, 200);
+    let ids: Vec<&str> = body["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"p1"), "list must contain p1: {ids:?}");
+
+    // Duplicate create → 409 already_exists.
+    let (st, body) = uds_send(&sock, "POST", "/profiles", Some(&valid_profile("p1"))).await;
+    assert_eq!(st, 409);
+    assert_eq!(body["error"]["code"], "already_exists");
+
+    // Update (PUT replaces).
+    let mut updated = valid_profile("p1");
+    updated["name"] = "Renamed".into();
+    let (st, body) = uds_send(&sock, "PUT", "/profiles/p1", Some(&updated)).await;
+    assert_eq!(st, 200, "update: {body}");
+    assert_eq!(body["profile_id"], "p1");
+
+    // Delete, then it's gone.
+    let (st, _) = uds_send(&sock, "DELETE", "/profiles/p1", None).await;
+    assert_eq!(st, 200);
+    let (st, _) = uds_get(&sock, "/profiles/p1").await;
+    assert_eq!(st, 404);
+}
+
+#[tokio::test]
+async fn profile_create_invalid_returns_field_violations() {
+    let (state, store) = state_with_temp_store();
+    let (sock, _tx, _sock_tmp) = start_test_server(state).await;
+
+    let bad = serde_json::json!({
+        "id": "bad", "name": "Bad", "version": 7, "controls": [],
+        "curves": [{"id": "fc", "name": "F", "type": "flat", "flat_output_pct": 140.0}],
+    });
+    let (st, body) = uds_send(&sock, "POST", "/profiles", Some(&bad)).await;
+    assert_eq!(st, 400);
+    assert_eq!(body["error"]["code"], "validation_error");
+    let violations = body["error"]["details"]["field_violations"]
+        .as_array()
+        .unwrap();
+    assert!(
+        violations.iter().any(|v| v["reason"] == "OUT_OF_RANGE"),
+        "expected OUT_OF_RANGE, got {violations:?}"
+    );
+    assert!(
+        !store.path().join("bad.json").exists(),
+        "invalid profile must not be persisted"
+    );
+}
+
+#[tokio::test]
+async fn profile_validate_only_persists_nothing_but_still_rejects_invalid() {
+    let (state, store) = state_with_temp_store();
+    let (sock, _tx, _sock_tmp) = start_test_server(state).await;
+
+    // Valid + validate_only → 200, nothing written.
+    let (st, body) = uds_send(
+        &sock,
+        "POST",
+        "/profiles?validate_only=true",
+        Some(&valid_profile("dry")),
+    )
+    .await;
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(body["valid"], true);
+    assert!(
+        !store.path().join("dry.json").exists(),
+        "validate_only must not persist"
+    );
+
+    // Invalid + validate_only → 400 (AIP-163: fails exactly when a real one would).
+    let bad = serde_json::json!({
+        "id": "dry2", "name": "Bad", "version": 7, "controls": [],
+        "curves": [{"id": "fc", "name": "F", "type": "flat", "flat_output_pct": 140.0}],
+    });
+    let (st, _) = uds_send(&sock, "POST", "/profiles?validate_only=true", Some(&bad)).await;
+    assert_eq!(st, 400);
+}
+
+#[tokio::test]
+async fn profile_put_id_mismatch_rejected() {
+    let (state, _store) = state_with_temp_store();
+    let (sock, _tx, _sock_tmp) = start_test_server(state).await;
+
+    // Body id "realid" but path id "otherid" → 400.
+    let (st, body) = uds_send(
+        &sock,
+        "PUT",
+        "/profiles/otherid",
+        Some(&valid_profile("realid")),
+    )
+    .await;
+    assert_eq!(st, 400);
+    assert_eq!(body["error"]["code"], "validation_error");
+}
+
+#[tokio::test]
+async fn delete_active_profile_returns_409() {
+    // Mark a profile active in-memory directly (no activate → no /var/lib write).
+    let (state, _store) = state_with_temp_store();
+    *state.active_profile.lock() = Some(DaemonProfile {
+        id: "p1".into(),
+        name: "P1".into(),
+        version: 7,
+        description: String::new(),
+        controls: vec![],
+        curves: vec![],
+    });
+    let (sock, _tx, _sock_tmp) = start_test_server(state).await;
+
+    let (st, body) = uds_send(&sock, "DELETE", "/profiles/p1", None).await;
+    assert_eq!(st, 409);
+    assert_eq!(body["error"]["code"], "profile_in_use");
+}
+
+#[tokio::test]
+async fn profiles_persist_across_restart() {
+    // The store dir survives a daemon restart: a fresh AppState over the same
+    // dir still lists a previously-created profile.
+    let store = tempfile::tempdir().unwrap();
+
+    let state_a = test_app_state();
+    state_a
+        .profile_search_dirs
+        .write()
+        .push(store.path().to_path_buf());
+    let (sock_a, tx_a, _tmp_a) = start_test_server(state_a).await;
+    let (st, _) = uds_send(
+        &sock_a,
+        "POST",
+        "/profiles",
+        Some(&valid_profile("persist")),
+    )
+    .await;
+    assert_eq!(st, 201);
+    let _ = tx_a.send(()); // stop server A
+
+    let state_b = test_app_state();
+    state_b
+        .profile_search_dirs
+        .write()
+        .push(store.path().to_path_buf());
+    let (sock_b, _tx_b, _tmp_b) = start_test_server(state_b).await;
+    let (st, body) = uds_get(&sock_b, "/profiles").await;
+    assert_eq!(st, 200);
+    let ids: Vec<&str> = body["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&"persist"),
+        "store must survive restart: {ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn capabilities_advertises_profile_storage() {
+    let (state, _store) = state_with_temp_store();
+    let (sock, _tx, _sock_tmp) = start_test_server(state).await;
+    let (st, body) = uds_get(&sock, "/capabilities").await;
+    assert_eq!(st, 200);
+    assert_eq!(body["control"]["profile_storage"], true);
+    assert_eq!(body["control"]["curve_evaluation"], true);
 }

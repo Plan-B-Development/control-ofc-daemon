@@ -14,6 +14,7 @@
 //! an evaluation context inside the profile engine.
 
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// A fan control profile containing logical controls and curve definitions.
@@ -286,18 +287,26 @@ pub fn load_profile(path: &Path) -> Result<DaemonProfile, String> {
     Ok(profile)
 }
 
+/// Whether a profile id is safe to use as a filename stem (`{id}.json`).
+///
+/// Rejects empty ids and any containing `/`, `\`, `..`, or a null byte, to
+/// prevent CWE-22 path traversal. The single source of the id-safety rule for
+/// both `find_profile` (activation) and `profile_store` (CRUD writes).
+pub fn is_safe_profile_id(id: &str) -> bool {
+    !(id.is_empty()
+        || id.contains('/')
+        || id.contains('\\')
+        || id.contains("..")
+        || id.contains('\0'))
+}
+
 /// Search for a profile by name in the given search directories.
 ///
 /// The name must be a simple filename stem (no path separators or traversal
 /// components). Names containing `/`, `\`, `..`, or null bytes are rejected
 /// to prevent CWE-22 path traversal.
 pub fn find_profile(name: &str, search_dirs: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
-    if name.contains('/')
-        || name.contains('\\')
-        || name.contains("..")
-        || name.contains('\0')
-        || name.is_empty()
-    {
+    if !is_safe_profile_id(name) {
         log::warn!("rejected profile name with path traversal characters: {name:?}");
         return None;
     }
@@ -306,6 +315,415 @@ pub fn find_profile(name: &str, search_dirs: &[std::path::PathBuf]) -> Option<st
         let file = dir.join(format!("{name}.json"));
         if file.exists() {
             return Some(file);
+        }
+    }
+    None
+}
+
+// ─────────────────────────── Validation (DEC-160) ───────────────────────────
+
+/// Maximum number of points a graph/stepped curve may contain. Mirrors the
+/// GUI's `MAX_CURVE_POINTS` (profile_service.py) so a profile the GUI accepts
+/// the daemon also accepts, and vice-versa.
+pub const MAX_CURVE_POINTS: usize = 256;
+
+const KNOWN_CURVE_TYPES: [&str; 7] = [
+    "graph", "stepped", "linear", "flat", "trigger", "mix", "sync",
+];
+const KNOWN_MIX_FUNCTIONS: [&str; 5] = ["max", "min", "average", "sum", "subtract"];
+const KNOWN_MEMBER_SOURCES: [&str; 4] = ["openfan", "hwmon", "amd_gpu", "intel_gpu"];
+
+/// Severity of a [`FieldViolation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    /// Hard error — the profile is rejected (not stored / not activated).
+    Error,
+    /// Soft warning — the profile is accepted, but the condition is surfaced
+    /// (e.g. it references a sensor not present on this machine, so a control
+    /// will sit at its safe fallback until the sensor appears).
+    Warning,
+}
+
+/// A single validation finding tied to a field path.
+#[derive(Debug, Clone, Serialize)]
+pub struct FieldViolation {
+    /// Dotted/indexed path, e.g. `curves[2].points[5].output_pct`.
+    pub field: String,
+    /// Stable UPPER_SNAKE_CASE machine code, e.g. `OUT_OF_RANGE`. Clients map
+    /// this to a localized message; never string-match `description`.
+    pub reason: String,
+    /// Human-readable explanation.
+    pub description: String,
+    pub severity: Severity,
+}
+
+/// The result of [`validate`]: hard `errors` (reject) and soft `warnings`
+/// (accept + surface). See DEC-160.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ValidationReport {
+    pub errors: Vec<FieldViolation>,
+    pub warnings: Vec<FieldViolation>,
+}
+
+impl ValidationReport {
+    /// A profile is valid (storable / activatable) iff it has no hard errors.
+    /// Warnings never block.
+    pub fn is_valid(&self) -> bool {
+        self.errors.is_empty()
+    }
+
+    /// All findings (errors then warnings) under a `field_violations` key, for
+    /// the error-envelope `details` and the `?validate_only` response body.
+    pub fn field_violations_json(&self) -> serde_json::Value {
+        let all: Vec<&FieldViolation> = self.errors.iter().chain(self.warnings.iter()).collect();
+        serde_json::json!({ "field_violations": all })
+    }
+
+    fn error(&mut self, field: impl Into<String>, reason: &str, description: impl Into<String>) {
+        self.errors.push(FieldViolation {
+            field: field.into(),
+            reason: reason.into(),
+            description: description.into(),
+            severity: Severity::Error,
+        });
+    }
+
+    fn warn(&mut self, field: impl Into<String>, reason: &str, description: impl Into<String>) {
+        self.warnings.push(FieldViolation {
+            field: field.into(),
+            reason: reason.into(),
+            description: description.into(),
+            severity: Severity::Warning,
+        });
+    }
+}
+
+/// Validate a profile's structure and intra-profile referential integrity.
+///
+/// Returns hard `errors` (the profile is rejected) and soft `warnings`
+/// (accepted, surfaced). The split is deliberate (DEC-160):
+///
+/// * **Machine-independent invariants are hard errors** — non-finite numbers,
+///   out-of-range percentages, point-count limits, trigger temp ordering,
+///   intra-profile reference integrity (`curve_id` / `mix_curve_ids` /
+///   `sync_control_id` resolve), and Mix/Sync acyclicity. These are wrong on
+///   any machine.
+/// * **Machine-dependent facts are warnings only** — a `sensor_id` not present
+///   on *this* host. The engine already tolerates a missing sensor at eval time
+///   (the control holds a safe fallback, and the 105 °C thermal force
+///   backstops), so a profile authored on another machine must still store,
+///   validate, and import.
+///
+/// `known_sensor_ids` is the set of sensor entity ids currently discovered on
+/// this machine (the keys of `cache.sensors_snapshot()`).
+///
+/// The role-aware minimum-PWM floor backstop (DEC-162) layers onto this in a
+/// later phase; the signature is intentionally left extensible for it.
+pub fn validate(profile: &DaemonProfile, known_sensor_ids: &HashSet<String>) -> ValidationReport {
+    let mut report = ValidationReport::default();
+
+    let curve_ids: HashSet<&str> = profile.curves.iter().map(|c| c.id.as_str()).collect();
+    let control_ids: HashSet<&str> = profile.controls.iter().map(|c| c.id.as_str()).collect();
+
+    // ── Curves ──
+    for (i, curve) in profile.curves.iter().enumerate() {
+        let p = format!("curves[{i}]");
+
+        if !KNOWN_CURVE_TYPES.contains(&curve.curve_type.as_str()) {
+            report.warn(
+                format!("{p}.type"),
+                "UNKNOWN_CURVE_TYPE",
+                format!(
+                    "curve type '{}' is unrecognised; the engine will output 50%",
+                    curve.curve_type
+                ),
+            );
+        }
+
+        if curve.points.len() > MAX_CURVE_POINTS {
+            report.error(
+                format!("{p}.points"),
+                "TOO_MANY_POINTS",
+                format!(
+                    "{} points exceeds the maximum of {MAX_CURVE_POINTS}",
+                    curve.points.len()
+                ),
+            );
+        }
+        for (j, pt) in curve.points.iter().enumerate() {
+            check_finite(&mut report, format!("{p}.points[{j}].temp_c"), pt.temp_c);
+            check_pct(
+                &mut report,
+                format!("{p}.points[{j}].output_pct"),
+                pt.output_pct,
+            );
+        }
+
+        check_opt_finite(&mut report, &p, "start_temp_c", curve.start_temp_c);
+        check_opt_finite(&mut report, &p, "end_temp_c", curve.end_temp_c);
+        check_opt_pct(&mut report, &p, "start_output_pct", curve.start_output_pct);
+        check_opt_pct(&mut report, &p, "end_output_pct", curve.end_output_pct);
+        check_opt_pct(&mut report, &p, "flat_output_pct", curve.flat_output_pct);
+        check_opt_finite(
+            &mut report,
+            &p,
+            "trigger_idle_temp_c",
+            curve.trigger_idle_temp_c,
+        );
+        check_opt_finite(
+            &mut report,
+            &p,
+            "trigger_load_temp_c",
+            curve.trigger_load_temp_c,
+        );
+        check_opt_pct(&mut report, &p, "trigger_idle_pct", curve.trigger_idle_pct);
+        check_opt_pct(&mut report, &p, "trigger_load_pct", curve.trigger_load_pct);
+        check_opt_offset(&mut report, &p, "sync_offset_pct", curve.sync_offset_pct);
+
+        // Sensor reference is machine-dependent → warning, never an error.
+        if !curve.sensor_id.is_empty() && !known_sensor_ids.contains(&curve.sensor_id) {
+            report.warn(
+                format!("{p}.sensor_id"),
+                "UNKNOWN_SENSOR",
+                format!(
+                    "sensor '{}' is not present on this machine; the control will hold a \
+                     safe fallback until it appears",
+                    curve.sensor_id
+                ),
+            );
+        }
+
+        match curve.curve_type.as_str() {
+            "trigger" => {
+                let idle = curve.trigger_idle_temp_c.unwrap_or(40.0);
+                let load = curve.trigger_load_temp_c.unwrap_or(60.0);
+                if idle.is_finite() && load.is_finite() && idle >= load {
+                    report.error(
+                        format!("{p}.trigger_idle_temp_c"),
+                        "TRIGGER_IDLE_GE_LOAD",
+                        format!(
+                            "idle temp {idle} must be below load temp {load} or the trigger oscillates"
+                        ),
+                    );
+                }
+            }
+            "mix" => {
+                if let Some(f) = curve.mix_function.as_deref() {
+                    if !KNOWN_MIX_FUNCTIONS.contains(&f) {
+                        report.warn(
+                            format!("{p}.mix_function"),
+                            "UNKNOWN_MIX_FUNCTION",
+                            format!(
+                                "mix function '{f}' is unrecognised; the engine defaults to 'max'"
+                            ),
+                        );
+                    }
+                }
+                for (k, mid) in curve.mix_curve_ids.iter().enumerate() {
+                    if !curve_ids.contains(mid.as_str()) {
+                        report.error(
+                            format!("{p}.mix_curve_ids[{k}]"),
+                            "UNKNOWN_CURVE_REF",
+                            format!(
+                                "mix references curve '{mid}', which does not exist in this profile"
+                            ),
+                        );
+                    }
+                }
+            }
+            "sync" => {
+                if curve.sync_control_id.is_empty()
+                    || !control_ids.contains(curve.sync_control_id.as_str())
+                {
+                    report.error(
+                        format!("{p}.sync_control_id"),
+                        "UNKNOWN_CONTROL_REF",
+                        format!(
+                            "sync references control '{}', which does not exist in this profile",
+                            curve.sync_control_id
+                        ),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ── Controls ──
+    for (i, ctrl) in profile.controls.iter().enumerate() {
+        let p = format!("controls[{i}]");
+        check_pct(
+            &mut report,
+            format!("{p}.manual_output_pct"),
+            ctrl.manual_output_pct,
+        );
+        check_pct(&mut report, format!("{p}.minimum_pct"), ctrl.minimum_pct);
+        check_pct(&mut report, format!("{p}.start_pct"), ctrl.start_pct);
+        check_pct(&mut report, format!("{p}.stop_pct"), ctrl.stop_pct);
+        check_pct(&mut report, format!("{p}.step_up_pct"), ctrl.step_up_pct);
+        check_pct(
+            &mut report,
+            format!("{p}.step_down_pct"),
+            ctrl.step_down_pct,
+        );
+        check_offset(&mut report, format!("{p}.offset_pct"), ctrl.offset_pct);
+
+        if ctrl.mode == "curve"
+            && (ctrl.curve_id.is_empty() || !curve_ids.contains(ctrl.curve_id.as_str()))
+        {
+            report.error(
+                format!("{p}.curve_id"),
+                "UNKNOWN_CURVE_REF",
+                format!(
+                    "control is in curve mode but curve '{}' does not exist in this profile",
+                    ctrl.curve_id
+                ),
+            );
+        }
+
+        for (k, m) in ctrl.members.iter().enumerate() {
+            if !KNOWN_MEMBER_SOURCES.contains(&m.source.as_str()) {
+                report.warn(
+                    format!("{p}.members[{k}].source"),
+                    "UNKNOWN_SOURCE",
+                    format!("member source '{}' is unrecognised", m.source),
+                );
+            }
+        }
+    }
+
+    // ── Cycle detection (Mix over curves, Sync over controls) ──
+    if let Some(node) = mix_cycle(profile) {
+        report.error(
+            "curves",
+            "MIX_CYCLE",
+            format!("mix curves form a dependency cycle involving '{node}'"),
+        );
+    }
+    if let Some(node) = sync_cycle(profile) {
+        report.error(
+            "controls",
+            "SYNC_CYCLE",
+            format!("sync controls form a dependency cycle involving control '{node}'"),
+        );
+    }
+
+    report
+}
+
+fn check_finite(r: &mut ValidationReport, field: String, v: f64) {
+    if !v.is_finite() {
+        r.error(field, "NON_FINITE", "value must be a finite number");
+    }
+}
+
+fn check_pct(r: &mut ValidationReport, field: String, v: f64) {
+    if !v.is_finite() {
+        r.error(field, "NON_FINITE", "value must be a finite number");
+    } else if !(0.0..=100.0).contains(&v) {
+        r.error(
+            field,
+            "OUT_OF_RANGE",
+            format!("value {v} must be between 0 and 100"),
+        );
+    }
+}
+
+fn check_offset(r: &mut ValidationReport, field: String, v: f64) {
+    if !v.is_finite() {
+        r.error(field, "NON_FINITE", "value must be a finite number");
+    } else if !(-100.0..=100.0).contains(&v) {
+        r.error(
+            field,
+            "OUT_OF_RANGE",
+            format!("offset {v} must be between -100 and 100"),
+        );
+    }
+}
+
+fn check_opt_finite(r: &mut ValidationReport, prefix: &str, name: &str, v: Option<f64>) {
+    if let Some(v) = v {
+        check_finite(r, format!("{prefix}.{name}"), v);
+    }
+}
+
+fn check_opt_pct(r: &mut ValidationReport, prefix: &str, name: &str, v: Option<f64>) {
+    if let Some(v) = v {
+        check_pct(r, format!("{prefix}.{name}"), v);
+    }
+}
+
+fn check_opt_offset(r: &mut ValidationReport, prefix: &str, name: &str, v: Option<f64>) {
+    if let Some(v) = v {
+        check_offset(r, format!("{prefix}.{name}"), v);
+    }
+}
+
+/// Detect a cycle among `mix` curves (a curve referencing, transitively,
+/// itself via `mix_curve_ids`). Returns an involved curve id if found.
+fn mix_cycle(profile: &DaemonProfile) -> Option<String> {
+    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+    for c in &profile.curves {
+        if c.curve_type == "mix" {
+            adj.insert(c.id.clone(), c.mix_curve_ids.clone());
+        }
+    }
+    graph_first_cycle(&adj)
+}
+
+/// Detect a cycle among `sync` controls (a control whose sync target,
+/// transitively, mirrors itself). Returns an involved control id if found.
+fn sync_cycle(profile: &DaemonProfile) -> Option<String> {
+    // curve_id -> target control id, for sync curves only.
+    let sync_target: HashMap<&str, &str> = profile
+        .curves
+        .iter()
+        .filter(|c| c.curve_type == "sync")
+        .map(|c| (c.id.as_str(), c.sync_control_id.as_str()))
+        .collect();
+    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+    for ctrl in &profile.controls {
+        if ctrl.mode == "curve" {
+            if let Some(target) = sync_target.get(ctrl.curve_id.as_str()) {
+                if !target.is_empty() {
+                    adj.insert(ctrl.id.clone(), vec![(*target).to_string()]);
+                }
+            }
+        }
+    }
+    graph_first_cycle(&adj)
+}
+
+/// Iterative DFS cycle detection over a directed adjacency map. Returns the
+/// first node found on a back-edge (i.e. part of a cycle), or `None` if the
+/// graph is acyclic.
+fn graph_first_cycle(adj: &HashMap<String, Vec<String>>) -> Option<String> {
+    let mut done: HashSet<String> = HashSet::new();
+    for start in adj.keys() {
+        if done.contains(start) {
+            continue;
+        }
+        let mut on_path: HashSet<String> = HashSet::new();
+        let mut stack: Vec<(String, usize)> = vec![(start.clone(), 0)];
+        on_path.insert(start.clone());
+        while let Some((node, idx)) = stack.last().cloned() {
+            let neighbors = adj.get(&node).map(Vec::as_slice).unwrap_or(&[]);
+            if idx < neighbors.len() {
+                stack.last_mut().unwrap().1 = idx + 1;
+                let next = &neighbors[idx];
+                if on_path.contains(next) {
+                    return Some(next.clone());
+                }
+                if !done.contains(next) {
+                    on_path.insert(next.clone());
+                    stack.push((next.clone(), 0));
+                }
+            } else {
+                on_path.remove(&node);
+                done.insert(node.clone());
+                stack.pop();
+            }
         }
     }
     None
@@ -861,5 +1279,236 @@ mod tests {
         // the guard reject everything is caught here too.
         std::fs::write(profiles.join("quiet.json"), "{}").unwrap();
         assert!(find_profile("quiet", &dirs).is_some());
+    }
+
+    // ───────────────────────── validate() (DEC-160) ─────────────────────────
+
+    fn mk_profile(curves: Vec<CurveConfig>, controls: Vec<LogicalControl>) -> DaemonProfile {
+        DaemonProfile {
+            id: "p".into(),
+            name: "P".into(),
+            version: 7,
+            description: String::new(),
+            controls,
+            curves,
+        }
+    }
+
+    fn graph_curve(id: &str, sensor: &str) -> CurveConfig {
+        CurveConfig {
+            id: id.into(),
+            name: id.into(),
+            curve_type: "graph".into(),
+            sensor_id: sensor.into(),
+            points: vec![
+                CurvePoint {
+                    temp_c: 30.0,
+                    output_pct: 20.0,
+                },
+                CurvePoint {
+                    temp_c: 80.0,
+                    output_pct: 100.0,
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn curve_control(id: &str, curve_id: &str) -> LogicalControl {
+        LogicalControl {
+            id: id.into(),
+            name: id.into(),
+            mode: "curve".into(),
+            curve_id: curve_id.into(),
+            manual_output_pct: 50.0,
+            members: vec![],
+            step_up_pct: 100.0,
+            step_down_pct: 100.0,
+            offset_pct: 0.0,
+            minimum_pct: 0.0,
+            start_pct: 0.0,
+            stop_pct: 0.0,
+        }
+    }
+
+    fn sset(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn validate_valid_profile_passes_clean() {
+        let profile = mk_profile(
+            vec![graph_curve("c", "cpu")],
+            vec![curve_control("ctl", "c")],
+        );
+        let report = validate(&profile, &sset(&["cpu"]));
+        assert!(report.is_valid(), "unexpected errors: {:?}", report.errors);
+        assert!(
+            report.warnings.is_empty(),
+            "unexpected warnings: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn validate_unknown_sensor_is_warning_not_error() {
+        // Portability: a profile authored on another machine references a sensor
+        // absent here. Must NOT be rejected — the engine holds a safe fallback.
+        let profile = mk_profile(
+            vec![graph_curve("c", "ghost_sensor")],
+            vec![curve_control("ctl", "c")],
+        );
+        let report = validate(&profile, &sset(&["cpu"]));
+        assert!(
+            report.is_valid(),
+            "unknown sensor must not block: {:?}",
+            report.errors
+        );
+        assert!(report.warnings.iter().any(|w| w.reason == "UNKNOWN_SENSOR"));
+    }
+
+    #[test]
+    fn validate_out_of_range_pct_is_error() {
+        let mut curve = graph_curve("c", "cpu");
+        curve.points[1].output_pct = 140.0;
+        let profile = mk_profile(vec![curve], vec![curve_control("ctl", "c")]);
+        let report = validate(&profile, &sset(&["cpu"]));
+        assert!(!report.is_valid());
+        assert!(report.errors.iter().any(|e| e.reason == "OUT_OF_RANGE"));
+    }
+
+    #[test]
+    fn validate_nonfinite_is_error() {
+        let mut curve = graph_curve("c", "cpu");
+        curve.points[0].temp_c = f64::NAN;
+        let profile = mk_profile(vec![curve], vec![curve_control("ctl", "c")]);
+        let report = validate(&profile, &sset(&["cpu"]));
+        assert!(report.errors.iter().any(|e| e.reason == "NON_FINITE"));
+    }
+
+    #[test]
+    fn validate_too_many_points_is_error() {
+        let mut curve = graph_curve("c", "cpu");
+        curve.points = (0..=MAX_CURVE_POINTS)
+            .map(|i| CurvePoint {
+                temp_c: i as f64,
+                output_pct: 50.0,
+            })
+            .collect(); // MAX_CURVE_POINTS + 1 points
+        let profile = mk_profile(vec![curve], vec![curve_control("ctl", "c")]);
+        let report = validate(&profile, &sset(&["cpu"]));
+        assert!(report.errors.iter().any(|e| e.reason == "TOO_MANY_POINTS"));
+    }
+
+    #[test]
+    fn validate_trigger_idle_ge_load_is_error() {
+        let curve = CurveConfig {
+            id: "t".into(),
+            name: "T".into(),
+            curve_type: "trigger".into(),
+            sensor_id: "cpu".into(),
+            trigger_idle_temp_c: Some(60.0),
+            trigger_load_temp_c: Some(50.0),
+            trigger_idle_pct: Some(30.0),
+            trigger_load_pct: Some(80.0),
+            ..Default::default()
+        };
+        let profile = mk_profile(vec![curve], vec![curve_control("ctl", "t")]);
+        let report = validate(&profile, &sset(&["cpu"]));
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.reason == "TRIGGER_IDLE_GE_LOAD"));
+    }
+
+    #[test]
+    fn validate_dangling_curve_ref_is_error() {
+        let profile = mk_profile(vec![], vec![curve_control("ctl", "missing")]);
+        let report = validate(&profile, &sset(&[]));
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.reason == "UNKNOWN_CURVE_REF"));
+    }
+
+    #[test]
+    fn validate_mix_cycle_is_error() {
+        let a = CurveConfig {
+            id: "a".into(),
+            name: "A".into(),
+            curve_type: "mix".into(),
+            mix_curve_ids: vec!["b".into()],
+            ..Default::default()
+        };
+        let b = CurveConfig {
+            id: "b".into(),
+            name: "B".into(),
+            curve_type: "mix".into(),
+            mix_curve_ids: vec!["a".into()],
+            ..Default::default()
+        };
+        let report = validate(&mk_profile(vec![a, b], vec![]), &sset(&[]));
+        assert!(report.errors.iter().any(|e| e.reason == "MIX_CYCLE"));
+    }
+
+    #[test]
+    fn validate_sync_cycle_is_error() {
+        // c1 mirrors c2 (via sync curve s1), c2 mirrors c1 (via s2) → cycle.
+        let s1 = CurveConfig {
+            id: "s1".into(),
+            name: "S1".into(),
+            curve_type: "sync".into(),
+            sync_control_id: "c2".into(),
+            ..Default::default()
+        };
+        let s2 = CurveConfig {
+            id: "s2".into(),
+            name: "S2".into(),
+            curve_type: "sync".into(),
+            sync_control_id: "c1".into(),
+            ..Default::default()
+        };
+        let report = validate(
+            &mk_profile(
+                vec![s1, s2],
+                vec![curve_control("c1", "s1"), curve_control("c2", "s2")],
+            ),
+            &sset(&[]),
+        );
+        assert!(report.errors.iter().any(|e| e.reason == "SYNC_CYCLE"));
+    }
+
+    #[test]
+    fn validate_collects_all_errors_no_fail_fast() {
+        let mut curve = graph_curve("c", "cpu");
+        curve.points[0].output_pct = 200.0; // error 1: OUT_OF_RANGE
+        let profile = mk_profile(vec![curve], vec![curve_control("ctl", "missing")]); // error 2
+        let report = validate(&profile, &sset(&["cpu"]));
+        assert!(
+            report.errors.len() >= 2,
+            "expected all errors collected, got {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn severity_serializes_lowercase() {
+        let v = FieldViolation {
+            field: "x".into(),
+            reason: "R".into(),
+            description: "d".into(),
+            severity: Severity::Warning,
+        };
+        assert_eq!(serde_json::to_value(&v).unwrap()["severity"], "warning");
+    }
+
+    #[test]
+    fn field_violations_json_has_array() {
+        let mut curve = graph_curve("c", "cpu");
+        curve.points[0].output_pct = 200.0;
+        let report = validate(&mk_profile(vec![curve], vec![]), &sset(&["cpu"]));
+        let details = report.field_violations_json();
+        assert!(details["field_violations"].is_array());
+        assert!(!details["field_violations"].as_array().unwrap().is_empty());
     }
 }
