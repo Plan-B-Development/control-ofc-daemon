@@ -1,5 +1,37 @@
 # Changelog
 
+## [2.0.0] — 2026-06-19
+
+**Breaking — daemon-owned control cutover (DEC-159 / DEC-165).** The daemon's profile engine is now the
+**sole writer** of every fan backend (OpenFan, hwmon, GPU PMFW). The 30 s `gui_active` defer window is
+deleted — the daemon no longer steps aside for a GUI writer, because there is no GUI writer. The paired
+`control-ofc-gui` ≥ v2.0.0 is an editor/viewer/controller-of-intent that never writes PWM. Pairs with
+`control-ofc-gui` ≥ v2.0.0.
+
+### Changed (breaking)
+- **Engine is primary.** `profile_engine` evaluates the active profile and writes every tick with no
+  deferral; the `gui_active` / `record_gui_write` machinery (retiring DEC-071 / DEC-074 / DEC-093) is
+  removed.
+- **`GET /capabilities`** gains `control.autonomous_control = true` and `control.min_supported_gui =
+  "2.0.0"`, so a 2.0 GUI can detect a daemon that has actually flipped (1.19–1.21 advertised the
+  `control` block while still deferring — block presence is not the discriminator).
+
+### Removed (breaking)
+- Bare PWM write endpoints: `POST /fans/openfan/{ch}/pwm`, `POST /fans/openfan/pwm`,
+  `POST /fans/openfan/{ch}/target_rpm`, `POST /hwmon/{id}/pwm`, `POST /gpu/{id}/fan/pwm`.
+- The hwmon lease API: `POST /hwmon/lease/take` / `release` / `renew` and `GET /hwmon/lease/status`.
+  The engine now holds the hwmon lease internally; `POST /hwmon/{id}/verify` runs under that internal
+  lease and no longer accepts a `lease_id`.
+
+### Safety
+- The 105 / 80 / 60 °C thermal ladder is unchanged and remains the absolute backstop; GPU fans stay
+  excluded (DEC-130). The role-aware pump/CPU floor is enforced by the engine every tick (DEC-162), and
+  manual overrides (DEC-163) are floor-clamped with a daemon-clock deadman.
+
+### Packaging
+- PKGBUILD gains `conflicts=('control-ofc-gui<2.0.0')` to refuse a partial upgrade — the 2.0 GUI cannot
+  control fans against a pre-2.0 daemon.
+
 ## [1.21.0] — 2026-06-18
 
 Daemon-owned **manual-override + fan-identify API** (DEC-163 / DEC-166) — Phase 4 of the GUI→daemon

@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Json;
 
@@ -43,244 +43,6 @@ pub async fn hwmon_headers_handler(
             headers,
         },
     )
-}
-
-/// POST /hwmon/lease/take — acquire the exclusive hwmon write lease.
-pub async fn hwmon_lease_take_handler(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<TakeLeaseRequest>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let Some(ref controller) = state.hwmon_controller else {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &ErrorEnvelope::hardware_unavailable("no hwmon PWM headers available"),
-        );
-    };
-
-    let mut ctrl = controller.lock();
-
-    // GUI always preempts internal holders (profile engine, thermal safety).
-    // Use force_take to evict any current holder.
-    let lease = ctrl.lease_manager_mut().force_take_lease(&body.owner_hint);
-    json_ok(
-        StatusCode::OK,
-        LeaseResponse {
-            api_version: API_VERSION,
-            lease_id: lease.lease_id.clone(),
-            owner_hint: lease.owner_hint.clone(),
-            ttl_seconds: lease.ttl_seconds(),
-        },
-    )
-}
-
-/// POST /hwmon/lease/release — release the hwmon write lease.
-pub async fn hwmon_lease_release_handler(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<ReleaseLeaseRequest>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let Some(ref controller) = state.hwmon_controller else {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &ErrorEnvelope::hardware_unavailable("no hwmon PWM headers available"),
-        );
-    };
-
-    let mut ctrl = controller.lock();
-
-    match ctrl.lease_manager_mut().release_lease(&body.lease_id) {
-        Ok(()) => {
-            ctrl.on_lease_released();
-            json_ok(
-                StatusCode::OK,
-                LeaseReleasedResponse {
-                    api_version: API_VERSION,
-                    released: true,
-                },
-            )
-        }
-        Err(LeaseError::InvalidLease) => error_response(
-            StatusCode::BAD_REQUEST,
-            &ErrorEnvelope::lease_error("invalid lease id"),
-        ),
-        Err(LeaseError::Expired) => error_response(
-            StatusCode::BAD_REQUEST,
-            &ErrorEnvelope::lease_error("lease expired"),
-        ),
-        Err(LeaseError::NoLease) => error_response(
-            StatusCode::BAD_REQUEST,
-            &ErrorEnvelope::lease_error("no active lease to release"),
-        ),
-        Err(e) => error_response(
-            StatusCode::BAD_REQUEST,
-            &ErrorEnvelope::lease_error(e.to_string()),
-        ),
-    }
-}
-
-/// GET /hwmon/lease/status — lease status for UI display.
-pub async fn hwmon_lease_status_handler(
-    State(state): State<Arc<AppState>>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let Some(ref controller) = state.hwmon_controller else {
-        let resp = LeaseStatusResponse {
-            api_version: API_VERSION,
-            lease_required: true,
-            held: false,
-            lease_id: None,
-            ttl_seconds_remaining: None,
-            owner_hint: None,
-        };
-        return json_ok(StatusCode::OK, resp);
-    };
-
-    let ctrl = controller.lock();
-
-    let resp = match ctrl.lease_manager().active_lease() {
-        Some(lease) => LeaseStatusResponse {
-            api_version: API_VERSION,
-            lease_required: true,
-            held: true,
-            lease_id: Some(lease.lease_id.clone()),
-            ttl_seconds_remaining: Some(lease.ttl_seconds()),
-            owner_hint: Some(lease.owner_hint.clone()),
-        },
-        None => LeaseStatusResponse {
-            api_version: API_VERSION,
-            lease_required: true,
-            held: false,
-            lease_id: None,
-            ttl_seconds_remaining: None,
-            owner_hint: None,
-        },
-    };
-
-    json_ok(StatusCode::OK, resp)
-}
-
-/// POST /hwmon/lease/renew — extend the TTL of the current lease.
-pub async fn hwmon_lease_renew_handler(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<RenewLeaseRequest>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let Some(ref controller) = state.hwmon_controller else {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &ErrorEnvelope::hardware_unavailable("no hwmon PWM headers available"),
-        );
-    };
-
-    let mut ctrl = controller.lock();
-
-    match ctrl.lease_manager_mut().renew_lease(&body.lease_id) {
-        Ok(lease) => json_ok(
-            StatusCode::OK,
-            LeaseResponse {
-                api_version: API_VERSION,
-                lease_id: lease.lease_id.clone(),
-                owner_hint: lease.owner_hint.clone(),
-                ttl_seconds: lease.ttl_seconds(),
-            },
-        ),
-        Err(LeaseError::InvalidLease) => error_response(
-            StatusCode::BAD_REQUEST,
-            &ErrorEnvelope::lease_error("invalid lease id"),
-        ),
-        Err(LeaseError::Expired) => error_response(
-            StatusCode::BAD_REQUEST,
-            &ErrorEnvelope::lease_error("lease expired"),
-        ),
-        Err(e) => error_response(
-            StatusCode::BAD_REQUEST,
-            &ErrorEnvelope::lease_error(e.to_string()),
-        ),
-    }
-}
-
-/// POST /hwmon/{header_id}/pwm — set PWM on an hwmon header (requires lease).
-///
-/// DEC-099: dispatched on `spawn_blocking` to keep tokio worker threads
-/// available while the (parking_lot) controller mutex is held by another
-/// task. Hwmon writes are typically sub-millisecond, but contention with
-/// the verify endpoint or the thermal-emergency scan can extend the
-/// critical section by seconds.
-///
-/// DEC-102: short-circuit with `400 feature_unavailable` when the header's
-/// discovered `is_writable` flag is `false`. Without this guard the kernel
-/// returns `EACCES`, which the controller surfaces as `503 hardware_unavailable`
-/// with `retryable: true` — a misclassification that traps GUI clients with
-/// retry policies into a 1 Hz storm. The condition (a read-only sysfs file)
-/// is permanent for this header, so the correct envelope is the same one
-/// DEC-094/DEC-098 chose for capability gaps. Defense-in-depth: discovery
-/// already drops `chip_name == "amdgpu"` (the canonical case), so this path
-/// only fires when an unforeseen chip exposes a read-only `pwmN`.
-pub async fn hwmon_set_pwm_handler(
-    State(state): State<Arc<AppState>>,
-    Path(header_id): Path<String>,
-    Json(body): Json<HwmonSetPwmRequest>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let Some(controller) = state.hwmon_controller.clone() else {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &ErrorEnvelope::hardware_unavailable("no hwmon PWM headers available"),
-        );
-    };
-
-    // Pre-flight writability check (DEC-102). Mirrors the GPU handlers'
-    // `feature_unavailable` shape from DEC-098 so a single-prefix client
-    // (the GUI control loop) can treat the response as "drop this member"
-    // rather than "retry next cycle".
-    {
-        let ctrl = controller.lock();
-        match ctrl.header(&header_id) {
-            Some(h) if !h.is_writable => {
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    &ErrorEnvelope::feature_unavailable(format!(
-                        "hwmon header '{header_id}' is read-only \
-                         (sysfs pwm file lacks write permission); \
-                         this header cannot accept PWM writes"
-                    )),
-                );
-            }
-            Some(_) => {}
-            None => {
-                return error_response(
-                    StatusCode::NOT_FOUND,
-                    &ErrorEnvelope::validation(format!("unknown header: {header_id}")),
-                );
-            }
-        }
-    }
-
-    let pwm_percent = body.pwm_percent;
-    let lease_id = body.lease_id.clone();
-    let header_id_clone = header_id.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        controller
-            .lock()
-            .set_pwm(&header_id_clone, pwm_percent, &lease_id)
-    })
-    .await;
-
-    match result {
-        Ok(Ok(set_result)) => {
-            state.cache.record_gui_write();
-            json_ok(
-                StatusCode::OK,
-                HwmonSetPwmResponse {
-                    api_version: API_VERSION,
-                    header_id: set_result.header_id,
-                    pwm_percent: set_result.pwm_percent,
-                    raw_value: set_result.raw_value,
-                },
-            )
-        }
-        Ok(Err(e)) => hwmon_control_error_response(e),
-        Err(e) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &ErrorEnvelope::internal(format!("hwmon write task failed: {e}")),
-        ),
-    }
 }
 
 /// Map a `HwmonControlError` to an HTTP error response.
@@ -361,16 +123,16 @@ const VERIFY_WAIT_SECONDS: u8 = crate::constants::VERIFY_WAIT_SECONDS;
 /// POST /hwmon/{header_id}/verify — behavioural test of PWM write effectiveness.
 ///
 /// Writes a test PWM value, waits for hardware to respond, then reads back
-/// pwm_enable, PWM value, and RPM to classify the result. Requires a valid
-/// hwmon lease. Takes ~6 seconds — slow-spinning fans (pumps, large 140mm
-/// chassis fans) need >3s to settle, and a too-short wait produced false
-/// `no_rpm_effect` verdicts. The GUI's `VERIFY_PAUSE_SAFETY_MS` and the
-/// per-call HTTP timeout in `client.py::verify_hwmon_pwm` must stay above
-/// this value (≥9 s and ≥12 s respectively).
+/// pwm_enable, PWM value, and RPM to classify the result. The daemon manages
+/// coordination itself (DEC-165): it pauses the profile engine's write phase
+/// for the verify window and force-takes a short-lived "verify" lease for its
+/// own test writes — no client lease is required. Takes ~6 seconds: slow-
+/// spinning fans (pumps, large 140mm chassis fans) need >3s to settle, and a
+/// too-short wait produced false `no_rpm_effect` verdicts. The per-call HTTP
+/// timeout in `client.py::verify_hwmon_pwm` must stay above this value (≥12 s).
 pub async fn hwmon_verify_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(header_id): axum::extract::Path<String>,
-    Json(body): Json<HwmonVerifyRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let controller = match &state.hwmon_controller {
         Some(c) => c,
@@ -386,15 +148,9 @@ pub async fn hwmon_verify_handler(
         }
     };
 
-    // Validate lease and extract header paths
+    // Extract header paths (404 if unknown) before pausing the engine.
     let (pwm_path, enable_path, rpm_path) = {
         let ctrl = controller.lock();
-        if let Err(e) = ctrl.lease_manager().validate_lease(&body.lease_id) {
-            return error_response(
-                StatusCode::FORBIDDEN,
-                &ErrorEnvelope::lease_error(e.to_string()),
-            );
-        }
         match ctrl.header(&header_id) {
             Some(h) => (
                 h.pwm_path.clone(),
@@ -408,6 +164,23 @@ pub async fn hwmon_verify_handler(
                 )
             }
         }
+    };
+
+    // Single-flight + pause the engine's write phase for the verify's lifetime
+    // (reject a concurrent verify with 409), then force-take a daemon-owned
+    // "verify" lease for our own controlled writes. The engine is the sole
+    // writer now (DEC-165) — no client lease.
+    let Some(_verify_guard) =
+        super::begin_verify_pause(&state.cache, crate::constants::VERIFY_PAUSE_DEADMAN)
+    else {
+        return error_response(
+            StatusCode::CONFLICT,
+            &ErrorEnvelope::validation("a hardware verify is already in progress"),
+        );
+    };
+    let verify_lease_id = {
+        let mut ctrl = controller.lock();
+        ctrl.lease_manager_mut().force_take_lease("verify").lease_id
     };
 
     let read_state = |pwm: &str, en: &Option<String>, rpm: &Option<String>| -> HwmonVerifyState {
@@ -445,7 +218,7 @@ pub async fn hwmon_verify_handler(
     // surface as 403 lease_required, not 500 internal_error.
     {
         let mut ctrl = controller.lock();
-        if let Err(e) = ctrl.set_pwm(&header_id, test_pct, &body.lease_id) {
+        if let Err(e) = ctrl.set_pwm(&header_id, test_pct, &verify_lease_id) {
             return hwmon_control_error_response(e);
         }
     }
@@ -463,7 +236,7 @@ pub async fn hwmon_verify_handler(
     // PWM). Previously the error was silently swallowed.
     let restore_failed = {
         let mut ctrl = controller.lock();
-        match ctrl.set_pwm(&header_id, current_pct, &body.lease_id) {
+        match ctrl.set_pwm(&header_id, current_pct, &verify_lease_id) {
             Ok(_) => false,
             Err(e) => {
                 log::warn!(
@@ -474,6 +247,13 @@ pub async fn hwmon_verify_handler(
             }
         }
     };
+
+    // Release the verify lease (best-effort; the engine reclaims it next tick).
+    // The engine's write pause is cleared by `_verify_guard` on drop.
+    {
+        let mut ctrl = controller.lock();
+        let _ = ctrl.lease_manager_mut().release_lease(&verify_lease_id);
+    }
 
     // Classify result
     let (result, details) = classify_verify_result(&initial, &final_state, test_pct);

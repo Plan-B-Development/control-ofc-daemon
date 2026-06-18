@@ -371,6 +371,48 @@ mod tests {
     }
 
     #[test]
+    fn entries_expire_exactly_at_their_deadline() {
+        // Expiry is judged strictly: an entry is live only while `now <
+        // expires_at`, so at EXACTLY its deadline it is already expired. This
+        // pins the `<` (not `<=`) boundary across the deadman sweep, the
+        // engine-applied snapshot, and the renew/release lifecycle — a
+        // one-tick-late deadman would hold a stale pin one tick past its TTL.
+        let clock = ManualClock::new();
+        let mut t = OverrideTable::with_clock(clock.clone());
+        let g = t.take_override("ctrl-a", 70, ttl());
+        t.identify_stop("fan-1", ttl());
+
+        // One tick before the deadline: both still live.
+        clock.advance(ttl() - Duration::from_nanos(1));
+        assert_eq!(t.snapshot().controls.get("ctrl-a"), Some(&70));
+        assert!(t.snapshot().identify_stop.contains("fan-1"));
+
+        // Land EXACTLY on `expires_at` (now == expires_at, so `now < expires_at`
+        // is false): the entry is already expired everywhere it is read.
+        clock.advance(Duration::from_nanos(1));
+        let snap = t.snapshot();
+        assert!(
+            snap.controls.is_empty() && snap.identify_stop.is_empty(),
+            "snapshot must exclude an entry at exactly its deadline"
+        );
+        // renew/release at the exact deadline see no live override → NotActive
+        // (re-take), never a fencing rejection and never a successful renew.
+        assert_eq!(
+            t.renew_override("ctrl-a", g.token, ttl()),
+            Err(OverrideReject::NotActive)
+        );
+        assert_eq!(
+            t.release_override("ctrl-a", g.token),
+            Err(OverrideReject::NotActive)
+        );
+        // ...and the sweep reports both as cleared so the engine resets their
+        // cross-tick state (control re-anchors to its curve; fan resumes).
+        let cleared = t.sweep();
+        assert!(cleared.controls.contains(&"ctrl-a".to_string()));
+        assert!(cleared.fans.contains(&"fan-1".to_string()));
+    }
+
+    #[test]
     fn continuously_renewed_override_never_expires() {
         // No absolute max-duration cap (D4-c): a live renewing client holds
         // indefinitely; the 105°C force is the safety net, not a hard cap.

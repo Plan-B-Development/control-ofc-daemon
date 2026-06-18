@@ -2,7 +2,7 @@
 
 use parking_lot::Mutex;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use http_body_util::BodyExt;
 use hyper::Request;
@@ -11,7 +11,6 @@ use tokio::net::UnixStream;
 
 use control_ofc_daemon::api::handlers::AppState;
 use control_ofc_daemon::api::server;
-use control_ofc_daemon::error::SerialError;
 use control_ofc_daemon::health::cache::StateCache;
 use control_ofc_daemon::health::history::HistoryRing;
 use control_ofc_daemon::health::staleness::StalenessConfig;
@@ -23,8 +22,6 @@ use control_ofc_daemon::hwmon::pwm_control::{HwmonPwmController, SysfsWriter};
 use control_ofc_daemon::hwmon::pwm_discovery::PwmHeaderDescriptor;
 use control_ofc_daemon::hwmon::types::SensorKind;
 use control_ofc_daemon::profile::DaemonProfile;
-use control_ofc_daemon::serial::controller::FanController;
-use control_ofc_daemon::serial::transport::SerialTransport;
 
 /// Helper: create AppState with a pre-populated cache.
 fn test_app_state() -> Arc<AppState> {
@@ -429,167 +426,6 @@ async fn uds_post(
     (status, json)
 }
 
-/// Mock transport that accepts writes and returns canned OK responses in FIFO order.
-struct IntegrationMockTransport {
-    responses: Mutex<std::collections::VecDeque<Result<String, SerialError>>>,
-}
-
-impl IntegrationMockTransport {
-    fn with_ok_responses(count: usize) -> Self {
-        let responses = (0..count)
-            .map(|_| Ok("<02|00:0400;>\r\n".to_string()))
-            .collect();
-        Self {
-            responses: Mutex::new(responses),
-        }
-    }
-}
-
-impl SerialTransport for IntegrationMockTransport {
-    fn write_line(&mut self, _data: &str) -> Result<(), SerialError> {
-        Ok(())
-    }
-
-    fn read_line(&mut self, _timeout: Duration) -> Result<String, SerialError> {
-        self.responses
-            .lock()
-            .pop_front()
-            .unwrap_or(Err(SerialError::Timeout { timeout_ms: 500 }))
-    }
-}
-
-/// Helper: create AppState with a mock FanController.
-fn test_app_state_with_controller(response_count: usize) -> Arc<AppState> {
-    let cache = Arc::new(StateCache::new());
-    let transport = IntegrationMockTransport::with_ok_responses(response_count);
-    let controller = FanController::new(
-        Box::new(transport),
-        cache.clone(),
-        Duration::from_millis(500),
-    );
-
-    Arc::new(AppState {
-        cache,
-        staleness_config: StalenessConfig::default(),
-        daemon_version: "0.1.0-test".into(),
-        fan_controller: Some(Arc::new(Mutex::new(controller))),
-        hwmon_controller: None,
-        start_time: std::time::Instant::now(),
-        history: Arc::new(HistoryRing::new(250)),
-        active_profile: Arc::new(parking_lot::Mutex::new(None)),
-        calibrating: std::sync::atomic::AtomicBool::new(false),
-        amd_gpus: Vec::new(),
-        intel_gpus: Vec::new(),
-        profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
-        config_path: String::new(),
-        runtime_config_path: std::path::PathBuf::new(),
-        sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        override_table: Arc::new(parking_lot::Mutex::new(
-            control_ofc_daemon::control_override::OverrideTable::new(),
-        )),
-    })
-}
-
-#[tokio::test]
-async fn set_pwm_single_channel() {
-    let state = test_app_state_with_controller(5);
-    let (path, shutdown, _dir) = start_test_server(state).await;
-
-    let body = serde_json::json!({ "pwm_percent": 50 });
-    let (status, json) = uds_post(&path, "/fans/openfan/0/pwm", &body).await;
-
-    assert_eq!(status, 200);
-    assert_eq!(json["api_version"], 1);
-    assert_eq!(json["channel"], 0);
-    assert_eq!(json["pwm_percent"], 50);
-    assert_eq!(json["coalesced"], false);
-
-    let _ = shutdown.send(());
-    let _ = std::fs::remove_file(&path);
-}
-
-#[tokio::test]
-async fn set_pwm_all_channels() {
-    let state = test_app_state_with_controller(5);
-    let (path, shutdown, _dir) = start_test_server(state).await;
-
-    let body = serde_json::json!({ "pwm_percent": 75 });
-    let (status, json) = uds_post(&path, "/fans/openfan/pwm", &body).await;
-
-    assert_eq!(status, 200);
-    assert_eq!(json["api_version"], 1);
-    assert_eq!(json["pwm_percent"], 75);
-    assert_eq!(json["channels_affected"], 10);
-
-    let _ = shutdown.send(());
-    let _ = std::fs::remove_file(&path);
-}
-
-#[tokio::test]
-async fn set_pwm_invalid_channel() {
-    let state = test_app_state_with_controller(5);
-    let (path, shutdown, _dir) = start_test_server(state).await;
-
-    let body = serde_json::json!({ "pwm_percent": 50 });
-    let (status, json) = uds_post(&path, "/fans/openfan/99/pwm", &body).await;
-
-    assert_eq!(status, 400);
-    assert_eq!(json["error"]["code"], "validation_error");
-    assert_eq!(json["error"]["retryable"], false);
-
-    let _ = shutdown.send(());
-    let _ = std::fs::remove_file(&path);
-}
-
-#[tokio::test]
-async fn set_pwm_invalid_percent() {
-    let state = test_app_state_with_controller(5);
-    let (path, shutdown, _dir) = start_test_server(state).await;
-
-    let body = serde_json::json!({ "pwm_percent": 200 });
-    let (status, json) = uds_post(&path, "/fans/openfan/0/pwm", &body).await;
-
-    assert_eq!(status, 400);
-    assert_eq!(json["error"]["code"], "validation_error");
-
-    let _ = shutdown.send(());
-    let _ = std::fs::remove_file(&path);
-}
-
-#[tokio::test]
-async fn set_pwm_no_controller_returns_unavailable() {
-    let state = test_app_state(); // no fan_controller
-    let (path, shutdown, _dir) = start_test_server(state).await;
-
-    let body = serde_json::json!({ "pwm_percent": 50 });
-    let (status, json) = uds_post(&path, "/fans/openfan/0/pwm", &body).await;
-
-    assert_eq!(status, 503);
-    assert_eq!(json["error"]["code"], "hardware_unavailable");
-    assert_eq!(json["error"]["retryable"], true);
-
-    let _ = shutdown.send(());
-    let _ = std::fs::remove_file(&path);
-}
-
-#[tokio::test]
-async fn set_target_rpm_single_channel() {
-    let state = test_app_state_with_controller(5);
-    let (path, shutdown, _dir) = start_test_server(state).await;
-
-    let body = serde_json::json!({ "target_rpm": 1200 });
-    let (status, json) = uds_post(&path, "/fans/openfan/0/target_rpm", &body).await;
-
-    assert_eq!(status, 200);
-    assert_eq!(json["api_version"], 1);
-    assert_eq!(json["channel"], 0);
-    assert_eq!(json["target_rpm"], 1200);
-
-    let _ = shutdown.send(());
-    let _ = std::fs::remove_file(&path);
-}
-
 // ── Hwmon integration tests ──────────────────────────────────────────
 
 /// Mock sysfs writer for hwmon integration tests.
@@ -679,106 +515,6 @@ async fn hwmon_headers_returns_discovered() {
 }
 
 #[tokio::test]
-async fn hwmon_lease_take_and_release() {
-    let state = test_app_state_with_hwmon();
-    let (path, shutdown, _dir) = start_test_server(state).await;
-
-    // Take lease
-    let body = serde_json::json!({ "owner_hint": "test-gui" });
-    let (status, json) = uds_post(&path, "/hwmon/lease/take", &body).await;
-
-    assert_eq!(status, 200);
-    assert_eq!(json["api_version"], 1);
-    assert!(json["lease_id"].is_string());
-    assert_eq!(json["owner_hint"], "test-gui");
-    assert!(json["ttl_seconds"].as_u64().unwrap() > 0);
-
-    let lease_id = json["lease_id"].as_str().unwrap().to_string();
-
-    // Release lease
-    let body = serde_json::json!({ "lease_id": lease_id });
-    let (status, json) = uds_post(&path, "/hwmon/lease/release", &body).await;
-
-    assert_eq!(status, 200);
-    assert_eq!(json["released"], true);
-
-    let _ = shutdown.send(());
-    let _ = std::fs::remove_file(&path);
-}
-
-#[tokio::test]
-async fn hwmon_lease_take_conflict() {
-    let state = test_app_state_with_hwmon();
-    let (path, shutdown, _dir) = start_test_server(state).await;
-
-    // First take succeeds
-    let body = serde_json::json!({ "owner_hint": "gui-1" });
-    let (status, _) = uds_post(&path, "/hwmon/lease/take", &body).await;
-    assert_eq!(status, 200);
-
-    // Second take succeeds (force_take preempts — GUI always wins)
-    let body = serde_json::json!({ "owner_hint": "gui-2" });
-    let (status, json) = uds_post(&path, "/hwmon/lease/take", &body).await;
-
-    assert_eq!(status, 200);
-    assert_eq!(json["owner_hint"], "gui-2");
-
-    let _ = shutdown.send(());
-    let _ = std::fs::remove_file(&path);
-}
-
-#[tokio::test]
-async fn hwmon_set_pwm_with_lease() {
-    let state = test_app_state_with_hwmon();
-    let cache = state.cache.clone();
-    // DEC-131: a hwmon PWM write must record GUI liveness so the profile engine
-    // defers to the GUI. A regression dropping record_gui_write() on this path
-    // would silently hand hwmon control back to the engine while the GUI writes.
-    assert!(!cache.gui_active(), "test precondition: GUI not yet active");
-    let (path, shutdown, _dir) = start_test_server(state).await;
-
-    // Take lease (a lease op — must NOT itself mark the GUI active).
-    let body = serde_json::json!({ "owner_hint": "gui" });
-    let (_, lease_json) = uds_post(&path, "/hwmon/lease/take", &body).await;
-    let lease_id = lease_json["lease_id"].as_str().unwrap();
-    assert!(
-        !cache.gui_active(),
-        "taking a lease must not mark the GUI active; only a write does"
-    );
-
-    // Set PWM
-    let body = serde_json::json!({ "pwm_percent": 60, "lease_id": lease_id });
-    let (status, json) = uds_post(&path, "/hwmon/h1/pwm", &body).await;
-
-    assert_eq!(status, 200);
-    assert_eq!(json["api_version"], 1);
-    assert_eq!(json["header_id"], "h1");
-    assert_eq!(json["pwm_percent"], 60);
-    assert!(
-        cache.gui_active(),
-        "hwmon PWM write must record GUI liveness (DEC-131)"
-    );
-
-    let _ = shutdown.send(());
-    let _ = std::fs::remove_file(&path);
-}
-
-#[tokio::test]
-async fn hwmon_set_pwm_without_lease() {
-    let state = test_app_state_with_hwmon();
-    let (path, shutdown, _dir) = start_test_server(state).await;
-
-    let body = serde_json::json!({ "pwm_percent": 50, "lease_id": "invalid" });
-    let (status, json) = uds_post(&path, "/hwmon/h1/pwm", &body).await;
-
-    assert_eq!(status, 403);
-    assert_eq!(json["error"]["code"], "lease_required");
-
-    let _ = shutdown.send(());
-    let _ = std::fs::remove_file(&path);
-}
-
-#[tokio::test]
 async fn hwmon_headers_empty_when_no_controller() {
     let state = test_app_state(); // no hwmon_controller
     let (path, shutdown, _dir) = start_test_server(state).await;
@@ -841,84 +577,6 @@ async fn capabilities_with_hwmon_shows_headers() {
     let _ = std::fs::remove_file(&path);
 }
 
-// ── Lease status/renew integration tests ─────────────────────────────
-
-#[tokio::test]
-async fn lease_status_no_lease() {
-    let state = test_app_state_with_hwmon();
-    let (path, shutdown, _dir) = start_test_server(state).await;
-
-    let (status, json) = uds_get(&path, "/hwmon/lease/status").await;
-
-    assert_eq!(status, 200);
-    assert_eq!(json["lease_required"], true);
-    assert_eq!(json["held"], false);
-    assert!(json.get("lease_id").is_none());
-
-    let _ = shutdown.send(());
-    let _ = std::fs::remove_file(&path);
-}
-
-#[tokio::test]
-async fn lease_status_with_active_lease() {
-    let state = test_app_state_with_hwmon();
-    let (path, shutdown, _dir) = start_test_server(state).await;
-
-    // Take lease
-    let body = serde_json::json!({ "owner_hint": "gui" });
-    let (_, lease_json) = uds_post(&path, "/hwmon/lease/take", &body).await;
-    let lease_id = lease_json["lease_id"].as_str().unwrap();
-
-    // Check status
-    let (status, json) = uds_get(&path, "/hwmon/lease/status").await;
-
-    assert_eq!(status, 200);
-    assert_eq!(json["held"], true);
-    assert_eq!(json["lease_id"], lease_id);
-    assert_eq!(json["owner_hint"], "gui");
-    assert!(json["ttl_seconds_remaining"].as_u64().unwrap() > 0);
-
-    let _ = shutdown.send(());
-    let _ = std::fs::remove_file(&path);
-}
-
-#[tokio::test]
-async fn lease_renew_extends_ttl() {
-    let state = test_app_state_with_hwmon();
-    let (path, shutdown, _dir) = start_test_server(state).await;
-
-    // Take lease
-    let body = serde_json::json!({ "owner_hint": "gui" });
-    let (_, lease_json) = uds_post(&path, "/hwmon/lease/take", &body).await;
-    let lease_id = lease_json["lease_id"].as_str().unwrap();
-
-    // Renew
-    let body = serde_json::json!({ "lease_id": lease_id });
-    let (status, json) = uds_post(&path, "/hwmon/lease/renew", &body).await;
-
-    assert_eq!(status, 200);
-    assert_eq!(json["lease_id"], lease_id);
-    assert!(json["ttl_seconds"].as_u64().unwrap() > 55);
-
-    let _ = shutdown.send(());
-    let _ = std::fs::remove_file(&path);
-}
-
-#[tokio::test]
-async fn lease_renew_invalid_id_fails() {
-    let state = test_app_state_with_hwmon();
-    let (path, shutdown, _dir) = start_test_server(state).await;
-
-    let body = serde_json::json!({ "lease_id": "bogus" });
-    let (status, json) = uds_post(&path, "/hwmon/lease/renew", &body).await;
-
-    assert_eq!(status, 400);
-    assert_eq!(json["error"]["code"], "lease_required");
-
-    let _ = shutdown.send(());
-    let _ = std::fs::remove_file(&path);
-}
-
 #[tokio::test]
 async fn unknown_endpoint_returns_error_envelope() {
     let state = test_app_state();
@@ -955,23 +613,6 @@ async fn hwmon_verify_no_controller_returns_503() {
     assert_eq!(json["error"]["code"], "hardware_unavailable");
     assert_eq!(json["error"]["retryable"], true);
     assert_eq!(json["error"]["source"], "hardware");
-
-    let _ = shutdown.send(());
-    let _ = std::fs::remove_file(&path);
-}
-
-#[tokio::test]
-async fn gpu_set_fan_unknown_gpu_returns_404() {
-    // Sanity: unknown GPU id remains 404 (that IS a validation error — the
-    // endpoint exists, the caller's id doesn't).
-    let state = test_app_state(); // amd_gpus empty
-    let (path, shutdown, _dir) = start_test_server(state).await;
-
-    let body = serde_json::json!({ "speed_pct": 50 });
-    let (status, json) = uds_post(&path, "/gpu/0000:99:00.0/fan/pwm", &body).await;
-
-    assert_eq!(status, 404);
-    assert_eq!(json["error"]["code"], "validation_error");
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
@@ -1034,63 +675,6 @@ fn test_app_state_with_unsupported_gpu(pci_bdf: &str) -> Arc<AppState> {
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
     })
-}
-
-#[tokio::test]
-async fn gpu_set_fan_unsupported_returns_400_feature_unavailable() {
-    // P1-1: when a GPU exists but has no fan write path (no PMFW fan_curve,
-    // no legacy pwm1), the handler previously returned 400 hardware_unavailable
-    // + retryable:true — a contract violation (hardware_unavailable is a 503
-    // code, and the condition is permanent so not retryable).
-    //
-    // The fix is a dedicated `feature_unavailable` code (400, retryable:false,
-    // source "validation") to distinguish "this device can't do this" from
-    // "hardware failed transiently".
-    let bdf = "0000:99:00.0";
-    let state = test_app_state_with_unsupported_gpu(bdf);
-    let (path, shutdown, _dir) = start_test_server(state).await;
-
-    let body = serde_json::json!({ "speed_pct": 50 });
-    let (status, json) = uds_post(&path, &format!("/gpu/{bdf}/fan/pwm"), &body).await;
-
-    assert_eq!(status, 400);
-    assert_eq!(json["error"]["code"], "feature_unavailable");
-    assert_eq!(json["error"]["retryable"], false);
-    assert_eq!(json["error"]["source"], "validation");
-
-    let _ = shutdown.send(());
-    let _ = std::fs::remove_file(&path);
-}
-
-#[tokio::test]
-async fn gpu_set_fan_coalesced_write_still_records_gui_activity() {
-    // DEC-131: the 5% coalesced early-return must still call
-    // record_gui_write(). Every other write handler records on every OK
-    // (their coalescing lives below the handler); skipping it here let
-    // gui_active() lapse during slow temperature ramps (1-4% deltas), handing
-    // GPU control to the profile engine while the GUI believed it was in
-    // control. The coalesce check runs before the write-path dispatch, so a
-    // GPU without a write path exercises it fine once the cache is seeded.
-    let bdf = "0000:99:00.5";
-    let state = test_app_state_with_unsupported_gpu(bdf);
-    let cache = state.cache.clone();
-    cache.set_gpu_fan_commanded_pct(&format!("amd_gpu:{bdf}"), 50);
-    assert!(!cache.gui_active(), "test precondition: GUI not yet active");
-    let (path, shutdown, _dir) = start_test_server(state).await;
-
-    // delta = |52 - 50| = 2 < GPU_COALESCE_DELTA_PCT (5) → coalesced 200 OK.
-    let body = serde_json::json!({ "speed_pct": 52 });
-    let (status, json) = uds_post(&path, &format!("/gpu/{bdf}/fan/pwm"), &body).await;
-
-    assert_eq!(status, 200);
-    assert_eq!(json["speed_pct"], 52);
-    assert!(
-        cache.gui_active(),
-        "coalesced GPU write must record GUI liveness (DEC-131)"
-    );
-
-    let _ = shutdown.send(());
-    let _ = std::fs::remove_file(&path);
 }
 
 #[tokio::test]
@@ -1162,36 +746,6 @@ fn test_app_state_with_read_only_gpu(pci_bdf: &str, pci_device_id: u16) -> Arc<A
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
     })
-}
-
-#[tokio::test]
-async fn gpu_set_fan_read_only_rdna_returns_400_feature_unavailable() {
-    // DEC-098: the legacy-PWM dispatch arm previously gated on `gpu.has_pwm`
-    // alone. RDNA3/RDNA4 GPUs without overdrive expose `pwm1` read-only and
-    // lack `pwm1_enable`, so the handler would attempt to write `pwm1_enable`,
-    // fail with ENOENT, and surface 503 hardware_unavailable + retryable:true.
-    // The canonical answer is 400 feature_unavailable + retryable:false (DEC-094)
-    // and the message must include the `amdgpu.ppfeaturemask=0xffffffff` hint
-    // so users on bare RDNA3/4 know how to unlock PMFW.
-    let bdf = "0000:03:00.0";
-    let state = test_app_state_with_read_only_gpu(bdf, 0x7550); // RX 9070 XT device id
-    let (path, shutdown, _dir) = start_test_server(state).await;
-
-    let body = serde_json::json!({ "speed_pct": 50 });
-    let (status, json) = uds_post(&path, &format!("/gpu/{bdf}/fan/pwm"), &body).await;
-
-    assert_eq!(status, 400);
-    assert_eq!(json["error"]["code"], "feature_unavailable");
-    assert_eq!(json["error"]["retryable"], false);
-    assert_eq!(json["error"]["source"], "validation");
-    let msg = json["error"]["message"].as_str().expect("message string");
-    assert!(
-        msg.contains("amdgpu.ppfeaturemask=0xffffffff"),
-        "expected ppfeaturemask hint in message, got: {msg}"
-    );
-
-    let _ = shutdown.send(());
-    let _ = std::fs::remove_file(&path);
 }
 
 #[tokio::test]
@@ -1364,7 +918,7 @@ async fn deactivate_profile_preserves_gui_lease() {
     let _ = std::fs::remove_file(&path);
 }
 
-// ── Audit P2.7: GPU reset records gui_active ────────────────────────────
+// ── GPU reset succeeds (daemon-mediated action) ─────────────────────────
 
 /// Construct an `AppState` with a fully-writable PMFW GPU pointing at real
 /// files in a tempdir. The caller must keep the returned ``TempDir`` alive
@@ -1431,19 +985,13 @@ fn test_app_state_with_writable_pmfw_gpu(pci_bdf: &str) -> (Arc<AppState>, tempf
 }
 
 #[tokio::test]
-async fn gpu_reset_fan_records_gui_write() {
-    // Audit P2.7 regression: a successful POST /gpu/{id}/fan/reset must
-    // call record_gui_write() so the profile engine defers for the
-    // GUI_ACTIVITY_TIMEOUT window. Without this, the next 1 Hz profile-engine
-    // tick re-asserts the curve and silently undoes the user's reset.
+async fn gpu_reset_fan_succeeds() {
+    // POST /gpu/{id}/fan/reset on a writable PMFW GPU restores automatic fan
+    // control and returns 200 {reset:true}. DEC-165: the daemon engine is the
+    // sole writer now, so reset no longer records GUI activity — it is a
+    // daemon-mediated action, not a GUI write.
     let bdf = "0000:03:00.0";
     let (state, _tmp) = test_app_state_with_writable_pmfw_gpu(bdf);
-
-    // Pre-condition: gui_active() is false (no prior writes).
-    assert!(
-        !state.cache.snapshot().gui_active(),
-        "precondition: gui_active should start false"
-    );
 
     let (path, shutdown, _dir) = start_test_server(state.clone()).await;
     let (status, json) = uds_post(
@@ -1455,13 +1003,6 @@ async fn gpu_reset_fan_records_gui_write() {
 
     assert_eq!(status, 200, "body: {json}");
     assert_eq!(json["reset"], true);
-
-    // Post-condition: gui_active() is now true. The profile engine will
-    // skip GPU writes until GUI_ACTIVITY_TIMEOUT (30 s) elapses.
-    assert!(
-        state.cache.snapshot().gui_active(),
-        "reset must record a GUI write so the profile engine defers"
-    );
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
@@ -1533,109 +1074,6 @@ async fn hwmon_verify_response_includes_restore_failed_when_true() {
         json["restore_failed"], true,
         "restore_failed must be present and true so GUI can warn the operator"
     );
-}
-
-// ── DEC-102: read-only hwmon header gating ───────────────────────────
-
-/// Build a synthetic AppState whose hwmon controller advertises a single
-/// header with `is_writable=false`. Mimics the post-DEC-102 state when an
-/// unforeseen chip exposes a read-only `pwmN`. (The canonical case —
-/// `chip_name="amdgpu"` — is excluded one layer earlier in
-/// `pwm_discovery::discover_device_pwm`, so no header reaches this point;
-/// this fixture pins the defense-in-depth handler check.)
-fn test_app_state_with_read_only_hwmon_header() -> Arc<AppState> {
-    let cache = Arc::new(StateCache::new());
-    let mut header = make_test_header("ro1", "ReadOnlyFan", 0);
-    header.is_writable = false;
-    let lease_mgr = LeaseManager::new();
-    let ctrl = HwmonPwmController::new(
-        vec![header],
-        lease_mgr,
-        Box::new(HwmonMockWriter),
-        cache.clone(),
-    );
-
-    Arc::new(AppState {
-        cache,
-        staleness_config: StalenessConfig::default(),
-        daemon_version: "0.1.0-test".into(),
-        fan_controller: None,
-        hwmon_controller: Some(Arc::new(Mutex::new(ctrl))),
-        start_time: std::time::Instant::now(),
-        history: Arc::new(HistoryRing::new(250)),
-        active_profile: Arc::new(parking_lot::Mutex::new(None)),
-        calibrating: std::sync::atomic::AtomicBool::new(false),
-        amd_gpus: Vec::new(),
-        intel_gpus: Vec::new(),
-        profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
-        config_path: String::new(),
-        runtime_config_path: std::path::PathBuf::new(),
-        sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        override_table: Arc::new(parking_lot::Mutex::new(
-            control_ofc_daemon::control_override::OverrideTable::new(),
-        )),
-    })
-}
-
-/// DEC-102: a write to a header whose discovered `is_writable=false` must
-/// short-circuit with `400 feature_unavailable`, never with `503`. Without
-/// the gate the controller attempts the sysfs write, the kernel returns
-/// `EACCES`, and the controller surfaces `503 hardware_unavailable +
-/// retryable: true` — which is both wrong (the condition is permanent) and
-/// triggers a 1 Hz retry storm in clients with retry policies.
-#[tokio::test]
-async fn hwmon_set_pwm_read_only_header_returns_400_feature_unavailable() {
-    let state = test_app_state_with_read_only_hwmon_header();
-    let (path, shutdown, _dir) = start_test_server(state).await;
-
-    // Take a valid lease — the failure must not be lease-shaped.
-    let body = serde_json::json!({ "owner_hint": "gui" });
-    let (status, lease_json) = uds_post(&path, "/hwmon/lease/take", &body).await;
-    assert_eq!(status, 200);
-    let lease_id = lease_json["lease_id"].as_str().unwrap();
-
-    let body = serde_json::json!({ "pwm_percent": 50, "lease_id": lease_id });
-    let (status, json) = uds_post(&path, "/hwmon/ro1/pwm", &body).await;
-
-    assert_eq!(
-        status, 400,
-        "read-only header must yield 400, never 503: {json}"
-    );
-    assert_eq!(json["error"]["code"], "feature_unavailable");
-    assert_eq!(json["error"]["retryable"], false);
-    let msg = json["error"]["message"].as_str().unwrap_or_default();
-    assert!(
-        msg.contains("read-only"),
-        "message missing 'read-only': {msg}"
-    );
-    assert!(
-        msg.contains("ro1"),
-        "message must name the header id: {msg}"
-    );
-
-    let _ = shutdown.send(());
-    let _ = std::fs::remove_file(&path);
-}
-
-/// DEC-102 sibling check: the writability gate must take precedence over
-/// the lease check, so a stale or invalid lease still yields the
-/// `feature_unavailable` verdict for a permanently read-only header.
-/// Without this ordering, a client could mistakenly conclude the header is
-/// writable and that only the lease is wrong.
-#[tokio::test]
-async fn hwmon_set_pwm_read_only_header_takes_precedence_over_lease() {
-    let state = test_app_state_with_read_only_hwmon_header();
-    let (path, shutdown, _dir) = start_test_server(state).await;
-
-    let body = serde_json::json!({ "pwm_percent": 50, "lease_id": "definitely-not-a-real-lease" });
-    let (status, json) = uds_post(&path, "/hwmon/ro1/pwm", &body).await;
-
-    assert_eq!(status, 400, "must be 400 even with a bogus lease: {json}");
-    assert_eq!(json["error"]["code"], "feature_unavailable");
-
-    let _ = shutdown.send(());
-    let _ = std::fs::remove_file(&path);
 }
 
 /// DEC-102 integration: discovery + IPC. Build a fake hwmon root with one
@@ -1725,33 +1163,6 @@ async fn hwmon_discovery_excludes_amdgpu_end_to_end_via_ipc() {
             "header id must not reference amdgpu: {id}"
         );
     }
-
-    let _ = shutdown.send(());
-    let _ = std::fs::remove_file(&path);
-}
-
-/// DEC-102: writes targeted at a header that was never discovered must
-/// continue to return 404 — discovery dropping the amdgpu header (Option A)
-/// shifts the failure mode from 503/EACCES to a clean 404.
-#[tokio::test]
-async fn hwmon_set_pwm_unknown_header_returns_404() {
-    let state = test_app_state_with_hwmon();
-    let (path, shutdown, _dir) = start_test_server(state).await;
-
-    let body = serde_json::json!({ "owner_hint": "gui" });
-    let (_, lease_json) = uds_post(&path, "/hwmon/lease/take", &body).await;
-    let lease_id = lease_json["lease_id"].as_str().unwrap();
-
-    let body = serde_json::json!({ "pwm_percent": 50, "lease_id": lease_id });
-    let (status, json) = uds_post(
-        &path,
-        "/hwmon/hwmon:amdgpu:0000:03:00.0:pwm1:pwm1/pwm",
-        &body,
-    )
-    .await;
-
-    assert_eq!(status, 404, "unknown header must yield 404: {json}");
-    assert_eq!(json["error"]["code"], "validation_error");
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
@@ -2166,6 +1577,59 @@ async fn capabilities_advertises_profile_storage() {
     // DEC-163 / DEC-166: the override + identify APIs land in 1.21.0.
     assert_eq!(body["control"]["manual_override"], true);
     assert_eq!(body["control"]["fan_identify"], true);
+    // DEC-165 (2.0.0 flip): the daemon is the sole authoritative writer and
+    // advertises the version floor that powers the GUI's safety gate.
+    assert_eq!(body["control"]["autonomous_control"], true);
+    assert_eq!(body["control"]["min_supported_gui"], "2.0.0");
+}
+
+#[tokio::test]
+async fn hwmon_verify_rejects_concurrent_with_409() {
+    // DEC-165 single-flight: while one hardware verify holds the slot, a second
+    // verify must be rejected with 409 rather than clobbering the first's engine
+    // pause / "verify" lease. Pre-occupy the slot as if a verify were in flight.
+    let state = test_app_state_with_hwmon();
+    assert!(state
+        .cache
+        .try_begin_verify(std::time::Duration::from_secs(30)));
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_post(&path, "/hwmon/h1/verify", &serde_json::json!({})).await;
+    assert_eq!(status, 409, "concurrent verify must be rejected: {json}");
+    assert_eq!(json["error"]["code"], "validation_error");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn retired_write_and_lease_endpoints_return_404() {
+    // DEC-165: the bare PWM-write + lease endpoints were retired from the
+    // contract at 2.0.0. They must now hit the fallback handler (404), proving
+    // a stray old-GUI write cannot silently succeed against a new daemon.
+    let state = test_app_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    for ep in [
+        "/fans/openfan/0/pwm",
+        "/fans/openfan/pwm",
+        "/fans/openfan/0/target_rpm",
+        "/hwmon/h1/pwm",
+        "/gpu/0000:03:00.0/fan/pwm",
+        "/hwmon/lease/take",
+        "/hwmon/lease/release",
+        "/hwmon/lease/renew",
+    ] {
+        let (status, json) = uds_post(&path, ep, &serde_json::json!({})).await;
+        assert_eq!(status, 404, "retired endpoint {ep} must 404: {json}");
+        assert_eq!(json["error"]["code"], "not_found", "endpoint {ep}");
+    }
+    // GET /hwmon/lease/status is also retired.
+    let (status, _) = uds_get(&path, "/hwmon/lease/status").await;
+    assert_eq!(status, 404, "retired GET /hwmon/lease/status must 404");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
 }
 
 // ── Manual override + fan identify API (DEC-163 / DEC-166) ──────────────

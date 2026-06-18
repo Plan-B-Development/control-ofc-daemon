@@ -2,7 +2,7 @@
 //!
 //! All IPC responses and safety logic draw from these types.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::hwmon::types::{SensorKind, SensorThresholds};
@@ -161,10 +161,21 @@ pub struct DaemonState {
     pub aio: AioPumpState,
     /// Per-subsystem last-update timestamps.
     pub subsystem_timestamps: SubsystemTimestamps,
-    /// Last time a GUI-initiated write command was processed.
-    pub last_gui_write_at: Option<Instant>,
     /// Thermal safety override state: "normal", "emergency", or "recovery".
     pub thermal_override_state: Option<String>,
+    /// True while a hardware verify (hwmon or GPU) is in progress. Held for the
+    /// verify's entire lifetime by the handler's RAII guard, so the engine pause
+    /// outlasts a slow verify rather than expiring on a fixed timer. Single-
+    /// flight: a second verify is rejected (409) while this is set (DEC-165).
+    pub verify_in_progress: bool,
+    /// Generous deadman backing `verify_in_progress`: the RAII guard always
+    /// clears the flag on drop/panic/cancel, but if it somehow does not, the
+    /// pause self-clears after this instant so a verify can never strand control.
+    pub verify_active_until: Option<Instant>,
+    /// GPU fan ids the daemon has relinquished to firmware-auto via
+    /// `POST /gpu/{id}/fan/reset` (DEC-165). The engine skips writing these so a
+    /// reset is durable under an active profile; cleared on profile activation.
+    pub relinquished_gpu_fans: HashSet<String>,
 }
 
 impl Default for DaemonState {
@@ -177,21 +188,10 @@ impl Default for DaemonState {
             sensors: HashMap::new(),
             aio: AioPumpState::default(),
             subsystem_timestamps: SubsystemTimestamps::default(),
-            last_gui_write_at: None,
             thermal_override_state: None,
+            verify_in_progress: false,
+            verify_active_until: None,
+            relinquished_gpu_fans: HashSet::new(),
         }
-    }
-}
-
-impl DaemonState {
-    /// True when the GUI wrote via the API within the last
-    /// [`crate::constants::GUI_ACTIVITY_TIMEOUT`] window.
-    ///
-    /// Profile-engine fan phases skip writes while this is true so the GUI's
-    /// control loop has exclusive authority over fan outputs, avoiding
-    /// dual-writer conflicts (see DEC-071 / DEC-074 in the GUI repo).
-    pub fn gui_active(&self) -> bool {
-        self.last_gui_write_at
-            .is_some_and(|t| t.elapsed() < crate::constants::GUI_ACTIVITY_TIMEOUT)
     }
 }

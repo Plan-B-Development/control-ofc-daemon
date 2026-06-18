@@ -387,6 +387,34 @@ fn parse_profile_arg(search_dirs: &[std::path::PathBuf]) -> Option<std::path::Pa
     None
 }
 
+/// Resolve a profile from persisted daemon state, mapping **any** load failure
+/// (no pointer, missing file, corrupt/invalid/hand-edited JSON) to `None`.
+///
+/// This is the boot-time fail-safe (DEC-165): a persisted profile that has gone
+/// bad on disk must never crash startup — the daemon falls back to imperative
+/// mode (no autonomous writes) and waits for a valid profile to be activated.
+/// Pure over an injected `load` fn so the fail-safe is unit-testable without the
+/// real state file. The caller logs the success case (it owns the "restored"
+/// message); this fn logs the warn-level failure cases.
+fn resolve_persisted_profile(
+    state: &daemon_state::DaemonState,
+    load: impl Fn(&Path) -> Result<DaemonProfile, String>,
+) -> Option<DaemonProfile> {
+    let path_str = state.active_profile_path.as_ref()?;
+    let path = PathBuf::from(path_str);
+    if !path.exists() {
+        log::warn!("Persisted profile path no longer exists: {path_str}");
+        return None;
+    }
+    match load(&path) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            log::warn!("Persisted profile invalid: {e}");
+            None
+        }
+    }
+}
+
 /// Load the initial profile from CLI, env, or persisted state.
 fn resolve_initial_profile(search_dirs: &[std::path::PathBuf]) -> Option<DaemonProfile> {
     // Priority 1: CLI / env override
@@ -410,23 +438,13 @@ fn resolve_initial_profile(search_dirs: &[std::path::PathBuf]) -> Option<DaemonP
         };
     }
 
-    // Priority 2: Persisted state
+    // Priority 2: Persisted state. A corrupt/missing/hand-edited persisted
+    // profile must fail SAFE to no-profile, never crash startup — see
+    // `resolve_persisted_profile`.
     let state = daemon_state::load_state();
-    if let Some(ref path_str) = state.active_profile_path {
-        let path = std::path::PathBuf::from(path_str);
-        if path.exists() {
-            match profile::load_profile(&path) {
-                Ok(p) => {
-                    log::info!("Restored persisted profile: '{}'", p.name);
-                    return Some(p);
-                }
-                Err(e) => {
-                    log::warn!("Persisted profile invalid: {e}");
-                }
-            }
-        } else {
-            log::warn!("Persisted profile path no longer exists: {path_str}");
-        }
+    if let Some(p) = resolve_persisted_profile(&state, profile::load_profile) {
+        log::info!("Restored persisted profile: '{}'", p.name);
+        return Some(p);
     }
 
     // Priority 3: No profile — run in pure imperative mode
@@ -986,6 +1004,50 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
+
+    // ── Boot-time profile resolution fail-safe (DEC-165) ─────────────────
+
+    #[test]
+    fn persisted_profile_resolves_to_none_when_corrupt() {
+        // A persisted profile that is corrupt/hand-edited-invalid on disk must
+        // resolve to None (imperative mode), never crash startup. This is the
+        // boot variant of "profile invalid" — the boot path skips validate(),
+        // so load_profile failing safe is the load-bearing net.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("active.json");
+        std::fs::write(&path, "{ this is not valid json").unwrap();
+        let state = daemon_state::DaemonState {
+            version: 1,
+            active_profile_id: Some("x".into()),
+            active_profile_path: Some(path.display().to_string()),
+        };
+        assert!(
+            resolve_persisted_profile(&state, profile::load_profile).is_none(),
+            "a corrupt persisted profile must fail safe to no-profile"
+        );
+    }
+
+    #[test]
+    fn persisted_profile_resolves_to_none_without_a_pointer() {
+        // No persisted pointer → None, and the loader is never consulted.
+        let state = daemon_state::DaemonState {
+            version: 1,
+            active_profile_id: None,
+            active_profile_path: None,
+        };
+        assert!(resolve_persisted_profile(&state, |_| panic!("loader must not run")).is_none());
+    }
+
+    #[test]
+    fn persisted_profile_resolves_to_none_when_file_missing() {
+        // A pointer to a path that no longer exists → None; loader not run.
+        let state = daemon_state::DaemonState {
+            version: 1,
+            active_profile_id: Some("x".into()),
+            active_profile_path: Some("/nonexistent/control-ofc/profile.json".into()),
+        };
+        assert!(resolve_persisted_profile(&state, |_| panic!("loader must not run")).is_none());
+    }
 
     #[tokio::test]
     async fn shutdown_stops_ipc_server_before_restoring_hardware() {

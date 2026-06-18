@@ -83,13 +83,12 @@ daemon/src/
 [serial USB]  ──read──>                                  SSE stream  ──>
 [GPU sysfs]   ──read──>
 
-GUI ──POST──> API handlers ──write──> [hwmon sysfs]
-                                      [serial USB]
-                                      [GPU sysfs]
-
-profile_engine ──read──> StateCache
+profile_engine ──read──> StateCache        (SOLE writer, 2.0.0+ — DEC-159/DEC-165)
                ──eval──> curves
-               ──write──> [all backends]
+               ──write──> [all backends: hwmon sysfs, serial USB, GPU sysfs]
+
+GUI ──POST intent──> API handlers ──> profile_engine
+     (activate profile / override / identify — never a direct PWM write)
 ```
 
 ## Safety Model
@@ -106,11 +105,13 @@ profile_engine ──read──> StateCache
      OpenFan+hwmon fans to 40%
    - Override state is surfaced as `thermal_state` in `GET /status`
      (`normal` | `recovery` | `emergency` | `no_sensor_fallback`, DEC-132)
-     so the GUI stands its control loop down while the override runs
+     so the GUI shows a poll-driven thermal banner (DEC-165 — there is no GUI
+     loop to stand down; the daemon owns control)
 
 2. **Lease system** (`lease.rs`): Exclusive hwmon write access
    - 60s TTL, holder must renew periodically
-   - Prevents GUI and profile engine from conflicting
+   - Held internally by the profile engine (sole writer, 2.0.0+); guards against
+     conflicting external hwmon writers. The GUI holds no lease (DEC-165).
 
 3. **Stop timeout** (`controller.rs`): OpenFan 0% time limit
    - 8 seconds at 0% PWM, then rejects further 0% commands
@@ -199,20 +200,19 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 | GET | `/profile/active` | Current active profile or `{"active": false}` |
 | GET | `/diagnostics/hardware` | Hardware readiness report (hwmon chips, GPU, thermal safety, kernel modules, ACPI conflicts, board info) |
 
-### Write endpoints — OpenFan
+As of 2.0.0 the profile engine is the **sole writer** (DEC-159/DEC-165); the GUI sends intent (activate / override / identify) and a few diagnostics calls — there is no bare PWM write surface.
+
+### Write endpoints — fans
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| POST | `/fans/openfan/{channel}/pwm` | Set a single OpenFan channel PWM |
-| POST | `/fans/openfan/pwm` | Set all OpenFan channels in one call |
-| POST | `/fans/openfan/{channel}/target_rpm` | Closed-loop RPM target (not used by V1 GUI) |
 | POST | `/fans/openfan/{channel}/calibrate` | PWM→RPM sweep (long-running, thermal-aborting) |
+| POST | `/fans/{fan_id}/identify` | Per-fan stop/restore for identification — floor-exempt, deadman auto-restore (DEC-166) |
 
 ### Write endpoints — GPU
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| POST | `/gpu/{gpu_id}/fan/pwm` | Set GPU fan to static speed (5% change threshold) |
 | POST | `/gpu/{gpu_id}/fan/reset` | Restore GPU fan to automatic / re-enable zero-RPM |
 | POST | `/gpu/{gpu_id}/fan/verify` | Test GPU fan-control effectiveness (~6s, no lease; detects ppfeaturemask/SMU/BIOS silent failures) |
 
@@ -220,21 +220,21 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| POST | `/hwmon/lease/take` | Acquire exclusive write lease (60s TTL) |
-| POST | `/hwmon/lease/renew` | Renew held lease |
-| POST | `/hwmon/lease/release` | Release held lease |
-| POST | `/hwmon/{header_id}/pwm` | Set hwmon PWM (lease required) |
-| POST | `/hwmon/{header_id}/verify` | Test PWM write effectiveness (~6s, lease required, detects BIOS/EC interference) |
+| POST | `/hwmon/{header_id}/verify` | Test PWM write effectiveness (~6s; daemon uses its own internal lease, detects BIOS/EC interference) |
 | POST | `/hwmon/rescan` | Re-enumerate hwmon devices and return fresh header list |
 
-### Write endpoints — profile / config
+### Write endpoints — profile / control / config
 
 | Method | Path | Purpose |
 |--------|------|---------|
+| POST/PUT/DELETE | `/profiles`, `/profiles/{id}` | Profile CRUD + `?validate_only` — daemon is the store of record (DEC-160) |
 | POST | `/profile/activate` | Switch active profile by id or path |
-| POST | `/profile/deactivate` | Clear active profile (DEC-097); idempotent; releases the `profile-engine` lease but preserves any GUI lease |
+| POST | `/profile/deactivate` | Clear active profile (DEC-097); idempotent |
+| POST | `/control/{control_id}/override` (+`/override/renew`, `DELETE`) | Expiring manual override — floor-clamped, deadman, monotonic fencing (DEC-163) |
 | POST | `/config/profile-search-dirs` | Additively register profile search directories (persists to `runtime.toml`; 503 `persistence_failed` on write error) |
 | POST | `/config/startup-delay` | Set startup delay seconds (persists to `runtime.toml`, takes effect on restart; 503 `persistence_failed` on write error) |
+
+**Retired at 2.0.0 (DEC-165):** bare PWM writes (`/fans/openfan/{ch}/pwm`, `/fans/openfan/pwm`, `/hwmon/{id}/pwm`, `/gpu/{id}/fan/pwm`), `/fans/openfan/{ch}/target_rpm`, and all `/hwmon/lease/*`.
 
 Error envelope (all errors):
 

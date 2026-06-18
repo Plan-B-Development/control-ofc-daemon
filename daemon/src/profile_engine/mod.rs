@@ -777,7 +777,8 @@ pub async fn profile_engine_loop(
     log::info!("Profile engine started (1Hz)");
 
     // Per-backend write paths (DEC-135). Each backend owns its own gating —
-    // GUI deferral, coalescing thresholds, failure caching, lease handling.
+    // coalescing thresholds, failure caching, lease handling (no GUI deferral
+    // as of 2.0.0 — DEC-165).
     // GpuBackend is deliberately NOT a SafetyWriteBackend (DEC-130): there
     // is no GPU emergency threshold.
     let mut openfan_be = fan_controller.map(OpenFanBackend::new);
@@ -864,9 +865,7 @@ pub async fn profile_engine_loop(
         // clock (never a client timestamp) and reset the cross-tick state of any
         // control whose override just lapsed, so it re-anchors to its curve
         // instead of step-rate-clamping from the pin. Then snapshot the live
-        // overlay to apply this tick. (While the GUI is the active writer this
-        // overlay is computed but not written — the backends defer on
-        // `gui_active`; it takes effect once the engine is primary.)
+        // overlay to apply this tick.
         let override_snapshot = {
             let mut table = override_table.lock();
             for control_id in table.sweep().controls {
@@ -893,16 +892,22 @@ pub async fn profile_engine_loop(
         };
 
         // Apply per backend (DEC-135). Each backend owns its own gating and
-        // none holds a controller guard across an .await. `gui_active` is
-        // read once per tick — a cheap bool instead of the full snapshot the
-        // old inline phases cloned every cycle.
-        let gui_active = cache.gui_active();
-        if let Some(be) = openfan_be.as_mut() {
-            be.apply(&commands, gui_active).await;
-        }
-        gpu_be.apply(&commands, gui_active).await;
-        if let Some(be) = hwmon_be.as_mut() {
-            be.apply(&commands, gui_active).await;
+        // none holds a controller guard across an .await. The engine is the
+        // sole authoritative writer (DEC-165) — no GUI deferral.
+        //
+        // While a hardware verify is in progress (hwmon or GPU), pause the
+        // write phase so the verify's controlled test writes are not
+        // overwritten. The thermal safety force_all runs earlier this tick and
+        // `continue`s before reaching here, so a verify never suppresses an
+        // emergency. The verify pause is deadman-bounded (DEC-165).
+        if !cache.verify_active() {
+            if let Some(be) = openfan_be.as_mut() {
+                be.apply(&commands).await;
+            }
+            gpu_be.apply(&commands).await;
+            if let Some(be) = hwmon_be.as_mut() {
+                be.apply(&commands).await;
+            }
         }
     }
 }
@@ -2515,23 +2520,19 @@ mod tests {
         assert_eq!(gpu_cmd.pwm_percent, 60);
     }
 
-    /// T2 (test-tests audit): when `cache.gui_active()` is true (the GUI has
-    /// written via the API within the last 30s) the profile-engine loop must
-    /// skip its OpenFan write phase. Without this deferral, the GUI's control
-    /// loop and the headless engine would race for the same fan, producing
-    /// serial chatter and PWM oscillation. Mirrors DEC-074.
+    /// P5 precondition (DEC-165): with a profile active and no GUI, the engine
+    /// is the sole writer and must drive OpenFan PWM. This is the gate the
+    /// GUI's (now deleted) control loop relied on — it must hold before the GUI
+    /// is thinned. Replaces the old `loop_defers_openfan_writes_when_gui_active`
+    /// deferral test, which is meaningless now the defer machinery is gone.
     #[tokio::test(start_paused = true)]
-    async fn loop_defers_openfan_writes_when_gui_active() {
+    async fn loop_writes_openfan_when_profile_active() {
         let cache = make_cache_with_sensor("cpu", 55.0);
-        // Mark the GUI as active — record_gui_write() flips gui_active() to true.
-        cache.record_gui_write();
-        assert!(cache.snapshot().gui_active(), "test precondition");
 
         let profile = make_profile("curve", "graph", 50.0);
         let profile_arc = Arc::new(Mutex::new(Some(profile)));
         let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
 
-        // Allocate plenty of mock responses in case the engine does try to write.
         let (transport, written) = LoopTestTransport::new(10);
         let fan_ctrl = crate::serial::controller::FanController::new(
             Box::new(transport),
@@ -2552,19 +2553,111 @@ mod tests {
             shutdown_rx,
         ));
 
-        // Let the loop run one cycle.
+        // Let the loop run a cycle.
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         shutdown_tx.send(true).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         let _ = handle.await;
 
-        // No SetPwm (>02) commands should have been issued — the engine
-        // deferred to the active GUI.
+        // The engine is now primary: it must have issued SetPwm (>02) commands.
+        let cmds = written.lock();
+        let set_pwm_cmds: Vec<_> = cmds.iter().filter(|c| c.starts_with(">02")).collect();
+        assert!(
+            !set_pwm_cmds.is_empty(),
+            "profile engine must write OpenFan PWM when a profile is active (DEC-165); got: {cmds:?}",
+        );
+    }
+
+    /// P5.4 (DEC-165): while a hardware verify is in progress the engine pauses
+    /// its write phase so the verify's controlled test writes are not
+    /// overwritten. With a profile active AND a verify claimed, the loop must
+    /// issue NO OpenFan PWM writes for the verify's lifetime.
+    #[tokio::test(start_paused = true)]
+    async fn loop_pauses_writes_during_verify() {
+        let cache = make_cache_with_sensor("cpu", 55.0);
+        // Claim the verify slot for a long window. The deadman uses the real
+        // wall clock, which the test's simulated tokio time barely advances, so
+        // the pause stays active for the whole run.
+        assert!(cache.try_begin_verify(std::time::Duration::from_secs(60)));
+
+        let profile = make_profile("curve", "graph", 50.0);
+        let profile_arc = Arc::new(Mutex::new(Some(profile)));
+        let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
+
+        let (transport, written) = LoopTestTransport::new(10);
+        let fan_ctrl = crate::serial::controller::FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            std::time::Duration::from_millis(500),
+        );
+        let fan_ctrl = Some(Arc::new(Mutex::new(fan_ctrl)));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(profile_engine_loop(
+            cache,
+            profile_arc,
+            fan_ctrl,
+            None,
+            vec![],
+            safety,
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            shutdown_rx,
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        shutdown_tx.send(true).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let _ = handle.await;
+
         let cmds = written.lock();
         let set_pwm_cmds: Vec<_> = cmds.iter().filter(|c| c.starts_with(">02")).collect();
         assert!(
             set_pwm_cmds.is_empty(),
-            "profile engine must NOT write OpenFan PWM while gui_active is true; got: {set_pwm_cmds:?}",
+            "engine must NOT write while a verify is in progress (DEC-165); got: {cmds:?}",
+        );
+    }
+
+    /// Imperative mode (no active profile): the engine must issue NO writes, so
+    /// deactivating a profile cleanly stops control instead of asserting stale
+    /// curve outputs. The single-writer invariant has no dual-writer gap to
+    /// cover post-flip (DEC-165) — this pins the "engine is silent with no
+    /// profile" half; `loop_writes_openfan_when_profile_active` pins the other.
+    #[tokio::test(start_paused = true)]
+    async fn loop_does_not_write_without_active_profile() {
+        let cache = make_cache_with_sensor("cpu", 55.0);
+        let profile_arc = Arc::new(Mutex::new(None)); // no profile → imperative
+        let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
+
+        let (transport, written) = LoopTestTransport::new(10);
+        let fan_ctrl = crate::serial::controller::FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            std::time::Duration::from_millis(500),
+        );
+        let fan_ctrl = Some(Arc::new(Mutex::new(fan_ctrl)));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(profile_engine_loop(
+            cache,
+            profile_arc,
+            fan_ctrl,
+            None,
+            vec![],
+            safety,
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            shutdown_rx,
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        shutdown_tx.send(true).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let _ = handle.await;
+
+        let cmds = written.lock();
+        let set_pwm_cmds: Vec<_> = cmds.iter().filter(|c| c.starts_with(">02")).collect();
+        assert!(
+            set_pwm_cmds.is_empty(),
+            "engine must not write in imperative mode (no active profile); got: {cmds:?}",
         );
     }
 
@@ -2680,6 +2773,67 @@ mod tests {
             snap.get("amd_gpu:0000:03:00.0")
                 .and_then(|f| f.last_commanded_pct),
             Some(60)
+        );
+    }
+
+    /// DEC-130: the 105 °C thermal force drives OpenFan + writable hwmon to
+    /// 100 %, but GPU fans are EXCLUDED — AMD PMFW firmware owns GPU thermal
+    /// protection and `GpuBackend` deliberately does not implement
+    /// `SafetyWriteBackend`. This pins the exclusion behaviourally: with a GPU
+    /// member in the active profile and a fake GPU registered, a sustained
+    /// emergency must force OpenFan yet leave the GPU's `fan_curve` untouched.
+    #[tokio::test(start_paused = true)]
+    async fn loop_thermal_force_excludes_gpu() {
+        let dir = tempfile::tempdir().unwrap();
+        let (gpu, curve_path) = make_fake_gpu(&dir);
+
+        // 110 °C ≥ the 105 °C force threshold → sustained thermal emergency.
+        let cache = make_cache_with_sensor("cpu", 110.0);
+
+        // A profile that controls the GPU, so absent the DEC-130 exclusion the
+        // engine would have a GPU member it could force.
+        let profile = make_gpu_profile("curve", "graph", 50.0);
+        let profile_arc = Arc::new(Mutex::new(Some(profile)));
+        let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
+
+        // OpenFan present so we can confirm the force path actually ran.
+        let (transport, written) = LoopTestTransport::new(30);
+        let fan_ctrl = crate::serial::controller::FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            std::time::Duration::from_millis(500),
+        );
+        let fan_ctrl = Some(Arc::new(Mutex::new(fan_ctrl)));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(profile_engine_loop(
+            cache,
+            profile_arc,
+            fan_ctrl,
+            None,
+            vec![gpu],
+            safety,
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            shutdown_rx,
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        shutdown_tx.send(true).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let _ = handle.await;
+
+        // The GPU was NOT forced — its PMFW curve file is still empty (DEC-130).
+        let content = std::fs::read_to_string(&curve_path).unwrap();
+        assert!(
+            content.is_empty(),
+            "GPU must be excluded from the thermal force (DEC-130); \
+             fan_curve received: {content:?}"
+        );
+        // ...but the force path DID run: OpenFan channels were forced to 100 %.
+        let cmds = written.lock();
+        assert!(
+            cmds.iter().any(|c| c.starts_with(">02")),
+            "thermal force must drive OpenFan (proves the force ran); got: {cmds:?}"
         );
     }
 

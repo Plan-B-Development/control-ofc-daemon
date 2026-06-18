@@ -1729,6 +1729,154 @@ mod tests {
         assert!(report.errors.iter().any(|e| e.reason == "SYNC_CYCLE"));
     }
 
+    // ── validate() branch coverage (Phase 7 mutation hardening) ──────────────
+    // These pin the Mix/Sync/trigger/offset/source/max-points validation
+    // branches that cargo-mutants flagged as untested in `validate`.
+
+    #[test]
+    fn validate_exactly_max_points_passes() {
+        // Boundary: `points.len() > MAX` (not `>=`) — exactly MAX points is OK.
+        let mut curve = graph_curve("c", "cpu");
+        curve.points = (0..MAX_CURVE_POINTS)
+            .map(|i| CurvePoint {
+                temp_c: i as f64,
+                output_pct: 50.0,
+            })
+            .collect(); // EXACTLY MAX_CURVE_POINTS
+        let report = validate(&mk_profile(vec![curve], vec![]), &sset(&["cpu"]));
+        assert!(
+            !report.errors.iter().any(|e| e.reason == "TOO_MANY_POINTS"),
+            "exactly MAX_CURVE_POINTS must be accepted: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn validate_valid_trigger_idle_below_load_passes() {
+        // A well-formed trigger (idle < load, both finite) must NOT error —
+        // pins the `&&` guards in the idle>=load check.
+        let curve = CurveConfig {
+            id: "t".into(),
+            name: "T".into(),
+            curve_type: "trigger".into(),
+            sensor_id: "cpu".into(),
+            trigger_idle_temp_c: Some(40.0),
+            trigger_load_temp_c: Some(60.0),
+            trigger_idle_pct: Some(30.0),
+            trigger_load_pct: Some(80.0),
+            ..Default::default()
+        };
+        let report = validate(&mk_profile(vec![curve], vec![]), &sset(&["cpu"]));
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|e| e.reason == "TRIGGER_IDLE_GE_LOAD"),
+            "idle below load must be valid: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn validate_mix_unknown_function_warns() {
+        let mix = CurveConfig {
+            id: "m".into(),
+            name: "M".into(),
+            curve_type: "mix".into(),
+            mix_function: Some("definitely-not-a-function".into()),
+            mix_curve_ids: vec!["g".into()], // valid ref — only the function is bad
+            ..Default::default()
+        };
+        let report = validate(
+            &mk_profile(vec![graph_curve("g", "cpu"), mix], vec![]),
+            &sset(&["cpu"]),
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.reason == "UNKNOWN_MIX_FUNCTION"),
+            "unknown mix function must warn: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn validate_mix_dangling_ref_is_error() {
+        let mix = CurveConfig {
+            id: "m".into(),
+            name: "M".into(),
+            curve_type: "mix".into(),
+            mix_curve_ids: vec!["nonexistent".into()],
+            ..Default::default()
+        };
+        let report = validate(&mk_profile(vec![mix], vec![]), &sset(&[]));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.reason == "UNKNOWN_CURVE_REF"),
+            "a mix referencing a missing curve must error: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn validate_sync_dangling_ref_is_error() {
+        // Non-empty sync_control_id that does not exist → UNKNOWN_CONTROL_REF.
+        // (Also pins the `||`/`!` in the sync reference check.)
+        let sync = CurveConfig {
+            id: "s".into(),
+            name: "S".into(),
+            curve_type: "sync".into(),
+            sync_control_id: "missing".into(),
+            ..Default::default()
+        };
+        let report = validate(&mk_profile(vec![sync], vec![]), &sset(&[]));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.reason == "UNKNOWN_CONTROL_REF"),
+            "a sync referencing a missing control must error: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn validate_unknown_member_source_warns() {
+        let bogus = member("martian", "martian:0", "");
+        let report = validate(
+            &mk_profile(vec![], vec![control_with_members(0.0, vec![bogus])]),
+            &sset(&[]),
+        );
+        assert!(
+            report.warnings.iter().any(|w| w.reason == "UNKNOWN_SOURCE"),
+            "an unknown member source must warn: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn validate_out_of_range_offset_is_error() {
+        // check_offset must flag an offset outside ±100 — a no-op check_offset
+        // (the mutant) would let a wild offset through unvalidated.
+        let mut ctl = curve_control("ctl", "c");
+        ctl.offset_pct = 150.0;
+        let report = validate(
+            &mk_profile(vec![graph_curve("c", "cpu")], vec![ctl]),
+            &sset(&["cpu"]),
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.reason == "OUT_OF_RANGE" && e.field.ends_with("offset_pct")),
+            "offset_pct 150 must be OUT_OF_RANGE: {:?}",
+            report.errors
+        );
+    }
+
     #[test]
     fn validate_collects_all_errors_no_fail_fast() {
         let mut curve = graph_curve("c", "cpu");

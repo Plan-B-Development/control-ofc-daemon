@@ -19,7 +19,7 @@ pub async fn status_handler(State(state): State<Arc<AppState>>) -> Json<StatusRe
     let snap = state.cache.snapshot();
     let now = Instant::now();
     let health = compute_health(&snap, &state.staleness_config, now);
-    Json(build_status_response(&state, &snap, health, now))
+    Json(build_status_response(&state, &snap, health))
 }
 
 /// GET /sensors — cached sensor readings.
@@ -52,7 +52,7 @@ pub async fn poll_handler(State(state): State<Arc<AppState>>) -> Json<PollRespon
 
     Json(PollResponse {
         api_version: API_VERSION,
-        status: build_status_response(&state, &snap, health, now),
+        status: build_status_response(&state, &snap, health),
         sensors: build_sensor_entries(&snap, now),
         fans: build_fan_entries(&snap, now),
     })
@@ -210,15 +210,17 @@ pub async fn capabilities_handler(
             openfan_stop_timeout_s: 8,
         },
         // Control-execution capability (DEC-159/160). 1.20.0 delivered daemon-
-        // owned profile storage; 1.21.0 adds the manual-override (DEC-163) and
-        // fan-identify (DEC-166) APIs. min_supported_gui stays empty until the
-        // 2.0.0 cutover enforces a floor.
+        // owned profile storage; 1.21.0 added the manual-override (DEC-163) and
+        // fan-identify (DEC-166) APIs. The 2.0.0 cutover (DEC-165) makes the
+        // engine the sole writer: `autonomous_control` flips true and
+        // `min_supported_gui` enforces the GUI floor for the legible hard-fail.
         control: ControlCapability {
             profile_storage: true,
             curve_evaluation: true,
             manual_override: true,
             fan_identify: true,
-            min_supported_gui: String::new(),
+            autonomous_control: true,
+            min_supported_gui: "2.0.0".into(),
         },
     })
 }

@@ -20,9 +20,6 @@ pub struct StatusResponse {
     /// Seconds since daemon process started.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uptime_seconds: Option<u64>,
-    /// Seconds since last GUI write command (None if no writes received).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gui_last_seen_seconds_ago: Option<u64>,
     /// Thermal safety override state: `"normal"` | `"recovery"` | `"emergency"`
     /// | `"no_sensor_fallback"` (forced 40% when no CPU sensor is reachable).
     /// Mirrors the value the profile engine reports each tick (the same string
@@ -186,92 +183,6 @@ pub struct FanEntry {
     pub stall_detected: Option<bool>,
 }
 
-/// Request body for `POST /fans/openfan/{channel}/pwm` and `POST /fans/openfan/pwm`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct SetPwmRequest {
-    pub pwm_percent: u8,
-}
-
-/// Request body for `POST /fans/openfan/{channel}/target_rpm`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct SetRpmRequest {
-    pub target_rpm: u16,
-}
-
-/// Response for successful per-channel PWM set.
-#[derive(Debug, Clone, Serialize)]
-pub struct SetPwmResponse {
-    pub api_version: u32,
-    pub channel: u8,
-    pub pwm_percent: u8,
-    pub coalesced: bool,
-}
-
-/// Response for successful all-channel PWM set.
-#[derive(Debug, Clone, Serialize)]
-pub struct SetPwmAllResponse {
-    pub api_version: u32,
-    pub pwm_percent: u8,
-    pub channels_affected: u8,
-    /// True when the controller short-circuited the serial command because
-    /// every channel already held this value. Lets the GUI distinguish
-    /// "no-op" from "wrote and cache fresh".
-    pub coalesced: bool,
-}
-
-/// Response for successful target RPM set.
-#[derive(Debug, Clone, Serialize)]
-pub struct SetRpmResponse {
-    pub api_version: u32,
-    pub channel: u8,
-    pub target_rpm: u16,
-}
-
-/// Request body for `POST /hwmon/lease/take`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct TakeLeaseRequest {
-    #[serde(default)]
-    pub owner_hint: String,
-}
-
-/// Response for successful lease take.
-#[derive(Debug, Clone, Serialize)]
-pub struct LeaseResponse {
-    pub api_version: u32,
-    pub lease_id: String,
-    pub owner_hint: String,
-    pub ttl_seconds: u64,
-}
-
-/// Request body for `POST /hwmon/lease/release`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ReleaseLeaseRequest {
-    pub lease_id: String,
-}
-
-/// Response for successful lease release.
-#[derive(Debug, Clone, Serialize)]
-pub struct LeaseReleasedResponse {
-    pub api_version: u32,
-    pub released: bool,
-}
-
-/// Request body for `POST /hwmon/{header_id}/pwm`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct HwmonSetPwmRequest {
-    pub pwm_percent: u8,
-    pub lease_id: String,
-}
-
-/// Response for successful hwmon PWM set.
-#[derive(Debug, Clone, Serialize)]
-pub struct HwmonSetPwmResponse {
-    pub api_version: u32,
-    pub header_id: String,
-    pub pwm_percent: u8,
-    pub raw_value: u8,
-}
-
 /// A single PWM header in the API response.
 #[derive(Debug, Clone, Serialize)]
 pub struct PwmHeaderEntry {
@@ -375,6 +286,14 @@ pub struct ControlCapability {
     pub manual_override: bool,
     /// Daemon exposes a fan-identify API. False until that API lands (DEC-166).
     pub fan_identify: bool,
+    /// True only when the daemon engine is the sole authoritative fan writer —
+    /// the 2.0.0 cutover (DEC-165) deleted the `gui_active` defer machinery, so
+    /// the engine writes every tick a profile is active. A loop-less GUI may run
+    /// against the daemon ONLY when this is true; a pre-2.0 daemon omits the
+    /// field, so a client defaults it to `false` (AIP-180) and refuses to take
+    /// control rather than silently leaving fans uncontrolled. The
+    /// safety-critical version gate.
+    pub autonomous_control: bool,
     /// Minimum GUI version this daemon supports for daemon-owned control, or
     /// empty when no floor is enforced yet (set at the 2.0.0 cutover).
     pub min_supported_gui: String,
@@ -587,26 +506,6 @@ pub struct Limits {
     pub pwm_percent_min: u8,
     pub pwm_percent_max: u8,
     pub openfan_stop_timeout_s: u8,
-}
-
-/// Response for `GET /hwmon/lease/status`.
-#[derive(Debug, Clone, Serialize)]
-pub struct LeaseStatusResponse {
-    pub api_version: u32,
-    pub lease_required: bool,
-    pub held: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub lease_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ttl_seconds_remaining: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub owner_hint: Option<String>,
-}
-
-/// Request body for `POST /hwmon/lease/renew`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct RenewLeaseRequest {
-    pub lease_id: String,
 }
 
 /// Response for `GET /sensors/history`.
@@ -893,12 +792,6 @@ pub struct BoardInfo {
 }
 
 // ── PWM verification ──────────────────────────────────────────────
-
-/// Request body for `POST /hwmon/{header_id}/verify`.
-#[derive(Debug, Deserialize)]
-pub struct HwmonVerifyRequest {
-    pub lease_id: String,
-}
 
 /// Response for `POST /hwmon/{header_id}/verify`.
 #[derive(Debug, Clone, Serialize)]
@@ -1301,7 +1194,6 @@ mod tests {
                 last_error_summary: None,
             },
             uptime_seconds: Some(3600),
-            gui_last_seen_seconds_ago: None,
             thermal_state: "normal".into(),
             overrides: Vec::new(),
             fan_identify: Vec::new(),
@@ -1482,6 +1374,7 @@ mod tests {
                 curve_evaluation: true,
                 manual_override: false,
                 fan_identify: false,
+                autonomous_control: false,
                 min_supported_gui: String::new(),
             },
         };
@@ -1596,35 +1489,6 @@ mod tests {
         assert_eq!(json["amdgpu_driver_bound"], true);
         assert!(json.get("fan_minimum_pwm").is_none());
         assert!(json.get("kernel_warnings").is_none());
-    }
-
-    #[test]
-    fn lease_status_response_schema() {
-        let resp = LeaseStatusResponse {
-            api_version: API_VERSION,
-            lease_required: true,
-            held: true,
-            lease_id: Some("lease-1".into()),
-            ttl_seconds_remaining: Some(55),
-            owner_hint: Some("gui".into()),
-        };
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["held"], true);
-        assert_eq!(json["lease_id"], "lease-1");
-        assert_eq!(json["ttl_seconds_remaining"], 55);
-
-        // No lease case: optional fields absent
-        let resp2 = LeaseStatusResponse {
-            api_version: API_VERSION,
-            lease_required: true,
-            held: false,
-            lease_id: None,
-            ttl_seconds_remaining: None,
-            owner_hint: None,
-        };
-        let json2 = serde_json::to_value(&resp2).unwrap();
-        assert_eq!(json2["held"], false);
-        assert!(json2.get("lease_id").is_none());
     }
 
     #[test]

@@ -6,9 +6,9 @@
 //! shared `OverrideTable`; the profile engine tick sweeps it on the daemon's
 //! own clock and applies the overlay.
 //!
-//! They deliberately do **not** call `record_gui_write()` — an override is
-//! daemon-applied intent, not a GUI direct write, so it must not mark the
-//! engine `gui_active` (which would make the write backends defer).
+//! An override is daemon-applied intent — the engine reads the `OverrideTable`
+//! and applies the overlay each tick. The GUI never writes fans (DEC-165), so
+//! these handlers only mutate shared state; there is no direct hardware write.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

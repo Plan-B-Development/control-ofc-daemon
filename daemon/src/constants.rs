@@ -86,11 +86,15 @@ pub const GPU_FAIL_COOLDOWN: Duration = Duration::from_secs(60);
 /// respectively).
 pub const VERIFY_WAIT_SECONDS: u8 = 6;
 
-// ── Profile engine ───────────────────────────────────────────────────
+/// Generous deadman backstop for the profile-engine verify pause (DEC-165).
+/// The verify handler holds the pause for its whole lifetime via an RAII guard
+/// that clears it on drop/panic/cancel — this only fires if that guard somehow
+/// never runs. Set well above the worst-case verify duration (the
+/// `VERIFY_WAIT_SECONDS` settle plus sysfs I/O and scheduling slack) so it never
+/// trips a legitimate verify; it merely bounds a leaked pause.
+pub const VERIFY_PAUSE_DEADMAN: Duration = Duration::from_secs(30);
 
-/// Duration of recent GUI activity that causes the profile engine to
-/// defer writes (dual-writer guard — DEC-071/DEC-074).
-pub const GUI_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
+// ── Profile engine ───────────────────────────────────────────────────
 
 /// Temperature deadband (°C) that the profile engine holds the previous
 /// curve output across when temperature is falling. Closes the audible

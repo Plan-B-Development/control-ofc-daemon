@@ -24,24 +24,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/sensors/history", get(handlers::history_handler))
         // Server-Sent Events
         .route("/events", get(sse::events_handler))
-        // Write endpoints (OpenFanController)
-        .route(
-            "/fans/openfan/{channel}/pwm",
-            post(handlers::set_pwm_handler),
-        )
-        .route("/fans/openfan/pwm", post(handlers::set_pwm_all_handler))
-        .route(
-            "/fans/openfan/{channel}/target_rpm",
-            post(handlers::set_target_rpm_handler),
-        )
+        // OpenFanController calibration sweep (diagnostic; daemon-performed).
+        // The bare PWM/RPM write endpoints were retired at 2.0.0 (DEC-165) —
+        // the profile engine is the sole writer.
         .route(
             "/fans/openfan/{channel}/calibrate",
             post(handlers::calibrate_openfan_handler),
         )
         // Capabilities
         .route("/capabilities", get(handlers::capabilities_handler))
-        // GPU fan endpoints
-        .route("/gpu/{gpu_id}/fan/pwm", post(handlers::gpu_set_fan_handler))
+        // GPU fan endpoints — the bare PWM write was retired at 2.0.0
+        // (DEC-165); reset (daemon-mediated) + verify remain.
         .route(
             "/gpu/{gpu_id}/fan/reset",
             post(handlers::gpu_reset_fan_handler),
@@ -50,28 +43,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/gpu/{gpu_id}/fan/verify",
             post(handlers::gpu_verify_handler),
         )
-        // Hwmon PWM endpoints
+        // Hwmon endpoints — the lease quartet and the bare PWM write were
+        // retired at 2.0.0 (DEC-165): the engine self-leases and is the sole
+        // writer. Header listing + verify (daemon-performed) remain.
         .route("/hwmon/headers", get(handlers::hwmon_headers_handler))
-        .route(
-            "/hwmon/lease/take",
-            post(handlers::hwmon_lease_take_handler),
-        )
-        .route(
-            "/hwmon/lease/release",
-            post(handlers::hwmon_lease_release_handler),
-        )
-        .route(
-            "/hwmon/lease/status",
-            get(handlers::hwmon_lease_status_handler),
-        )
-        .route(
-            "/hwmon/lease/renew",
-            post(handlers::hwmon_lease_renew_handler),
-        )
-        .route(
-            "/hwmon/{header_id}/pwm",
-            post(handlers::hwmon_set_pwm_handler),
-        )
         .route(
             "/hwmon/{header_id}/verify",
             post(handlers::hwmon_verify_handler),

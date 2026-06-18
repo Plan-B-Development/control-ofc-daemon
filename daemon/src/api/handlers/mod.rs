@@ -174,11 +174,42 @@ pub struct AppState {
     pub override_table: Arc<Mutex<crate::control_override::OverrideTable>>,
 }
 
+/// RAII guard that clears the profile engine's verify pause on drop (DEC-165),
+/// so a dropped or panicked verify handler never leaves the engine paused.
+/// Construct via [`begin_verify_pause`].
+pub(crate) struct VerifyPauseGuard {
+    cache: Arc<crate::health::cache::StateCache>,
+}
+
+impl Drop for VerifyPauseGuard {
+    fn drop(&mut self) {
+        self.cache.end_verify();
+    }
+}
+
+/// Claim the single verify slot and pause the profile engine's write phase,
+/// returning a guard that clears it on drop — or `None` if a verify is already
+/// in progress (single-flight; the caller must reject with 409). While paused,
+/// the engine skips its write phase so a verify's controlled test writes are not
+/// overwritten. `window` is the deadman backstop; the guard is the normal clear
+/// path.
+pub(crate) fn begin_verify_pause(
+    cache: &Arc<crate::health::cache::StateCache>,
+    window: std::time::Duration,
+) -> Option<VerifyPauseGuard> {
+    if cache.try_begin_verify(window) {
+        Some(VerifyPauseGuard {
+            cache: cache.clone(),
+        })
+    } else {
+        None
+    }
+}
+
 pub(crate) fn build_status_response(
     state: &AppState,
     snap: &DaemonState,
     health: crate::health::staleness::HealthSummary,
-    now: Instant,
 ) -> StatusResponse {
     let subsystems = health
         .subsystems
@@ -192,9 +223,6 @@ pub(crate) fn build_status_response(
         .collect();
 
     let uptime = state.start_time.elapsed().as_secs();
-    let gui_last_seen = snap
-        .last_gui_write_at
-        .map(|t| now.duration_since(t).as_secs());
 
     // Daemon-owned override + identify state (DEC-163/DEC-166) — poll surface.
     let (override_rows, identify_rows) = state.override_table.lock().status_rows();
@@ -223,7 +251,6 @@ pub(crate) fn build_status_response(
             last_error_summary: None,
         },
         uptime_seconds: Some(uptime),
-        gui_last_seen_seconds_ago: gui_last_seen,
         // DEC-132: surface the profile engine's thermal override state.
         // `None` only before the engine's first tick — report "normal".
         thermal_state: snap

@@ -132,13 +132,9 @@ pub async fn activate_profile_handler(
         let mut guard = state.active_profile.lock();
         *guard = Some(profile);
     }
-
-    // Treat activation as GUI activity so the profile engine defers writes
-    // for the next GUI_ACTIVITY_TIMEOUT window. This gives the GUI exclusive
-    // ownership of fan writes during a profile switch and prevents a dead
-    // zone where neither writer is pushing values (see DEC on profile
-    // activation deferral in CHANGELOG).
-    state.cache.record_gui_write();
+    // DEC-165: a freshly-activated profile takes control of all its members, so
+    // clear any GPU fans previously relinquished to firmware-auto via reset.
+    state.cache.clear_relinquished_gpu_fans();
 
     // Persist
     let new_state = crate::daemon_state::DaemonState {
@@ -206,11 +202,6 @@ pub async fn deactivate_profile_handler(
         }
     }
 
-    // Treat deactivation as GUI activity so the engine doesn't immediately
-    // try to take a new lease and reassert old curves while the GUI is
-    // still in the loop reconfiguring fans.
-    state.cache.record_gui_write();
-
     let (deactivated_id, deactivated_name) = previous
         .map(|(id, name)| (Some(id), Some(name)))
         .unwrap_or((None, None));
@@ -236,8 +227,8 @@ pub async fn deactivate_profile_handler(
 // The daemon is the store of record. Writes go to the primary (first) search
 // dir — the daemon-owned store that `main` prepends (`with_store_dir`). Reads
 // (list/get) span all search dirs so package presets remain visible and
-// shadowable. CRUD does NOT call `record_gui_write()` — editing the stored set
-// is not a control-loop write and must not arm the GUI-activity defer window.
+// shadowable. Editing the stored profile set is not a fan write and does not
+// affect the running engine until a profile is activated.
 
 /// `true` when `?validate_only=true` is present.
 fn is_validate_only(params: &HashMap<String, String>) -> bool {

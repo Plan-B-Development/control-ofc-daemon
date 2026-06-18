@@ -1,11 +1,11 @@
 //! Per-backend write paths for the profile engine (DEC-135).
 //!
 //! Each fan-control backend (OpenFan serial, AMD GPU PMFW, motherboard
-//! hwmon) implements [`WriteBackend`]. ALL per-backend gating — GUI
-//! deferral, write coalescing/thresholds, failure caching, lease
-//! handling — lives behind `apply`, so each rule exists in exactly one
-//! place per backend. The engine loop is reduced to: safety tick →
-//! profile evaluation → `apply` per backend.
+//! hwmon) implements [`WriteBackend`]. ALL per-backend gating — write
+//! coalescing/thresholds, failure caching, lease handling — lives behind
+//! `apply`, so each rule exists in exactly one place per backend. The
+//! engine loop is reduced to: safety tick → profile evaluation → `apply`
+//! per backend. (The GUI-deferral gate was removed at 2.0.0 — DEC-165.)
 //!
 //! Backends that participate in forced safety writes (thermal emergency,
 //! no-CPU-sensor fallback) additionally implement [`SafetyWriteBackend`].
@@ -28,7 +28,7 @@ use crate::serial::protocol::NUM_CHANNELS;
 /// One fan-control backend the profile engine writes through.
 ///
 /// To add a backend: implement this trait, give the implementation sole
-/// ownership of its gating rules (deferral, coalescing, failure caching),
+/// ownership of its gating rules (coalescing, failure caching, lease),
 /// and call it from the loop's apply sequence in `profile_engine_loop`.
 pub(crate) trait WriteBackend {
     /// Backend name for logs.
@@ -37,10 +37,10 @@ pub(crate) trait WriteBackend {
 
     /// Apply this backend's share of the profile commands.
     ///
-    /// `gui_active` is true when the GUI has written via the API within the
-    /// last `GUI_ACTIVITY_TIMEOUT` window — every backend defers to the GUI
-    /// (DEC-071/DEC-074) but each documents its own rationale.
-    async fn apply(&mut self, commands: &[PwmCommand], gui_active: bool);
+    /// The engine is the sole authoritative writer (DEC-165): there is no GUI
+    /// deferral. Each backend still owns its coalescing, failure caching, and
+    /// lease handling behind this call.
+    async fn apply(&mut self, commands: &[PwmCommand]);
 }
 
 /// Backends that participate in forced safety writes (thermal emergency /
@@ -78,21 +78,14 @@ impl WriteBackend for OpenFanBackend {
 
     /// OpenFan writes (serial I/O on the blocking pool — lock per command).
     ///
-    /// Skipped entirely when the GUI is actively connected: the GUI's
-    /// control loop drives fan speed via the API, and both writing
-    /// simultaneously causes unnecessary serial traffic and potential PWM
-    /// oscillation (DEC-074). Exact-match coalescing lives below this in
-    /// `serial::controller`.
+    /// Exact-match coalescing lives below this in `serial::controller`.
     ///
     /// DEC-146 P3-8: serial writes block up to the configured timeout
     /// (500 ms default) per channel, so the batch runs on `spawn_blocking`
     /// (matching `GpuBackend::apply` and both poll loops) instead of pinning
     /// a tokio worker. The mutex is still taken per command (DEC-099) so
-    /// GUI API requests interleave exactly as before.
-    async fn apply(&mut self, commands: &[PwmCommand], gui_active: bool) {
-        if gui_active {
-            return;
-        }
+    /// concurrent API requests interleave exactly as before.
+    async fn apply(&mut self, commands: &[PwmCommand]) {
         let chans: Vec<(u8, u8)> = commands
             .iter()
             .filter(|c| c.source == "openfan")
@@ -236,21 +229,22 @@ impl WriteBackend for GpuBackend {
 
     /// GPU fan writes (async via spawn_blocking, no lease required).
     ///
-    /// Defers to the GUI (DEC-071): both writing simultaneously causes SMU
-    /// firmware churn. Suppresses writes whose delta from the last
-    /// commanded value is below `GPU_COALESCE_DELTA_PCT`, mirroring the API
-    /// handler so headless and GUI-driven paths share DEC-070's single 5%
-    /// threshold (DEC-131).
-    async fn apply(&mut self, commands: &[PwmCommand], gui_active: bool) {
-        if gui_active {
-            return;
-        }
+    /// Suppresses writes whose delta from the last commanded value is below
+    /// `GPU_COALESCE_DELTA_PCT`, mirroring the API handler so headless and
+    /// imperative paths share DEC-070's single 5% threshold (DEC-131).
+    async fn apply(&mut self, commands: &[PwmCommand]) {
         // One snapshot per tick — advisory write-suppression state, not
         // correctness-critical (a torn read vs. the API path is harmless:
         // the next tick re-evaluates).
         let gpu_fans = self.cache.gpu_fans_snapshot();
 
         for cmd in commands.iter().filter(|c| c.source == "amd_gpu") {
+            // DEC-165: skip a GPU fan the operator relinquished to firmware-auto
+            // via POST /gpu/{id}/fan/reset, so the reset is durable under an
+            // active profile (the set is cleared on the next profile activation).
+            if self.cache.is_gpu_fan_relinquished(&cmd.member_id) {
+                continue;
+            }
             if let Some(cached) = gpu_fans.get(&cmd.member_id) {
                 if let Some(last_pct) = cached.last_commanded_pct {
                     let delta = (cmd.pwm_percent as i16 - last_pct as i16).unsigned_abs();
@@ -339,26 +333,22 @@ impl WriteBackend for HwmonBackend {
 
     /// hwmon writes (auto-lease for headless profile mode).
     ///
-    /// The profile engine auto-acquires the lease when writing hwmon
-    /// members. If the GUI holds the lease, hwmon writes are skipped (GUI
-    /// has priority). Also skips when `gui_active` (last GUI write < 30s)
-    /// to close the startup race where the GUI has written via /fans/...
-    /// but has not yet taken the hwmon lease, or the lease has briefly
-    /// lapsed — DEC-074 semantics extended to hwmon.
-    /// DEC-146 P3-8: the body runs on the blocking pool (matching the hwmon
-    /// poll loop). DEC-154: the lease-acquire → per-header write → renew
-    /// sequence now locks the controller mutex PER COMMAND (like `force_all`
-    /// and `OpenFanBackend`), not once for the whole batch, so concurrent API
+    /// The profile engine auto-acquires the lease when writing hwmon members
+    /// and is the steady-state holder (DEC-165 — the GUI no longer takes the
+    /// lease). DEC-146 P3-8: the body runs on the blocking pool (matching the
+    /// hwmon poll loop). DEC-154: the lease-acquire → per-header write → renew
+    /// sequence locks the controller mutex PER COMMAND (like `force_all` and
+    /// `OpenFanBackend`), not once for the whole batch, so concurrent API
     /// requests are not starved for the duration of a multi-header tick. A
-    /// GUI/thermal force-take mid-scan fails the remaining writes with
-    /// InvalidLease; the next 1 Hz tick re-acquires.
-    async fn apply(&mut self, commands: &[PwmCommand], gui_active: bool) {
+    /// thermal force-take mid-scan fails the remaining writes with InvalidLease;
+    /// the next 1 Hz tick re-acquires.
+    async fn apply(&mut self, commands: &[PwmCommand]) {
         let hwmon_cmds: Vec<(String, u8)> = commands
             .iter()
             .filter(|c| c.source == "hwmon")
             .map(|c| (c.member_id.clone(), c.pwm_percent))
             .collect();
-        if hwmon_cmds.is_empty() || gui_active {
+        if hwmon_cmds.is_empty() {
             return;
         }
         let ctrl = self.ctrl.clone();
@@ -370,12 +360,12 @@ impl WriteBackend for HwmonBackend {
                 let mut guard = ctrl.lock();
                 let existing = {
                     let mgr = guard.lease_manager();
-                    match mgr.active_lease() {
-                        // GUI has priority — skip hwmon writes.
-                        Some(lease) if lease.owner_hint == "gui" => None,
-                        Some(lease) => Some(lease.lease_id.clone()),
-                        None => None, // Need to acquire
-                    }
+                    // Reuse any active lease — the engine's own, or a transient
+                    // verify/thermal-safety force-take. The engine is the sole
+                    // writer (DEC-165); there is no GUI lease to yield to (and
+                    // during a verify the engine is paused, so it never reaches
+                    // here while the "verify" lease is held). `None` ⇒ acquire.
+                    mgr.active_lease().map(|lease| lease.lease_id.clone())
                 };
                 existing.or_else(|| {
                     guard
@@ -393,6 +383,15 @@ impl WriteBackend for HwmonBackend {
             // the next 1 Hz tick re-acquires.
             for (member_id, pwm_percent) in &hwmon_cmds {
                 let mut guard = ctrl.lock();
+                // DEC-102 backstop on the engine path: never attempt a write to
+                // a header discovered read-only (`is_writable == false`). The GUI
+                // member-picker and profile load drop these, but the un-validated
+                // boot-load path does not, so the engine must skip them itself —
+                // otherwise every tick would EACCES-spam the log and the member
+                // would silently never take effect.
+                if guard.header(member_id).is_some_and(|h| !h.is_writable) {
+                    continue;
+                }
                 if let Err(e) = guard.set_pwm(member_id, *pwm_percent, &lease_id) {
                     log::warn!("hwmon write failed for {member_id}: {e}");
                 }
@@ -499,22 +498,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gpu_backend_defers_to_active_gui() {
-        let dir = tempfile::tempdir().unwrap();
-        let (gpu, curve_path) = fake_gpu(&dir);
-        let cache = Arc::new(StateCache::new());
-        let mut be = GpuBackend::new(cache, Arc::new(vec![gpu]));
-
-        be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 70)], true)
-            .await;
-
-        assert!(
-            std::fs::read_to_string(&curve_path).unwrap().is_empty(),
-            "GPU backend must not write while the GUI is active (DEC-071)"
-        );
-    }
-
-    #[tokio::test]
     async fn gpu_backend_suppresses_below_threshold_and_writes_at_threshold() {
         let dir = tempfile::tempdir().unwrap();
         let (gpu, curve_path) = fake_gpu(&dir);
@@ -523,12 +506,12 @@ mod tests {
         let mut be = GpuBackend::new(cache.clone(), Arc::new(vec![gpu]));
 
         // delta 4 < 5 → suppressed (DEC-131).
-        be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 64)], false)
+        be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 64)])
             .await;
         assert!(std::fs::read_to_string(&curve_path).unwrap().is_empty());
 
         // delta 5 ≥ 5 → written, cache updated.
-        be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 65)], false)
+        be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 65)])
             .await;
         assert!(!std::fs::read_to_string(&curve_path).unwrap().is_empty());
         assert_eq!(
@@ -550,13 +533,13 @@ mod tests {
         let cache = Arc::new(StateCache::new());
         let mut be = GpuBackend::new(cache, Arc::new(vec![gpu.clone()]));
 
-        be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 70)], false)
+        be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 70)])
             .await;
         assert_eq!(be.fail_cache_len(), 1, "failed write must be cached");
 
         // Same speed within the cooldown → suppressed (no second attempt
         // visible; the cache entry persists).
-        be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 70)], false)
+        be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 70)])
             .await;
         assert_eq!(be.fail_cache_len(), 1);
 
@@ -566,7 +549,7 @@ mod tests {
         gpu_ok.fan_curve_path = Some(curve_path);
         let cache = Arc::new(StateCache::new());
         let mut be = GpuBackend::new(cache, Arc::new(vec![gpu_ok]));
-        be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 70)], false)
+        be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 70)])
             .await;
         assert_eq!(be.fail_cache_len(), 0);
     }
@@ -673,14 +656,11 @@ mod tests {
             make_header_idx("hwmon:it8696:pwm3", 3),
         ]);
 
-        be.apply(
-            &[
-                cmd("hwmon:it8696:pwm1", "hwmon", 40),
-                cmd("hwmon:it8696:pwm2", "hwmon", 55),
-                cmd("hwmon:it8696:pwm3", "hwmon", 70),
-            ],
-            false,
-        )
+        be.apply(&[
+            cmd("hwmon:it8696:pwm1", "hwmon", 40),
+            cmd("hwmon:it8696:pwm2", "hwmon", 55),
+            cmd("hwmon:it8696:pwm3", "hwmon", 70),
+        ])
         .await;
 
         let w = writes.lock();
@@ -721,8 +701,7 @@ mod tests {
         let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl)));
 
         // 1. Engine controls the header → first pwm_enable=1 write.
-        be.apply(&[cmd("hwmon:it8696:pwm1", "hwmon", 40)], false)
-            .await;
+        be.apply(&[cmd("hwmon:it8696:pwm1", "hwmon", 40)]).await;
         // 2. Thermal safety force-takes the lease and forces 100%.
         be.force_all(100).await;
 
@@ -739,26 +718,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hwmon_backend_skips_when_gui_holds_lease() {
-        let (mut be, writes) = hwmon_backend(vec![make_header("hwmon:it8696:pwm1")]);
-        // GUI takes the lease first.
-        be.ctrl.lock().lease_manager_mut().force_take_lease("gui");
-
-        be.apply(&[cmd("hwmon:it8696:pwm1", "hwmon", 55)], false)
-            .await;
-
-        assert!(
-            writes.lock().is_empty(),
-            "profile engine must not write hwmon while the GUI holds the lease"
-        );
-    }
-
-    #[tokio::test]
     async fn hwmon_backend_auto_leases_and_writes() {
         let (mut be, writes) = hwmon_backend(vec![make_header("hwmon:it8696:pwm1")]);
 
-        be.apply(&[cmd("hwmon:it8696:pwm1", "hwmon", 55)], false)
-            .await;
+        be.apply(&[cmd("hwmon:it8696:pwm1", "hwmon", 55)]).await;
 
         let w = writes.lock();
         assert!(
@@ -770,15 +733,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hwmon_backend_defers_when_gui_active() {
-        let (mut be, writes) = hwmon_backend(vec![make_header("hwmon:it8696:pwm1")]);
+    async fn hwmon_apply_skips_read_only_header() {
+        // DEC-102 engine-path backstop: a read-only header (is_writable=false)
+        // must be skipped, never EACCES-spammed; a writable sibling still writes.
+        let mut ro = make_header_idx("hwmon:it8696:pwm1", 1);
+        ro.is_writable = false;
+        let rw = make_header_idx("hwmon:it8696:pwm2", 2);
+        let (mut be, writes) = hwmon_backend(vec![ro, rw]);
 
-        be.apply(&[cmd("hwmon:it8696:pwm1", "hwmon", 55)], true)
-            .await;
+        be.apply(&[
+            cmd("hwmon:it8696:pwm1", "hwmon", 40),
+            cmd("hwmon:it8696:pwm2", "hwmon", 55),
+        ])
+        .await;
 
+        let w = writes.lock();
         assert!(
-            writes.lock().is_empty(),
-            "DEC-074: hwmon writes must defer while gui_active"
+            !w.iter().any(|(p, _)| p.ends_with("pwm1")),
+            "read-only header must be skipped (no write); got {w:?}"
+        );
+        assert!(
+            w.iter().any(|(p, _)| p.ends_with("pwm2")),
+            "writable sibling must still be written; got {w:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gpu_backend_skips_relinquished_fan() {
+        // DEC-165: a GPU fan relinquished to firmware-auto via reset must be
+        // skipped by the engine so the reset is durable under an active profile.
+        let dir = tempfile::tempdir().unwrap();
+        let (gpu, curve_path) = fake_gpu(&dir);
+        let cache = Arc::new(StateCache::new());
+        cache.relinquish_gpu_fan("amd_gpu:0000:03:00.0");
+        let mut be = GpuBackend::new(cache.clone(), Arc::new(vec![gpu]));
+
+        be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 70)])
+            .await;
+        assert!(
+            std::fs::read_to_string(&curve_path).unwrap().is_empty(),
+            "engine must not write a relinquished GPU fan (DEC-165)"
+        );
+
+        // Clearing the relinquish (e.g. on profile activation) resumes control.
+        cache.clear_relinquished_gpu_fans();
+        be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 70)])
+            .await;
+        assert!(
+            !std::fs::read_to_string(&curve_path).unwrap().is_empty(),
+            "engine must resume writing after the relinquish is cleared"
         );
     }
 
@@ -837,28 +840,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openfan_backend_defers_when_gui_active() {
-        let (mut be, written) = openfan_backend();
-
-        be.apply(&[cmd("openfan:ch00", "openfan", 50)], true).await;
-
-        assert!(
-            written.lock().is_empty(),
-            "DEC-074: openfan writes must defer while gui_active"
-        );
-    }
-
-    #[tokio::test]
     async fn openfan_backend_drops_malformed_member_ids() {
         let (mut be, written) = openfan_backend();
 
-        be.apply(
-            &[
-                cmd("openfan:chXX", "openfan", 50),
-                cmd("not-a-channel", "openfan", 50),
-            ],
-            false,
-        )
+        be.apply(&[
+            cmd("openfan:chXX", "openfan", 50),
+            cmd("not-a-channel", "openfan", 50),
+        ])
         .await;
 
         assert!(written.lock().is_empty());
@@ -868,7 +856,7 @@ mod tests {
     async fn openfan_backend_writes_when_gui_inactive() {
         let (mut be, written) = openfan_backend();
 
-        be.apply(&[cmd("openfan:ch00", "openfan", 50)], false).await;
+        be.apply(&[cmd("openfan:ch00", "openfan", 50)]).await;
 
         let w = written.lock();
         assert!(
@@ -889,6 +877,67 @@ mod tests {
             set_pwm.len(),
             NUM_CHANNELS as usize,
             "expected one forced SetPwm per channel; got {w:?}"
+        );
+    }
+
+    /// A toggleable serial transport: `write_line` fails (link "vanished")
+    /// while `fail` is set, otherwise records the write. Models an OpenFan
+    /// controller being unplugged and re-plugged at runtime.
+    struct FlakySerial {
+        written: Arc<Mutex<Vec<String>>>,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::serial::transport::SerialTransport for FlakySerial {
+        fn write_line(&mut self, data: &str) -> Result<(), crate::error::SerialError> {
+            if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(crate::error::SerialError::Timeout { timeout_ms: 100 });
+            }
+            self.written.lock().push(data.to_string());
+            Ok(())
+        }
+        fn read_line(
+            &mut self,
+            _timeout: std::time::Duration,
+        ) -> Result<String, crate::error::SerialError> {
+            Ok("OK".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn openfan_backend_tolerates_vanish_then_resumes_on_reappear() {
+        // Matrix row (OpenFan vanish/reappear): when the serial link drops, the
+        // engine's OpenFan apply must NOT panic and must record no successful
+        // write; when the link returns, writes resume. Post-flip the engine is
+        // the sole writer (DEC-165), so this resilience is load-bearing.
+        let written: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let transport = FlakySerial {
+            written: written.clone(),
+            fail: fail.clone(),
+        };
+        let cache = Arc::new(StateCache::new());
+        let ctrl = crate::serial::controller::FanController::new(
+            Box::new(transport),
+            cache,
+            std::time::Duration::from_millis(100),
+        );
+        let mut be = OpenFanBackend::new(Arc::new(Mutex::new(ctrl)));
+
+        // Vanished: writes fail; the engine no-ops without panicking.
+        be.apply(&[cmd("openfan:ch00", "openfan", 50)]).await;
+        assert!(
+            written.lock().is_empty(),
+            "no successful OpenFan write while the link is down"
+        );
+
+        // Reappeared: writes resume on the next tick.
+        fail.store(false, std::sync::atomic::Ordering::Relaxed);
+        be.apply(&[cmd("openfan:ch00", "openfan", 50)]).await;
+        let w = written.lock();
+        assert!(
+            w.iter().any(|c| c.starts_with(">02")),
+            "OpenFan writes must resume once the link reappears; got {w:?}"
         );
     }
 }

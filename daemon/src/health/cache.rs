@@ -6,7 +6,7 @@
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::serial::protocol::NUM_CHANNELS;
 
@@ -39,14 +39,6 @@ impl StateCache {
     pub fn snapshot(&self) -> DaemonState {
         let state = self.inner.read();
         state.clone()
-    }
-
-    /// Cheap read of GUI-active status without cloning the whole state.
-    ///
-    /// The 1 Hz profile engine checks this every tick; a full `snapshot()`
-    /// would deep-clone four HashMaps just to read one `Option<Instant>`.
-    pub fn gui_active(&self) -> bool {
-        self.inner.read().gui_active()
     }
 
     /// Clone only the sensor map. The profile engine's curve evaluation and
@@ -130,17 +122,68 @@ impl StateCache {
         state.snapshot_at = now;
     }
 
-    /// Record that a GUI-initiated write command was processed.
-    pub fn record_gui_write(&self) {
-        let now = Instant::now();
-        let mut state = self.inner.write();
-        state.last_gui_write_at = Some(now);
-    }
-
     /// Update the thermal safety override state.
     pub fn set_thermal_override_state(&self, state_str: &str) {
         let mut state = self.inner.write();
         state.thermal_override_state = Some(state_str.to_string());
+    }
+
+    /// Try to claim the single hardware-verify slot, pausing the profile
+    /// engine's write phase for the verify's lifetime. Returns `false` if a
+    /// verify is already in progress (the caller must reject with 409) — this
+    /// single-flight guard stops two concurrent verifies from clobbering each
+    /// other's pause or lease (DEC-165). `window` is a generous deadman
+    /// backstop: the caller's RAII guard clears the flag on drop/panic/cancel,
+    /// but if it somehow does not, the pause self-clears after `window` so a
+    /// verify can never strand fan control.
+    pub fn try_begin_verify(&self, window: Duration) -> bool {
+        let mut state = self.inner.write();
+        if state.verify_in_progress {
+            return false;
+        }
+        state.verify_in_progress = true;
+        state.verify_active_until = Some(Instant::now() + window);
+        true
+    }
+
+    /// Release the hardware-verify slot (the engine resumes writing next tick).
+    pub fn end_verify(&self) {
+        let mut state = self.inner.write();
+        state.verify_in_progress = false;
+        state.verify_active_until = None;
+    }
+
+    /// True while a hardware verify is in progress — held for the verify's
+    /// entire lifetime by the handler's RAII guard, and bounded by the deadman
+    /// backstop so a leaked guard cannot pause the engine indefinitely.
+    pub fn verify_active(&self) -> bool {
+        let state = self.inner.read();
+        state.verify_in_progress
+            && state
+                .verify_active_until
+                .is_some_and(|deadline| Instant::now() < deadline)
+    }
+
+    /// Relinquish a GPU fan to firmware-auto: the profile engine stops writing
+    /// it, so a `POST /gpu/{id}/fan/reset` is durable under an active profile
+    /// instead of being re-asserted on the next tick. Cleared on the next
+    /// profile activation (DEC-165).
+    pub fn relinquish_gpu_fan(&self, fan_id: &str) {
+        self.inner
+            .write()
+            .relinquished_gpu_fans
+            .insert(fan_id.to_string());
+    }
+
+    /// Clear all relinquished GPU fans so a freshly-activated profile resumes
+    /// controlling them.
+    pub fn clear_relinquished_gpu_fans(&self) {
+        self.inner.write().relinquished_gpu_fans.clear();
+    }
+
+    /// True if the given GPU fan has been relinquished to firmware-auto.
+    pub fn is_gpu_fan_relinquished(&self, fan_id: &str) -> bool {
+        self.inner.read().relinquished_gpu_fans.contains(fan_id)
     }
 
     /// Update the last commanded PWM for a single OpenFanController channel.
@@ -453,129 +496,35 @@ mod tests {
     }
 
     #[test]
-    fn gui_active_false_on_fresh_cache() {
-        // A newly-created cache has never seen a GUI write.
+    fn verify_active_lifecycle_deadman_and_single_flight() {
+        use std::time::Duration;
         let cache = StateCache::new();
-        assert!(!cache.snapshot().gui_active());
-    }
-
-    #[test]
-    fn gui_active_true_after_record_gui_write() {
-        // record_gui_write() must flip gui_active() to true so profile-engine
-        // phases (openfan, hwmon, gpu) defer to the GUI's control loop.
-        let cache = StateCache::new();
-        cache.record_gui_write();
-        assert!(cache.snapshot().gui_active());
-    }
-
-    #[test]
-    fn gui_active_false_after_timeout() {
-        // A write older than GUI_ACTIVITY_TIMEOUT should NOT keep gui_active true.
-        use std::time::{Duration, Instant};
-        let cache = StateCache::new();
+        // Fresh cache: no verify in progress.
+        assert!(!cache.verify_active());
+        // Claiming the slot → active.
+        assert!(cache.try_begin_verify(Duration::from_secs(60)));
+        assert!(cache.verify_active());
+        // Single-flight: a second concurrent claim is rejected.
+        assert!(
+            !cache.try_begin_verify(Duration::from_secs(60)),
+            "a second concurrent verify must be rejected (single-flight)"
+        );
+        // end_verify releases the slot; it can be claimed again.
+        cache.end_verify();
+        assert!(!cache.verify_active());
+        assert!(cache.try_begin_verify(Duration::from_secs(60)));
+        cache.end_verify();
+        // Deadman: even with the flag still set, an elapsed deadline reads
+        // inactive, so a leaked guard can never strand the engine paused.
         {
             let mut state = cache.inner.write();
-            state.last_gui_write_at = Some(
-                Instant::now()
-                    .checked_sub(crate::constants::GUI_ACTIVITY_TIMEOUT + Duration::from_secs(1))
-                    .expect("timeout subtraction should succeed on a fresh Instant"),
-            );
-        }
-        assert!(!cache.snapshot().gui_active());
-    }
-
-    /// T2 (test-tests audit): the profile-engine deferral window is the
-    /// "GUI active within 30s" check. Lock the boundary at:
-    ///   - well-inside (1s elapsed) → active
-    ///   - just-inside (TIMEOUT - 1s elapsed) → active
-    ///   - exactly at the boundary (TIMEOUT elapsed) → inactive
-    ///   - just-outside (TIMEOUT + 1s elapsed) → inactive
-    ///
-    /// Catches `<` ↔ `<=` mutations on the predicate.
-    #[test]
-    fn gui_active_boundary_inside_timeout_is_true() {
-        use std::time::{Duration, Instant};
-        let cache = StateCache::new();
-        {
-            let mut state = cache.inner.write();
-            state.last_gui_write_at = Some(
-                Instant::now()
-                    .checked_sub(Duration::from_secs(1))
-                    .expect("subtraction should succeed"),
-            );
+            state.verify_in_progress = true;
+            state.verify_active_until = Some(std::time::Instant::now() - Duration::from_secs(1));
         }
         assert!(
-            cache.snapshot().gui_active(),
-            "1s elapsed must be active (< 30s)"
+            !cache.verify_active(),
+            "an expired verify deadman must read inactive even with the flag set"
         );
-    }
-
-    #[test]
-    fn gui_active_boundary_one_second_before_timeout_is_true() {
-        use std::time::{Duration, Instant};
-        let cache = StateCache::new();
-        {
-            let mut state = cache.inner.write();
-            state.last_gui_write_at = Some(
-                Instant::now()
-                    .checked_sub(crate::constants::GUI_ACTIVITY_TIMEOUT - Duration::from_secs(1))
-                    .expect("subtraction should succeed"),
-            );
-        }
-        assert!(
-            cache.snapshot().gui_active(),
-            "29s elapsed must still be active"
-        );
-    }
-
-    #[test]
-    fn gui_active_boundary_exactly_at_timeout_is_false() {
-        // The predicate is `elapsed < TIMEOUT`, so elapsed == TIMEOUT is
-        // inactive. This locks down the strict `<` vs `<=` semantics.
-        use std::time::Instant;
-        let cache = StateCache::new();
-        {
-            let mut state = cache.inner.write();
-            state.last_gui_write_at = Some(
-                Instant::now()
-                    .checked_sub(crate::constants::GUI_ACTIVITY_TIMEOUT)
-                    .expect("subtraction should succeed"),
-            );
-        }
-        assert!(
-            !cache.snapshot().gui_active(),
-            "exactly at timeout must be inactive"
-        );
-    }
-
-    #[test]
-    fn gui_active_boundary_one_second_past_timeout_is_false() {
-        use std::time::{Duration, Instant};
-        let cache = StateCache::new();
-        {
-            let mut state = cache.inner.write();
-            state.last_gui_write_at = Some(
-                Instant::now()
-                    .checked_sub(crate::constants::GUI_ACTIVITY_TIMEOUT + Duration::from_secs(1))
-                    .expect("subtraction should succeed"),
-            );
-        }
-        assert!(
-            !cache.snapshot().gui_active(),
-            "31s elapsed must be inactive"
-        );
-    }
-
-    #[test]
-    fn gui_active_accessor_matches_snapshot() {
-        // The cheap cache-level accessor must agree with the snapshot-based
-        // path profile_engine previously used (per-tick clone trim).
-        let cache = StateCache::new();
-        assert!(!cache.gui_active());
-        assert_eq!(cache.gui_active(), cache.snapshot().gui_active());
-        cache.record_gui_write();
-        assert!(cache.gui_active());
-        assert_eq!(cache.gui_active(), cache.snapshot().gui_active());
     }
 
     #[test]

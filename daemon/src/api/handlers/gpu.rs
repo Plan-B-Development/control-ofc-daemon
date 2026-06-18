@@ -10,172 +10,6 @@ use super::{error_response, json_ok, AppState};
 use crate::api::responses::*;
 use crate::constants;
 
-/// Request body for `POST /gpu/{gpu_id}/fan/pwm`.
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct GpuSetFanRequest {
-    pub speed_pct: u8,
-}
-
-/// Response for successful GPU fan speed set.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct GpuSetFanResponse {
-    pub api_version: u32,
-    pub gpu_id: String,
-    pub speed_pct: u8,
-}
-
-/// POST /gpu/{gpu_id}/fan/pwm — set GPU fan to a static speed percentage.
-pub async fn gpu_set_fan_handler(
-    State(state): State<Arc<AppState>>,
-    Path(gpu_id): Path<String>,
-    Json(body): Json<GpuSetFanRequest>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    if body.speed_pct > 100 {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            &ErrorEnvelope::validation("speed_pct must be 0-100"),
-        );
-    }
-
-    // Find the GPU by PCI BDF
-    let gpu = state.amd_gpus.iter().find(|g| g.pci_bdf == gpu_id);
-    let gpu = match gpu {
-        Some(g) => g,
-        None => {
-            return error_response(
-                StatusCode::NOT_FOUND,
-                &ErrorEnvelope::validation(format!("GPU not found: {gpu_id}")),
-            );
-        }
-    };
-
-    // Skip write if speed is within 5% of last commanded value. PMFW flat
-    // curves don't benefit from 1% granularity — the firmware manages the
-    // actual fan speed. A higher threshold avoids sysfs churn from minor
-    // temperature fluctuations during gaming (each write triggers SMU
-    // firmware processing that can stall the display pipeline).
-    let fan_id = format!("amd_gpu:{gpu_id}");
-    let snap = state.cache.snapshot();
-    if let Some(cached_fan) = snap.gpu_fans.get(&fan_id) {
-        if let Some(last_pct) = cached_fan.last_commanded_pct {
-            let delta = (body.speed_pct as i16 - last_pct as i16).unsigned_abs();
-            if delta < constants::GPU_COALESCE_DELTA_PCT {
-                // DEC-131: a coalesced write is still GUI liveness. The
-                // OpenFan/hwmon handlers record on every OK because their
-                // coalescing lives below the handler (serial controller /
-                // pwm_control); skipping the record here let `gui_active()`
-                // lapse during a slow temperature ramp (1-4% deltas), handing
-                // GPU control to the profile engine while the GUI believed it
-                // was in control — exactly the dual-writer churn DEC-070/071
-                // exist to prevent.
-                state.cache.record_gui_write();
-                return json_ok(
-                    StatusCode::OK,
-                    GpuSetFanResponse {
-                        api_version: API_VERSION,
-                        gpu_id,
-                        speed_pct: body.speed_pct,
-                    },
-                );
-            }
-        }
-    }
-
-    let fan_curve_path = match &gpu.fan_curve_path {
-        Some(p) => p.clone(),
-        // Legacy hwmon write path requires BOTH `pwm1` and `pwm1_enable` —
-        // a read-only RDNA3/RDNA4 GPU (no `amdgpu.ppfeaturemask`) exposes
-        // `pwm1` alone and used to surface a misleading 503 hardware_unavailable
-        // here when `set_legacy_pwm` failed with ENOENT. DEC-098 narrows this
-        // arm to the canonical capability check.
-        None if gpu.can_write_legacy_pwm() => {
-            let hwmon_path = gpu.hwmon_path.clone();
-            let speed_pct = body.speed_pct;
-            let result = tokio::task::spawn_blocking(move || {
-                crate::hwmon::gpu_fan::set_legacy_pwm(&hwmon_path, speed_pct)
-            })
-            .await;
-
-            return match result {
-                Ok(Ok(())) => {
-                    let fan_id = format!("amd_gpu:{gpu_id}");
-                    state
-                        .cache
-                        .set_gpu_fan_commanded_pct(&fan_id, body.speed_pct);
-                    state.cache.record_gui_write();
-                    json_ok(
-                        StatusCode::OK,
-                        GpuSetFanResponse {
-                            api_version: API_VERSION,
-                            gpu_id,
-                            speed_pct: body.speed_pct,
-                        },
-                    )
-                }
-                // M13: hardware_unavailable is a 503, not a 500. Sibling
-                // hwmon handlers already use 503 for this case.
-                Ok(Err(e)) => error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &ErrorEnvelope::hardware_unavailable(format!(
-                        "GPU legacy PWM write failed: {e}"
-                    )),
-                ),
-                // spawn_blocking task failure — that IS an internal error.
-                Err(e) => error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &ErrorEnvelope::internal(format!("GPU fan write task failed: {e}")),
-                ),
-            };
-        }
-        None => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                &ErrorEnvelope::feature_unavailable(unsupported_fan_control_message(gpu)),
-            );
-        }
-    };
-
-    // PMFW fan_curve path (RDNA3+)
-    let speed_pct = body.speed_pct;
-    let zero_rpm_path = gpu.fan_zero_rpm_path.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        crate::hwmon::gpu_fan::set_static_speed(
-            &fan_curve_path,
-            zero_rpm_path.as_deref(),
-            speed_pct,
-            constants::GPU_PMFW_NUM_CURVE_POINTS,
-        )
-    })
-    .await;
-
-    match result {
-        Ok(Ok(())) => {
-            let fan_id = format!("amd_gpu:{gpu_id}");
-            state
-                .cache
-                .set_gpu_fan_commanded_pct(&fan_id, body.speed_pct);
-            state.cache.record_gui_write();
-            json_ok(
-                StatusCode::OK,
-                GpuSetFanResponse {
-                    api_version: API_VERSION,
-                    gpu_id,
-                    speed_pct: body.speed_pct,
-                },
-            )
-        }
-        // M13: hardware_unavailable is a 503.
-        Ok(Err(e)) => error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &ErrorEnvelope::hardware_unavailable(format!("GPU fan write failed: {e}")),
-        ),
-        Err(e) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &ErrorEnvelope::internal(format!("GPU fan write task failed: {e}")),
-        ),
-    }
-}
-
 /// POST /gpu/{gpu_id}/fan/reset — reset GPU fan to automatic (firmware default).
 pub async fn gpu_reset_fan_handler(
     State(state): State<Arc<AppState>>,
@@ -204,11 +38,10 @@ pub async fn gpu_reset_fan_handler(
             Ok(Ok(())) => {
                 let fan_id = format!("amd_gpu:{gpu_id}");
                 state.cache.set_gpu_fan_commanded_pct(&fan_id, 0);
-                // Record this as a GUI write so the profile engine defers for
-                // the GUI_ACTIVITY_TIMEOUT window. Without this, a profile-
-                // engine tick within ~1 s of the reset re-asserts the curve's
-                // commanded speed and silently undoes the user's reset.
-                state.cache.record_gui_write();
+                // DEC-165: relinquish this GPU fan so the engine stops writing
+                // it and the reset to firmware-auto is durable under an active
+                // profile (cleared on the next profile activation).
+                state.cache.relinquish_gpu_fan(&fan_id);
                 log::info!("GPU {gpu_id} fan reset to auto");
                 json_ok(
                     StatusCode::OK,
@@ -240,9 +73,9 @@ pub async fn gpu_reset_fan_handler(
             Ok(Ok(())) => {
                 let fan_id = format!("amd_gpu:{gpu_id}");
                 state.cache.set_gpu_fan_commanded_pct(&fan_id, 0);
-                // Same dual-writer guard as the PMFW reset arm above —
-                // see comment there.
-                state.cache.record_gui_write();
+                // DEC-165: relinquish (see the PMFW arm above) so the reset is
+                // durable under an active profile.
+                state.cache.relinquish_gpu_fan(&fan_id);
                 log::info!("GPU {gpu_id} legacy fan reset to auto");
                 json_ok(
                     StatusCode::OK,
@@ -300,10 +133,17 @@ pub async fn gpu_verify_handler(
         );
     }
 
-    // Mark GUI activity so the profile engine defers GPU writes for the test
-    // window (dual-writer guard, DEC-071/074). The GUI control loop is paused
-    // GUI-side via the `amd_gpu:{bdf}` verify key.
-    state.cache.record_gui_write();
+    // Single-flight + pause the engine's write phase for the verify's lifetime
+    // so the engine's GPU backend does not overwrite our controlled test speed.
+    // GPU writes need no lease (DEC-045); the pause is the only coordination.
+    let Some(_verify_guard) =
+        super::begin_verify_pause(&state.cache, constants::VERIFY_PAUSE_DEADMAN)
+    else {
+        return error_response(
+            StatusCode::CONFLICT,
+            &ErrorEnvelope::validation("a hardware verify is already in progress"),
+        );
+    };
 
     let fan_id = format!("amd_gpu:{gpu_id}");
     let prior_pct = state

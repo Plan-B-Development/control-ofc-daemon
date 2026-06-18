@@ -1,6 +1,6 @@
 # control-ofc-daemon
 
-Rust-based fan control daemon for the Control-OFC system. Manages hardware access (hwmon sysfs, OpenFanController serial, AMD GPU PMFW), runs safety rules, serves an HTTP API over a Unix socket, and optionally evaluates fan curve profiles autonomously.
+Rust-based fan control daemon for the Control-OFC system. Manages hardware access (hwmon sysfs, OpenFanController serial, AMD GPU PMFW), runs safety rules, serves an HTTP API over a Unix socket, and **owns runtime fan control** — as of 2.0.0 its profile engine evaluates fan-curve profiles and is the sole writer of every backend (DEC-159/DEC-165). The GUI is an editor/viewer/controller-of-intent that never writes PWM.
 
 ## Build
 

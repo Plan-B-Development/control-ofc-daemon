@@ -124,29 +124,29 @@ sudo systemctl enable --now control-ofc-daemon
 | `GET /sensors/history` | Per-entity time-series history |
 | `GET /events` | SSE real-time sensor/fan stream (max `SSE_MAX_CLIENTS` concurrent; bounded admission retries) |
 | `GET /hwmon/headers` | Discovered controllable PWM headers |
-| `GET /hwmon/lease/status` | Lease held/TTL/owner |
+| `GET /profiles`, `GET /profiles/{id}` | Daemon-stored profiles (store of record, DEC-160) |
 | `GET /profile/active` | Currently active profile info |
 | `GET /diagnostics/hardware` | Hardware readiness: hwmon chips, GPU detection, thermal-safety state, kernel modules, ACPI conflicts, board info, kernel warnings |
 
 ### Write
+The profile engine is the **sole writer** as of 2.0.0 (DEC-159/DEC-165); the GUI sends intent + diagnostics calls. Bare PWM/lease endpoints were retired (note below).
+
 | Endpoint | Description |
 |---|---|
-| `POST /fans/openfan/{ch}/pwm` | Set PWM on one OpenFanController channel |
-| `POST /fans/openfan/pwm` | Set PWM on all channels |
-| `POST /fans/openfan/{ch}/target_rpm` | Set target RPM (closed-loop) |
-| `POST /fans/openfan/{ch}/calibrate` | Run a PWM-to-RPM calibration sweep |
-| `POST /hwmon/lease/take` | Acquire exclusive hwmon write lease (force-take per DEC-049) |
-| `POST /hwmon/lease/release` | Release lease |
-| `POST /hwmon/lease/renew` | Extend lease TTL |
-| `POST /hwmon/{header_id}/pwm` | Set hwmon PWM (requires lease) |
-| `POST /hwmon/{header_id}/verify` | Behavioural test of PWM write effectiveness (~3 s); returns `restore_failed: bool` per DEC-100 |
-| `POST /hwmon/rescan` | Re-enumerate hwmon devices |
-| `POST /gpu/{gpu_id}/fan/pwm` | Set GPU fan speed (PMFW or legacy pwm1); records GUI activity |
-| `POST /gpu/{gpu_id}/fan/reset` | Reset GPU fan to automatic; records GUI activity (DEC-100) so the profile engine defers for `GUI_ACTIVITY_TIMEOUT` |
+| `POST /profiles`, `PUT`/`DELETE /profiles/{id}` | Profile CRUD + `?validate_only` — daemon is the store of record (DEC-160) |
 | `POST /profile/activate` | Switch active profile at runtime |
-| `POST /profile/deactivate` | Clear active profile (DEC-097); idempotent; releases the profile-engine lease but preserves any GUI lease |
+| `POST /profile/deactivate` | Clear active profile (DEC-097); idempotent |
+| `POST /control/{control_id}/override` (+ `/override/renew`, `DELETE`) | Expiring manual override — floor-clamped, deadman, monotonic fencing (DEC-163) |
+| `POST /fans/{fan_id}/identify` | Per-fan stop/restore — floor-exempt, deadman auto-restore (DEC-166) |
+| `POST /fans/openfan/{ch}/calibrate` | Run a PWM-to-RPM calibration sweep |
+| `POST /hwmon/{header_id}/verify` | Behavioural test of PWM write effectiveness (~6 s; daemon's own internal lease); returns `restore_failed: bool` per DEC-100 |
+| `POST /gpu/{gpu_id}/fan/verify` | Test GPU fan-control effectiveness (~6 s, no lease) |
+| `POST /gpu/{gpu_id}/fan/reset` | Reset GPU fan to automatic |
+| `POST /hwmon/rescan` | Re-enumerate hwmon devices |
 | `POST /config/profile-search-dirs` | Register additional profile search dirs (persists to `runtime.toml`) |
 | `POST /config/startup-delay` | Set startup delay seconds (persists to `runtime.toml`) |
+
+**Retired at 2.0.0 (DEC-165):** bare PWM writes (`/fans/openfan/{ch}/pwm`, `/fans/openfan/pwm`, `/hwmon/{id}/pwm`, `/gpu/{id}/fan/pwm`), `/fans/openfan/{ch}/target_rpm`, and all `/hwmon/lease/*`.
 
 ## Identity contract
 
@@ -166,7 +166,7 @@ Every sensor/fan/header includes:
 
 - **Thermal safety** (`safety.rs`): hottest CpuTemp sensor triggers at 105°C → force all OpenFan channels and writable hwmon headers to 100%. Hold until 80°C (hysteresis), one-cycle 60% recovery floor. Forces 40% if no CpuTemp sensor found for 5 consecutive cycles. GPU fans are excluded by design (DEC-130) — PMFW firmware owns GPU thermal protection; the exclusion is structural (`GpuBackend` does not implement `SafetyWriteBackend`).
 - **OpenFan stop timeout**: 0% PWM allowed for max 8s, then rejected
-- **hwmon PWM**: no daemon-enforced per-header floors (`min_pwm_percent: 0` for all). Safety floors are GUI-side profile constraints via `/capabilities` limits.
+- **hwmon PWM**: no daemon-enforced per-header floors (`min_pwm_percent: 0` for all). The role-aware pump/CPU floor is GUI-baked and **daemon-enforced** (validate-time reject + eval-time clamp, DEC-162); the 105 °C thermal force is the absolute backstop.
 - **PWM enable mode** (`pwmN_enable=1`) set on first write per lease, reset on release
 - **ExecStopPost**: restores `pwm_enable=2` (auto) and resets GPU fan curves on any service stop
 - **GPU PMFW writes**: clamped to OD_RANGE from firmware PPTable (prevents EINVAL)
