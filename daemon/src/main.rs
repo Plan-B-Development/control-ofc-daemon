@@ -577,12 +577,11 @@ async fn main() {
     // Ensure the store dir exists so listing/activation work immediately — the
     // systemd StateDirectory= creates {state_dir} but not the profiles/ subdir.
     let profile_store_dir = daemon_state::profiles_dir();
-    if let Err(e) = std::fs::create_dir_all(&profile_store_dir) {
-        log::warn!(
-            "could not create profile store dir '{}': {e}",
-            profile_store_dir.display()
-        );
+    if let Err(e) = control_ofc_daemon::atomic_io::create_dir_private(&profile_store_dir) {
+        // Non-fatal: save_raw recreates it on demand. 0o700 owner-only (DEC-173).
+        log::warn!("could not create profile store dir: {e}");
     }
+
     log::info!("Profile search dirs: {:?}", profile_search_dirs);
 
     let cache = Arc::new(StateCache::new());

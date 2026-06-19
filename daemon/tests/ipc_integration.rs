@@ -1853,3 +1853,48 @@ async fn fan_identify_bad_action_is_400() {
     assert_eq!(st, 400, "{body}");
     assert_eq!(body["error"]["code"], "validation_error");
 }
+
+#[tokio::test]
+async fn create_profile_rejects_overlong_id() {
+    // DEC-173: an over-long id is rejected with a clean 400 at the safety gate,
+    // BEFORE it reaches the filesystem — where it would otherwise surface as an
+    // opaque 500 ENAMETOOLONG when `{id}.json` is written. The id check fires
+    // ahead of any store-dir need, so no store has to be configured here.
+    let (sock, _tx, _d) = start_test_server(test_app_state()).await;
+    let overlong = "a".repeat(129); // one byte over MAX_PROFILE_ID_BYTES (128)
+    let (st, body) = uds_post(&sock, "/profiles", &serde_json::json!({ "id": overlong })).await;
+    assert_eq!(st, 400, "{body}");
+    assert_eq!(body["error"]["code"], "validation_error");
+}
+
+#[tokio::test]
+async fn save_profile_failure_message_omits_internal_path() {
+    // DEC-173: a save failure must not leak the internal store path in the
+    // client envelope — the path-bearing detail goes to the server log only.
+    // Force the failure root-independently: the store dir's parent is a regular
+    // FILE, so create_dir fails with ENOTDIR even when the suite runs as root (a
+    // 0o500 dir would not stop root).
+    let tmp = tempfile::tempdir().unwrap();
+    let not_a_dir = tmp.path().join("not-a-dir");
+    std::fs::write(&not_a_dir, b"x").unwrap();
+    let store = not_a_dir.join("store"); // parent is a file → create_dir_private errors
+    let state = test_app_state_with_profile_dirs(vec![store]);
+    let (sock, _tx, _d) = start_test_server(state).await;
+
+    // Minimal profile with no sensor refs — validates clean against the fixture's
+    // empty sensor set, so the request reaches the save path (not a 400).
+    let body = serde_json::json!({
+        "id": "p", "name": "P", "description": "", "version": 7,
+        "controls": [], "curves": []
+    });
+    let (st, resp) = uds_post(&sock, "/profiles", &body).await;
+
+    assert_eq!(st, 500, "{resp}");
+    assert_eq!(resp["error"]["code"], "internal_error");
+    let msg = resp["error"]["message"].as_str().unwrap();
+    assert_eq!(msg, "failed to save profile");
+    assert!(
+        !msg.contains('/'),
+        "client message must not leak a path: {msg}"
+    );
+}

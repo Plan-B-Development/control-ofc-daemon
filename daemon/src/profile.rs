@@ -287,17 +287,29 @@ pub fn load_profile(path: &Path) -> Result<DaemonProfile, String> {
     Ok(profile)
 }
 
+/// Maximum byte length of a profile id. The on-disk filename is `{id}.json`;
+/// Linux `NAME_MAX` is 255 bytes, so 128 leaves ample headroom while staying a
+/// human-reasonable id length. Compared in bytes, not chars, because the
+/// filesystem limit is on encoded bytes (DEC-173).
+pub const MAX_PROFILE_ID_BYTES: usize = 128;
+
 /// Whether a profile id is safe to use as a filename stem (`{id}.json`).
 ///
-/// Rejects empty ids and any containing `/`, `\`, `..`, or a null byte, to
-/// prevent CWE-22 path traversal. The single source of the id-safety rule for
-/// both `find_profile` (activation) and `profile_store` (CRUD writes).
+/// Rejects empty ids and any containing `/`, `\`, or `..` (CWE-22 path
+/// traversal), plus two filesystem-safety limits (DEC-173): ids longer than
+/// [`MAX_PROFILE_ID_BYTES`] bytes — an over-long id would otherwise surface as
+/// an opaque `500 ENAMETOOLONG` from the filesystem instead of a clean `400` —
+/// and any Unicode control character (C0/C1 + `DEL`; subsumes the old null-byte
+/// check and keeps log lines / error envelopes free of control bytes). The
+/// single source of the id-safety rule for both `find_profile` (activation) and
+/// `profile_store` (CRUD writes).
 pub fn is_safe_profile_id(id: &str) -> bool {
     !(id.is_empty()
+        || id.len() > MAX_PROFILE_ID_BYTES
         || id.contains('/')
         || id.contains('\\')
         || id.contains("..")
-        || id.contains('\0'))
+        || id.chars().any(char::is_control))
 }
 
 /// Search for a profile by name in the given search directories.
@@ -1364,6 +1376,43 @@ mod tests {
         // the guard reject everything is caught here too.
         std::fs::write(profiles.join("quiet.json"), "{}").unwrap();
         assert!(find_profile("quiet", &dirs).is_some());
+    }
+
+    #[test]
+    fn is_safe_profile_id_accepts_normal_ids() {
+        // The GUI emits 8-char hex ids; hand-authored/imported ids may use word
+        // characters. None of these should be rejected by the DEC-173 limits.
+        assert!(is_safe_profile_id("quiet"));
+        assert!(is_safe_profile_id("a1b2c3d4")); // GUI uuid4()[:8] shape
+        assert!(is_safe_profile_id("my-profile_2"));
+        // Boundary: exactly MAX_PROFILE_ID_BYTES bytes is allowed.
+        assert!(is_safe_profile_id(&"a".repeat(MAX_PROFILE_ID_BYTES)));
+    }
+
+    #[test]
+    fn is_safe_profile_id_rejects_overlong() {
+        // One byte over the cap is rejected — an over-long id would otherwise
+        // surface as an opaque 500 ENAMETOOLONG once `{id}.json` is written.
+        assert!(!is_safe_profile_id(&"a".repeat(MAX_PROFILE_ID_BYTES + 1)));
+        // Bytes, not chars: 'é' is 2 UTF-8 bytes, so this id is under the cap by
+        // char count but over it by byte count, and must still be rejected.
+        let multibyte = "é".repeat(MAX_PROFILE_ID_BYTES / 2 + 1);
+        assert!(multibyte.chars().count() <= MAX_PROFILE_ID_BYTES);
+        assert!(multibyte.len() > MAX_PROFILE_ID_BYTES);
+        assert!(!is_safe_profile_id(&multibyte));
+    }
+
+    #[test]
+    fn is_safe_profile_id_rejects_control_chars() {
+        // C0 controls, DEL, C1 controls, and NUL (subsumed from the old explicit
+        // null-byte check) are all rejected — they corrupt log lines / error
+        // envelopes and have no business in a filename stem.
+        assert!(!is_safe_profile_id("a\tb")); // tab (C0)
+        assert!(!is_safe_profile_id("a\nb")); // newline (C0)
+        assert!(!is_safe_profile_id("a\u{07}b")); // BEL (C0)
+        assert!(!is_safe_profile_id("a\u{7f}b")); // DEL
+        assert!(!is_safe_profile_id("a\u{9f}b")); // C1 control
+        assert!(!is_safe_profile_id("foo\0bar")); // NUL
     }
 
     // ───────────────────────── validate() (DEC-160) ─────────────────────────

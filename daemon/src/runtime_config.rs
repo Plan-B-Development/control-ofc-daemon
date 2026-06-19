@@ -19,7 +19,7 @@
 //! process crash, kernel panic, or power loss mid-write leaves either the
 //! previous complete file or the new complete file, never a zero-length file.
 
-use crate::atomic_io::write_atomic;
+use crate::atomic_io::{create_dir_private, write_atomic};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -90,10 +90,7 @@ impl RuntimeConfig {
     /// Sets owner-only (0o600) permissions before rename, matching daemon_state.json.
     pub fn save_to(&self, path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
-            }
+            create_dir_private(parent)?;
         }
 
         let content =
@@ -276,7 +273,7 @@ mod tests {
         cfg.set_startup_delay_secs(1);
         let err = cfg.save_to(&path).unwrap_err();
         assert!(
-            err.contains("failed to create")
+            err.contains("create dir") // create_dir_private mkdir failure (DEC-173)
                 || err.contains("write tmp")
                 || err.contains("create tmp file"),
             "expected mkdir/write error, got: {err}"

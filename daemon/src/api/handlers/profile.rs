@@ -383,9 +383,12 @@ fn validate_and_store(
         }
     };
     if let Err(e) = crate::profile_store::save_raw(&dir, expected_id, &bytes) {
+        // Keep the path-bearing detail server-side; the client gets a generic
+        // message (DEC-173 — internal fs paths must not leak in the envelope).
+        log::error!("Failed to save profile '{expected_id}': {e}");
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &ErrorEnvelope::internal(format!("failed to save profile: {e}")),
+            &ErrorEnvelope::internal("failed to save profile"),
         );
     }
 
@@ -490,9 +493,13 @@ pub async fn delete_profile_handler(
             StatusCode::NOT_FOUND,
             &ErrorEnvelope::validation(format!("profile '{id}' not found in store")),
         ),
-        Err(e) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &ErrorEnvelope::internal(e),
-        ),
+        Err(e) => {
+            // Path-bearing detail to the log only (DEC-173); generic to client.
+            log::error!("Failed to delete profile '{id}': {e}");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorEnvelope::internal("failed to delete profile"),
+            )
+        }
     }
 }

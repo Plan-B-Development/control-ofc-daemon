@@ -7,7 +7,7 @@
 //! panic, or power loss mid-write leaves either the previous complete file or
 //! the new complete file, never a zero-length file.
 
-use crate::atomic_io::write_atomic;
+use crate::atomic_io::{create_dir_private, write_atomic};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -138,15 +138,13 @@ pub fn save_state(state: &DaemonState) -> Result<(), String> {
 
 /// Persist state to a specific directory (testable without global OnceLock).
 ///
-/// Confidentiality note: systemd `StateDirectory=control-ofc` creates
-/// `/var/lib/control-ofc` with `StateDirectoryMode=` (default 0o755), so the
-/// file's 0o600 mode (applied by `write_atomic`) is the actual confidentiality
-/// boundary for this file.
+/// Confidentiality note: the state dir is created — and an existing dir
+/// migrated — `0o700` via `create_dir_private` (DEC-173); the state file itself
+/// is `0o600` (applied by `write_atomic`). systemd `StateDirectory=control-ofc`
+/// may create `/var/lib/control-ofc` first at `StateDirectoryMode=` (default
+/// 0o755); the next save tightens it to 0o700.
 pub fn save_state_to(dir: &Path, state: &DaemonState) -> Result<(), String> {
-    if !dir.exists() {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("failed to create state dir '{}': {e}", dir.display()))?;
-    }
+    create_dir_private(dir)?;
 
     let path = dir.join(STATE_FILE);
     let content = serde_json::to_string_pretty(state)

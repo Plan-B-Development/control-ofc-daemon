@@ -76,10 +76,7 @@ pub async fn update_profile_search_dirs_handler(
         );
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            &ErrorEnvelope::persistence_failed(format!(
-                "failed to persist runtime config at {}: {e}",
-                state.runtime_config_path.display()
-            )),
+            &ErrorEnvelope::persistence_failed("failed to persist runtime configuration"),
         );
     }
 
@@ -134,10 +131,7 @@ pub async fn update_startup_delay_handler(
         );
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            &ErrorEnvelope::persistence_failed(format!(
-                "failed to persist runtime config at {}: {e}",
-                state.runtime_config_path.display()
-            )),
+            &ErrorEnvelope::persistence_failed("failed to persist runtime configuration"),
         );
     }
 

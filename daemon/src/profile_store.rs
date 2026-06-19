@@ -22,7 +22,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::api::responses::ProfileSummary;
-use crate::atomic_io::write_atomic;
+use crate::atomic_io::{create_dir_private, write_atomic};
 use crate::profile::{is_safe_profile_id, DaemonProfile};
 
 /// Path of a stored profile within `dir`. `None` if the id is unsafe.
@@ -37,8 +37,7 @@ fn profile_path(dir: &Path, id: &str) -> Option<PathBuf> {
 /// filename-safe and must equal the document's `id` field (the caller checks).
 pub fn save_raw(store_dir: &Path, id: &str, bytes: &[u8]) -> Result<(), String> {
     let path = profile_path(store_dir, id).ok_or_else(|| format!("unsafe profile id: {id:?}"))?;
-    std::fs::create_dir_all(store_dir)
-        .map_err(|e| format!("create profile store dir '{}': {e}", store_dir.display()))?;
+    create_dir_private(store_dir)?;
     write_atomic(&path, bytes)
 }
 
@@ -154,6 +153,21 @@ mod tests {
         assert!(save_raw(dir.path(), "", b"{}").is_err());
         // Nothing escaped the store dir.
         assert!(!dir.path().parent().unwrap().join("escape.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_raw_creates_private_store_dir() {
+        // DEC-173: the store dir is created 0o700 (owner-only), matching the
+        // 0o600 profile files written into it — an other-readable store dir would
+        // leak the set of profile ids (filenames) to local users.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("profiles"); // does not exist yet
+        save_raw(&store, "p", &sample("p", "P")).unwrap();
+        assert!(store.join("p.json").exists());
+        let mode = std::fs::metadata(&store).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
     }
 
     #[test]

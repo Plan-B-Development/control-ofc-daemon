@@ -92,6 +92,39 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Create `dir` (and any missing parents) as a daemon-private directory,
+/// `0o700` on Unix — owner-only, matching the `0o600` files [`write_atomic`]
+/// places inside it. Idempotent: an already-existing directory has its mode
+/// tightened to `0o700`, so a directory a pre-hardening daemon created `0o755`
+/// is migrated on the next write (DEC-173).
+///
+/// On non-Unix targets this is a plain recursive create (mode is a Unix
+/// concept). Errors are returned as a human-readable `String`, matching the
+/// other helpers in this module and the call sites in `profile_store.rs`,
+/// `daemon_state.rs`, and `runtime_config.rs`.
+pub fn create_dir_private(dir: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        // Create race-free at 0o700: the directory is never briefly group/world
+        // readable under the process umask in the window between create + chmod.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(|e| format!("create dir '{}': {e}", dir.display()))?;
+        // `recursive(true)` is a no-op (Ok) on an existing directory and does
+        // NOT re-apply the mode, so tighten an existing 0o755 dir explicitly.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("set dir mode '{}': {e}", dir.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create dir '{}': {e}", dir.display()))?;
+    }
+    Ok(())
+}
+
 fn tmp_path_for(path: &Path) -> PathBuf {
     // Append `.tmp` literally so `daemon_state.json` → `daemon_state.json.tmp`
     // and `runtime.toml` → `runtime.toml.tmp`, matching the prior call
@@ -164,6 +197,48 @@ mod tests {
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_private_creates_owner_only_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("store");
+
+        create_dir_private(&dir).unwrap();
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_private_tightens_existing_loose_dir() {
+        // A directory a pre-hardening daemon created 0o755 must be migrated to
+        // 0o700 on the next write (DEC-173) — the create is a no-op but the mode
+        // is still tightened.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("store");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        create_dir_private(&dir).unwrap();
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn create_dir_private_is_idempotent_and_recursive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("a").join("b"); // missing parent → recursive create
+
+        create_dir_private(&dir).unwrap();
+        create_dir_private(&dir).unwrap(); // second call must not error
+
+        assert!(dir.is_dir());
     }
 
     #[test]
