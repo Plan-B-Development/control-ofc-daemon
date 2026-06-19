@@ -793,7 +793,13 @@ pub async fn profile_engine_loop(
     override_table: Arc<Mutex<crate::control_override::OverrideTable>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    let interval = std::time::Duration::from_secs(1);
+    // Interval (not `sleep`) so the period is measured tick-to-tick and the
+    // per-tick work time is absorbed rather than added (a bare `sleep(1s)` +
+    // work yields a `1s + work` period that drifts the 1Hz-calibrated step-rate
+    // limiter and falling-temp deadband). `Skip` over-runs without bursting,
+    // matching the hwmon/openfan poll loops (`polling.rs`).
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     log::info!("Profile engine started (1Hz)");
 
     // Per-backend write paths (DEC-135). Each backend owns its own gating —
@@ -816,7 +822,7 @@ pub async fn profile_engine_loop(
 
     loop {
         tokio::select! {
-            _ = tokio::time::sleep(interval) => {},
+            _ = tick.tick() => {}
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     log::info!("Profile engine shutting down");
@@ -910,6 +916,21 @@ pub async fn profile_engine_loop(
                 &override_snapshot,
             )
         };
+
+        // If shutdown was signalled while this tick was computing (after the
+        // `select!` arm, before the write phase), stop here so the engine does
+        // not issue a routine control write that could race
+        // `restore_hardware()` on the way out. Defense-in-depth: in normal
+        // timing the write is fast, `.await`-joined, and drained before the
+        // restore anyway (`shutdown_sequence` awaits this task first). A thermal
+        // emergency is handled earlier this tick (force_all + `continue`) and is
+        // never suppressed here. The only window this cannot close — a single
+        // sysfs/serial write that hangs past `SHUTDOWN_TASK_TIMEOUT`, which
+        // `spawn_blocking` cannot cancel — is backstopped by `ExecStopPost`.
+        if *shutdown.borrow() {
+            log::info!("Profile engine shutting down (mid-tick)");
+            break;
+        }
 
         // Apply per backend (DEC-135). Each backend owns its own gating and
         // none holds a controller guard across an .await. The engine is the
@@ -2441,6 +2462,101 @@ mod tests {
         assert!(
             !set_pwm_cmds.is_empty(),
             "expected at least one SetPwm command, got: {cmds:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn loop_first_tick_is_immediate_interval_semantics() {
+        // Regression guard for the interval-vs-sleep fix: the loop must be
+        // driven by `tokio::time::interval` (whose first `tick()` fires
+        // immediately), NOT `sleep(1s)`-then-work. We shut down after only
+        // 500 ms of virtual time — less than one 1 s period — and still expect
+        // a write, proving the first evaluation happened at t≈0. The pre-fix
+        // `sleep`-first loop would not have ticked yet at 500 ms (0 writes), so
+        // this test fails if the interval scheduler is reverted to a bare sleep.
+        let cache = make_cache_with_sensor("cpu", 55.0);
+        let profile = make_profile("curve", "graph", 50.0);
+        let profile_arc = Arc::new(Mutex::new(Some(profile)));
+        let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
+
+        let (transport, written) = LoopTestTransport::new(1);
+        let fan_ctrl = crate::serial::controller::FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            std::time::Duration::from_millis(500),
+        );
+        let fan_ctrl = Some(Arc::new(Mutex::new(fan_ctrl)));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let handle = tokio::spawn(profile_engine_loop(
+            cache,
+            profile_arc,
+            fan_ctrl,
+            None,
+            vec![],
+            safety,
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            shutdown_rx,
+        ));
+
+        // Less than one period: only an immediate first tick can write by now.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        shutdown_tx.send(true).unwrap();
+        let _ = handle.await; // flush any dispatched blocking write before asserting
+
+        let cmds = written.lock();
+        let set_pwm_cmds: Vec<_> = cmds.iter().filter(|c| c.starts_with(">02")).collect();
+        assert!(
+            !set_pwm_cmds.is_empty(),
+            "interval's first tick must fire immediately (<1s); got: {cmds:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn loop_shutting_down_issues_no_control_write() {
+        // Phase 2 guard: an engine that observes shutdown must not issue a
+        // routine control write (defense-in-depth before `restore_hardware()`).
+        // With shutdown preset before the loop runs, whichever `select!` arm
+        // wins the loop breaks before the write phase → zero writes. The
+        // positive control is `loop_evaluates_profile_and_writes_openfan`, which
+        // writes ≥1 with the identical setup minus the shutdown, so this 0 is
+        // non-vacuous.
+        let cache = make_cache_with_sensor("cpu", 55.0);
+        let profile = make_profile("curve", "graph", 50.0);
+        let profile_arc = Arc::new(Mutex::new(Some(profile)));
+        let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
+
+        let (transport, written) = LoopTestTransport::new(1);
+        let fan_ctrl = crate::serial::controller::FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            std::time::Duration::from_millis(500),
+        );
+        let fan_ctrl = Some(Arc::new(Mutex::new(fan_ctrl)));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        shutdown_tx.send(true).unwrap(); // shutting down before the loop's first tick
+
+        let handle = tokio::spawn(profile_engine_loop(
+            cache,
+            profile_arc,
+            fan_ctrl,
+            None,
+            vec![],
+            safety,
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            shutdown_rx,
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let _ = handle.await;
+
+        let cmds = written.lock();
+        let set_pwm_cmds: Vec<_> = cmds.iter().filter(|c| c.starts_with(">02")).collect();
+        assert!(
+            set_pwm_cmds.is_empty(),
+            "a shutting-down engine must not issue control writes; got: {cmds:?}"
         );
     }
 

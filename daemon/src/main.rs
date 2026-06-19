@@ -466,6 +466,13 @@ const SHUTDOWN_TASK_TIMEOUT: Duration = Duration::from_secs(3);
 /// (e.g. an SSE `/events` stream) can never block the safety restore; on timeout
 /// we log and proceed, and `ExecStopPost=control-ofc-restore-auto` backstops
 /// production regardless.
+///
+/// The engine task `.await`-joins every `spawn_blocking` backend write before
+/// its loop iteration ends, so draining its task handle here also drains those
+/// writes — a blocking write cannot be left in flight once the handle resolves.
+/// The only residual window is a single sysfs/serial write that hangs past
+/// `task_timeout` (a running `spawn_blocking` cannot be cancelled); the
+/// `ExecStopPost` restore backstops that pathological case.
 async fn shutdown_sequence<F>(
     poll_shutdown_tx: &tokio::sync::watch::Sender<bool>,
     server_shutdown_tx: tokio::sync::oneshot::Sender<()>,
