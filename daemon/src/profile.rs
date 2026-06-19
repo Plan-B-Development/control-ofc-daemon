@@ -656,6 +656,26 @@ pub fn validate(profile: &DaemonProfile, known_sensor_ids: &HashSet<String>) -> 
                 ),
             );
         }
+
+        // DEC-167: a pump must never be configured to stop. A non-zero stop_pct
+        // can snap a pump/CPU control's output to 0 when it falls below the
+        // threshold — even though the control is hard-floored — and stopping a
+        // pump risks coolant-flow loss and rapid thermal runaway. Reject so the
+        // shape never persists; the engine also skips the stop-snap for pump/CPU
+        // members at eval time for any profile that reaches it un-validated
+        // (boot-load / hand-edit). GPU and chassis-only controls are unaffected.
+        if ctrl.stop_pct != 0.0 && ctrl.members.iter().any(member_is_pump_or_cpu) {
+            report.error(
+                format!("{p}.stop_pct"),
+                "PUMP_STOP_FORBIDDEN",
+                format!(
+                    "control has a pump/CPU member but stop_pct {} is non-zero; a \
+                     pump must never be configured to stop (coolant-flow loss leads \
+                     to rapid thermal runaway)",
+                    ctrl.stop_pct
+                ),
+            );
+        }
     }
 
     // ── Cycle detection (Mix over curves, Sync over controls) ──
@@ -1555,6 +1575,62 @@ mod tests {
             .filter(|e| e.reason == "FLOOR_TOO_LOW")
             .count();
         assert_eq!(n, 1, "exactly one FLOOR_TOO_LOW per control");
+    }
+
+    // ─────────────── DEC-167 validate() PUMP_STOP_FORBIDDEN backstop ──────────
+
+    fn pump_stop_violation(report: &ValidationReport) -> bool {
+        report
+            .errors
+            .iter()
+            .any(|e| e.reason == "PUMP_STOP_FORBIDDEN")
+    }
+
+    #[test]
+    fn validate_rejects_pump_control_with_nonzero_stop_pct() {
+        // DEC-167: a pump must never be configured to stop. A pump control with a
+        // valid floor (30) but stop_pct=35 would let the engine snap it to 0 below
+        // the threshold — reject at author time.
+        let pump = member("hwmon", "hwmon:z53:n:pwm1:pwm1", "AIO_PUMP");
+        let mut ctl = control_with_members(30.0, vec![pump]);
+        ctl.stop_pct = 35.0;
+        let report = validate(&mk_profile(vec![], vec![ctl]), &sset(&[]));
+        assert!(
+            !report.is_valid(),
+            "pump with non-zero stop_pct must reject"
+        );
+        assert!(pump_stop_violation(&report), "must be PUMP_STOP_FORBIDDEN");
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.field == "controls[0].stop_pct"));
+    }
+
+    #[test]
+    fn validate_accepts_pump_control_with_zero_stop_pct() {
+        // The common, correct shape: a pump with stop_pct=0 (stop disabled).
+        let pump = member("hwmon", "hwmon:z53:n:pwm1:pwm1", "AIO_PUMP");
+        let ctl = control_with_members(30.0, vec![pump]); // stop_pct defaults to 0
+        let report = validate(&mk_profile(vec![], vec![ctl]), &sset(&[]));
+        assert!(
+            !pump_stop_violation(&report),
+            "pump with stop_pct=0 must NOT trip PUMP_STOP_FORBIDDEN: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn validate_accepts_nonzero_stop_pct_on_nonpump_control() {
+        // A chassis/openfan control keeps the legitimate stop-to-0 feature.
+        let cha = member("hwmon", "hwmon:it8696:d:pwm2:CHA_FAN", "Radiator Top");
+        let mut ctl = control_with_members(20.0, vec![cha]);
+        ctl.stop_pct = 20.0;
+        let report = validate(&mk_profile(vec![], vec![ctl]), &sset(&[]));
+        assert!(
+            !pump_stop_violation(&report),
+            "non-pump stop_pct must be allowed: {:?}",
+            report.errors
+        );
     }
 
     #[test]

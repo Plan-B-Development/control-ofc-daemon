@@ -222,7 +222,7 @@ fn evaluate_trigger(
 /// delta tracked cycle-to-cycle is the final clamped output; stop-threshold
 /// comes after step-rate so a slow-falling curve can still snap to zero.
 fn apply_tuning(control: &LogicalControl, raw_output: f64, last_output: Option<f64>) -> f64 {
-    apply_tuning_with_floor(control, raw_output, last_output, control.minimum_pct)
+    apply_tuning_with_floor(control, raw_output, last_output, control.minimum_pct, false)
 }
 
 /// `apply_tuning` with an explicit minimum-floor override.
@@ -233,11 +233,17 @@ fn apply_tuning(control: &LogicalControl, raw_output: f64, last_output: Option<f
 /// the public `apply_tuning` (and its tests) is unchanged. Keeping this a
 /// floor parameter — rather than special-casing GPU inside the pipeline —
 /// preserves the exact offset → floor → step → stop/start order for both.
+///
+/// DEC-167: `floor_is_hard` marks a pump/CPU member whose floor must never be
+/// breached. When set, the stop-snap (step 4) is skipped so a non-zero
+/// `stop_pct` can never zero a pump (coolant-flow loss → thermal runaway). The
+/// public `apply_tuning` passes `false` (the generic control-wide path).
 fn apply_tuning_with_floor(
     control: &LogicalControl,
     raw_output: f64,
     last_output: Option<f64>,
     floor: f64,
+    floor_is_hard: bool,
 ) -> f64 {
     // 1. Offset
     let mut output = raw_output + control.offset_pct;
@@ -257,8 +263,11 @@ fn apply_tuning_with_floor(
 
     // 4. Stop threshold — snap to zero below stop_pct so the fan actually
     //    stops instead of spinning at a near-stall speed. `stop_pct == 0`
-    //    disables the feature (matches GUI semantics).
-    if control.stop_pct > 0.0 && output < control.stop_pct {
+    //    disables the feature (matches GUI semantics). A HARD floor (pump/CPU)
+    //    is exempt (DEC-167): a pump must never be snapped to 0 — the step-2
+    //    floor already holds it at >= HARD_PUMP_CPU_FLOOR_PCT, and zeroing it
+    //    would risk coolant-flow loss and rapid thermal runaway.
+    if !floor_is_hard && control.stop_pct > 0.0 && output < control.stop_pct {
         output = 0.0;
     }
 
@@ -630,27 +639,38 @@ pub fn evaluate_profile_with_overrides(
         // Generate write commands for all members
         for member in &control.members {
             let gpu_fan_zero_rpm = member.source == "amd_gpu" && member.fan_zero_rpm;
-            // DEC-119 + DEC-162: each member's effective minimum-PWM floor.
-            // GPU members carry no floor (0% — PMFW enforces its own OD_RANGE
-            // minimum). A pump/CPU header is hard-floored to at least
+            // DEC-119 + DEC-162 + DEC-167: each member's effective minimum-PWM
+            // floor. GPU members carry no floor (0% — PMFW enforces its own
+            // OD_RANGE minimum). A pump/CPU header is hard-floored to at least
             // HARD_PUMP_CPU_FLOOR_PCT even when the control declares a lower
-            // `minimum_pct`: validate() rejects such a profile at the API
-            // boundary, but a persisted or hand-edited profile reaches the engine
-            // un-validated via `resolve_initial_profile`, so this clamp is the
-            // load-bearing safety net. Every other member uses the control-wide
-            // floor. Recompute with a namespaced per-member step-rate tracker
-            // only when the effective floor differs from the control-wide one
-            // (covers both the GPU lower-to-0 and the pump raise-to-floor cases),
-            // so headless mode matches the GUI's per-member flooring (the DEC-096
-            // consistency guarantee); otherwise reuse the control-wide value so
-            // the common path stays byte-identical and the parity oracle is
-            // unperturbed. `!=` compares the same source value — no float hazard.
+            // `minimum_pct`, AND its stop-snap is skipped (`floor_is_hard`) so a
+            // non-zero `stop_pct` can never zero a pump — coolant-flow loss leads
+            // to rapid thermal runaway. validate() rejects both shapes at the API
+            // boundary (FLOOR_TOO_LOW / PUMP_STOP_FORBIDDEN), but a persisted or
+            // hand-edited profile reaches the engine un-validated via
+            // `resolve_initial_profile`, so this per-member path is the
+            // load-bearing safety net for every reachable input. Every other
+            // member uses the control-wide floor. Recompute with a namespaced
+            // per-member step-rate tracker when the effective floor differs from
+            // the control-wide one (GPU lower-to-0, pump raise-to-floor) OR the
+            // member is pump/CPU — so the hard-floor stop-snap exemption applies
+            // even when effective_floor == minimum_pct, where the control-wide
+            // `pwm_percent` above may already have been snapped to 0. This
+            // matches the GUI's per-member flooring (the DEC-096 consistency
+            // guarantee); otherwise reuse the control-wide value so the common
+            // path stays byte-identical and the parity oracle is unperturbed.
             let effective_floor = member_effective_floor(control, member);
-            let member_pwm = if effective_floor != control.minimum_pct {
+            let floor_is_hard = member_is_pump_or_cpu(member);
+            let member_pwm = if effective_floor != control.minimum_pct || floor_is_hard {
                 let key = format!("{}::m::{}", control.id, member.member_id);
                 let prev_member = engine_state.last_output(&key);
-                let tuned_member =
-                    apply_tuning_with_floor(control, raw_output, prev_member, effective_floor);
+                let tuned_member = apply_tuning_with_floor(
+                    control,
+                    raw_output,
+                    prev_member,
+                    effective_floor,
+                    floor_is_hard,
+                );
                 engine_state.last_output.insert(key, tuned_member);
                 tuned_member.round().clamp(0.0, 100.0) as u8
             } else {
@@ -1723,6 +1743,78 @@ mod tests {
         );
         let pump = cmds.iter().find(|c| c.source == "hwmon").unwrap();
         assert_eq!(pump.pwm_percent, 45);
+    }
+
+    #[test]
+    fn evaluate_pump_member_floor_survives_nonzero_stop_pct() {
+        // DEC-167 regression: a pump/CPU control with a non-zero stop_pct ABOVE
+        // the hard floor must NOT be snapped to 0. minimum_pct=30 (== the hard
+        // floor) so effective_floor == minimum_pct and the per-member branch was
+        // historically skipped — the control-wide value was snapped to 0 by the
+        // stop threshold (35 > floored 30). The fix runs the per-member branch
+        // for the pump and skips its stop-snap. Held across ticks. FAILS pre-fix.
+        let mut profile = make_profile("curve", "flat", 10.0);
+        profile.controls[0].members.clear();
+        push_pump_member(&mut profile);
+        profile.controls[0].minimum_pct = 30.0;
+        profile.controls[0].stop_pct = 35.0;
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let mut state = ProfileEngineState::new();
+        for tick in 0..3 {
+            let cmds = evaluate_profile(&profile, &cache.sensors_snapshot(), &mut state);
+            let pump = cmds.iter().find(|c| c.source == "hwmon").unwrap();
+            assert_eq!(
+                pump.pwm_percent, 30,
+                "tick {tick}: pump must hold the hard floor, never snap to 0"
+            );
+        }
+    }
+
+    #[test]
+    fn evaluate_pump_member_floor_survives_stop_pct_on_unvalidated_boot_path() {
+        // DEC-167: same protection on the un-validated boot/hand-edit path, where
+        // minimum_pct=20 is BELOW the hard floor (validate() would reject it with
+        // FLOOR_TOO_LOW, but resolve_initial_profile never calls validate()).
+        // effective_floor=30 != 20 so the per-member safety-net branch IS taken —
+        // but pre-fix its own stop-snap still re-zeroed the floored value
+        // (30 < 35). The skip-snap makes the safety net actually hold. FAILS pre-fix.
+        let mut profile = make_profile("curve", "flat", 10.0);
+        profile.controls[0].members.clear();
+        push_pump_member(&mut profile);
+        profile.controls[0].minimum_pct = 20.0;
+        profile.controls[0].stop_pct = 35.0;
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let cmds = evaluate_profile(
+            &profile,
+            &cache.sensors_snapshot(),
+            &mut ProfileEngineState::new(),
+        );
+        let pump = cmds.iter().find(|c| c.source == "hwmon").unwrap();
+        assert_eq!(
+            pump.pwm_percent, 30,
+            "pump must clamp to the hard floor on the un-validated boot path, never 0"
+        );
+    }
+
+    #[test]
+    fn evaluate_nonpump_member_still_snaps_to_zero_below_stop_pct() {
+        // Guard against over-scoping DEC-167: a non-pump (openfan) member must
+        // KEEP the legitimate stop-to-0 feature. Flat curve 10 with stop_pct=20
+        // → below threshold → snaps to 0. Passes before and after the fix.
+        let mut profile = make_profile("curve", "flat", 10.0);
+        profile.controls[0].minimum_pct = 0.0;
+        profile.controls[0].stop_pct = 20.0;
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let cmds = evaluate_profile(
+            &profile,
+            &cache.sensors_snapshot(),
+            &mut ProfileEngineState::new(),
+        );
+        let fan = cmds.iter().find(|c| c.source == "openfan").unwrap();
+        assert_eq!(
+            fan.pwm_percent, 0,
+            "non-pump fan must still stop below stop_pct"
+        );
     }
 
     #[test]
