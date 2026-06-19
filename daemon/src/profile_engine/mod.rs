@@ -2456,12 +2456,15 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         let _ = handle.await;
 
-        // Verify a SetPwm command was written (commands start with ">02")
+        // Pin the commanded value, not just that *a* write happened: at 55°C the
+        // graph curve (30→20%, 80→100%) yields 60% → percent_to_raw(60)=153=0x99
+        // on ch0, so the only SetPwm frame must be ">020099". Asserting the exact
+        // frame turns this from a change-detector into a curve-eval regression guard.
         let cmds = written.lock();
         let set_pwm_cmds: Vec<_> = cmds.iter().filter(|c| c.starts_with(">02")).collect();
         assert!(
-            !set_pwm_cmds.is_empty(),
-            "expected at least one SetPwm command, got: {cmds:?}"
+            !set_pwm_cmds.is_empty() && set_pwm_cmds.iter().all(|c| c.as_str() == ">020099\n"),
+            "expected SetPwm 60% (raw 0x99) on ch0 = \">020099\"; got: {cmds:?}"
         );
     }
 
@@ -2767,12 +2770,15 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         let _ = handle.await;
 
-        // The engine is now primary: it must have issued SetPwm (>02) commands.
+        // The engine is now primary: it must have issued SetPwm (>02) commands —
+        // and at the pinned value. Same profile/sensor as
+        // loop_evaluates_profile_and_writes_openfan: 55°C → 60% → raw 0x99 on ch0,
+        // so the only frame is ">020099". Pin the value, not mere occurrence.
         let cmds = written.lock();
         let set_pwm_cmds: Vec<_> = cmds.iter().filter(|c| c.starts_with(">02")).collect();
         assert!(
-            !set_pwm_cmds.is_empty(),
-            "profile engine must write OpenFan PWM when a profile is active (DEC-165); got: {cmds:?}",
+            !set_pwm_cmds.is_empty() && set_pwm_cmds.iter().all(|c| c.as_str() == ">020099\n"),
+            "profile engine must write OpenFan PWM 60% (raw 0x99) on ch0 = \">020099\" (DEC-165); got: {cmds:?}",
         );
     }
 

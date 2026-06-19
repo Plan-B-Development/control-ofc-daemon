@@ -212,3 +212,28 @@ fn override_reject_response(reject: OverrideReject) -> (StatusCode, Json<serde_j
         ),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `resolve_ttl` is the deadman cap on a per-grant override TTL: a client
+    /// extends control by renewing, never by requesting one long grant. Pin both
+    /// clamp ends, the default, and an in-range passthrough so removing or
+    /// loosening the bound is caught — the integration roundtrip
+    /// (`ipc_integration.rs`) only exercises the default.
+    #[test]
+    fn resolve_ttl_clamps_both_ends_and_defaults() {
+        let max = constants::OVERRIDE_TTL_SECS;
+        // No request → the full default window.
+        assert_eq!(resolve_ttl(None), Duration::from_secs(max));
+        // Above the cap → clamped down to the cap.
+        assert_eq!(resolve_ttl(Some(999)), Duration::from_secs(max));
+        // Exactly at the cap → unchanged (upper boundary).
+        assert_eq!(resolve_ttl(Some(max)), Duration::from_secs(max));
+        // Zero → floored to 1s (a 0s deadman would expire instantly).
+        assert_eq!(resolve_ttl(Some(0)), Duration::from_secs(1));
+        // In range → passed through unchanged.
+        assert_eq!(resolve_ttl(Some(10)), Duration::from_secs(10));
+    }
+}
