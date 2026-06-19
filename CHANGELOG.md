@@ -1,5 +1,36 @@
 # Changelog
 
+## [2.1.0] — 2026-06-19
+
+Hardening and correctness release on top of the 2.0.0 daemon-owned-control cutover. Pairs with
+`control-ofc-gui` ≥ v2.0.0.
+
+### Fixed
+- **The hard pump/CPU floor can no longer be defeated by `stop_pct` (DEC-167).** A control with a
+  pump/CPU member and a non-zero `stop_pct` could be snapped to 0% despite its role floor. The
+  engine now skips the stop-snap for hard-floored members, and `validate()` rejects a non-zero
+  `stop_pct` on a pump/CPU control (`PUMP_STOP_FORBIDDEN`).
+- **The profile engine evaluates on a fixed 1 Hz interval (DEC-168)** via `tokio::time::interval`
+  (`MissedTickBehavior::Skip`) instead of `sleep`-after-work, removing period drift, plus a
+  shutdown mid-tick guard.
+
+### Changed
+- **Retired the lease capability surface (DEC-170).** `/capabilities` no longer advertises
+  `lease_required` / `lease_required_for_hwmon_writes`; verify-effectiveness failures map to
+  `503 hardware_unavailable` (`403 lease_required` / `409 lease_already_held` are emitted by no
+  route). `/status` drops the dead `counters` / `last_error_summary` envelope.
+
+### Security
+- **Hardened profile-id validation and on-disk confidentiality (DEC-173).** `is_safe_profile_id`
+  now rejects ids over 128 bytes or containing control characters (a clean `400` instead of a
+  filesystem `500`); the profile-store, state, and runtime-config directories are created `0o700`
+  (owner-only); and `500`/`503` error responses no longer leak internal filesystem paths.
+
+### Build
+- **Added a `cargo-deny` license/advisory gate (DEC-174).** `deny.toml` encodes the project's
+  license policy (DEC-043 no-LGPL, DEC-155 serialport MPL-2.0); `cargo deny check` runs at release
+  time alongside `cargo audit`.
+
 ## [2.0.0] — 2026-06-19
 
 **Breaking — daemon-owned control cutover (DEC-159 / DEC-165).** The daemon's profile engine is now the
