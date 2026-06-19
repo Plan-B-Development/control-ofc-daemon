@@ -1,4 +1,4 @@
-//! Hwmon PWM and lease endpoints.
+//! Hwmon PWM and verify endpoints.
 //!
 //! Named `hwmon_ctl` to avoid confusion with the top-level `crate::hwmon` module.
 
@@ -10,7 +10,6 @@ use axum::response::Json;
 
 use super::{error_response, json_ok, AppState};
 use crate::api::responses::*;
-use crate::hwmon::lease::LeaseError;
 use crate::hwmon::pwm_control::HwmonControlError;
 
 /// GET /hwmon/headers — list discovered controllable PWM headers.
@@ -46,20 +45,20 @@ pub async fn hwmon_headers_handler(
 }
 
 /// Map a `HwmonControlError` to an HTTP error response.
+///
+/// Post-2.0.0 the client holds no hwmon lease — the profile engine is the sole
+/// writer (DEC-165) and `/hwmon/{id}/verify` drives its own short-lived internal
+/// "verify" lease. A `Lease` error from a verify write is therefore an internal
+/// race (the daemon's own lease lapsed mid-write), never a client precondition,
+/// so it surfaces as a retryable `503 hardware_unavailable` rather than the
+/// retired `403 lease_required` / `409 lease_already_held` client codes (DEC-170).
 fn hwmon_control_error_response(err: HwmonControlError) -> (StatusCode, Json<serde_json::Value>) {
     match err {
-        HwmonControlError::Lease(LeaseError::AlreadyHeld {
-            owner_hint,
-            ttl_seconds,
-        }) => error_response(
-            StatusCode::CONFLICT,
-            &ErrorEnvelope::lease_already_held(format!(
-                "lease held by '{owner_hint}' (expires in {ttl_seconds}s)"
-            )),
-        ),
         HwmonControlError::Lease(_) => error_response(
-            StatusCode::FORBIDDEN,
-            &ErrorEnvelope::lease_error("valid lease required for hwmon PWM writes"),
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::hardware_unavailable(
+                "hwmon verify could not hold the daemon's internal lease (transient) — retry",
+            ),
         ),
         HwmonControlError::Validation(msg) => {
             error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(msg))
@@ -213,9 +212,10 @@ pub async fn hwmon_verify_handler(
     let test_pct: u8 = if current_pct > 50 { 20 } else { 80 };
 
     // Write test value via controller (sets pwm_enable=1 + PWM).
-    // Route errors through the shared HwmonControlError mapper: a lease that
-    // expired between the up-front validate_lease check and this write must
-    // surface as 403 lease_required, not 500 internal_error.
+    // Route errors through the shared HwmonControlError mapper: if the daemon's
+    // own force-taken "verify" lease lapses between here and the write, that is
+    // an internal race, surfaced as a retryable 503 hardware_unavailable
+    // (DEC-170) — not a client lease error and not a 500 internal_error.
     {
         let mut ctrl = controller.lock();
         if let Err(e) = ctrl.set_pwm(&header_id, test_pct, &verify_lease_id) {
@@ -352,40 +352,56 @@ mod tests {
     use crate::hwmon::lease::LeaseError;
     use crate::hwmon::pwm_control::HwmonControlError;
 
-    /// P1-2 regression: a `HwmonControlError::Lease(_)` — which is what
-    /// `set_pwm` returns when the lease expires mid-call — must map to
-    /// 403 `lease_required`, never 500 `internal_error`. The verify handler
-    /// previously hand-rolled a 500; it now delegates to this mapper.
+    /// DEC-170 regression: post-2.0.0 the client holds no hwmon lease, so a
+    /// `HwmonControlError::Lease(_)` from a verify write is an internal race
+    /// (the daemon's own "verify" lease lapsed mid-call), not a client
+    /// precondition. Every `LeaseError` variant must map to a retryable
+    /// `503 hardware_unavailable` — never the retired `403 lease_required` or
+    /// `409 lease_already_held` client codes. Pins the arm-collapse so a future
+    /// edit cannot reintroduce a lease-named client error.
     #[test]
-    fn hwmon_control_error_response_maps_lease_to_403() {
+    fn hwmon_control_error_response_maps_no_lease_to_503() {
         let err = HwmonControlError::Lease(LeaseError::NoLease);
         let (status, body) = hwmon_control_error_response(err);
-        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         let json = body.0;
-        assert_eq!(json["error"]["code"], "lease_required");
-        assert_eq!(json["error"]["retryable"], false);
+        assert_eq!(json["error"]["code"], "hardware_unavailable");
+        assert_eq!(json["error"]["retryable"], true);
     }
 
     #[test]
-    fn hwmon_control_error_response_maps_invalid_lease_to_403() {
+    fn hwmon_control_error_response_maps_invalid_lease_to_503() {
         let err = HwmonControlError::Lease(LeaseError::InvalidLease);
         let (status, body) = hwmon_control_error_response(err);
-        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         let json = body.0;
-        assert_eq!(json["error"]["code"], "lease_required");
+        assert_eq!(json["error"]["code"], "hardware_unavailable");
+        assert_eq!(json["error"]["retryable"], true);
     }
 
     #[test]
-    fn hwmon_control_error_response_maps_expired_lease_to_403() {
-        // T2 (test-tests audit): Expired joined LeaseError as a distinct
-        // variant. The HTTP shape must remain 403 lease_required so existing
-        // GUI retry policies (re-acquire on 403) keep working.
+    fn hwmon_control_error_response_maps_expired_lease_to_503() {
         let err = HwmonControlError::Lease(LeaseError::Expired);
         let (status, body) = hwmon_control_error_response(err);
-        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         let json = body.0;
-        assert_eq!(json["error"]["code"], "lease_required");
-        assert_eq!(json["error"]["retryable"], false);
+        assert_eq!(json["error"]["code"], "hardware_unavailable");
+        assert_eq!(json["error"]["retryable"], true);
+    }
+
+    #[test]
+    fn hwmon_control_error_response_maps_already_held_to_503() {
+        // The AlreadyHeld arm used to map to 409 lease_already_held; after the
+        // DEC-170 collapse it joins the wildcard → 503 hardware_unavailable.
+        let err = HwmonControlError::Lease(LeaseError::AlreadyHeld {
+            owner_hint: "verify".into(),
+            ttl_seconds: 6,
+        });
+        let (status, body) = hwmon_control_error_response(err);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let json = body.0;
+        assert_eq!(json["error"]["code"], "hardware_unavailable");
+        assert_eq!(json["error"]["retryable"], true);
     }
 
     /// B1: classify_verify_result `details` must acknowledge that an

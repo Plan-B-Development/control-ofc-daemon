@@ -154,7 +154,9 @@ async fn status_endpoint_returns_health() {
     assert_eq!(json["overall_status"], "ok");
     assert!(json["subsystems"].is_array());
     assert_eq!(json["subsystems"][0]["status"], "ok");
-    assert!(json["counters"].is_object());
+    // DEC-170: the counters envelope (only ever carried a dead last_error_summary)
+    // was removed — /status no longer emits it.
+    assert!(json.get("counters").is_none());
     // DEC-132: thermal_state defaults to "normal" before the profile engine's
     // first tick reports anything.
     assert_eq!(json["thermal_state"], "normal");
@@ -372,7 +374,8 @@ async fn poll_endpoint_returns_batched_shape() {
     // Exact wire string — fresh fixture timestamps yield "ok" (audit P2).
     assert_eq!(status_obj["overall_status"], "ok");
     assert!(status_obj["subsystems"].is_array());
-    assert!(status_obj["counters"].is_object());
+    // DEC-170: counters envelope removed.
+    assert!(status_obj.get("counters").is_none());
 
     // Sensors block — same shape as /sensors.
     let sensors = json["sensors"]
@@ -550,7 +553,10 @@ async fn capabilities_endpoint_returns_schema() {
     // Feature flags
     assert_eq!(json["features"]["openfan_write_supported"], false);
     assert_eq!(json["features"]["hwmon_write_supported"], false);
-    assert_eq!(json["features"]["lease_required_for_hwmon_writes"], true);
+    // DEC-170: lease capability surface retired — the feature flag is gone.
+    assert!(json["features"]
+        .get("lease_required_for_hwmon_writes")
+        .is_none());
     // Limits
     assert_eq!(json["limits"]["pwm_percent_min"], 0);
     assert_eq!(json["limits"]["pwm_percent_max"], 100);
@@ -570,7 +576,8 @@ async fn capabilities_with_hwmon_shows_headers() {
     assert_eq!(status, 200);
     assert_eq!(json["devices"]["hwmon"]["present"], true);
     assert_eq!(json["devices"]["hwmon"]["pwm_header_count"], 2);
-    assert_eq!(json["devices"]["hwmon"]["lease_required"], true);
+    // DEC-170: per-header lease_required flag retired.
+    assert!(json["devices"]["hwmon"].get("lease_required").is_none());
     assert_eq!(json["features"]["hwmon_write_supported"], true);
 
     let _ = shutdown.send(());

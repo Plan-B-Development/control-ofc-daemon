@@ -16,7 +16,6 @@ pub struct StatusResponse {
     pub daemon_version: String,
     pub overall_status: String,
     pub subsystems: Vec<SubsystemStatus>,
-    pub counters: Counters,
     /// Seconds since daemon process started.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uptime_seconds: Option<u64>,
@@ -60,13 +59,6 @@ pub struct SubsystemStatus {
     pub status: String,
     pub age_ms: Option<u64>,
     pub reason: String,
-}
-
-/// Operational counters.
-#[derive(Debug, Clone, Serialize)]
-pub struct Counters {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_error_summary: Option<String>,
 }
 
 /// Response for `/sensors` endpoint.
@@ -420,7 +412,6 @@ pub struct OpenfanCapability {
 pub struct HwmonCapability {
     pub present: bool,
     pub pwm_header_count: usize,
-    pub lease_required: bool,
     pub write_support: bool,
 }
 
@@ -497,7 +488,6 @@ pub struct UnsupportedCapability {
 pub struct FeatureFlags {
     pub openfan_write_supported: bool,
     pub hwmon_write_supported: bool,
-    pub lease_required_for_hwmon_writes: bool,
 }
 
 /// Policy-level limits the GUI should respect.
@@ -1011,18 +1001,6 @@ impl ErrorEnvelope {
         }
     }
 
-    pub fn lease_error(message: impl Into<String>) -> Self {
-        Self {
-            error: ErrorBody {
-                code: "lease_required".into(),
-                message: message.into(),
-                details: None,
-                retryable: false,
-                source: "validation".into(),
-            },
-        }
-    }
-
     /// A renew/release presented a stale or superseded override token — a
     /// thawed/resumed GUI cannot re-pin fans it no longer owns (Kleppmann
     /// fencing, DEC-163). HTTP 409 Conflict, `retryable: false`.
@@ -1045,18 +1023,6 @@ impl ErrorEnvelope {
         Self {
             error: ErrorBody {
                 code: "override_expired".into(),
-                message: message.into(),
-                details: None,
-                retryable: false,
-                source: "validation".into(),
-            },
-        }
-    }
-
-    pub fn lease_already_held(message: impl Into<String>) -> Self {
-        Self {
-            error: ErrorBody {
-                code: "lease_already_held".into(),
                 message: message.into(),
                 details: None,
                 retryable: false,
@@ -1190,9 +1156,6 @@ mod tests {
                 age_ms: Some(500),
                 reason: "readings fresh".into(),
             }],
-            counters: Counters {
-                last_error_summary: None,
-            },
             uptime_seconds: Some(3600),
             thermal_state: "normal".into(),
             overrides: Vec::new(),
@@ -1203,8 +1166,9 @@ mod tests {
         assert_eq!(json["overall_status"], "ok");
         assert_eq!(json["subsystems"][0]["name"], "openfan");
         assert_eq!(json["subsystems"][0]["age_ms"], 500);
-        // last_error_summary absent when None
-        assert!(json["counters"].get("last_error_summary").is_none());
+        // DEC-170: the counters envelope was removed entirely (its only field,
+        // last_error_summary, was permanently dead).
+        assert!(json.get("counters").is_none());
         // DEC-132: thermal_state is always serialized (additive field).
         assert_eq!(json["thermal_state"], "normal");
         // DEC-163/166: override + identify arrays omitted when empty (additive).
@@ -1321,7 +1285,6 @@ mod tests {
                 hwmon: HwmonCapability {
                     present: true,
                     pwm_header_count: 3,
-                    lease_required: true,
                     write_support: true,
                 },
                 amd_gpu: AmdGpuCapability {
@@ -1362,7 +1325,6 @@ mod tests {
             features: FeatureFlags {
                 openfan_write_supported: true,
                 hwmon_write_supported: true,
-                lease_required_for_hwmon_writes: true,
             },
             limits: Limits {
                 pwm_percent_min: 0,
@@ -1388,7 +1350,12 @@ mod tests {
         assert_eq!(json["devices"]["openfan"]["present"], true);
         assert_eq!(json["devices"]["openfan"]["channels"], 10);
         assert_eq!(json["devices"]["hwmon"]["pwm_header_count"], 3);
-        assert_eq!(json["features"]["lease_required_for_hwmon_writes"], true);
+        // DEC-170: the lease capability surface is gone — neither the per-header
+        // flag nor the feature flag is emitted any more.
+        assert!(json["devices"]["hwmon"].get("lease_required").is_none());
+        assert!(json["features"]
+            .get("lease_required_for_hwmon_writes")
+            .is_none());
         // M11: both pci_id (legacy) and pci_bdf (canonical) must be emitted
         // with the same BDF string so clients on either name keep working.
         assert_eq!(json["devices"]["amd_gpu"]["pci_id"], "0000:2d:00.0");

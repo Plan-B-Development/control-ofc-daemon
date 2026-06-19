@@ -187,7 +187,6 @@ pub async fn capabilities_handler(
             hwmon: HwmonCapability {
                 present: hwmon_present,
                 pwm_header_count: hwmon_header_count,
-                lease_required: true,
                 write_support: hwmon_present,
             },
             amd_gpu: amd_gpu_cap,
@@ -201,7 +200,6 @@ pub async fn capabilities_handler(
         features: FeatureFlags {
             openfan_write_supported: openfan_present,
             hwmon_write_supported: hwmon_present,
-            lease_required_for_hwmon_writes: true,
         },
         limits: Limits {
             pwm_percent_min: 0,

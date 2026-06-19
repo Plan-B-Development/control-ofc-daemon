@@ -247,9 +247,6 @@ pub(crate) fn build_status_response(
         daemon_version: state.daemon_version.clone(),
         overall_status: health.overall.to_string(),
         subsystems,
-        counters: Counters {
-            last_error_summary: None,
-        },
         uptime_seconds: Some(uptime),
         // DEC-132: surface the profile engine's thermal override state.
         // `None` only before the engine's first tick — report "normal".

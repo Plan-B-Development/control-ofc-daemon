@@ -250,6 +250,8 @@ Error envelope (all errors):
 }
 ```
 
-Codes: `validation_error` (400), `lease_required` (400 for invalid/expired lease, 403 for missing lease on write),
-`not_found` (404), `lease_already_held` (409), `thermal_abort` (409),
+Codes: `validation_error` (400), `not_found` (404), `thermal_abort` (409),
 `internal_error` (500), `hardware_unavailable` (503), `persistence_failed` (503).
+The client-lease codes `lease_required` / `lease_already_held` were retired (DEC-165)
+and fully removed at DEC-170 — a verify-path internal-lease lapse now returns
+`503 hardware_unavailable`.
