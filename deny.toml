@@ -1,0 +1,53 @@
+# cargo-deny supply-chain policy for control-ofc-daemon (DEC-174).
+#
+# Primary purpose: an enforced LICENSE gate encoding DEC-043 (no LGPL — the
+# re-linking obligation is unacceptable for our statically-linked binary) and
+# DEC-155 (serialport's MPL-2.0 is accepted; see NOTICE.md). Everything not in
+# `allow` below is denied, so a future dependency that drags in a copyleft or
+# unknown license fails `cargo deny check` instead of shipping silently.
+#
+# Run at release time alongside `cargo audit` (see CLAUDE.md "Release-time
+# additions"). Install with `cargo install cargo-deny --locked`.
+
+[advisories]
+# RustSec advisory DB (default source). Vulnerabilities fail by default; treat a
+# yanked crate as a hard failure too. Justified, specific waivers go in `ignore`.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Allow-list is the EXACT minimal set the current dependency tree resolves to
+# (verified against `cargo tree --format '{l}'`):
+#   MIT           — the bulk of the tree + our own crate
+#   Apache-2.0    — the OR-half of most dual licences + sync_wrapper (alone)
+#   BSD-3-Clause  — matchit is "MIT AND BSD-3-Clause" (needs BOTH)
+#   Unicode-3.0   — unicode-ident is "(MIT OR Apache-2.0) AND Unicode-3.0"
+#   MPL-2.0       — serialport (DEC-155, acknowledged in NOTICE.md)
+# Notably ABSENT (therefore denied): every LGPL/GPL-only variant (DEC-043).
+# unescaper declares the legacy "GPL-3.0/MIT" (the slash means OR); MIT
+# satisfies it, so NO GPL allowance is needed. If a future cargo-deny ever
+# flags it, prefer a scoped `[[licenses.exceptions]]` for `unescaper` over
+# allowing GPL globally.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+# Our own unpublishable workspace crates are not subject to the license gate.
+[licenses.private]
+ignore = true
+
+[bans]
+# Duplicate semver-incompatible versions (e.g. bitflags 1.x + 2.x) are an
+# advisory smell, not a release blocker — warn, don't fail.
+multiple-versions = "warn"
+
+[sources]
+# Every dependency must come from a known registry / git source (crates.io for
+# us). An unknown source is a supply-chain red flag.
+unknown-registry = "deny"
+unknown-git = "deny"
