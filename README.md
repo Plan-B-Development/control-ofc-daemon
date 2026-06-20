@@ -100,6 +100,11 @@ Full build / install / CLI / environment reference lives in
 | [`docs/DEVELOPER_HANDOVER.md`](docs/DEVELOPER_HANDOVER.md) | contributors | Developer onboarding, full API reference |
 | [`docs/ADRs/`](docs/ADRs/) | contributors | Architecture decision records |
 | [`CHANGELOG.md`](CHANGELOG.md) | all | Release history |
+| [GUI manual — OpenFan Controller][gui-openfan] | end users | What the OpenFan Controller is and how Control-OFC drives it through the daemon (detection, serial access, stable paths, troubleshooting) |
+| [GUI manual — Understanding Motherboard Fan Control][gui-understanding-fans] | end users | Plain-English primer on hwmon, Super I/O, and PWM for new users |
+
+[gui-openfan]: https://github.com/Plan-B-Development/control-ofc-gui/blob/main/manual/openfan-controller.md
+[gui-understanding-fans]: https://github.com/Plan-B-Development/control-ofc-gui/blob/main/manual/understanding-fan-control.md
 
 ## Architecture summary
 

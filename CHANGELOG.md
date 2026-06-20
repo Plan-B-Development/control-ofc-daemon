@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Documentation
+- Cross-linked the GUI manual's new first-time-user pages — OpenFan Controller and Understanding
+  Motherboard Fan Control — from the README documentation index and the USER_GUIDE intro. Docs only;
+  no code or API change.
+
 ## [2.1.0] — 2026-06-19
 
 Hardening and correctness release on top of the 2.0.0 daemon-owned-control cutover. Pairs with

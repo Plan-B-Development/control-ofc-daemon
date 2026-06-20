@@ -8,6 +8,8 @@ Control-OFC is a fan control daemon for Linux desktops. It communicates with:
 
 The daemon provides a local API that a GUI (or scripts) can use to monitor temperatures, read fan RPM, and set fan speeds.
 
+> **New to Control-OFC?** The GUI manual has friendly, step-by-step guides aimed at first-time users — [OpenFan Controller](https://github.com/Plan-B-Development/control-ofc-gui/blob/main/manual/openfan-controller.md), [Understanding Motherboard Fan Control](https://github.com/Plan-B-Development/control-ofc-gui/blob/main/manual/understanding-fan-control.md), and the ordered [Setup Checklist](https://github.com/Plan-B-Development/control-ofc-gui/blob/main/manual/setup-checklist.md).
+
 ## Supported hardware
 
 | Device | Read | Write |
