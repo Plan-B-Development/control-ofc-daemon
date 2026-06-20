@@ -34,6 +34,7 @@ daemon/src/
     pwm_discovery.rs   — PWM header discovery (fan outputs)
     pwm_control.rs     — HwmonPwmController + SysfsWriter trait
     lease.rs           — LeaseManager (exclusive write access)
+    aio.rs             — liquid-cooler (AIO/custom-loop) recognition: coolant-sensor + is_aio flag + aio_hwmon cap (DEC-156)
     gpu_detect.rs      — AMD GPU detection via sysfs/DRM
     intel_gpu_detect.rs— Intel discrete GPU (Arc) detection, read-only (DEC-121)
     gpu_fan.rs         — PMFW fan curve read/write/reset
@@ -57,8 +58,9 @@ daemon/src/
       status.rs        — read endpoints (status, sensors, fans, poll, capabilities, history)
       openfan.rs       — OpenFan serial write endpoints + calibration handler
       gpu.rs           — AMD GPU fan set/reset endpoints
-      hwmon_ctl.rs     — hwmon lease, PWM, rescan, verify endpoints
-      profile.rs       — profile activation endpoints
+      hwmon_ctl.rs     — hwmon header list, rescan, PWM-verify endpoints
+      profile.rs       — profile activation + CRUD endpoints
+      control.rs       — manual-override + fan-identify endpoints (DEC-163/166)
       config.rs        — runtime config endpoints (search dirs, startup delay)
       hw_diagnostics.rs — hardware diagnostics endpoint
     responses.rs       — response structs (Serialize)
@@ -66,10 +68,14 @@ daemon/src/
     calibration.rs     — OpenFan calibration sweep
 
   pwm.rs               — shared percent_to_raw / raw_to_percent conversion
+  clock.rs             — injectable monotonic clock (lease/override/identify TTLs; deterministic in tests)
+  atomic_io.rs         — crash-safe atomic file write (tmp+fsync+rename)
   profile.rs           — profile JSON loading + curve evaluation
+  profile_store.rs     — daemon-owned profile storage (store of record, DEC-160)
   profile_engine/      — headless 1Hz curve evaluation loop (DEC-135)
     mod.rs             — safety tick + profile evaluation + loop
     backends.rs        — WriteBackend per fan backend (gating/coalescing)
+  control_override.rs  — manual-override + fan-identify state (expiring, fencing-guarded, deadman; DEC-163/166)
   daemon_state.rs      — persistent state (active profile pointer)
   safety.rs            — ThermalSafetyRule (CPU emergency override)
   polling.rs           — hwmon + OpenFan polling loops
@@ -100,7 +106,8 @@ GUI ──POST intent──> API handlers ──> profile_engine
      threshold; AMD PMFW firmware owns GPU thermal protection (junction-temp
      throttling, firmware fan ramp) independently of OS fan control
    - Holds until CpuTemp <= 80C (25C hysteresis)
-   - One-cycle 60% recovery floor after release
+   - 60% recovery floor for two cycles after release (the release cycle + a
+     one-cycle recovery floor), then control returns to the profile
    - If no CpuTemp sensor found for 5 consecutive cycles, forces all
      OpenFan+hwmon fans to 40%
    - Override state is surfaced as `thermal_state` in `GET /status`
@@ -128,6 +135,21 @@ GUI ──POST intent──> API handlers ──> profile_engine
    - The field uses `#[serde(skip_serializing_if = "Vec::is_empty")]` so older clients that don't know about it see no change in the wire shape
    - The GUI raises a one-time `QMessageBox` for `high` and `critical` warnings; the user's acknowledgement is persisted in `app_settings.acknowledged_kernel_warnings` so the popup does not re-fire on every reconnect
    - Adding a new regression entry is a 30-line PR against `kernel_warnings.rs`; no schema or contract change required
+
+6. **Pump-stop guard** (`profile.rs`, DEC-167): a control with a pump/CPU member
+   may not be configured to stop. A non-zero `stop_pct` on such a control is
+   rejected at profile-validate time (a `PUMP_STOP_FORBIDDEN` error in the
+   validation report → `400 validation_error`); for any profile that reaches the
+   engine un-validated (boot-load / hand-edit), the eval-time stop-snap is skipped
+   for pump/CPU members. Stopping a pump risks coolant-flow loss and rapid thermal
+   runaway. GPU- and chassis-only controls are unaffected.
+
+7. **AIO / coolant surface, no coolant safety rule** (`hwmon/aio.rs`, DEC-156):
+   liquid-cooler coolant temperatures are classified as the `CoolantTemp` sensor
+   kind and AIO PWM headers carry an `is_aio` flag (surfaced via the dynamic
+   `aio_hwmon` capability). This is detection only — there is **deliberately no
+   coolant thermal-override rule**; the CPU-only `ThermalSafetyRule` is the sole
+   emergency backstop. Scope is hwmon-only (USB-only coolers are out of scope).
 
 ## Running
 
@@ -196,7 +218,7 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 | GET | `/events` | Server-Sent Events stream (`event: update`, 5s heartbeat) |
 | GET | `/capabilities` | Device list, feature flags, limits, `amd_gpu.kernel_warnings` (kernel-version regression catalogue, DEC-098) |
 | GET | `/hwmon/headers` | Controllable motherboard PWM outputs |
-| GET | `/hwmon/lease/status` | Lease holder + TTL |
+| GET | `/profiles`, `/profiles/{id}` | Daemon-stored profiles (store of record — DEC-160) |
 | GET | `/profile/active` | Current active profile or `{"active": false}` |
 | GET | `/diagnostics/hardware` | Hardware readiness report (hwmon chips, GPU, thermal safety, kernel modules, ACPI conflicts, board info) |
 
@@ -250,8 +272,20 @@ Error envelope (all errors):
 }
 ```
 
-Codes: `validation_error` (400), `not_found` (404), `thermal_abort` (409),
-`internal_error` (500), `hardware_unavailable` (503), `persistence_failed` (503).
+Codes:
+- `validation_error` (400, source: validation) — bad input shape, or unknown resource on a known route
+- `feature_unavailable` (400, source: validation) — route + device exist, but the device lacks this capability (e.g. GPU fan write with neither PMFW `fan_curve` nor legacy `pwm1`)
+- `not_found` (404, source: validation) — unknown route only
+- `override_expired` (404, source: validation) — renew/release of a lapsed manual override (DEC-163); re-take
+- `already_exists` (409, source: validation) — `POST /profiles` with a duplicate id (DEC-160)
+- `profile_in_use` (409, source: validation) — `DELETE /profiles/{id}` of the active profile (DEC-160)
+- `stale_fencing_token` (409, source: validation) — override renew/release bearing a superseded `override_token` (DEC-163)
+- `thermal_abort` (409, source: hardware) — calibration aborted due to high temperature
+- `internal_error` (500, source: internal)
+- `hardware_unavailable` (503, source: hardware)
+- `persistence_failed` (503, source: internal) — `POST /config/*` could not persist `runtime.toml`
+- `too_many_clients` (503, source: internal) — SSE `GET /events` concurrent-client cap reached
+
 The client-lease codes `lease_required` / `lease_already_held` were retired (DEC-165)
 and fully removed at DEC-170 — a verify-path internal-lease lapse now returns
 `503 hardware_unavailable`.

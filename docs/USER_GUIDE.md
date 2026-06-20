@@ -6,7 +6,9 @@ Control-OFC is a fan control daemon for Linux desktops. It communicates with:
 - **OpenFanController** — a USB fan controller (up to 10 channels)
 - **Motherboard fan headers** — via the Linux hwmon sysfs interface (ITE, NCT Super I/O chips)
 
-The daemon provides a local API that a GUI (or scripts) can use to monitor temperatures, read fan RPM, and set fan speeds.
+The daemon is the **autonomous, sole controller** of your fans. When a profile is active its built-in profile engine evaluates the fan curves at 1 Hz and writes every backend (OpenFan, hwmon, AMD GPU) itself — it keeps fans controlled through GUI close, crash, or sleep. The GUI is an editor/viewer/controller-of-intent; it never writes PWM and is poll-only (DEC-159 / DEC-165). With no profile active the daemon is purely imperative — it holds fans at whatever the hardware last had and only the thermal-safety override acts on its own.
+
+The daemon provides a local API that a GUI (or scripts) can use to monitor temperatures, read fan RPM, express control intent (activate a profile, take an expiring manual override, identify a fan), and run diagnostics. Direct PWM writes are not part of the surface — control flows through the profile engine.
 
 > **New to Control-OFC?** The GUI manual has friendly, step-by-step guides aimed at first-time users — [OpenFan Controller](https://github.com/Plan-B-Development/control-ofc-gui/blob/main/manual/openfan-controller.md), [Understanding Motherboard Fan Control](https://github.com/Plan-B-Development/control-ofc-gui/blob/main/manual/understanding-fan-control.md), and the ordered [Setup Checklist](https://github.com/Plan-B-Development/control-ofc-gui/blob/main/manual/setup-checklist.md).
 
@@ -19,10 +21,10 @@ The daemon provides a local API that a GUI (or scripts) can use to monitor tempe
 | Intel Arc discrete GPU temperature (`xe` / `i915`) | Yes | N/A |
 | Disk temperature (NVMe) | Yes | N/A |
 | Motherboard temperature (ITE, NCT) | Yes | N/A |
-| OpenFanController fans (RPM) | Yes | Yes (PWM, target RPM) |
-| Motherboard fan headers (hwmon) | Yes | Yes (PWM, requires lease) |
-| AMD GPU fans (RDNA3+, PMFW) | Yes | Yes (static speed, no lease) |
-| AMD GPU fans (pre-RDNA3) | Yes | Yes (pwm1, no lease) |
+| OpenFanController fans (RPM) | Yes | Yes (daemon-driven) |
+| Motherboard fan headers (hwmon) | Yes | Yes (daemon-driven; daemon holds the lease internally) |
+| AMD GPU fans (RDNA3+, PMFW) | Yes | Yes (daemon-driven via PMFW fan curve) |
+| AMD GPU fans (pre-RDNA3) | Yes | Yes (daemon-driven via pwm1) |
 | Intel Arc discrete GPU fans (`xe` / `i915`) | Yes (RPM) | No — firmware-managed, no kernel PWM interface (DEC-121) |
 | AIO coolers | Not yet | Not yet |
 
@@ -130,7 +132,7 @@ including request/response shapes.
 
 | Endpoint | Use |
 |---|---|
-| `GET /status` | Subsystem health + counters; one-line answer to "is the daemon happy?" |
+| `GET /status` | Subsystem health + freshness, `thermal_state`, uptime, and any active manual overrides / fan-identify holds; one-line answer to "is the daemon happy?" |
 | `GET /capabilities` | Device list, feature flags, safety limits, kernel-warning catalogue (`amd_gpu.kernel_warnings`) |
 | `GET /sensors` | All temperature readings |
 | `GET /fans` | Fan RPM + last-commanded PWM |
@@ -138,74 +140,105 @@ including request/response shapes.
 | `GET /events` | Server-Sent Events stream of sensor/fan updates (max 5 concurrent clients; the GUI does not consume this — for integration tooling) |
 | `GET /sensors/history?id=...&last=N` | Time-series history for a sensor entity |
 | `GET /hwmon/headers` | Controllable motherboard PWM outputs |
-| `GET /hwmon/lease/status` | Active lease holder + TTL |
+| `GET /profiles`, `GET /profiles/{id}` | List stored profiles / fetch one full profile document (daemon is the store of record — DEC-160) |
 | `GET /profile/active` | Current active profile or `{"active": false}` |
 | `GET /diagnostics/hardware` | **The central troubleshooting endpoint.** Hardware readiness report — hwmon chips, GPU detection, thermal-safety state, kernel modules, ACPI conflicts, board info, kernel warnings. Use this first when something looks wrong. |
 
 ### Write
 
+As of 2.0.0 the profile engine is the **sole writer** (DEC-159 / DEC-165) — there are no bare PWM write endpoints. Clients express *intent* (activate a profile, take an expiring override, identify a fan) and run a few diagnostics / maintenance calls. The hwmon lease is held internally by the daemon; there is no client lease surface.
+
+**Profiles (store of record — DEC-160):**
+
 | Endpoint | Use |
 |---|---|
-| `POST /fans/openfan/{ch}/pwm` | Set OpenFan channel PWM (no lease required) |
-| `POST /fans/openfan/pwm` | Set all OpenFan channels |
-| `POST /fans/openfan/{ch}/calibrate` | Long-running calibration sweep (~315 s upper bound) |
-| `POST /fans/openfan/{ch}/target_rpm` | Closed-loop RPM target (no lease) |
-| `POST /hwmon/{header}/pwm` | Set hwmon PWM (lease required) |
-| `POST /hwmon/{header}/verify` | Behavioural test of PWM write effectiveness; ~6 s (raised from 3 s in DEC-101 — slow-spinning fans need more settle time); detects BIOS/EC reclaim. Returns `restore_failed: true` if the post-test restore-to-original-PWM write fails (DEC-100). |
-| `POST /hwmon/lease/take` | Force-take the hwmon lease (DEC-049) |
-| `POST /hwmon/lease/release` | Release the lease |
-| `POST /hwmon/lease/renew` | Renew the lease (60 s TTL) |
+| `POST /profiles` | Create a stored profile (`?validate_only=true` validates only; `409 already_exists` on a duplicate id) |
+| `PUT /profiles/{id}` | Replace a stored profile's desired-state (re-activate to apply — no hot reload) |
+| `DELETE /profiles/{id}` | Remove a stored profile (`409 profile_in_use` if it is the active profile) |
+| `POST /profile/activate` | Activate a profile by id (`{"profile_id": "..."}`) or path (`{"profile_path": "..."}`) |
+| `POST /profile/deactivate` | Clear the active profile; releases the daemon's internal `profile-engine` lease (DEC-097); idempotent |
+
+**Live control intent (DEC-163 / DEC-166):**
+
+| Endpoint | Use |
+|---|---|
+| `POST /control/{control_id}/override` | Pin a control's fans to a fixed PWM — expiring, floor-clamped, deadman auto-reverts to the curve. Body `{"pwm_percent": 0..100, "ttl_secs"?}` |
+| `POST /control/{control_id}/override/renew` | Extend the override deadman (fresh TTL). Body `{"override_token": N}` |
+| `DELETE /control/{control_id}/override` | Release the override, reverting to curve control immediately. Body `{"override_token": N}` |
+| `POST /fans/{fan_id}/identify` | Stop or restore one fan for physical identification (floor-exempt, deadman auto-restore). Body `{"action": "stop"\|"restore", "ttl_secs"?}` |
+
+**Diagnostics / maintenance:**
+
+| Endpoint | Use |
+|---|---|
+| `POST /fans/openfan/{ch}/calibrate` | Long-running PWM→RPM calibration sweep; restores pre-calibration PWM on every exit path, aborts on thermal limit (DEC-134) |
+| `POST /hwmon/{header}/verify` | Behavioural test of PWM write effectiveness; ~6 s (raised from 3 s in DEC-101 — slow-spinning fans need more settle time); the daemon uses its own internal verify lease (no `lease_id`). Returns `restore_failed: true` if the post-test restore-to-original-PWM write fails (DEC-100). |
 | `POST /hwmon/rescan` | Re-enumerate hwmon devices and return fresh header list |
-| `POST /gpu/{gpu_id}/fan/pwm` | Set GPU fan speed (PMFW or legacy pwm1) |
-| `POST /gpu/{gpu_id}/fan/reset` | Restore GPU fan to firmware automatic (records gui_active per DEC-100) |
+| `POST /gpu/{gpu_id}/fan/reset` | Restore GPU fan to firmware automatic and re-enable zero-RPM |
 | `POST /gpu/{gpu_id}/fan/verify` | Behavioural test of GPU fan-control effectiveness; ~6 s, no lease (DEC-120). Drives a test speed biased upward, reads back the applied PMFW `fan_curve`/`pwm1` + RPM, then restores. Detects the silent failures static checks miss (`ppfeaturemask` bit 14 unset, SMU mismatch, BIOS overdrive lock). |
-| `POST /profile/activate` | Activate a profile by id or path |
-| `POST /profile/deactivate` | Clear active profile, release the `profile-engine` lease (DEC-097) |
-| `POST /config/profile-search-dirs` | Add directories to the profile search path (immediate) |
+| `POST /config/profile-search-dirs` | Add directories to the profile search path (immediate; persists to `runtime.toml`) |
 | `POST /config/startup-delay` | Set startup-delay seconds (persisted to `runtime.toml`, takes effect on restart) |
+
+**Retired at 2.0.0 (DEC-165):** the bare PWM writes (`/fans/openfan/{ch}/pwm`, `/fans/openfan/pwm`, `/hwmon/{id}/pwm`, `/gpu/{id}/fan/pwm`), `/fans/openfan/{ch}/target_rpm`, and the entire lease surface (`POST /hwmon/lease/take` / `/release` / `/renew` and `GET /hwmon/lease/status`). The daemon engine is the sole writer and self-leases.
 
 All errors use a nested envelope: `{"error": {"code": "...", "message": "...", "retryable": bool, "source": "...", "details": ...}}`. See `daemon.md` § Error Envelope for the full code list.
 
 ## Setting fan speeds
 
-### OpenFanController
+The daemon, not the client, sets fan speeds. When a profile is active its profile engine evaluates the curves at 1 Hz and writes every backend (OpenFan, hwmon, AMD GPU) directly — across all backends in a single, coalesced control loop. There is no bare PWM write endpoint and no client-held lease (both retired at 2.0.0, DEC-165); the daemon holds the hwmon lease internally.
+
+To change fan behaviour you have two levers:
+
+- **Persistent:** author a profile (the GUI is the easiest way) and activate it. See **Fan profiles** below.
+- **Temporary:** pin one control to a fixed speed with the **manual override** API. This is an expiring, deadman-guarded overlay on top of the active profile — see **Manual override** below.
+
+### Manual override (temporary, per-control)
+
+A manual override pins all fans in one of the active profile's logical *controls* to a fixed PWM. It is daemon-owned, expiring, and fencing-guarded (DEC-163): the override **reverts to autonomous curve control** if you stop renewing it (a deadman on the daemon's clock), and a superseded token cannot re-pin. The PWM is still clamped by the daemon's hard pump/CPU floor (≥30 %) and the GPU 0 % floor; the 105 °C thermal force always wins.
 
 ```bash
-# Set channel 0 to 50% PWM
-curl --unix-socket /run/control-ofc/control-ofc.sock \
-  -X POST -H "Content-Type: application/json" \
-  -d '{"pwm_percent": 50}' \
-  http://localhost/fans/openfan/0/pwm | jq .
+SOCK="/run/control-ofc/control-ofc.sock"
 
-# Set all channels to 75%
-curl --unix-socket /run/control-ofc/control-ofc.sock \
+# 1. Take an override on a control (control_id comes from the active profile).
+#    Returns an override_token plus the TTL (15 s) and advised renew interval (~5 s).
+TOKEN=$(curl -s --unix-socket $SOCK \
   -X POST -H "Content-Type: application/json" \
-  -d '{"pwm_percent": 75}' \
-  http://localhost/fans/openfan/pwm | jq .
+  -d '{"pwm_percent": 60}' \
+  http://localhost/control/cpu_fans/override | jq -r .override_token)
+
+# 2. Renew before the TTL lapses (repeat roughly every 5 s to hold it).
+curl -s --unix-socket $SOCK \
+  -X POST -H "Content-Type: application/json" \
+  -d "{\"override_token\": $TOKEN}" \
+  http://localhost/control/cpu_fans/override/renew | jq .
+
+# 3. Release when done (reverts to the curve immediately).
+curl -s --unix-socket $SOCK \
+  -X DELETE -H "Content-Type: application/json" \
+  -d "{\"override_token\": $TOKEN}" \
+  http://localhost/control/cpu_fans/override | jq .
 ```
 
-### Motherboard fan headers (hwmon)
+Active overrides also appear in `GET /status` (`overrides[]` of `{control_id, pwm_percent, expires_in_secs}`), but those entries carry no token — they can be displayed but only renewed or released by the client that created them.
 
-Hwmon writes require an exclusive lease:
+### Identifying a fan (temporary stop/restore)
+
+To find which physical fan is which, the fan-identify API stops a single fan briefly so you can spot the one that went quiet. It is floor-exempt (it can stop even a pump) and auto-restores on a deadman, so a crashed client can never leave a fan stopped (DEC-166):
 
 ```bash
-# 1. Take lease
-LEASE=$(curl -s --unix-socket /run/control-ofc/control-ofc.sock \
-  -X POST -H "Content-Type: application/json" \
-  -d '{"owner_hint": "manual"}' \
-  http://localhost/hwmon/lease/take | jq -r .lease_id)
+SOCK="/run/control-ofc/control-ofc.sock"
 
-# 2. Set PWM (use header ID from /hwmon/headers)
-curl --unix-socket /run/control-ofc/control-ofc.sock \
+# Stop one fan (fan_id from GET /fans). Auto-restores after the deadman TTL.
+curl -s --unix-socket $SOCK \
   -X POST -H "Content-Type: application/json" \
-  -d "{\"pwm_percent\": 60, \"lease_id\": \"$LEASE\"}" \
-  http://localhost/hwmon/hwmon:it8696:0000:00:1f.0:pwm1:CHA_FAN1/pwm | jq .
+  -d '{"action": "stop"}' \
+  http://localhost/fans/amd_gpu:0000:03:00.0/identify | jq .
 
-# 3. Release lease when done
-curl --unix-socket /run/control-ofc/control-ofc.sock \
+# Restore it immediately (the engine resumes the fan's curve value).
+curl -s --unix-socket $SOCK \
   -X POST -H "Content-Type: application/json" \
-  -d "{\"lease_id\": \"$LEASE\"}" \
-  http://localhost/hwmon/lease/release | jq .
+  -d '{"action": "restore"}' \
+  http://localhost/fans/amd_gpu:0000:03:00.0/identify | jq .
 ```
 
 ## Serial device setup (OpenFanController)
@@ -262,16 +295,12 @@ AMD discrete GPU fans are supported. The control method depends on GPU generatio
 
 - **Pre-RDNA3 (RX 6000 and older):** Uses traditional `pwm1_enable=1` + `pwm1` control.
 
-GPU fan writes do not require a lease. The daemon uses a 5% minimum change threshold to avoid SMU firmware churn. Fan curves are restored to automatic mode on daemon shutdown.
+GPU fans are driven by the daemon engine when a profile owns them — the bare `POST /gpu/{id}/fan/pwm` write was retired at 2.0.0 (DEC-165). For live manual control use the override API (DEC-163); to physically identify a GPU fan use the identify API (DEC-166); both are shown under **Setting fan speeds** above. GPU writes require no lease, and the daemon applies a 5% minimum-change threshold to avoid SMU firmware churn (DEC-070). Fan curves are restored to automatic mode on daemon shutdown.
+
+If a GPU fan has been left in a manual state and you want the firmware to take back over, reset it to automatic:
 
 ```bash
-# Set GPU fan to 60%
-curl --unix-socket /run/control-ofc/control-ofc.sock \
-  -X POST -H "Content-Type: application/json" \
-  -d '{"speed_pct": 60}' \
-  http://localhost/gpu/gpu:amd:0000:03:00.0/fan/pwm | jq .
-
-# Restore GPU fan to automatic
+# Restore GPU fan to firmware automatic (re-enables zero-RPM)
 curl --unix-socket /run/control-ofc/control-ofc.sock \
   -X POST http://localhost/gpu/gpu:amd:0000:03:00.0/fan/reset | jq .
 ```
@@ -305,6 +334,44 @@ curl --unix-socket /run/control-ofc/control-ofc.sock \
 
 The daemon persists the active profile selection to `/var/lib/control-ofc/daemon_state.json`, so it survives restarts.
 
+### Profile storage (CRUD)
+
+Since 2.0.0 the daemon is the profile **store of record** (DEC-160): stored profiles live under `/var/lib/control-ofc/profiles/`, and the full document is served and edited over the API. The GUI uses this surface; scripts can too.
+
+```bash
+SOCK="/run/control-ofc/control-ofc.sock"
+
+# List stored profiles (id / name / description summaries only)
+curl -s --unix-socket $SOCK http://localhost/profiles | jq .
+
+# Fetch one full profile document
+curl -s --unix-socket $SOCK http://localhost/profiles/quiet | jq .
+
+# Create a profile from a local JSON file
+curl -s --unix-socket $SOCK \
+  -X POST -H "Content-Type: application/json" \
+  --data @my-profile.json \
+  http://localhost/profiles | jq .
+
+# Validate a document without storing it (?validate_only=true)
+curl -s --unix-socket $SOCK \
+  -X POST -H "Content-Type: application/json" \
+  --data @my-profile.json \
+  'http://localhost/profiles?validate_only=true' | jq .
+
+# Replace a stored profile (re-activate afterwards to apply — no hot reload)
+curl -s --unix-socket $SOCK \
+  -X PUT -H "Content-Type: application/json" \
+  --data @my-profile.json \
+  http://localhost/profiles/my-profile | jq .
+
+# Delete a stored profile (fails 409 profile_in_use if it is active)
+curl -s --unix-socket $SOCK \
+  -X DELETE http://localhost/profiles/my-profile | jq .
+```
+
+Profile ids are filesystem-safe stems (non-empty, ≤128 bytes, no `/`, `\`, `..`, or control characters — DEC-173). Validation returns hard `errors` (which reject the profile) and soft `warnings` (which are accepted); an unknown `sensor_id` is a warning, not an error, so profiles stay portable across machines.
+
 ### Profile search directories
 
 The daemon searches for profiles in:
@@ -320,9 +387,9 @@ curl --unix-socket /run/control-ofc/control-ofc.sock \
   http://localhost/config/profile-search-dirs | jq .
 ```
 
-### Profile engine and GUI coexistence
+### Profile engine ownership
 
-When the GUI has written a fan command within the last 30 seconds, the profile engine defers its writes to avoid dual-writer contention. The thermal safety override always takes priority over both the GUI and the profile engine.
+While a profile is active the profile engine is the **sole writer** of every backend (DEC-159 / DEC-165) — there is no second writer to coordinate with. The GUI never writes PWM; it only sends intent (activate / override / identify). A manual override (DEC-163) overlays the curve for the controls it targets until it is released or its deadman expires; everything else keeps curve-controlling. The thermal-safety override (105 °C) always takes priority over both the active profile and any manual override.
 
 ## Runtime configuration
 
@@ -392,9 +459,9 @@ After stopping the daemon, hwmon fans are automatically restored to automatic mo
 
 The daemon enforces the following safety rules:
 
-- **Thermal emergency override** — if the hottest CPU temperature sensor reaches 105°C, all OpenFan channels and writable motherboard (hwmon) fan headers are forced to 100%. The override holds until CPU temperature drops to 80°C (25°C hysteresis), then applies a one-cycle 60% recovery floor before returning control to the active profile. GPU fans are deliberately excluded: there is no GPU emergency threshold — AMD's PMFW firmware protects the GPU itself (junction-temperature throttling and its own fan ramp) independently of any OS fan control.
+- **Thermal emergency override** — if the hottest CPU temperature sensor reaches 105°C, all OpenFan channels and writable motherboard (hwmon) fan headers are forced to 100%. The override holds until CPU temperature drops to 80°C (25°C hysteresis), then holds 60% for two cycles (the release cycle plus a one-cycle recovery floor) before returning control to the active profile. GPU fans are deliberately excluded: there is no GPU emergency threshold — AMD's PMFW firmware protects the GPU itself (junction-temperature throttling and its own fan ramp) independently of any OS fan control.
 - **Missing sensor fallback** — if no CPU temperature sensor reports for 5 consecutive polling cycles, all OpenFan and hwmon fans are forced to 40% as a defensive measure (GPU fans excluded, as above).
-- **Override visibility** — the current override state is reported as `thermal_state` in `GET /status` (`normal`, `recovery`, `emergency`, or `no_sensor_fallback`); the GUI pauses its own fan control while any override is active.
+- **Override visibility** — the current thermal-override state is reported as `thermal_state` in `GET /status` (`normal`, `recovery`, `emergency`, or `no_sensor_fallback`); the GUI shows a poll-driven thermal banner from it (DEC-165). The GUI has no fan-control loop of its own to pause — the daemon owns control throughout.
 - **OpenFanController stop timeout** — 0% PWM is allowed for a maximum of 8 seconds per channel, after which further 0% commands are rejected until a non-zero value is sent.
 - **Hwmon PWM headers** — the daemon does not enforce per-header minimum floors. Safety limits are expressed via the `/capabilities` endpoint and enforced by the GUI's profile constraints.
 - **GPU fan curves** are restored to automatic mode on daemon shutdown (via `ExecStopPost` in the systemd service file).

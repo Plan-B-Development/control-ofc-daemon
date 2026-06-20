@@ -268,7 +268,7 @@ pub struct CapabilitiesResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct ControlCapability {
     /// Daemon can store, validate, list, and delete GUI-authored profiles via
-    /// the `/profiles` CRUD API. True since 1.20.0 (DEC-160).
+    /// the `/profiles` CRUD API. True since 1.19.0 (DEC-160).
     pub profile_storage: bool,
     /// Daemon can evaluate fan curves headlessly (always true — the engine has
     /// done this since the profile engine landed; see DEC-096).

@@ -19,6 +19,9 @@ daemon/                     Rust crate (control-ofc-daemon)
     runtime_config.rs       Daemon-mutable runtime.toml (ADR-002)
     constants.rs            Centralized operational tuning values
     pwm.rs                  Shared PWM percent ↔ raw (0–255) conversion
+    clock.rs                Injectable monotonic clock (deterministic TTL/expiry in tests)
+    atomic_io.rs            Crash-safe atomic file write (tmp+fsync+rename)
+    control_override.rs     Manual-override + fan-identify state (expiring, fencing-guarded; DEC-163/166)
     daemon_state.rs         Persistent state (configurable state_dir via OnceLock)
     error.rs                Structured error types
     api/
@@ -27,8 +30,9 @@ daemon/                     Rust crate (control-ofc-daemon)
         status.rs           Read endpoints (status, sensors, fans, poll, capabilities)
         openfan.rs          OpenFan serial write + calibration handlers
         gpu.rs              AMD GPU fan set/reset handlers
-        hwmon_ctl.rs        Hwmon lease, PWM, rescan, verify handlers
-        profile.rs          Profile activation handlers
+        hwmon_ctl.rs        Hwmon header list, rescan, PWM-verify handlers
+        profile.rs          Profile activation + CRUD handlers
+        control.rs          Manual-override + fan-identify handlers (DEC-163/166)
         config.rs           Runtime config handlers
         hw_diagnostics.rs   Hardware diagnostics handler
       responses.rs          JSON response/request types (v1 schema)
@@ -47,6 +51,7 @@ daemon/                     Rust crate (control-ofc-daemon)
       pwm_discovery.rs      PWM header discovery with stable IDs
       pwm_control.rs        PWM writes with lease enforcement
       lease.rs              Exclusive write lease (take/release/renew, 60s TTL)
+      aio.rs                Liquid-cooler (AIO) recognition: coolant sensor + is_aio + aio_hwmon cap (DEC-156)
       gpu_detect.rs         AMD GPU detection via sysfs/DRM
       gpu_fan.rs            PMFW fan curve read/write/reset (RDNA3+)
       kernel_warnings.rs    Kernel-version regression catalog (DEC-098).
@@ -60,6 +65,7 @@ daemon/                     Rust crate (control-ofc-daemon)
       real_transport.rs     serialport impl + auto-detect
       controller.rs         Fan control logic (PWM, target RPM, coalescing)
     profile.rs              Profile JSON loading + curve evaluation
+    profile_store.rs        Daemon-owned profile storage (store of record, DEC-160)
     profile_engine/         Headless 1Hz curve evaluation loop (DEC-135)
       mod.rs                  Safety tick + profile evaluation + loop body
       backends.rs             WriteBackend impls (OpenFan/GPU/hwmon gating)
@@ -164,9 +170,11 @@ Every sensor/fan/header includes:
 
 ## Safety invariants
 
-- **Thermal safety** (`safety.rs`): hottest CpuTemp sensor triggers at 105°C → force all OpenFan channels and writable hwmon headers to 100%. Hold until 80°C (hysteresis), one-cycle 60% recovery floor. Forces 40% if no CpuTemp sensor found for 5 consecutive cycles. GPU fans are excluded by design (DEC-130) — PMFW firmware owns GPU thermal protection; the exclusion is structural (`GpuBackend` does not implement `SafetyWriteBackend`).
+- **Thermal safety** (`safety.rs`): hottest CpuTemp sensor triggers at 105°C → force all OpenFan channels and writable hwmon headers to 100%. Hold until 80°C (hysteresis), then 60% for two cycles (the release cycle + a one-cycle recovery floor). Forces 40% if no CpuTemp sensor found for 5 consecutive cycles. GPU fans are excluded by design (DEC-130) — PMFW firmware owns GPU thermal protection; the exclusion is structural (`GpuBackend` does not implement `SafetyWriteBackend`).
+- **AIO / coolant** (`hwmon/aio.rs`, DEC-156): coolant temperatures are classified as the `CoolantTemp` sensor kind and AIO PWM headers are flagged `is_aio` (dynamic `aio_hwmon` capability). Detection only — there is **deliberately no coolant thermal-override rule**; the CPU-only `ThermalSafetyRule` is the sole emergency backstop.
 - **OpenFan stop timeout**: 0% PWM allowed for max 8s, then rejected
 - **hwmon PWM**: no daemon-enforced per-header floors (`min_pwm_percent: 0` for all). The role-aware pump/CPU floor is GUI-baked and **daemon-enforced** (validate-time reject + eval-time clamp, DEC-162); the 105 °C thermal force is the absolute backstop.
+- **Pump-stop guard** (`profile.rs`, DEC-167): a control with a pump/CPU member may not be set to stop — a non-zero `stop_pct` is rejected at profile-validate time (`PUMP_STOP_FORBIDDEN` → `400 validation_error`), and the eval-time stop-snap is skipped for pump/CPU members on any un-validated profile. Distinct from the DEC-162 *floor* above: this forbids *stopping*, not merely clamps the minimum.
 - **PWM enable mode** (`pwmN_enable=1`) set on first write per lease, reset on release
 - **ExecStopPost**: restores `pwm_enable=2` (auto) and resets GPU fan curves on any service stop
 - **GPU PMFW writes**: clamped to OD_RANGE from firmware PPTable (prevents EINVAL)

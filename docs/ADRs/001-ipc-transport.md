@@ -37,7 +37,7 @@ Implementation:
   (default `/run/control-ofc/control-ofc.sock`, created by
   `RuntimeDirectory=control-ofc` in the systemd unit);
 - request bodies are JSON; SSE responses are `text/event-stream`;
-- a server-side concurrent-client cap (currently 8) gates `GET /events`
+- a server-side concurrent-client cap (`SSE_MAX_CLIENTS = 5`) gates `GET /events`
   with `503 too_many_clients` to prevent fan-out-induced starvation of
   the control loop.
 

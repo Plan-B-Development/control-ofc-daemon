@@ -9,7 +9,9 @@ cd daemon
 cargo build --release
 ```
 
-Binary: `target/release/control-ofc-daemon`
+Binary: `../target/release/control-ofc-daemon` (this is a Cargo workspace
+member — the build emits to the workspace-root `target/`, one level above
+`daemon/`).
 
 ## Install
 
@@ -32,7 +34,7 @@ Binary: `target/release/control-ofc-daemon`
 **Manual:**
 
 ```bash
-sudo cp target/release/control-ofc-daemon /usr/local/bin/
+sudo cp ../target/release/control-ofc-daemon /usr/local/bin/
 sudo cp ../packaging/control-ofc-daemon.service /etc/systemd/system/
 sudo mkdir -p /etc/control-ofc
 sudo cp ../packaging/daemon.toml.example /etc/control-ofc/daemon.toml
@@ -83,6 +85,8 @@ See `docs/DEVELOPER_HANDOVER.md` for the full API reference.
 
 For routine upgrades, the daemon reads forward-compatible config and migrates state in place. The notes below cover changes that require an operator action.
 
+**v1.18.0 (liquid-cooler / AIO support — Phase 1, DEC-156):** Adds hwmon-only AIO recognition — a `CoolantTemp` sensor kind, an `is_aio` flag on PWM headers, and a dynamic `aio_hwmon` capability `{present, status, pump_writable, coolant_available}` (an additive superset of the old `{present, status}`). There is **no coolant safety rule** — `safety.rs` stays CPU-only. Purely additive; **no operator action required.** USB-only coolers remain out of scope (`aio_usb` stays `unsupported`).
+
 **v1.15.0–v1.17.0 (profile schema v5 → v7):** Each step only *adds* a curve type — v5 Stepped, v6 Trigger, v7 Mix/Sync composites. They are purely additive: the daemon reads older profiles unchanged, and the GUI re-stamps a profile to v7 the next time it is saved. **No operator action required.**
 
 **v1.6.0 (profile schema v4):** Profiles authored before v4 auto-migrate on load (role-aware `minimum_pct` floor lifted to 30 % for CPU/pump-labelled hwmon members, 20 % for chassis/openfan, 0 % for GPU-only). No file edit required; the migrated profile is re-saved when the user next persists it.
@@ -93,8 +97,20 @@ For routine upgrades, the daemon reads forward-compatible config and migrates st
 
 For full upgrade details and the per-version contract changes, see `docs/USER_GUIDE.md` and the `CHANGELOG.md` at the repo root.
 
-## Tests
+## Quality gates
+
+Standard gates (run on every change):
 
 ```bash
-cargo test
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all --all-features
+```
+
+Release-time supply-chain gates (DEC-174): `deny.toml` encodes the project's
+license/advisory policy (DEC-043 no-LGPL, DEC-155 serialport MPL-2.0).
+
+```bash
+cargo audit
+cargo deny check
 ```

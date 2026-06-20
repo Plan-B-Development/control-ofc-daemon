@@ -6,8 +6,11 @@ Rust workspace for the Control-OFC fan control daemon.
 
 > A privileged Linux daemon that manages fan hardware (hwmon sysfs, OpenFanController
 > serial, AMD GPU PMFW) and serves an HTTP API over a Unix socket for the
-> `control-ofc-gui` PySide6 desktop application. Runs headless with autonomous
-> profile evaluation, or as a passive backend for the GUI.
+> `control-ofc-gui` PySide6 desktop application. It is the **autonomous sole
+> controller** (2.0.0+): its profile engine evaluates the active profile and is
+> the only writer of every backend, keeping fans controlled headless through GUI
+> close, crash, or sleep. The GUI is an editor/viewer/controller-of-intent that
+> never writes PWM.
 
 ## Workspace layout
 
@@ -71,12 +74,12 @@ discover what your specific system needs without trial and error.
 ## Quick start
 
 ```bash
-# Build
+# Build (workspace member — binary lands in the workspace-root target/)
 cd daemon
 cargo build --release
 
-# Install
-sudo cp target/release/control-ofc-daemon /usr/local/bin/
+# Install (run from inside daemon/ — the binary is one level up)
+sudo cp ../target/release/control-ofc-daemon /usr/local/bin/
 sudo cp ../packaging/control-ofc-daemon.service /etc/systemd/system/
 sudo mkdir -p /etc/control-ofc
 sudo cp ../packaging/daemon.toml.example /etc/control-ofc/daemon.toml
@@ -116,11 +119,14 @@ Full build / install / CLI / environment reference lives in
   motherboard (hwmon) fans to 100%, 25°C hysteresis, 40% fallback when no CPU
   sensor reports for 5 cycles. GPU fans are excluded — AMD PMFW firmware owns
   GPU thermal protection independently of OS fan control (DEC-130).
-- **Headless profile engine** (`profile_engine.rs`) evaluates fan curves autonomously
-  on a 1 Hz loop; defers to the GUI when the GUI has written in the last 30 seconds
-  (DEC-071, DEC-074).
-- **Lease system** provides exclusive hwmon write access (60 s TTL) to prevent
-  GUI/profile-engine write races.
+- **Headless profile engine** (`profile_engine/`) evaluates the active profile's
+  fan curves autonomously on a 1 Hz loop and is the **sole writer** of every
+  backend (2.0.0+, DEC-159/DEC-165). There is no GUI defer window — the 30 s
+  `gui_active` defer (DEC-071/074) was deleted at the 2.0.0 cutover; the GUI never
+  writes PWM.
+- **Lease system** provides exclusive hwmon write access (60 s TTL), held
+  **internally** by the profile engine, to guard against conflicting external
+  hwmon writers. The GUI holds no lease (DEC-165).
 - **Systemd-hardened** (`ProtectHome=read-only`, `ProtectSystem=strict`,
   `SystemCallFilter=@system-service`, etc.); shutdown restores
   `pwm_enable=2` and GPU fan curves to automatic via `ExecStopPost`.
