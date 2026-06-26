@@ -97,6 +97,16 @@ GUI ──POST intent──> API handlers ──> profile_engine
      (activate profile / override / identify — never a direct PWM write)
 ```
 
+The engine keeps per-control cross-tick state (step-rate anchors, the 2°C
+falling-temperature deadband DEC-096, trigger latches). Two rules stop that state
+from masking a change the user just made (DEC-188): an explicit
+`POST /profile/activate` — **including re-applying the same profile id** after
+editing its curve — re-anchors all of it on the next tick (an activation-epoch
+counter on `StateCache`, bumped and read under the `active_profile` lock so the
+swap and the bump are observed together), and the deadband self-releases for one
+tick after `DEADBAND_MAX_HOLD_CYCLES` (~30 s) so a temperature that settles just
+inside the band cannot pin the pre-settle fan speed indefinitely.
+
 ## Safety Model
 
 1. **ThermalSafetyRule** (`safety.rs`): Emergency CPU override

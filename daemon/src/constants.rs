@@ -103,6 +103,19 @@ pub const VERIFY_PAUSE_DEADMAN: Duration = Duration::from_secs(30);
 /// See DEC-096.
 pub const HYSTERESIS_DEADBAND_C: f64 = 2.0;
 
+/// Maximum consecutive 1 Hz engine ticks the falling-temperature deadband
+/// ([`HYSTERESIS_DEADBAND_C`], DEC-096) may hold a control's output before it
+/// is force-released for a single tick so the curve re-anchors to the current
+/// temperature (DEC-188). Without this valve a temperature that settles just
+/// inside the 2°C band pins the pre-settle fan speed indefinitely — the
+/// "nothing changes for tens of seconds" steady-state stall. The streak counts
+/// only consecutive HELD ticks — any re-evaluation (the reading leaving the
+/// band) resets it — so the valve fires solely to release an output that has
+/// sat unchanged for the full window and cannot reintroduce oscillation.
+/// 30 ticks ≈ 30 s, matching CoolerControl's "fan speed unchanged for 30 s →
+/// bypass hysteresis" safety valve.
+pub const DEADBAND_MAX_HOLD_CYCLES: u32 = 30;
+
 // ── Manual override + fan-identify deadman (DEC-163 / DEC-166) ────────
 
 /// Time-to-live for a daemon-owned manual override before it reverts to
@@ -150,6 +163,7 @@ pub const CALIBRATION_MAX_TEMP_C: f64 = 85.0;
 // constant to an unsafe value.
 const _: () = assert!(CALIBRATION_MAX_TEMP_C < 105.0);
 const _: () = assert!(NO_SENSOR_SAFE_PCT > 0);
+const _: () = assert!(DEADBAND_MAX_HOLD_CYCLES > 0);
 // The renew interval must leave room for ~3 attempts inside the TTL, and the
 // TTL must be non-trivial — a too-tight window would drop legitimate overrides.
 const _: () = assert!(OVERRIDE_RENEW_SECS > 0);

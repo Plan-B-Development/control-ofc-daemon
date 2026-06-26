@@ -5,7 +5,7 @@
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::serial::protocol::NUM_CHANNELS;
@@ -22,6 +22,14 @@ pub struct StateCache {
     /// (CLOCK_BOOTTIME gap). Checked and cleared by HwmonPwmController
     /// on the next set_pwm() call to force re-establishing manual mode.
     pub resume_detected: AtomicBool,
+    /// Monotonic counter bumped on every `POST /profile/activate` (DEC-188).
+    /// The profile-engine loop tracks the last value it observed and re-anchors
+    /// all cross-tick state when it changes, so re-activating the *same* profile
+    /// id (the "tweak the active curve and re-apply" path) takes effect on the
+    /// next tick instead of being suppressed by the 2°C deadband (DEC-096).
+    /// Bumped and read under the `active_profile` mutex so the tick that first
+    /// observes a swapped profile also observes the new epoch (no extra tick).
+    profile_activation_epoch: AtomicU64,
 }
 
 impl StateCache {
@@ -30,7 +38,23 @@ impl StateCache {
         Self {
             inner: RwLock::new(DaemonState::default()),
             resume_detected: AtomicBool::new(false),
+            profile_activation_epoch: AtomicU64::new(0),
         }
+    }
+
+    /// Bump the profile-activation epoch (DEC-188). Called by
+    /// `activate_profile_handler` immediately after swapping `active_profile`,
+    /// while still holding that mutex, so the engine sees the swap and the bump
+    /// atomically. `SeqCst` is belt-and-braces over the mutex's own ordering.
+    pub fn bump_profile_activation_epoch(&self) {
+        self.profile_activation_epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Read the current profile-activation epoch (DEC-188). The engine loop
+    /// reads this under the `active_profile` mutex and re-anchors its cross-tick
+    /// state whenever the value differs from the previous tick's.
+    pub fn profile_activation_epoch(&self) -> u64 {
+        self.profile_activation_epoch.load(Ordering::SeqCst)
     }
 
     /// Get a consistent snapshot of the current state.
@@ -364,6 +388,19 @@ mod tests {
         cache.update_openfan_fans(vec![rewritten]);
         let snap = cache.snapshot();
         assert_eq!(snap.openfan_fans[&0].last_commanded_pwm, Some(60));
+    }
+
+    #[test]
+    fn profile_activation_epoch_starts_zero_and_increments() {
+        // DEC-188: the profile engine re-anchors its cross-tick state whenever
+        // this value changes, so a fresh cache must start at 0 and every bump
+        // (one per `POST /profile/activate`) must advance it monotonically.
+        let cache = StateCache::new();
+        assert_eq!(cache.profile_activation_epoch(), 0);
+        cache.bump_profile_activation_epoch();
+        assert_eq!(cache.profile_activation_epoch(), 1);
+        cache.bump_profile_activation_epoch();
+        assert_eq!(cache.profile_activation_epoch(), 2);
     }
 
     #[test]

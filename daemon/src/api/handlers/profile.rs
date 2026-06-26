@@ -131,6 +131,14 @@ pub async fn activate_profile_handler(
     {
         let mut guard = state.active_profile.lock();
         *guard = Some(profile);
+        // DEC-188: re-anchor the engine even on a same-id re-activation (the
+        // "edit the active profile's curve and re-apply" path). Bump the epoch
+        // inside the `active_profile` lock so the engine observes the swap and
+        // the epoch atomically and re-evaluates the new curve on its next tick,
+        // instead of holding the previous output through the 2°C deadband
+        // (DEC-096). Switching to a *different* id already re-anchored via
+        // `sync_profile_id`; this closes the same-id gap.
+        state.cache.bump_profile_activation_epoch();
     }
     // DEC-165: a freshly-activated profile takes control of all its members, so
     // clear any GPU fans previously relinquished to firmware-auto via reset.

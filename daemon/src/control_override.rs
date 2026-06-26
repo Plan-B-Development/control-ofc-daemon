@@ -533,16 +533,30 @@ mod tests {
         // One nanosecond before the deadline: both still reported.
         clock.advance(Duration::from_secs(10) - Duration::from_nanos(1));
         let (ovr, ident) = t.status_rows();
-        assert_eq!(ovr.len(), 1, "override just before expiry must still be reported");
-        assert_eq!(ident.len(), 1, "identify just before expiry must still be reported");
+        assert_eq!(
+            ovr.len(),
+            1,
+            "override just before expiry must still be reported"
+        );
+        assert_eq!(
+            ident.len(),
+            1,
+            "identify just before expiry must still be reported"
+        );
 
         // Land EXACTLY on expires_at (now == expires_at): `now < expires_at` is
         // false, so both status_rows filters must EXCLUDE the entry. Guards the
         // `<` -> `<=` off-by-one in the remaining-TTL status report.
         clock.advance(Duration::from_nanos(1));
         let (ovr, ident) = t.status_rows();
-        assert!(ovr.is_empty(), "override at exact expiry must not appear in status_rows");
-        assert!(ident.is_empty(), "identify at exact expiry must not appear in status_rows");
+        assert!(
+            ovr.is_empty(),
+            "override at exact expiry must not appear in status_rows"
+        );
+        assert!(
+            ident.is_empty(),
+            "identify at exact expiry must not appear in status_rows"
+        );
     }
 
     #[test]

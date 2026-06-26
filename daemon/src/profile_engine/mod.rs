@@ -66,6 +66,13 @@ pub struct ProfileEngineState {
     /// deadband; this holds the latch across cycles. Mirrors the GUI's
     /// ``TargetState.trigger_latch``.
     trigger_latch: HashMap<String, bool>,
+    /// DEC-188 steady-state safety valve: consecutive ticks the 2°C deadband has
+    /// HELD this control's output. Reset whenever the curve actually
+    /// re-evaluates (any in-band rise or a fall past the band). Once it reaches
+    /// [`constants::DEADBAND_MAX_HOLD_CYCLES`] the deadband is bypassed for one
+    /// tick so a temperature that settled just inside the band re-anchors to its
+    /// true curve value instead of holding the pre-settle output forever.
+    deadband_hold_cycles: HashMap<String, u32>,
     /// Id of the profile the current state belongs to.
     active_profile_id: Option<String>,
 }
@@ -99,6 +106,7 @@ impl ProfileEngineState {
         self.last_curve_output.clear();
         self.last_transition_temp.clear();
         self.trigger_latch.clear();
+        self.deadband_hold_cycles.clear();
         self.active_profile_id = None;
     }
 
@@ -113,6 +121,7 @@ impl ProfileEngineState {
         self.last_curve_output.remove(control_id);
         self.last_transition_temp.remove(control_id);
         self.trigger_latch.remove(control_id);
+        self.deadband_hold_cycles.remove(control_id);
         // Per-member step-rate trackers live only in `last_output`.
         let prefix = format!("{control_id}::m::");
         self.last_output.retain(|k, _| !k.starts_with(&prefix));
@@ -130,6 +139,7 @@ impl ProfileEngineState {
             self.last_curve_output.clear();
             self.last_transition_temp.clear();
             self.trigger_latch.clear();
+            self.deadband_hold_cycles.clear();
             self.active_profile_id = Some(new_id.to_string());
         }
         changed
@@ -159,11 +169,32 @@ fn evaluate_curve_with_deadband(
 
     if let (Some(prev_out), Some(anchor)) = (prev_pwm, prev_transition) {
         if current_temp <= anchor && current_temp >= anchor - constants::HYSTERESIS_DEADBAND_C {
-            // Inside the deadband — hold the previously commanded output.
-            // Do not move the anchor; do not update last_curve_output.
-            return prev_out;
+            // Inside the deadband. Normally hold the previously commanded output
+            // (do not move the anchor; do not update last_curve_output).
+            //
+            // DEC-188 steady-state valve: count consecutive holds and, once the
+            // output has been pinned here for DEADBAND_MAX_HOLD_CYCLES, fall
+            // through to re-anchor for a single tick — so a temperature that
+            // settled just inside the band can't hold the pre-settle output
+            // indefinitely (the "nothing changes for tens of seconds" stall).
+            // Any in-band rise (band condition false) or a fall past the band
+            // re-evaluates below and clears the streak, so the valve fires only
+            // on a genuinely settled reading and cannot reintroduce oscillation.
+            let held = state
+                .deadband_hold_cycles
+                .entry(control.id.clone())
+                .or_insert(0);
+            *held += 1;
+            if *held < constants::DEADBAND_MAX_HOLD_CYCLES {
+                return prev_out;
+            }
+            // Valve open — fall through to re-anchor at the settled temperature.
         }
     }
+
+    // Re-evaluating (curve glide, band exit, or an open valve) ends any hold
+    // streak so the next settle starts its own DEADBAND_MAX_HOLD_CYCLES window.
+    state.deadband_hold_cycles.remove(&control.id);
 
     let curve_output = evaluate_curve(curve, current_temp).clamp(0.0, 100.0);
 
@@ -820,6 +851,14 @@ pub async fn profile_engine_loop(
     // hysteresis don't leak between unrelated profiles.
     let mut engine_state = ProfileEngineState::new();
 
+    // DEC-188: last profile-activation epoch this loop observed. A bump (any
+    // `POST /profile/activate`, including re-activating the *same* id after
+    // editing its curve) re-anchors ALL cross-tick state so the new curve takes
+    // effect on the next tick instead of being suppressed by the 2°C deadband
+    // (DEC-096). Seeded from the current value so a bump that landed before the
+    // loop started doesn't trigger a spurious (though harmless) reset.
+    let mut last_epoch = cache.profile_activation_epoch();
+
     loop {
         tokio::select! {
             _ = tick.tick() => {}
@@ -903,6 +942,20 @@ pub async fn profile_engine_loop(
         // Get active profile — scope guard strictly to avoid !Send across .await
         let commands = {
             let profile_guard = profile.lock();
+
+            // DEC-188: re-anchor on an activation epoch bump. Read under the
+            // same `active_profile` lock the handler bumps it under, so the
+            // first tick that observes a swapped profile also observes the new
+            // epoch — the edited curve re-evaluates this very tick rather than
+            // waiting for the temperature to leave the deadband. Re-activating
+            // the same id (curve tweak + re-apply) is the path `sync_profile_id`
+            // could not catch on its own.
+            let epoch = cache.profile_activation_epoch();
+            if epoch != last_epoch {
+                last_epoch = epoch;
+                engine_state.deactivate();
+            }
+
             let Some(ref active_profile) = *profile_guard else {
                 // No profile loaded — drop any leftover tuning state so a
                 // later activation doesn't pick up stale cross-cycle outputs.
@@ -2371,6 +2424,95 @@ mod tests {
         assert!(state.last_curve_output("ctrl1").is_none());
     }
 
+    // ── DEC-188 steady-state deadband valve ──────────────────────────
+
+    #[test]
+    fn deadband_valve_releases_after_max_hold_cycles() {
+        // A temperature that settles just inside the 2°C band must not pin the
+        // pre-settle output forever. After DEADBAND_MAX_HOLD_CYCLES consecutive
+        // holds the valve opens for one tick and the output re-anchors to the
+        // settled temperature's true curve value.
+        let profile = make_graph_profile_for_deadband();
+        let mut state = ProfileEngineState::new();
+        let eval = |t: f64, st: &mut ProfileEngineState| -> u8 {
+            evaluate_profile(
+                &profile,
+                &make_cache_with_sensor("cpu", t).sensors_snapshot(),
+                st,
+            )[0]
+            .pwm_percent
+        };
+
+        // Anchor at 70°C → curve = 50%.
+        assert_eq!(eval(70.0, &mut state), 50);
+
+        // Settle at 68.5°C (inside [68, 70]); the deadband holds 50% for the
+        // whole window short of the valve threshold.
+        let n = constants::DEADBAND_MAX_HOLD_CYCLES;
+        for i in 1..n {
+            assert_eq!(
+                eval(68.5, &mut state),
+                50,
+                "tick {i}: deadband must still hold the pre-settle output"
+            );
+        }
+
+        // The next in-band tick opens the valve → curve(68.5) = 30 + 8.5*2 = 47%.
+        assert_eq!(
+            eval(68.5, &mut state),
+            47,
+            "valve must re-anchor to the settled curve value after the hold window"
+        );
+        assert_eq!(
+            state.last_transition_temp("ctrl1"),
+            Some(68.5),
+            "valve re-anchors the deadband to the settled temperature"
+        );
+    }
+
+    #[test]
+    fn deadband_valve_streak_resets_on_reevaluation() {
+        // Only CONSECUTIVE in-band holds count toward the valve. A re-evaluation
+        // (here a fall past the band) clears the streak, so the valve needs a
+        // fresh full window afterwards and cannot fire mid-drift.
+        let profile = make_graph_profile_for_deadband();
+        let mut state = ProfileEngineState::new();
+        let eval = |t: f64, st: &mut ProfileEngineState| -> u8 {
+            evaluate_profile(
+                &profile,
+                &make_cache_with_sensor("cpu", t).sensors_snapshot(),
+                st,
+            )[0]
+            .pwm_percent
+        };
+        let n = constants::DEADBAND_MAX_HOLD_CYCLES;
+
+        assert_eq!(eval(70.0, &mut state), 50); // anchor 70 → 50%
+                                                // A handful of in-band holds — not enough to open the valve.
+        for _ in 0..5 {
+            assert_eq!(eval(69.0, &mut state), 50);
+        }
+        // Fall past the band → re-evaluate, re-anchor at 67°C (curve = 44%), and
+        // discard the 5-tick streak.
+        assert_eq!(eval(67.0, &mut state), 44);
+        assert_eq!(state.last_transition_temp("ctrl1"), Some(67.0));
+
+        // Settle at 66°C (inside the new [65, 67] band): a FULL fresh window of
+        // holds at 44% is required, proving the earlier streak was discarded.
+        for i in 1..n {
+            assert_eq!(
+                eval(66.0, &mut state),
+                44,
+                "tick {i}: fresh window must hold; the pre-fall streak must not count"
+            );
+        }
+        assert_eq!(
+            eval(66.0, &mut state),
+            42,
+            "valve fires only after a full fresh window → curve(66) = 42%"
+        );
+    }
+
     // ── Profile engine loop integration tests (T2 audit finding) ───
 
     // Local mock transport for integration tests — records all writes.
@@ -2872,6 +3014,77 @@ mod tests {
         assert!(
             set_pwm_cmds.is_empty(),
             "engine must not write in imperative mode (no active profile); got: {cmds:?}",
+        );
+    }
+
+    /// DEC-188: editing the active profile's curve and re-applying it (same id)
+    /// must take effect on the next tick. Without the activation-epoch reset the
+    /// 2°C deadband holds the pre-edit output for tens of seconds, because at a
+    /// stable temperature the reading never leaves the band. This drives the loop
+    /// exactly as `activate_profile_handler` would — swap the profile and bump
+    /// the epoch under the same lock — and asserts the new value is written.
+    #[tokio::test(start_paused = true)]
+    async fn loop_reactivation_reanchors_through_deadband() {
+        let cache = make_cache_with_sensor("cpu", 50.0);
+
+        // Initial active profile: flat 30%, one openfan member.
+        let profile_arc = Arc::new(Mutex::new(Some(make_profile("curve", "flat", 30.0))));
+        let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
+
+        let (transport, written) = LoopTestTransport::new(10);
+        let fan_ctrl = crate::serial::controller::FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            std::time::Duration::from_millis(500),
+        );
+        let fan_ctrl = Some(Arc::new(Mutex::new(fan_ctrl)));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(profile_engine_loop(
+            cache.clone(),
+            profile_arc.clone(),
+            fan_ctrl,
+            None,
+            vec![],
+            safety,
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            shutdown_rx,
+        ));
+
+        // Several ticks: the first anchors at 30%; the rest are deadband holds
+        // (temperature unchanged, inside the band) — the engine is now "stuck"
+        // at 30% and would stay there for DEADBAND_MAX_HOLD_CYCLES.
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+
+        // Edit the active profile's curve to 80% (SAME id) and re-apply, exactly
+        // as the activate handler does: swap the profile and bump the epoch under
+        // the same `active_profile` lock the engine reads it under.
+        {
+            let mut guard = profile_arc.lock();
+            *guard = Some(make_profile("curve", "flat", 80.0));
+            cache.bump_profile_activation_epoch();
+        }
+
+        // One more tick: the epoch bump re-anchors, so the new 80% applies now
+        // instead of waiting for the temperature to leave the deadband.
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let _ = handle.await;
+
+        // The final SetPwm must be 80%, not the held 30%. (Writes coalesce, so in
+        // the unfixed code the only frame would be the initial 30%.)
+        let cmds = written.lock();
+        let set_pwm_cmds: Vec<_> = cmds.iter().filter(|c| c.starts_with(">02")).collect();
+        let last = set_pwm_cmds.last().expect("expected SetPwm commands");
+        let hex_value = &last[last.len() - 3..last.len() - 1];
+        let expected = format!("{:02X}", crate::pwm::percent_to_raw(80));
+        let stale = format!("{:02X}", crate::pwm::percent_to_raw(30));
+        assert_eq!(
+            hex_value, expected,
+            "re-activation must re-anchor through the deadband (expected 80% = 0x{expected}; \
+             stale-hold bug yields 30% = 0x{stale}); commands: {set_pwm_cmds:?}"
         );
     }
 

@@ -1,6 +1,25 @@
 # Changelog
 
-## [Unreleased]
+## [2.2.0] — 2026-06-26
+
+### Added
+- **Steady-state deadband safety valve (DEC-188).** The 2°C falling-temperature deadband
+  (DEC-096) now self-releases for one tick after `DEADBAND_MAX_HOLD_CYCLES` (~30 s) of holding, so a
+  temperature that settles just inside the band re-anchors to its true curve value instead of
+  pinning the pre-settle fan speed indefinitely. Mirrors CoolerControl's "fan speed unchanged for
+  30 s → bypass hysteresis" rule: the streak counts only consecutive *held* ticks and resets the
+  moment the output re-evaluates (the reading leaves the band), so the valve fires solely to release
+  an output that has sat unchanged for the full window and cannot reintroduce oscillation.
+
+### Fixed
+- **Re-applying the active profile now takes effect immediately (DEC-188).** Editing the active
+  profile's curve and re-activating it (same profile id) previously left fans unchanged for tens of
+  seconds on an idle/stable machine — the falling-temperature deadband held the pre-edit output
+  until the temperature drifted out of the band. `POST /profile/activate` now bumps an
+  activation-epoch counter on `StateCache` (read by the engine under the `active_profile` lock, so
+  the profile swap and the bump are observed together), re-anchoring all per-control cross-tick
+  state so the new curve is applied on the very next tick. Switching to a *different* profile id
+  already re-anchored; this closes the same-id gap.
 
 ### Documentation
 - Cross-linked the GUI manual's new first-time-user pages — OpenFan Controller and Understanding
