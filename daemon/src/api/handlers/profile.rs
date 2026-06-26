@@ -127,7 +127,13 @@ pub async fn activate_profile_handler(
     let profile_name = profile.name.clone();
     let profile_id = profile.id.clone();
 
-    // Apply
+    // Apply. Everything in this block runs under the `active_profile` lock so
+    // the swap and the dependent state resets are observed atomically by the
+    // engine tick (which reads `active_profile` then the epoch). Lock order is
+    // `active_profile` (outer) → `override_table` / `cache.inner` (inner); the
+    // engine never holds those inner locks while waiting on `active_profile`
+    // (it releases `override_table` before `profile.lock()`), so there is no
+    // inversion (DEC-189).
     {
         let mut guard = state.active_profile.lock();
         *guard = Some(profile);
@@ -139,10 +145,24 @@ pub async fn activate_profile_handler(
         // (DEC-096). Switching to a *different* id already re-anchored via
         // `sync_profile_id`; this closes the same-id gap.
         state.cache.bump_profile_activation_epoch();
+        // DEC-189: a freshly-activated profile owns its controls' intent. Clear
+        // any standing manual overrides while holding `active_profile`, so an
+        // override taken against the previous profile cannot bleed onto a
+        // same-id control in the new one, and so a concurrent override-take
+        // (which now also holds `active_profile`, control.rs) serialises either
+        // fully before this clear — and is wiped — or fully after — and is
+        // validated against the new profile. Identify-stops are per-fan and
+        // profile-independent, so they are left intact. The engine resets the
+        // cleared controls' cross-tick state on its next tick via the epoch
+        // path above.
+        state.override_table.lock().clear_all_overrides();
+        // DEC-165 / audit P3-4: a freshly-activated profile takes control of
+        // all its members, so clear any GPU fans previously relinquished to
+        // firmware-auto via reset. Done inside the `active_profile` lock so the
+        // engine cannot evaluate the new profile and skip a still-relinquished
+        // GPU fan for one tick (the clear used to run after the lock dropped).
+        state.cache.clear_relinquished_gpu_fans();
     }
-    // DEC-165: a freshly-activated profile takes control of all its members, so
-    // clear any GPU fans previously relinquished to firmware-auto via reset.
-    state.cache.clear_relinquished_gpu_fans();
 
     // Persist
     let new_state = crate::daemon_state::DaemonState {
@@ -207,6 +227,16 @@ pub async fn deactivate_profile_handler(
             if let Err(e) = guard.lease_manager_mut().release_lease(&id) {
                 log::debug!("profile-engine lease release after deactivate failed: {e}");
             }
+            // Audit P3-3: pair the release with a coalescing reset, exactly as
+            // the thermal force-take does (`profile_engine/backends.rs`
+            // force_all). This clears the engine's stale `manual_mode_set` so a
+            // later re-activation re-asserts `pwm_enable=1` from a clean slate
+            // after the deactivated gap — defense-in-depth alongside the
+            // per-write pwm_enable watchdog in `HwmonPwmController::set_pwm`,
+            // not an I/O optimisation (the watchdog already preserves
+            // correctness; this trades a steady-state readback for a clean
+            // re-assert on the next acquisition).
+            guard.on_lease_released();
         }
     }
 

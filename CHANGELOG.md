@@ -1,5 +1,28 @@
 # Changelog
 
+## [2.2.1] — 2026-06-26
+
+### Fixed
+- **Manual overrides are now scoped to the active profile (DEC-189).** A `POST /control/{id}/override`
+  taken against one profile could survive into the next and pin a *same-id* control (e.g. `cpu`)
+  there. Activating a profile now clears every standing control-override while holding the
+  `active_profile` lock, and the override-take handler holds that same lock across its
+  control-existence check and the insert — closing a check-then-act race where a concurrent
+  `POST /profile/activate` could strand an override against a control absent from the now-active
+  profile. Fan-identify stops are per physical fan and deliberately survive a switch. Not a thermal
+  hole (overrides are floor-clamped and deadman-bounded, and the GUI already released them on a
+  switch); this hardens the headless/orchestration path.
+
+### Changed
+- **Profile deactivation resets the hwmon coalescing state (audit P3-3).** `POST /profile/deactivate`
+  now pairs the profile-engine lease release with `on_lease_released()` — matching the thermal
+  force-take path — so a later reactivation re-asserts `pwm_enable=1` from a clean slate after the
+  deactivated gap. Defense-in-depth alongside the existing per-write `pwm_enable` watchdog (the
+  verify path deliberately does not reset — it restores the header value with no writer handoff).
+- **GPU-fan relinquish clear is now atomic with activation (audit P3-4).** The clear of GPU fans
+  relinquished to firmware-auto runs inside the `active_profile` lock, so the engine can no longer
+  evaluate a freshly-activated profile and skip a still-relinquished GPU fan for one ~1 s tick.
+
 ## [2.2.0] — 2026-06-26
 
 ### Added

@@ -217,6 +217,22 @@ impl OverrideTable {
         }
     }
 
+    /// Clear every control-override (revert all pinned controls to curve).
+    /// Called on profile activation (DEC-189): a freshly-activated profile owns
+    /// its controls' intent, so an override taken against the previous profile
+    /// must not bleed onto a same-id control in the new one. The engine resets
+    /// the cleared controls' cross-tick state on its next tick via the DEC-188
+    /// activation-epoch path (`engine_state.deactivate()`), not via `sweep`, so
+    /// no cleared-id list is returned here.
+    ///
+    /// Identify-stops are deliberately **not** cleared: an identify is per
+    /// *physical fan* (`openfan:ch00`, `hwmon:…`, `amd_gpu:…`) and
+    /// profile-independent — it must survive a profile switch and auto-restore
+    /// on its own deadman.
+    pub fn clear_all_overrides(&mut self) {
+        self.controls.clear();
+    }
+
     /// Stop a fan for identification, auto-restoring after `ttl` (deadman). A
     /// repeat call refreshes the deadman.
     pub fn identify_stop(&mut self, fan_id: &str, ttl: Duration) {
@@ -570,5 +586,44 @@ mod tests {
         let cleared = t.sweep();
         assert_eq!(cleared.controls, vec!["short".to_string()]);
         assert_eq!(t.snapshot().controls.get("long"), Some(&60));
+    }
+
+    #[test]
+    fn clear_all_overrides_drops_controls_but_keeps_identify() {
+        // DEC-189: a profile activation clears EVERY control-override (so an
+        // override taken against the old profile cannot bleed onto a same-id
+        // control in the newly-activated one) but must NOT touch identify-stops,
+        // which are per physical fan and profile-independent.
+        let mut t = OverrideTable::new();
+        let g1 = t.take_override("cpu", 80, ttl());
+        t.take_override("gpu", 40, ttl());
+        t.identify_stop("openfan:ch00", ttl());
+
+        t.clear_all_overrides();
+
+        let snap = t.snapshot();
+        assert!(
+            snap.controls.is_empty(),
+            "every control-override must be cleared on activation"
+        );
+        assert!(
+            snap.identify_stop.contains("openfan:ch00"),
+            "identify-stops survive a profile activation (per-fan, not per-profile)"
+        );
+
+        // The cleared control's old token is dead — a renew now sees nothing
+        // live (re-take, never a fencing rejection)...
+        assert_eq!(
+            t.renew_override("cpu", g1.token, ttl()),
+            Err(OverrideReject::NotActive)
+        );
+        // ...and a fresh take still issues a strictly-greater token: clearing
+        // the table must not reset the monotonic fence and let a pre-clear token
+        // become valid again.
+        let g2 = t.take_override("cpu", 55, ttl());
+        assert!(
+            g2.token > g1.token,
+            "the fencing counter is monotonic across a clear, not reset"
+        );
     }
 }

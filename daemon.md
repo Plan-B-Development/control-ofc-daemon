@@ -260,9 +260,9 @@ As of 2.0.0 the profile engine is the **sole writer** (DEC-159/DEC-165); the GUI
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST/PUT/DELETE | `/profiles`, `/profiles/{id}` | Profile CRUD + `?validate_only` — daemon is the store of record (DEC-160) |
-| POST | `/profile/activate` | Switch active profile by id or path |
+| POST | `/profile/activate` | Switch active profile by id or path; clears all active control-overrides, not identify-stops (DEC-189) |
 | POST | `/profile/deactivate` | Clear active profile (DEC-097); idempotent |
-| POST | `/control/{control_id}/override` (+`/override/renew`, `DELETE`) | Expiring manual override — floor-clamped, deadman, monotonic fencing (DEC-163) |
+| POST | `/control/{control_id}/override` (+`/override/renew`, `DELETE`) | Expiring manual override — floor-clamped, deadman, monotonic fencing (DEC-163); cleared on profile activation (DEC-189) |
 | POST | `/config/profile-search-dirs` | Additively register profile search directories (persists to `runtime.toml`; 503 `persistence_failed` on write error) |
 | POST | `/config/startup-delay` | Set startup delay seconds (persists to `runtime.toml`, takes effect on restart; 503 `persistence_failed` on write error) |
 

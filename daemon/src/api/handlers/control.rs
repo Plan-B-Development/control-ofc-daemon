@@ -47,26 +47,40 @@ pub async fn override_take_handler(
             )),
         );
     }
+    let ttl = resolve_ttl(body.ttl_secs);
     // The control must exist in the active profile — nothing to override
     // otherwise. (Matches the GUI's per-control Manual card, which only appears
     // for controls in the active profile.)
-    let exists = state
-        .active_profile
-        .lock()
-        .as_ref()
-        .is_some_and(|p| p.controls.iter().any(|c| c.id == control_id));
-    if !exists {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            &ErrorEnvelope::validation(format!("no control '{control_id}' in the active profile")),
-        );
-    }
-
-    let ttl = resolve_ttl(body.ttl_secs);
-    let grant = state
-        .override_table
-        .lock()
-        .take_override(&control_id, body.pwm_percent, ttl);
+    //
+    // DEC-189: hold `active_profile` across BOTH the existence check and the
+    // override insert. Releasing it between the two (as the original code did)
+    // left a window where a concurrent `POST /profile/activate` could swap the
+    // profile after the check passed, pinning an override against a control
+    // that is not in the now-active profile (TOCTOU). With the lock held, an
+    // activation serialises strictly before (the check sees the new profile) or
+    // strictly after (the activation's `clear_all_overrides` wipes this insert).
+    // Lock order `active_profile` (outer) → `override_table` (inner) matches the
+    // activate handler; the engine takes `override_table` alone, so there is no
+    // inversion. No `.await` is held across the guard (a parking_lot guard
+    // across `.await` would not compile — the handler future must be `Send`).
+    let grant = {
+        let profile_guard = state.active_profile.lock();
+        let exists = profile_guard
+            .as_ref()
+            .is_some_and(|p| p.controls.iter().any(|c| c.id == control_id));
+        if !exists {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                &ErrorEnvelope::validation(format!(
+                    "no control '{control_id}' in the active profile"
+                )),
+            );
+        }
+        state
+            .override_table
+            .lock()
+            .take_override(&control_id, body.pwm_percent, ttl)
+    };
 
     json_ok(
         StatusCode::OK,

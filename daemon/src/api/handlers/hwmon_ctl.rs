@@ -250,6 +250,15 @@ pub async fn hwmon_verify_handler(
 
     // Release the verify lease (best-effort; the engine reclaims it next tick).
     // The engine's write pause is cleared by `_verify_guard` on drop.
+    //
+    // Deliberately NOT paired with `on_lease_released()` here — unlike the
+    // deactivate (profile.rs) and thermal force-take (backends.rs) paths, which
+    // hand control to a different writer across a gap. Verify already restored
+    // the header to its pre-verify value above (`set_pwm(current_pct)`), so the
+    // controller's coalescing state matches the hardware; resetting it would
+    // force the engine to re-write `pwm_enable` + PWM on its very next tick —
+    // pure churn — on every verify. Leaving it intact lets the next engine
+    // write coalesce normally (audit P3-3).
     {
         let mut ctrl = controller.lock();
         let _ = ctrl.lease_manager_mut().release_lease(&verify_lease_id);

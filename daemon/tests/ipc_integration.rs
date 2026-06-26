@@ -925,6 +925,125 @@ async fn deactivate_profile_preserves_gui_lease() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Hwmon writer that records every write so a test can assert `pwm_enable`
+/// re-assertion. `read_file` returns "1" so the `pwm_enable` watchdog sees
+/// manual mode still set (it would re-write on any read ≠ 1) — leaving
+/// *coalescing*, not the watchdog, to decide whether `pwm_enable` is re-written.
+#[derive(Clone)]
+struct LoggingHwmonWriter {
+    writes: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl SysfsWriter for LoggingHwmonWriter {
+    fn write_file(
+        &mut self,
+        path: &str,
+        value: &str,
+    ) -> Result<(), control_ofc_daemon::error::HwmonError> {
+        self.writes
+            .lock()
+            .push((path.to_string(), value.to_string()));
+        Ok(())
+    }
+
+    fn read_file(&self, _path: &str) -> Result<String, control_ofc_daemon::error::HwmonError> {
+        Ok("1\n".to_string())
+    }
+}
+
+#[tokio::test]
+async fn deactivate_profile_resets_hwmon_coalescing() {
+    // Audit P3-3: deactivation releases the profile-engine lease AND must pair
+    // it with `on_lease_released()`, so a later reactivation re-asserts
+    // `pwm_enable=1` from a clean slate. Without the pairing, the controller's
+    // stale write-state would coalesce the next same-value write and skip the
+    // enable re-assert — this test fails if the pairing is removed.
+    let writes: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let cache = Arc::new(StateCache::new());
+    let ctrl = HwmonPwmController::new(
+        vec![make_test_header("h1", "CHA_FAN1", 0)],
+        LeaseManager::new(),
+        Box::new(LoggingHwmonWriter {
+            writes: writes.clone(),
+        }),
+        cache.clone(),
+    );
+    let state = Arc::new(AppState {
+        cache: cache.clone(),
+        staleness_config: StalenessConfig::default(),
+        daemon_version: "0.1.0-test".into(),
+        fan_controller: None,
+        hwmon_controller: Some(Arc::new(Mutex::new(ctrl))),
+        start_time: std::time::Instant::now(),
+        history: Arc::new(HistoryRing::new(250)),
+        active_profile: Arc::new(Mutex::new(Some(DaemonProfile {
+            id: "p".into(),
+            name: "P".into(),
+            version: 7,
+            description: String::new(),
+            controls: Vec::new(),
+            curves: Vec::new(),
+        }))),
+        calibrating: std::sync::atomic::AtomicBool::new(false),
+        amd_gpus: Vec::new(),
+        intel_gpus: Vec::new(),
+        profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
+        config_path: String::new(),
+        runtime_config_path: std::path::PathBuf::new(),
+        sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        override_table: Arc::new(Mutex::new(
+            control_ofc_daemon::control_override::OverrideTable::new(),
+        )),
+    });
+    let hwmon = state.hwmon_controller.clone().unwrap();
+
+    // The engine holds a profile-engine lease and has written a value, seeding
+    // coalescing state (manual_mode_set=true, last=50): enable(1) + pwm(50).
+    {
+        let mut g = hwmon.lock();
+        let lease = g
+            .lease_manager_mut()
+            .take_lease("profile-engine")
+            .unwrap()
+            .lease_id;
+        g.set_pwm("h1", 50, &lease).unwrap();
+    }
+    assert_eq!(writes.lock().len(), 2, "seed = enable(1) + pwm(50)");
+
+    let (sock, shutdown, _d) = start_test_server(state.clone()).await;
+    let (st, _j) = uds_post(&sock, "/profile/deactivate", &serde_json::json!({})).await;
+    assert_eq!(st, 200);
+
+    // Reacquire control with a fresh lease and the SAME value. Because
+    // deactivate reset coalescing, this re-writes pwm_enable=1 rather than
+    // coalescing to a no-op.
+    {
+        let mut g = hwmon.lock();
+        let lease = g
+            .lease_manager_mut()
+            .take_lease("profile-engine")
+            .unwrap()
+            .lease_id;
+        g.set_pwm("h1", 50, &lease).unwrap();
+    }
+
+    let w = writes.lock();
+    let enable_asserts = w
+        .iter()
+        .filter(|(p, v)| p.ends_with("pwm1_enable") && v == "1")
+        .count();
+    assert_eq!(
+        enable_asserts, 2,
+        "pwm_enable must be re-asserted after deactivate (coalescing reset by \
+         on_lease_released); writes were {:?}",
+        *w
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&sock);
+}
+
 // ── GPU reset succeeds (daemon-mediated action) ─────────────────────────
 
 /// Construct an `AppState` with a fully-writable PMFW GPU pointing at real
@@ -1795,6 +1914,70 @@ async fn override_renew_unknown_control_is_404() {
     .await;
     assert_eq!(st, 404, "{body}");
     assert_eq!(body["error"]["code"], "override_expired");
+}
+
+#[tokio::test]
+async fn activate_profile_clears_standing_overrides_and_gpu_relinquish() {
+    // DEC-189 + audit P3-4: activating a profile must clear any standing manual
+    // override (so an override taken against the previous profile cannot bleed
+    // onto a same-id control in the newly-activated one) AND clear any GPU fans
+    // previously relinquished to firmware-auto. Drives the real activate +
+    // override handlers end-to-end on the HEADLESS path — there is no GUI
+    // `_release_all_overrides()` here, so the daemon must self-scope.
+    let tmp = tempfile::tempdir().unwrap();
+    let search_dir = tmp.path().join("search");
+    std::fs::create_dir_all(&search_dir).unwrap();
+    let profile_path = search_dir.join("p.json");
+    // Minimal profile that validates: a control "cpu" bound to a flat curve, so
+    // the override take-path finds the control in the active profile.
+    std::fs::write(
+        &profile_path,
+        r#"{"id":"p","name":"P","version":7,
+            "controls":[{"id":"cpu","name":"CPU","curve_id":"c1"}],
+            "curves":[{"id":"c1","name":"C1","type":"flat","flat_output_pct":50}]}"#,
+    )
+    .unwrap();
+
+    let state = test_app_state_with_profile_dirs(vec![search_dir.clone()]);
+    let (sock, shutdown, _d) = start_test_server(state.clone()).await;
+    let activate = serde_json::json!({ "profile_path": profile_path.display().to_string() });
+
+    // Activate, pin "cpu" with a manual override, and relinquish a GPU fan.
+    let (st, j) = uds_post(&sock, "/profile/activate", &activate).await;
+    assert_eq!(st, 200, "first activate: {j}");
+    let (st, j) = uds_post(
+        &sock,
+        "/control/cpu/override",
+        &serde_json::json!({"pwm_percent": 80}),
+    )
+    .await;
+    assert_eq!(st, 200, "override take: {j}");
+    state.cache.relinquish_gpu_fan("amd_gpu:0000:03:00.0");
+
+    // Sanity: /status surfaces the live override and the fan is relinquished.
+    let (_st, status) = uds_get(&sock, "/status").await;
+    assert_eq!(status["overrides"][0]["control_id"], "cpu");
+    assert!(state.cache.is_gpu_fan_relinquished("amd_gpu:0000:03:00.0"));
+
+    // Re-activate the SAME profile id (the DEC-188 "edit the active curve and
+    // re-apply" path — exactly the case the GUI cannot self-heal headlessly).
+    let (st, j) = uds_post(&sock, "/profile/activate", &activate).await;
+    assert_eq!(st, 200, "re-activate: {j}");
+
+    // The override is gone from /status (cleared on activation) and the GPU fan
+    // is no longer relinquished.
+    let (_st, status) = uds_get(&sock, "/status").await;
+    assert!(
+        status.get("overrides").is_none(),
+        "activation must clear standing overrides, got {status}"
+    );
+    assert!(
+        !state.cache.is_gpu_fan_relinquished("amd_gpu:0000:03:00.0"),
+        "activation must clear relinquished GPU fans"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&sock);
 }
 
 #[tokio::test]
