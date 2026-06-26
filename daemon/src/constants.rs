@@ -143,6 +143,16 @@ pub const NO_SENSOR_CYCLE_THRESHOLD: u32 = 5;
 /// sensor is found for `NO_SENSOR_CYCLE_THRESHOLD` consecutive cycles.
 pub const NO_SENSOR_SAFE_PCT: u8 = 40;
 
+// ── Profile engine — OpenFan write-failure alerting (audit P3-5) ──────
+
+/// Consecutive write failures — per channel, or across the whole link — before
+/// the profile engine's OpenFan backend escalates to a SAFETY-level alert.
+/// Tracked per channel (so a persistent single-channel fault among healthy
+/// channels still trips, rather than being masked by the others resetting a
+/// shared counter) and separately for the whole-link "serial down" case; each
+/// fires once at the exact threshold (edge-triggered) to avoid 1 Hz log spam.
+pub const OPENFAN_FAIL_ALERT_THRESHOLD: u32 = 5;
+
 // ── Sensor polling — descriptor cache (DEC-133) ──────────────────────
 
 /// Consecutive failed value-reads for a single cached sensor descriptor

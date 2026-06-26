@@ -779,21 +779,41 @@ fn evaluate_safety_tick(
     };
 
     let safety_pct = hottest_cpu_c.and_then(|temp| safety.evaluate(temp));
+    let sensor_missing = hottest_cpu_c.is_none();
+    // `is_active()` reflects the LATCH: with the sensor missing, `evaluate()` is
+    // not called, so a latched emergency stays latched (it can only clear on a
+    // real reading at or below the release temp).
+    let emergency_latched = safety.is_active();
 
-    let thermal_state = if safety.is_active() {
+    // DEC-190: a CPU-sensor dropout while a thermal emergency is latched must
+    // not let fans fall to profile control. Before this fix, cycles 1–4 of such
+    // a dropout forced nothing — `evaluate()` cannot run without a reading and
+    // the 5-cycle no-sensor fallback had not yet tripped — so fans dropped from
+    // forced-100% to the curve mid-emergency while `thermal_state` still
+    // (incoherently) reported "emergency". Force the no-sensor safe floor
+    // immediately in that case and report it honestly. The normal-operation
+    // no-sensor debounce (`forced_by_no_sensor`, 5 cycles) is left unchanged: a
+    // transient 1–2 cycle blip with no latched emergency must not spin fans.
+    let force_no_sensor = forced_by_no_sensor || (sensor_missing && emergency_latched);
+
+    let thermal_state = if emergency_latched && !sensor_missing {
         "emergency"
+    } else if force_no_sensor {
+        // Covers BOTH the latched-emergency dropout (DEC-190) and the plain
+        // 5-cycle no-sensor fallback (DEC-132): in each the daemon forces
+        // NO_SENSOR_SAFE_PCT and force-takes the hwmon lease, so the GUI must
+        // stand down — surface a distinct state rather than a stale "emergency"
+        // with no force, or a bare "normal". (Mutually exclusive with the
+        // "recovery" arm below: any no-sensor force implies `safety_pct` is None,
+        // since `evaluate()` did not run this tick.)
+        "no_sensor_fallback"
     } else if safety_pct.is_some() {
         "recovery"
-    } else if forced_by_no_sensor {
-        // DEC-132: the no-sensor fallback also forces PWM (and force-takes
-        // the hwmon lease), so the GUI must stand down here too — surface a
-        // distinct state rather than claiming "normal".
-        "no_sensor_fallback"
     } else {
         "normal"
     };
 
-    let forced_pct = safety_pct.or(if forced_by_no_sensor {
+    let forced_pct = safety_pct.or(if force_no_sensor {
         Some(constants::NO_SENSOR_SAFE_PCT)
     } else {
         None
@@ -838,7 +858,7 @@ pub async fn profile_engine_loop(
     // as of 2.0.0 — DEC-165).
     // GpuBackend is deliberately NOT a SafetyWriteBackend (DEC-130): there
     // is no GPU emergency threshold.
-    let mut openfan_be = fan_controller.map(OpenFanBackend::new);
+    let mut openfan_be = fan_controller.map(|ctrl| OpenFanBackend::new(ctrl, cache.clone()));
     let mut gpu_be = GpuBackend::new(cache.clone(), Arc::new(gpu_infos));
     let mut hwmon_be = hwmon_controller.map(HwmonBackend::new);
 
@@ -989,11 +1009,16 @@ pub async fn profile_engine_loop(
         // none holds a controller guard across an .await. The engine is the
         // sole authoritative writer (DEC-165) — no GUI deferral.
         //
-        // While a hardware verify is in progress (hwmon or GPU), pause the
-        // write phase so the verify's controlled test writes are not
-        // overwritten. The thermal safety force_all runs earlier this tick and
-        // `continue`s before reaching here, so a verify never suppresses an
-        // emergency. The verify pause is deadman-bounded (DEC-165).
+        // While a hardware verify (or an OpenFan calibration sweep) holds the
+        // write-pause, skip the write phase so its controlled test writes are
+        // not overwritten. This loop-level gate handles the steady-state pause;
+        // each backend ALSO re-checks the pause in-flight — hwmon refuses to
+        // adopt a "verify" lease, GPU re-checks per fan, OpenFan re-checks per
+        // channel — to close the race where a verify/calibration begins *after*
+        // this gate is read but before the awaited writes land (P2-1 / DEC-191).
+        // Thermal safety force_all runs earlier this tick and `continue`s before
+        // here, so a verify never suppresses an emergency. Deadman-bounded
+        // (DEC-165).
         if !cache.verify_active() {
             if let Some(be) = openfan_be.as_mut() {
                 be.apply(&commands).await;
@@ -3447,6 +3472,102 @@ mod tests {
             }
         );
         assert_eq!(cycles, 0);
+    }
+
+    #[test]
+    fn safety_tick_forces_floor_on_sensor_dropout_during_latched_emergency() {
+        // DEC-190: once a thermal emergency is latched, a CPU-sensor dropout must
+        // force the no-sensor safe floor IMMEDIATELY — not fall to profile
+        // control for cycles 1-4 (the pre-fix bug) — and report a coherent state
+        // rather than a stale "emergency" with no force.
+        let mut rule = crate::safety::ThermalSafetyRule::new();
+        let mut cycles = 0u32;
+
+        // Latch the emergency with a real over-limit reading.
+        let d = evaluate_safety_tick(Some(106.0), &mut cycles, &mut rule);
+        assert_eq!(d.thermal_state, "emergency");
+        assert_eq!(d.forced_pct, Some(100));
+
+        // Sensor vanishes the very next tick (cycle 1 of the dropout): force the
+        // no-sensor floor NOW, do not drop to profile control.
+        let d = evaluate_safety_tick(None, &mut cycles, &mut rule);
+        assert_eq!(
+            d,
+            SafetyDecision {
+                thermal_state: "no_sensor_fallback",
+                forced_pct: Some(constants::NO_SENSOR_SAFE_PCT),
+            },
+            "a dropout mid-emergency must force the no-sensor floor immediately, \
+             coherent with the reported state"
+        );
+    }
+
+    #[test]
+    fn safety_tick_transient_dropout_without_emergency_does_not_force() {
+        // DEC-190 scope guard: with NO emergency latched, the normal-operation
+        // no-sensor debounce is UNCHANGED — a transient 1-4 cycle dropout must
+        // not force fans (only the 5-cycle fallback does). Guards against an
+        // over-broad "force 40% whenever the sensor is missing" rewrite.
+        let mut rule = crate::safety::ThermalSafetyRule::new();
+        let mut cycles = 0u32;
+
+        for cycle in 1..constants::NO_SENSOR_CYCLE_THRESHOLD {
+            let d = evaluate_safety_tick(None, &mut cycles, &mut rule);
+            assert_eq!(
+                d,
+                SafetyDecision {
+                    thermal_state: "normal",
+                    forced_pct: None,
+                },
+                "cycle {cycle}: a transient dropout with no emergency must not force"
+            );
+        }
+    }
+
+    #[test]
+    fn safety_tick_dropout_during_emergency_stays_forced_past_the_no_sensor_threshold() {
+        // DEC-190: a dropout during a latched emergency forces 40% from cycle 1
+        // AND keeps forcing 40% once the generic 5-cycle no-sensor fallback ALSO
+        // trips (both branches of `force_no_sensor` true) — no flip-flop at the
+        // threshold boundary.
+        let mut rule = crate::safety::ThermalSafetyRule::new();
+        let mut cycles = 0u32;
+        evaluate_safety_tick(Some(106.0), &mut cycles, &mut rule); // latch emergency
+
+        for cycle in 1..=(constants::NO_SENSOR_CYCLE_THRESHOLD + 2) {
+            let d = evaluate_safety_tick(None, &mut cycles, &mut rule);
+            assert_eq!(
+                d,
+                SafetyDecision {
+                    thermal_state: "no_sensor_fallback",
+                    forced_pct: Some(constants::NO_SENSOR_SAFE_PCT),
+                },
+                "cycle {cycle} of a mid-emergency dropout must hold the 40% floor"
+            );
+        }
+    }
+
+    #[test]
+    fn safety_tick_sensor_return_after_dropout_resumes_emergency_force() {
+        // DEC-190 latch-persistence: the emergency latch survives a multi-cycle
+        // sensor dropout (evaluate() never ran), so a still-hot reading on return
+        // (>= the 80°C release temp) snaps back to forced-100% that tick.
+        let mut rule = crate::safety::ThermalSafetyRule::new();
+        let mut cycles = 0u32;
+        evaluate_safety_tick(Some(106.0), &mut cycles, &mut rule); // latch 100%
+        for _ in 0..3 {
+            evaluate_safety_tick(None, &mut cycles, &mut rule); // dropout → 40%
+        }
+        // Sensor returns at 95°C (still above the 80°C release): emergency resumes.
+        let d = evaluate_safety_tick(Some(95.0), &mut cycles, &mut rule);
+        assert_eq!(
+            d,
+            SafetyDecision {
+                thermal_state: "emergency",
+                forced_pct: Some(100),
+            },
+            "a still-hot reading after a dropout must re-assert forced-100%"
+        );
     }
 
     /// A sensor returning mid-streak (before the threshold) resets the

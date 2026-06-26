@@ -119,7 +119,10 @@ inside the band cannot pin the pre-settle fan speed indefinitely.
    - 60% recovery floor for two cycles after release (the release cycle + a
      one-cycle recovery floor), then control returns to the profile
    - If no CpuTemp sensor found for 5 consecutive cycles, forces all
-     OpenFan+hwmon fans to 40%
+     OpenFan+hwmon fans to 40%; a sensor dropout *while an emergency is
+     latched* forces 40% immediately (from the first missing cycle) and
+     reports `no_sensor_fallback` rather than dropping to profile control
+     (DEC-190)
    - Override state is surfaced as `thermal_state` in `GET /status`
      (`normal` | `recovery` | `emergency` | `no_sensor_fallback`, DEC-132)
      so the GUI shows a poll-driven thermal banner (DEC-165 — there is no GUI
@@ -238,7 +241,7 @@ As of 2.0.0 the profile engine is the **sole writer** (DEC-159/DEC-165); the GUI
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| POST | `/fans/openfan/{channel}/calibrate` | PWM→RPM sweep (long-running, thermal-aborting) |
+| POST | `/fans/openfan/{channel}/calibrate` | PWM→RPM sweep (long-running, thermal-aborting; pauses the engine write phase for the sweep so an active profile cannot corrupt the readback — DEC-191) |
 | POST | `/fans/{fan_id}/identify` | Per-fan stop/restore for identification — floor-exempt, deadman auto-restore (DEC-166) |
 
 ### Write endpoints — GPU
@@ -291,6 +294,7 @@ Codes:
 - `profile_in_use` (409, source: validation) — `DELETE /profiles/{id}` of the active profile (DEC-160)
 - `stale_fencing_token` (409, source: validation) — override renew/release bearing a superseded `override_token` (DEC-163)
 - `thermal_abort` (409, source: hardware) — calibration aborted due to high temperature
+- `validation_error` (409, source: validation) — `POST /fans/openfan/{ch}/calibrate` when a calibration **or** a hardware verify is already in progress; the sweep shares the verify single-flight pause (DEC-191)
 - `internal_error` (500, source: internal)
 - `hardware_unavailable` (503, source: hardware)
 - `persistence_failed` (503, source: internal) — `POST /config/*` could not persist `runtime.toml`

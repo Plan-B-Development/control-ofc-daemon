@@ -141,7 +141,7 @@ pub async fn gpu_verify_handler(
     else {
         return error_response(
             StatusCode::CONFLICT,
-            &ErrorEnvelope::validation("a hardware verify is already in progress"),
+            &ErrorEnvelope::validation("a hardware verify or calibration is already in progress"),
         );
     };
 

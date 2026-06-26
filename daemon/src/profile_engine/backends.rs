@@ -58,16 +58,117 @@ pub(crate) trait SafetyWriteBackend: WriteBackend {
 
 pub(crate) struct OpenFanBackend {
     ctrl: Arc<Mutex<crate::serial::controller::FanController>>,
-    /// Consecutive write failures for P0-R2 safety alerting.
-    consecutive_failures: u32,
+    /// Per-channel consecutive write-failure streaks (audit P3-5). Replaces a
+    /// single shared counter that reset on ANY channel's success, so a
+    /// persistent single-channel fault among healthy channels never tripped the
+    /// SAFETY alert. Reset per channel by that channel's own success.
+    channel_failures: HashMap<u8, u32>,
+    /// Consecutive ticks where EVERY attempted channel failed (or the blocking
+    /// write task panicked): the whole-link "serial link down" signal (audit
+    /// P3-5), kept distinct from the per-channel streaks. Reset when any channel
+    /// succeeds.
+    link_down_streak: u32,
+    /// Engine write-pause gate (DEC-165). Re-checked inside the blocking write
+    /// (DEC-191) so an OpenFan calibration sweep that claims the pause mid-tick
+    /// is not overwritten by an engine tick already in flight.
+    cache: Arc<StateCache>,
 }
 
 impl OpenFanBackend {
-    pub(crate) fn new(ctrl: Arc<Mutex<crate::serial::controller::FanController>>) -> Self {
+    pub(crate) fn new(
+        ctrl: Arc<Mutex<crate::serial::controller::FanController>>,
+        cache: Arc<StateCache>,
+    ) -> Self {
         Self {
             ctrl,
-            consecutive_failures: 0,
+            channel_failures: HashMap::new(),
+            link_down_streak: 0,
+            cache,
         }
+    }
+
+    /// Record this tick's per-channel write outcomes and fire SAFETY alerts
+    /// (audit P3-5). Two independent signals, each edge-triggered at
+    /// [`constants::OPENFAN_FAIL_ALERT_THRESHOLD`] so a persistent fault does not
+    /// re-log every 1 Hz tick:
+    /// - **per-channel** — a channel's consecutive-failure streak hitting the
+    ///   threshold ("ch{n} not responding"); reset only by that channel's own
+    ///   success, so a single dead channel among healthy ones is no longer
+    ///   masked by the others.
+    /// - **whole-link** — every attempted channel failing for the threshold
+    ///   consecutively ("serial link appears down"); reset the moment any
+    ///   channel succeeds.
+    ///
+    /// `results` holds only channels actually attempted this tick — channels
+    /// skipped by the in-flight verify/calibration pause are absent, so they
+    /// neither count as a failure nor reset a streak.
+    fn note_outcomes(&mut self, results: &[(u8, Result<(), String>)]) {
+        if results.is_empty() {
+            return;
+        }
+        let mut any_ok = false;
+        for (ch, res) in results {
+            match res {
+                Err(e) => {
+                    let streak = self.channel_failures.entry(*ch).or_insert(0);
+                    *streak += 1;
+                    let n = *streak;
+                    log::warn!(
+                        "Profile engine: OpenFan ch{ch} write failed ({n} consecutive): {e}"
+                    );
+                    if n == constants::OPENFAN_FAIL_ALERT_THRESHOLD {
+                        log::error!(
+                            "SAFETY: OpenFan ch{ch} not responding \
+                             ({n} consecutive write failures)"
+                        );
+                    }
+                }
+                Ok(()) => {
+                    any_ok = true;
+                    self.channel_failures.remove(ch);
+                }
+            }
+        }
+        if any_ok {
+            self.link_down_streak = 0;
+        } else {
+            self.link_down_streak += 1;
+            if self.link_down_streak == constants::OPENFAN_FAIL_ALERT_THRESHOLD {
+                log::error!(
+                    "SAFETY: OpenFan serial link appears down \
+                     (all {} channels failing for {} consecutive ticks)",
+                    results.len(),
+                    self.link_down_streak
+                );
+            }
+        }
+    }
+
+    /// Account a panicked blocking write task as a whole-link failure (no
+    /// per-channel results exist — the task died). Returns the new link-down
+    /// streak for the caller's alert log.
+    fn note_task_panic(&mut self) -> u32 {
+        self.link_down_streak += 1;
+        let n = self.link_down_streak;
+        // A persistent panic mode must also trip the whole-link SAFETY alert,
+        // not just the per-tick "task panicked" log (audit P3-5 follow-up).
+        if n == constants::OPENFAN_FAIL_ALERT_THRESHOLD {
+            log::error!(
+                "SAFETY: OpenFan serial link appears down \
+                 (write task panicking for {n} consecutive ticks)"
+            );
+        }
+        n
+    }
+
+    #[cfg(test)]
+    fn channel_failure_streak(&self, ch: u8) -> u32 {
+        self.channel_failures.get(&ch).copied().unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    fn link_down_streak(&self) -> u32 {
+        self.link_down_streak
     }
 }
 
@@ -111,18 +212,32 @@ impl WriteBackend for OpenFanBackend {
             return;
         }
         let ctrl = self.ctrl.clone();
+        let cache = self.cache.clone();
         let join = tokio::task::spawn_blocking(move || {
             chans
                 .into_iter()
-                .map(|(ch, pct)| {
+                .filter_map(|(ch, pct)| {
                     // Lock per command (DEC-099) so GUI API requests can
                     // interleave between channel writes.
                     let mut guard = ctrl.lock();
+                    // DEC-191: re-check the engine write-pause while HOLDING the
+                    // controller lock, so the check-and-write is atomic against a
+                    // concurrent OpenFan calibration sweep (whose test writes take
+                    // this same lock). An engine tick already in flight when the
+                    // sweep claims the pause must not overwrite the sweep's test
+                    // PWM; checking before the lock left a narrow window where one
+                    // channel's write could still land just after the sweep
+                    // claimed the pause, corrupting its first RPM readback. A
+                    // skipped channel records no outcome (it was not attempted),
+                    // so it neither counts as a failure nor resets a streak.
+                    if cache.verify_active() {
+                        return None;
+                    }
                     let res = guard
                         .set_pwm(ch, pct)
                         .map(|_| ())
                         .map_err(|e| e.to_string());
-                    (ch, res)
+                    Some((ch, res))
                 })
                 .collect::<Vec<(u8, Result<(), String>)>>()
         })
@@ -130,33 +245,21 @@ impl WriteBackend for OpenFanBackend {
         let results = match join {
             Ok(results) => results,
             Err(e) => {
-                // Concurrency review D3: a panic inside the blocking task
-                // must not be silent — count it and alert immediately.
-                self.consecutive_failures += 1;
+                // Concurrency review D3: a panic inside the blocking task must
+                // not be silent. The whole write task died, so account it as a
+                // whole-link failure (audit P3-5) and alert immediately.
+                let n = self.note_task_panic();
                 log::error!(
                     "SAFETY: Profile engine OpenFan write task panicked: {e} \
-                     ({} consecutive failures)",
-                    self.consecutive_failures
+                     (link-down streak {n})"
                 );
                 return;
             }
         };
-        // `&mut self` state can't cross into the 'static closure — apply the
-        // failure bookkeeping to the returned results instead.
-        for (ch, res) in results {
-            if let Err(e) = res {
-                self.consecutive_failures += 1;
-                let n = self.consecutive_failures;
-                log::warn!("Profile engine: OpenFan ch{ch} write failed ({n} consecutive): {e}");
-                if n == 5 {
-                    log::error!(
-                        "SAFETY: OpenFan serial link appears down ({n} consecutive write failures)"
-                    );
-                }
-            } else {
-                self.consecutive_failures = 0;
-            }
-        }
+        // `&mut self` state can't cross into the 'static closure, so the
+        // per-channel + whole-link failure bookkeeping runs here on the returned
+        // results (audit P3-5).
+        self.note_outcomes(&results);
     }
 }
 
@@ -239,6 +342,16 @@ impl WriteBackend for GpuBackend {
         let gpu_fans = self.cache.gpu_fans_snapshot();
 
         for cmd in commands.iter().filter(|c| c.source == "amd_gpu") {
+            // P2-1: re-check the engine write-pause per fan. A GPU fan verify
+            // (POST /gpu/{id}/fan/verify) sets the pause and force-writes a test
+            // value mid-tick; an engine tick already past the loop-level
+            // `verify_active` gate (mod.rs) must not overwrite it. GPU fans have
+            // no lease (DEC-045), so this per-fan recheck is the only guard —
+            // re-read each iteration so a verify starting mid-loop stops the
+            // remaining fans too.
+            if self.cache.verify_active() {
+                continue;
+            }
             // DEC-165: skip a GPU fan the operator relinquished to firmware-auto
             // via POST /gpu/{id}/fan/reset, so the reset is durable under an
             // active profile (the set is cleared on the next profile activation).
@@ -360,12 +473,25 @@ impl WriteBackend for HwmonBackend {
                 let mut guard = ctrl.lock();
                 let existing = {
                     let mgr = guard.lease_manager();
-                    // Reuse any active lease — the engine's own, or a transient
-                    // verify/thermal-safety force-take. The engine is the sole
-                    // writer (DEC-165); there is no GUI lease to yield to (and
-                    // during a verify the engine is paused, so it never reaches
-                    // here while the "verify" lease is held). `None` ⇒ acquire.
-                    mgr.active_lease().map(|lease| lease.lease_id.clone())
+                    // P2-1: reuse the engine's own lease or a transient
+                    // thermal-safety force-take, but NEVER a hardware verify's
+                    // lease. A verify force-takes the lease as "verify"
+                    // (hwmon_ctl.rs) and sets the engine write-pause; if it
+                    // starts *after* this tick passed the loop-level
+                    // `verify_active` gate (mod.rs), the engine still reaches
+                    // here. Adopting the verify's lease would let the engine
+                    // write through it and clobber the test value — the bug the
+                    // single up-front check did not close. Excluding owner_hint
+                    // "verify" makes `take_lease` below return AlreadyHeld ⇒
+                    // `lease_id = None` ⇒ the engine skips its hwmon writes this
+                    // tick; the verify's RAII guard releases the lease when it
+                    // ends and the next tick re-acquires. Thermal-safety is NOT
+                    // excluded — after an emergency the engine adopts and renews
+                    // that lease as before, so there is no post-thermal stall.
+                    // `None` ⇒ acquire.
+                    mgr.active_lease()
+                        .filter(|lease| lease.owner_hint != "verify")
+                        .map(|lease| lease.lease_id.clone())
                 };
                 existing.or_else(|| {
                     guard
@@ -825,7 +951,7 @@ mod tests {
         }
     }
 
-    fn openfan_backend() -> (OpenFanBackend, Arc<Mutex<Vec<String>>>) {
+    fn openfan_backend() -> (OpenFanBackend, Arc<Mutex<Vec<String>>>, Arc<StateCache>) {
         let written: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let transport = SerialMock {
             written: written.clone(),
@@ -833,15 +959,19 @@ mod tests {
         let cache = Arc::new(StateCache::new());
         let ctrl = crate::serial::controller::FanController::new(
             Box::new(transport),
-            cache,
+            cache.clone(),
             std::time::Duration::from_millis(100),
         );
-        (OpenFanBackend::new(Arc::new(Mutex::new(ctrl))), written)
+        (
+            OpenFanBackend::new(Arc::new(Mutex::new(ctrl)), cache.clone()),
+            written,
+            cache,
+        )
     }
 
     #[tokio::test]
     async fn openfan_backend_drops_malformed_member_ids() {
-        let (mut be, written) = openfan_backend();
+        let (mut be, written, _cache) = openfan_backend();
 
         be.apply(&[
             cmd("openfan:chXX", "openfan", 50),
@@ -854,7 +984,7 @@ mod tests {
 
     #[tokio::test]
     async fn openfan_backend_writes_when_gui_inactive() {
-        let (mut be, written) = openfan_backend();
+        let (mut be, written, _cache) = openfan_backend();
 
         be.apply(&[cmd("openfan:ch00", "openfan", 50)]).await;
 
@@ -867,7 +997,7 @@ mod tests {
 
     #[tokio::test]
     async fn openfan_force_all_writes_every_channel() {
-        let (mut be, written) = openfan_backend();
+        let (mut be, written, _cache) = openfan_backend();
 
         be.force_all(100).await;
 
@@ -919,10 +1049,10 @@ mod tests {
         let cache = Arc::new(StateCache::new());
         let ctrl = crate::serial::controller::FanController::new(
             Box::new(transport),
-            cache,
+            cache.clone(),
             std::time::Duration::from_millis(100),
         );
-        let mut be = OpenFanBackend::new(Arc::new(Mutex::new(ctrl)));
+        let mut be = OpenFanBackend::new(Arc::new(Mutex::new(ctrl)), cache);
 
         // Vanished: writes fail; the engine no-ops without panicking.
         be.apply(&[cmd("openfan:ch00", "openfan", 50)]).await;
@@ -938,6 +1068,156 @@ mod tests {
         assert!(
             w.iter().any(|c| c.starts_with(">02")),
             "OpenFan writes must resume once the link reappears; got {w:?}"
+        );
+    }
+
+    // ── Phase 2 / P-CAL additions (daemon /audit 2026-06-26) ──────────
+
+    #[test]
+    fn openfan_per_channel_failure_streak_not_masked_by_healthy_channel() {
+        // P3-5: a persistent single-channel fault must climb its OWN streak to
+        // the SAFETY threshold even while another channel succeeds every tick.
+        // The pre-fix shared counter reset on ANY success, so it never tripped.
+        let (mut be, _written, _cache) = openfan_backend();
+        for _ in 0..constants::OPENFAN_FAIL_ALERT_THRESHOLD {
+            be.note_outcomes(&[(0, Ok(())), (3, Err("link".into()))]);
+        }
+        assert_eq!(
+            be.channel_failure_streak(3),
+            constants::OPENFAN_FAIL_ALERT_THRESHOLD,
+            "the dead channel's streak must reach the threshold despite ch0 succeeding"
+        );
+        assert_eq!(
+            be.channel_failure_streak(0),
+            0,
+            "the healthy channel's streak stays at 0"
+        );
+        assert_eq!(
+            be.link_down_streak(),
+            0,
+            "a partial fault is not a whole-link failure"
+        );
+        // The dead channel's own success — and only that — resets its streak.
+        be.note_outcomes(&[(3, Ok(()))]);
+        assert_eq!(be.channel_failure_streak(3), 0);
+    }
+
+    #[test]
+    fn openfan_whole_link_down_trips_distinct_link_streak() {
+        // P3-5: every attempted channel failing for the threshold consecutively
+        // trips the distinct whole-link "serial down" streak; one success
+        // anywhere resets it.
+        let (mut be, _written, _cache) = openfan_backend();
+        for _ in 0..constants::OPENFAN_FAIL_ALERT_THRESHOLD {
+            be.note_outcomes(&[(0, Err("x".into())), (1, Err("x".into()))]);
+        }
+        assert_eq!(
+            be.link_down_streak(),
+            constants::OPENFAN_FAIL_ALERT_THRESHOLD
+        );
+        be.note_outcomes(&[(0, Ok(())), (1, Err("x".into()))]);
+        assert_eq!(
+            be.link_down_streak(),
+            0,
+            "any channel success resets the whole-link streak"
+        );
+    }
+
+    #[tokio::test]
+    async fn openfan_backend_skips_writes_while_engine_paused() {
+        // DEC-191: while a verify/calibration holds the engine write-pause, the
+        // OpenFan backend's in-flight recheck must skip writes (so a calibration
+        // sweep's test PWM survives), then resume when the pause clears.
+        let (mut be, written, cache) = openfan_backend();
+
+        assert!(cache.try_begin_verify(std::time::Duration::from_secs(30)));
+        be.apply(&[cmd("openfan:ch00", "openfan", 50)]).await;
+        assert!(
+            written.lock().is_empty(),
+            "no OpenFan write may land while the engine is paused (DEC-191)"
+        );
+
+        cache.end_verify();
+        be.apply(&[cmd("openfan:ch00", "openfan", 50)]).await;
+        assert!(
+            written.lock().iter().any(|c| c.starts_with(">02")),
+            "writes resume once the pause clears"
+        );
+    }
+
+    #[tokio::test]
+    async fn hwmon_apply_skips_while_a_verify_lease_is_held() {
+        // P2-1: a hardware verify force-takes the lease as "verify". If it starts
+        // after the loop-level gate, the engine still reaches apply; it must NOT
+        // adopt the verify lease and write through it (clobbering the test value).
+        // Option B: the engine skips its hwmon writes and leaves the lease intact.
+        let (mut be, writes) = hwmon_backend(vec![make_header("hwmon:it8696:pwm1")]);
+        be.ctrl
+            .lock()
+            .lease_manager_mut()
+            .force_take_lease("verify");
+
+        be.apply(&[cmd("hwmon:it8696:pwm1", "hwmon", 55)]).await;
+
+        let w = writes.lock();
+        assert!(
+            !w.iter().any(|(p, _)| p.ends_with("pwm1")),
+            "engine must not write hwmon while a verify holds the lease (P2-1); got {w:?}"
+        );
+        drop(w);
+        let lease = be.ctrl.lock().lease_manager().active_lease().cloned();
+        assert_eq!(
+            lease.map(|l| l.owner_hint),
+            Some("verify".into()),
+            "the verify lease must remain intact — the engine did not take over"
+        );
+    }
+
+    #[tokio::test]
+    async fn hwmon_apply_reuses_thermal_safety_lease_no_post_emergency_stall() {
+        // P2-1 regression guard: Option B excludes ONLY the verify lease. A
+        // non-verify foreign lease (e.g. "thermal-safety" left by force_all after
+        // an emergency) must still be reused so the engine resumes hwmon control
+        // immediately instead of being locked out for the lease's 60 s TTL.
+        let (mut be, writes) = hwmon_backend(vec![make_header("hwmon:it8696:pwm1")]);
+        be.ctrl
+            .lock()
+            .lease_manager_mut()
+            .force_take_lease("thermal-safety");
+
+        be.apply(&[cmd("hwmon:it8696:pwm1", "hwmon", 55)]).await;
+
+        let w = writes.lock();
+        assert!(
+            w.iter().any(|(p, _)| p.ends_with("pwm1")),
+            "engine must reuse a thermal-safety lease and write (no 60 s stall); got {w:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gpu_backend_skips_writes_while_engine_paused() {
+        // P2-1: GPU fans have no lease (DEC-045), so the per-fan verify_active
+        // recheck is the ONLY guard against the engine overwriting a GPU verify's
+        // test value mid-tick. While the pause is held, no curve write may land.
+        let dir = tempfile::tempdir().unwrap();
+        let (gpu, curve_path) = fake_gpu(&dir);
+        let cache = Arc::new(StateCache::new());
+        assert!(cache.try_begin_verify(std::time::Duration::from_secs(30)));
+        let mut be = GpuBackend::new(cache.clone(), Arc::new(vec![gpu]));
+
+        be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 70)])
+            .await;
+        assert!(
+            std::fs::read_to_string(&curve_path).unwrap().is_empty(),
+            "engine must not write a GPU fan while a verify holds the pause (P2-1)"
+        );
+
+        cache.end_verify();
+        be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 70)])
+            .await;
+        assert!(
+            !std::fs::read_to_string(&curve_path).unwrap().is_empty(),
+            "writes resume once the pause clears"
         );
     }
 }

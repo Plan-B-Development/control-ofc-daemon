@@ -1,5 +1,39 @@
 # Changelog
 
+## [2.2.2] — 2026-06-27
+
+### Fixed
+- **Hardware verify can no longer be clobbered by an in-flight engine tick (audit P2-1).** The
+  profile engine paused its write phase once per tick, before three awaited backend writes, so a
+  verify starting *after* that check but during the awaits could still be overwritten. Each backend
+  now re-checks the pause in-flight: hwmon refuses to adopt the verify's force-taken lease (reuses
+  only its own or a thermal-safety lease, never `"verify"`), GPU re-checks per fan (it has no lease —
+  DEC-045), and OpenFan re-checks per channel. Thermal-safety reuse is preserved, so there is no
+  post-emergency hwmon stall. The verify handler also releases its force-taken lease on every exit
+  path (RAII guard), so a cancelled or disconnected verify can no longer strand engine hwmon writes
+  for the lease TTL. Effect was a rare, self-correcting false-negative verify verdict.
+- **A dead OpenFan channel among healthy ones now trips the SAFETY alert (audit P3-5).** The engine's
+  OpenFan write-failure counter was a single shared value that reset on *any* channel's success, so a
+  persistent single-channel fault was masked. It is now a per-channel consecutive-failure streak
+  (reset only by that channel's own success), with a distinct whole-link "serial link down" signal.
+  Logging/alerting only — no control change.
+
+### Changed
+- **A CPU-sensor dropout during a latched thermal emergency now forces the no-sensor floor
+  immediately (DEC-190).** Previously the first few cycles of such a dropout forced nothing —
+  `evaluate()` cannot run without a reading and the 5-cycle no-sensor fallback had not yet tripped —
+  so fans briefly fell from forced-100% to profile control while `thermal_state` still reported
+  `"emergency"`. The daemon now forces `NO_SENSOR_SAFE_PCT` (40%) from the first missing cycle when an
+  emergency is latched and reports `"no_sensor_fallback"` coherently. The normal-operation 5-cycle
+  no-sensor debounce is unchanged (a transient blip with no emergency does not spin fans).
+
+### Added
+- **OpenFan calibration pauses the profile engine for the sweep (DEC-191).** `POST
+  /fans/openfan/{ch}/calibrate` now claims the engine write-pause (sized to the whole sweep) so an
+  active profile cannot overwrite each step's test PWM and corrupt the derived start/stop PWM — the
+  OpenFan backend has no lease to fence it, unlike hwmon. The pause shares the verify single-flight
+  slot, so a calibration and a hardware verify are mutually exclusive (`409` either way).
+
 ## [2.2.1] — 2026-06-26
 
 ### Fixed

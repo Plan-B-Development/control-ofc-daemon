@@ -119,6 +119,30 @@ pub async fn hwmon_rescan_handler(
 /// the cross-repo GUI coupling (`VERIFY_PAUSE_SAFETY_MS`).
 const VERIFY_WAIT_SECONDS: u8 = crate::constants::VERIFY_WAIT_SECONDS;
 
+/// RAII release of the force-taken "verify" lease on EVERY handler exit path —
+/// including a cancelled or panicked future (e.g. the client disconnects during
+/// the settle sleep). The profile engine deliberately does NOT adopt a "verify"
+/// lease (P2-1, `profile_engine/backends.rs`), so a leaked lease would strand
+/// hwmon control until its 60 s TTL; releasing it here lets the engine
+/// re-acquire its own lease on the next tick. Releases only — NOT paired with
+/// `on_lease_released()`: the verify restores the header to its pre-verify value
+/// itself, so the controller's coalescing state already matches the hardware;
+/// resetting it would force a pure-churn pwm_enable+PWM re-write on the engine's
+/// next tick, every verify (P3-3).
+struct VerifyLeaseGuard {
+    controller: std::sync::Arc<parking_lot::Mutex<crate::hwmon::pwm_control::HwmonPwmController>>,
+    lease_id: String,
+}
+impl Drop for VerifyLeaseGuard {
+    fn drop(&mut self) {
+        let _ = self
+            .controller
+            .lock()
+            .lease_manager_mut()
+            .release_lease(&self.lease_id);
+    }
+}
+
 /// POST /hwmon/{header_id}/verify — behavioural test of PWM write effectiveness.
 ///
 /// Writes a test PWM value, waits for hardware to respond, then reads back
@@ -174,12 +198,19 @@ pub async fn hwmon_verify_handler(
     else {
         return error_response(
             StatusCode::CONFLICT,
-            &ErrorEnvelope::validation("a hardware verify is already in progress"),
+            &ErrorEnvelope::validation("a hardware verify or calibration is already in progress"),
         );
     };
+    // Force-take a daemon-owned "verify" lease for our own controlled writes,
+    // released by `VerifyLeaseGuard` (defined above the handler) on EVERY exit
+    // path — including a cancelled or panicked future.
     let verify_lease_id = {
         let mut ctrl = controller.lock();
         ctrl.lease_manager_mut().force_take_lease("verify").lease_id
+    };
+    let _verify_lease = VerifyLeaseGuard {
+        controller: controller.clone(),
+        lease_id: verify_lease_id.clone(),
     };
 
     let read_state = |pwm: &str, en: &Option<String>, rpm: &Option<String>| -> HwmonVerifyState {
@@ -248,21 +279,10 @@ pub async fn hwmon_verify_handler(
         }
     };
 
-    // Release the verify lease (best-effort; the engine reclaims it next tick).
-    // The engine's write pause is cleared by `_verify_guard` on drop.
-    //
-    // Deliberately NOT paired with `on_lease_released()` here — unlike the
-    // deactivate (profile.rs) and thermal force-take (backends.rs) paths, which
-    // hand control to a different writer across a gap. Verify already restored
-    // the header to its pre-verify value above (`set_pwm(current_pct)`), so the
-    // controller's coalescing state matches the hardware; resetting it would
-    // force the engine to re-write `pwm_enable` + PWM on its very next tick —
-    // pure churn — on every verify. Leaving it intact lets the next engine
-    // write coalesce normally (audit P3-3).
-    {
-        let mut ctrl = controller.lock();
-        let _ = ctrl.lease_manager_mut().release_lease(&verify_lease_id);
-    }
+    // The "verify" lease is released by `_verify_lease`'s RAII guard on every
+    // exit path (see its definition above), and the engine's write pause by
+    // `_verify_guard` — both on scope exit, so a cancelled/panicked verify can
+    // never strand hwmon control.
 
     // Classify result
     let (result, details) = classify_verify_result(&initial, &final_state, test_pct);
@@ -505,5 +525,54 @@ mod tests {
         };
         let (result, _) = classify_verify_result(&initial, &clamped, 20);
         assert_eq!(result, "pwm_value_clamped");
+    }
+
+    /// No-op sysfs writer for constructing a bare `HwmonPwmController` in tests
+    /// that only exercise lease bookkeeping (no real writes).
+    struct NoopWriter;
+    impl crate::hwmon::pwm_control::SysfsWriter for NoopWriter {
+        fn write_file(
+            &mut self,
+            _path: &str,
+            _value: &str,
+        ) -> Result<(), crate::error::HwmonError> {
+            Ok(())
+        }
+        fn read_file(&self, _path: &str) -> Result<String, crate::error::HwmonError> {
+            Ok("0\n".into())
+        }
+    }
+
+    #[test]
+    fn verify_lease_guard_releases_lease_on_drop() {
+        // F1/P2-1: the force-taken "verify" lease must be released on EVERY exit
+        // path (incl. a cancelled/panicked handler future), so the profile engine
+        // — which deliberately does not adopt a "verify" lease — is never
+        // stranded for the lease TTL. Dropping the guard releases it.
+        use crate::hwmon::lease::LeaseManager;
+        use crate::hwmon::pwm_control::HwmonPwmController;
+        let cache = std::sync::Arc::new(crate::health::cache::StateCache::new());
+        let ctrl = std::sync::Arc::new(parking_lot::Mutex::new(HwmonPwmController::new(
+            vec![],
+            LeaseManager::new(),
+            Box::new(NoopWriter),
+            cache,
+        )));
+        let lease_id = ctrl
+            .lock()
+            .lease_manager_mut()
+            .force_take_lease("verify")
+            .lease_id;
+        assert!(ctrl.lock().lease_manager().active_lease().is_some());
+        {
+            let _g = VerifyLeaseGuard {
+                controller: ctrl.clone(),
+                lease_id,
+            };
+        } // guard drops here
+        assert!(
+            ctrl.lock().lease_manager().active_lease().is_none(),
+            "the verify lease must be released when the guard drops"
+        );
     }
 }
