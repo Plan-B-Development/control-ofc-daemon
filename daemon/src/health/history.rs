@@ -68,9 +68,17 @@ impl HistoryRing {
     /// Record a value for a sensor or fan.
     pub fn record(&self, entity_id: &str, value: f64) {
         let mut map = self.inner.write();
-        map.entry(entity_id.to_string())
-            .or_insert_with(|| EntityHistory::new(self.max_per_entity))
-            .push(value);
+        // EFF-2: only allocate the key `String` when the entity is new. The
+        // engine records every known sensor/fan each tick (1 Hz), so the common
+        // path is an existing entry — `entry(entity_id.to_string())` would
+        // allocate a throwaway key every time. `get_mut` borrows the &str.
+        if let Some(history) = map.get_mut(entity_id) {
+            history.push(value);
+        } else {
+            let mut history = EntityHistory::new(self.max_per_entity);
+            history.push(value);
+            map.insert(entity_id.to_string(), history);
+        }
     }
 
     /// Get the last N points for an entity.

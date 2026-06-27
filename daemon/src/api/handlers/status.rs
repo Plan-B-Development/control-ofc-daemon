@@ -14,47 +14,72 @@ use super::{
 use crate::api::responses::*;
 use crate::health::staleness::compute_health;
 
+/// Thermal-state field for a status response, defaulting to `"normal"` before
+/// the engine's first tick. Extracted under the cache read guard so
+/// `build_status_response` (which locks `override_table`) needs no snapshot
+/// and no cache guard of its own (EFF-1).
+fn thermal_state_of(snap: &crate::health::state::DaemonState) -> String {
+    snap.thermal_override_state
+        .clone()
+        .unwrap_or_else(|| "normal".to_string())
+}
+
 /// GET /status — overall health and subsystem freshness.
 pub async fn status_handler(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
-    let snap = state.cache.snapshot();
     let now = Instant::now();
-    let health = compute_health(&snap, &state.staleness_config, now);
-    Json(build_status_response(&state, &snap, health))
+    // EFF-1: read the state once under a shared guard instead of cloning the
+    // whole `DaemonState`. Only pure reads happen inside; the override_table
+    // lock in `build_status_response` stays outside the guard.
+    let (health, thermal_state) = state.cache.read_with(|snap| {
+        (
+            compute_health(snap, &state.staleness_config, now),
+            thermal_state_of(snap),
+        )
+    });
+    Json(build_status_response(&state, thermal_state, health))
 }
 
 /// GET /sensors — cached sensor readings.
 pub async fn sensors_handler(State(state): State<Arc<AppState>>) -> Json<SensorsResponse> {
-    let snap = state.cache.snapshot();
     let now = Instant::now();
-
     Json(SensorsResponse {
         api_version: API_VERSION,
-        sensors: build_sensor_entries(&snap, now),
+        sensors: state
+            .cache
+            .read_with(|snap| build_sensor_entries(snap, now)),
     })
 }
 
 /// GET /fans — cached fan state (OpenFanController + hwmon).
 pub async fn fans_handler(State(state): State<Arc<AppState>>) -> Json<FansResponse> {
-    let snap = state.cache.snapshot();
     let now = Instant::now();
-
     Json(FansResponse {
         api_version: API_VERSION,
-        fans: build_fan_entries(&snap, now),
+        fans: state.cache.read_with(|snap| build_fan_entries(snap, now)),
     })
 }
 
 /// GET /poll — combined sensors, fans, and status in one response.
 pub async fn poll_handler(State(state): State<Arc<AppState>>) -> Json<PollResponse> {
-    let snap = state.cache.snapshot();
     let now = Instant::now();
-    let health = compute_health(&snap, &state.staleness_config, now);
+    // EFF-1: build everything that needs `DaemonState` under one read guard, so
+    // the most frequent request (the GUI polls /poll at 1 Hz) no longer clones
+    // the entire state. The `override_table` lock lives in
+    // `build_status_response`, kept outside this guard to preserve lock order.
+    let (health, thermal_state, sensors, fans) = state.cache.read_with(|snap| {
+        (
+            compute_health(snap, &state.staleness_config, now),
+            thermal_state_of(snap),
+            build_sensor_entries(snap, now),
+            build_fan_entries(snap, now),
+        )
+    });
 
     Json(PollResponse {
         api_version: API_VERSION,
-        status: build_status_response(&state, &snap, health),
-        sensors: build_sensor_entries(&snap, now),
-        fans: build_fan_entries(&snap, now),
+        status: build_status_response(&state, thermal_state, health),
+        sensors,
+        fans,
     })
 }
 

@@ -1,5 +1,32 @@
 # Changelog
 
+## [2.2.3] — 2026-06-27
+
+### Fixed
+- **A fan no longer stays stuck off when `step_up_pct < stop_pct` (audit P3-2, DEC-192).** On the
+  stopped → on transition the per-cycle step-rate cap could hold a starting fan's output below
+  `stop_pct`; the stop-snap then zeroed it and the start-threshold (gated on a positive output)
+  could never fire, so the fan stayed off until the 105 °C thermal force. The start-threshold now
+  judges "is the fan genuinely meant to run?" on the pre-step-rate demand and spins the fan up to
+  `start_pct` whenever the curve + floor demand survives the stop threshold. Default profiles
+  (`step_up_pct = 100`, `stop_pct = 0`) are byte-identical to before, so the `tuning_sequence`
+  parity oracle is unchanged. Triggered only by the non-default `step_up_pct < stop_pct` combination.
+
+### Internal
+- **GPU fail-cooldown is now driven by an injectable clock (audit P3-7).** `GpuBackend` called
+  `Instant::now()` directly, so the 60 s `GPU_FAIL_COOLDOWN` retry-suppression path could not be
+  exercised under deterministic time. It now takes an `Arc<dyn Clock>` like the override table and
+  lease manager, with a fake-clock test covering the cooldown.
+- **Fewer per-request and per-tick allocations (audit EFF-1/EFF-2/EFF-4).** `/poll` and `/status`
+  read the cache under a shared guard (`cache.read_with`) instead of cloning the whole `DaemonState`;
+  `HistoryRing::record` only allocates a key when the entity is new; the thermal-state setter skips
+  its exclusive write + `String` allocation when the value is unchanged (the engine writes it every
+  tick, almost always `"normal"`).
+- **The engine caches its per-activation evaluation plan (audit EFF-3).** The topological control
+  order and the curve-id → index map are computed once per profile activation and reused each tick
+  rather than rebuilt every second, invalidated whenever the active profile changes or the engine
+  re-anchors (DEC-188 activation-epoch bump).
+
 ## [2.2.2] — 2026-06-27
 
 ### Fixed

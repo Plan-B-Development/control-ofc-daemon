@@ -21,6 +21,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use super::PwmCommand;
+use crate::clock::Clock;
 use crate::constants;
 use crate::health::cache::StateCache;
 use crate::serial::protocol::NUM_CHANNELS;
@@ -305,6 +306,11 @@ pub(crate) struct GpuBackend {
     /// cooldown elapses. Prevents 1/sec journal spam when PMFW rejects the
     /// value. Key: fan_id, Value: (failed_speed_pct, failure_instant).
     fail_cache: HashMap<String, (u8, std::time::Instant)>,
+    /// Monotonic clock for the [`constants::GPU_FAIL_COOLDOWN`] TTL (P3-7).
+    /// Injectable so the 60 s cooldown can be exercised under deterministic
+    /// fake time, mirroring `OverrideTable`/`LeaseManager`; production uses
+    /// [`crate::clock::SystemClock`].
+    clock: Arc<dyn Clock>,
 }
 
 impl GpuBackend {
@@ -312,10 +318,21 @@ impl GpuBackend {
         cache: Arc<StateCache>,
         gpu_infos: Arc<Vec<crate::hwmon::gpu_detect::AmdGpuInfo>>,
     ) -> Self {
+        Self::with_clock(cache, gpu_infos, Arc::new(crate::clock::SystemClock))
+    }
+
+    /// Construct on an injected clock. Tests advance a fake clock to exercise
+    /// the fail-cooldown deterministically instead of sleeping 60 s.
+    pub(crate) fn with_clock(
+        cache: Arc<StateCache>,
+        gpu_infos: Arc<Vec<crate::hwmon::gpu_detect::AmdGpuInfo>>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         Self {
             cache,
             gpu_infos,
             fail_cache: HashMap::new(),
+            clock,
         }
     }
 
@@ -371,7 +388,8 @@ impl WriteBackend for GpuBackend {
             // recently.
             if let Some((failed_pct, failed_at)) = self.fail_cache.get(&cmd.member_id) {
                 if *failed_pct == cmd.pwm_percent
-                    && failed_at.elapsed() < constants::GPU_FAIL_COOLDOWN
+                    && self.clock.now().saturating_duration_since(*failed_at)
+                        < constants::GPU_FAIL_COOLDOWN
                 {
                     continue;
                 }
@@ -420,7 +438,7 @@ impl WriteBackend for GpuBackend {
                 }
                 _ => {
                     self.fail_cache
-                        .insert(fan_id, (cmd.pwm_percent, std::time::Instant::now()));
+                        .insert(fan_id, (cmd.pwm_percent, self.clock.now()));
                 }
             }
         }
@@ -678,6 +696,71 @@ mod tests {
         be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 70)])
             .await;
         assert_eq!(be.fail_cache_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn gpu_backend_fail_cooldown_is_clock_gated() {
+        // P3-7: with an injectable clock the 60 s GPU_FAIL_COOLDOWN is testable
+        // deterministically. A failed write is retried only after the cooldown
+        // elapses on the daemon's clock — advanced here instead of sleeping.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        struct AdvanceClock {
+            base: std::time::Instant,
+            offset_ms: AtomicU64,
+        }
+        impl Clock for AdvanceClock {
+            fn now(&self) -> std::time::Instant {
+                self.base + std::time::Duration::from_millis(self.offset_ms.load(Ordering::SeqCst))
+            }
+        }
+        let clock = Arc::new(AdvanceClock {
+            base: std::time::Instant::now(),
+            offset_ms: AtomicU64::new(0),
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut gpu, _good) = fake_gpu(&dir);
+        // Curve path under a not-yet-existing subdir → the first write fails.
+        let sub = dir.path().join("sub");
+        let curve_path = sub.join("fan_curve");
+        gpu.fan_curve_path = Some(curve_path.clone());
+        let cache = Arc::new(StateCache::new());
+        let mut be = GpuBackend::with_clock(cache, Arc::new(vec![gpu]), clock.clone());
+
+        // t=0: write fails (parent dir missing) → cached.
+        be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 70)])
+            .await;
+        assert_eq!(be.fail_cache_len(), 1, "failed write must be cached");
+
+        // Make the path writable so a *retry* could succeed.
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(&curve_path, "").unwrap();
+
+        // Within the cooldown: same speed suppressed — no retry, file stays empty.
+        clock.offset_ms.store(
+            (constants::GPU_FAIL_COOLDOWN / 2).as_millis() as u64,
+            Ordering::SeqCst,
+        );
+        be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 70)])
+            .await;
+        assert!(
+            std::fs::read_to_string(&curve_path).unwrap().is_empty(),
+            "within cooldown the failed speed must not be retried"
+        );
+        assert_eq!(be.fail_cache_len(), 1);
+
+        // Past the cooldown: the retry fires, succeeds, and clears the cache.
+        clock.offset_ms.store(
+            (constants::GPU_FAIL_COOLDOWN + std::time::Duration::from_secs(1)).as_millis() as u64,
+            Ordering::SeqCst,
+        );
+        be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 70)])
+            .await;
+        assert!(
+            !std::fs::read_to_string(&curve_path).unwrap().is_empty(),
+            "after the cooldown the failed speed must be retried"
+        );
+        assert_eq!(be.fail_cache_len(), 0, "successful retry clears the cache");
     }
 
     // ── hwmon backend ────────────────────────────────────────────────

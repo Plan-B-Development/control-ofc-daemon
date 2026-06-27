@@ -65,6 +65,21 @@ impl StateCache {
         state.clone()
     }
 
+    /// Run `f` against the live state under a shared read guard, returning its
+    /// result without cloning the whole `DaemonState`.
+    ///
+    /// EFF-1: the read-only response builders (`build_*`, `compute_health`) only
+    /// borrow `&DaemonState`. `/poll` and `/status` are the most frequent
+    /// requests (the GUI polls at 1 Hz); calling `snapshot()` for them clones
+    /// the entire state (five `HashMap`s + owned `String`s) just to read it.
+    /// `read_with` lets those builders run under the guard with no intermediate
+    /// clone. `f` must NOT call back into `self` (the parking_lot read guard is
+    /// not reentrant) — keep it to pure reads of the borrowed `&DaemonState`.
+    pub fn read_with<R>(&self, f: impl FnOnce(&DaemonState) -> R) -> R {
+        let state = self.inner.read();
+        f(&state)
+    }
+
     /// Clone only the sensor map. The profile engine's curve evaluation and
     /// thermal-safety scan read sensors but none of the fan/AIO state, so this
     /// avoids cloning the rest of `DaemonState` on every tick.
@@ -147,7 +162,18 @@ impl StateCache {
     }
 
     /// Update the thermal safety override state.
+    ///
+    /// EFF-4: the profile engine calls this every tick (1 Hz) and the value is
+    /// `"normal"` the vast majority of the time. Take a shared read lock to
+    /// compare first and skip the exclusive write + `String` allocation when
+    /// unchanged. The engine tick is the sole writer of this field
+    /// (`profile_engine::run`), so the read→write gap cannot race another
+    /// writer; a concurrent reader only ever sees the old or new value, never a
+    /// torn one.
     pub fn set_thermal_override_state(&self, state_str: &str) {
+        if self.inner.read().thermal_override_state.as_deref() == Some(state_str) {
+            return;
+        }
         let mut state = self.inner.write();
         state.thermal_override_state = Some(state_str.to_string());
     }
@@ -388,6 +414,56 @@ mod tests {
         cache.update_openfan_fans(vec![rewritten]);
         let snap = cache.snapshot();
         assert_eq!(snap.openfan_fans[&0].last_commanded_pwm, Some(60));
+    }
+
+    #[test]
+    fn read_with_observes_live_state_without_snapshot() {
+        // EFF-1: read_with runs a closure against the live state under a shared
+        // read guard and returns a derived value, with no full DaemonState
+        // clone. It must observe exactly what snapshot() would.
+        let cache = StateCache::new();
+        cache.set_thermal_override_state("emergency");
+        cache.update_sensors(vec![]);
+
+        let via_read_with = cache.read_with(|s| s.thermal_override_state.clone());
+        let via_snapshot = cache.snapshot().thermal_override_state;
+        assert_eq!(via_read_with, via_snapshot);
+        assert_eq!(via_read_with.as_deref(), Some("emergency"));
+    }
+
+    #[test]
+    fn set_thermal_override_state_applies_changes_and_is_idempotent() {
+        // EFF-4: the engine calls this every tick. A redundant value is skipped
+        // (no exclusive write / no String alloc) but a genuine change MUST still
+        // land — this guards against an inverted compare dropping real
+        // transitions.
+        let cache = StateCache::new();
+        assert_eq!(cache.snapshot().thermal_override_state, None);
+
+        cache.set_thermal_override_state("normal");
+        assert_eq!(
+            cache.snapshot().thermal_override_state.as_deref(),
+            Some("normal")
+        );
+
+        // Redundant write — value stays correct.
+        cache.set_thermal_override_state("normal");
+        assert_eq!(
+            cache.snapshot().thermal_override_state.as_deref(),
+            Some("normal")
+        );
+
+        // Genuine change must be applied, not skipped.
+        cache.set_thermal_override_state("emergency");
+        assert_eq!(
+            cache.snapshot().thermal_override_state.as_deref(),
+            Some("emergency")
+        );
+        cache.set_thermal_override_state("recovery");
+        assert_eq!(
+            cache.snapshot().thermal_override_state.as_deref(),
+            Some("recovery")
+        );
     }
 
     #[test]

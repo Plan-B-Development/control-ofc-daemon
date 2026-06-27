@@ -49,6 +49,26 @@ pub struct PwmCommand {
 ///
 /// Cleared whenever the active profile id changes or no profile is loaded,
 /// mirroring the GUI's `_on_profile_changed` → `_reset_hysteresis()`.
+///
+/// EFF-3: per-activation static evaluation plan, cached so the engine does not
+/// rebuild it every 1 Hz tick. The topological control order and the
+/// `curve_id` → index map depend only on the active profile's structure, which
+/// is immutable between activations. Invalidated (set to `None`) the moment the
+/// active profile id changes (`sync_profile_id`) or the engine re-anchors on an
+/// activation-epoch bump (`deactivate`, called by the tick loop on every
+/// `POST /profile/activate`, including same-id re-apply — DEC-188). A `None`
+/// cache therefore always means "recompute on next evaluate".
+#[derive(Debug)]
+struct StaticEvalCache {
+    /// Topological control order (indices into `profile.controls`) so Sync
+    /// dependency resolution is stable without re-running the DFS each tick.
+    order: Vec<usize>,
+    /// `curve_id` → index into `profile.curves`, replacing the per-control
+    /// linear `curves.iter().find(...)` (O(controls × curves)) with an O(1)
+    /// lookup on the hot path.
+    curve_index: HashMap<String, usize>,
+}
+
 #[derive(Debug, Default)]
 pub struct ProfileEngineState {
     /// Last tuned output (pre-rounding f64) per control id.
@@ -75,6 +95,10 @@ pub struct ProfileEngineState {
     deadband_hold_cycles: HashMap<String, u32>,
     /// Id of the profile the current state belongs to.
     active_profile_id: Option<String>,
+    /// EFF-3: cached topological order + curve index for the active profile.
+    /// `None` until the first evaluate after a (re)activation; see
+    /// [`StaticEvalCache`].
+    static_cache: Option<StaticEvalCache>,
 }
 
 impl ProfileEngineState {
@@ -108,6 +132,12 @@ impl ProfileEngineState {
         self.trigger_latch.clear();
         self.deadband_hold_cycles.clear();
         self.active_profile_id = None;
+        // EFF-3: drop the cached eval plan so a re-anchor (epoch bump, thermal
+        // force, or no-profile) rebuilds it against whatever activates next.
+        // (Redundant with the sync_profile_id null below — deactivate also
+        // clears active_profile_id, so the next evaluate rebuilds anyway — but
+        // kept so a deactivated state is internally consistent, not half-cleared.)
+        self.static_cache = None;
     }
 
     /// Drop all cross-tick state for a single control so its next evaluation
@@ -141,8 +171,51 @@ impl ProfileEngineState {
             self.trigger_latch.clear();
             self.deadband_hold_cycles.clear();
             self.active_profile_id = Some(new_id.to_string());
+            // EFF-3: a different profile has a different structure → its cached
+            // order/curve-index no longer applies. Rebuilt lazily next evaluate.
+            self.static_cache = None;
         }
         changed
+    }
+
+    /// EFF-3: build the per-activation [`StaticEvalCache`] if absent or stale.
+    /// Staleness is double-checked cheaply by control count — a freshly built
+    /// cache always has `order.len() == controls.len()`, so an add/remove forces
+    /// a rebuild even if an invalidation path was somehow missed. The common
+    /// path (steady state on one activation) finds a valid cache and does
+    /// nothing.
+    fn ensure_static_cache(&mut self, profile: &DaemonProfile) {
+        let valid = self
+            .static_cache
+            .as_ref()
+            .is_some_and(|c| c.order.len() == profile.controls.len());
+        if !valid {
+            let order = topological_control_order(profile);
+            let curve_index = profile
+                .curves
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.id.clone(), i))
+                .collect();
+            self.static_cache = Some(StaticEvalCache { order, curve_index });
+        }
+    }
+
+    /// Cached topological control order (EFF-3). Empty until
+    /// [`ensure_static_cache`] has run for the active profile.
+    fn eval_order(&self) -> &[usize] {
+        match &self.static_cache {
+            Some(c) => &c.order,
+            None => &[],
+        }
+    }
+
+    /// Cached `curve_id` → `profile.curves` index (EFF-3). `None` for an unknown
+    /// curve id or before [`ensure_static_cache`] has run.
+    fn curve_index_of(&self, curve_id: &str) -> Option<usize> {
+        self.static_cache
+            .as_ref()
+            .and_then(|c| c.curve_index.get(curve_id).copied())
     }
 }
 
@@ -284,6 +357,13 @@ fn apply_tuning_with_floor(
         output = floor;
     }
 
+    // The post-offset/post-floor demand — what the curve + floor want THIS
+    // cycle, captured BEFORE step-rate limiting. The start-threshold (step 5)
+    // judges "is the fan genuinely meant to run?" from this rather than from the
+    // step-rate-capped `output`, so a slow ramp cannot strand a starting fan at
+    // 0 (see step 5 / P3-2).
+    let demand = output;
+
     // 3. Step-rate limiting — only bites when we have a previous cycle's output.
     //    step_up_pct / step_down_pct are per-cycle caps (1Hz here).
     if let Some(last) = last_output {
@@ -304,9 +384,28 @@ fn apply_tuning_with_floor(
 
     // 5. Start threshold — when transitioning from stopped (previous cycle = 0)
     //    back to non-zero, jump up to at least `start_pct` so the fan actually
-    //    spins up instead of stalling at a too-low PWM. Matches the GUI's
-    //    guard: only triggers on the 0 → non-zero transition.
-    if output > 0.0 && matches!(last_output, Some(prev) if prev == 0.0) && control.start_pct > 0.0 {
+    //    spins up instead of stalling at a too-low PWM. Only the 0 → on
+    //    transition triggers it.
+    //
+    //    P3-2 / DEC-192: the trigger is judged on `demand` (the pre-step-rate
+    //    request), NOT the stepped/stopped `output`. With `step_up_pct <
+    //    stop_pct`, step 3 caps a from-stopped fan below `stop_pct`, step 4 then
+    //    snaps it to 0, and the old `output > 0.0` guard could never fire — the
+    //    fan stayed off forever despite the curve demanding it on (until the
+    //    105°C thermal force). Judging on `demand` rescues that case: the
+    //    kick raises the zeroed `output` back to `start_pct`. A demand the
+    //    stop-snap would itself keep off (`demand < stop_pct`) correctly does
+    //    NOT start. For a HARD floor step 4 is skipped, so `demand_wants_on`
+    //    collapses to `demand > 0` and the result is unchanged on that path.
+    //    Default profiles (`step_up_pct = 100`, `stop_pct = 0`) are byte-
+    //    identical to the old guard, so the `tuning_sequence` parity oracle is
+    //    unperturbed.
+    let demand_wants_on =
+        demand > 0.0 && (floor_is_hard || control.stop_pct == 0.0 || demand >= control.stop_pct);
+    if demand_wants_on
+        && matches!(last_output, Some(prev) if prev == 0.0)
+        && control.start_pct > 0.0
+    {
         output = output.max(control.start_pct);
     }
 
@@ -569,6 +668,10 @@ pub fn evaluate_profile_with_overrides(
     overrides: &OverrideSnapshot,
 ) -> Vec<PwmCommand> {
     engine_state.sync_profile_id(&profile.id);
+    // EFF-3: (re)build the cached topological order + curve index for this
+    // activation (no-op on the steady-state path), then evaluate against the
+    // cache instead of rebuilding both every tick.
+    engine_state.ensure_static_cache(profile);
 
     let mut commands = Vec::new();
     // Per-tick control outputs (post-tuning), consumed by Sync curves mirroring
@@ -580,8 +683,12 @@ pub fn evaluate_profile_with_overrides(
 
     // Evaluate in stable topological order so a Sync control's target is already
     // in `tick_outputs` when the Sync mirrors it (DEC-151). Sync-free profiles
-    // keep their natural profile order.
-    for idx in topological_control_order(profile) {
+    // keep their natural profile order. The order is read from the cached plan
+    // (EFF-3) by position, copying each `usize` out so no borrow of
+    // `engine_state` is held across the per-control mutations below.
+    let control_count = engine_state.eval_order().len();
+    for order_pos in 0..control_count {
+        let idx = engine_state.eval_order()[order_pos];
         let control = &profile.controls[idx];
 
         // Transient manual override (DEC-163): pin this control's members to a
@@ -618,11 +725,14 @@ pub fn evaluate_profile_with_overrides(
         let raw_output = if control.mode == "manual" {
             Some(control.manual_output_pct)
         } else {
-            // Find the assigned curve, then resolve via the shared dispatcher
-            // (deadband / trigger latch / mix / sync) — mirrors the GUI's
-            // `_curve_output_for_control` so headless behaviour matches
-            // GUI-driven behaviour.
-            match profile.curves.iter().find(|c| c.id == control.curve_id) {
+            // Find the assigned curve (O(1) via the cached curve index, EFF-3),
+            // then resolve via the shared dispatcher (deadband / trigger latch /
+            // mix / sync) — mirrors the GUI's `_curve_output_for_control` so
+            // headless behaviour matches GUI-driven behaviour.
+            match engine_state
+                .curve_index_of(&control.curve_id)
+                .map(|ci| &profile.curves[ci])
+            {
                 None => {
                     log::debug!(
                         "Control '{}': curve '{}' not found, skipping",
@@ -693,6 +803,13 @@ pub fn evaluate_profile_with_overrides(
             let effective_floor = member_effective_floor(control, member);
             let floor_is_hard = member_is_pump_or_cpu(member);
             let member_pwm = if effective_floor != control.minimum_pct || floor_is_hard {
+                // EFF-4: this per-member step-rate key allocates each tick for
+                // pump/CPU/GPU members. Left as-is deliberately — the key scheme
+                // `{control_id}::m::{member_id}` is load-bearing for
+                // `reset_control`'s prefix sweep, so collapsing it to a composite
+                // key or a cached/scratch buffer would touch the whole
+                // `last_output` map and the override-clear path for a sub-µs,
+                // conditional-path saving. Not worth the hot-loop complexity.
                 let key = format!("{}::m::{}", control.id, member.member_id);
                 let prev_member = engine_state.last_output(&key);
                 let tuned_member = apply_tuning_with_floor(
@@ -2074,6 +2191,124 @@ mod tests {
         );
         // Without start_pct it would be 25; with start_pct=35 from 0 → clamped up to 35
         assert_eq!(cmds[0].pwm_percent, 35);
+    }
+
+    #[test]
+    fn tuning_start_threshold_survives_small_step_up() {
+        // P3-2 / DEC-192: a stopped fan must spin up when the curve genuinely
+        // demands it on, even when step_up_pct < stop_pct. Pre-fix, step-rate
+        // capped the from-zero output below stop_pct, the stop-snap zeroed it,
+        // and the start-kick (gated on output > 0) could never fire — the fan
+        // stayed off forever (until the 105°C thermal force).
+        let mut profile = make_profile("curve", "flat", 10.0);
+        profile.controls[0].stop_pct = 20.0;
+        profile.controls[0].start_pct = 35.0;
+        profile.controls[0].step_up_pct = 5.0; // < stop_pct — the bug trigger
+        let mut state = ProfileEngineState::new();
+
+        // Cycle 1: curve 10 < stop 20 → snap to 0 (fan stopped).
+        let cmds = evaluate_profile(
+            &profile,
+            &make_cache_with_sensor("cpu", 50.0).sensors_snapshot(),
+            &mut state,
+        );
+        assert_eq!(cmds[0].pwm_percent, 0);
+
+        // Cycle 2: curve now demands 60 (well above stop_pct). The demand is
+        // ≥ stop_pct, so the start-kick fires and spins up to start_pct despite
+        // step_up=5 capping the stepped output to 5 → snapped to 0.
+        profile.curves[0].flat_output_pct = Some(60.0);
+        let cmds = evaluate_profile(
+            &profile,
+            &make_cache_with_sensor("cpu", 51.0).sensors_snapshot(),
+            &mut state,
+        );
+        assert_eq!(
+            cmds[0].pwm_percent, 35,
+            "stopped fan must spin up to start_pct despite step_up_pct < stop_pct"
+        );
+    }
+
+    #[test]
+    fn tuning_start_threshold_not_triggered_when_demand_below_stop() {
+        // P3-2 guard: a from-stopped fan whose demand is genuinely below
+        // stop_pct must stay off — the start-kick must NOT over-fire on a
+        // near-zero request the stop threshold should keep stopped.
+        let mut profile = make_profile("curve", "flat", 10.0);
+        profile.controls[0].stop_pct = 20.0;
+        profile.controls[0].start_pct = 35.0;
+        profile.controls[0].step_up_pct = 5.0;
+        let mut state = ProfileEngineState::new();
+
+        // Cycle 1: 10 < stop 20 → 0.
+        let cmds = evaluate_profile(
+            &profile,
+            &make_cache_with_sensor("cpu", 50.0).sensors_snapshot(),
+            &mut state,
+        );
+        assert_eq!(cmds[0].pwm_percent, 0);
+
+        // Cycle 2: demand 15, still < stop 20 → must remain 0 (no spurious start).
+        profile.curves[0].flat_output_pct = Some(15.0);
+        let cmds = evaluate_profile(
+            &profile,
+            &make_cache_with_sensor("cpu", 51.0).sensors_snapshot(),
+            &mut state,
+        );
+        assert_eq!(
+            cmds[0].pwm_percent, 0,
+            "demand below stop_pct must not trigger the start-kick"
+        );
+    }
+
+    #[test]
+    fn eval_static_cache_invalidated_on_profile_change_curve_reorder() {
+        // EFF-3 regression: the cached curve index maps curve_id → slot in
+        // profile.curves. When the active profile changes (the DEC-188 re-anchor
+        // path also routes here — deactivate() clears active_profile_id, so the
+        // next evaluate sees an id change), sync_profile_id MUST null the cache.
+        // If the new profile reorders its curves (same control count, so the
+        // count guard can't catch it), a surviving stale index would resolve the
+        // control to the wrong curve. Remove the sync_profile_id null and this
+        // emits 10 instead of 80.
+        let flat = |id: &str, out: f64| CurveConfig {
+            id: id.into(),
+            name: id.into(),
+            curve_type: "flat".into(),
+            sensor_id: "cpu".into(),
+            flat_output_pct: Some(out),
+            ..Default::default()
+        };
+        let mut profile = make_profile("curve", "flat", 0.0);
+        profile.id = "A".into();
+        profile.controls[0].curve_id = "hot".into();
+        profile.curves = vec![flat("hot", 80.0), flat("cold", 10.0)];
+
+        let mut state = ProfileEngineState::new();
+        let cmds = evaluate_profile(
+            &profile,
+            &make_cache_with_sensor("cpu", 50.0).sensors_snapshot(),
+            &mut state,
+        );
+        assert_eq!(
+            cmds[0].pwm_percent, 80,
+            "control follows curve 'hot' (slot 0)"
+        );
+
+        // Activate a different profile whose curves are reordered so 'hot' is now
+        // slot 1. A stale index (hot→0) would resolve curves[0]='cold' → 10; the
+        // rebuilt index resolves hot→1 → 80.
+        profile.id = "B".into();
+        profile.curves = vec![flat("cold", 10.0), flat("hot", 80.0)];
+        let cmds = evaluate_profile(
+            &profile,
+            &make_cache_with_sensor("cpu", 50.0).sensors_snapshot(),
+            &mut state,
+        );
+        assert_eq!(
+            cmds[0].pwm_percent, 80,
+            "rebuilt curve index must resolve 'hot' after a profile change + reorder"
+        );
     }
 
     #[test]

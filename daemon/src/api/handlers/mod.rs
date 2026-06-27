@@ -208,7 +208,7 @@ pub(crate) fn begin_verify_pause(
 
 pub(crate) fn build_status_response(
     state: &AppState,
-    snap: &DaemonState,
+    thermal_state: String,
     health: crate::health::staleness::HealthSummary,
 ) -> StatusResponse {
     let subsystems = health
@@ -248,12 +248,12 @@ pub(crate) fn build_status_response(
         overall_status: health.overall.to_string(),
         subsystems,
         uptime_seconds: Some(uptime),
-        // DEC-132: surface the profile engine's thermal override state.
-        // `None` only before the engine's first tick — report "normal".
-        thermal_state: snap
-            .thermal_override_state
-            .clone()
-            .unwrap_or_else(|| "normal".to_string()),
+        // DEC-132: surface the profile engine's thermal override state. The
+        // caller extracts it from the cache (defaulting "normal" before the
+        // engine's first tick) so this builder no longer needs a `DaemonState`
+        // snapshot — only the `override_table` lock, which must stay OUTSIDE any
+        // cache read guard to preserve the lock order (EFF-1).
+        thermal_state,
         overrides,
         fan_identify,
     }
