@@ -58,11 +58,39 @@ pub(crate) fn build_sensor_entries(snap: &DaemonState, now: Instant) -> Vec<Sens
                 chip_name: s.chip_name.clone(),
                 temp_type: s.temp_type,
                 thresholds: s.thresholds.as_ref().map(SensorThresholdsResponse::from),
+                // DEC-193: wireless-radio PHY temps (e.g. ath12k WiFi) must not
+                // drive a fan curve — derived from the chip name (the daemon
+                // engine never consults this; it is an advisory hint the GUI uses
+                // to filter its curve-source picker).
+                control_eligible: !crate::hwmon::is_wireless_phy_chip(&s.chip_name),
             }
         })
         .collect();
     // DEC-146 P3-11: deterministic wire order, matching build_fan_entries —
     // and this function's doc comment, which promised "sorted" all along.
+    entries.sort_by(|a, b| a.id.cmp(&b.id));
+    entries
+}
+
+/// Build the sorted list of currently-unavailable sensor entries (DEC-193) from
+/// a cache snapshot — sensors that exist but fail every read (e.g. an `ath12k`
+/// WiFi temp while the radio is down). Surfaced on `/status` + `/poll` for
+/// display only; they are absent from `build_sensor_entries` (evicted on
+/// quarantine).
+pub(crate) fn build_unavailable_entries(
+    snap: &DaemonState,
+    now: Instant,
+) -> Vec<UnavailableSensorEntry> {
+    let mut entries: Vec<UnavailableSensorEntry> = snap
+        .unavailable_sensors
+        .iter()
+        .map(|u| UnavailableSensorEntry {
+            id: u.id.clone(),
+            label: u.label.clone(),
+            reason: u.reason.clone(),
+            unavailable_for_ms: now.duration_since(u.since).as_millis() as u64,
+        })
+        .collect();
     entries.sort_by(|a, b| a.id.cmp(&b.id));
     entries
 }
@@ -209,6 +237,7 @@ pub(crate) fn begin_verify_pause(
 pub(crate) fn build_status_response(
     state: &AppState,
     thermal_state: String,
+    unavailable_sensors: Vec<UnavailableSensorEntry>,
     health: crate::health::staleness::HealthSummary,
 ) -> StatusResponse {
     let subsystems = health
@@ -256,6 +285,7 @@ pub(crate) fn build_status_response(
         thermal_state,
         overrides,
         fan_identify,
+        unavailable_sensors,
     }
 }
 
@@ -444,6 +474,77 @@ mod tests {
         let json = serde_json::to_value(&entries[0]).unwrap();
         assert_eq!(json["chip_name"], "nct6683");
         assert_eq!(json["temp_type"], 3);
+    }
+
+    #[test]
+    fn build_sensor_entries_marks_wireless_phy_not_control_eligible() {
+        // DEC-193: an ath12k WiFi temp is surfaced for display but flagged
+        // control_eligible=false so the GUI won't offer it as a curve source;
+        // a real motherboard/CPU sensor stays eligible.
+        let mut state = DaemonState::default();
+        let now = Instant::now();
+        let mk = |id: &str, chip: &str| crate::health::state::CachedSensorReading {
+            id: id.into(),
+            kind: crate::hwmon::types::SensorKind::MbTemp,
+            label: "temp1".into(),
+            value_c: 44.0,
+            source: crate::health::state::DeviceLabel::Hwmon,
+            updated_at: now,
+            rate_c_per_s: None,
+            session_min_c: None,
+            session_max_c: None,
+            chip_name: chip.into(),
+            temp_type: None,
+            thresholds: None,
+        };
+        state.sensors.insert(
+            "hwmon:ath12k_hwmon:phy0:temp1".into(),
+            mk("hwmon:ath12k_hwmon:phy0:temp1", "ath12k_hwmon"),
+        );
+        state.sensors.insert(
+            "hwmon:k10temp:nodev:Tctl".into(),
+            mk("hwmon:k10temp:nodev:Tctl", "k10temp"),
+        );
+
+        let entries = build_sensor_entries(&state, now);
+        let wifi = entries
+            .iter()
+            .find(|e| e.chip_name == "ath12k_hwmon")
+            .unwrap();
+        let cpu = entries.iter().find(|e| e.chip_name == "k10temp").unwrap();
+        assert!(
+            !wifi.control_eligible,
+            "wireless PHY must not be a curve source"
+        );
+        assert!(cpu.control_eligible, "real sensors stay control-eligible");
+    }
+
+    #[test]
+    fn build_unavailable_entries_sorts_and_computes_age() {
+        // DEC-193: unavailable sensors are surfaced sorted by id, with a
+        // millisecond age since quarantine.
+        let mut state = DaemonState::default();
+        let now = Instant::now();
+        let since = now - std::time::Duration::from_millis(1500);
+        state.unavailable_sensors = vec![
+            crate::health::state::UnavailableSensor {
+                id: "z_sensor".into(),
+                label: "z".into(),
+                reason: "Network is down".into(),
+                since,
+            },
+            crate::health::state::UnavailableSensor {
+                id: "a_sensor".into(),
+                label: "a".into(),
+                reason: "Network is down".into(),
+                since,
+            },
+        ];
+        let entries = build_unavailable_entries(&state, now);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "a_sensor");
+        assert_eq!(entries[1].id, "z_sensor");
+        assert!(entries[0].unavailable_for_ms >= 1500);
     }
 
     #[test]

@@ -35,6 +35,24 @@ pub struct StatusResponse {
     /// Omitted when none are active.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub fan_identify: Vec<IdentifyStatusEntry>,
+    /// Sensors discovered but currently unreadable (DEC-193) — e.g. an `ath12k`
+    /// WiFi temperature while the radio is soft-blocked. Display-only: they are
+    /// evicted from the `sensors` array so a stale value is never served. Omitted
+    /// when none, so the common-case wire shape is unchanged (additive).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unavailable_sensors: Vec<UnavailableSensorEntry>,
+}
+
+/// One present-but-unreadable sensor on the `/status` + `/poll` surface
+/// (DEC-193).
+#[derive(Debug, Clone, Serialize)]
+pub struct UnavailableSensorEntry {
+    pub id: String,
+    pub label: String,
+    /// Human-readable cause — the daemon's hwmon read error.
+    pub reason: String,
+    /// Milliseconds since the sensor was quarantined as unreadable.
+    pub unavailable_for_ms: u64,
 }
 
 /// One active manual override on the `/status` poll surface (DEC-163).
@@ -98,6 +116,12 @@ pub struct SensorEntry {
     /// sensor. Alarm flags are sampled at discovery time only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thresholds: Option<SensorThresholdsResponse>,
+    /// False when this temperature must not be offered as a fan-curve source
+    /// (DEC-193) — currently set only for wireless-radio PHY temps (e.g.
+    /// `ath12k` WiFi), which read `ENETDOWN` whenever the radio is down and
+    /// would strand a curve. Display is unaffected. Always present here; clients
+    /// talking to a pre-2.3.0 daemon that omits it must default to `true`.
+    pub control_eligible: bool,
 }
 
 /// JSON serialization shape for the curated hwmon threshold attributes
@@ -1160,6 +1184,7 @@ mod tests {
             thermal_state: "normal".into(),
             overrides: Vec::new(),
             fan_identify: Vec::new(),
+            unavailable_sensors: Vec::new(),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["api_version"], 1);
@@ -1174,6 +1199,41 @@ mod tests {
         // DEC-163/166: override + identify arrays omitted when empty (additive).
         assert!(json.get("overrides").is_none());
         assert!(json.get("fan_identify").is_none());
+        // DEC-193: unavailable_sensors omitted when empty (additive).
+        assert!(json.get("unavailable_sensors").is_none());
+    }
+
+    #[test]
+    fn status_response_serializes_unavailable_sensors_when_present() {
+        // DEC-193: a quarantined sensor surfaces on /status (and /poll via the
+        // embedded status) with its cause and how long it has been unreadable.
+        let resp = StatusResponse {
+            api_version: API_VERSION,
+            daemon_version: "0.1.0".into(),
+            overall_status: "ok".into(),
+            subsystems: Vec::new(),
+            uptime_seconds: Some(1),
+            thermal_state: "normal".into(),
+            overrides: Vec::new(),
+            fan_identify: Vec::new(),
+            unavailable_sensors: vec![UnavailableSensorEntry {
+                id: "hwmon:ath12k_hwmon:phy0:temp1".into(),
+                label: "temp1".into(),
+                reason: "read error: Network is down (os error 100)".into(),
+                unavailable_for_ms: 4200,
+            }],
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            json["unavailable_sensors"][0]["id"],
+            "hwmon:ath12k_hwmon:phy0:temp1"
+        );
+        assert_eq!(json["unavailable_sensors"][0]["label"], "temp1");
+        assert!(json["unavailable_sensors"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("Network is down"));
+        assert_eq!(json["unavailable_sensors"][0]["unavailable_for_ms"], 4200);
     }
 
     #[test]
@@ -1191,6 +1251,7 @@ mod tests {
             chip_name: "k10temp".into(),
             temp_type: None,
             thresholds: None,
+            control_eligible: true,
         };
         let json = serde_json::to_value(&entry).unwrap();
         assert_eq!(json["id"], "hwmon:k10temp:0000:00:18.3:Tctl");
@@ -1201,6 +1262,8 @@ mod tests {
         assert!(json.get("temp_type").is_none());
         // DEC-117: thresholds omitted entirely when None
         assert!(json.get("thresholds").is_none());
+        // DEC-193: control_eligible is always serialized (a real sensor is true).
+        assert_eq!(json["control_eligible"], true);
     }
 
     #[test]
@@ -1218,6 +1281,7 @@ mod tests {
             chip_name: "nct6683".into(),
             temp_type: Some(5),
             thresholds: None,
+            control_eligible: true,
         };
         let json = serde_json::to_value(&entry).unwrap();
         assert_eq!(json["chip_name"], "nct6683");
@@ -1255,6 +1319,7 @@ mod tests {
                 crit_alarm: Some(false),
                 fault: None,
             }),
+            control_eligible: true,
         };
         let json = serde_json::to_value(&entry).unwrap();
         let thresholds = &json["thresholds"];

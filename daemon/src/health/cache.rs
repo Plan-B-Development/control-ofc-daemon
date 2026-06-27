@@ -330,6 +330,30 @@ impl StateCache {
         state.subsystem_timestamps.aio = Some(now);
         state.snapshot_at = now;
     }
+
+    /// Replace the set of present-but-unreadable sensors (DEC-193) and evict any
+    /// stale cached reading for the listed ids.
+    ///
+    /// Without the eviction, a sensor that was readable and then went
+    /// permanently unreadable (e.g. WiFi soft-blocked → `ENETDOWN`) would linger
+    /// in `sensors` at its last value forever — served as a live temperature and
+    /// even usable as a curve input. Listing it here removes that stale entry;
+    /// when it recovers, the next successful `update_sensors` re-inserts it and
+    /// the poll loop drops it from this set.
+    ///
+    /// The common case (nothing unavailable, nothing previously unavailable)
+    /// takes only a shared read lock and returns — the poll loop calls this every
+    /// tick.
+    pub fn update_unavailable_sensors(&self, unavailable: Vec<UnavailableSensor>) {
+        if unavailable.is_empty() && self.inner.read().unavailable_sensors.is_empty() {
+            return;
+        }
+        let mut state = self.inner.write();
+        for u in &unavailable {
+            state.sensors.remove(&u.id);
+        }
+        state.unavailable_sensors = unavailable;
+    }
 }
 
 impl Default for StateCache {
@@ -664,6 +688,54 @@ mod tests {
             gpu_fans["amd_gpu:0000:2d:00.0"].last_commanded_pct,
             Some(75)
         );
+    }
+
+    #[test]
+    fn update_unavailable_sensors_evicts_stale_reading_and_recovers() {
+        // DEC-193: a sensor that was readable then goes unreadable must be
+        // evicted from `sensors` (no stale value served) and listed as
+        // unavailable; recovery clears the list and lets it re-enter `sensors`.
+        let cache = StateCache::new();
+        cache.update_sensors(vec![make_sensor("hwmon:ath12k_hwmon:phy0:temp1", 48.0)]);
+        assert!(cache
+            .snapshot()
+            .sensors
+            .contains_key("hwmon:ath12k_hwmon:phy0:temp1"));
+
+        cache.update_unavailable_sensors(vec![UnavailableSensor {
+            id: "hwmon:ath12k_hwmon:phy0:temp1".into(),
+            label: "temp1".into(),
+            reason: "read error: Network is down (os error 100)".into(),
+            since: Instant::now(),
+        }]);
+
+        let snap = cache.snapshot();
+        assert!(
+            !snap.sensors.contains_key("hwmon:ath12k_hwmon:phy0:temp1"),
+            "stale reading must be evicted while unavailable"
+        );
+        assert_eq!(snap.unavailable_sensors.len(), 1);
+        assert_eq!(snap.unavailable_sensors[0].label, "temp1");
+
+        // Recovery: an empty unavailable set clears the list; a fresh reading
+        // re-enters `sensors`.
+        cache.update_unavailable_sensors(vec![]);
+        cache.update_sensors(vec![make_sensor("hwmon:ath12k_hwmon:phy0:temp1", 50.0)]);
+        let snap = cache.snapshot();
+        assert!(snap.unavailable_sensors.is_empty());
+        assert!(snap.sensors.contains_key("hwmon:ath12k_hwmon:phy0:temp1"));
+    }
+
+    #[test]
+    fn update_unavailable_sensors_empty_is_noop_fast_path() {
+        // The poll loop calls this every tick; with nothing unavailable it must
+        // not disturb existing sensor state.
+        let cache = StateCache::new();
+        cache.update_sensors(vec![make_sensor("hwmon:k10temp:nodev:Tctl", 55.0)]);
+        cache.update_unavailable_sensors(vec![]);
+        let snap = cache.snapshot();
+        assert!(snap.unavailable_sensors.is_empty());
+        assert!(snap.sensors.contains_key("hwmon:k10temp:nodev:Tctl"));
     }
 
     #[test]

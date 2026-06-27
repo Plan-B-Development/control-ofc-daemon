@@ -119,8 +119,9 @@ pub async fn hwmon_poll_loop(
     sensor_rescan: Arc<std::sync::atomic::AtomicBool>,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    use crate::health::sensor_failure::{SensorFailureTracker, TrackerEvent};
     use crate::hwmon::types::{SensorDescriptor, SensorKind};
-    use std::collections::HashMap;
+    use crate::hwmon::SensorReadOutcome;
     use std::sync::atomic::Ordering;
 
     let hwmon_root = hwmon_root.to_path_buf();
@@ -134,12 +135,16 @@ pub async fn hwmon_poll_loop(
     let mut prev_boot: Option<Duration> = None;
     let mut prev_mono: Option<Instant> = None;
 
-    // DEC-133: cached sensor descriptor set + per-descriptor read-failure
-    // streaks. `Arc` so each tick's spawn_blocking can borrow the set
-    // without cloning descriptor contents.
+    // DEC-133: cached sensor descriptor set. `Arc` so each tick's spawn_blocking
+    // can borrow the set without cloning descriptor contents.
     let mut descriptors: Arc<Vec<SensorDescriptor>> = Arc::new(Vec::new());
     let mut discovered_once = false;
-    let mut read_fail_streaks: HashMap<String, u32> = HashMap::new();
+    // DEC-193: owns per-descriptor read-failure streaks, the re-discovery
+    // throttle, and quarantine of present-but-unreadable sensors (e.g. an
+    // `ath12k` WiFi temp while the radio is down) so they cannot spam the
+    // journal and are surfaced as "unavailable" instead.
+    let mut failure_tracker =
+        SensorFailureTracker::new(crate::constants::SENSOR_READ_FAIL_REDISCOVER_STREAK);
 
     loop {
         tokio::select! {
@@ -170,23 +175,22 @@ pub async fn hwmon_poll_loop(
         prev_boot = Some(now_boot);
         prev_mono = Some(now_mono);
 
-        // DEC-133: decide whether this tick re-runs sensor discovery.
+        // DEC-133/DEC-193: decide whether this tick re-runs sensor discovery.
+        // The failure tracker grants a still-failing descriptor exactly one
+        // re-discovery (the "did it actually unbind?" probe); once quarantined it
+        // no longer asks, which is what ends the per-`threshold` re-discovery spam.
         let rescan_requested = sensor_rescan.swap(false, Ordering::SeqCst);
-        let streak_exceeded = read_fail_streaks
-            .values()
-            .any(|&n| n >= crate::constants::SENSOR_READ_FAIL_REDISCOVER_STREAK);
+        let wants_rediscovery = failure_tracker.wants_rediscovery();
         let cpu_temp_missing = descriptors.iter().all(|d| d.kind != SensorKind::CpuTemp);
         let needs_discovery =
-            !discovered_once || rescan_requested || streak_exceeded || cpu_temp_missing;
+            !discovered_once || rescan_requested || wants_rediscovery || cpu_temp_missing;
         if rescan_requested {
             log::info!("Sensor descriptor refresh requested via /hwmon/rescan");
-        } else if streak_exceeded && discovered_once {
-            let failing: Vec<&str> = read_fail_streaks
-                .iter()
-                .filter(|(_, &n)| n >= crate::constants::SENSOR_READ_FAIL_REDISCOVER_STREAK)
-                .map(|(id, _)| id.as_str())
-                .collect();
-            log::warn!("Re-discovering sensors after persistent read failures on {failing:?}");
+        } else if wants_rediscovery && discovered_once {
+            log::warn!(
+                "Re-discovering sensors after persistent read failures on {:?}",
+                failure_tracker.rediscovery_ids()
+            );
         }
 
         // Run blocking sysfs I/O on the blocking thread pool
@@ -198,15 +202,19 @@ pub async fn hwmon_poll_loop(
         let result: Result<_, tokio::task::JoinError> = tokio::task::spawn_blocking(move || {
             // Sensor leg: full discovery only when triggered; otherwise the
             // hot path reads each cached descriptor's temp*_input file only.
-            let sensors: Result<(Option<Vec<SensorDescriptor>>, Vec<_>), crate::error::HwmonError> =
-                if needs_discovery {
-                    crate::hwmon::discovery::discover_sensors(&root).map(|fresh| {
-                        let readings = crate::hwmon::read_sensor_values(&fresh);
-                        (Some(fresh), readings)
-                    })
-                } else {
-                    Ok((None, crate::hwmon::read_sensor_values(&descs)))
-                };
+            // The read returns successes *and* failures (DEC-193) — the loop owns
+            // logging/quarantine policy, so this blocking leg stays silent.
+            let sensors: Result<
+                (Option<Vec<SensorDescriptor>>, SensorReadOutcome),
+                crate::error::HwmonError,
+            > = if needs_discovery {
+                crate::hwmon::discovery::discover_sensors(&root).map(|fresh| {
+                    let outcome = crate::hwmon::read_sensor_values(&fresh);
+                    (Some(fresh), outcome)
+                })
+            } else {
+                Ok((None, crate::hwmon::read_sensor_values(&descs)))
+            };
             let fan_states: Vec<HwmonFanState> = read_hwmon_fan_states(&hdrs);
             // AMD + Intel discrete GPU fans share the cache `gpu_fans` map,
             // distinguished by their ID prefix (`amd_gpu:` / `intel_gpu:`).
@@ -217,7 +225,7 @@ pub async fn hwmon_poll_loop(
         .await;
 
         match result {
-            Ok((Ok((fresh_descriptors, readings)), fan_states, gpu_fan_states)) => {
+            Ok((Ok((fresh_descriptors, outcome)), fan_states, gpu_fan_states)) => {
                 consecutive_errors = 0;
                 if let Some(fresh) = fresh_descriptors {
                     if !discovered_once || rescan_requested {
@@ -225,18 +233,25 @@ pub async fn hwmon_poll_loop(
                     }
                     descriptors = Arc::new(fresh);
                     discovered_once = true;
-                    read_fail_streaks.clear();
                 }
 
-                // Track per-descriptor read failures: a descriptor present in
-                // the cache but absent from this tick's readings failed.
-                let read_ids: std::collections::HashSet<&str> =
-                    readings.iter().map(|r| r.id.as_str()).collect();
-                for d in descriptors.iter() {
-                    if read_ids.contains(d.id.as_str()) {
-                        read_fail_streaks.remove(&d.id);
-                    } else {
-                        *read_fail_streaks.entry(d.id.clone()).or_insert(0) += 1;
+                let SensorReadOutcome { readings, failures } = outcome;
+
+                // DEC-193: advance the failure tracker against the active
+                // descriptor set. It quarantines a still-present-but-unreadable
+                // sensor after one re-discovery probe (logged once), recovers it
+                // on the next good read (logged once), and forgets a genuinely
+                // unbound descriptor — replacing the old per-tick streak loop and
+                // its 1-Hz `Failed to read sensor` spam.
+                for event in failure_tracker.record_tick(&descriptors, &failures, Instant::now()) {
+                    match event {
+                        TrackerEvent::Quarantined { id, reason } => log::warn!(
+                            "Sensor {id} unreadable ({reason}); suppressing further \
+                             read-failure logs until it recovers"
+                        ),
+                        TrackerEvent::Recovered { id } => {
+                            log::info!("Sensor {id} is readable again")
+                        }
                     }
                 }
 
@@ -251,6 +266,10 @@ pub async fn hwmon_poll_loop(
                 // surfaces coolant temp on /status + /poll when a cooler exists.
                 let aio_state = derive_aio_state(&cached, Instant::now());
                 cache.update_sensors(cached);
+                // Sync the quarantine set into the cache: evicts any stale
+                // reading for an unavailable sensor and surfaces it on
+                // /status + /poll (display-only). Cheap no-op when none.
+                cache.update_unavailable_sensors(failure_tracker.unavailable());
                 if let Some(aio) = aio_state {
                     cache.update_aio(aio);
                 }
@@ -539,6 +558,17 @@ mod tests {
         fs::write(dir.join("temp1_label"), "Composite\n").unwrap();
     }
 
+    /// Write a chip whose `temp1_input` exists (so discovery creates a
+    /// descriptor) but holds unparseable data, so every value-read fails while
+    /// the sysfs node persists — the present-but-unreadable shape of an `ath12k`
+    /// WiFi temp with the radio off (DEC-193).
+    fn write_unreadable_chip(root: &std::path::Path, dir: &str, chip: &str) {
+        let d = root.join(dir);
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("name"), format!("{chip}\n")).unwrap();
+        fs::write(d.join("temp1_input"), "garbage\n").unwrap();
+    }
+
     /// Write a fake NZXT Kraken (z53) into the tempdir sysfs root: a single
     /// `temp1` = coolant (no label needed — chip name classifies it).
     fn write_kraken(root: &std::path::Path, coolant_c: f64) {
@@ -763,6 +793,67 @@ mod tests {
         assert!(
             sensor_by_label(&h.cache, "Composite").is_some(),
             "read-failure streak must trigger re-discovery and pick up the new chip"
+        );
+
+        stop(h).await;
+    }
+
+    /// DEC-193: a sensor present in sysfs but failing every read (an `ath12k`
+    /// WiFi temp while the radio is down) is quarantined — surfaced as
+    /// unavailable, kept out of `sensors`, and it stops driving re-discovery so
+    /// it no longer spams the journal. We prove the loop is no longer
+    /// re-discovering by adding a fresh chip *after* quarantine and asserting it
+    /// is NOT picked up — a still-re-discovering loop would surface it.
+    #[tokio::test(start_paused = true)]
+    async fn poll_loop_quarantines_present_but_unreadable_sensor() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Readable CPU sensor → no cpu_temp_missing trigger forcing per-tick
+        // discovery, isolating the failure-driven re-discovery path.
+        write_k10temp(tmp.path(), 55.0);
+        write_unreadable_chip(tmp.path(), "hwmon3", "ath12k_hwmon");
+        let h = spawn_poll_loop(tmp.path().to_path_buf());
+
+        // Advance past STREAK + the single re-discovery + quarantine.
+        let ticks = crate::constants::SENSOR_READ_FAIL_REDISCOVER_STREAK + 4;
+        for _ in 0..ticks {
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+        }
+
+        let snap = h.cache.snapshot();
+        assert!(
+            sensor_by_label(&h.cache, "Tctl").is_some(),
+            "the readable CPU sensor stays in service"
+        );
+        assert_eq!(
+            snap.unavailable_sensors.len(),
+            1,
+            "the unreadable WiFi temp must be quarantined as unavailable"
+        );
+        assert!(snap.unavailable_sensors[0].id.contains("ath12k_hwmon"));
+        assert!(snap.unavailable_sensors[0]
+            .reason
+            .contains("invalid temperature"));
+        assert!(
+            !snap.sensors.values().any(|s| s.chip_name == "ath12k_hwmon"),
+            "an unreadable sensor must never be served as a live reading"
+        );
+
+        // A new chip appears AFTER quarantine. Because the WiFi temp is
+        // quarantined (no re-discovery) and the CPU sensor is present (no
+        // cpu_temp_missing trigger), the loop performs NO discovery — so the new
+        // chip stays invisible. This is the anti-spam property at the loop level.
+        write_nvme(tmp.path());
+        for _ in 0..(crate::constants::SENSOR_READ_FAIL_REDISCOVER_STREAK + 2) {
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+        }
+        assert!(
+            sensor_by_label(&h.cache, "Composite").is_none(),
+            "a quarantined sensor must stop driving re-discovery (no journal spam)"
+        );
+        assert_eq!(
+            h.cache.snapshot().unavailable_sensors.len(),
+            1,
+            "the quarantine stays stable — surfaced once, not re-churned"
         );
 
         stop(h).await;

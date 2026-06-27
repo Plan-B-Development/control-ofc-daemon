@@ -116,6 +116,28 @@ pub struct AmdGpuFanState {
     pub updated_at: Instant,
 }
 
+/// A sensor that was discovered but currently fails every read (DEC-193).
+///
+/// Distinct from a *stale* reading (a sensor that read recently but not this
+/// instant) and from a *vanished* descriptor (a device unbound from sysfs):
+/// this is a descriptor that is still present but whose `temp*_input` read
+/// fails persistently — e.g. an `ath12k` WiFi-radio temperature while the radio
+/// is soft-blocked (`ENETDOWN`). The polling loop quarantines such sensors so
+/// they stop spamming the journal, evicts their stale cached reading, and
+/// surfaces them here for display-only (Diagnostics) visibility.
+#[derive(Debug, Clone)]
+pub struct UnavailableSensor {
+    /// Stable sensor ID (matches what it would have on `/sensors` when readable).
+    pub id: String,
+    /// Human-friendly label from discovery.
+    pub label: String,
+    /// Human-readable cause — the hwmon read error (e.g.
+    /// "read error: /sys/.../temp1_input: Network is down (os error 100)").
+    pub reason: String,
+    /// When the sensor was quarantined as unreadable.
+    pub since: Instant,
+}
+
 /// Placeholder for AIO pump state (future implementation).
 #[derive(Debug, Clone, Default)]
 pub struct AioPumpState {
@@ -176,6 +198,11 @@ pub struct DaemonState {
     /// `POST /gpu/{id}/fan/reset` (DEC-165). The engine skips writing these so a
     /// reset is durable under an active profile; cleared on profile activation.
     pub relinquished_gpu_fans: HashSet<String>,
+    /// Sensors discovered but currently unreadable (DEC-193). Maintained by the
+    /// hwmon poll loop's `SensorFailureTracker`; surfaced on `/status` + `/poll`
+    /// for display. Sensors listed here are evicted from `sensors` so a stale
+    /// value is never served.
+    pub unavailable_sensors: Vec<UnavailableSensor>,
 }
 
 impl Default for DaemonState {
@@ -192,6 +219,7 @@ impl Default for DaemonState {
             verify_in_progress: false,
             verify_active_until: None,
             relinquished_gpu_fans: HashSet::new(),
+            unavailable_sensors: Vec::new(),
         }
     }
 }

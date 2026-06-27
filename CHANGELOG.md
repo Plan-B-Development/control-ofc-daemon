@@ -1,5 +1,29 @@
 # Changelog
 
+## [2.3.0] — 2026-06-27
+
+### Fixed
+- **A present-but-unreadable sensor no longer spams the journal (DEC-193).** A sensor that is
+  discovered but fails every read — the canonical case is an `ath12k` WiFi-radio temperature
+  returning `ENETDOWN` while the radio is soft-blocked — used to emit a `WARN Failed to read
+  sensor …` every tick (1 Hz) *and* a `WARN Re-discovering sensors after persistent read failures
+  …` every 5 ticks forever (the read-failure→re-discovery recovery, meant for a device *unbound*
+  mid-session, kept re-finding the still-present descriptor and rebuilding the streak). A new
+  `SensorFailureTracker` collapses this into a bounded two-line story per sensor: it earns exactly
+  one re-discovery probe, then — if still failing — is **quarantined** (logged once, suppressed
+  thereafter) and recovers silently with a single info line when it reads again. A genuinely
+  unbound descriptor is still dropped as before.
+
+### Added
+- **`unavailable_sensors` on `/status` + `/poll` (DEC-193).** Quarantined sensors are surfaced
+  (id, label, read-error reason, and how long they have been unavailable) for display only, and
+  their stale cached reading is evicted from `sensors` so a sensor that goes unreadable is never
+  served at its last value. Omitted from the wire when empty (additive; `api_version` unchanged).
+- **`control_eligible` on each sensor entry (DEC-193).** `false` for wireless-radio PHY temps
+  (e.g. `ath12k`/`iwlwifi`), which must never drive a fan curve — they read `ENETDOWN` whenever
+  the radio is down. Advisory: the GUI drops them from its curve-source picker; the engine never
+  consults it and display is unaffected.
+
 ## [2.2.3] — 2026-06-27
 
 ### Fixed

@@ -8,8 +8,8 @@ use axum::http::StatusCode;
 use axum::response::Json;
 
 use super::{
-    build_fan_entries, build_sensor_entries, build_status_response, error_response, json_ok,
-    AppState,
+    build_fan_entries, build_sensor_entries, build_status_response, build_unavailable_entries,
+    error_response, json_ok, AppState,
 };
 use crate::api::responses::*;
 use crate::health::staleness::compute_health;
@@ -30,13 +30,19 @@ pub async fn status_handler(State(state): State<Arc<AppState>>) -> Json<StatusRe
     // EFF-1: read the state once under a shared guard instead of cloning the
     // whole `DaemonState`. Only pure reads happen inside; the override_table
     // lock in `build_status_response` stays outside the guard.
-    let (health, thermal_state) = state.cache.read_with(|snap| {
+    let (health, thermal_state, unavailable) = state.cache.read_with(|snap| {
         (
             compute_health(snap, &state.staleness_config, now),
             thermal_state_of(snap),
+            build_unavailable_entries(snap, now),
         )
     });
-    Json(build_status_response(&state, thermal_state, health))
+    Json(build_status_response(
+        &state,
+        thermal_state,
+        unavailable,
+        health,
+    ))
 }
 
 /// GET /sensors — cached sensor readings.
@@ -66,10 +72,11 @@ pub async fn poll_handler(State(state): State<Arc<AppState>>) -> Json<PollRespon
     // the most frequent request (the GUI polls /poll at 1 Hz) no longer clones
     // the entire state. The `override_table` lock lives in
     // `build_status_response`, kept outside this guard to preserve lock order.
-    let (health, thermal_state, sensors, fans) = state.cache.read_with(|snap| {
+    let (health, thermal_state, unavailable, sensors, fans) = state.cache.read_with(|snap| {
         (
             compute_health(snap, &state.staleness_config, now),
             thermal_state_of(snap),
+            build_unavailable_entries(snap, now),
             build_sensor_entries(snap, now),
             build_fan_entries(snap, now),
         )
@@ -77,7 +84,7 @@ pub async fn poll_handler(State(state): State<Arc<AppState>>) -> Json<PollRespon
 
     Json(PollResponse {
         api_version: API_VERSION,
-        status: build_status_response(&state, thermal_state, health),
+        status: build_status_response(&state, thermal_state, unavailable, health),
         sensors,
         fans,
     })
