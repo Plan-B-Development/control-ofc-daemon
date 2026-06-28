@@ -29,7 +29,8 @@ are:
 | Unix socket | World-readable (`0666`) by design (DEC-049) — connections must not require any local-trust beyond "non-root user on this host". Authentication / multi-user policy is out of scope for V1. |
 | Sysfs writes | The daemon writes to `/sys/class/hwmon/*/pwm*`, `/sys/class/hwmon/*/pwm*_enable`, and `/sys/class/drm/*/device/gpu_od/fan_ctrl/fan_curve`. All writes are bounded by hardcoded validation (PWM 0–255, percent 0–100). |
 | Serial I/O | `/dev/ttyACM*` and `/dev/ttyUSB*` access for the OpenFanController, scoped via systemd `DeviceAllow=` and `SupplementaryGroups=uucp`. |
-| Profile and config parsing | TOML / JSON deserialization of operator-supplied files. The daemon refuses unknown fields (`#[serde(deny_unknown_fields)]`). |
+| Config parsing | TOML deserialization of `daemon.toml` / `runtime.toml`. These config structs refuse unknown fields (`#[serde(deny_unknown_fields)]`). |
+| Profile parsing | JSON deserialization of operator-supplied profiles. Profiles **intentionally do not** use `deny_unknown_fields`: every field is `#[serde(default)]` and unknown curve types fall through, so newer profiles stay forward-compatible on older daemons. Safety comes from explicit validation (bounds, floors, filesystem-safe ids — DEC-173), not from rejecting unknown keys. |
 | Persistence | Atomic tmp+rename writes with `0600` permissions for `daemon_state.json` and `runtime.toml`. |
 
 The daemon never executes operator-supplied code, never opens network

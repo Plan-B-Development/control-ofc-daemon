@@ -1,7 +1,9 @@
 # ADR-001: IPC transport — HTTP over Unix domain socket
 
 **Status:** Accepted (v1.0.0).
-**Last reviewed:** 2026-04 (no change).
+**Last reviewed:** 2026-06 — transport unchanged; the Context's payload examples
+predate the 2.0.0 sole-writer cutover (client-facing PWM writes and lease
+operations were retired then — DEC-165). The transport decision itself stands.
 
 ## Context
 

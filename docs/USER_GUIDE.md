@@ -26,7 +26,7 @@ The daemon provides a local API that a GUI (or scripts) can use to monitor tempe
 | AMD GPU fans (RDNA3+, PMFW) | Yes | Yes (daemon-driven via PMFW fan curve) |
 | AMD GPU fans (pre-RDNA3) | Yes | Yes (daemon-driven via pwm1) |
 | Intel Arc discrete GPU fans (`xe` / `i915`) | Yes (RPM) | No — firmware-managed, no kernel PWM interface (DEC-121) |
-| AIO coolers | Not yet | Not yet |
+| AIO coolers (hwmon-attached) | Yes — coolant temp (`CoolantTemp` kind) + pump RPM (DEC-156) | Yes — hwmon pump PWM via the guided Configure-AIO flow, constant-speed pump (DEC-157) |
 
 ## Installation
 
@@ -35,11 +35,14 @@ The daemon provides a local API that a GUI (or scripts) can use to monitor tempe
 cd daemon
 cargo build --release
 
-# Install binary
-sudo cp target/release/control-ofc-daemon /usr/local/bin/
+# Install (run from inside daemon/ — this is a Cargo workspace, so the binary
+# and packaging files are one level up, under the workspace root)
+sudo cp ../target/release/control-ofc-daemon /usr/local/bin/
 
-# Install systemd service
-sudo cp packaging/control-ofc-daemon.service /etc/systemd/system/
+# Install systemd service + example config
+sudo cp ../packaging/control-ofc-daemon.service /etc/systemd/system/
+sudo mkdir -p /etc/control-ofc
+sudo cp ../packaging/daemon.toml.example /etc/control-ofc/daemon.toml
 sudo systemctl daemon-reload
 sudo systemctl enable --now control-ofc-daemon
 ```
@@ -336,7 +339,7 @@ The daemon persists the active profile selection to `/var/lib/control-ofc/daemon
 
 ### Profile storage (CRUD)
 
-Since 2.0.0 the daemon is the profile **store of record** (DEC-160): stored profiles live under `/var/lib/control-ofc/profiles/`, and the full document is served and edited over the API. The GUI uses this surface; scripts can too.
+Since v1.19.0 the daemon is the profile **store of record** (DEC-160): stored profiles live under `/var/lib/control-ofc/profiles/`, and the full document is served and edited over the API. The GUI uses this surface; scripts can too.
 
 ```bash
 SOCK="/run/control-ofc/control-ofc.sock"
@@ -374,9 +377,10 @@ Profile ids are filesystem-safe stems (non-empty, ≤128 bytes, no `/`, `\`, `..
 
 ### Profile search directories
 
-The daemon searches for profiles in:
-1. `/etc/control-ofc/profiles` (always included)
-2. `$HOME/.config/control-ofc/profiles` (or `$XDG_CONFIG_HOME/control-ofc/profiles`)
+The daemon searches for profiles in (highest priority first):
+1. `/var/lib/control-ofc/profiles` — the daemon-owned **store of record**, prepended at startup so CRUD-created profiles are always found first (DEC-160)
+2. `/etc/control-ofc/profiles` (always included)
+3. `$HOME/.config/control-ofc/profiles` (or `$XDG_CONFIG_HOME/control-ofc/profiles`; `/root/.config/...` when `HOME` is unset for the systemd service)
 
 Additional directories can be registered at runtime via the API:
 
@@ -463,6 +467,6 @@ The daemon enforces the following safety rules:
 - **Missing sensor fallback** — if no CPU temperature sensor reports for 5 consecutive polling cycles, all OpenFan and hwmon fans are forced to 40% as a defensive measure (GPU fans excluded, as above).
 - **Override visibility** — the current thermal-override state is reported as `thermal_state` in `GET /status` (`normal`, `recovery`, `emergency`, or `no_sensor_fallback`); the GUI shows a poll-driven thermal banner from it (DEC-165). The GUI has no fan-control loop of its own to pause — the daemon owns control throughout.
 - **OpenFanController stop timeout** — 0% PWM is allowed for a maximum of 8 seconds per channel, after which further 0% commands are rejected until a non-zero value is sent.
-- **Hwmon PWM headers** — the daemon does not enforce per-header minimum floors. Safety limits are expressed via the `/capabilities` endpoint and enforced by the GUI's profile constraints.
+- **Per-member minimum floors (DEC-162)** — the daemon reports no per-*header* floor (`min_pwm_percent: 0` for every hwmon header), but it **does** enforce the role-aware minimum the GUI bakes into each control's `minimum_pct`. A profile whose pump/CPU control drops below the hard `HARD_PUMP_CPU_FLOOR_PCT` (30%) is rejected at validation with `400 validation_error` (`FLOOR_TOO_LOW`), and the profile engine re-clamps every member to its effective floor on each eval tick (`member_effective_floor`). So floor safety is daemon-enforced, not merely a GUI profile constraint.
 - **GPU fan curves** are restored to automatic mode on daemon shutdown (via `ExecStopPost` in the systemd service file).
 - **Hwmon headers** are restored to automatic mode (`pwm_enable=2`) on daemon shutdown so the BIOS regains thermal control.

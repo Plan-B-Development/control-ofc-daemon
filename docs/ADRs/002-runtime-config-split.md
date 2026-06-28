@@ -141,7 +141,7 @@ On startup:
 - `daemon/src/runtime_config.rs` — type and serde model.
 - `daemon/src/api/handlers/config.rs` — write path with atomic
   tmp+rename and `503 persistence_failed` envelope.
-- `daemon/src/main.rs:452` — startup overlay logic.
+- `daemon/src/main.rs` — `apply_runtime_overlay()` (defined ~`main.rs:257`, invoked at startup ~`main.rs:552`).
 - `packaging/control-ofc-daemon.install` —
   `_strip_legacy_runtime_sections` (1.1.x → 1.2.0 migration).
 - `daemon.md` § Configuration — operator-facing summary.

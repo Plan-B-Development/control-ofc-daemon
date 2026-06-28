@@ -44,13 +44,14 @@ daemon/                     Rust crate (control-ofc-daemon)
       cache.rs              RwLock in-memory cache
       staleness.rs          Health computation (OK/Warn/Crit)
       history.rs            Per-entity time-series ring buffer
+      sensor_failure.rs     SensorFailureTracker — quarantines present-but-unreadable sensors (DEC-193)
     hwmon/
       discovery.rs          hwmon sysfs sensor discovery
       reader.rs             hwmon temp reads
       types.rs              SensorKind, SensorReading, SensorDescriptor
       pwm_discovery.rs      PWM header discovery with stable IDs
-      pwm_control.rs        PWM writes with lease enforcement
-      lease.rs              Exclusive write lease (take/release/renew, 60s TTL)
+      pwm_control.rs        PWM writes with lease enforcement (daemon-internal since 2.0.0)
+      lease.rs              Exclusive write lease (take/release/renew, 60s TTL) — **internal-only since 2.0.0**: the profile engine self-leases; there is no client `/hwmon/lease/*` route (DEC-165)
       aio.rs                Liquid-cooler (AIO) recognition: coolant sensor + is_aio + aio_hwmon cap (DEC-156)
       gpu_detect.rs         AMD GPU detection via sysfs/DRM
       gpu_fan.rs            PMFW fan curve read/write/reset (RDNA3+)
@@ -159,7 +160,7 @@ The profile engine is the **sole writer** as of 2.0.0 (DEC-159/DEC-165); the GUI
 Every sensor/fan/header includes:
 - `id` — stable machine key (never depends on `hwmonN` index or `/dev/sdX`)
 - `label` — best-effort human name
-- `source` — `openfan` | `hwmon`
+- `source` — fan `source` is `openfan` | `hwmon` | `amd_gpu` | `intel_gpu` (the four `KNOWN_MEMBER_SOURCES`); GPU fan ids embed the PCI BDF (`amd_gpu:{bdf}` / `intel_gpu:{bdf}`). Sensor `source` is `hwmon` | `amd_gpu`. (`aio_hwmon` is an *internal* `DeviceLabel` classification, not a wire fan source — AIO pump fans surface as `hwmon`.)
 - `kind`/`type` where applicable
 
 ## Measured vs commanded

@@ -49,6 +49,7 @@ daemon/src/
     state.rs           — CachedSensorReading, CachedFanReading types
     staleness.rs       — Freshness enum + age thresholds
     history.rs         — HistoryRing (per-entity time-series)
+    sensor_failure.rs  — SensorFailureTracker: quarantines present-but-unreadable sensors (DEC-193)
 
   api/
     mod.rs             — API subsystem re-exports
@@ -223,10 +224,10 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/status` | Subsystem health + freshness |
-| GET | `/sensors` | All temperature readings (each entry optionally carries a curated hwmon `thresholds` object — DEC-117) |
-| GET | `/fans` | Fan RPM + last commanded PWM |
-| GET | `/poll` | Batch: status + sensors + fans |
+| GET | `/status` | Subsystem health + freshness; `thermal_state`; `unavailable_sensors[]` (present-but-unreadable sensors, DEC-193) |
+| GET | `/sensors` | All temperature readings (each entry optionally carries a curated hwmon `thresholds` object — DEC-117; each also carries `control_eligible: bool` — DEC-193) |
+| GET | `/fans` | Fan RPM + last commanded PWM (+ `stall_detected`) |
+| GET | `/poll` | Batch: status (incl. `unavailable_sensors[]`) + sensors (incl. `control_eligible`) + fans |
 | GET | `/sensors/history` | Per-entity time-series (ring buffer) |
 | GET | `/events` | Server-Sent Events stream (`event: update`, 5s heartbeat) |
 | GET | `/capabilities` | Device list, feature flags, limits, `amd_gpu.kernel_warnings` (kernel-version regression catalogue, DEC-098) |
@@ -236,6 +237,15 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 | GET | `/diagnostics/hardware` | Hardware readiness report (hwmon chips, GPU, thermal safety, kernel modules, ACPI conflicts, board info) |
 
 As of 2.0.0 the profile engine is the **sole writer** (DEC-159/DEC-165); the GUI sends intent (activate / override / identify) and a few diagnostics calls — there is no bare PWM write surface.
+
+**Sensor quarantine (DEC-193, additive):** a sensor that is discovered but fails
+every read (canonically an `ath12k`/`iwlwifi` WiFi temperature returning
+`ENETDOWN` while the radio is off) is logged once, then evicted from `sensors`
+and surfaced on `/status` + `/poll` as `unavailable_sensors[] = {id, label,
+reason, unavailable_for_ms}`. Each live `sensors` entry also carries
+`control_eligible: bool` (derived from `is_wireless_phy_chip(chip_name)`). Both
+fields are additive — older clients ignore them; the GUI defaults
+`control_eligible = true` and `unavailable_sensors = []` when absent.
 
 ### Write endpoints — fans
 
@@ -285,10 +295,11 @@ Error envelope (all errors):
 }
 ```
 
-Codes:
-- `validation_error` (400, source: validation) — bad input shape, or unknown resource on a known route
+Codes (note `validation_error` is returned with **two** HTTP statuses):
+- `validation_error` (**400**, source: validation) — bad input shape / payload on a known route
+- `validation_error` (**404**, source: validation) — a known route naming a resource that does not exist: unknown profile id (`POST /profile/activate`, `GET`/`DELETE /profiles/{id}`), unknown control on the active profile (override take), unknown fan id (`/fans/{id}/identify`), unknown hwmon header, or unknown GPU id. The HTTP status is 404 but the envelope `code` stays `validation_error`, **not** `not_found`
 - `feature_unavailable` (400, source: validation) — route + device exist, but the device lacks this capability (e.g. GPU fan write with neither PMFW `fan_curve` nor legacy `pwm1`)
-- `not_found` (404, source: validation) — unknown route only
+- `not_found` (404, source: validation) — genuinely unknown *route* only (the catch-all fallback handler)
 - `override_expired` (404, source: validation) — renew/release of a lapsed manual override (DEC-163); re-take
 - `already_exists` (409, source: validation) — `POST /profiles` with a duplicate id (DEC-160)
 - `profile_in_use` (409, source: validation) — `DELETE /profiles/{id}` of the active profile (DEC-160)
