@@ -833,8 +833,10 @@ async fn main() {
     };
 
     // ── Spawn profile engine ─────────────────────────────────────────
-    // Evaluates curves and writes PWM headlessly at 1Hz.
-    // In imperative mode (no profile), the GUI drives PWM writes instead.
+    // Evaluates curves and writes PWM headlessly at 1Hz. The engine is the
+    // sole PWM writer (DEC-159/DEC-165). In imperative mode (no active profile)
+    // nothing autonomous runs — the daemon only writes in response to explicit
+    // API intent (manual override, fan identify); the GUI never writes PWM.
     let engine_handle = {
         let engine_cache = cache.clone();
         let engine_profile = active_profile.clone();

@@ -2,8 +2,9 @@
 //!
 //! Single latched rule: if CPU Tctl reaches 105°C, force all OpenFan channels
 //! and writable hwmon headers to 100%. Hold until Tctl drops to 80°C, then
-//! apply a one-cycle 60% recovery floor before returning control to the
-//! active profile.
+//! hold a 60% recovery floor for two cycles (the release cycle that drops out
+//! of emergency, plus one more recovery-floor cycle) before returning control
+//! to the active profile.
 //!
 //! GPU fans are deliberately excluded from this rule (DEC-130): there is no
 //! GPU emergency threshold. AMD PMFW firmware owns GPU thermal protection
@@ -135,6 +136,18 @@ mod tests {
         rule.evaluate(80.0); // release → recovery
         assert_eq!(rule.evaluate(70.0), Some(60)); // one-cycle recovery floor
         assert_eq!(rule.evaluate(70.0), None); // back to normal
+    }
+
+    #[test]
+    fn recovery_floor_spans_exactly_two_60pct_cycles() {
+        // Pins the module-doc invariant: after release, the 60% floor is held
+        // for TWO cycles — the release cycle plus one recovery-floor cycle —
+        // before control returns to the active profile.
+        let mut rule = ThermalSafetyRule::new();
+        rule.evaluate(105.0); // trigger → emergency
+        assert_eq!(rule.evaluate(80.0), Some(60)); // cycle 1: release at 60%
+        assert_eq!(rule.evaluate(70.0), Some(60)); // cycle 2: recovery floor at 60%
+        assert_eq!(rule.evaluate(70.0), None); // cycle 3: back to profile control
     }
 
     #[test]
