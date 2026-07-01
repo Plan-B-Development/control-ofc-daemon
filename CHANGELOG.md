@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [2.4.0] — 2026-07-01
 
 ### Added
 - **`active_profile_id` / `active_profile_name` on `/status` + `/poll` (DEC-194).** The currently-active
@@ -20,6 +20,9 @@
 - **Override/identify error-envelope tests hardened.** `ipc_integration.rs` now pins the full error
   envelope shape ({code, message, retryable, source}) on a representative override path and the
   `error.code` on the unknown-fan 404; a serde test pins `override_token` as required (no silent default).
+
+Additive `/status` + `/poll` field (DEC-194) plus test/CI hardening (DEC-195); no `api_version` or
+runtime behaviour change. Pairs with `control-ofc-gui` ≥ v2.0.0.
 
 ## [2.3.0] — 2026-06-27
 
