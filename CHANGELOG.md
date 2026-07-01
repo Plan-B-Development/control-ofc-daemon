@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [2.4.1] — 2026-07-01
 
 ### Internal
 - **`profile_engine/mod.rs` split into submodules (Cluster C).** The pure leaf
@@ -10,6 +10,8 @@
   god-module into sibling `pub(crate)` modules, leaving `mod.rs` as the 1 Hz loop +
   evaluation orchestrators + state + tests. Pure code-move, no behaviour change;
   the parity oracle and the DEC-190/188/167/149 safety tests are unchanged and green.
+
+Internal refactor only — no behaviour or contract change. Pairs with `control-ofc-gui` ≥ v2.0.0.
 
 ## [2.4.0] — 2026-07-01
 
