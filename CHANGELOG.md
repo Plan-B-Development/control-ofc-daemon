@@ -13,6 +13,13 @@
 - **Per-commit/PR CI (`.github/workflows/ci.yml`).** `cargo fmt --check`, `cargo clippy -D warnings`,
   `cargo test`, and a per-PR `cargo deny` supply-chain check now run on every push/PR to `main` — the
   standard gates previously ran only at release-tag time (inside `release.yml`).
+- **Parity-oracle drift guard (`.github/workflows/parity.yml`, DEC-195).** On any change to
+  `daemon/tests/fixtures/parity_vectors.json`, CI checks out the GUI repo and asserts the two
+  `parity_vectors.json` copies (DEC-126) are byte-identical — closing the only gap where the shared
+  evaluator oracle could diverge with both repos' CI green.
+- **Override/identify error-envelope tests hardened.** `ipc_integration.rs` now pins the full error
+  envelope shape ({code, message, retryable, source}) on a representative override path and the
+  `error.code` on the unknown-fan 404; a serde test pins `override_token` as required (no silent default).
 
 ## [2.3.0] — 2026-06-27
 

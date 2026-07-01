@@ -1947,6 +1947,29 @@ async fn override_pwm_out_of_range_is_400() {
 }
 
 #[tokio::test]
+async fn override_error_envelope_shape_complete() {
+    // Pin the FULL error envelope (not just `code`) on a representative override
+    // error path, so a change to the {code, message, retryable, source} contract
+    // documented in docs/08 can't slip through with green CI.
+    let (sock, _tx, _d) = start_test_server(app_state_with_control("ctrl1")).await;
+    let (st, body) = uds_post(
+        &sock,
+        "/control/ctrl1/override",
+        &serde_json::json!({"pwm_percent": 150}),
+    )
+    .await;
+    assert_eq!(st, 400, "{body}");
+    let err = &body["error"];
+    assert_eq!(err["code"], "validation_error");
+    assert!(
+        !err["message"].as_str().unwrap_or("").is_empty(),
+        "error.message must be a non-empty string: {body}"
+    );
+    assert_eq!(err["retryable"], false);
+    assert_eq!(err["source"], "validation");
+}
+
+#[tokio::test]
 async fn override_renew_unknown_control_is_404() {
     let (sock, _tx, _d) = start_test_server(app_state_with_control("ctrl1")).await;
     let (st, body) = uds_post(
@@ -2065,6 +2088,9 @@ async fn fan_identify_unknown_fan_is_404() {
     )
     .await;
     assert_eq!(st, 404, "{body}");
+    // Pin the error code, not just the status — a client (or docs/08) relies on
+    // `validation_error` for an unknown fan id.
+    assert_eq!(body["error"]["code"], "validation_error");
 }
 
 #[tokio::test]

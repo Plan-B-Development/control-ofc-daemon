@@ -1180,6 +1180,17 @@ mod tests {
     }
 
     #[test]
+    fn override_token_request_requires_token() {
+        // `override_token` has no serde default — a token-less body must fail to
+        // deserialize, so a renew/release handler can never treat a missing token
+        // as 0. Pins the DEC-163 fencing contract at the type level (cheaper and
+        // more direct than asserting axum's plain-text extractor rejection).
+        assert!(serde_json::from_str::<OverrideTokenRequest>("{}").is_err());
+        let ok: OverrideTokenRequest = serde_json::from_str(r#"{"override_token": 7}"#).unwrap();
+        assert_eq!(ok.override_token, 7);
+    }
+
+    #[test]
     fn status_response_schema() {
         let resp = StatusResponse {
             api_version: API_VERSION,
