@@ -193,6 +193,49 @@ async fn status_endpoint_reflects_thermal_override_state() {
 }
 
 #[tokio::test]
+async fn status_and_poll_surface_active_profile() {
+    // DEC-194: the active profile id+name are mirrored onto /status and /poll so
+    // an external activation (CLI --profile, another client, systemd) shows within
+    // one 1 Hz poll instead of the GUI's slow /profile/active refresh. Both keys
+    // are OMITTED when no profile is active, keeping the additive wire shape
+    // unchanged — a client treats an absent key as "unknown" and falls back to
+    // /profile/active.
+    let state = test_app_state();
+    let active = state.active_profile.clone();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    // Default: no active profile → both keys absent on /status and /poll's status.
+    let (status, json) = uds_get(&path, "/status").await;
+    assert_eq!(status, 200);
+    assert!(
+        json.get("active_profile_id").is_none(),
+        "active_profile_id must be omitted when no profile is active"
+    );
+    assert!(json.get("active_profile_name").is_none());
+    let (_, poll) = uds_get(&path, "/poll").await;
+    assert!(poll["status"].get("active_profile_name").is_none());
+
+    // Activate a profile → id+name appear on both surfaces (same StatusResponse).
+    *active.lock() = Some(DaemonProfile {
+        id: "silent".into(),
+        name: "Silent".into(),
+        version: 7,
+        description: String::new(),
+        controls: Vec::new(),
+        curves: Vec::new(),
+    });
+    let (_, json) = uds_get(&path, "/status").await;
+    assert_eq!(json["active_profile_id"], "silent");
+    assert_eq!(json["active_profile_name"], "Silent");
+    let (_, poll) = uds_get(&path, "/poll").await;
+    assert_eq!(poll["status"]["active_profile_id"], "silent");
+    assert_eq!(poll["status"]["active_profile_name"], "Silent");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
 async fn hardware_diagnostics_endpoint_returns_report() {
     // Exercises the spawn_blocking offload path: the handler performs blocking
     // sysfs/procfs reads on the blocking pool and serializes the report. The

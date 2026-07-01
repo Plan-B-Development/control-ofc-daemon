@@ -224,10 +224,10 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/status` | Subsystem health + freshness; `thermal_state`; `unavailable_sensors[]` (present-but-unreadable sensors, DEC-193) |
+| GET | `/status` | Subsystem health + freshness; `thermal_state`; `unavailable_sensors[]` (present-but-unreadable sensors, DEC-193); `active_profile_id`/`active_profile_name` (active profile, DEC-194) |
 | GET | `/sensors` | All temperature readings (each entry optionally carries a curated hwmon `thresholds` object — DEC-117; each also carries `control_eligible: bool` — DEC-193) |
 | GET | `/fans` | Fan RPM + last commanded PWM (+ `stall_detected`) |
-| GET | `/poll` | Batch: status (incl. `unavailable_sensors[]`) + sensors (incl. `control_eligible`) + fans |
+| GET | `/poll` | Batch: status (incl. `unavailable_sensors[]`, `active_profile_*`) + sensors (incl. `control_eligible`) + fans |
 | GET | `/sensors/history` | Per-entity time-series (ring buffer) |
 | GET | `/events` | Server-Sent Events stream (`event: update`, 5s heartbeat) |
 | GET | `/capabilities` | Device list, feature flags, limits, `amd_gpu.kernel_warnings` (kernel-version regression catalogue, DEC-098) |

@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **`active_profile_id` / `active_profile_name` on `/status` + `/poll` (DEC-194).** The currently-active
+  profile is mirrored onto the status surface so a client can reflect an external activation (CLI
+  `--profile`, another client, systemd) within one 1 Hz poll instead of waiting for its periodic
+  `/profile/active` refresh. Both fields are omitted when no profile is active (additive; `api_version`
+  unchanged).
+
+### Internal
+- **Per-commit/PR CI (`.github/workflows/ci.yml`).** `cargo fmt --check`, `cargo clippy -D warnings`,
+  `cargo test`, and a per-PR `cargo deny` supply-chain check now run on every push/PR to `main` — the
+  standard gates previously ran only at release-tag time (inside `release.yml`).
+
 ## [2.3.0] — 2026-06-27
 
 ### Fixed

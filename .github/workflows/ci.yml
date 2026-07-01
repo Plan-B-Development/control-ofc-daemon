@@ -1,0 +1,77 @@
+name: CI
+
+# Push/PR quality gates for the daemon — the safety-critical PWM writer. The
+# canonical CLAUDE.md "Standard gates" (fmt/clippy/test) run on every change to
+# main, and the DEC-174 supply-chain policy (deny.toml) is enforced per-PR here
+# instead of only at release-tag time. release.yml stays publish-only; this
+# workflow is the correctness net.
+#
+# NOTE: DECISIONS.md, CLAUDE.md and scripts/ are gitignored and never reach the
+# runner, so ADR-parity stays a LOCAL gate (/ship, /meta-audit), not a CI job.
+#
+# Third-party actions are SHA-pinned for supply-chain hygiene; the trailing
+# comment records the human-readable version.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Install build deps
+        # serialport pulls libudev-sys on Linux (see Cargo.lock); it needs
+        # libudev-dev + pkg-config to link. This is the one CI-specific bit that
+        # can't be verified locally — the daemon's equivalent of the GUI's
+        # headless-Qt step. Add libs here if a future -sys dep needs them.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libudev-dev pkg-config
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: cargo test
+        run: cargo test --all-targets --all-features
+
+  deny:
+    # DEC-174 supply-chain gate, moved from release-only to every PR. Runs in its
+    # own container (no project build → no libudev needed) against the committed
+    # Cargo.lock + deny.toml. The advisories lane is allowed to soft-fail so a
+    # freshly-published RustSec advisory doesn't red-X unrelated PRs; bans /
+    # licenses / sources stay hard failures.
+    name: cargo-deny (${{ matrix.checks }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        checks:
+          - advisories
+          - bans licenses sources
+    continue-on-error: ${{ matrix.checks == 'advisories' }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+        with:
+          command: check ${{ matrix.checks }}

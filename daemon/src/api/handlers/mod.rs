@@ -271,6 +271,17 @@ pub(crate) fn build_status_response(
         })
         .collect();
 
+    // Active profile (DEC-194) — mirror id+name onto the poll surface so an
+    // external activation shows within one poll. Tight lock: clone out and drop
+    // the guard within this statement; the override_table lock above is already
+    // released, so lock order (EFF-1) is preserved.
+    let (active_profile_id, active_profile_name) = state
+        .active_profile
+        .lock()
+        .as_ref()
+        .map(|p| (Some(p.id.clone()), Some(p.name.clone())))
+        .unwrap_or((None, None));
+
     StatusResponse {
         api_version: API_VERSION,
         daemon_version: state.daemon_version.clone(),
@@ -286,6 +297,8 @@ pub(crate) fn build_status_response(
         overrides,
         fan_identify,
         unavailable_sensors,
+        active_profile_id,
+        active_profile_name,
     }
 }
 

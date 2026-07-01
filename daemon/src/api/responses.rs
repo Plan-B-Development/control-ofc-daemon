@@ -41,6 +41,17 @@ pub struct StatusResponse {
     /// when none, so the common-case wire shape is unchanged (additive).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unavailable_sensors: Vec<UnavailableSensorEntry>,
+    /// Active profile id + display name, mirrored onto the `/status` + `/poll`
+    /// surface so an external activation (CLI `--profile`, another client,
+    /// systemd) is reflected within one 1 Hz poll instead of the GUI's slow
+    /// `/profile/active` refresh (DEC-194). Both omitted when no profile is
+    /// active, so the common-case wire shape is unchanged (additive) — a client
+    /// treats an absent key (old daemon, or genuinely no profile) as "unknown"
+    /// and falls back to `/profile/active`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_profile_name: Option<String>,
 }
 
 /// One present-but-unreadable sensor on the `/status` + `/poll` surface
@@ -1185,6 +1196,8 @@ mod tests {
             overrides: Vec::new(),
             fan_identify: Vec::new(),
             unavailable_sensors: Vec::new(),
+            active_profile_id: None,
+            active_profile_name: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["api_version"], 1);
@@ -1201,6 +1214,9 @@ mod tests {
         assert!(json.get("fan_identify").is_none());
         // DEC-193: unavailable_sensors omitted when empty (additive).
         assert!(json.get("unavailable_sensors").is_none());
+        // DEC-194: active_profile_* omitted when no profile is active (additive).
+        assert!(json.get("active_profile_id").is_none());
+        assert!(json.get("active_profile_name").is_none());
     }
 
     #[test]
@@ -1222,6 +1238,8 @@ mod tests {
                 reason: "read error: Network is down (os error 100)".into(),
                 unavailable_for_ms: 4200,
             }],
+            active_profile_id: None,
+            active_profile_name: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(
