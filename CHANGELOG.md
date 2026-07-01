@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+### Internal
+- **`profile_engine/mod.rs` split into submodules (Cluster C).** The pure leaf
+  functions — curve/deadband/trigger + Mix/Sync composites + topo ordering
+  (`curve_eval.rs`), the tuning pipeline + per-member floor (`tuning.rs`), and the
+  thermal-safety decision (`safety_tick.rs`) — moved out of the ~4.1k-line
+  god-module into sibling `pub(crate)` modules, leaving `mod.rs` as the 1 Hz loop +
+  evaluation orchestrators + state + tests. Pure code-move, no behaviour change;
+  the parity oracle and the DEC-190/188/167/149 safety tests are unchanged and green.
+
 ## [2.4.0] — 2026-07-01
 
 ### Added
