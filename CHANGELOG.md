@@ -14,7 +14,7 @@
 
 `it8689` deliberately still reports NOT-mainline (DEC-144 policy — 7.1 is not yet the common
 kernel). Comment- and test-only; no behaviour or contract change. (Follow-up flagged:
-enrolling STEALTH ICE in the dual-chip detection table.) Pairs with `control-ofc-gui` ≥ v2.6.2.
+enrolling STEALTH ICE in the dual-chip detection table.) Pairs with `control-ofc-gui` ≥ v2.0.0.
 
 ## [2.4.1] — 2026-07-01
 
