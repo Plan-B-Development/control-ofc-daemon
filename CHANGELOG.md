@@ -1,5 +1,21 @@
 # Changelog
 
+## [2.4.2] — 2026-07-02
+
+### Fixed
+- **Driver-state comments in `diagnostics.rs` refreshed to July 2026 (lockstep with GUI
+  v2.6.2).** Corrected the `chip_driver_in_mainline` / `KNOWN_MODULES` rationale: mainline
+  kernel 7.1 added IT8689E fan *control* (commit `66b8eaf` — six PWM, `FEAT_FANCTL_ONOFF`;
+  released 2026-06-14), not "sensor support"; the enum reference is now verified against
+  v7.1 / 7.2-rc1.
+- **Corrected the X870 AORUS STEALTH ICE comment + test.** Its secondary is an IT8696E +
+  IT87952E pair — not an undriveable "IT8883" (device-ID `0x8883` is only a stuck-config-mode
+  symptom; a clean read is `0x8695`), recovered with `mmio=on` (frankcrawford/it87 #81/#70).
+
+`it8689` deliberately still reports NOT-mainline (DEC-144 policy — 7.1 is not yet the common
+kernel). Comment- and test-only; no behaviour or contract change. (Follow-up flagged:
+enrolling STEALTH ICE in the dual-chip detection table.) Pairs with `control-ofc-gui` ≥ v2.6.2.
+
 ## [2.4.1] — 2026-07-01
 
 ### Internal

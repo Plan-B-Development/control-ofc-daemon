@@ -9,13 +9,14 @@ use super::responses::{AcpiConflictInfo, KernelModuleInfo, ModuleCollisionInfo};
 
 /// Known hwmon driver modules and whether they're in the mainline kernel.
 ///
-/// Note on `it87`: the *module name* exists in the mainline tree, but every
-/// AM5/Z790-class chip we actually care about (IT8625E/IT8686E/IT8688E/
-/// IT8689E/IT8696E/IT87952E) requires the out-of-tree frankcrawford/it87
-/// fork. Marking the module as `false` keeps the modules table honest for
-/// users running the DKMS build — the chip-level mainline column
-/// (`chip_driver_in_mainline`) still reports per-chip accuracy for the
-/// few legacy IT87xx chips that genuinely are upstream.
+/// Note on `it87`: the *module name* exists in the mainline tree, but most
+/// AM5/Z790-class chips people run (IT8625E/IT8686E/IT8688E/IT8696E, and —
+/// pragmatically — IT8689E) still want the out-of-tree frankcrawford/it87
+/// fork. IT8689E fan *control* only landed in mainline 7.1 (commit 66b8eaf)
+/// and IT87952E enumerates since 6.4, but on the 6.12/6.18 LTS kernels most
+/// users run, and for dual-chip control, the DKMS build is what they need.
+/// Marking the module `false` keeps the modules table honest for DKMS users;
+/// the chip-level column (`chip_driver_in_mainline`) reports per-chip.
 const KNOWN_MODULES: &[(&str, bool)] = &[
     ("nct6775", true),
     ("nct6775_core", true),
@@ -72,16 +73,15 @@ fn expected_driver_for_chip(chip_name: &str) -> &'static str {
 
 /// Whether a chip's driver is in the mainline kernel.
 ///
-/// The ITE list mirrors the `enum chips` in mainline
-/// `drivers/hwmon/it87.c` (verified against v6.17). `it8622` added in
-/// DEC-144 — it has been in the mainline enum for years but was missing
-/// here. `it8689` is deliberately NOT listed (DEC-144): mainline gains
-/// IT8689E *sensor* support in kernel 7.1 (commit 66b8eaf), but no
-/// released stable kernel ships it yet and fan *control* on the Gigabyte
-/// boards that carry this chip still requires the out-of-tree DKMS
-/// build's MMIO path — reporting "mainline: yes" would steer users away
-/// from the driver they actually need. Revisit once 7.1+ is the common
-/// floor AND upstream control is proven on these boards.
+/// The ITE list mirrors mainline `it87` chip support
+/// (`drivers/hwmon/it87.c` enum + docs.kernel.org/hwmon/it87.html,
+/// verified against v7.1 / 7.2-rc1). `it8622` added in DEC-144. `it8689`
+/// is deliberately NOT listed (DEC-144, re-evaluated 2026-07): mainline 7.1
+/// added IT8689E fan *control* (commit 66b8eaf — six PWM, FEAT_FANCTL_ONOFF,
+/// not just sensors; released 2026-06-14), but 7.1 is not yet the common
+/// kernel (the 6.12/6.18 LTS lines are) and some Gigabyte Rev 1 boards
+/// still have EC quirks — reporting "mainline: yes" would steer users off
+/// the DKMS build they still need. Revisit once 7.1+ is the common floor.
 pub fn chip_driver_in_mainline(chip_name: &str) -> bool {
     let driver = expected_driver_for_chip(chip_name);
     // ITE chips IT8625E+ require out-of-tree frankcrawford/it87
@@ -568,12 +568,13 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "B850 AI TOP",
         chips: &["it8696", "it87952"],
     },
-    // X870 AORUS STEALTH ICE (frankcrawford/it87 issue #81, still open)
-    // deliberately NOT in this table — its secondary chip is IT8883,
-    // which has no Linux driver (re-checked 2026-06: zero matches in
-    // frankcrawford/it87 master), so a "missing secondary chip" warning
-    // would be permanent and useless. The chip is recognised in the GUI
-    // chip-guidance DB with a "no driver available" note instead.
+    // X870 AORUS STEALTH ICE: NOT enrolled above (yet). The earlier reason —
+    // "secondary chip is an undriveable IT8883" — was wrong: per
+    // frankcrawford/it87 #81/#70 the real pair is IT8696E + IT87952E, and
+    // 0x8883 is only what the secondary reports when stuck in config mode
+    // (clean read 0x8695), recovered with mmio=on. Enrolling it like the
+    // other it8696+it87952 boards is a reasonable follow-up; kept out here to
+    // avoid a behaviour change in the 2026-07 doc-correctness pass.
 ];
 
 /// Look up the chip names a known Gigabyte dual-chip board is expected to
@@ -830,20 +831,21 @@ mod tests {
     #[test]
     fn it8622_is_mainline() {
         // DEC-144: it8622 is in the mainline it87 `enum chips` (verified
-        // against torvalds/linux drivers/hwmon/it87.c v6.17) but was
+        // against torvalds/linux drivers/hwmon/it87.c v7.1 / 7.2-rc1) but was
         // missing from our list — the chips table falsely told IT8622E
         // owners they needed the DKMS build.
         assert!(chip_driver_in_mainline("it8622"));
     }
 
     #[test]
-    fn it8689_stays_out_of_mainline_until_stable_control_exists() {
-        // DEC-144 intent lock: mainline gains IT8689E *sensor* support in
-        // kernel 7.1 (commit 66b8eaf), but no released stable kernel ships
-        // it yet and Gigabyte fan *control* still needs the out-of-tree
-        // DKMS MMIO path. Flipping this to true would steer users away
-        // from the driver they actually need — do not change it without
-        // revisiting DEC-144.
+    fn it8689_stays_out_of_mainline_pending_common_7_1() {
+        // DEC-144 intent lock (re-evaluated 2026-07): mainline 7.1 added
+        // IT8689E fan *control* (commit 66b8eaf — six PWM, FEAT_FANCTL_ONOFF;
+        // released 2026-06-14), not just sensors. We still report it as NOT
+        // mainline because 7.1 is not yet the common kernel (the 6.12/6.18
+        // LTS lines are) and some Gigabyte Rev 1 boards still have EC quirks
+        // — flipping this to true would steer users off the DKMS build they
+        // still need. Do not change without revisiting DEC-144.
         assert!(!chip_driver_in_mainline("it8689"));
     }
 
@@ -1114,11 +1116,11 @@ mod tests {
 
     #[test]
     fn expected_chips_x870_aorus_stealth_ice_not_in_table() {
-        // DEC-106: X870 AORUS STEALTH ICE has IT8883 as secondary
-        // (frankcrawford/it87 issue #81). IT8883 has no Linux driver, so
-        // listing it in `expected_chips` would permanently mis-flag the
-        // board as missing a chip. The chip is documented in the GUI
-        // chip-guidance DB instead.
+        // X870 AORUS STEALTH ICE is an IT8696E + IT87952E board (NOT an
+        // undriveable "IT8883" — corrected 2026-07 per frankcrawford/it87
+        // #81/#70; 0x8883 is only a stuck-config-mode symptom, clean read
+        // 0x8695). It is deliberately left out of the table for now, so
+        // `expected_chips` stays empty; enrolling it is a tracked follow-up.
         let chips =
             expected_chips_for_board("Gigabyte Technology Co., Ltd.", "X870 AORUS STEALTH ICE");
         assert!(chips.is_empty());
