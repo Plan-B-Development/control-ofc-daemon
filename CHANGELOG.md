@@ -1,5 +1,45 @@
 # Changelog
 
+## [2.5.0] — 2026-07-03
+
+Audit-2026-07-03 Cluster 2: post-2.0.0 demolition-debris cleanup. No runtime behaviour
+change except the SSE removal (a documented-but-unused endpoint leaves the API surface).
+
+### Removed
+- **`GET /events` SSE endpoint removed (DEC-198).** The Server-Sent Events stream had zero
+  consumers — the GUI is poll-only and DEC-164 deferred SSE past 2.0.0. Deleted the endpoint,
+  the `sse_clients` counter, the four `SSE_*` constants, the `too_many_clients` error code, and
+  `futures-util` as a direct dependency. **Contract change:** `GET /events` and the
+  `503 too_many_clients` code leave the API; the GUI's `docs/08` is updated in lockstep. Only a
+  hypothetical external SSE client is affected (there are none).
+- **Dead serial write surface (~490 lines).** Removed the never-called
+  `FanController::set_pwm_all` / `set_target_rpm` (and their `Command` variants + result types),
+  `StateCache::set_openfan_commanded_pwm_all`, the unused `MAX_PWM` / `MAX_RPM` consts,
+  `hwmon::collect_sensors`, `WriteBackend::name()`, and two never-constructed error variants —
+  all `pub` (so invisible to the dead_code lint) but with zero production callers since the
+  2.0.0 sole-writer cutover.
+
+### Changed
+- **hwmon PWM writes are arbitrated by a typed in-process token, not a client lease (DEC-197).**
+  Replaced the arbiter's free-form `owner_hint: String` with
+  `enum HwmonWriter { Engine, Verify, ThermalSafety }` and removed three dead members
+  (`is_expired` / `ttl_seconds` / `created_at`). Behaviour-preserving — same state machine and
+  per-write fence, log strings unchanged; the client-lease protocol was already retired at 2.0.0
+  (DEC-165). Verify/calibration exclusion stays arbiter-based so a thermal emergency can still
+  preempt a verify's in-flight restore write.
+- **Trigger-curve defaults (40 / 60 / 30 / 80) extracted to named `pub(crate)` constants** —
+  values byte-for-byte unchanged (cross-stack GUI parity, DEC-126/149).
+- Corrected five stale post-2.0.0 code comments that described a GUI write-loop, a GUI lease, or
+  a PWM floor that no longer exist.
+
+### Security
+- **Config / state / profile JSON reads are capped at 4 MiB** (`atomic_io::read_to_string_capped`,
+  matching the GUI's `load_json_capped`) instead of being buffered whole by the long-lived root
+  process, and the HTTP request-body limit is now explicit (`DefaultBodyLimit::max(4 MiB)`).
+
+Pairs with `control-ofc-gui` ≥ v2.0.0 — the GUI needs no code change; its `docs/08` tracks the
+SSE removal.
+
 ## [2.4.2] — 2026-07-02
 
 ### Fixed

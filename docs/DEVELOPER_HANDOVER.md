@@ -63,7 +63,7 @@ daemon/                     Rust crate (control-ofc-daemon)
       protocol.rs           OpenFanController protocol encode/decode
       transport.rs          Serial transport trait
       real_transport.rs     serialport impl + auto-detect
-      controller.rs         Fan control logic (PWM, target RPM, coalescing)
+      controller.rs         Fan control logic (per-channel PWM writes, coalescing)
     profile.rs              Profile JSON loading + curve evaluation
     profile_store.rs        Daemon-owned profile storage (store of record, DEC-160)
     profile_engine/         Headless 1Hz curve evaluation loop (DEC-135)

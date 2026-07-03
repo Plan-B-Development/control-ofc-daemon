@@ -130,8 +130,10 @@ inside the band cannot pin the pre-settle fan speed indefinitely.
 
 2. **Lease system** (`lease.rs`): Exclusive hwmon write access
    - 60s TTL, holder must renew periodically
-   - Held internally by the profile engine (sole writer, 2.0.0+); guards against
-     conflicting external hwmon writers. The GUI holds no lease (DEC-165).
+   - A daemon-internal single-writer token (`HwmonWriter::{Engine,Verify,ThermalSafety}`,
+     DEC-197) arbitrating the three in-process writers — the profile-engine tick, a hardware
+     verify, and the thermal-safety force. Not a client lease: the GUI holds nothing (DEC-165).
+     A thermal force-take evicts a verify mid-scan, so the verify's stale token is refused.
 
 3. **Stop timeout** (`controller.rs`): OpenFan 0% time limit
    - 8 seconds at 0% PWM, then rejects further 0% commands
