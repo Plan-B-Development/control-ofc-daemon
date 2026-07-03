@@ -1,9 +1,12 @@
 # ADR-001: IPC transport — HTTP over Unix domain socket
 
 **Status:** Accepted (v1.0.0).
-**Last reviewed:** 2026-06 — transport unchanged; the Context's payload examples
+**Last reviewed:** 2026-07 — transport unchanged; the Context's payload examples
 predate the 2.0.0 sole-writer cutover (client-facing PWM writes and lease
 operations were retired then — DEC-165). The transport decision itself stands.
+The SSE (`GET /events`, `text/event-stream`, `SSE_MAX_CLIENTS`, `too_many_clients`)
+details below are **historical** — that endpoint was removed in v2.5.0 (DEC-198);
+it had no consumers.
 
 ## Context
 

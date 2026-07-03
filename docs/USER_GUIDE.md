@@ -140,7 +140,6 @@ including request/response shapes.
 | `GET /sensors` | All temperature readings |
 | `GET /fans` | Fan RPM + last-commanded PWM |
 | `GET /poll` | Combined status + sensors + fans in one round-trip (the GUI's primary 1 Hz read path) |
-| `GET /events` | Server-Sent Events stream of sensor/fan updates (max 5 concurrent clients; the GUI does not consume this — for integration tooling) |
 | `GET /sensors/history?id=...&last=N` | Time-series history for a sensor entity |
 | `GET /hwmon/headers` | Controllable motherboard PWM outputs |
 | `GET /profiles`, `GET /profiles/{id}` | List stored profiles / fetch one full profile document (daemon is the store of record — DEC-160) |

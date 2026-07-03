@@ -65,7 +65,6 @@ daemon/src/
       config.rs        — runtime config endpoints (search dirs, startup delay)
       hw_diagnostics.rs — hardware diagnostics endpoint
     responses.rs       — response structs (Serialize)
-    sse.rs             — Server-Sent Events stream
     calibration.rs     — OpenFan calibration sweep
 
   pwm.rs               — shared percent_to_raw / raw_to_percent conversion
@@ -87,7 +86,7 @@ daemon/src/
 
 ```
 [hwmon sysfs] ──read──> polling loops ──> StateCache ──> API handlers ──> GUI
-[serial USB]  ──read──>                                  SSE stream  ──>
+[serial USB]  ──read──>
 [GPU sysfs]   ──read──>
 
 profile_engine ──read──> StateCache        (SOLE writer, 2.0.0+ — DEC-159/DEC-165)
@@ -229,7 +228,6 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 | GET | `/fans` | Fan RPM + last commanded PWM (+ `stall_detected`) |
 | GET | `/poll` | Batch: status (incl. `unavailable_sensors[]`, `active_profile_*`) + sensors (incl. `control_eligible`) + fans |
 | GET | `/sensors/history` | Per-entity time-series (ring buffer) |
-| GET | `/events` | Server-Sent Events stream (`event: update`, 5s heartbeat) |
 | GET | `/capabilities` | Device list, feature flags, limits, `amd_gpu.kernel_warnings` (kernel-version regression catalogue, DEC-098) |
 | GET | `/hwmon/headers` | Controllable motherboard PWM outputs |
 | GET | `/profiles`, `/profiles/{id}` | Daemon-stored profiles (store of record — DEC-160) |
@@ -309,7 +307,6 @@ Codes (note `validation_error` is returned with **two** HTTP statuses):
 - `internal_error` (500, source: internal)
 - `hardware_unavailable` (503, source: hardware)
 - `persistence_failed` (503, source: internal) — `POST /config/*` could not persist `runtime.toml`
-- `too_many_clients` (503, source: internal) — SSE `GET /events` concurrent-client cap reached
 
 The client-lease codes `lease_required` / `lease_already_held` were retired (DEC-165)
 and fully removed at DEC-170 — a verify-path internal-lease lapse now returns

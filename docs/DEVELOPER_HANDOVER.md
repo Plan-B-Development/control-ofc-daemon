@@ -37,7 +37,6 @@ daemon/                     Rust crate (control-ofc-daemon)
         hw_diagnostics.rs   Hardware diagnostics handler
       responses.rs          JSON response/request types (v1 schema)
       server.rs             Unix socket server lifecycle
-      sse.rs                Server-Sent Events stream
       calibration.rs        OpenFan calibration sweep
     health/
       state.rs              Canonical state model (DaemonState)
@@ -129,7 +128,6 @@ sudo systemctl enable --now control-ofc-daemon
 | `GET /fans` | Fan RPM + last commanded PWM |
 | `GET /poll` | Batch: status + sensors + fans in one call |
 | `GET /sensors/history` | Per-entity time-series history |
-| `GET /events` | SSE real-time sensor/fan stream (max `SSE_MAX_CLIENTS` concurrent; bounded admission retries) |
 | `GET /hwmon/headers` | Discovered controllable PWM headers |
 | `GET /profiles`, `GET /profiles/{id}` | Daemon-stored profiles (store of record, DEC-160) |
 | `GET /profile/active` | Currently active profile info |
