@@ -18,9 +18,6 @@ pub mod reader;
 pub mod types;
 pub mod util;
 
-use std::path::Path;
-
-use crate::error::HwmonError;
 use types::{SensorDescriptor, SensorReading};
 
 /// Default sysfs hwmon root.
@@ -53,20 +50,6 @@ pub struct SensorReadFailure {
     /// Human-readable cause — the [`HwmonError`] display (e.g.
     /// "read error: /sys/.../temp1_input: Network is down (os error 100)").
     pub reason: String,
-}
-
-/// Discover all temperature sensors and read their current values.
-///
-/// Performs fresh discovery on each call. The polling loop does NOT call
-/// this per tick — it caches descriptors and calls [`read_sensor_values`]
-/// instead, re-discovering only on explicit triggers (DEC-133). This
-/// remains the one-shot entry point for discovery + first read.
-pub fn collect_sensors(
-    hwmon_root: &Path,
-) -> Result<(Vec<SensorDescriptor>, Vec<SensorReading>), HwmonError> {
-    let descriptors = discovery::discover_sensors(hwmon_root)?;
-    let readings = read_sensor_values(&descriptors).readings;
-    Ok((descriptors, readings))
 }
 
 /// Read current values for an already-discovered descriptor set.
@@ -111,54 +94,6 @@ pub fn is_wireless_phy_chip(chip_name: &str) -> bool {
 mod tests {
     use super::*;
     use std::fs;
-
-    #[test]
-    fn collect_sensors_end_to_end() {
-        let tmp = tempfile::tempdir().unwrap();
-
-        // Create k10temp device
-        let hwmon0 = tmp.path().join("hwmon0");
-        fs::create_dir_all(&hwmon0).unwrap();
-        fs::write(hwmon0.join("name"), "k10temp\n").unwrap();
-        fs::write(hwmon0.join("temp1_input"), "55000\n").unwrap();
-        fs::write(hwmon0.join("temp1_label"), "Tctl\n").unwrap();
-
-        // Create amdgpu device
-        let hwmon1 = tmp.path().join("hwmon1");
-        fs::create_dir_all(&hwmon1).unwrap();
-        fs::write(hwmon1.join("name"), "amdgpu\n").unwrap();
-        fs::write(hwmon1.join("temp1_input"), "42000\n").unwrap();
-        fs::write(hwmon1.join("temp1_label"), "edge\n").unwrap();
-
-        let (descriptors, readings) = collect_sensors(tmp.path()).unwrap();
-
-        assert_eq!(descriptors.len(), 2);
-        assert_eq!(readings.len(), 2);
-
-        // Verify readings match descriptors
-        assert!((readings[0].value_c - 55.0).abs() < f64::EPSILON);
-        assert!((readings[1].value_c - 42.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn collect_sensors_skips_unreadable() {
-        let tmp = tempfile::tempdir().unwrap();
-
-        let hwmon0 = tmp.path().join("hwmon0");
-        fs::create_dir_all(&hwmon0).unwrap();
-        fs::write(hwmon0.join("name"), "k10temp\n").unwrap();
-        fs::write(hwmon0.join("temp1_input"), "55000\n").unwrap();
-        fs::write(hwmon0.join("temp1_label"), "Tctl\n").unwrap();
-        // temp2 exists in discovery but has bad data
-        fs::write(hwmon0.join("temp2_input"), "garbage\n").unwrap();
-
-        let (descriptors, readings) = collect_sensors(tmp.path()).unwrap();
-
-        assert_eq!(descriptors.len(), 2);
-        // Only the valid reading comes through
-        assert_eq!(readings.len(), 1);
-        assert!((readings[0].value_c - 55.0).abs() < f64::EPSILON);
-    }
 
     /// DEC-193: `read_sensor_values` surfaces failures instead of logging, so a
     /// present-but-unreadable sensor (bad data here) is reported as a failure

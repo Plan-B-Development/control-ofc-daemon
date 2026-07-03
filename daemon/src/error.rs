@@ -15,9 +15,6 @@ pub enum ConfigError {
 /// Serial protocol and transport errors.
 #[derive(Debug, Error)]
 pub enum SerialError {
-    #[error("port unavailable: {path}")]
-    PortUnavailable { path: String },
-
     #[error("timeout after {timeout_ms}ms")]
     Timeout { timeout_ms: u64 },
 
@@ -33,9 +30,6 @@ pub enum SerialError {
 /// and the paths provide significant diagnostic value for troubleshooting.
 #[derive(Debug, Error)]
 pub enum HwmonError {
-    #[error("sensor not found: {id}")]
-    SensorNotFound { id: String },
-
     #[error("read error: {path}: {message}")]
     ReadError { path: String, message: String },
 

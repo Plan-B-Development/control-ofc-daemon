@@ -32,10 +32,6 @@ use crate::serial::protocol::NUM_CHANNELS;
 /// ownership of its gating rules (coalescing, failure caching, lease),
 /// and call it from the loop's apply sequence in `profile_engine_loop`.
 pub(crate) trait WriteBackend {
-    /// Backend name for logs.
-    #[allow(dead_code)] // part of the backend contract; used in tests/logs
-    fn name(&self) -> &'static str;
-
     /// Apply this backend's share of the profile commands.
     ///
     /// The engine is the sole authoritative writer (DEC-165): there is no GUI
@@ -174,10 +170,6 @@ impl OpenFanBackend {
 }
 
 impl WriteBackend for OpenFanBackend {
-    fn name(&self) -> &'static str {
-        "openfan"
-    }
-
     /// OpenFan writes (serial I/O on the blocking pool — lock per command).
     ///
     /// Exact-match coalescing lives below this in `serial::controller`.
@@ -343,10 +335,6 @@ impl GpuBackend {
 }
 
 impl WriteBackend for GpuBackend {
-    fn name(&self) -> &'static str {
-        "amd_gpu"
-    }
-
     /// GPU fan writes (async via spawn_blocking, no lease required).
     ///
     /// Suppresses writes whose delta from the last commanded value is below
@@ -458,10 +446,6 @@ impl HwmonBackend {
 }
 
 impl WriteBackend for HwmonBackend {
-    fn name(&self) -> &'static str {
-        "hwmon"
-    }
-
     /// hwmon writes (auto-lease for headless profile mode).
     ///
     /// The profile engine auto-acquires the lease when writing hwmon members

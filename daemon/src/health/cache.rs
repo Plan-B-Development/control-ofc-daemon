@@ -8,8 +8,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::serial::protocol::NUM_CHANNELS;
-
 use crate::health::state::*;
 
 /// Thread-safe in-memory cache for daemon state.
@@ -254,30 +252,6 @@ impl StateCache {
                     rpm_polled: false,
                 },
             );
-        }
-        state.snapshot_at = now;
-    }
-
-    /// Update the last commanded PWM for all OpenFanController channels.
-    pub fn set_openfan_commanded_pwm_all(&self, pwm: u8) {
-        let now = Instant::now();
-        let mut state = self.inner.write();
-        for ch in 0..NUM_CHANNELS {
-            if let Some(fan) = state.openfan_fans.get_mut(&ch) {
-                fan.last_commanded_pwm = Some(pwm);
-                fan.updated_at = now;
-            } else {
-                state.openfan_fans.insert(
-                    ch,
-                    OpenFanState {
-                        channel: ch,
-                        rpm: 0,
-                        last_commanded_pwm: Some(pwm),
-                        updated_at: now,
-                        rpm_polled: false,
-                    },
-                );
-            }
         }
         state.snapshot_at = now;
     }

@@ -10,12 +10,6 @@ use crate::error::SerialError;
 /// Number of channels on the OpenFanController.
 pub const NUM_CHANNELS: u8 = 10;
 
-/// Maximum valid PWM value (0–255).
-pub const MAX_PWM: u8 = 255;
-
-/// Maximum valid RPM value for set target RPM command.
-pub const MAX_RPM: u16 = 0xFFFF;
-
 /// A channel identifier (0–9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Channel(u8);
@@ -47,10 +41,6 @@ pub enum Command {
     ReadRpm(Channel),
     /// Set PWM on a single channel (switches to open-loop). Wire: `>02{ch:02X}{pwm:02X}\n`
     SetPwm(Channel, u8),
-    /// Set PWM on all channels. Wire: `>03{pwm:02X}\n`
-    SetAllPwm(u8),
-    /// Set target RPM on a single channel (closed-loop EMC2305). Wire: `>04{ch:02X}{rpm:04X}\n`
-    SetTargetRpm(Channel, u16),
 }
 
 impl Command {
@@ -60,8 +50,6 @@ impl Command {
             Command::ReadAllRpm => ">00\n".to_string(),
             Command::ReadRpm(ch) => format!(">01{:02X}\n", ch.index()),
             Command::SetPwm(ch, pwm) => format!(">02{:02X}{:02X}\n", ch.index(), pwm),
-            Command::SetAllPwm(pwm) => format!(">03{:02X}\n", pwm),
-            Command::SetTargetRpm(ch, rpm) => format!(">04{:02X}{:04X}\n", ch.index(), rpm),
         }
     }
 }
@@ -221,34 +209,6 @@ mod tests {
     fn encode_set_pwm_zero() {
         let ch = Channel::new(9).unwrap();
         assert_eq!(Command::SetPwm(ch, 0).encode(), ">020900\n");
-    }
-
-    #[test]
-    fn encode_set_all_pwm() {
-        assert_eq!(Command::SetAllPwm(255).encode(), ">03FF\n");
-    }
-
-    #[test]
-    fn encode_set_all_pwm_zero() {
-        assert_eq!(Command::SetAllPwm(0).encode(), ">0300\n");
-    }
-
-    #[test]
-    fn encode_set_target_rpm() {
-        let ch = Channel::new(5).unwrap();
-        assert_eq!(Command::SetTargetRpm(ch, 1000).encode(), ">040503E8\n");
-    }
-
-    #[test]
-    fn encode_set_target_rpm_max() {
-        let ch = Channel::new(0).unwrap();
-        assert_eq!(Command::SetTargetRpm(ch, 0xFFFF).encode(), ">0400FFFF\n");
-    }
-
-    #[test]
-    fn encode_set_target_rpm_zero() {
-        let ch = Channel::new(3).unwrap();
-        assert_eq!(Command::SetTargetRpm(ch, 0).encode(), ">04030000\n");
     }
 
     // ── Decoding golden tests ───────────────────────────────────────
@@ -460,8 +420,6 @@ mod tests {
             Command::ReadAllRpm,
             Command::ReadRpm(Channel::new(0).unwrap()),
             Command::SetPwm(Channel::new(0).unwrap(), 0),
-            Command::SetAllPwm(0),
-            Command::SetTargetRpm(Channel::new(0).unwrap(), 0),
         ];
         for cmd in commands {
             let encoded = cmd.encode();
