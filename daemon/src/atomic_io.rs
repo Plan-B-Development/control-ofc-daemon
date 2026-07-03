@@ -144,9 +144,55 @@ fn fsync_dir(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Maximum size (bytes) of a daemon-read JSON config/state/profile file. Matches
+/// the GUI's `MAX_IMPORT_BYTES` (paths.py). Files larger than this are rejected
+/// rather than buffered whole — a local DoS / accidental-huge-file guard for a
+/// long-lived root process.
+pub const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Read a file to a `String`, rejecting anything larger than [`MAX_CONFIG_BYTES`]
+/// instead of buffering it whole. Drop-in for `std::fs::read_to_string` at the
+/// daemon's JSON config/state/profile read sites (`profile`, `profile_store`,
+/// `daemon_state`). Sysfs/proc reads stay uncapped — the kernel bounds them.
+pub fn read_to_string_capped(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    File::open(path)?
+        .take(MAX_CONFIG_BYTES + 1)
+        .read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "file exceeds {MAX_CONFIG_BYTES}-byte cap: {}",
+                path.display()
+            ),
+        ));
+    }
+    String::from_utf8(buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_capped_reads_a_normal_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("ok.json");
+        std::fs::write(&p, b"{\"hello\": 1}").unwrap();
+        assert_eq!(read_to_string_capped(&p).unwrap(), "{\"hello\": 1}");
+    }
+
+    #[test]
+    fn read_capped_rejects_oversized_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("huge.json");
+        // One byte over the 4 MiB cap must be refused, not read into memory.
+        std::fs::write(&p, vec![b'a'; (MAX_CONFIG_BYTES + 1) as usize]).unwrap();
+        let err = read_to_string_capped(&p).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
 
     #[test]
     fn writes_content_to_destination() {

@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use axum::Router;
 use tokio::net::UnixListener;
@@ -104,6 +105,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(handlers::update_startup_delay_handler),
         )
         .fallback(handlers::fallback_handler)
+        // Explicit 4 MiB request-body cap (S1): profile POSTs are the only
+        // large ingress; matches the file-read cap in `atomic_io`.
+        .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
         .with_state(state)
 }
 

@@ -69,7 +69,7 @@ pub fn delete(store_dir: &Path, id: &str) -> Result<bool, String> {
 /// (store first), so a stored profile shadows a same-id preset.
 pub fn get_raw(search_dirs: &[PathBuf], id: &str) -> Option<serde_json::Value> {
     let path = crate::profile::find_profile(id, search_dirs)?;
-    let content = std::fs::read_to_string(&path).ok()?;
+    let content = crate::atomic_io::read_to_string_capped(&path).ok()?;
     serde_json::from_str(&content).ok()
 }
 
@@ -89,7 +89,7 @@ pub fn list(search_dirs: &[PathBuf]) -> Vec<ProfileSummary> {
             .collect();
         json_files.sort(); // deterministic order within a directory
         for path in json_files {
-            let Ok(content) = std::fs::read_to_string(&path) else {
+            let Ok(content) = crate::atomic_io::read_to_string_capped(&path) else {
                 continue;
             };
             let Ok(profile) = serde_json::from_str::<DaemonProfile>(&content) else {

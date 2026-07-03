@@ -276,7 +276,7 @@ fn evaluate_trigger_stateless(curve: &CurveConfig, temp_c: f64) -> f64 {
 
 /// Load a profile from a JSON file.
 pub fn load_profile(path: &Path) -> Result<DaemonProfile, String> {
-    let content = std::fs::read_to_string(path)
+    let content = crate::atomic_io::read_to_string_capped(path)
         .map_err(|e| format!("failed to read profile '{}': {e}", path.display()))?;
     let profile: DaemonProfile = serde_json::from_str(&content)
         .map_err(|e| format!("failed to parse profile '{}': {e}", path.display()))?;

@@ -79,7 +79,7 @@ pub fn load_state_from(dir: &Path) -> DaemonState {
     if !path.exists() {
         return DaemonState::default();
     }
-    match std::fs::read_to_string(&path) {
+    match crate::atomic_io::read_to_string_capped(&path) {
         Ok(content) => match serde_json::from_str::<DaemonState>(&content) {
             Ok(state) => state,
             Err(e) => {
@@ -104,7 +104,7 @@ pub fn load_state() -> DaemonState {
         );
         return DaemonState::default();
     }
-    match std::fs::read_to_string(&path) {
+    match crate::atomic_io::read_to_string_capped(&path) {
         Ok(content) => match serde_json::from_str::<DaemonState>(&content) {
             Ok(state) => {
                 log::info!(
