@@ -469,7 +469,7 @@ impl HwmonPwmController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hwmon::lease::LeaseManager;
+    use crate::hwmon::lease::{HwmonWriter, LeaseManager};
     use parking_lot::Mutex;
     use std::collections::HashMap as StdHashMap;
     use std::time::Duration;
@@ -581,7 +581,10 @@ mod tests {
     fn set_pwm_with_valid_lease() {
         let (mut ctrl, writes, _cache) = setup_controller(vec![make_header("h1", "CHA_FAN1", 20)]);
 
-        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
         let result = ctrl.set_pwm("h1", 50, &lease.lease_id).unwrap();
 
         assert_eq!(result.header_id, "h1");
@@ -600,7 +603,10 @@ mod tests {
         // Manual mode is set on first write per lease, then skipped (coalescing)
         let (mut ctrl, writes, _cache) = setup_controller(vec![make_header("h1", "CHA_FAN1", 0)]);
 
-        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
         ctrl.set_pwm("h1", 50, &lease.lease_id).unwrap();
         ctrl.set_pwm("h1", 75, &lease.lease_id).unwrap();
 
@@ -617,7 +623,10 @@ mod tests {
         // No floor clamping — thermal safety handled by ThermalSafetyRule
         let (mut ctrl, _writes, _cache) = setup_controller(vec![make_header("h1", "CHA_FAN1", 0)]);
 
-        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
         let result = ctrl.set_pwm("h1", 10, &lease.lease_id).unwrap();
 
         assert_eq!(result.pwm_percent, 10); // no clamping
@@ -628,7 +637,10 @@ mod tests {
         // CPU headers no longer have special floor — safety is centralized
         let (mut ctrl, _writes, _cache) = setup_controller(vec![make_header("h1", "CPU_FAN", 0)]);
 
-        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
         let result = ctrl.set_pwm("h1", 0, &lease.lease_id).unwrap();
         assert_eq!(result.pwm_percent, 0);
     }
@@ -637,7 +649,10 @@ mod tests {
     fn set_pwm_chassis_allows_zero() {
         let (mut ctrl, _writes, _cache) = setup_controller(vec![make_header("h1", "CHA_FAN1", 20)]);
 
-        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
         let result = ctrl.set_pwm("h1", 0, &lease.lease_id).unwrap();
         assert_eq!(result.pwm_percent, 0);
     }
@@ -646,7 +661,10 @@ mod tests {
     fn set_pwm_unknown_header() {
         let (mut ctrl, _writes, _cache) = setup_controller(vec![make_header("h1", "CHA_FAN1", 20)]);
 
-        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
         let err = ctrl
             .set_pwm("nonexistent", 50, &lease.lease_id)
             .unwrap_err();
@@ -663,7 +681,10 @@ mod tests {
     fn set_pwm_invalid_percent() {
         let (mut ctrl, _writes, _cache) = setup_controller(vec![make_header("h1", "CHA_FAN1", 20)]);
 
-        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
         let err = ctrl.set_pwm("h1", 200, &lease.lease_id).unwrap_err();
 
         match err {
@@ -682,7 +703,10 @@ mod tests {
     #[test]
     fn set_pwm_boundary_100_accepted_101_rejected() {
         let (mut ctrl, _writes, _cache) = setup_controller(vec![make_header("h1", "CHA_FAN1", 0)]);
-        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
         let lid = lease.lease_id.clone();
 
         // 100 — exact boundary, must succeed (full speed is a legal value).
@@ -714,7 +738,10 @@ mod tests {
     fn set_pwm_updates_cache() {
         let (mut ctrl, _writes, cache) = setup_controller(vec![make_header("h1", "CHA_FAN1", 20)]);
 
-        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
         ctrl.set_pwm("h1", 75, &lease.lease_id).unwrap();
 
         let snap = cache.snapshot();
@@ -731,7 +758,10 @@ mod tests {
         let headers = vec![make_header("h1", "CHA_FAN1", 20)];
         let mut ctrl = HwmonPwmController::new(headers, lease_mgr, Box::new(writer), cache);
 
-        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
         let id = lease.lease_id.clone();
 
         std::thread::sleep(Duration::from_millis(5));
@@ -756,7 +786,10 @@ mod tests {
         ];
         let mut ctrl = HwmonPwmController::new(headers, lease_mgr, Box::new(writer), cache);
 
-        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
         let lid = lease.lease_id.clone();
 
         // First write succeeds (lease still valid)
@@ -777,7 +810,10 @@ mod tests {
     fn on_lease_released_resets_manual_mode() {
         let (mut ctrl, writes, _cache) = setup_controller(vec![make_header("h1", "CHA_FAN1", 20)]);
 
-        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
         let lease_id = lease.lease_id.clone();
         ctrl.set_pwm("h1", 50, &lease_id).unwrap();
 
@@ -786,7 +822,10 @@ mod tests {
         ctrl.on_lease_released();
 
         // Take new lease and write again — should set enable mode again
-        let lease2 = ctrl.lease_manager_mut().take_lease("gui2").unwrap();
+        let lease2 = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Verify)
+            .unwrap();
         ctrl.set_pwm("h1", 60, &lease2.lease_id).unwrap();
 
         let writes = writes.lock();
@@ -818,7 +857,7 @@ mod tests {
 
         let lease = ctrl
             .lease_manager_mut()
-            .take_lease("gui")
+            .take_lease(HwmonWriter::Engine)
             .expect("take lease");
         ctrl.set_pwm("h1", 75, &lease.lease_id).unwrap();
 
@@ -842,7 +881,10 @@ mod tests {
         // Two identical set_pwm calls → second produces zero sysfs writes
         let (mut ctrl, writes, _cache) = setup_controller(vec![make_header("h1", "CHA_FAN1", 0)]);
 
-        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
         ctrl.set_pwm("h1", 50, &lease.lease_id).unwrap();
         ctrl.set_pwm("h1", 50, &lease.lease_id).unwrap(); // identical
 
@@ -856,7 +898,10 @@ mod tests {
         // Different value after coalesced call → only PWM written (enable skipped)
         let (mut ctrl, writes, _cache) = setup_controller(vec![make_header("h1", "CHA_FAN1", 0)]);
 
-        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
         ctrl.set_pwm("h1", 50, &lease.lease_id).unwrap();
         ctrl.set_pwm("h1", 50, &lease.lease_id).unwrap(); // coalesced
         ctrl.set_pwm("h1", 75, &lease.lease_id).unwrap(); // different
@@ -872,14 +917,20 @@ mod tests {
         // After lease release + new lease → enable written on first call again
         let (mut ctrl, writes, _cache) = setup_controller(vec![make_header("h1", "CHA_FAN1", 0)]);
 
-        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
         let lid = lease.lease_id.clone();
         ctrl.set_pwm("h1", 50, &lid).unwrap(); // enable + pwm
 
         ctrl.lease_manager_mut().release_lease(&lid).unwrap();
         ctrl.on_lease_released();
 
-        let lease2 = ctrl.lease_manager_mut().take_lease("gui2").unwrap();
+        let lease2 = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Verify)
+            .unwrap();
         ctrl.set_pwm("h1", 50, &lease2.lease_id).unwrap(); // same value, new lease
 
         let writes = writes.lock();
@@ -899,7 +950,7 @@ mod tests {
 
         let lease = ctrl
             .lease_manager_mut()
-            .take_lease("gui")
+            .take_lease(HwmonWriter::Engine)
             .expect("take lease");
         ctrl.set_pwm("h1", 60, &lease.lease_id).unwrap();
         let snap1 = cache.snapshot();
@@ -990,7 +1041,10 @@ mod tests {
             })],
         );
 
-        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
         let result = ctrl.set_pwm("h1", 50, &lease.lease_id);
 
         assert!(result.is_err());
@@ -1030,7 +1084,10 @@ mod tests {
             ],
         );
 
-        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
         let result = ctrl.set_pwm("h1", 50, &lease.lease_id);
 
         assert!(result.is_err());
@@ -1065,7 +1122,10 @@ mod tests {
             })],
         );
 
-        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
         let _ = ctrl.set_pwm("h1", 50, &lease.lease_id);
 
         // Only the enable write was attempted — PWM write never reached
@@ -1096,7 +1156,10 @@ mod tests {
         let (mut ctrl, writes, _cache) =
             setup_controller_with_enable(vec![make_header("h1", "CHA_FAN1", 0)], "2");
 
-        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
 
         // First write: manual_mode_set=false, watchdog skipped, sets enable+PWM
         ctrl.set_pwm("h1", 50, &lease.lease_id).unwrap();
@@ -1119,7 +1182,10 @@ mod tests {
         let (mut ctrl, writes, _cache) =
             setup_controller_with_enable(vec![make_header("h1", "CHA_FAN1", 0)], "1");
 
-        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
         ctrl.set_pwm("h1", 50, &lease.lease_id).unwrap();
         ctrl.set_pwm("h1", 50, &lease.lease_id).unwrap(); // coalesced
 
@@ -1135,7 +1201,10 @@ mod tests {
         let (mut ctrl, writes, _cache) =
             setup_controller_with_enable(vec![make_header("h1", "CHA_FAN1", 0)], "2");
 
-        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
         ctrl.set_pwm("h1", 50, &lease.lease_id).unwrap();
         ctrl.set_pwm("h1", 50, &lease.lease_id).unwrap(); // would coalesce but BIOS reclaimed
 
@@ -1150,7 +1219,10 @@ mod tests {
         let (mut ctrl, _writes, _cache) =
             setup_controller_with_enable(vec![make_header("h1", "CHA_FAN1", 0)], "2");
 
-        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
         let lid = lease.lease_id.clone();
         ctrl.set_pwm("h1", 50, &lid).unwrap();
         ctrl.set_pwm("h1", 60, &lid).unwrap(); // triggers revert
@@ -1158,7 +1230,10 @@ mod tests {
         ctrl.lease_manager_mut().release_lease(&lid).unwrap();
         ctrl.on_lease_released();
 
-        let lease2 = ctrl.lease_manager_mut().take_lease("gui2").unwrap();
+        let lease2 = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Verify)
+            .unwrap();
         ctrl.set_pwm("h1", 70, &lease2.lease_id).unwrap();
         ctrl.set_pwm("h1", 80, &lease2.lease_id).unwrap(); // triggers revert again
 
@@ -1170,7 +1245,10 @@ mod tests {
         let (mut ctrl, writes, cache) =
             setup_controller_with_enable(vec![make_header("h1", "CHA_FAN1", 0)], "1");
 
-        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
         ctrl.set_pwm("h1", 50, &lease.lease_id).unwrap(); // enable + pwm
 
         // Simulate system resume
@@ -1331,7 +1409,10 @@ mod tests {
         let (mut ctrl, _writes, _cache) =
             setup_controller_with_enable(vec![make_header("h1", "CHA_FAN1", 0)], "2");
 
-        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
         let lid = lease.lease_id.clone();
 
         // First write seeds manual_mode_set; subsequent writes each hit the
@@ -1416,7 +1497,10 @@ mod tests {
             cache.clone(),
         );
 
-        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
         // 50% → raw 128. The mock reports back 153, triggering the mismatch.
         ctrl.set_pwm("h1", 50, &lease.lease_id).unwrap();
 
@@ -1446,7 +1530,10 @@ mod tests {
             cache.clone(),
         );
 
-        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
         ctrl.set_pwm("h1", 50, &lease.lease_id).unwrap();
 
         assert!(
@@ -1473,7 +1560,10 @@ mod tests {
             cache.clone(),
         );
 
-        let lease = ctrl.lease_manager_mut().take_lease("gui").unwrap();
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
         let lid = lease.lease_id.clone();
         ctrl.set_pwm("h1", 30, &lid).unwrap();
         ctrl.set_pwm("h1", 40, &lid).unwrap();

@@ -9,6 +9,7 @@ use axum::response::Json;
 
 use super::{error_response, json_ok, AppState};
 use crate::api::responses::*;
+use crate::hwmon::lease::HwmonWriter;
 
 /// The set of sensor entity ids currently discovered on this machine, used to
 /// flag (as a warning, never an error) curve `sensor_id`s that aren't present
@@ -221,7 +222,7 @@ pub async fn deactivate_profile_handler(
         let release_id = guard
             .lease_manager()
             .active_lease()
-            .filter(|l| l.owner_hint == "profile-engine")
+            .filter(|l| l.owner == HwmonWriter::Engine)
             .map(|l| l.lease_id.clone());
         if let Some(id) = release_id {
             if let Err(e) = guard.lease_manager_mut().release_lease(&id) {

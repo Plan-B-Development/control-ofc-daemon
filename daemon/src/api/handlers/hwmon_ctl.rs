@@ -10,6 +10,7 @@ use axum::response::Json;
 
 use super::{error_response, json_ok, AppState};
 use crate::api::responses::*;
+use crate::hwmon::lease::HwmonWriter;
 use crate::hwmon::pwm_control::HwmonControlError;
 
 /// GET /hwmon/headers — list discovered controllable PWM headers.
@@ -206,7 +207,9 @@ pub async fn hwmon_verify_handler(
     // path — including a cancelled or panicked future.
     let verify_lease_id = {
         let mut ctrl = controller.lock();
-        ctrl.lease_manager_mut().force_take_lease("verify").lease_id
+        ctrl.lease_manager_mut()
+            .force_take_lease(HwmonWriter::Verify)
+            .lease_id
     };
     let _verify_lease = VerifyLeaseGuard {
         controller: controller.clone(),
@@ -423,7 +426,7 @@ mod tests {
         // The AlreadyHeld arm used to map to 409 lease_already_held; after the
         // DEC-170 collapse it joins the wildcard → 503 hardware_unavailable.
         let err = HwmonControlError::Lease(LeaseError::AlreadyHeld {
-            owner_hint: "verify".into(),
+            owner: HwmonWriter::Verify,
             ttl_seconds: 6,
         });
         let (status, body) = hwmon_control_error_response(err);
@@ -561,7 +564,7 @@ mod tests {
         let lease_id = ctrl
             .lock()
             .lease_manager_mut()
-            .force_take_lease("verify")
+            .force_take_lease(HwmonWriter::Verify)
             .lease_id;
         assert!(ctrl.lock().lease_manager().active_lease().is_some());
         {

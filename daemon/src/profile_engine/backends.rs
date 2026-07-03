@@ -24,6 +24,7 @@ use super::PwmCommand;
 use crate::clock::Clock;
 use crate::constants;
 use crate::health::cache::StateCache;
+use crate::hwmon::lease::HwmonWriter;
 use crate::serial::protocol::NUM_CHANNELS;
 
 /// One fan-control backend the profile engine writes through.
@@ -483,8 +484,8 @@ impl WriteBackend for HwmonBackend {
                     // `verify_active` gate (mod.rs), the engine still reaches
                     // here. Adopting the verify's lease would let the engine
                     // write through it and clobber the test value — the bug the
-                    // single up-front check did not close. Excluding owner_hint
-                    // "verify" makes `take_lease` below return AlreadyHeld ⇒
+                    // single up-front check did not close. Excluding the
+                    // `Verify` owner makes `take_lease` below return AlreadyHeld ⇒
                     // `lease_id = None` ⇒ the engine skips its hwmon writes this
                     // tick; the verify's RAII guard releases the lease when it
                     // ends and the next tick re-acquires. Thermal-safety is NOT
@@ -492,13 +493,13 @@ impl WriteBackend for HwmonBackend {
                     // that lease as before, so there is no post-thermal stall.
                     // `None` ⇒ acquire.
                     mgr.active_lease()
-                        .filter(|lease| lease.owner_hint != "verify")
+                        .filter(|lease| lease.owner != HwmonWriter::Verify)
                         .map(|lease| lease.lease_id.clone())
                 };
                 existing.or_else(|| {
                     guard
                         .lease_manager_mut()
-                        .take_lease("profile-engine")
+                        .take_lease(HwmonWriter::Engine)
                         .ok()
                         .map(|l| l.lease_id)
                 })
@@ -557,7 +558,7 @@ impl SafetyWriteBackend for HwmonBackend {
                 let hdr_ids: Vec<String> = guard.headers().iter().map(|h| h.id.clone()).collect();
                 let lease_id = guard
                     .lease_manager_mut()
-                    .force_take_lease("thermal-safety")
+                    .force_take_lease(HwmonWriter::ThermalSafety)
                     .lease_id;
                 // Audit P1-E: a force-take is an ownership change the previous
                 // holder was never notified of, so its coalescing state
@@ -868,7 +869,7 @@ mod tests {
         // The profile engine auto-acquired the lease and still holds it.
         let lease = be.ctrl.lock().lease_manager().active_lease().cloned();
         assert!(
-            lease.is_some_and(|l| l.owner_hint == "profile-engine"),
+            lease.is_some_and(|l| l.owner == HwmonWriter::Engine),
             "profile-engine lease must be active after apply"
         );
     }
@@ -922,7 +923,7 @@ mod tests {
             "expected a pwm write after auto-lease; got {w:?}"
         );
         let lease = be.ctrl.lock().lease_manager().active_lease().cloned();
-        assert_eq!(lease.map(|l| l.owner_hint), Some("profile-engine".into()));
+        assert_eq!(lease.map(|l| l.owner), Some(HwmonWriter::Engine));
     }
 
     #[tokio::test]
@@ -984,13 +985,16 @@ mod tests {
             make_header("hwmon:it8696:pwm1"),
             make_header("hwmon:it8696:pwm2"),
         ]);
-        // Even a GUI-held lease is force-taken for safety writes.
-        be.ctrl.lock().lease_manager_mut().force_take_lease("gui");
+        // Even an engine-held lease is force-taken for safety writes.
+        be.ctrl
+            .lock()
+            .lease_manager_mut()
+            .force_take_lease(HwmonWriter::Engine);
 
         be.force_all(100).await;
 
         let lease = be.ctrl.lock().lease_manager().active_lease().cloned();
-        assert_eq!(lease.map(|l| l.owner_hint), Some("thermal-safety".into()));
+        assert_eq!(lease.map(|l| l.owner), Some(HwmonWriter::ThermalSafety));
         let w = writes.lock();
         let pwm_writes: Vec<_> = w.iter().filter(|(p, _)| p.ends_with("pwm1")).collect();
         assert!(
@@ -1222,7 +1226,7 @@ mod tests {
         be.ctrl
             .lock()
             .lease_manager_mut()
-            .force_take_lease("verify");
+            .force_take_lease(HwmonWriter::Verify);
 
         be.apply(&[cmd("hwmon:it8696:pwm1", "hwmon", 55)]).await;
 
@@ -1234,8 +1238,8 @@ mod tests {
         drop(w);
         let lease = be.ctrl.lock().lease_manager().active_lease().cloned();
         assert_eq!(
-            lease.map(|l| l.owner_hint),
-            Some("verify".into()),
+            lease.map(|l| l.owner),
+            Some(HwmonWriter::Verify),
             "the verify lease must remain intact — the engine did not take over"
         );
     }
@@ -1250,7 +1254,7 @@ mod tests {
         be.ctrl
             .lock()
             .lease_manager_mut()
-            .force_take_lease("thermal-safety");
+            .force_take_lease(HwmonWriter::ThermalSafety);
 
         be.apply(&[cmd("hwmon:it8696:pwm1", "hwmon", 55)]).await;
 

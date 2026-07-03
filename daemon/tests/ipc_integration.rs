@@ -17,7 +17,7 @@ use control_ofc_daemon::health::staleness::StalenessConfig;
 use control_ofc_daemon::health::state::{
     AmdGpuFanState, CachedSensorReading, DeviceLabel, OpenFanState,
 };
-use control_ofc_daemon::hwmon::lease::LeaseManager;
+use control_ofc_daemon::hwmon::lease::{HwmonWriter, LeaseManager};
 use control_ofc_daemon::hwmon::pwm_control::{HwmonPwmController, SysfsWriter};
 use control_ofc_daemon::hwmon::pwm_discovery::PwmHeaderDescriptor;
 use control_ofc_daemon::hwmon::types::SensorKind;
@@ -903,11 +903,11 @@ async fn deactivate_profile_releases_profile_engine_lease() {
         let mut guard = ctrl.lock();
         guard
             .lease_manager_mut()
-            .take_lease("profile-engine")
+            .take_lease(HwmonWriter::Engine)
             .expect("take should succeed");
         assert_eq!(
-            guard.lease_manager().active_lease().unwrap().owner_hint,
-            "profile-engine"
+            guard.lease_manager().active_lease().unwrap().owner,
+            HwmonWriter::Engine
         );
     }
 
@@ -917,7 +917,7 @@ async fn deactivate_profile_releases_profile_engine_lease() {
     assert_eq!(status, 200);
 
     // Profile-engine lease should now be released — leaving the controller
-    // free for a fresh GUI lease without a force-take.
+    // free for the engine to re-acquire on its next tick.
     let ctrl = state.hwmon_controller.as_ref().unwrap();
     let guard = ctrl.lock();
     assert!(
@@ -930,17 +930,17 @@ async fn deactivate_profile_releases_profile_engine_lease() {
 }
 
 #[tokio::test]
-async fn deactivate_profile_preserves_gui_lease() {
-    // A non-profile-engine lease (e.g. GUI's own lease for manual writes)
-    // must NOT be touched by deactivation — the GUI is still in control of
-    // hwmon and may want to keep writing PWM directly.
+async fn deactivate_profile_preserves_foreign_lease() {
+    // A non-engine holder (a hardware verify or a thermal-safety force) must NOT
+    // be touched by deactivation — the deactivate handler releases only the
+    // engine's own lease (post-2.0.0 there is no GUI/client lease — DEC-165/197).
     let state = test_app_state_with_hwmon();
-    let gui_lease_id = {
+    let foreign_lease_id = {
         let ctrl = state.hwmon_controller.as_ref().unwrap();
         let mut guard = ctrl.lock();
         guard
             .lease_manager_mut()
-            .take_lease("gui")
+            .take_lease(HwmonWriter::Verify)
             .expect("take should succeed")
             .lease_id
     };
@@ -949,15 +949,48 @@ async fn deactivate_profile_preserves_gui_lease() {
     let (status, _json) = uds_post(&path, "/profile/deactivate", &serde_json::json!({})).await;
     assert_eq!(status, 200);
 
-    // GUI lease unchanged.
+    // Foreign (verify) lease unchanged.
     let ctrl = state.hwmon_controller.as_ref().unwrap();
     let guard = ctrl.lock();
     let active = guard
         .lease_manager()
         .active_lease()
-        .expect("GUI lease should still be active");
-    assert_eq!(active.owner_hint, "gui");
-    assert_eq!(active.lease_id, gui_lease_id);
+        .expect("foreign lease should still be active");
+    assert_eq!(active.owner, HwmonWriter::Verify);
+    assert_eq!(active.lease_id, foreign_lease_id);
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn deactivate_profile_preserves_thermal_lease() {
+    // A live thermal-safety force-take must also survive a deactivation —
+    // deactivate releases ONLY the engine's own lease. Guards profile.rs against
+    // a `!= Verify` broadening that would wrongly release a post-emergency thermal
+    // lease (DEC-197).
+    let state = test_app_state_with_hwmon();
+    let thermal_lease_id = {
+        let ctrl = state.hwmon_controller.as_ref().unwrap();
+        let mut guard = ctrl.lock();
+        guard
+            .lease_manager_mut()
+            .force_take_lease(HwmonWriter::ThermalSafety)
+            .lease_id
+    };
+
+    let (path, shutdown, _dir) = start_test_server(state.clone()).await;
+    let (status, _json) = uds_post(&path, "/profile/deactivate", &serde_json::json!({})).await;
+    assert_eq!(status, 200);
+
+    let ctrl = state.hwmon_controller.as_ref().unwrap();
+    let guard = ctrl.lock();
+    let active = guard
+        .lease_manager()
+        .active_lease()
+        .expect("thermal-safety lease should still be active");
+    assert_eq!(active.owner, HwmonWriter::ThermalSafety);
+    assert_eq!(active.lease_id, thermal_lease_id);
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
@@ -1041,7 +1074,7 @@ async fn deactivate_profile_resets_hwmon_coalescing() {
         let mut g = hwmon.lock();
         let lease = g
             .lease_manager_mut()
-            .take_lease("profile-engine")
+            .take_lease(HwmonWriter::Engine)
             .unwrap()
             .lease_id;
         g.set_pwm("h1", 50, &lease).unwrap();
@@ -1059,7 +1092,7 @@ async fn deactivate_profile_resets_hwmon_coalescing() {
         let mut g = hwmon.lock();
         let lease = g
             .lease_manager_mut()
-            .take_lease("profile-engine")
+            .take_lease(HwmonWriter::Engine)
             .unwrap()
             .lease_id;
         g.set_pwm("h1", 50, &lease).unwrap();
