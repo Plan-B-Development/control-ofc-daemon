@@ -85,10 +85,18 @@ pub(crate) fn evaluate_trigger(
     current_temp: f64,
     state: &mut ProfileEngineState,
 ) -> f64 {
-    let idle_temp = curve.trigger_idle_temp_c.unwrap_or(40.0);
-    let load_temp = curve.trigger_load_temp_c.unwrap_or(60.0);
-    let idle_pct = curve.trigger_idle_pct.unwrap_or(30.0);
-    let load_pct = curve.trigger_load_pct.unwrap_or(80.0);
+    let idle_temp = curve
+        .trigger_idle_temp_c
+        .unwrap_or(crate::profile::TRIGGER_IDLE_TEMP_C);
+    let load_temp = curve
+        .trigger_load_temp_c
+        .unwrap_or(crate::profile::TRIGGER_LOAD_TEMP_C);
+    let idle_pct = curve
+        .trigger_idle_pct
+        .unwrap_or(crate::profile::TRIGGER_IDLE_PCT);
+    let load_pct = curve
+        .trigger_load_pct
+        .unwrap_or(crate::profile::TRIGGER_LOAD_PCT);
     let is_load = match state.trigger_latch.get(&control.id).copied() {
         // In the load state: fall back to idle only once temp reaches the idle temp.
         Some(true) => current_temp > idle_temp,

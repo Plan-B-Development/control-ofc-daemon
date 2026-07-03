@@ -224,8 +224,8 @@ impl HwmonPwmController {
     /// Look up a single header by id — O(1) against the internal map.
     ///
     /// Prefer this over scanning `headers()` (which allocates and sorts a
-    /// Vec on every call) on per-write hot paths: the GUI control loop hits
-    /// the PWM-write handler once per fan per second (DEC-146 P3-13).
+    /// Vec on every call) on per-write hot paths: the profile-engine tick
+    /// writes to a header once per fan per second (DEC-146 P3-13).
     pub fn header(&self, id: &str) -> Option<&PwmHeaderDescriptor> {
         self.headers.get(id)
     }

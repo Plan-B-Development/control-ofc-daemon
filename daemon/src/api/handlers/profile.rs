@@ -213,9 +213,9 @@ pub async fn deactivate_profile_handler(
         log::warn!("Failed to persist deactivation: {e}");
     }
 
-    // Release any lease held by the profile engine so a fresh GUI lease
-    // can be granted without a force-take. Manual GUI leases are
-    // unaffected — only the "profile-engine" owner is released.
+    // Release the profile engine's own self-lease so the next activation
+    // re-acquires cleanly. The engine is the sole hwmon writer post-2.0.0
+    // (DEC-165); only the "profile-engine" owner is released.
     if let Some(ref ctrl) = state.hwmon_controller {
         let mut guard = ctrl.lock();
         let release_id = guard

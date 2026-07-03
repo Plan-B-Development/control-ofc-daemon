@@ -126,7 +126,8 @@ impl FanController {
         })
     }
 
-    /// Apply safety rules: stop timeout and minimum PWM floor.
+    /// Apply safety rules: stop timeout only (the minimum-PWM floor is applied
+    /// upstream in the profile-engine tuning pipeline).
     fn apply_safety(&self, channel: u8, pwm_percent: u8) -> Result<u8, FanControlError> {
         if pwm_percent == 0 {
             // Check stop timeout (hardware safety for serial protocol)

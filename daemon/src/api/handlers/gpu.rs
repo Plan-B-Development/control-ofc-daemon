@@ -1,4 +1,4 @@
-//! AMD GPU fan endpoints: set fan speed, reset to automatic.
+//! AMD GPU fan endpoints: reset to automatic (firmware default) + verify.
 
 use std::sync::Arc;
 

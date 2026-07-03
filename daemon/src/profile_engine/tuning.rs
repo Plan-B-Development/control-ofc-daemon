@@ -5,8 +5,9 @@ use super::*;
 
 /// Apply the full per-control tuning pipeline.
 ///
-/// Mirrors `ControlLoopService._apply_tuning` in the GUI so headless profile
-/// mode produces the same output as GUI-driven mode for identical inputs.
+/// The sole tuning evaluator (the daemon is the only PWM writer post-2.0.0,
+/// DEC-165), locked to the `tuning_sequence` cross-stack parity oracle (DEC-126)
+/// so the GUI's demo evaluator produces identical output for identical inputs.
 /// Order matters: step-rate limiting runs AFTER offset/minimum so the
 /// delta tracked cycle-to-cycle is the final clamped output; stop-threshold
 /// comes after step-rate so a slow-falling curve can still snap to zero.

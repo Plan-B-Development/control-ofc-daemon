@@ -248,6 +248,15 @@ fn evaluate_linear(curve: &CurveConfig, temp_c: f64) -> f64 {
     start_o + t * (end_o - start_o)
 }
 
+/// Trigger-curve default thresholds (DEC-149). Byte-for-byte GUI parity with
+/// `_interpolate_trigger` / `_evaluate_trigger`, locked to the `tuning_sequence`
+/// cross-stack parity oracle (DEC-126) — do not change without updating the
+/// oracle in lockstep. `pub(crate)` so `profile_engine::curve_eval` shares them.
+pub(crate) const TRIGGER_IDLE_TEMP_C: f64 = 40.0;
+pub(crate) const TRIGGER_LOAD_TEMP_C: f64 = 60.0;
+pub(crate) const TRIGGER_IDLE_PCT: f64 = 30.0;
+pub(crate) const TRIGGER_LOAD_PCT: f64 = 80.0;
+
 /// Stateless (cold-start) trigger value: the load speed at/above the load
 /// temperature, else the idle speed. The latching hysteresis — holding the load
 /// state down through the idle..load band — is applied per-control by the
@@ -255,9 +264,9 @@ fn evaluate_linear(curve: &CurveConfig, temp_c: f64) -> f64 {
 /// `curve_eval` parity tier. Must match the GUI's `_interpolate_trigger`
 /// (DEC-126 / DEC-149).
 fn evaluate_trigger_stateless(curve: &CurveConfig, temp_c: f64) -> f64 {
-    let load_temp = curve.trigger_load_temp_c.unwrap_or(60.0);
-    let load_pct = curve.trigger_load_pct.unwrap_or(80.0);
-    let idle_pct = curve.trigger_idle_pct.unwrap_or(30.0);
+    let load_temp = curve.trigger_load_temp_c.unwrap_or(TRIGGER_LOAD_TEMP_C);
+    let load_pct = curve.trigger_load_pct.unwrap_or(TRIGGER_LOAD_PCT);
+    let idle_pct = curve.trigger_idle_pct.unwrap_or(TRIGGER_IDLE_PCT);
     if temp_c >= load_temp {
         load_pct
     } else {
@@ -554,8 +563,8 @@ pub fn validate(profile: &DaemonProfile, known_sensor_ids: &HashSet<String>) -> 
 
         match curve.curve_type.as_str() {
             "trigger" => {
-                let idle = curve.trigger_idle_temp_c.unwrap_or(40.0);
-                let load = curve.trigger_load_temp_c.unwrap_or(60.0);
+                let idle = curve.trigger_idle_temp_c.unwrap_or(TRIGGER_IDLE_TEMP_C);
+                let load = curve.trigger_load_temp_c.unwrap_or(TRIGGER_LOAD_TEMP_C);
                 if idle.is_finite() && load.is_finite() && idle >= load {
                     report.error(
                         format!("{p}.trigger_idle_temp_c"),
