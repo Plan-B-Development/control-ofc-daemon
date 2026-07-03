@@ -66,6 +66,7 @@ daemon/src/
       hw_diagnostics.rs — hardware diagnostics endpoint
     responses.rs       — response structs (Serialize)
     calibration.rs     — OpenFan calibration sweep
+    diagnostics.rs     — hardware-diagnostics scanning logic behind /diagnostics/hardware
 
   pwm.rs               — shared percent_to_raw / raw_to_percent conversion
   clock.rs             — injectable monotonic clock (lease/override/identify TTLs; deterministic in tests)
@@ -73,7 +74,10 @@ daemon/src/
   profile.rs           — profile JSON loading + curve evaluation
   profile_store.rs     — daemon-owned profile storage (store of record, DEC-160)
   profile_engine/      — headless 1Hz curve evaluation loop (DEC-135)
-    mod.rs             — safety tick + profile evaluation + loop
+    mod.rs             — loop body / coordinator: orchestrates safety_tick + curve_eval + tuning + backends
+    curve_eval.rs      — deadband + trigger latch + Mix/Sync composites (topological order)
+    tuning.rs          — offset→floor→step-rate→stop-snap→start-kick→clamp + floor policy
+    safety_tick.rs     — 105/80/60 °C thermal ladder + no-sensor fallback (DEC-190)
     backends.rs        — WriteBackend per fan backend (gating/coalescing)
   control_override.rs  — manual-override + fan-identify state (expiring, fencing-guarded, deadman; DEC-163/166)
   daemon_state.rs      — persistent state (active profile pointer)
@@ -207,15 +211,18 @@ Other paths:
 - **Socket**: `/run/control-ofc/control-ofc.sock` (configurable via `ipc.socket_path`)
 - **Persisted state**: `/var/lib/control-ofc/daemon_state.json` (configurable via `state.state_dir`)
 
-### Migration (1.0.x → 1.1.x)
+### `daemon.toml` `[profiles]` / `[startup]` vs `runtime.toml`
 
-The 1.1.x release window still parses `[profiles]` and `[startup]` from
-`daemon.toml` for backward compatibility. On first start after upgrade the
-daemon copies those sections into `runtime.toml` if the runtime file does
-not already contain them. The legacy sections in `daemon.toml` are not
-deleted — the daemon never rewrites admin-owned config — but they are
-shadowed by `runtime.toml` from that point forward. In 1.2.0 parsing
-`[profiles]` / `[startup]` from `daemon.toml` becomes a hard error.
+`daemon.toml`'s `[profiles]` and `[startup]` sections remain **valid admin
+defaults** — the base layer. `config.rs` still parses them (see the
+`parse_profiles_section` / `parse_startup_delay_section` tests); they are not
+deprecated and never become a parse error. `runtime.toml` is written **only**
+when an API call mutates a runtime-mutable key
+(`POST /config/profile-search-dirs` or `POST /config/startup-delay`); when it
+exists, its keys **overlay** the `daemon.toml` defaults (runtime wins — see the
+overlay note above). There is no copy and no one-time migration: the two files
+coexist, and if `runtime.toml` shadows a non-default `daemon.toml` key the daemon
+surfaces it only via an `info` log at startup (`main.rs::apply_runtime_overlay`).
 
 ## API Endpoints
 

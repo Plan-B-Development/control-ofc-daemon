@@ -167,7 +167,11 @@ impl StateCache {
     /// unchanged. The engine tick is the sole writer of this field
     /// (`profile_engine::run`), so the read→write gap cannot race another
     /// writer; a concurrent reader only ever sees the old or new value, never a
-    /// torn one.
+    /// torn one. This skip-if-unchanged optimization **depends on** that
+    /// single-writer invariant: if a second writer of `thermal_override_state`
+    /// is ever introduced, this must revert to an unconditional write under the
+    /// write lock (drop the read-lock pre-check), or two writers could each read
+    /// the stale value and lose an update.
     pub fn set_thermal_override_state(&self, state_str: &str) {
         if self.inner.read().thermal_override_state.as_deref() == Some(state_str) {
             return;

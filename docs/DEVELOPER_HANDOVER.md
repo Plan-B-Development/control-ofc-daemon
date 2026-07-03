@@ -38,6 +38,7 @@ daemon/                     Rust crate (control-ofc-daemon)
       responses.rs          JSON response/request types (v1 schema)
       server.rs             Unix socket server lifecycle
       calibration.rs        OpenFan calibration sweep
+      diagnostics.rs        Hardware-diagnostics scanning logic behind /diagnostics/hardware
     health/
       state.rs              Canonical state model (DaemonState)
       cache.rs              RwLock in-memory cache
@@ -54,6 +55,7 @@ daemon/                     Rust crate (control-ofc-daemon)
       aio.rs                Liquid-cooler (AIO) recognition: coolant sensor + is_aio + aio_hwmon cap (DEC-156)
       gpu_detect.rs         AMD GPU detection via sysfs/DRM
       gpu_fan.rs            PMFW fan curve read/write/reset (RDNA3+)
+      intel_gpu_detect.rs   Intel discrete-GPU detection (read-only monitoring, DEC-121)
       kernel_warnings.rs    Kernel-version regression catalog (DEC-098).
                             Matches running kernel against published amdgpu
                             regressions; surfaced via
@@ -67,7 +69,10 @@ daemon/                     Rust crate (control-ofc-daemon)
     profile.rs              Profile JSON loading + curve evaluation
     profile_store.rs        Daemon-owned profile storage (store of record, DEC-160)
     profile_engine/         Headless 1Hz curve evaluation loop (DEC-135)
-      mod.rs                  Safety tick + profile evaluation + loop body
+      mod.rs                  Loop body / coordinator: orchestrates safety_tick + curve_eval + tuning + backends
+      curve_eval.rs           Deadband + trigger latch + Mix/Sync composites (topological order)
+      tuning.rs               offset→floor→step-rate→stop-snap→start-kick→clamp + floor policy
+      safety_tick.rs          105/80/60 °C thermal ladder + no-sensor fallback (DEC-190)
       backends.rs             WriteBackend impls (OpenFan/GPU/hwmon gating)
     safety.rs               ThermalSafetyRule (CPU emergency override)
     polling.rs              hwmon + OpenFan polling loops

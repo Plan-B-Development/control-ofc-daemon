@@ -91,7 +91,7 @@ For routine upgrades, the daemon reads forward-compatible config and migrates st
 
 **v1.6.0 (profile schema v4):** Profiles authored before v4 auto-migrate on load (role-aware `minimum_pct` floor lifted to 30 % for CPU/pump-labelled hwmon members, 20 % for chassis/openfan, 0 % for GPU-only). No file edit required; the migrated profile is re-saved when the user next persists it.
 
-**v1.2.0 (legacy config sections removed):** Parsing `[profiles]` or `[startup]` from `daemon.toml` is now a hard error. Those sections were moved to the daemon-managed `runtime.toml` (ADR-002). If you upgraded from v1.1.x or earlier and your `daemon.toml` still has either section, delete the relevant block and reload — the daemon will recreate state in `runtime.toml` on first runtime mutation.
+**`daemon.toml` `[profiles]` / `[startup]` — no action required:** These sections stay valid; they are the admin-owned **base** defaults for the profile search dirs and startup delay, and the daemon still parses them. When an API call mutates one of those keys (`POST /config/profile-search-dirs` / `POST /config/startup-delay`) the daemon writes a `runtime.toml` whose keys **overlay** the `daemon.toml` defaults (runtime wins, ADR-002). The two files coexist — nothing is copied, no section is removed, and parsing either one is never an error. If `runtime.toml` ends up shadowing a non-default `daemon.toml` value, the daemon notes it once in an `info` log at startup.
 
 **Pre-v1.2 telemetry / polling:** `[telemetry]` and the `publish_interval_ms` field under `[polling]` were removed in the v0.7.x series. Anyone still upgrading from a pre-v0.8 install must delete those lines before starting the v1.x daemon.
 
