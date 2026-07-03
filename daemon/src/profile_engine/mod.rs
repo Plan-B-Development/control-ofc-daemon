@@ -3015,6 +3015,95 @@ mod tests {
         );
     }
 
+    // ── P1-1: thermal-force hwmon leg ────────────────────────────────
+    // A recording hwmon writer + a writable header, so the thermal force's
+    // hwmon leg can be observed *through the loop*. Mirrors the private
+    // TestWriter / make_header in backends.rs (not reachable from this module).
+    struct RecordingSysfsWriter {
+        writes: Arc<Mutex<Vec<(String, String)>>>,
+    }
+    impl crate::hwmon::pwm_control::SysfsWriter for RecordingSysfsWriter {
+        fn write_file(&mut self, path: &str, value: &str) -> Result<(), crate::error::HwmonError> {
+            self.writes.lock().push((path.into(), value.into()));
+            Ok(())
+        }
+        fn read_file(&self, _path: &str) -> Result<String, crate::error::HwmonError> {
+            Ok("128\n".into())
+        }
+    }
+
+    fn writable_pwm_header(id: &str) -> crate::hwmon::pwm_discovery::PwmHeaderDescriptor {
+        crate::hwmon::pwm_discovery::PwmHeaderDescriptor {
+            id: id.to_string(),
+            label: "CHA_FAN1".to_string(),
+            chip_name: "it8696".to_string(),
+            device_id: "it87.2624".to_string(),
+            pwm_index: 1,
+            supports_enable: true,
+            pwm_path: "/sys/class/hwmon/hwmon0/pwm1".to_string(),
+            enable_path: Some("/sys/class/hwmon/hwmon0/pwm1_enable".to_string()),
+            rpm_available: false,
+            rpm_path: None,
+            min_pwm_percent: 0,
+            max_pwm_percent: 100,
+            is_writable: true,
+            pwm_mode: None,
+            is_aio: false,
+        }
+    }
+
+    /// P1-1: the thermal force must drive WRITABLE HWMON headers to 100 % through
+    /// the loop (the `force_all` branch, hwmon leg). OpenFan-force + GPU-exclusion
+    /// are already covered (`safety_override_forces_all_channels_to_100` /
+    /// `loop_thermal_force_excludes_gpu`); the hwmon leg had no loop-level test —
+    /// every other thermal loop test passes `hwmon_controller = None`.
+    #[tokio::test(start_paused = true)]
+    async fn loop_thermal_force_drives_hwmon() {
+        let cache = make_cache_with_sensor("cpu", 106.0); // ≥105 °C → force
+        let profile_arc = Arc::new(Mutex::new(None::<DaemonProfile>));
+        let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
+
+        let writes: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let ctrl = crate::hwmon::pwm_control::HwmonPwmController::new(
+            vec![writable_pwm_header("hwmon:it8696:pwm1")],
+            crate::hwmon::lease::LeaseManager::new(),
+            Box::new(RecordingSysfsWriter {
+                writes: writes.clone(),
+            }),
+            cache.clone(),
+        );
+        let hwmon_ctrl = Some(Arc::new(Mutex::new(ctrl)));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(profile_engine_loop(
+            cache,
+            profile_arc,
+            None, // no OpenFan — isolates the hwmon leg
+            hwmon_ctrl,
+            vec![], // no GPU
+            safety,
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            shutdown_rx,
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        shutdown_tx.send(true).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let _ = handle.await;
+
+        let w = writes.lock();
+        let pwm_write = w
+            .iter()
+            .find(|(p, _)| p.ends_with("pwm1") && !p.ends_with("_enable"));
+        let (_, val) = pwm_write
+            .unwrap_or_else(|| panic!("thermal force must write the hwmon pwm header; got {w:?}"));
+        assert_eq!(
+            val.trim(),
+            "255",
+            "thermal force must drive hwmon to 100% (raw 255), got {val:?}"
+        );
+    }
+
     /// P3-2: a forced safety override must clear the engine's cross-cycle
     /// tuning state. The fans are physically at the forced PWM, so resuming
     /// normal evaluation from the pre-emergency `last_output` anchor would
