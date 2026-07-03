@@ -22,7 +22,7 @@ pub use profile::*;
 pub use status::*;
 
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -190,8 +190,6 @@ pub struct AppState {
     /// Path to the daemon-owned runtime.toml (read/write by handlers).
     /// Lives at `{state_dir}/runtime.toml`. See ADR-002.
     pub runtime_config_path: std::path::PathBuf,
-    /// Number of active SSE client connections (for connection limiting).
-    pub sse_clients: Arc<AtomicUsize>,
     /// Set by `POST /hwmon/rescan` to ask the sensor polling loop to refresh
     /// its cached descriptor set (labels, types, DEC-117 threshold snapshot)
     /// on its next tick. Swap-checked (and cleared) by the loop (DEC-133).

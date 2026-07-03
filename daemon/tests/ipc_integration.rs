@@ -75,7 +75,6 @@ fn test_app_state() -> Arc<AppState> {
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
-        sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
@@ -345,7 +344,6 @@ async fn fans_endpoint_tags_intel_gpu_source_by_id_prefix() {
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
-        sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
@@ -536,7 +534,6 @@ fn test_app_state_with_hwmon() -> Arc<AppState> {
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
-        sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
@@ -719,7 +716,6 @@ fn test_app_state_with_unsupported_gpu(pci_bdf: &str) -> Arc<AppState> {
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
-        sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
@@ -790,7 +786,6 @@ fn test_app_state_with_read_only_gpu(pci_bdf: &str, pci_device_id: u16) -> Arc<A
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
-        sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
@@ -1033,7 +1028,6 @@ async fn deactivate_profile_resets_hwmon_coalescing() {
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
-        sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         override_table: Arc::new(Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
@@ -1144,7 +1138,6 @@ fn test_app_state_with_writable_pmfw_gpu(pci_bdf: &str) -> (Arc<AppState>, tempf
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
-        sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
@@ -1311,7 +1304,6 @@ async fn hwmon_discovery_excludes_amdgpu_end_to_end_via_ipc() {
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
-        sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
@@ -1369,7 +1361,6 @@ fn test_app_state_with_profile_dirs(dirs: Vec<std::path::PathBuf>) -> Arc<AppSta
         profile_search_dirs: parking_lot::RwLock::new(dirs),
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
-        sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),

@@ -463,7 +463,7 @@ const SHUTDOWN_TASK_TIMEOUT: Duration = Duration::from_secs(3);
 /// neither a late client write (via the IPC server) nor an in-flight engine
 /// write can land after the restore and leave fans stuck in manual mode. Every
 /// await is bounded by `task_timeout` so a hung task or a lingering connection
-/// (e.g. an SSE `/events` stream) can never block the safety restore; on timeout
+/// (e.g. a slow client holding a request open) can never block the safety restore; on timeout
 /// we log and proceed, and `ExecStopPost=control-ofc-restore-auto` backstops
 /// production regardless.
 ///
@@ -747,7 +747,6 @@ async fn main() {
         profile_search_dirs: parking_lot::RwLock::new(profile_search_dirs),
         config_path: config_path.clone(),
         runtime_config_path: runtime_config_path.clone(),
-        sse_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),

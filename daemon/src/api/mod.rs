@@ -8,4 +8,3 @@ pub mod diagnostics;
 pub mod handlers;
 pub mod responses;
 pub mod server;
-pub mod sse;

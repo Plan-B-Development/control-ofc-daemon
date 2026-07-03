@@ -20,21 +20,6 @@ use std::time::Duration;
 /// considered a stall (fan may legitimately be stopped).
 pub const STALL_PWM_THRESHOLD: u8 = 20;
 
-// ── SSE streaming ────────────────────────────────────────────────────
-
-/// Maximum lifetime for a single SSE connection before the client
-/// must reconnect. Prevents resource leaks from idle connections.
-pub const SSE_MAX_LIFETIME: Duration = Duration::from_secs(3600);
-
-/// Interval between SSE heartbeat frames (server-sent `comment` lines).
-pub const SSE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Interval between SSE data pushes (sensor + fan snapshot).
-pub const SSE_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Maximum number of concurrent SSE client connections.
-pub const SSE_MAX_CLIENTS: usize = 5;
-
 // ── OpenFan serial controller ────────────────────────────────────────
 
 /// Duration after which a 0% PWM command is rejected to prevent
@@ -178,7 +163,6 @@ const _: () = assert!(DEADBAND_MAX_HOLD_CYCLES > 0);
 // TTL must be non-trivial — a too-tight window would drop legitimate overrides.
 const _: () = assert!(OVERRIDE_RENEW_SECS > 0);
 const _: () = assert!(OVERRIDE_RENEW_SECS * 3 <= OVERRIDE_TTL_SECS);
-const _: () = assert!(SSE_MAX_CLIENTS > 0);
 const _: () = assert!(GPU_COALESCE_DELTA_PCT > 0);
 // Slow-spinning fans/pumps and GPU tachometers need a multi-second settle
 // window; a too-short wait re-introduces the false `no_rpm_effect` verdicts

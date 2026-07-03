@@ -9,7 +9,6 @@ use axum::Router;
 use tokio::net::UnixListener;
 
 use super::handlers::{self, AppState};
-use super::sse;
 
 /// Error returned by [`serve`] when axum finishes unexpectedly.
 pub type ServeError = Box<dyn std::error::Error + Send + Sync>;
@@ -23,8 +22,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/fans", get(handlers::fans_handler))
         .route("/poll", get(handlers::poll_handler))
         .route("/sensors/history", get(handlers::history_handler))
-        // Server-Sent Events
-        .route("/events", get(sse::events_handler))
         // OpenFanController calibration sweep (diagnostic; daemon-performed).
         // The bare PWM/RPM write endpoints were retired at 2.0.0 (DEC-165) —
         // the profile engine is the sole writer.
