@@ -49,11 +49,18 @@ CapabilityBoundingSet=~CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE CAP_SYS_RAWIO CA
 # Security hardening
 ProtectHome=read-only
 ProtectSystem=strict
-# /sys/class/hwmon is directory-level — hwmon indices are dynamic, finer restriction not practical (P2-S3).
-# /run/control-ofc and /var/lib/control-ofc are provided by RuntimeDirectory= and StateDirectory=
-# above; systemd.exec(5) guarantees those are already writable under ProtectSystem=strict, so only
-# /sys paths need an explicit entry here.
-ReadWritePaths=/sys/class/hwmon /sys/class/drm
+# ProtectKernelTunables=true (below) remounts ALL of /sys read-only — ProtectSystem=strict
+# alone does NOT (it explicitly exempts /sys) — so this entry is what re-exposes the fan
+# nodes for writing. It MUST target /sys/devices, NOT /sys/class/hwmon or /sys/class/drm:
+# those class directories hold only symlinks, and sysfs decides writability by the *target*
+# inode's mount. Every pwm*/pwm*_enable and GPU fan_curve the daemon writes resolves through
+# those symlinks to /sys/devices/... — carving out the class dirs re-exposes the symlinks but
+# not their targets, so writes fail with EROFS ("Read-only file system", os error 30). The GPU
+# fan_curve lives under .../device/gpu_od/ (a sibling of drm/), also under /sys/devices. Reads
+# work fine on the ro mount, so only the write targets need this carve-out. See DEC-199.
+# /run/control-ofc and /var/lib/control-ofc are provided by RuntimeDirectory=/StateDirectory=
+# above; systemd.exec(5) guarantees those are writable under ProtectSystem=strict.
+ReadWritePaths=/sys/devices
 PrivateTmp=true
 NoNewPrivileges=true
 ProtectKernelTunables=true

@@ -35,7 +35,9 @@ are:
 
 The daemon never executes operator-supplied code, never opens network
 sockets, and never modifies files outside its declared write paths
-(`ReadWritePaths=/sys/class/hwmon /sys/class/drm` and the
+(`ReadWritePaths=/sys/devices` — the device tree the fan `pwm*`/`fan_curve`
+nodes physically live under; the `/sys/class/hwmon` and `/sys/class/drm`
+paths are only symlinks that resolve here — and the
 `StateDirectory=`/`RuntimeDirectory=` directories provided by systemd).
 
 The systemd unit applies a hardening set (`ProtectSystem=strict`,

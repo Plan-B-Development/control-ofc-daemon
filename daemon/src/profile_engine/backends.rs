@@ -438,11 +438,65 @@ impl WriteBackend for GpuBackend {
 
 pub(crate) struct HwmonBackend {
     ctrl: Arc<Mutex<crate::hwmon::pwm_control::HwmonPwmController>>,
+    /// Per-member consecutive write-failure streaks (DEC-199). Without this the
+    /// per-header `warn!` re-logged every 1 Hz tick, so a persistent hwmon write
+    /// failure — canonically EROFS when the systemd sandbox's `ReadWritePaths=`
+    /// carve-out does not cover the real `/sys/devices` inode — spammed journald
+    /// at 1 Hz. We log the FIRST failure per member, then only a periodic summary
+    /// every [`constants::HWMON_FAIL_SUMMARY_INTERVAL`] ticks, and an INFO
+    /// recovery line when the member writes successfully again. Reset per member
+    /// by its own success, so a single stuck header among healthy ones is tracked
+    /// in isolation (mirrors [`OpenFanBackend`]'s `channel_failures`, audit P3-5).
+    member_failures: HashMap<String, u32>,
 }
 
 impl HwmonBackend {
     pub(crate) fn new(ctrl: Arc<Mutex<crate::hwmon::pwm_control::HwmonPwmController>>) -> Self {
-        Self { ctrl }
+        Self {
+            ctrl,
+            member_failures: HashMap::new(),
+        }
+    }
+
+    /// Record this tick's per-member hwmon write outcomes and throttle the log
+    /// (DEC-199). `results` holds only members actually attempted — a member
+    /// skipped read-only (DEC-102) or skipped because the engine held no lease
+    /// this tick is absent, so it neither counts as a failure nor resets a
+    /// streak. `&mut self` state can't cross into the `'static` blocking closure,
+    /// so this bookkeeping runs on the returned outcomes after the join (mirrors
+    /// [`OpenFanBackend::note_outcomes`]).
+    fn note_outcomes(&mut self, results: &[(String, Result<(), String>)]) {
+        for (member_id, res) in results {
+            match res {
+                Err(e) => {
+                    let streak = self.member_failures.entry(member_id.clone()).or_insert(0);
+                    *streak += 1;
+                    let n = *streak;
+                    if n == 1 {
+                        log::warn!("hwmon write failed for {member_id}: {e}");
+                    } else if n.is_multiple_of(constants::HWMON_FAIL_SUMMARY_INTERVAL) {
+                        log::warn!(
+                            "hwmon write still failing for {member_id} \
+                             ({n} consecutive ticks): {e}"
+                        );
+                    }
+                }
+                Ok(()) => {
+                    // Recovery edge: a member that had been failing wrote again.
+                    if let Some(prev) = self.member_failures.remove(member_id) {
+                        log::info!(
+                            "hwmon write recovered for {member_id} \
+                             (after {prev} consecutive failure(s))"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn member_failure_streak(&self, member_id: &str) -> u32 {
+        self.member_failures.get(member_id).copied().unwrap_or(0)
     }
 }
 
@@ -504,12 +558,21 @@ impl WriteBackend for HwmonBackend {
                         .map(|l| l.lease_id)
                 })
             };
-            let Some(lease_id) = lease_id else { return };
+            // No lease this tick (e.g. a hardware verify holds it) ⇒ nothing was
+            // attempted; return an empty outcome set so no member's failure
+            // streak is advanced or reset.
+            let Some(lease_id) = lease_id else {
+                return Vec::new();
+            };
 
             // Phase 2: one lock per header (DEC-154) so a concurrent reader or
             // lease op is not starved for the whole batch. A GUI/thermal
             // force-take mid-scan fails the remaining writes with InvalidLease;
-            // the next 1 Hz tick re-acquires.
+            // the next 1 Hz tick re-acquires. Outcomes are collected here and the
+            // (throttled) failure logging runs on `&mut self` after the join
+            // (DEC-199) — the `'static` blocking closure cannot borrow self.
+            let mut outcomes: Vec<(String, Result<(), String>)> =
+                Vec::with_capacity(hwmon_cmds.len());
             for (member_id, pwm_percent) in &hwmon_cmds {
                 let mut guard = ctrl.lock();
                 // DEC-102 backstop on the engine path: never attempt a write to
@@ -517,24 +580,31 @@ impl WriteBackend for HwmonBackend {
                 // member-picker and profile load drop these, but the un-validated
                 // boot-load path does not, so the engine must skip them itself —
                 // otherwise every tick would EACCES-spam the log and the member
-                // would silently never take effect.
+                // would silently never take effect. A skipped header records no
+                // outcome (it was not attempted).
                 if guard.header(member_id).is_some_and(|h| !h.is_writable) {
                     continue;
                 }
-                if let Err(e) = guard.set_pwm(member_id, *pwm_percent, &lease_id) {
-                    log::warn!("hwmon write failed for {member_id}: {e}");
-                }
+                let res = guard
+                    .set_pwm(member_id, *pwm_percent, &lease_id)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string());
+                outcomes.push((member_id.clone(), res));
             }
 
             // Phase 3: renew under a brief lock to keep it alive for next cycle.
             if let Err(e) = ctrl.lock().lease_manager_mut().renew_lease(&lease_id) {
                 log::debug!("lease renewal failed (will re-acquire next cycle): {e}");
             }
+            outcomes
         })
         .await;
-        if let Err(e) = join {
-            // Concurrency review D3: surface panicked write tasks.
-            log::error!("Profile engine: hwmon write task panicked: {e}");
+        match join {
+            Ok(outcomes) => self.note_outcomes(&outcomes),
+            Err(e) => {
+                // Concurrency review D3: surface panicked write tasks.
+                log::error!("Profile engine: hwmon write task panicked: {e}");
+            }
         }
     }
 }
@@ -840,6 +910,50 @@ mod tests {
         }
     }
 
+    /// A [`SysfsWriter`] that fails writes whose path contains `fail_fragment`
+    /// with EROFS ("Read-only file system", os error 30) — the DEC-199 sandbox
+    /// carve-out symptom. `fail_fragment` is swappable at runtime so a test can
+    /// "repair" the sandbox and observe recovery, and is path-selective so one
+    /// stuck header can fail while a sibling still writes.
+    struct CarveoutFailWriter {
+        writes: WriteLog,
+        fail_fragment: Arc<Mutex<Option<String>>>,
+    }
+
+    impl SysfsWriter for CarveoutFailWriter {
+        fn write_file(&mut self, path: &str, value: &str) -> Result<(), HwmonError> {
+            let fails = {
+                let guard = self.fail_fragment.lock();
+                guard.as_deref().is_some_and(|frag| path.contains(frag))
+            };
+            if fails {
+                return Err(HwmonError::WriteError {
+                    path: path.into(),
+                    message: "Read-only file system (os error 30)".into(),
+                });
+            }
+            self.writes.lock().push((path.into(), value.into()));
+            Ok(())
+        }
+        fn read_file(&self, _path: &str) -> Result<String, HwmonError> {
+            Ok("128\n".into())
+        }
+    }
+
+    fn hwmon_backend_carveout(
+        headers: Vec<PwmHeaderDescriptor>,
+        fail_fragment: Option<&str>,
+    ) -> (HwmonBackend, Arc<Mutex<Option<String>>>) {
+        let frag = Arc::new(Mutex::new(fail_fragment.map(String::from)));
+        let writer = CarveoutFailWriter {
+            writes: Arc::new(Mutex::new(Vec::new())),
+            fail_fragment: frag.clone(),
+        };
+        let cache = Arc::new(StateCache::new());
+        let ctrl = HwmonPwmController::new(headers, LeaseManager::new(), Box::new(writer), cache);
+        (HwmonBackend::new(Arc::new(Mutex::new(ctrl))), frag)
+    }
+
     #[tokio::test]
     async fn hwmon_apply_writes_every_header_in_batch() {
         // DEC-154 per-command locking must still write EVERY header in a batch
@@ -949,6 +1063,70 @@ mod tests {
         assert!(
             w.iter().any(|(p, _)| p.ends_with("pwm2")),
             "writable sibling must still be written; got {w:?}"
+        );
+        drop(w);
+        assert_eq!(
+            be.member_failure_streak("hwmon:it8696:pwm1"),
+            0,
+            "a read-only header is skipped, never counted as a write failure (DEC-199)"
+        );
+    }
+
+    #[tokio::test]
+    async fn hwmon_failure_streak_increments_then_clears_on_recovery() {
+        // DEC-199: a persistent hwmon write failure (canonically EROFS from a
+        // misconfigured sandbox carve-out) must advance a per-member streak so
+        // the log can be throttled, and clear the moment the member writes again.
+        let (mut be, frag) =
+            hwmon_backend_carveout(vec![make_header("hwmon:it8696:pwm1")], Some("pwm1"));
+
+        for expected in 1..=3 {
+            be.apply(&[cmd("hwmon:it8696:pwm1", "hwmon", 55)]).await;
+            assert_eq!(
+                be.member_failure_streak("hwmon:it8696:pwm1"),
+                expected,
+                "each failing tick must advance the member's streak"
+            );
+        }
+
+        // Sandbox carve-out repaired → the write succeeds → the streak clears.
+        *frag.lock() = None;
+        be.apply(&[cmd("hwmon:it8696:pwm1", "hwmon", 55)]).await;
+        assert_eq!(
+            be.member_failure_streak("hwmon:it8696:pwm1"),
+            0,
+            "a successful write must reset the member's failure streak"
+        );
+    }
+
+    #[tokio::test]
+    async fn hwmon_failure_streak_isolated_per_member() {
+        // A single stuck header must not mask a healthy sibling: the failing
+        // member accrues a streak while the writable one stays at zero (mirrors
+        // the OpenFan per-channel isolation, audit P3-5).
+        let (mut be, _frag) = hwmon_backend_carveout(
+            vec![
+                make_header_idx("hwmon:it8696:pwm1", 1),
+                make_header_idx("hwmon:it8696:pwm2", 2),
+            ],
+            Some("pwm2"),
+        );
+
+        be.apply(&[
+            cmd("hwmon:it8696:pwm1", "hwmon", 40),
+            cmd("hwmon:it8696:pwm2", "hwmon", 55),
+        ])
+        .await;
+
+        assert_eq!(
+            be.member_failure_streak("hwmon:it8696:pwm2"),
+            1,
+            "the stuck header must accrue a failure streak"
+        );
+        assert_eq!(
+            be.member_failure_streak("hwmon:it8696:pwm1"),
+            0,
+            "the healthy sibling must stay at zero"
         );
     }
 

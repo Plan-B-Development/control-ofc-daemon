@@ -138,6 +138,20 @@ pub const NO_SENSOR_SAFE_PCT: u8 = 40;
 /// fires once at the exact threshold (edge-triggered) to avoid 1 Hz log spam.
 pub const OPENFAN_FAIL_ALERT_THRESHOLD: u32 = 5;
 
+// ── Profile engine — hwmon write-failure log throttle (DEC-199) ───────
+
+/// A persistent motherboard-fan (hwmon) write failure — canonically EROFS
+/// ("Read-only file system", os error 30) when the systemd sandbox's
+/// `ReadWritePaths=` carve-out does not cover the real `/sys/devices` inode
+/// (DEC-199) — is logged once on the first failing tick, then only every
+/// `HWMON_FAIL_SUMMARY_INTERVAL` ticks (≈ that many seconds at the 1 Hz loop)
+/// as a "still failing" summary, so a stuck header cannot spam journald at
+/// 1 Hz. A subsequent successful write clears the streak and logs an INFO
+/// recovery line. (The OpenFan and GPU backends already throttle their own
+/// write-failure logs — edge-triggered alerting and a 60 s fail-cooldown
+/// respectively — so this covers the one remaining un-throttled backend.)
+pub const HWMON_FAIL_SUMMARY_INTERVAL: u32 = 300;
+
 // ── Sensor polling — descriptor cache (DEC-133) ──────────────────────
 
 /// Consecutive failed value-reads for a single cached sensor descriptor

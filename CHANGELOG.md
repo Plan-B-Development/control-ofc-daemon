@@ -1,5 +1,47 @@
 # Changelog
 
+## [2.5.2] — 2026-07-04
+
+Packaging bugfix: motherboard (hwmon) and GPU fan writes failed with `EROFS`
+under the systemd sandbox, so those fans were never actually driven by the
+daemon (they stayed in BIOS/PMFW automatic mode) and journald was spammed at
+1 Hz. No API, wire-contract, or control-loop behaviour change. No GUI release
+(GUI stays v2.8.3; a docs-only troubleshooting cross-reference was added there).
+
+### Fixed
+- **Motherboard + GPU fans are controllable again under the packaged systemd
+  unit (DEC-199).** `ProtectKernelTunables=true` remounts all of `/sys`
+  read-only (`ProtectSystem=strict` alone does not — it exempts `/sys`), and the
+  writable carve-out was `ReadWritePaths=/sys/class/hwmon /sys/class/drm`. But
+  those class directories hold only symlinks, and sysfs decides writability by
+  the symlink *target* inode's mount: every `pwm*`, `pwm*_enable`, and GPU
+  `fan_curve` write resolves through those symlinks to `/sys/devices/...`, which
+  stayed read-only — so each write failed with `EROFS` ("Read-only file system",
+  os error 30). The carve-out is now `ReadWritePaths=/sys/devices`, which covers
+  the real inodes while keeping `/proc/sys`, `/sys/kernel`, and `/sys/module`
+  read-only (strictly better hardening than dropping `ProtectKernelTunables=`).
+  The stop-time restore helper's `[ -w ]` guard — which silently no-op'd on the
+  read-only mount — works again with the same fix. Latent since the first
+  packaging commit (2026-04-08); only ever hit on installed packages driving
+  motherboard/GPU fans (dev runs and OpenFan-only setups never exercise the
+  `/sys` write path). A new `packaging_version` test asserts the carve-out covers
+  `/sys/devices`, so a revert to the class-level path fails `cargo test`.
+
+### Changed
+- **The hwmon backend throttles its write-failure log (DEC-199).** A persistent
+  motherboard-fan write failure previously re-logged at WARN every 1 Hz tick; it
+  now logs once on the first failure, then a "still failing" summary every
+  `HWMON_FAIL_SUMMARY_INTERVAL` (300) ticks, plus an INFO recovery line when the
+  member writes again — tracked per member, so one stuck header is isolated from
+  healthy siblings (mirrors the OpenFan per-channel discipline; the GPU backend
+  already had a 60 s fail-cooldown). Keeps the journal quiet if a hwmon write
+  ever fails for another reason (e.g. a genuinely BIOS-locked chip).
+- **`post_install` surfaces the fan-control hardware prerequisites** — the
+  Super I/O DKMS driver, `acpi_enforce_resources=lax`, and
+  `amdgpu.ppfeaturemask=0xffffffff` — that otherwise leave a discovered header or
+  GPU fan silently uncontrolled, and points at the GUI's Hardware Readiness card
+  for the per-machine fix.
+
 ## [2.5.1] — 2026-07-04
 
 Packaging + supply-chain hardening pass (Cluster 6 + 7). No API, wire-contract, or
