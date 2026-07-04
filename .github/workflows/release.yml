@@ -129,6 +129,17 @@ jobs:
           fi
           echo "PKGBUILD pkgver matches tag: $pkgbuild_ver"
 
+      - name: Verify Cargo.toml version matches tag
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          cargo_ver="$(grep '^version' daemon/Cargo.toml | cut -d'"' -f2)"
+          if [[ "$cargo_ver" != "$version" ]]; then
+            echo "::error file=daemon/Cargo.toml::version is '$cargo_ver' but tag is 'v${version}'. Bump daemon/Cargo.toml before tagging."
+            exit 1
+          fi
+          echo "Cargo.toml version matches tag: $cargo_ver"
+
       - name: Publish to AUR
         uses: KSXGitHub/github-actions-deploy-aur@da03e160361ce01bf087e790b6ffd196d7dccff7 # v4.1.3
         with:

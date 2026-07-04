@@ -5,6 +5,10 @@
 # Without this, a daemon crash leaves motherboard fans stuck in manual mode
 # (pwm_enable=1) with no BIOS thermal management.
 
+# A no-match glob must expand to nothing, not the literal pattern, so the loops
+# below simply skip on a machine with no hwmon PWM or GPU fan_curve nodes.
+shopt -s nullglob
+
 for pwm_enable in /sys/class/hwmon/hwmon*/pwm*_enable; do
     [ -w "$pwm_enable" ] && echo 2 > "$pwm_enable" 2>/dev/null
 done

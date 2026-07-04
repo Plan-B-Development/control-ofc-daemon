@@ -1,5 +1,37 @@
 # Changelog
 
+## [2.5.1] — 2026-07-04
+
+Packaging-hardening pass (Cluster 6 Phase 1). No API, wire-contract, or control-loop
+behaviour change — the systemd unit, the release CI, and the stop-time restore script
+only. Verify on real hardware after install.
+
+### Security
+- **systemd unit hardened.** The service now drops the six capabilities the daemon
+  provably never uses (`CapabilityBoundingSet=~CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE
+  CAP_SYS_RAWIO CAP_SYS_MODULE CAP_SYS_BOOT` — `CAP_DAC_OVERRIDE` is deliberately KEPT as
+  insurance for a board whose sysfs node is not root-owned), runs in a private network
+  namespace (`PrivateNetwork=true`) restricted to `AF_UNIX`/`AF_NETLINK`
+  (`RestrictAddressFamilies`; the daemon's only socket is the filesystem Unix socket and
+  libudev port enumeration needs netlink — `AF_INET`/`INET6`/`PACKET` are blocked), and
+  adds `ProtectClock`, `ProtectHostname`, `ProtectProc=invisible`,
+  `SystemCallArchitectures=native`, `UMask=0027`, `StateDirectoryMode=0700`, and
+  `StartLimitIntervalSec=60`/`StartLimitBurst=5`. `ProcSubset=pid` is deliberately NOT
+  set — it would hide `/proc/{modules,ioports,cpuinfo}`, which the live
+  `GET /diagnostics/hardware` handler reads. Removed the redundant
+  `DeviceAllow=char-usb_device rwm`: the serial transport is a tty (no libusb linked), and
+  the `char-ttyACM`/`char-ttyUSB` rules already cover every device.
+
+### Changed
+- **Release CI asserts `daemon/Cargo.toml` version == tag** (mirrors the existing
+  PKGBUILD-pkgver-vs-tag guard), backed by a new `packaging_version` test pinning the crate
+  version to `packaging/PKGBUILD` `pkgver`. A version/tag drift now fails `cargo test` and
+  the AUR publish instead of shipping a mislabelled package.
+- **The stop-time restore script uses `shopt -s nullglob`** so a no-match hwmon/GPU glob
+  expands to nothing instead of the literal pattern.
+
+Pairs with `control-ofc-gui` ≥ v2.0.0 — packaging only; no GUI change.
+
 ## [2.5.0] — 2026-07-03
 
 Audit-2026-07-03 Cluster 2: post-2.0.0 demolition-debris cleanup. No runtime behaviour

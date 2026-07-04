@@ -9,6 +9,11 @@ After=local-fs.target
 Wants=modprobe@cdc_acm.service
 After=modprobe@cdc_acm.service
 
+# Cap restart storms: at most 5 starts per 60 s window (works with Restart=on-failure
+# below). These are [Unit]-section directives since systemd v230.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
 [Service]
 Type=simple
 ExecStart=/usr/bin/control-ofc-daemon
@@ -34,11 +39,12 @@ RestartSec=3
 # Root is required for direct read/write to /sys/class/hwmon and /sys/class/drm
 # sysfs nodes (motherboard fan PWM headers and GPU PMFW fan curves). Serial
 # device access (/dev/ttyACM*) is handled via DeviceAllow below.
-# CapabilityBoundingSet is intentionally omitted: with NoNewPrivileges=true and
-# SystemCallFilter active, child-process capability escalation is already blocked.
-# Adding CapabilityBoundingSet provides marginal additional protection for a root
-# process and risks breaking sysfs writes if the wrong cap is dropped. Revisit
-# post-release with per-capability verification on real hardware.
+# CapabilityBoundingSet: drop caps the daemon provably never uses (no netlink/raw-IO,
+# no ptrace, no module load, no reboot, no raw USB). CAP_DAC_OVERRIDE is deliberately
+# KEPT — sysfs pwm / drm fan_curve / serial-tty writes succeed on owner perms as UID 0,
+# but DAC_OVERRIDE is retained as insurance for any board whose sysfs node is not
+# root-owned. (Analysis-verified; smoke-test on real hardware before release.)
+CapabilityBoundingSet=~CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE CAP_SYS_RAWIO CAP_SYS_MODULE CAP_SYS_BOOT
 
 # Security hardening
 ProtectHome=read-only
@@ -61,10 +67,30 @@ LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallFilter=@system-service
 SystemCallFilter=~@mount @reboot @swap @debug
+SystemCallArchitectures=native
+
+# Extra Protect* isolation (safe set — verified on real hardware).
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+# ProcSubset=pid is deliberately NOT set: it would hide /proc/{modules,ioports,cpuinfo},
+# which the live GET /diagnostics/hardware handler reads (hw_diagnostics.rs).
+
+# Owner-only umask for new files and an owner-only StateDirectory.
+UMask=0027
+StateDirectoryMode=0700
+
+# Network isolation: the daemon's only socket is the filesystem Unix socket at
+# /run/control-ofc/control-ofc.sock (unaffected by a private net namespace) and it
+# makes no outbound network calls. AF_UNIX is the real socket; AF_NETLINK is kept
+# only so a netlink socket libudev may open during available_ports() does not hit
+# EAFNOSUPPORT (serial enumeration itself works via static sysfs reads + the
+# direct-probe fallback regardless). This still blocks AF_INET/INET6/PACKET.
+PrivateNetwork=true
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
 
 # Serial device access (OpenFanController)
 # Allow all ttyACM and ttyUSB devices (index varies across systems)
-DeviceAllow=char-usb_device rwm
 DeviceAllow=char-ttyACM rwm
 DeviceAllow=char-ttyUSB rwm
 # uucp (Arch/CachyOS) — dialout (Debian/Ubuntu) omitted; systemd fails on missing groups
