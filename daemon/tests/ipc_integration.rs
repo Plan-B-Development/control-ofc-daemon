@@ -1652,6 +1652,56 @@ async fn profile_create_invalid_returns_field_violations() {
     );
 }
 
+// Semantic 400 `validation_error` envelope: a VALID-JSON body that is *missing a
+// required field* on a `Json<serde_json::Value>` handler returns the standard
+// error envelope {code, message, retryable, source}. NOTE: a *syntactically*
+// malformed JSON body, or a missing field on a TYPED extractor (e.g.
+// `/control/{id}/override` without `pwm_percent`), deliberately returns axum's
+// plain-text rejection (400 for a syntax error, 422 for a typed-shape reject) —
+// NOT this envelope — because the daemon uses axum's default `Json<T>` extractor
+// with no custom rejection mapping (see daemon/src/api/responses.rs:1182-1191).
+// The absence of an envelope on those paths is intentional, not a coverage gap.
+#[tokio::test]
+async fn profile_create_missing_id_returns_validation_envelope() {
+    let (sock, _tx, _d) = start_test_server(test_app_state()).await;
+    // Valid JSON object with no `id` key → create_profile_handler's missing-`id`
+    // branch emits ErrorEnvelope::validation("missing 'id' field") and returns
+    // 400 before ever touching the profile store.
+    let (st, body) = uds_post(
+        &sock,
+        "/profiles",
+        &serde_json::json!({"name": "No Id", "version": 7, "controls": [], "curves": []}),
+    )
+    .await;
+    assert_eq!(st, 400, "{body}");
+    let err = &body["error"];
+    assert_eq!(err["code"], "validation_error");
+    assert!(
+        !err["message"].as_str().unwrap_or("").is_empty(),
+        "error.message must be a non-empty string: {body}"
+    );
+    assert_eq!(err["retryable"], false);
+    assert_eq!(err["source"], "validation");
+}
+
+/// Second `Json<serde_json::Value>` handler on the same semantic-400 path:
+/// activation with neither `profile_id` nor `profile_path` hits
+/// activate_profile_handler's missing-selector branch → same envelope.
+#[tokio::test]
+async fn profile_activate_missing_selector_returns_validation_envelope() {
+    let (sock, _tx, _d) = start_test_server(test_app_state()).await;
+    let (st, body) = uds_post(&sock, "/profile/activate", &serde_json::json!({})).await;
+    assert_eq!(st, 400, "{body}");
+    let err = &body["error"];
+    assert_eq!(err["code"], "validation_error");
+    assert!(
+        !err["message"].as_str().unwrap_or("").is_empty(),
+        "error.message must be a non-empty string: {body}"
+    );
+    assert_eq!(err["retryable"], false);
+    assert_eq!(err["source"], "validation");
+}
+
 #[tokio::test]
 async fn profile_validate_only_persists_nothing_but_still_rejects_invalid() {
     let (state, store) = state_with_temp_store();
