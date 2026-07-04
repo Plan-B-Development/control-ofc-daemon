@@ -2,9 +2,9 @@
 
 ## [2.5.1] — 2026-07-04
 
-Packaging-hardening pass (Cluster 6 Phase 1). No API, wire-contract, or control-loop
-behaviour change — the systemd unit, the release CI, and the stop-time restore script
-only. Verify on real hardware after install.
+Packaging + supply-chain hardening pass (Cluster 6 + 7). No API, wire-contract, or
+control-loop behaviour change — the systemd unit, the release CI, the stop-time restore
+script, and a dev-only advisory/licence cleanup. Verify on real hardware after install.
 
 ### Security
 - **systemd unit hardened.** The service now drops the six capabilities the daemon
@@ -21,6 +21,13 @@ only. Verify on real hardware after install.
   `GET /diagnostics/hardware` handler reads. Removed the redundant
   `DeviceAllow=char-usb_device rwm`: the serial transport is a tty (no libusb linked), and
   the `char-ttyACM`/`char-ttyUSB` rules already cover every device.
+- **Resolved RUSTSEC-2026-0190** (unsound `anyhow <1.0.103`) by bumping the lockfile to
+  1.0.103. anyhow reaches the tree only as a dev-only, wasm-target-gated transitive dep
+  (via `tempfile → getrandom`) and is absent from the shipped binary, but the fix is a
+  free one-crate lock bump. Separately documented in `deny.toml` that the `unescaper`
+  deprecated-SPDX (`GPL-3.0/MIT`) cargo-deny `parse-error` is a benign, exit-0 warning we
+  accept — the crate passes under MIT (`cargo deny check` stays green); a hash-pinned
+  `clarify` isn't worth the per-bump maintenance and no waiver is warranted.
 
 ### Changed
 - **Release CI asserts `daemon/Cargo.toml` version == tag** (mirrors the existing

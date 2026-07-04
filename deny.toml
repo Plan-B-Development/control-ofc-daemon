@@ -25,9 +25,15 @@ ignore = []
 #   MPL-2.0       — serialport (DEC-155, acknowledged in NOTICE.md)
 # Notably ABSENT (therefore denied): every LGPL/GPL-only variant (DEC-043).
 # unescaper declares the legacy "GPL-3.0/MIT" (the slash means OR); MIT
-# satisfies it, so NO GPL allowance is needed. If a future cargo-deny ever
-# flags it, prefer a scoped `[[licenses.exceptions]]` for `unescaper` over
-# allowing GPL globally.
+# satisfies it, so NO GPL allowance is needed and the crate PASSES the gate.
+# cargo-deny still prints a cosmetic `parse-error` warning about the deprecated
+# `GPL-3.0` identifier in unescaper's own Cargo.toml — this is NOT a failure
+# (`cargo deny check licenses` exits 0). A `[[licenses.clarify]]` with a
+# `license-files` SHA-256 hash COULD override the string and suppress the warning,
+# but that hash must be recomputed on every unescaper bump — recurring maintenance
+# for an exit-0 cosmetic warning, not worth it. (`[[licenses.exceptions]]` can't —
+# it only adds allowed licences.) Accepted as benign noise until unescaper
+# modernises its SPDX identifier upstream (audit-2026-07-03 Cluster 7).
 allow = [
     "MIT",
     "Apache-2.0",
