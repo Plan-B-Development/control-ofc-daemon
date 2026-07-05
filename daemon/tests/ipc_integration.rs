@@ -760,6 +760,67 @@ async fn hwmon_verify_no_controller_returns_503() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Seed one CPU sensor above the 85 °C verify/calibrate limit onto a base state.
+fn make_hot(state: &Arc<AppState>) {
+    state.cache.update_sensors(vec![CachedSensorReading {
+        id: "hwmon:k10temp:hot:Tccd".into(),
+        kind: SensorKind::CpuTemp,
+        label: "Tccd".into(),
+        value_c: 95.0, // over CALIBRATION_MAX_TEMP_C (85)
+        source: DeviceLabel::Hwmon,
+        updated_at: Instant::now(),
+        rate_c_per_s: None,
+        session_min_c: None,
+        session_max_c: None,
+        chip_name: "k10temp".into(),
+        temp_type: None,
+        thresholds: None,
+    }]);
+}
+
+#[tokio::test]
+async fn hwmon_verify_refused_when_hot() {
+    // Phase 6 (DEC-201): a fan verify must not run while the system is hot — it
+    // pauses the engine's write phase (incl. the 105 °C thermal force_all) for its
+    // window. A sensor over the 85 °C limit → 409 thermal_abort, before the
+    // controller/header is even consulted (a global safety gate).
+    let state = test_app_state();
+    make_hot(&state);
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_post(&path, "/hwmon/fake:header/verify", &serde_json::json!({})).await;
+
+    assert_eq!(status, 409);
+    assert_eq!(json["error"]["code"], "thermal_abort");
+    assert_eq!(json["error"]["source"], "hardware");
+    assert_eq!(json["error"]["retryable"], true);
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn gpu_verify_refused_when_hot() {
+    // The GPU verify also pauses the engine (suppressing the CPU thermal
+    // force_all), so it too must refuse to start while hot (DEC-201).
+    let state = test_app_state();
+    make_hot(&state);
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_post(
+        &path,
+        "/gpu/0000:99:00.0/fan/verify",
+        &serde_json::json!({}),
+    )
+    .await;
+
+    assert_eq!(status, 409);
+    assert_eq!(json["error"]["code"], "thermal_abort");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
 #[tokio::test]
 async fn gpu_reset_fan_unknown_gpu_returns_404() {
     let state = test_app_state(); // amd_gpus empty

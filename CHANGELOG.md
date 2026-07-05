@@ -40,6 +40,19 @@ additively; version bump + GUI consumption land at release.
   sensor later disappears. Advisory — thermal safety still uses the hottest
   CpuTemp, and a stale selection is never blindly applied.
 
+### Changed
+- **Fan verify refuses to start while the system is hot (DEC-201).**
+  `POST /hwmon/{header_id}/verify` and `POST /gpu/{gpu_id}/fan/verify` now return
+  `409 thermal_abort` when any sensor exceeds the 85 °C verify limit
+  (`CALIBRATION_MAX_TEMP_C`). A verify pauses the engine's write phase for its
+  window (DEC-191), which also suppresses the 105 °C thermal `force_all` — so a
+  fan diagnostic must not run during a thermal event. Reuses the calibrate
+  sweep's `check_thermal_safety` via a shared `verify_thermal_guard`, so verify
+  and calibrate share one thermal gate and threshold. This is the "abort on high
+  temperature" requirement of the Phase-6 safe-verify design; every other Phase-6
+  requirement was already satisfied by the existing verify path
+  (DEC-098/101/120/165/191).
+
 ## [2.5.2] — 2026-07-04
 
 Packaging bugfix: motherboard (hwmon) and GPU fan writes failed with `EROFS`

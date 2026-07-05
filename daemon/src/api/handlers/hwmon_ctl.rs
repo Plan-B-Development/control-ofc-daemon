@@ -158,6 +158,11 @@ pub async fn hwmon_verify_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(header_id): axum::extract::Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // Phase 6 (DEC-201): refuse to start a verify while the system is hot — the
+    // verify pauses the engine (incl. the thermal force_all) for its window.
+    if let Some(resp) = super::verify_thermal_guard(&state.cache) {
+        return resp;
+    }
     let controller = match &state.hwmon_controller {
         Some(c) => c,
         None => {

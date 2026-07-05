@@ -234,6 +234,32 @@ pub(crate) fn begin_verify_pause(
     }
 }
 
+/// Phase 6 (DEC-201): refuse to START a hardware fan verify while the system is
+/// hot. A verify pauses the engine's write phase for its window, which also
+/// suppresses the 105 °C thermal `force_all` — so a fan diagnostic must never run
+/// during a thermal event. Returns `Some(409 thermal_abort)` when any sensor
+/// exceeds the calibrate/verify limit (reuses `check_thermal_safety`, matching
+/// the calibrate sweep — DEC-134); `None` when it is safe to proceed.
+pub(crate) fn verify_thermal_guard(
+    cache: &crate::health::cache::StateCache,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    if let Err(crate::api::calibration::CalibrationError::ThermalAbort {
+        sensor_id,
+        temp_c,
+        limit_c,
+    }) = crate::api::calibration::check_thermal_safety(cache)
+    {
+        return Some(error_response(
+            StatusCode::CONFLICT,
+            &ErrorEnvelope::thermal_abort(format!(
+                "Cannot run a fan verify while hot: {sensor_id} at {temp_c:.1}°C \
+                 (limit {limit_c:.0}°C). Let the system cool, then retry."
+            )),
+        ));
+    }
+    None
+}
+
 pub(crate) fn build_status_response(
     state: &AppState,
     thermal_state: String,

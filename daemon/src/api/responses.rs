@@ -1235,6 +1235,22 @@ impl ErrorEnvelope {
         }
     }
 
+    /// A `409 thermal_abort` — a hardware fan action (verify / calibrate) was
+    /// refused because a sensor is too hot to run it safely. Retryable once the
+    /// system cools. Phase 6 / DEC-201 wires this into the verify handlers;
+    /// mirrors the calibrate sweep's abort (DEC-134).
+    pub fn thermal_abort(message: impl Into<String>) -> Self {
+        Self {
+            error: ErrorBody {
+                code: "thermal_abort".into(),
+                message: message.into(),
+                details: None,
+                retryable: true,
+                source: "hardware".into(),
+            },
+        }
+    }
+
     /// A `validation_error` carrying structured per-field violations in
     /// `details` (DEC-160). The envelope shape is unchanged — `details` is the
     /// existing free-form field — so older clients that read only
