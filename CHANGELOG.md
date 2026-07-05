@@ -1,11 +1,17 @@
 # Changelog
 
-## [Unreleased]
+## [2.6.0] — 2026-07-05
 
-Daemon-owned, read-only CPU/hwmon/PWM discovery + readiness (DEC-200). No
-behaviour change to existing endpoints; API v1. The profile engine remains the
-sole PWM writer — discovery never writes hardware. The GUI consumes these
-additively; version bump + GUI consumption land at release.
+Daemon-owned, read-only CPU/hwmon/PWM discovery + readiness (DEC-200), plus a
+verify thermal-abort precondition (DEC-201). API v1 — the only change to an
+existing endpoint is the new `409 thermal_abort` refusal on the verify routes;
+everything else is additive. The profile engine remains the sole PWM writer —
+discovery never writes hardware.
+
+Pairs with `control-ofc-gui` ≥ v2.0.0 (additive — any 2.x GUI keeps working). The
+new inventory / readiness / preferred-sensor / verify-thermal surfaces are
+consumed by `control-ofc-gui` ≥ v2.9.0, which degrades gracefully on older
+daemons (unknown routes 404 and the new UI hides itself).
 
 ### Added
 - **Read-only hwmon inventory — `GET /inventory/hwmon`.** A structured snapshot
