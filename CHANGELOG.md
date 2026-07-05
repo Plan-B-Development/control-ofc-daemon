@@ -1,5 +1,35 @@
 # Changelog
 
+## [Unreleased]
+
+Daemon-owned, read-only CPU/hwmon/PWM discovery + readiness (DEC-200). No
+behaviour change to existing endpoints; API v1. The profile engine remains the
+sole PWM writer — discovery never writes hardware. The GUI consumes these
+additively; version bump + GUI consumption land at release.
+
+### Added
+- **Read-only hwmon inventory — `GET /inventory/hwmon`.** A structured snapshot
+  of hwmon-visible hardware for the GUI: temperature sensors, controllable PWM
+  headers, and **monitor-only fan tachometers** (`fanN_input` with no matching
+  `pwmN`, previously invisible to the API). Never writes hardware.
+- **Fine-grained temperature-sensor classification.** Each inventory temp sensor
+  gains an advisory `classification` (cpu_package / cpu_core / cpu_tctl /
+  cpu_tdie / motherboard_temp / vrm_temp / chipset_temp / gpu_temp / disk_temp /
+  coolant_temp / unknown_temp), a `confidence` (high/medium/low/unknown), and a
+  plain-English `rationale`. It **refines** the coarse `kind` — a sensor's `kind`
+  and the daemon's thermal safety are unchanged. A deterministic, explainable
+  `default_cpu` recommendation is included: advisory only, never a silent
+  replacement of a user's choice.
+- **Structured hardware-readiness list — `GET /inventory/readiness`.** An
+  actionable diagnose-and-guide list (`items[]` with a stable `code`, severity
+  `ok`/`info`/`warning`/`critical`, component, summary, detail, recommended
+  action, and per-item `can_automate`/`blocks_monitoring`/`blocks_control`/
+  `affects_safety`/`reboot_may_be_required` flags) plus an `overall` rollup.
+  Covers CPU-sensor presence (safety-relevant), default-CPU confidence, PWM
+  controls present/read-only/unverified, monitor-only tachometers, quarantined
+  sensors (DEC-193), and unclassified sensors. Read-only — the daemon never
+  mutates the system or auto-remediates.
+
 ## [2.5.2] — 2026-07-04
 
 Packaging bugfix: motherboard (hwmon) and GPU fan writes failed with `EROFS`

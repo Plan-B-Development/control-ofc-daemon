@@ -242,6 +242,8 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 | GET | `/profiles`, `/profiles/{id}` | Daemon-stored profiles (store of record — DEC-160) |
 | GET | `/profile/active` | Current active profile or `{"active": false}` |
 | GET | `/diagnostics/hardware` | Hardware readiness report (hwmon chips, GPU, thermal safety, kernel modules, ACPI conflicts, board info) |
+| GET | `/inventory/hwmon` | Read-only structured inventory: temp sensors (each with a fine `classification`/`confidence`/`rationale` + an advisory `default_cpu`), controllable PWM headers, and monitor-only fan tachometers (`fanN_input` with no matching `pwmN`) |
+| GET | `/inventory/readiness` | Structured hardware-readiness list (`items[]` with code/severity/component/action + blocks-flags; `overall` rollup). Read-only diagnose-and-guide |
 
 As of 2.0.0 the profile engine is the **sole writer** (DEC-159/DEC-165); the GUI sends intent (activate / override / identify) and a few diagnostics calls — there is no bare PWM write surface.
 
@@ -253,6 +255,18 @@ reason, unavailable_for_ms}`. Each live `sensors` entry also carries
 `control_eligible: bool` (derived from `is_wireless_phy_chip(chip_name)`). Both
 fields are additive — older clients ignore them; the GUI defaults
 `control_eligible = true` and `unavailable_sensors = []` when absent.
+
+**Read-only hwmon discovery + readiness (DEC-200, additive, GUI-facing):** `GET
+/inventory/hwmon` returns a structured, read-only snapshot — temperature sensors
+(each with a fine `classification`/`confidence`/`rationale` that *refines* `kind`,
+plus a deterministic advisory `default_cpu`), controllable PWM headers, and
+monitor-only fan tachometers (`fanN_input` with no matching `pwmN`). `GET
+/inventory/readiness` turns that snapshot into an actionable readiness list
+(per-item `severity` + recommended action + `blocks_*`/`affects_safety`/
+`reboot_may_be_required` flags, and an `overall` rollup). Both are **read-only —
+discovery never writes hardware**; the classification is advisory (thermal safety
+still keys off `kind`), and GPU fan control stays out of scope (owned by the GPU
+subsystem — DEC-102 / DEC-130).
 
 ### Write endpoints — fans
 

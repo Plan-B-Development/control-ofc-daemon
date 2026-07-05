@@ -75,6 +75,17 @@ sudo systemctl restart control-ofc-daemon
 
 **Out-of-tree modules:** Some newer motherboard chipsets require DKMS modules not yet in mainline (e.g. `it87` for newer ITE chips, `nct6687` for some MSI/ASUS boards). These are available from the AUR and must be installed separately.
 
+### What the daemon detects — and what it deliberately doesn't
+
+The daemon exposes a structured, **read-only** view of your cooling hardware for the GUI (`GET /inventory/hwmon` and `GET /inventory/readiness`):
+
+- **Detected automatically (read-only):** CPU and motherboard temperature sensors — each classified (e.g. *CPU Tctl*, *VRM*, *chipset*) with a confidence and a plain-English reason — a recommended default CPU sensor, every controllable PWM fan header, and **monitor-only fan tachometers** (fans whose RPM can be read but not controlled). The daemon also builds a readiness checklist that explains what works, what is missing, what is read-only, and what to do about it.
+- **Deliberately NOT automated:** the daemon never runs `sensors-detect`, never loads kernel modules, never edits your bootloader/initramfs/udev, and **never writes to a fan during discovery**. Anything that could change system behaviour is left to you (with guidance), so discovery is safe to run at any time.
+- **"Control unverified":** a writable PWM header only *appears* controllable until a fan-control verification confirms a write actually changes fan speed. Until then, the readiness list marks control as unverified.
+- **Read-only fans:** some PWM channels are exposed read-only by the kernel driver; those fans can be monitored but not controlled, and the readiness list says so rather than pretending otherwise.
+- **Reboot may be required:** loading a missing Super I/O or DKMS driver to gain fan control usually needs a reboot or module reload — the relevant readiness item flags this.
+- **GPU is out of scope here:** GPU fan discovery and control are owned by the GPU subsystem, not this hwmon path (DEC-102 / DEC-130).
+
 ## Configuration
 
 Configuration is optional. The daemon uses sensible defaults if no config file exists.
