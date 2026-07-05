@@ -17,6 +17,7 @@ pub mod lease;
 pub mod pwm_control;
 pub mod pwm_discovery;
 pub mod reader;
+pub mod readiness;
 pub mod types;
 pub mod util;
 

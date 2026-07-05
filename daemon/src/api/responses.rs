@@ -346,6 +346,16 @@ pub struct HwmonInventoryResponse {
     pub default_cpu: Option<DefaultCpuEntry>,
 }
 
+/// Response for `GET /inventory/readiness` — the structured hardware-readiness
+/// list (Phase 3). Read-only diagnose-and-guide; the daemon never mutates the
+/// system to produce it. `overall` is the most severe item's severity.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReadinessResponse {
+    pub api_version: u32,
+    pub overall: crate::hwmon::readiness::ReadinessSeverity,
+    pub items: Vec<crate::hwmon::readiness::ReadinessItem>,
+}
+
 /// One entry in the `GET /profiles` listing — a lightweight summary parsed from
 /// each stored/preset profile (the full document is fetched via
 /// `GET /profiles/{id}`).

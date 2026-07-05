@@ -60,6 +60,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // sensors, controllable PWM headers, and monitor-only fan tachometers
         // (fanN_input with no matching pwmN). Additive; never writes hardware.
         .route("/inventory/hwmon", get(handlers::hwmon_inventory_handler))
+        // Structured hardware-readiness list (Phase 3): actionable diagnose-and-
+        // guide items (severity + recommended action + blocks-flags). Read-only.
+        .route(
+            "/inventory/readiness",
+            get(handlers::hwmon_readiness_handler),
+        )
         // Manual override + fan identify (DEC-163 / DEC-166). axum 0.8 needs
         // method-chaining on a single route per path (duplicate paths panic).
         .route(

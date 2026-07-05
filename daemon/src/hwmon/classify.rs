@@ -230,6 +230,11 @@ fn cpu_class_rank(class: TempClass) -> Option<u8> {
     }
 }
 
+/// True when a fine class is a CPU sub-class (i.e. a default-CPU candidate).
+pub fn is_cpu_class(class: TempClass) -> bool {
+    cpu_class_rank(class).is_some()
+}
+
 /// Pick the deterministic default CPU temperature sensor from a set of
 /// classified sensors. Prefers the most representative CPU sub-class, then the
 /// highest confidence, then the lexicographically-smallest id (stable tiebreak).

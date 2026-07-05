@@ -294,6 +294,35 @@ async fn inventory_hwmon_endpoint_returns_structured_inventory() {
 }
 
 #[tokio::test]
+async fn inventory_readiness_endpoint_reports_structured_items() {
+    // Phase 3: GET /inventory/readiness diagnoses the inventory into actionable
+    // items. The fixture has one CPU sensor (cpu_sensor_present / ok) and no
+    // hwmon controller (no_pwm_controls / warning), so overall = warning. The
+    // monitor_only item depends on the host's sysfs and is not asserted.
+    let state = test_app_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/inventory/readiness").await;
+
+    assert_eq!(status, 200);
+    assert_eq!(json["api_version"], 1);
+    assert_eq!(json["overall"], "warning");
+    let items = json["items"].as_array().unwrap();
+    assert!(items
+        .iter()
+        .any(|i| i["code"] == "cpu_sensor_present" && i["severity"] == "ok"));
+    let no_pwm = items
+        .iter()
+        .find(|i| i["code"] == "no_pwm_controls")
+        .expect("no_pwm_controls item present");
+    assert_eq!(no_pwm["severity"], "warning");
+    assert_eq!(no_pwm["blocks_control"], true);
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
 async fn sensors_endpoint_returns_readings() {
     let state = test_app_state();
     let (path, shutdown, _dir) = start_test_server(state).await;
