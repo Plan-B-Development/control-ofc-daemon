@@ -264,6 +264,53 @@ pub struct PwmHeadersResponse {
     pub headers: Vec<PwmHeaderEntry>,
 }
 
+/// A monitor-only fan tachometer in the hwmon inventory (Phase 1) — an
+/// `fanN_input` with no matching `pwmN` control, i.e. RPM-readable but not
+/// controllable. Controllable fans appear under `pwm_controls` instead (with
+/// `rpm_available = true`). Structural only: the live RPM value is served via
+/// `/fans` + `/poll`, not here.
+#[derive(Debug, Clone, Serialize)]
+pub struct FanInputEntry {
+    pub id: String,
+    /// Always `"hwmon"` — monitor-only fans are an hwmon-subsystem concept.
+    pub source: String,
+    pub chip_name: String,
+    pub label: String,
+    /// The N in `fanN_input`.
+    pub fan_index: u8,
+}
+
+impl From<&crate::hwmon::inventory::FanInputDescriptor> for FanInputEntry {
+    fn from(f: &crate::hwmon::inventory::FanInputDescriptor) -> Self {
+        FanInputEntry {
+            id: f.id.clone(),
+            source: "hwmon".into(),
+            chip_name: f.chip_name.clone(),
+            label: f.label.clone(),
+            fan_index: f.fan_index,
+        }
+    }
+}
+
+/// Response for `GET /inventory/hwmon` — a structured, read-only inventory of
+/// hwmon-visible hardware for the GUI (Phase 1). Composed from existing
+/// discovery plus the live cache; the daemon never writes hardware to build it.
+///
+/// - `temp_sensors`: the live sensor set (same projection as `/sensors`).
+/// - `pwm_controls`: discovered controllable PWM headers (same as
+///   `/hwmon/headers`).
+/// - `monitor_only_fans`: RPM tachometers with no controllable `pwmN`
+///   (previously invisible to the API). Omitted when empty so a host with none
+///   keeps the common-case wire shape (additive).
+#[derive(Debug, Clone, Serialize)]
+pub struct HwmonInventoryResponse {
+    pub api_version: u32,
+    pub temp_sensors: Vec<SensorEntry>,
+    pub pwm_controls: Vec<PwmHeaderEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub monitor_only_fans: Vec<FanInputEntry>,
+}
+
 /// One entry in the `GET /profiles` listing — a lightweight summary parsed from
 /// each stored/preset profile (the full document is fetched via
 /// `GET /profiles/{id}`).
@@ -1188,6 +1235,48 @@ mod tests {
         assert!(serde_json::from_str::<OverrideTokenRequest>("{}").is_err());
         let ok: OverrideTokenRequest = serde_json::from_str(r#"{"override_token": 7}"#).unwrap();
         assert_eq!(ok.override_token, 7);
+    }
+
+    #[test]
+    fn hwmon_inventory_response_schema() {
+        // Phase 1: the inventory response is additive. `monitor_only_fans` is
+        // omitted when empty so a host with no orphan tachometers keeps the
+        // common-case wire shape; a present entry carries id/source/chip/label/index.
+        let empty = HwmonInventoryResponse {
+            api_version: API_VERSION,
+            temp_sensors: Vec::new(),
+            pwm_controls: Vec::new(),
+            monitor_only_fans: Vec::new(),
+        };
+        let json = serde_json::to_value(&empty).unwrap();
+        assert_eq!(json["api_version"], 1);
+        assert!(json["temp_sensors"].is_array());
+        assert!(json["pwm_controls"].is_array());
+        assert!(
+            json.get("monitor_only_fans").is_none(),
+            "monitor_only_fans must be omitted when empty (additive)"
+        );
+
+        let populated = HwmonInventoryResponse {
+            api_version: API_VERSION,
+            temp_sensors: Vec::new(),
+            pwm_controls: Vec::new(),
+            monitor_only_fans: vec![FanInputEntry {
+                id: "hwmon:nct6798:isa:fan3:PUMP_TACH".into(),
+                source: "hwmon".into(),
+                chip_name: "nct6798".into(),
+                label: "PUMP_TACH".into(),
+                fan_index: 3,
+            }],
+        };
+        let json = serde_json::to_value(&populated).unwrap();
+        assert_eq!(
+            json["monitor_only_fans"][0]["id"],
+            "hwmon:nct6798:isa:fan3:PUMP_TACH"
+        );
+        assert_eq!(json["monitor_only_fans"][0]["source"], "hwmon");
+        assert_eq!(json["monitor_only_fans"][0]["fan_index"], 3);
+        assert_eq!(json["monitor_only_fans"][0]["label"], "PUMP_TACH");
     }
 
     #[test]

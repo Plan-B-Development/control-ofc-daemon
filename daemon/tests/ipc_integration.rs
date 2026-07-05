@@ -258,6 +258,33 @@ async fn hardware_diagnostics_endpoint_returns_report() {
 }
 
 #[tokio::test]
+async fn inventory_hwmon_endpoint_returns_structured_inventory() {
+    // Phase 1: GET /inventory/hwmon composes the live sensor set (from the
+    // cache) + controllable PWM headers (none here) + monitor-only fan
+    // tachometers (scanned from real sysfs on the blocking pool). Only the
+    // machine-independent shape is asserted — the monitor_only_fans list depends
+    // on the host's /sys/class/hwmon and is omitted when empty, mirroring the
+    // /diagnostics/hardware test discipline.
+    let state = test_app_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/inventory/hwmon").await;
+
+    assert_eq!(status, 200);
+    assert_eq!(json["api_version"], 1);
+    // temp_sensors mirrors /sensors — the fixture seeds one CPU sensor.
+    let sensors = json["temp_sensors"].as_array().unwrap();
+    assert_eq!(sensors.len(), 1);
+    assert_eq!(sensors[0]["id"], "hwmon:k10temp:0000:00:18.3:Tctl");
+    assert_eq!(sensors[0]["kind"], "cpu_temp");
+    // No hwmon controller in the test state → no controllable headers.
+    assert!(json["pwm_controls"].as_array().unwrap().is_empty());
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
 async fn sensors_endpoint_returns_readings() {
     let state = test_app_state();
     let (path, shutdown, _dir) = start_test_server(state).await;
