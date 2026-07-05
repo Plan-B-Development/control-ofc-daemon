@@ -299,6 +299,8 @@ subsystem — DEC-102 / DEC-130).
 | POST | `/control/{control_id}/override` (+`/override/renew`, `DELETE`) | Expiring manual override — floor-clamped, deadman, monotonic fencing (DEC-163); cleared on profile activation (DEC-189) |
 | POST | `/config/profile-search-dirs` | Additively register profile search directories (persists to `runtime.toml`; 503 `persistence_failed` on write error) |
 | POST | `/config/startup-delay` | Set startup delay seconds (persists to `runtime.toml`, takes effect on restart; 503 `persistence_failed` on write error) |
+| POST | `/config/preferred-cpu-sensor` | Persist the user's preferred CPU temperature sensor by stable id (`{"sensor_id":"<id>"}` sets, `null` clears; validated against the live sensor set). Advisory — reflected in `/inventory/hwmon` `default_cpu` (`source:"user"`) + `preferences` and the readiness `selected_cpu_sensor_missing` item (DEC-200) |
+| POST | `/config/preferred-mb-sensor` | Persist the user's preferred case/motherboard temperature sensor (same shape) |
 
 **Retired at 2.0.0 (DEC-165):** bare PWM writes (`/fans/openfan/{ch}/pwm`, `/fans/openfan/pwm`, `/hwmon/{id}/pwm`, `/gpu/{id}/fan/pwm`), `/fans/openfan/{ch}/target_rpm`, and all `/hwmon/lease/*`.
 

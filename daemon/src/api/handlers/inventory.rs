@@ -49,14 +49,20 @@ fn build_hwmon_inventory(state: &AppState) -> (StatusCode, Json<serde_json::Valu
     let snap = state.cache.snapshot();
     let classified = classify_cache_sensors(&snap, now);
 
-    let default_cpu =
-        select_default_cpu(classified.iter().map(|(s, c)| (s.id.as_str(), c))).map(|r| {
-            DefaultCpuEntry {
-                sensor_id: r.sensor_id,
-                confidence: r.confidence.to_string(),
-                rationale: r.rationale,
-            }
-        });
+    // Persisted user selections (Phase 5): the preferred CPU sensor wins over the
+    // auto-pick when present; both selections are echoed under `preferences`.
+    let runtime = crate::runtime_config::RuntimeConfig::load_from(&state.runtime_config_path);
+    let preferred_cpu = runtime.preferred_cpu_sensor().map(str::to_string);
+    let preferred_mb = runtime.preferred_mb_sensor().map(str::to_string);
+    let default_cpu = build_default_cpu(&classified, preferred_cpu.as_deref());
+    let preferences = if preferred_cpu.is_some() || preferred_mb.is_some() {
+        Some(InventoryPreferences {
+            cpu_sensor_id: preferred_cpu,
+            mb_sensor_id: preferred_mb,
+        })
+    } else {
+        None
+    };
 
     let temp_sensors: Vec<InventoryTempSensor> = classified
         .into_iter()
@@ -102,8 +108,37 @@ fn build_hwmon_inventory(state: &AppState) -> (StatusCode, Json<serde_json::Valu
             pwm_controls,
             monitor_only_fans,
             default_cpu,
+            preferences,
         },
     )
+}
+
+/// Build the `default_cpu` recommendation: the persisted preferred CPU sensor
+/// wins when it is present in the live set (`source: "user"`), otherwise the
+/// deterministic auto-pick (`source: "auto"`). A set-but-absent preference falls
+/// back to auto — never blindly applied — and the readiness model flags it stale.
+fn build_default_cpu(
+    classified: &[(SensorEntry, TempClassification)],
+    preferred_cpu: Option<&str>,
+) -> Option<DefaultCpuEntry> {
+    if let Some(pref) = preferred_cpu {
+        if let Some((s, c)) = classified.iter().find(|(s, _)| s.id == pref) {
+            return Some(DefaultCpuEntry {
+                sensor_id: s.id.clone(),
+                confidence: c.confidence.to_string(),
+                rationale: "user-selected preferred CPU sensor".into(),
+                source: "user".into(),
+            });
+        }
+    }
+    select_default_cpu(classified.iter().map(|(s, c)| (s.id.as_str(), c))).map(|r| {
+        DefaultCpuEntry {
+            sensor_id: r.sensor_id,
+            confidence: r.confidence.to_string(),
+            rationale: r.rationale,
+            source: "auto".into(),
+        }
+    })
 }
 
 /// Classify the live cache sensors once — shared by the inventory and readiness
@@ -172,6 +207,16 @@ fn build_readiness_response(state: &AppState) -> (StatusCode, Json<serde_json::V
         .map(|v| v.len())
         .unwrap_or(0);
 
+    // Persisted selections (Phase 5): present iff the stored id is in the live
+    // set — a set-but-absent selection drives the readiness "missing" items.
+    let runtime = crate::runtime_config::RuntimeConfig::load_from(&state.runtime_config_path);
+    let selected_cpu_present = runtime
+        .preferred_cpu_sensor()
+        .map(|id| classified.iter().any(|(s, _)| s.id == id));
+    let selected_mb_present = runtime
+        .preferred_mb_sensor()
+        .map(|id| classified.iter().any(|(s, _)| s.id == id));
+
     let inputs = ReadinessInputs {
         cpu_sensor_count,
         default_cpu_confident,
@@ -180,6 +225,8 @@ fn build_readiness_response(state: &AppState) -> (StatusCode, Json<serde_json::V
         monitor_only_fan_count,
         unavailable_sensor_count: snap.unavailable_sensors.len(),
         unknown_sensor_count,
+        selected_cpu_present,
+        selected_mb_present,
     };
 
     let items = build_readiness(&inputs);
@@ -193,4 +240,69 @@ fn build_readiness_response(state: &AppState) -> (StatusCode, Json<serde_json::V
             items,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sensor(id: &str, chip: &str, label: &str) -> SensorEntry {
+        SensorEntry {
+            id: id.into(),
+            kind: "cpu_temp".into(),
+            label: label.into(),
+            value_c: 50.0,
+            source: "hwmon".into(),
+            age_ms: 0,
+            rate_c_per_s: None,
+            session_min_c: None,
+            session_max_c: None,
+            chip_name: chip.into(),
+            temp_type: None,
+            thresholds: None,
+            control_eligible: true,
+        }
+    }
+
+    fn classified(pairs: &[(&str, &str, &str)]) -> Vec<(SensorEntry, TempClassification)> {
+        pairs
+            .iter()
+            .map(|(id, chip, label)| (sensor(id, chip, label), classify_temp_sensor(chip, label)))
+            .collect()
+    }
+
+    #[test]
+    fn default_cpu_user_preference_wins_when_present() {
+        let c = classified(&[
+            ("hwmon:k10temp:x:Tctl", "k10temp", "Tctl"),
+            ("hwmon:coretemp:x:Package", "coretemp", "Package id 0"),
+        ]);
+        let d = build_default_cpu(&c, Some("hwmon:coretemp:x:Package")).unwrap();
+        assert_eq!(d.sensor_id, "hwmon:coretemp:x:Package");
+        assert_eq!(d.source, "user");
+    }
+
+    #[test]
+    fn default_cpu_falls_back_to_auto_when_preference_absent() {
+        // A set-but-absent preference must NOT be blindly applied — fall back to
+        // the auto pick (the readiness model flags the stale selection).
+        let c = classified(&[("hwmon:k10temp:x:Tctl", "k10temp", "Tctl")]);
+        let d = build_default_cpu(&c, Some("hwmon:gone:x:Tctl")).unwrap();
+        assert_eq!(d.sensor_id, "hwmon:k10temp:x:Tctl");
+        assert_eq!(d.source, "auto");
+    }
+
+    #[test]
+    fn default_cpu_auto_when_no_preference() {
+        let c = classified(&[("hwmon:k10temp:x:Tctl", "k10temp", "Tctl")]);
+        let d = build_default_cpu(&c, None).unwrap();
+        assert_eq!(d.source, "auto");
+        assert_eq!(d.sensor_id, "hwmon:k10temp:x:Tctl");
+    }
+
+    #[test]
+    fn default_cpu_none_when_no_cpu_sensors() {
+        let c = classified(&[("hwmon:nct6798:x:SYSTIN", "nct6798", "SYSTIN")]);
+        assert!(build_default_cpu(&c, None).is_none());
+    }
 }

@@ -111,6 +111,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/config/startup-delay",
             post(handlers::update_startup_delay_handler),
         )
+        // Persisted preferred CPU / motherboard sensor (Phase 5, DEC-200). Set
+        // via {"sensor_id": "<id>"} or clear via {"sensor_id": null}. Advisory —
+        // thermal safety still uses the hottest CpuTemp.
+        .route(
+            "/config/preferred-cpu-sensor",
+            post(handlers::update_preferred_cpu_sensor_handler),
+        )
+        .route(
+            "/config/preferred-mb-sensor",
+            post(handlers::update_preferred_mb_sensor_handler),
+        )
         .fallback(handlers::fallback_handler)
         // Explicit 4 MiB request-body cap (S1): profile POSTs are the only
         // large ingress; matches the file-read cap in `atomic_io`.

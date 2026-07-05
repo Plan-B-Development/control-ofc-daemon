@@ -312,15 +312,29 @@ pub struct InventoryTempSensor {
     pub rationale: String,
 }
 
-/// The daemon's deterministic default-CPU-sensor recommendation (Phase 2).
-/// Advisory only: thermal safety still uses the hottest CpuTemp, and this never
-/// silently replaces a user's stored choice (that is Phase-5 persistence).
-/// Omitted from the response when no CPU temperature sensor was found.
+/// The daemon's default-CPU-sensor recommendation. Advisory only: thermal safety
+/// still uses the hottest CpuTemp, and this never silently replaces a user's
+/// stored choice. Omitted from the response when no CPU temperature sensor was
+/// found. `source` is `"user"` when it echoes the persisted preferred CPU sensor
+/// (Phase 5), else `"auto"` for the deterministic auto-pick (Phase 2).
 #[derive(Debug, Clone, Serialize)]
 pub struct DefaultCpuEntry {
     pub sensor_id: String,
     pub confidence: String,
     pub rationale: String,
+    pub source: String,
+}
+
+/// The user's persisted hardware selections echoed on the inventory (Phase 5).
+/// Each id is the raw stored preference and may be stale — check the sensor list
+/// or the readiness `selected_*_sensor_missing` items. The whole object is
+/// omitted when nothing is persisted (additive).
+#[derive(Debug, Clone, Serialize)]
+pub struct InventoryPreferences {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_sensor_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mb_sensor_id: Option<String>,
 }
 
 /// Response for `GET /inventory/hwmon` — a structured, read-only inventory of
@@ -344,6 +358,10 @@ pub struct HwmonInventoryResponse {
     pub monitor_only_fans: Vec<FanInputEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_cpu: Option<DefaultCpuEntry>,
+    /// The user's persisted preferred CPU/motherboard sensors (Phase 5), omitted
+    /// when none are set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferences: Option<InventoryPreferences>,
 }
 
 /// Response for `GET /inventory/readiness` — the structured hardware-readiness
@@ -1293,6 +1311,7 @@ mod tests {
             pwm_controls: Vec::new(),
             monitor_only_fans: Vec::new(),
             default_cpu: None,
+            preferences: None,
         };
         let json = serde_json::to_value(&empty).unwrap();
         assert_eq!(json["api_version"], 1);
@@ -1341,6 +1360,11 @@ mod tests {
                 sensor_id: "hwmon:k10temp:0000:00:18.3:Tctl".into(),
                 confidence: "high".into(),
                 rationale: "only CPU candidate".into(),
+                source: "auto".into(),
+            }),
+            preferences: Some(InventoryPreferences {
+                cpu_sensor_id: Some("hwmon:k10temp:0000:00:18.3:Tctl".into()),
+                mb_sensor_id: None,
             }),
         };
         let json = serde_json::to_value(&populated).unwrap();
@@ -1359,6 +1383,13 @@ mod tests {
             "hwmon:k10temp:0000:00:18.3:Tctl"
         );
         assert_eq!(json["default_cpu"]["confidence"], "high");
+        assert_eq!(json["default_cpu"]["source"], "auto");
+        // Phase 5: persisted preferences echoed (mb omitted when unset).
+        assert_eq!(
+            json["preferences"]["cpu_sensor_id"],
+            "hwmon:k10temp:0000:00:18.3:Tctl"
+        );
+        assert!(json["preferences"].get("mb_sensor_id").is_none());
         // monitor_only_fans still surfaces unchanged.
         assert_eq!(json["monitor_only_fans"][0]["fan_index"], 3);
     }

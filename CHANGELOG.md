@@ -29,6 +29,16 @@ additively; version bump + GUI consumption land at release.
   controls present/read-only/unverified, monitor-only tachometers, quarantined
   sensors (DEC-193), and unclassified sensors. Read-only — the daemon never
   mutates the system or auto-remediates.
+- **Persisted preferred CPU / motherboard sensor (Phase 5).**
+  `POST /config/preferred-cpu-sensor` and `POST /config/preferred-mb-sensor`
+  store a user-approved sensor by stable id in `runtime.toml`
+  (`{"sensor_id":"<id>"}` sets, `null` clears; validated against the live sensor
+  set; persist-first with `503 persistence_failed` on write error). The preferred
+  CPU sensor is reflected in `/inventory/hwmon` `default_cpu` (`source:"user"`)
+  and echoed under `preferences`; `/inventory/readiness` gains
+  `selected_cpu_sensor_missing` / `selected_mb_sensor_missing` when a chosen
+  sensor later disappears. Advisory — thermal safety still uses the hottest
+  CpuTemp, and a stale selection is never blindly applied.
 
 ## [2.5.2] — 2026-07-04
 

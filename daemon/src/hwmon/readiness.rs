@@ -128,6 +128,11 @@ pub struct ReadinessInputs {
     pub unavailable_sensor_count: usize,
     /// Sensors that classified as `unknown_temp`.
     pub unknown_sensor_count: usize,
+    /// Persisted preferred CPU sensor status (Phase 5): `None` = none selected;
+    /// `Some(true)` = selected and present; `Some(false)` = selected but missing.
+    pub selected_cpu_present: Option<bool>,
+    /// Persisted preferred motherboard sensor status (same tri-state).
+    pub selected_mb_present: Option<bool>,
 }
 
 /// Build the structured readiness list from the read-only inventory facts.
@@ -305,6 +310,37 @@ pub fn build_readiness(inp: &ReadinessInputs) -> Vec<ReadinessItem> {
         ));
     }
 
+    // ── Persisted user selections (Phase 5) — flag stale ones ──
+    if inp.selected_cpu_present == Some(false) {
+        items.push(
+            ReadinessItem::new(
+                "selected_cpu_sensor_missing",
+                ReadinessSeverity::Warning,
+                "cpu",
+                "Your selected CPU sensor is no longer present",
+                "The CPU temperature sensor you chose is not in the current sensor set — the \
+                 hardware or its driver may have changed since you selected it. The daemon has \
+                 fallen back to its automatic CPU-sensor pick."
+                    .into(),
+            )
+            .action("Pick a new default CPU sensor."),
+        );
+    }
+    if inp.selected_mb_present == Some(false) {
+        items.push(
+            ReadinessItem::new(
+                "selected_mb_sensor_missing",
+                ReadinessSeverity::Warning,
+                "sensor",
+                "Your selected motherboard sensor is no longer present",
+                "The case/motherboard temperature sensor you chose is not in the current sensor \
+                 set — the hardware or its driver may have changed since you selected it."
+                    .into(),
+            )
+            .action("Pick a new motherboard sensor."),
+        );
+    }
+
     items
 }
 
@@ -436,6 +472,7 @@ mod tests {
             monitor_only_fan_count: 2,
             unavailable_sensor_count: 1,
             unknown_sensor_count: 3,
+            ..Default::default()
         });
         assert_eq!(
             get(&items, "monitor_only_fans_present").severity,
@@ -468,6 +505,40 @@ mod tests {
             "d".into(),
         )];
         assert_eq!(overall_severity(&crit), ReadinessSeverity::Critical);
+    }
+
+    #[test]
+    fn selected_sensor_missing_items_flag_stale_selections() {
+        // Selected-but-missing → warning items; present / None → nothing.
+        let items = build_readiness(&ReadinessInputs {
+            cpu_sensor_count: 1,
+            default_cpu_confident: Some(true),
+            pwm_total: 1,
+            pwm_writable: 1,
+            selected_cpu_present: Some(false),
+            selected_mb_present: Some(false),
+            ..Default::default()
+        });
+        assert_eq!(
+            get(&items, "selected_cpu_sensor_missing").severity,
+            ReadinessSeverity::Warning
+        );
+        assert_eq!(
+            get(&items, "selected_mb_sensor_missing").severity,
+            ReadinessSeverity::Warning
+        );
+
+        let present = build_readiness(&ReadinessInputs {
+            cpu_sensor_count: 1,
+            default_cpu_confident: Some(true),
+            pwm_total: 1,
+            pwm_writable: 1,
+            selected_cpu_present: Some(true),
+            selected_mb_present: None,
+            ..Default::default()
+        });
+        assert!(!has(&present, "selected_cpu_sensor_missing"));
+        assert!(!has(&present, "selected_mb_sensor_missing"));
     }
 
     #[test]

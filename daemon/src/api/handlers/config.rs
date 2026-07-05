@@ -147,3 +147,104 @@ pub async fn update_startup_delay_handler(
         })),
     )
 }
+
+/// Which preferred-sensor slot a request targets (Phase 5).
+enum PreferredSensorRole {
+    Cpu,
+    Mb,
+}
+
+/// Shared logic for `POST /config/preferred-{cpu,mb}-sensor`. Body:
+/// `{"sensor_id": "<stable id>"}` to set, or `{"sensor_id": null}` to clear.
+///
+/// A set is validated against the live sensor set (unknown id → 400); staleness
+/// after a later hardware change is surfaced by the readiness model, not here.
+/// Persist-first like the sibling handlers: a write failure returns 503 and does
+/// not change anything the daemon acts on (the preference is advisory — thermal
+/// safety still uses the hottest CpuTemp).
+fn set_preferred_sensor(
+    state: &AppState,
+    body: &serde_json::Value,
+    role: PreferredSensorRole,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // Parse sensor_id: the key is required; a string sets, null clears.
+    let new_id: Option<String> = match body.get("sensor_id") {
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(
+                    "missing 'sensor_id' (a stable sensor id, or null to clear)",
+                ),
+            );
+        }
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation("'sensor_id' must be a string or null"),
+            );
+        }
+    };
+
+    // Validate a set id against the live sensor set.
+    if let Some(ref id) = new_id {
+        if !state.cache.snapshot().sensors.contains_key(id) {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(format!("unknown sensor id: {id}")),
+            );
+        }
+    }
+
+    // Persist-first, matching the sibling config handlers.
+    let mut runtime = crate::runtime_config::RuntimeConfig::load_from(&state.runtime_config_path);
+    let role_str = match role {
+        PreferredSensorRole::Cpu => {
+            runtime.set_preferred_cpu_sensor(new_id.clone());
+            "cpu"
+        }
+        PreferredSensorRole::Mb => {
+            runtime.set_preferred_mb_sensor(new_id.clone());
+            "mb"
+        }
+    };
+    if let Err(e) = runtime.save_to(&state.runtime_config_path) {
+        log::error!(
+            "Failed to persist preferred {role_str} sensor to {}: {e}",
+            state.runtime_config_path.display()
+        );
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::persistence_failed("failed to persist runtime configuration"),
+        );
+    }
+
+    log::info!("Preferred {role_str} sensor set to {new_id:?}");
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "api_version": API_VERSION,
+            "updated": true,
+            "role": role_str,
+            "preferred_sensor": new_id,
+        })),
+    )
+}
+
+/// POST /config/preferred-cpu-sensor — set/clear the preferred CPU temp sensor (Phase 5).
+pub async fn update_preferred_cpu_sensor_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    set_preferred_sensor(&state, &body, PreferredSensorRole::Cpu)
+}
+
+/// POST /config/preferred-mb-sensor — set/clear the preferred motherboard sensor (Phase 5).
+pub async fn update_preferred_mb_sensor_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    set_preferred_sensor(&state, &body, PreferredSensorRole::Mb)
+}

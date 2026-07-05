@@ -286,6 +286,8 @@ async fn inventory_hwmon_endpoint_returns_structured_inventory() {
         "hwmon:k10temp:0000:00:18.3:Tctl"
     );
     assert_eq!(json["default_cpu"]["confidence"], "high");
+    // Phase 5: no persisted preference in the test state → the auto pick.
+    assert_eq!(json["default_cpu"]["source"], "auto");
     // No hwmon controller in the test state → no controllable headers.
     assert!(json["pwm_controls"].as_array().unwrap().is_empty());
 
@@ -317,6 +319,34 @@ async fn inventory_readiness_endpoint_reports_structured_items() {
         .expect("no_pwm_controls item present");
     assert_eq!(no_pwm["severity"], "warning");
     assert_eq!(no_pwm["blocks_control"], true);
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn config_preferred_cpu_sensor_rejects_unknown_id() {
+    // Phase 5: setting a preferred sensor is validated against the live sensor
+    // set before persisting — an unknown id (or a missing key) is a 400.
+    let state = test_app_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_post(
+        &path,
+        "/config/preferred-cpu-sensor",
+        &serde_json::json!({ "sensor_id": "hwmon:does-not-exist" }),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert_eq!(json["error"]["code"], "validation_error");
+
+    let (status, _) = uds_post(
+        &path,
+        "/config/preferred-cpu-sensor",
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, 400);
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);

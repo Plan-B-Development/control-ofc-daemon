@@ -39,6 +39,9 @@ pub struct RuntimeConfig {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup: Option<RuntimeStartup>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware: Option<RuntimeHardware>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +54,25 @@ pub struct RuntimeProfiles {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeStartup {
     pub delay_secs: u64,
+}
+
+/// User-approved hardware selections (Phase 5). Persisted by stable sensor id
+/// (never a volatile `hwmonN` path). Advisory only — the daemon's thermal safety
+/// still uses the hottest CpuTemp; these drive the inventory's `default_cpu`
+/// recommendation + the readiness "selected sensor missing" items.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeHardware {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_cpu_sensor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_mb_sensor: Option<String>,
+}
+
+impl RuntimeHardware {
+    fn is_empty(&self) -> bool {
+        self.preferred_cpu_sensor.is_none() && self.preferred_mb_sensor.is_none()
+    }
 }
 
 impl RuntimeConfig {
@@ -130,6 +152,36 @@ impl RuntimeConfig {
     /// Set `startup.delay_secs`, creating the section if absent.
     pub fn set_startup_delay_secs(&mut self, delay: u64) {
         self.startup = Some(RuntimeStartup { delay_secs: delay });
+    }
+
+    /// Preferred CPU temperature sensor (stable id), if set.
+    pub fn preferred_cpu_sensor(&self) -> Option<&str> {
+        self.hardware
+            .as_ref()
+            .and_then(|h| h.preferred_cpu_sensor.as_deref())
+    }
+
+    /// Preferred case/motherboard temperature sensor (stable id), if set.
+    pub fn preferred_mb_sensor(&self) -> Option<&str> {
+        self.hardware
+            .as_ref()
+            .and_then(|h| h.preferred_mb_sensor.as_deref())
+    }
+
+    /// Set (or clear, with `None`) the preferred CPU sensor. Preserves the mb
+    /// selection; drops the whole `[hardware]` section when both are cleared.
+    pub fn set_preferred_cpu_sensor(&mut self, id: Option<String>) {
+        let mut hw = self.hardware.take().unwrap_or_default();
+        hw.preferred_cpu_sensor = id;
+        self.hardware = if hw.is_empty() { None } else { Some(hw) };
+    }
+
+    /// Set (or clear, with `None`) the preferred motherboard sensor. Preserves
+    /// the CPU selection; drops the `[hardware]` section when both are cleared.
+    pub fn set_preferred_mb_sensor(&mut self, id: Option<String>) {
+        let mut hw = self.hardware.take().unwrap_or_default();
+        hw.preferred_mb_sensor = id;
+        self.hardware = if hw.is_empty() { None } else { Some(hw) };
     }
 }
 
@@ -299,5 +351,51 @@ mod tests {
             &["/one".to_string(), "/two".to_string()]
         );
         assert_eq!(reloaded.startup_delay_secs(), Some(2));
+    }
+
+    #[test]
+    fn roundtrip_preferred_sensors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("runtime.toml");
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_preferred_cpu_sensor(Some("hwmon:k10temp:x:Tctl".into()));
+        cfg.set_preferred_mb_sensor(Some("hwmon:nct6798:x:SYSTIN".into()));
+        cfg.save_to(&path).unwrap();
+
+        let loaded = RuntimeConfig::load_from(&path);
+        assert_eq!(loaded.preferred_cpu_sensor(), Some("hwmon:k10temp:x:Tctl"));
+        assert_eq!(loaded.preferred_mb_sensor(), Some("hwmon:nct6798:x:SYSTIN"));
+    }
+
+    #[test]
+    fn clearing_one_preferred_keeps_the_other() {
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_preferred_cpu_sensor(Some("cpu".into()));
+        cfg.set_preferred_mb_sensor(Some("mb".into()));
+        cfg.set_preferred_cpu_sensor(None);
+        assert_eq!(cfg.preferred_cpu_sensor(), None);
+        assert_eq!(cfg.preferred_mb_sensor(), Some("mb"));
+    }
+
+    #[test]
+    fn clearing_both_preferred_drops_hardware_section() {
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_preferred_cpu_sensor(Some("cpu".into()));
+        cfg.set_preferred_cpu_sensor(None);
+        assert!(cfg.hardware.is_none());
+    }
+
+    #[test]
+    fn preferred_sensors_coexist_with_other_sections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("runtime.toml");
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_profile_search_dirs(vec!["/p".into()]);
+        cfg.set_preferred_cpu_sensor(Some("cpu".into()));
+        cfg.save_to(&path).unwrap();
+
+        let loaded = RuntimeConfig::load_from(&path);
+        assert_eq!(loaded.profile_search_dirs().unwrap(), &["/p".to_string()]);
+        assert_eq!(loaded.preferred_cpu_sensor(), Some("cpu"));
     }
 }
