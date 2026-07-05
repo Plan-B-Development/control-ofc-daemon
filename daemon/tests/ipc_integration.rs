@@ -277,6 +277,15 @@ async fn inventory_hwmon_endpoint_returns_structured_inventory() {
     assert_eq!(sensors.len(), 1);
     assert_eq!(sensors[0]["id"], "hwmon:k10temp:0000:00:18.3:Tctl");
     assert_eq!(sensors[0]["kind"], "cpu_temp");
+    // Phase 2: the fixture's k10temp Tctl refines to cpu_tctl (high), flattened
+    // onto the same temp_sensors entry, and is the deterministic default CPU.
+    assert_eq!(sensors[0]["classification"], "cpu_tctl");
+    assert_eq!(sensors[0]["confidence"], "high");
+    assert_eq!(
+        json["default_cpu"]["sensor_id"],
+        "hwmon:k10temp:0000:00:18.3:Tctl"
+    );
+    assert_eq!(json["default_cpu"]["confidence"], "high");
     // No hwmon controller in the test state → no controllable headers.
     assert!(json["pwm_controls"].as_array().unwrap().is_empty());
 

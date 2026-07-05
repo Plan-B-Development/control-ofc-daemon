@@ -292,23 +292,58 @@ impl From<&crate::hwmon::inventory::FanInputDescriptor> for FanInputEntry {
     }
 }
 
+/// An inventory temperature sensor (Phase 2): the standard `SensorEntry` fields
+/// plus a fine-grained classification refinement. The three extra fields are
+/// flattened alongside the `SensorEntry` fields, so each `temp_sensors` object
+/// carries `id`/`kind`/`value_c`/… *and* `classification`/`confidence`/
+/// `rationale`. The refinement is advisory — `kind` and the daemon's thermal
+/// safety are unchanged.
+#[derive(Debug, Clone, Serialize)]
+pub struct InventoryTempSensor {
+    #[serde(flatten)]
+    pub sensor: SensorEntry,
+    /// Fine class: `cpu_package` | `cpu_core` | `cpu_tctl` | `cpu_tdie` |
+    /// `motherboard_temp` | `vrm_temp` | `chipset_temp` | `gpu_temp` |
+    /// `disk_temp` | `coolant_temp` | `unknown_temp`. A refinement of `kind`.
+    pub classification: String,
+    /// Classifier confidence: `high` | `medium` | `low` | `unknown`.
+    pub confidence: String,
+    /// Plain-English reason for the classification (daemon-owned wording).
+    pub rationale: String,
+}
+
+/// The daemon's deterministic default-CPU-sensor recommendation (Phase 2).
+/// Advisory only: thermal safety still uses the hottest CpuTemp, and this never
+/// silently replaces a user's stored choice (that is Phase-5 persistence).
+/// Omitted from the response when no CPU temperature sensor was found.
+#[derive(Debug, Clone, Serialize)]
+pub struct DefaultCpuEntry {
+    pub sensor_id: String,
+    pub confidence: String,
+    pub rationale: String,
+}
+
 /// Response for `GET /inventory/hwmon` — a structured, read-only inventory of
-/// hwmon-visible hardware for the GUI (Phase 1). Composed from existing
-/// discovery plus the live cache; the daemon never writes hardware to build it.
+/// hwmon-visible hardware for the GUI. Composed from existing discovery plus the
+/// live cache; the daemon never writes hardware to build it.
 ///
-/// - `temp_sensors`: the live sensor set (same projection as `/sensors`).
+/// - `temp_sensors`: the live sensor set (the standard `SensorEntry` fields plus
+///   the Phase-2 `classification`/`confidence`/`rationale` refinement).
 /// - `pwm_controls`: discovered controllable PWM headers (same as
 ///   `/hwmon/headers`).
 /// - `monitor_only_fans`: RPM tachometers with no controllable `pwmN`
-///   (previously invisible to the API). Omitted when empty so a host with none
-///   keeps the common-case wire shape (additive).
+///   (previously invisible to the API). Omitted when empty (additive).
+/// - `default_cpu`: the deterministic default-CPU recommendation, omitted when
+///   no CPU sensor is present (additive).
 #[derive(Debug, Clone, Serialize)]
 pub struct HwmonInventoryResponse {
     pub api_version: u32,
-    pub temp_sensors: Vec<SensorEntry>,
+    pub temp_sensors: Vec<InventoryTempSensor>,
     pub pwm_controls: Vec<PwmHeaderEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub monitor_only_fans: Vec<FanInputEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_cpu: Option<DefaultCpuEntry>,
 }
 
 /// One entry in the `GET /profiles` listing — a lightweight summary parsed from
@@ -1239,14 +1274,15 @@ mod tests {
 
     #[test]
     fn hwmon_inventory_response_schema() {
-        // Phase 1: the inventory response is additive. `monitor_only_fans` is
-        // omitted when empty so a host with no orphan tachometers keeps the
-        // common-case wire shape; a present entry carries id/source/chip/label/index.
+        // Phase 2: temp_sensors flatten the standard SensorEntry fields with the
+        // classification refinement; default_cpu + monitor_only_fans are omitted
+        // when absent (additive).
         let empty = HwmonInventoryResponse {
             api_version: API_VERSION,
             temp_sensors: Vec::new(),
             pwm_controls: Vec::new(),
             monitor_only_fans: Vec::new(),
+            default_cpu: None,
         };
         let json = serde_json::to_value(&empty).unwrap();
         assert_eq!(json["api_version"], 1);
@@ -1256,10 +1292,33 @@ mod tests {
             json.get("monitor_only_fans").is_none(),
             "monitor_only_fans must be omitted when empty (additive)"
         );
+        assert!(
+            json.get("default_cpu").is_none(),
+            "default_cpu must be omitted when no CPU sensor (additive)"
+        );
 
         let populated = HwmonInventoryResponse {
             api_version: API_VERSION,
-            temp_sensors: Vec::new(),
+            temp_sensors: vec![InventoryTempSensor {
+                sensor: SensorEntry {
+                    id: "hwmon:k10temp:0000:00:18.3:Tctl".into(),
+                    kind: "cpu_temp".into(),
+                    label: "Tctl".into(),
+                    value_c: 55.0,
+                    source: "hwmon".into(),
+                    age_ms: 100,
+                    rate_c_per_s: None,
+                    session_min_c: None,
+                    session_max_c: None,
+                    chip_name: "k10temp".into(),
+                    temp_type: None,
+                    thresholds: None,
+                    control_eligible: true,
+                },
+                classification: "cpu_tctl".into(),
+                confidence: "high".into(),
+                rationale: "k10temp Tctl control temperature".into(),
+            }],
             pwm_controls: Vec::new(),
             monitor_only_fans: vec![FanInputEntry {
                 id: "hwmon:nct6798:isa:fan3:PUMP_TACH".into(),
@@ -1268,15 +1327,30 @@ mod tests {
                 label: "PUMP_TACH".into(),
                 fan_index: 3,
             }],
+            default_cpu: Some(DefaultCpuEntry {
+                sensor_id: "hwmon:k10temp:0000:00:18.3:Tctl".into(),
+                confidence: "high".into(),
+                rationale: "only CPU candidate".into(),
+            }),
         };
         let json = serde_json::to_value(&populated).unwrap();
+        // Flatten: the SensorEntry fields sit at the same level as the
+        // classification refinement on each temp_sensors entry.
         assert_eq!(
-            json["monitor_only_fans"][0]["id"],
-            "hwmon:nct6798:isa:fan3:PUMP_TACH"
+            json["temp_sensors"][0]["id"],
+            "hwmon:k10temp:0000:00:18.3:Tctl"
         );
-        assert_eq!(json["monitor_only_fans"][0]["source"], "hwmon");
+        assert_eq!(json["temp_sensors"][0]["kind"], "cpu_temp");
+        assert_eq!(json["temp_sensors"][0]["classification"], "cpu_tctl");
+        assert_eq!(json["temp_sensors"][0]["confidence"], "high");
+        // default_cpu present with the recommended sensor id.
+        assert_eq!(
+            json["default_cpu"]["sensor_id"],
+            "hwmon:k10temp:0000:00:18.3:Tctl"
+        );
+        assert_eq!(json["default_cpu"]["confidence"], "high");
+        // monitor_only_fans still surfaces unchanged.
         assert_eq!(json["monitor_only_fans"][0]["fan_index"], 3);
-        assert_eq!(json["monitor_only_fans"][0]["label"], "PUMP_TACH");
     }
 
     #[test]

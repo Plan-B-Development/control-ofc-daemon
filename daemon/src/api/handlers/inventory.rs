@@ -15,6 +15,7 @@ use axum::response::Json;
 
 use super::{build_sensor_entries, error_response, json_ok, AppState};
 use crate::api::responses::*;
+use crate::hwmon::classify::{classify_temp_sensor, select_default_cpu, TempClassification};
 use crate::hwmon::inventory::discover_monitor_only_fans;
 use crate::hwmon::HWMON_SYSFS_ROOT;
 
@@ -37,11 +38,39 @@ pub async fn hwmon_inventory_handler(
 /// Assemble the inventory response. Synchronous and (for the fan scan) blocking
 /// — invoked via `spawn_blocking` from the handler above.
 fn build_hwmon_inventory(state: &AppState) -> (StatusCode, Json<serde_json::Value>) {
-    // Temperature sensors — the live cache projection, identical to `/sensors`
-    // (structure + current values, sorted, control_eligible, thresholds).
+    // Temperature sensors — the live cache projection (identical fields to
+    // `/sensors`), enriched with the Phase-2 classification refinement.
     let now = std::time::Instant::now();
     let snap = state.cache.snapshot();
-    let temp_sensors = build_sensor_entries(&snap, now);
+
+    // Classify each sensor once so the same result feeds both the enriched wire
+    // entries and the deterministic default-CPU recommendation.
+    let classified: Vec<(SensorEntry, TempClassification)> = build_sensor_entries(&snap, now)
+        .into_iter()
+        .map(|s| {
+            let c = classify_temp_sensor(&s.chip_name, &s.label);
+            (s, c)
+        })
+        .collect();
+
+    let default_cpu =
+        select_default_cpu(classified.iter().map(|(s, c)| (s.id.as_str(), c))).map(|r| {
+            DefaultCpuEntry {
+                sensor_id: r.sensor_id,
+                confidence: r.confidence.to_string(),
+                rationale: r.rationale,
+            }
+        });
+
+    let temp_sensors: Vec<InventoryTempSensor> = classified
+        .into_iter()
+        .map(|(sensor, c)| InventoryTempSensor {
+            classification: c.class.to_string(),
+            confidence: c.confidence.to_string(),
+            rationale: c.rationale,
+            sensor,
+        })
+        .collect();
 
     // Controllable PWM headers — the controller's discovered set, identical to
     // `/hwmon/headers`. Empty when no controller was constructed at startup.
@@ -76,6 +105,7 @@ fn build_hwmon_inventory(state: &AppState) -> (StatusCode, Json<serde_json::Valu
             temp_sensors,
             pwm_controls,
             monitor_only_fans,
+            default_cpu,
         },
     )
 }

@@ -99,7 +99,10 @@ fn read_thresholds(hwmon_dir: &Path, index: &str, chip_name: &str) -> Option<Sen
 }
 
 /// Known chip name → sensor kind classification.
-fn classify_chip(chip_name: &str, label: &str) -> SensorKind {
+///
+/// `pub(crate)` so the Phase-2 fine classifier (`hwmon::classify`) can refine
+/// *within* this coarse decision and never contradict the sensor's `kind`.
+pub(crate) fn classify_chip(chip_name: &str, label: &str) -> SensorKind {
     // Liquid-cooler coolant temperature takes priority over the generic
     // chip/label heuristics below: an NZXT Kraken `temp1` is coolant, and any
     // sensor a vendor labels coolant/water/liquid is coolant regardless of chip
