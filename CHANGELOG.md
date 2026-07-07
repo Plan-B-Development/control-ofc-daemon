@@ -1,5 +1,39 @@
 # Changelog
 
+## [Unreleased]
+
+Foundation for built-in Super-I/O chip detection (DEC-202) — internal, with no
+new API surface yet. Report-only and passive: never probes I/O ports, loads
+modules, or writes hardware.
+
+### Added
+- **`hwmon::superio` passive Super-I/O detector** (internal). Composes the DMI
+  board table, bound hwmon chips, `/proc/modules`, `/dev/kmsg`, and ACPI I/O-port
+  conflicts into a per-chip presence report with an allowlisted, caveated "load
+  this driver" recommendation for unbound chips. x86-gated; dependency-injected
+  for hardware-free testing. Not yet exposed over the API (the endpoint lands in
+  a later phase).
+- **Extended Super-I/O chip recognition to the full driver-family set** — ITE,
+  Nuvoton, Winbond (`w83627ehf` / `w83627hf`), SMSC (`smsc47m1` / `smsc47b397` /
+  `dme1737`), National (`pc87360` / `pc87427`) and Fintek — each mapping verified
+  against that driver's kernel documentation. `GET /diagnostics/hardware` now
+  lists these additional known modules.
+
+### Fixed
+- **Fintek chip→driver mapping.** `F71805F` / `F71806F` / `F71872F` now correctly
+  resolve to the `f71805f` driver instead of `f71882fg` (they are separate
+  drivers); the daemon previously would have pointed owners of those chips at a
+  module that will not bind.
+
+### Changed
+- Internal refactor: the chip↔driver knowledge base and passive detection
+  primitives moved from `api::diagnostics` into a new single-source-of-truth
+  `hwmon::chip_db` module; `api::diagnostics` is now a thin re-export shim. No
+  behaviour change to `GET /diagnostics/hardware` beyond the additions above.
+
+_Version: deferred — batched with the upcoming Super-I/O feature under
+[Unreleased]._
+
 ## [2.6.0] — 2026-07-05
 
 Daemon-owned, read-only CPU/hwmon/PWM discovery + readiness (DEC-200), plus a

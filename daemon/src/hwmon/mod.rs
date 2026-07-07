@@ -6,6 +6,7 @@
 //! - Lease-protected PWM writes with safety floors
 
 pub mod aio;
+pub mod chip_db;
 pub mod classify;
 pub mod discovery;
 pub mod gpu_detect;
@@ -18,6 +19,7 @@ pub mod pwm_control;
 pub mod pwm_discovery;
 pub mod reader;
 pub mod readiness;
+pub mod superio;
 pub mod types;
 pub mod util;
 
