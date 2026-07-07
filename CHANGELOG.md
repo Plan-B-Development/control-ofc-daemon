@@ -2,22 +2,31 @@
 
 ## [Unreleased]
 
-Foundation for built-in Super-I/O chip detection (DEC-202) — internal, with no
-new API surface yet. Report-only and passive: never probes I/O ports, loads
-modules, or writes hardware.
+Built-in Super-I/O chip detection (DEC-202). Report-only and passive: never
+probes I/O ports, loads modules, or writes hardware — it tells you which
+motherboard sensor/fan driver to load, it does not load it.
 
 ### Added
-- **`hwmon::superio` passive Super-I/O detector** (internal). Composes the DMI
-  board table, bound hwmon chips, `/proc/modules`, `/dev/kmsg`, and ACPI I/O-port
-  conflicts into a per-chip presence report with an allowlisted, caveated "load
-  this driver" recommendation for unbound chips. x86-gated; dependency-injected
-  for hardware-free testing. Not yet exposed over the API (the endpoint lands in
-  a later phase).
+- **`GET /inventory/superio`** — passive Super-I/O detection report. Composes the
+  DMI board table, bound hwmon chips, `/proc/modules`, `/dev/kmsg`, and ACPI
+  I/O-port conflicts into a per-chip presence report (vendor, evidence,
+  confidence, bound driver) with an allowlisted, caveated "load this driver"
+  recommendation for unbound chips. x86-gated (`arch_supported:false` elsewhere);
+  read-only. Additive — older GUIs ignore it, and it 404s on older daemons like
+  the other `/inventory/*` routes.
+- **Super-I/O guidance in `GET /inventory/readiness`.** The readiness list now
+  gains `superio_driver_unloaded` / `superio_acpi_conflict` items so
+  board-specific "your chip has no driver loaded" guidance appears alongside the
+  generic `no_pwm_controls` item.
+- **`hwmon::superio` passive detector** (the engine behind the endpoint): a
+  dependency-injected `SuperIoEvidence` trait for hardware-free testing, and a
+  collision(DEC-106)/ACPI/DKMS-aware recommendation engine that only ever names
+  an allowlisted module and never suggests a risky parameter.
 - **Extended Super-I/O chip recognition to the full driver-family set** — ITE,
   Nuvoton, Winbond (`w83627ehf` / `w83627hf`), SMSC (`smsc47m1` / `smsc47b397` /
-  `dme1737`), National (`pc87360` / `pc87427`) and Fintek — each mapping verified
-  against that driver's kernel documentation. `GET /diagnostics/hardware` now
-  lists these additional known modules.
+  `dme1737` / `sch5627` / `sch5636`), National (`pc87360` / `pc87427`) and Fintek
+  — each mapping verified against that driver's kernel documentation.
+  `GET /diagnostics/hardware` now lists these additional known modules.
 
 ### Fixed
 - **Fintek chip→driver mapping.** `F71805F` / `F71806F` / `F71872F` now correctly

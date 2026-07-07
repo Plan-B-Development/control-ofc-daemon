@@ -47,6 +47,20 @@ pub enum SuperIoVendor {
     Unknown,
 }
 
+impl std::fmt::Display for SuperIoVendor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Ite => "ite",
+            Self::Nuvoton => "nuvoton",
+            Self::Winbond => "winbond",
+            Self::Smsc => "smsc",
+            Self::National => "national",
+            Self::Fintek => "fintek",
+            Self::Unknown => "unknown",
+        })
+    }
+}
+
 /// Where a chip's presence was observed. A chip may carry more than one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Evidence {
@@ -56,6 +70,16 @@ pub enum Evidence {
     KernelLog,
     /// Currently bound and exposing an hwmon device.
     BoundHwmon,
+}
+
+impl std::fmt::Display for Evidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::DmiBoardTable => "dmi_board_table",
+            Self::KernelLog => "kernel_log",
+            Self::BoundHwmon => "bound_hwmon",
+        })
+    }
 }
 
 /// A concrete "load this driver" suggestion for an unbound chip. Only ever

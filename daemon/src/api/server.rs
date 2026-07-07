@@ -66,6 +66,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/inventory/readiness",
             get(handlers::hwmon_readiness_handler),
         )
+        // Passive Super-I/O chip detection (DEC-202): per-chip presence +
+        // allowlisted "load this driver" recommendations. Read-only — never
+        // probes I/O ports, loads modules, or writes hardware. 404-gated.
+        .route("/inventory/superio", get(handlers::superio_handler))
         // Manual override + fan identify (DEC-163 / DEC-166). axum 0.8 needs
         // method-chaining on a single route per path (duplicate paths panic).
         .route(

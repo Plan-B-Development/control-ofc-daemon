@@ -353,6 +353,74 @@ pub fn overall_severity(items: &[ReadinessItem]) -> ReadinessSeverity {
         .unwrap_or(ReadinessSeverity::Ok)
 }
 
+/// Map a passive Super-I/O detection report (DEC-202) into readiness items, so
+/// board-specific "your chip has no driver loaded" guidance surfaces in the
+/// existing readiness list alongside the generic `no_pwm_controls` item. Lives
+/// here (not in the handler) because `ReadinessItem`'s builders are private to
+/// this module. The handler appends the result and recomputes `overall`.
+///
+/// Two aggregate items at most (unique codes — the GUI keys off `code`):
+/// `superio_driver_unloaded` when any detected chip is present-but-unbound with
+/// a load recommendation, and `superio_acpi_conflict` when a Super-I/O driver's
+/// I/O range collides with an ACPI OperationRegion.
+pub fn superio_readiness_items(
+    report: &crate::hwmon::superio::SuperIoReport,
+) -> Vec<ReadinessItem> {
+    let mut items = Vec::new();
+
+    let unbound: Vec<String> = report
+        .chips
+        .iter()
+        .filter(|c| c.recommendation.is_some())
+        .map(|c| format!("{} → {}", c.chip_name, c.expected_module))
+        .collect();
+    if !unbound.is_empty() {
+        items.push(
+            ReadinessItem::new(
+                "superio_driver_unloaded",
+                ReadinessSeverity::Warning,
+                "hwmon",
+                "Motherboard Super-I/O chip detected without its driver loaded",
+                format!(
+                    "{} Super-I/O chip(s) were detected but no matching kernel driver is bound: \
+                     {}. Loading the driver is what makes the motherboard fan headers and sensors \
+                     appear.",
+                    unbound.len(),
+                    unbound.join(", ")
+                ),
+            )
+            .action(
+                "Open Diagnostics ▸ Super-I/O for the exact module and copy-paste command; a \
+                 reboot or module reload may be needed.",
+            )
+            .reboot(),
+        );
+    }
+
+    if !report.acpi_conflict_drivers.is_empty() {
+        items.push(
+            ReadinessItem::new(
+                "superio_acpi_conflict",
+                ReadinessSeverity::Warning,
+                "hwmon",
+                "ACPI claims a Super-I/O chip's I/O ports",
+                format!(
+                    "ACPI firmware has reserved the I/O ports used by {}. Under \
+                     acpi_enforce_resources=strict (the default) the driver may refuse to bind, so \
+                     the chip's sensors/fans stay unavailable.",
+                    report.acpi_conflict_drivers.join(", ")
+                ),
+            )
+            .action(
+                "See Diagnostics ▸ Super-I/O. Do not switch to acpi_enforce_resources=lax without \
+                 understanding the driver/ACPI race it reintroduces.",
+            ),
+        );
+    }
+
+    items
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,5 +619,58 @@ mod tests {
             serde_json::to_value(ReadinessSeverity::Ok).unwrap(),
             serde_json::json!("ok")
         );
+    }
+
+    #[test]
+    fn superio_items_emitted_for_unbound_chip_and_acpi_conflict() {
+        use crate::hwmon::superio::{
+            Evidence, SuperIoChip, SuperIoRecommendation, SuperIoReport, SuperIoVendor,
+        };
+        let report = SuperIoReport {
+            arch_supported: true,
+            chips: vec![SuperIoChip {
+                chip_name: "it8688".into(),
+                vendor: SuperIoVendor::Ite,
+                evidence: vec![Evidence::DmiBoardTable],
+                confidence: crate::hwmon::classify::Confidence::Medium,
+                bound_driver: None,
+                expected_module: "it87".into(),
+                module_loaded: false,
+                hwmon_present: false,
+                recommendation: Some(SuperIoRecommendation {
+                    module: "it87".into(),
+                    in_mainline: false,
+                    load_hint: "install it87-dkms-git".into(),
+                    reason: "board lists it8688".into(),
+                    risk_notes: vec![],
+                }),
+                caveats: vec![],
+            }],
+            acpi_conflict_drivers: vec!["it87".into()],
+            notes: vec![],
+        };
+        let items = superio_readiness_items(&report);
+        let codes: Vec<&str> = items.iter().map(|i| i.code.as_str()).collect();
+        assert!(codes.contains(&"superio_driver_unloaded"));
+        assert!(codes.contains(&"superio_acpi_conflict"));
+        let unloaded = items
+            .iter()
+            .find(|i| i.code == "superio_driver_unloaded")
+            .unwrap();
+        assert!(unloaded.detail.contains("it8688 → it87"));
+        assert!(unloaded.reboot_may_be_required);
+        assert_eq!(unloaded.severity, ReadinessSeverity::Warning);
+    }
+
+    #[test]
+    fn superio_items_empty_when_nothing_unbound_and_no_conflict() {
+        use crate::hwmon::superio::SuperIoReport;
+        let report = SuperIoReport {
+            arch_supported: true,
+            chips: vec![],
+            acpi_conflict_drivers: vec![],
+            notes: vec![],
+        };
+        assert!(superio_readiness_items(&report).is_empty());
     }
 }

@@ -374,6 +374,57 @@ pub struct ReadinessResponse {
     pub items: Vec<crate::hwmon::readiness::ReadinessItem>,
 }
 
+/// Response for `GET /inventory/superio` (DEC-202) — the passive Super-I/O
+/// detection report. Read-only; the daemon never probes I/O ports, loads
+/// modules, or writes hardware to produce it. `arch_supported` is false on
+/// non-x86 (with an empty `chips` list). Absent route ⇒ daemon predates the
+/// feature (clients gate on 404, mirroring the other `/inventory/*` endpoints).
+#[derive(Debug, Clone, Serialize)]
+pub struct SuperIoResponse {
+    pub api_version: u32,
+    pub arch_supported: bool,
+    pub chips: Vec<SuperIoChipEntry>,
+    /// Driver names whose ISA I/O range collides with an ACPI OperationRegion.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub acpi_conflict_drivers: Vec<String>,
+    /// Report-level notes (always carries the "present ≠ controllable" caveat).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+/// One detected Super-I/O chip in a [`SuperIoResponse`].
+#[derive(Debug, Clone, Serialize)]
+pub struct SuperIoChipEntry {
+    pub chip_name: String,
+    pub vendor: String,
+    /// Evidence sources: `dmi_board_table` | `kernel_log` | `bound_hwmon`.
+    pub evidence: Vec<String>,
+    /// Presence confidence: `high` | `medium` | `low` | `unknown`.
+    pub confidence: String,
+    /// The module inferred to have bound this chip (present only when bound).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bound_driver: Option<String>,
+    pub expected_module: String,
+    pub module_loaded: bool,
+    pub hwmon_present: bool,
+    /// A load recommendation, present only for an unbound, allowlisted chip.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recommendation: Option<SuperIoRecommendationEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub caveats: Vec<String>,
+}
+
+/// A "load this driver" recommendation for an unbound chip.
+#[derive(Debug, Clone, Serialize)]
+pub struct SuperIoRecommendationEntry {
+    pub module: String,
+    pub in_mainline: bool,
+    pub load_hint: String,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub risk_notes: Vec<String>,
+}
+
 /// One entry in the `GET /profiles` listing — a lightweight summary parsed from
 /// each stored/preset profile (the full document is fetched via
 /// `GET /profiles/{id}`).
