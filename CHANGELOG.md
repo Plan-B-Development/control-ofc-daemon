@@ -54,7 +54,7 @@ discovery never writes hardware.
 Pairs with `control-ofc-gui` ≥ v2.0.0 (additive — any 2.x GUI keeps working). The
 new inventory / readiness / preferred-sensor / verify-thermal surfaces are
 consumed by `control-ofc-gui` ≥ v2.9.0, which degrades gracefully on older
-daemons (unknown routes 404 and the new UI hides itself).
+daemons (unknown routes 404 and the new UI shows an "unavailable" state).
 
 ### Added
 - **Read-only hwmon inventory — `GET /inventory/hwmon`.** A structured snapshot
