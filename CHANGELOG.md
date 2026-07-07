@@ -1,10 +1,14 @@
 # Changelog
 
-## [Unreleased]
+## [2.7.0] — 2026-07-07
 
-Built-in Super-I/O chip detection (DEC-202). Report-only and passive: never
-probes I/O ports, loads modules, or writes hardware — it tells you which
-motherboard sensor/fan driver to load, it does not load it.
+Built-in Super-I/O chip detection (DEC-202/203). Passive detection is report-only
+and never touches hardware — it tells you which motherboard sensor/fan driver to
+load, it does not load it. A separate, **off-by-default** active `/dev/port` probe
+(DEC-203) can identify an unbound chip on request; it needs an explicit config
+flag *and* a `CAP_SYS_RAWIO` systemd drop-in, so the default install is unchanged.
+
+Pairs with `control-ofc-gui` ≥ v2.10.0.
 
 ### Added
 - **`POST /inventory/superio/probe` — opt-in ACTIVE Super-I/O port probe
