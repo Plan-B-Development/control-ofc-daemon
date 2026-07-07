@@ -70,6 +70,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // allowlisted "load this driver" recommendations. Read-only — never
         // probes I/O ports, loads modules, or writes hardware. 404-gated.
         .route("/inventory/superio", get(handlers::superio_handler))
+        // Opt-in ACTIVE Super-I/O port probe (DEC-203): a deliberate, one-shot
+        // /dev/port read to identify an UNBOUND chip. Gated by
+        // [detection] allow_port_probe + CAP_SYS_RAWIO; refuses ports owned by a
+        // bound driver or ACPI. Off by default; reports availability truthfully.
+        .route(
+            "/inventory/superio/probe",
+            post(handlers::superio_probe_handler),
+        )
         // Manual override + fan identify (DEC-163 / DEC-166). axum 0.8 needs
         // method-chaining on a single route per path (duplicate paths panic).
         .route(

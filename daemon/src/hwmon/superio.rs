@@ -70,6 +70,8 @@ pub enum Evidence {
     KernelLog,
     /// Currently bound and exposing an hwmon device.
     BoundHwmon,
+    /// Identified by the opt-in active `/dev/port` probe (DEC-203).
+    PortProbe,
 }
 
 impl std::fmt::Display for Evidence {
@@ -78,6 +80,7 @@ impl std::fmt::Display for Evidence {
             Self::DmiBoardTable => "dmi_board_table",
             Self::KernelLog => "kernel_log",
             Self::BoundHwmon => "bound_hwmon",
+            Self::PortProbe => "port_probe",
         })
     }
 }

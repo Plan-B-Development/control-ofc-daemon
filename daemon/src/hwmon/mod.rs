@@ -20,6 +20,7 @@ pub mod pwm_discovery;
 pub mod reader;
 pub mod readiness;
 pub mod superio;
+pub mod superio_probe;
 pub mod types;
 pub mod util;
 

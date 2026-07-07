@@ -200,6 +200,10 @@ pub struct AppState {
     /// Mutated by the `/control/*/override` + `/fans/*/identify` handlers and
     /// swept + applied by the profile engine tick (both hold this same `Arc`).
     pub override_table: Arc<Mutex<crate::control_override::OverrideTable>>,
+    /// DEC-203: whether the opt-in active Super-I/O `/dev/port` probe is enabled
+    /// (`[detection] allow_port_probe`). Off by default; the probe also needs the
+    /// `CAP_SYS_RAWIO` drop-in to actually function.
+    pub allow_port_probe: bool,
 }
 
 /// RAII guard that clears the profile engine's verify pause on drop (DEC-165),

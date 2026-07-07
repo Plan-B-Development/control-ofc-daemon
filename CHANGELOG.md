@@ -7,6 +7,18 @@ probes I/O ports, loads modules, or writes hardware — it tells you which
 motherboard sensor/fan driver to load, it does not load it.
 
 ### Added
+- **`POST /inventory/superio/probe` — opt-in ACTIVE Super-I/O port probe
+  (DEC-203).** A deliberate, one-shot `/dev/port` read of the Super-I/O config
+  ports (0x2E/0x4E) that identifies an **unbound** chip passive detection cannot
+  see, so the user can be told which driver to load. **Off by default** — needs
+  both `[detection] allow_port_probe = true` and an opt-in `CAP_SYS_RAWIO`
+  systemd drop-in (shipped as `superio-port-probe.conf.example`, NOT installed;
+  the default unit stays fully hardened). Refuses to probe at all when any
+  Super-I/O driver is already bound, skips any ACPI-reserved base, and refuses if
+  `/proc/ioports` can't be read; reads only chip-ID registers; never writes a config
+  value or `force_id`; safe-Rust `/dev/port` I/O; fails gracefully under kernel
+  lockdown (Secure Boot). `GET /inventory/superio` gains `port_probe_available`
+  + `port_probe_reason` so the GUI can gate its advanced probe button.
 - **`GET /inventory/superio`** — passive Super-I/O detection report. Composes the
   DMI board table, bound hwmon chips, `/proc/modules`, `/dev/kmsg`, and ACPI
   I/O-port conflicts into a per-chip presence report (vendor, evidence,

@@ -25,6 +25,7 @@ use crate::hwmon::readiness::{
     build_readiness, overall_severity, superio_readiness_items, ReadinessInputs,
 };
 use crate::hwmon::superio;
+use crate::hwmon::superio_probe;
 use crate::hwmon::HWMON_SYSFS_ROOT;
 
 /// GET /inventory/hwmon — structured, read-only hardware inventory.
@@ -275,7 +276,10 @@ fn build_superio_response(state: &AppState) -> (StatusCode, Json<serde_json::Val
     let now = std::time::Instant::now();
     let snap = state.cache.snapshot();
     let report = detect_superio_from(state, &snap, now);
-    json_ok(StatusCode::OK, map_superio_report(&report))
+    // GET is passive only — report whether the active probe *could* run, but
+    // never touch a port here (that is the deliberate POST below).
+    let (avail, reason) = superio_probe::port_probe_available(state.allow_port_probe);
+    json_ok(StatusCode::OK, map_superio_report(&report, avail, reason))
 }
 
 /// Run the passive detector against the live cache. Shared by the Super-I/O
@@ -347,13 +351,19 @@ fn merge_bound_chips(
         .collect()
 }
 
-fn map_superio_report(report: &superio::SuperIoReport) -> SuperIoResponse {
+fn map_superio_report(
+    report: &superio::SuperIoReport,
+    port_probe_available: bool,
+    port_probe_reason: String,
+) -> SuperIoResponse {
     SuperIoResponse {
         api_version: API_VERSION,
         arch_supported: report.arch_supported,
         chips: report.chips.iter().map(map_superio_chip).collect(),
         acpi_conflict_drivers: report.acpi_conflict_drivers.clone(),
         notes: report.notes.clone(),
+        port_probe_available,
+        port_probe_reason,
     }
 }
 
@@ -378,6 +388,226 @@ fn map_superio_chip(c: &superio::SuperIoChip) -> SuperIoChipEntry {
                 risk_notes: r.risk_notes.clone(),
             }),
         caveats: c.caveats.clone(),
+    }
+}
+
+// ── Active port probe (DEC-203, opt-in) ─────────────────────────────
+
+/// POST /inventory/superio/probe — the opt-in active `/dev/port` probe.
+///
+/// A deliberate, one-shot action (never polled): identifies an UNBOUND
+/// Super-I/O chip by reading its config port, so the user can be told which
+/// driver to load. Gated by `[detection] allow_port_probe` + `CAP_SYS_RAWIO`;
+/// refuses to touch a port claimed by a bound driver or ACPI. Returns the same
+/// `SuperIoResponse` shape, enriched with any probe-detected chips.
+pub async fn superio_probe_handler(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match tokio::task::spawn_blocking(move || build_superio_probe_response(&state)).await {
+        Ok(resp) => resp,
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &ErrorEnvelope::internal(format!("superio probe task failed: {e}")),
+        ),
+    }
+}
+
+/// Serializes active probes (single-flight) and records the last run time
+/// (cooldown). The 0666 socket (DEC-049) means any local client could otherwise
+/// loop the probe, and some firmware reacts poorly to rapid config-mode cycles
+/// (SEC review, DEC-203).
+static PROBE_GATE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+const PROBE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn build_superio_probe_response(state: &AppState) -> (StatusCode, Json<serde_json::Value>) {
+    let now = std::time::Instant::now();
+    let snap = state.cache.snapshot();
+    let mut report = detect_superio_from(state, &snap, now);
+
+    if !state.allow_port_probe {
+        let (_avail, reason) = superio_probe::port_probe_available(false);
+        report
+            .notes
+            .push(format!("Active port probe not run: {reason}"));
+        return json_ok(StatusCode::OK, map_superio_report(&report, false, reason));
+    }
+
+    // Single-flight + cooldown: holding this lock across the probe serializes
+    // concurrent probes; the timestamp rate-limits repeated ones.
+    let mut gate = PROBE_GATE.lock().unwrap_or_else(|e| e.into_inner());
+    if gate.is_some_and(|last| last.elapsed() < PROBE_COOLDOWN) {
+        report.notes.push(
+            "Active port probe is on a brief cooldown — try again in a few seconds.".to_string(),
+        );
+        return json_ok(
+            StatusCode::OK,
+            map_superio_report(&report, true, "available".to_string()),
+        );
+    }
+
+    // Open /dev/port ONCE — this doubles as the availability check (no TOCTOU
+    // double-open, SEC F5). A failure here is reported as unavailable.
+    let reader = match superio_probe::port_probe_open() {
+        Ok(r) => r,
+        Err(reason) => {
+            report
+                .notes
+                .push(format!("Active port probe not run: {reason}"));
+            return json_ok(StatusCode::OK, map_superio_report(&report, false, reason));
+        }
+    };
+
+    match safe_probe_bases(state, &snap, now) {
+        Err(skip) => report
+            .notes
+            .push(format!("Active port probe skipped: {skip}")),
+        Ok(bases) if bases.is_empty() => report.notes.push(
+            "Active port probe: both Super-I/O config ports are reserved (ACPI); skipped."
+                .to_string(),
+        ),
+        Ok(bases) => {
+            let probed = superio_probe::probe_ports(&reader, &bases);
+            if probed.is_empty() {
+                report.notes.push(
+                    "Active port probe found no unbound Super-I/O chip at 0x2E/0x4E.".to_string(),
+                );
+            }
+            for p in &probed {
+                report.chips.push(probed_to_superio_chip(p));
+            }
+        }
+    }
+
+    *gate = Some(std::time::Instant::now());
+    json_ok(
+        StatusCode::OK,
+        map_superio_report(&report, true, "available".to_string()),
+    )
+}
+
+/// The Super-I/O config bases (0x2E/0x4E) safe to probe. Thin wrapper over the
+/// pure [`pick_probe_bases`] that gathers the live inputs.
+fn safe_probe_bases(
+    state: &AppState,
+    snap: &DaemonState,
+    now: std::time::Instant,
+) -> Result<Vec<u16>, String> {
+    let names: Vec<String> = gather_bound_chips(state, snap, now)
+        .into_iter()
+        .map(|c| c.chip_name)
+        .collect();
+    let ioports = std::fs::read_to_string("/proc/ioports").ok();
+    pick_probe_bases(&names, ioports.as_deref())
+}
+
+/// Decide which config bases are safe to probe (pure, so it is unit-tested).
+///
+/// - `ioports = None` (the `/proc/ioports` read failed) ⇒ **refuse** rather than
+///   probe blind — the driver/ACPI port-claim fence must never silently vanish
+///   (SEC F1).
+/// - Refuse ALL probing if any recognized Super-I/O chip is already bound
+///   (probing would race its driver, DEC-203). Note: an unrecognized bound chip
+///   is caught only if it reserves the port in `/proc/ioports` (SEC F2 residual).
+/// - Drop any base reserved in `/proc/ioports`.
+fn pick_probe_bases(
+    bound_chip_names: &[String],
+    ioports: Option<&str>,
+) -> Result<Vec<u16>, String> {
+    let Some(ioports) = ioports else {
+        return Err(
+            "/proc/ioports could not be read — refusing to probe without the \
+                    driver/ACPI port-claim check"
+                .to_string(),
+        );
+    };
+    if bound_chip_names
+        .iter()
+        .any(|n| crate::hwmon::chip_db::expected_driver(n) != "unknown")
+    {
+        return Err(
+            "a Super-I/O driver is already bound — refusing to probe its config port".to_string(),
+        );
+    }
+    Ok(superio_probe::SIO_BASES
+        .iter()
+        .copied()
+        .filter(|&b| !superio_probe::base_claimed(ioports, b))
+        .collect())
+}
+
+/// Convert a port-probe hit into a `SuperIoChip` (unbound, evidence = PortProbe)
+/// with a load recommendation. ITE chips get a precise module + DKMS status via
+/// `chip_db`; the Nuvoton/Winbond family is reported at vendor level.
+fn probed_to_superio_chip(p: &superio_probe::ProbedChip) -> superio::SuperIoChip {
+    let (chip_name, expected_module, in_mainline) = match (&p.chip_name, p.vendor) {
+        (Some(name), _) => (
+            name.clone(),
+            crate::hwmon::chip_db::expected_driver(name).to_string(),
+            crate::hwmon::chip_db::chip_driver_in_mainline(name),
+        ),
+        (None, superio::SuperIoVendor::Nuvoton) => (
+            format!("Nuvoton/Winbond Super-I/O (DEVID 0x{:04x})", p.devid),
+            "nct6775".to_string(),
+            true,
+        ),
+        (None, _) => (
+            format!("Super-I/O (DEVID 0x{:04x})", p.devid),
+            "unknown".to_string(),
+            false,
+        ),
+    };
+
+    let reason = format!(
+        "An active port probe found this chip at base 0x{:04x} (DEVID 0x{:04x}) with no driver \
+         bound.",
+        p.base, p.devid
+    );
+    let recommendation = if expected_module == "unknown" {
+        None
+    } else {
+        let load_hint = if p.vendor == superio::SuperIoVendor::Nuvoton {
+            "Load the `nct6775` driver (or `w83627ehf` for a genuine Winbond chip): `sudo modprobe \
+             nct6775`, or add it to /etc/modules-load.d/. A reboot or module reload may be needed."
+                .to_string()
+        } else if in_mainline {
+            format!(
+                "Enable it at boot: `echo {expected_module} | sudo tee \
+                 /etc/modules-load.d/{expected_module}.conf`, or load it now with `sudo modprobe \
+                 {expected_module}`."
+            )
+        } else {
+            "This ITE chip needs the out-of-tree it87-dkms-git driver — install it, then load \
+             `it87`. Do not pass force_id."
+                .to_string()
+        };
+        Some(superio::SuperIoRecommendation {
+            module: expected_module.clone(),
+            in_mainline,
+            load_hint,
+            reason: reason.clone(),
+            risk_notes: Vec::new(),
+        })
+    };
+    let caveats = if expected_module == "unknown" {
+        vec![format!(
+            "Unrecognized Super-I/O chip (vendor {}, DEVID 0x{:04x}).",
+            p.vendor, p.devid
+        )]
+    } else {
+        Vec::new()
+    };
+
+    superio::SuperIoChip {
+        chip_name,
+        vendor: p.vendor,
+        evidence: vec![superio::Evidence::PortProbe],
+        confidence: Confidence::High,
+        bound_driver: None,
+        expected_module,
+        module_loaded: false,
+        hwmon_present: false,
+        recommendation,
+        caveats,
     }
 }
 
@@ -499,8 +729,10 @@ mod tests {
             acpi_conflict_drivers: vec!["it87".into()],
             notes: vec!["present != control".into()],
         };
-        let dto = map_superio_report(&report);
+        let dto = map_superio_report(&report, false, "disabled".to_string());
         assert!(dto.arch_supported);
+        assert!(!dto.port_probe_available);
+        assert_eq!(dto.port_probe_reason, "disabled");
         assert_eq!(dto.chips.len(), 1);
         let c = &dto.chips[0];
         assert_eq!(c.vendor, "ite");
@@ -514,5 +746,92 @@ mod tests {
         let v = serde_json::to_value(&dto).unwrap();
         assert_eq!(v["arch_supported"], serde_json::json!(true));
         assert_eq!(v["chips"][0]["vendor"], serde_json::json!("ite"));
+    }
+
+    #[test]
+    fn probed_ite_chip_maps_to_dkms_recommendation() {
+        let p = superio_probe::ProbedChip {
+            base: 0x2e,
+            vendor: superio::SuperIoVendor::Ite,
+            devid: 0x8688,
+            chip_name: Some("it8688".to_string()),
+        };
+        let chip = probed_to_superio_chip(&p);
+        assert_eq!(chip.chip_name, "it8688");
+        assert_eq!(chip.evidence, vec![superio::Evidence::PortProbe]);
+        assert!(!chip.hwmon_present);
+        let rec = chip
+            .recommendation
+            .expect("unbound probed chip → recommendation");
+        assert_eq!(rec.module, "it87");
+        assert!(!rec.in_mainline, "it8688 is DKMS-only");
+        assert!(rec.load_hint.contains("it87-dkms-git"));
+        assert!(rec.reason.contains("active port probe"));
+    }
+
+    #[test]
+    fn probed_nuvoton_family_maps_to_nct6775_at_vendor_level() {
+        let p = superio_probe::ProbedChip {
+            base: 0x4e,
+            vendor: superio::SuperIoVendor::Nuvoton,
+            devid: 0xd592,
+            chip_name: None,
+        };
+        let chip = probed_to_superio_chip(&p);
+        assert!(chip.chip_name.contains("DEVID 0xd592"));
+        let rec = chip.recommendation.expect("recommendation");
+        assert_eq!(rec.module, "nct6775");
+        assert!(rec.in_mainline);
+        assert!(rec.load_hint.contains("nct6775"));
+    }
+
+    #[test]
+    fn probed_unknown_vendor_gets_no_recommendation_but_a_caveat() {
+        let p = superio_probe::ProbedChip {
+            base: 0x2e,
+            vendor: superio::SuperIoVendor::Unknown,
+            devid: 0x1234,
+            chip_name: None,
+        };
+        let chip = probed_to_superio_chip(&p);
+        assert_eq!(chip.expected_module, "unknown");
+        assert!(chip.recommendation.is_none());
+        assert!(chip.caveats.iter().any(|c| c.contains("Unrecognized")));
+    }
+
+    // ── The race gate (SEC review): pick_probe_bases ──
+
+    #[test]
+    fn pick_probe_bases_refuses_when_a_recognized_chip_is_bound() {
+        let r = pick_probe_bases(&["nct6799".to_string()], Some(""));
+        assert!(r.unwrap_err().contains("already bound"));
+    }
+
+    #[test]
+    fn pick_probe_bases_refuses_when_ioports_unreadable() {
+        // None = /proc/ioports read failed → refuse, don't probe blind (SEC F1).
+        let r = pick_probe_bases(&[], None);
+        assert!(r.unwrap_err().contains("ioports"));
+    }
+
+    #[test]
+    fn pick_probe_bases_drops_a_base_reserved_in_ioports() {
+        // No recognized SIO chip; 0x2e reserved → only 0x4e is probable.
+        let bases =
+            pick_probe_bases(&["k10temp".to_string()], Some("002e-002f : pnp 00:03\n")).unwrap();
+        assert_eq!(bases, vec![0x4e]);
+    }
+
+    #[test]
+    fn pick_probe_bases_allows_both_when_clean() {
+        assert_eq!(pick_probe_bases(&[], Some("")).unwrap(), vec![0x2e, 0x4e]);
+    }
+
+    #[test]
+    fn pick_probe_bases_unrecognized_bound_chip_passes_the_name_gate() {
+        // A chip chip_db doesn't know passes the name gate (SEC F2 residual —
+        // the /proc/ioports fence is the backstop for a port it actually holds).
+        let bases = pick_probe_bases(&["brandnewchip99".to_string()], Some("")).unwrap();
+        assert_eq!(bases, vec![0x2e, 0x4e]);
     }
 }

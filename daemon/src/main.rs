@@ -751,6 +751,7 @@ async fn main() {
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
+        allow_port_probe: config.detection.allow_port_probe,
     });
 
     // Silence "assigned but not read" — runtime_cfg is consumed by the

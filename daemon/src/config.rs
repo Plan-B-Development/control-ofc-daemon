@@ -24,6 +24,9 @@ pub struct DaemonConfig {
 
     #[serde(default)]
     pub startup: StartupConfig,
+
+    #[serde(default)]
+    pub detection: DetectionConfig,
 }
 
 /// Serial port configuration.
@@ -165,6 +168,23 @@ pub struct StartupConfig {
 
 // Default: delay_secs = 0 (no startup delay).
 // Derived rather than manual impl per clippy::derivable_impls.
+
+/// Hardware-detection configuration (DEC-203).
+///
+/// Governs the opt-in active Super-I/O port probe. **`allow_port_probe`
+/// defaults to `false`** — the daemon never touches an I/O port unless the
+/// operator explicitly opts in here *and* installs the `CAP_SYS_RAWIO` systemd
+/// drop-in (both are required; see `packaging/`). Even when enabled the probe is
+/// one-shot, read-only, and refuses a port claimed by a bound driver or ACPI.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DetectionConfig {
+    /// Allow the active `/dev/port` Super-I/O probe (`POST /inventory/superio/probe`).
+    /// `false` (default) = the probe endpoint refuses with `port_probe_available:
+    /// false`. Requires the opt-in `CAP_SYS_RAWIO` drop-in to actually function.
+    #[serde(default)]
+    pub allow_port_probe: bool,
+}
 
 impl DaemonConfig {
     /// Parse configuration from a TOML string.

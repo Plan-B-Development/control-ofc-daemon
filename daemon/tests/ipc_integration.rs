@@ -79,6 +79,7 @@ fn test_app_state() -> Arc<AppState> {
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
+        allow_port_probe: false,
     })
 }
 
@@ -443,6 +444,7 @@ async fn fans_endpoint_tags_intel_gpu_source_by_id_prefix() {
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
+        allow_port_probe: false,
     });
     let (path, shutdown, _dir) = start_test_server(state).await;
 
@@ -633,6 +635,7 @@ fn test_app_state_with_hwmon() -> Arc<AppState> {
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
+        allow_port_probe: false,
     })
 }
 
@@ -876,6 +879,7 @@ fn test_app_state_with_unsupported_gpu(pci_bdf: &str) -> Arc<AppState> {
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
+        allow_port_probe: false,
     })
 }
 
@@ -946,6 +950,7 @@ fn test_app_state_with_read_only_gpu(pci_bdf: &str, pci_device_id: u16) -> Arc<A
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
+        allow_port_probe: false,
     })
 }
 
@@ -1221,6 +1226,7 @@ async fn deactivate_profile_resets_hwmon_coalescing() {
         override_table: Arc::new(Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
+        allow_port_probe: false,
     });
     let hwmon = state.hwmon_controller.clone().unwrap();
 
@@ -1331,6 +1337,7 @@ fn test_app_state_with_writable_pmfw_gpu(pci_bdf: &str) -> (Arc<AppState>, tempf
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
+        allow_port_probe: false,
     });
     (state, tmp)
 }
@@ -1497,6 +1504,7 @@ async fn hwmon_discovery_excludes_amdgpu_end_to_end_via_ipc() {
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
+        allow_port_probe: false,
     });
     let (path, shutdown, _dir) = start_test_server(state).await;
 
@@ -1554,6 +1562,7 @@ fn test_app_state_with_profile_dirs(dirs: Vec<std::path::PathBuf>) -> Arc<AppSta
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
+        allow_port_probe: false,
     })
 }
 

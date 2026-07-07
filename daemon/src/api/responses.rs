@@ -390,6 +390,13 @@ pub struct SuperIoResponse {
     /// Report-level notes (always carries the "present ≠ controllable" caveat).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
+    /// DEC-203: whether the opt-in active `/dev/port` probe
+    /// (`POST /inventory/superio/probe`) can run right now. Off by default; the
+    /// GUI gates its "probe" affordance on this.
+    pub port_probe_available: bool,
+    /// Plain-English reason for `port_probe_available` (`"available"`, or why not
+    /// — flag off / no CAP_SYS_RAWIO / kernel lockdown / no `/dev/port`).
+    pub port_probe_reason: String,
 }
 
 /// One detected Super-I/O chip in a [`SuperIoResponse`].

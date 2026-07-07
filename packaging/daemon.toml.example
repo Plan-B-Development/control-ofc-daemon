@@ -20,3 +20,19 @@
 
 [state]
 # state_dir = "/var/lib/control-ofc"
+
+[startup]
+# Seconds to wait before device detection at boot (0–30). The API
+# (POST /config/startup-delay) can override this at runtime.
+# delay_secs = 0
+
+[detection]
+# Opt-in active Super-I/O port probe (DEC-203). Default: false.
+# When true AND the CAP_SYS_RAWIO systemd drop-in is installed (see
+# /usr/share/doc/control-ofc-daemon/superio-port-probe.conf.example), the
+# daemon will, on a deliberate POST /inventory/superio/probe, read the
+# Super-I/O config ports (0x2E/0x4E) to identify an UNBOUND motherboard chip.
+# It never touches a port owned by a bound driver or ACPI. Leave false unless
+# you specifically need it — the passive detection covers the common cases,
+# and CAP_SYS_RAWIO is effectively root-equivalent.
+# allow_port_probe = false

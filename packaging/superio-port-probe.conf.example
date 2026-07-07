@@ -1,0 +1,52 @@
+# Opt-in systemd drop-in for the ACTIVE Super-I/O port probe (DEC-203).
+#
+# ─────────────────────────────  READ THIS  ─────────────────────────────
+# This drop-in grants control-ofc-daemon CAP_SYS_RAWIO and access to
+# /dev/port so it can actively probe the Super-I/O configuration ports
+# (0x2E / 0x4E) to identify a motherboard chip whose kernel driver is NOT
+# loaded. Passive detection already covers the common cases; you only need
+# this for an unbound chip that never reached hwmon, /dev/kmsg, or the DMI
+# board table.
+#
+# SECURITY WARNING
+#   CAP_SYS_RAWIO is effectively root-equivalent — it permits raw I/O port
+#   access, /dev/mem-class access, MSRs, and PCI config space. Installing
+#   this file materially weakens the daemon's otherwise-hardened systemd
+#   sandbox. Only install it if you specifically need active Super-I/O
+#   probing and accept that trade-off.
+#
+# The probe itself stays conservative even when enabled: it is one-shot
+# (a deliberate POST, never a loop or a startup action), reads only the
+# fixed chip-ID registers, never writes a configuration value or force_id,
+# and REFUSES to touch a config port owned by a bound driver or reserved by
+# ACPI. On a Secure-Boot (kernel-lockdown) system the kernel blocks
+# /dev/port regardless, and the daemon degrades gracefully.
+#
+# ────────────────────────────  TO ENABLE  ─────────────────────────────
+#   1. Set the config flag in /etc/control-ofc/daemon.toml:
+#          [detection]
+#          allow_port_probe = true
+#   2. Install this drop-in (run from anywhere — the source is the full path):
+#          sudo install -Dm644 \
+#            /usr/share/doc/control-ofc-daemon/superio-port-probe.conf.example \
+#            /etc/systemd/system/control-ofc-daemon.service.d/superio-port-probe.conf
+#   3. Reload + restart:
+#          sudo systemctl daemon-reload
+#          sudo systemctl restart control-ofc-daemon
+#
+# BOTH the flag and this drop-in are required. With only the flag, the probe
+# reports "port_probe_available: false" (no CAP_SYS_RAWIO / no /dev/port).
+#
+# ───────────────────────────  TO DISABLE  ─────────────────────────────
+#   sudo rm /etc/systemd/system/control-ofc-daemon.service.d/superio-port-probe.conf
+#   sudo systemctl daemon-reload && sudo systemctl restart control-ofc-daemon
+# (and/or set allow_port_probe = false).
+
+[Service]
+# Re-add CAP_SYS_RAWIO, which the base unit deliberately drops. A non-"~"
+# assignment merges by OR into the base unit's "~"-form bounding set, so this
+# re-includes exactly CAP_SYS_RAWIO and nothing else (systemd.exec(5)).
+CapabilityBoundingSet=CAP_SYS_RAWIO
+# Expose the /dev/port character device; the base unit's DeviceAllow= list
+# (ttyACM/ttyUSB only) otherwise blocks it. DeviceAllow= accumulates.
+DeviceAllow=/dev/port rw

@@ -84,6 +84,13 @@ package() {
     install -Dm644 packaging/99-control-ofc.rules \
         "$pkgdir/usr/share/doc/$pkgname/99-control-ofc.rules.example"
 
+    # Opt-in systemd drop-in for the ACTIVE Super-I/O port probe (DEC-203).
+    # Shipped as a doc example ONLY — NOT installed into the .service.d/ dir,
+    # so the default unit stays fully hardened. Grants CAP_SYS_RAWIO (~root),
+    # so the operator must copy it deliberately AND set allow_port_probe=true.
+    install -Dm644 packaging/superio-port-probe.conf.example \
+        "$pkgdir/usr/share/doc/$pkgname/superio-port-probe.conf.example"
+
     # Kernel module loading — Super I/O chipset drivers that expose
     # motherboard fan headers and sensors. See packaging/modules-load.d/
     # for rationale. Covered by backup=() so pacman preserves user edits.
