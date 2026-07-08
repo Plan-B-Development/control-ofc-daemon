@@ -1,13 +1,14 @@
 # Changelog
 
-## [Unreleased]
+## [2.8.0] — 2026-07-08
 
-NVIDIA GPU support — Phase 1 (read-only telemetry). Batched under `[Unreleased]`
-pending GUI consumption (P1e) before release. **NOT independently releasable** —
-the current GUI does not list `nvidia_gpu` in its GPU-fan sources, so an idle
-NVIDIA fan is hidden by default (DEC-047 regression), and it does not yet consume
-the new `nvidia_gpu` capability/diagnostics blocks or the `duty_pct` field; ships
-coordinated with the GUI (DEC-204, P1e).
+NVIDIA GPU support — Phase 1 (read-only telemetry). Ships coordinated with GUI
+v2.11.0, which consumes these surfaces (the GUI closes the DEC-047 idle-fan gap
+and renders `nvidia_gpu` capability/diagnostics + the `duty_pct` field). Pairs
+with `control-ofc-gui` ≥ v2.11.0. Additive and version-skew tolerant — a client
+that predates these fields simply ignores them. Fan **write** control is a
+deliberately deferred Phase 2 (needs NVIDIA hardware to validate); the NVML path
+is experimental/unverified on real hardware and **off by default**.
 
 ### Added
 - **NVIDIA discrete GPU read-only sensing via the open `nouveau` driver
