@@ -180,6 +180,35 @@ pub async fn capabilities_handler(
             },
         };
 
+    // NVIDIA discrete GPU detection (DEC-204) — read-only monitoring only
+    // (nouveau hwmon leg + opt-in NVML leg, unified in `state.nvidia_gpus`).
+    let nvidia_gpu_cap = match crate::hwmon::nvidia::select_primary_nvidia_gpu(&state.nvidia_gpus) {
+        Some(gpu) => NvidiaGpuCapability {
+            present: true,
+            model_name: gpu.model_name.clone(),
+            display_label: gpu.display_label(),
+            pci_id: Some(gpu.pci_bdf.clone()),
+            pci_bdf: Some(gpu.pci_bdf.clone()),
+            driver: Some(gpu.driver.to_string()),
+            driver_version: gpu.driver_version.clone(),
+            fan_control_method: gpu.fan_control_method().to_string(),
+            fan_rpm_available: gpu.fan_rpm_available,
+            is_discrete: true,
+        },
+        None => NvidiaGpuCapability {
+            present: false,
+            model_name: None,
+            display_label: "NVIDIA D-GPU".to_string(),
+            pci_id: None,
+            pci_bdf: None,
+            driver: None,
+            driver_version: None,
+            fan_control_method: "none".to_string(),
+            fan_rpm_available: false,
+            is_discrete: false,
+        },
+    };
+
     // AIO (liquid cooler) hwmon capability — dynamic since 1.18.0 (DEC-156).
     // Pump writability is header-driven (available immediately at startup);
     // coolant sensing is read from the cache. USB-only coolers stay out of
@@ -223,6 +252,7 @@ pub async fn capabilities_handler(
             },
             amd_gpu: amd_gpu_cap,
             intel_gpu: intel_gpu_cap,
+            nvidia_gpu: nvidia_gpu_cap,
             aio_hwmon: aio_hwmon_cap,
             aio_usb: UnsupportedCapability {
                 present: false,

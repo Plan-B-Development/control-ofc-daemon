@@ -57,6 +57,7 @@ daemon/                     Rust crate (control-ofc-daemon)
       gpu_fan.rs            PMFW fan curve read/write/reset (RDNA3+)
       intel_gpu_detect.rs   Intel discrete-GPU detection (read-only monitoring, DEC-121)
       nouveau_detect.rs     NVIDIA discrete-GPU detection via the open nouveau driver (read-only, DEC-204)
+      nvidia.rs             Unified NVIDIA GPU identity (nouveau + NVML) for /capabilities + /diagnostics (DEC-204)
       nvml.rs               Opt-in read-only NVIDIA telemetry backend over NVML (proprietary driver, DEC-204)
       nvml_sys.rs           Isolated unsafe FFI to libnvidia-ml.so.1 via libloading (DEC-204)
       kernel_warnings.rs    Kernel-version regression catalog (DEC-098).

@@ -509,6 +509,9 @@ pub struct DeviceCapabilities {
     /// Intel discrete GPU (Arc) capability. Additive field (DEC-121) — older
     /// GUIs ignore it; read-only monitoring only, never fan-writable.
     pub intel_gpu: IntelGpuCapability,
+    /// NVIDIA discrete GPU capability. Additive field (DEC-204) — older GUIs
+    /// ignore it; read-only monitoring only, never fan-writable.
+    pub nvidia_gpu: NvidiaGpuCapability,
     /// Liquid-cooler (AIO) hwmon capability — dynamic since 1.18.0 (DEC-156).
     pub aio_hwmon: AioHwmonCapability,
     /// USB-only coolers (liquidctl/USB-HID) are out of scope — always
@@ -604,6 +607,44 @@ pub struct IntelGpuCapability {
     pub fan_rpm_available: bool,
     /// Whether this is a discrete (VGA) GPU. Always true for a detected Intel
     /// GPU (the hwmon node is DGFX-gated), emitted for symmetry.
+    pub is_discrete: bool,
+}
+
+/// NVIDIA discrete GPU capability details (DEC-204).
+///
+/// Read-only, like the Intel Arc capability (DEC-121) — NVIDIA fan control is
+/// never offered (nouveau's writable `pwm1` is excluded from discovery; the
+/// NVML backend is telemetry-only), so there is no `fan_write_supported` field.
+/// `model_name`/`driver_version` are populated only via the proprietary NVML
+/// driver; the open `nouveau` leg yields a generic label.
+#[derive(Debug, Clone, Serialize)]
+pub struct NvidiaGpuCapability {
+    pub present: bool,
+    /// Product name (e.g. "NVIDIA GeForce RTX 4080") — NVML only, else null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
+    /// Compact display label (model name, or "NVIDIA D-GPU").
+    pub display_label: String,
+    /// PCI Bus:Device.Function (legacy alias, kept symmetric with amd/intel_gpu
+    /// for the GUI's `_coalesce_pci_bdf` tolerance).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pci_id: Option<String>,
+    /// PCI Bus:Device.Function (canonical).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pci_bdf: Option<String>,
+    /// Backing kernel driver: "nouveau" (open) or "nvidia" (proprietary). The
+    /// proprietary GPU is read via the NVML library, but the kernel module — and
+    /// so this field's value — is "nvidia" (mirrors Intel's `driver` semantics).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+    /// NVIDIA driver version (e.g. "565.77") — NVML only, else null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub driver_version: Option<String>,
+    /// Fan control method: "read_only" (fan present) or "none". Never writable.
+    pub fan_control_method: String,
+    /// Whether fan RPM reading is available.
+    pub fan_rpm_available: bool,
+    /// Whether this is a discrete GPU. Always true for a detected NVIDIA GPU.
     pub is_discrete: bool,
 }
 
@@ -751,6 +792,10 @@ pub struct HardwareDiagnosticsResponse {
     /// Intel GPU is present; older clients ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intel_gpu: Option<IntelGpuDiagnostics>,
+    /// NVIDIA discrete GPU diagnostics (DEC-204). Additive — omitted when no
+    /// NVIDIA GPU is present; older clients ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nvidia_gpu: Option<NvidiaGpuDiagnostics>,
     pub thermal_safety: ThermalSafetyInfo,
     pub kernel_modules: Vec<KernelModuleInfo>,
     pub acpi_conflicts: Vec<AcpiConflictInfo>,
@@ -902,6 +947,34 @@ pub struct IntelGpuDiagnostics {
     pub fan_rpm_available: bool,
     /// Truthful, user-facing explanation of why fan control is unavailable,
     /// suitable for direct display in the GUI Diagnostics page.
+    pub fan_control_note: String,
+}
+
+/// NVIDIA discrete GPU diagnostics (DEC-204).
+///
+/// Read-only by nature — no fan write path exists (nouveau's `pwm1` is excluded
+/// from discovery; the NVML backend is telemetry-only), so this carries only
+/// identity, the backing driver leg, and a truthful explanation of why fan
+/// control is unavailable.
+#[derive(Debug, Clone, Serialize)]
+pub struct NvidiaGpuDiagnostics {
+    /// PCI Bus:Device.Function address (canonical).
+    pub pci_bdf: String,
+    /// Alias for `pci_bdf`, emitted for symmetry with the other GPU diagnostics.
+    pub pci_id: String,
+    /// Product name (NVML only) or null (nouveau).
+    pub model_name: Option<String>,
+    /// Backing kernel driver: "nouveau" (open) or "nvidia" (proprietary). The
+    /// proprietary GPU is read via the NVML library, but the kernel module — and
+    /// so this field's value — is "nvidia" (mirrors Intel's `driver` semantics).
+    pub driver: String,
+    /// NVIDIA driver version (NVML only) or null.
+    pub driver_version: Option<String>,
+    /// Always "read_only" (fan present) or "none" — NVIDIA never writable.
+    pub fan_control_method: String,
+    /// Whether fan RPM reading is available.
+    pub fan_rpm_available: bool,
+    /// Truthful, user-facing explanation of why fan control is unavailable.
     pub fan_control_note: String,
 }
 
@@ -1694,6 +1767,18 @@ mod tests {
                     fan_rpm_available: false,
                     is_discrete: false,
                 },
+                nvidia_gpu: NvidiaGpuCapability {
+                    present: true,
+                    model_name: Some("NVIDIA GeForce RTX 4080".into()),
+                    display_label: "NVIDIA GeForce RTX 4080".into(),
+                    pci_id: Some("0000:03:00.0".into()),
+                    pci_bdf: Some("0000:03:00.0".into()),
+                    driver: Some("nvidia".into()),
+                    driver_version: Some("565.77".into()),
+                    fan_control_method: "read_only".into(),
+                    fan_rpm_available: false,
+                    is_discrete: true,
+                },
                 aio_hwmon: AioHwmonCapability::unsupported(),
                 aio_usb: UnsupportedCapability {
                     present: false,
@@ -1738,6 +1823,22 @@ mod tests {
         // with the same BDF string so clients on either name keep working.
         assert_eq!(json["devices"]["amd_gpu"]["pci_id"], "0000:2d:00.0");
         assert_eq!(json["devices"]["amd_gpu"]["pci_bdf"], "0000:2d:00.0");
+        // NVIDIA capability (DEC-204): additive, read-only (no fan_write_supported).
+        assert_eq!(json["devices"]["nvidia_gpu"]["present"], true);
+        assert_eq!(
+            json["devices"]["nvidia_gpu"]["display_label"],
+            "NVIDIA GeForce RTX 4080"
+        );
+        // `driver` is the kernel module name ("nvidia"), not the NVML library.
+        assert_eq!(json["devices"]["nvidia_gpu"]["driver"], "nvidia");
+        assert_eq!(json["devices"]["nvidia_gpu"]["driver_version"], "565.77");
+        assert_eq!(
+            json["devices"]["nvidia_gpu"]["fan_control_method"],
+            "read_only"
+        );
+        assert!(json["devices"]["nvidia_gpu"]
+            .get("fan_write_supported")
+            .is_none());
         // AIO Phase 1 (DEC-156): aio_hwmon is the dynamic capability — the
         // back-compat present+status plus pump_writable/coolant_available.
         assert_eq!(json["devices"]["aio_hwmon"]["present"], false);

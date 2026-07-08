@@ -190,6 +190,10 @@ pub struct AppState {
     /// Detected Intel discrete GPU info (populated at startup). Empty if none
     /// found. Read-only telemetry — no fan write path (DEC-121).
     pub intel_gpus: Vec<crate::hwmon::intel_gpu_detect::IntelGpuInfo>,
+    /// Unified NVIDIA discrete GPU identity (nouveau + NVML legs), gathered at
+    /// startup. Empty if none found. Read-only telemetry — no fan write path
+    /// (DEC-204).
+    pub nvidia_gpus: Vec<crate::hwmon::nvidia::NvidiaGpuIdentity>,
     /// Configured profile search directories (from daemon.toml [profiles] section).
     /// Wrapped in RwLock to allow runtime updates via SIGHUP reload or API endpoint.
     pub profile_search_dirs: parking_lot::RwLock<Vec<std::path::PathBuf>>,

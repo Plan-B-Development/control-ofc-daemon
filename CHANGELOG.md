@@ -3,12 +3,11 @@
 ## [Unreleased]
 
 NVIDIA GPU support — Phase 1 (read-only telemetry). Batched under `[Unreleased]`
-pending the rest of Phase 1 (`/capabilities` + `/diagnostics/hardware` NVIDIA
-surfaces and GUI consumption) before release. **NOT independently releasable** —
+pending GUI consumption (P1e) before release. **NOT independently releasable** —
 the current GUI does not list `nvidia_gpu` in its GPU-fan sources, so an idle
-NVIDIA fan is hidden by default (DEC-047 regression), it does not yet consume the
-new `duty_pct` field, and the `/capabilities` + `/diagnostics/hardware` NVIDIA
-surfaces are still absent; ships coordinated with the GUI (DEC-204, P1e).
+NVIDIA fan is hidden by default (DEC-047 regression), and it does not yet consume
+the new `nvidia_gpu` capability/diagnostics blocks or the `duty_pct` field; ships
+coordinated with the GUI (DEC-204, P1e).
 
 ### Added
 - **NVIDIA discrete GPU read-only sensing via the open `nouveau` driver
@@ -36,6 +35,19 @@ surfaces are still absent; ships coordinated with the GUI (DEC-204, P1e).
   conflated. **May exceed 100** (NVML expresses it as a % of the product's
   max-noise-tolerance fan speed, not a hard ceiling). Optional/omitted when
   absent, so older clients are unaffected.
+- **NVIDIA `/capabilities` + `/diagnostics/hardware` surfaces (DEC-204).**
+  `GET /capabilities` gains an additive read-only `devices.nvidia_gpu` block
+  (present, display_label, model_name, pci_bdf/pci_id, driver
+  `"nouveau"`/`"nvidia"`, driver_version, `fan_control_method`
+  `"read_only"`/`"none"`, fan_rpm_available, is_discrete)
+  — mirroring the Intel Arc capability (DEC-121), with **no `fan_write_supported`**
+  (never writable). `GET /diagnostics/hardware` gains a matching additive
+  `nvidia_gpu` block with the identity + a truthful "why fan control is
+  unavailable" note. Both are fed by a unified `nvidia_gpus` identity (nouveau +
+  NVML), gathered once at startup: the proprietary NVML leg supplies the real
+  model name + driver version (via the added `nvmlDeviceGetName` /
+  `nvmlSystemGetDriverVersion` getters), the open nouveau leg a generic
+  "NVIDIA D-GPU" label.
 
 ## [2.7.0] — 2026-07-07
 

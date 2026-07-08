@@ -756,6 +756,15 @@ async fn main() {
         config.detection.enable_nvidia_telemetry,
     );
 
+    // Unified NVIDIA GPU identity (nouveau + NVML legs), gathered once for the
+    // `/capabilities` + `/diagnostics/hardware` surfaces (DEC-204). Read-only.
+    // Gathered before `nouveau_gpus_for_poll` / `nvml_backend` are moved into
+    // the poll loop below.
+    let nvidia_gpus = control_ofc_daemon::hwmon::nvidia::gather_nvidia_gpus(
+        &nouveau_gpus_for_poll,
+        &*nvml_backend,
+    );
+
     let app_state = Arc::new(AppState {
         cache: cache.clone(),
         staleness_config,
@@ -768,6 +777,7 @@ async fn main() {
         calibrating: std::sync::atomic::AtomicBool::new(false),
         amd_gpus,
         intel_gpus,
+        nvidia_gpus,
         profile_search_dirs: parking_lot::RwLock::new(profile_search_dirs),
         config_path: config_path.clone(),
         runtime_config_path: runtime_config_path.clone(),

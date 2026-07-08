@@ -50,6 +50,10 @@ pub const NVML_ERROR_ARGUMENT_VERSION_MISMATCH: NvmlReturn = 25;
 /// `nvmlTemperatureSensors_t::NVML_TEMPERATURE_GPU` — the only sensor type.
 const NVML_TEMPERATURE_GPU: c_int = 0;
 
+/// Buffer sizes for NVML string getters (from nvml.h).
+const NVML_DEVICE_NAME_V2_BUFFER_SIZE: usize = 96;
+const NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE: usize = 80;
+
 // ── PCI info (highest-risk struct; layout cross-verified, sizeof == 68) ──────
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -107,6 +111,8 @@ type PfnTemp = unsafe extern "C" fn(NvmlDeviceHandle, c_int, *mut c_uint) -> Nvm
 type PfnNumFans = unsafe extern "C" fn(NvmlDeviceHandle, *mut c_uint) -> NvmlReturn;
 type PfnFanSpeedV2 = unsafe extern "C" fn(NvmlDeviceHandle, c_uint, *mut c_uint) -> NvmlReturn;
 type PfnFanSpeedRpm = unsafe extern "C" fn(NvmlDeviceHandle, *mut NvmlFanSpeedInfo) -> NvmlReturn;
+type PfnName = unsafe extern "C" fn(NvmlDeviceHandle, *mut c_char, c_uint) -> NvmlReturn;
+type PfnDriverVer = unsafe extern "C" fn(*mut c_char, c_uint) -> NvmlReturn;
 
 /// A resolved, opaque NVML device handle. Safe to move/share across threads: it
 /// is an opaque process-lifetime identifier owned by NVML, we only ever read
@@ -189,6 +195,11 @@ pub struct NvmlLib {
     fan_speed_v2: PfnFanSpeedV2,
     // Optional — added in driver R565; `None` on older drivers.
     fan_speed_rpm: Option<PfnFanSpeedRpm>,
+    // Optional identity getters (ancient, stable symbols — but resolved
+    // best-effort so a name/version mismatch degrades to `None` rather than
+    // disabling the whole NVML backend).
+    name: Option<PfnName>,
+    driver_version: Option<PfnDriverVer>,
 }
 
 impl NvmlLib {
@@ -221,6 +232,10 @@ impl NvmlLib {
             // Optional (driver R565+): absent -> no per-fan RPM, not an error.
             let fan_speed_rpm: Option<PfnFanSpeedRpm> =
                 resolve::<PfnFanSpeedRpm>(&lib, b"nvmlDeviceGetFanSpeedRPM\0").ok();
+            // Optional identity getters — best-effort (see field docs).
+            let name: Option<PfnName> = resolve::<PfnName>(&lib, b"nvmlDeviceGetName\0").ok();
+            let driver_version: Option<PfnDriverVer> =
+                resolve::<PfnDriverVer>(&lib, b"nvmlSystemGetDriverVersion\0").ok();
 
             Ok(Self {
                 init,
@@ -232,6 +247,8 @@ impl NvmlLib {
                 num_fans,
                 fan_speed_v2,
                 fan_speed_rpm,
+                name,
+                driver_version,
                 _lib: lib,
             })
         }
@@ -344,6 +361,37 @@ impl NvmlLib {
         }
         check(ret, "nvmlDeviceGetFanSpeedRPM")?;
         Ok(Some(info.speed))
+    }
+
+    /// Whether the optional per-fan RPM symbol (driver R565+) is available.
+    pub fn has_fan_rpm(&self) -> bool {
+        self.fan_speed_rpm.is_some()
+    }
+
+    /// `nvmlDeviceGetName()` — product name (e.g. "NVIDIA GeForce RTX 4080").
+    /// Best-effort: `None` if the symbol is absent or the call fails.
+    pub fn device_name(&self, dev: NvmlHandle) -> Option<String> {
+        let name_fn = self.name?;
+        let mut buf = [0 as c_char; NVML_DEVICE_NAME_V2_BUFFER_SIZE];
+        // SAFETY: valid handle; `buf` is a valid, correctly-sized out-buffer.
+        let ret = unsafe { name_fn(dev.0, buf.as_mut_ptr(), buf.len() as c_uint) };
+        // Treat an empty string as absent so `display_label()` falls back.
+        (ret == NVML_SUCCESS)
+            .then(|| cstr_to_string(&buf))
+            .filter(|s| !s.is_empty())
+    }
+
+    /// `nvmlSystemGetDriverVersion()` — NVIDIA driver version (system-wide, e.g.
+    /// "565.77"). Best-effort: `None` if the symbol is absent or the call fails.
+    pub fn driver_version(&self) -> Option<String> {
+        let ver_fn = self.driver_version?;
+        let mut buf = [0 as c_char; NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE];
+        // SAFETY: `buf` is a valid, correctly-sized out-buffer.
+        let ret = unsafe { ver_fn(buf.as_mut_ptr(), buf.len() as c_uint) };
+        // Treat an empty string as absent so `display_label()` falls back.
+        (ret == NVML_SUCCESS)
+            .then(|| cstr_to_string(&buf))
+            .filter(|s| !s.is_empty())
     }
 }
 

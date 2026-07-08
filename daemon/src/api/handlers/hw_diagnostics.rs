@@ -169,6 +169,27 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
             }
         });
 
+    // NVIDIA discrete GPU diagnostics (DEC-204). Read-only — the note explains
+    // why fan control is unavailable for both driver legs.
+    let nvidia_gpu_diag =
+        crate::hwmon::nvidia::select_primary_nvidia_gpu(&state.nvidia_gpus).map(|gpu| {
+            NvidiaGpuDiagnostics {
+                pci_bdf: gpu.pci_bdf.clone(),
+                pci_id: gpu.pci_bdf.clone(),
+                model_name: gpu.model_name.clone(),
+                driver: gpu.driver.to_string(),
+                driver_version: gpu.driver_version.clone(),
+                fan_control_method: gpu.fan_control_method().to_string(),
+                fan_rpm_available: gpu.fan_rpm_available,
+                fan_control_note:
+                    "NVIDIA GPU fan control is not exposed to this daemon: the open nouveau \
+                     driver's writable pwm1 is deliberately excluded for safety, and the \
+                     proprietary NVML backend is read-only telemetry. Temperature and fan \
+                     telemetry are read-only."
+                        .to_string(),
+            }
+        });
+
     // Thermal safety — report thresholds and whether CPU sensor is present
     let snap = state.cache.snapshot();
     let cpu_sensor_found = snap
@@ -244,6 +265,7 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
             },
             gpu: gpu_diag,
             intel_gpu: intel_gpu_diag,
+            nvidia_gpu: nvidia_gpu_diag,
             thermal_safety,
             kernel_modules,
             acpi_conflicts,

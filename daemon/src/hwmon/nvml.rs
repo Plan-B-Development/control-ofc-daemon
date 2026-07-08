@@ -37,6 +37,20 @@ pub struct NvmlReading {
     pub fan_rpm: Option<u16>,
 }
 
+/// Static identity for one NVIDIA GPU, gathered once at NVML init — distinct
+/// from the per-tick [`NvmlReading`] telemetry. Feeds the `/capabilities` +
+/// `/diagnostics/hardware` surfaces (DEC-204). `model_name`/`driver_version` are
+/// best-effort (`None` if the optional NVML getters are absent).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NvmlDeviceIdentity {
+    pub pci_bdf: String,
+    pub model_name: Option<String>,
+    pub driver_version: Option<String>,
+    pub num_fans: u32,
+    /// Whether per-fan RPM can be read (device has fans AND the R565+ symbol is present).
+    pub fan_rpm_available: bool,
+}
+
 /// Read-only NVIDIA telemetry source. `read_all` returns one reading per
 /// detected GPU (empty when NVML is disabled or unavailable). Implementations
 /// are `Send + Sync` so the backend can be shared into the poll loop's blocking
@@ -45,6 +59,10 @@ pub trait NvmlBackend: Send + Sync {
     /// Read current telemetry for every detected NVIDIA GPU. Called once per
     /// poll tick from a blocking thread; must not panic.
     fn read_all(&self) -> Vec<NvmlReading>;
+
+    /// Static per-GPU identity gathered at init (empty when disabled/absent).
+    /// Read once at startup for the capability + diagnostics surfaces.
+    fn devices(&self) -> Vec<NvmlDeviceIdentity>;
 }
 
 /// NVML unavailable/disabled — the default. The library is never loaded.
@@ -54,22 +72,44 @@ impl NvmlBackend for DisabledNvml {
     fn read_all(&self) -> Vec<NvmlReading> {
         Vec::new()
     }
+
+    fn devices(&self) -> Vec<NvmlDeviceIdentity> {
+        Vec::new()
+    }
 }
 
 /// Scripted backend for deterministic tests (no hardware, no FFI).
 pub struct FakeNvml {
     readings: Vec<NvmlReading>,
+    identities: Vec<NvmlDeviceIdentity>,
 }
 
 impl FakeNvml {
     pub fn new(readings: Vec<NvmlReading>) -> Self {
-        Self { readings }
+        Self {
+            readings,
+            identities: Vec::new(),
+        }
+    }
+
+    pub fn with_identities(
+        readings: Vec<NvmlReading>,
+        identities: Vec<NvmlDeviceIdentity>,
+    ) -> Self {
+        Self {
+            readings,
+            identities,
+        }
     }
 }
 
 impl NvmlBackend for FakeNvml {
     fn read_all(&self) -> Vec<NvmlReading> {
         self.readings.clone()
+    }
+
+    fn devices(&self) -> Vec<NvmlDeviceIdentity> {
+        self.identities.clone()
     }
 }
 
@@ -78,6 +118,7 @@ struct RealDevice {
     handle: crate::hwmon::nvml_sys::NvmlHandle,
     bdf: String,
     num_fans: u32,
+    model_name: Option<String>,
 }
 
 /// The live NVML backend. Owns the loaded library and the device handles for
@@ -85,16 +126,20 @@ struct RealDevice {
 pub struct RealNvml {
     lib: NvmlLib,
     devices: Vec<RealDevice>,
+    /// NVIDIA driver version (system-wide), read once at init. Best-effort.
+    driver_version: Option<String>,
 }
 
 impl RealNvml {
-    /// Load NVML, initialise it, and enumerate GPUs (reading each BDF + fan
-    /// count once). Returns an error if the library/`nvmlInit` is unavailable;
-    /// a per-device failure skips that device rather than failing the whole load.
+    /// Load NVML, initialise it, and enumerate GPUs (reading each BDF, fan
+    /// count, and model name once). Returns an error if the library/`nvmlInit`
+    /// is unavailable; a per-device failure skips that device rather than
+    /// failing the whole load.
     fn load_and_init() -> Result<Self, crate::hwmon::nvml_sys::NvmlError> {
         let lib = NvmlLib::load()?;
         lib.init()?;
         let count = lib.device_count()?;
+        let driver_version = lib.driver_version();
 
         let mut devices = Vec::new();
         for i in 0..count {
@@ -113,17 +158,24 @@ impl RealNvml {
                 }
             };
             let num_fans = lib.num_fans(handle).unwrap_or(0);
+            let model_name = lib.device_name(handle);
             log::info!(
-                "NVIDIA GPU detected via NVML: PCI {bdf} ({num_fans} fan(s)) \
-                 [read-only, experimental]"
+                "NVIDIA GPU detected via NVML: {} PCI {bdf} ({num_fans} fan(s)) \
+                 [read-only, experimental]",
+                model_name.as_deref().unwrap_or("(unknown model)")
             );
             devices.push(RealDevice {
                 handle,
                 bdf,
                 num_fans,
+                model_name,
             });
         }
-        Ok(Self { lib, devices })
+        Ok(Self {
+            lib,
+            devices,
+            driver_version,
+        })
     }
 }
 
@@ -158,6 +210,20 @@ impl NvmlBackend for RealNvml {
                     fan_duty_pct,
                     fan_rpm,
                 }
+            })
+            .collect()
+    }
+
+    fn devices(&self) -> Vec<NvmlDeviceIdentity> {
+        let has_rpm = self.lib.has_fan_rpm();
+        self.devices
+            .iter()
+            .map(|d| NvmlDeviceIdentity {
+                pci_bdf: d.bdf.clone(),
+                model_name: d.model_name.clone(),
+                driver_version: self.driver_version.clone(),
+                num_fans: d.num_fans,
+                fan_rpm_available: d.num_fans >= 1 && has_rpm,
             })
             .collect()
     }
@@ -247,5 +313,25 @@ mod tests {
     fn backend_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Arc<dyn NvmlBackend>>();
+    }
+
+    #[test]
+    fn fake_backend_devices_returns_identities() {
+        let ident = NvmlDeviceIdentity {
+            pci_bdf: "0000:03:00.0".into(),
+            model_name: Some("NVIDIA GeForce RTX 4080".into()),
+            driver_version: Some("565.77".into()),
+            num_fans: 2,
+            fan_rpm_available: true,
+        };
+        let fake = FakeNvml::with_identities(vec![], vec![ident.clone()]);
+        assert_eq!(fake.devices(), vec![ident]);
+        // Telemetry and identity are independent channels.
+        assert!(fake.read_all().is_empty());
+    }
+
+    #[test]
+    fn disabled_backend_devices_is_empty() {
+        assert!(DisabledNvml.devices().is_empty());
     }
 }

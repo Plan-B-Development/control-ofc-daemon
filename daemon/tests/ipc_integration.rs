@@ -72,6 +72,7 @@ fn test_app_state() -> Arc<AppState> {
         calibrating: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: Vec::new(),
         intel_gpus: Vec::new(),
+        nvidia_gpus: Vec::new(),
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
@@ -439,6 +440,7 @@ async fn fans_endpoint_tags_intel_gpu_source_by_id_prefix() {
         calibrating: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: Vec::new(),
         intel_gpus: Vec::new(),
+        nvidia_gpus: Vec::new(),
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
@@ -485,6 +487,143 @@ async fn capabilities_includes_intel_gpu_absent_by_default() {
     assert_eq!(intel["present"], false);
     assert_eq!(intel["fan_control_method"], "none");
     assert_eq!(intel["display_label"], "Intel D-GPU");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Build an AppState carrying one NVIDIA GPU identity for the DEC-204
+/// capability/diagnostics boundary tests.
+fn test_app_state_with_nvidia_gpu(
+    gpu: control_ofc_daemon::hwmon::nvidia::NvidiaGpuIdentity,
+) -> Arc<AppState> {
+    Arc::new(AppState {
+        cache: Arc::new(StateCache::new()),
+        staleness_config: StalenessConfig::default(),
+        daemon_version: "0.1.0-test".into(),
+        fan_controller: None,
+        hwmon_controller: None,
+        start_time: std::time::Instant::now(),
+        history: Arc::new(HistoryRing::new(250)),
+        active_profile: Arc::new(parking_lot::Mutex::new(None)),
+        calibrating: std::sync::atomic::AtomicBool::new(false),
+        amd_gpus: Vec::new(),
+        intel_gpus: Vec::new(),
+        nvidia_gpus: vec![gpu],
+        profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
+        config_path: String::new(),
+        runtime_config_path: std::path::PathBuf::new(),
+        sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        override_table: Arc::new(parking_lot::Mutex::new(
+            control_ofc_daemon::control_override::OverrideTable::new(),
+        )),
+        allow_port_probe: false,
+    })
+}
+
+#[tokio::test]
+async fn capabilities_includes_nvidia_gpu_absent_by_default() {
+    // The additive `nvidia_gpu` capability object (DEC-204) must always be
+    // present for the GUI parser; with no NVIDIA GPU it reports present:false
+    // and — being read-only — never carries a fan_write_supported field.
+    let state = test_app_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/capabilities").await;
+    assert_eq!(status, 200);
+    let nvidia = &json["devices"]["nvidia_gpu"];
+    assert_eq!(nvidia["present"], false);
+    assert_eq!(nvidia["fan_control_method"], "none");
+    assert_eq!(nvidia["display_label"], "NVIDIA D-GPU");
+    assert!(nvidia.get("fan_write_supported").is_none());
+
+    // The diagnostics `nvidia_gpu` block is Option/skip-when-None — with no
+    // NVIDIA GPU it must be entirely ABSENT from the wire (not `null`), so an
+    // older client sees no unexpected key.
+    let (status, diag_json) = uds_get(&path, "/diagnostics/hardware").await;
+    assert_eq!(status, 200);
+    assert!(diag_json.get("nvidia_gpu").is_none());
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn capabilities_and_diagnostics_report_nvidia_gpu_when_present() {
+    // The handlers must read `state.nvidia_gpus` into both the capability and
+    // the diagnostics surfaces (DEC-204), read-only.
+    use control_ofc_daemon::hwmon::nvidia::NvidiaGpuIdentity;
+    let bdf = "0000:03:00.0";
+    let state = test_app_state_with_nvidia_gpu(NvidiaGpuIdentity {
+        pci_bdf: bdf.into(),
+        driver: "nvidia",
+        model_name: Some("NVIDIA GeForce RTX 4080".into()),
+        driver_version: Some("565.77".into()),
+        has_fan: true,
+        fan_rpm_available: false,
+    });
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/capabilities").await;
+    assert_eq!(status, 200);
+    let cap = &json["devices"]["nvidia_gpu"];
+    assert_eq!(cap["present"], true);
+    assert_eq!(cap["display_label"], "NVIDIA GeForce RTX 4080");
+    // Kernel module name, not the "nvml" library (DEC-204, contract Finding 2).
+    assert_eq!(cap["driver"], "nvidia");
+    assert_eq!(cap["driver_version"], "565.77");
+    assert_eq!(cap["fan_control_method"], "read_only");
+    assert_eq!(cap["fan_rpm_available"], false);
+    assert_eq!(cap["is_discrete"], true);
+    // Both pci_id (legacy alias) and pci_bdf must carry the BDF for the GUI's
+    // _coalesce_pci_bdf tolerance (M11) — a dropped alias would be silent.
+    assert_eq!(cap["pci_bdf"], bdf);
+    assert_eq!(cap["pci_id"], bdf);
+
+    let (status, json) = uds_get(&path, "/diagnostics/hardware").await;
+    assert_eq!(status, 200);
+    let diag = &json["nvidia_gpu"];
+    assert_eq!(diag["pci_bdf"], bdf);
+    assert_eq!(diag["pci_id"], bdf);
+    assert_eq!(diag["driver"], "nvidia");
+    assert_eq!(diag["driver_version"], "565.77");
+    assert_eq!(diag["model_name"], "NVIDIA GeForce RTX 4080");
+    assert_eq!(diag["fan_control_method"], "read_only");
+    assert!(diag["fan_control_note"]
+        .as_str()
+        .unwrap()
+        .contains("read-only"));
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn capabilities_nouveau_backed_nvidia_gpu_generic_label() {
+    // A nouveau-backed NVIDIA GPU (open driver) at the HTTP boundary: generic
+    // label, driver "nouveau", and the None model_name/driver_version must be
+    // OMITTED from the wire (skip_serializing_if), not leaked as null.
+    use control_ofc_daemon::hwmon::nvidia::NvidiaGpuIdentity;
+    let state = test_app_state_with_nvidia_gpu(NvidiaGpuIdentity {
+        pci_bdf: "0000:03:00.0".into(),
+        driver: "nouveau",
+        model_name: None,
+        driver_version: None,
+        has_fan: true,
+        fan_rpm_available: true,
+    });
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/capabilities").await;
+    assert_eq!(status, 200);
+    let cap = &json["devices"]["nvidia_gpu"];
+    assert_eq!(cap["present"], true);
+    assert_eq!(cap["display_label"], "NVIDIA D-GPU");
+    assert_eq!(cap["driver"], "nouveau");
+    assert_eq!(cap["fan_control_method"], "read_only");
+    // None identity fields must be absent, not null.
+    assert!(cap.get("model_name").is_none());
+    assert!(cap.get("driver_version").is_none());
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
@@ -630,6 +769,7 @@ fn test_app_state_with_hwmon() -> Arc<AppState> {
         calibrating: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: Vec::new(),
         intel_gpus: Vec::new(),
+        nvidia_gpus: Vec::new(),
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
@@ -874,6 +1014,7 @@ fn test_app_state_with_unsupported_gpu(pci_bdf: &str) -> Arc<AppState> {
         calibrating: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: vec![unsupported],
         intel_gpus: Vec::new(),
+        nvidia_gpus: Vec::new(),
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
@@ -945,6 +1086,7 @@ fn test_app_state_with_read_only_gpu(pci_bdf: &str, pci_device_id: u16) -> Arc<A
         calibrating: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: vec![read_only],
         intel_gpus: Vec::new(),
+        nvidia_gpus: Vec::new(),
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
@@ -1221,6 +1363,7 @@ async fn deactivate_profile_resets_hwmon_coalescing() {
         calibrating: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: Vec::new(),
         intel_gpus: Vec::new(),
+        nvidia_gpus: Vec::new(),
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
@@ -1332,6 +1475,7 @@ fn test_app_state_with_writable_pmfw_gpu(pci_bdf: &str) -> (Arc<AppState>, tempf
         calibrating: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: vec![pmfw],
         intel_gpus: Vec::new(),
+        nvidia_gpus: Vec::new(),
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
@@ -1499,6 +1643,7 @@ async fn hwmon_discovery_excludes_amdgpu_end_to_end_via_ipc() {
         calibrating: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: Vec::new(),
         intel_gpus: Vec::new(),
+        nvidia_gpus: Vec::new(),
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
@@ -1557,6 +1702,7 @@ fn test_app_state_with_profile_dirs(dirs: Vec<std::path::PathBuf>) -> Arc<AppSta
         calibrating: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: Vec::new(),
         intel_gpus: Vec::new(),
+        nvidia_gpus: Vec::new(),
         profile_search_dirs: parking_lot::RwLock::new(dirs),
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
