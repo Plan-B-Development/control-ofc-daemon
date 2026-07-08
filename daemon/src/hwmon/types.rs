@@ -102,6 +102,11 @@ pub enum SensorSource {
     /// (`if (!IS_DGFX) return;`), so this source is always a discrete card.
     /// Read-only: temperature + fan RPM only, no PWM/write path (DEC-121).
     IntelGpu,
+    /// NVIDIA discrete GPU. Phase-1 support is read-only telemetry — temperature
+    /// via the `nouveau` hwmon node (proprietary NVML telemetry lands later).
+    /// The writable nouveau `pwm1` is excluded from hwmon discovery so it is
+    /// never driven (DEC-204).
+    NvidiaGpu,
 }
 
 impl std::fmt::Display for SensorSource {
@@ -110,6 +115,7 @@ impl std::fmt::Display for SensorSource {
             Self::Hwmon => write!(f, "hwmon"),
             Self::AmdGpu => write!(f, "amd_gpu"),
             Self::IntelGpu => write!(f, "intel_gpu"),
+            Self::NvidiaGpu => write!(f, "nvidia_gpu"),
         }
     }
 }

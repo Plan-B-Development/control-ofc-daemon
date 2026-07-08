@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased]
+
+NVIDIA GPU support — Phase 1 (read-only telemetry), first slice. Batched under
+`[Unreleased]` pending the rest of Phase 1 (proprietary NVML telemetry,
+`/capabilities` + `/diagnostics` surfaces, GUI consumption) before release.
+
+### Added
+- **NVIDIA discrete GPU read-only sensing via the open `nouveau` driver
+  (DEC-204).** GPU temperatures now appear on `/sensors` with `source:
+  "nvidia_gpu"` (kind `GpuTemp`), and fan RPM on `/fans` with id
+  `nvidia_gpu:<PCI_BDF>` and no `last_commanded_pwm` (read-only). Detection is
+  hwmon-based (`name == "nouveau"`), mirroring the Intel Arc read-only leg
+  (DEC-121). **No fan writes** — the writable nouveau `pwm1` is deliberately
+  excluded from hwmon PWM-header and monitor-only-fan discovery (shared
+  `is_gpu_owned_hwmon_chip` predicate, alongside the `amdgpu` DEC-102
+  exclusion), so the profile engine can never drive a GPU fan. Proprietary-driver
+  (NVML) telemetry and the `/capabilities` + `/diagnostics/hardware` NVIDIA
+  surfaces land in later Phase-1 slices.
+
 ## [2.7.0] — 2026-07-07
 
 Built-in Super-I/O chip detection (DEC-202/203). Passive detection is report-only

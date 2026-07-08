@@ -56,6 +56,7 @@ daemon/                     Rust crate (control-ofc-daemon)
       gpu_detect.rs         AMD GPU detection via sysfs/DRM
       gpu_fan.rs            PMFW fan curve read/write/reset (RDNA3+)
       intel_gpu_detect.rs   Intel discrete-GPU detection (read-only monitoring, DEC-121)
+      nouveau_detect.rs     NVIDIA discrete-GPU detection via the open nouveau driver (read-only, DEC-204)
       kernel_warnings.rs    Kernel-version regression catalog (DEC-098).
                             Matches running kernel against published amdgpu
                             regressions; surfaced via
@@ -163,7 +164,7 @@ The profile engine is the **sole writer** as of 2.0.0 (DEC-159/DEC-165); the GUI
 Every sensor/fan/header includes:
 - `id` — stable machine key (never depends on `hwmonN` index or `/dev/sdX`)
 - `label` — best-effort human name
-- `source` — fan `source` is `openfan` | `hwmon` | `amd_gpu` | `intel_gpu` (the four `KNOWN_MEMBER_SOURCES`); GPU fan ids embed the PCI BDF (`amd_gpu:{bdf}` / `intel_gpu:{bdf}`). Sensor `source` is `hwmon` | `amd_gpu`. (`aio_hwmon` is an *internal* `DeviceLabel` classification, not a wire fan source — AIO pump fans surface as `hwmon`.)
+- `source` — fan `source` is `openfan` | `hwmon` | `amd_gpu` | `intel_gpu` | `nvidia_gpu` (the five `KNOWN_MEMBER_SOURCES`; `intel_gpu`/`nvidia_gpu` are read-only — DEC-121/DEC-204); GPU fan ids embed the PCI BDF (`amd_gpu:{bdf}` / `intel_gpu:{bdf}` / `nvidia_gpu:{bdf}`). Sensor `source` is `hwmon` | `amd_gpu` | `intel_gpu` | `nvidia_gpu`. (`aio_hwmon` is an *internal* `DeviceLabel` classification, not a wire fan source — AIO pump fans surface as `hwmon`.)
 - `kind`/`type` where applicable
 
 ## Measured vs commanded

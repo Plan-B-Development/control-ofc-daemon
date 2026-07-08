@@ -84,10 +84,11 @@ fn discover_device_monitor_only_fans(
         .trim()
         .to_string();
 
-    // DEC-102: amdgpu fans are owned by the GPU subsystem, never by hwmon —
-    // consistent with `pwm_discovery`. GPU fan RPM is surfaced via the
-    // `amd_gpu:` prefix + `/gpu/...` endpoints, not the hwmon inventory.
-    if chip_name == "amdgpu" {
+    // GPU-owned fans are never surfaced in the hwmon inventory — consistent
+    // with `pwm_discovery`. amdgpu (DEC-102) and nouveau (DEC-204) fan RPM is
+    // surfaced via the `amd_gpu:` / `nvidia_gpu:` prefixes + the GPU endpoints,
+    // not the hwmon monitor-only-fan inventory.
+    if crate::hwmon::is_gpu_owned_hwmon_chip(&chip_name) {
         return Ok(Vec::new());
     }
 
@@ -297,6 +298,17 @@ mod tests {
 
         let fans = discover_monitor_only_fans(tmp.path()).unwrap();
         assert!(fans.is_empty(), "amdgpu fans must be excluded: {fans:#?}");
+    }
+
+    #[test]
+    fn nouveau_fans_excluded() {
+        // DEC-204: nouveau GPU fans are owned by the GPU subsystem (surfaced via
+        // the `nvidia_gpu:` prefix), never by the hwmon monitor-only inventory.
+        let tmp = tempfile::tempdir().unwrap();
+        create_fan_fixture(tmp.path(), "hwmon0", "nouveau", &[(1, None, false)]);
+
+        let fans = discover_monitor_only_fans(tmp.path()).unwrap();
+        assert!(fans.is_empty(), "nouveau fans must be excluded: {fans:#?}");
     }
 
     #[test]

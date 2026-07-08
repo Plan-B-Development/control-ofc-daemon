@@ -37,6 +37,7 @@ daemon/src/
     aio.rs             — liquid-cooler (AIO/custom-loop) recognition: coolant-sensor + is_aio flag + aio_hwmon cap (DEC-156)
     gpu_detect.rs      — AMD GPU detection via sysfs/DRM
     intel_gpu_detect.rs— Intel discrete GPU (Arc) detection, read-only (DEC-121)
+    nouveau_detect.rs  — NVIDIA discrete GPU detection via the open nouveau driver, read-only (DEC-204)
     gpu_fan.rs         — PMFW fan curve read/write/reset
     kernel_warnings.rs — kernel-version regression catalog
                           (RDNA3/4 hard hang on 6.19, R9700 SMU on 7.0)

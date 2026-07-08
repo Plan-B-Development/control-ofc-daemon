@@ -352,7 +352,7 @@ const KNOWN_CURVE_TYPES: [&str; 7] = [
     "graph", "stepped", "linear", "flat", "trigger", "mix", "sync",
 ];
 const KNOWN_MIX_FUNCTIONS: [&str; 5] = ["max", "min", "average", "sum", "subtract"];
-const KNOWN_MEMBER_SOURCES: [&str; 4] = ["openfan", "hwmon", "amd_gpu", "intel_gpu"];
+const KNOWN_MEMBER_SOURCES: [&str; 5] = ["openfan", "hwmon", "amd_gpu", "intel_gpu", "nvidia_gpu"];
 
 // ──────────────────── Role classification + floor (DEC-162) ────────────────────
 
@@ -368,11 +368,12 @@ pub(crate) const HARD_PUMP_CPU_FLOOR_PCT: f64 = 30.0;
 /// `hwmon::aio` `COOLANT_LABEL_HINTS`, which classifies temperature *sensors*.
 const CPU_PUMP_LABEL_HINTS: &[&str] = &["cpu", "pump", "aio"];
 
-/// True when a control member is a GPU fan (`amd_gpu` or `intel_gpu`). GPU fans
-/// carry no daemon floor — PMFW enforces its own OD_RANGE minimum (DEC-119).
-/// Mirrors the GUI's `infer_member_role` GPU branch.
+/// True when a control member is a GPU fan (`amd_gpu`, `intel_gpu`, or
+/// `nvidia_gpu`). GPU fans carry no daemon floor — PMFW enforces its own
+/// OD_RANGE minimum (DEC-119). Intel + NVIDIA are read-only (no backend writes
+/// them). Mirrors the GUI's `infer_member_role` GPU branch.
 pub(crate) fn member_is_gpu(member: &ControlMember) -> bool {
-    member.source == "amd_gpu" || member.source == "intel_gpu"
+    member.source == "amd_gpu" || member.source == "intel_gpu" || member.source == "nvidia_gpu"
 }
 
 /// True when a control member is a pump/CPU header that needs the hard floor.
@@ -1540,7 +1541,7 @@ mod tests {
 
     #[test]
     fn classify_gpu_is_gpu_not_pump() {
-        for src in ["amd_gpu", "intel_gpu"] {
+        for src in ["amd_gpu", "intel_gpu", "nvidia_gpu"] {
             let m = member(src, "amd_gpu:0000:03:00.0", "9070XT Fan");
             assert!(member_is_gpu(&m));
             assert!(!member_is_pump_or_cpu(&m));
@@ -1987,6 +1988,22 @@ mod tests {
         assert!(
             report.warnings.iter().any(|w| w.reason == "UNKNOWN_SOURCE"),
             "an unknown member source must warn: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn validate_nvidia_gpu_member_source_is_known() {
+        // nvidia_gpu is a recognised (read-only) GPU source like intel_gpu — a
+        // profile referencing it must NOT raise UNKNOWN_SOURCE (DEC-204).
+        let m = member("nvidia_gpu", "nvidia_gpu:0000:03:00.0", "");
+        let report = validate(
+            &mk_profile(vec![], vec![control_with_members(0.0, vec![m])]),
+            &sset(&[]),
+        );
+        assert!(
+            !report.warnings.iter().any(|w| w.reason == "UNKNOWN_SOURCE"),
+            "nvidia_gpu must be a known member source: {:?}",
             report.warnings
         );
     }

@@ -33,7 +33,7 @@ pub(crate) use tuning::*;
 #[derive(Debug, Clone)]
 pub struct PwmCommand {
     pub member_id: String,
-    pub source: String, // "openfan", "hwmon", or "amd_gpu"
+    pub source: String, // "openfan", "hwmon", "amd_gpu" (writable); "intel_gpu"/"nvidia_gpu" accepted but read-only — no backend writes them (DEC-121/DEC-204)
     pub pwm_percent: u8,
     /// For ``amd_gpu`` members only: when true, the GPU's PMFW
     /// ``fan_zero_rpm_enable`` flag is preserved while writing the curve.

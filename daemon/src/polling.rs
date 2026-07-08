@@ -32,6 +32,7 @@ use crate::health::state::{
 };
 use crate::hwmon::gpu_detect::AmdGpuInfo;
 use crate::hwmon::intel_gpu_detect::IntelGpuInfo;
+use crate::hwmon::nouveau_detect::NouveauGpuInfo;
 use crate::hwmon::types::{SensorKind, SensorReading};
 use crate::serial::protocol::Command;
 use crate::serial::transport::{send_command, SerialTransport};
@@ -42,6 +43,7 @@ fn to_cached(reading: &SensorReading) -> CachedSensorReading {
     let source = match reading.source {
         SensorSource::AmdGpu => DeviceLabel::AmdGpu,
         SensorSource::IntelGpu => DeviceLabel::IntelGpu,
+        SensorSource::NvidiaGpu => DeviceLabel::NvidiaGpu,
         SensorSource::Hwmon => DeviceLabel::Hwmon,
     };
     CachedSensorReading {
@@ -114,6 +116,7 @@ pub async fn hwmon_poll_loop(
     headers: Vec<crate::hwmon::pwm_discovery::PwmHeaderDescriptor>,
     gpu_infos: Vec<AmdGpuInfo>,
     intel_gpu_infos: Vec<IntelGpuInfo>,
+    nouveau_gpu_infos: Vec<NouveauGpuInfo>,
     hwmon_root: &Path,
     interval: Duration,
     sensor_rescan: Arc<std::sync::atomic::AtomicBool>,
@@ -128,6 +131,7 @@ pub async fn hwmon_poll_loop(
     let headers = Arc::new(headers);
     let gpu_infos = Arc::new(gpu_infos);
     let intel_gpu_infos = Arc::new(intel_gpu_infos);
+    let nouveau_gpu_infos = Arc::new(nouveau_gpu_infos);
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -198,6 +202,7 @@ pub async fn hwmon_poll_loop(
         let hdrs = headers.clone();
         let gpus = gpu_infos.clone();
         let intel_gpus = intel_gpu_infos.clone();
+        let nouveau_gpus = nouveau_gpu_infos.clone();
         let descs = descriptors.clone();
         let result: Result<_, tokio::task::JoinError> = tokio::task::spawn_blocking(move || {
             // Sensor leg: full discovery only when triggered; otherwise the
@@ -216,10 +221,12 @@ pub async fn hwmon_poll_loop(
                 Ok((None, crate::hwmon::read_sensor_values(&descs)))
             };
             let fan_states: Vec<HwmonFanState> = read_hwmon_fan_states(&hdrs);
-            // AMD + Intel discrete GPU fans share the cache `gpu_fans` map,
-            // distinguished by their ID prefix (`amd_gpu:` / `intel_gpu:`).
+            // AMD + Intel + NVIDIA discrete GPU fans share the cache `gpu_fans`
+            // map, distinguished by their ID prefix (`amd_gpu:` / `intel_gpu:` /
+            // `nvidia_gpu:`). Intel + nouveau are read-only (last_commanded_pct None).
             let mut gpu_fan_states: Vec<AmdGpuFanState> = read_gpu_fan_states(&gpus);
             gpu_fan_states.extend(read_intel_fan_states(&intel_gpus));
+            gpu_fan_states.extend(read_nouveau_fan_states(&nouveau_gpus));
             (sensors, fan_states, gpu_fan_states)
         })
         .await;
@@ -402,6 +409,31 @@ fn read_intel_fan_states(gpus: &[IntelGpuInfo]) -> Vec<AmdGpuFanState> {
                 id: format!("intel_gpu:{}", g.pci_bdf),
                 rpm,
                 last_commanded_pct: None, // Always None — read-only.
+                updated_at: now,
+            }
+        })
+        .collect()
+}
+
+/// Read fan RPM for all detected nouveau-backed NVIDIA discrete GPUs (DEC-204).
+///
+/// Read-only in Phase 1: `last_commanded_pct` is always `None`. Only GPUs that
+/// actually expose `fan1_input` produce a fan entity. The id uses the vendor-
+/// level `nvidia_gpu:` prefix (shared with the proprietary NVML leg added later).
+fn read_nouveau_fan_states(gpus: &[NouveauGpuInfo]) -> Vec<AmdGpuFanState> {
+    let now = Instant::now();
+    gpus.iter()
+        .filter(|g| g.has_fan_rpm)
+        .map(|g| {
+            let fan_input = g.hwmon_path.join("fan1_input");
+            let rpm = std::fs::read_to_string(&fan_input)
+                .ok()
+                .and_then(|s| s.trim().parse::<u16>().ok());
+
+            AmdGpuFanState {
+                id: format!("nvidia_gpu:{}", g.pci_bdf),
+                rpm,
+                last_commanded_pct: None, // Always None — read-only (Phase 1).
                 updated_at: now,
             }
         })
@@ -637,6 +669,7 @@ mod tests {
             hwmon_poll_loop(
                 cache2,
                 history,
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -939,5 +972,78 @@ mod tests {
         let states = read_intel_fan_states(&gpus);
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].rpm, None);
+    }
+
+    fn fake_nouveau_gpu(
+        hwmon_path: std::path::PathBuf,
+        bdf: &str,
+        has_fan_rpm: bool,
+    ) -> NouveauGpuInfo {
+        NouveauGpuInfo {
+            pci_bdf: bdf.to_string(),
+            hwmon_path,
+            has_fan_rpm,
+        }
+    }
+
+    #[test]
+    fn read_nouveau_fan_states_reads_rpm_with_nvidia_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hwmon = tmp.path().join("hwmon4");
+        fs::create_dir_all(&hwmon).unwrap();
+        fs::write(hwmon.join("fan1_input"), "1600\n").unwrap();
+
+        let gpus = [fake_nouveau_gpu(hwmon, "0000:03:00.0", true)];
+        let states = read_nouveau_fan_states(&gpus);
+
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].id, "nvidia_gpu:0000:03:00.0");
+        assert_eq!(states[0].rpm, Some(1600));
+        // Read-only: never a commanded percentage.
+        assert_eq!(states[0].last_commanded_pct, None);
+    }
+
+    #[test]
+    fn read_nouveau_fan_states_skips_fanless_gpu() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hwmon = tmp.path().join("hwmon4");
+        fs::create_dir_all(&hwmon).unwrap();
+
+        let gpus = [fake_nouveau_gpu(hwmon, "0000:03:00.0", false)];
+        assert!(read_nouveau_fan_states(&gpus).is_empty());
+    }
+
+    #[test]
+    fn read_nouveau_fan_states_missing_file_yields_none_rpm() {
+        // has_fan_rpm true at detection, but the file vanished by poll time.
+        let tmp = tempfile::tempdir().unwrap();
+        let hwmon = tmp.path().join("hwmon4");
+        fs::create_dir_all(&hwmon).unwrap();
+
+        let gpus = [fake_nouveau_gpu(hwmon, "0000:03:00.0", true)];
+        let states = read_nouveau_fan_states(&gpus);
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].rpm, None);
+    }
+
+    #[test]
+    fn to_cached_maps_nvidia_source_to_nvidia_label() {
+        // A nouveau GPU temp's `source` must survive the SensorReading ->
+        // CachedSensorReading conversion so `/sensors` reports "nvidia_gpu"
+        // (DEC-204) — a wrong/omitted arm would silently retag it as hwmon.
+        let reading = SensorReading {
+            id: "nvidia_gpu:nouveau:temp1".into(),
+            kind: SensorKind::GpuTemp,
+            label: "temp1".into(),
+            value_c: 42.0,
+            timestamp: std::time::SystemTime::UNIX_EPOCH,
+            source: crate::hwmon::types::SensorSource::NvidiaGpu,
+            chip_name: "nouveau".into(),
+            temp_type: None,
+            thresholds: None,
+        };
+        let cached = to_cached(&reading);
+        assert_eq!(cached.source, DeviceLabel::NvidiaGpu);
+        assert_eq!(cached.kind, SensorKind::GpuTemp);
     }
 }

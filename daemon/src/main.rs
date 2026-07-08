@@ -732,6 +732,22 @@ async fn main() {
     }
     let intel_gpus_for_poll = intel_gpus.clone();
 
+    // Detect nouveau-backed NVIDIA discrete GPUs (DEC-204). Read-only telemetry —
+    // temps flow through the sensor pipeline; fan RPM is polled here. The writable
+    // nouveau `pwm1` is excluded from hwmon discovery (`is_gpu_owned_hwmon_chip`)
+    // so the engine never drives it. Passed straight to the poll loop (no AppState
+    // store yet — the `/capabilities` + `/diagnostics` surfaces land in a later phase).
+    let nouveau_gpus_for_poll = control_ofc_daemon::hwmon::nouveau_detect::detect_nouveau_gpus(
+        std::path::Path::new(HWMON_SYSFS_ROOT),
+    );
+    for gpu in &nouveau_gpus_for_poll {
+        log::info!(
+            "NVIDIA GPU detected (nouveau): PCI {} (fan RPM: {} [read-only])",
+            gpu.pci_bdf,
+            if gpu.has_fan_rpm { "available" } else { "none" },
+        );
+    }
+
     let app_state = Arc::new(AppState {
         cache: cache.clone(),
         staleness_config,
@@ -805,6 +821,7 @@ async fn main() {
             hwmon_headers_for_poll,
             gpu_infos_for_poll,
             intel_gpus_for_poll,
+            nouveau_gpus_for_poll,
             hwmon_root,
             hwmon_interval,
             sensor_rescan_for_poll,

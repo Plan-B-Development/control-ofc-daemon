@@ -15,6 +15,7 @@ pub mod intel_gpu_detect;
 pub mod inventory;
 pub mod kernel_warnings;
 pub mod lease;
+pub mod nouveau_detect;
 pub mod pwm_control;
 pub mod pwm_discovery;
 pub mod reader;
@@ -96,6 +97,23 @@ pub fn is_wireless_phy_chip(chip_name: &str) -> bool {
         || chip_name.starts_with("iwlmvm")
 }
 
+/// True when an hwmon chip's fans/PWMs are owned by a GPU subsystem rather than
+/// by hwmon, so they must be excluded from hwmon PWM-header discovery
+/// ([`pwm_discovery`]) and monitor-only-fan discovery ([`inventory`]).
+///
+/// - `amdgpu` — DEC-102: RDNA3+ exposes `pwm1` read-only (no `pwm1_enable`), so
+///   binding it as an hwmon header produces a 1 Hz EACCES storm.
+/// - `nouveau` — DEC-204: the open NVIDIA driver exposes a **writable**
+///   `pwm1`/`pwm1_enable`; leaking it as an hwmon header would let the profile
+///   engine drive a GPU fan, violating the read-only-telemetry contract.
+///
+/// GPU fan RPM is surfaced exclusively via the `amd_gpu:` / `nvidia_gpu:` id
+/// prefixes and the GPU endpoints — never as an hwmon header. Single source of
+/// truth for the exclusion list so the two discovery sites cannot drift.
+pub fn is_gpu_owned_hwmon_chip(chip_name: &str) -> bool {
+    chip_name == "amdgpu" || chip_name == "nouveau"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,5 +154,20 @@ mod tests {
         assert!(!is_wireless_phy_chip("nct6798"));
         assert!(!is_wireless_phy_chip("amdgpu"));
         assert!(!is_wireless_phy_chip("z53")); // NZXT Kraken coolant
+    }
+
+    #[test]
+    fn is_gpu_owned_hwmon_chip_recognises_gpu_chips() {
+        // Single source of truth for the PWM-header + monitor-only-fan exclusion.
+        assert!(is_gpu_owned_hwmon_chip("amdgpu")); // DEC-102 (read-only pwm1, EACCES storm)
+        assert!(is_gpu_owned_hwmon_chip("nouveau")); // DEC-204 (writable pwm1 — must not be driven)
+                                                     // Motherboard / CPU chips are hwmon-owned. Intel Arc (`xe`/`i915`) exposes
+                                                     // NO pwm attribute at all, so it needs no exclusion here — its temps flow
+                                                     // through the sensor pipeline and it has no fan header to leak.
+        assert!(!is_gpu_owned_hwmon_chip("k10temp"));
+        assert!(!is_gpu_owned_hwmon_chip("nct6798"));
+        assert!(!is_gpu_owned_hwmon_chip("it8696"));
+        assert!(!is_gpu_owned_hwmon_chip("xe"));
+        assert!(!is_gpu_owned_hwmon_chip("i915"));
     }
 }

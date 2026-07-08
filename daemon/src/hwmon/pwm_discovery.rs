@@ -92,15 +92,16 @@ fn discover_device_pwm(hwmon_dir: &Path) -> Result<Vec<PwmHeaderDescriptor>, Hwm
         .trim()
         .to_string();
 
-    // DEC-102: AMD GPU `pwm1` is owned by the GPU subsystem, not by hwmon.
-    // RDNA3+ exposes `pwm1` read-only with no `pwm1_enable`, so any write
-    // attempt fails with EACCES. Surfacing it as an hwmon header lets the
-    // GUI bind it to a profile and produces a 1 Hz 503/EACCES storm. GPU
-    // fans are addressed exclusively via the `amd_gpu:` prefix and the
-    // `/gpu/{id}/fan/...` endpoints.
-    if chip_name == "amdgpu" {
+    // GPU-owned hwmon `pwm1` is never surfaced as an hwmon header.
+    // - amdgpu (DEC-102): RDNA3+ exposes `pwm1` read-only with no `pwm1_enable`,
+    //   so binding it produces a 1 Hz 503/EACCES storm.
+    // - nouveau (DEC-204): exposes a *writable* `pwm1`; leaking it here would let
+    //   the profile engine drive a GPU fan, breaking the read-only contract.
+    // GPU fans are addressed exclusively via the `amd_gpu:` / `nvidia_gpu:`
+    // prefixes and the GPU endpoints. Single source of truth: `is_gpu_owned_hwmon_chip`.
+    if crate::hwmon::is_gpu_owned_hwmon_chip(&chip_name) {
         log::debug!(
-            "Skipping amdgpu hwmon at {} — GPU fans are owned by the GPU subsystem (DEC-102)",
+            "Skipping GPU-owned hwmon chip '{chip_name}' at {} — GPU fans are owned by the GPU subsystem (DEC-102/DEC-204)",
             hwmon_dir.display()
         );
         return Ok(Vec::new());
@@ -398,6 +399,42 @@ mod tests {
             &[(1, Some("CPU_FAN"), true, true)],
         );
         create_pwm_fixture(tmp.path(), "hwmon1", "amdgpu", &[(1, None, false, true)]);
+
+        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        assert_eq!(headers.len(), 1, "headers: {headers:#?}");
+        assert_eq!(headers[0].chip_name, "it8696");
+    }
+
+    /// DEC-204 (safety): the open `nouveau` driver exposes a **writable**
+    /// `pwm1` + `pwm1_enable`. It must never appear as an hwmon header, or the
+    /// profile engine could drive a GPU fan — violating the read-only-telemetry
+    /// contract for Phase-1 NVIDIA support. Pins the write-block.
+    #[test]
+    fn discover_nouveau_excluded_even_though_writable() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Writable shape: pwm1 + pwm1_enable + fan1_input — still excluded.
+        create_pwm_fixture(tmp.path(), "hwmon0", "nouveau", &[(1, None, true, true)]);
+
+        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        assert!(
+            headers.is_empty(),
+            "nouveau hwmon (writable pwm1) must not be advertised as a header: {headers:#?}"
+        );
+    }
+
+    #[test]
+    fn discover_nouveau_excluded_alongside_motherboard_chip() {
+        // Mixed system: motherboard PWM chip and nouveau both present. Discovery
+        // returns only the motherboard chip's headers — the nouveau exclusion
+        // must not drop unrelated chips (mirrors the amdgpu mixed-system case).
+        let tmp = tempfile::tempdir().unwrap();
+        create_pwm_fixture(
+            tmp.path(),
+            "hwmon0",
+            "it8696",
+            &[(1, Some("CPU_FAN"), true, true)],
+        );
+        create_pwm_fixture(tmp.path(), "hwmon1", "nouveau", &[(1, None, true, true)]);
 
         let headers = discover_pwm_headers(tmp.path()).unwrap();
         assert_eq!(headers.len(), 1, "headers: {headers:#?}");

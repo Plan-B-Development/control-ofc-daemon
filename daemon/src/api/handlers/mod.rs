@@ -137,12 +137,15 @@ pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntr
         });
     }
 
-    // Discrete GPU fans (AMD + Intel share the gpu_fans map; the vendor is
-    // encoded in the ID prefix — `amd_gpu:` / `intel_gpu:` — DEC-121).
+    // Discrete GPU fans (AMD + Intel + NVIDIA share the gpu_fans map; the vendor
+    // is encoded in the ID prefix — `amd_gpu:` / `intel_gpu:` / `nvidia_gpu:` —
+    // DEC-121/DEC-204).
     for (id, fan) in &snap.gpu_fans {
         let age_ms = now.duration_since(fan.updated_at).as_millis() as u64;
         let source = if id.starts_with("intel_gpu:") {
             "intel_gpu"
+        } else if id.starts_with("nvidia_gpu:") {
+            "nvidia_gpu"
         } else {
             "amd_gpu"
         };
@@ -453,6 +456,39 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, "hwmon:a_fan");
         assert_eq!(entries[1].id, "hwmon:z_fan");
+    }
+
+    #[test]
+    fn build_fan_entries_routes_gpu_source_by_id_prefix() {
+        // The wire `source` the GUI keys on is derived from the gpu_fans id
+        // prefix. Each vendor prefix must map to the right source string
+        // (DEC-121/DEC-204); a transposed branch would mislabel GPU fans.
+        let mut state = DaemonState::default();
+        let now = Instant::now();
+        let cases = [
+            ("amd_gpu:0000:03:00.0", "amd_gpu"),
+            ("intel_gpu:0000:04:00.0", "intel_gpu"),
+            ("nvidia_gpu:0000:05:00.0", "nvidia_gpu"),
+        ];
+        for (id, _) in cases {
+            state.gpu_fans.insert(
+                id.into(),
+                crate::health::state::AmdGpuFanState {
+                    id: id.into(),
+                    rpm: Some(1200),
+                    last_commanded_pct: None,
+                    updated_at: now,
+                },
+            );
+        }
+
+        let entries = build_fan_entries(&state, now);
+        for (id, expected_source) in cases {
+            let e = entries.iter().find(|e| e.id == id).unwrap();
+            assert_eq!(e.source.as_str(), expected_source, "source for {id}");
+            // GPU fan telemetry here is read-only — no commanded PWM.
+            assert_eq!(e.last_commanded_pwm, None);
+        }
     }
 
     #[test]

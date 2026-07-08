@@ -119,6 +119,8 @@ pub(crate) fn classify_chip(chip_name: &str, label: &str) -> SensorKind {
         // Intel discrete GPU (Arc). Both drivers register hwmon only for
         // discrete cards, so any "xe"/"i915" chip is a dGPU temp (DEC-121).
         "xe" | "i915" => SensorKind::GpuTemp,
+        // NVIDIA discrete GPU via the open `nouveau` driver (DEC-204).
+        "nouveau" => SensorKind::GpuTemp,
         "nvme" => SensorKind::DiskTemp,
         "sbtsi_temp" => SensorKind::CpuTemp,
         _ if chip_name.starts_with("it87") => SensorKind::MbTemp,
@@ -301,6 +303,10 @@ fn discover_device_sensors(hwmon_dir: &Path) -> Result<Vec<SensorDescriptor>, Hw
             // discrete Intel GPUs (DGFX-gated), so these are always dGPU
             // temps (DEC-121).
             "xe" | "i915" => SensorSource::IntelGpu,
+            // NVIDIA discrete GPU via the open `nouveau` driver. Read-only
+            // telemetry; the writable `pwm1` is excluded from PWM discovery
+            // (`is_gpu_owned_hwmon_chip`) so the engine never drives it (DEC-204).
+            "nouveau" => SensorSource::NvidiaGpu,
             _ => SensorSource::Hwmon,
         };
 
@@ -429,6 +435,21 @@ mod tests {
 
         let sensors = discover_sensors(tmp.path()).unwrap();
         assert_eq!(sensors[0].source, SensorSource::AmdGpu);
+    }
+
+    #[test]
+    fn discover_nvidia_gpu_nouveau_source_and_kind() {
+        // NVIDIA via the open nouveau driver: temp1 classified as GpuTemp with
+        // source NvidiaGpu (DEC-204). Temps flow through the normal pipeline;
+        // the writable pwm1 is excluded elsewhere (`is_gpu_owned_hwmon_chip`).
+        let tmp = tempfile::tempdir().unwrap();
+        create_fixture_with_chip_name(tmp.path(), "hwmon0", "nouveau", &[("1", None)]);
+
+        let sensors = discover_sensors(tmp.path()).unwrap();
+        assert_eq!(sensors.len(), 1);
+        assert_eq!(sensors[0].kind, SensorKind::GpuTemp);
+        assert_eq!(sensors[0].source, SensorSource::NvidiaGpu);
+        assert_eq!(sensors[0].chip_name, "nouveau");
     }
 
     #[test]
@@ -951,6 +972,9 @@ mod tests {
             ("xe", "temp2", SensorKind::GpuTemp),
             ("i915", "", SensorKind::GpuTemp),
             ("i915", "temp1", SensorKind::GpuTemp),
+            // NVIDIA via nouveau (DEC-204) — always GPU regardless of label.
+            ("nouveau", "", SensorKind::GpuTemp),
+            ("nouveau", "temp1", SensorKind::GpuTemp),
             ("nvme", "Composite", SensorKind::DiskTemp),
             ("nvme", "Sensor 1", SensorKind::DiskTemp),
             ("sbtsi_temp", "", SensorKind::CpuTemp),

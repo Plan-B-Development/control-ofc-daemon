@@ -19,6 +19,9 @@ pub enum DeviceLabel {
     /// Intel discrete GPU (Arc) via the `xe`/`i915` hwmon node. Read-only
     /// telemetry — no fan write path exists in the kernel (DEC-121).
     IntelGpu,
+    /// NVIDIA discrete GPU via the `nouveau` hwmon node. Read-only telemetry;
+    /// the writable nouveau `pwm1` is excluded from hwmon discovery (DEC-204).
+    NvidiaGpu,
     /// AIO cooler exposed via hwmon (future).
     AioHwmon,
     /// AIO cooler exposed via USB/HID (future).
@@ -32,6 +35,7 @@ impl std::fmt::Display for DeviceLabel {
             Self::Hwmon => write!(f, "hwmon"),
             Self::AmdGpu => write!(f, "amd_gpu"),
             Self::IntelGpu => write!(f, "intel_gpu"),
+            Self::NvidiaGpu => write!(f, "nvidia_gpu"),
             Self::AioHwmon => write!(f, "aio_hwmon"),
             Self::AioUsb => write!(f, "aio_usb"),
         }
