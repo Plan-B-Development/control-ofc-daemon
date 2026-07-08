@@ -33,6 +33,7 @@ use crate::health::state::{
 use crate::hwmon::gpu_detect::AmdGpuInfo;
 use crate::hwmon::intel_gpu_detect::IntelGpuInfo;
 use crate::hwmon::nouveau_detect::NouveauGpuInfo;
+use crate::hwmon::nvml::NvmlBackend;
 use crate::hwmon::types::{SensorKind, SensorReading};
 use crate::serial::protocol::Command;
 use crate::serial::transport::{send_command, SerialTransport};
@@ -117,6 +118,7 @@ pub async fn hwmon_poll_loop(
     gpu_infos: Vec<AmdGpuInfo>,
     intel_gpu_infos: Vec<IntelGpuInfo>,
     nouveau_gpu_infos: Vec<NouveauGpuInfo>,
+    nvml_backend: Arc<dyn NvmlBackend>,
     hwmon_root: &Path,
     interval: Duration,
     sensor_rescan: Arc<std::sync::atomic::AtomicBool>,
@@ -203,8 +205,20 @@ pub async fn hwmon_poll_loop(
         let gpus = gpu_infos.clone();
         let intel_gpus = intel_gpu_infos.clone();
         let nouveau_gpus = nouveau_gpu_infos.clone();
+        let nvml = nvml_backend.clone();
         let descs = descriptors.clone();
         let result: Result<_, tokio::task::JoinError> = tokio::task::spawn_blocking(move || {
+            // NVIDIA NVML telemetry (opt-in, read-only, DEC-204): GPU temps merge
+            // into the sensor readings, fan states into the GPU fan set. Both are
+            // empty when NVML is disabled/absent (the default). Read once per tick.
+            // Like the sysfs reads below, these are blocking C calls with no
+            // per-call timeout: an NVIDIA driver fault could stall this tick until
+            // it returns. The existing backstops bound the blast radius (the
+            // shutdown-drain timeout still fires; the no-CPU-sensor 40% fallback
+            // covers stale readings). A timeout wrapper around the whole blocking
+            // leg — which would benefit the sysfs reads too — is a possible future
+            // hardening, deliberately out of scope for this read-only slice.
+            let (nvml_temps, nvml_fans) = read_nvml_states(&*nvml);
             // Sensor leg: full discovery only when triggered; otherwise the
             // hot path reads each cached descriptor's temp*_input file only.
             // The read returns successes *and* failures (DEC-193) — the loop owns
@@ -214,19 +228,27 @@ pub async fn hwmon_poll_loop(
                 crate::error::HwmonError,
             > = if needs_discovery {
                 crate::hwmon::discovery::discover_sensors(&root).map(|fresh| {
-                    let outcome = crate::hwmon::read_sensor_values(&fresh);
+                    let mut outcome = crate::hwmon::read_sensor_values(&fresh);
+                    outcome.readings.extend(nvml_temps.iter().cloned());
                     (Some(fresh), outcome)
                 })
             } else {
-                Ok((None, crate::hwmon::read_sensor_values(&descs)))
+                let mut outcome = crate::hwmon::read_sensor_values(&descs);
+                outcome.readings.extend(nvml_temps.iter().cloned());
+                Ok((None, outcome))
             };
             let fan_states: Vec<HwmonFanState> = read_hwmon_fan_states(&hdrs);
             // AMD + Intel + NVIDIA discrete GPU fans share the cache `gpu_fans`
             // map, distinguished by their ID prefix (`amd_gpu:` / `intel_gpu:` /
-            // `nvidia_gpu:`). Intel + nouveau are read-only (last_commanded_pct None).
+            // `nvidia_gpu:`). Intel + nouveau + NVML are read-only (last_commanded_pct None).
             let mut gpu_fan_states: Vec<AmdGpuFanState> = read_gpu_fan_states(&gpus);
             gpu_fan_states.extend(read_intel_fan_states(&intel_gpus));
+            // nouveau and NVML both mint `nvidia_gpu:<BDF>` ids, but they can
+            // never collide for the same BDF: nouveau (open) and the proprietary
+            // driver that provides libnvidia-ml are mutually exclusive kernel
+            // modules per GPU, so each BDF is produced by at most one of the two.
             gpu_fan_states.extend(read_nouveau_fan_states(&nouveau_gpus));
+            gpu_fan_states.extend(nvml_fans);
             (sensors, fan_states, gpu_fan_states)
         })
         .await;
@@ -384,6 +406,7 @@ fn read_gpu_fan_states(gpus: &[AmdGpuInfo]) -> Vec<AmdGpuFanState> {
                 id: format!("amd_gpu:{}", g.pci_bdf),
                 rpm,
                 last_commanded_pct: None, // Preserved from cache by the caller
+                duty_pct: None,           // AMD reports RPM, not a duty readback
                 updated_at: now,
             }
         })
@@ -409,6 +432,7 @@ fn read_intel_fan_states(gpus: &[IntelGpuInfo]) -> Vec<AmdGpuFanState> {
                 id: format!("intel_gpu:{}", g.pci_bdf),
                 rpm,
                 last_commanded_pct: None, // Always None — read-only.
+                duty_pct: None,           // Intel reports RPM only
                 updated_at: now,
             }
         })
@@ -434,10 +458,49 @@ fn read_nouveau_fan_states(gpus: &[NouveauGpuInfo]) -> Vec<AmdGpuFanState> {
                 id: format!("nvidia_gpu:{}", g.pci_bdf),
                 rpm,
                 last_commanded_pct: None, // Always None — read-only (Phase 1).
+                duty_pct: None,           // nouveau fan1_input is RPM only
                 updated_at: now,
             }
         })
         .collect()
+}
+
+/// Read NVIDIA telemetry from the (opt-in) NVML backend into the poll pipeline
+/// (DEC-204). Produces GPU temperature `SensorReading`s (source `NvidiaGpu`,
+/// kind `GpuTemp`) plus read-only fan states (`nvidia_gpu:<BDF>`) carrying the
+/// firmware-reported `duty_pct` and — on driver R565+ — `rpm`. Returns empty
+/// vecs when NVML is disabled/absent. Runs on the blocking poll thread.
+fn read_nvml_states(backend: &dyn NvmlBackend) -> (Vec<SensorReading>, Vec<AmdGpuFanState>) {
+    let now_sys = std::time::SystemTime::now();
+    let now = Instant::now();
+    let mut sensors = Vec::new();
+    let mut fans = Vec::new();
+    for r in backend.read_all() {
+        if let Some(temp_c) = r.temp_c {
+            sensors.push(SensorReading {
+                id: format!("nvidia_gpu:{}:temp", r.pci_bdf),
+                kind: SensorKind::GpuTemp,
+                label: "GPU".to_string(),
+                value_c: temp_c,
+                timestamp: now_sys,
+                source: crate::hwmon::types::SensorSource::NvidiaGpu,
+                chip_name: "nvml".to_string(),
+                temp_type: None,
+                thresholds: None,
+            });
+        }
+        // Emit a single aggregate fan entity when NVML reported any fan telemetry.
+        if r.fan_duty_pct.is_some() || r.fan_rpm.is_some() {
+            fans.push(AmdGpuFanState {
+                id: format!("nvidia_gpu:{}", r.pci_bdf),
+                rpm: r.fan_rpm,
+                last_commanded_pct: None, // read-only
+                duty_pct: r.fan_duty_pct,
+                updated_at: now,
+            });
+        }
+    }
+    (sensors, fans)
 }
 
 /// Run the OpenFanController RPM polling loop.
@@ -673,6 +736,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                Arc::new(crate::hwmon::nvml::DisabledNvml),
                 &root,
                 Duration::from_secs(1),
                 rescan2,
@@ -949,6 +1013,8 @@ mod tests {
         assert_eq!(states[0].rpm, Some(1234));
         // Read-only: never a commanded percentage.
         assert_eq!(states[0].last_commanded_pct, None);
+        // hwmon RPM source has no duty readback — duty_pct is NVML-only.
+        assert_eq!(states[0].duty_pct, None);
     }
 
     #[test]
@@ -1001,6 +1067,8 @@ mod tests {
         assert_eq!(states[0].rpm, Some(1600));
         // Read-only: never a commanded percentage.
         assert_eq!(states[0].last_commanded_pct, None);
+        // nouveau fan1_input has no duty readback — duty_pct is NVML-only.
+        assert_eq!(states[0].duty_pct, None);
     }
 
     #[test]
@@ -1045,5 +1113,112 @@ mod tests {
         let cached = to_cached(&reading);
         assert_eq!(cached.source, DeviceLabel::NvidiaGpu);
         assert_eq!(cached.kind, SensorKind::GpuTemp);
+    }
+
+    #[test]
+    fn read_nvml_states_produces_temp_and_fan() {
+        use crate::hwmon::nvml::{FakeNvml, NvmlReading};
+        let backend = FakeNvml::new(vec![NvmlReading {
+            pci_bdf: "0000:03:00.0".into(),
+            temp_c: Some(61.0),
+            fan_duty_pct: Some(55),
+            fan_rpm: Some(1800),
+        }]);
+        let (temps, fans) = read_nvml_states(&backend);
+
+        assert_eq!(temps.len(), 1);
+        assert_eq!(temps[0].id, "nvidia_gpu:0000:03:00.0:temp");
+        assert_eq!(
+            temps[0].source,
+            crate::hwmon::types::SensorSource::NvidiaGpu
+        );
+        assert_eq!(temps[0].kind, SensorKind::GpuTemp);
+        assert_eq!(temps[0].value_c, 61.0);
+
+        assert_eq!(fans.len(), 1);
+        assert_eq!(fans[0].id, "nvidia_gpu:0000:03:00.0");
+        assert_eq!(fans[0].rpm, Some(1800));
+        assert_eq!(fans[0].duty_pct, Some(55));
+        // Read-only: never a commanded percentage.
+        assert_eq!(fans[0].last_commanded_pct, None);
+    }
+
+    #[test]
+    fn read_nvml_states_empty_backend_yields_nothing() {
+        let (temps, fans) = read_nvml_states(&crate::hwmon::nvml::DisabledNvml);
+        assert!(temps.is_empty());
+        assert!(fans.is_empty());
+    }
+
+    #[test]
+    fn read_nvml_states_temp_only_emits_no_fan() {
+        use crate::hwmon::nvml::{FakeNvml, NvmlReading};
+        // A GPU reporting temperature but no fan telemetry (fanless/unsupported):
+        // a temp sensor appears, but no fan entity is fabricated.
+        let backend = FakeNvml::new(vec![NvmlReading {
+            pci_bdf: "0000:03:00.0".into(),
+            temp_c: Some(50.0),
+            fan_duty_pct: None,
+            fan_rpm: None,
+        }]);
+        let (temps, fans) = read_nvml_states(&backend);
+        assert_eq!(temps.len(), 1);
+        assert!(fans.is_empty());
+    }
+
+    #[test]
+    fn read_nvml_states_emits_fan_on_duty_only_or_rpm_only() {
+        use crate::hwmon::nvml::{FakeNvml, NvmlReading};
+        // Partial fan telemetry must still emit a fan entity — pins the `||`
+        // emission gate (a `&&` regression would drop these). (a) duty %, no RPM
+        // (common pre-R565); (b) RPM, no duty.
+        let duty_only = FakeNvml::new(vec![NvmlReading {
+            pci_bdf: "0000:03:00.0".into(),
+            temp_c: None,
+            fan_duty_pct: Some(60),
+            fan_rpm: None,
+        }]);
+        let (_, fans) = read_nvml_states(&duty_only);
+        assert_eq!(fans.len(), 1);
+        assert_eq!(fans[0].duty_pct, Some(60));
+        assert_eq!(fans[0].rpm, None);
+
+        let rpm_only = FakeNvml::new(vec![NvmlReading {
+            pci_bdf: "0000:03:00.0".into(),
+            temp_c: None,
+            fan_duty_pct: None,
+            fan_rpm: Some(1500),
+        }]);
+        let (_, fans) = read_nvml_states(&rpm_only);
+        assert_eq!(fans.len(), 1);
+        assert_eq!(fans[0].rpm, Some(1500));
+        assert_eq!(fans[0].duty_pct, None);
+    }
+
+    #[test]
+    fn read_nvml_states_multi_gpu_distinct_ids() {
+        use crate::hwmon::nvml::{FakeNvml, NvmlReading};
+        let backend = FakeNvml::new(vec![
+            NvmlReading {
+                pci_bdf: "0000:03:00.0".into(),
+                temp_c: Some(40.0),
+                fan_duty_pct: Some(30),
+                fan_rpm: None,
+            },
+            NvmlReading {
+                pci_bdf: "0000:0a:00.0".into(),
+                temp_c: Some(70.0),
+                fan_duty_pct: Some(80),
+                fan_rpm: None,
+            },
+        ]);
+        let (temps, fans) = read_nvml_states(&backend);
+        assert_eq!(temps.len(), 2);
+        assert_eq!(fans.len(), 2);
+        // Distinct BDFs → distinct fan ids (no collision/overwrite).
+        assert_eq!(fans[0].id, "nvidia_gpu:0000:03:00.0");
+        assert_eq!(fans[1].id, "nvidia_gpu:0000:0a:00.0");
+        assert_eq!(temps[0].id, "nvidia_gpu:0000:03:00.0:temp");
+        assert_eq!(temps[1].id, "nvidia_gpu:0000:0a:00.0:temp");
     }
 }

@@ -204,6 +204,12 @@ pub struct FanEntry {
     pub rpm: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_commanded_pwm: Option<u8>,
+    /// Firmware-reported current fan duty % (measured, not commanded) — present
+    /// only for sources that expose a duty readback (NVIDIA via NVML, DEC-204).
+    /// Distinct from `last_commanded_pwm`. May exceed 100 (NVML expresses it as
+    /// a % of max noise tolerance). Additive/optional (API v1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duty_pct: Option<u8>,
     pub age_ms: u64,
     /// True when RPM is 0 but last_commanded_pwm is above the safety floor.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1837,12 +1843,30 @@ mod tests {
             source: "openfan".into(),
             rpm: Some(1200),
             last_commanded_pwm: None,
+            duty_pct: None,
             age_ms: 50,
             stall_detected: None,
         };
         let json = serde_json::to_value(&entry).unwrap();
         assert_eq!(json["rpm"], 1200);
-        // last_commanded_pwm absent when None
+        // last_commanded_pwm + duty_pct absent when None — old GUIs see no new nulls.
+        assert!(json.get("last_commanded_pwm").is_none());
+        assert!(json.get("duty_pct").is_none());
+
+        // A read-only NVIDIA fan surfaces its measured duty % (DEC-204).
+        let nvidia = FanEntry {
+            id: "nvidia_gpu:0000:03:00.0".into(),
+            source: "nvidia_gpu".into(),
+            rpm: None,
+            last_commanded_pwm: None,
+            duty_pct: Some(47),
+            age_ms: 10,
+            stall_detected: None,
+        };
+        let json = serde_json::to_value(&nvidia).unwrap();
+        assert_eq!(json["duty_pct"], 47);
+        assert_eq!(json["source"], "nvidia_gpu");
+        // Read-only NVIDIA fan: never a commanded PWM on the wire.
         assert!(json.get("last_commanded_pwm").is_none());
     }
 }

@@ -16,6 +16,8 @@ pub mod inventory;
 pub mod kernel_warnings;
 pub mod lease;
 pub mod nouveau_detect;
+pub mod nvml;
+pub mod nvml_sys;
 pub mod pwm_control;
 pub mod pwm_discovery;
 pub mod reader;

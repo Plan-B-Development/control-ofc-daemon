@@ -36,3 +36,12 @@
 # you specifically need it — the passive detection covers the common cases,
 # and CAP_SYS_RAWIO is effectively root-equivalent.
 # allow_port_probe = false
+#
+# Opt-in READ-ONLY NVIDIA telemetry via NVML (DEC-204). Default: false. When
+# true AND the /dev/nvidia* systemd drop-in is installed (see
+# /usr/share/doc/control-ofc-daemon/nvidia-telemetry.conf.example), the daemon
+# reads NVIDIA GPU temperature + fan telemetry through libnvidia-ml.so.1. It
+# NEVER writes to the GPU. EXPERIMENTAL — the NVML path is unverified on
+# hardware. The open nouveau driver is read via hwmon and needs neither this
+# flag nor the drop-in.
+# enable_nvidia_telemetry = false

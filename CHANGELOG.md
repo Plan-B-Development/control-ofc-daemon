@@ -2,22 +2,40 @@
 
 ## [Unreleased]
 
-NVIDIA GPU support — Phase 1 (read-only telemetry), first slice. Batched under
-`[Unreleased]` pending the rest of Phase 1 (proprietary NVML telemetry,
-`/capabilities` + `/diagnostics` surfaces, GUI consumption) before release.
+NVIDIA GPU support — Phase 1 (read-only telemetry). Batched under `[Unreleased]`
+pending the rest of Phase 1 (`/capabilities` + `/diagnostics/hardware` NVIDIA
+surfaces and GUI consumption) before release. **NOT independently releasable** —
+the current GUI does not list `nvidia_gpu` in its GPU-fan sources, so an idle
+NVIDIA fan is hidden by default (DEC-047 regression), it does not yet consume the
+new `duty_pct` field, and the `/capabilities` + `/diagnostics/hardware` NVIDIA
+surfaces are still absent; ships coordinated with the GUI (DEC-204, P1e).
 
 ### Added
 - **NVIDIA discrete GPU read-only sensing via the open `nouveau` driver
-  (DEC-204).** GPU temperatures now appear on `/sensors` with `source:
-  "nvidia_gpu"` (kind `GpuTemp`), and fan RPM on `/fans` with id
-  `nvidia_gpu:<PCI_BDF>` and no `last_commanded_pwm` (read-only). Detection is
-  hwmon-based (`name == "nouveau"`), mirroring the Intel Arc read-only leg
-  (DEC-121). **No fan writes** — the writable nouveau `pwm1` is deliberately
-  excluded from hwmon PWM-header and monitor-only-fan discovery (shared
-  `is_gpu_owned_hwmon_chip` predicate, alongside the `amdgpu` DEC-102
-  exclusion), so the profile engine can never drive a GPU fan. Proprietary-driver
-  (NVML) telemetry and the `/capabilities` + `/diagnostics/hardware` NVIDIA
-  surfaces land in later Phase-1 slices.
+  (DEC-204).** GPU temperatures appear on `/sensors` with `source: "nvidia_gpu"`
+  (kind `GpuTemp`), and fan RPM on `/fans` with id `nvidia_gpu:<PCI_BDF>` and no
+  `last_commanded_pwm` (read-only). Detection is hwmon-based (`name ==
+  "nouveau"`), mirroring the Intel Arc read-only leg (DEC-121). **No fan
+  writes** — the writable nouveau `pwm1` is excluded from hwmon PWM-header and
+  monitor-only-fan discovery (shared `is_gpu_owned_hwmon_chip` predicate,
+  alongside the `amdgpu` DEC-102 exclusion), so the profile engine can never
+  drive a GPU fan.
+- **Opt-in, read-only NVIDIA telemetry via NVML (proprietary driver, DEC-204).**
+  Where the proprietary driver exposes no hwmon node, the daemon can dlopen
+  `libnvidia-ml.so.1` and read GPU temperature + fan telemetry. **Off by
+  default** (`[detection] enable_nvidia_telemetry = false`); also needs an opt-in
+  `/dev/nvidia*` systemd drop-in (`nvidia-telemetry.conf.example`, shipped to
+  `/usr/share/doc`, NOT installed). **Experimental — the NVML path is unverified
+  on real hardware**; it degrades to a no-op when NVML is absent and NEVER writes
+  to any GPU. All `unsafe` FFI is isolated in `hwmon/nvml_sys` (hand-written
+  bindings cross-verified against `nvml-wrapper-sys`); adds the `libloading`
+  dependency (ISC — see `deny.toml`).
+- **`duty_pct` on `/fans` (additive, DEC-204).** A measured/firmware-reported
+  current fan duty %, present only for sources that expose a duty readback
+  (NVIDIA via NVML). Distinct from `last_commanded_pwm` (commanded) — never
+  conflated. **May exceed 100** (NVML expresses it as a % of the product's
+  max-noise-tolerance fan speed, not a hard ceiling). Optional/omitted when
+  absent, so older clients are unaffected.
 
 ## [2.7.0] — 2026-07-07
 

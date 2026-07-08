@@ -748,6 +748,14 @@ async fn main() {
         );
     }
 
+    // Initialise the opt-in, read-only NVIDIA NVML telemetry backend (DEC-204).
+    // Default: disabled — `libnvidia-ml.so.1` is never loaded. When enabled but
+    // NVML is absent or fails to init, this degrades to a no-op backend (never
+    // fatal). EXPERIMENTAL: the real NVML path is unverified on hardware.
+    let nvml_backend = control_ofc_daemon::hwmon::nvml::init_nvml_backend(
+        config.detection.enable_nvidia_telemetry,
+    );
+
     let app_state = Arc::new(AppState {
         cache: cache.clone(),
         staleness_config,
@@ -822,6 +830,7 @@ async fn main() {
             gpu_infos_for_poll,
             intel_gpus_for_poll,
             nouveau_gpus_for_poll,
+            nvml_backend,
             hwmon_root,
             hwmon_interval,
             sensor_rescan_for_poll,

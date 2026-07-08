@@ -415,12 +415,14 @@ async fn fans_endpoint_tags_intel_gpu_source_by_id_prefix() {
             id: "amd_gpu:0000:2d:00.0".into(),
             rpm: Some(900),
             last_commanded_pct: Some(40),
+            duty_pct: None,
             updated_at: Instant::now(),
         },
         AmdGpuFanState {
             id: "intel_gpu:0000:03:00.0".into(),
             rpm: Some(1500),
             last_commanded_pct: None,
+            duty_pct: None,
             updated_at: Instant::now(),
         },
     ]);

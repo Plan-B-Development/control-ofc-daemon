@@ -11,6 +11,11 @@ authors = ["Plan-B-Development <https://github.com/Plan-B-Development>"]
 axum = "0.8"
 env_logger = "0.11"
 libc = "0.2"
+# Runtime dynamic loading of libnvidia-ml.so.1 for opt-in, read-only NVIDIA
+# telemetry (DEC-204). ISC-licensed — see deny.toml. Never a build/link-time
+# dependency on any NVIDIA library; the daemon degrades cleanly when NVML is
+# absent (the default: [detection] enable_nvidia_telemetry = false).
+libloading = "0.9"
 log = "0.4"
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }

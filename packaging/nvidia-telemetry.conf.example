@@ -1,0 +1,57 @@
+# Opt-in systemd drop-in for READ-ONLY NVIDIA telemetry via NVML (DEC-204).
+#
+# ─────────────────────────────  READ THIS  ─────────────────────────────
+# This drop-in grants control-ofc-daemon access to the NVIDIA device nodes so
+# it can read GPU temperature and fan telemetry through NVML
+# (libnvidia-ml.so.1). It is ONLY needed for the NVIDIA proprietary driver —
+# the open `nouveau` driver is read via hwmon and needs nothing extra.
+#
+# EXPERIMENTAL / UNVERIFIED
+#   The NVML telemetry path has NOT been validated against real NVIDIA
+#   hardware. It is read-only (it never writes a fan value or changes any GPU
+#   state) and degrades to a no-op when NVML is unavailable, but treat it as
+#   experimental. Please report whether it works on your card.
+#
+# SECURITY NOTE
+#   This exposes the NVIDIA char devices to the daemon. That is far narrower
+#   than a raw-I/O capability, but it does widen the otherwise-hardened
+#   sandbox to reach the GPU driver. Only install it if you want NVIDIA
+#   telemetry and accept that trade-off.
+#
+# ────────────────────────────  TO ENABLE  ─────────────────────────────
+#   1. Set the config flag in /etc/control-ofc/daemon.toml:
+#          [detection]
+#          enable_nvidia_telemetry = true
+#   2. Install this drop-in (run from anywhere — the source is the full path):
+#          sudo install -Dm644 \
+#            /usr/share/doc/control-ofc-daemon/nvidia-telemetry.conf.example \
+#            /etc/systemd/system/control-ofc-daemon.service.d/nvidia-telemetry.conf
+#   3. Reload + restart:
+#          sudo systemctl daemon-reload
+#          sudo systemctl restart control-ofc-daemon
+#
+# BOTH the flag and this drop-in are required. With only the flag, NVML cannot
+# open the device nodes and telemetry stays absent (the daemon logs one line
+# and continues).
+#
+# ───────────────────────────  TO DISABLE  ─────────────────────────────
+#   sudo rm /etc/systemd/system/control-ofc-daemon.service.d/nvidia-telemetry.conf
+#   sudo systemctl daemon-reload && sudo systemctl restart control-ofc-daemon
+# (and/or set enable_nvidia_telemetry = false).
+
+[Service]
+# Expose the NVIDIA control device and per-GPU nodes; the base unit's
+# DeviceAllow= list (ttyACM/ttyUSB only) otherwise blocks them. DeviceAllow=
+# accumulates. Add more `/dev/nvidiaN rw` lines for additional GPUs.
+DeviceAllow=/dev/nvidiactl rw
+DeviceAllow=/dev/nvidia0 rw
+# DeviceAllow=/dev/nvidia1 rw
+# DeviceAllow=/dev/nvidia2 rw
+#
+# MemoryDenyWriteExecute: pure NVML telemetry reads do NOT require W+X memory —
+# only the CUDA JIT compiler (libnvrtc.so) does, and this daemon never invokes
+# it. Standard NVML tools (nvidia-smi, nvtop) run fine under MDWE=true. Leave the
+# next line commented; treat it as a last resort ONLY if nvmlInit_v2 still fails
+# after you have confirmed the DeviceAllow lines above are correct and the
+# driver is loaded (it further relaxes the sandbox):
+# MemoryDenyWriteExecute=false

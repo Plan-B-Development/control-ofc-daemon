@@ -293,6 +293,7 @@ impl StateCache {
                 id: gpu_id.to_string(),
                 rpm: None,
                 last_commanded_pct: None,
+                duty_pct: None,
                 updated_at: now,
             });
         fan.last_commanded_pct = Some(pct);
@@ -579,6 +580,7 @@ mod tests {
             id: "amd_gpu:0000:2d:00.0".into(),
             rpm: Some(1800),
             last_commanded_pct: Some(50),
+            duty_pct: None,
             updated_at: Instant::now(),
         }]);
 

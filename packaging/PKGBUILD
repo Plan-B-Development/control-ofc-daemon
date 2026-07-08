@@ -91,6 +91,13 @@ package() {
     install -Dm644 packaging/superio-port-probe.conf.example \
         "$pkgdir/usr/share/doc/$pkgname/superio-port-probe.conf.example"
 
+    # Opt-in systemd drop-in for READ-ONLY NVIDIA NVML telemetry (DEC-204).
+    # Shipped as a doc example ONLY — NOT installed into the .service.d/ dir, so
+    # the default unit stays hardened. Grants access to the NVIDIA device nodes;
+    # the operator must copy it deliberately AND set enable_nvidia_telemetry=true.
+    install -Dm644 packaging/nvidia-telemetry.conf.example \
+        "$pkgdir/usr/share/doc/$pkgname/nvidia-telemetry.conf.example"
+
     # Kernel module loading — Super I/O chipset drivers that expose
     # motherboard fan headers and sensors. See packaging/modules-load.d/
     # for rationale. Covered by backup=() so pacman preserves user edits.

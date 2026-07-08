@@ -184,6 +184,15 @@ pub struct DetectionConfig {
     /// false`. Requires the opt-in `CAP_SYS_RAWIO` drop-in to actually function.
     #[serde(default)]
     pub allow_port_probe: bool,
+
+    /// Enable opt-in, **read-only** NVIDIA telemetry via NVML (DEC-204).
+    /// `false` (default) = `libnvidia-ml.so.1` is never loaded. When `true` the
+    /// daemon dlopens NVML and reads GPU temperature + fan telemetry; it also
+    /// needs the opt-in `/dev/nvidia*` systemd drop-in to actually function (see
+    /// `packaging/nvidia-telemetry.conf.example`). **Experimental — the NVML
+    /// path is unverified on real hardware.** Never writes to any GPU.
+    #[serde(default)]
+    pub enable_nvidia_telemetry: bool,
 }
 
 impl DaemonConfig {

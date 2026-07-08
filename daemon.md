@@ -38,6 +38,8 @@ daemon/src/
     gpu_detect.rs      — AMD GPU detection via sysfs/DRM
     intel_gpu_detect.rs— Intel discrete GPU (Arc) detection, read-only (DEC-121)
     nouveau_detect.rs  — NVIDIA discrete GPU detection via the open nouveau driver, read-only (DEC-204)
+    nvml.rs            — opt-in read-only NVIDIA telemetry backend (trait + Real/Fake/Disabled), proprietary driver (DEC-204)
+    nvml_sys.rs        — isolated unsafe FFI to libnvidia-ml.so.1 via libloading (the only NVIDIA unsafe, DEC-204)
     gpu_fan.rs         — PMFW fan curve read/write/reset
     kernel_warnings.rs — kernel-version regression catalog
                           (RDNA3/4 hard hang on 6.19, R9700 SMU on 7.0)

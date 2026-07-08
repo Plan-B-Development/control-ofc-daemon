@@ -57,6 +57,8 @@ daemon/                     Rust crate (control-ofc-daemon)
       gpu_fan.rs            PMFW fan curve read/write/reset (RDNA3+)
       intel_gpu_detect.rs   Intel discrete-GPU detection (read-only monitoring, DEC-121)
       nouveau_detect.rs     NVIDIA discrete-GPU detection via the open nouveau driver (read-only, DEC-204)
+      nvml.rs               Opt-in read-only NVIDIA telemetry backend over NVML (proprietary driver, DEC-204)
+      nvml_sys.rs           Isolated unsafe FFI to libnvidia-ml.so.1 via libloading (DEC-204)
       kernel_warnings.rs    Kernel-version regression catalog (DEC-098).
                             Matches running kernel against published amdgpu
                             regressions; surfaced via
@@ -169,8 +171,9 @@ Every sensor/fan/header includes:
 
 ## Measured vs commanded
 
-- `rpm` — measured from hardware (OpenFanController serial reads, hwmon `fanN_input`)
+- `rpm` — measured from hardware (OpenFanController serial reads, hwmon `fanN_input`, or NVML per driver R565+)
 - `last_commanded_pwm` — daemon-tracked (firmware does not report PWM state)
+- `duty_pct` — firmware-**reported** current fan duty % (NVIDIA via NVML, DEC-204); a *measured* value, present only where the source exposes a duty readback
 - These are always separate fields, never ambiguous
 
 ## Safety invariants

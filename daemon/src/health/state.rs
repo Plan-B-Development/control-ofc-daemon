@@ -101,21 +101,27 @@ pub struct CachedSensorReading {
 }
 
 /// Cached state for a discrete GPU fan (one per GPU — hardware exposes a
-/// single aggregate fan1_input).
+/// single aggregate fan).
 ///
-/// Shared by both AMD and Intel discrete GPUs, distinguished by the ID prefix:
-/// `amd_gpu:<PCI_BDF>` or `intel_gpu:<PCI_BDF>`. For Intel GPUs
-/// `last_commanded_pct` is always `None` — Intel fan control is firmware-managed
-/// and has no userspace write path (DEC-121).
+/// Shared by AMD, Intel, and NVIDIA discrete GPUs, distinguished by the ID
+/// prefix: `amd_gpu:` / `intel_gpu:` / `nvidia_gpu:<PCI_BDF>`. For read-only
+/// sources (Intel DEC-121, NVIDIA DEC-204) `last_commanded_pct` is always
+/// `None` — fan control is firmware-managed with no userspace write path.
 #[derive(Debug, Clone)]
 pub struct AmdGpuFanState {
-    /// Stable fan ID: `amd_gpu:<PCI_BDF>` or `intel_gpu:<PCI_BDF>`.
+    /// Stable fan ID: `<vendor>_gpu:<PCI_BDF>`.
     pub id: String,
-    /// Current fan RPM if available (from fan1_input).
+    /// Current fan RPM if available (hwmon `fan1_input`, or NVML per driver R565+).
     pub rpm: Option<u16>,
     /// Last speed percentage commanded by the daemon via PMFW flat curve.
-    /// Always `None` for Intel GPUs (read-only).
+    /// Always `None` for read-only sources (Intel, NVIDIA).
     pub last_commanded_pct: Option<u8>,
+    /// Firmware-**reported** current fan duty %, when the source exposes it
+    /// (NVML `nvmlDeviceGetFanSpeed_v2`, DEC-204). A *measured* value distinct
+    /// from `last_commanded_pct` — never conflate the two. `None` for AMD/Intel
+    /// (which report RPM, not a duty readback). Per NVML this may exceed 100 (it
+    /// is a % of the product's max-noise-tolerance fan speed).
+    pub duty_pct: Option<u8>,
     /// When this reading was taken.
     pub updated_at: Instant,
 }

@@ -115,6 +115,7 @@ pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntr
             source: "openfan".into(),
             rpm: Some(fan.rpm),
             last_commanded_pwm: fan.last_commanded_pwm,
+            duty_pct: None,
             age_ms,
             stall_detected: stall,
         });
@@ -132,6 +133,7 @@ pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntr
             source: "hwmon".into(),
             rpm: fan.rpm,
             last_commanded_pwm: fan.last_commanded_pwm,
+            duty_pct: None,
             age_ms,
             stall_detected: stall,
         });
@@ -154,6 +156,7 @@ pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntr
             source: source.into(),
             rpm: fan.rpm,
             last_commanded_pwm: fan.last_commanded_pct,
+            duty_pct: fan.duty_pct,
             age_ms,
             stall_detected: None,
         });
@@ -477,6 +480,7 @@ mod tests {
                     id: id.into(),
                     rpm: Some(1200),
                     last_commanded_pct: None,
+                    duty_pct: Some(33),
                     updated_at: now,
                 },
             );
@@ -488,6 +492,8 @@ mod tests {
             assert_eq!(e.source.as_str(), expected_source, "source for {id}");
             // GPU fan telemetry here is read-only — no commanded PWM.
             assert_eq!(e.last_commanded_pwm, None);
+            // The measured duty % must route from the cache to the wire (DEC-204).
+            assert_eq!(e.duty_pct, Some(33), "duty_pct for {id}");
         }
     }
 
