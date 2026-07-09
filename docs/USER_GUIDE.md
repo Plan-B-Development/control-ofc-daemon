@@ -19,6 +19,7 @@ The daemon provides a local API that a GUI (or scripts) can use to monitor tempe
 | CPU temperature (k10temp, coretemp) | Yes | N/A |
 | AMD GPU temperature (amdgpu) | Yes | N/A |
 | Intel Arc discrete GPU temperature (`xe` / `i915`) | Yes | N/A |
+| NVIDIA discrete GPU temperature (`nouveau` / opt-in NVML) | Yes | N/A |
 | Disk temperature (NVMe) | Yes | N/A |
 | Motherboard temperature (ITE, NCT) | Yes | N/A |
 | OpenFanController fans (RPM) | Yes | Yes (daemon-driven) |
@@ -26,6 +27,7 @@ The daemon provides a local API that a GUI (or scripts) can use to monitor tempe
 | AMD GPU fans (RDNA3+, PMFW) | Yes | Yes (daemon-driven via PMFW fan curve) |
 | AMD GPU fans (pre-RDNA3) | Yes | Yes (daemon-driven via pwm1) |
 | Intel Arc discrete GPU fans (`xe` / `i915`) | Yes (RPM) | No — firmware-managed, no kernel PWM interface (DEC-121) |
+| NVIDIA discrete GPU fans (`nouveau` / opt-in NVML) | Yes (RPM; firmware-measured duty via NVML) | No — read-only, no kernel/PMFW write path (DEC-204) |
 | AIO coolers (hwmon-attached) | Yes — coolant temp (`CoolantTemp` kind) + pump RPM (DEC-156) | Yes — hwmon pump PWM via the guided Configure-AIO flow, constant-speed pump (DEC-157) |
 
 ## Installation

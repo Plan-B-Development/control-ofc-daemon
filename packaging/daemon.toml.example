@@ -2,10 +2,13 @@
 # Copy to /etc/control-ofc/daemon.toml and edit as needed.
 # All fields are optional — defaults are shown below.
 #
-# NOTE: runtime-mutable settings (profile search directories, startup delay)
-# are stored separately in /var/lib/control-ofc/runtime.toml, which the
-# daemon manages itself via the API. This file is admin-owned and is never
-# rewritten by the daemon at runtime. See docs/ADRs/002-runtime-config-split.md.
+# NOTE: a few settings — the startup delay ([startup] below) and profile search
+# directories — can be set here as admin-owned BASE defaults. When the API
+# mutates one of them (POST /config/startup-delay / /config/profile-search-dirs),
+# the daemon writes /var/lib/control-ofc/runtime.toml, whose keys OVERLAY these
+# defaults (runtime wins, ADR-002). The two files coexist; this file is admin-
+# owned and is never rewritten by the daemon at runtime. See
+# docs/ADRs/002-runtime-config-split.md.
 
 [serial]
 # Use stable /dev/serial/by-id/ path (survives USB re-enumeration)

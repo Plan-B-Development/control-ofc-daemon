@@ -31,6 +31,9 @@ daemon/src/
     discovery.rs       — sensor enumeration + stable ID generation
     reader.rs          — temperature reading from sysfs
     types.rs           — SensorKind, SensorReading, SensorDescriptor
+    inventory.rs       — structured read-only hwmon inventory: temps + PWM headers + monitor-only tachometers (DEC-200)
+    classify.rs        — refines each temp sensor's CPU/motherboard classification for the inventory (DEC-200)
+    readiness.rs       — turns the inventory into an actionable hardware-readiness list (DEC-200)
     pwm_discovery.rs   — PWM header discovery (fan outputs)
     pwm_control.rs     — HwmonPwmController + SysfsWriter trait
     lease.rs           — LeaseManager (exclusive write access)
@@ -43,8 +46,12 @@ daemon/src/
     nvml_sys.rs        — isolated unsafe FFI to libnvidia-ml.so.1 via libloading (the only NVIDIA unsafe, DEC-204)
     gpu_fan.rs         — PMFW fan curve read/write/reset
     kernel_warnings.rs — kernel-version regression catalog
-                          (RDNA3/4 hard hang on 6.19, R9700 SMU on 7.0)
+                          (RDNA3/4 hard hang on 6.18.x + 6.19.x; R9700/Navi48
+                          0x7551 SMU mismatch — device-scoped, not kernel-tied)
                           surfaced via /capabilities.amd_gpu.kernel_warnings
+    superio.rs         — passive Super-I/O chip detection (DMI + hwmon + /proc/modules + kmsg + ACPI evidence, DEC-202)
+    superio_probe.rs   — opt-in active /dev/port Super-I/O probe, off by default (DEC-203)
+    chip_db.rs         — Super-I/O chip → expected-driver knowledge base (DEC-202)
     util.rs            — shared sysfs path helpers
 
   health/
@@ -68,6 +75,7 @@ daemon/src/
       control.rs       — manual-override + fan-identify endpoints (DEC-163/166)
       config.rs        — runtime config endpoints (search dirs, startup delay)
       hw_diagnostics.rs — hardware diagnostics endpoint
+      inventory.rs     — /inventory/{hwmon,readiness,superio} reads + Super-I/O probe (DEC-200/202/203)
     responses.rs       — response structs (Serialize)
     calibration.rs     — OpenFan calibration sweep
     diagnostics.rs     — hardware-diagnostics scanning logic behind /diagnostics/hardware
@@ -248,6 +256,7 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 | GET | `/diagnostics/hardware` | Hardware readiness report (hwmon chips, GPU, thermal safety, kernel modules, ACPI conflicts, board info) |
 | GET | `/inventory/hwmon` | Read-only structured inventory: temp sensors (each with a fine `classification`/`confidence`/`rationale` + an advisory `default_cpu`), controllable PWM headers, and monitor-only fan tachometers (`fanN_input` with no matching `pwmN`) |
 | GET | `/inventory/readiness` | Structured hardware-readiness list (`items[]` with code/severity/component/action + blocks-flags; `overall` rollup). Read-only diagnose-and-guide |
+| GET | `/inventory/superio` | Passive Super-I/O chip detection report — DMI/hwmon/`/proc/modules`/kmsg/ACPI evidence → per-chip presence + allowlisted driver recommendations; `port_probe_available` flags the opt-in active probe. Read-only, never touches an I/O port (DEC-202) |
 
 As of 2.0.0 the profile engine is the **sole writer** (DEC-159/DEC-165); the GUI sends intent (activate / override / identify) and a few diagnostics calls — there is no bare PWM write surface.
 
@@ -292,6 +301,12 @@ subsystem — DEC-102 / DEC-130).
 |--------|------|---------|
 | POST | `/hwmon/{header_id}/verify` | Test PWM write effectiveness (~6s; daemon uses its own internal lease, detects BIOS/EC interference) |
 | POST | `/hwmon/rescan` | Re-enumerate hwmon devices and return fresh header list |
+
+### Write endpoints — inventory (opt-in active probe)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/inventory/superio/probe` | Opt-in active Super-I/O `/dev/port` probe (DEC-203) — a deliberate one-shot that identifies an UNBOUND chip so the user can be told which driver to load. Refuses unless `[detection] allow_port_probe` + `CAP_SYS_RAWIO`; skips ports claimed by a driver/ACPI; single-flight + 10 s cooldown. Returns the `/inventory/superio` shape enriched with probe hits |
 
 ### Write endpoints — profile / control / config
 

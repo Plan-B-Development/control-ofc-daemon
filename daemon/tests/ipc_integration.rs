@@ -355,6 +355,57 @@ async fn config_preferred_cpu_sensor_rejects_unknown_id() {
 }
 
 #[tokio::test]
+async fn inventory_superio_endpoint_returns_report() {
+    // GET /inventory/superio returns the passive detection report (DEC-202). With
+    // allow_port_probe=false (the test default) the active probe advertises as
+    // unavailable — the passive report itself is always present and structured.
+    let state = test_app_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/inventory/superio").await;
+    assert_eq!(status, 200);
+    assert_eq!(json["api_version"], 1);
+    assert!(json["chips"].is_array(), "report carries a chips array");
+    assert!(json["arch_supported"].is_boolean());
+    assert_eq!(
+        json["port_probe_available"], false,
+        "opt-in probe is off by default"
+    );
+    assert!(json["port_probe_reason"].is_string());
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn inventory_superio_probe_disabled_by_default() {
+    // POST /inventory/superio/probe with allow_port_probe=false must NOT touch a
+    // port: it returns 200 with the passive report, port_probe_available=false,
+    // and a note explaining the probe did not run (DEC-203).
+    let state = test_app_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_post(&path, "/inventory/superio/probe", &serde_json::json!({})).await;
+    assert_eq!(status, 200);
+    assert_eq!(json["port_probe_available"], false);
+    let notes = json["notes"].as_array().unwrap();
+    // Attribute the skip to the DISABLED CONFIG FLAG specifically (reason mentions
+    // allow_port_probe), not a hardware-unavailable open failure: both paths push
+    // an "Active port probe not run: {reason}" note, so the reason text is what
+    // proves the config gate fired rather than an EACCES on /dev/port.
+    assert!(
+        notes.iter().any(|n| {
+            let s = n.as_str().unwrap_or("");
+            s.contains("Active port probe not run") && s.contains("allow_port_probe")
+        }),
+        "the note must attribute the skip to the disabled config flag: {notes:?}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
 async fn sensors_endpoint_returns_readings() {
     let state = test_app_state();
     let (path, shutdown, _dir) = start_test_server(state).await;
@@ -469,6 +520,89 @@ async fn fans_endpoint_tags_intel_gpu_source_by_id_prefix() {
     assert_eq!(intel["rpm"], 1500);
     // Read-only: Intel never has a commanded PWM.
     assert!(intel.get("last_commanded_pwm").is_none());
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn sensors_endpoint_tags_nvidia_gpu_source() {
+    // DEC-204: a nouveau-backed NVIDIA GPU temperature reaches /sensors via the
+    // normal discovery pipeline (NOT read_nouveau_fan_states) and must serialize
+    // source "nvidia_gpu", kind "gpu_temp", chip_name "nouveau".
+    let state = test_app_state();
+    state.cache.update_sensors(vec![CachedSensorReading {
+        id: "nvidia_gpu:0000:01:00.0:temp".into(),
+        kind: SensorKind::GpuTemp,
+        label: "NVIDIA GPU".into(),
+        value_c: 42.0,
+        source: DeviceLabel::NvidiaGpu,
+        updated_at: Instant::now(),
+        rate_c_per_s: None,
+        session_min_c: None,
+        session_max_c: None,
+        chip_name: "nouveau".into(),
+        temp_type: None,
+        thresholds: None,
+    }]);
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/sensors").await;
+    assert_eq!(status, 200);
+    let sensors = json["sensors"].as_array().unwrap();
+    let nvidia = sensors
+        .iter()
+        .find(|s| s["id"] == "nvidia_gpu:0000:01:00.0:temp")
+        .expect("nvidia gpu temp present on /sensors");
+    assert_eq!(nvidia["source"], "nvidia_gpu");
+    assert_eq!(nvidia["kind"], "gpu_temp");
+    assert_eq!(nvidia["chip_name"], "nouveau");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn fans_endpoint_serializes_duty_pct_including_zero() {
+    // DEC-204: NVML-measured `duty_pct` must serialize even when 0 (only None is
+    // skipped by skip_serializing_if) and round-trip other values. Treating 0 as
+    // "absent" would hide a genuinely-stopped NVIDIA fan in the GUI.
+    let state = test_app_state();
+    state.cache.update_gpu_fans(vec![
+        AmdGpuFanState {
+            id: "nvidia_gpu:0000:01:00.0".into(),
+            rpm: Some(0),
+            last_commanded_pct: None,
+            duty_pct: Some(0),
+            updated_at: Instant::now(),
+        },
+        AmdGpuFanState {
+            id: "nvidia_gpu:0000:0a:00.0".into(),
+            rpm: Some(1400),
+            last_commanded_pct: None,
+            duty_pct: Some(33),
+            updated_at: Instant::now(),
+        },
+    ]);
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/fans").await;
+    assert_eq!(status, 200);
+    let fans = json["fans"].as_array().unwrap();
+    let zero = fans
+        .iter()
+        .find(|f| f["id"] == "nvidia_gpu:0000:01:00.0")
+        .unwrap();
+    assert_eq!(
+        zero["duty_pct"], 0,
+        "duty_pct=0 must serialize, not be omitted"
+    );
+    assert_eq!(zero["source"], "nvidia_gpu");
+    let some = fans
+        .iter()
+        .find(|f| f["id"] == "nvidia_gpu:0000:0a:00.0")
+        .unwrap();
+    assert_eq!(some["duty_pct"], 33);
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);

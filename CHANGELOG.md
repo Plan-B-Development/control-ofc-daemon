@@ -1,5 +1,49 @@
 # Changelog
 
+## [2.8.1] — 2026-07-09
+
+Post-release hardening for the DEC-200/202/203/204 features (audit 2026-07-08,
+Wave 1). Bugfix + docs + packaging + tests; no contract change, no new DEC. Pairs
+with `control-ofc-gui` ≥ v2.11.0 (unchanged).
+
+### Fixed
+- **The active Super-I/O probe no longer leaves a chip in config/unlock mode when
+  a DEVID read fails (DEC-203).** In `probe_base`, an `io::Error` from the DEVID
+  read after `ite_enter`/`nuvoton_enter` returned via `?` without running the
+  matching `*_exit`. A new RAII `SioExitGuard` (mirroring the `CalibrationGuard`
+  idiom) now issues the exit on every path out — including the error path — while
+  logging a failed exit write at `debug` rather than masking the original read
+  error. Regression tests cover both the ITE and Nuvoton legs.
+
+### Documentation
+- `daemon.md`: added the six missing `hwmon/` modules (`chip_db`, `classify`,
+  `inventory`, `readiness`, `superio`, `superio_probe`) and `api/handlers/
+  inventory.rs` to the module map; added `GET /inventory/superio` and `POST
+  /inventory/superio/probe` to the endpoint tables; corrected the
+  `kernel_warnings` summary (the RDNA3/4 hang spans kernel 6.18.x **and** 6.19.x;
+  the R9700 SMU mismatch is device-scoped to PCI 0x7551, not kernel-tied).
+- `docs/USER_GUIDE.md`: added NVIDIA GPU rows to the supported-hardware table
+  (read-only — `nouveau` temps + fan RPM, opt-in NVML temps + measured duty).
+- `daemon/README.md`: added a v2.8.0 upgrade note for the two opt-ins (NVML
+  telemetry, Super-I/O port probe) and their systemd drop-in examples.
+- `SECURITY.md`: documented the opt-in `/dev/port` (Super-I/O probe) and
+  `/dev/nvidia*` (NVML) device-access boundaries.
+
+### Packaging
+- PKGBUILD: added an `nvidia-utils` optdepend (the NVML runtime for the opt-in
+  telemetry; the open `nouveau` driver does not need it).
+- `.install`: `post_upgrade` now flags any hand-installed opt-in drop-in for
+  review against the updated example.
+- `daemon.toml.example`: reworded the top NOTE — the startup delay and profile
+  search dirs are admin-owned base defaults that `runtime.toml` overlays on API
+  write, not settings that live *only* in `runtime.toml`.
+
+### Tests
+- `ipc_integration`: added coverage for `GET /inventory/superio`, `POST
+  /inventory/superio/probe` (disabled-by-default), an NVIDIA `nvidia_gpu`
+  temperature on `/sensors`, and `duty_pct` wire serialization including the `0`
+  edge (only `None` is omitted).
+
 ## [2.8.0] — 2026-07-08
 
 NVIDIA GPU support — Phase 1 (read-only telemetry). Ships coordinated with GUI

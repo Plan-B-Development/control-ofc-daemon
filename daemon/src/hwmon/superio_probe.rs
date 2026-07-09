@@ -145,40 +145,88 @@ fn is_valid_family_devid(devid: u16) -> bool {
     devid != 0xffff && devid != 0x0000
 }
 
+/// RAII guard that issues the matching Super-I/O config-mode *exit* on drop, so
+/// a probe that dies mid-sequence (canonically the DEVID read erroring right
+/// after the unlock) can never leave the chip in unlock/config mode. Mirrors the
+/// `CalibrationGuard` idiom in `api/handlers/openfan.rs`.
+///
+/// Best-effort by necessity: `drop` cannot return a `Result`, so a failed exit
+/// write is logged at `debug` and swallowed — the caller still sees the original
+/// probe error (the read failure), which is the meaningful one to surface.
+struct SioExitGuard<'a> {
+    r: &'a dyn SuperIoPortReader,
+    base: u16,
+    vendor: SuperIoVendor,
+}
+
+impl Drop for SioExitGuard<'_> {
+    fn drop(&mut self) {
+        let exit = match self.vendor {
+            SuperIoVendor::Ite => ite_exit(self.r, self.base),
+            SuperIoVendor::Nuvoton => nuvoton_exit(self.r, self.base),
+            // The probe arms this guard only for ITE / Nuvoton — the two families
+            // with an unlock sequence here. No other vendor is ever put into
+            // config mode, so there is nothing to exit.
+            _ => return,
+        };
+        if let Err(e) = exit {
+            // A failed exit leaves the chip in config mode until reset — warn so
+            // it is visible above the default log level, not just at `debug`.
+            log::warn!(
+                "Super-I/O {:?} config-mode exit at base {:#06x} failed: {e}",
+                self.vendor,
+                self.base
+            );
+        }
+    }
+}
+
 /// Probe one already-confirmed-unclaimed base. Tries ITE first (short-circuits
 /// on a match so the wrong vendor's exit never runs on an identified chip), then
 /// the Nuvoton/Winbond family. Returns `Ok(None)` when nothing plausible
-/// responds. Each attempt does a clean enter/exit even on a miss.
+/// responds. Each vendor attempt arms a [`SioExitGuard`] right after its unlock,
+/// so the matching exit runs on every path out of the block — including an early
+/// `?` return when the DEVID read itself errors (DEC-203 config-mode-leak fix).
 fn probe_base(r: &dyn SuperIoPortReader, base: u16) -> io::Result<Option<ProbedChip>> {
     // ── ITE ──
-    ite_enter(r, base)?;
-    let devid = sio_devid(r, base)?;
-    if is_ite_devid(devid) {
-        ite_exit(r, base)?;
-        return Ok(Some(ProbedChip {
+    {
+        ite_enter(r, base)?;
+        let _exit = SioExitGuard {
+            r,
             base,
             vendor: SuperIoVendor::Ite,
-            devid,
-            chip_name: Some(format!("it{devid:04x}")),
-        }));
+        };
+        let devid = sio_devid(r, base)?;
+        if is_ite_devid(devid) {
+            return Ok(Some(ProbedChip {
+                base,
+                vendor: SuperIoVendor::Ite,
+                devid,
+                chip_name: Some(format!("it{devid:04x}")),
+            }));
+        }
     }
-    ite_exit(r, base)?;
 
     // ── Nuvoton / Winbond family ──
-    nuvoton_enter(r, base)?;
-    let devid = sio_devid(r, base)?;
-    let hit = if is_valid_family_devid(devid) {
-        Some(ProbedChip {
+    {
+        nuvoton_enter(r, base)?;
+        let _exit = SioExitGuard {
+            r,
             base,
             vendor: SuperIoVendor::Nuvoton,
-            devid,
-            chip_name: None,
-        })
-    } else {
-        None
-    };
-    nuvoton_exit(r, base)?;
-    Ok(hit)
+        };
+        let devid = sio_devid(r, base)?;
+        if is_valid_family_devid(devid) {
+            return Ok(Some(ProbedChip {
+                base,
+                vendor: SuperIoVendor::Nuvoton,
+                devid,
+                chip_name: None,
+            }));
+        }
+    }
+
+    Ok(None)
 }
 
 /// Probe each supplied base (the caller MUST pass only unclaimed bases). A probe
@@ -259,7 +307,7 @@ pub fn base_claimed(proc_ioports: &str, base: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     /// Fake port device: records every write, and answers reads from a map keyed
     /// by (port, current-index). Lets tests assert the exact protocol bytes and
@@ -275,6 +323,10 @@ mod tests {
         unlocked_by: Option<Vec<u8>>, // the exact enter bytes that unlock it
         selected: RefCell<u8>,
         entered: RefCell<Vec<u8>>,
+        /// Fault injection: succeed this many reads, then error on every read
+        /// after. `None` never fails. Exercises the exit-guard when a DEVID read
+        /// dies mid-sequence.
+        fail_read_after: Cell<Option<usize>>,
     }
 
     impl FakePort {
@@ -304,6 +356,7 @@ mod tests {
                 unlocked_by: None,
                 selected: RefCell::new(0),
                 entered: RefCell::new(Vec::new()),
+                fail_read_after: Cell::new(None),
             }
         }
         fn new(devid: u16, unlock: Vec<u8>) -> Self {
@@ -314,6 +367,7 @@ mod tests {
                 unlocked_by: Some(unlock),
                 selected: RefCell::new(0),
                 entered: RefCell::new(Vec::new()),
+                fail_read_after: Cell::new(None),
             }
         }
         fn is_unlocked(&self) -> bool {
@@ -328,6 +382,13 @@ mod tests {
                     .any(|w| w == seq.as_slice()),
             }
         }
+        /// Builder: succeed `ok_reads` reads, then error on every read after —
+        /// models a DEVID read that dies after the unlock, exercising the
+        /// [`SioExitGuard`] exit path.
+        fn failing_after(self, ok_reads: usize) -> Self {
+            self.fail_read_after.set(Some(ok_reads));
+            self
+        }
     }
 
     impl SuperIoPortReader for FakePort {
@@ -341,6 +402,13 @@ mod tests {
             Ok(())
         }
         fn read_port(&self, port: u16) -> io::Result<u8> {
+            // Optional fault injection: succeed `n` reads, then error — models a
+            // DEVID read that dies mid-sequence so the exit-guard path is taken.
+            match self.fail_read_after.get() {
+                Some(0) => return Err(io::Error::other("injected read failure")),
+                Some(n) => self.fail_read_after.set(Some(n - 1)),
+                None => {}
+            }
             // A register value must be read from the DATA port (base + 1, odd).
             // A read from the index port (even) is a protocol error and yields
             // nothing — so a regression that read the wrong port fails its test.
@@ -436,6 +504,58 @@ mod tests {
         // …and the final write is the Nuvoton exit's last byte (the base is left
         // clean, not mid-config).
         assert_eq!(writes.last(), Some(&(0x2f, 0x02)));
+    }
+
+    #[test]
+    fn probe_ite_devid_read_failure_still_exits_config_mode() {
+        // DEC-203 leak regression: if the DEVID read errors right after
+        // ite_enter, the SioExitGuard must still fire ite_exit. The pre-fix code
+        // returned via `?` without exiting, stranding the chip in unlock/config
+        // mode where nothing owns it.
+        let p = FakePort::ite(0x8688).failing_after(0);
+        let err = probe_base(&p, 0x2e).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::Other,
+            "the original read error still propagates to the caller"
+        );
+        let writes = p.writes.borrow();
+        assert!(
+            writes.windows(2).any(|w| w == [(0x2e, 0x02), (0x2f, 0x02)]),
+            "ITE exit (CR02) must run even when the DEVID read fails: {writes:?}"
+        );
+        assert_eq!(
+            writes.last(),
+            Some(&(0x2f, 0x02)),
+            "base left clean (exited), not mid-config"
+        );
+    }
+
+    #[test]
+    fn probe_nuvoton_devid_read_failure_still_exits_config_mode() {
+        // Same leak on the Nuvoton leg: the ITE leg misses (its two DEVID reads
+        // read a locked 0xffff), then the Nuvoton DEVID read (the 3rd read)
+        // errors — the guard must fire nuvoton_exit on the way out.
+        //
+        // `failing_after(2)` assumes the ITE leg performs exactly two port reads
+        // (sio_devid = hi @ 0x20 + lo @ 0x21). If sio_devid's read count ever
+        // changes, bump this — otherwise the fault would land on the ITE leg and
+        // silently stop exercising the Nuvoton guard.
+        let p = FakePort::nuvoton(0xd428).failing_after(2);
+        let err = probe_base(&p, 0x2e).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        let writes = p.writes.borrow();
+        assert!(
+            writes
+                .windows(3)
+                .any(|w| w == [(0x2e, 0xaa), (0x2e, 0x02), (0x2f, 0x02)]),
+            "Nuvoton exit must run even when its DEVID read fails: {writes:?}"
+        );
+        assert_eq!(
+            writes.last(),
+            Some(&(0x2f, 0x02)),
+            "base left clean (exited), not mid-config"
+        );
     }
 
     #[test]
