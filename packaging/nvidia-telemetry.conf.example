@@ -48,6 +48,13 @@ DeviceAllow=/dev/nvidia0 rw
 # DeviceAllow=/dev/nvidia1 rw
 # DeviceAllow=/dev/nvidia2 rw
 #
+# LD_LIBRARY_PATH: do NOT set it for this service. The daemon resolves
+# libnvidia-ml.so.1 from fixed absolute paths (/usr/lib, /usr/lib64,
+# /usr/lib/x86_64-linux-gnu) and finally the bare SONAME (DEC-205). The three
+# absolute paths are immune to LD_LIBRARY_PATH; only the bare-SONAME fallback is
+# susceptible, so leave LD_LIBRARY_PATH unset so the library search cannot be
+# redirected.
+#
 # MemoryDenyWriteExecute: pure NVML telemetry reads do NOT require W+X memory —
 # only the CUDA JIT compiler (libnvrtc.so) does, and this daemon never invokes
 # it. Standard NVML tools (nvidia-smi, nvtop) run fine under MDWE=true. Leave the

@@ -10,6 +10,7 @@ mod hw_diagnostics;
 mod hwmon_ctl;
 mod inventory;
 mod openfan;
+mod path_confine;
 mod profile;
 mod status;
 

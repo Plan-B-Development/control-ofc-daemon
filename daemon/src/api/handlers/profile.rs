@@ -76,7 +76,7 @@ pub async fn activate_profile_handler(
             );
         }
         drop(search_dirs); // release lock before potentially long operations
-        if !allowed.iter().any(|d| canonical.starts_with(d)) {
+        if !super::path_confine::path_is_within(&canonical, &allowed) {
             return error_response(
                 StatusCode::BAD_REQUEST,
                 &ErrorEnvelope::validation(

@@ -3,8 +3,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use axum::extract::connect_info::Connected;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
+use axum::serve::IncomingStream;
 use axum::Router;
 use tokio::net::UnixListener;
 
@@ -12,6 +14,32 @@ use super::handlers::{self, AppState};
 
 /// Error returned by [`serve`] when axum finishes unexpectedly.
 pub type ServeError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Peer credentials of a Unix-socket client, captured at connection-accept time
+/// and exposed to handlers as `ConnectInfo<UdsConnectInfo>` (DEC-205).
+///
+/// `uid` is the connecting process's effective user id read from `SO_PEERCRED`,
+/// or `None` when it could not be read. Handlers treat `None` as untrusted and
+/// fail closed. Consumed by `POST /config/profile-search-dirs` to confine a
+/// non-root caller's added search directories to its own home directory on
+/// multi-user hosts (the file-picker UX is preserved for single-user desktops
+/// and for root/CLI callers, which are exempt).
+#[derive(Clone, Debug)]
+pub struct UdsConnectInfo {
+    /// Effective uid of the peer, or `None` if `SO_PEERCRED` was unavailable.
+    pub uid: Option<u32>,
+}
+
+impl<'a> Connected<IncomingStream<'a, UnixListener>> for UdsConnectInfo {
+    fn connect_info(stream: IncomingStream<'a, UnixListener>) -> Self {
+        // `io()` yields the accepted `UnixStream`; `peer_cred()` reads
+        // SO_PEERCRED. A read failure degrades to `None` (fail-closed for the
+        // caller) rather than dropping the connection.
+        Self {
+            uid: stream.io().peer_cred().ok().map(|cred| cred.uid()),
+        }
+    }
+}
 
 /// Build the axum router with all endpoints.
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -161,12 +189,19 @@ pub async fn serve(
 
     let app = build_router(state);
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = shutdown.await;
-            log::info!("IPC server shutting down");
-        })
-        .await?;
+    // `into_make_service_with_connect_info` threads per-connection peer
+    // credentials (SO_PEERCRED) to handlers via `ConnectInfo<UdsConnectInfo>`
+    // (DEC-205). The stock `UnixListener` already implements axum's `Listener`,
+    // so no custom listener is needed — only the connect-info make-service.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<UdsConnectInfo>(),
+    )
+    .with_graceful_shutdown(async {
+        let _ = shutdown.await;
+        log::info!("IPC server shutting down");
+    })
+    .await?;
 
     // Clean up socket file on clean shutdown.
     let path = Path::new(&socket_path);

@@ -1,5 +1,32 @@
 # Changelog
 
+## [2.9.0] — 2026-07-10
+
+Security + hardening follow-up from the 2026-07-08 audit (Wave 2, DEC-205). No
+breaking changes; pairs with `control-ofc-gui` ≥ v2.11.1 (unchanged — the GUI
+already surfaces the daemon's message).
+
+### Security
+- **`POST /config/profile-search-dirs` is now peer-uid-confined (DEC-205).** On a
+  multi-user host, a non-root client could previously register any absolute
+  directory as a profile search path. The daemon now reads the connecting
+  peer's uid from `SO_PEERCRED` (threaded through axum via
+  `into_make_service_with_connect_info`) and, for a non-root caller, only
+  accepts directories that exist and canonicalize to within that user's own
+  home directory (closing symlink/`..` escapes). Root and CLI callers stay
+  unrestricted; an unresolvable uid or home fails closed. The file-picker UX for
+  single-user desktops is unchanged.
+
+### Changed
+- **NVML is loaded from absolute paths first (DEC-205).** `libnvidia-ml.so.1` is
+  now resolved by trying `/usr/lib`, `/usr/lib64`, then
+  `/usr/lib/x86_64-linux-gnu`, falling back to the bare SONAME last, so a
+  hardened service with a minimal linker search path still finds it. The three
+  absolute-path candidates are immune to `LD_LIBRARY_PATH` redirection; only the
+  bare-SONAME fallback remains susceptible, so `LD_LIBRARY_PATH` must not be set
+  for the service. Still gated behind `enable_nvidia_telemetry` (off by default);
+  no new config key.
+
 ## [2.8.1] — 2026-07-09
 
 Post-release hardening for the DEC-200/202/203/204 features (audit 2026-07-08,

@@ -2,12 +2,13 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 
 use super::{error_response, AppState};
 use crate::api::responses::*;
+use crate::api::server::UdsConnectInfo;
 
 /// POST /config/profile-search-dirs — add directories to the profile search path.
 ///
@@ -21,6 +22,7 @@ use crate::api::responses::*;
 /// config split.
 pub async fn update_profile_search_dirs_handler(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<UdsConnectInfo>,
     Json(body): Json<serde_json::Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let add = body.get("add").and_then(|v| v.as_array()).map(|arr| {
@@ -52,6 +54,29 @@ pub async fn update_profile_search_dirs_handler(
             );
         }
     }
+
+    // Multi-user confinement (DEC-205): a non-root client may only add search
+    // directories that exist within its own home directory. Root/CLI callers
+    // are exempt. The peer uid comes from SO_PEERCRED via the connect-info
+    // layer; an unresolvable uid/home fails closed.
+    if let Err(msg) = super::path_confine::confine_added_dirs(
+        &new_dirs,
+        peer.uid,
+        super::path_confine::home_dir_for_uid,
+    ) {
+        return error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(msg));
+    }
+
+    // NOTE (DEC-205 residual, security review F1): confinement above validates the
+    // *canonical* dir at add-time, but we store the raw path (below) and
+    // `activate_profile_handler` re-canonicalizes stored search dirs at use-time.
+    // A caller who later swaps an approved in-home dir for a symlink out of their
+    // home can thus redirect it. Accepted as a bounded residual: activation
+    // validates the profile schema and never returns file contents, and any fan
+    // output is clamped by the safety floors — the caller gains nothing they
+    // cannot already do inside their own home. Fully closing it needs use-time
+    // peer-uid confinement of activation (a change to the pre-existing activation
+    // path), deferred as out of Wave-2 scope.
 
     // Merge with existing dirs (dedup, always keep /etc/control-ofc/profiles)
     let mut merged: Vec<String> = {

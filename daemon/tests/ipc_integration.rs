@@ -2671,3 +2671,61 @@ async fn save_profile_failure_message_omits_internal_path() {
         "client message must not leak a path: {msg}"
     );
 }
+
+/// DEC-205: peer-uid confinement of `POST /config/profile-search-dirs`.
+///
+/// The request travels over the real Unix socket, so the handler sees the test
+/// process's own uid via `SO_PEERCRED`. A non-root caller adding a directory
+/// outside its home is rejected with `400 validation_error` *before* any
+/// persistence — proving the peer uid is delivered end-to-end and confinement
+/// fires. Root is exempt (it bypasses confinement and then hits the test's
+/// unwritable runtime path), so it is asserted only to NOT be the confinement
+/// 400.
+#[tokio::test]
+async fn profile_search_dirs_confines_non_root_to_home() {
+    let state = test_app_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    // `/tmp` exists (so canonicalize succeeds) but is not within any user's home.
+    let (status, json) = uds_post(
+        &path,
+        "/config/profile-search-dirs",
+        &serde_json::json!({ "add": ["/tmp"] }),
+    )
+    .await;
+
+    // SAFETY: getuid() takes no arguments and always succeeds.
+    let uid = unsafe { libc::getuid() };
+    if uid == 0 {
+        // Root is exempt from confinement, so it falls through to the persist
+        // step — which fails against this test state's empty runtime path,
+        // yielding 503. The point: root is NEVER the confinement 400, and it
+        // clearly reached persistence (proving the exemption fired).
+        assert_eq!(
+            status, 503,
+            "root must bypass confinement and reach persistence: {json}"
+        );
+        assert_eq!(json["error"]["code"], "persistence_failed");
+    } else {
+        assert_eq!(
+            status, 400,
+            "non-root out-of-home dir must be rejected: {json}"
+        );
+        assert_eq!(json["error"]["code"], "validation_error");
+        // The message must come from the home-confinement logic specifically —
+        // "within your home directory …" (home resolved, /tmp is outside) or, in
+        // an exotic passwd-less env, "cannot resolve the home directory …". Both
+        // contain "home directory"; the None-uid fail-closed branch ("cannot
+        // identify the requesting user") and any generic pre-filter 400 do NOT.
+        // This proves the peer uid reached the handler AND the confinement path
+        // executed end-to-end, not merely that some 400 occurred.
+        let msg = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("home directory"),
+            "expected a home-confinement rejection reached via SO_PEERCRED, got: {msg}"
+        );
+    }
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}

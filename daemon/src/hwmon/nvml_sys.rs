@@ -202,6 +202,44 @@ pub struct NvmlLib {
     driver_version: Option<PfnDriverVer>,
 }
 
+/// Ordered load candidates for `libnvidia-ml.so.1` (DEC-205).
+///
+/// Absolute paths of the common multilib install locations come first — so the
+/// library resolves even when the dynamic linker's default search path is
+/// minimal (as under a hardened systemd service) — with the bare SONAME last so
+/// a nonstandard prefix still loads via `ld.so`. Pure (no I/O) so the ordering
+/// can be unit-tested; `LD_LIBRARY_PATH` must not be set for the service, since
+/// this list is the trusted resolution order.
+fn nvml_library_candidates() -> [&'static str; 4] {
+    [
+        "/usr/lib/libnvidia-ml.so.1",
+        "/usr/lib64/libnvidia-ml.so.1",
+        "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1",
+        "libnvidia-ml.so.1",
+    ]
+}
+
+/// Try each [`nvml_library_candidates`] entry in order, returning the first that
+/// loads. Every candidate failing is the normal case on a non-NVIDIA host and
+/// surfaces as [`NvmlError::Load`] carrying the last loader error.
+fn load_nvml_library() -> Result<Library, NvmlError> {
+    let mut last_err = None;
+    for candidate in nvml_library_candidates() {
+        // SAFETY: loading a shared library runs its initializers.
+        // `libnvidia-ml.so.1` is the stable versioned SONAME of NVIDIA's own
+        // runtime library; each candidate is a fixed absolute path or that
+        // SONAME — never operator-controlled — and only reached after the
+        // operator opts in (`enable_nvidia_telemetry`).
+        match unsafe { Library::new(candidate) } {
+            Ok(lib) => return Ok(lib),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(NvmlError::Load(
+        last_err.expect("candidate list is non-empty"),
+    ))
+}
+
 impl NvmlLib {
     /// Load `libnvidia-ml.so.1` and resolve the read-only symbol set.
     ///
@@ -209,10 +247,10 @@ impl NvmlLib {
     /// a non-NVIDIA system) and `NvmlError::Symbol` when a *required* symbol is
     /// missing. The optional per-fan-RPM symbol is resolved best-effort.
     pub fn load() -> Result<Self, NvmlError> {
-        // SAFETY: loading a shared library runs its initializers. `libnvidia-ml.so.1`
-        // is the stable versioned SONAME of NVIDIA's own runtime library; we load
-        // it by fixed name only when the operator has opted in.
-        let lib = unsafe { Library::new("libnvidia-ml.so.1") }.map_err(NvmlError::Load)?;
+        // Absolute multilib paths first, then the bare SONAME (DEC-205) — see
+        // `load_nvml_library` / `nvml_library_candidates` for the safety argument
+        // and rationale.
+        let lib = load_nvml_library()?;
 
         // SAFETY: each symbol is resolved (via `resolve`) with the exact C
         // signature from nvml.h, cross-verified against nvml-wrapper-sys
@@ -398,6 +436,34 @@ impl NvmlLib {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nvml_library_candidates_are_absolute_first_then_soname() {
+        let candidates = nvml_library_candidates();
+        // Exact ordering is the contract (DEC-205): specific multilib paths
+        // first so a hardened service still resolves the library, bare SONAME
+        // last as the ld.so-search fallback.
+        assert_eq!(
+            candidates,
+            [
+                "/usr/lib/libnvidia-ml.so.1",
+                "/usr/lib64/libnvidia-ml.so.1",
+                "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1",
+                "libnvidia-ml.so.1",
+            ]
+        );
+        // Structural invariant, independent of the exact paths above: every
+        // candidate but the last is absolute; the last is the bare SONAME.
+        let (soname, absolute) = candidates.split_last().unwrap();
+        assert!(
+            absolute.iter().all(|p| p.starts_with('/')),
+            "all but the last candidate must be absolute paths"
+        );
+        assert!(
+            !soname.starts_with('/'),
+            "the last candidate must be the bare SONAME fallback"
+        );
+    }
 
     #[test]
     fn pci_info_layout_is_68_bytes_repr_c() {
