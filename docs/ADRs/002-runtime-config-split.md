@@ -1,8 +1,10 @@
 # ADR-002: Runtime config split — `daemon.toml` vs `runtime.toml`
 
-**Status:** Accepted (v1.1.0; legacy parsing removed in v1.2.0).
-**Last reviewed:** 2026-05 (no change; PKGBUILD `post_upgrade` strips
-remaining legacy sections automatically).
+**Status:** Accepted (v1.1.0). The originally-planned v1.2.0 removal of legacy
+`[profiles]` / `[startup]` parsing was **superseded** — those sections are
+retained as valid admin-layer *defaults* (the base layer that `runtime.toml`
+overlays), parsed and never a parse error. See `daemon.md` for the current state.
+**Last reviewed:** 2026-07.
 
 > **Status as of v1.6.x:** This ADR is now historical for migration
 > purposes — the v1.0 → v1.1 → v1.2 transition has been baked into the
@@ -24,7 +26,9 @@ The daemon has two kinds of configuration:
    restarts. These are currently:
    - `[profiles] search_dirs` (mutated by
      `POST /config/profile-search-dirs`);
-   - `[startup] delay_secs` (mutated by `POST /config/startup-delay`).
+   - `[startup] delay_secs` (mutated by `POST /config/startup-delay`);
+   - `[hardware] preferred_cpu_sensor` / `preferred_mb_sensor` (mutated by
+     `POST /config/preferred-cpu-sensor` / `-mb-sensor`; DEC-200).
 
 In v1.0.x both kinds lived in a single file at
 `/etc/control-ofc/daemon.toml`. The daemon's `POST /config/*`
@@ -79,16 +83,19 @@ On startup:
 
 ### Migration (1.0.x → 1.1.x → 1.2.0)
 
-- **1.1.x**: still parses `[profiles]` and `[startup]` from
-  `daemon.toml` for backward compatibility. On first start after
-  upgrade, the daemon copies those sections into `runtime.toml` if the
-  runtime file does not already contain them. The legacy sections in
-  `daemon.toml` are not deleted by the daemon — that would violate
-  the rule above — but they are shadowed.
-- **1.2.0+**: parsing `[profiles]` / `[startup]` from `daemon.toml` is
-  a hard error at startup. The PKGBUILD's `post_upgrade` function
-  (`_strip_legacy_runtime_sections`) auto-removes them on package
-  upgrade and saves a backup at `daemon.toml.pre-1.1.2.bak`.
+- **1.1.x**: `[profiles]` and `[startup]` in `daemon.toml` are parsed as the
+  base admin-layer defaults; `runtime.toml` overlays them when an API call
+  mutates a runtime-mutable key. The daemon never deletes the `daemon.toml`
+  sections and — contrary to an earlier draft of this ADR — does **not** copy
+  them into `runtime.toml`: the two files simply coexist.
+- **1.2.0+ (plan superseded)**: the original plan was to make parsing
+  `[profiles]` / `[startup]` from `daemon.toml` a hard error at startup,
+  auto-stripped by a PKGBUILD `post_upgrade`. That was **not** shipped. The
+  sections remain valid admin-layer defaults — `config.rs` still parses them
+  (guarded by the `parse_profiles_section` / `parse_startup_delay_section`
+  tests) and they never become a parse error. See `daemon.md` §
+  "`daemon.toml` `[profiles]` / `[startup]` vs `runtime.toml`" for the
+  authoritative current behaviour.
 
 ## Consequences
 

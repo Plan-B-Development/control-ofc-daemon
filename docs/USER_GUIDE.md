@@ -158,6 +158,9 @@ including request/response shapes.
 | `GET /profiles`, `GET /profiles/{id}` | List stored profiles / fetch one full profile document (daemon is the store of record — DEC-160) |
 | `GET /profile/active` | Current active profile or `{"active": false}` |
 | `GET /diagnostics/hardware` | **The central troubleshooting endpoint.** Hardware readiness report — hwmon chips, GPU detection, thermal-safety state, kernel modules, ACPI conflicts, board info, kernel warnings. Use this first when something looks wrong. |
+| `GET /inventory/hwmon` | Structured hwmon inventory — temps, fan tachs, PWM metadata (DEC-200) |
+| `GET /inventory/readiness` | Hardware-readiness items with blocking flags (DEC-200) |
+| `GET /inventory/superio` | Passive Super-I/O chip detection (DEC-202) |
 
 ### Write
 
@@ -193,6 +196,9 @@ As of 2.0.0 the profile engine is the **sole writer** (DEC-159 / DEC-165) — th
 | `POST /gpu/{gpu_id}/fan/verify` | Behavioural test of GPU fan-control effectiveness; ~6 s, no lease (DEC-120). Drives a test speed biased upward, reads back the applied PMFW `fan_curve`/`pwm1` + RPM, then restores. Detects the silent failures static checks miss (`ppfeaturemask` bit 14 unset, SMU mismatch, BIOS overdrive lock). |
 | `POST /config/profile-search-dirs` | Add directories to the profile search path (immediate; persists to `runtime.toml`) |
 | `POST /config/startup-delay` | Set startup-delay seconds (persisted to `runtime.toml`, takes effect on restart) |
+| `POST /inventory/superio/probe` | Opt-in active Super-I/O `/dev/port` probe — off by default, needs `allow_port_probe` (DEC-203) |
+| `POST /config/preferred-cpu-sensor` | Persist the preferred CPU temp sensor (persists to `runtime.toml`; DEC-200) |
+| `POST /config/preferred-mb-sensor` | Persist the preferred motherboard temp sensor (persists to `runtime.toml`; DEC-200) |
 
 **Retired at 2.0.0 (DEC-165):** the bare PWM writes (`/fans/openfan/{ch}/pwm`, `/fans/openfan/pwm`, `/hwmon/{id}/pwm`, `/gpu/{id}/fan/pwm`), `/fans/openfan/{ch}/target_rpm`, and the entire lease surface (`POST /hwmon/lease/take` / `/release` / `/renew` and `GET /hwmon/lease/status`). The daemon engine is the sole writer and self-leases.
 
@@ -412,7 +418,7 @@ While a profile is active the profile engine is the **sole writer** of every bac
 Configuration is split between two files (see `docs/ADRs/002-runtime-config-split.md`):
 
 - **`/etc/control-ofc/daemon.toml`** — admin-owned, hand-edited. Contains static topology: serial port, polling interval, socket path, state directory. Never rewritten by the daemon.
-- **`/var/lib/control-ofc/runtime.toml`** — daemon-managed. Contains settings that API endpoints mutate at runtime: profile search directories and startup delay. Written with 0600 permissions via atomic rename.
+- **`/var/lib/control-ofc/runtime.toml`** — daemon-managed. Contains settings that API endpoints mutate at runtime: profile search directories, startup delay, and the preferred CPU/motherboard temp sensors (DEC-200). Written with 0600 permissions via atomic rename.
 
 On startup the daemon loads `daemon.toml`, then overlays `runtime.toml` on top (runtime values win). `SIGHUP` / `systemctl reload` re-reads both files, but only the **profile search directories** are applied live — changes to the startup delay, serial port, polling interval, or socket path are read but take effect only on the next restart.
 

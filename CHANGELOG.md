@@ -1,6 +1,6 @@
 # Changelog
 
-## [2.9.0] — 2026-07-10
+## [2.9.0] — 2026-07-11
 
 Security + hardening follow-up from the 2026-07-08 audit (Wave 2, DEC-205). No
 breaking changes; pairs with `control-ofc-gui` ≥ v2.11.1 (unchanged — the GUI

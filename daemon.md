@@ -76,6 +76,7 @@ daemon/src/
       config.rs        — runtime config endpoints (search dirs, startup delay)
       hw_diagnostics.rs — hardware diagnostics endpoint
       inventory.rs     — /inventory/{hwmon,readiness,superio} reads + Super-I/O probe (DEC-200/202/203)
+      path_confine.rs  — SO_PEERCRED search-dir confinement predicate (DEC-205)
     responses.rs       — response structs (Serialize)
     calibration.rs     — OpenFan calibration sweep
     diagnostics.rs     — hardware-diagnostics scanning logic behind /diagnostics/hardware
@@ -211,8 +212,9 @@ Configuration lives in two files (see `docs/ADRs/002-runtime-config-split.md`):
 - **Runtime config** — `{state_dir}/runtime.toml`
   (default `/var/lib/control-ofc/runtime.toml`).
   Managed by the daemon. Holds the keys that API endpoints mutate at
-  runtime: `[profiles] search_dirs`, `[startup] delay_secs`. Written with
-  0600 permissions via atomic tmp+rename.
+  runtime: `[profiles] search_dirs`, `[startup] delay_secs`, and
+  `[hardware] preferred_cpu_sensor` / `preferred_mb_sensor` (DEC-200). Written
+  with 0600 permissions via atomic tmp+rename.
 
 On startup the daemon loads `daemon.toml`, then overlays `runtime.toml` on
 top; runtime values win. SIGHUP re-reads both and re-applies the overlay.

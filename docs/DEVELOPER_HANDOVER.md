@@ -35,6 +35,8 @@ daemon/                     Rust crate (control-ofc-daemon)
         control.rs          Manual-override + fan-identify handlers (DEC-163/166)
         config.rs           Runtime config handlers
         hw_diagnostics.rs   Hardware diagnostics handler
+        inventory.rs        /inventory/{hwmon,readiness,superio} reads + Super-I/O probe (DEC-200/202/203)
+        path_confine.rs     SO_PEERCRED search-dir confinement predicate (DEC-205)
       responses.rs          JSON response/request types (v1 schema)
       server.rs             Unix socket server lifecycle
       calibration.rs        OpenFan calibration sweep
@@ -64,6 +66,12 @@ daemon/                     Rust crate (control-ofc-daemon)
                             Matches running kernel against published amdgpu
                             regressions; surfaced via
                             /capabilities.amd_gpu.kernel_warnings.
+      inventory.rs          Structured hwmon inventory (temps, fans, PWM metadata; DEC-200)
+      classify.rs           CPU/mobo sensor + PWM classification (DEC-200)
+      readiness.rs          Hardware-readiness item computation (DEC-200)
+      chip_db.rs            Super-I/O chip + Gigabyte dual-chip board database (DEC-202)
+      superio.rs            Passive Super-I/O detection (DEC-202)
+      superio_probe.rs      Opt-in active /dev/port Super-I/O probe (DEC-203)
       util.rs               Shared sysfs path helpers
     serial/
       protocol.rs           OpenFanController protocol encode/decode
@@ -141,6 +149,9 @@ sudo systemctl enable --now control-ofc-daemon
 | `GET /profiles`, `GET /profiles/{id}` | Daemon-stored profiles (store of record, DEC-160) |
 | `GET /profile/active` | Currently active profile info |
 | `GET /diagnostics/hardware` | Hardware readiness: hwmon chips, GPU detection, thermal-safety state, kernel modules, ACPI conflicts, board info, kernel warnings |
+| `GET /inventory/hwmon` | Structured hwmon inventory — temps, fan tachs, PWM metadata (DEC-200) |
+| `GET /inventory/readiness` | Readiness items (`blocks_monitoring`/`blocks_control`, `reboot_may_be_required`; DEC-200) |
+| `GET /inventory/superio` | Passive Super-I/O chip detection (DEC-202) |
 
 ### Write
 The profile engine is the **sole writer** as of 2.0.0 (DEC-159/DEC-165); the GUI sends intent + diagnostics calls. Bare PWM/lease endpoints were retired (note below).
@@ -159,6 +170,9 @@ The profile engine is the **sole writer** as of 2.0.0 (DEC-159/DEC-165); the GUI
 | `POST /hwmon/rescan` | Re-enumerate hwmon devices |
 | `POST /config/profile-search-dirs` | Register additional profile search dirs (persists to `runtime.toml`) |
 | `POST /config/startup-delay` | Set startup delay seconds (persists to `runtime.toml`) |
+| `POST /inventory/superio/probe` | Opt-in active Super-I/O `/dev/port` probe (DEC-203) |
+| `POST /config/preferred-cpu-sensor` | Persist the preferred CPU temp sensor (DEC-200) |
+| `POST /config/preferred-mb-sensor` | Persist the preferred motherboard temp sensor (DEC-200) |
 
 **Retired at 2.0.0 (DEC-165):** bare PWM writes (`/fans/openfan/{ch}/pwm`, `/fans/openfan/pwm`, `/hwmon/{id}/pwm`, `/gpu/{id}/fan/pwm`), `/fans/openfan/{ch}/target_rpm`, and all `/hwmon/lease/*`.
 

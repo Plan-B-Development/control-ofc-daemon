@@ -114,7 +114,8 @@ Full build / install / CLI / environment reference lives in
 - **Three fan backends**: OpenFanController (serial/USB), motherboard hwmon (sysfs
   PWM), and AMD GPU (RDNA3+ PMFW fan curves, legacy hwmon PWM for pre-RDNA3).
 - **HTTP over Unix domain socket** at `/run/control-ofc/control-ofc.sock`, exposing
-  both snapshot reads (`/poll`) and a real-time SSE stream (`/events`).
+  snapshot reads (`/poll`) — the GUI's 1 Hz poll path (the unused `/events` SSE
+  stream was removed at v2.5.0, DEC-198).
 - **Thermal safety** is daemon-enforced: 105°C CPU trigger → all OpenFan and
   motherboard (hwmon) fans to 100%, 25°C hysteresis, 40% fallback when no CPU
   sensor reports for 5 cycles. GPU fans are excluded — AMD PMFW firmware owns
