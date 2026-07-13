@@ -22,7 +22,8 @@ use crate::hwmon::classify::{
 };
 use crate::hwmon::inventory::discover_monitor_only_fans;
 use crate::hwmon::readiness::{
-    build_readiness, overall_severity, superio_readiness_items, ReadinessInputs,
+    build_readiness, derive_rollup, overall_severity, superio_readiness_items, ReadinessInputs,
+    ReadinessItem, ReadinessSeverity,
 };
 use crate::hwmon::superio;
 use crate::hwmon::superio_probe;
@@ -178,6 +179,39 @@ pub async fn hwmon_readiness_handler(
 }
 
 fn build_readiness_response(state: &AppState) -> (StatusCode, Json<serde_json::Value>) {
+    let (overall, items) = compute_readiness(state);
+    // DEC-206: opening the readiness view is an authoritative refresh of the
+    // cached rollup, keeping the Dashboard health chip consistent with this list.
+    *state.readiness_rollup.lock() = Some(derive_rollup(overall, &items));
+    json_ok(
+        StatusCode::OK,
+        ReadinessResponse {
+            api_version: API_VERSION,
+            overall,
+            items,
+        },
+    )
+}
+
+/// Recompute the cached readiness rollup (DEC-206) from the current inventory and
+/// store it in `AppState`, so the next `/status` + `/poll` carries a fresh rollup
+/// for the Dashboard health chip. Calls [`compute_readiness`] — **expensive**
+/// (cache snapshot + `/sys/class/hwmon` walk + `runtime.toml` read + Super-I/O
+/// detect), so callers on an async task must wrap it in `spawn_blocking`. Invoked
+/// on discovery-changing events only (startup / rescan / preferred-sensor), never
+/// on the poll path. Read-only — never mutates hardware.
+pub fn refresh_readiness_rollup(state: &AppState) {
+    let (overall, items) = compute_readiness(state);
+    *state.readiness_rollup.lock() = Some(derive_rollup(overall, &items));
+}
+
+/// Compute the full readiness (overall severity + item list) from the live,
+/// read-only inventory. **Expensive** — clones the cache snapshot, walks
+/// `/sys/class/hwmon` for monitor-only fans, reads `runtime.toml`, and runs
+/// passive Super-I/O detection. Never mutates the system. Shared by the GET
+/// handler and [`refresh_readiness_rollup`]; keep it OFF the 1 Hz poll path
+/// (that path only clones the cached [`crate::hwmon::readiness::ReadinessRollup`]).
+fn compute_readiness(state: &AppState) -> (ReadinessSeverity, Vec<ReadinessItem>) {
     let now = std::time::Instant::now();
     let snap = state.cache.snapshot();
     let classified = classify_cache_sensors(&snap, now);
@@ -235,19 +269,12 @@ fn build_readiness_response(state: &AppState) -> (StatusCode, Json<serde_json::V
 
     let mut items = build_readiness(&inputs);
     // DEC-202: enrich with passive Super-I/O detection guidance, reusing this
-    // handler's cache snapshot so the two views never disagree.
+    // snapshot so the two views never disagree.
     let superio_report = detect_superio_from(state, &snap, now);
     items.extend(superio_readiness_items(&superio_report));
     let overall = overall_severity(&items);
 
-    json_ok(
-        StatusCode::OK,
-        ReadinessResponse {
-            api_version: API_VERSION,
-            overall,
-            items,
-        },
-    )
+    (overall, items)
 }
 
 // ── Super-I/O detection endpoint (DEC-202) ──────────────────────────

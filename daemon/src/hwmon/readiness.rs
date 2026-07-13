@@ -353,6 +353,67 @@ pub fn overall_severity(items: &[ReadinessItem]) -> ReadinessSeverity {
         .unwrap_or(ReadinessSeverity::Ok)
 }
 
+/// Compact readiness rollup mirrored onto `/status` + `/poll` (DEC-206) so the
+/// GUI Dashboard can show a single health chip without fetching the expensive
+/// `/inventory/readiness` list on the 1 Hz poll. Derived from the same
+/// [`ReadinessItem`] list the full endpoint returns, cached in `AppState`, and
+/// refreshed only on discovery-changing events (startup / rescan /
+/// preferred-sensor / readiness GET) — never recomputed on the poll path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReadinessRollup {
+    /// Rollup severity = the most severe item (see [`overall_severity`]).
+    pub overall: ReadinessSeverity,
+    /// Item counts by severity. `Ok` (positive) items are not counted — the
+    /// chip's "N to fix" is `critical + warning`.
+    pub critical: usize,
+    pub warning: usize,
+    pub info: usize,
+    /// The most-severe item's one-line summary + stable `code`, so the chip can
+    /// name the single most-important next step and deep-link to it. Both
+    /// omitted when `overall` is `Ok` (nothing to fix).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_code: Option<String>,
+}
+
+/// Derive the compact [`ReadinessRollup`] from the full item list. Pure.
+///
+/// `top_*` = the first item whose severity equals `overall`, skipping `Ok`
+/// (matches the GUI view's stable "most severe first" sort), so the chip's
+/// headline equals the merged tab's first actionable row. When `overall` is
+/// `Ok` there is nothing to fix ⇒ `top_*` are `None`.
+pub fn derive_rollup(overall: ReadinessSeverity, items: &[ReadinessItem]) -> ReadinessRollup {
+    let mut critical = 0;
+    let mut warning = 0;
+    let mut info = 0;
+    for it in items {
+        match it.severity {
+            ReadinessSeverity::Critical => critical += 1,
+            ReadinessSeverity::Warning => warning += 1,
+            ReadinessSeverity::Info => info += 1,
+            ReadinessSeverity::Ok => {}
+        }
+    }
+    let (top_summary, top_code) = if overall == ReadinessSeverity::Ok {
+        (None, None)
+    } else {
+        items
+            .iter()
+            .find(|it| it.severity == overall)
+            .map(|it| (Some(it.summary.clone()), Some(it.code.clone())))
+            .unwrap_or((None, None))
+    };
+    ReadinessRollup {
+        overall,
+        critical,
+        warning,
+        info,
+        top_summary,
+        top_code,
+    }
+}
+
 /// Map a passive Super-I/O detection report (DEC-202) into readiness items, so
 /// board-specific "your chip has no driver loaded" guidance surfaces in the
 /// existing readiness list alongside the generic `no_pwm_controls` item. Lives
@@ -672,5 +733,105 @@ mod tests {
             notes: vec![],
         };
         assert!(superio_readiness_items(&report).is_empty());
+    }
+
+    // ── ReadinessRollup / derive_rollup (DEC-206) ──
+
+    #[test]
+    fn derive_rollup_counts_and_top_from_readiness_list() {
+        // No CPU sensor (critical) + read-only PWM (warning) + unknown (info).
+        let items = build_readiness(&ReadinessInputs {
+            cpu_sensor_count: 0,
+            default_cpu_confident: None,
+            pwm_total: 3,
+            pwm_writable: 1,
+            unknown_sensor_count: 2,
+            ..Default::default()
+        });
+        let overall = overall_severity(&items);
+        let rollup = derive_rollup(overall, &items);
+        assert_eq!(rollup.overall, ReadinessSeverity::Critical);
+        // Deterministic for these inputs: cpu_sensor_missing (crit);
+        // pwm_read_only (warn); pwm_control_unverified + unknown_sensors_present
+        // (info); pwm_controls_present (ok, uncounted).
+        assert_eq!(rollup.critical, 1);
+        assert_eq!(rollup.warning, 1);
+        assert_eq!(rollup.info, 2);
+        // top_* = the first item at the overall (critical) severity.
+        assert_eq!(rollup.top_code.as_deref(), Some("cpu_sensor_missing"));
+        assert_eq!(
+            rollup.top_summary.as_deref(),
+            Some("No CPU temperature sensor detected")
+        );
+    }
+
+    #[test]
+    fn derive_rollup_top_is_first_item_at_overall_severity_skipping_ok() {
+        // ok, then two warnings — top must be the FIRST warning, not the ok item.
+        let items = vec![
+            ReadinessItem::new("ok_one", ReadinessSeverity::Ok, "cpu", "fine", "d".into()),
+            ReadinessItem::new(
+                "warn_one",
+                ReadinessSeverity::Warning,
+                "pwm",
+                "first warning",
+                "d".into(),
+            ),
+            ReadinessItem::new(
+                "warn_two",
+                ReadinessSeverity::Warning,
+                "pwm",
+                "second warning",
+                "d".into(),
+            ),
+        ];
+        let rollup = derive_rollup(overall_severity(&items), &items);
+        assert_eq!(rollup.overall, ReadinessSeverity::Warning);
+        assert_eq!(rollup.warning, 2);
+        assert_eq!(rollup.top_code.as_deref(), Some("warn_one"));
+        assert_eq!(rollup.top_summary.as_deref(), Some("first warning"));
+    }
+
+    #[test]
+    fn derive_rollup_all_ok_has_no_top_and_zero_issue_counts() {
+        let items = vec![
+            ReadinessItem::new(
+                "cpu_sensor_present",
+                ReadinessSeverity::Ok,
+                "cpu",
+                "s",
+                "d".into(),
+            ),
+            ReadinessItem::new(
+                "pwm_controls_present",
+                ReadinessSeverity::Ok,
+                "pwm",
+                "s",
+                "d".into(),
+            ),
+        ];
+        let rollup = derive_rollup(overall_severity(&items), &items);
+        assert_eq!(rollup.overall, ReadinessSeverity::Ok);
+        assert_eq!((rollup.critical, rollup.warning, rollup.info), (0, 0, 0));
+        assert!(rollup.top_summary.is_none());
+        assert!(rollup.top_code.is_none());
+    }
+
+    #[test]
+    fn derive_rollup_empty_is_ok_with_no_top() {
+        let rollup = derive_rollup(overall_severity(&[]), &[]);
+        assert_eq!(rollup.overall, ReadinessSeverity::Ok);
+        assert_eq!((rollup.critical, rollup.warning, rollup.info), (0, 0, 0));
+        assert!(rollup.top_code.is_none());
+    }
+
+    #[test]
+    fn rollup_serialises_lowercase_and_omits_top_when_none() {
+        let ok = derive_rollup(ReadinessSeverity::Ok, &[]);
+        let v = serde_json::to_value(&ok).unwrap();
+        assert_eq!(v["overall"], serde_json::json!("ok"));
+        assert_eq!(v["critical"], serde_json::json!(0));
+        assert!(v.get("top_summary").is_none());
+        assert!(v.get("top_code").is_none());
     }
 }

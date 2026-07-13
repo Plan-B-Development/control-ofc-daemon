@@ -52,6 +52,15 @@ pub struct StatusResponse {
     pub active_profile_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_profile_name: Option<String>,
+    /// Compact hardware-readiness rollup (DEC-206) for the GUI Dashboard health
+    /// chip: overall severity + per-severity counts + the most-severe item's
+    /// summary/code (for a deep-link). Cached in `AppState` and mirrored here so
+    /// the 1 Hz poll stays cheap — the full item list stays on
+    /// `/inventory/readiness`. Omitted by daemons predating DEC-206 (and until the
+    /// startup refresh runs), so a client treats an absent key as "no rollup" and
+    /// hides the chip (additive — API_VERSION unchanged).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<crate::hwmon::readiness::ReadinessRollup>,
 }
 
 /// One present-but-unreadable sensor on the `/status` + `/poll` surface
@@ -1566,6 +1575,7 @@ mod tests {
             unavailable_sensors: Vec::new(),
             active_profile_id: None,
             active_profile_name: None,
+            readiness: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["api_version"], 1);
@@ -1585,6 +1595,45 @@ mod tests {
         // DEC-194: active_profile_* omitted when no profile is active (additive).
         assert!(json.get("active_profile_id").is_none());
         assert!(json.get("active_profile_name").is_none());
+        // DEC-206: readiness rollup omitted when None (old daemon / pre-startup).
+        assert!(json.get("readiness").is_none());
+    }
+
+    #[test]
+    fn status_response_serializes_readiness_rollup_when_present() {
+        // DEC-206: the cached rollup rides /status (and /poll) for the Dashboard
+        // health chip. Present ⇒ overall + counts + top_* serialize.
+        use crate::hwmon::readiness::{ReadinessRollup, ReadinessSeverity};
+        let resp = StatusResponse {
+            api_version: API_VERSION,
+            daemon_version: "0.1.0".into(),
+            overall_status: "ok".into(),
+            subsystems: Vec::new(),
+            uptime_seconds: Some(1),
+            thermal_state: "normal".into(),
+            overrides: Vec::new(),
+            fan_identify: Vec::new(),
+            unavailable_sensors: Vec::new(),
+            active_profile_id: None,
+            active_profile_name: None,
+            readiness: Some(ReadinessRollup {
+                overall: ReadinessSeverity::Warning,
+                critical: 0,
+                warning: 2,
+                info: 1,
+                top_summary: Some("No motherboard PWM fan controls detected".into()),
+                top_code: Some("no_pwm_controls".into()),
+            }),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["readiness"]["overall"], "warning");
+        assert_eq!(json["readiness"]["warning"], 2);
+        assert_eq!(json["readiness"]["info"], 1);
+        assert_eq!(json["readiness"]["top_code"], "no_pwm_controls");
+        assert_eq!(
+            json["readiness"]["top_summary"],
+            "No motherboard PWM fan controls detected"
+        );
     }
 
     #[test]
@@ -1608,6 +1657,7 @@ mod tests {
             }],
             active_profile_id: None,
             active_profile_name: None,
+            readiness: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(

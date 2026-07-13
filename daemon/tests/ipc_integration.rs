@@ -81,6 +81,7 @@ fn test_app_state() -> Arc<AppState> {
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        readiness_rollup: Arc::new(parking_lot::Mutex::new(None)),
     })
 }
 
@@ -231,6 +232,77 @@ async fn status_and_poll_surface_active_profile() {
     let (_, poll) = uds_get(&path, "/poll").await;
     assert_eq!(poll["status"]["active_profile_id"], "silent");
     assert_eq!(poll["status"]["active_profile_name"], "Silent");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn status_and_poll_surface_readiness_rollup() {
+    // DEC-206: the compact readiness rollup is mirrored onto /status and /poll for
+    // the GUI Dashboard health chip. It is OMITTED until the rollup is cached
+    // (older daemon, or before the startup seed task runs), keeping the additive
+    // wire shape unchanged — a client treats an absent key as "no rollup" and
+    // hides the chip. Once cached, it rides both surfaces (same StatusResponse).
+    use control_ofc_daemon::hwmon::readiness::{ReadinessRollup, ReadinessSeverity};
+    let state = test_app_state();
+    let rollup_slot = state.readiness_rollup.clone();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    // Default: no cached rollup → key absent on /status and /poll's status.
+    let (status, json) = uds_get(&path, "/status").await;
+    assert_eq!(status, 200);
+    assert!(
+        json.get("readiness").is_none(),
+        "readiness rollup must be omitted when not yet cached"
+    );
+    let (_, poll) = uds_get(&path, "/poll").await;
+    assert!(poll["status"].get("readiness").is_none());
+
+    // Cache a rollup → it rides both surfaces with counts + the top item.
+    *rollup_slot.lock() = Some(ReadinessRollup {
+        overall: ReadinessSeverity::Warning,
+        critical: 0,
+        warning: 1,
+        info: 0,
+        top_summary: Some("No motherboard PWM fan controls detected".into()),
+        top_code: Some("no_pwm_controls".into()),
+    });
+    let (_, json) = uds_get(&path, "/status").await;
+    assert_eq!(json["readiness"]["overall"], "warning");
+    assert_eq!(json["readiness"]["warning"], 1);
+    assert_eq!(json["readiness"]["top_code"], "no_pwm_controls");
+    let (_, poll) = uds_get(&path, "/poll").await;
+    assert_eq!(poll["status"]["readiness"]["overall"], "warning");
+    assert_eq!(poll["status"]["readiness"]["top_code"], "no_pwm_controls");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn readiness_get_writes_through_to_poll_rollup() {
+    // DEC-206: GET /inventory/readiness caches the rollup as a side-effect, so the
+    // next /poll carries a `readiness` whose `overall` matches the full list — the
+    // write-through path (the daemon never recomputes readiness on the poll itself).
+    let state = test_app_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    // Before any readiness GET the rollup is not cached → absent on /poll.
+    let (_, poll) = uds_get(&path, "/poll").await;
+    assert!(poll["status"].get("readiness").is_none());
+
+    // GET the full readiness list — this side-effect-caches the rollup.
+    let (status, readiness) = uds_get(&path, "/inventory/readiness").await;
+    assert_eq!(status, 200);
+    let overall = readiness["overall"]
+        .as_str()
+        .expect("overall present")
+        .to_string();
+
+    // The next /poll now carries the rollup, with the same overall severity.
+    let (_, poll) = uds_get(&path, "/poll").await;
+    assert_eq!(poll["status"]["readiness"]["overall"], overall);
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
@@ -500,6 +572,7 @@ async fn fans_endpoint_tags_intel_gpu_source_by_id_prefix() {
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        readiness_rollup: Arc::new(parking_lot::Mutex::new(None)),
     });
     let (path, shutdown, _dir) = start_test_server(state).await;
 
@@ -652,6 +725,7 @@ fn test_app_state_with_nvidia_gpu(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        readiness_rollup: Arc::new(parking_lot::Mutex::new(None)),
     })
 }
 
@@ -912,6 +986,7 @@ fn test_app_state_with_hwmon() -> Arc<AppState> {
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        readiness_rollup: Arc::new(parking_lot::Mutex::new(None)),
     })
 }
 
@@ -1157,6 +1232,7 @@ fn test_app_state_with_unsupported_gpu(pci_bdf: &str) -> Arc<AppState> {
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        readiness_rollup: Arc::new(parking_lot::Mutex::new(None)),
     })
 }
 
@@ -1229,6 +1305,7 @@ fn test_app_state_with_read_only_gpu(pci_bdf: &str, pci_device_id: u16) -> Arc<A
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        readiness_rollup: Arc::new(parking_lot::Mutex::new(None)),
     })
 }
 
@@ -1506,6 +1583,7 @@ async fn deactivate_profile_resets_hwmon_coalescing() {
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        readiness_rollup: Arc::new(parking_lot::Mutex::new(None)),
     });
     let hwmon = state.hwmon_controller.clone().unwrap();
 
@@ -1618,6 +1696,7 @@ fn test_app_state_with_writable_pmfw_gpu(pci_bdf: &str) -> (Arc<AppState>, tempf
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        readiness_rollup: Arc::new(parking_lot::Mutex::new(None)),
     });
     (state, tmp)
 }
@@ -1786,6 +1865,7 @@ async fn hwmon_discovery_excludes_amdgpu_end_to_end_via_ipc() {
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        readiness_rollup: Arc::new(parking_lot::Mutex::new(None)),
     });
     let (path, shutdown, _dir) = start_test_server(state).await;
 
@@ -1845,6 +1925,7 @@ fn test_app_state_with_profile_dirs(dirs: Vec<std::path::PathBuf>) -> Arc<AppSta
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        readiness_rollup: Arc::new(parking_lot::Mutex::new(None)),
     })
 }
 

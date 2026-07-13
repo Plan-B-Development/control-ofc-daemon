@@ -786,6 +786,8 @@ async fn main() {
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: config.detection.allow_port_probe,
+        // DEC-206: seeded by the rollup task below once the poll cache is warm.
+        readiness_rollup: Arc::new(parking_lot::Mutex::new(None)),
     });
 
     // Silence "assigned but not read" — runtime_cfg is consumed by the
@@ -848,6 +850,35 @@ async fn main() {
         )
         .await;
     });
+
+    // ── DEC-206: seed the readiness rollup for the Dashboard health chip ──
+    // Recompute the compact rollup once the poll loop's first tick has filled the
+    // sensor cache, so the chip reflects real hardware (not a false "no CPU
+    // sensor" against an empty cache) from the user's first poll. Decoupled from
+    // the hot poll loop; later refreshes ride the preferred-sensor and
+    // readiness-GET handlers (a rescan-driven update rides the GUI's post-rescan
+    // readiness GET). Bounded wait, then compute regardless — a genuinely
+    // sensorless host still gets a (critical) rollup.
+    {
+        let seed_state = app_state.clone();
+        let seed_interval = hwmon_interval;
+        tokio::spawn(async move {
+            for _ in 0..30u32 {
+                if !seed_state.cache.snapshot().sensors.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(seed_interval).await;
+            }
+            let s = seed_state.clone();
+            if let Err(e) = tokio::task::spawn_blocking(move || {
+                control_ofc_daemon::api::handlers::refresh_readiness_rollup(&s)
+            })
+            .await
+            {
+                log::warn!("readiness rollup seed task failed: {e}");
+            }
+        });
+    }
 
     // ── Spawn OpenFanController polling loop ────────────────────────
     let openfan_poll_handle = if let Some(transport) = openfan_transport {

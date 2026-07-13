@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.10.0] — 2026-07-13
+
+Additive hardware-readiness rollup on the poll surface for the GUI's new Dashboard
+cooling-readiness health chip (DEC-206). No breaking changes; pairs with
+`control-ofc-gui` ≥ v2.12.0 (older GUIs ignore the new field).
+
+### Added
+- **Compact readiness rollup on `/status` + `/poll` (DEC-206).** `StatusResponse`
+  gains an optional `readiness` object — `{overall, critical, warning, info,
+  top_summary, top_code}` — derived from the same items `/inventory/readiness`
+  returns. It is cached in `AppState` and refreshed only on discovery-changing
+  events (startup, a preferred-sensor change, and each `/inventory/readiness`
+  GET), so the 1 Hz poll only clones a small struct: `build_readiness` stays pure
+  and the expensive readiness scan (cache snapshot + sysfs walk + `runtime.toml`
+  read + Super-I/O detect) never runs on the hot path. Omitted by daemons
+  predating the field (and until the startup seed runs), so the wire shape is
+  unchanged for older clients.
+
 ## [2.9.0] — 2026-07-11
 
 Security + hardening follow-up from the 2026-07-08 audit (Wave 2, DEC-205). No

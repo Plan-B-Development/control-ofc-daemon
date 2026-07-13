@@ -215,6 +215,15 @@ pub struct AppState {
     /// (`[detection] allow_port_probe`). Off by default; the probe also needs the
     /// `CAP_SYS_RAWIO` drop-in to actually function.
     pub allow_port_probe: bool,
+    /// Cached compact readiness rollup (DEC-206) mirrored onto `/status` + `/poll`
+    /// for the GUI Dashboard health chip. `None` until the first refresh (at
+    /// startup, after discovery). Recomputed only on discovery-changing events
+    /// (startup seed, a preferred-sensor change, and each `/inventory/readiness`
+    /// GET; a rescan-driven update rides the post-rescan readiness GET) via
+    /// [`refresh_readiness_rollup`], so `build_status_response` only clones this
+    /// small struct on the 1 Hz poll — it never re-runs the expensive readiness
+    /// scan (cache snapshot + sysfs walk + disk read + Super-I/O detect).
+    pub readiness_rollup: Arc<Mutex<Option<crate::hwmon::readiness::ReadinessRollup>>>,
 }
 
 /// RAII guard that clears the profile engine's verify pause on drop (DEC-165),
@@ -323,6 +332,12 @@ pub(crate) fn build_status_response(
         .map(|p| (Some(p.id.clone()), Some(p.name.clone())))
         .unwrap_or((None, None));
 
+    // DEC-206: mirror the cached readiness rollup for the GUI Dashboard chip.
+    // Cheap — clones a small `Option<ReadinessRollup>` under a tight lock (no
+    // sysfs/disk; the rollup is refreshed off the poll path). Independent lock,
+    // taken and released within this statement, so lock order is preserved.
+    let readiness = state.readiness_rollup.lock().clone();
+
     StatusResponse {
         api_version: API_VERSION,
         daemon_version: state.daemon_version.clone(),
@@ -340,6 +355,7 @@ pub(crate) fn build_status_response(
         unavailable_sensors,
         active_profile_id,
         active_profile_name,
+        readiness,
     }
 }
 

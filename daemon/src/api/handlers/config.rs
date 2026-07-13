@@ -263,7 +263,9 @@ pub async fn update_preferred_cpu_sensor_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    set_preferred_sensor(&state, &body, PreferredSensorRole::Cpu)
+    let resp = set_preferred_sensor(&state, &body, PreferredSensorRole::Cpu);
+    refresh_rollup_if_ok(&state, resp.0);
+    resp
 }
 
 /// POST /config/preferred-mb-sensor — set/clear the preferred motherboard sensor (Phase 5).
@@ -271,5 +273,25 @@ pub async fn update_preferred_mb_sensor_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    set_preferred_sensor(&state, &body, PreferredSensorRole::Mb)
+    let resp = set_preferred_sensor(&state, &body, PreferredSensorRole::Mb);
+    refresh_rollup_if_ok(&state, resp.0);
+    resp
+}
+
+/// DEC-206: after a successful preferred-sensor change, recompute the cached
+/// readiness rollup on the blocking pool so the Dashboard health chip's
+/// `selected_*_sensor_missing` state updates within a poll. Fire-and-forget — the
+/// response does not depend on it and the change is already persisted.
+fn refresh_rollup_if_ok(state: &Arc<AppState>, status: StatusCode) {
+    if status == StatusCode::OK {
+        let s = state.clone();
+        // Await the blocking join in a lightweight task so a panic in the refresh
+        // is logged rather than silently lost (mirrors the startup seed task).
+        let handle = tokio::task::spawn_blocking(move || super::refresh_readiness_rollup(&s));
+        tokio::spawn(async move {
+            if let Err(e) = handle.await {
+                log::warn!("readiness rollup refresh after preferred-sensor change failed: {e}");
+            }
+        });
+    }
 }
