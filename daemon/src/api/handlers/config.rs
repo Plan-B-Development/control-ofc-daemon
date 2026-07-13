@@ -285,13 +285,12 @@ pub async fn update_preferred_mb_sensor_handler(
 fn refresh_rollup_if_ok(state: &Arc<AppState>, status: StatusCode) {
     if status == StatusCode::OK {
         let s = state.clone();
-        // Await the blocking join in a lightweight task so a panic in the refresh
-        // is logged rather than silently lost (mirrors the startup seed task).
-        let handle = tokio::task::spawn_blocking(move || super::refresh_readiness_rollup(&s));
+        // DEC-207: a preferred-sensor change invalidates the shared assessment
+        // (readiness items depend on runtime.toml). Fire-and-forget, force-refresh
+        // — the response does not depend on it; ensure_assessment coalesces the
+        // scan off the poll path and logs its own failure.
         tokio::spawn(async move {
-            if let Err(e) = handle.await {
-                log::warn!("readiness rollup refresh after preferred-sensor change failed: {e}");
-            }
+            let _ = super::ensure_assessment(s, true).await;
         });
     }
 }

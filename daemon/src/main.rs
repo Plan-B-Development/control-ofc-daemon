@@ -765,6 +765,10 @@ async fn main() {
         &*nvml_backend,
     );
 
+    // DEC-206/207: share ONE rollup Arc between the AppState poll mirror and the
+    // AssessmentCache — the cache's store() writes both in lockstep so the poll
+    // path stays a cheap clone and the two never drift.
+    let readiness_rollup = Arc::new(parking_lot::Mutex::new(None));
     let app_state = Arc::new(AppState {
         cache: cache.clone(),
         staleness_config,
@@ -786,8 +790,13 @@ async fn main() {
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: config.detection.allow_port_probe,
-        // DEC-206: seeded by the rollup task below once the poll cache is warm.
-        readiness_rollup: Arc::new(parking_lot::Mutex::new(None)),
+        // DEC-206/207: seeded by the assessment task below once the poll cache is
+        // warm. The rollup Arc is shared with the AssessmentCache (its store keeps
+        // this poll mirror in lockstep with the full snapshot).
+        readiness_rollup: readiness_rollup.clone(),
+        assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
+            readiness_rollup,
+        )),
     });
 
     // Silence "assigned but not read" — runtime_cfg is consumed by the
@@ -869,14 +878,10 @@ async fn main() {
                 }
                 tokio::time::sleep(seed_interval).await;
             }
-            let s = seed_state.clone();
-            if let Err(e) = tokio::task::spawn_blocking(move || {
-                control_ofc_daemon::api::handlers::refresh_readiness_rollup(&s)
-            })
-            .await
-            {
-                log::warn!("readiness rollup seed task failed: {e}");
-            }
+            // DEC-207: seed the shared hardware assessment (its store also mirrors
+            // the rollup for the Dashboard chip). Coalesced, off the poll path,
+            // and logs its own failure; `force` so the seed always runs one scan.
+            let _ = control_ofc_daemon::api::handlers::ensure_assessment(seed_state, true).await;
         });
     }
 

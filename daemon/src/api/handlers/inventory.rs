@@ -13,7 +13,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Json;
 
-use super::{build_sensor_entries, error_response, json_ok, AppState};
+use super::{build_sensor_entries, error_response, json_ok, AppState, ASSESSMENT_TTL};
 use crate::api::responses::*;
 use crate::health::state::DaemonState;
 use crate::hwmon::classify::{
@@ -21,10 +21,7 @@ use crate::hwmon::classify::{
     TempClassification,
 };
 use crate::hwmon::inventory::discover_monitor_only_fans;
-use crate::hwmon::readiness::{
-    build_readiness, derive_rollup, overall_severity, superio_readiness_items, ReadinessInputs,
-    ReadinessItem, ReadinessSeverity,
-};
+use crate::hwmon::readiness::{build_readiness, ReadinessInputs};
 use crate::hwmon::superio;
 use crate::hwmon::superio_probe;
 use crate::hwmon::HWMON_SYSFS_ROOT;
@@ -165,53 +162,118 @@ fn classify_cache_sensors(
 ///
 /// Diagnoses the CPU/hwmon/PWM inventory into actionable items (severity +
 /// recommended action + blocks-flags) for the GUI's first-run guide. Read-only;
-/// never mutates the system. Runs on the blocking pool (monitor-only-fan scan).
+/// never mutates the system. Serves the shared hardware-assessment snapshot
+/// (DEC-207) with a `force` refresh, so "opening readiness" stays an authoritative
+/// refresh of the Dashboard rollup — the underlying scan is still coalesced with
+/// any concurrent Super-I/O / combined request.
 pub async fn hwmon_readiness_handler(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match tokio::task::spawn_blocking(move || build_readiness_response(&state)).await {
-        Ok(resp) => resp,
-        Err(e) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &ErrorEnvelope::internal(format!("hwmon readiness task failed: {e}")),
+    match ensure_assessment(state, true).await {
+        Some(a) => json_ok(
+            StatusCode::OK,
+            ReadinessResponse {
+                api_version: API_VERSION,
+                overall: a.overall,
+                items: a.items.clone(),
+            },
+        ),
+        None => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::hardware_unavailable(
+                "hardware assessment is temporarily unavailable — retry",
+            ),
         ),
     }
 }
 
-fn build_readiness_response(state: &AppState) -> (StatusCode, Json<serde_json::Value>) {
-    let (overall, items) = compute_readiness(state);
-    // DEC-206: opening the readiness view is an authoritative refresh of the
-    // cached rollup, keeping the Dashboard health chip consistent with this list.
-    *state.readiness_rollup.lock() = Some(derive_rollup(overall, &items));
-    json_ok(
-        StatusCode::OK,
-        ReadinessResponse {
-            api_version: API_VERSION,
-            overall,
-            items,
-        },
-    )
+/// Return a fresh-enough shared
+/// [`HardwareAssessment`](crate::hwmon::readiness::HardwareAssessment), running AT
+/// MOST one coalesced blocking scan for any burst of callers (DEC-207).
+///
+/// `force` bypasses the freshness TTL (manual refresh / preferred-sensor / rescan
+/// / opening readiness). The single passive scan runs on the blocking pool; a
+/// burst of simultaneous requests coalesces to one scan; the 1 Hz poll path never
+/// calls this. On success the cache's `store` also mirrors the compact
+/// rollup into `readiness_rollup` for `/status` + `/poll`. Returns `None` only if
+/// the scan task fails AND no prior scan ever succeeded (⇒ the caller answers
+/// `503`); a scan failure otherwise keeps the last-good result and never affects
+/// fan control.
+pub async fn ensure_assessment(
+    state: Arc<AppState>,
+    force: bool,
+) -> Option<Arc<crate::hwmon::readiness::HardwareAssessment>> {
+    let cache = state.assessment.clone();
+    cache
+        .ensure_with(force, ASSESSMENT_TTL, || async move {
+            match tokio::task::spawn_blocking(move || compute_hardware_assessment(&state)).await {
+                Ok(a) => Some(a),
+                Err(e) => {
+                    log::warn!("hardware assessment scan task failed: {e}");
+                    None
+                }
+            }
+        })
+        .await
 }
 
-/// Recompute the cached readiness rollup (DEC-206) from the current inventory and
-/// store it in `AppState`, so the next `/status` + `/poll` carries a fresh rollup
-/// for the Dashboard health chip. Calls [`compute_readiness`] — **expensive**
-/// (cache snapshot + `/sys/class/hwmon` walk + `runtime.toml` read + Super-I/O
-/// detect), so callers on an async task must wrap it in `spawn_blocking`. Invoked
-/// on discovery-changing events only (startup / rescan / preferred-sensor), never
-/// on the poll path. Read-only — never mutates hardware.
-pub fn refresh_readiness_rollup(state: &AppState) {
-    let (overall, items) = compute_readiness(state);
-    *state.readiness_rollup.lock() = Some(derive_rollup(overall, &items));
+/// Query for `GET /inventory/hardware-readiness`. `?refresh=true` (or `1`) forces
+/// a fresh scan; anything else — including an absent or malformed value — serves
+/// the cached assessment. `Option<String>` so the extractor can never `400` on
+/// this parameter (DEC-207).
+#[derive(serde::Deserialize, Default)]
+pub struct HardwareReadinessQuery {
+    #[serde(default)]
+    refresh: Option<String>,
 }
 
-/// Compute the full readiness (overall severity + item list) from the live,
-/// read-only inventory. **Expensive** — clones the cache snapshot, walks
-/// `/sys/class/hwmon` for monitor-only fans, reads `runtime.toml`, and runs
-/// passive Super-I/O detection. Never mutates the system. Shared by the GET
-/// handler and [`refresh_readiness_rollup`]; keep it OFF the 1 Hz poll path
-/// (that path only clones the cached [`crate::hwmon::readiness::ReadinessRollup`]).
-fn compute_readiness(state: &AppState) -> (ReadinessSeverity, Vec<ReadinessItem>) {
+/// GET /inventory/hardware-readiness — the combined readiness + Super-I/O snapshot
+/// (DEC-207). The merged "Cooling Hardware Readiness" GUI page fetches this in ONE
+/// request, so both halves come from the same shared passive scan (no
+/// cross-endpoint drift, no redundant detection). Read-only. `?refresh=true`
+/// forces a fresh (coalesced) scan; otherwise the cached assessment is served.
+/// Gated purely by 404 on older daemons, mirroring the other `/inventory/*`
+/// endpoints.
+pub async fn hardware_readiness_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<HardwareReadinessQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let force = q
+        .refresh
+        .as_deref()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    // Read the (Copy) probe-availability flag before moving `state` into the scan.
+    let (avail, reason) = superio_probe::port_probe_available(state.allow_port_probe);
+    match ensure_assessment(state, force).await {
+        Some(a) => json_ok(
+            StatusCode::OK,
+            HardwareReadinessResponse {
+                api_version: API_VERSION,
+                rollup: a.rollup.clone(),
+                overall: a.overall,
+                items: a.items.clone(),
+                superio: map_superio_report(&a.superio, avail, reason),
+                scanned_age_ms: a.scanned_at.elapsed().as_millis() as u64,
+                generation: a.generation,
+            },
+        ),
+        None => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::hardware_unavailable(
+                "hardware assessment is temporarily unavailable — retry",
+            ),
+        ),
+    }
+}
+
+/// Run ONE passive hardware assessment from the live, read-only inventory — the
+/// single expensive scan (cache snapshot + `/sys/class/hwmon` walk + `runtime.toml`
+/// read + Super-I/O detect) that every readiness / Super-I/O consumer shares
+/// (DEC-207), so the work runs once instead of three times. Never mutates the
+/// system. Invoked only via [`ensure_assessment`] on the blocking pool; keep it
+/// OFF the 1 Hz poll path (that path only clones the cached
+/// [`crate::hwmon::readiness::ReadinessRollup`]).
+fn compute_hardware_assessment(state: &AppState) -> crate::hwmon::readiness::HardwareAssessment {
     let now = std::time::Instant::now();
     let snap = state.cache.snapshot();
     let classified = classify_cache_sensors(&snap, now);
@@ -267,14 +329,12 @@ fn compute_readiness(state: &AppState) -> (ReadinessSeverity, Vec<ReadinessItem>
         selected_mb_present,
     };
 
-    let mut items = build_readiness(&inputs);
-    // DEC-202: enrich with passive Super-I/O detection guidance, reusing this
-    // snapshot so the two views never disagree.
-    let superio_report = detect_superio_from(state, &snap, now);
-    items.extend(superio_readiness_items(&superio_report));
-    let overall = overall_severity(&items);
-
-    (overall, items)
+    let items = build_readiness(&inputs);
+    // DEC-202/207: enrich with passive Super-I/O detection, reusing this snapshot
+    // so every consumer observes the same chips — and KEEP the report on the
+    // assessment (the Super-I/O view reads it instead of running its own scan).
+    let superio = detect_superio_from(state, &snap, now);
+    crate::hwmon::readiness::HardwareAssessment::from_parts(items, superio)
 }
 
 // ── Super-I/O detection endpoint (DEC-202) ──────────────────────────
@@ -290,23 +350,23 @@ fn compute_readiness(state: &AppState) -> (ReadinessSeverity, Vec<ReadinessItem>
 pub async fn superio_handler(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match tokio::task::spawn_blocking(move || build_superio_response(&state)).await {
-        Ok(resp) => resp,
-        Err(e) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &ErrorEnvelope::internal(format!("superio detection task failed: {e}")),
+    // Serve the Super-I/O report from the shared assessment (DEC-207): a passive
+    // GET reuses the recent readiness/combined scan within the coalescing TTL
+    // instead of running its own detection. GET is passive only — report whether
+    // the active probe *could* run, but never touch a port here (the POST below).
+    let (avail, reason) = superio_probe::port_probe_available(state.allow_port_probe);
+    match ensure_assessment(state, false).await {
+        Some(a) => json_ok(
+            StatusCode::OK,
+            map_superio_report(&a.superio, avail, reason),
+        ),
+        None => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::hardware_unavailable(
+                "hardware assessment is temporarily unavailable — retry",
+            ),
         ),
     }
-}
-
-fn build_superio_response(state: &AppState) -> (StatusCode, Json<serde_json::Value>) {
-    let now = std::time::Instant::now();
-    let snap = state.cache.snapshot();
-    let report = detect_superio_from(state, &snap, now);
-    // GET is passive only — report whether the active probe *could* run, but
-    // never touch a port here (that is the deliberate POST below).
-    let (avail, reason) = superio_probe::port_probe_available(state.allow_port_probe);
-    json_ok(StatusCode::OK, map_superio_report(&report, avail, reason))
 }
 
 /// Run the passive detector against the live cache. Shared by the Super-I/O
@@ -430,7 +490,12 @@ fn map_superio_chip(c: &superio::SuperIoChip) -> SuperIoChipEntry {
 pub async fn superio_probe_handler(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match tokio::task::spawn_blocking(move || build_superio_probe_response(&state)).await {
+    // Base passive report from the shared assessment (DEC-207) — the probe never
+    // triggers its own passive scan; it only appends any actively-probed chips.
+    let base = ensure_assessment(state.clone(), false)
+        .await
+        .map(|a| a.superio.clone());
+    match tokio::task::spawn_blocking(move || build_superio_probe_response(&state, base)).await {
         Ok(resp) => resp,
         Err(e) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -446,10 +511,15 @@ pub async fn superio_probe_handler(
 static PROBE_GATE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 const PROBE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
 
-fn build_superio_probe_response(state: &AppState) -> (StatusCode, Json<serde_json::Value>) {
+fn build_superio_probe_response(
+    state: &AppState,
+    base: Option<superio::SuperIoReport>,
+) -> (StatusCode, Json<serde_json::Value>) {
     let now = std::time::Instant::now();
     let snap = state.cache.snapshot();
-    let mut report = detect_superio_from(state, &snap, now);
+    // Reuse the shared passive report as the base (DEC-207); fall back to a fresh
+    // detection only if the assessment was unavailable (rare).
+    let mut report = base.unwrap_or_else(|| detect_superio_from(state, &snap, now));
 
     if !state.allow_port_probe {
         let (_avail, reason) = superio_probe::port_probe_available(false);
@@ -500,7 +570,23 @@ fn build_superio_probe_response(state: &AppState) -> (StatusCode, Json<serde_jso
                 );
             }
             for p in &probed {
-                report.chips.push(probed_to_superio_chip(p));
+                let chip = probed_to_superio_chip(p);
+                // Fold a probe hit into an existing same-name passive card
+                // (union the PortProbe evidence) rather than emitting a duplicate
+                // — the same physical chip can surface both passively (DMI/kmsg,
+                // while unbound) and via the active probe (DEC-207). Distinct
+                // chips (different names) still get their own card.
+                if let Some(existing) = report
+                    .chips
+                    .iter_mut()
+                    .find(|c| c.chip_name.eq_ignore_ascii_case(&chip.chip_name))
+                {
+                    if !existing.evidence.contains(&superio::Evidence::PortProbe) {
+                        existing.evidence.push(superio::Evidence::PortProbe);
+                    }
+                } else {
+                    report.chips.push(chip);
+                }
             }
         }
     }

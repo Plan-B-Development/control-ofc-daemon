@@ -1,5 +1,40 @@
 # Changelog
 
+## [2.11.0] — 2026-07-13
+
+A single shared hardware-assessment snapshot behind the readiness + Super-I/O
+endpoints (one coalesced passive scan instead of three), a new combined `GET
+/inventory/hardware-readiness` endpoint for the GUI's merged "Cooling Hardware
+Readiness" page, and a Super-I/O classification fix. No breaking changes; pairs
+with `control-ofc-gui` ≥ v2.13.0 (older GUIs keep using the existing endpoints).
+DEC-207.
+
+### Added
+- **Combined `GET /inventory/hardware-readiness` (DEC-207).** One atomic fetch
+  returning the readiness `rollup` + `overall` + `items`, the passive `superio`
+  report, `scanned_age_ms`, and a monotonic `generation`, so the GUI's merged page
+  gets a consistent snapshot in one request. `?refresh=true` forces a fresh
+  (coalesced) scan. Additive and 404-gated on older daemons.
+
+### Changed
+- **Single shared hardware-assessment snapshot (DEC-207).** `/inventory/readiness`,
+  `/inventory/superio`, the combined endpoint, and the `/status` + `/poll` rollup
+  are now served from ONE cached passive scan (cache snapshot + `/sys` walk +
+  `runtime.toml` read + Super-I/O detect) instead of each recomputing Super-I/O
+  detection independently. A single-flight coordinator coalesces simultaneous
+  requests into one scan; a short freshness window lets a passive Super-I/O GET
+  reuse a recent readiness scan; the 1 Hz poll path still only clones the small
+  cached rollup (kept in lockstep with the full snapshot). `POST /hwmon/rescan` now
+  also refreshes the assessment (deferred, so the descriptor set rebuilds first).
+
+### Fixed
+- **Ordinary hwmon chips are no longer reported as Super-I/O (DEC-207).** The
+  passive detector now gates bound-hwmon evidence on a Super-I/O family check, so
+  ordinary sensor chips such as `amdgpu`, `k10temp`, `nvme`, and `spd5118` no
+  longer appear as "Unrecognized Super-I/O" entries in `/inventory/superio`. An
+  active-probe hit for a chip already seen passively now folds into that chip's
+  card (unioning the `port_probe` evidence) instead of producing a duplicate.
+
 ## [2.10.0] — 2026-07-13
 
 Additive hardware-readiness rollup on the poll surface for the GUI's new Dashboard

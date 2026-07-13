@@ -94,6 +94,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/inventory/readiness",
             get(handlers::hwmon_readiness_handler),
         )
+        // Combined readiness + Super-I/O snapshot (DEC-207): one atomic fetch for
+        // the merged "Cooling Hardware Readiness" GUI page, served from a single
+        // shared passive scan. Read-only; `?refresh=true` forces a fresh
+        // (coalesced) scan. 404-gated on older daemons.
+        .route(
+            "/inventory/hardware-readiness",
+            get(handlers::hardware_readiness_handler),
+        )
         // Passive Super-I/O chip detection (DEC-202): per-chip presence +
         // allowlisted "load this driver" recommendations. Read-only — never
         // probes I/O ports, loads modules, or writes hardware. 404-gated.

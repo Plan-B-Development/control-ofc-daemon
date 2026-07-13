@@ -3,6 +3,7 @@
 //! Read handlers read from the `StateCache` — no direct hardware access.
 //! Write handlers dispatch through the `FanController`.
 
+mod assessment;
 mod config;
 mod control;
 mod gpu;
@@ -14,6 +15,7 @@ mod path_confine;
 mod profile;
 mod status;
 
+pub use assessment::*;
 pub use config::*;
 pub use control::*;
 pub use gpu::*;
@@ -216,14 +218,21 @@ pub struct AppState {
     /// `CAP_SYS_RAWIO` drop-in to actually function.
     pub allow_port_probe: bool,
     /// Cached compact readiness rollup (DEC-206) mirrored onto `/status` + `/poll`
-    /// for the GUI Dashboard health chip. `None` until the first refresh (at
-    /// startup, after discovery). Recomputed only on discovery-changing events
-    /// (startup seed, a preferred-sensor change, and each `/inventory/readiness`
-    /// GET; a rescan-driven update rides the post-rescan readiness GET) via
-    /// [`refresh_readiness_rollup`], so `build_status_response` only clones this
-    /// small struct on the 1 Hz poll — it never re-runs the expensive readiness
-    /// scan (cache snapshot + sysfs walk + disk read + Super-I/O detect).
+    /// for the GUI Dashboard health chip. `None` until the first scan completes
+    /// (startup seed). Written by [`AssessmentCache::store`] as the poll mirror of
+    /// the full hardware-assessment snapshot (DEC-207) — refreshed only on
+    /// discovery-changing events (startup / rescan / preferred-sensor /
+    /// `/inventory/*` GET), never recomputed on the poll path. `build_status_response`
+    /// only clones this small struct on the 1 Hz poll — it never re-runs the
+    /// expensive scan (cache snapshot + sysfs walk + disk read + Super-I/O detect).
     pub readiness_rollup: Arc<Mutex<Option<crate::hwmon::readiness::ReadinessRollup>>>,
+    /// Daemon-owned hardware-assessment cache + single-flight coordinator
+    /// (DEC-207): ONE coalesced passive scan feeds the readiness rollup above,
+    /// the `/inventory/readiness` + `/inventory/superio` compat readers, and the
+    /// combined `/inventory/hardware-readiness` endpoint — so the expensive
+    /// Super-I/O scan runs once instead of three times. Holds the SAME
+    /// `readiness_rollup` `Arc` as its poll mirror. Never on the 1 Hz poll path.
+    pub assessment: Arc<AssessmentCache>,
 }
 
 /// RAII guard that clears the profile engine's verify pause on drop (DEC-165),

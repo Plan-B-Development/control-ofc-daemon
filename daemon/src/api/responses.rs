@@ -447,6 +447,33 @@ pub struct SuperIoRecommendationEntry {
     pub risk_notes: Vec<String>,
 }
 
+/// Response for `GET /inventory/hardware-readiness` (DEC-207) — the combined
+/// readiness + Super-I/O snapshot the merged "Cooling Hardware Readiness" GUI page
+/// fetches in ONE atomic request, so both halves come from a single shared passive
+/// scan (no cross-endpoint drift, no redundant detection). Read-only; the daemon
+/// never mutates the system to produce it. Absent route ⇒ daemon predates the
+/// feature (clients gate on 404, mirroring the other `/inventory/*` endpoints).
+/// The compact `rollup` mirrors the one on `/status` + `/poll`; `items` matches
+/// `GET /inventory/readiness`; `superio` matches `GET /inventory/superio`.
+#[derive(Debug, Clone, Serialize)]
+pub struct HardwareReadinessResponse {
+    pub api_version: u32,
+    /// Compact rollup (same shape mirrored onto `/status` + `/poll`).
+    pub rollup: crate::hwmon::readiness::ReadinessRollup,
+    /// The overall severity (== `rollup.overall`), for convenience.
+    pub overall: crate::hwmon::readiness::ReadinessSeverity,
+    /// The full readiness list (== `GET /inventory/readiness`).
+    pub items: Vec<crate::hwmon::readiness::ReadinessItem>,
+    /// The passive Super-I/O report (== `GET /inventory/superio`).
+    pub superio: SuperIoResponse,
+    /// Milliseconds since the underlying passive scan completed (matches the API's
+    /// `age_ms` freshness convention; the GUI renders a "last scanned" time).
+    pub scanned_age_ms: u64,
+    /// Monotonic scan id; changes exactly when a new scan is served, so the GUI
+    /// can detect a fresh assessment without diffing.
+    pub generation: u64,
+}
+
 /// One entry in the `GET /profiles` listing — a lightweight summary parsed from
 /// each stored/preset profile (the full document is fetched via
 /// `GET /profiles/{id}`).
@@ -1768,6 +1795,54 @@ mod tests {
         assert!(thresholds.get("min_c").is_none());
         assert!(thresholds.get("alarm").is_none());
         assert!(thresholds.get("fault").is_none());
+    }
+
+    #[test]
+    fn hardware_readiness_response_serializes_combined_snapshot() {
+        // DEC-207: the combined endpoint's DTO carries the rollup + readiness items
+        // + the Super-I/O report + freshness/generation, all additive. Nested
+        // skip_serializing_if is honored (rollup.top_* when None; empty superio
+        // vecs), and `api_version` stays 1.
+        use crate::hwmon::readiness::{ReadinessRollup, ReadinessSeverity};
+        let resp = HardwareReadinessResponse {
+            api_version: API_VERSION,
+            rollup: ReadinessRollup {
+                overall: ReadinessSeverity::Ok,
+                critical: 0,
+                warning: 0,
+                info: 0,
+                top_summary: None,
+                top_code: None,
+            },
+            overall: ReadinessSeverity::Ok,
+            items: Vec::new(),
+            superio: SuperIoResponse {
+                api_version: API_VERSION,
+                arch_supported: true,
+                chips: Vec::new(),
+                acpi_conflict_drivers: Vec::new(),
+                notes: Vec::new(),
+                port_probe_available: false,
+                port_probe_reason: "flag off".into(),
+            },
+            scanned_age_ms: 42,
+            generation: 7,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["api_version"], 1);
+        assert_eq!(json["overall"], "ok");
+        assert_eq!(json["rollup"]["overall"], "ok");
+        // An all-ok rollup omits top_* (skip_serializing_if).
+        assert!(json["rollup"].get("top_summary").is_none());
+        assert!(json["rollup"].get("top_code").is_none());
+        assert!(json["items"].as_array().unwrap().is_empty());
+        // The nested SuperIoResponse: empty vecs omitted; chips is an empty array.
+        assert_eq!(json["superio"]["arch_supported"], true);
+        assert!(json["superio"].get("acpi_conflict_drivers").is_none());
+        assert!(json["superio"].get("notes").is_none());
+        assert_eq!(json["superio"]["chips"].as_array().unwrap().len(), 0);
+        assert_eq!(json["scanned_age_ms"], 42);
+        assert_eq!(json["generation"], 7);
     }
 
     #[test]

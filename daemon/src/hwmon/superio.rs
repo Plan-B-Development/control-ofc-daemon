@@ -324,6 +324,15 @@ pub fn detect_superio(ev: &dyn SuperIoEvidence) -> SuperIoReport {
     // Union evidence into a name-keyed map (BTreeMap ⇒ deterministic ordering).
     let mut acc: BTreeMap<String, EvidenceAcc> = BTreeMap::new();
     for b in ev.bound_chips() {
+        // Only BOUND chips that are recognised Super-I/O monitoring chips become
+        // candidates. An ordinary sensor chip (k10temp/coretemp/amdgpu/nvme/
+        // spd5118/…) is a legitimate hwmon device but NOT a Super-I/O chip, and
+        // must not be reported as an "Unrecognized Super-I/O" card (DEC-207). The
+        // DMI/kmsg evidence sources below are already Super-I/O-scoped, so only
+        // the bound-hwmon source needs this gate.
+        if !chip_db::is_known_superio_chip(&b.chip_name) {
+            continue;
+        }
         acc.entry(normalize(&b.chip_name)).or_default().bound = true;
     }
     for c in ev.kmsg_chips() {
@@ -967,6 +976,94 @@ mod tests {
         assert_eq!(
             chip.evidence,
             vec![Evidence::KernelLog, Evidence::BoundHwmon]
+        );
+        assert!(chip.hwmon_present);
+    }
+
+    #[test]
+    fn bound_non_superio_sensor_chips_are_never_cards() {
+        // DEC-207: ordinary sensor chips are legitimate hwmon devices but NOT
+        // Super-I/O chips — none may appear as an "Unrecognized Super-I/O" card.
+        let ev = FakeEvidence {
+            bound: vec![
+                bound("amdgpu", "pci-0000:03:00.0"),
+                bound("k10temp", "pci-0000:00:18.3"),
+                bound("nvme", "pci-0000:01:00.0"),
+                bound("spd5118", "i2c-0-0050"),
+                bound("coretemp", "isa-0000"),
+            ],
+            ..Default::default()
+        };
+        let r = detect_superio(&ev);
+        assert!(
+            r.chips.is_empty(),
+            "no non-Super-I/O sensor chip may become a card: {:?}",
+            r.chips
+        );
+    }
+
+    #[test]
+    fn bound_genuine_superio_chips_are_cards() {
+        for name in ["nct6799", "it8688"] {
+            let ev = FakeEvidence {
+                bound: vec![bound(name, "isa-0290")],
+                ..Default::default()
+            };
+            let r = detect_superio(&ev);
+            assert_eq!(r.chips.len(), 1, "{name} should be one card: {:?}", r.chips);
+            assert_eq!(r.chips[0].chip_name, name);
+            assert!(r.chips[0].hwmon_present);
+        }
+    }
+
+    #[test]
+    fn bound_mixed_keeps_only_superio_chips() {
+        // A realistic host: a Super-I/O chip bound alongside ordinary sensor
+        // chips. Only the Super-I/O chips are cards.
+        let ev = FakeEvidence {
+            bound: vec![
+                bound("k10temp", "pci-0000:00:18.3"),
+                bound("nct6799", "isa-0290"),
+                bound("amdgpu", "pci-0000:03:00.0"),
+                bound("it8688", "isa-0a40"),
+            ],
+            ..Default::default()
+        };
+        let r = detect_superio(&ev);
+        let mut names: Vec<&str> = r.chips.iter().map(|c| c.chip_name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["it8688", "nct6799"]);
+    }
+
+    #[test]
+    fn same_chip_via_bound_dmi_and_kmsg_is_one_card_with_all_evidence() {
+        // The X570 AORUS MASTER DMI table expects it8688; the same chip is also
+        // kernel-logged and bound. All three evidence sources must collapse into
+        // ONE it8688 card (DEC-207 "combine evidence, don't duplicate").
+        let ev = FakeEvidence {
+            board: (
+                "Gigabyte Technology Co., Ltd.".into(),
+                "X570 AORUS MASTER".into(),
+            ),
+            kmsg: vec!["IT8688".into()],
+            bound: vec![bound("it8688", "isa-0a40")],
+            ..Default::default()
+        };
+        let r = detect_superio(&ev);
+        assert_eq!(
+            r.chips.iter().filter(|c| c.chip_name == "it8688").count(),
+            1,
+            "it8688 must be a single card, not one per source: {:?}",
+            r.chips
+        );
+        let chip = find(&r, "it8688");
+        assert_eq!(
+            chip.evidence,
+            vec![
+                Evidence::DmiBoardTable,
+                Evidence::KernelLog,
+                Evidence::BoundHwmon
+            ]
         );
         assert!(chip.hwmon_present);
     }

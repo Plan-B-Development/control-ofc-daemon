@@ -60,6 +60,7 @@ fn test_app_state() -> Arc<AppState> {
         thresholds: None,
     }]);
 
+    let readiness_rollup = Arc::new(parking_lot::Mutex::new(None));
     Arc::new(AppState {
         cache,
         staleness_config: StalenessConfig::default(),
@@ -81,7 +82,10 @@ fn test_app_state() -> Arc<AppState> {
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
-        readiness_rollup: Arc::new(parking_lot::Mutex::new(None)),
+        readiness_rollup: readiness_rollup.clone(),
+        assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
+            readiness_rollup,
+        )),
     })
 }
 
@@ -303,6 +307,98 @@ async fn readiness_get_writes_through_to_poll_rollup() {
     // The next /poll now carries the rollup, with the same overall severity.
     let (_, poll) = uds_get(&path, "/poll").await;
     assert_eq!(poll["status"]["readiness"]["overall"], overall);
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn hardware_readiness_endpoint_returns_combined_snapshot() {
+    // DEC-207: the combined endpoint returns the readiness list + rollup + the
+    // Super-I/O report from ONE shared scan, so the merged GUI page fetches
+    // everything in one request. Only the machine-independent shape is asserted.
+    let state = test_app_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/inventory/hardware-readiness").await;
+    assert_eq!(status, 200);
+    assert_eq!(json["api_version"], 1);
+    // The readiness half: rollup + overall + items.
+    let overall = json["overall"].as_str().expect("overall present");
+    assert_eq!(json["rollup"]["overall"], overall);
+    assert!(json["items"].is_array());
+    // The Super-I/O half: the passive report (arch_supported is a bool on any host;
+    // chips is always an array — host-dependent contents, stable shape).
+    assert!(json["superio"]["arch_supported"].is_boolean());
+    assert!(json["superio"]["chips"].is_array());
+    // Freshness + generation (a fresh scan ran, so generation >= 1).
+    assert!(json["scanned_age_ms"].is_u64());
+    assert!(json["generation"].as_u64().expect("generation") >= 1);
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn hardware_readiness_writes_through_to_poll_rollup() {
+    // DEC-207: the combined endpoint (like /inventory/readiness) caches the rollup,
+    // so the next /poll carries a `readiness` whose `overall` matches the snapshot.
+    let state = test_app_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, combined) = uds_get(&path, "/inventory/hardware-readiness").await;
+    assert_eq!(status, 200);
+    let overall = combined["overall"].as_str().expect("overall").to_string();
+
+    let (_, poll) = uds_get(&path, "/poll").await;
+    assert_eq!(poll["status"]["readiness"]["overall"], overall);
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn combined_endpoint_refresh_bumps_generation_and_serves_cached_within_ttl() {
+    // DEC-207: `?refresh=true` forces a new scan (higher generation); a plain GET
+    // within the coalescing TTL reuses that scan (same generation), so opening the
+    // page then hitting Refresh scans exactly once more.
+    let state = test_app_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (_, a) = uds_get(&path, "/inventory/hardware-readiness").await;
+    let g1 = a["generation"].as_u64().expect("g1");
+
+    let (_, b) = uds_get(&path, "/inventory/hardware-readiness?refresh=true").await;
+    let g2 = b["generation"].as_u64().expect("g2");
+    assert!(
+        g2 > g1,
+        "forced refresh must bump the generation ({g1} -> {g2})"
+    );
+
+    // A plain GET within the 3 s TTL reuses the forced scan (no new generation).
+    let (_, c) = uds_get(&path, "/inventory/hardware-readiness").await;
+    assert_eq!(
+        c["generation"].as_u64().expect("g3"),
+        g2,
+        "a plain GET within the TTL must reuse the cached scan"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn superio_endpoint_matches_combined_endpoint_superio() {
+    // DEC-207: /inventory/superio and the combined endpoint both project the SAME
+    // shared assessment's Super-I/O report — they must agree (no cross-endpoint
+    // drift, and /inventory/superio reused the combined scan instead of re-scanning).
+    let state = test_app_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (_, combined) = uds_get(&path, "/inventory/hardware-readiness").await;
+    let (status, superio) = uds_get(&path, "/inventory/superio").await;
+    assert_eq!(status, 200);
+    assert_eq!(superio, combined["superio"]);
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
@@ -551,6 +647,7 @@ async fn fans_endpoint_tags_intel_gpu_source_by_id_prefix() {
         },
     ]);
 
+    let readiness_rollup = Arc::new(parking_lot::Mutex::new(None));
     let state = Arc::new(AppState {
         cache,
         staleness_config: StalenessConfig::default(),
@@ -572,7 +669,10 @@ async fn fans_endpoint_tags_intel_gpu_source_by_id_prefix() {
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
-        readiness_rollup: Arc::new(parking_lot::Mutex::new(None)),
+        readiness_rollup: readiness_rollup.clone(),
+        assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
+            readiness_rollup,
+        )),
     });
     let (path, shutdown, _dir) = start_test_server(state).await;
 
@@ -704,6 +804,7 @@ async fn capabilities_includes_intel_gpu_absent_by_default() {
 fn test_app_state_with_nvidia_gpu(
     gpu: control_ofc_daemon::hwmon::nvidia::NvidiaGpuIdentity,
 ) -> Arc<AppState> {
+    let readiness_rollup = Arc::new(parking_lot::Mutex::new(None));
     Arc::new(AppState {
         cache: Arc::new(StateCache::new()),
         staleness_config: StalenessConfig::default(),
@@ -725,7 +826,10 @@ fn test_app_state_with_nvidia_gpu(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
-        readiness_rollup: Arc::new(parking_lot::Mutex::new(None)),
+        readiness_rollup: readiness_rollup.clone(),
+        assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
+            readiness_rollup,
+        )),
     })
 }
 
@@ -965,6 +1069,7 @@ fn test_app_state_with_hwmon() -> Arc<AppState> {
     let ctrl =
         HwmonPwmController::new(headers, lease_mgr, Box::new(HwmonMockWriter), cache.clone());
 
+    let readiness_rollup = Arc::new(parking_lot::Mutex::new(None));
     Arc::new(AppState {
         cache,
         staleness_config: StalenessConfig::default(),
@@ -986,7 +1091,10 @@ fn test_app_state_with_hwmon() -> Arc<AppState> {
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
-        readiness_rollup: Arc::new(parking_lot::Mutex::new(None)),
+        readiness_rollup: readiness_rollup.clone(),
+        assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
+            readiness_rollup,
+        )),
     })
 }
 
@@ -1211,6 +1319,7 @@ fn test_app_state_with_unsupported_gpu(pci_bdf: &str) -> Arc<AppState> {
         has_pwm_enable: false,
         overdrive_enabled: false,
     };
+    let readiness_rollup = Arc::new(parking_lot::Mutex::new(None));
     Arc::new(AppState {
         cache,
         staleness_config: StalenessConfig::default(),
@@ -1232,7 +1341,10 @@ fn test_app_state_with_unsupported_gpu(pci_bdf: &str) -> Arc<AppState> {
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
-        readiness_rollup: Arc::new(parking_lot::Mutex::new(None)),
+        readiness_rollup: readiness_rollup.clone(),
+        assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
+            readiness_rollup,
+        )),
     })
 }
 
@@ -1284,6 +1396,7 @@ fn test_app_state_with_read_only_gpu(pci_bdf: &str, pci_device_id: u16) -> Arc<A
         has_pwm_enable: false, // but pwm1_enable does NOT — this is the bug shape
         overdrive_enabled: false,
     };
+    let readiness_rollup = Arc::new(parking_lot::Mutex::new(None));
     Arc::new(AppState {
         cache,
         staleness_config: StalenessConfig::default(),
@@ -1305,7 +1418,10 @@ fn test_app_state_with_read_only_gpu(pci_bdf: &str, pci_device_id: u16) -> Arc<A
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
-        readiness_rollup: Arc::new(parking_lot::Mutex::new(None)),
+        readiness_rollup: readiness_rollup.clone(),
+        assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
+            readiness_rollup,
+        )),
     })
 }
 
@@ -1555,6 +1671,7 @@ async fn deactivate_profile_resets_hwmon_coalescing() {
         }),
         cache.clone(),
     );
+    let readiness_rollup = Arc::new(parking_lot::Mutex::new(None));
     let state = Arc::new(AppState {
         cache: cache.clone(),
         staleness_config: StalenessConfig::default(),
@@ -1583,7 +1700,10 @@ async fn deactivate_profile_resets_hwmon_coalescing() {
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
-        readiness_rollup: Arc::new(parking_lot::Mutex::new(None)),
+        readiness_rollup: readiness_rollup.clone(),
+        assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
+            readiness_rollup,
+        )),
     });
     let hwmon = state.hwmon_controller.clone().unwrap();
 
@@ -1675,6 +1795,7 @@ fn test_app_state_with_writable_pmfw_gpu(pci_bdf: &str) -> (Arc<AppState>, tempf
         overdrive_enabled: true,
     };
 
+    let readiness_rollup = Arc::new(parking_lot::Mutex::new(None));
     let state = Arc::new(AppState {
         cache,
         staleness_config: StalenessConfig::default(),
@@ -1696,7 +1817,10 @@ fn test_app_state_with_writable_pmfw_gpu(pci_bdf: &str) -> (Arc<AppState>, tempf
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
-        readiness_rollup: Arc::new(parking_lot::Mutex::new(None)),
+        readiness_rollup: readiness_rollup.clone(),
+        assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
+            readiness_rollup,
+        )),
     });
     (state, tmp)
 }
@@ -1844,6 +1968,7 @@ async fn hwmon_discovery_excludes_amdgpu_end_to_end_via_ipc() {
         Box::new(HwmonMockWriter),
         cache.clone(),
     );
+    let readiness_rollup = Arc::new(parking_lot::Mutex::new(None));
     let state = Arc::new(AppState {
         cache,
         staleness_config: StalenessConfig::default(),
@@ -1865,7 +1990,10 @@ async fn hwmon_discovery_excludes_amdgpu_end_to_end_via_ipc() {
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
-        readiness_rollup: Arc::new(parking_lot::Mutex::new(None)),
+        readiness_rollup: readiness_rollup.clone(),
+        assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
+            readiness_rollup,
+        )),
     });
     let (path, shutdown, _dir) = start_test_server(state).await;
 
@@ -1904,6 +2032,7 @@ async fn hwmon_discovery_excludes_amdgpu_end_to_end_via_ipc() {
 /// hwmon controllers are wired in — these tests only need the profile
 /// activation handler to run.
 fn test_app_state_with_profile_dirs(dirs: Vec<std::path::PathBuf>) -> Arc<AppState> {
+    let readiness_rollup = Arc::new(parking_lot::Mutex::new(None));
     Arc::new(AppState {
         cache: Arc::new(StateCache::new()),
         staleness_config: StalenessConfig::default(),
@@ -1925,7 +2054,10 @@ fn test_app_state_with_profile_dirs(dirs: Vec<std::path::PathBuf>) -> Arc<AppSta
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
-        readiness_rollup: Arc::new(parking_lot::Mutex::new(None)),
+        readiness_rollup: readiness_rollup.clone(),
+        assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
+            readiness_rollup,
+        )),
     })
 }
 

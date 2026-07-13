@@ -131,6 +131,14 @@ pub fn classify_temp_sensor(chip_name: &str, label: &str) -> TempClassification 
 /// True for a motherboard Super-I/O monitoring chip: Nuvoton `nct6*` or the ITE
 /// `it8*` family (it85xx/it86xx/it87xx/it88xx — the whole range the `it87`
 /// kernel driver binds, not just literally-`it87`-prefixed names).
+///
+/// NOTE: this is a **CPU/MB temperature-confidence heuristic** (it only needs to
+/// recognise the common `nct6*`/`it8*` PECI/TSI readers), NOT a Super-I/O chip
+/// allowlist. It is deliberately distinct from
+/// [`crate::hwmon::chip_db::is_known_superio_chip`], which is the authoritative
+/// "driven by a Super-I/O driver?" gate for the Super-I/O detector (DEC-207).
+/// Broadening this one to more families would silently change sensor
+/// classification (and this module's tests) — keep them separate.
 fn is_superio_chip(chip: &str) -> bool {
     chip.starts_with("nct6") || chip.starts_with("it8")
 }

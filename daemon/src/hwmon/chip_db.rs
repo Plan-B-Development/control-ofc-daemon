@@ -214,6 +214,20 @@ pub fn expected_driver(chip_name: &str) -> &'static str {
     expected_driver_for_chip(chip_name)
 }
 
+/// Whether `chip_name` is a Super-I/O hardware-monitor chip this project
+/// recognizes — i.e. a known Super-I/O driver ([`expected_driver`]) maps to it.
+///
+/// This is the authoritative "is this a Super-I/O chip name?" gate for the
+/// passive detector's **bound-hwmon** evidence: it lets ordinary sensor chips
+/// (k10temp, coretemp, amdgpu, nvme, spd5118, zenpower, …) — which are legitimate
+/// hwmon devices but not Super-I/O monitoring chips — be dropped so they are never
+/// mis-reported as "Unrecognized Super-I/O" (DEC-207). It is deliberately distinct
+/// from [`crate::hwmon::classify::is_superio_chip`], which answers a *different*
+/// question (a CPU/MB temperature-confidence heuristic over `nct6*`/`it8*` only).
+pub fn is_known_superio_chip(chip_name: &str) -> bool {
+    expected_driver_for_chip(chip_name) != "unknown"
+}
+
 /// Detect which known hwmon kernel modules are currently loaded.
 pub fn detect_loaded_modules() -> Vec<KernelModuleInfo> {
     detect_loaded_modules_from(Path::new("/proc/modules"))
@@ -948,6 +962,41 @@ mod tests {
         assert_eq!(expected_driver("it8688"), "it87");
         assert_eq!(expected_driver("f71882fg"), "f71882fg");
         assert_eq!(expected_driver("unknown_chip"), "unknown");
+    }
+
+    #[test]
+    fn is_known_superio_chip_accepts_families_and_rejects_sensor_chips() {
+        // DEC-207: authoritative Super-I/O gate for the detector's bound path.
+        for c in [
+            "it8688",
+            "nct6799",
+            "nct6687",
+            "nct6683",
+            "f71882fg",
+            "f71805f",
+            "w83627ehf",
+            "w83627hf",
+            "smsc47m1",
+            "smsc47b397",
+            "dme1737",
+            "sch5627",
+            "sch5636",
+            "pc87360",
+            "pc87427",
+        ] {
+            assert!(
+                is_known_superio_chip(c),
+                "{c} should be a known Super-I/O chip"
+            );
+        }
+        for c in [
+            "amdgpu", "k10temp", "coretemp", "nvme", "spd5118", "zenpower", "",
+        ] {
+            assert!(
+                !is_known_superio_chip(c),
+                "{c} must NOT be a Super-I/O chip"
+            );
+        }
     }
 
     #[test]

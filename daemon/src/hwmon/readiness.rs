@@ -414,6 +414,52 @@ pub fn derive_rollup(overall: ReadinessSeverity, items: &[ReadinessItem]) -> Rea
     }
 }
 
+/// A daemon-owned hardware-assessment snapshot (DEC-207): the product of ONE
+/// passive scan, shared by every readiness/Super-I/O consumer so the expensive
+/// work (cache snapshot + `/sys` walk + `runtime.toml` read + Super-I/O detect)
+/// runs once instead of three times. Read-only; produced off the 1 Hz poll path
+/// and cached in `AppState`. `scanned_at` is a monotonic [`std::time::Instant`]
+/// (so TTL math is clock-safe); the wire carries the relative `scanned_age_ms`.
+#[derive(Debug, Clone)]
+pub struct HardwareAssessment {
+    /// Rollup severity == `rollup.overall` == `overall_severity(&items)`.
+    pub overall: ReadinessSeverity,
+    /// The full readiness list (base items + Super-I/O enrichment).
+    pub items: Vec<ReadinessItem>,
+    /// Compact rollup derived from `items` (mirrored onto `/status`+`/poll`).
+    pub rollup: ReadinessRollup,
+    /// The passive Super-I/O report the enrichment items were derived from.
+    pub superio: crate::hwmon::superio::SuperIoReport,
+    /// Monotonic scan id, assigned by the cache on store (0 before that).
+    pub generation: u64,
+    /// When this scan completed (monotonic clock).
+    pub scanned_at: std::time::Instant,
+}
+
+impl HardwareAssessment {
+    /// Compose an assessment from the base readiness items + the Super-I/O report,
+    /// enforcing the `overall`/`rollup`/`items` invariant in one place: the
+    /// Super-I/O enrichment is appended, then `overall` and the compact `rollup`
+    /// are derived from the combined list. `generation` stays 0 until the cache
+    /// assigns it on store; `scanned_at` is stamped now.
+    pub fn from_parts(
+        mut items: Vec<ReadinessItem>,
+        superio: crate::hwmon::superio::SuperIoReport,
+    ) -> Self {
+        items.extend(superio_readiness_items(&superio));
+        let overall = overall_severity(&items);
+        let rollup = derive_rollup(overall, &items);
+        Self {
+            overall,
+            items,
+            rollup,
+            superio,
+            generation: 0,
+            scanned_at: std::time::Instant::now(),
+        }
+    }
+}
+
 /// Map a passive Super-I/O detection report (DEC-202) into readiness items, so
 /// board-specific "your chip has no driver loaded" guidance surfaces in the
 /// existing readiness list alongside the generic `no_pwm_controls` item. Lives

@@ -91,6 +91,20 @@ pub async fn hwmon_rescan_handler(
         .sensor_rescan_requested
         .store(true, std::sync::atomic::Ordering::SeqCst);
 
+    // DEC-207: a rescan is a discovery-changing event — proactively refresh the
+    // shared hardware assessment (and the mirrored Dashboard rollup) once the poll
+    // loop has had a chance to rebuild its descriptor set on its next tick, so the
+    // chip reflects newly-visible chips without waiting for an inventory GET.
+    // Deferred + fire-and-forget + coalesced; the readiness page's own force-fetch
+    // remains the authoritative path.
+    {
+        let s = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            let _ = super::ensure_assessment(s, true).await;
+        });
+    }
+
     let hwmon_root = std::path::Path::new(HWMON_SYSFS_ROOT);
     match discover_pwm_headers(hwmon_root) {
         Ok(headers) => {

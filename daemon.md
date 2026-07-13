@@ -75,7 +75,8 @@ daemon/src/
       control.rs       — manual-override + fan-identify endpoints (DEC-163/166)
       config.rs        — runtime config endpoints (search dirs, startup delay)
       hw_diagnostics.rs — hardware diagnostics endpoint
-      inventory.rs     — /inventory/{hwmon,readiness,superio} reads + Super-I/O probe (DEC-200/202/203)
+      inventory.rs     — /inventory/{hwmon,readiness,superio,hardware-readiness} reads + Super-I/O probe; shared assessment snapshot + coalesced scan (DEC-200/202/203/207)
+      assessment.rs    — hardware-assessment cache + single-flight coordinator (DEC-207)
       path_confine.rs  — SO_PEERCRED search-dir confinement predicate (DEC-205)
     responses.rs       — response structs (Serialize)
     calibration.rs     — OpenFan calibration sweep
@@ -259,6 +260,7 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 | GET | `/inventory/hwmon` | Read-only structured inventory: temp sensors (each with a fine `classification`/`confidence`/`rationale` + an advisory `default_cpu`), controllable PWM headers, and monitor-only fan tachometers (`fanN_input` with no matching `pwmN`) |
 | GET | `/inventory/readiness` | Structured hardware-readiness list (`items[]` with code/severity/component/action + blocks-flags; `overall` rollup). Read-only diagnose-and-guide |
 | GET | `/inventory/superio` | Passive Super-I/O chip detection report — DMI/hwmon/`/proc/modules`/kmsg/ACPI evidence → per-chip presence + allowlisted driver recommendations; `port_probe_available` flags the opt-in active probe. Read-only, never touches an I/O port (DEC-202) |
+| GET | `/inventory/hardware-readiness` | Combined readiness + Super-I/O snapshot from ONE shared passive scan (DEC-207): the readiness `rollup`/`overall`/`items`, the `superio` report, `scanned_age_ms`, and a monotonic `generation`. The GUI's merged "Cooling Hardware Readiness" page fetches this in a single request; `?refresh=true` forces a fresh (coalesced) scan. Read-only, 404-gated |
 
 As of 2.0.0 the profile engine is the **sole writer** (DEC-159/DEC-165); the GUI sends intent (activate / override / identify) and a few diagnostics calls — there is no bare PWM write surface.
 
