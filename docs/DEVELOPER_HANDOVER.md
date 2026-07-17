@@ -152,6 +152,7 @@ sudo systemctl enable --now control-ofc-daemon
 | `GET /inventory/hwmon` | Structured hwmon inventory — temps, fan tachs, PWM metadata (DEC-200) |
 | `GET /inventory/readiness` | Readiness items (`blocks_monitoring`/`blocks_control`, `reboot_may_be_required`; DEC-200) |
 | `GET /inventory/superio` | Passive Super-I/O chip detection (DEC-202) |
+| `GET /inventory/hardware-readiness` | Combined readiness + Super-I/O snapshot from one shared scan (DEC-207) |
 
 ### Write
 The profile engine is the **sole writer** as of 2.0.0 (DEC-159/DEC-165); the GUI sends intent + diagnostics calls. Bare PWM/lease endpoints were retired (note below).

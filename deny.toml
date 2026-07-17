@@ -28,6 +28,10 @@ ignore = []
 #                   BSD/MIT). Pulled in for runtime dlopen of libnvidia-ml.so.1
 #                   (opt-in, read-only NVIDIA telemetry). No copyleft obligation.
 # Notably ABSENT (therefore denied): every LGPL/GPL-only variant (DEC-043).
+# Scope: this gate governs the statically-linked Rust dependency tree ONLY. The
+# GUI's PySide6 (LGPL-3.0) is a separate, compliant concern — used via dynamic
+# import (LGPL §4's shared-library carve-out), not static linkage, so it never
+# falls under this Rust static-binary ban. Do not "fix" that non-violation.
 # unescaper declares the legacy "GPL-3.0/MIT" (the slash means OR); MIT
 # satisfies it, so NO GPL allowance is needed and the crate PASSES the gate.
 # cargo-deny still prints a cosmetic `parse-error` warning about the deprecated
