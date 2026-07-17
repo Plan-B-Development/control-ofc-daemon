@@ -1,5 +1,31 @@
 # Changelog
 
+## [2.12.0] — 2026-07-17
+
+Thermal-safety and override-lifecycle hardening from the 2026-07-15 cross-stack
+audit remediation, plus systemd-unit tightening. No breaking changes; no wire or
+API-version change (`api_version` stays 1). Coordinated with `control-ofc-gui`
+≥ v2.23.0 — the changes are daemon-internal, so older GUIs are unaffected. DEC-218.
+
+### Fixed
+- **Thermal `force_all` completes every header despite a mid-scan lease preemption.**
+  When a `Verify` write preempts the thermal-safety lease mid-scan, `force_all` now
+  re-takes the `ThermalSafety` lease and retries that one header, atomically under
+  the controller lock (bounded — a persistent preemptor cannot thrash), so a 105 °C
+  emergency forces every OpenFan + writable hwmon fan even under contention. Mutation-
+  proven regression test.
+
+### Changed
+- **`POST /profile/deactivate` clears standing control-overrides (DEC-218).** Symmetric
+  with DEC-189 (activate clears overrides): deactivating a profile now clears all
+  control-overrides under the `active_profile` lock, so a renew after deactivation
+  returns `404 override_expired` instead of surviving into the idle (no-profile) state.
+  Identify-stops are preserved.
+- **systemd unit hardening.** The OpenFan-TTY `DeviceAllow` drops the `mknod` bit
+  (`rwm`→`rw`; the daemon only opens existing device nodes); `RuntimeDirectoryMode=0755`
+  and `User=root` are pinned explicitly (the DEC-049 non-root-GUI socket-access model
+  depends on the world-traversable runtime directory). No privilege change.
+
 ## [2.11.0] — 2026-07-13
 
 A single shared hardware-assessment snapshot behind the readiness + Super-I/O
