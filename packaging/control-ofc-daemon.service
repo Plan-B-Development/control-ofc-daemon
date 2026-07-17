@@ -20,6 +20,10 @@ ExecStart=/usr/bin/control-ofc-daemon
 ExecStopPost=/usr/bin/control-ofc-restore-auto
 ExecReload=/bin/kill -HUP $MAINPID
 RuntimeDirectory=control-ofc
+# 0755 (systemd's default, pinned explicitly) so a non-root GUI can traverse
+# /run/control-ofc to reach the 0666 socket the daemon chmods after bind
+# (DEC-049); a future UMask/hardening change then can't silently lock the GUI out.
+RuntimeDirectoryMode=0755
 StateDirectory=control-ofc
 # Socket: /run/control-ofc/control-ofc.sock (created by daemon)
 # State: /var/lib/control-ofc/daemon_state.json (active profile pointer)
@@ -28,14 +32,18 @@ StateDirectory=control-ofc
 # Logging goes to journald by default (env_logger → stderr → journald)
 Environment=RUST_LOG=info
 # HOME is required for default profile search dirs (~/.config/control-ofc/profiles).
-# systemd does not set HOME when no User= is specified (systemd.exec(5)).
+# User=root (below) sets it from the passwd entry, but it is pinned explicitly so
+# the resolved path stays obvious and independent of NSS (systemd.exec(5)).
 Environment=HOME=/root
 
 # Restart on crash
 Restart=on-failure
 RestartSec=3
 
-# Privilege model: daemon runs as root (no User= directive).
+# Privilege model: daemon runs as root, declared explicitly via User=root
+# (identical to the prior implicit default — root is what a User=-less system
+# service already gets — but it states intent).
+User=root
 # Root is required for direct read/write to /sys/class/hwmon and /sys/class/drm
 # sysfs nodes (motherboard fan PWM headers and GPU PMFW fan curves). Serial
 # device access (/dev/ttyACM*) is handled via DeviceAllow below.
@@ -97,9 +105,11 @@ PrivateNetwork=true
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
 
 # Serial device access (OpenFanController)
-# Allow all ttyACM and ttyUSB devices (index varies across systems)
-DeviceAllow=char-ttyACM rwm
-DeviceAllow=char-ttyUSB rwm
+# Allow all ttyACM and ttyUSB devices (index varies across systems). read+write
+# only — the daemon opens existing device nodes and never creates them, so the
+# mknod bit (m) is dropped.
+DeviceAllow=char-ttyACM rw
+DeviceAllow=char-ttyUSB rw
 # uucp (Arch/CachyOS) — dialout (Debian/Ubuntu) omitted; systemd fails on missing groups
 SupplementaryGroups=uucp
 

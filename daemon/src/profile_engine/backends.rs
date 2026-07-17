@@ -25,6 +25,7 @@ use crate::clock::Clock;
 use crate::constants;
 use crate::health::cache::StateCache;
 use crate::hwmon::lease::HwmonWriter;
+use crate::hwmon::pwm_control::HwmonControlError;
 use crate::serial::protocol::NUM_CHANNELS;
 
 /// One fan-control backend the profile engine writes through.
@@ -612,18 +613,20 @@ impl WriteBackend for HwmonBackend {
 impl SafetyWriteBackend for HwmonBackend {
     /// Force every hwmon header to `pct` (auto-lease for safety writes).
     ///
-    /// Takes the lease once (force-take as "thermal-safety"), then re-locks
-    /// per header so concurrent GUI activity can proceed between writes
-    /// (DEC-099). If a GUI request force-takes the lease mid-scan, writes
-    /// fail with InvalidLease until the next 1Hz tick re-acquires it — same
-    /// safety net as the OpenFan path.
-    /// DEC-146 P3-8: runs on the blocking pool; the take-once /
-    /// re-lock-per-header structure (DEC-099) is preserved verbatim inside
-    /// the closure.
+    /// Force-takes the lease as thermal-safety, then re-locks the controller per
+    /// header so concurrent GUI activity can proceed between writes (DEC-099).
+    /// Because the lock is dropped between headers, a GUI hardware-verify can
+    /// force-take the lease mid-scan and invalidate ours. Thermal safety
+    /// outranks maintenance, so a write that fails with a lease error re-takes
+    /// the lease and retries that header once — bounded, so a persistent
+    /// preemptor cannot thrash — rather than leaving the remaining fans
+    /// un-forced. (The lease system is hwmon-only; the OpenFan path has none.)
+    /// DEC-146 P3-8: runs on the blocking pool; the re-lock-per-header structure
+    /// (DEC-099) is preserved inside the closure.
     async fn force_all(&mut self, pct: u8) {
         let ctrl = self.ctrl.clone();
         let join = tokio::task::spawn_blocking(move || {
-            let (hdr_ids, lease_id) = {
+            let (hdr_ids, mut lease_id) = {
                 let mut guard = ctrl.lock();
                 let hdr_ids: Vec<String> = guard.headers().iter().map(|h| h.id.clone()).collect();
                 let lease_id = guard
@@ -641,8 +644,32 @@ impl SafetyWriteBackend for HwmonBackend {
             };
             for hdr_id in &hdr_ids {
                 let mut guard = ctrl.lock();
-                if let Err(e) = guard.set_pwm(hdr_id, pct, &lease_id) {
-                    log::error!("THERMAL SAFETY: hwmon {hdr_id} write FAILED: {e}");
+                match guard.set_pwm(hdr_id, pct, &lease_id) {
+                    Ok(_) => {}
+                    Err(HwmonControlError::Lease(_)) => {
+                        // A concurrent GUI verify force-took the lease in the
+                        // window DEC-099 leaves between headers, invalidating
+                        // ours. Thermal safety outranks maintenance: re-take
+                        // unconditionally and retry THIS header once. The re-take
+                        // and retry share this one lock, so a preemptor cannot
+                        // slip between them; the bound (one re-take per header)
+                        // stops a persistent preemptor from thrashing the scan.
+                        // force-take resets the new owner's coalescing state, so
+                        // re-assert pwm_enable on the retry (Audit P1-E).
+                        lease_id = guard
+                            .lease_manager_mut()
+                            .force_take_lease(HwmonWriter::ThermalSafety)
+                            .lease_id;
+                        guard.on_lease_released();
+                        if let Err(e) = guard.set_pwm(hdr_id, pct, &lease_id) {
+                            log::error!(
+                                "THERMAL SAFETY: hwmon {hdr_id} write FAILED after lease re-take: {e}"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("THERMAL SAFETY: hwmon {hdr_id} write FAILED: {e}");
+                    }
                 }
             }
         })
@@ -1178,6 +1205,97 @@ mod tests {
         assert!(
             !pwm_writes.is_empty(),
             "expected forced pwm writes; got {w:?}"
+        );
+    }
+
+    /// Writer that signals once (on its first write) so a test can time a
+    /// mid-scan lease preemption, then holds the lock long enough that the
+    /// parked preemptor crosses parking_lot's eventual-fairness window and
+    /// reliably acquires the lock in the gap after the first header.
+    struct SignalOnFirstWriter {
+        writes: WriteLog,
+        tx: std::sync::mpsc::Sender<()>,
+        signaled: bool,
+    }
+
+    impl SysfsWriter for SignalOnFirstWriter {
+        fn write_file(&mut self, path: &str, value: &str) -> Result<(), HwmonError> {
+            self.writes.lock().push((path.into(), value.into()));
+            if !self.signaled {
+                self.signaled = true;
+                let _ = self.tx.send(());
+                // Still holding the controller lock: park the preemptor long
+                // enough that the next unlock hands off to it (fairness), not
+                // to force_all's own re-lock for the second header.
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(())
+        }
+        fn read_file(&self, _path: &str) -> Result<String, HwmonError> {
+            Ok("128\n".into())
+        }
+    }
+
+    fn header_with_paths(i: usize) -> PwmHeaderDescriptor {
+        let mut h = make_header(&format!("hwmon:it8696:pwm{i}"));
+        h.pwm_path = format!("/sys/class/hwmon/hwmon0/pwm{i}");
+        h.enable_path = Some(format!("/sys/class/hwmon/hwmon0/pwm{i}_enable"));
+        h
+    }
+
+    #[tokio::test]
+    async fn hwmon_force_all_completes_every_header_despite_midscan_verify_preempt() {
+        // Regression for the force_all partial-write bug. DEC-099 drops the
+        // controller lock between headers, so a GUI verify can force-take the
+        // lease mid-scan and invalidate force_all's. The retry-on-lease-error
+        // fix re-takes thermal-safety and still forces EVERY header; without it
+        // the header after the preemption is silently left un-forced during a
+        // thermal emergency.
+        const N: usize = 8;
+        let writes: WriteLog = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let writer = SignalOnFirstWriter {
+            writes: writes.clone(),
+            tx,
+            signaled: false,
+        };
+        let headers: Vec<_> = (1..=N).map(header_with_paths).collect();
+        let cache = Arc::new(StateCache::new());
+        let ctrl = HwmonPwmController::new(headers, LeaseManager::new(), Box::new(writer), cache);
+        let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl)));
+
+        // Exactly one mid-scan preemption: a GUI verify force-takes the lease
+        // once force_all is past the first header.
+        let ctrl_for_preempt = be.ctrl.clone();
+        let preemptor = std::thread::spawn(move || {
+            rx.recv().expect("force_all must write at least one header");
+            ctrl_for_preempt
+                .lock()
+                .lease_manager_mut()
+                .force_take_lease(HwmonWriter::Verify);
+        });
+
+        be.force_all(100).await;
+        preemptor.join().unwrap();
+
+        // Every header must have been forced despite the mid-scan preemption.
+        let w = writes.lock();
+        for i in 1..=N {
+            let pwm_path = format!("/sys/class/hwmon/hwmon0/pwm{i}");
+            assert!(
+                w.iter().any(|(p, _)| *p == pwm_path),
+                "header pwm{i} was not forced to 100% (partial-write bug); writes={w:?}"
+            );
+        }
+        drop(w);
+
+        // force_all reclaimed the lease from the verify preemptor — proof the
+        // re-take (not just a lucky race) carried the scan to completion.
+        let lease = be.ctrl.lock().lease_manager().active_lease().cloned();
+        assert_eq!(
+            lease.map(|l| l.owner),
+            Some(HwmonWriter::ThermalSafety),
+            "force_all must re-take thermal-safety after a mid-scan verify preempt"
         );
     }
 

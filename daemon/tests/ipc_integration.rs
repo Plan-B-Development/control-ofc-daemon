@@ -2781,6 +2781,68 @@ async fn activate_profile_clears_standing_overrides_and_gpu_relinquish() {
 }
 
 #[tokio::test]
+async fn deactivate_profile_clears_standing_overrides() {
+    // DEC-218: deactivation relinquishes curve-driven control, so it must clear
+    // standing manual overrides too — symmetric with activation (DEC-189). An
+    // override left behind would bleed onto a same-id control in the next
+    // profile, and its token would still renew after deactivation.
+    let tmp = tempfile::tempdir().unwrap();
+    let search_dir = tmp.path().join("search");
+    std::fs::create_dir_all(&search_dir).unwrap();
+    let profile_path = search_dir.join("p.json");
+    std::fs::write(
+        &profile_path,
+        r#"{"id":"p","name":"P","version":7,
+            "controls":[{"id":"cpu","name":"CPU","curve_id":"c1"}],
+            "curves":[{"id":"c1","name":"C1","type":"flat","flat_output_pct":50}]}"#,
+    )
+    .unwrap();
+
+    let state = test_app_state_with_profile_dirs(vec![search_dir.clone()]);
+    let (sock, shutdown, _d) = start_test_server(state.clone()).await;
+    let activate = serde_json::json!({ "profile_path": profile_path.display().to_string() });
+
+    // Activate, then pin "cpu" with a manual override and capture its token.
+    let (st, j) = uds_post(&sock, "/profile/activate", &activate).await;
+    assert_eq!(st, 200, "activate: {j}");
+    let (st, j) = uds_post(
+        &sock,
+        "/control/cpu/override",
+        &serde_json::json!({"pwm_percent": 80}),
+    )
+    .await;
+    assert_eq!(st, 200, "override take: {j}");
+    let token = j["override_token"].clone();
+
+    // Sanity: /status surfaces the live override.
+    let (_st, status) = uds_get(&sock, "/status").await;
+    assert_eq!(status["overrides"][0]["control_id"], "cpu");
+
+    // Deactivate — DEC-218 must clear the override under the active_profile lock.
+    let (st, j) = uds_post(&sock, "/profile/deactivate", &serde_json::json!({})).await;
+    assert_eq!(st, 200, "deactivate: {j}");
+
+    // The override is gone from /status ...
+    let (_st, status) = uds_get(&sock, "/status").await;
+    assert!(
+        status.get("overrides").is_none(),
+        "deactivation must clear standing overrides, got {status}"
+    );
+    // ... and its token no longer renews (the card would revert on next renew).
+    let (st, body) = uds_post(
+        &sock,
+        "/control/cpu/override/renew",
+        &serde_json::json!({ "override_token": token }),
+    )
+    .await;
+    assert_eq!(st, 404, "renew after deactivate: {body}");
+    assert_eq!(body["error"]["code"], "override_expired");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[tokio::test]
 async fn fan_identify_stop_then_restore() {
     let (sock, _tx, _d) = start_test_server(test_app_state()).await;
 

@@ -199,7 +199,18 @@ pub async fn deactivate_profile_handler(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let previous = {
         let mut guard = state.active_profile.lock();
-        guard.take().map(|p| (p.id, p.name))
+        let previous = guard.take().map(|p| (p.id, p.name));
+        // DEC-218: deactivation relinquishes curve-driven control, so it must
+        // also clear standing manual overrides — symmetric with activation
+        // (DEC-189). An override outlives the profile it was taken against
+        // otherwise, and would bleed onto a same-id control in the next
+        // profile. Done while holding `active_profile` (lock order
+        // active_profile → override_table, matching activate at line 159) so a
+        // concurrent override-take (control.rs, which also holds
+        // active_profile) serialises fully before this clear — and is wiped —
+        // or fully after.
+        state.override_table.lock().clear_all_overrides();
+        previous
     };
 
     // Persist the cleared state so a daemon restart doesn't resurrect the
