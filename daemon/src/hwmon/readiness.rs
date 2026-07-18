@@ -606,6 +606,24 @@ mod tests {
     }
 
     #[test]
+    fn all_writable_pwm_has_no_read_only_warning() {
+        // B3: when every header is writable (pwm_writable == pwm_total) the
+        // read-only warning must be ABSENT. Kills `pwm_writable < pwm_total` → `<=`,
+        // which would emit `pwm_read_only` (with blocks_control) on healthy hardware.
+        let items = build_readiness(&ReadinessInputs {
+            cpu_sensor_count: 1,
+            default_cpu_confident: Some(true),
+            pwm_total: 3,
+            pwm_writable: 3,
+            ..Default::default()
+        });
+        assert!(has(&items, "pwm_controls_present"));
+        assert!(!has(&items, "pwm_read_only"));
+        // At least one writable header → the unverified note IS present.
+        assert!(has(&items, "pwm_control_unverified"));
+    }
+
+    #[test]
     fn some_read_only_pwm_warns_but_still_lists_writable() {
         let items = build_readiness(&ReadinessInputs {
             cpu_sensor_count: 1,

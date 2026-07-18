@@ -3104,6 +3104,46 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn loop_writes_thermal_state_to_cache_during_emergency() {
+        // A2: the engine loop must write `thermal_state` to the cache on the
+        // forced/emergency path — which short-circuits via `continue`. `/status`
+        // maps None→"normal", so it cannot distinguish "engine wrote normal" from
+        // "engine never wrote"; assert the cache field directly. No controllers
+        // are needed — the cache write precedes any backend use.
+        let cache = make_cache_with_sensor("cpu", 106.0); // ≥105 °C → emergency + force 100
+        let profile_arc = Arc::new(Mutex::new(None::<DaemonProfile>));
+        let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
+
+        // Precondition: nothing has written thermal state yet.
+        assert_eq!(cache.snapshot().thermal_override_state, None);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(profile_engine_loop(
+            cache.clone(),
+            profile_arc,
+            None,   // no OpenFan
+            None,   // no hwmon — the cache write precedes any backend use
+            vec![], // no GPU
+            safety,
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            shutdown_rx,
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await; // ≥1 tick
+        shutdown_tx.send(true).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let _ = handle.await;
+
+        // The emergency path (which hits `continue`) MUST still have written the
+        // cache. If the setter were moved below the `continue`, this stays None.
+        assert_eq!(
+            cache.snapshot().thermal_override_state.as_deref(),
+            Some("emergency"),
+            "engine loop must write thermal_state to the cache on the forced path"
+        );
+    }
+
     /// P3-2: a forced safety override must clear the engine's cross-cycle
     /// tuning state. The fans are physically at the forced PWM, so resuming
     /// normal evaluation from the pre-emergency `last_output` anchor would
@@ -3287,6 +3327,55 @@ mod tests {
             }
         );
         assert_eq!(cycles, 0);
+    }
+
+    #[test]
+    fn safety_tick_no_sensor_fallback_persists_past_threshold_without_emergency() {
+        // A3: with NO emergency latched, the plain no-sensor fallback must KEEP
+        // forcing past the threshold on the counter alone. Kills the mutation
+        // `n >= THRESHOLD` → `n == THRESHOLD` (which survives both existing tests:
+        // `..._after_threshold` stops at cycle 5, and the DEC-190 dropout test
+        // holds via the emergency latch, not the counter).
+        let mut rule = crate::safety::ThermalSafetyRule::new();
+        let mut cycles = 0u32;
+
+        // Cycles 1..THRESHOLD: below the gate, nothing forced.
+        for cycle in 1..constants::NO_SENSOR_CYCLE_THRESHOLD {
+            let d = evaluate_safety_tick(None, &mut cycles, &mut rule);
+            assert_eq!(
+                d,
+                SafetyDecision {
+                    thermal_state: "normal",
+                    forced_pct: None
+                },
+                "cycle {cycle}: below threshold must not force"
+            );
+            assert!(
+                !rule.is_active(),
+                "cycle {cycle}: no emergency may be latched in this path"
+            );
+        }
+
+        // Cycle THRESHOLD (forcing begins), THRESHOLD+1, THRESHOLD+2: force PERSISTS.
+        for cycle in
+            constants::NO_SENSOR_CYCLE_THRESHOLD..=(constants::NO_SENSOR_CYCLE_THRESHOLD + 2)
+        {
+            let d = evaluate_safety_tick(None, &mut cycles, &mut rule);
+            assert_eq!(
+                d,
+                SafetyDecision {
+                    thermal_state: "no_sensor_fallback",
+                    forced_pct: Some(constants::NO_SENSOR_SAFE_PCT),
+                },
+                "cycle {cycle}: non-emergency no-sensor force must persist past the \
+                 threshold (n >= THRESHOLD, not n == THRESHOLD)"
+            );
+            // Persistence is the counter, not the latch.
+            assert!(
+                !rule.is_active(),
+                "cycle {cycle}: emergency latch must stay clear"
+            );
+        }
     }
 
     #[test]

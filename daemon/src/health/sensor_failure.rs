@@ -321,6 +321,32 @@ mod tests {
         assert!(!tracker.wants_rediscovery());
     }
 
+    /// B6: a sensor that is quarantined and THEN vanishes (device unbound) must be
+    /// reconciled out of `unavailable()` — exercising `quarantined.retain(...)`,
+    /// the branch the pre-quarantine vanish test never reaches. Deleting that
+    /// retain would strand the sensor in `unavailable()` forever (re-opens DEC-193).
+    #[test]
+    fn quarantined_descriptor_that_vanishes_is_reconciled_out_silently() {
+        let mut tracker = SensorFailureTracker::new(THRESHOLD);
+        // Run well past quarantine: now quarantined and surfaced as unavailable.
+        run_failing(&mut tracker, "wifi", 20);
+        assert_eq!(tracker.unavailable().len(), 1);
+
+        // The descriptor now vanishes entirely (empty present set) — the
+        // `quarantined.retain(...)` reconcile branch, not a recovery.
+        let events = tracker.record_tick(&[], &[], Instant::now());
+
+        assert!(
+            events.is_empty(),
+            "a vanished quarantined sensor emits no Recovered event"
+        );
+        assert!(
+            tracker.unavailable().is_empty(),
+            "quarantined.retain must drop the absent id"
+        );
+        assert!(!tracker.wants_rediscovery());
+    }
+
     /// A transient blip (a few failures, then success) never quarantines and
     /// never asks for re-discovery.
     #[test]

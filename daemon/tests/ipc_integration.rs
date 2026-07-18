@@ -2781,6 +2781,80 @@ async fn activate_profile_clears_standing_overrides_and_gpu_relinquish() {
 }
 
 #[tokio::test]
+async fn activating_different_profile_does_not_bleed_override_onto_same_id_control() {
+    // B4 / DEC-189: an override taken while profile A is active must NOT carry onto
+    // the same-id "cpu" control when a DIFFERENT profile B is activated. The
+    // existing activate test only re-activates the SAME profile (least likely to
+    // regress) — this exercises a real profile switch.
+    let tmp = tempfile::tempdir().unwrap();
+    let search_dir = tmp.path().join("search");
+    std::fs::create_dir_all(&search_dir).unwrap();
+
+    // Two DISTINCT profiles (ids "pa"/"pb"), each carrying a control "cpu".
+    let path_a = search_dir.join("a.json");
+    let path_b = search_dir.join("b.json");
+    std::fs::write(
+        &path_a,
+        r#"{"id":"pa","name":"A","version":7,
+            "controls":[{"id":"cpu","name":"CPU","curve_id":"c1"}],
+            "curves":[{"id":"c1","name":"C1","type":"flat","flat_output_pct":50}]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &path_b,
+        r#"{"id":"pb","name":"B","version":7,
+            "controls":[{"id":"cpu","name":"CPU","curve_id":"c2"}],
+            "curves":[{"id":"c2","name":"C2","type":"flat","flat_output_pct":30}]}"#,
+    )
+    .unwrap();
+
+    let state = test_app_state_with_profile_dirs(vec![search_dir.clone()]);
+    let (sock, shutdown, _d) = start_test_server(state.clone()).await;
+    let activate_a = serde_json::json!({ "profile_path": path_a.display().to_string() });
+    let activate_b = serde_json::json!({ "profile_path": path_b.display().to_string() });
+
+    // Activate A, take an override on "cpu", capture the token.
+    let (st, j) = uds_post(&sock, "/profile/activate", &activate_a).await;
+    assert_eq!(st, 200, "activate A: {j}");
+    let (st, j) = uds_post(
+        &sock,
+        "/control/cpu/override",
+        &serde_json::json!({"pwm_percent": 80}),
+    )
+    .await;
+    assert_eq!(st, 200, "override take: {j}");
+    let token = j["override_token"].clone();
+
+    // Sanity: /status shows the override under A.
+    let (_st, status) = uds_get(&sock, "/status").await;
+    assert_eq!(status["overrides"][0]["control_id"], "cpu");
+
+    // Activate the DIFFERENT profile B.
+    let (st, j) = uds_post(&sock, "/profile/activate", &activate_b).await;
+    assert_eq!(st, 200, "activate B: {j}");
+
+    // (a) No overrides bleed onto B's same-id "cpu".
+    let (_st, status) = uds_get(&sock, "/status").await;
+    assert!(
+        status.get("overrides").is_none(),
+        "cross-profile activation must clear standing overrides, got {status}"
+    );
+
+    // (b) The old token no longer renews.
+    let (st, body) = uds_post(
+        &sock,
+        "/control/cpu/override/renew",
+        &serde_json::json!({ "override_token": token }),
+    )
+    .await;
+    assert_eq!(st, 404, "stale renew after cross-profile activate: {body}");
+    assert_eq!(body["error"]["code"], "override_expired");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[tokio::test]
 async fn deactivate_profile_clears_standing_overrides() {
     // DEC-218: deactivation relinquishes curve-driven control, so it must clear
     // standing manual overrides too — symmetric with activation (DEC-189). An

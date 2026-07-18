@@ -913,6 +913,27 @@ mod tests {
     }
 
     #[test]
+    fn set_pwm_coalescing_is_exact_equality_not_delta() {
+        // B2: a one-unit delta (50 → 51) must NOT coalesce — the guard is
+        // `== Some(effective_pct)`, exact equality, NOT a delta tolerance. If the
+        // GPU 5% rule (or any `abs_diff <= N`) leaked onto the hwmon path, 51 would
+        // coalesce and drop this to 2 writes.
+        let (mut ctrl, writes, _cache) = setup_controller(vec![make_header("h1", "CHA_FAN1", 0)]);
+
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
+        ctrl.set_pwm("h1", 50, &lease.lease_id).unwrap(); // enable(1) + pwm(50)
+        ctrl.set_pwm("h1", 51, &lease.lease_id).unwrap(); // delta 1 → pwm(51), enable skipped
+
+        let writes = writes.lock();
+        // enable(1) + pwm(50) + pwm(51) = 3 writes; the second set_pwm went through.
+        assert_eq!(writes.len(), 3);
+        assert_eq!(writes[2].1, percent_to_raw(51).to_string());
+    }
+
+    #[test]
     fn on_lease_released_resets_coalescing() {
         // After lease release + new lease → enable written on first call again
         let (mut ctrl, writes, _cache) = setup_controller(vec![make_header("h1", "CHA_FAN1", 0)]);

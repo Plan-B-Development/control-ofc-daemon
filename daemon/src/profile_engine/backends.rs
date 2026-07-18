@@ -1186,10 +1186,10 @@ mod tests {
 
     #[tokio::test]
     async fn hwmon_force_all_takes_thermal_safety_lease_and_writes_every_header() {
-        let (mut be, writes) = hwmon_backend(vec![
-            make_header("hwmon:it8696:pwm1"),
-            make_header("hwmon:it8696:pwm2"),
-        ]);
+        // Distinct pwm paths per header (make_header hardcodes pwm1) so the
+        // value assertion below proves EVERY header — not just the first — was
+        // driven to 100%.
+        let (mut be, writes) = hwmon_backend(vec![header_with_paths(1), header_with_paths(2)]);
         // Even an engine-held lease is force-taken for safety writes.
         be.ctrl
             .lock()
@@ -1201,11 +1201,25 @@ mod tests {
         let lease = be.ctrl.lock().lease_manager().active_lease().cloned();
         assert_eq!(lease.map(|l| l.owner), Some(HwmonWriter::ThermalSafety));
         let w = writes.lock();
-        let pwm_writes: Vec<_> = w.iter().filter(|(p, _)| p.ends_with("pwm1")).collect();
-        assert!(
-            !pwm_writes.is_empty(),
-            "expected forced pwm writes; got {w:?}"
-        );
+        // Pin the forced VALUE (100% → raw "255"), not just write-presence: a
+        // force_all that ignored its pct and wrote 40% would else pass. Assert
+        // both headers' pwm data write (the pwm{i} path excludes pwm{i}_enable).
+        for i in 1..=2 {
+            let pwm_path = format!("/sys/class/hwmon/hwmon0/pwm{i}");
+            let vals: Vec<_> = w
+                .iter()
+                .filter(|(p, _)| *p == pwm_path)
+                .map(|(_, v)| v.trim())
+                .collect();
+            assert!(
+                !vals.is_empty(),
+                "header pwm{i} received no forced write; got {w:?}"
+            );
+            assert!(
+                vals.iter().all(|v| *v == "255"),
+                "header pwm{i} must be forced to 100% (raw 255); got {vals:?}"
+            );
+        }
     }
 
     /// Writer that signals once (on its first write) so a test can time a
@@ -1278,13 +1292,24 @@ mod tests {
         be.force_all(100).await;
         preemptor.join().unwrap();
 
-        // Every header must have been forced despite the mid-scan preemption.
+        // Every header must have been forced to 100% despite the mid-scan
+        // preemption. Assert the VALUE (raw "255"), not just presence — the
+        // failure message already claims "100%", so prove it.
         let w = writes.lock();
         for i in 1..=N {
             let pwm_path = format!("/sys/class/hwmon/hwmon0/pwm{i}");
+            let vals: Vec<_> = w
+                .iter()
+                .filter(|(p, _)| *p == pwm_path)
+                .map(|(_, v)| v.trim())
+                .collect();
             assert!(
-                w.iter().any(|(p, _)| *p == pwm_path),
-                "header pwm{i} was not forced to 100% (partial-write bug); writes={w:?}"
+                !vals.is_empty(),
+                "header pwm{i} was not forced (partial-write bug); writes={w:?}"
+            );
+            assert!(
+                vals.iter().all(|v| *v == "255"),
+                "header pwm{i} must be forced to 100% (raw 255); got {vals:?}"
             );
         }
         drop(w);
@@ -1375,6 +1400,15 @@ mod tests {
             NUM_CHANNELS as usize,
             "expected one forced SetPwm per channel; got {w:?}"
         );
+        // Count alone can't catch a force_all that ignores its pct argument and
+        // sends e.g. 40% during a 105°C emergency. Pin the VALUE: 100% → raw 255
+        // → frame ">02{ch:02X}FF\n" for every channel.
+        for frame in &set_pwm {
+            assert!(
+                frame.trim_end().ends_with("FF"),
+                "thermal force must drive every OpenFan channel to 100% (raw FF); got {frame:?}"
+            );
+        }
     }
 
     /// A toggleable serial transport: `write_line` fails (link "vanished")
