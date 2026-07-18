@@ -1,5 +1,20 @@
 # Changelog
 
+## [2.12.1] — 2026-07-18
+
+Test-coverage hardening only — **no runtime behaviour, wire, or API change**
+(`api_version` stays 1). Regression tests added in the 2026-07-18 `/test-tests`
+pass; every change is inside `#[cfg(test)]`/integration-test code. Pairs
+(unchanged) with `control-ofc-gui` ≥ v2.23.0.
+
+### Changed
+- **Regression-test hardening (no behaviour change).** Added tests around
+  thermal-safety `force_all` (per-header value assertions — proves every header,
+  not just the first, is driven to the emergency duty and survives a mid-scan
+  lease preemption), manual-override take/renew/release lifecycle, the sensor-
+  failure quarantine tracker, and hwmon readiness classification. These pin
+  behaviour that already shipped in v2.12.0; no source logic changed.
+
 ## [2.12.0] — 2026-07-17
 
 Thermal-safety and override-lifecycle hardening from the 2026-07-15 cross-stack
