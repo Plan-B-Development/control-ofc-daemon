@@ -44,6 +44,11 @@ RestartSec=3
 # (identical to the prior implicit default — root is what a User=-less system
 # service already gets — but it states intent).
 User=root
+# Group=root pinned explicitly (2026-07-21 audit PKG-3): systemd already
+# derives it from root's passwd entry, so this is a no-op today — but it
+# states intent and stops a future User= change (or DynamicUser=) from
+# silently inheriting an unexpected primary group.
+Group=root
 # Root is required for direct read/write to /sys/class/hwmon and /sys/class/drm
 # sysfs nodes (motherboard fan PWM headers and GPU PMFW fan curves). Serial
 # device access (/dev/ttyACM*) is handled via DeviceAllow below.

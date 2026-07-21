@@ -3,6 +3,14 @@
 ## [Unreleased]
 
 ### Fixed
+- **CI clippy failure on `main` cleared (2026-07-21 audit Phase 8, PKG-2
+  finding).** The profile `sync`-curve validation arm was a bare `if` that
+  Rust 1.95+'s `clippy::collapsible_match` (implied by the CI gate's
+  `-D warnings`) rejects; the daemon's CI job had been red since the
+  toolchain rolled forward. Bound `sync_control_id.as_str()` once and reshaped
+  the arm to match its `trigger`/`mix` siblings — behaviour identical
+  (`validate_sync_dangling_ref_is_error` unchanged), now clean under clippy
+  1.97.1 (the runner's current `stable`).
 - **GPU verify race closed at the blocking-task boundary (2026-07-21 audit
   CONC-1).** The engine's GPU write task now re-checks the verify write-pause
   *inside* the blocking task, immediately before the PMFW sysfs write —
@@ -37,6 +45,11 @@
   `profile_activate_parse_error_returns_generic_message_without_path`.
 
 ### Changed
+- **systemd unit: `Group=root` pinned explicitly (2026-07-21 audit PKG-3; no
+  behaviour change).** systemd already derived the group from root's passwd
+  entry, so this is a no-op today — it documents intent and stops a future
+  `User=` change (or `DynamicUser=`) from silently inheriting an unexpected
+  primary group. `systemd-analyze verify` clean.
 - **Regression-test hardening (2026-07-21 audit remediation, Phase 4; no
   behaviour change).** `OpenFanBackend::apply` gains backend-level coverage:
   exact pct→wire frame translation (channel-index hex + raw byte, `>0203FF` /

@@ -601,9 +601,8 @@ pub fn validate(profile: &DaemonProfile, known_sensor_ids: &HashSet<String>) -> 
                 }
             }
             "sync" => {
-                if curve.sync_control_id.is_empty()
-                    || !control_ids.contains(curve.sync_control_id.as_str())
-                {
+                let sid = curve.sync_control_id.as_str();
+                if sid.is_empty() || !control_ids.contains(sid) {
                     report.error(
                         format!("{p}.sync_control_id"),
                         "UNKNOWN_CONTROL_REF",
