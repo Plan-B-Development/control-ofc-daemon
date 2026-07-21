@@ -1,6 +1,11 @@
 # Changelog
 
-## [Unreleased]
+## [2.12.2] — 2026-07-21
+
+Audit-2026-07-21 remediation (daemon side): three profile-engine correctness
+fixes, a CI-clippy unblock, doc/packaging hygiene, and test hardening. **No
+wire, schema, or API change** (`api_version` stays 1). Pairs with
+`control-ofc-gui` ≥ v2.23.0 (unchanged — no new GUI feature required).
 
 ### Fixed
 - **CI clippy failure on `main` cleared (2026-07-21 audit Phase 8, PKG-2
