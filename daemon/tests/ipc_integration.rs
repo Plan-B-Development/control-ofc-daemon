@@ -2180,6 +2180,49 @@ async fn profile_activate_accepts_path_inside_search_dir() {
     let _ = std::fs::remove_file(&path);
 }
 
+#[tokio::test]
+async fn profile_activate_parse_error_returns_generic_message_without_path() {
+    // DEC-173 posture on the activate path (2026-07-21 audit): a corrupt
+    // stored profile must produce a generic envelope — the store's absolute
+    // path and the serde parser detail stay server-side (log only).
+    let tmp = tempfile::tempdir().unwrap();
+    let search_dir = tmp.path().join("search");
+    std::fs::create_dir_all(&search_dir).unwrap();
+
+    let profile_path = search_dir.join("corrupt.json");
+    std::fs::write(&profile_path, "{ not json").unwrap();
+
+    let state = test_app_state_with_profile_dirs(vec![search_dir.clone()]);
+    let (path, shutdown, _dir) = start_test_server(state.clone()).await;
+
+    let body = serde_json::json!({
+        "profile_path": profile_path.display().to_string(),
+    });
+    let (status, json) = uds_post(&path, "/profile/activate", &body).await;
+
+    assert_eq!(
+        status, 400,
+        "corrupt profile must 400, got {status}: {json}"
+    );
+    assert_eq!(json["error"]["code"], "validation_error");
+    assert_eq!(
+        json["error"]["message"].as_str().unwrap_or_default(),
+        "profile could not be read or parsed",
+        "message must be the generic text, got: {json}"
+    );
+    assert!(
+        !json.to_string().contains(&search_dir.display().to_string()),
+        "envelope must not leak the store path: {json}"
+    );
+    assert!(
+        state.active_profile.lock().is_none(),
+        "a failed activation must not install a profile"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
 // ───────────────────── Profile CRUD (DEC-160) ─────────────────────
 
 /// Send an arbitrary-method request (optionally with a JSON body) over the UDS.

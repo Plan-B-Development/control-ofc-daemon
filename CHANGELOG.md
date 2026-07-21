@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Security
+- **`POST /profile/activate` no longer leaks the store path in its error
+  envelope (2026-07-21 audit SEC-2, recorded under DEC-223).** A corrupt or
+  unreadable stored profile now returns the generic `400 validation_error`
+  message "profile could not be read or parsed"; the path-bearing read/parse
+  detail goes to the daemon log only — matching the DEC-173 posture of the
+  CRUD save/delete handlers. HTTP status and error code are unchanged.
+  Regression test:
+  `profile_activate_parse_error_returns_generic_message_without_path`.
+
 ### Changed
 - **Docs/packaging text corrections (2026-07-21 audit remediation, Phase 1; no
   code, wire, or behaviour change).** `daemon.md`'s endpoint table now records

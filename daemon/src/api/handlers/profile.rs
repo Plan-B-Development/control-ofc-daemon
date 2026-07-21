@@ -107,7 +107,13 @@ pub async fn activate_profile_handler(
     let profile = match crate::profile::load_profile(&profile_path) {
         Ok(p) => p,
         Err(e) => {
-            return error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(e));
+            // Path-bearing read/parse detail to the log only (DEC-173 —
+            // internal fs paths must not leak in the envelope).
+            log::error!("Failed to load profile for activation: {e}");
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation("profile could not be read or parsed"),
+            );
         }
     };
 
