@@ -37,6 +37,14 @@
   `profile_activate_parse_error_returns_generic_message_without_path`.
 
 ### Changed
+- **Regression-test hardening (2026-07-21 audit remediation, Phase 4; no
+  behaviour change).** `OpenFanBackend::apply` gains backend-level coverage:
+  exact pct→wire frame translation (channel-index hex + raw byte, `>0203FF` /
+  `>020000`), and a CONC-2 propagation test proving a coalesced steady-0 %
+  hold keeps the per-channel and link-down failure streaks clear. The
+  baseline (store-less) `/capabilities` integration test now pins
+  `control.autonomous_control = true` — previously only the store-enabled
+  test asserted the flag the GUI's startup control gate depends on.
 - **Docs/packaging text corrections (2026-07-21 audit remediation, Phase 1; no
   code, wire, or behaviour change).** `daemon.md`'s endpoint table now records
   DEC-218 on `POST /profile/deactivate` (clears control-overrides, not

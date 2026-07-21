@@ -1154,6 +1154,13 @@ async fn capabilities_endpoint_returns_schema() {
     assert!(json["features"]
         .get("lease_required_for_hwmon_writes")
         .is_none());
+    // TEST-4 (2026-07-21 audit): the GUI's startup gate blocks ALL control
+    // against a daemon lacking control.autonomous_control (2.0.0
+    // sole-writer). Pin it in this BASELINE (store-less) capabilities shape,
+    // not only in the store-enabled test — a regression dropping it from the
+    // no-store response would otherwise stay green here while gating every
+    // user without a profile store.
+    assert_eq!(json["control"]["autonomous_control"], true);
     // Limits
     assert_eq!(json["limits"]["pwm_percent_min"], 0);
     assert_eq!(json["limits"]["pwm_percent_max"], 100);

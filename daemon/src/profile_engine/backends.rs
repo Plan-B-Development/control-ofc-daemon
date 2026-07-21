@@ -1381,7 +1381,11 @@ mod tests {
             &mut self,
             _timeout: std::time::Duration,
         ) -> Result<String, crate::error::SerialError> {
-            Ok("OK".into())
+            // A protocol-valid SetPwm ACK (Phase-4 fix): the old "OK" was a
+            // debug line, so every mocked set_pwm silently returned an ACK
+            // error after its write — invisible to frame-only assertions but
+            // fatal to any test observing outcomes/streaks.
+            Ok("<02|00:0000;>".into())
         }
     }
 
@@ -1430,6 +1434,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openfan_apply_translates_pct_to_exact_channel_frames() {
+        // TEST-3 (2026-07-21 audit): pin the pct→wire translation end-to-end
+        // through apply() — channel index and raw byte, not just the ">02"
+        // prefix the smoke test checks. 100% → FF and 0% → 00 are the two
+        // rounding-free anchors of the percent→raw map; ch03/ch00 pin the
+        // channel-index hex encoding.
+        let (mut be, written, _cache) = openfan_backend();
+
+        be.apply(&[
+            cmd("openfan:ch03", "openfan", 100),
+            cmd("openfan:ch00", "openfan", 0),
+        ])
+        .await;
+
+        let w = written.lock();
+        assert!(
+            w.iter().any(|f| f.trim_end() == ">0203FF"),
+            "ch03 @ 100% must encode as >0203FF; got {w:?}"
+        );
+        assert!(
+            w.iter().any(|f| f.trim_end() == ">020000"),
+            "ch00 @ 0% must encode as >020000; got {w:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openfan_coalesced_zero_hold_keeps_failure_streak_clear() {
+        // CONC-2 propagation (2026-07-21 audit follow-up): a coalesced
+        // same-value repeat returns Ok from set_pwm and must flow through
+        // note_outcomes as a SUCCESS — keeping the per-channel failure streak
+        // and the link-down streak clear. Guards the streak-inflation
+        // regression the pre-CONC-2 check order caused for steady 0% holds.
+        let written: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let transport = FlakySerial {
+            written: written.clone(),
+            fail: fail.clone(),
+        };
+        let cache = Arc::new(StateCache::new());
+        let ctrl = crate::serial::controller::FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            std::time::Duration::from_millis(100),
+        );
+        let mut be = OpenFanBackend::new(Arc::new(Mutex::new(ctrl)), cache);
+
+        // Failing link: one 0% attempt starts both streaks.
+        be.apply(&[cmd("openfan:ch00", "openfan", 0)]).await;
+        assert_eq!(be.channel_failures.get(&0).copied(), Some(1));
+        assert_eq!(be.link_down_streak, 1);
+
+        // Link back: the 0% retry reaches the wire and clears both streaks.
+        fail.store(false, std::sync::atomic::Ordering::Relaxed);
+        be.apply(&[cmd("openfan:ch00", "openfan", 0)]).await;
+        assert_eq!(be.channel_failures.get(&0), None);
+        assert_eq!(be.link_down_streak, 0);
+        let wire_after_success = written.lock().len();
+
+        // Steady hold: the repeat coalesces (nothing new on the wire) and
+        // still counts as success — streaks stay clear.
+        be.apply(&[cmd("openfan:ch00", "openfan", 0)]).await;
+        assert_eq!(
+            written.lock().len(),
+            wire_after_success,
+            "repeat 0% must coalesce, not re-write"
+        );
+        assert_eq!(be.channel_failures.get(&0), None);
+        assert_eq!(be.link_down_streak, 0);
+    }
+
+    #[tokio::test]
     async fn openfan_force_all_writes_every_channel() {
         let (mut be, written, _cache) = openfan_backend();
 
@@ -1473,7 +1548,8 @@ mod tests {
             &mut self,
             _timeout: std::time::Duration,
         ) -> Result<String, crate::error::SerialError> {
-            Ok("OK".into())
+            // Protocol-valid SetPwm ACK (see SerialMock::read_line).
+            Ok("<02|00:0000;>".into())
         }
     }
 
