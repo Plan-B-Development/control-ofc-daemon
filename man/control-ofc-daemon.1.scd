@@ -107,7 +107,7 @@ To set the kernel parameter:
 A reboot is required for kernel parameter changes to take effect.
 
 Verify with *cat /proc/cmdline* -- the parameter must appear in the
-output. The GUI's Diagnostics page also reports whether the PMFW
+output. The GUI's Hardware page also reports whether the PMFW
 fan_curve interface is reachable.
 
 # SEE ALSO

@@ -35,7 +35,8 @@ daemon/                     Rust crate (control-ofc-daemon)
         control.rs          Manual-override + fan-identify handlers (DEC-163/166)
         config.rs           Runtime config handlers
         hw_diagnostics.rs   Hardware diagnostics handler
-        inventory.rs        /inventory/{hwmon,readiness,superio} reads + Super-I/O probe (DEC-200/202/203)
+        inventory.rs        /inventory/{hwmon,readiness,superio,hardware-readiness} reads + Super-I/O probe; shared assessment snapshot + coalesced scan (DEC-200/202/203/207)
+        assessment.rs       Hardware-assessment cache + single-flight coordinator (DEC-207)
         path_confine.rs     SO_PEERCRED search-dir confinement predicate (DEC-205)
       responses.rs          JSON response/request types (v1 schema)
       server.rs             Unix socket server lifecycle

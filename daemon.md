@@ -292,6 +292,14 @@ subsystem — DEC-102 / DEC-130).
 | POST | `/fans/openfan/{channel}/calibrate` | PWM→RPM sweep (long-running, thermal-aborting; pauses the engine write phase for the sweep so an active profile cannot corrupt the readback — DEC-191) |
 | POST | `/fans/{fan_id}/identify` | Per-fan stop/restore for identification — floor-exempt, deadman auto-restore (DEC-166) |
 
+The floor-exempt identify `stop` on the world-writable socket (0666, DEC-049) lets any local
+user hold any fan — including a pump-class header — stopped by re-issuing `stop` inside the
+deadman window. **Accepted, bounded risk** (2026-07-21 audit: accept + document): identification
+requires stopping any fan by design (DEC-166); the deadman auto-restore limits an abandoned stop
+to one TTL; and a thermal emergency outranks the identify overlay entirely — the engine's
+`force_all` path (105 °C emergency, and the no-sensor 40 % fallback) drives every OpenFan +
+writable hwmon header directly, spinning a stalled pump back up regardless of standing stops.
+
 ### Write endpoints — GPU
 
 | Method | Path | Purpose |
@@ -318,8 +326,8 @@ subsystem — DEC-102 / DEC-130).
 |--------|------|---------|
 | POST/PUT/DELETE | `/profiles`, `/profiles/{id}` | Profile CRUD + `?validate_only` — daemon is the store of record (DEC-160) |
 | POST | `/profile/activate` | Switch active profile by id or path; clears all active control-overrides, not identify-stops (DEC-189) |
-| POST | `/profile/deactivate` | Clear active profile (DEC-097); idempotent |
-| POST | `/control/{control_id}/override` (+`/override/renew`, `DELETE`) | Expiring manual override — floor-clamped, deadman, monotonic fencing (DEC-163); cleared on profile activation (DEC-189) |
+| POST | `/profile/deactivate` | Clear active profile (DEC-097); also clears all active control-overrides, not identify-stops (DEC-218, ≥ 2.12.0); idempotent |
+| POST | `/control/{control_id}/override` (+`/override/renew`, `DELETE`) | Expiring manual override — floor-clamped, deadman, monotonic fencing (DEC-163); cleared on profile activation/deactivation (DEC-189/DEC-218) |
 | POST | `/config/profile-search-dirs` | Additively register profile search directories (persists to `runtime.toml`; 503 `persistence_failed` on write error) |
 | POST | `/config/startup-delay` | Set startup delay seconds (persists to `runtime.toml`, takes effect on restart; 503 `persistence_failed` on write error) |
 | POST | `/config/preferred-cpu-sensor` | Persist the user's preferred CPU temperature sensor by stable id (`{"sensor_id":"<id>"}` sets, `null` clears; validated against the live sensor set). Advisory — reflected in `/inventory/hwmon` `default_cpu` (`source:"user"`) + `preferences` and the readiness `selected_cpu_sensor_missing` item (DEC-200) |

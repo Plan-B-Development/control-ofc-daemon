@@ -1,5 +1,20 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- **Docs/packaging text corrections (2026-07-21 audit remediation, Phase 1; no
+  code, wire, or behaviour change).** `daemon.md`'s endpoint table now records
+  DEC-218 on `POST /profile/deactivate` (clears control-overrides, not
+  identify-stops) and extends the override row's clear condition to
+  activation/deactivation; `docs/DEVELOPER_HANDOVER.md`'s module map gains
+  `assessment.rs` and the `/inventory/hardware-readiness` route (DEC-207);
+  the `modules-load.d` comment and the man page now point at the GUI's
+  **Hardware** page (the tabbed Diagnostics page was retired in the GUI
+  redesign, GUI DEC-216); `daemon.md` documents the accepted bounded-risk
+  posture of floor-exempt identify-stops (any local uid, deadman + thermal
+  `force_all` backstops — 2026-07-21 audit accept+document).
+
 ## [2.12.1] — 2026-07-18
 
 Test-coverage hardening only — **no runtime behaviour, wire, or API change**
