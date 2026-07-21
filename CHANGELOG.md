@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+### Fixed
+- **GPU verify race closed at the blocking-task boundary (2026-07-21 audit
+  CONC-1).** The engine's GPU write task now re-checks the verify write-pause
+  *inside* the blocking task, immediately before the PMFW sysfs write —
+  previously only the async-side checks ran, so a `POST /gpu/{id}/fan/verify`
+  starting in the dispatch gap could have its test value overwritten and
+  report a false verify result. A pause-skip records no outcome (it is
+  neither a success nor a cached failure), mirroring the OpenFan in-closure
+  re-check (DEC-191). Unit-tested via the extracted `gpu_blocking_write`
+  helper; kill-verified.
+- **Steady 0 % holds no longer inflate OpenFan failure streaks (2026-07-21
+  audit CONC-2).** `FanController::set_pwm` now coalesces a same-value repeat
+  *before* the 8 s stop-timeout check. Previously a curve or identify-stop
+  legitimately holding 0 % returned `Validation` on every tick past 8 s,
+  growing per-channel failure streaks (and potentially the whole-link alert)
+  on a healthy link. The timeout still rejects a wire-bound 0 % against an
+  expired stop timer (channel-tracking drift) as defence-in-depth.
+  Kill-verified both ways.
+- **Thermal-state cache write is now unconditional (2026-07-21 audit
+  CONC-3).** `set_thermal_override_state` dropped its read-lock
+  compare-and-skip fast path (EFF-4), which was lossless only under an
+  unenforced single-writer invariant. One uncontended write lock per 1 Hz
+  tick; no observable behaviour change.
+
 ### Security
 - **`POST /profile/activate` no longer leaks the store path in its error
   envelope (2026-07-21 audit SEC-2, recorded under DEC-223).** A corrupt or

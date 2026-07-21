@@ -161,23 +161,15 @@ impl StateCache {
 
     /// Update the thermal safety override state.
     ///
-    /// EFF-4: the profile engine calls this every tick (1 Hz) and the value is
-    /// `"normal"` the vast majority of the time. Take a shared read lock to
-    /// compare first and skip the exclusive write + `String` allocation when
-    /// unchanged. The engine tick is the sole writer of this field
-    /// (`profile_engine::run`), so the read→write gap cannot race another
-    /// writer; a concurrent reader only ever sees the old or new value, never a
-    /// torn one. This skip-if-unchanged optimization **depends on** that
-    /// single-writer invariant: if a second writer of `thermal_override_state`
-    /// is ever introduced, this must revert to an unconditional write under the
-    /// write lock (drop the read-lock pre-check), or two writers could each read
-    /// the stale value and lose an update.
+    /// Unconditional write under the write lock (CONC-3, 2026-07-21 audit).
+    /// An earlier fast path (EFF-4) took a read lock to compare-and-skip
+    /// first — lossless only while the engine tick stayed the sole writer,
+    /// an invariant no type enforces and a read→write TOCTOU if it ever
+    /// broke. The engine calls this once per 1 Hz tick with a short string;
+    /// an uncontended `parking_lot` write at that rate is noise, so the
+    /// invariant-free form wins.
     pub fn set_thermal_override_state(&self, state_str: &str) {
-        if self.inner.read().thermal_override_state.as_deref() == Some(state_str) {
-            return;
-        }
-        let mut state = self.inner.write();
-        state.thermal_override_state = Some(state_str.to_string());
+        self.inner.write().thermal_override_state = Some(state_str.to_string());
     }
 
     /// Try to claim the single hardware-verify slot, pausing the profile
@@ -436,10 +428,10 @@ mod tests {
 
     #[test]
     fn set_thermal_override_state_applies_changes_and_is_idempotent() {
-        // EFF-4: the engine calls this every tick. A redundant value is skipped
-        // (no exclusive write / no String alloc) but a genuine change MUST still
-        // land — this guards against an inverted compare dropping real
-        // transitions.
+        // The engine calls this every tick (unconditional write since CONC-3
+        // dropped the EFF-4 compare-and-skip fast path). A redundant write
+        // must stay value-correct and a genuine change MUST land — this
+        // guards against any future fast-path dropping real transitions.
         let cache = StateCache::new();
         assert_eq!(cache.snapshot().thermal_override_state, None);
 

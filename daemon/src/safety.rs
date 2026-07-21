@@ -73,7 +73,10 @@ impl ThermalSafetyRule {
             return Some(self.forced_output_pct);
         }
 
-        // One-cycle recovery floor after emergency release
+        // Second of the two recovery-floor cycles: the first 60% tick was the
+        // release return above (the release_temp crossing), this one completes
+        // the floor before control returns to the profile — pinned by
+        // `recovery_floor_spans_exactly_two_60pct_cycles`.
         if self.recovery {
             self.recovery = false;
             return Some(self.recovery_output_pct);

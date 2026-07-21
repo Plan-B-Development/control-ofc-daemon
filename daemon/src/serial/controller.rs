@@ -84,17 +84,24 @@ impl FanController {
             )));
         }
 
-        let effective_pct = self.apply_safety(channel, pwm_percent)?;
         let ch_ctrl = &self.channels[channel as usize];
 
-        // Coalesce: skip if same as last commanded
-        if ch_ctrl.last_commanded_pct == Some(effective_pct) {
+        // Coalesce BEFORE the stop-timeout check (CONC-2, 2026-07-21 audit):
+        // a curve or identify-stop legitimately holding 0% re-sends the same
+        // value every engine tick. A coalesced repeat writes nothing to the
+        // wire, so it must not trip the stop timeout — with the old order,
+        // every 0% tick past 8 s returned Validation, inflating per-channel
+        // failure streaks (and the whole-link alert) on a healthy link. The
+        // timeout below now guards only writes that would actually land.
+        if ch_ctrl.last_commanded_pct == Some(pwm_percent) {
             return Ok(SetPwmResult {
                 channel,
-                pwm_percent: effective_pct,
+                pwm_percent,
                 coalesced: true,
             });
         }
+
+        let effective_pct = self.apply_safety(channel, pwm_percent)?;
 
         let raw = percent_to_raw(effective_pct);
         let ch = Channel::new(channel).map_err(FanControlError::Serial)?;
@@ -128,6 +135,13 @@ impl FanController {
 
     /// Apply safety rules: stop timeout only (the minimum-PWM floor is applied
     /// upstream in the profile-engine tuning pipeline).
+    ///
+    /// The coalesce check in [`Self::set_pwm`] runs first (CONC-2), so a
+    /// steady 0% hold never reaches this — repeats coalesce. The timeout
+    /// still rejects a *wire-bound* 0% against an expired stop timer. No
+    /// normal `set_pwm` sequence produces that state (any non-zero write
+    /// clears the timer; a repeat 0% coalesces) — kept as defence-in-depth
+    /// against tracking state ever being written outside `set_pwm`.
     fn apply_safety(&self, channel: u8, pwm_percent: u8) -> Result<u8, FanControlError> {
         if pwm_percent == 0 {
             // Check stop timeout (hardware safety for serial protocol)
@@ -293,30 +307,57 @@ mod tests {
     }
 
     #[test]
-    fn set_pwm_zero_rejected_after_stop_timeout() {
-        // After constants::STOP_TIMEOUT (8s) at 0%, further 0% commands are rejected.
-        let (transport, _written) = MockTransport::with_ok_responses(2);
+    fn repeated_zero_beyond_stop_timeout_coalesces_not_errors() {
+        // CONC-2 (2026-07-21 audit): a curve/identify hold at 0% re-sends 0
+        // every engine tick. Past the 8 s stop timeout those repeats must
+        // coalesce (Ok, nothing on the wire) rather than return Validation —
+        // the pre-fix order errored every tick, inflating per-channel failure
+        // streaks and risking a false link-down alert on a healthy link.
+        let (transport, written) = MockTransport::with_ok_responses(2);
         let mut ctrl = make_controller(transport);
 
-        // First 0% succeeds and starts the stop timer
+        // First 0% writes and starts the stop timer.
         ctrl.set_pwm(0, 0).unwrap();
         assert!(ctrl.channels[0].stop_started_at.is_some());
+        let wire_writes_after_first = written.lock().len();
 
-        // Backdate stop_started_at to simulate 8 seconds passing
+        // Backdate the timer beyond STOP_TIMEOUT (8 s).
         ctrl.channels[0].stop_started_at =
             Some(std::time::Instant::now() - std::time::Duration::from_secs(9));
 
-        // Next 0% should be rejected (stop timeout exceeded)
+        let result = ctrl.set_pwm(0, 0).unwrap();
+        assert!(result.coalesced, "repeat 0% must coalesce, not error");
+        assert_eq!(
+            written.lock().len(),
+            wire_writes_after_first,
+            "a coalesced repeat must not touch the wire"
+        );
+
+        // Non-zero PWM still works and clears the stop timer.
+        let result = ctrl.set_pwm(0, 50).unwrap();
+        assert_eq!(result.pwm_percent, 50);
+        assert!(ctrl.channels[0].stop_started_at.is_none());
+    }
+
+    #[test]
+    fn stop_timeout_still_rejects_wire_bound_zero() {
+        // The stop timeout is defence-in-depth for a *wire-bound* 0% against
+        // an expired stop timer. No normal set_pwm sequence produces that
+        // state (any non-zero write clears the timer; a repeat 0% coalesces),
+        // so it guards tracking state written outside set_pwm — construct
+        // that state directly.
+        let (transport, _written) = MockTransport::with_ok_responses(1);
+        let mut ctrl = make_controller(transport);
+
+        ctrl.channels[0].last_commanded_pct = Some(50);
+        ctrl.channels[0].stop_started_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(9));
+
         let err = ctrl.set_pwm(0, 0).unwrap_err();
         match err {
             FanControlError::Validation(msg) => assert!(msg.contains("stop timeout")),
             _ => panic!("expected stop timeout validation error"),
         }
-
-        // Non-zero PWM should still work (clears the stop timer)
-        let result = ctrl.set_pwm(0, 50).unwrap();
-        assert_eq!(result.pwm_percent, 50);
-        assert!(ctrl.channels[0].stop_started_at.is_none());
     }
 
     #[test]

@@ -291,6 +291,51 @@ impl SafetyWriteBackend for OpenFanBackend {
 
 /// GPU fan writes via the PMFW `fan_curve` interface.
 ///
+/// Body of the GPU write blocking task (CONC-1, 2026-07-21 audit).
+///
+/// Re-checks the engine write-pause at the last moment before the sysfs
+/// write: the loop-level gate (`mod.rs`) and the per-fan pre-check in
+/// [`GpuBackend`]'s `apply` both run on the async worker, so a GPU fan verify
+/// (`POST /gpu/{id}/fan/verify`) can claim the pause after those checks and
+/// before this task executes on the blocking pool — its test value must not
+/// be overwritten. GPU writes hold no lock (DEC-045), so this mirrors the
+/// OpenFan in-closure re-check (DEC-191) as closely as a lockless path can;
+/// the remaining window is the gap between this check and the write syscall.
+///
+/// Returns `None` when the pause was held (skipped — no outcome: neither a
+/// success nor a failure for the fail-cache), `Some(write result)` otherwise.
+/// A named fn rather than a closure so the in-task guard is unit-testable.
+fn gpu_blocking_write(
+    cache: &StateCache,
+    fan_curve_path: &std::path::Path,
+    zero_rpm_path: Option<&std::path::Path>,
+    speed_pct: u8,
+    preserve_zero_rpm: bool,
+    fan_id: &str,
+) -> Option<Result<(), ()>> {
+    if cache.verify_active() {
+        return None;
+    }
+    Some(
+        match crate::hwmon::gpu_fan::set_static_speed_with_zero_rpm(
+            fan_curve_path,
+            zero_rpm_path,
+            speed_pct,
+            constants::GPU_PMFW_NUM_CURVE_POINTS,
+            preserve_zero_rpm,
+        ) {
+            Ok(()) => {
+                cache.set_gpu_fan_commanded_pct(fan_id, speed_pct);
+                Ok(())
+            }
+            Err(e) => {
+                log::warn!("GPU fan write failed: {e}");
+                Err(())
+            }
+        },
+    )
+}
+
 /// Deliberately NOT a [`SafetyWriteBackend`] (DEC-130) — see the module
 /// docs. GPU thermal protection is the firmware's job.
 pub(crate) struct GpuBackend {
@@ -403,29 +448,26 @@ impl WriteBackend for GpuBackend {
             let fan_id = cmd.member_id.clone();
             let fan_id_inner = fan_id.clone();
             let result = tokio::task::spawn_blocking(move || {
-                match crate::hwmon::gpu_fan::set_static_speed_with_zero_rpm(
+                gpu_blocking_write(
+                    &cache_ref,
                     &path,
                     zero_rpm.as_deref(),
                     pct,
-                    constants::GPU_PMFW_NUM_CURVE_POINTS,
                     preserve_zero_rpm,
-                ) {
-                    Ok(()) => {
-                        cache_ref.set_gpu_fan_commanded_pct(&fan_id_inner, pct);
-                        Ok(())
-                    }
-                    Err(e) => {
-                        log::warn!("GPU fan write failed: {e}");
-                        Err(())
-                    }
-                }
+                    &fan_id_inner,
+                )
             })
             .await;
 
             match result {
-                Ok(Ok(())) => {
+                Ok(Some(Ok(()))) => {
                     self.fail_cache.remove(&fan_id);
                 }
+                // CONC-1: a verify claimed the pause between the per-fan check
+                // above and the blocking task running — the write was skipped,
+                // which is no outcome at all (mirrors the OpenFan in-closure
+                // skip, DEC-191): not a success, and *not* a failure to cache.
+                Ok(None) => {}
                 _ => {
                     self.fail_cache
                         .insert(fan_id, (cmd.pwm_percent, self.clock.now()));
@@ -1620,5 +1662,44 @@ mod tests {
             !std::fs::read_to_string(&curve_path).unwrap().is_empty(),
             "writes resume once the pause clears"
         );
+    }
+
+    #[test]
+    fn gpu_blocking_write_skips_when_pause_claimed_mid_dispatch() {
+        // CONC-1 (2026-07-21 audit): the in-task re-check guards the window
+        // where a verify claims the pause AFTER the async-side per-fan check
+        // but BEFORE the blocking task runs. The helper is a named fn for
+        // exactly this test: pause held → None (skipped, no outcome), file
+        // untouched; pause clear → Some(Ok), the write lands.
+        let dir = tempfile::tempdir().unwrap();
+        let (gpu, curve_path) = fake_gpu(&dir);
+        let cache = StateCache::new();
+
+        assert!(cache.try_begin_verify(std::time::Duration::from_secs(30)));
+        let out = gpu_blocking_write(
+            &cache,
+            gpu.fan_curve_path.as_deref().unwrap(),
+            gpu.fan_zero_rpm_path.as_deref(),
+            70,
+            true,
+            "amd_gpu:0000:03:00.0",
+        );
+        assert!(out.is_none(), "pause held → skipped with no outcome");
+        assert!(
+            std::fs::read_to_string(&curve_path).unwrap().is_empty(),
+            "the in-task guard must stop the write, not just relabel it"
+        );
+
+        cache.end_verify();
+        let out = gpu_blocking_write(
+            &cache,
+            gpu.fan_curve_path.as_deref().unwrap(),
+            gpu.fan_zero_rpm_path.as_deref(),
+            70,
+            true,
+            "amd_gpu:0000:03:00.0",
+        );
+        assert!(matches!(out, Some(Ok(()))), "clear pause → write proceeds");
+        assert!(!std::fs::read_to_string(&curve_path).unwrap().is_empty());
     }
 }

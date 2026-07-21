@@ -153,8 +153,12 @@ inside the band cannot pin the pre-settle fan speed indefinitely.
      verify, and the thermal-safety force. Not a client lease: the GUI holds nothing (DEC-165).
      A thermal force-take evicts a verify mid-scan, so the verify's stale token is refused.
 
-3. **Stop timeout** (`controller.rs`): OpenFan 0% time limit
-   - 8 seconds at 0% PWM, then rejects further 0% commands
+3. **Stop timeout** (`controller.rs`): OpenFan 0% wire-write limit
+   - Rejects a *wire-bound* 0% write against a stop timer older than 8 s.
+     A steady 0% hold coalesces — same-value repeats never reach the wire or
+     the timeout (CONC-2, 2026-07-21 audit; the old order errored every tick
+     past 8 s, inflating failure streaks) — so this is defence-in-depth
+     against channel-tracking drift, not a periodic re-arm requirement
 
 4. **ExecStopPost restore** (`packaging/control-ofc-restore-auto.sh`):
    - Restores `pwm_enable=2` (auto) on ANY service stop (including SIGKILL)
