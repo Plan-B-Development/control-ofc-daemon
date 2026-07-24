@@ -982,7 +982,7 @@ pub struct IntelGpuDiagnostics {
     /// Whether `fan1_input` RPM reading is available.
     pub fan_rpm_available: bool,
     /// Truthful, user-facing explanation of why fan control is unavailable,
-    /// suitable for direct display in the GUI Diagnostics page.
+    /// suitable for direct display in the GUI System State page.
     pub fan_control_note: String,
 }
 
