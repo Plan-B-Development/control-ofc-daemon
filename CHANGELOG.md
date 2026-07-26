@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.12.3] — 2026-07-26
+
+Contributor-facing comment and documentation cleanup from the 2026-07-26 audit — **no behavioural
+change** (`api_version` stays 1). Pairs with `control-ofc-gui` ≥ v2.23.0 (patch v2.30.2). DEC-232.
+
+### Changed
+- Reworded three stale "GUI stand-down" / DEC-132 comments to the DEC-165 sole-writer model: since
+  the 2.0.0 cutover the GUI holds no control loop, so it surfaces a display-only thermal-safety
+  banner rather than standing a loop down.
+- Both READMEs no longer call `docs/DEVELOPER_HANDOVER.md` "the full API reference" — it is
+  developer onboarding; `daemon.md` is the architecture overview.
+- Added a DEC-199 rationale comment to the ExecStopPost fan-restore script (it writes through the
+  `/sys/class/*` symlinks, but the service sandbox grants write via `ReadWritePaths=/sys/devices`).
+
 ## [2.12.2] — 2026-07-21
 
 Audit-2026-07-21 remediation (daemon side): three profile-engine correctness

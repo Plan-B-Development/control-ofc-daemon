@@ -22,9 +22,10 @@ pub struct StatusResponse {
     /// Thermal safety override state: `"normal"` | `"recovery"` | `"emergency"`
     /// | `"no_sensor_fallback"` (forced 40% when no CPU sensor is reachable).
     /// Mirrors the value the profile engine reports each tick (the same string
-    /// `/diagnostics/hardware` exposes) so the GUI can stand its control loop
-    /// down while the daemon is forcing safety PWM (DEC-132). Additive field —
-    /// API_VERSION unchanged.
+    /// `/diagnostics/hardware` exposes) so the GUI can surface a thermal-safety
+    /// banner while the daemon is forcing safety PWM (DEC-132; the DEC-165
+    /// cutover left the GUI with no control loop to stand down — it is
+    /// display-only). Additive field — API_VERSION unchanged.
     pub thermal_state: String,
     /// Active manual overrides (DEC-163), each with remaining TTL. Omitted when
     /// none are active so the common-case `/status` wire shape is unchanged

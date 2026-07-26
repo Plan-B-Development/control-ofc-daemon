@@ -4,6 +4,11 @@
 # This runs as ExecStopPost so it executes even after SIGKILL, OOM, or panic.
 # Without this, a daemon crash leaves motherboard fans stuck in manual mode
 # (pwm_enable=1) with no BIOS thermal management.
+#
+# DEC-199: the writes below go through the /sys/class/hwmon and /sys/class/drm
+# *symlinks*, but the service sandbox grants write access via
+# ReadWritePaths=/sys/devices (the real backing path). A ReadWritePaths entry on
+# the /sys/class/* symlink directories does NOT work — writes fail with EROFS.
 
 # A no-match glob must expand to nothing, not the literal pattern, so the loops
 # below simply skip on a machine with no hwmon PWM or GPU fan_curve nodes.

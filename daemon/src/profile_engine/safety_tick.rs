@@ -70,11 +70,12 @@ pub(crate) fn evaluate_safety_tick(
     } else if force_no_sensor {
         // Covers BOTH the latched-emergency dropout (DEC-190) and the plain
         // 5-cycle no-sensor fallback (DEC-132): in each the daemon forces
-        // NO_SENSOR_SAFE_PCT and force-takes the hwmon lease, so the GUI must
-        // stand down — surface a distinct state rather than a stale "emergency"
-        // with no force, or a bare "normal". (Mutually exclusive with the
-        // "recovery" arm below: any no-sensor force implies `safety_pct` is None,
-        // since `evaluate()` did not run this tick.)
+        // NO_SENSOR_SAFE_PCT, so the GUI must surface a distinct safety state
+        // (it has no control loop to stand down since the DEC-165 cutover — it
+        // is display-only) rather than a stale "emergency" with no force, or a
+        // bare "normal". (Mutually exclusive with the "recovery" arm below: any
+        // no-sensor force implies `safety_pct` is None, since `evaluate()` did
+        // not run this tick.)
         "no_sensor_fallback"
     } else if safety_pct.is_some() {
         "recovery"

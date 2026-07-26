@@ -1,6 +1,6 @@
 # control-ofc-daemon
 
-**Latest release:** v2.12.2 — 2026-07-21. Pairs with `control-ofc-gui` ≥ v2.23.0. See [`CHANGELOG.md`](CHANGELOG.md) for the full history.
+**Latest release:** v2.12.3 — 2026-07-26. Pairs with `control-ofc-gui` ≥ v2.23.0. See [`CHANGELOG.md`](CHANGELOG.md) for the full history.
 
 Rust workspace for the Control-OFC fan control daemon.
 
@@ -100,7 +100,7 @@ Full build / install / CLI / environment reference lives in
 | [`daemon.md`](daemon.md) | all | Architecture overview, module map, data flow, safety model, full API endpoint table |
 | [`daemon/README.md`](daemon/README.md) | operators | Build, install, CLI flags, env vars, config |
 | [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) | end users | Configuration, profiles, upgrade notes |
-| [`docs/DEVELOPER_HANDOVER.md`](docs/DEVELOPER_HANDOVER.md) | contributors | Developer onboarding, full API reference |
+| [`docs/DEVELOPER_HANDOVER.md`](docs/DEVELOPER_HANDOVER.md) | contributors | Developer onboarding (architecture overview: `daemon.md`) |
 | [`docs/ADRs/`](docs/ADRs/) | contributors | Architecture decision records |
 | [`CHANGELOG.md`](CHANGELOG.md) | all | Release history |
 | [GUI manual — OpenFan Controller][gui-openfan] | end users | What the OpenFan Controller is and how Control-OFC drives it through the daemon (detection, serial access, stable paths, troubleshooting) |

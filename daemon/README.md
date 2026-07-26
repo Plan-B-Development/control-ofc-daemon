@@ -79,7 +79,7 @@ HTTP over Unix socket at `/run/control-ofc/control-ofc.sock`.
 curl --unix-socket /run/control-ofc/control-ofc.sock http://localhost/status
 ```
 
-See `docs/DEVELOPER_HANDOVER.md` for the full API reference.
+See `docs/DEVELOPER_HANDOVER.md` for developer onboarding and `daemon.md` for the architecture overview.
 
 ## Upgrade notes
 

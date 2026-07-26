@@ -3295,8 +3295,9 @@ mod tests {
 
     /// P0-R1 + DEC-132: the no-CPU-sensor fallback forces the safe minimum
     /// after the cycle threshold and surfaces a distinct thermal state
-    /// (it forces PWM and force-takes the lease, so "normal" would lie to
-    /// the GUI's stand-down logic).
+    /// (it forces PWM, so "normal" would misinform the GUI's thermal-safety
+    /// banner — there is no GUI stand-down logic since DEC-165, the daemon is
+    /// the sole writer).
     #[test]
     fn safety_tick_no_sensor_fallback_after_threshold() {
         let mut rule = crate::safety::ThermalSafetyRule::new();
