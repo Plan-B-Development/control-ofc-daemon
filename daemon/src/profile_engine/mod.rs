@@ -827,6 +827,114 @@ mod tests {
     }
 
     #[test]
+    fn sync_deep_chain_does_not_overflow_the_stack() {
+        // Twin of mix_deep_acyclic_chain_...: a long Sync chain (ctl0 mirrors
+        // ctl1 mirrors ctl2 ...) is acyclic, so `on_path` never fires and
+        // topo_visit recurses once per link. Built in memory to bypass the
+        // ingestion caps on purpose, exercising topo_visit's own depth backstop.
+        //
+        // Honest scope note: unlike the Mix twin, this chain does NOT abort
+        // without the guard — a topo_visit frame is far smaller than a
+        // resolve_mix one (no Vec, no HashSet), so 3k links fit comfortably.
+        // What this pins is that the backstop FIRES without losing work: every
+        // control must still be ordered exactly once, and evaluation must
+        // terminate. The guard's value is bounding depth for chains far longer
+        // than any we want to enumerate in a unit test.
+        const CHAIN: usize = 3_000;
+        let mut curves: Vec<CurveConfig> = (0..CHAIN)
+            .map(|i| sync_curve(&format!("s{i}"), &format!("ctl{}", i + 1), 0.0))
+            .collect();
+        let mut term = mix_curve("term", "max", &[]);
+        term.curve_type = "flat".into();
+        term.sensor_id = "cpu".into();
+        term.flat_output_pct = Some(50.0);
+        curves.push(term);
+
+        let mut controls: Vec<LogicalControl> = (0..CHAIN)
+            .map(|i| openfan_control(&format!("ctl{i}"), &format!("s{i}"), "openfan:ch00"))
+            .collect();
+        controls.push(openfan_control(
+            &format!("ctl{CHAIN}"),
+            "term",
+            "openfan:ch01",
+        ));
+
+        let profile = DaemonProfile {
+            id: "syncdeep".into(),
+            name: "SyncDeep".into(),
+            version: 7,
+            description: "".into(),
+            controls,
+            curves,
+        };
+        // The backstop bails out of deep recursion; it must not drop controls.
+        let ordered = curve_eval::topological_control_order(&profile);
+        assert_eq!(
+            ordered.len(),
+            CHAIN + 1,
+            "every control must still be ordered exactly once"
+        );
+        let unique: std::collections::HashSet<usize> = ordered.iter().copied().collect();
+        assert_eq!(unique.len(), CHAIN + 1, "no duplicates in the ordering");
+
+        // And a full evaluation still terminates.
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let _ = evaluate_profile(
+            &profile,
+            &cache.sensors_snapshot(),
+            &mut ProfileEngineState::new(),
+        );
+    }
+
+    #[test]
+    fn mix_diamond_shares_a_child_across_both_branches() {
+        // Pins the insert/remove discipline the depth guard depends on. `visited`
+        // is a PATH set, not a seen-set: the shared child D must resolve on the
+        // B branch, be REMOVED on the way out, and resolve again on the C branch.
+        // If `visited` accumulated across siblings instead, D would look like a
+        // cycle on the second branch and silently drop out — and `visited.len()`
+        // would count distinct nodes rather than depth, which would make the
+        // MAX_PROFILE_CURVES backstop fire on legal wide graphs.
+        // The shared child D must itself be a MIX curve — only `resolve_mix`
+        // inserts into `visited`, so a flat shared child would never exercise the
+        // discipline at all. The root SUMs its two branches, so a dropped branch
+        // changes the value rather than being masked by max().
+        let mut term = mix_curve("term", "max", &[]);
+        term.curve_type = "flat".into();
+        term.sensor_id = "cpu".into(); // non-mix curves resolve at their own sensor
+        term.flat_output_pct = Some(40.0);
+
+        let profile = DaemonProfile {
+            id: "diamond".into(),
+            name: "Diamond".into(),
+            version: 7,
+            description: "".into(),
+            controls: vec![openfan_control("c", "a", "openfan:ch00")],
+            curves: vec![
+                mix_curve("a", "sum", &["b", "c2"]),
+                mix_curve("b", "max", &["d"]),
+                mix_curve("c2", "max", &["d"]),
+                mix_curve("d", "max", &["term"]),
+                term,
+            ],
+        };
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let cmds = evaluate_profile(
+            &profile,
+            &cache.sensors_snapshot(),
+            &mut ProfileEngineState::new(),
+        );
+        assert_eq!(cmds.len(), 1, "diamond must resolve, not be skipped");
+        // Both branches reach D (40%) → sum = 80. With a seen-set, the second
+        // branch would see D as already-visited, mistake it for a cycle, drop
+        // out, and yield 40.
+        assert_eq!(
+            cmds[0].pwm_percent, 80,
+            "both diamond branches must resolve"
+        );
+    }
+
+    #[test]
     fn sync_mirrors_target_with_offset_and_ordering() {
         // Mirror is listed BEFORE its target — the topological order must still
         // evaluate the target first so the mirror reads its current-tick output.

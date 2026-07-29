@@ -316,11 +316,20 @@ pub(crate) fn topological_control_order(profile: &DaemonProfile) -> Vec<usize> {
             &mut ordered,
             &mut emitted,
             &mut on_path,
+            0,
         );
     }
     ordered
 }
 
+/// Depth-first Sync ordering. `depth` is the current recursion depth, carried so
+/// this mirrors the eval-time backstop in [`resolve_mix`]: a Sync chain recurses
+/// once per link, and while [`crate::profile::MAX_PROFILE_CONTROLS`] bounds that
+/// at both ingestion gates, this makes the engine self-limiting rather than
+/// trusting them. Bailing out is safe — the tail simply is not pre-ordered, and a
+/// Sync whose target has not been computed yet already falls back to skipping the
+/// control (fan holds), the same degradation as a Sync cycle.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn topo_visit(
     idx: usize,
     profile: &DaemonProfile,
@@ -328,15 +337,31 @@ pub(crate) fn topo_visit(
     ordered: &mut Vec<usize>,
     emitted: &mut [bool],
     on_path: &mut [bool],
+    depth: usize,
 ) {
     if emitted[idx] || on_path[idx] {
+        return;
+    }
+    if depth >= crate::profile::MAX_PROFILE_CONTROLS {
+        log::warn!(
+            "Sync chain exceeds the maximum depth of {} — leaving the tail unordered",
+            crate::profile::MAX_PROFILE_CONTROLS
+        );
         return;
     }
     on_path[idx] = true;
     if let Some(dep_id) = sync_dependency(&profile.controls[idx], profile) {
         if let Some(&dep_idx) = id_to_idx.get(dep_id) {
             if dep_idx != idx {
-                topo_visit(dep_idx, profile, id_to_idx, ordered, emitted, on_path);
+                topo_visit(
+                    dep_idx,
+                    profile,
+                    id_to_idx,
+                    ordered,
+                    emitted,
+                    on_path,
+                    depth + 1,
+                );
             }
         }
     }

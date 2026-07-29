@@ -388,8 +388,12 @@ pub const MAX_CURVE_POINTS: usize = 256;
 pub const MAX_PROFILE_CURVES: usize = 256;
 
 /// Maximum number of controls a profile may contain. Companion to
-/// [`MAX_PROFILE_CURVES`]: bounds the Sync-chain recursion depth in
-/// `curve_eval::topo_visit`, which recurses once per chained control.
+/// [`MAX_PROFILE_CURVES`], and enforced at the same three layers:
+/// `curve_eval::topo_visit` recurses once per Sync-chained control, so [`validate`]
+/// and [`load_profile`] cap the collection and `topo_visit` carries its own depth
+/// backstop. Keeping the two symmetric matters — an asymmetry here would mean a
+/// future path that reached the engine unvalidated failed safe for Mix but
+/// overflowed the stack for Sync.
 pub const MAX_PROFILE_CONTROLS: usize = 256;
 
 const KNOWN_CURVE_TYPES: [&str; 7] = [
@@ -1928,6 +1932,63 @@ mod tests {
 
         let loaded = load_profile(&path).expect("a profile exactly at the cap must load");
         assert_eq!(loaded.curves.len(), MAX_PROFILE_CURVES);
+    }
+
+    #[test]
+    fn load_profile_rejects_too_many_controls() {
+        // The CONTROLS half of the load-time net. Distinct from the curves case
+        // above and separately load-bearing: controls chain through Sync, which
+        // recurses in `curve_eval::topo_visit`, and the boot paths skip
+        // validate() — so without this guard an oversized-by-CONTROL-count
+        // profile on disk still reaches the engine and aborts it at startup.
+        let controls: Vec<LogicalControl> = (0..=MAX_PROFILE_CONTROLS)
+            .map(|i| curve_control(&format!("ctl{i}"), "c"))
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many_controls.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string(&mk_profile(vec![graph_curve("c", "cpu")], controls)).unwrap(),
+        )
+        .unwrap();
+
+        let err = load_profile(&path).unwrap_err();
+        assert!(
+            err.contains("controls") && err.contains("exceeding the maximum"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn load_profile_accepts_controls_at_the_cap() {
+        let controls: Vec<LogicalControl> = (0..MAX_PROFILE_CONTROLS)
+            .map(|i| curve_control(&format!("ctl{i}"), "c"))
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("controls_atcap.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string(&mk_profile(vec![graph_curve("c", "cpu")], controls)).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_profile(&path).expect("controls exactly at the cap must load");
+        assert_eq!(loaded.controls.len(), MAX_PROFILE_CONTROLS);
+    }
+
+    #[test]
+    fn validate_exactly_max_controls_is_allowed() {
+        // Boundary twin of validate_exactly_max_curves_is_allowed: a `>` that
+        // slipped to `>=` would reject a profile sitting exactly on the cap.
+        let controls: Vec<LogicalControl> = (0..MAX_PROFILE_CONTROLS)
+            .map(|i| curve_control(&format!("ctl{i}"), "c"))
+            .collect();
+        let profile = mk_profile(vec![graph_curve("c", "cpu")], controls);
+        let report = validate(&profile, &sset(&["cpu"]));
+        assert!(!report
+            .errors
+            .iter()
+            .any(|e| e.reason == "TOO_MANY_CONTROLS"));
     }
 
     #[test]
