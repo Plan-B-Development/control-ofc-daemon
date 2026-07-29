@@ -83,7 +83,7 @@ impl RuntimeConfig {
     /// config is regenerated on the next successful write, so a one-off
     /// corruption should not prevent the daemon from starting.
     pub fn load_from(path: &Path) -> Self {
-        match std::fs::read_to_string(path) {
+        match crate::atomic_io::read_to_string_capped(path) {
             Ok(content) => match toml::from_str::<RuntimeConfig>(&content) {
                 Ok(cfg) => {
                     log::info!("Loaded runtime config from {}", path.display());

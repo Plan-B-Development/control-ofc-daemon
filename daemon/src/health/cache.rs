@@ -316,6 +316,13 @@ impl StateCache {
     /// takes only a shared read lock and returns — the poll loop calls this every
     /// tick.
     pub fn update_unavailable_sensors(&self, unavailable: Vec<UnavailableSensor>) {
+        // Deliberate double-checked shape: the fast-path read guard is dropped
+        // before the write lock is taken, so another caller can interleave
+        // between check and write. That race is harmless — the write path is
+        // idempotent (re-removing absent ids / re-assigning an equal list), so
+        // the worst case is duplicated work. Do not "fix" it by holding a
+        // single lock across the whole function; the fast path exists so the
+        // every-tick common case never contends for the write lock.
         if unavailable.is_empty() && self.inner.read().unavailable_sensors.is_empty() {
             return;
         }

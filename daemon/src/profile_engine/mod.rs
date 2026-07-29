@@ -734,7 +734,8 @@ mod tests {
 
     #[test]
     fn combine_mix_functions_and_clamp() {
-        // Must match the GUI's `_combine_mix` exactly (parity tuning_sequence).
+        // Daemon-owned since the 2.0.0 cutover (DEC-165); the `tuning_sequence`
+        // golden vectors (DEC-126) pin combine_mix end-to-end.
         assert_eq!(combine_mix("max", &[60.0, 40.0, 20.0]), 60.0);
         assert_eq!(combine_mix("min", &[60.0, 40.0, 20.0]), 20.0);
         assert_eq!(combine_mix("average", &[60.0, 40.0, 20.0]), 40.0);
@@ -783,6 +784,46 @@ mod tests {
             &mut ProfileEngineState::new(),
         );
         assert!(cmds.is_empty()); // cycle → skipped, no command
+    }
+
+    #[test]
+    fn mix_deep_acyclic_chain_does_not_overflow_the_stack() {
+        // Regression: a LONG but perfectly ACYCLIC mix chain (c0→c1→…→cN) is a
+        // legal DAG, so cycle detection never fires — the engine simply recursed
+        // once per link. At ~3k links that overflowed the stack and aborted the
+        // process (SIGABRT) on the tick, a DoS of the sole PWM writer that
+        // survived reboot because activation persists active_profile_id.
+        //
+        // The chain is built in memory, bypassing the validate()/load_profile()
+        // caps on purpose: this pins the third layer, the depth backstop in
+        // resolve_mix. If that guard is removed this test does not merely fail —
+        // it aborts the test binary, which is precisely the regression.
+        const CHAIN: usize = 3_000;
+        let mut curves: Vec<CurveConfig> = (0..CHAIN)
+            .map(|i| {
+                let child = format!("c{}", i + 1);
+                mix_curve(&format!("c{i}"), "max", &[child.as_str()])
+            })
+            .collect();
+        curves.push(mix_curve(&format!("c{CHAIN}"), "max", &[])); // terminal
+
+        let profile = DaemonProfile {
+            id: "deep".into(),
+            name: "Deep".into(),
+            version: 7,
+            description: "".into(),
+            controls: vec![openfan_control("c", "c0", "openfan:ch00")],
+            curves,
+        };
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let cmds = evaluate_profile(
+            &profile,
+            &cache.sensors_snapshot(),
+            &mut ProfileEngineState::new(),
+        );
+        // Depth exceeded → None, same safe fallback as the cycle case: the
+        // control is skipped and its fan holds.
+        assert!(cmds.is_empty());
     }
 
     #[test]

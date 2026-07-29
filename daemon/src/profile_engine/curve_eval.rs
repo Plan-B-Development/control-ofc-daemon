@@ -5,8 +5,9 @@
 use super::*;
 
 /// Threshold (percent) below which a curve-output change does not move the
-/// deadband transition anchor. Matches the GUI's `0.5` constant in
-/// ``_evaluate_curve_with_hysteresis``.
+/// deadband transition anchor. Deadband evaluation is daemon-only since the
+/// 2.0.0 sole-writer cutover (DEC-165) — the GUI's demo/preview tier is
+/// stateless `interpolate()` and has no deadband.
 pub(crate) const DEADBAND_ANCHOR_DELTA_PCT: f64 = 0.5;
 
 /// Evaluate a curve with the 2°C falling-temperature deadband applied.
@@ -58,7 +59,7 @@ pub(crate) fn evaluate_curve_with_deadband(
 
     // Move the transition anchor only when the new curve output meaningfully
     // differs from the last one — keeps the deadband stationary as the curve
-    // glides through small interpolation deltas (matches GUI parity).
+    // glides through small interpolation deltas (DEC-096).
     let move_anchor = prev_pwm
         .map(|p| (curve_output - p).abs() >= DEADBAND_ANCHOR_DELTA_PCT)
         .unwrap_or(true);
@@ -78,7 +79,10 @@ pub(crate) fn evaluate_curve_with_deadband(
 /// load temp run load speed; within the idle..load band hold the current state.
 /// Owns its own hysteresis, so it bypasses the 2°C deadband. Latch state lives
 /// in `ProfileEngineState::trigger_latch` (`true` = load) keyed by control id.
-/// Must match the GUI's `_evaluate_trigger` byte-for-byte (parity tuning_sequence).
+/// Daemon-owned outright since the 2.0.0 sole-writer cutover (DEC-165) — the
+/// GUI kept only the stateless `interpolate` tier; latched behaviour is pinned
+/// by the daemon-only `tuning_sequence` golden vectors in `parity_vectors.json`
+/// (DEC-126).
 pub(crate) fn evaluate_trigger(
     control: &LogicalControl,
     curve: &crate::profile::CurveConfig,
@@ -114,9 +118,10 @@ pub(crate) fn evaluate_trigger(
 /// Combine child-curve outputs for a Mix curve (DEC-150), clamped 0–100.
 ///
 /// `values` is non-empty (the caller drops unresolved children and skips the
-/// Mix entirely when nothing resolves). Must stay byte-for-byte identical to
-/// the GUI's `_combine_mix` (parity `tuning_sequence`). `subtract` is the first
-/// input minus the sum of the rest, matching the ordered `mix_curve_ids`.
+/// Mix entirely when nothing resolves). Daemon-owned outright since the 2.0.0
+/// cutover (DEC-165); pinned by the daemon-only `tuning_sequence` golden
+/// vectors in `parity_vectors.json` (DEC-126). `subtract` is the first input
+/// minus the sum of the rest, matching the ordered `mix_curve_ids`.
 pub(crate) fn combine_mix(function: &str, values: &[f64]) -> f64 {
     let result = match function {
         "min" => values.iter().copied().fold(f64::INFINITY, f64::min),
@@ -137,8 +142,9 @@ pub(crate) fn combine_mix(function: &str, values: &[f64]) -> f64 {
 /// Sync; the editor prevents it). Every single-temperature type uses the pure
 /// `evaluate_curve` at its own sensor, clamped 0–100 — the "raw child-curve
 /// output" the Mix combines. Returns None when the value cannot be resolved
-/// (missing sensor, unresolvable/cyclic Mix). Must stay byte-for-byte identical
-/// to the GUI's `_resolve_curve_output`.
+/// (missing sensor, unresolvable/cyclic Mix). Daemon-owned outright since the
+/// 2.0.0 cutover (DEC-165) — the GUI no longer resolves composites; behaviour
+/// is pinned by the `tuning_sequence` golden vectors (DEC-126).
 pub(crate) fn resolve_curve_output(
     curve: &crate::profile::CurveConfig,
     profile: &DaemonProfile,
@@ -159,8 +165,8 @@ pub(crate) fn resolve_curve_output(
 /// sensor; unresolved children are dropped; surviving values are combined by
 /// `mix_function` and clamped 0–100. Returns None when the curve is part of a
 /// cycle or no child resolves (control skipped — fan holds). Path-based
-/// `visited` (insert on entry, remove on exit) matches the GUI's per-branch set
-/// union so diamonds re-evaluate and only true cycles drop out.
+/// `visited` (insert on entry, remove on exit) is a per-branch path set, so
+/// diamonds re-evaluate and only true cycles drop out.
 pub(crate) fn resolve_mix(
     curve: &crate::profile::CurveConfig,
     profile: &DaemonProfile,
@@ -171,6 +177,21 @@ pub(crate) fn resolve_mix(
         log::warn!(
             "Mix curve '{}' has a dependency cycle — skipping",
             curve.name
+        );
+        return None;
+    }
+    // Depth backstop (see profile::MAX_PROFILE_CURVES). `visited` is the current
+    // resolution path, so its length IS the recursion depth; because a cycle is
+    // already rejected above, no curve repeats on a path and this can only trip
+    // if a profile carrying more than MAX_PROFILE_CURVES curves reached the
+    // engine — i.e. both the validate() and load_profile() caps were bypassed.
+    // Falling out as None matches the cycle case: the control is skipped and its
+    // fan holds, which is preferable to overflowing the stack and aborting.
+    if visited.len() >= crate::profile::MAX_PROFILE_CURVES {
+        log::warn!(
+            "Mix curve '{}' exceeds the maximum dependency depth of {} — skipping",
+            curve.name,
+            crate::profile::MAX_PROFILE_CURVES
         );
         return None;
     }
@@ -198,7 +219,8 @@ pub(crate) fn resolve_mix(
 /// an acyclic graph. Adds `sync_offset_pct` and clamps 0–100; the Sync control's
 /// own tuning is applied afterwards by the caller. Returns None (control skipped)
 /// for an unset/self target or one not yet computed (cycle / skipped / missing).
-/// Must match the GUI's `_resolve_sync_output` byte-for-byte.
+/// Daemon-owned outright since the 2.0.0 cutover (DEC-165); pinned by the
+/// multi-control `tuning_sequence` golden vectors (DEC-126).
 pub(crate) fn resolve_sync_output(
     control: &LogicalControl,
     curve: &crate::profile::CurveConfig,
@@ -216,8 +238,8 @@ pub(crate) fn resolve_sync_output(
 /// Resolve the raw curve output for one control, before the tuning pipeline.
 ///
 /// Routes trigger to the latch, mix/sync to the context resolvers, and every
-/// single-temperature type to the 2°C deadband path — mirroring the GUI's
-/// `_curve_output_for_control`. Returns None when the control must be skipped
+/// single-temperature type to the 2°C deadband path (daemon-owned since the
+/// 2.0.0 cutover, DEC-165). Returns None when the control must be skipped
 /// this tick (missing sensor, unresolvable composite).
 pub(crate) fn curve_output_for_control(
     control: &LogicalControl,
@@ -246,8 +268,7 @@ pub(crate) fn curve_output_for_control(
     }
 }
 
-/// The control id a Sync-driven control depends on, else None. Mirrors the GUI's
-/// `_sync_dependency`.
+/// The control id a Sync-driven control depends on, else None.
 pub(crate) fn sync_dependency<'a>(
     control: &'a LogicalControl,
     profile: &'a DaemonProfile,
@@ -271,9 +292,11 @@ pub(crate) fn sync_dependency<'a>(
 /// (DEC-151). A control whose curve is a `sync` depends on the control it
 /// targets, so the target is emitted first; independent controls keep their
 /// profile order (stable). A cycle is broken deterministically (the closing
-/// Sync reads a not-yet-computed target and falls back at eval time). Mirrors
-/// the GUI's `_ordered_controls` DFS so both evaluators order controls
-/// identically (parity-critical). Sync-free profiles emit `[0, 1, …, n-1]`.
+/// Sync reads a not-yet-computed target and falls back at eval time). The
+/// daemon has been the sole evaluator since the 2.0.0 cutover (DEC-165); the
+/// multi-control `tuning_sequence` vectors deliberately list controls out of
+/// dependency order to pin this sort (DEC-126). Sync-free profiles emit
+/// `[0, 1, …, n-1]`.
 pub(crate) fn topological_control_order(profile: &DaemonProfile) -> Vec<usize> {
     let id_to_idx: HashMap<&str, usize> = profile
         .controls

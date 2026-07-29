@@ -64,7 +64,9 @@ pub async fn activate_profile_handler(
         };
         // Canonicalize both sides to prevent symlink-based path traversal (CWE-22).
         // Skip search dirs that don't exist on disk (can't canonicalize).
-        let search_dirs = state.profile_search_dirs.read();
+        // Snapshot the configured dirs so the read lock is released before the
+        // canonicalize() syscalls below — never hold it across filesystem I/O.
+        let search_dirs: Vec<std::path::PathBuf> = state.profile_search_dirs.read().clone();
         let allowed: Vec<std::path::PathBuf> = search_dirs
             .iter()
             .filter_map(|d| d.canonicalize().ok())
@@ -72,10 +74,9 @@ pub async fn activate_profile_handler(
         if allowed.is_empty() {
             log::warn!(
                 "No profile search directories exist on disk: {:?}",
-                *search_dirs
+                search_dirs
             );
         }
-        drop(search_dirs); // release lock before potentially long operations
         if !super::path_confine::path_is_within(&canonical, &allowed) {
             return error_response(
                 StatusCode::BAD_REQUEST,

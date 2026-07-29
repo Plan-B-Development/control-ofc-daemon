@@ -248,10 +248,12 @@ fn evaluate_linear(curve: &CurveConfig, temp_c: f64) -> f64 {
     start_o + t * (end_o - start_o)
 }
 
-/// Trigger-curve default thresholds (DEC-149). Byte-for-byte GUI parity with
-/// `_interpolate_trigger` / `_evaluate_trigger`, locked to the `tuning_sequence`
-/// cross-stack parity oracle (DEC-126) — do not change without updating the
-/// oracle in lockstep. `pub(crate)` so `profile_engine::curve_eval` shares them.
+/// Trigger-curve default thresholds (DEC-149). Cross-stack parity: the GUI's
+/// retained stateless `_interpolate_trigger` tier defaults to the same values
+/// (the latched evaluator is daemon-only since the 2.0.0 cutover, DEC-165),
+/// and the `parity_vectors.json` oracle (DEC-126) is authored against them —
+/// do not change without updating the oracle in lockstep. `pub(crate)` so
+/// `profile_engine::curve_eval` shares them.
 pub(crate) const TRIGGER_IDLE_TEMP_C: f64 = 40.0;
 pub(crate) const TRIGGER_LOAD_TEMP_C: f64 = 60.0;
 pub(crate) const TRIGGER_IDLE_PCT: f64 = 30.0;
@@ -280,6 +282,25 @@ pub fn load_profile(path: &Path) -> Result<DaemonProfile, String> {
         .map_err(|e| format!("failed to read profile '{}': {e}", path.display()))?;
     let profile: DaemonProfile = serde_json::from_str(&content)
         .map_err(|e| format!("failed to parse profile '{}': {e}", path.display()))?;
+    // Recursion bound (see MAX_PROFILE_CURVES). The boot paths (CLI --profile and
+    // persisted-state restore) deliberately skip validate(), so this load-time
+    // check is the net that keeps an oversized on-disk profile — hand-placed in
+    // /etc/control-ofc/profiles, or predating this cap — from aborting the daemon
+    // at startup. Callers already fail safe to imperative mode on Err.
+    if profile.curves.len() > MAX_PROFILE_CURVES {
+        return Err(format!(
+            "profile '{}' has {} curves, exceeding the maximum of {MAX_PROFILE_CURVES}",
+            path.display(),
+            profile.curves.len()
+        ));
+    }
+    if profile.controls.len() > MAX_PROFILE_CONTROLS {
+        return Err(format!(
+            "profile '{}' has {} controls, exceeding the maximum of {MAX_PROFILE_CONTROLS}",
+            path.display(),
+            profile.controls.len()
+        ));
+    }
     if profile.version < 3 {
         log::warn!(
             "Profile '{}' has version {}, expected 3+ (v4 introduces fan_zero_rpm)",
@@ -347,6 +368,29 @@ pub fn find_profile(name: &str, search_dirs: &[std::path::PathBuf]) -> Option<st
 /// GUI's `MAX_CURVE_POINTS` (profile_service.py) so a profile the GUI accepts
 /// the daemon also accepts, and vice-versa.
 pub const MAX_CURVE_POINTS: usize = 256;
+
+/// Maximum number of curves a profile may contain.
+///
+/// This is a **recursion bound**, not a taste limit. `profile_engine::curve_eval`
+/// resolves Mix dependencies by mutual recursion (`resolve_curve_output` ↔
+/// `resolve_mix`), so a chain of N mix curves recurses N frames deep. The
+/// `visited` set rejects *cycles*, not *depth*, so a deep but perfectly acyclic
+/// chain used to overflow the stack and abort the process (SIGABRT) on the next
+/// engine tick — a reachable, reboot-surviving DoS of the sole PWM writer, since
+/// activation persists `active_profile_id` and boot re-activates it.
+///
+/// 256 is far above any real cooling setup (a busy machine uses ~10–20 curves)
+/// and far below the empirical overflow threshold. Enforced in three places:
+/// [`validate`] (API front door, structured `TOO_MANY_CURVES`), [`load_profile`]
+/// (every on-disk path — the boot paths deliberately skip `validate`), and a
+/// depth guard in `resolve_mix` (eval-time last resort). Mirrors the GUI's
+/// `MAX_PROFILE_CURVES` (profile_service.py).
+pub const MAX_PROFILE_CURVES: usize = 256;
+
+/// Maximum number of controls a profile may contain. Companion to
+/// [`MAX_PROFILE_CURVES`]: bounds the Sync-chain recursion depth in
+/// `curve_eval::topo_visit`, which recurses once per chained control.
+pub const MAX_PROFILE_CONTROLS: usize = 256;
 
 const KNOWN_CURVE_TYPES: [&str; 7] = [
     "graph", "stepped", "linear", "flat", "trigger", "mix", "sync",
@@ -493,6 +537,28 @@ pub fn validate(profile: &DaemonProfile, known_sensor_ids: &HashSet<String>) -> 
 
     let curve_ids: HashSet<&str> = profile.curves.iter().map(|c| c.id.as_str()).collect();
     let control_ids: HashSet<&str> = profile.controls.iter().map(|c| c.id.as_str()).collect();
+
+    // ── Collection sizes (recursion bounds — see MAX_PROFILE_CURVES) ──
+    if profile.curves.len() > MAX_PROFILE_CURVES {
+        report.error(
+            "curves".to_string(),
+            "TOO_MANY_CURVES",
+            format!(
+                "{} curves exceeds the maximum of {MAX_PROFILE_CURVES}",
+                profile.curves.len()
+            ),
+        );
+    }
+    if profile.controls.len() > MAX_PROFILE_CONTROLS {
+        report.error(
+            "controls".to_string(),
+            "TOO_MANY_CONTROLS",
+            format!(
+                "{} controls exceeds the maximum of {MAX_PROFILE_CONTROLS}",
+                profile.controls.len()
+            ),
+        );
+    }
 
     // ── Curves ──
     for (i, curve) in profile.curves.iter().enumerate() {
@@ -1783,6 +1849,85 @@ mod tests {
         let profile = mk_profile(vec![curve], vec![curve_control("ctl", "c")]);
         let report = validate(&profile, &sset(&["cpu"]));
         assert!(report.errors.iter().any(|e| e.reason == "TOO_MANY_POINTS"));
+    }
+
+    // ────── Recursion bounds: MAX_PROFILE_CURVES / MAX_PROFILE_CONTROLS ──────
+    // A deep but ACYCLIC Mix chain used to recurse once per curve and abort the
+    // process with a stack overflow on the next engine tick. Cycle detection does
+    // not help — these chains are legal DAGs. Guarded at three layers; these tests
+    // pin all three.
+
+    #[test]
+    fn validate_too_many_curves_is_error() {
+        let curves: Vec<CurveConfig> = (0..=MAX_PROFILE_CURVES)
+            .map(|i| graph_curve(&format!("c{i}"), "cpu"))
+            .collect(); // MAX_PROFILE_CURVES + 1
+        let report = validate(&mk_profile(curves, vec![]), &sset(&["cpu"]));
+        assert!(report.errors.iter().any(|e| e.reason == "TOO_MANY_CURVES"));
+    }
+
+    #[test]
+    fn validate_exactly_max_curves_is_allowed() {
+        // Boundary: the cap must not reject a profile sitting exactly on it.
+        let curves: Vec<CurveConfig> = (0..MAX_PROFILE_CURVES)
+            .map(|i| graph_curve(&format!("c{i}"), "cpu"))
+            .collect();
+        let report = validate(&mk_profile(curves, vec![]), &sset(&["cpu"]));
+        assert!(!report.errors.iter().any(|e| e.reason == "TOO_MANY_CURVES"));
+    }
+
+    #[test]
+    fn validate_too_many_controls_is_error() {
+        let controls: Vec<LogicalControl> = (0..=MAX_PROFILE_CONTROLS)
+            .map(|i| curve_control(&format!("ctl{i}"), "c"))
+            .collect(); // MAX_PROFILE_CONTROLS + 1
+        let profile = mk_profile(vec![graph_curve("c", "cpu")], controls);
+        let report = validate(&profile, &sset(&["cpu"]));
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.reason == "TOO_MANY_CONTROLS"));
+    }
+
+    #[test]
+    fn load_profile_rejects_oversized_profile() {
+        // The load-time net. The boot paths (CLI --profile, persisted-state
+        // restore) skip validate(), so an oversized profile already on disk must
+        // be refused HERE or it aborts the daemon at startup — a crash loop that
+        // survives reboot. Callers treat Err as "no profile" (imperative mode).
+        let curves: Vec<CurveConfig> = (0..=MAX_PROFILE_CURVES)
+            .map(|i| graph_curve(&format!("c{i}"), "cpu"))
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string(&mk_profile(curves, vec![])).unwrap(),
+        )
+        .unwrap();
+
+        let err = load_profile(&path).unwrap_err();
+        assert!(
+            err.contains("exceeding the maximum"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn load_profile_accepts_profile_at_the_cap() {
+        let curves: Vec<CurveConfig> = (0..MAX_PROFILE_CURVES)
+            .map(|i| graph_curve(&format!("c{i}"), "cpu"))
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atcap.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string(&mk_profile(curves, vec![])).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_profile(&path).expect("a profile exactly at the cap must load");
+        assert_eq!(loaded.curves.len(), MAX_PROFILE_CURVES);
     }
 
     #[test]

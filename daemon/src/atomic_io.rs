@@ -144,16 +144,17 @@ fn fsync_dir(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Maximum size (bytes) of a daemon-read JSON config/state/profile file. Matches
-/// the GUI's `MAX_IMPORT_BYTES` (paths.py). Files larger than this are rejected
-/// rather than buffered whole — a local DoS / accidental-huge-file guard for a
-/// long-lived root process.
+/// Maximum size (bytes) of a daemon-read config/state/profile file (JSON or
+/// TOML). Matches the GUI's `MAX_IMPORT_BYTES` (paths.py). Files larger than
+/// this are rejected rather than buffered whole — a local DoS /
+/// accidental-huge-file guard for a long-lived root process.
 pub const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Read a file to a `String`, rejecting anything larger than [`MAX_CONFIG_BYTES`]
 /// instead of buffering it whole. Drop-in for `std::fs::read_to_string` at the
-/// daemon's JSON config/state/profile read sites (`profile`, `profile_store`,
-/// `daemon_state`). Sysfs/proc reads stay uncapped — the kernel bounds them.
+/// daemon's config/state/profile read sites (`profile`, `profile_store`,
+/// `daemon_state`, `runtime_config`). Sysfs/proc reads stay uncapped — the
+/// kernel bounds them.
 pub fn read_to_string_capped(path: &Path) -> std::io::Result<String> {
     use std::io::Read;
     let mut buf = Vec::new();
