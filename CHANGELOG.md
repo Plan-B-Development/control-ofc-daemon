@@ -1,5 +1,43 @@
 # Changelog
 
+## [2.13.0] — 2026-07-30
+
+Security and hardening release from the 2026-07-29 full cross-stack audit. Fixes a
+denial-of-service any local user could trigger. **No wire, schema, or API-shape
+change** (`api_version` stays 1); the `GET /capabilities` payload is untouched, so
+existing GUIs need no upgrade. Pairs with `control-ofc-gui` ≥ v2.23.0 (v2.33.0
+mirrors the new limits client-side). DEC-237.
+
+### Fixed
+- **A crafted profile could crash the daemon and keep it crashing across reboots
+  (denial of service).** Mix and Sync curves resolve their dependencies by recursion,
+  and while *cycles* were rejected, *depth* was not bounded — a long but perfectly
+  legal acyclic chain overflowed the stack and aborted the process on the next
+  control tick. Because activating a profile persists it as the active one, the
+  daemon then re-loaded the same profile at boot and aborted again, leaving the
+  service in a failed state until manually cleared. The socket is world-accessible by
+  design, so any local user could reach it.
+
+  Cooling was never at risk: the shutdown path restores firmware fan control on every
+  exit, including a crash. The impact was loss of daemon-managed fan control until an
+  operator intervened.
+
+  Profiles are now capped at 256 curves and 256 controls — over ten times any real
+  setup — rejected with `TOO_MANY_CURVES` / `TOO_MANY_CONTROLS`. The cap is enforced
+  at three independent points: profile validation, profile loading (the boot paths
+  deliberately skip validation, so this is the one that closes the reboot loop), and
+  the evaluator itself, which now bails out of over-deep Mix and Sync resolution and
+  falls back to holding the fan rather than crashing.
+
+### Changed
+- Runtime configuration is read through the size-capped file reader used elsewhere.
+- A read lock is no longer held across filesystem calls while resolving profile paths.
+
+### Documentation
+- Corrected comments that claimed several evaluator functions had to stay identical to
+  GUI code deleted at the 2.0.0 single-writer cutover. The golden-vector fixtures are
+  the real cross-stack oracle; the daemon owns this evaluation outright.
+
 ## [2.12.3] — 2026-07-26
 
 Contributor-facing comment and documentation cleanup from the 2026-07-26 audit — **no behavioural
