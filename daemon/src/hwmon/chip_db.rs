@@ -1034,8 +1034,9 @@ mod tests {
     fn it8665_not_in_mainline() {
         // DEC-144: IT8665E (X399 ROG Zenith Extreme era) is NOT in the
         // mainline it87 enum — it must keep reporting out-of-tree so the
-        // GUI's chip guidance (DKMS + `mmio=off` regression note, issue
-        // #106) lines up with the modules table.
+        // GUI's chip guidance (DKMS; the mmio=on default regression was fixed
+        // by frankcrawford/it87 PR #120, merged 2026-07-22 — issue #106 closed)
+        // lines up with the modules table.
         assert!(!chip_driver_in_mainline("it8665"));
     }
 
