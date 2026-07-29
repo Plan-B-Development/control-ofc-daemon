@@ -64,7 +64,7 @@ The daemon discovers sensors and fan headers by scanning `/sys/class/hwmon/`. Fo
 
 CPU temperature modules (`coretemp` for Intel, `k10temp` for AMD) and SMBus adapter modules (`i2c-i801`, `i2c-piix4`) auto-load via PCI/ACPI matching — no configuration needed.
 
-**If your hardware is not detected:** check the GUI's readiness report first (the **Hardware** page) — it identifies your board's chips and the exact module or AUR package needed **without probing the hardware**. As a **last resort**, install `lm_sensors` and run:
+**If your hardware is not detected:** check the GUI's readiness report first (the **System State** page) — it identifies your board's chips and the exact module or AUR package needed **without probing the hardware**. As a **last resort**, install `lm_sensors` and run:
 ```bash
 sudo sensors-detect
 ```

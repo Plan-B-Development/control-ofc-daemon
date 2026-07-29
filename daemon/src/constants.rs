@@ -82,10 +82,11 @@ pub const VERIFY_PAUSE_DEADMAN: Duration = Duration::from_secs(30);
 // ── Profile engine ───────────────────────────────────────────────────
 
 /// Temperature deadband (°C) that the profile engine holds the previous
-/// curve output across when temperature is falling. Closes the audible
-/// parity gap between GUI-driven and headless evaluation. Mirrors the
-/// GUI's ``HYSTERESIS_DEADBAND_C`` in ``services/control_loop.py``.
-/// See DEC-096.
+/// curve output across when temperature is falling — it prevents audible fan
+/// oscillation as the temperature hovers around a curve knee. Since the 2.0.0
+/// sole-writer cutover (DEC-165) the daemon is the only evaluator and owns this
+/// behaviour outright; it was historically kept in parity with the (now-deleted)
+/// GUI control loop. See DEC-096.
 pub const HYSTERESIS_DEADBAND_C: f64 = 2.0;
 
 /// Maximum consecutive 1 Hz engine ticks the falling-temperature deadband
