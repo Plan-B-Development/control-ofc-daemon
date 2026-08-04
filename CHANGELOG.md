@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [2.14.0] — 2026-08-04
+
+**The AUR is retired as a publishing channel — GitHub is now the sole release target.**
+This is a release-infrastructure and documentation change: no daemon code changed, and
+**no wire, schema, or API-shape change** (`api_version` stays 1; the `GET /capabilities`
+payload is untouched, so existing GUIs need no upgrade). Pairs with `control-ofc-gui`
+≥ v2.23.0. DEC-239, DEC-240.
+
 ### Added
 - **Every GitHub Release now carries the clean-room-built Arch package as a downloadable
   asset, with a keyless Sigstore build-provenance attestation over it.** The AUR is a
@@ -12,11 +20,26 @@
   came from this repo's CI. The package — built by the same clean-room job that runs a
   full `cargo build --release` + `cargo test` — was already being thrown away, so
   attaching it costs nothing. DEC-239.
-- **The README gained an Install section** covering the AUR, the AUR-free prebuilt
-  package, provenance verification, and building from the in-repo `PKGBUILD` with
-  `updpkgsums && makepkg -si`.
 
 ### Changed
+- **Releases no longer publish to the AUR.** The `aur-publish` CI job is gated to a
+  manual `workflow_dispatch` and never runs on a tag push, so a release that is fully
+  published by the only channel that matters no longer reports red because a third party
+  is down. A tag push now runs exactly two jobs: `build-test` → `github-release`. The job
+  is kept rather than deleted — one `gh workflow run release.yml -f tag=vX.Y.Z` resumes
+  publishing if the AUR ever becomes viable again. DEC-240.
+- **The PKGBUILD-pkgver and `daemon/Cargo.toml`-version guards moved into `build-test`.**
+  They previously lived inside `aur-publish`, so gating that job to manual dispatch would
+  have silently dropped both from every tag push. They now run on both paths and, because
+  `build-test` gates the Release, a forgotten version bump blocks the Release itself
+  rather than only the AUR push — strictly stronger than before. DEC-240.
+- **The README leads with the prebuilt-package install** and demotes the AUR to a note
+  recording that `control-ofc-daemon` is frozen there at v2.13.0. `pacman -U` upgrades an
+  AUR-installed copy in place: same package name, and the newer version outranks the
+  frozen one, so no AUR helper pulls you backwards. **The out-of-tree DKMS drivers in the
+  prerequisites table (`it87-dkms-git`, `nct6687d-dkms-git`, `nct6686d-dkms-git`) are
+  separate third-party AUR packages and are unaffected** — install them from the AUR as
+  before.
 - **The GitHub Release is now gated on the clean-room package build.** The two jobs
   previously ran in parallel, so a tag whose `PKGBUILD` did not build (or whose tests
   failed) still produced a Release. The attached asset is now always the exact artifact

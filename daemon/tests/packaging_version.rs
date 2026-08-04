@@ -200,3 +200,52 @@ fn release_actions_are_pinned_to_a_sha() {
         "release.yml actions must be pinned to a 40-char commit SHA; found {unpinned:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// DEC-240 — the AUR is retired as a publishing channel. `aur-publish` is kept
+// in the workflow but gated to a manual `workflow_dispatch`, so a release is
+// never reddened by a third party being down. Both guards below protect the
+// *silent* failure modes of that change.
+// ---------------------------------------------------------------------------
+
+/// `aur-publish` must stay gated to a manual dispatch. Dropping the `if:`
+/// restores the pre-DEC-240 behaviour where an upstream AUR outage turns an
+/// otherwise-complete release red — the failure that burned four release
+/// attempts on the GUI's v2.34.0. Nothing else in the workflow breaks if this
+/// condition is removed, so only this test catches it.
+#[test]
+fn aur_publish_never_runs_on_a_tag_push() {
+    let block = job_block(&release_workflow(), "aur-publish");
+    assert!(
+        block
+            .lines()
+            .any(|l| l.trim() == "if: github.event_name == 'workflow_dispatch'"),
+        "aur-publish must be gated to `if: github.event_name == 'workflow_dispatch'` \
+         (DEC-240) so it never runs on a tag push"
+    );
+}
+
+/// The pkgver / Cargo.toml version guards must live in `build-test`.
+///
+/// They originally sat in `aur-publish`. Because that job no longer runs on a
+/// tag push (DEC-240), leaving them there would let a forgotten version bump
+/// produce a GitHub Release whose attached package disagrees with its own tag —
+/// green, published, and wrong. `build-test` runs on both paths and gates
+/// `github-release`, so the guards belong there.
+#[test]
+fn version_guards_run_on_the_tag_push_path() {
+    let block = job_block(&release_workflow(), "build-test");
+    assert!(
+        block.contains("packaging/PKGBUILD") && block.contains("pkgver="),
+        "build-test must verify packaging/PKGBUILD pkgver against the tag (DEC-240) — \
+         it is the only job on the tag-push path that can catch a missed bump"
+    );
+    assert!(
+        block.contains("daemon/Cargo.toml"),
+        "build-test must verify daemon/Cargo.toml's version against the tag (DEC-240)"
+    );
+    assert!(
+        block.contains("RELEASE_TAG"),
+        "build-test must expose RELEASE_TAG for the version guards to compare against"
+    );
+}
