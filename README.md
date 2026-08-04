@@ -1,6 +1,6 @@
 # control-ofc-daemon
 
-**Latest release:** v2.14.0 — 2026-08-04. Pairs with `control-ofc-gui` ≥ v2.23.0 (the recommended capability floor; the package itself only hard-blocks GUIs < 2.0.0, the sole-writer cutover). See [`CHANGELOG.md`](CHANGELOG.md) for the full history.
+**Latest release:** v2.15.0 — 2026-08-04. Pairs with `control-ofc-gui` ≥ v2.23.0 (the recommended capability floor; the package itself only hard-blocks GUIs < 2.0.0, the sole-writer cutover). See [`CHANGELOG.md`](CHANGELOG.md) for the full history.
 
 Rust workspace for the Control-OFC fan control daemon.
 
@@ -73,10 +73,36 @@ discover what your specific system needs without trial and error.
 
 ## Install
 
-**Prebuilt package (recommended):** every release attaches the same
-clean-room-built package the CI pipeline verifies (a full `cargo build
---release` + `cargo test`), so this is a complete install path that needs
-nothing but GitHub:
+**Signed pacman repository (recommended).** Set it up once; the daemon then
+upgrades with your normal `sudo pacman -Syu`. Arch / x86_64.
+
+```bash
+# 1. trust the signing key
+curl -fsSL https://raw.githubusercontent.com/Plan-B-Development/pacman-repo/main/keys/control-ofc.gpg \
+  | sudo pacman-key --add -
+sudo pacman-key --lsign-key 4AAD6D2DE40D0D10773BF770BC27C5EB2831FCDA
+
+# 2. add the repository
+sudo tee -a /etc/pacman.conf <<'EOF'
+
+[control-ofc]
+SigLevel = Required
+Server = https://github.com/Plan-B-Development/pacman-repo/releases/download/repo
+EOF
+
+# 3. install
+sudo pacman -Sy control-ofc-daemon
+sudo systemctl enable --now control-ofc-daemon
+```
+
+`SigLevel = Required` means pacman refuses any package or database not signed by
+that key. The repository also carries `control-ofc-gui`, so
+`pacman -Sy control-ofc-gui` installs both. Details, upgrade and removal
+instructions: [Plan-B-Development/pacman-repo](https://github.com/Plan-B-Development/pacman-repo).
+
+**One-off install without touching `pacman.conf`:** every release also attaches
+the same clean-room-built package the CI pipeline verifies (a full `cargo build
+--release` + `cargo test`).
 
 ```bash
 gh release download --repo Plan-B-Development/control-ofc-daemon --pattern '*.pkg.tar.zst'
@@ -84,8 +110,9 @@ sudo pacman -U ./control-ofc-daemon-*.pkg.tar.zst
 sudo systemctl enable --now control-ofc-daemon
 ```
 
-Each package carries a keyless [Sigstore](https://www.sigstore.dev/) build
-provenance attestation. Verify before installing:
+Upgrading then means repeating those commands — which is the chore the
+repository above exists to remove. Each package additionally carries a keyless
+[Sigstore](https://www.sigstore.dev/) build provenance attestation:
 
 ```bash
 gh attestation verify ./control-ofc-daemon-*.pkg.tar.zst \

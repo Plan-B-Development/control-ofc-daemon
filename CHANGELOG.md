@@ -2,6 +2,40 @@
 
 ## [Unreleased]
 
+## [2.15.0] — 2026-08-04
+
+**`sudo pacman -Syu` upgrades Control-OFC again.** DEC-240 retired the AUR and left
+`pacman -U` from a GitHub Release as the only path, which meant upgrading was a manual
+chore. This release adds a signed pacman repository served from GitHub, restoring
+one-command upgrades without depending on the AUR. No daemon code changed, and **no
+wire, schema, or API-shape change** (`api_version` stays 1; `GET /capabilities` is
+untouched, so existing GUIs need no upgrade). Pairs with `control-ofc-gui` ≥ v2.23.0.
+DEC-241.
+
+### Added
+- **A signed pacman repository — [`Plan-B-Development/pacman-repo`](https://github.com/Plan-B-Development/pacman-repo).**
+  Trust one key, add one `pacman.conf` stanza, and the daemon then upgrades with your
+  normal `sudo pacman -Syu`. Every package and the repository database are GPG-signed
+  and served with `SigLevel = Required`, so pacman refuses anything not signed by the
+  project key. The repository carries both packages, so `pacman -Sy control-ofc-gui`
+  installs the pair.
+- **`notify-repo` release job.** On a tag push, once the GitHub Release exists, the
+  release workflow tells the repository to rebuild itself from it. It declares
+  `needs: github-release` deliberately: the assembler pulls from the *latest* Release,
+  so firing early would rebuild the repository around the previous version and serve a
+  stale package as current.
+- **Three regression tests** pinning that wiring — the job's existence, its
+  `needs: github-release` ordering, its tag-push gating, the dispatch endpoint, and the
+  use of the cross-repo token rather than the ambient `GITHUB_TOKEN`. Every one of those
+  failures is silent: the release goes green, the Release object is correct, and users
+  simply never receive the update.
+
+### Changed
+- **The README leads with the repository install.** The one-off `pacman -U` path
+  remains documented as the no-`pacman.conf` alternative, and the DEC-240 note that the
+  AUR package is frozen at v2.13.0 still stands. The out-of-tree DKMS drivers in the
+  prerequisites table are unaffected third-party AUR packages, as before.
+
 ## [2.14.0] — 2026-08-04
 
 **The AUR is retired as a publishing channel — GitHub is now the sole release target.**

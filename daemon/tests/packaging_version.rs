@@ -249,3 +249,61 @@ fn version_guards_run_on_the_tag_push_path() {
         "build-test must expose RELEASE_TAG for the version guards to compare against"
     );
 }
+
+// ---------------------------------------------------------------------------
+// DEC-241 — the [control-ofc] pacman repository is what makes `pacman -Syu`
+// upgrade this package. `notify-repo` is the only thing that tells it a new
+// release exists. Every failure below is SILENT: the release goes green, the
+// Release object is correct, and users simply never receive the update.
+// ---------------------------------------------------------------------------
+
+/// The pacman repository must be told about a release, on the tag path.
+#[test]
+fn notify_repo_runs_on_a_tag_push() {
+    let block = job_block(&release_workflow(), "notify-repo");
+    assert!(
+        block
+            .lines()
+            .any(|l| l.trim() == "if: github.event_name == 'push'"),
+        "notify-repo must be gated to tag pushes (DEC-241) so the manual AUR path \
+         does not also trigger a rebuild"
+    );
+}
+
+/// `needs: github-release` is correctness, not ordering aesthetics.
+///
+/// The assembler downloads `*.pkg.tar.zst` from this repo's *latest* Release.
+/// If notify-repo fires before github-release has created it, the rebuild picks
+/// up the PREVIOUS version and republishes it as current — a stale package
+/// served to every user, with a fully green release run.
+#[test]
+fn notify_repo_waits_for_the_release_to_exist() {
+    let block = job_block(&release_workflow(), "notify-repo");
+    assert!(
+        block.lines().any(|l| l.trim() == "needs: github-release"),
+        "notify-repo must declare `needs: github-release` (DEC-241) — firing early \
+         rebuilds the pacman repo around the previous version"
+    );
+}
+
+/// Endpoint and credential must both be right, and neither fails loudly. The
+/// ambient GITHUB_TOKEN cannot dispatch to another repository, so a swap to
+/// `github.token` yields a 404 that looks like a typo.
+#[test]
+fn notify_repo_targets_the_pacman_repo_with_a_cross_repo_token() {
+    let block = job_block(&release_workflow(), "notify-repo");
+    assert!(
+        block.contains("repos/Plan-B-Development/pacman-repo/dispatches"),
+        "notify-repo must POST to the pacman-repo dispatches endpoint (DEC-241)"
+    );
+    assert!(
+        block.contains("package-released"),
+        "the dispatch event_type must be `package-released` — publish.yml listens \
+         for exactly that type and ignores anything else"
+    );
+    assert!(
+        block.contains("PACMAN_REPO_TOKEN"),
+        "notify-repo must authenticate with the cross-repo PACMAN_REPO_TOKEN; the \
+         ambient GITHUB_TOKEN cannot dispatch across repositories"
+    );
+}
