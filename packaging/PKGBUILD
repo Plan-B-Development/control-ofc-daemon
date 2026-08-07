@@ -25,8 +25,12 @@ backup=('etc/control-ofc/daemon.toml'
 install=control-ofc-daemon.install
 options=(!lto)
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-# sha256sums are CI-maintained (updpkgsums at tag time); a manual makepkg needs 'updpkgsums' first.
-sha256sums=('8215a90f2b9f9a9e3a966403c4cf1e0acb945a46c69ff94f753806fb1b1114f5')
+# Self-referential by construction: the tarball GitHub generates for the tag
+# CONTAINS this file, so any sha256 written here changes the tree, the tag, and
+# therefore the hash it claims to pin. SKIP is the only honest value. Integrity
+# of the published package comes from the GPG signature + Sigstore attestation
+# on the pacman-repo asset, not from this line.
+sha256sums=('SKIP')
 
 prepare() {
     cd "$pkgname-$pkgver"

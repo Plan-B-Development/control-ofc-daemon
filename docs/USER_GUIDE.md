@@ -32,6 +32,14 @@ The daemon provides a local API that a GUI (or scripts) can use to monitor tempe
 
 ## Installation
 
+Most users should install the package rather than build from source: add the
+signed `[control-ofc]` pacman repository once and the daemon then upgrades with
+a normal `sudo pacman -Syu`. The setup commands, the one-off `pacman -U` path
+using the package attached to every release, and the Sigstore verification step
+are all in the [Install section of the README](../README.md#install).
+
+Building from a checkout instead:
+
 ```bash
 # Build
 cd daemon
