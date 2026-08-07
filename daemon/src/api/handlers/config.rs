@@ -360,7 +360,7 @@ fn config_key(
     };
     ConfigKey {
         key: key.to_string(),
-        running_value: (value != running).then(|| running.clone()),
+        running_value: running,
         value,
         source: source.to_string(),
         mutable,
@@ -398,14 +398,26 @@ pub async fn get_config_handler(
     };
 
     let keys = vec![
+        // The ONLY key that applies live: `update_profile_search_dirs_handler`
+        // swaps `state.profile_search_dirs` in-process, and SIGHUP re-applies it
+        // too. So `requires_restart` is false, and the running value is read
+        // from that live lock rather than from `running_config` (which is frozen
+        // at startup and would therefore report a restart as owed forever — the
+        // GUI re-registers its profiles dir on every connect, so that false
+        // banner would fire for essentially every user).
         config_key(
             "profiles.search_dirs",
             serde_json::json!(disk.profiles.search_dirs),
-            serde_json::json!(run.profiles.search_dirs),
+            serde_json::json!(state
+                .profile_search_dirs
+                .read()
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()),
             runtime.profile_search_dirs().is_some(),
             admin_has("profiles.search_dirs"),
             true,
-            true,
+            false,
             None,
         ),
         config_key(
@@ -553,17 +565,27 @@ pub async fn update_poll_interval_handler(
         // Floor of 250 ms: the control loop, serial I/O and sysfs writes all run
         // on this cadence, so a tiny value is a self-inflicted denial of service
         // on the very hardware the daemon is meant to protect.
-        Some(v) if (250..=10_000).contains(&v) => v,
+        //
+        // [SAFETY] Ceiling of 2000 ms, deliberately tighter than what
+        // `daemon.toml` accepts. This interval drives the sensor poll loop, and
+        // the thermal-safety leg reads the cache with no age filter — so it
+        // bounds how stale a temperature the 105 C emergency rule can act on.
+        // `StalenessConfig` is itself derived from this value, so raising it
+        // also widens what counts as "fresh" and nothing flags the degradation.
+        // The admin file has no ceiling, but this endpoint is reachable by any
+        // local user (the socket is 0666, DEC-049), so the API caps what the
+        // hand-edited file does not.
+        Some(v) if (250..=2_000).contains(&v) => v,
         Some(v) => {
             return error_response(
                 StatusCode::BAD_REQUEST,
-                &ErrorEnvelope::validation(format!("poll_interval_ms must be 250-10000, got {v}")),
+                &ErrorEnvelope::validation(format!("poll_interval_ms must be 250-2000, got {v}")),
             );
         }
         None => {
             return error_response(
                 StatusCode::BAD_REQUEST,
-                &ErrorEnvelope::validation("missing 'poll_interval_ms' (integer 250-10000)"),
+                &ErrorEnvelope::validation("missing 'poll_interval_ms' (integer 250-2000)"),
             );
         }
     };
@@ -594,15 +616,29 @@ pub async fn update_serial_port_handler(
         }
         Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(s)) => {
-            // Confine to /dev: the daemon opens this path as root, so accepting
-            // an arbitrary path would let an unprivileged client point it at any
-            // file on the system.
-            if !s.starts_with("/dev/") || s.contains("..") {
+            // [SAFETY] Validate against the transport's OWN allowlist, not a
+            // private `/dev/` test. The daemon opens this path as root, and the
+            // endpoint is reachable by any local user (0666 socket, DEC-049).
+            // A second copy of a security check drifts: the previous `/dev/`
+            // test accepted `/dev/shm/...` and `/dev/mqueue/...` — the only
+            // world-writable, symlink-capable directories under /dev — which
+            // `RealSerialTransport::open` then rejected anyway.
+            if !crate::serial::real_transport::is_allowed_serial_path(s) {
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     &ErrorEnvelope::validation(format!(
-                        "serial port must be an absolute path under /dev/ with no '..': {s}"
+                        "serial port must be a supported serial device path: {s}"
                     )),
+                );
+            }
+            // Bound the length: an oversized value would push runtime.toml past
+            // the 4 MiB read cap, after which `load_from` treats the file as
+            // malformed and silently reverts EVERY runtime setting to defaults —
+            // which the next successful write then makes permanent.
+            if s.len() > 256 {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    &ErrorEnvelope::validation("serial port path must be 256 characters or fewer"),
                 );
             }
             Some(s.clone())
@@ -625,17 +661,23 @@ pub async fn update_serial_timeout_handler(
     Json(body): Json<serde_json::Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let ms = match body.get("timeout_ms").and_then(|v| v.as_u64()) {
-        Some(v) if (50..=5_000).contains(&v) => v,
+        // [SAFETY] Ceiling of 1000 ms, tighter than the admin file allows. An
+        // emergency `force_all` awaits the OpenFan backend before the hwmon one,
+        // costing up to `channels x timeout` on a wedged serial link — at 5000 ms
+        // that is ~40 s for 8 channels, during which no further safety
+        // evaluation runs. Same reasoning as the poll ceiling: the API is
+        // unprivileged-reachable, the file is not.
+        Some(v) if (50..=1_000).contains(&v) => v,
         Some(v) => {
             return error_response(
                 StatusCode::BAD_REQUEST,
-                &ErrorEnvelope::validation(format!("timeout_ms must be 50-5000, got {v}")),
+                &ErrorEnvelope::validation(format!("timeout_ms must be 50-1000, got {v}")),
             );
         }
         None => {
             return error_response(
                 StatusCode::BAD_REQUEST,
-                &ErrorEnvelope::validation("missing 'timeout_ms' (integer 50-5000)"),
+                &ErrorEnvelope::validation("missing 'timeout_ms' (integer 50-1000)"),
             );
         }
     };

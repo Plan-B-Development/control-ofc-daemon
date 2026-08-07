@@ -255,7 +255,7 @@ surfaces it only via an `info` log at startup (`main.rs::apply_runtime_overlay`)
   write would make that loss permanent. Unknown sections are skipped; each
   section keeps `deny_unknown_fields`, so a typo inside a known section still
   fails loudly.
-- **Only `profiles.search_dirs` is re-applied live** (on SIGHUP). Everything else
+- **Only `profiles.search_dirs` is re-applied live** (by its own POST handler and on SIGHUP) — so `GET /config` reports it `requires_restart: false` and reads its running value from the live lock, not the startup snapshot. Everything else
   is consumed once at process start, so the setters report "takes effect on next
   daemon restart" and `GET /config` exposes `restart_pending` per key by
   comparing the on-disk effective value against `AppState::running_config`.
@@ -356,9 +356,9 @@ writable hwmon header directly, spinning a stalled pump back up regardless of st
 | POST | `/profile/deactivate` | Clear active profile (DEC-097); also clears all active control-overrides, not identify-stops (DEC-218, ≥ 2.12.0); idempotent |
 | POST | `/control/{control_id}/override` (+`/override/renew`, `DELETE`) | Expiring manual override — floor-clamped, deadman, monotonic fencing (DEC-163); cleared on profile activation/deactivation (DEC-189/DEC-218) |
 | POST | `/config/profile-search-dirs` | Additively register profile search directories (persists to `runtime.toml`; 503 `persistence_failed` on write error) |
-| POST | `/config/poll-interval` | Set the sensor/fan poll interval, 250-10000 ms (DEC-243; persists to `runtime.toml`, restart to apply) |
-| POST | `/config/serial-port` | Set the OpenFan serial device, confined to `/dev/` (`null` = auto-detect). DEC-243; restart to apply |
-| POST | `/config/serial-timeout` | Set the serial read timeout, 50-5000 ms (DEC-243; restart to apply) |
+| POST | `/config/poll-interval` | Set the sensor/fan poll interval, 250-2000 ms (DEC-243; persists to `runtime.toml`, restart to apply). **[SAFETY]** the ceiling bounds how stale a temperature the 105 C rule can act on |
+| POST | `/config/serial-port` | Set the OpenFan serial device (`null` = auto-detect). Validated against the transport's own allowlist and capped at 256 chars; a configured port that fails to open falls back to auto-detection, so a bad value cannot remove OpenFan control. DEC-243; restart to apply |
+| POST | `/config/serial-timeout` | Set the serial read timeout, 50-1000 ms (DEC-243; restart to apply). **[SAFETY]** bounds emergency `force_all` latency |
 | POST | `/config/allow-port-probe` | Opt into the active Super-I/O probe (DEC-243). **Also needs the `CAP_SYS_RAWIO` drop-in** — the flag alone does not enable it |
 | POST | `/config/nvidia-telemetry` | Opt into read-only NVML telemetry (DEC-243). **Also needs the `/dev/nvidia*` drop-in** |
 | POST | `/config/startup-delay` | Set startup delay seconds (persists to `runtime.toml`, takes effect on restart; 503 `persistence_failed` on write error) |

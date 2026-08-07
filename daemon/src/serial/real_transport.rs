@@ -30,7 +30,11 @@ const ALLOWED_SERIAL_PREFIXES: &[&str] = &[
 ///
 /// Also rejects paths containing traversal components (`..`) or null bytes
 /// to prevent CWE-22 path traversal even if the prefix matches.
-fn is_allowed_serial_path(path: &str) -> bool {
+///
+/// `pub` so `POST /config/serial-port` validates against this exact list rather
+/// than its own looser `/dev/` test — two copies of a security check drift, and
+/// the API's copy accepted paths (`/dev/shm/...`) that `open()` then rejected.
+pub fn is_allowed_serial_path(path: &str) -> bool {
     if path.contains("..") || path.contains('\0') {
         return false;
     }

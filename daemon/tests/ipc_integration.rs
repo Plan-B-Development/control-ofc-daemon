@@ -3265,7 +3265,7 @@ async fn write_then_read_reports_runtime_source_and_restart_pending() {
     let (status, _) = uds_post(
         &path,
         "/config/poll-interval",
-        &serde_json::json!({"poll_interval_ms": 2500}),
+        &serde_json::json!({"poll_interval_ms": 1500}),
     )
     .await;
     assert_eq!(status, 200);
@@ -3276,7 +3276,7 @@ async fn write_then_read_reports_runtime_source_and_restart_pending() {
         .iter()
         .find(|k| k["key"] == "polling.poll_interval_ms")
         .unwrap();
-    assert_eq!(poll["value"], 2500, "on-disk value = what a restart gives");
+    assert_eq!(poll["value"], 1500, "on-disk value = what a restart gives");
     assert_eq!(
         poll["running_value"], 1000,
         "the process still runs the old one"
@@ -3295,7 +3295,7 @@ async fn poll_interval_rejects_out_of_range() {
     let (state, _tmp) = config_test_state("");
     let (path, shutdown, _dir) = start_test_server(state).await;
 
-    for bad in [0, 10, 249, 10_001, 999_999] {
+    for bad in [0, 10, 249, 2_001, 10_000, 999_999] {
         let (status, json) = uds_post(
             &path,
             "/config/poll-interval",
@@ -3320,7 +3320,19 @@ async fn serial_port_is_confined_to_dev() {
     let (state, _tmp) = config_test_state("");
     let (path, shutdown, _dir) = start_test_server(state).await;
 
-    for bad in ["/etc/shadow", "relative/path", "/dev/../etc/passwd", ""] {
+    // /dev/shm and /dev/mqueue are the world-writable, symlink-capable dirs
+    // under /dev — the old `starts_with("/dev/")` test let them through and only
+    // the transport's allowlist caught them. The API now uses that same list.
+    for bad in [
+        "/etc/shadow",
+        "relative/path",
+        "/dev/../etc/passwd",
+        "",
+        "/dev/shm/evil",
+        "/dev/mqueue/x",
+        "/dev/null",
+        "/dev/sda",
+    ] {
         let (status, json) = uds_post(
             &path,
             "/config/serial-port",
@@ -3379,7 +3391,7 @@ async fn serial_timeout_rejects_out_of_range() {
     let (state, _tmp) = config_test_state("");
     let (path, shutdown, _dir) = start_test_server(state).await;
 
-    for bad in [0, 49, 5001] {
+    for bad in [0, 49, 1_001, 5_000] {
         let (status, _) = uds_post(
             &path,
             "/config/serial-timeout",
@@ -3417,6 +3429,122 @@ async fn advertised_stop_timeout_tracks_the_constant() {
         control_ofc_daemon::constants::STOP_TIMEOUT.as_secs(),
         "advertised stop timeout must be derived from STOP_TIMEOUT, not restated"
     );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn live_applied_key_does_not_claim_a_restart_is_owed() {
+    // REGRESSION (DEC-243 review): `profiles.search_dirs` was declared
+    // requires_restart=true, but its POST handler applies the change live
+    // (`*state.profile_search_dirs.write() = ...`). `restart_pending` compares
+    // against `running_config`, frozen at startup, so the key latched
+    // restart_pending=true forever — and the GUI re-registers its profiles dir
+    // on EVERY connect, so essentially every user would see a permanent, and
+    // uncleaarable, "restart the daemon" banner for a change already in effect.
+    let (state, _tmp) = config_test_state("");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    // DEC-205 confines a non-root caller to dirs inside its own home, and the
+    // dir must exist — so create a real one there rather than naming /etc.
+    let home = std::env::var("HOME").expect("HOME must be set for this test");
+    let added = tempfile::tempdir_in(&home).unwrap();
+    let added_path = added.path().to_str().unwrap().to_string();
+
+    let (status, body) = uds_post(
+        &path,
+        "/config/profile-search-dirs",
+        &serde_json::json!({"add": [added_path]}),
+    )
+    .await;
+    assert_eq!(status, 200, "search-dir add rejected: {body}");
+
+    let (_status, json) = uds_get(&path, "/config").await;
+    let keys = json["keys"].as_array().unwrap();
+    let dirs = keys
+        .iter()
+        .find(|k| k["key"] == "profiles.search_dirs")
+        .unwrap();
+    assert_eq!(
+        dirs["requires_restart"], false,
+        "search dirs apply live — declaring otherwise manufactures a false banner"
+    );
+    assert_eq!(dirs["restart_pending"], false);
+    assert_eq!(
+        json["restart_pending"], false,
+        "and it must not poison the top-level rollup"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn running_value_is_always_present_so_null_is_unambiguous() {
+    // REGRESSION (DEC-243 review): `running_value` used to be skipped when equal
+    // to `value`, with clients told "absent means same". That is unrepresentable
+    // for `serial.port`, the one nullable key: a genuine null running value
+    // serialises as `"running_value": null`, indistinguishable from omitted. A
+    // client applying the absent-means-same rule then reports the FILE's port as
+    // the one in use — on the first-use path of the feature. Always emitting it
+    // makes null mean exactly one thing.
+    let (state, _tmp) = config_test_state("");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, _) = uds_post(
+        &path,
+        "/config/serial-port",
+        &serde_json::json!({"port": "/dev/ttyACM0"}),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let (_status, json) = uds_get(&path, "/config").await;
+    let keys = json["keys"].as_array().unwrap();
+    for key in keys {
+        assert!(
+            key.get("running_value").is_some(),
+            "{} omitted running_value",
+            key["key"]
+        );
+    }
+
+    let port = keys.iter().find(|k| k["key"] == "serial.port").unwrap();
+    assert_eq!(port["value"], "/dev/ttyACM0", "the file now names a port");
+    assert!(
+        port["running_value"].is_null(),
+        "the process started with none — this must be an explicit null, not absence"
+    );
+    assert_eq!(port["restart_pending"], true);
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn serial_port_length_is_bounded() {
+    // REGRESSION (DEC-243 security review): an unbounded value pushes
+    // runtime.toml past the 4 MiB read cap, after which `load_from` treats the
+    // file as malformed and reverts EVERY runtime setting to defaults — which
+    // the next successful write makes permanent. The request body itself fits
+    // under the 4 MiB DefaultBodyLimit, so the body cap does not cover this.
+    let (state, _tmp) = config_test_state("");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let huge = format!("/dev/ttyACM{}", "0".repeat(4096));
+    let (status, json) = uds_post(
+        &path,
+        "/config/serial-port",
+        &serde_json::json!({"port": huge}),
+    )
+    .await;
+    assert_eq!(status, 400, "an oversized serial path must be rejected");
+    assert_eq!(json["error"]["code"], "validation_error");
+
+    // And the runtime config must still be readable afterwards.
+    let (status, _) = uds_get(&path, "/config").await;
+    assert_eq!(status, 200);
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);

@@ -634,12 +634,26 @@ async fn main() {
             std::thread::sleep(delay);
         }
 
-        let serial_port_path = config.serial.port.clone().or_else(|| {
-            log::info!("Auto-detecting OpenFanController serial port...");
-            auto_detect_port(serial_timeout)
-        });
+        // [SAFETY] Try the configured port first, then ALWAYS fall back to
+        // auto-detection if it could not be opened.
+        //
+        // This used to be `config.serial.port.clone().or_else(auto_detect)`, so a
+        // configured port suppressed auto-detection outright. Since `serial.port`
+        // became settable over the 0666 socket (DEC-243), any local user could
+        // persist a well-formed but dead path (`/dev/ttyACM9`) and, from the next
+        // restart, leave `fan_controller` permanently `None`. That does not merely
+        // disable fan control: the profile engine's thermal-emergency `force_all`
+        // is guarded by `if let Some(be) = openfan_be`, so the 105 °C rule loses
+        // its only path to every OpenFan-attached fan. Falling back keeps the
+        // emergency actuator reachable, and is what an operator wants regardless
+        // (a renamed or unplugged device should not disable fan control).
+        let mut candidates: Vec<String> = Vec::new();
+        if let Some(ref configured) = config.serial.port {
+            candidates.push(configured.clone());
+        }
 
-        if let Some(ref port) = serial_port_path {
+        let mut connected_this_attempt = false;
+        for port in &candidates {
             log::info!("Opening OpenFanController on {port}");
             match RealSerialTransport::open(port, serial_timeout) {
                 Ok(transport) => {
@@ -654,14 +668,49 @@ async fn main() {
                     fc = Some(Arc::new(Mutex::new(ctrl)));
                     ot = Some(shared);
                     serial_connected = true;
+                    connected_this_attempt = true;
                     break;
                 }
                 Err(e) => {
                     log::warn!("Failed to open OpenFanController on {port}: {e}");
                 }
             }
+        }
+        if connected_this_attempt {
+            break;
+        }
+
+        // Configured port absent or unusable — auto-detect.
+        if !candidates.is_empty() {
+            log::warn!("Configured serial port unusable — falling back to auto-detection");
         } else if attempt == 0 {
-            log::info!("No serial port in config — trying auto-detect on retries");
+            log::info!("No serial port in config — auto-detecting");
+        }
+        log::info!("Auto-detecting OpenFanController serial port...");
+        if let Some(detected) = auto_detect_port(serial_timeout) {
+            if candidates.contains(&detected) {
+                continue; // already tried and failed this one above
+            }
+            log::info!("Opening OpenFanController on {detected}");
+            match RealSerialTransport::open(&detected, serial_timeout) {
+                Ok(transport) => {
+                    log::info!("OpenFanController connected on {detected}");
+                    let boxed: Box<
+                        dyn control_ofc_daemon::serial::transport::SerialTransport + Send,
+                    > = Box::new(transport);
+                    let shared = Arc::new(Mutex::new(boxed));
+
+                    let ctrl =
+                        FanController::new_shared(shared.clone(), cache.clone(), serial_timeout);
+                    fc = Some(Arc::new(Mutex::new(ctrl)));
+                    ot = Some(shared);
+                    serial_connected = true;
+                    break;
+                }
+                Err(e) => {
+                    log::warn!("Failed to open OpenFanController on {detected}: {e}");
+                }
+            }
         }
     }
 

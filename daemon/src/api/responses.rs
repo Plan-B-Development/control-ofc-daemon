@@ -2118,9 +2118,17 @@ pub struct ConfigKey {
     pub key: String,
     /// Effective on-disk value, JSON-typed (string, integer, boolean, or array).
     pub value: serde_json::Value,
-    /// Value this process is running with. Omitted when identical to `value`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub running_value: Option<serde_json::Value>,
+    /// Value this process is actually running with.
+    ///
+    /// **Always emitted, never omitted** — deliberately. It was previously
+    /// skipped when equal to `value`, with clients told to read "absent" as
+    /// "same". That protocol is unrepresentable for a nullable key: `serial.port`
+    /// is `Option<String>`, so a genuine null running value serialises as
+    /// `"running_value": null`, which a client cannot distinguish from the field
+    /// being skipped — and a client applying the absent-means-same rule then
+    /// reports the *file's* port as the one in use. Always sending it makes
+    /// `null` mean exactly one thing: not set.
+    pub running_value: serde_json::Value,
     /// Which layer supplied `value`: `runtime`, `admin`, or `default`.
     pub source: String,
     /// Whether a `POST /config/*` route exists for this key.

@@ -54,6 +54,24 @@ DEC-243.
   **deliberately not writable**: a bad socket path locks every client out of the
   daemon permanently, and moving the state directory orphans `runtime.toml`
   itself along with the daemon-owned profile store.
+- **A configured serial port that cannot be opened now falls back to
+  auto-detection.** Previously a configured port suppressed auto-detection
+  entirely, so a wrong or stale path left the daemon with no OpenFan connection
+  at all — and the thermal-emergency path to those fans is conditional on that
+  connection existing. This is also simply what an operator wants when a device
+  is renamed or unplugged.
+- **The API's bounds for the poll interval (250–2000 ms) and serial timeout
+  (50–1000 ms) are tighter than the config file's.** Both values bound how
+  quickly the 105 °C rule can see a temperature and act on it, and unlike the
+  config file the API is reachable by any local user.
+- **`POST /config/serial-port` validates against the serial transport's own
+  allowlist** rather than a second, looser check of its own, and caps the length.
+  Two copies of a security check drift apart; the looser one accepted paths the
+  transport then rejected.
+- `GET /config` reports `profiles.search_dirs` as **not** requiring a restart,
+  because its setter applies it immediately, and reads its running value from
+  live state rather than the startup snapshot. Reporting otherwise produced a
+  permanent, unclearable "restart required" for a change already in effect.
 
 ## [2.15.0] — 2026-08-04
 
