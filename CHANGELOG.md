@@ -2,6 +2,59 @@
 
 ## [Unreleased]
 
+## [2.16.0] — 2026-08-07
+
+**The daemon can now be asked what it is configured with.** `GET /capabilities`
+carried devices, features and limits but nothing about configuration, and the
+writable knobs were write-only — a client could set the startup delay but never
+read it back, so it had to keep a local guess that could silently disagree.
+Pairs with GUI ≥ v2.38.0; API version stays 1 and every change is additive.
+DEC-243.
+
+### Added
+- **`GET /config`** — the effective merged configuration. Each key reports its
+  on-disk `value` (what a restart would produce), the `running_value` this
+  process actually started with, its `source` (`runtime` / `admin` / `default`),
+  and whether it is `mutable`, `requires_restart`, or has a saved change still
+  waiting (`restart_pending`). `source: "runtime"` is the one that matters most
+  in practice: it is how an operator discovers that a `daemon.toml` edit is being
+  shadowed by an API write, which previously showed up only as a single `info`
+  line at startup.
+- **Five more writable keys**, all persisted to `runtime.toml` via the existing
+  ADR-002 overlay rather than a privileged helper: `POST /config/poll-interval`
+  (250–10000 ms), `/config/serial-port` (**confined to `/dev/`** — the daemon
+  opens this path as root), `/config/serial-timeout` (50–5000 ms),
+  `/config/allow-port-probe` and `/config/nvidia-telemetry`.
+- **Honest reporting for the two opt-ins.** `allow_port_probe` and
+  `enable_nvidia_telemetry` each need a root-installed systemd drop-in *as well
+  as* the config flag. Both the write response and `GET /config` carry
+  `requires_privilege` saying so, so a client cannot truthfully show the feature
+  as enabled on the strength of the flag alone.
+
+### Fixed
+- **`runtime.toml` no longer loses everything on a downgrade.** The top-level
+  `RuntimeConfig` used `deny_unknown_fields`, and `load_from` treats any parse
+  error as "malformed → use defaults". An older daemon started against a
+  `runtime.toml` written by a newer one would therefore discard **every** runtime
+  setting — profile search directories and startup delay included — and the next
+  successful write would make that loss permanent. Unknown *sections* are now
+  ignored; each section keeps `deny_unknown_fields`, so a typo inside a known
+  section still fails loudly.
+- **The advertised OpenFan stop timeout is derived, not restated.**
+  `GET /capabilities` hardcoded `openfan_stop_timeout_s: 8` beside a
+  `STOP_TIMEOUT` constant of 8 s — correct by coincidence, and silently wrong the
+  moment the constant moved. Clients size their identify/stop timeouts from this
+  value.
+- **The manpage no longer overstates SIGHUP.** It claimed polling intervals were
+  refreshed on reload; only the profile search directories are re-applied to the
+  running daemon. Everything else is consumed once at process start.
+
+### Changed
+- `ipc.socket_path` and `state.state_dir` are reported by `GET /config` but are
+  **deliberately not writable**: a bad socket path locks every client out of the
+  daemon permanently, and moving the state directory orphans `runtime.toml`
+  itself along with the daemon-owned profile store.
+
 ## [2.15.0] — 2026-08-04
 
 **`sudo pacman -Syu` upgrades Control-OFC again.** DEC-240 retired the AUR and left

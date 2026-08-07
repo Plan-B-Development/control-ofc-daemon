@@ -267,6 +267,30 @@ fn apply_runtime_overlay(config: &mut DaemonConfig, runtime: &RuntimeConfig, adm
         config.startup.delay_secs = delay;
     }
 
+    // DEC-243 admin keys. These are consumed once at process start, so the API
+    // that sets them reports "takes effect on restart" — this overlay is what
+    // makes that true. Without it the value would persist and never apply.
+    if let Some(port) = runtime.serial_port() {
+        log::info!("runtime.toml overrides [serial] port = {port}");
+        config.serial.port = Some(port.to_string());
+    }
+    if let Some(timeout) = runtime.serial_timeout_ms() {
+        log::info!("runtime.toml overrides [serial] timeout_ms = {timeout}");
+        config.serial.timeout_ms = timeout;
+    }
+    if let Some(interval) = runtime.poll_interval_ms() {
+        log::info!("runtime.toml overrides [polling] poll_interval_ms = {interval}");
+        config.polling.poll_interval_ms = interval;
+    }
+    if let Some(allow) = runtime.allow_port_probe() {
+        log::info!("runtime.toml overrides [detection] allow_port_probe = {allow}");
+        config.detection.allow_port_probe = allow;
+    }
+    if let Some(enable) = runtime.enable_nvidia_telemetry() {
+        log::info!("runtime.toml overrides [detection] enable_nvidia_telemetry = {enable}");
+        config.detection.enable_nvidia_telemetry = enable;
+    }
+
     // Sanity: if the admin config *also* has non-default runtime-mutable keys,
     // the runtime values still win — but warn so the admin knows their edits
     // are being shadowed. This catches the "admin edits daemon.toml but the
@@ -790,6 +814,7 @@ async fn main() {
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: config.detection.allow_port_probe,
+        running_config: config.clone(),
         // DEC-206/207: seeded by the assessment task below once the poll cache is
         // warm. The rollup Arc is shared with the AssessmentCache (its store keeps
         // this poll mirror in lockstep with the full snapshot).

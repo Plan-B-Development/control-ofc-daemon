@@ -1,4 +1,11 @@
-//! Runtime config endpoints: profile search dirs, startup delay.
+//! Configuration endpoints.
+//!
+//! Read: `GET /config` — the effective merged configuration (DEC-243).
+//! Write: profile search dirs, startup delay, preferred sensors, and the
+//! DEC-243 admin keys (poll interval, serial port/timeout, the two `[detection]`
+//! opt-ins). Every write lands in `runtime.toml`, never in the admin-owned
+//! `daemon.toml` (ADR-002), and is persist-first: a failed write returns
+//! `503 persistence_failed` and changes nothing the daemon acts on.
 
 use std::sync::Arc;
 
@@ -9,6 +16,7 @@ use axum::response::Json;
 use super::{error_response, AppState};
 use crate::api::responses::*;
 use crate::api::server::UdsConnectInfo;
+use crate::runtime_config::RuntimeConfig;
 
 /// POST /config/profile-search-dirs — add directories to the profile search path.
 ///
@@ -293,4 +301,430 @@ fn refresh_rollup_if_ok(state: &Arc<AppState>, status: StatusCode) {
             let _ = super::ensure_assessment(s, true).await;
         });
     }
+}
+
+// ── DEC-243: readable + extended-writable daemon configuration ───────────
+
+/// Build the effective on-disk config: admin `daemon.toml` with the
+/// `runtime.toml` overlay applied. This is what a restart would produce.
+///
+/// Deliberately re-reads both files rather than reusing the running config —
+/// the whole point of the endpoint is to expose the difference between what is
+/// persisted and what is in effect.
+fn effective_on_disk(state: &AppState) -> (crate::config::DaemonConfig, RuntimeConfig) {
+    let mut cfg = crate::config::DaemonConfig::load(&state.config_path).unwrap_or_default();
+    let runtime = RuntimeConfig::load_from(&state.runtime_config_path);
+    if let Some(dirs) = runtime.profile_search_dirs() {
+        cfg.profiles.search_dirs = dirs.to_vec();
+    }
+    if let Some(d) = runtime.startup_delay_secs() {
+        cfg.startup.delay_secs = d;
+    }
+    if let Some(p) = runtime.serial_port() {
+        cfg.serial.port = Some(p.to_string());
+    }
+    if let Some(t) = runtime.serial_timeout_ms() {
+        cfg.serial.timeout_ms = t;
+    }
+    if let Some(i) = runtime.poll_interval_ms() {
+        cfg.polling.poll_interval_ms = i;
+    }
+    if let Some(a) = runtime.allow_port_probe() {
+        cfg.detection.allow_port_probe = a;
+    }
+    if let Some(e) = runtime.enable_nvidia_telemetry() {
+        cfg.detection.enable_nvidia_telemetry = e;
+    }
+    (cfg, runtime)
+}
+
+/// Assemble one `ConfigKey`, deriving `restart_pending` from disk-vs-running.
+#[allow(clippy::too_many_arguments)]
+fn config_key(
+    key: &str,
+    value: serde_json::Value,
+    running: serde_json::Value,
+    overridden: bool,
+    is_admin_set: bool,
+    mutable: bool,
+    requires_restart: bool,
+    requires_privilege: Option<&str>,
+) -> ConfigKey {
+    let pending = requires_restart && value != running;
+    let source = if overridden {
+        "runtime"
+    } else if is_admin_set {
+        "admin"
+    } else {
+        "default"
+    };
+    ConfigKey {
+        key: key.to_string(),
+        running_value: (value != running).then(|| running.clone()),
+        value,
+        source: source.to_string(),
+        mutable,
+        requires_restart,
+        restart_pending: pending,
+        requires_privilege: requires_privilege.map(String::from),
+    }
+}
+
+/// GET /config — the daemon's effective configuration (DEC-243).
+///
+/// Read-only. Contains no secrets: paths, intervals and booleans only.
+pub async fn get_config_handler(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (disk, runtime) = effective_on_disk(&state);
+    let run = &state.running_config;
+    // Parse the admin file to decide `source`: "admin" must mean *this exact
+    // key* is set in daemon.toml, not merely that its section header appears
+    // (a commented-out header or a section holding only sibling keys would
+    // both fool a raw text match).
+    let admin_doc: toml::Value = std::fs::read_to_string(&state.config_path)
+        .ok()
+        .and_then(|s| toml::from_str(&s).ok())
+        .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
+    let admin_has = |dotted: &str| -> bool {
+        let mut node = &admin_doc;
+        for part in dotted.split('.') {
+            match node.get(part) {
+                Some(next) => node = next,
+                None => return false,
+            }
+        }
+        true
+    };
+
+    let keys = vec![
+        config_key(
+            "profiles.search_dirs",
+            serde_json::json!(disk.profiles.search_dirs),
+            serde_json::json!(run.profiles.search_dirs),
+            runtime.profile_search_dirs().is_some(),
+            admin_has("profiles.search_dirs"),
+            true,
+            true,
+            None,
+        ),
+        config_key(
+            "startup.delay_secs",
+            serde_json::json!(disk.startup.delay_secs),
+            serde_json::json!(run.startup.delay_secs),
+            runtime.startup_delay_secs().is_some(),
+            admin_has("startup.delay_secs"),
+            true,
+            true,
+            None,
+        ),
+        config_key(
+            "polling.poll_interval_ms",
+            serde_json::json!(disk.polling.poll_interval_ms),
+            serde_json::json!(run.polling.poll_interval_ms),
+            runtime.poll_interval_ms().is_some(),
+            admin_has("polling.poll_interval_ms"),
+            true,
+            true,
+            None,
+        ),
+        config_key(
+            "serial.port",
+            serde_json::json!(disk.serial.port),
+            serde_json::json!(run.serial.port),
+            runtime.serial_port().is_some(),
+            admin_has("serial.port"),
+            true,
+            true,
+            None,
+        ),
+        config_key(
+            "serial.timeout_ms",
+            serde_json::json!(disk.serial.timeout_ms),
+            serde_json::json!(run.serial.timeout_ms),
+            runtime.serial_timeout_ms().is_some(),
+            admin_has("serial.timeout_ms"),
+            true,
+            true,
+            None,
+        ),
+        config_key(
+            "detection.allow_port_probe",
+            serde_json::json!(disk.detection.allow_port_probe),
+            serde_json::json!(run.detection.allow_port_probe),
+            runtime.allow_port_probe().is_some(),
+            admin_has("detection.allow_port_probe"),
+            true,
+            true,
+            Some(
+                "also requires the CAP_SYS_RAWIO systemd drop-in \
+                 (superio-port-probe.conf.example)",
+            ),
+        ),
+        config_key(
+            "detection.enable_nvidia_telemetry",
+            serde_json::json!(disk.detection.enable_nvidia_telemetry),
+            serde_json::json!(run.detection.enable_nvidia_telemetry),
+            runtime.enable_nvidia_telemetry().is_some(),
+            admin_has("detection.enable_nvidia_telemetry"),
+            true,
+            true,
+            Some(
+                "also requires the /dev/nvidia* systemd drop-in \
+                 (nvidia-telemetry.conf.example)",
+            ),
+        ),
+        // Read-only by design (DEC-243). Editing either from an unprivileged
+        // client is self-destructive: a bad socket path locks every client out
+        // of the daemon permanently, and moving state_dir orphans runtime.toml
+        // and the daemon-owned profile store. Shown so they are diagnosable.
+        config_key(
+            "ipc.socket_path",
+            serde_json::json!(disk.ipc.socket_path),
+            serde_json::json!(run.ipc.socket_path),
+            false,
+            admin_has("ipc.socket_path"),
+            false,
+            true,
+            None,
+        ),
+        config_key(
+            "state.state_dir",
+            serde_json::json!(disk.state.state_dir),
+            serde_json::json!(run.state.state_dir),
+            false,
+            admin_has("state.state_dir"),
+            false,
+            true,
+            None,
+        ),
+    ];
+
+    let restart_pending = keys.iter().any(|k| k.restart_pending);
+    let body = ConfigResponse {
+        api_version: API_VERSION,
+        admin_config_path: state.config_path.clone(),
+        runtime_config_path: state.runtime_config_path.display().to_string(),
+        restart_pending,
+        keys,
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(body).unwrap_or_else(|_| serde_json::json!({}))),
+    )
+}
+
+/// Shared persist-and-report tail for the DEC-243 setters.
+fn persist_runtime(
+    state: &AppState,
+    runtime: &RuntimeConfig,
+    key: &str,
+    applied: serde_json::Value,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err(e) = runtime.save_to(&state.runtime_config_path) {
+        log::error!(
+            "Failed to persist {key} to {}: {e}",
+            state.runtime_config_path.display()
+        );
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::persistence_failed("failed to persist runtime configuration"),
+        );
+    }
+    log::info!("{key} set to {applied} (takes effect on restart)");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "api_version": API_VERSION,
+            "updated": true,
+            "key": key,
+            "value": applied,
+            "note": "Takes effect on next daemon restart",
+        })),
+    )
+}
+
+/// POST /config/poll-interval — `{"poll_interval_ms": 250..=10000}`.
+pub async fn update_poll_interval_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let ms = match body.get("poll_interval_ms").and_then(|v| v.as_u64()) {
+        // Floor of 250 ms: the control loop, serial I/O and sysfs writes all run
+        // on this cadence, so a tiny value is a self-inflicted denial of service
+        // on the very hardware the daemon is meant to protect.
+        Some(v) if (250..=10_000).contains(&v) => v,
+        Some(v) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(format!("poll_interval_ms must be 250-10000, got {v}")),
+            );
+        }
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation("missing 'poll_interval_ms' (integer 250-10000)"),
+            );
+        }
+    };
+    let mut runtime = RuntimeConfig::load_from(&state.runtime_config_path);
+    runtime.set_poll_interval_ms(Some(ms));
+    persist_runtime(
+        &state,
+        &runtime,
+        "polling.poll_interval_ms",
+        serde_json::json!(ms),
+    )
+}
+
+/// POST /config/serial-port — `{"port": "/dev/ttyACM0"}` or `{"port": null}`
+/// to clear the override and return to auto-detection.
+pub async fn update_serial_port_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let port: Option<String> = match body.get("port") {
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(
+                    "missing 'port' (a device path, or null to auto-detect)",
+                ),
+            );
+        }
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => {
+            // Confine to /dev: the daemon opens this path as root, so accepting
+            // an arbitrary path would let an unprivileged client point it at any
+            // file on the system.
+            if !s.starts_with("/dev/") || s.contains("..") {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    &ErrorEnvelope::validation(format!(
+                        "serial port must be an absolute path under /dev/ with no '..': {s}"
+                    )),
+                );
+            }
+            Some(s.clone())
+        }
+        Some(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation("'port' must be a string or null"),
+            );
+        }
+    };
+    let mut runtime = RuntimeConfig::load_from(&state.runtime_config_path);
+    runtime.set_serial_port(port.clone());
+    persist_runtime(&state, &runtime, "serial.port", serde_json::json!(port))
+}
+
+/// POST /config/serial-timeout — `{"timeout_ms": 50..=5000}`.
+pub async fn update_serial_timeout_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let ms = match body.get("timeout_ms").and_then(|v| v.as_u64()) {
+        Some(v) if (50..=5_000).contains(&v) => v,
+        Some(v) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(format!("timeout_ms must be 50-5000, got {v}")),
+            );
+        }
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation("missing 'timeout_ms' (integer 50-5000)"),
+            );
+        }
+    };
+    let mut runtime = RuntimeConfig::load_from(&state.runtime_config_path);
+    runtime.set_serial_timeout_ms(Some(ms));
+    persist_runtime(&state, &runtime, "serial.timeout_ms", serde_json::json!(ms))
+}
+
+/// Shared body parse for the two `[detection]` opt-ins.
+fn parse_enabled(body: &serde_json::Value) -> Result<bool, (StatusCode, Json<serde_json::Value>)> {
+    match body.get("enabled") {
+        Some(serde_json::Value::Bool(b)) => Ok(*b),
+        Some(_) => Err(error_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorEnvelope::validation("'enabled' must be a boolean"),
+        )),
+        None => Err(error_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorEnvelope::validation("missing 'enabled' (boolean)"),
+        )),
+    }
+}
+
+/// POST /config/allow-port-probe — `{"enabled": bool}` (DEC-203 opt-in).
+///
+/// Persisting `true` is only half of enabling the probe: it also needs the
+/// `CAP_SYS_RAWIO` systemd drop-in, which this unprivileged-reachable endpoint
+/// cannot install. The response says so explicitly so a client cannot honestly
+/// report the feature as on.
+pub async fn update_allow_port_probe_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let enabled = match parse_enabled(&body) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let mut runtime = RuntimeConfig::load_from(&state.runtime_config_path);
+    runtime.set_allow_port_probe(Some(enabled));
+    let (status, mut resp) = persist_runtime(
+        &state,
+        &runtime,
+        "detection.allow_port_probe",
+        serde_json::json!(enabled),
+    );
+    if status == StatusCode::OK && enabled {
+        if let Some(obj) = resp.0.as_object_mut() {
+            obj.insert(
+                "requires_privilege".into(),
+                serde_json::json!(
+                    "also requires the CAP_SYS_RAWIO systemd drop-in \
+                     (superio-port-probe.conf.example)"
+                ),
+            );
+        }
+    }
+    (status, resp)
+}
+
+/// POST /config/nvidia-telemetry — `{"enabled": bool}` (DEC-204 opt-in).
+///
+/// Same half-a-requirement caveat as the port probe: the NVML backend also needs
+/// the `/dev/nvidia*` drop-in.
+pub async fn update_nvidia_telemetry_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let enabled = match parse_enabled(&body) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let mut runtime = RuntimeConfig::load_from(&state.runtime_config_path);
+    runtime.set_enable_nvidia_telemetry(Some(enabled));
+    let (status, mut resp) = persist_runtime(
+        &state,
+        &runtime,
+        "detection.enable_nvidia_telemetry",
+        serde_json::json!(enabled),
+    );
+    if status == StatusCode::OK && enabled {
+        if let Some(obj) = resp.0.as_object_mut() {
+            obj.insert(
+                "requires_privilege".into(),
+                serde_json::json!(
+                    "also requires the /dev/nvidia* systemd drop-in \
+                     (nvidia-telemetry.conf.example)"
+                ),
+            );
+        }
+    }
+    (status, resp)
 }

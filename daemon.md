@@ -230,18 +230,40 @@ Other paths:
 - **Socket**: `/run/control-ofc/control-ofc.sock` (configurable via `ipc.socket_path`)
 - **Persisted state**: `/var/lib/control-ofc/daemon_state.json` (configurable via `state.state_dir`)
 
-### `daemon.toml` `[profiles]` / `[startup]` vs `runtime.toml`
+### `daemon.toml` vs `runtime.toml` (the runtime overlay)
 
 `daemon.toml`'s `[profiles]` and `[startup]` sections remain **valid admin
 defaults** — the base layer. `config.rs` still parses them (see the
 `parse_profiles_section` / `parse_startup_delay_section` tests); they are not
 deprecated and never become a parse error. `runtime.toml` is written **only**
 when an API call mutates a runtime-mutable key
-(`POST /config/profile-search-dirs` or `POST /config/startup-delay`); when it
+(any `POST /config/*` route); when it
 exists, its keys **overlay** the `daemon.toml` defaults (runtime wins — see the
 overlay note above). There is no copy and no one-time migration: the two files
 coexist, and if `runtime.toml` shadows a non-default `daemon.toml` key the daemon
 surfaces it only via an `info` log at startup (`main.rs::apply_runtime_overlay`).
+
+
+**DEC-243 widened the overlay.** `runtime.toml` now also carries `[serial]`
+(`port`, `timeout_ms`), `[polling]` (`poll_interval_ms`) and `[detection]`
+(`allow_port_probe`, `enable_nvidia_telemetry`). Two consequences worth knowing:
+
+- **The top-level `RuntimeConfig` struct deliberately does *not* use
+  `deny_unknown_fields`.** `load_from` treats any parse error as "malformed ->
+  defaults", so denying unknown *sections* would make an older daemon reading a
+  newer `runtime.toml` silently discard **every** runtime setting — and the next
+  write would make that loss permanent. Unknown sections are skipped; each
+  section keeps `deny_unknown_fields`, so a typo inside a known section still
+  fails loudly.
+- **Only `profiles.search_dirs` is re-applied live** (on SIGHUP). Everything else
+  is consumed once at process start, so the setters report "takes effect on next
+  daemon restart" and `GET /config` exposes `restart_pending` per key by
+  comparing the on-disk effective value against `AppState::running_config`.
+
+`ipc.socket_path` and `state.state_dir` are **not** runtime-mutable: a bad socket
+path locks every client out of the daemon, and moving the state dir orphans
+`runtime.toml` and the profile store. `GET /config` reports them with
+`mutable: false`.
 
 ## API Endpoints
 
@@ -257,6 +279,7 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 | GET | `/poll` | Batch: status (incl. `unavailable_sensors[]`, `active_profile_*`, `readiness` rollup) + sensors (incl. `control_eligible`) + fans |
 | GET | `/sensors/history` | Per-entity time-series (ring buffer) |
 | GET | `/capabilities` | Device list, feature flags, limits, `amd_gpu.kernel_warnings` (kernel-version regression catalogue, DEC-098) |
+| GET | `/config` | Effective merged configuration (DEC-243): per key its on-disk `value`, the `running_value` this process started with, `source` (`runtime`/`admin`/`default`), `mutable`, `requires_restart`, `restart_pending`, and `requires_privilege` where a drop-in is also needed. `/capabilities` carries no configuration at all — this is the only read side |
 | GET | `/hwmon/headers` | Controllable motherboard PWM outputs |
 | GET | `/profiles`, `/profiles/{id}` | Daemon-stored profiles (store of record — DEC-160) |
 | GET | `/profile/active` | Current active profile or `{"active": false}` |
@@ -333,6 +356,11 @@ writable hwmon header directly, spinning a stalled pump back up regardless of st
 | POST | `/profile/deactivate` | Clear active profile (DEC-097); also clears all active control-overrides, not identify-stops (DEC-218, ≥ 2.12.0); idempotent |
 | POST | `/control/{control_id}/override` (+`/override/renew`, `DELETE`) | Expiring manual override — floor-clamped, deadman, monotonic fencing (DEC-163); cleared on profile activation/deactivation (DEC-189/DEC-218) |
 | POST | `/config/profile-search-dirs` | Additively register profile search directories (persists to `runtime.toml`; 503 `persistence_failed` on write error) |
+| POST | `/config/poll-interval` | Set the sensor/fan poll interval, 250-10000 ms (DEC-243; persists to `runtime.toml`, restart to apply) |
+| POST | `/config/serial-port` | Set the OpenFan serial device, confined to `/dev/` (`null` = auto-detect). DEC-243; restart to apply |
+| POST | `/config/serial-timeout` | Set the serial read timeout, 50-5000 ms (DEC-243; restart to apply) |
+| POST | `/config/allow-port-probe` | Opt into the active Super-I/O probe (DEC-243). **Also needs the `CAP_SYS_RAWIO` drop-in** — the flag alone does not enable it |
+| POST | `/config/nvidia-telemetry` | Opt into read-only NVML telemetry (DEC-243). **Also needs the `/dev/nvidia*` drop-in** |
 | POST | `/config/startup-delay` | Set startup delay seconds (persists to `runtime.toml`, takes effect on restart; 503 `persistence_failed` on write error) |
 | POST | `/config/preferred-cpu-sensor` | Persist the user's preferred CPU temperature sensor by stable id (`{"sensor_id":"<id>"}` sets, `null` clears; validated against the live sensor set). Advisory — reflected in `/inventory/hwmon` `default_cpu` (`source:"user"`) + `preferences` and the readiness `selected_cpu_sensor_missing` item (DEC-200) |
 | POST | `/config/preferred-mb-sensor` | Persist the user's preferred case/motherboard temperature sensor (same shape) |

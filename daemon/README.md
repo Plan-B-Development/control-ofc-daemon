@@ -18,18 +18,21 @@ member — the build emits to the workspace-root `target/`, one level above
 > **Before installing manually**, verify the host has the kernel modules,
 > DKMS drivers, BIOS settings, and (for RDNA3+ AMD GPUs) the kernel
 > parameter described in the [Prerequisites section of the top-level
-> README](../README.md#prerequisites). The AUR package declares the
-> common DKMS drivers as `optdepends`, but the user action items
+> README](../README.md#prerequisites). The package declares the common
+> DKMS drivers as `optdepends`, but the user action items
 > (BIOS / kernel command line) cannot be automated.
 
-**AUR (recommended):** `paru -S control-ofc-daemon` — installs to `/usr/bin/`.
+**Packaged (recommended):** install from the signed `[control-ofc]` pacman
+repository — installs to `/usr/bin/`, and upgrades then arrive with your normal
+`sudo pacman -Syu`. The setup commands (trust the key, add the repository,
+install) are in the [Install section of the top-level
+README](../README.md#install), which also covers the one-off `pacman -U` path
+using the clean-room package attached to every release.
 
-> **Tip — first-time AUR install UX:** paru pages the `PKGBUILD` and `.install`
-> through `less` and asks you to confirm before building. That is paru's default
-> security review (press `q` to exit the pager, then `y` to proceed), not
-> specific to this package. To install non-interactively, pass `--skipreview`
-> to paru (`paru -S --skipreview control-ofc-daemon`), or add `SkipReview` to
-> the `[options]` section of `~/.config/paru/paru.conf`.
+> **The AUR package is no longer updated** (DEC-240). `control-ofc-daemon` was
+> published to the AUR through v2.13.0 and is frozen there; releases now go to
+> GitHub only. The top-level README has the migration note for existing
+> `paru -S control-ofc-daemon` installs.
 
 **Manual:**
 
@@ -93,7 +96,7 @@ For routine upgrades, the daemon reads forward-compatible config and migrates st
 
 **v1.6.0 (profile schema v4):** Profiles authored before v4 auto-migrate on load (role-aware `minimum_pct` floor lifted to 30 % for CPU/pump-labelled hwmon members, 20 % for chassis/openfan, 0 % for GPU-only). No file edit required; the migrated profile is re-saved when the user next persists it.
 
-**`daemon.toml` `[profiles]` / `[startup]` — no action required:** These sections stay valid; they are the admin-owned **base** defaults for the profile search dirs and startup delay, and the daemon still parses them. When an API call mutates one of those keys (`POST /config/profile-search-dirs` / `POST /config/startup-delay`) the daemon writes a `runtime.toml` whose keys **overlay** the `daemon.toml` defaults (runtime wins, ADR-002). The two files coexist — nothing is copied, no section is removed, and parsing either one is never an error. If `runtime.toml` ends up shadowing a non-default `daemon.toml` value, the daemon notes it once in an `info` log at startup.
+**`daemon.toml` and `runtime.toml` — no action required:** These sections stay valid; they are the admin-owned **base** defaults for the profile search dirs and startup delay, and the daemon still parses them. When an API call mutates one of those keys (`POST /config/profile-search-dirs` / `POST /config/startup-delay`) the daemon writes a `runtime.toml` whose keys **overlay** the `daemon.toml` defaults (runtime wins, ADR-002). The two files coexist — nothing is copied, no section is removed, and parsing either one is never an error. If `runtime.toml` ends up shadowing a non-default `daemon.toml` value, the daemon notes it once in an `info` log at startup. **v2.16.0 (DEC-243)** widened the set of keys this applies to — `[polling] poll_interval_ms`, `[serial] port`/`timeout_ms` and the two `[detection]` opt-ins are now settable through the API as well, and `GET /config` reports every key with its value, its source (`runtime`/`admin`/`default`) and whether a saved change is still waiting on a restart. `ipc.socket_path` and `state.state_dir` remain read-only by design.
 
 **Pre-v1.2 telemetry / polling:** `[telemetry]` and the `publish_interval_ms` field under `[polling]` were removed in the v0.7.x series. Anyone still upgrading from a pre-v0.8 install must delete those lines before starting the v1.x daemon.
 

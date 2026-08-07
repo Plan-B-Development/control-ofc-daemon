@@ -150,7 +150,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                 .put(handlers::update_profile_handler)
                 .delete(handlers::delete_profile_handler),
         )
-        // Config management
+        // Config management. GET /config is the read side (DEC-243) — before it
+        // the writable knobs were write-only, so a client could only guess what
+        // the daemon was actually configured with.
+        .route("/config", get(handlers::get_config_handler))
         .route(
             "/config/profile-search-dirs",
             post(handlers::update_profile_search_dirs_handler),
@@ -169,6 +172,32 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/config/preferred-mb-sensor",
             post(handlers::update_preferred_mb_sensor_handler),
+        )
+        // DEC-243: admin keys made runtime-mutable via the runtime.toml overlay
+        // (ADR-002) rather than a privileged helper. All are start-only, so each
+        // response says so and GET /config reports restart_pending per key. The
+        // two [detection] opt-ins additionally need a root systemd drop-in that
+        // no API can install — the responses state that rather than implying the
+        // flag alone enables the feature.
+        .route(
+            "/config/poll-interval",
+            post(handlers::update_poll_interval_handler),
+        )
+        .route(
+            "/config/serial-port",
+            post(handlers::update_serial_port_handler),
+        )
+        .route(
+            "/config/serial-timeout",
+            post(handlers::update_serial_timeout_handler),
+        )
+        .route(
+            "/config/allow-port-probe",
+            post(handlers::update_allow_port_probe_handler),
+        )
+        .route(
+            "/config/nvidia-telemetry",
+            post(handlers::update_nvidia_telemetry_handler),
         )
         .fallback(handlers::fallback_handler)
         // Explicit 4 MiB request-body cap (S1): profile POSTs are the only

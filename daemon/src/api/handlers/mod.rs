@@ -217,6 +217,14 @@ pub struct AppState {
     /// (`[detection] allow_port_probe`). Off by default; the probe also needs the
     /// `CAP_SYS_RAWIO` drop-in to actually function.
     pub allow_port_probe: bool,
+    /// The fully-resolved config this process is *running* on — `daemon.toml`
+    /// with the `runtime.toml` overlay applied, captured at startup (DEC-243).
+    ///
+    /// `GET /config` compares this against a fresh read of the same two files to
+    /// decide `restart_pending` per key. Nearly every runtime-mutable key is
+    /// consumed once at process start, so "persisted" and "in effect" are
+    /// genuinely different states and the API must not conflate them.
+    pub running_config: crate::config::DaemonConfig,
     /// Cached compact readiness rollup (DEC-206) mirrored onto `/status` + `/poll`
     /// for the GUI Dashboard health chip. `None` until the first scan completes
     /// (startup seed). Written by [`AssessmentCache::store`] as the poll mirror of

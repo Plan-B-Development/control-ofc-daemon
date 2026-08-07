@@ -266,8 +266,15 @@ pub async fn capabilities_handler(
         limits: Limits {
             pwm_percent_min: 0,
             pwm_percent_max: 100,
-            // Legacy floor fields removed — thermal safety centralized
-            openfan_stop_timeout_s: 8,
+            // Legacy floor fields removed — thermal safety centralized.
+            // Derived from the constant the stop path actually uses, not a
+            // literal: a hardcoded 8 here silently drifts the moment
+            // STOP_TIMEOUT changes, and clients size their identify/stop UI
+            // timeouts from this advertised value.
+            // Saturating rather than `as u8`: a raw cast would silently wrap a
+            // future STOP_TIMEOUT above 255 s into a tiny advertised value.
+            openfan_stop_timeout_s: u8::try_from(crate::constants::STOP_TIMEOUT.as_secs())
+                .unwrap_or(u8::MAX),
         },
         // Control-execution capability (DEC-159/160). 1.20.0 delivered daemon-
         // owned profile storage; 1.21.0 added the manual-override (DEC-163) and

@@ -31,8 +31,17 @@ pub const RUNTIME_CONFIG_FILE: &str = "runtime.toml";
 /// All fields are `Option<...>` so "not present in runtime.toml" is distinct
 /// from "explicitly set to the default". Only fields that are `Some` shadow
 /// the admin config.
+/// **No `deny_unknown_fields` at this level — deliberate (DEC-243).**
+///
+/// `load_from` treats any parse error as "malformed → use defaults". With
+/// `deny_unknown_fields` here, an *older* daemon started against a
+/// `runtime.toml` written by a newer one would fail to parse a section it does
+/// not know, fall back to `default()`, and thereby silently discard **every**
+/// runtime setting — profile search dirs and startup delay included — which the
+/// next successful write would then make permanent. Ignoring unknown *sections*
+/// makes a downgrade lossless. Each section below keeps `deny_unknown_fields`,
+/// so a typo *within* a known section still fails loudly.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profiles: Option<RuntimeProfiles>,
@@ -42,6 +51,60 @@ pub struct RuntimeConfig {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hardware: Option<RuntimeHardware>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<RuntimeSerial>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub polling: Option<RuntimePolling>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detection: Option<RuntimeDetection>,
+}
+
+/// Runtime overrides for `[serial]` (DEC-243). Both take effect at next start.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSerial {
+    /// Serial port path; `None` here means "not overridden" (admin value wins).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+impl RuntimeSerial {
+    fn is_empty(&self) -> bool {
+        self.port.is_none() && self.timeout_ms.is_none()
+    }
+}
+
+/// Runtime override for `[polling]` (DEC-243). Takes effect at next start.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimePolling {
+    pub poll_interval_ms: u64,
+}
+
+/// Runtime overrides for `[detection]` (DEC-243).
+///
+/// Setting either of these is only *half* the requirement — each also needs a
+/// root-installed systemd drop-in granting the capability (`CAP_SYS_RAWIO` for
+/// the port probe, `/dev/nvidia* rw` for NVML). The flag alone does not make the
+/// feature work, and callers must not present it as if it does.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeDetection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_port_probe: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_nvidia_telemetry: Option<bool>,
+}
+
+impl RuntimeDetection {
+    fn is_empty(&self) -> bool {
+        self.allow_port_probe.is_none() && self.enable_nvidia_telemetry.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +246,66 @@ impl RuntimeConfig {
         hw.preferred_mb_sensor = id;
         self.hardware = if hw.is_empty() { None } else { Some(hw) };
     }
+
+    // ── DEC-243 runtime-mutable admin keys ──────────────────────────────
+    // Each getter returns `None` when unset, so `apply_runtime_overlay` can tell
+    // "not overridden" from "explicitly set to the default value".
+
+    pub fn serial_port(&self) -> Option<&str> {
+        self.serial.as_ref().and_then(|s| s.port.as_deref())
+    }
+
+    pub fn serial_timeout_ms(&self) -> Option<u64> {
+        self.serial.as_ref().and_then(|s| s.timeout_ms)
+    }
+
+    pub fn poll_interval_ms(&self) -> Option<u64> {
+        self.polling.as_ref().map(|p| p.poll_interval_ms)
+    }
+
+    pub fn allow_port_probe(&self) -> Option<bool> {
+        self.detection.as_ref().and_then(|d| d.allow_port_probe)
+    }
+
+    pub fn enable_nvidia_telemetry(&self) -> Option<bool> {
+        self.detection
+            .as_ref()
+            .and_then(|d| d.enable_nvidia_telemetry)
+    }
+
+    /// Set (or clear, with `None`) the serial port override. Preserves the
+    /// timeout; drops the `[serial]` section when both are cleared.
+    pub fn set_serial_port(&mut self, port: Option<String>) {
+        let mut s = self.serial.take().unwrap_or_default();
+        s.port = port;
+        self.serial = if s.is_empty() { None } else { Some(s) };
+    }
+
+    /// Set (or clear) the serial read timeout override.
+    pub fn set_serial_timeout_ms(&mut self, timeout: Option<u64>) {
+        let mut s = self.serial.take().unwrap_or_default();
+        s.timeout_ms = timeout;
+        self.serial = if s.is_empty() { None } else { Some(s) };
+    }
+
+    /// Set (or clear, with `None`) the poll-interval override.
+    pub fn set_poll_interval_ms(&mut self, interval: Option<u64>) {
+        self.polling = interval.map(|poll_interval_ms| RuntimePolling { poll_interval_ms });
+    }
+
+    /// Set (or clear) the Super-I/O port-probe opt-in.
+    pub fn set_allow_port_probe(&mut self, allow: Option<bool>) {
+        let mut d = self.detection.take().unwrap_or_default();
+        d.allow_port_probe = allow;
+        self.detection = if d.is_empty() { None } else { Some(d) };
+    }
+
+    /// Set (or clear) the NVML telemetry opt-in.
+    pub fn set_enable_nvidia_telemetry(&mut self, enable: Option<bool>) {
+        let mut d = self.detection.take().unwrap_or_default();
+        d.enable_nvidia_telemetry = enable;
+        self.detection = if d.is_empty() { None } else { Some(d) };
+    }
 }
 
 #[cfg(test)]
@@ -289,8 +412,11 @@ mod tests {
             "[profiles]\nsearch_dirs = [\"/p\"]\nextra_field = 1\n",
         )
         .unwrap();
-        // Should fall through to default (not panic), since deny_unknown_fields
-        // causes parse failure → warn + default.
+        // Falls through to default (not a panic): the *section-level*
+        // deny_unknown_fields on RuntimeProfiles makes this a parse failure →
+        // warn + default. Note the unknown key is inside a known section — the
+        // top-level struct deliberately no longer denies unknown *sections*, so
+        // a downgrade stays lossless (see unknown_section_is_ignored_not_fatal).
         let loaded = RuntimeConfig::load_from(&path);
         assert!(loaded.profiles.is_none());
     }
@@ -397,5 +523,111 @@ mod tests {
         let loaded = RuntimeConfig::load_from(&path);
         assert_eq!(loaded.profile_search_dirs().unwrap(), &["/p".to_string()]);
         assert_eq!(loaded.preferred_cpu_sensor(), Some("cpu"));
+    }
+
+    // ── DEC-243: new runtime-mutable admin keys ──────────────────────────
+
+    #[test]
+    fn dec243_keys_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("runtime.toml");
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_poll_interval_ms(Some(2000));
+        cfg.set_serial_port(Some("/dev/ttyACM1".into()));
+        cfg.set_serial_timeout_ms(Some(750));
+        cfg.set_allow_port_probe(Some(true));
+        cfg.set_enable_nvidia_telemetry(Some(true));
+        cfg.save_to(&path).unwrap();
+
+        let loaded = RuntimeConfig::load_from(&path);
+        assert_eq!(loaded.poll_interval_ms(), Some(2000));
+        assert_eq!(loaded.serial_port(), Some("/dev/ttyACM1"));
+        assert_eq!(loaded.serial_timeout_ms(), Some(750));
+        assert_eq!(loaded.allow_port_probe(), Some(true));
+        assert_eq!(loaded.enable_nvidia_telemetry(), Some(true));
+    }
+
+    #[test]
+    fn unset_dec243_keys_are_none_not_defaults() {
+        // The overlay must distinguish "not overridden" from "set to the
+        // default", or an untouched key would shadow the admin config.
+        let cfg = RuntimeConfig::default();
+        assert!(cfg.poll_interval_ms().is_none());
+        assert!(cfg.serial_port().is_none());
+        assert!(cfg.serial_timeout_ms().is_none());
+        assert!(cfg.allow_port_probe().is_none());
+        assert!(cfg.enable_nvidia_telemetry().is_none());
+    }
+
+    #[test]
+    fn clearing_one_serial_key_preserves_the_other() {
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_serial_port(Some("/dev/ttyACM0".into()));
+        cfg.set_serial_timeout_ms(Some(600));
+        cfg.set_serial_port(None);
+        assert_eq!(cfg.serial_timeout_ms(), Some(600));
+        assert!(cfg.serial_port().is_none());
+    }
+
+    #[test]
+    fn clearing_both_serial_keys_drops_the_section() {
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_serial_port(Some("/dev/ttyACM0".into()));
+        cfg.set_serial_timeout_ms(Some(600));
+        cfg.set_serial_port(None);
+        cfg.set_serial_timeout_ms(None);
+        assert!(cfg.serial.is_none());
+    }
+
+    #[test]
+    fn clearing_both_detection_keys_drops_the_section() {
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_allow_port_probe(Some(true));
+        cfg.set_enable_nvidia_telemetry(Some(true));
+        cfg.set_allow_port_probe(None);
+        cfg.set_enable_nvidia_telemetry(None);
+        assert!(cfg.detection.is_none());
+    }
+
+    #[test]
+    fn unknown_section_is_ignored_not_fatal() {
+        // THE DOWNGRADE GUARD (DEC-243). `load_from` treats any parse failure as
+        // "malformed -> defaults", so with `deny_unknown_fields` at the top level
+        // an older daemon reading a newer runtime.toml would discard EVERY
+        // setting — profile search dirs and startup delay included — and the next
+        // write would make that loss permanent. Unknown sections must be skipped
+        // while the known ones survive intact.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("runtime.toml");
+        std::fs::write(
+            &path,
+            "[profiles]\nsearch_dirs = [\"/p\"]\n\n[startup]\ndelay_secs = 7\n\n\
+             [from_the_future]\nsome_key = 1\n",
+        )
+        .unwrap();
+
+        let loaded = RuntimeConfig::load_from(&path);
+        assert_eq!(
+            loaded.profile_search_dirs().unwrap(),
+            &["/p".to_string()],
+            "a future section must not wipe the known ones"
+        );
+        assert_eq!(loaded.startup_delay_secs(), Some(7));
+    }
+
+    #[test]
+    fn unknown_key_inside_a_known_section_still_fails_loudly() {
+        // The flip side: dropping deny_unknown_fields at the top level must not
+        // also silence typos *within* a section, or a misspelled key would be
+        // accepted and silently do nothing.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("runtime.toml");
+        std::fs::write(&path, "[startup]\ndelay_sekonds = 7\n").unwrap();
+
+        let loaded = RuntimeConfig::load_from(&path);
+        assert!(
+            loaded.startup_delay_secs().is_none(),
+            "a typo in a known section must not be silently accepted"
+        );
     }
 }

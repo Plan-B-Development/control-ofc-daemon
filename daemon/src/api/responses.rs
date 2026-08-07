@@ -2097,3 +2097,55 @@ mod tests {
         assert!(json.get("last_commanded_pwm").is_none());
     }
 }
+
+// ── DEC-243: daemon configuration surface ────────────────────────────────
+// `GET /config` exists so the GUI can *read* daemon configuration. Before it,
+// `/capabilities` carried devices/features/limits/control and nothing about
+// configuration at all, and the two writable knobs were write-only: the GUI kept
+// a local mirror and pushed it on save, so a fresh GUI against a daemon set to
+// 10 s displayed 0 s. The value was a guess, not a reading.
+
+/// One configuration key as the daemon sees it.
+///
+/// `value` is what the *files* say (admin config plus the runtime overlay) —
+/// i.e. what this key would be after a restart. `running_value` is what this
+/// process actually started with. They differ exactly when a write has been
+/// persisted but not yet applied, which is what `restart_pending` reports; the
+/// GUI must not infer that state by remembering what it posted.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigKey {
+    /// Dotted path, e.g. `startup.delay_secs`.
+    pub key: String,
+    /// Effective on-disk value, JSON-typed (string, integer, boolean, or array).
+    pub value: serde_json::Value,
+    /// Value this process is running with. Omitted when identical to `value`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub running_value: Option<serde_json::Value>,
+    /// Which layer supplied `value`: `runtime`, `admin`, or `default`.
+    pub source: String,
+    /// Whether a `POST /config/*` route exists for this key.
+    pub mutable: bool,
+    /// Whether changing it only takes effect when the daemon restarts.
+    pub requires_restart: bool,
+    /// True when `value` and `running_value` disagree — a restart is owed.
+    pub restart_pending: bool,
+    /// Present when the key needs more than a config write to work — currently
+    /// the two `[detection]` opt-ins, each of which also needs a root-installed
+    /// systemd drop-in. Setting the flag alone does not enable the feature, and
+    /// a client must not present it as if it does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requires_privilege: Option<String>,
+}
+
+/// Response for `GET /config` (DEC-243).
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigResponse {
+    pub api_version: u32,
+    /// Admin-owned file. The daemon never writes it (ADR-002).
+    pub admin_config_path: String,
+    /// Daemon-owned overlay, written only by `POST /config/*` (ADR-002).
+    pub runtime_config_path: String,
+    /// True when any key has a persisted-but-unapplied value.
+    pub restart_pending: bool,
+    pub keys: Vec<ConfigKey>,
+}

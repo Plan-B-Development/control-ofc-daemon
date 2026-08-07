@@ -57,6 +57,34 @@ to the daemon and runtime mutations land somewhere else.
 | `daemon.toml` | admin | `/etc/control-ofc/daemon.toml` | hand-edit only |
 | `runtime.toml` | daemon | `{state_dir}/runtime.toml` (default `/var/lib/control-ofc/runtime.toml`) | `POST /config/*` |
 
+### Runtime-mutable keys
+
+Widened by **DEC-243**. The original set was `[profiles] search_dirs` and
+`[startup] delay_secs`; `[hardware]` (preferred sensors) followed in DEC-200.
+
+| `runtime.toml` section | Keys | Setter |
+|---|---|---|
+| `[profiles]` | `search_dirs` | `POST /config/profile-search-dirs` |
+| `[startup]` | `delay_secs` | `POST /config/startup-delay` |
+| `[hardware]` | `preferred_cpu_sensor`, `preferred_mb_sensor` | `POST /config/preferred-{cpu,mb}-sensor` |
+| `[polling]` | `poll_interval_ms` | `POST /config/poll-interval` |
+| `[serial]` | `port`, `timeout_ms` | `POST /config/serial-port`, `POST /config/serial-timeout` |
+| `[detection]` | `allow_port_probe`, `enable_nvidia_telemetry` | `POST /config/allow-port-probe`, `POST /config/nvidia-telemetry` |
+
+**Never runtime-mutable:** `ipc.socket_path` (a bad value locks every client,
+including the one writing it, out of the daemon) and `state.state_dir` (moving it
+orphans `runtime.toml` itself and the daemon-owned profile store). `GET /config`
+reports both with `mutable: false` so they stay diagnosable without being
+editable.
+
+**The top-level `RuntimeConfig` must not use `deny_unknown_fields`.** `load_from`
+treats any parse failure as "malformed → defaults", so denying unknown *sections*
+would make an older daemon reading a newer `runtime.toml` discard **every**
+runtime setting, with the next write making that loss permanent. Unknown sections
+are ignored; per-section `deny_unknown_fields` still catches typos within a known
+section. Guarded by `unknown_section_is_ignored_not_fatal` and
+`unknown_key_inside_a_known_section_still_fails_loudly`.
+
 This mirrors the **NetworkManager pattern**:
 
 - `/etc/NetworkManager/NetworkManager.conf` (admin-owned) +

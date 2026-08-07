@@ -69,8 +69,12 @@ _/run/control-ofc/control-ofc.sock_
 
 *SIGHUP*
 	Reload configuration from daemon.toml and runtime.toml without
-	restarting. Profile search directories and polling intervals are
-	refreshed.
+	restarting. Only the *profile search directories* are re-applied to
+	the running daemon. Every other key -- polling interval, serial port
+	and timeout, socket path, state directory, startup delay, and the
+	*[detection]* opt-ins -- is consumed once at process start, so
+	changing it requires a restart. *GET /config* reports which keys have
+	a persisted value that is not yet in effect.
 
 # AMD GPU SUPPORT
 

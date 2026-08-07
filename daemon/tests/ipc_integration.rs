@@ -82,6 +82,7 @@ fn test_app_state() -> Arc<AppState> {
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
         assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
             readiness_rollup,
@@ -669,6 +670,7 @@ async fn fans_endpoint_tags_intel_gpu_source_by_id_prefix() {
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
         assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
             readiness_rollup,
@@ -826,6 +828,7 @@ fn test_app_state_with_nvidia_gpu(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
         assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
             readiness_rollup,
@@ -1091,6 +1094,7 @@ fn test_app_state_with_hwmon() -> Arc<AppState> {
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
         assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
             readiness_rollup,
@@ -1348,6 +1352,7 @@ fn test_app_state_with_unsupported_gpu(pci_bdf: &str) -> Arc<AppState> {
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
         assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
             readiness_rollup,
@@ -1425,6 +1430,7 @@ fn test_app_state_with_read_only_gpu(pci_bdf: &str, pci_device_id: u16) -> Arc<A
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
         assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
             readiness_rollup,
@@ -1707,6 +1713,7 @@ async fn deactivate_profile_resets_hwmon_coalescing() {
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
         assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
             readiness_rollup,
@@ -1824,6 +1831,7 @@ fn test_app_state_with_writable_pmfw_gpu(pci_bdf: &str) -> (Arc<AppState>, tempf
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
         assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
             readiness_rollup,
@@ -1997,6 +2005,7 @@ async fn hwmon_discovery_excludes_amdgpu_end_to_end_via_ipc() {
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
         assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
             readiness_rollup,
@@ -2061,6 +2070,7 @@ fn test_app_state_with_profile_dirs(dirs: Vec<std::path::PathBuf>) -> Arc<AppSta
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
         assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
             readiness_rollup,
@@ -3124,6 +3134,289 @@ async fn profile_search_dirs_confines_non_root_to_home() {
             "expected a home-confinement rejection reached via SO_PEERCRED, got: {msg}"
         );
     }
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+// ── DEC-243: readable + extended-writable daemon configuration ───────────
+// `GET /config` exists because the writable knobs were previously write-only:
+// the GUI kept a local mirror and pushed it on save, so a fresh client against a
+// daemon set to 10 s displayed 0 s. Every assertion here is about the API being
+// *truthful* — the value, where it came from, and whether it is actually live.
+
+/// AppState with real config paths, so the config handlers hit real files.
+fn config_test_state(admin_toml: &str) -> (Arc<AppState>, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let admin = tmp.path().join("daemon.toml");
+    std::fs::write(&admin, admin_toml).unwrap();
+    let runtime = tmp.path().join("runtime.toml");
+
+    let mut state = test_app_state();
+    let inner = Arc::get_mut(&mut state).unwrap();
+    inner.config_path = admin.to_str().unwrap().to_string();
+    inner.runtime_config_path = runtime;
+    inner.running_config =
+        control_ofc_daemon::config::DaemonConfig::from_toml(admin_toml).unwrap_or_default();
+    (state, tmp)
+}
+
+#[tokio::test]
+async fn get_config_reports_defaults_with_source() {
+    let (state, _tmp) = config_test_state("");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/config").await;
+    assert_eq!(status, 200);
+    assert_eq!(json["api_version"], 1);
+    assert!(json["admin_config_path"].is_string());
+    assert!(json["runtime_config_path"].is_string());
+
+    let keys = json["keys"].as_array().unwrap();
+    let delay = keys
+        .iter()
+        .find(|k| k["key"] == "startup.delay_secs")
+        .expect("startup.delay_secs must be reported");
+    assert_eq!(delay["value"], 0);
+    assert_eq!(delay["source"], "default", "nothing set it — not 'admin'");
+    assert_eq!(delay["mutable"], true);
+    assert_eq!(delay["restart_pending"], false);
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn get_config_distinguishes_admin_from_default() {
+    // `source` must reflect the *key*, not merely the presence of its section
+    // header — a section holding only a sibling key must not read as "admin".
+    let (state, _tmp) = config_test_state("[startup]\ndelay_secs = 5\n");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (_status, json) = uds_get(&path, "/config").await;
+    let keys = json["keys"].as_array().unwrap();
+    let delay = keys
+        .iter()
+        .find(|k| k["key"] == "startup.delay_secs")
+        .unwrap();
+    assert_eq!(delay["value"], 5);
+    assert_eq!(delay["source"], "admin");
+
+    let poll = keys
+        .iter()
+        .find(|k| k["key"] == "polling.poll_interval_ms")
+        .unwrap();
+    assert_eq!(poll["source"], "default", "unset key in an absent section");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn get_config_marks_danger_keys_immutable() {
+    // An unprivileged client must not be able to move the socket (self-lockout)
+    // or the state dir (orphans runtime.toml and the profile store).
+    let (state, _tmp) = config_test_state("");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (_status, json) = uds_get(&path, "/config").await;
+    let keys = json["keys"].as_array().unwrap();
+    for key in ["ipc.socket_path", "state.state_dir"] {
+        let entry = keys.iter().find(|k| k["key"] == key).unwrap();
+        assert_eq!(entry["mutable"], false, "{key} must be read-only");
+    }
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn get_config_flags_the_privilege_gated_opt_ins() {
+    // Setting the flag is half the requirement; the drop-in is the other half.
+    // The API must say so or a client will claim the feature is on when it isn't.
+    let (state, _tmp) = config_test_state("");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (_status, json) = uds_get(&path, "/config").await;
+    let keys = json["keys"].as_array().unwrap();
+    for key in [
+        "detection.allow_port_probe",
+        "detection.enable_nvidia_telemetry",
+    ] {
+        let entry = keys.iter().find(|k| k["key"] == key).unwrap();
+        assert!(
+            entry["requires_privilege"].is_string(),
+            "{key} must declare the drop-in requirement"
+        );
+    }
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn write_then_read_reports_runtime_source_and_restart_pending() {
+    // The whole point of the endpoint: a persisted-but-unapplied value must be
+    // distinguishable from a live one, and the client must not have to remember
+    // what it posted to know that.
+    let (state, _tmp) = config_test_state("");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, _) = uds_post(
+        &path,
+        "/config/poll-interval",
+        &serde_json::json!({"poll_interval_ms": 2500}),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let (_status, json) = uds_get(&path, "/config").await;
+    let keys = json["keys"].as_array().unwrap();
+    let poll = keys
+        .iter()
+        .find(|k| k["key"] == "polling.poll_interval_ms")
+        .unwrap();
+    assert_eq!(poll["value"], 2500, "on-disk value = what a restart gives");
+    assert_eq!(
+        poll["running_value"], 1000,
+        "the process still runs the old one"
+    );
+    assert_eq!(poll["source"], "runtime");
+    assert_eq!(poll["restart_pending"], true);
+    assert_eq!(json["restart_pending"], true, "rolled up to the top level");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn poll_interval_rejects_out_of_range() {
+    // A tiny interval is a self-inflicted DoS on the hardware the daemon guards.
+    let (state, _tmp) = config_test_state("");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    for bad in [0, 10, 249, 10_001, 999_999] {
+        let (status, json) = uds_post(
+            &path,
+            "/config/poll-interval",
+            &serde_json::json!({"poll_interval_ms": bad}),
+        )
+        .await;
+        assert_eq!(status, 400, "poll_interval_ms={bad} must be rejected");
+        assert_eq!(json["error"]["code"], "validation_error");
+    }
+
+    let (status, _) = uds_post(&path, "/config/poll-interval", &serde_json::json!({})).await;
+    assert_eq!(status, 400, "a missing key is a validation error");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn serial_port_is_confined_to_dev() {
+    // The daemon opens this path as root. Without confinement an unprivileged
+    // client could point it at any file on the system.
+    let (state, _tmp) = config_test_state("");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    for bad in ["/etc/shadow", "relative/path", "/dev/../etc/passwd", ""] {
+        let (status, json) = uds_post(
+            &path,
+            "/config/serial-port",
+            &serde_json::json!({"port": bad}),
+        )
+        .await;
+        assert_eq!(status, 400, "serial port {bad:?} must be rejected");
+        assert_eq!(json["error"]["code"], "validation_error");
+    }
+
+    let (status, _) = uds_post(
+        &path,
+        "/config/serial-port",
+        &serde_json::json!({"port": "/dev/ttyACM0"}),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    // null clears the override and returns to auto-detection.
+    let (status, _) = uds_post(
+        &path,
+        "/config/serial-port",
+        &serde_json::json!({"port": serde_json::Value::Null}),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn detection_opt_ins_disclose_the_drop_in_requirement() {
+    let (state, _tmp) = config_test_state("");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    for route in ["/config/allow-port-probe", "/config/nvidia-telemetry"] {
+        let (status, json) = uds_post(&path, route, &serde_json::json!({"enabled": true})).await;
+        assert_eq!(status, 200, "{route} should accept a boolean");
+        assert!(
+            json["requires_privilege"].is_string(),
+            "{route} must say the systemd drop-in is still needed"
+        );
+
+        let (status, json) = uds_post(&path, route, &serde_json::json!({"enabled": "yes"})).await;
+        assert_eq!(status, 400, "{route} must reject a non-boolean");
+        assert_eq!(json["error"]["code"], "validation_error");
+    }
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn serial_timeout_rejects_out_of_range() {
+    let (state, _tmp) = config_test_state("");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    for bad in [0, 49, 5001] {
+        let (status, _) = uds_post(
+            &path,
+            "/config/serial-timeout",
+            &serde_json::json!({"timeout_ms": bad}),
+        )
+        .await;
+        assert_eq!(status, 400, "timeout_ms={bad} must be rejected");
+    }
+    let (status, _) = uds_post(
+        &path,
+        "/config/serial-timeout",
+        &serde_json::json!({"timeout_ms": 750}),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn advertised_stop_timeout_tracks_the_constant() {
+    // DEC-243: this was a hardcoded literal 8 next to a STOP_TIMEOUT constant of
+    // 8 s — correct by coincidence and silently wrong the moment the constant
+    // moves. Clients size their identify/stop UI timeouts from the advertised
+    // value, so a drift there strands the UI waiting on a fan that already
+    // restarted (or gives up before it does).
+    let state = test_app_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/capabilities").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        json["limits"]["openfan_stop_timeout_s"].as_u64().unwrap(),
+        control_ofc_daemon::constants::STOP_TIMEOUT.as_secs(),
+        "advertised stop timeout must be derived from STOP_TIMEOUT, not restated"
+    );
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
