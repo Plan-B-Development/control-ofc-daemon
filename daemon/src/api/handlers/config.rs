@@ -312,8 +312,22 @@ fn refresh_rollup_if_ok(state: &Arc<AppState>, status: StatusCode) {
 /// the whole point of the endpoint is to expose the difference between what is
 /// persisted and what is in effect.
 fn effective_on_disk(state: &AppState) -> (crate::config::DaemonConfig, RuntimeConfig) {
-    let mut cfg = crate::config::DaemonConfig::load(&state.config_path).unwrap_or_default();
-    let runtime = RuntimeConfig::load_from(&state.runtime_config_path);
+    effective_on_disk_paths(&state.config_path, &state.runtime_config_path)
+}
+
+/// Path-based core of [`effective_on_disk`].
+///
+/// Public so `main`'s overlay tests can assert this merge and
+/// `apply_runtime_overlay` agree. They are two independent implementations of
+/// the same precedence rule: this one answers `GET /config`, the other decides
+/// what the process actually runs on. If they drift, a setting persists,
+/// reports `restart_pending` forever, and never applies.
+pub fn effective_on_disk_paths(
+    admin_path: &str,
+    runtime_path: &std::path::Path,
+) -> (crate::config::DaemonConfig, RuntimeConfig) {
+    let mut cfg = crate::config::DaemonConfig::load(admin_path).unwrap_or_default();
+    let runtime = RuntimeConfig::load_from(runtime_path);
     if let Some(dirs) = runtime.profile_search_dirs() {
         cfg.profiles.search_dirs = dirs.to_vec();
     }

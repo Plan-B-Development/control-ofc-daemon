@@ -304,6 +304,36 @@ fn apply_runtime_overlay(config: &mut DaemonConfig, runtime: &RuntimeConfig, adm
     }
 }
 
+/// Decide which serial port paths to try, in order, for one connect attempt.
+///
+/// [SAFETY] The configured port is tried FIRST but is never the only candidate:
+/// auto-detection is always appended as a fallback. This used to be
+/// `configured.or_else(auto_detect)`, so a configured port suppressed detection
+/// outright. Since `serial.port` became settable over the 0666 socket
+/// (DEC-243), any local user could persist a well-formed but dead path and, from
+/// the next restart, leave `fan_controller` as `None` — which does not merely
+/// disable fan control, because the profile engine's thermal-emergency
+/// `force_all` is guarded by `if let Some(be) = openfan_be`. The 105 C rule
+/// would lose its only path to every OpenFan-attached fan, with no failsafe.
+///
+/// Pure so the rule is unit-testable without a serial device: `detect` is
+/// injected, and a detected path equal to the configured one is not retried.
+fn serial_port_candidates(
+    configured: Option<&str>,
+    detect: impl FnOnce() -> Option<String>,
+) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(c) = configured {
+        candidates.push(c.to_string());
+    }
+    if let Some(detected) = detect() {
+        if !candidates.contains(&detected) {
+            candidates.push(detected);
+        }
+    }
+    candidates
+}
+
 /// Reload the daemon config and runtime overlay, updating the shared
 /// profile search dirs. Extracted from the SIGHUP handler so it can be
 /// unit-tested without a full AppState.
@@ -634,25 +664,19 @@ async fn main() {
             std::thread::sleep(delay);
         }
 
-        // [SAFETY] Try the configured port first, then ALWAYS fall back to
-        // auto-detection if it could not be opened.
-        //
-        // This used to be `config.serial.port.clone().or_else(auto_detect)`, so a
-        // configured port suppressed auto-detection outright. Since `serial.port`
-        // became settable over the 0666 socket (DEC-243), any local user could
-        // persist a well-formed but dead path (`/dev/ttyACM9`) and, from the next
-        // restart, leave `fan_controller` permanently `None`. That does not merely
-        // disable fan control: the profile engine's thermal-emergency `force_all`
-        // is guarded by `if let Some(be) = openfan_be`, so the 105 °C rule loses
-        // its only path to every OpenFan-attached fan. Falling back keeps the
-        // emergency actuator reachable, and is what an operator wants regardless
-        // (a renamed or unplugged device should not disable fan control).
-        let mut candidates: Vec<String> = Vec::new();
-        if let Some(ref configured) = config.serial.port {
-            candidates.push(configured.clone());
+        // [SAFETY] Try the configured port first, then auto-detection. The
+        // ordering rule lives in `serial_port_candidates` so it is unit-testable
+        // without a serial device — see its doc comment for why a configured
+        // port must never be the only candidate.
+        let candidates = serial_port_candidates(config.serial.port.as_deref(), || {
+            log::info!("Auto-detecting OpenFanController serial port...");
+            auto_detect_port(serial_timeout)
+        });
+
+        if candidates.is_empty() && attempt == 0 {
+            log::info!("No serial port configured and none detected");
         }
 
-        let mut connected_this_attempt = false;
         for port in &candidates {
             log::info!("Opening OpenFanController on {port}");
             match RealSerialTransport::open(port, serial_timeout) {
@@ -668,7 +692,6 @@ async fn main() {
                     fc = Some(Arc::new(Mutex::new(ctrl)));
                     ot = Some(shared);
                     serial_connected = true;
-                    connected_this_attempt = true;
                     break;
                 }
                 Err(e) => {
@@ -676,41 +699,8 @@ async fn main() {
                 }
             }
         }
-        if connected_this_attempt {
+        if serial_connected {
             break;
-        }
-
-        // Configured port absent or unusable — auto-detect.
-        if !candidates.is_empty() {
-            log::warn!("Configured serial port unusable — falling back to auto-detection");
-        } else if attempt == 0 {
-            log::info!("No serial port in config — auto-detecting");
-        }
-        log::info!("Auto-detecting OpenFanController serial port...");
-        if let Some(detected) = auto_detect_port(serial_timeout) {
-            if candidates.contains(&detected) {
-                continue; // already tried and failed this one above
-            }
-            log::info!("Opening OpenFanController on {detected}");
-            match RealSerialTransport::open(&detected, serial_timeout) {
-                Ok(transport) => {
-                    log::info!("OpenFanController connected on {detected}");
-                    let boxed: Box<
-                        dyn control_ofc_daemon::serial::transport::SerialTransport + Send,
-                    > = Box::new(transport);
-                    let shared = Arc::new(Mutex::new(boxed));
-
-                    let ctrl =
-                        FanController::new_shared(shared.clone(), cache.clone(), serial_timeout);
-                    fc = Some(Arc::new(Mutex::new(ctrl)));
-                    ot = Some(shared);
-                    serial_connected = true;
-                    break;
-                }
-                Err(e) => {
-                    log::warn!("Failed to open OpenFanController on {detected}: {e}");
-                }
-            }
         }
     }
 
@@ -1158,6 +1148,173 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
+
+    // ── DEC-243 runtime overlay ──────────────────────────────────────────
+    // `apply_runtime_overlay` is the half that makes "takes effect on restart"
+    // TRUE: the setters persist to runtime.toml, and only this function moves
+    // those values into the config the process actually runs on. It is also a
+    // SECOND copy of the same merge — `api::handlers::config::effective_on_disk`
+    // computes it independently for GET /config. Nothing tied the two together,
+    // and deleting all five branches below left the entire suite green.
+    //
+    // If they drift, settings persist and silently never apply, while GET /config
+    // keeps reporting restart_pending after every restart — a permanently
+    // unclearable banner over a setting that does nothing. That exact shape had
+    // to be fixed once already for profiles.search_dirs.
+
+    #[test]
+    fn overlay_applies_every_dec243_key() {
+        let mut config = DaemonConfig::default();
+        let mut runtime = RuntimeConfig::default();
+        runtime.set_serial_port(Some("/dev/ttyACM7".into()));
+        runtime.set_serial_timeout_ms(Some(750));
+        runtime.set_poll_interval_ms(Some(1500));
+        runtime.set_allow_port_probe(Some(true));
+        runtime.set_enable_nvidia_telemetry(Some(true));
+
+        apply_runtime_overlay(&mut config, &runtime, "/etc/control-ofc/daemon.toml");
+
+        assert_eq!(config.serial.port.as_deref(), Some("/dev/ttyACM7"));
+        assert_eq!(config.serial.timeout_ms, 750);
+        assert_eq!(config.polling.poll_interval_ms, 1500);
+        assert!(config.detection.allow_port_probe);
+        assert!(config.detection.enable_nvidia_telemetry);
+    }
+
+    #[test]
+    fn overlay_leaves_admin_values_alone_when_runtime_is_empty() {
+        // "Not overridden" must be distinguishable from "set to the default",
+        // or an untouched runtime.toml would silently shadow the admin file.
+        let mut config = DaemonConfig::default();
+        config.serial.port = Some("/dev/ttyUSB3".into());
+        config.serial.timeout_ms = 321;
+        config.polling.poll_interval_ms = 4321;
+        config.detection.allow_port_probe = true;
+        config.detection.enable_nvidia_telemetry = true;
+
+        apply_runtime_overlay(&mut config, &RuntimeConfig::default(), "/etc/x.toml");
+
+        assert_eq!(config.serial.port.as_deref(), Some("/dev/ttyUSB3"));
+        assert_eq!(config.serial.timeout_ms, 321);
+        assert_eq!(config.polling.poll_interval_ms, 4321);
+        assert!(config.detection.allow_port_probe);
+        assert!(config.detection.enable_nvidia_telemetry);
+    }
+
+    #[test]
+    fn overlay_can_turn_a_detection_opt_in_back_off() {
+        // `false` is a real override, not "absent" — an operator must be able to
+        // revoke an opt-in the admin file enabled.
+        let mut config = DaemonConfig::default();
+        config.detection.allow_port_probe = true;
+        let mut runtime = RuntimeConfig::default();
+        runtime.set_allow_port_probe(Some(false));
+
+        apply_runtime_overlay(&mut config, &runtime, "/etc/x.toml");
+        assert!(!config.detection.allow_port_probe);
+    }
+
+    #[test]
+    fn overlay_matches_the_get_config_copy_of_the_same_merge() {
+        // Pins the two independent implementations to each other. If a sixth key
+        // is added to one and not the other, this fails rather than shipping a
+        // setting that persists, reports pending, and never applies.
+        let dir = tempfile::tempdir().unwrap();
+        let admin_path = dir.path().join("daemon.toml");
+        std::fs::write(
+            &admin_path,
+            "[serial]\ntimeout_ms = 400\n\n[polling]\npoll_interval_ms = 900\n",
+        )
+        .unwrap();
+        let runtime_path = dir.path().join("runtime.toml");
+
+        let mut runtime = RuntimeConfig::default();
+        runtime.set_serial_port(Some("/dev/ttyACM2".into()));
+        runtime.set_poll_interval_ms(Some(1750));
+        runtime.set_allow_port_probe(Some(true));
+        runtime.save_to(&runtime_path).unwrap();
+
+        let mut via_overlay = DaemonConfig::load(admin_path.to_str().unwrap()).unwrap();
+        apply_runtime_overlay(
+            &mut via_overlay,
+            &RuntimeConfig::load_from(&runtime_path),
+            admin_path.to_str().unwrap(),
+        );
+
+        let (via_api, _) = control_ofc_daemon::api::handlers::config::effective_on_disk_paths(
+            admin_path.to_str().unwrap(),
+            &runtime_path,
+        );
+
+        assert_eq!(via_overlay.serial.port, via_api.serial.port);
+        assert_eq!(via_overlay.serial.timeout_ms, via_api.serial.timeout_ms);
+        assert_eq!(
+            via_overlay.polling.poll_interval_ms,
+            via_api.polling.poll_interval_ms
+        );
+        assert_eq!(
+            via_overlay.detection.allow_port_probe,
+            via_api.detection.allow_port_probe
+        );
+        assert_eq!(
+            via_overlay.detection.enable_nvidia_telemetry,
+            via_api.detection.enable_nvidia_telemetry
+        );
+        assert_eq!(
+            via_overlay.profiles.search_dirs,
+            via_api.profiles.search_dirs
+        );
+        assert_eq!(via_overlay.startup.delay_secs, via_api.startup.delay_secs);
+    }
+
+    // ── [SAFETY] serial port fallback (DEC-243) ──────────────────────────
+
+    #[test]
+    fn configured_port_is_tried_first_but_detection_still_follows() {
+        // The whole point: a configured port must not be the ONLY candidate.
+        let c = serial_port_candidates(Some("/dev/ttyACM9"), || Some("/dev/ttyACM0".into()));
+        assert_eq!(c, vec!["/dev/ttyACM9", "/dev/ttyACM0"]);
+    }
+
+    #[test]
+    fn no_configured_port_falls_back_to_detection() {
+        let c = serial_port_candidates(None, || Some("/dev/ttyACM0".into()));
+        assert_eq!(c, vec!["/dev/ttyACM0"]);
+    }
+
+    #[test]
+    fn detected_port_equal_to_configured_is_not_retried() {
+        let c = serial_port_candidates(Some("/dev/ttyACM0"), || Some("/dev/ttyACM0".into()));
+        assert_eq!(
+            c,
+            vec!["/dev/ttyACM0"],
+            "no point opening the same path twice"
+        );
+    }
+
+    #[test]
+    fn nothing_configured_and_nothing_detected_yields_no_candidates() {
+        let c = serial_port_candidates(None, || None);
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn a_dead_configured_port_cannot_suppress_detection() {
+        // REGRESSION: the pre-fix `configured.or_else(detect)` returned exactly
+        // one candidate here, so an unprivileged user who persisted a dead path
+        // durably removed OpenFan control — and with it the 105 C emergency's
+        // only path to those fans. Detection must still be reachable.
+        let detect_called = std::cell::Cell::new(false);
+        let c = serial_port_candidates(Some("/dev/ttyACM9"), || {
+            detect_called.set(true);
+            Some("/dev/ttyACM0".into())
+        });
+        assert!(
+            detect_called.get(),
+            "detection must run even with a port configured"
+        );
+        assert!(c.contains(&"/dev/ttyACM0".to_string()));
+    }
 
     // ── Boot-time profile resolution fail-safe (DEC-165) ─────────────────
 

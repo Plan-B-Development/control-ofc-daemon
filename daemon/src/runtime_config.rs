@@ -39,8 +39,12 @@ pub const RUNTIME_CONFIG_FILE: &str = "runtime.toml";
 /// not know, fall back to `default()`, and thereby silently discard **every**
 /// runtime setting — profile search dirs and startup delay included — which the
 /// next successful write would then make permanent. Ignoring unknown *sections*
-/// makes a downgrade lossless. Each section below keeps `deny_unknown_fields`,
-/// so a typo *within* a known section still fails loudly.
+/// keeps the settings that older daemon still understands. It is not fully
+/// lossless: there is no `#[serde(flatten)]` catch-all, so the unknown section
+/// itself is still dropped on that daemon's next `save_to`. The point is that a
+/// downgrade costs you only the newer keys, not all of them. Each section below
+/// keeps `deny_unknown_fields`, so a typo *within* a known section still fails
+/// loudly.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RuntimeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -596,7 +600,9 @@ mod tests {
         // an older daemon reading a newer runtime.toml would discard EVERY
         // setting — profile search dirs and startup delay included — and the next
         // write would make that loss permanent. Unknown sections must be skipped
-        // while the known ones survive intact.
+        // while the known ones survive intact. (The unknown section itself is
+        // still dropped on that daemon's next save_to — there is no flatten
+        // catch-all — so a downgrade costs the newer keys, not all of them.)
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("runtime.toml");
         std::fs::write(

@@ -3213,6 +3213,72 @@ async fn get_config_distinguishes_admin_from_default() {
 }
 
 #[tokio::test]
+async fn admin_source_is_per_key_not_per_section() {
+    // `source` drives the GUI's provenance note ("set in daemon.toml"). Matching
+    // on the section header instead of the exact key would make serial.port
+    // claim admin provenance merely because [serial] timeout_ms exists — a false
+    // statement in the card whose entire job is provenance.
+    let (state, _tmp) = config_test_state("[serial]\ntimeout_ms = 600\n");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (_status, json) = uds_get(&path, "/config").await;
+    let keys = json["keys"].as_array().unwrap();
+
+    let timeout = keys
+        .iter()
+        .find(|k| k["key"] == "serial.timeout_ms")
+        .unwrap();
+    assert_eq!(timeout["source"], "admin", "this key IS set in daemon.toml");
+
+    let port = keys.iter().find(|k| k["key"] == "serial.port").unwrap();
+    assert_eq!(
+        port["source"], "default",
+        "a sibling key in the same section must not confer admin provenance"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn range_bounds_are_inclusive_at_both_edges() {
+    // The validators use `..=`; nothing pinned the inclusive edges, so a silent
+    // `..` would reject the documented maximum.
+    let (state, _tmp) = config_test_state("");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    for (route, key, v) in [
+        ("/config/poll-interval", "poll_interval_ms", 250u64),
+        ("/config/poll-interval", "poll_interval_ms", 2000),
+        ("/config/serial-timeout", "timeout_ms", 50),
+        ("/config/serial-timeout", "timeout_ms", 1000),
+    ] {
+        let (status, body) = uds_post(&path, route, &serde_json::json!({key: v})).await;
+        assert_eq!(status, 200, "{key}={v} is a documented bound: {body}");
+    }
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn detection_opt_in_requires_the_enabled_key() {
+    // A `{}` body must not silently persist `false` — that would DISABLE an
+    // opt-in the caller believes they enabled.
+    let (state, _tmp) = config_test_state("");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    for route in ["/config/allow-port-probe", "/config/nvidia-telemetry"] {
+        let (status, json) = uds_post(&path, route, &serde_json::json!({})).await;
+        assert_eq!(status, 400, "{route} must reject a body with no 'enabled'");
+        assert_eq!(json["error"]["code"], "validation_error");
+    }
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
 async fn get_config_marks_danger_keys_immutable() {
     // An unprivileged client must not be able to move the socket (self-lockout)
     // or the state dir (orphans runtime.toml and the profile store).

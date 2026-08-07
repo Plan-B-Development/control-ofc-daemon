@@ -4,7 +4,7 @@
 //! Write handlers dispatch through the `FanController`.
 
 mod assessment;
-mod config;
+pub mod config;
 mod control;
 mod gpu;
 mod hw_diagnostics;
