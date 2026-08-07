@@ -22,9 +22,11 @@ DEC-243.
   line at startup.
 - **Five more writable keys**, all persisted to `runtime.toml` via the existing
   ADR-002 overlay rather than a privileged helper: `POST /config/poll-interval`
-  (250–10000 ms), `/config/serial-port` (**confined to `/dev/`** — the daemon
-  opens this path as root), `/config/serial-timeout` (50–5000 ms),
-  `/config/allow-port-probe` and `/config/nvidia-telemetry`.
+  (250–2000 ms), `/config/serial-port` (validated against the serial transport's
+  own allowlist and length-capped — the daemon opens this path as root),
+  `/config/serial-timeout` (50–1000 ms), `/config/allow-port-probe` and
+  `/config/nvidia-telemetry`. The two interval bounds are deliberately tighter
+  than what `daemon.toml` accepts; see **Changed** below.
 - **Honest reporting for the two opt-ins.** `allow_port_probe` and
   `enable_nvidia_telemetry` each need a root-installed systemd drop-in *as well
   as* the config flag. Both the write response and `GET /config` carry

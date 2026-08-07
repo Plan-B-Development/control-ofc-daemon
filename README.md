@@ -91,13 +91,13 @@ Server = https://github.com/Plan-B-Development/pacman-repo/releases/download/rep
 EOF
 
 # 3. install
-sudo pacman -Sy control-ofc-daemon
+sudo pacman -Syu control-ofc-daemon
 sudo systemctl enable --now control-ofc-daemon
 ```
 
 `SigLevel = Required` means pacman refuses any package or database not signed by
 that key. The repository also carries `control-ofc-gui`, so
-`pacman -Sy control-ofc-gui` installs both. Details, upgrade and removal
+`pacman -Syu control-ofc-gui` installs both. Details, upgrade and removal
 instructions: [Plan-B-Development/pacman-repo](https://github.com/Plan-B-Development/pacman-repo).
 
 **One-off install without touching `pacman.conf`:** every release also attaches

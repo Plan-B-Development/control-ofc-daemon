@@ -2,13 +2,28 @@
 # Copy to /etc/control-ofc/daemon.toml and edit as needed.
 # All fields are optional — defaults are shown below.
 #
-# NOTE: a few settings — the startup delay ([startup] below) and profile search
-# directories — can be set here as admin-owned BASE defaults. When the API
-# mutates one of them (POST /config/startup-delay / /config/profile-search-dirs),
-# the daemon writes /var/lib/control-ofc/runtime.toml, whose keys OVERLAY these
-# defaults (runtime wins, ADR-002). The two files coexist; this file is admin-
-# owned and is never rewritten by the daemon at runtime. See
-# docs/ADRs/002-runtime-config-split.md.
+# NOTE: several settings below are admin-owned BASE defaults that the API may
+# later OVERRIDE. When a POST /config/* call mutates one of them, the daemon
+# writes /var/lib/control-ofc/runtime.toml, whose keys OVERLAY these defaults
+# (runtime wins, ADR-002). The two files coexist; this file is admin-owned and
+# is never rewritten by the daemon at runtime.
+#
+# Keys that can be shadowed this way, and by which route:
+#   [profiles] search_dirs            POST /config/profile-search-dirs
+#   [startup]  delay_secs             POST /config/startup-delay
+#   [polling]  poll_interval_ms       POST /config/poll-interval      (250-2000)
+#   [serial]   port                   POST /config/serial-port
+#   [serial]   timeout_ms             POST /config/serial-timeout     (50-1000)
+#   [detection] allow_port_probe      POST /config/allow-port-probe
+#   [detection] enable_nvidia_telemetry  POST /config/nvidia-telemetry
+#
+# The API's bounds on the two interval keys are deliberately TIGHTER than what
+# this file accepts: they bound how stale a temperature the 105 C thermal rule
+# can act on, and the API is reachable by any local user while this file is not.
+#
+# If an edit here appears not to take effect, a runtime override is shadowing it:
+# GET /config reports source="runtime" for that key, and the daemon logs it once
+# at startup. See docs/ADRs/002-runtime-config-split.md.
 
 [serial]
 # Use stable /dev/serial/by-id/ path (survives USB re-enumeration)

@@ -556,7 +556,7 @@ fn persist_runtime(
     )
 }
 
-/// POST /config/poll-interval — `{"poll_interval_ms": 250..=10000}`.
+/// POST /config/poll-interval — `{"poll_interval_ms": 250..=2000}`.
 pub async fn update_poll_interval_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
@@ -655,7 +655,7 @@ pub async fn update_serial_port_handler(
     persist_runtime(&state, &runtime, "serial.port", serde_json::json!(port))
 }
 
-/// POST /config/serial-timeout — `{"timeout_ms": 50..=5000}`.
+/// POST /config/serial-timeout — `{"timeout_ms": 50..=1000}`.
 pub async fn update_serial_timeout_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
