@@ -82,8 +82,8 @@ curl -fsSL https://raw.githubusercontent.com/Plan-B-Development/pacman-repo/main
   | sudo pacman-key --add -
 sudo pacman-key --lsign-key 4AAD6D2DE40D0D10773BF770BC27C5EB2831FCDA
 
-# 2. add the repository
-sudo tee -a /etc/pacman.conf <<'EOF'
+# 2. add the repository — run once; `tee -a` would append a duplicate block
+grep -q '^\[control-ofc\]' /etc/pacman.conf || sudo tee -a /etc/pacman.conf <<'EOF'
 
 [control-ofc]
 SigLevel = Required
@@ -94,6 +94,10 @@ EOF
 sudo pacman -Syu control-ofc-daemon
 sudo systemctl enable --now control-ofc-daemon
 ```
+
+There is also a signed `bootstrap.sh` that does all of the above (and checks the
+signing key's fingerprint before trusting it) — see
+[pacman-repo § Install](https://github.com/Plan-B-Development/pacman-repo#install).
 
 `SigLevel = Required` means pacman refuses any package or database not signed by
 that key. The repository also carries `control-ofc-gui`, so
