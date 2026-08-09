@@ -225,6 +225,63 @@ fn aur_publish_never_runs_on_a_tag_push() {
     );
 }
 
+/// The settle wait must exist AND run before the dispatch (DEC-248).
+///
+/// pacman-repo's publish is declarative: it assembles from whatever is the
+/// latest Release of each source project at the moment it runs. In a coordinated
+/// GUI + daemon release the two `release.yml` runs finish at different times, so
+/// dispatching the instant this one finishes can publish THIS new package paired
+/// with the OTHER project's previous one, and serve that pair as current.
+///
+/// A timing heuristic, not a guarantee — which is exactly why it needs a guard:
+/// nothing else in the workflow breaks if the wait is deleted or moved after the
+/// dispatch, and a wait that runs *afterwards* does nothing at all while still
+/// looking present in a diff. The GUI has carried this test since DEC-248
+/// (`test_notify_repo_settles_before_dispatching`); the daemon's half of the
+/// same change shipped without one.
+#[test]
+fn notify_repo_settles_before_dispatching() {
+    let block = job_block(&release_workflow(), "notify-repo");
+    let lines: Vec<&str> = block.lines().collect();
+
+    let sleep_at = lines
+        .iter()
+        .position(|l| l.contains("sleep "))
+        .expect("notify-repo must wait before dispatching so a paired cross-stack release can land first (DEC-248); no sleep step found");
+    let dispatch_at = lines
+        .iter()
+        .position(|l| l.contains("dispatches"))
+        .expect("notify-repo must dispatch to pacman-repo");
+
+    assert!(
+        sleep_at < dispatch_at,
+        "the settle wait must come BEFORE the dispatch — waiting afterwards does \
+         nothing at all. sleep at line {sleep_at}, dispatch at line {dispatch_at}"
+    );
+}
+
+/// The settle window must stay long enough to be worth having.
+///
+/// Measured against the two historical coordinated releases, the 180 s window had
+/// only **13–34 s of real slack** — so a shorter wait would have published a
+/// mismatched pair. This pins the order of magnitude rather than the exact value:
+/// trimming it to "a few seconds" because the wait feels slow in CI is the
+/// plausible future edit, and it would silently remove the protection.
+#[test]
+fn the_settle_window_is_not_trimmed_to_nothing() {
+    let block = job_block(&release_workflow(), "notify-repo");
+    let secs: u32 = block
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("run: sleep "))
+        .and_then(|v| v.trim().parse().ok())
+        .expect("notify-repo's settle step must be a plain `sleep <seconds>`");
+    assert!(
+        secs >= 120,
+        "the settle window is {secs}s; the two historical coordinated releases left \
+         only 13-34s of slack at 180s, so anything much shorter stops working (DEC-248)"
+    );
+}
+
 /// The pkgver / Cargo.toml version guards must live in `build-test`.
 ///
 /// They originally sat in `aur-publish`. Because that job no longer runs on a
