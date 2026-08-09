@@ -228,12 +228,15 @@ impl RuntimeConfig {
         let quarantined = quarantine_path(path);
         std::fs::rename(path, &quarantined).map_err(|e| {
             format!(
-                "existing runtime config at {} is {problem} and could not be moved                  aside ({e}); refusing to overwrite it",
+                "existing runtime config at {} is {problem} and could not be moved \
+                 aside ({e}); refusing to overwrite it",
                 path.display()
             )
         })?;
         log::error!(
-            "Runtime config at {} is {problem}; moved to {} and continuing with              defaults. Settings in that file are NOT applied — copy anything you              need back and restart.",
+            "Runtime config at {} is {problem}; moved to {} and continuing with \
+             defaults. Settings in that file are NOT applied — copy anything you \
+             need back and restart.",
             path.display(),
             quarantined.display()
         );
