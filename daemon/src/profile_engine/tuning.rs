@@ -134,7 +134,10 @@ pub(crate) fn apply_tuning_with_floor(
 pub(crate) fn member_effective_floor(control: &LogicalControl, member: &ControlMember) -> f64 {
     if member_is_gpu(member) {
         0.0
-    } else if member_is_pump_or_cpu(member) {
+    } else if member_needs_hard_floor(member) {
+        // DEC-252: the eval-time superset — the author's label OR the daemon's
+        // own discovered one. `validate`'s rejection deliberately stays on the
+        // narrower `member_is_pump_or_cpu`; see `member_needs_hard_floor`.
         control.minimum_pct.max(HARD_PUMP_CPU_FLOOR_PCT)
     } else {
         control.minimum_pct

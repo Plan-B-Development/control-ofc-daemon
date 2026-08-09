@@ -100,7 +100,10 @@ pub async fn update_profile_search_dirs_handler(
     // Persist first. On failure, leave in-memory state alone and return 503
     // so the caller sees a durable, actionable error rather than a silent
     // drift between in-memory and on-disk state.
-    let mut runtime = crate::runtime_config::RuntimeConfig::load_from(&state.runtime_config_path);
+    let mut runtime = match runtime_for_update(&state) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
     runtime.set_profile_search_dirs(merged.clone());
     if let Err(e) = runtime.save_to(&state.runtime_config_path) {
         log::error!(
@@ -155,7 +158,10 @@ pub async fn update_startup_delay_handler(
         }
     };
 
-    let mut runtime = crate::runtime_config::RuntimeConfig::load_from(&state.runtime_config_path);
+    let mut runtime = match runtime_for_update(&state) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
     runtime.set_startup_delay_secs(delay);
     if let Err(e) = runtime.save_to(&state.runtime_config_path) {
         log::error!(
@@ -231,7 +237,10 @@ fn set_preferred_sensor(
     }
 
     // Persist-first, matching the sibling config handlers.
-    let mut runtime = crate::runtime_config::RuntimeConfig::load_from(&state.runtime_config_path);
+    let mut runtime = match runtime_for_update(state) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
     let role_str = match role {
         PreferredSensorRole::Cpu => {
             runtime.set_preferred_cpu_sensor(new_id.clone());
@@ -540,14 +549,38 @@ pub async fn get_config_handler(
     )
 }
 
+/// Load runtime.toml for a setter, converting an unreadable existing file into a
+/// 503 rather than letting the write erase it (DEC-252).
+///
+/// Every `POST /config/*` is load → mutate one key → save. Without this the
+/// fallback-to-defaults inside `load_from` turns a failed read into a permanent
+/// overwrite of every other setting.
+fn runtime_for_update(
+    state: &AppState,
+) -> Result<RuntimeConfig, (StatusCode, Json<serde_json::Value>)> {
+    RuntimeConfig::load_for_update(&state.runtime_config_path).map_err(|e| {
+        log::error!("{e}");
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::persistence_failed(
+                "existing runtime configuration could not be read; refusing to overwrite it",
+            ),
+        )
+    })
+}
+
 /// Shared persist-and-report tail for the DEC-243 setters.
-fn persist_runtime(
+async fn persist_runtime(
     state: &AppState,
     runtime: &RuntimeConfig,
     key: &str,
     applied: serde_json::Value,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if let Err(e) = runtime.save_to(&state.runtime_config_path) {
+    // DEC-252: write + fsync + rename + directory fsync, off the async worker
+    // threads the 1 Hz profile engine shares. See `persist_off_runtime`.
+    let runtime_owned = runtime.clone();
+    let path = state.runtime_config_path.clone();
+    if let Err(e) = super::persist_off_runtime(move || runtime_owned.save_to(&path)).await {
         log::error!(
             "Failed to persist {key} to {}: {e}",
             state.runtime_config_path.display()
@@ -603,7 +636,10 @@ pub async fn update_poll_interval_handler(
             );
         }
     };
-    let mut runtime = RuntimeConfig::load_from(&state.runtime_config_path);
+    let mut runtime = match runtime_for_update(&state) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
     runtime.set_poll_interval_ms(Some(ms));
     persist_runtime(
         &state,
@@ -611,6 +647,7 @@ pub async fn update_poll_interval_handler(
         "polling.poll_interval_ms",
         serde_json::json!(ms),
     )
+    .await
 }
 
 /// POST /config/serial-port — `{"port": "/dev/ttyACM0"}` or `{"port": null}`
@@ -664,9 +701,12 @@ pub async fn update_serial_port_handler(
             );
         }
     };
-    let mut runtime = RuntimeConfig::load_from(&state.runtime_config_path);
+    let mut runtime = match runtime_for_update(&state) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
     runtime.set_serial_port(port.clone());
-    persist_runtime(&state, &runtime, "serial.port", serde_json::json!(port))
+    persist_runtime(&state, &runtime, "serial.port", serde_json::json!(port)).await
 }
 
 /// POST /config/serial-timeout — `{"timeout_ms": 50..=1000}`.
@@ -695,9 +735,12 @@ pub async fn update_serial_timeout_handler(
             );
         }
     };
-    let mut runtime = RuntimeConfig::load_from(&state.runtime_config_path);
+    let mut runtime = match runtime_for_update(&state) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
     runtime.set_serial_timeout_ms(Some(ms));
-    persist_runtime(&state, &runtime, "serial.timeout_ms", serde_json::json!(ms))
+    persist_runtime(&state, &runtime, "serial.timeout_ms", serde_json::json!(ms)).await
 }
 
 /// Shared body parse for the two `[detection]` opt-ins.
@@ -729,14 +772,18 @@ pub async fn update_allow_port_probe_handler(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let mut runtime = RuntimeConfig::load_from(&state.runtime_config_path);
+    let mut runtime = match runtime_for_update(&state) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
     runtime.set_allow_port_probe(Some(enabled));
     let (status, mut resp) = persist_runtime(
         &state,
         &runtime,
         "detection.allow_port_probe",
         serde_json::json!(enabled),
-    );
+    )
+    .await;
     if status == StatusCode::OK && enabled {
         if let Some(obj) = resp.0.as_object_mut() {
             obj.insert(
@@ -763,14 +810,18 @@ pub async fn update_nvidia_telemetry_handler(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let mut runtime = RuntimeConfig::load_from(&state.runtime_config_path);
+    let mut runtime = match runtime_for_update(&state) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
     runtime.set_enable_nvidia_telemetry(Some(enabled));
     let (status, mut resp) = persist_runtime(
         &state,
         &runtime,
         "detection.enable_nvidia_telemetry",
         serde_json::json!(enabled),
-    );
+    )
+    .await;
     if status == StatusCode::OK && enabled {
         if let Some(obj) = resp.0.as_object_mut() {
             obj.insert(

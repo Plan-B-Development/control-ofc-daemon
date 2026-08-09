@@ -178,7 +178,10 @@ pub async fn activate_profile_handler(
         active_profile_id: Some(profile_id.clone()),
         active_profile_path: Some(profile_path.display().to_string()),
     };
-    if let Err(e) = crate::daemon_state::save_state(&new_state) {
+    // DEC-252: fsync off the async worker threads the engine shares.
+    if let Err(e) =
+        super::persist_off_runtime(move || crate::daemon_state::save_state(&new_state)).await
+    {
         log::warn!("Failed to persist profile state: {e}");
     }
 
@@ -228,7 +231,10 @@ pub async fn deactivate_profile_handler(
         active_profile_id: None,
         active_profile_path: None,
     };
-    if let Err(e) = crate::daemon_state::save_state(&new_state) {
+    // DEC-252: fsync off the async worker threads the engine shares.
+    if let Err(e) =
+        super::persist_off_runtime(move || crate::daemon_state::save_state(&new_state)).await
+    {
         log::warn!("Failed to persist deactivation: {e}");
     }
 
@@ -345,7 +351,7 @@ pub async fn get_profile_handler(
 /// is the id the document must carry (the path id for PUT, or the body id for
 /// POST). `allow_overwrite` is true for PUT (replace) and false for POST
 /// (409 on a store-scoped duplicate). On `validate_only`, nothing is persisted.
-fn validate_and_store(
+async fn validate_and_store(
     state: &AppState,
     body: &serde_json::Value,
     expected_id: &str,
@@ -439,7 +445,15 @@ fn validate_and_store(
             )
         }
     };
-    if let Err(e) = crate::profile_store::save_raw(&dir, expected_id, &bytes) {
+    // DEC-252: fsync off the async worker threads the engine shares.
+    let save_dir = dir.clone();
+    let save_id = expected_id.to_string();
+    let save_bytes = bytes.clone();
+    if let Err(e) = super::persist_off_runtime(move || {
+        crate::profile_store::save_raw(&save_dir, &save_id, &save_bytes)
+    })
+    .await
+    {
         // Keep the path-bearing detail server-side; the client gets a generic
         // message (DEC-173 — internal fs paths must not leak in the envelope).
         log::error!("Failed to save profile '{expected_id}': {e}");
@@ -490,6 +504,7 @@ pub async fn create_profile_handler(
         StatusCode::CREATED,
         "created",
     )
+    .await
 }
 
 /// PUT /profiles/{id} — create-or-replace by id. Does NOT hot-reload the active
@@ -509,6 +524,7 @@ pub async fn update_profile_handler(
         StatusCode::OK,
         "updated",
     )
+    .await
 }
 
 /// DELETE /profiles/{id} — remove a stored profile. 409 if it is active; 404 if
@@ -537,7 +553,11 @@ pub async fn delete_profile_handler(
             &ErrorEnvelope::internal("no profile store directory configured"),
         );
     };
-    match crate::profile_store::delete(&dir, &id) {
+    // DEC-252: unlink + directory fsync off the async worker threads.
+    let del_dir = dir.clone();
+    let del_id = id.clone();
+    match super::persist_off_runtime(move || crate::profile_store::delete(&del_dir, &del_id)).await
+    {
         Ok(true) => json_ok(
             StatusCode::OK,
             serde_json::json!({

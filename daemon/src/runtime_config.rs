@@ -175,6 +175,39 @@ impl RuntimeConfig {
         }
     }
 
+    /// Load runtime.toml for a **read-modify-write** setter, refusing to
+    /// continue if a file exists that we could not understand (DEC-252).
+    ///
+    /// [SAFETY] `load_from` deliberately falls back to defaults so a corrupt
+    /// file can never stop the daemon booting. That fallback is wrong for a
+    /// setter: every `POST /config/*` is load → mutate one key → `save_to`, so
+    /// loading defaults and then writing does not merely *ignore* the unreadable
+    /// file — it **overwrites every other setting in it with a default**, and the
+    /// loss is permanent from that moment. The warning `load_from` logs goes to
+    /// the journal, where nobody looks until their configuration has already
+    /// gone. This repo has shipped one settings-destruction bug already
+    /// (DEC-244); a read that failed must not become a write that erases.
+    ///
+    /// A *missing* file is not an error — that is the first-write case, and
+    /// defaults are exactly right.
+    pub fn load_for_update(path: &Path) -> Result<Self, String> {
+        match crate::atomic_io::read_to_string_capped(path) {
+            Ok(content) => toml::from_str::<RuntimeConfig>(&content).map_err(|e| {
+                format!(
+                    "existing runtime config at {} is malformed ({e}); refusing to \
+                     overwrite it — move it aside to start fresh",
+                    path.display()
+                )
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(format!(
+                "cannot read existing runtime config at {} ({e}); refusing to \
+                 overwrite it",
+                path.display()
+            )),
+        }
+    }
+
     /// Atomically persist runtime.toml. Creates the parent directory if needed.
     /// Sets owner-only (0o600) permissions before rename, matching daemon_state.json.
     pub fn save_to(&self, path: &Path) -> Result<(), String> {
@@ -634,6 +667,59 @@ mod tests {
         assert!(
             loaded.startup_delay_secs().is_none(),
             "a typo in a known section must not be silently accepted"
+        );
+    }
+
+    // ── DEC-252: a failed read must never become a destructive write ──────
+
+    #[test]
+    fn load_for_update_refuses_a_malformed_file() {
+        // load_from() falls back to defaults so a corrupt file cannot stop the
+        // daemon booting. For a setter that fallback is destructive: load →
+        // mutate one key → save would replace every other setting with a
+        // default, permanently.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.toml");
+        std::fs::write(&path, "this is not = valid toml [[[").unwrap();
+
+        assert!(
+            RuntimeConfig::load_for_update(&path).is_err(),
+            "a malformed file must refuse the update"
+        );
+        // The boot path still tolerates it.
+        let _booted = RuntimeConfig::load_from(&path);
+    }
+
+    #[test]
+    fn load_for_update_accepts_a_missing_file() {
+        // First write: defaults are exactly right, and refusing here would make
+        // the very first setter call impossible.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.toml");
+        assert!(RuntimeConfig::load_for_update(&path).is_ok());
+    }
+
+    #[test]
+    fn a_refused_update_leaves_the_existing_file_untouched() {
+        // The property that actually matters to a user: their unreadable
+        // settings file is still there afterwards, byte for byte, instead of
+        // having been silently replaced by defaults plus one key.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.toml");
+        let original = "[polling]\npoll_interval_ms = 900\n[garbage\n";
+        std::fs::write(&path, original).unwrap();
+
+        let outcome = RuntimeConfig::load_for_update(&path);
+        assert!(outcome.is_err());
+        if let Ok(mut cfg) = outcome {
+            // Would-be destructive path — only runs if the guard regressed.
+            cfg.set_poll_interval_ms(Some(1000));
+            cfg.save_to(&path).unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "the user's file must survive a refused update"
         );
     }
 }

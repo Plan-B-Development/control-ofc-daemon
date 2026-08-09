@@ -547,6 +547,69 @@ pub(crate) fn member_is_pump_or_cpu(member: &ControlMember) -> bool {
     crate::hwmon::aio::is_liquid_cooler_chip(chip)
 }
 
+/// The label the *daemon itself* discovered for a hwmon header, read back out of
+/// the member's stable id.
+///
+/// `pwm_discovery` mints the id as `hwmon:{chip}:{device_id}:pwm{N}:{label}`, so
+/// the daemon's own view of the header's name travels with every member for free
+/// — no hardware access and no schema change.
+///
+/// [SAFETY] This field cannot be forged into something *weaker*. The hwmon write
+/// path resolves a member by exact-string lookup (`headers.get(id)`), so an id
+/// whose label has been edited does not match any discovered header and nothing
+/// is ever written through it. A client can therefore only ever hand us the
+/// daemon's real label, or an id that is inert.
+///
+/// Split on the `:pwm` marker rather than by field index: `device_id` is a PCI
+/// BDF (`0000:00:18.3`) and carries its own colons, and a label may too — taking
+/// everything after the index keeps a label like `CPU:FAN` intact.
+fn daemon_label_from_member_id(member_id: &str) -> Option<&str> {
+    let (_, after_marker) = member_id.split_once(":pwm")?;
+    let (_index, label) = after_marker.split_once(':')?;
+    Some(label)
+}
+
+/// Whether a member must be held at the pump/CPU hard floor **at eval time**
+/// (DEC-252).
+///
+/// A superset of [`member_is_pump_or_cpu`]: the floor applies if the *author's*
+/// label says pump/CPU, **or** the daemon's own discovered label does. Union,
+/// never replacement — the daemon's view can only ever *add* a floor, never
+/// remove one the author asked for.
+///
+/// The gap this closes: `member_label` is written by the client, and the GUI
+/// resolves it through a display-name tier list, so renaming a `PUMP` header to
+/// "Radiator Top" used to drop it from a 30% floor to 20% with nothing to catch
+/// it (a documented past regression — DEC-228 shipped three of these). The
+/// daemon held the real label the whole time and never looked.
+///
+/// **Deliberately not used by [`validate`].** Its `FLOOR_TOO_LOW` /
+/// `PUMP_STOP_FORBIDDEN` errors *reject* a profile, and a daemon that rejected
+/// more than the paired GUI stamps would break profile saving for anyone who
+/// upgraded the daemon first — the GUI bakes `minimum_pct` from its own
+/// classifier. Both `validate` sites already document the engine as the
+/// independent eval-time backstop for anything that reaches it unvalidated; this
+/// strengthens that backstop without moving the rejection line. When the GUI
+/// adopts the same union it will simply stamp the higher floor itself.
+///
+/// **Known limit, not a hidden one:** `read_label` synthesises `pwm{N}` when a
+/// chip publishes no label file (`pwm_discovery`), and the daemon parses no
+/// `/etc/sensors.d`. On such a board the daemon's label is `pwm7`, carries no
+/// hint, and this adds nothing — the author's label remains the only signal.
+/// It bites exactly where the chip does publish a real name.
+pub(crate) fn member_needs_hard_floor(member: &ControlMember) -> bool {
+    if member_is_pump_or_cpu(member) {
+        return true;
+    }
+    if member.source != "hwmon" {
+        return false;
+    }
+    daemon_label_from_member_id(&member.member_id).is_some_and(|label| {
+        let lower = label.to_lowercase();
+        CPU_PUMP_LABEL_HINTS.iter().any(|hint| lower.contains(hint))
+    })
+}
+
 /// Severity of a [`FieldViolation`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -1721,6 +1784,92 @@ mod tests {
     fn classify_empty_label_non_cooler_is_not_pump() {
         let m = member("hwmon", "hwmon:nct6798:dev:pwm4:", "");
         assert!(!member_is_pump_or_cpu(&m));
+    }
+
+    // ────── DEC-252: the daemon's own label as an eval-time floor backstop ────
+
+    #[test]
+    fn renamed_pump_keeps_its_hard_floor_at_eval_time() {
+        // THE case. `member_label` is written by the client, and the GUI resolves
+        // it through a display-name tier list — so renaming a PUMP header to
+        // "Radiator Top" dropped it from the 30% floor to 20%, silently. The
+        // daemon held the real label in the member's own id the whole time.
+        let renamed = member("hwmon", "hwmon:nct6798:0000:pwm3:PUMP", "Radiator Top");
+        assert!(
+            !member_is_pump_or_cpu(&renamed),
+            "precondition: the author-declared label carries no hint"
+        );
+        assert!(
+            member_needs_hard_floor(&renamed),
+            "the daemon's own discovered label must still assert pump-ness"
+        );
+    }
+
+    #[test]
+    fn daemon_label_only_ever_adds_a_floor() {
+        // Union, never replacement: a member the author declared as a pump stays
+        // one even when the daemon's own label is the synthetic placeholder.
+        let declared = member("hwmon", "hwmon:nct6798:0000:pwm3:pwm3", "AIO_PUMP");
+        assert!(member_is_pump_or_cpu(&declared));
+        assert!(member_needs_hard_floor(&declared));
+
+        // And a chassis fan stays chassis on both signals.
+        let chassis = member("hwmon", "hwmon:it8696:0000:pwm2:CHA_FAN", "Radiator Top");
+        assert!(!member_needs_hard_floor(&chassis));
+        let openfan = member("openfan", "openfan:ch00", "Front");
+        assert!(!member_needs_hard_floor(&openfan));
+    }
+
+    #[test]
+    fn synthetic_pwm_label_adds_nothing() {
+        // The honest limit, pinned so nobody mistakes this for a pump detector:
+        // `read_label` synthesises "pwm{N}" when the chip publishes no label file
+        // and the daemon parses no /etc/sensors.d, so on such a board the
+        // author's label remains the only signal.
+        let m = member("hwmon", "hwmon:nct6798:0000:pwm7:pwm7", "Radiator Top");
+        assert!(!member_needs_hard_floor(&m));
+    }
+
+    #[test]
+    fn daemon_label_survives_colons_in_the_device_id_and_label() {
+        // device_id is a PCI BDF and carries its own colons; a label may too.
+        // Parsing by field index would take the wrong slice.
+        assert_eq!(
+            daemon_label_from_member_id("hwmon:k10temp:0000:00:18.3:pwm2:CPU_FAN"),
+            Some("CPU_FAN")
+        );
+        assert_eq!(
+            daemon_label_from_member_id("hwmon:nct6798:dev:pwm1:CPU:FAN"),
+            Some("CPU:FAN")
+        );
+        assert_eq!(
+            daemon_label_from_member_id("hwmon:nct6798:dev:pwm4:"),
+            Some("")
+        );
+        // Malformed / non-hwmon ids yield no label rather than a wrong one.
+        assert_eq!(daemon_label_from_member_id("openfan:ch00"), None);
+        assert_eq!(daemon_label_from_member_id("garbage"), None);
+    }
+
+    #[test]
+    fn validate_still_rejects_only_on_the_author_declared_label() {
+        // [SAFETY] Version-skew guard. validate()'s FLOOR_TOO_LOW *rejects* a
+        // profile, and the GUI bakes `minimum_pct` from its own classifier. If
+        // the daemon rejected more than the paired GUI stamps, upgrading the
+        // daemon first would block profile saving outright. The eval-time clamp
+        // is strengthened; the rejection line does not move.
+        let renamed = member("hwmon", "hwmon:nct6798:0000:pwm3:PUMP", "Radiator Top");
+        let mut ctrl = control_with_members(20.0, vec![renamed]);
+        ctrl.curve_id = "c".into();
+        ctrl.mode = "curve".into();
+        let profile = mk_profile(vec![graph_curve("c", "cpu")], vec![ctrl]);
+
+        let report = validate(&profile, &sset(&["cpu"]));
+        assert!(
+            !report.errors.iter().any(|e| e.reason == "FLOOR_TOO_LOW"),
+            "a profile an older GUI baked must still validate: {:?}",
+            report.errors
+        );
     }
 
     // ────────────────── DEC-162 validate() FLOOR_TOO_LOW backstop ────────────

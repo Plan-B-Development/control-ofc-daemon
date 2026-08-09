@@ -3,6 +3,27 @@
 ## [Unreleased]
 
 ### Fixed
+- **A renamed pump keeps its 30 % floor.** The pump/CPU hard floor was decided
+  entirely from `member_label`, which the client writes and the GUI fills from a
+  display-name tier list — so renaming a `PUMP` header to something like
+  "Radiator Top" dropped it to the ordinary 20 % floor and removed its
+  stop-snap exemption, with nothing to catch it. The daemon had the real label
+  the whole time: it is embedded in the member's own stable id
+  (`hwmon:chip:device:pwmN:LABEL`). At eval time the floor now applies if
+  *either* label says pump/CPU — a union, so the daemon's view can only ever add
+  a floor, never remove one the profile asked for. **Limit worth knowing:** when
+  a chip publishes no label file the daemon synthesises `pwmN`, and it reads no
+  `/etc/sensors.d`, so on such a board this adds nothing and the author's label
+  remains the only signal. `validate()`'s rejection is deliberately unchanged, so
+  upgrading the daemon ahead of the GUI cannot start refusing profiles the GUI
+  still bakes. DEC-252.
+- **A configuration file that cannot be read is no longer overwritten.** Every
+  `POST /config/*` is load → change one key → save, and the loader falls back to
+  defaults when a file is malformed or unreadable. The write that followed did
+  not merely ignore the bad file — it replaced **every other setting in it** with
+  a default, permanently, behind a single journal warning. Setters now refuse
+  with `503 persistence_failed` and leave the file untouched; the boot path still
+  tolerates a corrupt file so the daemon always starts. DEC-252.
 - **A serial port is no longer trusted just because it opened.** Startup accepted
   the first candidate `RealSerialTransport::open` succeeded on — and that
   succeeds on any readable tty, so a configured-but-wrong `/dev/ttyACM*` (a
@@ -34,6 +55,16 @@
   reject can reach the engine from disk either. Deliberately numeric-only —
   a profile referencing a sensor or header this machine does not currently have
   still loads, as before. DEC-249.
+
+### Changed
+- **Profile and configuration writes no longer run on the async worker threads.**
+  `write_atomic` does write + fsync + rename + a directory fsync, which was
+  unbounded wall-clock time on the same runtime the 1 Hz profile engine — and so
+  the 105 °C decision — is scheduled on. Moved to `spawn_blocking`, matching what
+  the GPU and hardware-diagnostics handlers already do. The runtime is
+  multi-threaded (one worker per core), so no single write could starve the
+  engine on its own; this removes the coupling instead of leaving engine timing
+  dependent on core count. DEC-252.
 
 ### Added
 - **`engine` subsystem on `GET /status` and `GET /poll`** — profile-engine

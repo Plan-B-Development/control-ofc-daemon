@@ -18,7 +18,7 @@ use crate::health::cache::StateCache;
 use crate::health::state::CachedSensorReading;
 use crate::hwmon::types::SensorKind;
 use crate::profile::{
-    evaluate_curve, member_is_gpu, member_is_pump_or_cpu, ControlMember, DaemonProfile,
+    evaluate_curve, member_is_gpu, member_needs_hard_floor, ControlMember, DaemonProfile,
     LogicalControl, HARD_PUMP_CPU_FLOOR_PCT,
 };
 
@@ -383,7 +383,10 @@ pub fn evaluate_profile_with_overrides(
             // guarantee); otherwise reuse the control-wide value so the common
             // path stays byte-identical and the parity oracle is unperturbed.
             let effective_floor = member_effective_floor(control, member);
-            let floor_is_hard = member_is_pump_or_cpu(member);
+            // DEC-252: same eval-time superset the floor uses. A pump the author
+            // renamed must not lose its stop-snap exemption either — that is the
+            // half that keeps a non-zero `stop_pct` from zeroing it outright.
+            let floor_is_hard = member_needs_hard_floor(member);
             let member_pwm = if effective_floor != control.minimum_pct || floor_is_hard {
                 // EFF-4: this per-member step-rate key allocates each tick for
                 // pump/CPU/GPU members. Left as-is deliberately — the key scheme
@@ -1583,6 +1586,43 @@ mod tests {
             assert_eq!(
                 pump.pwm_percent, 30,
                 "pump must clamp to the hard floor every tick"
+            );
+        }
+    }
+
+    #[test]
+    fn evaluate_renamed_pump_is_still_floored_and_never_stop_snapped() {
+        // DEC-252, at the eval path rather than at the classifier — the wiring is
+        // the part that can silently rot. This member's author-declared label
+        // carries no pump hint (the user renamed the header); only the label the
+        // daemon itself discovered, carried in the member's stable id, says PUMP.
+        //
+        // Both halves are asserted: the 30% floor, and the stop-snap exemption. A
+        // non-zero stop_pct with a 5% demand would otherwise zero the pump
+        // outright, which is the coolant-flow-loss case DEC-167 exists to stop.
+        let mut profile = make_profile("manual", "flat", 0.0);
+        profile.controls[0].members.clear();
+        profile.controls[0].members.push(ControlMember {
+            source: "hwmon".into(),
+            member_id: "hwmon:nct6798:0000:pwm3:PUMP".into(),
+            member_label: "Radiator Top".into(),
+            fan_zero_rpm: false,
+        });
+        profile.controls[0].manual_output_pct = 5.0;
+        profile.controls[0].minimum_pct = 20.0;
+        // Above the 30% hard floor on purpose: a stop_pct below it would never
+        // threaten the floored output, and the stop-snap half of this test would
+        // pass without the exemption being wired at all.
+        profile.controls[0].stop_pct = 35.0;
+
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let mut state = ProfileEngineState::new();
+        for tick in 0..3 {
+            let cmds = evaluate_profile(&profile, &cache.sensors_snapshot(), &mut state);
+            let pump = cmds.iter().find(|c| c.source == "hwmon").unwrap();
+            assert_eq!(
+                pump.pwm_percent, 30,
+                "tick {tick}: a renamed pump must still hold the hard floor"
             );
         }
     }

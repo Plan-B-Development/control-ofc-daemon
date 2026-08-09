@@ -301,6 +301,35 @@ pub(crate) fn verify_thermal_guard(
     None
 }
 
+/// Run a blocking, fsync-ing persistence call off the async worker threads
+/// (DEC-252).
+///
+/// `atomic_io::write_atomic` does `write` + `fsync` + `rename` + a directory
+/// `fsync`. That is unbounded wall-clock time on whichever tokio worker thread
+/// polls the handler — the same runtime the 1 Hz profile engine, and therefore
+/// the 105 °C decision, is scheduled on.
+///
+/// Severity, stated honestly: the runtime is multi-threaded with one worker per
+/// core (`#[tokio::main]` with no arguments), so a single write cannot starve
+/// the engine on its own — every other worker keeps polling. This removes the
+/// coupling rather than leaving the engine's timing dependent on how many cores
+/// the machine happens to have and how many writes arrive at once. It also
+/// matches what `gpu.rs` and `hw_diagnostics.rs` already do for their blocking
+/// sysfs work.
+pub(crate) async fn persist_off_runtime<T, F>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(result) => result,
+        // The closure panicked or the runtime is shutting down. Report it as a
+        // persistence failure rather than unwrapping — a panicking write must
+        // not take an API worker down with it.
+        Err(e) => Err(format!("persistence task failed: {e}")),
+    }
+}
+
 pub(crate) fn build_status_response(
     state: &AppState,
     thermal_state: String,
