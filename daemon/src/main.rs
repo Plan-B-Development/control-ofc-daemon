@@ -334,6 +334,53 @@ fn serial_port_candidates(
     candidates
 }
 
+/// Connect to the first candidate that opens **and** identifies as an
+/// OpenFanController.
+///
+/// [SAFETY] The other half of `serial_port_candidates` (DEC-250). That function
+/// guarantees auto-detection still *runs* when a port is configured; this one
+/// guarantees its result is still *reachable*. Acceptance used to be "the port
+/// opened", and `RealSerialTransport::open` succeeds on any readable tty — so a
+/// configured-but-wrong `/dev/ttyACM*` was adopted as the fan controller and the
+/// loop stopped there, discarding the correctly detected port that was sitting
+/// next in the candidate list. Because writes to an indifferent device return
+/// `Ok`, nothing surfaced: no failure was logged, `/status` showed OpenFan
+/// healthy, and the 105°C emergency's `force_all` reported success while driving
+/// nothing. `serial.port` is settable by any local user over the 0666 socket
+/// (DEC-243) and persists in `runtime.toml`, so this was durable across reboots.
+///
+/// A candidate that opens but fails the handshake is skipped, not fatal: the
+/// next candidate — in practice the auto-detected one — is tried.
+///
+/// Pure over the injected `open` so the accept/reject rule is unit-testable
+/// without a serial device, matching `serial_port_candidates`. The verification
+/// deliberately lives *inside* this function rather than in the closure: it is
+/// the property under test, and a caller cannot accidentally skip it.
+fn first_openfan_port<T: control_ofc_daemon::serial::transport::SerialTransport>(
+    candidates: &[String],
+    timeout: Duration,
+    mut open: impl FnMut(&str) -> Result<T, control_ofc_daemon::error::SerialError>,
+) -> Option<(String, T)> {
+    for port in candidates {
+        match open(port) {
+            Ok(mut transport) => {
+                match control_ofc_daemon::serial::transport::verify_openfan_identity(
+                    &mut transport,
+                    timeout,
+                ) {
+                    Ok(()) => return Some((port.clone(), transport)),
+                    Err(e) => log::warn!(
+                        "{port} opened but did not identify as an OpenFanController ({e}) \
+                         — not using it"
+                    ),
+                }
+            }
+            Err(e) => log::warn!("Failed to open OpenFanController on {port}: {e}"),
+        }
+    }
+    None
+}
+
 /// Reload the daemon config and runtime overlay, updating the shared
 /// profile search dirs. Extracted from the SIGHUP handler so it can be
 /// unit-tested without a full AppState.
@@ -677,29 +724,21 @@ async fn main() {
             log::info!("No serial port configured and none detected");
         }
 
-        for port in &candidates {
-            log::info!("Opening OpenFanController on {port}");
-            match RealSerialTransport::open(port, serial_timeout) {
-                Ok(transport) => {
-                    log::info!("OpenFanController connected on {port}");
-                    let boxed: Box<
-                        dyn control_ofc_daemon::serial::transport::SerialTransport + Send,
-                    > = Box::new(transport);
-                    let shared = Arc::new(Mutex::new(boxed));
+        // [SAFETY] Accept only a candidate that also *identifies* as an
+        // OpenFanController — see `first_openfan_port`.
+        if let Some((port, transport)) = first_openfan_port(&candidates, serial_timeout, |p| {
+            log::info!("Opening OpenFanController on {p}");
+            RealSerialTransport::open(p, serial_timeout)
+        }) {
+            log::info!("OpenFanController connected on {port}");
+            let boxed: Box<dyn control_ofc_daemon::serial::transport::SerialTransport + Send> =
+                Box::new(transport);
+            let shared = Arc::new(Mutex::new(boxed));
 
-                    let ctrl =
-                        FanController::new_shared(shared.clone(), cache.clone(), serial_timeout);
-                    fc = Some(Arc::new(Mutex::new(ctrl)));
-                    ot = Some(shared);
-                    serial_connected = true;
-                    break;
-                }
-                Err(e) => {
-                    log::warn!("Failed to open OpenFanController on {port}: {e}");
-                }
-            }
-        }
-        if serial_connected {
+            let ctrl = FanController::new_shared(shared.clone(), cache.clone(), serial_timeout);
+            fc = Some(Arc::new(Mutex::new(ctrl)));
+            ot = Some(shared);
+            serial_connected = true;
             break;
         }
     }
@@ -1318,6 +1357,109 @@ mod tests {
             "detection must run even with a port configured"
         );
         assert!(c.contains(&"/dev/ttyACM0".to_string()));
+    }
+
+    // ── DEC-250: openability is not identity ─────────────────────────────
+
+    /// A serial device that replies with a fixed script, then times out.
+    ///
+    /// `ok()` speaks the OpenFanController protocol; `wrong_device()` opens
+    /// cleanly and chatters but never answers `ReadAllRpm` — a modem, a printer,
+    /// an Arduino, anything else on a `/dev/ttyACM*`.
+    use control_ofc_daemon::error::SerialError;
+
+    struct ScriptedPort(std::collections::VecDeque<String>);
+
+    impl ScriptedPort {
+        fn ok() -> Self {
+            Self(
+                vec![concat!(
+                    "<00|00:04B0;01:044C;02:0000;03:0000;04:0000;",
+                    "05:0000;06:0000;07:0000;08:0000;09:0000;>\r\n"
+                )
+                .to_string()]
+                .into(),
+            )
+        }
+        fn wrong_device() -> Self {
+            Self(vec!["ok\r\n".to_string(), "READY\r\n".to_string()].into())
+        }
+    }
+
+    impl control_ofc_daemon::serial::transport::SerialTransport for ScriptedPort {
+        fn write_line(&mut self, _data: &str) -> Result<(), SerialError> {
+            Ok(())
+        }
+        fn read_line(&mut self, _timeout: Duration) -> Result<String, SerialError> {
+            self.0
+                .pop_front()
+                .ok_or(SerialError::Timeout { timeout_ms: 1 })
+        }
+    }
+
+    fn ports(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_port_that_opens_but_is_not_an_openfan_is_not_adopted() {
+        // REGRESSION: acceptance used to be "the port opened", and
+        // `RealSerialTransport::open` succeeds on any readable tty. A
+        // configured-but-wrong port was therefore adopted as the fan controller
+        // and the loop stopped there — discarding the correctly detected port
+        // sitting next in the candidate list. Writes to an indifferent device
+        // return Ok, so nothing surfaced: the 105 C emergency's `force_all`
+        // reported success while driving nothing.
+        let chosen = first_openfan_port(
+            &ports(&["/dev/ttyACM9", "/dev/ttyACM0"]),
+            Duration::from_millis(50),
+            |p| {
+                Ok(if p == "/dev/ttyACM9" {
+                    ScriptedPort::wrong_device()
+                } else {
+                    ScriptedPort::ok()
+                })
+            },
+        );
+
+        assert_eq!(
+            chosen.map(|(p, _)| p),
+            Some("/dev/ttyACM0".to_string()),
+            "a port that opens but does not answer ReadAllRpm must be skipped, \
+             not adopted — and must not stop later candidates being tried"
+        );
+    }
+
+    #[test]
+    fn no_identifying_port_yields_no_controller() {
+        // Failing to identify is not fatal, but it must not be papered over
+        // either: with nothing that answers, the daemon runs without serial fan
+        // control (and says so) rather than holding a handle to the wrong tty.
+        let chosen =
+            first_openfan_port(&ports(&["/dev/ttyACM9"]), Duration::from_millis(50), |_| {
+                Ok(ScriptedPort::wrong_device())
+            });
+        assert!(chosen.is_none());
+    }
+
+    #[test]
+    fn an_unopenable_candidate_does_not_stop_the_search() {
+        // Pre-existing behaviour, pinned: a port that cannot be opened at all is
+        // skipped and the next candidate is still tried.
+        let chosen = first_openfan_port(
+            &ports(&["/dev/ttyACM9", "/dev/ttyACM0"]),
+            Duration::from_millis(50),
+            |p| {
+                if p == "/dev/ttyACM9" {
+                    Err(SerialError::Protocol {
+                        message: "no such device".into(),
+                    })
+                } else {
+                    Ok(ScriptedPort::ok())
+                }
+            },
+        );
+        assert_eq!(chosen.map(|(p, _)| p), Some("/dev/ttyACM0".to_string()));
     }
 
     // ── Boot-time profile resolution fail-safe (DEC-165) ─────────────────

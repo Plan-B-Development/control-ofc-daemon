@@ -3,6 +3,18 @@
 ## [Unreleased]
 
 ### Fixed
+- **A serial port is no longer trusted just because it opened.** Startup accepted
+  the first candidate `RealSerialTransport::open` succeeded on — and that
+  succeeds on any readable tty, so a configured-but-wrong `/dev/ttyACM*` (a
+  modem, an Arduino, a 3D printer) was adopted as the fan controller and the
+  search stopped there, discarding the correctly auto-detected port sitting next
+  in the candidate list. Because writes to an indifferent device return success,
+  nothing ever surfaced: no failure was logged, `/status` reported OpenFan
+  healthy, and the 105 °C emergency's `force_all` reported success while not one
+  OpenFan-attached fan was being driven. `serial.port` is settable by any local
+  user over the socket and persists in `runtime.toml`, so this survived reboots.
+  A candidate must now answer the same `ReadAllRpm` handshake auto-detection
+  uses; one that does not is skipped and the next candidate is tried. DEC-250.
 - **The profile engine can no longer be killed by a profile it loaded itself.**
   The engine's step-rate limiter used `f64::clamp`, which panics when its bounds
   are inverted or non-finite. A `step_up_pct` / `step_down_pct` pair summing

@@ -19,6 +19,32 @@ pub trait SerialTransport {
     fn read_line(&mut self, timeout: Duration) -> Result<String, SerialError>;
 }
 
+/// Confirm that an already-open transport really is an OpenFanController.
+///
+/// [SAFETY] Openability is not identity (DEC-250). `RealSerialTransport::open`
+/// succeeds on any readable tty — a modem, an Arduino, a 3D printer — so
+/// accepting a port because it opened lets the wrong device be adopted as the
+/// fan controller. Every subsequent write then "succeeds" against a device that
+/// simply ignores it, **including the 105°C emergency `force_all`**: no error is
+/// ever returned, so no `THERMAL SAFETY ... FAILED` is logged, `/status` reports
+/// OpenFan healthy, and not one OpenFan-attached fan is actually being driven.
+///
+/// `ReadAllRpm` is the same handshake `auto_detect_port` uses to recognise the
+/// controller in the first place. Sharing it keeps "what counts as an
+/// OpenFanController" in exactly one place, so the configured-port path and the
+/// detection path can never disagree about what they accept.
+pub fn verify_openfan_identity(
+    transport: &mut dyn SerialTransport,
+    timeout: Duration,
+) -> Result<(), SerialError> {
+    send_command(
+        transport,
+        &crate::serial::protocol::Command::ReadAllRpm,
+        timeout,
+    )
+    .map(|_| ())
+}
+
 /// Maximum debug lines to skip before giving up.
 /// Normal firmware emits 0–3 debug lines; 50 is generous but finite.
 const MAX_DEBUG_LINES: usize = 50;

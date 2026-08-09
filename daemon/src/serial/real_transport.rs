@@ -166,10 +166,11 @@ fn probe_port(path: &str, timeout: Duration) -> Option<String> {
 
     match RealSerialTransport::open(path, timeout) {
         Ok(mut transport) => {
-            let cmd = crate::serial::protocol::Command::ReadAllRpm;
-            match crate::serial::transport::send_command(&mut transport, &cmd, timeout) {
-                Ok(response) => {
-                    log::info!("OpenFanController detected on {path}: {response:?}");
+            // Shared with the configured-port path in `main` (DEC-250) so both
+            // agree on what counts as an OpenFanController.
+            match crate::serial::transport::verify_openfan_identity(&mut transport, timeout) {
+                Ok(()) => {
+                    log::info!("OpenFanController detected on {path}");
                     Some(path.to_string())
                 }
                 Err(e) => {
