@@ -50,6 +50,23 @@ pub struct StateCache {
     /// takes `inner` briefly beneath it and no path holds `inner` across a GPU
     /// write, so no inversion is possible.
     gpu_write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Monotonic counter bumped whenever the OpenFanController's *device-side*
+    /// duty state may no longer match what we last commanded (DEC-256).
+    ///
+    /// `FanController` coalesces a write away when it equals `last_commanded_pct`,
+    /// which is only sound while that cache reflects the device. Two events break
+    /// that and neither was signalled: a system resume, and a serial reconnect —
+    /// the poll loop swaps the transport underneath the controller after a USB
+    /// re-enumeration, leaving per-channel state describing a device that may have
+    /// come back at its power-on default. Every subsequent identical command was
+    /// then coalesced into silence, so the fan sat at the firmware default with
+    /// the daemon reporting the commanded value.
+    ///
+    /// A counter rather than a flag because `take_resume_flag` is a *swap*: the
+    /// first consumer to call it clears it for everyone, and hwmon already owns
+    /// that one. Each consumer compares against its own last-seen value instead —
+    /// the same shape as `profile_activation_epoch`.
+    openfan_write_generation: AtomicU64,
 }
 
 impl StateCache {
@@ -60,6 +77,7 @@ impl StateCache {
             resume_detected: AtomicBool::new(false),
             profile_activation_epoch: AtomicU64::new(0),
             gpu_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            openfan_write_generation: AtomicU64::new(0),
         }
     }
 
@@ -416,7 +434,24 @@ impl StateCache {
     }
 
     /// Signal that a system resume was detected.
+    /// Read the OpenFan write generation (DEC-256). `FanController` compares this
+    /// against its own last-seen value and drops its coalescing cache on a change.
+    pub fn openfan_write_generation(&self) -> u64 {
+        self.openfan_write_generation.load(Ordering::SeqCst)
+    }
+
+    /// Declare that the OpenFanController's device-side duty may no longer match
+    /// what we last commanded, so the next write for each channel must actually
+    /// reach the wire (DEC-256). Called on serial reconnect and on resume.
+    pub fn invalidate_openfan_writes(&self) {
+        self.openfan_write_generation.fetch_add(1, Ordering::SeqCst);
+    }
+
     pub fn set_resume_detected(&self) {
+        // A resume invalidates OpenFan's coalescing cache for the same reason it
+        // clears hwmon's manual-mode flags: the device may have been reset
+        // underneath us (DEC-256).
+        self.invalidate_openfan_writes();
         self.resume_detected.store(true, Ordering::Relaxed);
     }
 }

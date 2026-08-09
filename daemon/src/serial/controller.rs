@@ -32,6 +32,10 @@ pub struct FanController {
     cache: Arc<StateCache>,
     timeout: Duration,
     channels: Vec<ChannelControl>,
+    /// Last OpenFan write generation this controller observed (DEC-256). A bump
+    /// means the device may no longer hold what we last commanded — see
+    /// `StateCache::invalidate_openfan_writes`.
+    last_write_generation: u64,
 }
 
 impl FanController {
@@ -45,6 +49,7 @@ impl FanController {
             cache,
             timeout,
             channels: vec![ChannelControl::default(); NUM_CHANNELS as usize],
+            last_write_generation: 0,
         }
     }
 
@@ -59,6 +64,7 @@ impl FanController {
             cache,
             timeout,
             channels: vec![ChannelControl::default(); NUM_CHANNELS as usize],
+            last_write_generation: 0,
         }
     }
 
@@ -82,6 +88,25 @@ impl FanController {
             return Err(FanControlError::Validation(format!(
                 "pwm_percent {pwm_percent} out of range (0–100)"
             )));
+        }
+
+        // DEC-256: a resume or a serial reconnect means the device may no longer
+        // hold what we last commanded — the poll loop swaps the transport
+        // underneath us after a USB re-enumeration, and the controller may come
+        // back at its power-on default. Coalescing against a stale cache then
+        // silences every subsequent identical command, leaving the fan at the
+        // firmware default while the daemon reports the commanded value.
+        //
+        // Whether this firmware actually resets duty on re-enumeration is NOT
+        // determinable from the protocol, so this takes the safe branch: assume
+        // it might have. The cost when it did not is one redundant write per
+        // channel, once, on a path that already just reconnected.
+        let generation = self.cache.openfan_write_generation();
+        if generation != self.last_write_generation {
+            self.last_write_generation = generation;
+            for ch in &mut self.channels {
+                ch.last_commanded_pct = None;
+            }
         }
 
         let ch_ctrl = &self.channels[channel as usize];
@@ -371,6 +396,83 @@ mod tests {
 
         // Only one command should have been written
         assert_eq!(written.lock().len(), 1);
+    }
+
+    #[test]
+    fn a_reconnect_or_resume_breaks_coalescing_so_the_next_write_lands() {
+        // DEC-256. Coalescing is only sound while `last_commanded_pct` reflects
+        // the DEVICE. A serial reconnect swaps the transport underneath this
+        // controller after a USB re-enumeration, and a resume can reset the
+        // hardware too — so the cache may describe a device that came back at its
+        // power-on default. Every subsequent identical command was then coalesced
+        // into silence, leaving the fan at the firmware default while the daemon
+        // reported the commanded value.
+        let (transport, written) = MockTransport::with_ok_responses(3);
+        let cache = Arc::new(StateCache::new());
+        let mut ctrl = FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            Duration::from_millis(500),
+        );
+
+        ctrl.set_pwm(0, 50).unwrap();
+        assert!(
+            ctrl.set_pwm(0, 50).unwrap().coalesced,
+            "precondition: an identical repeat coalesces on a healthy link"
+        );
+        assert_eq!(written.lock().len(), 1);
+
+        cache.invalidate_openfan_writes();
+
+        let result = ctrl.set_pwm(0, 50).unwrap();
+        assert!(
+            !result.coalesced,
+            "after a reconnect the same value must reach the wire again"
+        );
+        assert_eq!(written.lock().len(), 2);
+    }
+
+    #[test]
+    fn invalidation_clears_every_channel_not_just_the_one_being_written() {
+        // The device re-enumerates as a whole, so a per-channel invalidation
+        // keyed off whichever channel happens to be written first would leave the
+        // rest of the cache stale.
+        let (transport, written) = MockTransport::with_ok_responses(6);
+        let cache = Arc::new(StateCache::new());
+        let mut ctrl = FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            Duration::from_millis(500),
+        );
+
+        ctrl.set_pwm(0, 40).unwrap();
+        ctrl.set_pwm(1, 40).unwrap();
+        assert_eq!(written.lock().len(), 2);
+
+        cache.invalidate_openfan_writes();
+
+        // Writing channel 0 first must not consume the invalidation for channel 1.
+        assert!(!ctrl.set_pwm(0, 40).unwrap().coalesced);
+        assert!(!ctrl.set_pwm(1, 40).unwrap().coalesced);
+        assert_eq!(written.lock().len(), 4);
+    }
+
+    #[test]
+    fn a_resume_also_invalidates_openfan_coalescing() {
+        // hwmon has always cleared its manual-mode flags on resume; OpenFan had
+        // no equivalent. `set_resume_detected` now bumps the generation too, and
+        // must do so WITHOUT disturbing the hwmon flag, which is a separate
+        // swap-once consumer.
+        let cache = StateCache::new();
+        let before = cache.openfan_write_generation();
+
+        cache.set_resume_detected();
+
+        assert_ne!(cache.openfan_write_generation(), before);
+        assert!(
+            cache.take_resume_flag(),
+            "hwmon's own flag is still delivered"
+        );
     }
 
     #[test]

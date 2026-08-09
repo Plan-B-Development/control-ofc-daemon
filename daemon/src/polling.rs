@@ -566,6 +566,12 @@ pub async fn openfan_poll_loop(
 
             match reconnect_result {
                 Ok(Some(new_transport)) => {
+                    // DEC-256: the device just re-enumerated, so FanController's
+                    // per-channel coalescing cache describes a device that may no
+                    // longer exist in that state. Invalidate before the new
+                    // transport goes live, or the next identical command is
+                    // coalesced into silence.
+                    cache.invalidate_openfan_writes();
                     let mut guard = transport.lock();
                     *guard = new_transport;
                     consecutive_errors = 0;

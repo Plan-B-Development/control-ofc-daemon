@@ -3,6 +3,19 @@
 ## [Unreleased]
 
 ### Fixed
+- **A fan can no longer be left at the firmware default after a reconnect.**
+  OpenFan writes are coalesced when the value equals the last commanded one,
+  which is only sound while that cache reflects the device — and nothing
+  invalidated it when the device changed underneath. After a USB re-enumeration
+  the poll loop swaps in a new transport, but the per-channel cache still
+  described the old session, so every subsequent identical command was coalesced
+  into silence: the fan sat wherever the firmware left it while the daemon
+  reported the commanded value. The same gap existed across a system resume,
+  where hwmon has always cleared its equivalent state. Both now bump a write
+  generation the controller watches. Whether this firmware actually resets duty
+  on re-enumeration is not determinable from the protocol, so this assumes it
+  might; the cost when it did not is one redundant write per channel, once.
+  DEC-256.
 - **Resetting a GPU fan to automatic is now mutually exclusive with the engine's
   own writes, and cannot be undone by a later failure.** Review of the first
   attempt found three ways it still broke. A PMFW curve write is N point writes
