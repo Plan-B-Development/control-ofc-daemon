@@ -174,7 +174,7 @@ pub struct SubsystemTimestamps {
     pub hwmon: Option<Instant>,
     /// Last time AIO data was updated.
     pub aio: Option<Instant>,
-    /// Last time the profile engine completed a tick (DEC-249).
+    /// Last time the profile engine *began* a tick (DEC-249, split DEC-259).
     ///
     /// Liveness for the sole PWM writer. The other fields track *data* freshness
     /// from the poll loops; this one tracks whether the engine task is still
@@ -184,7 +184,26 @@ pub struct SubsystemTimestamps {
     /// answering 200 with a frozen `thermal_state`. Stamped by
     /// [`StateCache::record_engine_tick`] in the same write as that thermal
     /// state, so the two can never drift apart.
-    pub engine: Option<Instant>,
+    ///
+    /// DEC-259: this is the tick's START. On its own it could not tell a stopped
+    /// engine from a slow one, and the two want opposite reports — see
+    /// `engine_completed`.
+    pub engine_started: Option<Instant>,
+    /// Last time the profile engine *finished* a tick (DEC-259).
+    ///
+    /// Stamped by a drop guard, so it fires on every exit from the loop body —
+    /// the `continue` paths and the shutdown `break` included. That is what
+    /// makes "started but not completed" mean the tick is genuinely still
+    /// running, rather than that it took an exit nobody instrumented.
+    ///
+    /// The pair exists because a single timestamp reported a *slow* tick as a
+    /// *dead* engine. `force_all` walks all ten OpenFan channels, each bounded
+    /// by `serial.timeout_ms` (up to 1 s via the API), so a degraded-but-open
+    /// link makes a legitimate tick take 5-10 s — and the old single stamp then
+    /// read "not ticking — fan control and thermal safety are stalled" while the
+    /// engine was in the middle of driving the 105 °C emergency. Exactly
+    /// backwards, in the one state where the surface most needs to be right.
+    pub engine_completed: Option<Instant>,
 }
 
 /// The complete daemon state snapshot.

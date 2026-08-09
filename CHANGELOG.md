@@ -11,6 +11,20 @@
   a PCI-BDF id whose colons break naive label parsing. DEC-257.
 
 ### Fixed
+- **The engine no longer reports itself dead while it is saving your hardware.**
+  Liveness was a single timestamp taken at the start of each tick, so a *slow*
+  tick and a *stopped* engine looked identical — and the daemon reported the
+  worse of the two. A thermal `force_all` walks all ten OpenFan channels, each
+  bounded by `serial.timeout_ms`, so a degraded-but-open serial link makes a
+  legitimate tick take 5–10 s. In exactly that situation `/status` read
+  `crit` — *"not ticking — fan control and thermal safety are stalled"* — while
+  the engine was in the middle of driving the 105 °C emergency. The inverse of
+  the truth, in the one state where it matters most, and self-repeating because a
+  failed write does not advance the coalescing cache. The engine now stamps both
+  the start and the completion of each tick: a tick in flight reports as busy
+  (and says so), a tick that has genuinely stopped still reports `crit`, and a
+  tick that never finishes escalates past 30× the period. Widening the threshold
+  would have bought the same silence for a real death. DEC-259.
 - **A fan can no longer be left at the firmware default after a reconnect.**
   OpenFan writes are coalesced when the value equals the last commanded one,
   which is only sound while that cache reflects the device — and nothing

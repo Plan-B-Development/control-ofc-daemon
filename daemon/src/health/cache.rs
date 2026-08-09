@@ -224,7 +224,7 @@ impl StateCache {
         let now = Instant::now();
         let mut state = self.inner.write();
         state.thermal_override_state = Some(thermal_state.to_string());
-        state.subsystem_timestamps.engine = Some(now);
+        state.subsystem_timestamps.engine_started = Some(now);
     }
 
     /// Try to claim the single hardware-verify slot, pausing the profile
@@ -280,6 +280,16 @@ impl StateCache {
             .write()
             .relinquished_gpu_fans
             .insert(fan_id.to_string())
+    }
+
+    /// Stamp the engine's tick-*completed* timestamp (DEC-259).
+    ///
+    /// Called from a drop guard in the engine loop so it fires on every exit
+    /// path. Together with the started stamp this lets `compute_health` tell a
+    /// slow tick (busy — report it, do not alarm) from a stopped one (the sole
+    /// PWM writer is gone — alarm).
+    pub fn record_engine_tick_complete(&self) {
+        self.inner.write().subsystem_timestamps.engine_completed = Some(Instant::now());
     }
 
     /// Acquire exclusive access to the GPU fan write path (DEC-255).
@@ -579,7 +589,11 @@ mod tests {
         // has never ticked — that is what makes a dead-on-arrival engine visible.
         let cache = StateCache::new();
         assert!(
-            cache.snapshot().subsystem_timestamps.engine.is_none(),
+            cache
+                .snapshot()
+                .subsystem_timestamps
+                .engine_started
+                .is_none(),
             "a cache that has seen no tick must not look alive"
         );
 
@@ -587,13 +601,13 @@ mod tests {
         let first = cache
             .snapshot()
             .subsystem_timestamps
-            .engine
+            .engine_started
             .expect("tick must stamp the heartbeat");
 
         cache.record_engine_tick("emergency");
         let snap = cache.snapshot();
         assert!(
-            snap.subsystem_timestamps.engine.unwrap() >= first,
+            snap.subsystem_timestamps.engine_started.unwrap() >= first,
             "heartbeat must advance monotonically"
         );
         assert_eq!(

@@ -436,6 +436,22 @@ pub fn evaluate_profile_with_overrides(
     commands
 }
 
+/// Stamps the engine's tick-completed timestamp on drop (DEC-259).
+///
+/// A guard rather than a call at the bottom of the loop body, because that body
+/// has several `continue` paths and a shutdown `break`. With a guard, "started
+/// but not completed" can only mean the tick is genuinely still running — never
+/// that it took an exit somebody forgot to instrument. A panic mid-tick also
+/// drops it, which is correct: the task is dead either way and both stamps then
+/// freeze together.
+struct TickCompletion<'a>(&'a StateCache);
+
+impl Drop for TickCompletion<'_> {
+    fn drop(&mut self) {
+        self.0.record_engine_tick_complete();
+    }
+}
+
 /// Run the profile engine loop as an async task.
 ///
 /// One tick per second: safety evaluation (forced overrides short-circuit
@@ -528,6 +544,12 @@ pub async fn profile_engine_loop(
         // means the engine stopped ticking — the only signal a client has that
         // the sole PWM writer died, since nothing supervises this task.
         cache.record_engine_tick(decision.thermal_state);
+        // DEC-259: pairs the start stamp above with a completion stamp on every
+        // exit from this body. Without the pair a *slow* tick was indistinguishable
+        // from a *stopped* engine, and the surface reported the worse of the two —
+        // "fan control and thermal safety are stalled" while `force_all` was
+        // actively driving the 105°C emergency below.
+        let _tick_done = TickCompletion(&cache);
 
         if let Some(forced_pct) = decision.forced_pct {
             // Forced safety override — all OpenFan channels and writable
@@ -1878,6 +1900,48 @@ mod tests {
     }
 
     // ── DEC-249: the engine must not die on an unvalidated on-disk profile ──
+
+    #[tokio::test]
+    async fn every_tick_records_completion_even_on_the_no_profile_path() {
+        // DEC-259: the completion stamp comes from a drop guard precisely because
+        // the loop body has several `continue` paths. If any of them skipped it,
+        // "started but not completed" would be permanently true and the surface
+        // would report a healthy idle daemon as a tick that never finishes.
+        //
+        // The no-profile path is the one an idle daemon takes every second.
+        let cache = Arc::new(StateCache::new());
+        let profile = Arc::new(Mutex::new(None));
+        let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
+        let overrides = Arc::new(Mutex::new(crate::control_override::OverrideTable::new()));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+
+        let handle = tokio::spawn(profile_engine_loop(
+            cache.clone(),
+            profile,
+            None,
+            None,
+            Vec::new(),
+            safety,
+            overrides,
+            rx,
+        ));
+
+        // Let the immediate first tick run, then stop the loop.
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        let _ = tx.send(true);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+
+        let ts = cache.snapshot().subsystem_timestamps;
+        let started = ts.engine_started.expect("the engine must have ticked");
+        let completed = ts.engine_completed.expect(
+            "the completion guard must fire on the no-profile `continue` path — \
+             without it an idle daemon looks permanently mid-tick",
+        );
+        assert!(
+            completed >= started,
+            "completion must not predate the start it belongs to"
+        );
+    }
 
     #[test]
     fn tuning_survives_negative_step_rates_from_an_unvalidated_profile() {

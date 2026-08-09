@@ -105,6 +105,82 @@ const ENGINE_REASONS: SubsystemReasons = SubsystemReasons {
     never: "never ticked",
 };
 
+/// How long a single tick may legitimately take before it counts as wedged
+/// rather than slow (DEC-259), as a multiple of the nominal 1 Hz period.
+///
+/// Derived, not guessed. The worst legitimate tick is a thermal `force_all` over
+/// a degraded-but-open serial link: `NUM_CHANNELS` (10) writes, each bounded by
+/// `serial.timeout_ms`, which the API caps at 1000 ms — so ~10 s for OpenFan
+/// alone, plus the hwmon leg. 30× leaves room for that and for a slow sysfs
+/// without ever reporting a genuinely dead engine as merely busy: past this
+/// bound the tick is not slow, it is stuck, and the distinction stops being
+/// useful to a user.
+const WEDGED_TICK_MULTIPLE: u32 = 30;
+
+/// Engine liveness, which is a different question from data freshness.
+///
+/// [SAFETY] DEC-259. A single timestamp could not tell a *slow* tick from a
+/// *stopped* engine, and reported the worse of the two. `force_all` walks ten
+/// OpenFan channels at up to 1 s each, so a degraded link makes a legitimate
+/// tick take 5-10 s — and the surface then read "not ticking — fan control and
+/// thermal safety are stalled" **while the engine was driving the 105 °C
+/// emergency**. Exactly inverted, in the one state where a user most needs to
+/// trust it. Widening the threshold would have fixed the false alarm by blinding
+/// the surface to a real death for just as long; the pair of stamps distinguishes
+/// the cases instead.
+///
+/// A tick is *in progress* when it has started and not yet completed. There it is
+/// judged on how long it has been running: normal, slow-but-working, or wedged.
+/// Between ticks it is judged on how long ago the last one finished.
+fn engine_health(
+    started: Option<Instant>,
+    completed: Option<Instant>,
+    now: Instant,
+    interval_ms: u64,
+) -> SubsystemHealth {
+    let entry = |status, reason: &str, age: Option<u64>| SubsystemHealth {
+        name: "engine".into(),
+        status,
+        age_ms: age,
+        reason: reason.into(),
+    };
+
+    let Some(started_at) = started else {
+        return entry(HealthStatus::Crit, ENGINE_REASONS.never, None);
+    };
+
+    // Age is always "since the last COMPLETED pass" when there has been one —
+    // the honest answer to "how long since the engine last finished its work".
+    let age = age_ms(completed.or(Some(started_at)), now);
+    let in_progress = completed.is_none_or(|done| done < started_at);
+
+    if in_progress {
+        let running_ms = now.duration_since(started_at).as_millis() as u64;
+        if running_ms <= interval_ms * 2 {
+            // A tick that started moments ago is simply a tick.
+            entry(HealthStatus::Ok, ENGINE_REASONS.fresh, age)
+        } else if running_ms <= interval_ms * u64::from(WEDGED_TICK_MULTIPLE) {
+            entry(
+                HealthStatus::Warn,
+                "tick still running — a slow write is holding it up",
+                age,
+            )
+        } else {
+            entry(
+                HealthStatus::Crit,
+                "tick stuck — the engine has not finished a pass",
+                age,
+            )
+        }
+    } else {
+        match evaluate_staleness(completed, now, interval_ms) {
+            HealthStatus::Ok => entry(HealthStatus::Ok, ENGINE_REASONS.fresh, age),
+            HealthStatus::Warn => entry(HealthStatus::Warn, ENGINE_REASONS.stale, age),
+            HealthStatus::Crit => entry(HealthStatus::Crit, ENGINE_REASONS.critical, age),
+        }
+    }
+}
+
 /// Evaluate the staleness of a subsystem given its last update time.
 ///
 /// - OK: age <= 2 × interval
@@ -198,12 +274,11 @@ pub fn compute_health(
         // rule, but nothing supervises its task — so its liveness belongs in the
         // same rollup as the poll loops. It feeds `overall`, which is the point:
         // a dead engine must not present as a healthy daemon.
-        subsystem_health(
-            "engine",
-            ts.engine,
+        engine_health(
+            ts.engine_started,
+            ts.engine_completed,
             now,
             config.engine_interval_ms,
-            &ENGINE_REASONS,
         ),
     ];
 
@@ -240,7 +315,8 @@ mod tests {
     fn state_with_live_engine(now: Instant) -> DaemonState {
         DaemonState {
             subsystem_timestamps: SubsystemTimestamps {
-                engine: Some(now),
+                engine_started: Some(now),
+                engine_completed: Some(now),
                 ..Default::default()
             },
             ..DaemonState::default()
@@ -275,7 +351,8 @@ mod tests {
             openfan: Some(now),
             hwmon: Some(now),
             aio: None,
-            engine: Some(now),
+            engine_started: Some(now),
+            engine_completed: Some(now),
         };
 
         let health = compute_health(&state, &default_config(), now);
@@ -371,7 +448,11 @@ mod tests {
         let mut state = base_state();
         state.subsystem_timestamps.openfan = Some(now);
         state.subsystem_timestamps.hwmon = Some(now);
-        state.subsystem_timestamps.engine = Some(now - Duration::from_millis(6000));
+        // A STOPPED engine: the last tick finished, and no tick has begun since.
+        // (A tick that started and has not finished is a different state — slow,
+        // not dead — see `a_slow_tick_is_reported_as_busy_not_stalled`.)
+        state.subsystem_timestamps.engine_started = Some(now - Duration::from_millis(6100));
+        state.subsystem_timestamps.engine_completed = Some(now - Duration::from_millis(6000));
 
         let health = compute_health(&state, &default_config(), now);
 
@@ -383,6 +464,69 @@ mod tests {
             "not ticking — fan control and thermal safety are stalled"
         );
         assert_eq!(health.overall, HealthStatus::Crit);
+    }
+
+    #[test]
+    fn a_slow_tick_is_reported_as_busy_not_stalled() {
+        // [SAFETY] DEC-259, and the reason the stamps were split. `force_all`
+        // walks ten OpenFan channels at up to 1 s each, so a degraded-but-open
+        // link makes a legitimate tick take 5-10 s. With one timestamp the
+        // surface reported "not ticking — fan control and thermal safety are
+        // stalled" **while the engine was driving the 105 °C emergency**: the
+        // exact inverse of the truth, in the state where it matters most.
+        let now = Instant::now();
+        let mut state = base_state();
+        state.subsystem_timestamps.openfan = Some(now);
+        state.subsystem_timestamps.hwmon = Some(now);
+        // A tick began 8 s ago and has not finished — it is still writing.
+        state.subsystem_timestamps.engine_started = Some(now - Duration::from_millis(8000));
+        state.subsystem_timestamps.engine_completed = Some(now - Duration::from_millis(9000));
+
+        let engine = &compute_health(&state, &default_config(), now).subsystems[2];
+
+        assert_eq!(
+            engine.status,
+            HealthStatus::Warn,
+            "a slow tick is busy, not dead — reporting crit here is a false alarm \
+             during a thermal emergency"
+        );
+        assert!(
+            engine.reason.contains("still running"),
+            "and it must say so: {}",
+            engine.reason
+        );
+    }
+
+    #[test]
+    fn a_tick_that_never_finishes_still_escalates_eventually() {
+        // Busy must not become a permanent excuse: past the wedged bound the tick
+        // is stuck, not slow, and the distinction stops helping anyone.
+        let now = Instant::now();
+        let mut state = base_state();
+        state.subsystem_timestamps.openfan = Some(now);
+        state.subsystem_timestamps.hwmon = Some(now);
+        let ms = u64::from(WEDGED_TICK_MULTIPLE) * 1000 + 1;
+        state.subsystem_timestamps.engine_started = Some(now - Duration::from_millis(ms));
+        state.subsystem_timestamps.engine_completed = Some(now - Duration::from_millis(ms + 1000));
+
+        let engine = &compute_health(&state, &default_config(), now).subsystems[2];
+        assert_eq!(engine.status, HealthStatus::Crit);
+        assert!(engine.reason.contains("stuck"), "{}", engine.reason);
+    }
+
+    #[test]
+    fn a_tick_in_flight_right_now_is_not_an_alarm() {
+        // The common case: /status lands in the microseconds between the start
+        // stamp and the completion stamp of an ordinary tick.
+        let now = Instant::now();
+        let mut state = base_state();
+        state.subsystem_timestamps.openfan = Some(now);
+        state.subsystem_timestamps.hwmon = Some(now);
+        state.subsystem_timestamps.engine_started = Some(now - Duration::from_millis(5));
+        state.subsystem_timestamps.engine_completed = Some(now - Duration::from_millis(1005));
+
+        let engine = &compute_health(&state, &default_config(), now).subsystems[2];
+        assert_eq!(engine.status, HealthStatus::Ok, "{}", engine.reason);
     }
 
     #[test]
@@ -401,7 +545,8 @@ mod tests {
         let stamp = now - Duration::from_millis(3000);
         state.subsystem_timestamps.openfan = Some(stamp);
         state.subsystem_timestamps.hwmon = Some(stamp);
-        state.subsystem_timestamps.engine = Some(stamp);
+        state.subsystem_timestamps.engine_started = Some(stamp);
+        state.subsystem_timestamps.engine_completed = Some(stamp);
 
         let health = compute_health(&state, &config, now);
 
