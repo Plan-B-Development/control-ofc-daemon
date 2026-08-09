@@ -159,7 +159,9 @@ impl StateCache {
         state.snapshot_at = now;
     }
 
-    /// Update the thermal safety override state.
+    /// Record that the profile engine reached this tick's safety decision:
+    /// publish the thermal safety override state and stamp the engine liveness
+    /// heartbeat.
     ///
     /// Unconditional write under the write lock (CONC-3, 2026-07-21 audit).
     /// An earlier fast path (EFF-4) took a read lock to compare-and-skip
@@ -168,8 +170,20 @@ impl StateCache {
     /// broke. The engine calls this once per 1 Hz tick with a short string;
     /// an uncontended `parking_lot` write at that rate is noise, so the
     /// invariant-free form wins.
-    pub fn set_thermal_override_state(&self, state_str: &str) {
-        self.inner.write().thermal_override_state = Some(state_str.to_string());
+    ///
+    /// DEC-249: the two writes are deliberately one call under one lock rather
+    /// than two independent setters. The heartbeat's whole purpose is to tell a
+    /// client whether `thermal_state` is still being published, so it must be
+    /// stamped at exactly the point that publishes it — bound together, an early
+    /// `continue` added above this line freezes both, and the heartbeat reports
+    /// the outage. Two separate call sites could drift, leaving the heartbeat
+    /// claiming health while the safety state went stale: the exact failure this
+    /// surface exists to catch.
+    pub fn record_engine_tick(&self, thermal_state: &str) {
+        let now = Instant::now();
+        let mut state = self.inner.write();
+        state.thermal_override_state = Some(thermal_state.to_string());
+        state.subsystem_timestamps.engine = Some(now);
     }
 
     /// Try to claim the single hardware-verify slot, pausing the profile
@@ -424,7 +438,7 @@ mod tests {
         // read guard and returns a derived value, with no full DaemonState
         // clone. It must observe exactly what snapshot() would.
         let cache = StateCache::new();
-        cache.set_thermal_override_state("emergency");
+        cache.record_engine_tick("emergency");
         cache.update_sensors(vec![]);
 
         let via_read_with = cache.read_with(|s| s.thermal_override_state.clone());
@@ -442,29 +456,60 @@ mod tests {
         let cache = StateCache::new();
         assert_eq!(cache.snapshot().thermal_override_state, None);
 
-        cache.set_thermal_override_state("normal");
+        cache.record_engine_tick("normal");
         assert_eq!(
             cache.snapshot().thermal_override_state.as_deref(),
             Some("normal")
         );
 
         // Redundant write — value stays correct.
-        cache.set_thermal_override_state("normal");
+        cache.record_engine_tick("normal");
         assert_eq!(
             cache.snapshot().thermal_override_state.as_deref(),
             Some("normal")
         );
 
         // Genuine change must be applied, not skipped.
-        cache.set_thermal_override_state("emergency");
+        cache.record_engine_tick("emergency");
         assert_eq!(
             cache.snapshot().thermal_override_state.as_deref(),
             Some("emergency")
         );
-        cache.set_thermal_override_state("recovery");
+        cache.record_engine_tick("recovery");
         assert_eq!(
             cache.snapshot().thermal_override_state.as_deref(),
             Some("recovery")
+        );
+    }
+
+    #[test]
+    fn record_engine_tick_stamps_the_heartbeat_with_the_thermal_state() {
+        // DEC-249: the heartbeat exists to tell a client whether `thermal_state`
+        // is still being published, so the two must move together. A fresh cache
+        // has never ticked — that is what makes a dead-on-arrival engine visible.
+        let cache = StateCache::new();
+        assert!(
+            cache.snapshot().subsystem_timestamps.engine.is_none(),
+            "a cache that has seen no tick must not look alive"
+        );
+
+        cache.record_engine_tick("normal");
+        let first = cache
+            .snapshot()
+            .subsystem_timestamps
+            .engine
+            .expect("tick must stamp the heartbeat");
+
+        cache.record_engine_tick("emergency");
+        let snap = cache.snapshot();
+        assert!(
+            snap.subsystem_timestamps.engine.unwrap() >= first,
+            "heartbeat must advance monotonically"
+        );
+        assert_eq!(
+            snap.thermal_override_state.as_deref(),
+            Some("emergency"),
+            "the same call must publish the thermal state"
         );
     }
 

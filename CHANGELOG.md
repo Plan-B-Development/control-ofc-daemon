@@ -2,6 +2,37 @@
 
 ## [Unreleased]
 
+### Fixed
+- **The profile engine can no longer be killed by a profile it loaded itself.**
+  The engine's step-rate limiter used `f64::clamp`, which panics when its bounds
+  are inverted or non-finite. A `step_up_pct` / `step_down_pct` pair summing
+  below zero inverted them, so the engine wrote once and then aborted on its
+  next tick — taking the daemon's sole PWM writer *and* the 105 °C thermal rule
+  down with it. Nothing supervises that task, so the process stayed up and
+  `/status` kept answering 200 with a frozen `thermal_state`: fans ran on
+  whatever value the last good tick left behind, indefinitely, with every
+  health signal green. Reachable without the API — `validate()` bounds those
+  fields, but the boot paths (CLI `--profile` and persisted-state restore)
+  deliberately skip it, so a hand-edited or corrupt profile on disk was enough.
+  Negative caps now read as "no movement in that direction" and the control
+  holds its previous output instead. DEC-249.
+- **Profiles loaded from disk are range-checked.** The load-time net already
+  refused an oversized profile; it now also refuses out-of-range and non-finite
+  numbers, mirroring `validate()`'s bounds exactly, so nothing the API would
+  reject can reach the engine from disk either. Deliberately numeric-only —
+  a profile referencing a sensor or header this machine does not currently have
+  still loads, as before. DEC-249.
+
+### Added
+- **`engine` subsystem on `GET /status` and `GET /poll`** — profile-engine
+  liveness alongside the existing `openfan` and `hwmon` freshness entries, and
+  the missing half of the fix above: a stalled engine now escalates
+  `overall_status` to `"crit"` instead of hiding behind fresh poll data. Judged
+  against the engine's fixed 1 Hz tick rather than the configurable
+  `poll_interval_ms`, so raising the poll interval cannot widen what counts as
+  a live engine. Additive and appended to `subsystems[]` — `api_version` is
+  unchanged and index-based readers are unaffected. DEC-249.
+
 ## [2.16.0] — 2026-08-07
 
 **The daemon can now be asked what it is configured with.** `GET /capabilities`

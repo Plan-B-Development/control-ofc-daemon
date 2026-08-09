@@ -301,6 +301,15 @@ pub fn load_profile(path: &Path) -> Result<DaemonProfile, String> {
             profile.controls.len()
         ));
     }
+    // DEC-249: numeric net. The count caps above stop an oversized profile from
+    // aborting the daemon; this stops an out-of-range one from reaching the
+    // engine, which the same boot paths would otherwise feed unvalidated.
+    if let Err(e) = check_numeric_ranges(&profile) {
+        return Err(format!(
+            "profile '{}' has an out-of-range value: {e}",
+            path.display()
+        ));
+    }
     if profile.version < 3 {
         log::warn!(
             "Profile '{}' has version {}, expected 3+ (v4 introduces fan_zero_rpm)",
@@ -315,6 +324,97 @@ pub fn load_profile(path: &Path) -> Result<DaemonProfile, String> {
         profile.curves.len()
     );
     Ok(profile)
+}
+
+/// Load-time numeric net for a profile read from disk (DEC-249).
+///
+/// [`validate`] bounds every numeric field, but the boot paths — CLI
+/// `--profile` and persisted-state restore — deliberately skip it (see
+/// [`load_profile`]), so until this net existed an out-of-range or non-finite
+/// value on disk reached the engine unchecked. One was enough: a negative
+/// `step_up_pct` / `step_down_pct` pair inverted the step-rate window and
+/// panicked the engine task mid-tick, killing the sole PWM writer *and* the
+/// 105°C thermal leg while `/status` kept answering 200. `apply_tuning` no
+/// longer panics on that input either — this is the other half, so nothing the
+/// API would reject can reach the engine from disk.
+///
+/// Deliberately **numeric-only**, not a back door to full `validate()`. The boot
+/// paths skip `validate` because a profile may legitimately reference a sensor
+/// or header this machine does not have right now, and those stay tolerated (the
+/// engine falls back safely per member). Ranges mirror `check_pct` (0..=100),
+/// `check_offset` (-100..=100) and `check_finite` exactly, so any profile the
+/// API accepts still loads.
+fn check_numeric_ranges(profile: &DaemonProfile) -> Result<(), String> {
+    fn finite(field: String, v: f64) -> Result<(), String> {
+        if v.is_finite() {
+            Ok(())
+        } else {
+            Err(format!("{field} must be a finite number (got {v})"))
+        }
+    }
+    fn in_range(field: String, v: f64, lo: f64, hi: f64) -> Result<(), String> {
+        finite(field.clone(), v)?;
+        if (lo..=hi).contains(&v) {
+            Ok(())
+        } else {
+            Err(format!("{field} must be between {lo} and {hi} (got {v})"))
+        }
+    }
+
+    for (i, ctrl) in profile.controls.iter().enumerate() {
+        let p = format!("controls[{i}]");
+        in_range(
+            format!("{p}.manual_output_pct"),
+            ctrl.manual_output_pct,
+            0.0,
+            100.0,
+        )?;
+        in_range(format!("{p}.minimum_pct"), ctrl.minimum_pct, 0.0, 100.0)?;
+        in_range(format!("{p}.start_pct"), ctrl.start_pct, 0.0, 100.0)?;
+        in_range(format!("{p}.stop_pct"), ctrl.stop_pct, 0.0, 100.0)?;
+        in_range(format!("{p}.step_up_pct"), ctrl.step_up_pct, 0.0, 100.0)?;
+        in_range(format!("{p}.step_down_pct"), ctrl.step_down_pct, 0.0, 100.0)?;
+        in_range(format!("{p}.offset_pct"), ctrl.offset_pct, -100.0, 100.0)?;
+    }
+
+    for (i, curve) in profile.curves.iter().enumerate() {
+        let p = format!("curves[{i}]");
+        for (j, pt) in curve.points.iter().enumerate() {
+            finite(format!("{p}.points[{j}].temp_c"), pt.temp_c)?;
+            in_range(
+                format!("{p}.points[{j}].output_pct"),
+                pt.output_pct,
+                0.0,
+                100.0,
+            )?;
+        }
+        for (name, v) in [
+            ("start_temp_c", curve.start_temp_c),
+            ("end_temp_c", curve.end_temp_c),
+            ("trigger_idle_temp_c", curve.trigger_idle_temp_c),
+            ("trigger_load_temp_c", curve.trigger_load_temp_c),
+        ] {
+            if let Some(v) = v {
+                finite(format!("{p}.{name}"), v)?;
+            }
+        }
+        for (name, v) in [
+            ("start_output_pct", curve.start_output_pct),
+            ("end_output_pct", curve.end_output_pct),
+            ("flat_output_pct", curve.flat_output_pct),
+            ("trigger_idle_pct", curve.trigger_idle_pct),
+            ("trigger_load_pct", curve.trigger_load_pct),
+        ] {
+            if let Some(v) = v {
+                in_range(format!("{p}.{name}"), v, 0.0, 100.0)?;
+            }
+        }
+        if let Some(v) = curve.sync_offset_pct {
+            in_range(format!("{p}.sync_offset_pct"), v, -100.0, 100.0)?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Maximum byte length of a profile id. The on-disk filename is `{id}.json`;
@@ -1932,6 +2032,86 @@ mod tests {
 
         let loaded = load_profile(&path).expect("a profile exactly at the cap must load");
         assert_eq!(loaded.curves.len(), MAX_PROFILE_CURVES);
+    }
+
+    // ── DEC-249: load-time numeric net ──────────────────────────────────────
+
+    #[test]
+    fn load_profile_rejects_negative_step_rates() {
+        // The exact input that killed the engine. `validate()` bounds these
+        // 0..=100, but the boot paths skip it, so this profile used to load
+        // cleanly and then panic `apply_tuning` on the engine's second tick —
+        // taking the sole PWM writer and the 105°C thermal leg with it.
+        let mut ctrl = curve_control("c1", "cv");
+        ctrl.step_up_pct = -50.0;
+        ctrl.step_down_pct = -50.0;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("negsteps.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string(&mk_profile(vec![graph_curve("cv", "cpu")], vec![ctrl])).unwrap(),
+        )
+        .unwrap();
+
+        let err = load_profile(&path).unwrap_err();
+        assert!(
+            err.contains("step_up_pct") && err.contains("between 0 and 100"),
+            "error must name the offending field: {err}"
+        );
+    }
+
+    #[test]
+    fn load_profile_accepts_the_full_valid_range() {
+        // The net must not reject anything the API accepts. Every field sits on
+        // a boundary `check_pct` / `check_offset` allow.
+        let mut ctrl = curve_control("c1", "cv");
+        ctrl.step_up_pct = 0.0;
+        ctrl.step_down_pct = 100.0;
+        ctrl.minimum_pct = 100.0;
+        ctrl.start_pct = 0.0;
+        ctrl.stop_pct = 100.0;
+        ctrl.manual_output_pct = 0.0;
+        ctrl.offset_pct = -100.0;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boundaries.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string(&mk_profile(vec![graph_curve("cv", "cpu")], vec![ctrl])).unwrap(),
+        )
+        .unwrap();
+
+        assert!(load_profile(&path).is_ok());
+    }
+
+    #[test]
+    fn numeric_net_rejects_non_finite_values() {
+        // `f64::clamp` panics on a NaN bound as well as an inverted one, so the
+        // net mirrors `check_finite` too. Exercised directly: JSON has no NaN
+        // literal, so this guards the in-memory shape rather than a parse.
+        let mut ctrl = curve_control("c1", "cv");
+        ctrl.step_up_pct = f64::NAN;
+        assert!(check_numeric_ranges(&mk_profile(vec![], vec![ctrl.clone()])).is_err());
+
+        ctrl.step_up_pct = 100.0;
+        ctrl.offset_pct = f64::INFINITY;
+        assert!(check_numeric_ranges(&mk_profile(vec![], vec![ctrl])).is_err());
+
+        let mut curve = graph_curve("cv", "cpu");
+        curve.points[0].temp_c = f64::NAN;
+        assert!(check_numeric_ranges(&mk_profile(vec![curve], vec![])).is_err());
+    }
+
+    #[test]
+    fn numeric_net_covers_optional_curve_scalars() {
+        // The optional Stepped/Trigger/Sync scalars are bounded by `validate()`
+        // too, so the load-time net must reach them — not only `points`.
+        let mut curve = graph_curve("cv", "cpu");
+        curve.flat_output_pct = Some(150.0);
+        assert!(check_numeric_ranges(&mk_profile(vec![curve], vec![])).is_err());
+
+        let mut curve = graph_curve("cv2", "cpu");
+        curve.sync_offset_pct = Some(-250.0);
+        assert!(check_numeric_ranges(&mk_profile(vec![curve], vec![])).is_err());
     }
 
     #[test]

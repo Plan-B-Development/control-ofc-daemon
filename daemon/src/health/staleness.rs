@@ -58,6 +58,12 @@ pub struct StalenessConfig {
     pub openfan_interval_ms: u64,
     /// Expected update interval for hwmon sensors (ms).
     pub hwmon_interval_ms: u64,
+    /// Expected tick interval for the profile engine (ms).
+    ///
+    /// Unlike the two poll intervals this is **not** operator-configurable: the
+    /// engine's period is a fixed 1 Hz (`profile_engine_loop`). It lives here so
+    /// the threshold is visible next to its siblings and tests can shrink it.
+    pub engine_interval_ms: u64,
 }
 
 impl Default for StalenessConfig {
@@ -65,9 +71,39 @@ impl Default for StalenessConfig {
         Self {
             openfan_interval_ms: 1000,
             hwmon_interval_ms: 1000,
+            engine_interval_ms: 1000,
         }
     }
 }
+
+/// The four reason strings a subsystem reports, one per status outcome.
+///
+/// Parameterised rather than hardcoded so each subsystem speaks in its own
+/// terms: the poll loops report on *readings*, the engine on *ticks*.
+struct SubsystemReasons {
+    fresh: &'static str,
+    stale: &'static str,
+    critical: &'static str,
+    never: &'static str,
+}
+
+/// Wording for the two data-polling subsystems (OpenFanController, hwmon).
+const POLL_REASONS: SubsystemReasons = SubsystemReasons {
+    fresh: "readings fresh",
+    stale: "readings stale",
+    critical: "readings critically stale",
+    never: "never received data",
+};
+
+/// Wording for the profile engine (DEC-249). A stalled engine is not stale
+/// *data* — it means nothing is driving the fans and nothing is evaluating the
+/// 105°C rule, so the reasons say so in the operator's terms.
+const ENGINE_REASONS: SubsystemReasons = SubsystemReasons {
+    fresh: "evaluating on schedule",
+    stale: "tick overdue",
+    critical: "not ticking — fan control and thermal safety are stalled",
+    never: "never ticked",
+};
 
 /// Evaluate the staleness of a subsystem given its last update time.
 ///
@@ -101,6 +137,35 @@ fn age_ms(last_update: Option<Instant>, now: Instant) -> Option<u64> {
     last_update.map(|t| now.duration_since(t).as_millis() as u64)
 }
 
+/// Build one subsystem's health entry from its last-update instant.
+///
+/// Extracted when the engine became a third subsystem (DEC-249) — the two
+/// existing blocks were already identical apart from their name, threshold and
+/// wording, and a third copy of the same twenty lines would have made the
+/// duplication the dominant shape of this function.
+fn subsystem_health(
+    name: &str,
+    last_update: Option<Instant>,
+    now: Instant,
+    interval_ms: u64,
+    reasons: &SubsystemReasons,
+) -> SubsystemHealth {
+    let status = evaluate_staleness(last_update, now, interval_ms);
+    SubsystemHealth {
+        name: name.into(),
+        status,
+        age_ms: age_ms(last_update, now),
+        reason: match status {
+            HealthStatus::Ok => reasons.fresh.into(),
+            HealthStatus::Warn => reasons.stale.into(),
+            HealthStatus::Crit => match last_update {
+                None => reasons.never.into(),
+                Some(_) => reasons.critical.into(),
+            },
+        },
+    }
+}
+
 /// Compute the health summary for the daemon.
 ///
 /// This function is pure: it takes the current state, config, and a reference
@@ -110,47 +175,37 @@ pub fn compute_health(
     config: &StalenessConfig,
     now: Instant,
 ) -> HealthSummary {
-    let mut subsystems = Vec::new();
+    let ts = &state.subsystem_timestamps;
 
-    // OpenFanController subsystem
-    let openfan_status = evaluate_staleness(
-        state.subsystem_timestamps.openfan,
-        now,
-        config.openfan_interval_ms,
-    );
-    subsystems.push(SubsystemHealth {
-        name: "openfan".into(),
-        status: openfan_status,
-        age_ms: age_ms(state.subsystem_timestamps.openfan, now),
-        reason: match openfan_status {
-            HealthStatus::Ok => "readings fresh".into(),
-            HealthStatus::Warn => "readings stale".into(),
-            HealthStatus::Crit => match state.subsystem_timestamps.openfan {
-                None => "never received data".into(),
-                Some(_) => "readings critically stale".into(),
-            },
-        },
-    });
-
-    // hwmon sensor subsystem
-    let hwmon_status = evaluate_staleness(
-        state.subsystem_timestamps.hwmon,
-        now,
-        config.hwmon_interval_ms,
-    );
-    subsystems.push(SubsystemHealth {
-        name: "hwmon".into(),
-        status: hwmon_status,
-        age_ms: age_ms(state.subsystem_timestamps.hwmon, now),
-        reason: match hwmon_status {
-            HealthStatus::Ok => "readings fresh".into(),
-            HealthStatus::Warn => "readings stale".into(),
-            HealthStatus::Crit => match state.subsystem_timestamps.hwmon {
-                None => "never received data".into(),
-                Some(_) => "readings critically stale".into(),
-            },
-        },
-    });
+    // Order is part of the wire shape: existing clients read `subsystems[0]` as
+    // openfan and `[1]` as hwmon. Engine is appended, never inserted.
+    let subsystems = vec![
+        subsystem_health(
+            "openfan",
+            ts.openfan,
+            now,
+            config.openfan_interval_ms,
+            &POLL_REASONS,
+        ),
+        subsystem_health(
+            "hwmon",
+            ts.hwmon,
+            now,
+            config.hwmon_interval_ms,
+            &POLL_REASONS,
+        ),
+        // DEC-249: the profile engine is the sole PWM writer and runs the 105°C
+        // rule, but nothing supervises its task — so its liveness belongs in the
+        // same rollup as the poll loops. It feeds `overall`, which is the point:
+        // a dead engine must not present as a healthy daemon.
+        subsystem_health(
+            "engine",
+            ts.engine,
+            now,
+            config.engine_interval_ms,
+            &ENGINE_REASONS,
+        ),
+    ];
 
     // Overall: worst of all subsystems
     let overall = subsystems
@@ -173,6 +228,23 @@ mod tests {
 
     fn base_state() -> DaemonState {
         DaemonState::default()
+    }
+
+    /// Baseline for tests about the *poll* subsystems, with the engine
+    /// heartbeat fresh.
+    ///
+    /// `overall` is the worst of every subsystem, and the engine is one of them
+    /// (DEC-249) — an unstamped engine is Crit, which would otherwise drive
+    /// `overall` and make an assertion about openfan/hwmon pass or fail for the
+    /// wrong reason. Any test asserting `overall` should start here.
+    fn state_with_live_engine(now: Instant) -> DaemonState {
+        DaemonState {
+            subsystem_timestamps: SubsystemTimestamps {
+                engine: Some(now),
+                ..Default::default()
+            },
+            ..DaemonState::default()
+        }
     }
 
     fn default_config() -> StalenessConfig {
@@ -203,12 +275,14 @@ mod tests {
             openfan: Some(now),
             hwmon: Some(now),
             aio: None,
+            engine: Some(now),
         };
 
         let health = compute_health(&state, &default_config(), now);
         assert_eq!(health.overall, HealthStatus::Ok);
         assert_eq!(health.subsystems[0].status, HealthStatus::Ok);
         assert_eq!(health.subsystems[1].status, HealthStatus::Ok);
+        assert_eq!(health.subsystems[2].status, HealthStatus::Ok);
     }
 
     #[test]
@@ -230,7 +304,7 @@ mod tests {
         let now = Instant::now();
         let config = default_config();
         let update_time = now - Duration::from_millis(2001);
-        let mut state = base_state();
+        let mut state = state_with_live_engine(now);
         state.subsystem_timestamps.openfan = Some(update_time);
         state.subsystem_timestamps.hwmon = Some(now);
 
@@ -257,7 +331,7 @@ mod tests {
         let now = Instant::now();
         let config = default_config();
         let update_time = now - Duration::from_millis(5001);
-        let mut state = base_state();
+        let mut state = state_with_live_engine(now);
         state.subsystem_timestamps.openfan = Some(update_time);
         state.subsystem_timestamps.hwmon = Some(now);
 
@@ -266,13 +340,82 @@ mod tests {
         assert_eq!(health.overall, HealthStatus::Crit);
     }
 
+    // ── DEC-249: profile-engine liveness ────────────────────────────
+
+    #[test]
+    fn engine_is_reported_as_a_subsystem() {
+        let now = Instant::now();
+        let mut state = state_with_live_engine(now);
+        state.subsystem_timestamps.openfan = Some(now);
+        state.subsystem_timestamps.hwmon = Some(now);
+
+        let health = compute_health(&state, &default_config(), now);
+
+        // Appended, never inserted — clients index openfan at 0 and hwmon at 1.
+        assert_eq!(health.subsystems.len(), 3);
+        assert_eq!(health.subsystems[0].name, "openfan");
+        assert_eq!(health.subsystems[1].name, "hwmon");
+        let engine = &health.subsystems[2];
+        assert_eq!(engine.name, "engine");
+        assert_eq!(engine.status, HealthStatus::Ok);
+        assert_eq!(engine.reason, "evaluating on schedule");
+    }
+
+    #[test]
+    fn stalled_engine_escalates_overall_despite_fresh_poll_data() {
+        // The failure this surface exists to catch: the poll loops keep running
+        // and reporting fresh data after the engine task dies, so every other
+        // signal stays green while nothing drives the fans or evaluates the
+        // 105°C rule.
+        let now = Instant::now();
+        let mut state = base_state();
+        state.subsystem_timestamps.openfan = Some(now);
+        state.subsystem_timestamps.hwmon = Some(now);
+        state.subsystem_timestamps.engine = Some(now - Duration::from_millis(6000));
+
+        let health = compute_health(&state, &default_config(), now);
+
+        assert_eq!(health.subsystems[0].status, HealthStatus::Ok);
+        assert_eq!(health.subsystems[1].status, HealthStatus::Ok);
+        assert_eq!(health.subsystems[2].status, HealthStatus::Crit);
+        assert_eq!(
+            health.subsystems[2].reason,
+            "not ticking — fan control and thermal safety are stalled"
+        );
+        assert_eq!(health.overall, HealthStatus::Crit);
+    }
+
+    #[test]
+    fn engine_uses_its_own_threshold_not_the_poll_interval() {
+        // The engine ticks at a fixed 1 Hz; the poll interval is operator-
+        // configurable up to 2000 ms. Raising the poll interval must not widen
+        // what counts as a live engine.
+        let now = Instant::now();
+        let config = StalenessConfig {
+            openfan_interval_ms: 2000,
+            hwmon_interval_ms: 2000,
+            ..StalenessConfig::default()
+        };
+        let mut state = base_state();
+        // 3 s: fresh for a 2 s poll interval (< 2×), overdue for a 1 s engine.
+        let stamp = now - Duration::from_millis(3000);
+        state.subsystem_timestamps.openfan = Some(stamp);
+        state.subsystem_timestamps.hwmon = Some(stamp);
+        state.subsystem_timestamps.engine = Some(stamp);
+
+        let health = compute_health(&state, &config, now);
+
+        assert_eq!(health.subsystems[0].status, HealthStatus::Ok);
+        assert_eq!(health.subsystems[2].status, HealthStatus::Warn);
+    }
+
     // ── Overall escalation ──────────────────────────────────────────
 
     #[test]
     fn overall_is_worst_of_subsystems() {
         let now = Instant::now();
         let config = default_config();
-        let mut state = base_state();
+        let mut state = state_with_live_engine(now);
         // openfan: fresh (OK)
         state.subsystem_timestamps.openfan = Some(now);
         // hwmon: critically stale (CRIT)

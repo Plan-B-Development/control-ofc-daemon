@@ -519,8 +519,12 @@ pub async fn profile_engine_loop(
             (decision, hottest_cpu_c)
         };
 
-        // Report thermal safety state for /status (DEC-132) + /diagnostics.
-        cache.set_thermal_override_state(decision.thermal_state);
+        // Report thermal safety state for /status (DEC-132) + /diagnostics, and
+        // stamp the engine liveness heartbeat in the same write (DEC-249). This
+        // line is reached unconditionally once per tick, so a frozen heartbeat
+        // means the engine stopped ticking — the only signal a client has that
+        // the sole PWM writer died, since nothing supervises this task.
+        cache.record_engine_tick(decision.thermal_state);
 
         if let Some(forced_pct) = decision.forced_pct {
             // Forced safety override — all OpenFan channels and writable
@@ -1831,6 +1835,73 @@ mod tests {
         );
         // Without start_pct it would be 25; with start_pct=35 from 0 → clamped up to 35
         assert_eq!(cmds[0].pwm_percent, 35);
+    }
+
+    // ── DEC-249: the engine must not die on an unvalidated on-disk profile ──
+
+    #[test]
+    fn tuning_survives_negative_step_rates_from_an_unvalidated_profile() {
+        // `validate()` bounds step_up_pct/step_down_pct to 0..=100, but the boot
+        // paths (CLI `--profile`, persisted-state restore) skip it by design, so
+        // a hand-edited or corrupt on-disk profile reaches the engine unchecked.
+        // A negative pair inverted the step-rate window and `f64::clamp`
+        // panicked on tick 2 — killing the engine task, and with it the sole PWM
+        // writer and the 105°C thermal leg, while `/status` kept answering 200.
+        let mut profile = make_profile("curve", "flat", 30.0);
+        profile.controls[0].step_up_pct = -50.0;
+        profile.controls[0].step_down_pct = -50.0;
+        let mut state = ProfileEngineState::new();
+
+        // Tick 1: no prior output, so step-rate limiting is skipped entirely —
+        // this tick always worked, which is why the failure looked like a
+        // healthy start followed by silence.
+        let cmds = evaluate_profile(
+            &profile,
+            &make_cache_with_sensor("cpu", 50.0).sensors_snapshot(),
+            &mut state,
+        );
+        assert_eq!(cmds[0].pwm_percent, 30);
+
+        // Tick 2: `last_output` is now Some. This is the tick that aborted.
+        profile.curves[0].flat_output_pct = Some(80.0);
+        let cmds = evaluate_profile(
+            &profile,
+            &make_cache_with_sensor("cpu", 51.0).sensors_snapshot(),
+            &mut state,
+        );
+
+        // A negative cap reads as "no movement in that direction", so the
+        // control holds its previous output instead of taking the machine's fan
+        // control down with it.
+        assert_eq!(cmds[0].pwm_percent, 30);
+    }
+
+    #[test]
+    fn tuning_survives_non_finite_step_rates() {
+        // Same reachability as above (unvalidated boot path), different input:
+        // `f64::clamp` also panics when either bound is NaN, not only when they
+        // are inverted.
+        let mut profile = make_profile("curve", "flat", 40.0);
+        profile.controls[0].step_up_pct = f64::NAN;
+        profile.controls[0].step_down_pct = f64::INFINITY;
+        let mut state = ProfileEngineState::new();
+
+        let cmds = evaluate_profile(
+            &profile,
+            &make_cache_with_sensor("cpu", 50.0).sensors_snapshot(),
+            &mut state,
+        );
+        assert_eq!(cmds[0].pwm_percent, 40);
+
+        profile.curves[0].flat_output_pct = Some(90.0);
+        let cmds = evaluate_profile(
+            &profile,
+            &make_cache_with_sensor("cpu", 51.0).sensors_snapshot(),
+            &mut state,
+        );
+        // NaN up-cap collapses to 0 (no rise); the infinite down-cap imposes no
+        // limit but the curve is rising, so the output holds.
+        assert_eq!(cmds[0].pwm_percent, 40);
     }
 
     #[test]

@@ -174,6 +174,17 @@ pub struct SubsystemTimestamps {
     pub hwmon: Option<Instant>,
     /// Last time AIO data was updated.
     pub aio: Option<Instant>,
+    /// Last time the profile engine completed a tick (DEC-249).
+    ///
+    /// Liveness for the sole PWM writer. The other fields track *data* freshness
+    /// from the poll loops; this one tracks whether the engine task is still
+    /// running at all. Nothing supervises that task — it is spawned once and
+    /// only awaited during shutdown — so a panic inside a tick used to end fan
+    /// control and the 105°C thermal leg silently, while `/status` kept
+    /// answering 200 with a frozen `thermal_state`. Stamped by
+    /// [`StateCache::record_engine_tick`] in the same write as that thermal
+    /// state, so the two can never drift apart.
+    pub engine: Option<Instant>,
 }
 
 /// The complete daemon state snapshot.

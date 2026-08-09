@@ -752,6 +752,10 @@ async fn main() {
     let staleness_config = StalenessConfig {
         openfan_interval_ms: config.polling.poll_interval_ms,
         hwmon_interval_ms: config.polling.poll_interval_ms,
+        // Fixed 1 Hz — the engine's tick period is hardcoded in
+        // `profile_engine_loop`, not derived from `poll_interval_ms`, so raising
+        // the poll interval must not widen what counts as a live engine.
+        engine_interval_ms: 1000,
     };
 
     let history = Arc::new(HistoryRing::new(250));

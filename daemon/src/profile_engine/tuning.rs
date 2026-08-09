@@ -57,10 +57,26 @@ pub(crate) fn apply_tuning_with_floor(
 
     // 3. Step-rate limiting — only bites when we have a previous cycle's output.
     //    step_up_pct / step_down_pct are per-cycle caps (1Hz here).
+    //
+    //    DEC-249: deliberately `max`/`min` rather than `f64::clamp`, and the caps
+    //    are floored at 0 first. `clamp` panics when `min > max` or when either
+    //    bound is NaN, and this function is reachable with unvalidated values:
+    //    the boot paths (CLI `--profile`, persisted-state restore) skip
+    //    `validate()` by design (see `profile::load_profile`). A negative pair
+    //    (`step_up_pct + step_down_pct < 0`) inverts the window, and the panic
+    //    killed the engine task mid-tick — taking the sole PWM writer AND the
+    //    105°C thermal leg with it, silently, behind a still-200 `/status`.
+    //    A negative cap is meaningless, so it reads as 0 ("no movement in that
+    //    direction"), which freezes the output for that control instead of
+    //    aborting fan control for the whole machine. `f64::max` returns the
+    //    non-NaN operand, so a NaN cap also collapses to 0 and a NaN `last`
+    //    leaves `output` untouched. For finite, non-negative caps this is
+    //    bit-identical to the old `clamp` — the `tuning_sequence` parity
+    //    vectors (DEC-126/DEC-195) are unperturbed.
     if let Some(last) = last_output {
-        let max_up = last + control.step_up_pct;
-        let max_down = last - control.step_down_pct;
-        output = output.clamp(max_down, max_up);
+        let step_up = control.step_up_pct.max(0.0);
+        let step_down = control.step_down_pct.max(0.0);
+        output = output.max(last - step_down).min(last + step_up);
     }
 
     // 4. Stop threshold — snap to zero below stop_pct so the fan actually

@@ -23,9 +23,24 @@ use control_ofc_daemon::hwmon::pwm_discovery::PwmHeaderDescriptor;
 use control_ofc_daemon::hwmon::types::SensorKind;
 use control_ofc_daemon::profile::DaemonProfile;
 
-/// Helper: create AppState with a pre-populated cache.
+/// Helper: create AppState with a pre-populated cache, representing a healthy
+/// running daemon — fresh poll data *and* a live profile engine.
 fn test_app_state() -> Arc<AppState> {
+    test_app_state_with_engine(true)
+}
+
+/// `test_app_state`, with control over whether the profile engine has ticked.
+///
+/// DEC-249 made engine liveness a subsystem, so `overall_status` now depends on
+/// it. Pass `false` for the unhealthy shape: a daemon whose engine task has
+/// never completed a tick (spawned but dead on arrival), which must not present
+/// as healthy however fresh the poll data is.
+fn test_app_state_with_engine(engine_ticked: bool) -> Arc<AppState> {
     let cache = Arc::new(StateCache::new());
+
+    if engine_ticked {
+        cache.record_engine_tick("normal");
+    }
 
     // Populate with test data
     cache.update_openfan_fans(vec![
@@ -164,12 +179,54 @@ async fn status_endpoint_returns_health() {
     // DEC-170: the counters envelope (only ever carried a dead last_error_summary)
     // was removed — /status no longer emits it.
     assert!(json.get("counters").is_none());
-    // DEC-132: thermal_state defaults to "normal" before the profile engine's
-    // first tick reports anything.
+    // DEC-132: the thermal state the engine reported on its last tick. The
+    // pre-first-tick default is covered by
+    // `status_is_crit_when_engine_has_never_ticked`.
     assert_eq!(json["thermal_state"], "normal");
 
     let _ = shutdown.send(());
     // Clean up socket
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn status_is_crit_when_engine_has_never_ticked() {
+    // DEC-249. The profile engine is the sole PWM writer and runs the 105°C
+    // rule, but nothing supervises its task — a panic inside a tick used to end
+    // fan control silently while /status kept answering 200 with every
+    // subsystem "ok". Engine liveness is now a subsystem of its own, so a
+    // daemon whose engine is not ticking cannot report itself healthy no matter
+    // how fresh the poll data is.
+    let state = test_app_state_with_engine(false);
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/status").await;
+
+    assert_eq!(
+        status, 200,
+        "a dead engine is reported, not a failed request"
+    );
+    // The poll subsystems are fresh — only the engine is not.
+    assert_eq!(json["subsystems"][0]["status"], "ok", "openfan");
+    assert_eq!(json["subsystems"][1]["status"], "ok", "hwmon");
+
+    let engine = &json["subsystems"][2];
+    assert_eq!(engine["name"], "engine");
+    assert_eq!(engine["status"], "crit");
+    assert_eq!(engine["reason"], "never ticked");
+    assert!(
+        engine["age_ms"].is_null(),
+        "no age for a subsystem that never reported"
+    );
+
+    // The whole point: it must escalate to overall, which is what a client acts on.
+    assert_eq!(json["overall_status"], "crit");
+
+    // Unchanged: thermal_state still defaults to "normal" before the first tick
+    // (DEC-132) — the default lives in the response builder, not the heartbeat.
+    assert_eq!(json["thermal_state"], "normal");
+
+    let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
 }
 
@@ -182,16 +239,16 @@ async fn status_endpoint_reflects_thermal_override_state() {
     let cache = state.cache.clone();
     let (path, shutdown, _dir) = start_test_server(state).await;
 
-    cache.set_thermal_override_state("emergency");
+    cache.record_engine_tick("emergency");
     let (status, json) = uds_get(&path, "/status").await;
     assert_eq!(status, 200);
     assert_eq!(json["thermal_state"], "emergency");
 
-    cache.set_thermal_override_state("recovery");
+    cache.record_engine_tick("recovery");
     let (_, json) = uds_get(&path, "/status").await;
     assert_eq!(json["thermal_state"], "recovery");
 
-    cache.set_thermal_override_state("normal");
+    cache.record_engine_tick("normal");
     let (_, json) = uds_get(&path, "/status").await;
     assert_eq!(json["thermal_state"], "normal");
 
