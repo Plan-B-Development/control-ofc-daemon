@@ -3,6 +3,17 @@
 ## [Unreleased]
 
 ### Fixed
+- **Resetting a GPU fan to automatic can no longer be undone by the engine's own
+  in-flight write.** `POST /gpu/{id}/fan/reset` set its "engine, stand off" flag
+  *after* writing firmware-auto, while the engine checks that flag on the async
+  worker before dispatching its sysfs write to the blocking pool. An engine write
+  already past that check could therefore land on top of the reset — and because
+  the fan counted as relinquished by then, the engine skipped it on every later
+  tick and never corrected it. The GPU stayed pinned on a stale flat curve until
+  the next profile activation or a daemon restart. The flag is now claimed before
+  the write, so it covers the whole reset, the engine re-checks it at the last
+  moment before touching sysfs (mirroring the existing verify guard), and a reset
+  that *fails* hands the fan back instead of stranding it. DEC-254.
 - **A renamed pump keeps its 30 % floor.** The pump/CPU hard floor was decided
   entirely from `member_label`, which the client writes and the GUI fills from a
   display-name tier list — so renaming a `PUMP` header to something like

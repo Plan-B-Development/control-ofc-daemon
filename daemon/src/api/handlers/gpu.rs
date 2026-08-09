@@ -29,6 +29,19 @@ pub async fn gpu_reset_fan_handler(
     if let Some(fan_curve_path) = &gpu.fan_curve_path {
         let path = fan_curve_path.clone();
         let zero_rpm = gpu.fan_zero_rpm_path.clone();
+        // DEC-165: relinquish this GPU fan so the engine stops writing it and
+        // the reset to firmware-auto is durable under an active profile
+        // (cleared on the next profile activation).
+        //
+        // DEC-254: claimed BEFORE the write, not after. The engine's own
+        // relinquish check runs on the async worker before it dispatches its
+        // sysfs write to the blocking pool, so setting the flag afterwards left
+        // a window in which an in-flight engine write landed on top of
+        // firmware-auto — and the fan, relinquished by then, was skipped forever
+        // after, leaving the GPU pinned on a stale curve. Claiming it first
+        // makes the flag cover the whole reset write, which is the long part.
+        let fan_id = format!("amd_gpu:{gpu_id}");
+        state.cache.relinquish_gpu_fan(&fan_id);
         let result = tokio::task::spawn_blocking(move || {
             crate::hwmon::gpu_fan::reset_to_auto(&path, zero_rpm.as_deref())
         })
@@ -36,12 +49,7 @@ pub async fn gpu_reset_fan_handler(
 
         match result {
             Ok(Ok(())) => {
-                let fan_id = format!("amd_gpu:{gpu_id}");
                 state.cache.set_gpu_fan_commanded_pct(&fan_id, 0);
-                // DEC-165: relinquish this GPU fan so the engine stops writing
-                // it and the reset to firmware-auto is durable under an active
-                // profile (cleared on the next profile activation).
-                state.cache.relinquish_gpu_fan(&fan_id);
                 log::info!("GPU {gpu_id} fan reset to auto");
                 json_ok(
                     StatusCode::OK,
@@ -53,17 +61,28 @@ pub async fn gpu_reset_fan_handler(
                 )
             }
             // M13: hardware_unavailable is a 503.
-            Ok(Err(e)) => error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &ErrorEnvelope::hardware_unavailable(format!("GPU fan reset failed: {e}")),
-            ),
-            Err(e) => error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &ErrorEnvelope::internal(format!("GPU fan reset task failed: {e}")),
-            ),
+            // DEC-254: the reset did not happen, so give the fan back to the
+            // engine rather than stranding it — relinquished but not reset.
+            Ok(Err(e)) => {
+                state.cache.unrelinquish_gpu_fan(&fan_id);
+                error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &ErrorEnvelope::hardware_unavailable(format!("GPU fan reset failed: {e}")),
+                )
+            }
+            Err(e) => {
+                state.cache.unrelinquish_gpu_fan(&fan_id);
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &ErrorEnvelope::internal(format!("GPU fan reset task failed: {e}")),
+                )
+            }
         }
     } else if gpu.can_write_legacy_pwm() {
         let hwmon_path = gpu.hwmon_path.clone();
+        // DEC-165 / DEC-254: claim before the write — see the PMFW arm above.
+        let fan_id = format!("amd_gpu:{gpu_id}");
+        state.cache.relinquish_gpu_fan(&fan_id);
         let result = tokio::task::spawn_blocking(move || {
             crate::hwmon::gpu_fan::reset_legacy_to_auto(&hwmon_path)
         })
@@ -71,11 +90,7 @@ pub async fn gpu_reset_fan_handler(
 
         match result {
             Ok(Ok(())) => {
-                let fan_id = format!("amd_gpu:{gpu_id}");
                 state.cache.set_gpu_fan_commanded_pct(&fan_id, 0);
-                // DEC-165: relinquish (see the PMFW arm above) so the reset is
-                // durable under an active profile.
-                state.cache.relinquish_gpu_fan(&fan_id);
                 log::info!("GPU {gpu_id} legacy fan reset to auto");
                 json_ok(
                     StatusCode::OK,
@@ -87,14 +102,23 @@ pub async fn gpu_reset_fan_handler(
                 )
             }
             // M13: hardware_unavailable is a 503.
-            Ok(Err(e)) => error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &ErrorEnvelope::hardware_unavailable(format!("GPU legacy fan reset failed: {e}")),
-            ),
-            Err(e) => error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &ErrorEnvelope::internal(format!("GPU fan reset task failed: {e}")),
-            ),
+            // DEC-254: roll the flag back — see the PMFW arm.
+            Ok(Err(e)) => {
+                state.cache.unrelinquish_gpu_fan(&fan_id);
+                error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &ErrorEnvelope::hardware_unavailable(format!(
+                        "GPU legacy fan reset failed: {e}"
+                    )),
+                )
+            }
+            Err(e) => {
+                state.cache.unrelinquish_gpu_fan(&fan_id);
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &ErrorEnvelope::internal(format!("GPU fan reset task failed: {e}")),
+                )
+            }
         }
     } else {
         error_response(

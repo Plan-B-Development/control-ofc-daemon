@@ -233,6 +233,19 @@ impl StateCache {
             .insert(fan_id.to_string());
     }
 
+    /// Un-relinquish a single GPU fan — the rollback for a reset that claimed
+    /// the flag up-front and then failed (DEC-254).
+    ///
+    /// `POST /gpu/{id}/fan/reset` sets the flag *before* writing firmware-auto,
+    /// so the engine is already standing off while the write is in flight. If
+    /// that write then fails, leaving the flag set would strand the fan: not
+    /// reset, and no longer driven by the engine either. Distinct from
+    /// [`Self::clear_relinquished_gpu_fans`], which clears every fan on profile
+    /// activation and would also undo an unrelated, successful reset.
+    pub fn unrelinquish_gpu_fan(&self, fan_id: &str) {
+        self.inner.write().relinquished_gpu_fans.remove(fan_id);
+    }
+
     /// Clear all relinquished GPU fans so a freshly-activated profile resumes
     /// controlling them.
     pub fn clear_relinquished_gpu_fans(&self) {

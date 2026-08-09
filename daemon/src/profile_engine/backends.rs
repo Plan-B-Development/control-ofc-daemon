@@ -316,6 +316,17 @@ fn gpu_blocking_write(
     if cache.verify_active() {
         return None;
     }
+    // DEC-254: the same last-moment re-check for the *other* racer. `apply`
+    // tests this on the async worker before dispatching here, so a
+    // `POST /gpu/{id}/fan/reset` landing in between used to let this write
+    // overwrite firmware-auto with the profile's flat curve — and because the
+    // fan is relinquished by then, `apply` skips it on every later tick, so
+    // nothing ever corrects it. The GPU stays pinned on a stale curve until the
+    // next profile activation or a restart. Unlike the verify race above, whose
+    // cost is one lost test value, that outcome is permanent.
+    if cache.is_gpu_fan_relinquished(fan_id) {
+        return None;
+    }
     Some(
         match crate::hwmon::gpu_fan::set_static_speed_with_zero_rpm(
             fan_curve_path,
@@ -1777,5 +1788,69 @@ mod tests {
         );
         assert!(matches!(out, Some(Ok(()))), "clear pause → write proceeds");
         assert!(!std::fs::read_to_string(&curve_path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn gpu_blocking_write_skips_when_relinquished_mid_dispatch() {
+        // DEC-254: the sibling of the CONC-1 guard above, for the *other*
+        // racer. `apply` checks `is_gpu_fan_relinquished` on the async worker
+        // before dispatching; a `POST /gpu/{id}/fan/reset` landing between that
+        // check and this task used to let the profile's flat curve overwrite
+        // firmware-auto. Worse than the verify race: the fan is relinquished by
+        // then, so `apply` skips it on every later tick and nothing ever
+        // corrects it — the GPU stays on the stale curve until the next profile
+        // activation or a restart.
+        let dir = tempfile::tempdir().unwrap();
+        let (gpu, curve_path) = fake_gpu(&dir);
+        let cache = StateCache::new();
+        let fan_id = "amd_gpu:0000:03:00.0";
+
+        cache.relinquish_gpu_fan(fan_id);
+        let out = gpu_blocking_write(
+            &cache,
+            gpu.fan_curve_path.as_deref().unwrap(),
+            gpu.fan_zero_rpm_path.as_deref(),
+            70,
+            true,
+            fan_id,
+        );
+        assert!(out.is_none(), "relinquished → skipped with no outcome");
+        assert!(
+            std::fs::read_to_string(&curve_path).unwrap().is_empty(),
+            "the in-task guard must stop the write reaching sysfs"
+        );
+
+        // A reset that failed hands the fan back, and writes resume.
+        cache.unrelinquish_gpu_fan(fan_id);
+        let out = gpu_blocking_write(
+            &cache,
+            gpu.fan_curve_path.as_deref().unwrap(),
+            gpu.fan_zero_rpm_path.as_deref(),
+            70,
+            true,
+            fan_id,
+        );
+        assert!(
+            matches!(out, Some(Ok(()))),
+            "un-relinquished → write proceeds"
+        );
+        assert!(!std::fs::read_to_string(&curve_path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unrelinquish_is_scoped_to_one_fan() {
+        // The rollback must not behave like `clear_relinquished_gpu_fans`, which
+        // would also resurrect an unrelated, successful reset.
+        let cache = StateCache::new();
+        cache.relinquish_gpu_fan("amd_gpu:0000:03:00.0");
+        cache.relinquish_gpu_fan("amd_gpu:0000:0a:00.0");
+
+        cache.unrelinquish_gpu_fan("amd_gpu:0000:03:00.0");
+
+        assert!(!cache.is_gpu_fan_relinquished("amd_gpu:0000:03:00.0"));
+        assert!(
+            cache.is_gpu_fan_relinquished("amd_gpu:0000:0a:00.0"),
+            "the other GPU's reset must survive"
+        );
     }
 }

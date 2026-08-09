@@ -1495,6 +1495,88 @@ fn test_app_state_with_read_only_gpu(pci_bdf: &str, pci_device_id: u16) -> Arc<A
     })
 }
 
+/// Helper: AppState with a PMFW-capable GPU whose fan_curve lives at `curve_path`.
+/// Point it at a nonexistent path to make the reset fail (DEC-254).
+fn test_app_state_with_pmfw_gpu(pci_bdf: &str, curve_path: std::path::PathBuf) -> Arc<AppState> {
+    use control_ofc_daemon::hwmon::gpu_detect::AmdGpuInfo;
+    use std::path::PathBuf;
+
+    let cache = Arc::new(StateCache::new());
+    let gpu = AmdGpuInfo {
+        pci_bdf: pci_bdf.into(),
+        pci_device_id: 0x7550,
+        pci_revision: 0xC0,
+        pci_class: 0x030000,
+        marketing_name: Some("RX 9070 XT".into()),
+        hwmon_path: PathBuf::from("/nonexistent/hwmon"),
+        fan_curve_path: Some(curve_path),
+        fan_zero_rpm_path: None,
+        is_discrete: true,
+        has_fan_rpm: true,
+        has_pwm: true,         // pwm1 exists
+        has_pwm_enable: false, // but pwm1_enable does NOT — this is the bug shape
+        overdrive_enabled: true,
+    };
+    let readiness_rollup = Arc::new(parking_lot::Mutex::new(None));
+    Arc::new(AppState {
+        cache,
+        staleness_config: StalenessConfig::default(),
+        daemon_version: "0.1.0-test".into(),
+        fan_controller: None,
+        hwmon_controller: None,
+        start_time: std::time::Instant::now(),
+        history: Arc::new(HistoryRing::new(250)),
+        active_profile: Arc::new(parking_lot::Mutex::new(None)),
+        calibrating: std::sync::atomic::AtomicBool::new(false),
+        amd_gpus: vec![gpu],
+        intel_gpus: Vec::new(),
+        nvidia_gpus: Vec::new(),
+        profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
+        config_path: String::new(),
+        runtime_config_path: std::path::PathBuf::new(),
+        sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        override_table: Arc::new(parking_lot::Mutex::new(
+            control_ofc_daemon::control_override::OverrideTable::new(),
+        )),
+        allow_port_probe: false,
+        running_config: Default::default(),
+        readiness_rollup: readiness_rollup.clone(),
+        assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
+            readiness_rollup,
+        )),
+    })
+}
+
+#[tokio::test]
+async fn gpu_reset_that_fails_does_not_strand_the_fan() {
+    // DEC-254. The reset now relinquishes BEFORE writing, so the flag covers the
+    // whole sysfs write and an in-flight engine write cannot land on top of
+    // firmware-auto. That reordering owes a rollback: if the write then fails,
+    // leaving the flag set would strand the fan — not reset, and no longer
+    // driven by the engine either, until the next profile activation.
+    let bdf = "0000:03:00.0";
+    let state =
+        test_app_state_with_pmfw_gpu(bdf, std::path::PathBuf::from("/nonexistent/dir/fan_curve"));
+    let cache = state.cache.clone();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, _json) = uds_post(
+        &path,
+        &format!("/gpu/{bdf}/fan/reset"),
+        &serde_json::json!({}),
+    )
+    .await;
+
+    assert_eq!(status, 503, "a failed reset reports hardware_unavailable");
+    assert!(
+        !cache.is_gpu_fan_relinquished(&format!("amd_gpu:{bdf}")),
+        "a reset that failed must hand the fan back to the engine"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
 #[tokio::test]
 async fn gpu_reset_fan_read_only_rdna_returns_400_feature_unavailable() {
     // DEC-098 mirror for the reset path.
