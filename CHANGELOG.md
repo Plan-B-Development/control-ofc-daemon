@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Changed
+- **The cross-stack role-classification oracle now pins the classifier that
+  actually decides the floor.** It checked `member_is_pump_or_cpu`, while the
+  runtime floor and the stop-snap exemption are decided by the wider
+  `member_needs_hard_floor` (DEC-252) — so the GUI and daemon could disagree
+  about a renamed pump with nothing in CI noticing. Five vectors added, including
+  a PCI-BDF id whose colons break naive label parsing. DEC-257.
+
 ### Fixed
 - **A fan can no longer be left at the firmware default after a reconnect.**
   OpenFan writes are coalesced when the value equals the last commanded one,

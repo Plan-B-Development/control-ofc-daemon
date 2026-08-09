@@ -2020,9 +2020,14 @@ mod tests {
     #[test]
     fn role_classification_matches_oracle() {
         // DEC-162 cross-stack agreement: the daemon classifiers must produce the
-        // same role as the GUI's `infer_member_role` for every shared vector, or
-        // a GUI-baked profile could be wrongly rejected by the FLOOR_TOO_LOW
-        // backstop. The GUI half lives in tests/test_role_classification_parity.py
+        // same role as the GUI's `infer_member_role` for every shared vector.
+        //
+        // DEC-257: pinned against `member_needs_hard_floor` — the EVAL-TIME union
+        // (DEC-252) — rather than the narrower `member_is_pump_or_cpu`, because
+        // that is the classifier deciding the runtime floor and the stop-snap
+        // exemption, and it is what the GUI now mirrors. `validate()`'s rejection
+        // deliberately stays on the narrow one, so the GUI can only ever be
+        // stricter than what the daemon accepts — never the reverse. The GUI half lives in tests/test_role_classification_parity.py
         // against a byte-identical copy of this fixture.
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -2036,7 +2041,7 @@ mod tests {
                 serde_json::from_value(case.clone()).expect("deserialize member");
             let got = if member_is_gpu(&m) {
                 "gpu"
-            } else if member_is_pump_or_cpu(&m) {
+            } else if member_needs_hard_floor(&m) {
                 "cpu_or_pump"
             } else {
                 "chassis"
