@@ -458,7 +458,16 @@ impl WriteBackend for GpuBackend {
             let cache_ref = self.cache.clone();
             let fan_id = cmd.member_id.clone();
             let fan_id_inner = fan_id.clone();
+            // DEC-255: exclude `POST /gpu/{id}/fan/reset` for the duration of
+            // this write. A PMFW curve write is N point writes plus a `"c"`
+            // commit and a reset is `"r"`+`"c"`; interleaving them can commit a
+            // curve that is neither the profile's nor firmware-auto, which no
+            // later tick reconciles because the reset relinquishes the fan and
+            // this loop then skips it. The in-task relinquish re-check below
+            // narrows that race; this removes it.
+            let write_guard = self.cache.lock_gpu_writes().await;
             let result = tokio::task::spawn_blocking(move || {
+                let _write_guard = write_guard;
                 gpu_blocking_write(
                     &cache_ref,
                     &path,
@@ -1217,7 +1226,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (gpu, curve_path) = fake_gpu(&dir);
         let cache = Arc::new(StateCache::new());
-        cache.relinquish_gpu_fan("amd_gpu:0000:03:00.0");
+        let _ = cache.relinquish_gpu_fan("amd_gpu:0000:03:00.0");
         let mut be = GpuBackend::new(cache.clone(), Arc::new(vec![gpu]));
 
         be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 70)])
@@ -1805,7 +1814,7 @@ mod tests {
         let cache = StateCache::new();
         let fan_id = "amd_gpu:0000:03:00.0";
 
-        cache.relinquish_gpu_fan(fan_id);
+        let _ = cache.relinquish_gpu_fan(fan_id);
         let out = gpu_blocking_write(
             &cache,
             gpu.fan_curve_path.as_deref().unwrap(),
@@ -1842,8 +1851,8 @@ mod tests {
         // The rollback must not behave like `clear_relinquished_gpu_fans`, which
         // would also resurrect an unrelated, successful reset.
         let cache = StateCache::new();
-        cache.relinquish_gpu_fan("amd_gpu:0000:03:00.0");
-        cache.relinquish_gpu_fan("amd_gpu:0000:0a:00.0");
+        let _ = cache.relinquish_gpu_fan("amd_gpu:0000:03:00.0");
+        let _ = cache.relinquish_gpu_fan("amd_gpu:0000:0a:00.0");
 
         cache.unrelinquish_gpu_fan("amd_gpu:0000:03:00.0");
 

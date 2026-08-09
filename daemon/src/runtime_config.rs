@@ -142,6 +142,21 @@ impl RuntimeHardware {
     }
 }
 
+/// `runtime.toml` → `runtime.toml.invalid-<unix-ts>`.
+///
+/// Built by appending to the whole filename rather than `with_extension`, which
+/// would replace `.toml` and yield `runtime.invalid-…` — losing the hint about
+/// what the file was.
+fn quarantine_path(path: &Path) -> std::path::PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".invalid-{stamp}"));
+    path.with_file_name(name)
+}
+
 impl RuntimeConfig {
     /// Load runtime.toml from a specific file path.
     ///
@@ -175,37 +190,54 @@ impl RuntimeConfig {
         }
     }
 
-    /// Load runtime.toml for a **read-modify-write** setter, refusing to
-    /// continue if a file exists that we could not understand (DEC-252).
+    /// Load runtime.toml for a **read-modify-write** setter, quarantining a
+    /// file we cannot understand rather than overwriting or refusing (DEC-255).
     ///
     /// [SAFETY] `load_from` deliberately falls back to defaults so a corrupt
     /// file can never stop the daemon booting. That fallback is wrong for a
     /// setter: every `POST /config/*` is load → mutate one key → `save_to`, so
     /// loading defaults and then writing does not merely *ignore* the unreadable
     /// file — it **overwrites every other setting in it with a default**, and the
-    /// loss is permanent from that moment. The warning `load_from` logs goes to
-    /// the journal, where nobody looks until their configuration has already
-    /// gone. This repo has shipped one settings-destruction bug already
-    /// (DEC-244); a read that failed must not become a write that erases.
+    /// loss is permanent. This repo has shipped one settings-destruction bug
+    /// already (DEC-244); a read that failed must not become a write that erases.
     ///
-    /// A *missing* file is not an error — that is the first-write case, and
-    /// defaults are exactly right.
+    /// Refusing outright was the first attempt and was worse than it looked. The
+    /// realistic trigger is not corruption but a **daemon downgrade**: each
+    /// section carries `deny_unknown_fields`, so once a newer daemon adds a key
+    /// to an existing section, an older one cannot parse the file — and refusing
+    /// leaves every setter returning 503 forever, with the boot path already
+    /// silently running on defaults. Settings that are simultaneously not applied
+    /// and not settable, with no documented way out.
+    ///
+    /// Quarantine keeps the property that matters — the user's bytes are never
+    /// destroyed, just moved to `runtime.toml.invalid-<unix-ts>` — while letting
+    /// the daemon carry on. `Err` is now reserved for the case where even the
+    /// rename fails, because then we genuinely cannot write without erasing.
+    ///
+    /// A *missing* file is not an error: that is the first-write case.
     pub fn load_for_update(path: &Path) -> Result<Self, String> {
-        match crate::atomic_io::read_to_string_capped(path) {
-            Ok(content) => toml::from_str::<RuntimeConfig>(&content).map_err(|e| {
-                format!(
-                    "existing runtime config at {} is malformed ({e}); refusing to \
-                     overwrite it — move it aside to start fresh",
-                    path.display()
-                )
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(format!(
-                "cannot read existing runtime config at {} ({e}); refusing to \
-                 overwrite it",
+        let problem = match crate::atomic_io::read_to_string_capped(path) {
+            Ok(content) => match toml::from_str::<RuntimeConfig>(&content) {
+                Ok(cfg) => return Ok(cfg),
+                Err(e) => format!("malformed ({e})"),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => format!("unreadable ({e})"),
+        };
+
+        let quarantined = quarantine_path(path);
+        std::fs::rename(path, &quarantined).map_err(|e| {
+            format!(
+                "existing runtime config at {} is {problem} and could not be moved                  aside ({e}); refusing to overwrite it",
                 path.display()
-            )),
-        }
+            )
+        })?;
+        log::error!(
+            "Runtime config at {} is {problem}; moved to {} and continuing with              defaults. Settings in that file are NOT applied — copy anything you              need back and restart.",
+            path.display(),
+            quarantined.display()
+        );
+        Ok(Self::default())
     }
 
     /// Atomically persist runtime.toml. Creates the parent directory if needed.
@@ -673,21 +705,55 @@ mod tests {
     // ── DEC-252: a failed read must never become a destructive write ──────
 
     #[test]
-    fn load_for_update_refuses_a_malformed_file() {
-        // load_from() falls back to defaults so a corrupt file cannot stop the
-        // daemon booting. For a setter that fallback is destructive: load →
-        // mutate one key → save would replace every other setting with a
-        // default, permanently.
+    fn a_malformed_file_is_quarantined_not_destroyed_and_not_a_dead_end() {
+        // DEC-255. Three properties at once, because they are the whole point:
+        // the update proceeds (no permanent 503 wedge), the user's bytes survive
+        // verbatim, and they survive under a name that says what happened.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("runtime.toml");
-        std::fs::write(&path, "this is not = valid toml [[[").unwrap();
+        let original = "[polling]\npoll_interval_ms = 900\n[garbage\n";
+        std::fs::write(&path, original).unwrap();
 
+        let loaded = RuntimeConfig::load_for_update(&path).expect("must not dead-end");
+        assert!(loaded.polling.is_none(), "proceeds on defaults");
         assert!(
-            RuntimeConfig::load_for_update(&path).is_err(),
-            "a malformed file must refuse the update"
+            !path.exists(),
+            "the unparseable file is moved out of the way"
         );
-        // The boot path still tolerates it.
-        let _booted = RuntimeConfig::load_from(&path);
+
+        let quarantined: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("runtime.toml.invalid-")
+            })
+            .collect();
+        assert_eq!(quarantined.len(), 1, "exactly one quarantined copy");
+        assert_eq!(
+            std::fs::read_to_string(quarantined[0].path()).unwrap(),
+            original,
+            "the user's bytes must survive verbatim"
+        );
+    }
+
+    #[test]
+    fn a_quarantined_file_does_not_block_the_next_write() {
+        // The wedge this replaces: refusing left every setter returning 503
+        // forever after a daemon downgrade, while the boot path already ran on
+        // defaults. Prove the very next save succeeds.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.toml");
+        std::fs::write(&path, "not = valid = toml [[[").unwrap();
+
+        let mut cfg = RuntimeConfig::load_for_update(&path).unwrap();
+        cfg.set_poll_interval_ms(Some(1000));
+        cfg.save_to(&path)
+            .expect("the setter must be able to write");
+
+        let reloaded = RuntimeConfig::load_for_update(&path).unwrap();
+        assert_eq!(reloaded.polling.map(|p| p.poll_interval_ms), Some(1000));
     }
 
     #[test]
@@ -700,26 +766,14 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_update_leaves_the_existing_file_untouched() {
-        // The property that actually matters to a user: their unreadable
-        // settings file is still there afterwards, byte for byte, instead of
-        // having been silently replaced by defaults plus one key.
+    fn a_valid_file_is_never_quarantined() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("runtime.toml");
-        let original = "[polling]\npoll_interval_ms = 900\n[garbage\n";
-        std::fs::write(&path, original).unwrap();
+        std::fs::write(&path, "[polling]\npoll_interval_ms = 750\n").unwrap();
 
-        let outcome = RuntimeConfig::load_for_update(&path);
-        assert!(outcome.is_err());
-        if let Ok(mut cfg) = outcome {
-            // Would-be destructive path — only runs if the guard regressed.
-            cfg.set_poll_interval_ms(Some(1000));
-            cfg.save_to(&path).unwrap();
-        }
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            original,
-            "the user's file must survive a refused update"
-        );
+        let cfg = RuntimeConfig::load_for_update(&path).unwrap();
+        assert_eq!(cfg.polling.map(|p| p.poll_interval_ms), Some(750));
+        assert!(path.exists(), "a file we understood must be left alone");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

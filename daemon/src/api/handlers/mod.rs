@@ -733,3 +733,31 @@ mod tests {
         assert!(json.get("temp_type").is_none());
     }
 }
+
+#[cfg(test)]
+mod persist_tests {
+    use super::persist_off_runtime;
+
+    #[tokio::test]
+    async fn a_panicking_persistence_task_becomes_an_error_not_a_dead_worker() {
+        // DEC-255: `persist_off_runtime`'s doc claims "a panicking write must not
+        // take an API worker down with it". That property had no test, and it is
+        // cheap and deterministic to pin.
+        let result: Result<(), String> =
+            persist_off_runtime(|| panic!("simulated write panic")).await;
+        assert!(
+            result.is_err(),
+            "a panic must surface as Err, not unwind the handler"
+        );
+        assert!(
+            result.unwrap_err().contains("persistence task failed"),
+            "and must be distinguishable from an ordinary IO failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_persistence_task_passes_its_value_through() {
+        let result = persist_off_runtime(|| Ok::<u8, String>(7)).await;
+        assert_eq!(result, Ok(7));
+    }
+}

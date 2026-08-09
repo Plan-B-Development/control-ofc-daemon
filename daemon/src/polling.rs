@@ -543,9 +543,23 @@ pub async fn openfan_poll_loop(
             let t = timeout;
             let reconnect_result = tokio::task::spawn_blocking(move || {
                 crate::serial::real_transport::auto_detect_port(t).and_then(|path| {
-                    crate::serial::real_transport::RealSerialTransport::open(&path, t)
-                        .ok()
-                        .map(|rt| -> Box<dyn SerialTransport + Send> { Box::new(rt) })
+                    // DEC-250/255: detection probes identity on its OWN fd and
+                    // then closes it; this is a second open of the same path, so
+                    // the transport actually adopted has never been verified.
+                    // "Openability is not identity" applies here too — and this
+                    // is the path that runs continuously at runtime, where a
+                    // device swap between probe and open is the whole risk.
+                    let mut rt =
+                        crate::serial::real_transport::RealSerialTransport::open(&path, t).ok()?;
+                    crate::serial::transport::verify_openfan_identity(&mut rt, t)
+                        .map_err(|e| {
+                            log::warn!(
+                                "Reconnect: {path} opened but did not identify as an \
+                                 OpenFanController ({e}) — not adopting it"
+                            );
+                        })
+                        .ok()?;
+                    Some(Box::new(rt) as Box<dyn SerialTransport + Send>)
                 })
             })
             .await;

@@ -105,7 +105,10 @@ pub async fn update_profile_search_dirs_handler(
         Err(resp) => return resp,
     };
     runtime.set_profile_search_dirs(merged.clone());
-    if let Err(e) = runtime.save_to(&state.runtime_config_path) {
+    // DEC-252/255: fsync off the async worker threads the engine shares.
+    let runtime_owned = runtime.clone();
+    let rc_path = state.runtime_config_path.clone();
+    if let Err(e) = super::persist_off_runtime(move || runtime_owned.save_to(&rc_path)).await {
         log::error!(
             "Failed to persist profile search dirs to {}: {e}",
             state.runtime_config_path.display()
@@ -163,7 +166,10 @@ pub async fn update_startup_delay_handler(
         Err(resp) => return resp,
     };
     runtime.set_startup_delay_secs(delay);
-    if let Err(e) = runtime.save_to(&state.runtime_config_path) {
+    // DEC-252/255: fsync off the async worker threads the engine shares.
+    let runtime_owned = runtime.clone();
+    let rc_path = state.runtime_config_path.clone();
+    if let Err(e) = super::persist_off_runtime(move || runtime_owned.save_to(&rc_path)).await {
         log::error!(
             "Failed to persist startup delay to {}: {e}",
             state.runtime_config_path.display()
@@ -201,7 +207,7 @@ enum PreferredSensorRole {
 /// Persist-first like the sibling handlers: a write failure returns 503 and does
 /// not change anything the daemon acts on (the preference is advisory — thermal
 /// safety still uses the hottest CpuTemp).
-fn set_preferred_sensor(
+async fn set_preferred_sensor(
     state: &AppState,
     body: &serde_json::Value,
     role: PreferredSensorRole,
@@ -251,7 +257,11 @@ fn set_preferred_sensor(
             "mb"
         }
     };
-    if let Err(e) = runtime.save_to(&state.runtime_config_path) {
+    // DEC-252/255: fsync off the async worker threads the engine shares. This
+    // setter was a plain `fn`, which is why it was missed the first time.
+    let runtime_owned = runtime.clone();
+    let rc_path = state.runtime_config_path.clone();
+    if let Err(e) = super::persist_off_runtime(move || runtime_owned.save_to(&rc_path)).await {
         log::error!(
             "Failed to persist preferred {role_str} sensor to {}: {e}",
             state.runtime_config_path.display()
@@ -280,7 +290,7 @@ pub async fn update_preferred_cpu_sensor_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = set_preferred_sensor(&state, &body, PreferredSensorRole::Cpu);
+    let resp = set_preferred_sensor(&state, &body, PreferredSensorRole::Cpu).await;
     refresh_rollup_if_ok(&state, resp.0);
     resp
 }
@@ -290,7 +300,7 @@ pub async fn update_preferred_mb_sensor_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = set_preferred_sensor(&state, &body, PreferredSensorRole::Mb);
+    let resp = set_preferred_sensor(&state, &body, PreferredSensorRole::Mb).await;
     refresh_rollup_if_ok(&state, resp.0);
     resp
 }

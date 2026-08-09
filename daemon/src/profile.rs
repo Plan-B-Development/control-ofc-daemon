@@ -336,7 +336,14 @@ pub fn load_profile(path: &Path) -> Result<DaemonProfile, String> {
 /// panicked the engine task mid-tick, killing the sole PWM writer *and* the
 /// 105°C thermal leg while `/status` kept answering 200. `apply_tuning` no
 /// longer panics on that input either — this is the other half, so nothing the
-/// API would reject can reach the engine from disk.
+/// API would reject **on numeric grounds** can reach the engine from disk.
+///
+/// Deliberately narrower than `validate()`, which also rejects `TOO_MANY_POINTS`,
+/// `TRIGGER_IDLE_GE_LOAD`, `UNKNOWN_CURVE_REF`, `MIX_CYCLE`/`SYNC_CYCLE`,
+/// `FLOOR_TOO_LOW` and `PUMP_STOP_FORBIDDEN`. Those still reach the engine on the
+/// boot paths and are each handled at eval time (visited-set and topo guards,
+/// the floor clamp, unknown-curve fallback) — do not read this as a full
+/// `validate()`.
 ///
 /// Deliberately **numeric-only**, not a back door to full `validate()`. The boot
 /// paths skip `validate` because a profile may legitimately reference a sensor

@@ -6,6 +6,7 @@
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::health::state::*;
@@ -28,6 +29,27 @@ pub struct StateCache {
     /// Bumped and read under the `active_profile` mutex so the tick that first
     /// observes a swapped profile also observes the new epoch (no extra tick).
     profile_activation_epoch: AtomicU64,
+    /// Serialises GPU fan writes between the profile engine and
+    /// `POST /gpu/{id}/fan/reset` (DEC-255).
+    ///
+    /// [SAFETY] GPU writes hold no per-device lock by design (DEC-045), which was
+    /// fine while every write was a single value. A PMFW curve write is not: it
+    /// is N point writes followed by a `"c"` commit, and `reset_to_auto` is
+    /// `"r"`+`"c"` then `"1"`+`"c"`. Two of those interleaving can commit a curve
+    /// that is neither the profile's nor firmware-auto — a corrupt state no
+    /// later tick reconciles, because the reset relinquishes the fan and the
+    /// engine then skips it. The last-moment relinquish re-check narrows that
+    /// race; only mutual exclusion removes it.
+    ///
+    /// Deliberately ONE lock rather than one per GPU: writes are 1 Hz and
+    /// coalesced, machines carry one or two GPUs, and serialising them costs
+    /// nothing measurable while a keyed map costs a lookup and more surface.
+    ///
+    /// `tokio::sync::Mutex`, not `parking_lot`: it is held across
+    /// `spawn_blocking`. Lock order — strictly OUTSIDE `inner`; the write path
+    /// takes `inner` briefly beneath it and no path holds `inner` across a GPU
+    /// write, so no inversion is possible.
+    gpu_write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl StateCache {
@@ -37,6 +59,7 @@ impl StateCache {
             inner: RwLock::new(DaemonState::default()),
             resume_detected: AtomicBool::new(false),
             profile_activation_epoch: AtomicU64::new(0),
+            gpu_write_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -226,11 +249,30 @@ impl StateCache {
     /// it, so a `POST /gpu/{id}/fan/reset` is durable under an active profile
     /// instead of being re-asserted on the next tick. Cleared on the next
     /// profile activation (DEC-165).
-    pub fn relinquish_gpu_fan(&self, fan_id: &str) {
+    /// Returns `true` if **this call** claimed the fan, `false` if it was
+    /// already relinquished (DEC-255).
+    ///
+    /// The caller must roll back only when it claimed: an unconditional rollback
+    /// lets a second, failing reset clear the flag a first, *successful* reset
+    /// owns — handing the fan back to the engine after the API told the user it
+    /// was reset. That needs no concurrency at all, just two clicks.
+    #[must_use]
+    pub fn relinquish_gpu_fan(&self, fan_id: &str) -> bool {
         self.inner
             .write()
             .relinquished_gpu_fans
-            .insert(fan_id.to_string());
+            .insert(fan_id.to_string())
+    }
+
+    /// Acquire exclusive access to the GPU fan write path (DEC-255).
+    ///
+    /// Returns an **owned** guard so it can be moved into the `spawn_blocking`
+    /// task that performs the writes. That matters for more than ergonomics: if
+    /// the HTTP client disconnects, the handler's future is dropped, and a
+    /// borrowed guard would be released while the blocking write was still in
+    /// flight — re-opening the very window this closes.
+    pub async fn lock_gpu_writes(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.gpu_write_lock.clone().lock_owned().await
     }
 
     /// Un-relinquish a single GPU fan — the rollback for a reset that claimed
@@ -523,6 +565,51 @@ mod tests {
             snap.thermal_override_state.as_deref(),
             Some("emergency"),
             "the same call must publish the thermal state"
+        );
+    }
+
+    #[tokio::test]
+    async fn gpu_write_lock_actually_excludes() {
+        // DEC-255: the property the whole GPU-race fix now rests on. A PMFW
+        // curve write is N point writes plus a commit and a reset is "r"+"c";
+        // if these are not mutually exclusive they can interleave into a curve
+        // that is neither the profile's nor firmware-auto, which no later tick
+        // reconciles.
+        let cache = Arc::new(StateCache::new());
+        let held = cache.lock_gpu_writes().await;
+
+        let contender = cache.clone();
+        let blocked = tokio::time::timeout(std::time::Duration::from_millis(50), async move {
+            contender.lock_gpu_writes().await
+        })
+        .await;
+        assert!(blocked.is_err(), "a second GPU writer must wait");
+
+        drop(held);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                cache.lock_gpu_writes(),
+            )
+            .await
+            .is_ok(),
+            "and must proceed once the first releases"
+        );
+    }
+
+    #[test]
+    fn relinquish_reports_whether_this_call_claimed() {
+        // DEC-255: the bool is what makes the rollback ownership-aware. Without
+        // it a second, failing reset clears the flag a first, successful reset
+        // owns — no concurrency required, just two clicks.
+        let cache = StateCache::new();
+        assert!(
+            cache.relinquish_gpu_fan("amd_gpu:0000:03:00.0"),
+            "first claim"
+        );
+        assert!(
+            !cache.relinquish_gpu_fan("amd_gpu:0000:03:00.0"),
+            "second call must report that it did NOT claim"
         );
     }
 

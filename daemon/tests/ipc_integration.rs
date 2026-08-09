@@ -29,6 +29,12 @@ fn test_app_state() -> Arc<AppState> {
     test_app_state_with_engine(true)
 }
 
+/// `test_app_state` with a real `runtime.toml` path, so the `POST /config/*`
+/// setters can be exercised end-to-end (DEC-255).
+fn test_app_state_with_runtime_config(runtime_cfg: std::path::PathBuf) -> Arc<AppState> {
+    test_app_state_inner(true, runtime_cfg)
+}
+
 /// `test_app_state`, with control over whether the profile engine has ticked.
 ///
 /// DEC-249 made engine liveness a subsystem, so `overall_status` now depends on
@@ -36,6 +42,10 @@ fn test_app_state() -> Arc<AppState> {
 /// never completed a tick (spawned but dead on arrival), which must not present
 /// as healthy however fresh the poll data is.
 fn test_app_state_with_engine(engine_ticked: bool) -> Arc<AppState> {
+    test_app_state_inner(engine_ticked, std::path::PathBuf::new())
+}
+
+fn test_app_state_inner(engine_ticked: bool, runtime_cfg: std::path::PathBuf) -> Arc<AppState> {
     let cache = Arc::new(StateCache::new());
 
     if engine_ticked {
@@ -91,7 +101,7 @@ fn test_app_state_with_engine(engine_ticked: bool) -> Arc<AppState> {
         nvidia_gpus: Vec::new(),
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
         config_path: String::new(),
-        runtime_config_path: std::path::PathBuf::new(),
+        runtime_config_path: runtime_cfg,
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
@@ -1369,7 +1379,6 @@ async fn gpu_reset_fan_unknown_gpu_returns_404() {
 /// Construct an `AppState` with one GPU that has no write path at all.
 fn test_app_state_with_unsupported_gpu(pci_bdf: &str) -> Arc<AppState> {
     use control_ofc_daemon::hwmon::gpu_detect::AmdGpuInfo;
-    use std::path::PathBuf;
 
     let cache = Arc::new(StateCache::new());
     let unsupported = AmdGpuInfo {
@@ -1378,7 +1387,7 @@ fn test_app_state_with_unsupported_gpu(pci_bdf: &str) -> Arc<AppState> {
         pci_revision: 0x00,
         pci_class: 0x030000,
         marketing_name: Some("Fake unsupported GPU".into()),
-        hwmon_path: PathBuf::from("/nonexistent/hwmon"),
+        hwmon_path: std::path::PathBuf::from("/nonexistent/hwmon"),
         fan_curve_path: None,
         fan_zero_rpm_path: None,
         is_discrete: true,
@@ -1447,7 +1456,6 @@ async fn gpu_reset_fan_unsupported_returns_400_feature_unavailable() {
 /// write hit ENOENT; the canonical answer is 400 feature_unavailable.
 fn test_app_state_with_read_only_gpu(pci_bdf: &str, pci_device_id: u16) -> Arc<AppState> {
     use control_ofc_daemon::hwmon::gpu_detect::AmdGpuInfo;
-    use std::path::PathBuf;
 
     let cache = Arc::new(StateCache::new());
     let read_only = AmdGpuInfo {
@@ -1456,7 +1464,7 @@ fn test_app_state_with_read_only_gpu(pci_bdf: &str, pci_device_id: u16) -> Arc<A
         pci_revision: 0xC0,
         pci_class: 0x030000,
         marketing_name: Some("RX 9070 XT".into()),
-        hwmon_path: PathBuf::from("/nonexistent/hwmon"),
+        hwmon_path: std::path::PathBuf::from("/nonexistent/hwmon"),
         fan_curve_path: None,
         fan_zero_rpm_path: None,
         is_discrete: true,
@@ -1498,8 +1506,22 @@ fn test_app_state_with_read_only_gpu(pci_bdf: &str, pci_device_id: u16) -> Arc<A
 /// Helper: AppState with a PMFW-capable GPU whose fan_curve lives at `curve_path`.
 /// Point it at a nonexistent path to make the reset fail (DEC-254).
 fn test_app_state_with_pmfw_gpu(pci_bdf: &str, curve_path: std::path::PathBuf) -> Arc<AppState> {
+    test_app_state_with_amd_gpu(
+        pci_bdf,
+        Some(curve_path),
+        std::path::PathBuf::from("/nonexistent/hwmon"),
+    )
+}
+
+/// AppState with an AMD GPU. `curve_path: None` + a real `hwmon_path` exercises
+/// the legacy-PWM reset arm, which had no coverage of any kind (DEC-255).
+fn test_app_state_with_amd_gpu(
+    pci_bdf: &str,
+    curve_path: Option<std::path::PathBuf>,
+    hwmon_path: std::path::PathBuf,
+) -> Arc<AppState> {
+    let is_legacy = curve_path.is_none();
     use control_ofc_daemon::hwmon::gpu_detect::AmdGpuInfo;
-    use std::path::PathBuf;
 
     let cache = Arc::new(StateCache::new());
     let gpu = AmdGpuInfo {
@@ -1508,13 +1530,14 @@ fn test_app_state_with_pmfw_gpu(pci_bdf: &str, curve_path: std::path::PathBuf) -
         pci_revision: 0xC0,
         pci_class: 0x030000,
         marketing_name: Some("RX 9070 XT".into()),
-        hwmon_path: PathBuf::from("/nonexistent/hwmon"),
-        fan_curve_path: Some(curve_path),
+        hwmon_path,
+        fan_curve_path: curve_path,
         fan_zero_rpm_path: None,
         is_discrete: true,
         has_fan_rpm: true,
-        has_pwm: true,         // pwm1 exists
-        has_pwm_enable: false, // but pwm1_enable does NOT — this is the bug shape
+        has_pwm: true, // pwm1 exists
+        // Legacy (pre-RDNA3) GPUs expose pwm1_enable; the PMFW shape does not.
+        has_pwm_enable: is_legacy,
         overdrive_enabled: true,
     };
     let readiness_rollup = Arc::new(parking_lot::Mutex::new(None));
@@ -1571,6 +1594,160 @@ async fn gpu_reset_that_fails_does_not_strand_the_fan() {
     assert!(
         !cache.is_gpu_fan_relinquished(&format!("amd_gpu:{bdf}")),
         "a reset that failed must hand the fan back to the engine"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn a_failed_reset_does_not_undo_an_earlier_successful_one() {
+    // DEC-255. THE sequential bug, no concurrency required. The claim was
+    // unconditional and the rollback was too, so a second reset that failed
+    // cleared the flag the first, *successful* reset owned — handing the fan
+    // back to the engine after the API told the user it was reset.
+    let bdf = "0000:03:00.0";
+    let dir = tempfile::tempdir().unwrap();
+    let curve = dir.path().join("fan_curve");
+    std::fs::write(&curve, "").unwrap();
+    let state = test_app_state_with_pmfw_gpu(bdf, curve);
+    let cache = state.cache.clone();
+    let (path, shutdown, _tmp) = start_test_server(state).await;
+    let fan_id = format!("amd_gpu:{bdf}");
+
+    let (status, _) = uds_post(
+        &path,
+        &format!("/gpu/{bdf}/fan/reset"),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, 200, "first reset succeeds");
+    assert!(
+        cache.is_gpu_fan_relinquished(&fan_id),
+        "success must stand the engine off"
+    );
+
+    // Make the very next reset fail, leaving the first one's claim in place.
+    // Only the curve's directory — `_tmp` holds the server socket.
+    dir.close().unwrap();
+    let (status, _) = uds_post(
+        &path,
+        &format!("/gpu/{bdf}/fan/reset"),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, 503, "second reset fails");
+    assert!(
+        cache.is_gpu_fan_relinquished(&fan_id),
+        "a failed reset must not undo a reset the API already confirmed"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn legacy_pwm_reset_arm_relinquishes_and_rolls_back() {
+    // DEC-255: the legacy (pre-RDNA3 `pwm1_enable`) arm had no test of any kind,
+    // success or failure, so its copy of the claim/rollback logic was unguarded.
+    let bdf = "0000:04:00.0";
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("pwm1_enable"), "1\n").unwrap();
+    let state = test_app_state_with_amd_gpu(bdf, None, dir.path().to_path_buf());
+    let cache = state.cache.clone();
+    let (path, shutdown, _tmp) = start_test_server(state).await;
+    let fan_id = format!("amd_gpu:{bdf}");
+
+    let (status, _) = uds_post(
+        &path,
+        &format!("/gpu/{bdf}/fan/reset"),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("pwm1_enable")).unwrap(),
+        "2\n",
+        "legacy reset writes pwm1_enable=2"
+    );
+    assert!(cache.is_gpu_fan_relinquished(&fan_id));
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn a_failed_legacy_reset_hands_the_fan_back() {
+    let bdf = "0000:04:00.0";
+    let state =
+        test_app_state_with_amd_gpu(bdf, None, std::path::PathBuf::from("/nonexistent/dir"));
+    let cache = state.cache.clone();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, _) = uds_post(
+        &path,
+        &format!("/gpu/{bdf}/fan/reset"),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, 503);
+    assert!(!cache.is_gpu_fan_relinquished(&format!("amd_gpu:{bdf}")));
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn a_config_setter_quarantines_an_unreadable_file_and_still_applies() {
+    // DEC-255, end-to-end through HTTP. The review found that NOTHING exercised
+    // this wiring: a handler could be reverted to the old load_from (which
+    // silently replaces every other setting with a default) and the whole suite
+    // stayed green. This test fails if any setter stops going through
+    // `runtime_for_update`.
+    let dir = tempfile::tempdir().unwrap();
+    let rc = dir.path().join("runtime.toml");
+    let original = "[polling]\npoll_interval_ms = 900\n[garbage\n";
+    std::fs::write(&rc, original).unwrap();
+
+    let state = test_app_state_with_runtime_config(rc.clone());
+    let (path, shutdown, _tmp) = start_test_server(state).await;
+
+    let (status, _json) = uds_post(
+        &path,
+        "/config/poll-interval",
+        &serde_json::json!({"poll_interval_ms": 750}),
+    )
+    .await;
+
+    assert_eq!(
+        status, 200,
+        "an unparseable file must not dead-end the setter"
+    );
+    assert!(
+        std::fs::read_to_string(&rc)
+            .unwrap()
+            .contains("poll_interval_ms = 750"),
+        "the new value is written"
+    );
+
+    let quarantined: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("runtime.toml.invalid-")
+        })
+        .collect();
+    assert_eq!(
+        quarantined.len(),
+        1,
+        "the old file is preserved, not destroyed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(quarantined[0].path()).unwrap(),
+        original,
+        "byte for byte"
     );
 
     let _ = shutdown.send(());
@@ -2951,7 +3128,7 @@ async fn activate_profile_clears_standing_overrides_and_gpu_relinquish() {
     )
     .await;
     assert_eq!(st, 200, "override take: {j}");
-    state.cache.relinquish_gpu_fan("amd_gpu:0000:03:00.0");
+    let _ = state.cache.relinquish_gpu_fan("amd_gpu:0000:03:00.0");
 
     // Sanity: /status surfaces the live override and the fan is relinquished.
     let (_st, status) = uds_get(&sock, "/status").await;

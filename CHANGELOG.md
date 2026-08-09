@@ -3,6 +3,34 @@
 ## [Unreleased]
 
 ### Fixed
+- **Resetting a GPU fan to automatic is now mutually exclusive with the engine's
+  own writes, and cannot be undone by a later failure.** Review of the first
+  attempt found three ways it still broke. A PMFW curve write is N point writes
+  plus a commit and a reset is `"r"`+`"c"`, so with no lock between them they
+  could interleave into a curve that is neither the profile's nor firmware-auto —
+  a state nothing reconciles. A second reset that *failed* cleared the
+  stand-off flag a first, **successful** reset owned, handing the fan back to the
+  engine after the API had confirmed the reset — no concurrency needed, just two
+  clicks. And because the flag was claimed in the handler rather than in the
+  write task, a client disconnect (the GUI allows 5 s) dropped the request
+  between claim and rollback, stranding the fan: relinquished, never reset, and
+  skipped by the engine for the rest of the process's life. GPU writes now take a
+  shared lock, the claim and its rollback both happen inside the uncancellable
+  write task, and a rollback only undoes what that call actually claimed.
+  DEC-255.
+- **A configuration file that cannot be parsed is moved aside, not overwritten
+  and not a dead end.** The previous release refused the write, which protected
+  the file but left every `POST /config/*` returning 503 permanently — and the
+  realistic trigger is not corruption but a **daemon downgrade**, since each
+  config section rejects unknown keys. Settings were then simultaneously not
+  applied and not settable, with no documented way out. The file is now renamed
+  to `runtime.toml.invalid-<timestamp>` and the daemon carries on: the user's
+  bytes survive verbatim, and the next setter works. DEC-255.
+- **The serial reconnect path verifies identity too.** Auto-detection probes a
+  port on its own file descriptor and then closes it; reconnect re-opened the
+  path and adopted that second descriptor without re-checking. "Openability is
+  not identity" (DEC-250) applies most on the path that runs continuously.
+  DEC-255.
 - **Resetting a GPU fan to automatic can no longer be undone by the engine's own
   in-flight write.** `POST /gpu/{id}/fan/reset` set its "engine, stand off" flag
   *after* writing firmware-auto, while the engine checks that flag on the async
@@ -68,7 +96,11 @@
   still loads, as before. DEC-249.
 
 ### Changed
-- **Profile and configuration writes no longer run on the async worker threads.**
+- **Profile and configuration writes no longer run on the async worker threads** —
+  now genuinely all of them. The first pass converted only five of the eight
+  `POST /config/*` setters; profile-search-dirs, startup-delay and the two
+  preferred-sensor endpoints still fsynced inline, so the stated invariant was
+  not actually established. DEC-252/255.
   `write_atomic` does write + fsync + rename + a directory fsync, which was
   unbounded wall-clock time on the same runtime the 1 Hz profile engine — and so
   the 105 °C decision — is scheduled on. Moved to `spawn_blocking`, matching what
