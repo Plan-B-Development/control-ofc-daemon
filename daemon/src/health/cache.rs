@@ -303,6 +303,24 @@ impl StateCache {
         self.gpu_write_lock.clone().lock_owned().await
     }
 
+    /// Acquire the GPU write lock, or give up after `within`.
+    ///
+    /// `fan/reset` uses this rather than an unbounded wait. Both of the other
+    /// producers hold the lock for very different spans: an engine tick holds
+    /// it for a few milliseconds, so a reset should simply wait that out, but a
+    /// `fan/verify` holds it for its whole multi-second window, and blocking
+    /// there would strand the caller past the GUI's 5 s timeout with no
+    /// explanation. A bounded wait distinguishes the two — wait out a tick,
+    /// report a conflict for a verify.
+    pub async fn lock_gpu_writes_soon(
+        &self,
+        within: std::time::Duration,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        tokio::time::timeout(within, self.gpu_write_lock.clone().lock_owned())
+            .await
+            .ok()
+    }
+
     /// Un-relinquish a single GPU fan — the rollback for a reset that claimed
     /// the flag up-front and then failed (DEC-254).
     ///
@@ -468,6 +486,48 @@ impl StateCache {
 
 #[cfg(test)]
 mod tests {
+    // ── DEC-255 / release review 2026-08-10: bounded GPU-write acquisition ──
+
+    #[tokio::test]
+    async fn a_free_gpu_write_lock_is_acquired_immediately() {
+        let cache = StateCache::new();
+        let got = cache
+            .lock_gpu_writes_soon(std::time::Duration::from_millis(200))
+            .await;
+        assert!(got.is_some(), "an uncontended lock must be granted");
+    }
+
+    #[tokio::test]
+    async fn a_held_gpu_write_lock_times_out_rather_than_blocking() {
+        // This is what lets `fan/reset` tell an engine tick (milliseconds) apart
+        // from a `fan/verify` (multiple seconds) and report a conflict instead
+        // of hanging past the GUI's 5 s client timeout.
+        let cache = StateCache::new();
+        let _held = cache.lock_gpu_writes().await;
+
+        let got = cache
+            .lock_gpu_writes_soon(std::time::Duration::from_millis(50))
+            .await;
+        assert!(
+            got.is_none(),
+            "a held lock must time out, not block forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_lock_is_grantable_again_once_released() {
+        let cache = StateCache::new();
+        let held = cache.lock_gpu_writes().await;
+        drop(held);
+        assert!(
+            cache
+                .lock_gpu_writes_soon(std::time::Duration::from_millis(200))
+                .await
+                .is_some(),
+            "releasing must actually free the lock"
+        );
+    }
+
     use super::*;
     use crate::hwmon::types::SensorKind;
 

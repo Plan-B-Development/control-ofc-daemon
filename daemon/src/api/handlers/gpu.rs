@@ -37,7 +37,21 @@ pub async fn gpu_reset_fan_handler(
         // the client disconnects (the GUI gives this 5 s), the handler future is
         // dropped, and a borrowed guard would be released while the write was
         // still in flight.
-        let write_guard = state.cache.lock_gpu_writes().await;
+        let Some(write_guard) = state
+            .cache
+            .lock_gpu_writes_soon(constants::GPU_RESET_LOCK_WAIT)
+            .await
+        else {
+            // Held for longer than an engine tick ever holds it, so the holder
+            // is a `fan/verify` running its multi-second window. Say so rather
+            // than blocking past the GUI's 5 s timeout.
+            return error_response(
+                StatusCode::CONFLICT,
+                &ErrorEnvelope::validation(
+                    "a GPU fan verify is in progress — retry once it completes",
+                ),
+            );
+        };
         let cache = state.cache.clone();
         let task_fan_id = fan_id.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -100,7 +114,21 @@ pub async fn gpu_reset_fan_handler(
         let fan_id = format!("amd_gpu:{gpu_id}");
 
         // DEC-255: same shape as the PMFW arm above — see its comments.
-        let write_guard = state.cache.lock_gpu_writes().await;
+        let Some(write_guard) = state
+            .cache
+            .lock_gpu_writes_soon(constants::GPU_RESET_LOCK_WAIT)
+            .await
+        else {
+            // Held for longer than an engine tick ever holds it, so the holder
+            // is a `fan/verify` running its multi-second window. Say so rather
+            // than blocking past the GUI's 5 s timeout.
+            return error_response(
+                StatusCode::CONFLICT,
+                &ErrorEnvelope::validation(
+                    "a GPU fan verify is in progress — retry once it completes",
+                ),
+            );
+        };
         let cache = state.cache.clone();
         let task_fan_id = fan_id.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -195,6 +223,20 @@ pub async fn gpu_verify_handler(
             &ErrorEnvelope::validation("a hardware verify or calibration is already in progress"),
         );
     };
+
+    // Release review, 2026-08-10. The verify pause above coordinates against the
+    // ENGINE, and DEC-255's write lock coordinates the engine against
+    // `fan/reset` — but nothing coordinated verify against reset, and verify is
+    // the third multi-write PMFW producer. Take the write lock too, so a reset
+    // arriving mid-verify cannot interleave its curve commit with the test
+    // speed or the restore.
+    //
+    // Held for the whole verify window, not per-commit: this handler sleeps
+    // between writing the test speed and reading back, and a lock dropped
+    // across that sleep would reopen the exact gap. `reset` waits only
+    // briefly for it (see `lock_gpu_writes_soon`) and reports a clear conflict
+    // rather than hanging past the GUI's 5 s timeout.
+    let _gpu_write_guard = state.cache.lock_gpu_writes().await;
 
     let fan_id = format!("amd_gpu:{gpu_id}");
     let prior_pct = state

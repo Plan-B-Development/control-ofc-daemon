@@ -106,6 +106,24 @@ impl FanController {
             self.last_write_generation = generation;
             for ch in &mut self.channels {
                 ch.last_commanded_pct = None;
+                // The stop clock MUST be reset with it. `apply_safety`'s own
+                // doc note says the expired-timer branch is unreachable because
+                // "any non-zero write clears the timer; a repeat 0% coalesces"
+                // — and this loop is exactly the tracking-state write outside
+                // `set_pwm` that note guards against. Clearing only
+                // `last_commanded_pct` disables the coalesce while leaving a
+                // stale `stop_started_at` behind, so a channel legitimately
+                // parked at 0% fails the 8 s stop timeout on its next tick,
+                // every tick, forever: the write never lands, so neither field
+                // is ever updated to break the cycle. The fan is then stranded
+                // at whatever duty the re-enumerated device powered on with —
+                // the precise failure DEC-256 exists to prevent — while the
+                // daemon reports 0% and raises a link alert on healthy hardware.
+                //
+                // Resetting it is also the honest semantics: the device just
+                // re-enumerated, so "how long has THIS device been stopped" is
+                // unknown, and the safe answer is to start the clock again.
+                ch.stop_started_at = None;
             }
         }
 
@@ -362,6 +380,49 @@ mod tests {
         let result = ctrl.set_pwm(0, 50).unwrap();
         assert_eq!(result.pwm_percent, 50);
         assert!(ctrl.channels[0].stop_started_at.is_none());
+    }
+
+    #[test]
+    fn invalidation_resets_the_stop_clock_so_a_parked_channel_still_writes() {
+        // Release review, 2026-08-10. DEC-256's write-generation invalidation
+        // cleared `last_commanded_pct` but not `stop_started_at`, which is the
+        // one combination `apply_safety`'s defence-in-depth branch rejects.
+        //
+        // Sequence: a channel is legitimately parked at 0% (a curve's stop-snap
+        // or a DEC-166 identify-stop). Repeats coalesce, so the stop timer ages
+        // past 8 s harmlessly. Then the device re-enumerates or the machine
+        // resumes and the generation bumps. Pre-fix, the next 0% write lost its
+        // coalesce, hit the expired timer, and returned Validation — and since
+        // the write never landed, neither field changed, so it failed again
+        // every tick forever while the fan sat at the device's power-on duty.
+        let (transport, written) = MockTransport::with_ok_responses(4);
+        let mut ctrl = make_controller(transport);
+
+        ctrl.set_pwm(0, 0).unwrap();
+        ctrl.channels[0].stop_started_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(9));
+        let before = written.lock().len();
+
+        // The device re-enumerated: invalidate, as polling.rs does on reconnect.
+        ctrl.cache.invalidate_openfan_writes();
+
+        let result = ctrl
+            .set_pwm(0, 0)
+            .expect("a parked channel must still be writable after invalidation");
+        assert!(
+            !result.coalesced,
+            "invalidation must force this write onto the wire — that is its whole purpose"
+        );
+        assert_eq!(
+            written.lock().len(),
+            before + 1,
+            "the post-reconnect write DEC-256 exists to force must actually reach the device"
+        );
+
+        // And the cycle must not re-arm: the next tick coalesces normally
+        // instead of erroring, which is what proves the clock really restarted.
+        let repeat = ctrl.set_pwm(0, 0).unwrap();
+        assert!(repeat.coalesced);
     }
 
     #[test]

@@ -79,6 +79,16 @@ pub const VERIFY_WAIT_SECONDS: u8 = 6;
 /// trips a legitimate verify; it merely bounds a leaked pause.
 pub const VERIFY_PAUSE_DEADMAN: Duration = Duration::from_secs(30);
 
+/// How long `POST /gpu/{id}/fan/reset` waits for the GPU write lock (DEC-255)
+/// before reporting a conflict.
+///
+/// Sized to sit well above an engine tick's hold (milliseconds) and well below
+/// a `fan/verify` window (multiple seconds), so the two callers it can collide
+/// with are distinguishable: wait out a tick, report a conflict for a verify.
+/// Also below the GUI's own 5 s client timeout, so the user gets the explanatory
+/// 409 rather than an opaque request timeout.
+pub const GPU_RESET_LOCK_WAIT: Duration = Duration::from_millis(750);
+
 // ── Profile engine ───────────────────────────────────────────────────
 
 /// Temperature deadband (°C) that the profile engine holds the previous
