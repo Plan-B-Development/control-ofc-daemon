@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.17.0] — 2026-08-10
+
 ### Changed
 - **The cross-stack role-classification oracle now pins the classifier that
   actually decides the floor.** It checked `member_is_pump_or_cpu`, while the
@@ -11,6 +13,27 @@
   a PCI-BDF id whose colons break naive label parsing. DEC-257.
 
 ### Fixed
+- **A fan parked at 0% is no longer stranded by a reconnect.** The new
+  write-generation invalidation cleared each channel's last-commanded value but
+  not its stop clock — the one combination the 8 s stop-timeout rejects, and one
+  the timeout's own note calls unreachable because "any non-zero write clears the
+  timer; a repeat 0% coalesces". That loop is exactly the tracking-state write
+  outside `set_pwm` the note guards against. A channel legitimately held at 0%
+  therefore lost its coalesce on the first tick after a resume or reconnect, hit
+  the expired timer, and failed — and since the write never landed, nothing
+  changed, so it failed again every second forever. The fan sat at whatever duty
+  the re-enumerated device powered on with, which is the precise failure the
+  invalidation exists to prevent, while the daemon reported 0% and raised a link
+  alert on healthy hardware. The stop clock is now reset with it.
+- **`POST /gpu/{id}/fan/verify` now takes the GPU write lock.** The engine and
+  `fan/reset` were serialised against each other, but verify — which writes a
+  test curve and restores it, both multi-write PMFW commits — was not, so a reset
+  arriving mid-verify could interleave. Verify holds the lock for its whole
+  window rather than per-commit, because it sleeps between writing and reading
+  back. `fan/reset` therefore now waits *boundedly* for the lock and returns a
+  clear `409` instead of blocking past the GUI's 5 s timeout; the bound is what
+  distinguishes the two callers it can collide with — wait out an engine tick,
+  report a conflict for a verify.
 - **The engine no longer reports itself dead while it is saving your hardware.**
   Liveness was a single timestamp taken at the start of each tick, so a *slow*
   tick and a *stopped* engine looked identical — and the daemon reported the
