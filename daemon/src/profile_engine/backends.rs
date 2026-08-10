@@ -1734,6 +1734,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gpu_backend_actually_takes_the_write_lock() {
+        // DEC-260. DEC-255's headline fix is that `apply` acquires the shared GPU
+        // write lock so a concurrent `POST /gpu/{id}/fan/reset` cannot interleave
+        // its own multi-write commit with the engine's. That acquisition had NO
+        // test at its call site: the pre-release review deleted the
+        // `lock_gpu_writes()` line from `apply` and all 1043 tests stayed green,
+        // because the only lock test exercised the primitive directly.
+        //
+        // This asserts the engine genuinely waits: hold the lock as a reset would,
+        // and no curve byte may reach sysfs until it is released.
+        let dir = tempfile::tempdir().unwrap();
+        let (gpu, curve_path) = fake_gpu(&dir);
+        let cache = Arc::new(StateCache::new());
+        let mut be = GpuBackend::new(cache.clone(), Arc::new(vec![gpu]));
+
+        let held = cache.lock_gpu_writes().await;
+
+        let cmds = vec![cmd("amd_gpu:0000:03:00.0", "amd_gpu", 70)];
+        let writer = tokio::spawn(async move {
+            be.apply(&cmds).await;
+            be
+        });
+
+        // Give the engine every chance to write if it is not actually blocked.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            std::fs::read_to_string(&curve_path).unwrap().is_empty(),
+            "the engine wrote a GPU curve while the write lock was held — the \
+             reset/engine race DEC-255 closed is open again"
+        );
+
+        drop(held);
+        let _be = tokio::time::timeout(std::time::Duration::from_secs(5), writer)
+            .await
+            .expect("engine write must proceed once the lock is released")
+            .expect("apply task must not panic");
+        assert!(
+            !std::fs::read_to_string(&curve_path).unwrap().is_empty(),
+            "the write must land once the lock is free"
+        );
+    }
+
+    #[tokio::test]
     async fn gpu_backend_skips_writes_while_engine_paused() {
         // P2-1: GPU fans have no lease (DEC-045), so the per-fan verify_active
         // recheck is the ONLY guard against the engine overwriting a GPU verify's

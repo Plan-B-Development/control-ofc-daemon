@@ -508,6 +508,44 @@ fn read_nvml_states(backend: &dyn NvmlBackend) -> (Vec<SensorReading>, Vec<AmdGp
 /// Sends `ReadAllRpm` every `interval` and pushes fan state into the cache.
 /// After 5 consecutive errors, enters reconnect mode: attempts `auto_detect_port`
 /// with exponential backoff (1s..30s) until the device reappears.
+/// Verify and adopt a re-opened OpenFan transport, or refuse it (DEC-260).
+///
+/// Extracted from `openfan_poll_loop` for the same reason `first_openfan_port`
+/// was extracted from `main`: the reconnect arm's two safety steps were
+/// reachable only behind five consecutive failures *and* a backoff cycle, so
+/// the pre-release review could delete either one with the whole suite green.
+/// They are:
+///
+/// 1. **Identity** (DEC-250/255) — detection probes on its own fd and then
+///    closes it, so the transport actually adopted has never been verified.
+///    "Openability is not identity" applies hardest here, because this is the
+///    path that runs continuously at runtime, where a device swap between
+///    probe and open is the entire risk.
+/// 2. **Invalidation** (DEC-256) — the device just re-enumerated, so
+///    `FanController`'s per-channel coalescing cache describes a state that may
+///    no longer exist. Invalidate *before* the transport goes live, or the next
+///    identical command is coalesced into silence.
+///
+/// They belong together: invalidating only after a *verified* adoption is what
+/// keeps an impostor from resetting the real device's write cache.
+fn adopt_reconnected_transport<T: SerialTransport + Send + 'static>(
+    cache: &StateCache,
+    timeout: Duration,
+    open: impl FnOnce() -> Option<(String, T)>,
+) -> Option<Box<dyn SerialTransport + Send>> {
+    let (path, mut rt) = open()?;
+    crate::serial::transport::verify_openfan_identity(&mut rt, timeout)
+        .map_err(|e| {
+            log::warn!(
+                "Reconnect: {path} opened but did not identify as an \
+                 OpenFanController ({e}) — not adopting it"
+            );
+        })
+        .ok()?;
+    cache.invalidate_openfan_writes();
+    Some(Box::new(rt))
+}
+
 pub async fn openfan_poll_loop(
     cache: Arc<StateCache>,
     transport: Arc<parking_lot::Mutex<Box<dyn SerialTransport + Send>>>,
@@ -541,37 +579,19 @@ pub async fn openfan_poll_loop(
             }
 
             let t = timeout;
+            let c = cache.clone();
             let reconnect_result = tokio::task::spawn_blocking(move || {
-                crate::serial::real_transport::auto_detect_port(t).and_then(|path| {
-                    // DEC-250/255: detection probes identity on its OWN fd and
-                    // then closes it; this is a second open of the same path, so
-                    // the transport actually adopted has never been verified.
-                    // "Openability is not identity" applies here too — and this
-                    // is the path that runs continuously at runtime, where a
-                    // device swap between probe and open is the whole risk.
-                    let mut rt =
+                adopt_reconnected_transport(&c, t, || {
+                    let path = crate::serial::real_transport::auto_detect_port(t)?;
+                    let rt =
                         crate::serial::real_transport::RealSerialTransport::open(&path, t).ok()?;
-                    crate::serial::transport::verify_openfan_identity(&mut rt, t)
-                        .map_err(|e| {
-                            log::warn!(
-                                "Reconnect: {path} opened but did not identify as an \
-                                 OpenFanController ({e}) — not adopting it"
-                            );
-                        })
-                        .ok()?;
-                    Some(Box::new(rt) as Box<dyn SerialTransport + Send>)
+                    Some((path, rt))
                 })
             })
             .await;
 
             match reconnect_result {
                 Ok(Some(new_transport)) => {
-                    // DEC-256: the device just re-enumerated, so FanController's
-                    // per-channel coalescing cache describes a device that may no
-                    // longer exist in that state. Invalidate before the new
-                    // transport goes live, or the next identical command is
-                    // coalesced into silence.
-                    cache.invalidate_openfan_writes();
                     let mut guard = transport.lock();
                     *guard = new_transport;
                     consecutive_errors = 0;
@@ -648,6 +668,97 @@ pub async fn openfan_poll_loop(
 mod tests {
     use super::*;
     use std::fs;
+
+    // ── DEC-260: reconnect adoption (identity + cache invalidation) ──
+
+    /// Replays canned lines, so a "device" can be made to answer the identity
+    /// probe like an OpenFanController — or like anything else.
+    struct ReplayTransport(std::collections::VecDeque<String>);
+
+    impl SerialTransport for ReplayTransport {
+        fn write_line(&mut self, _data: &str) -> Result<(), crate::error::SerialError> {
+            Ok(())
+        }
+
+        fn read_line(&mut self, _timeout: Duration) -> Result<String, crate::error::SerialError> {
+            self.0
+                .pop_front()
+                .ok_or(crate::error::SerialError::Timeout { timeout_ms: 50 })
+        }
+    }
+
+    fn openfan_replies() -> ReplayTransport {
+        ReplayTransport(
+            vec![concat!(
+                "<00|00:04B0;01:044C;02:0000;03:0000;04:0000;",
+                "05:0000;06:0000;07:0000;08:0000;09:0000;>\r\n"
+            )
+            .to_string()]
+            .into(),
+        )
+    }
+
+    #[test]
+    fn a_reconnected_openfan_is_adopted_and_invalidates_the_write_cache() {
+        let cache = StateCache::new();
+        let before = cache.openfan_write_generation();
+
+        let adopted = adopt_reconnected_transport(&cache, Duration::from_millis(50), || {
+            Some(("/dev/ttyACM0".to_string(), openfan_replies()))
+        });
+
+        assert!(
+            adopted.is_some(),
+            "a device that identifies must be adopted"
+        );
+        assert_ne!(
+            cache.openfan_write_generation(),
+            before,
+            "DEC-256: the re-enumerated device's stale per-channel coalescing cache \
+             must be invalidated, or the next identical command is coalesced into silence"
+        );
+    }
+
+    #[test]
+    fn a_reconnected_impostor_is_refused_and_leaves_the_write_cache_alone() {
+        // DEC-250/255. The port opens but answers with something that is not an
+        // OpenFanController frame — a device swap between probe and open. It must
+        // not be adopted, and it must not get to reset the real device's cache.
+        let cache = StateCache::new();
+        let before = cache.openfan_write_generation();
+
+        let adopted = adopt_reconnected_transport(&cache, Duration::from_millis(50), || {
+            Some((
+                "/dev/ttyACM0".to_string(),
+                ReplayTransport(vec!["I am a 3D printer\r\n".to_string()].into()),
+            ))
+        });
+
+        assert!(
+            adopted.is_none(),
+            "openability is not identity — an unverified device must not be adopted"
+        );
+        assert_eq!(
+            cache.openfan_write_generation(),
+            before,
+            "a refused impostor must not invalidate the real device's write cache"
+        );
+    }
+
+    #[test]
+    fn a_port_that_will_not_open_is_not_an_adoption() {
+        let cache = StateCache::new();
+        let before = cache.openfan_write_generation();
+
+        let adopted = adopt_reconnected_transport::<ReplayTransport>(
+            &cache,
+            Duration::from_millis(50),
+            || None,
+        );
+
+        assert!(adopted.is_none());
+        assert_eq!(cache.openfan_write_generation(), before);
+    }
 
     // ── DEC-133: sensor descriptor cache ─────────────────────────────
 
