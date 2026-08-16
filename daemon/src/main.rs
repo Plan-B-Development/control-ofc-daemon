@@ -12,9 +12,43 @@ struct PanicRestoreTargets {
 
 static PANIC_RESTORE: OnceLock<PanicRestoreTargets> = OnceLock::new();
 
+/// The thread `install_panic_hook` ran on — i.e. the one whose death ends the
+/// process. Used to tell a fatal panic from a contained one (DEC-265).
+static MAIN_THREAD: OnceLock<std::thread::ThreadId> = OnceLock::new();
+
 fn install_panic_hook() {
+    // Called as the first statement of `main`, so this IS the main thread.
+    let _ = MAIN_THREAD.set(std::thread::current().id());
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // DEC-265: only a panic that actually takes the daemon down restores
+        // fans to firmware control.
+        //
+        // The hook fires for EVERY panic on EVERY thread, and tokio catches a
+        // panicking task and hands the caller a `JoinError` — the daemon keeps
+        // running. So one contained panic in a blocking write task used to reset
+        // every GPU curve and every hwmon `pwm*_enable` to automatic underneath a
+        // profile engine that was still alive and would re-assert its curve on
+        // the next tick. Fans lurched to firmware defaults and back for no
+        // reason, while the message claimed the process was aborting.
+        //
+        // A panic on the main thread ends the process; one on a tokio worker or
+        // blocking thread does not. That is the distinction, and it is drawn on
+        // thread identity rather than the thread's *name*, which tokio is free to
+        // change. The trade is accepted and deliberate: a contained panic now
+        // leaves the fans under daemon control, which the engine-liveness
+        // heartbeat (DEC-249/259) is what surfaces.
+        let fatal = MAIN_THREAD
+            .get()
+            .is_none_or(|main| std::thread::current().id() == *main);
+        if !fatal {
+            eprintln!(
+                "PANIC on a non-main thread: contained by the runtime, so fans are \
+                 left under daemon control and NOT reset to automatic"
+            );
+            default_hook(info);
+            return;
+        }
         if let Some(targets) = PANIC_RESTORE.get() {
             eprintln!("PANIC: restoring fans to automatic mode before aborting");
             for (curve_path, zero_rpm_path) in &targets.gpu_curves {
@@ -302,83 +336,6 @@ fn apply_runtime_overlay(config: &mut DaemonConfig, runtime: &RuntimeConfig, adm
              while runtime.toml exists. See docs/ADRs/002-runtime-config-split.md."
         );
     }
-}
-
-/// Decide which serial port paths to try, in order, for one connect attempt.
-///
-/// [SAFETY] The configured port is tried FIRST but is never the only candidate:
-/// auto-detection is always appended as a fallback. This used to be
-/// `configured.or_else(auto_detect)`, so a configured port suppressed detection
-/// outright. Since `serial.port` became settable over the 0666 socket
-/// (DEC-243), any local user could persist a well-formed but dead path and, from
-/// the next restart, leave `fan_controller` as `None` — which does not merely
-/// disable fan control, because the profile engine's thermal-emergency
-/// `force_all` is guarded by `if let Some(be) = openfan_be`. The 105 C rule
-/// would lose its only path to every OpenFan-attached fan, with no failsafe.
-///
-/// Pure so the rule is unit-testable without a serial device: `detect` is
-/// injected, and a detected path equal to the configured one is not retried.
-fn serial_port_candidates(
-    configured: Option<&str>,
-    detect: impl FnOnce() -> Option<String>,
-) -> Vec<String> {
-    let mut candidates: Vec<String> = Vec::new();
-    if let Some(c) = configured {
-        candidates.push(c.to_string());
-    }
-    if let Some(detected) = detect() {
-        if !candidates.contains(&detected) {
-            candidates.push(detected);
-        }
-    }
-    candidates
-}
-
-/// Connect to the first candidate that opens **and** identifies as an
-/// OpenFanController.
-///
-/// [SAFETY] The other half of `serial_port_candidates` (DEC-250). That function
-/// guarantees auto-detection still *runs* when a port is configured; this one
-/// guarantees its result is still *reachable*. Acceptance used to be "the port
-/// opened", and `RealSerialTransport::open` succeeds on any readable tty — so a
-/// configured-but-wrong `/dev/ttyACM*` was adopted as the fan controller and the
-/// loop stopped there, discarding the correctly detected port that was sitting
-/// next in the candidate list. Because writes to an indifferent device return
-/// `Ok`, nothing surfaced: no failure was logged, `/status` showed OpenFan
-/// healthy, and the 105°C emergency's `force_all` reported success while driving
-/// nothing. `serial.port` is settable by any local user over the 0666 socket
-/// (DEC-243) and persists in `runtime.toml`, so this was durable across reboots.
-///
-/// A candidate that opens but fails the handshake is skipped, not fatal: the
-/// next candidate — in practice the auto-detected one — is tried.
-///
-/// Pure over the injected `open` so the accept/reject rule is unit-testable
-/// without a serial device, matching `serial_port_candidates`. The verification
-/// deliberately lives *inside* this function rather than in the closure: it is
-/// the property under test, and a caller cannot accidentally skip it.
-fn first_openfan_port<T: control_ofc_daemon::serial::transport::SerialTransport>(
-    candidates: &[String],
-    timeout: Duration,
-    mut open: impl FnMut(&str) -> Result<T, control_ofc_daemon::error::SerialError>,
-) -> Option<(String, T)> {
-    for port in candidates {
-        match open(port) {
-            Ok(mut transport) => {
-                match control_ofc_daemon::serial::transport::verify_openfan_identity(
-                    &mut transport,
-                    timeout,
-                ) {
-                    Ok(()) => return Some((port.clone(), transport)),
-                    Err(e) => log::warn!(
-                        "{port} opened but did not identify as an OpenFanController ({e}) \
-                         — not using it"
-                    ),
-                }
-            }
-            Err(e) => log::warn!("Failed to open OpenFanController on {port}: {e}"),
-        }
-    }
-    None
 }
 
 /// Reload the daemon config and runtime overlay, updating the shared
@@ -715,10 +672,13 @@ async fn main() {
         // ordering rule lives in `serial_port_candidates` so it is unit-testable
         // without a serial device — see its doc comment for why a configured
         // port must never be the only candidate.
-        let candidates = serial_port_candidates(config.serial.port.as_deref(), || {
-            log::info!("Auto-detecting OpenFanController serial port...");
-            auto_detect_port(serial_timeout)
-        });
+        let candidates = control_ofc_daemon::serial::adoption::serial_port_candidates(
+            config.serial.port.as_deref(),
+            || {
+                log::info!("Auto-detecting OpenFanController serial port...");
+                auto_detect_port(serial_timeout)
+            },
+        );
 
         if candidates.is_empty() && attempt == 0 {
             log::info!("No serial port configured and none detected");
@@ -726,10 +686,14 @@ async fn main() {
 
         // [SAFETY] Accept only a candidate that also *identifies* as an
         // OpenFanController — see `first_openfan_port`.
-        if let Some((port, transport)) = first_openfan_port(&candidates, serial_timeout, |p| {
-            log::info!("Opening OpenFanController on {p}");
-            RealSerialTransport::open(p, serial_timeout)
-        }) {
+        if let Some((port, transport)) = control_ofc_daemon::serial::adoption::first_openfan_port(
+            &candidates,
+            serial_timeout,
+            |p| {
+                log::info!("Opening OpenFanController on {p}");
+                RealSerialTransport::open(p, serial_timeout)
+            },
+        ) {
             log::info!("OpenFanController connected on {port}");
             let boxed: Box<dyn control_ofc_daemon::serial::transport::SerialTransport + Send> =
                 Box::new(transport);
@@ -875,16 +839,26 @@ async fn main() {
     // AssessmentCache — the cache's store() writes both in lockstep so the poll
     // path stays a cheap clone and the two never drift.
     let readiness_rollup = Arc::new(parking_lot::Mutex::new(None));
+    // DEC-265: created here rather than just before the poll loops, because
+    // AppState carries a receiver so a loop started later by
+    // `POST /fans/openfan/rescan` shuts down with the ones started at boot.
+    let (poll_shutdown_tx, poll_shutdown_rx) = tokio::sync::watch::channel(false);
     let app_state = Arc::new(AppState {
         cache: cache.clone(),
         staleness_config,
         daemon_version: VERSION.to_string(),
-        fan_controller,
+        fan_controller: Arc::new(parking_lot::RwLock::new(fan_controller)),
+        openfan_runtime: control_ofc_daemon::api::handlers::OpenFanRuntime {
+            timeout: serial_timeout,
+            interval: Duration::from_millis(config.polling.poll_interval_ms),
+            shutdown: poll_shutdown_rx.clone(),
+        },
         hwmon_controller,
         start_time: Instant::now(),
         history: history.clone(),
         active_profile: active_profile.clone(),
         calibrating: std::sync::atomic::AtomicBool::new(false),
+        openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         amd_gpus,
         intel_gpus,
         nvidia_gpus,
@@ -939,7 +913,6 @@ async fn main() {
     }
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let (poll_shutdown_tx, poll_shutdown_rx) = tokio::sync::watch::channel(false);
 
     // ── Spawn hwmon sensor + fan polling loop ──────────────────────
     let hwmon_cache = cache.clone();
@@ -1315,19 +1288,27 @@ mod tests {
     #[test]
     fn configured_port_is_tried_first_but_detection_still_follows() {
         // The whole point: a configured port must not be the ONLY candidate.
-        let c = serial_port_candidates(Some("/dev/ttyACM9"), || Some("/dev/ttyACM0".into()));
+        let c = control_ofc_daemon::serial::adoption::serial_port_candidates(
+            Some("/dev/ttyACM9"),
+            || Some("/dev/ttyACM0".into()),
+        );
         assert_eq!(c, vec!["/dev/ttyACM9", "/dev/ttyACM0"]);
     }
 
     #[test]
     fn no_configured_port_falls_back_to_detection() {
-        let c = serial_port_candidates(None, || Some("/dev/ttyACM0".into()));
+        let c = control_ofc_daemon::serial::adoption::serial_port_candidates(None, || {
+            Some("/dev/ttyACM0".into())
+        });
         assert_eq!(c, vec!["/dev/ttyACM0"]);
     }
 
     #[test]
     fn detected_port_equal_to_configured_is_not_retried() {
-        let c = serial_port_candidates(Some("/dev/ttyACM0"), || Some("/dev/ttyACM0".into()));
+        let c = control_ofc_daemon::serial::adoption::serial_port_candidates(
+            Some("/dev/ttyACM0"),
+            || Some("/dev/ttyACM0".into()),
+        );
         assert_eq!(
             c,
             vec!["/dev/ttyACM0"],
@@ -1337,7 +1318,7 @@ mod tests {
 
     #[test]
     fn nothing_configured_and_nothing_detected_yields_no_candidates() {
-        let c = serial_port_candidates(None, || None);
+        let c = control_ofc_daemon::serial::adoption::serial_port_candidates(None, || None);
         assert!(c.is_empty());
     }
 
@@ -1348,10 +1329,13 @@ mod tests {
         // durably removed OpenFan control — and with it the 105 C emergency's
         // only path to those fans. Detection must still be reachable.
         let detect_called = std::cell::Cell::new(false);
-        let c = serial_port_candidates(Some("/dev/ttyACM9"), || {
-            detect_called.set(true);
-            Some("/dev/ttyACM0".into())
-        });
+        let c = control_ofc_daemon::serial::adoption::serial_port_candidates(
+            Some("/dev/ttyACM9"),
+            || {
+                detect_called.set(true);
+                Some("/dev/ttyACM0".into())
+            },
+        );
         assert!(
             detect_called.get(),
             "detection must run even with a port configured"
@@ -1410,7 +1394,7 @@ mod tests {
         // sitting next in the candidate list. Writes to an indifferent device
         // return Ok, so nothing surfaced: the 105 C emergency's `force_all`
         // reported success while driving nothing.
-        let chosen = first_openfan_port(
+        let chosen = control_ofc_daemon::serial::adoption::first_openfan_port(
             &ports(&["/dev/ttyACM9", "/dev/ttyACM0"]),
             Duration::from_millis(50),
             |p| {
@@ -1435,10 +1419,11 @@ mod tests {
         // Failing to identify is not fatal, but it must not be papered over
         // either: with nothing that answers, the daemon runs without serial fan
         // control (and says so) rather than holding a handle to the wrong tty.
-        let chosen =
-            first_openfan_port(&ports(&["/dev/ttyACM9"]), Duration::from_millis(50), |_| {
-                Ok(ScriptedPort::wrong_device())
-            });
+        let chosen = control_ofc_daemon::serial::adoption::first_openfan_port(
+            &ports(&["/dev/ttyACM9"]),
+            Duration::from_millis(50),
+            |_| Ok(ScriptedPort::wrong_device()),
+        );
         assert!(chosen.is_none());
     }
 
@@ -1446,7 +1431,7 @@ mod tests {
     fn an_unopenable_candidate_does_not_stop_the_search() {
         // Pre-existing behaviour, pinned: a port that cannot be opened at all is
         // skipped and the next candidate is still tried.
-        let chosen = first_openfan_port(
+        let chosen = control_ofc_daemon::serial::adoption::first_openfan_port(
             &ports(&["/dev/ttyACM9", "/dev/ttyACM0"]),
             Duration::from_millis(50),
             |p| {

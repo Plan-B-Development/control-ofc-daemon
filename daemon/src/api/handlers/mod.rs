@@ -169,6 +169,19 @@ pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntr
     fans
 }
 
+/// Parameters needed to start an OpenFan poll loop for a late-adopted
+/// controller (DEC-265). Cloned from config at boot; never discovery-dependent.
+#[derive(Clone)]
+pub struct OpenFanRuntime {
+    /// Serial read/write timeout.
+    pub timeout: std::time::Duration,
+    /// Poll cadence.
+    pub interval: std::time::Duration,
+    /// Shutdown signal shared with the loops spawned at boot, so a loop started
+    /// by a rescan stops with the rest of them.
+    pub shutdown: tokio::sync::watch::Receiver<bool>,
+}
+
 /// Shared application state passed to all handlers.
 pub struct AppState {
     pub cache: Arc<StateCache>,
@@ -176,7 +189,21 @@ pub struct AppState {
     pub daemon_version: String,
     /// Fan controller for OpenFanController write operations. `None` if not connected.
     /// Arc-wrapped to share between API handlers and the profile engine task.
-    pub fan_controller: Option<Arc<Mutex<FanController>>>,
+    ///
+    /// DEC-265: behind an `RwLock` so it can be filled in *after* startup. It used
+    /// to be a plain `Option` set once during boot, which meant a controller that
+    /// enumerated late — or failed its identity probe once — left the daemon with
+    /// no OpenFan backend for the whole process lifetime, and no way to recover
+    /// short of a restart. That is not only lost fan control: the profile engine's
+    /// 105 C `force_all` is guarded by `if let Some(be) = openfan_be`, so the
+    /// thermal emergency lost its reach to every OpenFan-attached fan too.
+    /// `POST /fans/openfan/rescan` is what fills it. Read it through
+    /// [`AppState::openfan`] rather than locking by hand.
+    pub fan_controller: Arc<parking_lot::RwLock<Option<Arc<Mutex<FanController>>>>>,
+    /// Everything needed to start the OpenFan poll loop for a controller adopted
+    /// after boot (DEC-265). Present regardless of whether a device was found —
+    /// these are configuration, not discovery.
+    pub openfan_runtime: OpenFanRuntime,
     /// Hwmon PWM controller for motherboard fan header writes. `None` if no headers found.
     /// Arc-wrapped to share between API handlers and the profile engine task.
     pub hwmon_controller: Option<Arc<Mutex<HwmonPwmController>>>,
@@ -188,6 +215,11 @@ pub struct AppState {
     pub active_profile: Arc<Mutex<Option<crate::profile::DaemonProfile>>>,
     /// Prevents concurrent calibration sweeps from corrupting each other.
     pub calibrating: AtomicBool,
+    /// Prevents concurrent `POST /fans/openfan/rescan` probes (DEC-265).
+    /// Two racing probes would open the same tty, and the loser would install
+    /// a controller over the winner's — orphaning a poll loop on a transport
+    /// nothing writes through.
+    pub openfan_rescanning: AtomicBool,
     /// Detected AMD GPU info (populated at startup). Empty if no AMD GPU found.
     pub amd_gpus: Vec<crate::hwmon::gpu_detect::AmdGpuInfo>,
     /// Detected Intel discrete GPU info (populated at startup). Empty if none
@@ -241,6 +273,17 @@ pub struct AppState {
     /// Super-I/O scan runs once instead of three times. Holds the SAME
     /// `readiness_rollup` `Arc` as its poll mirror. Never on the 1 Hz poll path.
     pub assessment: Arc<AssessmentCache>,
+}
+
+impl AppState {
+    /// The OpenFan controller, if one is currently adopted (DEC-265).
+    ///
+    /// Clones out from under the read lock so callers never hold it across an
+    /// `.await` — the field became a lock precisely so it could change at
+    /// runtime, and a handler that held it open would block a rescan.
+    pub fn openfan(&self) -> Option<Arc<Mutex<FanController>>> {
+        self.fan_controller.read().clone()
+    }
 }
 
 /// RAII guard that clears the profile engine's verify pause on drop (DEC-165),

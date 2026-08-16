@@ -117,8 +117,21 @@ pub fn parse_fan_curve(content: &str) -> Result<FanCurve, HwmonError> {
                 if parts.len() >= 2 {
                     let lo = parse_value_with_suffix(parts[0], 'C');
                     let hi = parse_value_with_suffix(parts[1], 'C');
+                    // DEC-265: ordering is checked, not assumed. These bounds are
+                    // parsed from device-supplied text and reach `Ord::clamp`
+                    // below, which panics outright on an inverted range — the
+                    // same panic class DEC-249 fixed in `tuning.rs` and whose
+                    // sweep missed this file. An inverted line is nonsense, so
+                    // drop it and let the caller's safe fallback stand.
                     if let (Some(l), Some(h)) = (lo, hi) {
-                        temp_range = Some((l, h));
+                        if l <= h {
+                            temp_range = Some((l, h));
+                        } else {
+                            log::warn!(
+                                "GPU fan_curve reported an inverted hotspot temp range \
+                                 ({l}C..{h}C) — ignoring it and using the default"
+                            );
+                        }
                     }
                 }
             }
@@ -131,8 +144,19 @@ pub fn parse_fan_curve(content: &str) -> Result<FanCurve, HwmonError> {
                 if parts.len() >= 2 {
                     let lo = parse_value_with_suffix(parts[0], '%');
                     let hi = parse_value_with_suffix(parts[1], '%');
+                    // DEC-265: same ordering rule as the temp range above. This
+                    // pair feeds `.max(lo).min(hi)`, which does not panic — but an
+                    // inverted range there silently pins every speed to `hi`, so
+                    // it is wrong in a quieter way rather than a safe one.
                     if let (Some(l), Some(h)) = (lo, hi) {
-                        speed_range = Some((l as u8, h as u8));
+                        if l <= h {
+                            speed_range = Some((l as u8, h as u8));
+                        } else {
+                            log::warn!(
+                                "GPU fan_curve reported an inverted fan speed range \
+                                 ({l}%..{h}%) — ignoring it and using the default"
+                            );
+                        }
                     }
                 }
             }
@@ -443,7 +467,15 @@ pub fn set_static_speed_with_zero_rpm(
             let raw_temp = temp_min + (i as i32 * (temp_max - temp_min) / divisor);
             FanCurvePoint {
                 index: i,
-                temp_c: raw_temp.clamp(temp_min, temp_max),
+                // DEC-265: `.max().min()`, matching `clamped_speed` above and
+                // `api/handlers/gpu.rs`. `Ord::clamp` panics when min > max, and
+                // this ran on the 1 Hz write path with bounds parsed from device
+                // text — so the one thing this call could do that the arithmetic
+                // above had not already done was kill the sole PWM writer. The
+                // parse now rejects an inverted range, which makes this
+                // unreachable; it stays panic-free anyway, because "unreachable"
+                // is what `tuning.rs` was too (DEC-249).
+                temp_c: raw_temp.max(temp_min).min(temp_max),
                 speed_pct: clamped_speed,
             }
         })
@@ -944,5 +976,68 @@ ZERO_RPM_ENABLE: 0 1
     fn reset_legacy_missing_path_returns_error() {
         let result = reset_legacy_to_auto(Path::new("/nonexistent/hwmon99"));
         assert!(result.is_err());
+    }
+
+    // ── DEC-265: inverted OD_RANGE lines from the device ──
+
+    const INVERTED_TEMP_RANGE: &str = "\
+OD_FAN_CURVE:
+0: 40C 30%
+1: 50C 35%
+OD_RANGE:
+FAN_CURVE(hotspot temp): 100C 25C
+FAN_CURVE(fan speed): 15% 100%
+";
+
+    const INVERTED_SPEED_RANGE: &str = "\
+OD_FAN_CURVE:
+0: 40C 30%
+1: 50C 35%
+OD_RANGE:
+FAN_CURVE(hotspot temp): 25C 100C
+FAN_CURVE(fan speed): 100% 15%
+";
+
+    #[test]
+    fn an_inverted_temp_range_is_rejected_rather_than_trusted() {
+        // `Ord::clamp` panics outright when min > max, and these bounds reach one
+        // on the 1 Hz write path — a panic there kills the sole PWM writer. The
+        // range is device-supplied text, so it is checked, not assumed.
+        let curve = parse_fan_curve(INVERTED_TEMP_RANGE).unwrap();
+        assert_eq!(
+            curve.temp_range, None,
+            "an inverted hotspot temp range must be dropped so the caller's safe \
+             fallback stands"
+        );
+    }
+
+    #[test]
+    fn an_inverted_speed_range_is_rejected_rather_than_trusted() {
+        // This pair feeds `.max(lo).min(hi)`, which does not panic — inverted, it
+        // would silently pin every speed to `hi`. Wrong quietly rather than safely.
+        let curve = parse_fan_curve(INVERTED_SPEED_RANGE).unwrap();
+        assert_eq!(curve.speed_range, None);
+    }
+
+    #[test]
+    fn a_well_ordered_range_is_still_accepted() {
+        // Guard against "fixed" by dropping every range.
+        let curve = parse_fan_curve(SAMPLE_CURVE).unwrap();
+        assert_eq!(curve.temp_range, Some((25, 100)));
+        assert_eq!(curve.speed_range, Some((15, 100)));
+    }
+
+    #[test]
+    fn set_static_speed_survives_a_device_reporting_an_inverted_range() {
+        // The end-to-end shape of the panic: before DEC-265 this input reached
+        // `raw_temp.clamp(temp_min, temp_max)` with min > max and took the process
+        // down — on the 1 Hz write path, killing the sole PWM writer. It must now
+        // write a curve instead.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fan_curve");
+        fs::write(&path, INVERTED_TEMP_RANGE).unwrap();
+
+        set_static_speed(&path, None, 50, 5).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "c\n");
     }
 }

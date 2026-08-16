@@ -61,7 +61,7 @@ pub async fn calibrate_openfan_handler(
 ) -> (StatusCode, Json<serde_json::Value>) {
     use crate::api::calibration::CalibrationError;
 
-    let Some(ctrl) = state.fan_controller.clone() else {
+    let Some(ctrl) = state.openfan() else {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             &ErrorEnvelope::hardware_unavailable("OpenFanController not connected"),
@@ -164,6 +164,127 @@ pub async fn calibrate_openfan_handler(
             StatusCode::SERVICE_UNAVAILABLE,
             &ErrorEnvelope::hardware_unavailable(msg),
         ),
+    }
+}
+
+/// `POST /fans/openfan/rescan` — look for an OpenFanController and adopt it
+/// without restarting the daemon (DEC-265).
+///
+/// [SAFETY] The gap this closes is not merely "fan control is unavailable". The
+/// controller used to be adopted once, during boot, into a plain `Option` that
+/// nothing could subsequently write. A device that enumerated a second too late,
+/// or that failed its DEC-250 identity handshake once, therefore left the daemon
+/// with no OpenFan backend for the entire process lifetime — and the profile
+/// engine's 105 C `force_all` is guarded by `if let Some(be) = openfan_be`, so
+/// the thermal emergency silently lost its reach to every OpenFan-attached fan
+/// too. A failed boot connect only logs a warning, so `Restart=on-failure` never
+/// fired and nothing recovered it.
+///
+/// Adoption goes through the same [`crate::serial::adoption`] pair the boot path
+/// uses, so the identity handshake cannot be skipped here. On success the
+/// controller is installed and a poll loop is started for it; the profile engine
+/// picks it up on its next tick.
+///
+/// Idempotent: rescanning while a controller is already adopted reports the
+/// existing one and probes nothing.
+pub async fn openfan_rescan_handler(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use crate::serial::adoption::{first_openfan_port, serial_port_candidates};
+    use crate::serial::controller::FanController;
+    use crate::serial::real_transport::{auto_detect_port, RealSerialTransport};
+    use crate::serial::transport::SerialTransport;
+
+    if state.openfan().is_some() {
+        return json_ok(
+            StatusCode::OK,
+            serde_json::json!({
+                "adopted": false,
+                "already_connected": true,
+                "message": "an OpenFanController is already connected",
+            }),
+        );
+    }
+
+    // Single-flight. Two concurrent rescans would both probe the same tty — and
+    // the loser would install a second controller over the winner's, leaving an
+    // orphaned poll loop reading a transport nothing writes through.
+    if state
+        .openfan_rescanning
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return error_response(
+            StatusCode::CONFLICT,
+            &ErrorEnvelope::validation("an OpenFan rescan is already in progress"),
+        );
+    }
+    let _guard = CalibrationGuard {
+        flag: &state.openfan_rescanning,
+    };
+
+    let timeout = state.openfan_runtime.timeout;
+    let configured = state.running_config.serial.port.clone();
+
+    // Serial probing is blocking and can take seconds across several candidates.
+    let probe = tokio::task::spawn_blocking(move || {
+        let candidates =
+            serial_port_candidates(configured.as_deref(), || auto_detect_port(timeout));
+        first_openfan_port(&candidates, timeout, |p| {
+            RealSerialTransport::open(p, timeout)
+        })
+    })
+    .await;
+
+    match probe {
+        Ok(Some((port, transport))) => {
+            let boxed: Box<dyn SerialTransport + Send> = Box::new(transport);
+            let shared = Arc::new(parking_lot::Mutex::new(boxed));
+            let ctrl = FanController::new_shared(shared.clone(), state.cache.clone(), timeout);
+
+            // Install BEFORE spawning the loop: the engine polls this slot every
+            // tick while it has no backend, and a controller that is reachable
+            // but not yet polled is strictly better than the reverse.
+            *state.fan_controller.write() = Some(Arc::new(parking_lot::Mutex::new(ctrl)));
+
+            let rt = state.openfan_runtime.clone();
+            let poll_cache = state.cache.clone();
+            tokio::spawn(async move {
+                crate::polling::openfan_poll_loop(
+                    poll_cache,
+                    shared,
+                    rt.timeout,
+                    rt.interval,
+                    rt.shutdown,
+                )
+                .await;
+            });
+
+            log::info!("OpenFanController adopted on {port} via rescan");
+            json_ok(
+                StatusCode::OK,
+                serde_json::json!({
+                    "adopted": true,
+                    "already_connected": false,
+                    "port": port,
+                    "message": format!("OpenFanController adopted on {port}"),
+                }),
+            )
+        }
+        Ok(None) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::hardware_unavailable(
+                "no OpenFanController found — no candidate port both opened and \
+                 identified as one",
+            ),
+        ),
+        Err(e) => {
+            log::error!("OpenFan rescan probe task panicked: {e}");
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &ErrorEnvelope::hardware_unavailable("OpenFan rescan failed to run"),
+            )
+        }
     }
 }
 

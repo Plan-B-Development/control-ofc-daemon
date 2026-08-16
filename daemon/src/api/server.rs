@@ -79,6 +79,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         // Hwmon rescan
         .route("/hwmon/rescan", post(handlers::hwmon_rescan_handler))
+        // DEC-265: adopt an OpenFanController that appeared after boot,
+        // or that failed its identity probe once at startup.
+        .route(
+            "/fans/openfan/rescan",
+            post(handlers::openfan_rescan_handler),
+        )
         // Hardware diagnostics
         .route(
             "/diagnostics/hardware",

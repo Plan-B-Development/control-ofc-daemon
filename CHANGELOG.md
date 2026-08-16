@@ -2,6 +2,48 @@
 
 ## [Unreleased]
 
+### Added
+- **An OpenFanController can now be adopted without restarting the daemon.** The
+  daemon looked for one only while it was starting up, and stored the result
+  somewhere nothing could later change. A controller that enumerated a moment too
+  late — or that failed its identity handshake once on a particular boot — was
+  therefore invisible for the rest of the daemon's life, with a warning in the
+  journal as the only sign. That cost more than fan control: the 105 °C thermal
+  emergency drives OpenFan fans through that same connection, so it silently had
+  no path to them either, while the status endpoint went on reporting a healthy
+  daemon. `POST /fans/openfan/rescan` looks again and installs what it finds, and
+  the profile engine picks it up on its next tick — the engine is what actually
+  writes, so a route that adopted a controller the engine never saw would have
+  fixed nothing. Adoption uses the same identity-verified path as startup, so a
+  port that opens but is not an OpenFanController is still refused. Advertised as
+  `control.openfan_rescan`. DEC-265.
+
+### Fixed
+- **A GPU reporting a backwards range could kill fan control outright.** The fan
+  curve's allowed temperature range is read from text the device supplies, and
+  nothing checked that the low end was actually below the high end. A reversed
+  line would reach a bounds function that treats that as a programming error and
+  aborts — on the once-a-second write path, which is the only thing writing fan
+  speeds at all. The range is now rejected as nonsense and the safe default used
+  instead, and the bounds call no longer aborts even if one slips through. Same
+  defect class as the one fixed in the previous release; this was its unswept
+  sibling. DEC-265.
+- **A panic that the runtime contained no longer resets every fan to automatic.**
+  The safety net that hands fans back to firmware control fired on *any* panic on
+  *any* thread — but a panicking background task is caught and the daemon carries
+  on. One contained panic therefore dropped every GPU curve and motherboard fan to
+  firmware defaults underneath a profile engine that was still running and put its
+  curve back a second later, announcing that it was aborting while it did no such
+  thing. Only a panic that genuinely ends the process now triggers the reset.
+- **Three failures that were logged but not counted, or not logged at all.** A
+  panicking fan-poll task did not count towards the failure total that triggers a
+  reconnect, so the one fault that never fixes itself was also the one that could
+  never prompt a retry. A panicking GPU write was indistinguishable in the log
+  from a fan that merely refused the write. And if the shutdown signal's sender
+  went away, the engine's wait returned instantly and forever — turning a
+  once-a-second loop into one that spins a CPU core flat out, while the health
+  endpoint reported it as perfectly on time, because it *was* ticking. DEC-265.
+
 ### Fixed
 - **A release can no longer be published from a commit whose tests failed.** The
   GUI's v2.41.0 shipped that way; this repo has the identical structure and is

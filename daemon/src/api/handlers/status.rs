@@ -94,7 +94,7 @@ pub async fn poll_handler(State(state): State<Arc<AppState>>) -> Json<PollRespon
 pub async fn capabilities_handler(
     State(state): State<Arc<AppState>>,
 ) -> Json<CapabilitiesResponse> {
-    let openfan_present = state.fan_controller.is_some();
+    let openfan_present = state.openfan().is_some();
     let hwmon_present = state.hwmon_controller.is_some();
     let hwmon_header_count = state
         .hwmon_controller
@@ -288,6 +288,7 @@ pub async fn capabilities_handler(
             fan_identify: true,
             autonomous_control: true,
             min_supported_gui: "2.0.0".into(),
+            openfan_rescan: true,
         },
     })
 }

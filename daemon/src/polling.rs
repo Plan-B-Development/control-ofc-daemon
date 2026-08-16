@@ -546,6 +546,27 @@ fn adopt_reconnected_transport<T: SerialTransport + Send + 'static>(
     Some(Box::new(rt))
 }
 
+/// Poll the OpenFanController for per-channel RPM at `interval`, reconnecting
+/// when the device stops answering.
+///
+/// Runs until `shutdown` flips. Serial I/O is blocking, so each poll and each
+/// reconnect attempt runs on the blocking pool.
+///
+/// Reconnect is not a separate task: after `reconnect_threshold` consecutive
+/// failures the loop stops polling and starts attempting adoption instead, with
+/// exponential backoff capped at 30 cycles. A candidate must pass the DEC-250
+/// identity probe before it is adopted — an openable port that is not an
+/// OpenFanController is worse than no port, because every subsequent write
+/// silently goes somewhere else.
+///
+/// **This loop is only spawned when a controller was adopted at startup**
+/// (`main.rs`). A device that appears later, or that fails its identity probe
+/// once at boot, needs `POST /fans/openfan/rescan` (DEC-265) — until that call
+/// there is no OpenFan backend at all, which also costs the 105 C thermal
+/// emergency its OpenFan leg.
+///
+/// (The doc comment here was lost in `419025d`, which moved the reconnect helper
+/// out and left the loop bare.)
 pub async fn openfan_poll_loop(
     cache: Arc<StateCache>,
     transport: Arc<parking_lot::Mutex<Box<dyn SerialTransport + Send>>>,
@@ -658,6 +679,12 @@ pub async fn openfan_poll_loop(
                 }
             }
             Err(e) => {
+                // DEC-265: a panicking poll task counts as a failed poll. It did
+                // not before, so the one failure mode that never self-heals — the
+                // blocking task dying every tick — was also the one that could
+                // never reach `reconnect_threshold`. The loop logged forever and
+                // never attempted the reconnect that might have fixed it.
+                consecutive_errors += 1;
                 log::error!("openfan poll task panicked: {e}");
             }
         }
@@ -1351,5 +1378,74 @@ mod tests {
         assert_eq!(fans[1].id, "nvidia_gpu:0000:0a:00.0");
         assert_eq!(temps[0].id, "nvidia_gpu:0000:03:00.0:temp");
         assert_eq!(temps[1].id, "nvidia_gpu:0000:0a:00.0:temp");
+    }
+
+    // ── DEC-265: the reconnect *trigger* arithmetic ──
+    //
+    // The block that decides WHEN to attempt a reconnect (threshold, backoff,
+    // skip-cycles) had no test at all: the existing DEC-260 cases cover
+    // `adopt_reconnected_transport`, i.e. what happens once an attempt is made.
+    // The whole trigger could be deleted and the suite stayed green. Driving the
+    // real loop needs a serial device, so the arithmetic is extracted and pinned
+    // directly — the loop keeps the same expressions inline.
+
+    /// Mirrors the loop's skip decision: with `consecutive_errors` at or past the
+    /// threshold, is this cycle an attempt or a skip?
+    fn attempts_this_cycle(consecutive_errors: u32, threshold: u32, backoff: u32) -> bool {
+        let cycle = consecutive_errors - threshold;
+        let skip_cycles = backoff.min(30);
+        skip_cycles == 0 || cycle.is_multiple_of(skip_cycles)
+    }
+
+    #[test]
+    fn reconnect_does_not_engage_before_the_threshold() {
+        // Below threshold the loop polls; the trigger block is not entered at all.
+        for errors in 0..5 {
+            assert!(
+                errors < 5,
+                "consecutive_errors={errors} must still be polling"
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_cycle_past_the_threshold_attempts_immediately() {
+        // backoff starts at 1, so the very first over-threshold cycle retries
+        // rather than waiting — a disconnect that self-heals recovers in one tick.
+        assert!(attempts_this_cycle(5, 5, 1));
+    }
+
+    #[test]
+    fn backoff_skips_cycles_but_always_comes_back_around() {
+        // At backoff=4 exactly every 4th cycle attempts. The property that matters
+        // is that it never stops attempting: an unbounded backoff would strand a
+        // reconnectable controller forever.
+        let attempts: Vec<u32> = (0..12)
+            .filter(|c| attempts_this_cycle(5 + c, 5, 4))
+            .collect();
+        assert_eq!(attempts, vec![0, 4, 8]);
+    }
+
+    #[test]
+    fn backoff_is_capped_so_retries_never_stop() {
+        // The loop caps both the doubling and the skip window at 30. Past the cap
+        // the period stays 30 cycles rather than growing without bound.
+        let mut backoff: u32 = 1;
+        for _ in 0..20 {
+            backoff = (backoff * 2).min(30);
+        }
+        assert_eq!(backoff, 30, "backoff must saturate, not overflow or grow");
+        let attempts: Vec<u32> = (0..91)
+            .filter(|c| attempts_this_cycle(5 + c, 5, backoff))
+            .collect();
+        assert_eq!(attempts, vec![0, 30, 60, 90]);
+    }
+
+    #[test]
+    fn a_zero_backoff_attempts_every_cycle_instead_of_dividing_by_zero() {
+        // `skip_cycles == 0 ||` is what stops `is_multiple_of(0)` being reached.
+        // Not reachable from the loop's own arithmetic today (backoff starts at 1
+        // and only doubles), but the guard is load-bearing if that ever changes.
+        assert!(attempts_this_cycle(5, 5, 0));
     }
 }

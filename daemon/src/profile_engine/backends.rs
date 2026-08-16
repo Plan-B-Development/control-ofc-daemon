@@ -488,7 +488,20 @@ impl WriteBackend for GpuBackend {
                 // which is no outcome at all (mirrors the OpenFan in-closure
                 // skip, DEC-191): not a success, and *not* a failure to cache.
                 Ok(None) => {}
-                _ => {
+                // DEC-265: a panicking write task used to land here silently —
+                // `_ =>` cached the failure and said nothing, so the one event
+                // that indicates a *bug* (rather than uncooperative hardware)
+                // was indistinguishable in the log from a fan that simply would
+                // not take a write. Split so a panic is reported as one.
+                Err(e) => {
+                    log::error!(
+                        "GPU fan write task panicked for {fan_id}: {e} — the write did \
+                         not happen; caching the failure and continuing"
+                    );
+                    self.fail_cache
+                        .insert(fan_id, (cmd.pwm_percent, self.clock.now()));
+                }
+                Ok(Some(Err(_))) => {
                     self.fail_cache
                         .insert(fan_id, (cmd.pwm_percent, self.clock.now()));
                 }

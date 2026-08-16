@@ -90,12 +90,18 @@ fn test_app_state_inner(engine_ticked: bool, runtime_cfg: std::path::PathBuf) ->
         cache,
         staleness_config: StalenessConfig::default(),
         daemon_version: "0.1.0-test".into(),
-        fan_controller: None,
+        fan_controller: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+        openfan_runtime: control_ofc_daemon::api::handlers::OpenFanRuntime {
+            timeout: std::time::Duration::from_millis(500),
+            interval: std::time::Duration::from_millis(1000),
+            shutdown: tokio::sync::watch::channel(false).1,
+        },
         hwmon_controller: None,
         start_time: std::time::Instant::now(),
         history: Arc::new(HistoryRing::new(250)),
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
+        openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: Vec::new(),
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -720,12 +726,18 @@ async fn fans_endpoint_tags_intel_gpu_source_by_id_prefix() {
         cache,
         staleness_config: StalenessConfig::default(),
         daemon_version: "0.1.0-test".into(),
-        fan_controller: None,
+        fan_controller: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+        openfan_runtime: control_ofc_daemon::api::handlers::OpenFanRuntime {
+            timeout: std::time::Duration::from_millis(500),
+            interval: std::time::Duration::from_millis(1000),
+            shutdown: tokio::sync::watch::channel(false).1,
+        },
         hwmon_controller: None,
         start_time: std::time::Instant::now(),
         history: Arc::new(HistoryRing::new(250)),
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
+        openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: Vec::new(),
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -878,12 +890,18 @@ fn test_app_state_with_nvidia_gpu(
         cache: Arc::new(StateCache::new()),
         staleness_config: StalenessConfig::default(),
         daemon_version: "0.1.0-test".into(),
-        fan_controller: None,
+        fan_controller: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+        openfan_runtime: control_ofc_daemon::api::handlers::OpenFanRuntime {
+            timeout: std::time::Duration::from_millis(500),
+            interval: std::time::Duration::from_millis(1000),
+            shutdown: tokio::sync::watch::channel(false).1,
+        },
         hwmon_controller: None,
         start_time: std::time::Instant::now(),
         history: Arc::new(HistoryRing::new(250)),
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
+        openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: Vec::new(),
         intel_gpus: Vec::new(),
         nvidia_gpus: vec![gpu],
@@ -1144,12 +1162,18 @@ fn test_app_state_with_hwmon() -> Arc<AppState> {
         cache,
         staleness_config: StalenessConfig::default(),
         daemon_version: "0.1.0-test".into(),
-        fan_controller: None,
+        fan_controller: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+        openfan_runtime: control_ofc_daemon::api::handlers::OpenFanRuntime {
+            timeout: std::time::Duration::from_millis(500),
+            interval: std::time::Duration::from_millis(1000),
+            shutdown: tokio::sync::watch::channel(false).1,
+        },
         hwmon_controller: Some(Arc::new(Mutex::new(ctrl))),
         start_time: std::time::Instant::now(),
         history: Arc::new(HistoryRing::new(250)),
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
+        openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: Vec::new(),
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -1401,12 +1425,18 @@ fn test_app_state_with_unsupported_gpu(pci_bdf: &str) -> Arc<AppState> {
         cache,
         staleness_config: StalenessConfig::default(),
         daemon_version: "0.1.0-test".into(),
-        fan_controller: None,
+        fan_controller: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+        openfan_runtime: control_ofc_daemon::api::handlers::OpenFanRuntime {
+            timeout: std::time::Duration::from_millis(500),
+            interval: std::time::Duration::from_millis(1000),
+            shutdown: tokio::sync::watch::channel(false).1,
+        },
         hwmon_controller: None,
         start_time: std::time::Instant::now(),
         history: Arc::new(HistoryRing::new(250)),
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
+        openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: vec![unsupported],
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -1478,12 +1508,18 @@ fn test_app_state_with_read_only_gpu(pci_bdf: &str, pci_device_id: u16) -> Arc<A
         cache,
         staleness_config: StalenessConfig::default(),
         daemon_version: "0.1.0-test".into(),
-        fan_controller: None,
+        fan_controller: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+        openfan_runtime: control_ofc_daemon::api::handlers::OpenFanRuntime {
+            timeout: std::time::Duration::from_millis(500),
+            interval: std::time::Duration::from_millis(1000),
+            shutdown: tokio::sync::watch::channel(false).1,
+        },
         hwmon_controller: None,
         start_time: std::time::Instant::now(),
         history: Arc::new(HistoryRing::new(250)),
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
+        openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: vec![read_only],
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -1545,12 +1581,18 @@ fn test_app_state_with_amd_gpu(
         cache,
         staleness_config: StalenessConfig::default(),
         daemon_version: "0.1.0-test".into(),
-        fan_controller: None,
+        fan_controller: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+        openfan_runtime: control_ofc_daemon::api::handlers::OpenFanRuntime {
+            timeout: std::time::Duration::from_millis(500),
+            interval: std::time::Duration::from_millis(1000),
+            shutdown: tokio::sync::watch::channel(false).1,
+        },
         hwmon_controller: None,
         start_time: std::time::Instant::now(),
         history: Arc::new(HistoryRing::new(250)),
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
+        openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: vec![gpu],
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -2005,7 +2047,12 @@ async fn deactivate_profile_resets_hwmon_coalescing() {
         cache: cache.clone(),
         staleness_config: StalenessConfig::default(),
         daemon_version: "0.1.0-test".into(),
-        fan_controller: None,
+        fan_controller: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+        openfan_runtime: control_ofc_daemon::api::handlers::OpenFanRuntime {
+            timeout: std::time::Duration::from_millis(500),
+            interval: std::time::Duration::from_millis(1000),
+            shutdown: tokio::sync::watch::channel(false).1,
+        },
         hwmon_controller: Some(Arc::new(Mutex::new(ctrl))),
         start_time: std::time::Instant::now(),
         history: Arc::new(HistoryRing::new(250)),
@@ -2018,6 +2065,7 @@ async fn deactivate_profile_resets_hwmon_coalescing() {
             curves: Vec::new(),
         }))),
         calibrating: std::sync::atomic::AtomicBool::new(false),
+        openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: Vec::new(),
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -2130,12 +2178,18 @@ fn test_app_state_with_writable_pmfw_gpu(pci_bdf: &str) -> (Arc<AppState>, tempf
         cache,
         staleness_config: StalenessConfig::default(),
         daemon_version: "0.1.0-test".into(),
-        fan_controller: None,
+        fan_controller: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+        openfan_runtime: control_ofc_daemon::api::handlers::OpenFanRuntime {
+            timeout: std::time::Duration::from_millis(500),
+            interval: std::time::Duration::from_millis(1000),
+            shutdown: tokio::sync::watch::channel(false).1,
+        },
         hwmon_controller: None,
         start_time: std::time::Instant::now(),
         history: Arc::new(HistoryRing::new(250)),
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
+        openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: vec![pmfw],
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -2304,12 +2358,18 @@ async fn hwmon_discovery_excludes_amdgpu_end_to_end_via_ipc() {
         cache,
         staleness_config: StalenessConfig::default(),
         daemon_version: "0.1.0-test".into(),
-        fan_controller: None,
+        fan_controller: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+        openfan_runtime: control_ofc_daemon::api::handlers::OpenFanRuntime {
+            timeout: std::time::Duration::from_millis(500),
+            interval: std::time::Duration::from_millis(1000),
+            shutdown: tokio::sync::watch::channel(false).1,
+        },
         hwmon_controller: Some(Arc::new(Mutex::new(ctrl))),
         start_time: std::time::Instant::now(),
         history: Arc::new(HistoryRing::new(250)),
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
+        openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: Vec::new(),
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -2369,12 +2429,18 @@ fn test_app_state_with_profile_dirs(dirs: Vec<std::path::PathBuf>) -> Arc<AppSta
         cache: Arc::new(StateCache::new()),
         staleness_config: StalenessConfig::default(),
         daemon_version: "0.1.0-test".into(),
-        fan_controller: None,
+        fan_controller: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+        openfan_runtime: control_ofc_daemon::api::handlers::OpenFanRuntime {
+            timeout: std::time::Duration::from_millis(500),
+            interval: std::time::Duration::from_millis(1000),
+            shutdown: tokio::sync::watch::channel(false).1,
+        },
         hwmon_controller: None,
         start_time: std::time::Instant::now(),
         history: Arc::new(HistoryRing::new(250)),
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
+        openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         amd_gpus: Vec::new(),
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -3930,4 +3996,57 @@ async fn serial_port_length_is_bounded() {
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
+}
+
+// ── DEC-265: POST /fans/openfan/rescan ──
+
+#[tokio::test]
+async fn openfan_rescan_short_circuits_when_a_controller_is_already_adopted() {
+    // The idempotent path, and the only one testable without a serial device: it
+    // must answer from the shared slot WITHOUT probing any tty. A rescan that
+    // re-probed while connected would tear down a working controller to
+    // rediscover it, and the sole PWM writer would lose its backend mid-tick.
+    let state = test_app_state();
+    // Adopt a controller the way the rescan handler does.
+    struct DeadTransport;
+    impl control_ofc_daemon::serial::transport::SerialTransport for DeadTransport {
+        fn write_line(&mut self, _d: &str) -> Result<(), control_ofc_daemon::error::SerialError> {
+            Ok(())
+        }
+        fn read_line(
+            &mut self,
+            _t: std::time::Duration,
+        ) -> Result<String, control_ofc_daemon::error::SerialError> {
+            Err(control_ofc_daemon::error::SerialError::Timeout { timeout_ms: 1 })
+        }
+    }
+    let ctrl = control_ofc_daemon::serial::controller::FanController::new(
+        Box::new(DeadTransport),
+        state.cache.clone(),
+        std::time::Duration::from_millis(50),
+    );
+    *state.fan_controller.write() = Some(Arc::new(parking_lot::Mutex::new(ctrl)));
+
+    let (sock_str, _tx, _tmp) = start_test_server(state.clone()).await;
+
+    let (code, body) = uds_post(&sock_str, "/fans/openfan/rescan", &serde_json::json!({})).await;
+    assert_eq!(code, 200, "route must exist and answer: {body}");
+    assert_eq!(body["already_connected"], true);
+    assert_eq!(
+        body["adopted"], false,
+        "an already-adopted controller must not be replaced"
+    );
+}
+
+#[tokio::test]
+async fn capabilities_advertise_the_openfan_rescan_route() {
+    // The GUI hides the action unless this is true, so an unadvertised route is
+    // an unreachable one — and a client defaulting the missing field to false is
+    // exactly how an older daemon is meant to read.
+    let state = test_app_state();
+    let (sock_str, _tx, _tmp) = start_test_server(state).await;
+
+    let (code, body) = uds_get(&sock_str, "/capabilities").await;
+    assert_eq!(code, 200);
+    assert_eq!(body["control"]["openfan_rescan"], true);
 }

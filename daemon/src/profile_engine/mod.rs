@@ -464,7 +464,13 @@ impl Drop for TickCompletion<'_> {
 pub async fn profile_engine_loop(
     cache: Arc<StateCache>,
     profile: Arc<Mutex<Option<DaemonProfile>>>,
-    fan_controller: Option<Arc<Mutex<crate::serial::controller::FanController>>>,
+    // DEC-265: a shared slot, not a value. It can be filled after boot by
+    // `POST /fans/openfan/rescan`, and the engine must pick that up — otherwise
+    // the route adopts a controller that the sole PWM writer never sees, and the
+    // 105 C `force_all` still has no OpenFan leg.
+    fan_controller: Arc<
+        parking_lot::RwLock<Option<Arc<Mutex<crate::serial::controller::FanController>>>>,
+    >,
     hwmon_controller: Option<Arc<Mutex<crate::hwmon::pwm_control::HwmonPwmController>>>,
     gpu_infos: Vec<crate::hwmon::gpu_detect::AmdGpuInfo>,
     safety: Arc<Mutex<crate::safety::ThermalSafetyRule>>,
@@ -485,7 +491,10 @@ pub async fn profile_engine_loop(
     // as of 2.0.0 — DEC-165).
     // GpuBackend is deliberately NOT a SafetyWriteBackend (DEC-130): there
     // is no GPU emergency threshold.
-    let mut openfan_be = fan_controller.map(|ctrl| OpenFanBackend::new(ctrl, cache.clone()));
+    let mut openfan_be = fan_controller
+        .read()
+        .clone()
+        .map(|ctrl| OpenFanBackend::new(ctrl, cache.clone()));
     let mut gpu_be = GpuBackend::new(cache.clone(), Arc::new(gpu_infos));
     let mut hwmon_be = hwmon_controller.map(HwmonBackend::new);
 
@@ -509,11 +518,39 @@ pub async fn profile_engine_loop(
     loop {
         tokio::select! {
             _ = tick.tick() => {}
-            _ = shutdown.changed() => {
+            changed = shutdown.changed() => {
+                // DEC-265: a dropped Sender must end the loop, not spin it. The
+                // `Result` used to be discarded, and `changed()` returns `Err`
+                // immediately and forever once every Sender is gone — so this arm
+                // would fire continuously with `borrow()` still false, never
+                // reaching the tick that paces the loop. A 1 Hz engine becomes a
+                // busy loop pinning a core, and the heartbeat would report peak
+                // health throughout, because it *is* ticking.
+                if changed.is_err() {
+                    log::warn!(
+                        "Profile engine shutdown channel closed — no sender remains; \
+                         stopping the engine"
+                    );
+                    break;
+                }
                 if *shutdown.borrow() {
                     log::info!("Profile engine shutting down");
                     break;
                 }
+            }
+        }
+
+        // DEC-265: adopt a controller that appeared after boot. Only checked
+        // while there is no backend, so the steady state is one uncontended
+        // read-lock acquisition per tick and an adopted backend is never
+        // rebuilt underneath its own coalescing/failure caches.
+        if openfan_be.is_none() {
+            if let Some(ctrl) = fan_controller.read().clone() {
+                log::info!(
+                    "Profile engine picked up an OpenFan controller adopted after \
+                     startup — fan control and the thermal emergency now reach it"
+                );
+                openfan_be = Some(OpenFanBackend::new(ctrl, cache.clone()));
             }
         }
 
@@ -1918,7 +1955,7 @@ mod tests {
         let handle = tokio::spawn(profile_engine_loop(
             cache.clone(),
             profile,
-            None,
+            Arc::new(parking_lot::RwLock::new(None)),
             None,
             Vec::new(),
             safety,
@@ -2656,7 +2693,7 @@ mod tests {
         let handle = tokio::spawn(profile_engine_loop(
             cache,
             profile_arc,
-            fan_ctrl,
+            Arc::new(parking_lot::RwLock::new(fan_ctrl)),
             None,   // no hwmon
             vec![], // no GPU
             safety,
@@ -2682,6 +2719,63 @@ mod tests {
         assert!(
             !set_pwm_cmds.is_empty() && set_pwm_cmds.iter().all(|c| c.as_str() == ">020099\n"),
             "expected SetPwm 60% (raw 0x99) on ch0 = \">020099\"; got: {cmds:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn loop_adopts_an_openfan_controller_installed_after_it_started() {
+        // [SAFETY] DEC-265. `POST /fans/openfan/rescan` installs a controller into
+        // the shared slot; if the engine did not re-read that slot, the route would
+        // report success while the SOLE PWM WRITER still had no OpenFan backend —
+        // and the 105 C `force_all` is guarded by `if let Some(be) = openfan_be`,
+        // so the thermal emergency would still have no path to those fans.
+        //
+        // Starts with an EMPTY slot, exactly as a boot with no controller found.
+        let cache = make_cache_with_sensor("cpu", 55.0);
+        let profile = make_profile("curve", "graph", 50.0);
+        let profile_arc = Arc::new(Mutex::new(Some(profile)));
+        let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
+
+        let slot = Arc::new(parking_lot::RwLock::new(None));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let handle = tokio::spawn(profile_engine_loop(
+            cache.clone(),
+            profile_arc,
+            slot.clone(),
+            None,
+            vec![],
+            safety,
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            shutdown_rx,
+        ));
+
+        // Several ticks with nothing adopted — the engine must survive this and
+        // keep running rather than latch "no backend" permanently.
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+
+        // Now a rescan adopts a controller.
+        let (transport, written) = LoopTestTransport::new(1);
+        let fan_ctrl = crate::serial::controller::FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            std::time::Duration::from_millis(500),
+        );
+        *slot.write() = Some(Arc::new(Mutex::new(fan_ctrl)));
+
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        shutdown_tx.send(true).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let _ = handle.await;
+
+        // Same 55 C / graph-curve expectation as `loop_evaluates_profile_and_writes_openfan`,
+        // so this asserts the adopted backend is fully wired, not merely constructed.
+        let cmds = written.lock();
+        let set_pwm: Vec<_> = cmds.iter().filter(|c| c.starts_with(">02")).collect();
+        assert!(
+            !set_pwm.is_empty() && set_pwm.iter().all(|c| c.as_str() == ">020099\n"),
+            "engine must pick up a controller adopted after startup and drive it \
+             (expected SetPwm 60% on ch0); got: {cmds:?}"
         );
     }
 
@@ -2712,7 +2806,7 @@ mod tests {
         let handle = tokio::spawn(profile_engine_loop(
             cache,
             profile_arc,
-            fan_ctrl,
+            Arc::new(parking_lot::RwLock::new(fan_ctrl)),
             None,
             vec![],
             safety,
@@ -2761,7 +2855,7 @@ mod tests {
         let handle = tokio::spawn(profile_engine_loop(
             cache,
             profile_arc,
-            fan_ctrl,
+            Arc::new(parking_lot::RwLock::new(fan_ctrl)),
             None,
             vec![],
             safety,
@@ -2802,7 +2896,7 @@ mod tests {
         let handle = tokio::spawn(profile_engine_loop(
             cache,
             profile_arc,
-            fan_ctrl,
+            Arc::new(parking_lot::RwLock::new(fan_ctrl)),
             None,
             vec![],
             safety,
@@ -2973,7 +3067,7 @@ mod tests {
         let handle = tokio::spawn(profile_engine_loop(
             cache,
             profile_arc,
-            fan_ctrl,
+            Arc::new(parking_lot::RwLock::new(fan_ctrl)),
             None,
             vec![],
             safety,
@@ -3027,7 +3121,7 @@ mod tests {
         let handle = tokio::spawn(profile_engine_loop(
             cache,
             profile_arc,
-            fan_ctrl,
+            Arc::new(parking_lot::RwLock::new(fan_ctrl)),
             None,
             vec![],
             safety,
@@ -3071,7 +3165,7 @@ mod tests {
         let handle = tokio::spawn(profile_engine_loop(
             cache,
             profile_arc,
-            fan_ctrl,
+            Arc::new(parking_lot::RwLock::new(fan_ctrl)),
             None,
             vec![],
             safety,
@@ -3118,7 +3212,7 @@ mod tests {
         let handle = tokio::spawn(profile_engine_loop(
             cache.clone(),
             profile_arc.clone(),
-            fan_ctrl,
+            Arc::new(parking_lot::RwLock::new(fan_ctrl)),
             None,
             vec![],
             safety,
@@ -3210,8 +3304,8 @@ mod tests {
         let handle = tokio::spawn(profile_engine_loop(
             cache,
             profile_arc,
-            None, // no openfan
-            None, // no hwmon
+            Arc::new(parking_lot::RwLock::new(None)), // no openfan
+            None,                                     // no hwmon
             vec![gpu],
             safety,
             Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
@@ -3250,7 +3344,7 @@ mod tests {
         let handle = tokio::spawn(profile_engine_loop(
             cache.clone(),
             profile_arc,
-            None,
+            Arc::new(parking_lot::RwLock::new(None)),
             None,
             vec![gpu],
             safety,
@@ -3311,7 +3405,7 @@ mod tests {
         let handle = tokio::spawn(profile_engine_loop(
             cache,
             profile_arc,
-            fan_ctrl,
+            Arc::new(parking_lot::RwLock::new(fan_ctrl)),
             None,
             vec![gpu],
             safety,
@@ -3402,7 +3496,7 @@ mod tests {
         let handle = tokio::spawn(profile_engine_loop(
             cache,
             profile_arc,
-            None, // no OpenFan — isolates the hwmon leg
+            Arc::new(parking_lot::RwLock::new(None)), // no OpenFan — isolates the hwmon leg
             hwmon_ctrl,
             vec![], // no GPU
             safety,
@@ -3446,7 +3540,7 @@ mod tests {
         let handle = tokio::spawn(profile_engine_loop(
             cache.clone(),
             profile_arc,
-            None,   // no OpenFan
+            Arc::new(parking_lot::RwLock::new(None)), // no OpenFan
             None,   // no hwmon — the cache write precedes any backend use
             vec![], // no GPU
             safety,
@@ -3521,7 +3615,7 @@ mod tests {
         let handle = tokio::spawn(profile_engine_loop(
             cache.clone(),
             profile_arc,
-            fan_ctrl,
+            Arc::new(parking_lot::RwLock::new(fan_ctrl)),
             None,
             vec![],
             safety,
@@ -3829,7 +3923,7 @@ mod tests {
         let handle = tokio::spawn(profile_engine_loop(
             cache,
             profile_arc,
-            None, // no fan controller
+            Arc::new(parking_lot::RwLock::new(None)), // no fan controller
             None,
             vec![],
             safety,
@@ -4083,7 +4177,7 @@ mod tests {
         let handle = tokio::spawn(profile_engine_loop(
             cache,
             profile_arc,
-            fan_ctrl,
+            Arc::new(parking_lot::RwLock::new(fan_ctrl)),
             None,
             vec![],
             safety,

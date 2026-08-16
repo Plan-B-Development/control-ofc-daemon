@@ -535,6 +535,12 @@ pub struct ControlCapability {
     /// Minimum GUI version this daemon supports for daemon-owned control, or
     /// empty when no floor is enforced yet (set at the 2.0.0 cutover).
     pub min_supported_gui: String,
+    /// Daemon exposes `POST /fans/openfan/rescan` — adopting an OpenFanController
+    /// that appeared after boot, without a restart (DEC-265). An older daemon
+    /// omits the field, so a client defaults it to `false` and hides the action
+    /// rather than offering a button that 404s.
+    #[serde(default)]
+    pub openfan_rescan: bool,
 }
 
 /// Per-device-group capability info.
@@ -1927,6 +1933,7 @@ mod tests {
                 fan_identify: false,
                 autonomous_control: false,
                 min_supported_gui: String::new(),
+                openfan_rescan: false,
             },
         };
         let json = serde_json::to_value(&resp).unwrap();
