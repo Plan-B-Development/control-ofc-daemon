@@ -1,7 +1,13 @@
 name: Release
 
-# Fires when a release tag (vX.Y.Z) is pushed. A tag push runs three jobs, in
-# this order (build-test -> github-release -> notify-repo):
+# Fires when a release tag (vX.Y.Z) is pushed. A tag push runs four jobs:
+# ci-green and build-test in parallel, then github-release, then notify-repo.
+#
+#   ci-green       — DEC-263: assert that ci.yml passed on the tagged commit.
+#                    build-test below runs the suite via the PKGBUILD's check(),
+#                    but only for this crate in a clean container — ci-green is
+#                    what pins the *repository's* CI result to the tag, and it
+#                    fails closed when no run exists for the commit.
 #
 #   build-test     — verify the version metadata matches the tag, then build the
 #                    Arch package in a clean container (a full `cargo build

@@ -132,6 +132,28 @@ fn release_artifact_name_matches_between_upload_and_download() {
     );
 }
 
+/// The dependency names in a job's `needs:`, accepting either the scalar form
+/// (`needs: build-test`) or the flow-sequence form (`needs: [a, b]`).
+///
+/// DEC-263: this used to be a literal `l.trim() == "needs: build-test"` match,
+/// which is a different assertion from the one the doc comment claimed — adding a
+/// second, *stricter* gate to the same job broke it. A guard that fails when the
+/// thing it guards gets stronger teaches you to weaken it.
+fn job_needs(wf: &str, job: &str) -> Vec<String> {
+    let block = job_block(wf, job);
+    let raw = block
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("needs:").map(str::trim))
+        .unwrap_or("")
+        .to_string();
+    raw.trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(',')
+        .map(|s| s.trim().trim_matches(['\'', '"']).to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 /// github-release must gate on build-test. Ordering: otherwise the jobs race
 /// and the download can run before the package exists. Integrity: the attached
 /// asset must be the artifact the clean-room build (a full `cargo build
@@ -139,11 +161,39 @@ fn release_artifact_name_matches_between_upload_and_download() {
 /// build must not produce a Release at all.
 #[test]
 fn github_release_gates_on_clean_room_build() {
-    let block = job_block(&release_workflow(), "github-release");
+    let needs = job_needs(&release_workflow(), "github-release");
     assert!(
-        block.lines().any(|l| l.trim() == "needs: build-test"),
+        needs.iter().any(|n| n == "build-test"),
         "github-release must declare `needs: build-test` (DEC-239) — without it the job \
-         races the build and can publish an unverified or missing asset"
+         races the build and can publish an unverified or missing asset; got needs={needs:?}"
+    );
+}
+
+/// github-release must also gate on the tagged commit's CI result.
+///
+/// DEC-263: `build-test` proves the package *assembles*; it runs no test suite.
+/// Until this gate existed the two were unrelated, and the GUI's v2.41.0 published
+/// with every test leg red. Pinned here because the failure mode is silent — the
+/// Release still succeeds, so nothing surfaces the loss if this job is dropped.
+#[test]
+fn github_release_gates_on_a_green_test_suite() {
+    let wf = release_workflow();
+    let needs = job_needs(&wf, "github-release");
+    assert!(
+        needs.iter().any(|n| n == "ci-green"),
+        "github-release must declare `needs: ci-green` (DEC-263) — build-test only proves \
+         the package builds, so without this a red test suite can still publish; \
+         got needs={needs:?}"
+    );
+    let block = job_block(&wf, "ci-green");
+    assert!(
+        block.contains("actions/workflows/ci.yml/runs"),
+        "ci-green must resolve the tagged commit's ci.yml run via the Checks API (DEC-263)"
+    );
+    assert!(
+        block.contains("head_sha=$SHA"),
+        "ci-green must query CI for THIS commit — a query that is not pinned to the tagged \
+         SHA would pass on some other commit's green run (DEC-263)"
     );
 }
 
