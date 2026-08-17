@@ -819,6 +819,13 @@ async fn main() {
         engine_interval_ms: 1000,
     };
 
+    // DEC-267: the same poll interval, published to the cache so the profile
+    // engine can tell a stale CPU reading from a current one. Set HERE, beside
+    // `staleness_config`, precisely so the two derivations of "how fresh should
+    // hwmon data be" stay visibly the same value — the health rollup and the
+    // 105 °C rule disagreeing about that would be the worst of both.
+    cache.set_hwmon_poll_interval_ms(config.polling.poll_interval_ms);
+
     let history = Arc::new(HistoryRing::new(250));
 
     // ── Thermal safety rule ─────────────────────────────────────────
@@ -981,7 +988,13 @@ async fn main() {
     let sensor_rescan_for_poll = app_state.sensor_rescan_requested.clone();
     // DEC-146 P3-9: keep the JoinHandles for the poll/engine tasks so
     // shutdown can await them before restoring hardware to automatic.
-    let hwmon_poll_handle = tokio::spawn(async move {
+    // DEC-267: supervised, for the same reason the engine is (DEC-266). This
+    // loop is the ONLY writer of the sensor map the 105 °C rule reads. Its death
+    // no longer blinds that rule — stale readings now present as absent, so the
+    // daemon falls back to NO_SENSOR_SAFE_PCT and says so — but "safe at 40 %
+    // forever, with no path back" is not a resting state to leave a machine in.
+    // Restore and exit so systemd brings the daemon back with a live poll loop.
+    let (hwmon_poll_handle, hwmon_dead_rx) = spawn_supervised(async move {
         control_ofc_daemon::polling::hwmon_poll_loop(
             hwmon_cache,
             hwmon_history,
@@ -1115,9 +1128,11 @@ async fn main() {
     // skipped. SIGHUP and SIGTERM registrations are both fail-soft: if the
     // kernel refuses (rare — typically only happens under unusual sandbox
     // policies), the daemon still terminates cleanly on SIGINT.
-    // DEC-266: set when the loop breaks because the profile engine died, so the
-    // process can exit non-zero AFTER the ordered restore has run.
-    let mut engine_died = false;
+    // DEC-266/267: set when the loop breaks because a task the daemon cannot
+    // function without ended — the profile engine (sole PWM writer) or the hwmon
+    // poll loop (sole writer of the sensor map the 105 C rule reads). Drives a
+    // non-zero exit AFTER the ordered restore has run, so systemd restarts us.
+    let mut must_restart = false;
     {
         use tokio::signal::unix::SignalKind;
 
@@ -1141,6 +1156,7 @@ async fn main() {
 
         tokio::pin!(ipc_dead_rx);
         tokio::pin!(engine_dead_rx);
+        tokio::pin!(hwmon_dead_rx);
 
         loop {
             tokio::select! {
@@ -1183,7 +1199,19 @@ async fn main() {
                          both gone. Restoring fans to firmware control and exiting so systemd \
                          restarts the daemon."
                     );
-                    engine_died = true;
+                    must_restart = true;
+                    break;
+                }
+                // DEC-267. Same reasoning one level upstream: this task is the
+                // only writer of the sensor map the 105 C rule reads.
+                _ = &mut hwmon_dead_rx => {
+                    log::error!(
+                        "SAFETY: the hwmon poll task exited unexpectedly — the sensor feed the \
+                         105 \u{b0}C rule reads is frozen, so the daemon is running on \
+                         readings that can no longer change. Restoring fans to firmware \
+                         control and exiting so systemd restarts the daemon."
+                    );
+                    must_restart = true;
                     break;
                 }
             }
@@ -1243,13 +1271,13 @@ async fn main() {
 
     log::info!("control-ofc-daemon v{VERSION} stopped");
 
-    // DEC-266. Deliberately after `shutdown_sequence`, so the hardware is back
-    // under firmware control before the process goes away: exiting first would
-    // leave fans latched at whatever duty the dead engine last wrote. Non-zero
-    // so `Restart=on-failure` brings the daemon back with a live engine — a
-    // clean exit here would look like a requested stop and systemd would leave
-    // the machine with no fan control.
-    if engine_died {
+    // DEC-266/267. Deliberately after `shutdown_sequence`, so the hardware is
+    // back under firmware control before the process goes away: exiting first
+    // would leave fans latched at whatever duty the dead engine last wrote.
+    // Non-zero so `Restart=on-failure` brings the daemon back with a live engine
+    // and a live sensor feed — a clean exit here would look like a requested
+    // stop and systemd would leave the machine with no fan control.
+    if must_restart {
         std::process::exit(1);
     }
 }

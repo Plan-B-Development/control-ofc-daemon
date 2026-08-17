@@ -15,6 +15,21 @@ use crate::health::state::*;
 ///
 /// All IPC responses should read from this cache rather than polling
 /// hardware directly.
+/// Fallback hwmon poll interval when nothing has published the real one
+/// (DEC-267) — matches `StalenessConfig::default()` and the shipped
+/// `polling.poll_interval_ms` default.
+const DEFAULT_HWMON_POLL_INTERVAL_MS: u64 = 1000;
+
+/// Multiple of the poll interval past which a CPU reading is treated as absent
+/// rather than current (DEC-267).
+///
+/// Matches the existing `Crit` boundary in `health::staleness` — a reading the
+/// health rollup would already be calling critically stale is not one to run the
+/// 105 °C ladder on. Deliberately not tighter: at 2x (the `Warn` boundary) an
+/// ordinary scheduling hiccup would drop the sensor and, five cycles later,
+/// force every fan to 40% for no reason.
+const CPU_TEMP_STALE_INTERVALS: u32 = 5;
+
 pub struct StateCache {
     inner: RwLock<DaemonState>,
     /// Set by the polling loop when a system suspend/resume is detected
@@ -29,6 +44,23 @@ pub struct StateCache {
     /// Bumped and read under the `active_profile` mutex so the tick that first
     /// observes a swapped profile also observes the new epoch (no extra tick).
     profile_activation_epoch: AtomicU64,
+    /// The hwmon poll loop's configured interval, in ms (DEC-267).
+    ///
+    /// [SAFETY] Published here so the profile engine can tell a *stale* CPU
+    /// reading from a current one. The engine's 105 °C rule reads
+    /// `sensors_snapshot()`, which has no freshness filter of its own — so if
+    /// the poll loop dies the last temperature is returned forever, the rule
+    /// never crosses its threshold, and the no-sensor fallback never engages
+    /// because the sensor is not *missing*, merely frozen. See
+    /// `profile_engine::hottest_fresh_cpu_c`.
+    ///
+    /// Set from the same `polling.poll_interval_ms` that builds
+    /// `StalenessConfig`, and deliberately set next to it in `main.rs` so the
+    /// two derivations cannot drift. `poll_interval_ms` has a lower bound of
+    /// 100 ms and **no upper bound**, which is why this is configured rather
+    /// than a constant: a fixed budget would permanently mark a legitimately
+    /// slow-polling system stale and pin its fans at `NO_SENSOR_SAFE_PCT`.
+    hwmon_poll_interval_ms: AtomicU64,
     /// Serialises GPU fan writes between the profile engine and
     /// `POST /gpu/{id}/fan/reset` (DEC-255).
     ///
@@ -76,9 +108,36 @@ impl StateCache {
             inner: RwLock::new(DaemonState::default()),
             resume_detected: AtomicBool::new(false),
             profile_activation_epoch: AtomicU64::new(0),
+            hwmon_poll_interval_ms: AtomicU64::new(DEFAULT_HWMON_POLL_INTERVAL_MS),
             gpu_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             openfan_write_generation: AtomicU64::new(0),
         }
+    }
+
+    /// Publish the hwmon poll loop's configured interval (DEC-267).
+    ///
+    /// Called once at startup from the same value that builds
+    /// `StalenessConfig`. Idempotent and lock-free.
+    pub fn set_hwmon_poll_interval_ms(&self, ms: u64) {
+        self.hwmon_poll_interval_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// How old a CPU temperature reading may be before the safety rule must
+    /// treat it as absent rather than current (DEC-267).
+    ///
+    /// [SAFETY] This is what converts "the poll loop died" into "no CPU sensor",
+    /// which is a state the daemon already handles correctly and has tested
+    /// (DEC-132's 5-cycle fallback, DEC-190's latched-emergency dropout). Without
+    /// it a dead poll loop freezes the last reading, the 105 °C ladder is
+    /// evaluated forever against a temperature that can no longer rise, and
+    /// `/status` reports a healthy engine throughout — because the engine *is*
+    /// ticking, on stale data.
+    pub fn cpu_temp_stale_after(&self) -> Duration {
+        let interval = self
+            .hwmon_poll_interval_ms
+            .load(Ordering::Relaxed)
+            .max(DEFAULT_HWMON_POLL_INTERVAL_MS);
+        Duration::from_millis(interval * u64::from(CPU_TEMP_STALE_INTERVALS))
     }
 
     /// Bump the profile-activation epoch (DEC-188). Called by

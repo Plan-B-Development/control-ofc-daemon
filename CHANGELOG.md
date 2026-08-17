@@ -1,5 +1,29 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **The 105 °C rule could be reading a temperature that had stopped changing.**
+  It takes its input from a cached sensor map that carries no freshness filter,
+  so if the hwmon poll task died the last reading was returned forever. Every
+  consequence of that was silent: the emergency could never trigger, because the
+  number it watches could no longer rise; the no-CPU-sensor fallback could never
+  engage either, because the sensor was not *missing*, only frozen; and the
+  engine's liveness heartbeat stayed green throughout, because the engine really
+  was ticking — on stale data. A reading older than five poll intervals is now
+  treated as no reading at all, which routes it into the no-sensor handling the
+  daemon already had and already tested. The budget follows the configured poll
+  interval rather than being a fixed number, because that interval has no upper
+  bound and a fixed one would mark a legitimately slow system permanently stale
+  and pin its fans at the fallback speed. DEC-267.
+- **The hwmon poll task is now supervised, like the profile engine.** Making a
+  frozen feed safe and visible is not the same as making it recoverable: without
+  this the daemon would sit at the fallback fan speed indefinitely with no path
+  back. It is the only writer of the sensor map the thermal rule reads, so its
+  death is now treated the same way the engine's is — restore every fan to
+  firmware control, then exit so systemd restarts the daemon with a live feed.
+  DEC-267.
+
 ## [2.18.0] — 2026-08-17
 
 ### Added

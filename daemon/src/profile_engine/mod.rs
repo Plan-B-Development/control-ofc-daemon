@@ -452,6 +452,47 @@ impl Drop for TickCompletion<'_> {
     }
 }
 
+/// The hottest CPU temperature that is still recent enough to decide safety on.
+///
+/// [SAFETY] DEC-267. `sensors_snapshot()` is a plain clone of the last values the
+/// poll loop wrote; it carries no freshness filter. So if `hwmon_poll_loop` dies
+/// — a panic in its own async body is contained by the runtime exactly as the
+/// engine's was before DEC-266 — the map keeps returning the last temperature
+/// forever. Every downstream consequence is silent:
+///
+/// * `ThermalSafetyRule::evaluate` runs on a number that can no longer rise, so
+///   the 105 °C emergency can never trigger no matter how hot the CPU gets;
+/// * the 5-cycle no-sensor fallback never engages either, because the sensor is
+///   not *missing* — it is frozen, which reads as present;
+/// * the engine keeps ticking, so the DEC-249 liveness heartbeat stays green and
+///   `/status` reports a healthy daemon throughout.
+///
+/// Filtering by age converts that into "no CPU sensor", which is a state the
+/// daemon already handles and has tested: DEC-132's 5-cycle force to
+/// `NO_SENSOR_SAFE_PCT`, and DEC-190's immediate force when an emergency is
+/// already latched. This function exists so the rule itself is unit-testable
+/// without driving the loop.
+///
+/// `stale_after` comes from [`StateCache::cpu_temp_stale_after`], i.e. from the
+/// configured poll interval — not a constant, because the interval has no upper
+/// bound and a fixed budget would mark a legitimately slow system permanently
+/// stale.
+pub(crate) fn hottest_fresh_cpu_c(
+    sensors: &HashMap<String, CachedSensorReading>,
+    now: std::time::Instant,
+    stale_after: std::time::Duration,
+) -> Option<f64> {
+    sensors
+        .values()
+        .filter(|s| s.kind == SensorKind::CpuTemp)
+        // `saturating_duration_since` because `updated_at` can be marginally in
+        // the future relative to `now` across a clock read boundary; that is a
+        // fresh reading, not an absent one.
+        .filter(|s| now.saturating_duration_since(s.updated_at) <= stale_after)
+        .map(|s| s.value_c)
+        .reduce(f64::max)
+}
+
 /// Run the profile engine loop as an async task.
 ///
 /// One tick per second: safety evaluation (forced overrides short-circuit
@@ -563,11 +604,14 @@ pub async fn profile_engine_loop(
         // makes the tick internally consistent (both legs see one snapshot).
         let sensors = cache.sensors_snapshot();
         let (decision, hottest_cpu_c) = {
-            let hottest_cpu_c: Option<f64> = sensors
-                .values()
-                .filter(|s| s.kind == SensorKind::CpuTemp)
-                .map(|s| s.value_c)
-                .reduce(f64::max);
+            // DEC-267: FRESH readings only. A frozen sensor map (dead poll
+            // loop) must present as "no CPU sensor", not as a temperature that
+            // happens never to change — see `hottest_fresh_cpu_c`.
+            let hottest_cpu_c: Option<f64> = hottest_fresh_cpu_c(
+                &sensors,
+                std::time::Instant::now(),
+                cache.cpu_temp_stale_after(),
+            );
 
             let mut safety_guard = safety.lock();
             let decision =
@@ -717,7 +761,7 @@ mod tests {
     use crate::health::state::{CachedSensorReading, DeviceLabel};
     use crate::hwmon::types::SensorKind;
     use crate::profile::{ControlMember, CurveConfig, CurvePoint, LogicalControl};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn trigger_latch_holds_load_across_band_and_bypasses_deadband() {
@@ -1139,6 +1183,142 @@ mod tests {
                 ..Default::default()
             }],
         }
+    }
+
+    // ── DEC-267: a frozen sensor map is not a live one ──────────────────
+    //
+    // The failure this guards is silent in every channel the daemon has: the
+    // engine keeps ticking (heartbeat green), the sensor is present (no-sensor
+    // fallback never engages), and the temperature never rises (105 °C never
+    // trips). Only the age distinguishes it.
+
+    fn cpu_reading(id: &str, temp_c: f64, updated_at: Instant) -> CachedSensorReading {
+        CachedSensorReading {
+            id: id.into(),
+            kind: SensorKind::CpuTemp,
+            label: "Tctl".into(),
+            value_c: temp_c,
+            source: DeviceLabel::Hwmon,
+            updated_at,
+            rate_c_per_s: None,
+            session_min_c: None,
+            session_max_c: None,
+            chip_name: "k10temp".into(),
+            temp_type: None,
+            thresholds: None,
+        }
+    }
+
+    fn sensor_map(readings: Vec<CachedSensorReading>) -> HashMap<String, CachedSensorReading> {
+        readings.into_iter().map(|r| (r.id.clone(), r)).collect()
+    }
+
+    #[test]
+    fn a_fresh_cpu_reading_is_used() {
+        let now = Instant::now();
+        let sensors = sensor_map(vec![cpu_reading("cpu", 62.0, now)]);
+        assert_eq!(
+            hottest_fresh_cpu_c(&sensors, now, Duration::from_secs(5)),
+            Some(62.0)
+        );
+    }
+
+    #[test]
+    fn a_stale_cpu_reading_reads_as_absent_not_as_its_last_value() {
+        // The whole point. Returning `Some(62.0)` here is what let a dead poll
+        // loop hold the 105 °C rule blind indefinitely.
+        let now = Instant::now();
+        let sensors = sensor_map(vec![cpu_reading(
+            "cpu",
+            62.0,
+            now - Duration::from_secs(30),
+        )]);
+        assert_eq!(
+            hottest_fresh_cpu_c(&sensors, now, Duration::from_secs(5)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_reading_exactly_at_the_budget_is_still_fresh() {
+        // Boundary is inclusive: at exactly one budget the reading is on time,
+        // not late. An exclusive bound would drop a sensor that arrived exactly
+        // on schedule.
+        let now = Instant::now();
+        let sensors = sensor_map(vec![cpu_reading("cpu", 55.0, now - Duration::from_secs(5))]);
+        assert_eq!(
+            hottest_fresh_cpu_c(&sensors, now, Duration::from_secs(5)),
+            Some(55.0)
+        );
+    }
+
+    #[test]
+    fn a_stale_sensor_does_not_mask_a_fresh_hotter_one() {
+        // Mixed ages must reduce over the fresh subset only — and must not let a
+        // stale *cooler* reading win, nor a stale hotter one inflate the max.
+        let now = Instant::now();
+        let sensors = sensor_map(vec![
+            cpu_reading("stale_hot", 99.0, now - Duration::from_secs(30)),
+            cpu_reading("fresh", 61.0, now),
+        ]);
+        assert_eq!(
+            hottest_fresh_cpu_c(&sensors, now, Duration::from_secs(5)),
+            Some(61.0)
+        );
+    }
+
+    #[test]
+    fn non_cpu_sensors_are_still_ignored_regardless_of_age() {
+        let now = Instant::now();
+        let mut gpu = cpu_reading("gpu", 90.0, now);
+        gpu.kind = SensorKind::GpuTemp;
+        let sensors = sensor_map(vec![gpu]);
+        assert_eq!(
+            hottest_fresh_cpu_c(&sensors, now, Duration::from_secs(5)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_frozen_sensor_map_routes_into_the_no_sensor_fallback() {
+        // End to end through the real decision function: a stale reading must
+        // reach `evaluate_safety_tick` as `None` and therefore force
+        // NO_SENSOR_SAFE_PCT after the existing 5-cycle debounce (DEC-132) —
+        // rather than being evaluated forever as a temperature that cannot rise.
+        let now = Instant::now();
+        let sensors = sensor_map(vec![cpu_reading(
+            "cpu",
+            62.0,
+            now - Duration::from_secs(30),
+        )]);
+        let hottest = hottest_fresh_cpu_c(&sensors, now, Duration::from_secs(5));
+        assert_eq!(hottest, None, "precondition: the reading is stale");
+
+        let mut cycles = 0u32;
+        let mut safety = crate::safety::ThermalSafetyRule::new();
+        let mut decision = evaluate_safety_tick(hottest, &mut cycles, &mut safety);
+        for _ in 1..constants::NO_SENSOR_CYCLE_THRESHOLD {
+            decision = evaluate_safety_tick(hottest, &mut cycles, &mut safety);
+        }
+
+        assert_eq!(decision.thermal_state, "no_sensor_fallback");
+        assert_eq!(decision.forced_pct, Some(constants::NO_SENSOR_SAFE_PCT));
+    }
+
+    #[test]
+    fn the_staleness_budget_follows_the_configured_poll_interval() {
+        // A fixed budget would mark a legitimately slow-polling system
+        // permanently stale and pin its fans at NO_SENSOR_SAFE_PCT forever.
+        let cache = StateCache::new();
+        assert_eq!(cache.cpu_temp_stale_after(), Duration::from_secs(5));
+
+        cache.set_hwmon_poll_interval_ms(4000);
+        assert_eq!(cache.cpu_temp_stale_after(), Duration::from_secs(20));
+
+        // Below the default the budget floors rather than shrinking, so a fast
+        // poll cannot make an ordinary scheduling hiccup look like a dead loop.
+        cache.set_hwmon_poll_interval_ms(200);
+        assert_eq!(cache.cpu_temp_stale_after(), Duration::from_secs(5));
     }
 
     fn make_cache_with_sensor(sensor_id: &str, temp_c: f64) -> Arc<StateCache> {
