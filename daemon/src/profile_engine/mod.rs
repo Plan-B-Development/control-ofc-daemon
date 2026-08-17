@@ -578,8 +578,14 @@ pub async fn profile_engine_loop(
         // Report thermal safety state for /status (DEC-132) + /diagnostics, and
         // stamp the engine liveness heartbeat in the same write (DEC-249). This
         // line is reached unconditionally once per tick, so a frozen heartbeat
-        // means the engine stopped ticking — the only signal a client has that
-        // the sole PWM writer died, since nothing supervises this task.
+        // means the engine stopped ticking.
+        //
+        // DEC-266: this is no longer the ONLY signal that the sole PWM writer
+        // died — the task is supervised now, and its death restores hardware and
+        // exits the process. The heartbeat still matters, because it also
+        // distinguishes a *slow* tick from a stopped one, which supervision
+        // cannot. Do not conclude from the supervisor's existence that this is
+        // redundant, or from this that the supervisor is.
         cache.record_engine_tick(decision.thermal_state);
         // DEC-259: pairs the start stamp above with a completion stamp on every
         // exit from this body. Without the pair a *slow* tick was indistinguishable
@@ -3940,6 +3946,45 @@ mod tests {
         assert!(
             result.is_ok(),
             "profile engine loop did not exit on shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_shutdown_sender_stops_the_loop_instead_of_spinning_it() {
+        // DEC-265 regression. `changed()` returns Err immediately and FOREVER
+        // once every Sender is gone. Discarding that Result (the pre-fix code)
+        // makes this arm fire continuously with `borrow()` still false, so the
+        // loop never reaches the tick that paces it and never breaks: a 1 Hz
+        // engine becomes a busy loop pinning a core, while the liveness
+        // heartbeat reports peak health because it genuinely *is* ticking.
+        //
+        // So the failure mode is a hang, and a timeout is what detects it.
+        // Deleting the `changed.is_err()` break makes this test time out.
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let profile_arc = Arc::new(Mutex::new(None::<DaemonProfile>));
+        let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let handle = tokio::spawn(profile_engine_loop(
+            cache,
+            profile_arc,
+            Arc::new(parking_lot::RwLock::new(None)),
+            None,
+            vec![],
+            safety,
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            shutdown_rx,
+        ));
+
+        // Never signalled — just dropped, as it would be if `main`'s frame
+        // unwound or the owner was restructured to drop it early.
+        drop(shutdown_tx);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        assert!(
+            result.is_ok(),
+            "a dropped shutdown sender must stop the engine, not spin it forever"
         );
     }
 

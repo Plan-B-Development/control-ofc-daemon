@@ -4039,6 +4039,70 @@ async fn openfan_rescan_short_circuits_when_a_controller_is_already_adopted() {
 }
 
 #[tokio::test]
+async fn openfan_rescan_releases_its_single_flight_flag_when_the_probe_ends() {
+    // DEC-266. The flag is set by a CAS in the handler and cleared by a `Drop`
+    // guard that now lives in a DETACHED task, so that a client disconnect cannot
+    // release it early while the uncancellable probe still holds a tty. The risk
+    // of moving it there is the opposite failure: never releasing it. That would
+    // wedge this route at 409 for the whole process lifetime — on the one endpoint
+    // whose entire purpose is recovering without a restart.
+    //
+    // Gutting `RescanGuard::drop` leaves every other test in the suite green.
+    // This one fails.
+    let state = test_app_state();
+    let (sock_str, _tx, _tmp) = start_test_server(state.clone()).await;
+
+    let (code, body) = uds_post(&sock_str, "/fans/openfan/rescan", &serde_json::json!({})).await;
+    // No serial hardware in CI, so this is 503 "nothing found" — but assert on the
+    // flag, not the outcome, so the test holds on a machine that does have one.
+    assert_ne!(
+        code, 409,
+        "the first rescan cannot conflict with itself: {body}"
+    );
+
+    assert!(
+        !state
+            .openfan_rescanning
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "the single-flight flag must be clear once the probe has finished"
+    );
+
+    let (code2, body2) = uds_post(&sock_str, "/fans/openfan/rescan", &serde_json::json!({})).await;
+    assert_ne!(
+        code2, 409,
+        "a second rescan after the first completed must not be rejected as \
+         'already in progress' — the flag leaked: {body2}"
+    );
+}
+
+#[tokio::test]
+async fn openfan_rescan_rejects_a_second_rescan_while_one_is_running() {
+    // The other half: the CAS must actually reject. Two concurrent probes would
+    // open the same tty, and the loser would install a controller over the
+    // winner's — leaving the engine writing through one transport while an
+    // orphaned poll loop read another.
+    let state = test_app_state();
+    state
+        .openfan_rescanning
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (sock_str, _tx, _tmp) = start_test_server(state.clone()).await;
+
+    let (code, body) = uds_post(&sock_str, "/fans/openfan/rescan", &serde_json::json!({})).await;
+
+    assert_eq!(
+        code, 409,
+        "a rescan already in flight must be rejected: {body}"
+    );
+    assert_eq!(body["error"]["code"], "validation_error");
+    assert!(
+        state
+            .openfan_rescanning
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "a rejected rescan must NOT clear the flag the in-flight one owns"
+    );
+}
+
+#[tokio::test]
 async fn capabilities_advertise_the_openfan_rescan_route() {
     // The GUI hides the action unless this is true, so an unadvertised route is
     // an unreachable one — and a client defaulting the missing field to false is

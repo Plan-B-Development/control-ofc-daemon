@@ -200,6 +200,7 @@ As of 2.0.0 the profile engine is the **sole writer** (DEC-159 / DEC-165) — th
 | `POST /fans/openfan/{ch}/calibrate` | Long-running PWM→RPM calibration sweep; restores pre-calibration PWM on every exit path, aborts on thermal limit (DEC-134) |
 | `POST /hwmon/{header}/verify` | Behavioural test of PWM write effectiveness; ~6 s (raised from 3 s in DEC-101 — slow-spinning fans need more settle time); the daemon uses its own internal verify lease (no `lease_id`). Returns `restore_failed: true` if the post-test restore-to-original-PWM write fails (DEC-100). |
 | `POST /hwmon/rescan` | Re-enumerate hwmon devices and return fresh header list |
+| `POST /fans/openfan/rescan` | Look for an OpenFanController and adopt it without restarting the daemon |
 | `POST /gpu/{gpu_id}/fan/reset` | Restore GPU fan to firmware automatic and re-enable zero-RPM |
 | `POST /gpu/{gpu_id}/fan/verify` | Behavioural test of GPU fan-control effectiveness; ~6 s, no lease (DEC-120). Drives a test speed biased upward, reads back the applied PMFW `fan_curve`/`pwm1` + RPM, then restores. Detects the silent failures static checks miss (`ppfeaturemask` bit 14 unset, SMU mismatch, BIOS overdrive lock). |
 | `POST /config/profile-search-dirs` | Add directories to the profile search path (immediate; persists to `runtime.toml`) |

@@ -271,9 +271,14 @@ pub fn compute_health(
             &POLL_REASONS,
         ),
         // DEC-249: the profile engine is the sole PWM writer and runs the 105°C
-        // rule, but nothing supervises its task — so its liveness belongs in the
-        // same rollup as the poll loops. It feeds `overall`, which is the point:
-        // a dead engine must not present as a healthy daemon.
+        // rule, so its liveness belongs in the same rollup as the poll loops. It
+        // feeds `overall`, which is the point: a dead engine must not present as
+        // a healthy daemon.
+        //
+        // DEC-266: the task is now supervised — a death restores hardware and
+        // ends the process — so a client sees a dropped socket rather than a
+        // green /status. This rollup remains the signal for a *degraded* engine
+        // (slow ticks), which supervision does not cover.
         engine_health(
             ts.engine_started,
             ts.engine_completed,

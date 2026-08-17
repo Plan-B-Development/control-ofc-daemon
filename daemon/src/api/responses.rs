@@ -813,6 +813,26 @@ pub struct CalibrationResponse {
     pub max_rpm: u16,
 }
 
+/// Response for `POST /fans/openfan/rescan` (DEC-265).
+///
+/// Typed rather than an ad-hoc `json!` so the shape is declared in one place and
+/// the `adopted: true` arm — which no test can reach without real hardware — is
+/// still pinned by serialisation. It previously carried no `api_version` either,
+/// silently breaking the "every success response carries one" general rule in
+/// `docs/08` (DEC-266).
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenFanRescanResponse {
+    pub api_version: u32,
+    /// A controller was found and installed by *this* call.
+    pub adopted: bool,
+    /// One was already connected, so nothing was probed.
+    pub already_connected: bool,
+    /// Present only when `adopted` — the port it was adopted on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<String>,
+    pub message: String,
+}
+
 /// Response for `GET /poll` — combined sensors, fans, and status in one call.
 #[derive(Debug, Clone, Serialize)]
 pub struct PollResponse {
@@ -2102,6 +2122,43 @@ mod tests {
         assert_eq!(json["source"], "nvidia_gpu");
         // Read-only NVIDIA fan: never a commanded PWM on the wire.
         assert!(json.get("last_commanded_pwm").is_none());
+    }
+
+    #[test]
+    fn openfan_rescan_response_shape_is_pinned_on_both_arms() {
+        // DEC-266. The adopted arm cannot be reached by any test without real
+        // serial hardware, so its field names were asserted nowhere and could
+        // drift away from the GUI's reader and `docs/08` unnoticed. Pinning the
+        // serialisation is the part that does not need a device.
+        let adopted = OpenFanRescanResponse {
+            api_version: API_VERSION,
+            adopted: true,
+            already_connected: false,
+            port: Some("/dev/ttyACM0".into()),
+            message: "OpenFanController adopted on /dev/ttyACM0".into(),
+        };
+        let json = serde_json::to_value(&adopted).unwrap();
+        assert_eq!(json["api_version"], API_VERSION);
+        assert_eq!(json["adopted"], true);
+        assert_eq!(json["already_connected"], false);
+        assert_eq!(json["port"], "/dev/ttyACM0");
+
+        // Already-connected arm: `port` is absent, not null — an older GUI must
+        // not start seeing a new null key.
+        let existing = OpenFanRescanResponse {
+            api_version: API_VERSION,
+            adopted: false,
+            already_connected: true,
+            port: None,
+            message: "an OpenFanController is already connected".into(),
+        };
+        let json = serde_json::to_value(&existing).unwrap();
+        assert_eq!(json["api_version"], API_VERSION);
+        assert_eq!(json["adopted"], false);
+        assert!(
+            json.get("port").is_none(),
+            "port must be omitted when nothing was adopted"
+        );
     }
 }
 

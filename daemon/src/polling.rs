@@ -546,6 +546,44 @@ fn adopt_reconnected_transport<T: SerialTransport + Send + 'static>(
     Some(Box::new(rt))
 }
 
+/// Consecutive failed polls before the loop stops polling and starts trying to
+/// reconnect instead. Named so the value is pinnable: lowering it diverts the
+/// loop into a seconds-long blocking probe on every transient hiccup.
+const RECONNECT_THRESHOLD: u32 = 5;
+
+/// Should this over-threshold cycle attempt a reconnect, or skip and wait?
+///
+/// The loop calls this; so do its tests. It used to be an expression inline in
+/// the loop with a *copy* of it in the test module, and the copy had drifted
+/// into asserting the opposite of production for `backoff == 0` (DEC-266). A
+/// mirror that can disagree with the thing it mirrors is worse than no test.
+///
+/// A zero window means "no backoff" — attempt every cycle. Written as a guard
+/// rather than falling into `is_multiple_of(0)`. Unreachable from the loop's own
+/// arithmetic today (backoff starts at 1 and only doubles), but load-bearing if
+/// that changes, and the safe direction is to retry rather than to strand a
+/// reconnectable controller forever.
+fn attempts_reconnect_this_cycle(consecutive_errors: u32, threshold: u32, backoff: u32) -> bool {
+    let cycle = consecutive_errors.saturating_sub(threshold);
+    let skip_cycles = backoff.min(30);
+    skip_cycles == 0 || cycle.is_multiple_of(skip_cycles)
+}
+
+/// Does a completed poll attempt count toward the reconnect threshold?
+///
+/// DEC-265: a panicked blocking task counts, like any other failed poll. It did
+/// not before, so the one failure mode that never self-heals — the task dying
+/// every tick — was also the one that could never reach the threshold and
+/// prompt the reconnect that might have fixed it.
+///
+/// All three outcomes route through this single rule so a newly added one
+/// cannot quietly opt out of the failure count the way the panic arm did.
+fn poll_attempt_failed<T>(
+    result: &Result<Result<T, crate::error::SerialError>, tokio::task::JoinError>,
+) -> bool {
+    !matches!(result, Ok(Ok(_)))
+}
+
 /// Poll the OpenFanController for per-channel RPM at `interval`, reconnecting
 /// when the device stops answering.
 ///
@@ -559,26 +597,67 @@ fn adopt_reconnected_transport<T: SerialTransport + Send + 'static>(
 /// OpenFanController is worse than no port, because every subsequent write
 /// silently goes somewhere else.
 ///
-/// **This loop is only spawned when a controller was adopted at startup**
-/// (`main.rs`). A device that appears later, or that fails its identity probe
-/// once at boot, needs `POST /fans/openfan/rescan` (DEC-265) — until that call
-/// there is no OpenFan backend at all, which also costs the 105 C thermal
-/// emergency its OpenFan leg.
+/// Spawned either when a controller is adopted at startup (`main.rs`) or when
+/// one is adopted later by `POST /fans/openfan/rescan` (DEC-265,
+/// `api::handlers::openfan`). Exactly one loop exists per adopted controller:
+/// the slot is written once and never replaced — the rescan installs only under
+/// the same write guard it checks (DEC-266), so two racing rescans cannot each
+/// start a loop, and neither can replace a controller the engine is already
+/// writing through. Until *some* controller is
+/// adopted there is no OpenFan backend at all, which also costs the 105 C
+/// thermal emergency its OpenFan leg.
 ///
-/// (The doc comment here was lost in `419025d`, which moved the reconnect helper
-/// out and left the loop bare.)
+/// (This block was lost once in `419025d`, which moved the reconnect helper out
+/// and left the loop bare, and again in DEC-266, where it ended up attached to
+/// the constant below it and silently documented a `u32`. Keep it on the fn.)
 pub async fn openfan_poll_loop(
     cache: Arc<StateCache>,
     transport: Arc<parking_lot::Mutex<Box<dyn SerialTransport + Send>>>,
     timeout: Duration,
     interval: Duration,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) {
+    // DEC-266: the real reconnect probe, injected. Everything else lives in
+    // `openfan_poll_loop_with`, which is the same code the daemon runs — so a
+    // test can drive the actual loop instead of a copy of its arithmetic. Before
+    // this split the loop had never been executed by any test ("driving the real
+    // loop needs a serial device"), and that is exactly how the panic-counting
+    // fix came to be pinned at its helper but not at its call site.
+    openfan_poll_loop_with(cache, transport, timeout, interval, shutdown, |c, t| {
+        adopt_reconnected_transport(c, t, || {
+            let path = crate::serial::real_transport::auto_detect_port(t)?;
+            let rt = crate::serial::real_transport::RealSerialTransport::open(&path, t).ok()?;
+            Some((path, rt))
+        })
+    })
+    .await;
+}
+
+/// The poll loop proper, with the reconnect probe as a parameter.
+///
+/// `reconnect` runs on the blocking pool and returns a replacement transport, or
+/// `None` if nothing suitable was found. It must perform the DEC-250 identity
+/// handshake itself — the production closure does so via
+/// [`adopt_reconnected_transport`].
+async fn openfan_poll_loop_with<F>(
+    cache: Arc<StateCache>,
+    transport: Arc<parking_lot::Mutex<Box<dyn SerialTransport + Send>>>,
+    timeout: Duration,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+    reconnect: F,
+) where
+    F: Fn(&Arc<StateCache>, Duration) -> Option<Box<dyn SerialTransport + Send>>
+        + Send
+        + Sync
+        + Clone
+        + 'static,
+{
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut consecutive_errors: u32 = 0;
-    let reconnect_threshold: u32 = 5;
+    let reconnect_threshold: u32 = RECONNECT_THRESHOLD;
     let mut reconnect_backoff: u32 = 1;
 
     loop {
@@ -592,24 +671,19 @@ pub async fn openfan_poll_loop(
 
         // If too many consecutive errors, attempt reconnect instead of polling
         if consecutive_errors >= reconnect_threshold {
-            let cycle = consecutive_errors - reconnect_threshold;
-            let skip_cycles = reconnect_backoff.min(30);
-            if skip_cycles == 0 || !cycle.is_multiple_of(skip_cycles) {
+            if !attempts_reconnect_this_cycle(
+                consecutive_errors,
+                reconnect_threshold,
+                reconnect_backoff,
+            ) {
                 consecutive_errors += 1;
                 continue;
             }
 
             let t = timeout;
             let c = cache.clone();
-            let reconnect_result = tokio::task::spawn_blocking(move || {
-                adopt_reconnected_transport(&c, t, || {
-                    let path = crate::serial::real_transport::auto_detect_port(t)?;
-                    let rt =
-                        crate::serial::real_transport::RealSerialTransport::open(&path, t).ok()?;
-                    Some((path, rt))
-                })
-            })
-            .await;
+            let probe = reconnect.clone();
+            let reconnect_result = tokio::task::spawn_blocking(move || probe(&c, t)).await;
 
             match reconnect_result {
                 Ok(Some(new_transport)) => {
@@ -639,10 +713,17 @@ pub async fn openfan_poll_loop(
         })
         .await;
 
+        // DEC-265/266: one accounting rule for every outcome, applied before the
+        // match so no arm can forget it (the panic arm used to).
+        if poll_attempt_failed(&result) {
+            consecutive_errors += 1;
+        } else {
+            consecutive_errors = 0;
+            reconnect_backoff = 1;
+        }
+
         match result {
             Ok(Ok(response)) => {
-                consecutive_errors = 0;
-                reconnect_backoff = 1;
                 let now = Instant::now();
                 match response {
                     crate::serial::protocol::Response::Rpm { readings, .. } => {
@@ -667,7 +748,6 @@ pub async fn openfan_poll_loop(
                 }
             }
             Ok(Err(e)) => {
-                consecutive_errors += 1;
                 if consecutive_errors <= 3 {
                     log::warn!("openfan poll error: {e}");
                 } else if consecutive_errors == 4 {
@@ -679,12 +759,9 @@ pub async fn openfan_poll_loop(
                 }
             }
             Err(e) => {
-                // DEC-265: a panicking poll task counts as a failed poll. It did
-                // not before, so the one failure mode that never self-heals — the
-                // blocking task dying every tick — was also the one that could
-                // never reach `reconnect_threshold`. The loop logged forever and
-                // never attempted the reconnect that might have fixed it.
-                consecutive_errors += 1;
+                // Counted above by `poll_attempt_failed` (DEC-265) — this arm
+                // only distinguishes a panicked task in the log from a fan that
+                // merely refused the read.
                 log::error!("openfan poll task panicked: {e}");
             }
         }
@@ -1386,26 +1463,147 @@ mod tests {
     // skip-cycles) had no test at all: the existing DEC-260 cases cover
     // `adopt_reconnected_transport`, i.e. what happens once an attempt is made.
     // The whole trigger could be deleted and the suite stayed green. Driving the
-    // real loop needs a serial device, so the arithmetic is extracted and pinned
-    // directly — the loop keeps the same expressions inline.
+    // real loop needs a serial device, so the arithmetic is pinned directly —
+    // but through the SAME function the loop calls, not a copy of it.
+    //
+    // DEC-266: the copy that used to live here had drifted into asserting the
+    // opposite of production for `backoff == 0`. The loop's inline expression
+    // was the SKIP decision (`skip_cycles == 0 || !cycle.is_multiple_of(..)`),
+    // the mirror read as the ATTEMPT decision, and nothing could notice.
+    use super::{
+        attempts_reconnect_this_cycle as attempts_this_cycle, openfan_poll_loop_with,
+        poll_attempt_failed, RECONNECT_THRESHOLD,
+    };
 
-    /// Mirrors the loop's skip decision: with `consecutive_errors` at or past the
-    /// threshold, is this cycle an attempt or a skip?
-    fn attempts_this_cycle(consecutive_errors: u32, threshold: u32, backoff: u32) -> bool {
-        let cycle = consecutive_errors - threshold;
-        let skip_cycles = backoff.min(30);
-        skip_cycles == 0 || cycle.is_multiple_of(skip_cycles)
+    /// A transport whose every write panics, counting how many polls the loop
+    /// issued before it gave up on polling.
+    struct PanickingTransport(Arc<std::sync::atomic::AtomicU32>);
+
+    impl SerialTransport for PanickingTransport {
+        fn write_line(&mut self, _data: &str) -> Result<(), crate::error::SerialError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("blocking poll task died");
+        }
+        fn read_line(&mut self, _t: Duration) -> Result<String, crate::error::SerialError> {
+            unreachable!("write_line panics first")
+        }
+    }
+
+    #[tokio::test]
+    async fn the_loop_stops_polling_once_panics_reach_the_reconnect_threshold() {
+        // DEC-266. The helper test below proves `poll_attempt_failed` classifies a
+        // panicked task as a failure. It does NOT prove the loop still calls it —
+        // and that distinction is exactly the mirror trap this release already fell
+        // into once. So drive the REAL loop.
+        //
+        // Reverting the loop to the pre-DEC-265 per-arm accounting (panic arm does
+        // not increment) makes it poll forever: the threshold is never reached, the
+        // reconnect that might fix the fault is never attempted, and this assertion
+        // fails on the poll count.
+        let polls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let reconnects = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let transport: Arc<parking_lot::Mutex<Box<dyn SerialTransport + Send>>> = Arc::new(
+            parking_lot::Mutex::new(Box::new(PanickingTransport(polls.clone()))),
+        );
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let r = reconnects.clone();
+        let handle = tokio::spawn(openfan_poll_loop_with(
+            Arc::new(StateCache::new()),
+            transport,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            shutdown_rx,
+            // Never finds anything, and never touches real hardware — the point is
+            // to observe that the loop switched from polling to reconnecting.
+            move |_cache, _t| {
+                r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                None
+            },
+        ));
+
+        // Long enough for far more than RECONNECT_THRESHOLD ticks at 1 ms.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+
+        let polled = polls.load(std::sync::atomic::Ordering::SeqCst);
+        let tried_reconnect = reconnects.load(std::sync::atomic::Ordering::SeqCst);
+
+        assert!(
+            tried_reconnect > 0,
+            "a task that panics every tick must eventually trigger a reconnect \
+             attempt; it never did ({polled} polls, {tried_reconnect} reconnects) — \
+             the panic outcome is not reaching the failure count"
+        );
+        assert!(
+            polled <= RECONNECT_THRESHOLD + 2,
+            "the loop kept polling ({polled} polls) past the reconnect threshold \
+             of {RECONNECT_THRESHOLD} — panics are not being counted"
+        );
+    }
+
+    #[test]
+    fn a_panicked_poll_task_counts_toward_the_reconnect_threshold() {
+        // DEC-265 regression. A blocking task that dies every tick is the one
+        // failure that never self-heals, so it is the one that most needs to
+        // reach the threshold — yet it used to be the only outcome that did not
+        // count. The loop logged forever and never attempted the reconnect.
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let join_err = rt.block_on(async {
+            tokio::spawn(async { panic!("blocking poll task died") })
+                .await
+                .expect_err("task should have panicked")
+        });
+        let panicked: Result<Result<u8, crate::error::SerialError>, tokio::task::JoinError> =
+            Err(join_err);
+        assert!(
+            poll_attempt_failed(&panicked),
+            "a panicked poll task must count as a failed poll"
+        );
+    }
+
+    #[test]
+    fn a_good_read_clears_the_failure_count_and_a_refused_one_does_not() {
+        let good: Result<Result<u8, crate::error::SerialError>, tokio::task::JoinError> = Ok(Ok(7));
+        assert!(
+            !poll_attempt_failed(&good),
+            "a successful poll must clear the failure count, not add to it"
+        );
+
+        // DEC-266: the ordinary disconnect — an unplugged or wedged controller
+        // refusing the read. Asserting only the `Ok(Ok)` half left the most
+        // common failure unpinned, and `result.is_err()` is the obvious
+        // "simplification" of `!matches!(result, Ok(Ok(_)))`: it keeps the panic
+        // case counting, so every other test stays green, while silently
+        // disarming the reconnect trigger for every real serial error.
+        let refused: Result<Result<u8, crate::error::SerialError>, tokio::task::JoinError> =
+            Ok(Err(crate::error::SerialError::Timeout { timeout_ms: 100 }));
+        assert!(
+            poll_attempt_failed(&refused),
+            "a refused read must count toward the reconnect threshold"
+        );
     }
 
     #[test]
     fn reconnect_does_not_engage_before_the_threshold() {
-        // Below threshold the loop polls; the trigger block is not entered at all.
-        for errors in 0..5 {
-            assert!(
-                errors < 5,
-                "consecutive_errors={errors} must still be polling"
-            );
-        }
+        // The gate is `consecutive_errors >= RECONNECT_THRESHOLD`, and it lives
+        // in the loop rather than in the arithmetic — so what is pinnable here
+        // is the threshold value itself. Lowering it diverts the loop into a
+        // seconds-long blocking probe on every transient hiccup; raising it
+        // strands a genuinely disconnected controller for longer.
+        assert_eq!(
+            RECONNECT_THRESHOLD, 5,
+            "the reconnect threshold is a deliberate value, not an accident"
+        );
+        // And the first cycle that does engage attempts immediately: backoff
+        // starts at 1, so a disconnect that self-heals recovers in one tick.
+        assert!(attempts_this_cycle(
+            RECONNECT_THRESHOLD,
+            RECONNECT_THRESHOLD,
+            1
+        ));
     }
 
     #[test]

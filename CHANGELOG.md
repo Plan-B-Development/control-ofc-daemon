@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [2.18.0] — 2026-08-17
 
 ### Added
 - **An OpenFanController can now be adopted without restarting the daemon.** The
@@ -43,8 +43,52 @@
   went away, the engine's wait returned instantly and forever — turning a
   once-a-second loop into one that spins a CPU core flat out, while the health
   endpoint reported it as perfectly on time, because it *was* ticking. DEC-265.
+- **The profile engine is now supervised, so its death is no longer silent.**
+  The panic-hook change above is right — a contained panic should not lurch every
+  fan to firmware defaults — but it presumed something that was not true. The
+  engine runs on a tokio worker thread, so a panic inside its own tick body is
+  "contained" by construction: the task died, nothing polled its handle until
+  shutdown, and the process stayed up answering `/status` while every hwmon
+  header sat latched in manual at a frozen duty with the BIOS locked out, the GPU
+  on a frozen curve, and no 105 °C emergency. `Restart=on-failure` never fired
+  because nothing exited. That is strictly worse than the pre-existing behaviour
+  the panic hook used to provide, and the bug class is live — two audits have
+  each found a `clamp` panic on that exact path, including one fixed in this
+  release. The engine now reports its own death, on a drop guard so an unwinding
+  panic reports it too, and the daemon responds by running the same ordered
+  restore a SIGTERM would and then exiting non-zero so systemd restarts it with a
+  live engine. DEC-266.
+- **A GPU reporting a negative or over-100% fan-speed bound is no longer
+  trusted.** The inverted-range guard added above compared the two bounds as
+  signed integers and *then* narrowed them to bytes, so the conversion could
+  reintroduce the inversion the guard exists to reject: `-1% 100%` passed and
+  became `(255, 100)`, and `0% 300%` became `(0, 44)`, silently capping every GPU
+  fan at 44%. Bounds are now converted before they are compared, and a hotspot
+  range wide enough to overflow the downstream subtraction is rejected as
+  implausible. DEC-266.
+- **A rescan whose HTTP request timed out no longer throws away the controller it
+  found.** Probing and adoption ran inside the request handler, so a client that
+  gave up — the GUI allowed 5 s, and a sweep across several unresponsive
+  USB-serial devices takes longer — caused the handler's future to be dropped.
+  The probe itself cannot be cancelled, so it ran to completion, identified a
+  controller, and then discarded it, losing the very thermal-emergency leg the
+  route exists to restore. It also released the single-flight flag early, so a
+  retry raced the still-running orphan for the same port. Probe, adoption and
+  flag release now live in a detached task; the request only waits for the
+  answer. DEC-266.
+- **Two rescans racing could each install a controller.** The "one is already
+  connected" check and the single-flight claim are two adjacent statements, and
+  on a multi-threaded runtime two requests on different threads can still
+  interleave between them: the loser probes for seconds, then installs its
+  controller over the winner's. The engine only looks for a controller while it
+  has none, so it would have gone on writing through the first one while a poll
+  loop read RPM from the second. The install is now made under the same lock
+  that checks, so the second probe is discarded and answers as the idempotent
+  repeat it is. DEC-266.
+- **A rescan no longer reports "nothing found" while still holding the lock that
+  says one is running**, which made an immediate retry fail as a conflict with
+  the attempt that had just finished. DEC-266.
 
-### Fixed
 - **A release can no longer be published from a commit whose tests failed.** The
   GUI's v2.41.0 shipped that way; this repo has the identical structure and is
   fixed alongside it rather than waiting for its turn. The publish workflow gated

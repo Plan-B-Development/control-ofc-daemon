@@ -340,6 +340,7 @@ writable hwmon header directly, spinning a stalled pump back up regardless of st
 |--------|------|---------|
 | POST | `/hwmon/{header_id}/verify` | Test PWM write effectiveness (~6s; daemon uses its own internal lease, detects BIOS/EC interference) |
 | POST | `/hwmon/rescan` | Re-enumerate hwmon devices and return fresh header list |
+| POST | `/fans/openfan/rescan` | Look for an OpenFanController and adopt it without a restart (DEC-265) |
 
 ### Write endpoints — inventory (opt-in active probe)
 

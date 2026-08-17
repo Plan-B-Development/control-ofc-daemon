@@ -123,13 +123,21 @@ pub fn parse_fan_curve(content: &str) -> Result<FanCurve, HwmonError> {
                     // same panic class DEC-249 fixed in `tuning.rs` and whose
                     // sweep missed this file. An inverted line is nonsense, so
                     // drop it and let the caller's safe fallback stand.
+                    //
+                    // DEC-266: bounded, not merely ordered. `temp_max - temp_min`
+                    // is computed downstream in i32, so a wildly wide reported
+                    // range overflows — wrapping in release, panicking in debug
+                    // and under test, on the once-per-second sole-writer path.
+                    // Anything outside a plausible silicon range is nonsense from
+                    // the device, so treat it the same as an inversion.
+                    const TEMP_SANE: std::ops::RangeInclusive<i32> = -50..=200;
                     if let (Some(l), Some(h)) = (lo, hi) {
-                        if l <= h {
+                        if l <= h && TEMP_SANE.contains(&l) && TEMP_SANE.contains(&h) {
                             temp_range = Some((l, h));
                         } else {
                             log::warn!(
-                                "GPU fan_curve reported an inverted hotspot temp range \
-                                 ({l}C..{h}C) — ignoring it and using the default"
+                                "GPU fan_curve reported an implausible or inverted hotspot \
+                                 temp range ({l}C..{h}C) — ignoring it and using the default"
                             );
                         }
                     }
@@ -148,14 +156,25 @@ pub fn parse_fan_curve(content: &str) -> Result<FanCurve, HwmonError> {
                     // pair feeds `.max(lo).min(hi)`, which does not panic — but an
                     // inverted range there silently pins every speed to `hi`, so
                     // it is wrong in a quieter way rather than a safe one.
+                    //
+                    // DEC-266: convert BEFORE comparing. `parse_value_with_suffix`
+                    // returns i32 and accepts a leading `-`, so ordering checked in
+                    // i32 and then cast with `as u8` re-admits the exact inversion
+                    // this guard exists to reject: `-1% 100%` passes `-1 <= 100` and
+                    // truncates to `(255, 100)`, and `0% 300%` to `(0, 44)`, which
+                    // silently caps every GPU fan at 44%.
                     if let (Some(l), Some(h)) = (lo, hi) {
-                        if l <= h {
-                            speed_range = Some((l as u8, h as u8));
-                        } else {
-                            log::warn!(
-                                "GPU fan_curve reported an inverted fan speed range \
-                                 ({l}%..{h}%) — ignoring it and using the default"
-                            );
+                        match (u8::try_from(l), u8::try_from(h)) {
+                            (Ok(l), Ok(h)) if l <= h && h <= 100 => {
+                                speed_range = Some((l, h));
+                            }
+                            _ => {
+                                log::warn!(
+                                    "GPU fan_curve reported an out-of-range or inverted fan \
+                                     speed range ({l}%..{h}%) — ignoring it and using the \
+                                     default"
+                                );
+                            }
                         }
                     }
                 }
@@ -1025,6 +1044,79 @@ FAN_CURVE(fan speed): 100% 15%
         let curve = parse_fan_curve(SAMPLE_CURVE).unwrap();
         assert_eq!(curve.temp_range, Some((25, 100)));
         assert_eq!(curve.speed_range, Some((15, 100)));
+    }
+
+    // ── DEC-266: the ordering guard must survive the conversion ──
+    //
+    // `parse_value_with_suffix` returns i32 and accepts a leading `-`. Checking
+    // order in i32 and *then* casting with `as u8` re-admits the exact inversion
+    // the guard rejects, silently — no panic, no log, just wrong fan speeds
+    // forever. These are the two shapes that slipped through.
+
+    #[test]
+    fn a_negative_speed_bound_cannot_wrap_past_the_ordering_guard() {
+        // -1 <= 100 passes in i32; `as u8` then yields (255, 100) — inverted
+        // again, and `.max(255).min(100)` pins every write to 100%.
+        let curve = parse_fan_curve(
+            "\
+OD_FAN_CURVE:
+0: 40C 30%
+1: 50C 35%
+OD_RANGE:
+FAN_CURVE(hotspot temp): 25C 100C
+FAN_CURVE(fan speed): -1% 100%
+",
+        )
+        .unwrap();
+        assert_eq!(
+            curve.speed_range, None,
+            "a negative bound must be rejected, not truncated into an inverted pair"
+        );
+    }
+
+    #[test]
+    fn a_speed_bound_above_100_cannot_wrap_past_the_ordering_guard() {
+        // 0 <= 300 passes in i32; `as u8` yields (0, 44), silently capping every
+        // GPU fan at 44%.
+        let curve = parse_fan_curve(
+            "\
+OD_FAN_CURVE:
+0: 40C 30%
+1: 50C 35%
+OD_RANGE:
+FAN_CURVE(hotspot temp): 25C 100C
+FAN_CURVE(fan speed): 0% 300%
+",
+        )
+        .unwrap();
+        assert_eq!(
+            curve.speed_range, None,
+            "an out-of-range bound must be rejected, not truncated to 44%"
+        );
+    }
+
+    #[test]
+    fn an_implausible_temp_range_is_rejected_before_it_can_overflow() {
+        // `temp_max - temp_min` is computed in i32 downstream, so a range this
+        // wide overflows — wrapping in release, panicking under test, on the
+        // once-per-second sole-writer path.
+        let curve = parse_fan_curve(
+            "\
+OD_FAN_CURVE:
+0: 40C 30%
+1: 50C 35%
+OD_RANGE:
+FAN_CURVE(hotspot temp): -2147483648C 2147483647C
+FAN_CURVE(fan speed): 15% 100%
+",
+        )
+        .unwrap();
+        assert_eq!(curve.temp_range, None);
+        assert_eq!(
+            curve.speed_range,
+            Some((15, 100)),
+            "one bad line must not discard the other"
+        );
     }
 
     #[test]

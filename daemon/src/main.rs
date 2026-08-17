@@ -16,6 +16,59 @@ static PANIC_RESTORE: OnceLock<PanicRestoreTargets> = OnceLock::new();
 /// process. Used to tell a fatal panic from a contained one (DEC-265).
 static MAIN_THREAD: OnceLock<std::thread::ThreadId> = OnceLock::new();
 
+/// Does a panic on `current` end the process?
+///
+/// Only a panic on the main thread does; tokio catches one on a worker or
+/// blocking thread and hands the caller a `JoinError`. Split out from the hook
+/// so the decision is unit-testable — it decides whether fans are handed back
+/// to firmware control, and an inverted condition here is silent (DEC-266).
+///
+/// Fails **safe**: an unset `main` (the hook somehow firing before
+/// `install_panic_hook` finished) is treated as fatal, so the restore runs.
+fn panic_is_fatal(main: Option<&std::thread::ThreadId>, current: std::thread::ThreadId) -> bool {
+    main.is_none_or(|main| current == *main)
+}
+
+/// Reports the profile engine's task ending, however it ended (DEC-266).
+///
+/// A `Drop` guard rather than a send after the `.await`, because the case that
+/// matters most — a panic inside the engine's own tick body — unwinds past any
+/// such send. Dropping the future runs this; returning normally runs it too.
+struct EngineDeathSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl Drop for EngineDeathSignal {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// Spawn `fut` on the runtime and hand back a receiver that fires when it ends,
+/// however it ends (DEC-266).
+///
+/// Exists as a function so the binding can be tested. The guard must be held in a
+/// **named** local across the `.await`: written as `let _ = EngineDeathSignal(..)`
+/// it would drop at construction, the receiver would be ready before the main
+/// loop even started, and the daemon would restore-and-exit on its first tick —
+/// a boot crash-loop that compiles and passes every other test.
+fn spawn_supervised<F>(
+    fut: F,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::oneshot::Receiver<()>,
+)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        let _death = EngineDeathSignal(Some(tx));
+        fut.await;
+    });
+    (handle, rx)
+}
+
 fn install_panic_hook() {
     // Called as the first statement of `main`, so this IS the main thread.
     let _ = MAIN_THREAD.set(std::thread::current().id());
@@ -36,11 +89,16 @@ fn install_panic_hook() {
         // blocking thread does not. That is the distinction, and it is drawn on
         // thread identity rather than the thread's *name*, which tokio is free to
         // change. The trade is accepted and deliberate: a contained panic now
-        // leaves the fans under daemon control, which the engine-liveness
-        // heartbeat (DEC-249/259) is what surfaces.
-        let fatal = MAIN_THREAD
-            .get()
-            .is_none_or(|main| std::thread::current().id() == *main);
+        // leaves the fans under daemon control.
+        //
+        // "Under daemon control" is only true while the daemon still has a
+        // writer, so it is not this hook that makes it true — the profile engine
+        // is supervised (DEC-266, see `engine_dead_rx`). A panic that kills the
+        // engine task is contained by the runtime but fatal to fan control, and
+        // the supervisor turns it back into a restore-and-exit. Removing that
+        // supervision silently re-arms the regression this branch would
+        // otherwise introduce.
+        let fatal = panic_is_fatal(MAIN_THREAD.get(), std::thread::current().id());
         if !fatal {
             eprintln!(
                 "PANIC on a non-main thread: contained by the runtime, so fans are \
@@ -989,7 +1047,17 @@ async fn main() {
     // sole PWM writer (DEC-159/DEC-165). In imperative mode (no active profile)
     // nothing autonomous runs — the daemon only writes in response to explicit
     // API intent (manual override, fan identify); the GUI never writes PWM.
-    let engine_handle = {
+    //
+    // DEC-266: the engine is SUPERVISED. Its task dying is not a contained
+    // failure — it is the loss of the only PWM writer, and with it the 105 °C
+    // emergency, while the process stays up and `/status` keeps answering. The
+    // panic hook cannot cover this (the engine runs on a tokio worker thread, so
+    // its panic is "contained" by construction), and `Restart=on-failure` cannot
+    // either, because nothing exits. So the task signals its own death on drop —
+    // which a panic-unwind triggers just as a normal return does — and the main
+    // loop turns that into the same restore-to-automatic shutdown a SIGTERM
+    // would, then exits non-zero so systemd restarts us with a live engine.
+    let (engine_handle, engine_dead_rx) = {
         let engine_cache = cache.clone();
         let engine_profile = active_profile.clone();
         let engine_safety = safety_rule.clone();
@@ -999,7 +1067,7 @@ async fn main() {
         let engine_overrides = app_state.override_table.clone();
         let engine_shutdown = poll_shutdown_rx;
 
-        tokio::spawn(async move {
+        spawn_supervised(async move {
             control_ofc_daemon::profile_engine::profile_engine_loop(
                 engine_cache,
                 engine_profile,
@@ -1047,6 +1115,9 @@ async fn main() {
     // skipped. SIGHUP and SIGTERM registrations are both fail-soft: if the
     // kernel refuses (rare — typically only happens under unusual sandbox
     // policies), the daemon still terminates cleanly on SIGINT.
+    // DEC-266: set when the loop breaks because the profile engine died, so the
+    // process can exit non-zero AFTER the ordered restore has run.
+    let mut engine_died = false;
     {
         use tokio::signal::unix::SignalKind;
 
@@ -1069,6 +1140,7 @@ async fn main() {
         };
 
         tokio::pin!(ipc_dead_rx);
+        tokio::pin!(engine_dead_rx);
 
         loop {
             tokio::select! {
@@ -1099,6 +1171,19 @@ async fn main() {
                             "IPC server task dropped its dead-signal channel — shutting down"
                         ),
                     }
+                    break;
+                }
+                // DEC-266. Reached only while the main loop is still running, and
+                // shutdown is not requested until after it breaks — so the engine
+                // ending here is always unexpected, never the clean-exit path.
+                _ = &mut engine_dead_rx => {
+                    log::error!(
+                        "SAFETY: the profile engine task exited unexpectedly — it is the sole \
+                         PWM writer, so fan control and the 105 \u{b0}C thermal emergency are \
+                         both gone. Restoring fans to firmware control and exiting so systemd \
+                         restarts the daemon."
+                    );
+                    engine_died = true;
                     break;
                 }
             }
@@ -1157,6 +1242,16 @@ async fn main() {
     .await;
 
     log::info!("control-ofc-daemon v{VERSION} stopped");
+
+    // DEC-266. Deliberately after `shutdown_sequence`, so the hardware is back
+    // under firmware control before the process goes away: exiting first would
+    // leave fans latched at whatever duty the dead engine last wrote. Non-zero
+    // so `Restart=on-failure` brings the daemon back with a live engine — a
+    // clean exit here would look like a requested stop and systemd would leave
+    // the machine with no fan control.
+    if engine_died {
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
@@ -1177,6 +1272,122 @@ mod tests {
     // keeps reporting restart_pending after every restart — a permanently
     // unclearable banner over a setting that does nothing. That exact shape had
     // to be fixed once already for profiles.search_dirs.
+
+    // ── DEC-266 panic classification + engine supervision ────────────────
+    // Both halves decide whether fans go back to firmware control, and both
+    // used to be untestable: the classification was inline in the hook, and the
+    // engine's death had no consequence at all to observe. Inverting either is
+    // silent — the daemon keeps running and `/status` keeps answering — so
+    // these pin the decision itself rather than any downstream effect.
+
+    #[test]
+    fn a_panic_on_the_main_thread_is_fatal() {
+        let main = std::thread::current().id();
+        assert!(panic_is_fatal(Some(&main), main));
+    }
+
+    #[test]
+    fn a_panic_on_a_worker_thread_is_contained() {
+        let main = std::thread::current().id();
+        let worker = std::thread::spawn(|| std::thread::current().id())
+            .join()
+            .expect("worker thread panicked");
+        assert_ne!(main, worker, "test needs two genuinely distinct threads");
+        assert!(!panic_is_fatal(Some(&main), worker));
+    }
+
+    #[test]
+    fn an_unknown_main_thread_fails_safe_to_fatal() {
+        // If the hook somehow fires before MAIN_THREAD is set, restoring fans is
+        // the safe guess: a needless reset beats leaving them latched in manual.
+        assert!(panic_is_fatal(None, std::thread::current().id()));
+    }
+
+    #[test]
+    fn a_running_engine_is_not_reported_as_dead() {
+        // The binding test. `spawn_supervised` must hold the guard in a NAMED
+        // local across the `.await` — written `let _ = EngineDeathSignal(..)` it
+        // drops at construction, the receiver is ready before the main loop even
+        // starts, and the daemon restore-and-exits on its first tick. That is a
+        // boot crash-loop until systemd's StartLimitBurst gives up, and it
+        // compiles and passes every other test in the suite.
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let (handle, mut dead_rx) = spawn_supervised(async move {
+                let _ = release_rx.await;
+            });
+
+            // Give the task a chance to be polled at least once.
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+            assert!(
+                dead_rx.try_recv().is_err(),
+                "a still-running engine must NOT report itself dead"
+            );
+
+            let _ = release_tx.send(());
+            handle.await.expect("task should not panic");
+            assert!(
+                dead_rx.await.is_ok(),
+                "once the engine ends, its death must be reported"
+            );
+        });
+    }
+
+    #[test]
+    fn a_supervised_task_that_panics_still_reports_its_death() {
+        // Same wiring, via the panic path — the case the drop guard exists for.
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let (handle, dead_rx) = spawn_supervised(async {
+                panic!("engine tick body blew up");
+            });
+            assert!(handle.await.is_err(), "the task should have panicked");
+            assert!(
+                dead_rx.await.is_ok(),
+                "a panicking engine task must report its death"
+            );
+        });
+    }
+
+    #[test]
+    fn the_engine_reports_its_death_when_its_task_unwinds() {
+        // The case that matters: a panic inside the engine's own tick body. It
+        // unwinds past any send placed after the `.await`, so the signal has to
+        // ride on Drop. Without it the task dies silently and the daemon keeps
+        // running with no PWM writer and no 105 °C emergency.
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let fired = rt.block_on(async {
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            let handle = tokio::spawn(async move {
+                let _death = EngineDeathSignal(Some(tx));
+                panic!("engine tick body blew up");
+            });
+            assert!(handle.await.is_err(), "the task should have panicked");
+            rx.await.is_ok()
+        });
+        assert!(fired, "a panicking engine task must report its death");
+    }
+
+    #[test]
+    fn the_engine_reports_its_death_when_its_task_returns() {
+        // A clean return is equally a loss of the writer while the daemon is up.
+        // The main loop only listens for this before shutdown is requested, so
+        // reporting both ways costs nothing and misses nothing.
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let fired = rt.block_on(async {
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            tokio::spawn(async move {
+                let _death = EngineDeathSignal(Some(tx));
+            })
+            .await
+            .expect("task should not panic");
+            rx.await.is_ok()
+        });
+        assert!(fired, "an engine task that returns must report its death");
+    }
 
     #[test]
     fn overlay_applies_every_dec243_key() {
