@@ -90,6 +90,37 @@ impl ThermalSafetyRule {
     pub fn is_active(&self) -> bool {
         self.active
     }
+
+    /// The temperature at or below which a latched emergency releases.
+    ///
+    /// Exposed so the tick can ask "was the last thing we knew hot enough to
+    /// matter?" without duplicating the threshold (DEC-269).
+    pub fn release_temp_c(&self) -> f64 {
+        self.release_temp_c
+    }
+
+    /// The output this rule is already holding, read **without** a temperature.
+    ///
+    /// [SAFETY] DEC-269. For the case where the CPU reading is *stale* rather
+    /// than *absent*: the poll loop has stopped updating, but the last thing it
+    /// told us still stands as evidence. A latched emergency means we saw at
+    /// least 105 C and have never since seen 80 C or below, and that remains
+    /// true while we are blind — so the safe response to losing sight is to keep
+    /// forcing what we were already forcing, not to fall back to a lower floor.
+    ///
+    /// Deliberately **non-mutating**, unlike [`Self::evaluate`]. A stale reading
+    /// must not clear the latch, advance the two-cycle recovery counter, or
+    /// trigger a new emergency — it is not evidence of anything *current*, only
+    /// of what was last true.
+    pub fn held_output_pct(&self) -> Option<u8> {
+        if self.active {
+            Some(self.forced_output_pct)
+        } else if self.recovery {
+            Some(self.recovery_output_pct)
+        } else {
+            None
+        }
+    }
 }
 
 impl Default for ThermalSafetyRule {
@@ -151,6 +182,32 @@ mod tests {
         assert_eq!(rule.evaluate(80.0), Some(60)); // cycle 1: release at 60%
         assert_eq!(rule.evaluate(70.0), Some(60)); // cycle 2: recovery floor at 60%
         assert_eq!(rule.evaluate(70.0), None); // cycle 3: back to profile control
+    }
+
+    #[test]
+    fn held_output_reports_what_the_rule_is_forcing_without_a_reading() {
+        // DEC-269. This is what a stale reading holds onto, so it must track the
+        // rule's real state — and must not mutate it.
+        let mut rule = ThermalSafetyRule::new();
+        assert_eq!(rule.held_output_pct(), None, "nothing forced at rest");
+
+        rule.evaluate(106.0);
+        assert_eq!(rule.held_output_pct(), Some(100), "latched");
+        assert_eq!(rule.held_output_pct(), Some(100), "and it is idempotent");
+        assert!(rule.is_active(), "reading it must not clear the latch");
+
+        rule.evaluate(70.0); // release -> recovery
+        assert_eq!(rule.held_output_pct(), Some(60), "recovery floor");
+        // Reading it repeatedly must not consume the two-cycle recovery window.
+        assert_eq!(rule.held_output_pct(), Some(60));
+        assert_eq!(
+            rule.evaluate(70.0),
+            Some(60),
+            "the second recovery cycle must still be owed — held_output_pct \
+             advanced the state machine"
+        );
+        assert_eq!(rule.evaluate(70.0), None);
+        assert_eq!(rule.held_output_pct(), None);
     }
 
     #[test]

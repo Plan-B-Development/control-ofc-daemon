@@ -11,25 +11,80 @@ use std::time::{Duration, Instant};
 
 use crate::health::state::*;
 
-/// Thread-safe in-memory cache for daemon state.
-///
-/// All IPC responses should read from this cache rather than polling
-/// hardware directly.
 /// Fallback hwmon poll interval when nothing has published the real one
 /// (DEC-267) — matches `StalenessConfig::default()` and the shipped
 /// `polling.poll_interval_ms` default.
 const DEFAULT_HWMON_POLL_INTERVAL_MS: u64 = 1000;
 
-/// Multiple of the poll interval past which a CPU reading is treated as absent
-/// rather than current (DEC-267).
+/// Multiple of the poll interval past which a CPU reading is treated as no
+/// longer current (DEC-267).
 ///
-/// Matches the existing `Crit` boundary in `health::staleness` — a reading the
-/// health rollup would already be calling critically stale is not one to run the
-/// 105 °C ladder on. Deliberately not tighter: at 2x (the `Warn` boundary) an
-/// ordinary scheduling hiccup would drop the sensor and, five cycles later,
-/// force every fan to 40% for no reason.
+/// Five intervals is the same multiplier `health::staleness` uses for its `Crit`
+/// boundary — a reading the health rollup would already call critically stale is
+/// not one to run the 105 °C ladder on. Deliberately not tighter: at 2x (the
+/// `Warn` boundary) an ordinary scheduling hiccup would drop the sensor.
+///
+/// DEC-269: the two are **not** identical, and the earlier claim that they
+/// "match" was wrong. This budget is floored at [`DEFAULT_HWMON_POLL_INTERVAL_MS`]
+/// and the rollup's is not, so below a 1 s poll interval the rollup calls hwmon
+/// `crit` while the safety rule still trusts the reading. That asymmetry is the
+/// safe direction — more headroom means fewer false fallbacks — and is kept
+/// deliberately.
 const CPU_TEMP_STALE_INTERVALS: u32 = 5;
 
+/// Hard ceiling on the staleness budget, however the poll interval is configured
+/// (DEC-269).
+///
+/// [SAFETY] `polling.poll_interval_ms` is validated only as `>= 100`; the
+/// 250–2000 ms clamp lives on the API route, not on the config file. So an admin
+/// typo of `poll_interval_ms = 3600000` would otherwise hand the 105 °C rule a
+/// five-hour staleness budget — silently disabling the protection with no
+/// signal anywhere. Defence in depth under the DEC-253 trusted-local posture.
+///
+/// DEC-270: this used to say the daemon stops trusting a temperature older than
+/// the ceiling *regardless* of the interval. That is no longer true, and taken
+/// literally it was not safe either. Once the cadence passes this ceiling the
+/// budget is *shorter than one poll period*, so every reading is stale on
+/// arrival, `hottest_cpu_reading` never returns `Fresh`, and the 105 °C ladder —
+/// which runs only on a fresh reading — is disabled entirely. The floor in
+/// [`StateCache::cpu_temp_stale_after`] now makes that impossible at any
+/// cadence, and `apply_runtime_overlay` keeps the cadence low enough that this
+/// ceiling never even binds. So this constant is no longer self-standing: do not
+/// remove either guard on the strength of it.
+pub(crate) const CPU_TEMP_STALE_CEILING_MS: u64 = 30_000;
+
+/// The slowest poll cadence this daemon can actually supervise, derived from the
+/// two constants above rather than written down twice (DEC-270).
+///
+/// [SAFETY] Above this, `interval * CPU_TEMP_STALE_INTERVALS` exceeds
+/// [`CPU_TEMP_STALE_CEILING_MS`], so the budget stops tracking the cadence and
+/// the 5x headroom this design promises erodes towards 1x — by a ~15 s cadence a
+/// single missed poll already reads as stale, and at the 30 s ceiling there is no
+/// margin left at all. Past 30 s it inverts outright: the budget is shorter than
+/// one poll period, every reading is stale on arrival, the 105 °C ladder is
+/// silently disabled and fans pin at NO_SENSOR_SAFE_PCT. Rather than pick a
+/// failure direction, refuse the cadence:
+/// `apply_runtime_overlay` clamps to this and logs a warning, so the daemon still
+/// starts (a fan controller that will not boot over a config typo is worse than
+/// one that polls faster than it was told) and still supervises temperature.
+pub const MAX_SUPERVISABLE_POLL_INTERVAL_MS: u64 =
+    CPU_TEMP_STALE_CEILING_MS / CPU_TEMP_STALE_INTERVALS as u64;
+
+// `MAX_SUPERVISABLE_POLL_INTERVAL_MS` is what `apply_runtime_overlay` clamps the
+// cadence *down to*, so the danger is it becoming absurdly small: raising
+// `CPU_TEMP_STALE_INTERVALS` far enough drives it below the API's own 250 ms
+// floor, and past `CEILING` it reaches 0 — which would clamp the interval to
+// zero and panic `tokio::time::interval` in the hwmon poll loop, killing the only
+// writer of the sensor map the 105 °C rule reads.
+//
+// Asserting `MAX * INTERVALS <= CEILING` instead would be vacuous: `MAX` is
+// *derived* by that division, so it holds for every input.
+const _: () = assert!(MAX_SUPERVISABLE_POLL_INTERVAL_MS >= 250);
+
+/// Thread-safe in-memory cache for daemon state.
+///
+/// All IPC responses should read from this cache rather than polling
+/// hardware directly.
 pub struct StateCache {
     inner: RwLock<DaemonState>,
     /// Set by the polling loop when a system suspend/resume is detected
@@ -137,7 +192,26 @@ impl StateCache {
             .hwmon_poll_interval_ms
             .load(Ordering::Relaxed)
             .max(DEFAULT_HWMON_POLL_INTERVAL_MS);
-        Duration::from_millis(interval * u64::from(CPU_TEMP_STALE_INTERVALS))
+        // `saturating_mul`, not `*`: a wrapping multiply would produce a *tiny*
+        // budget — permanent false-stale, every fan pinned at NO_SENSOR_SAFE_PCT
+        // — which is the worst possible direction to fail in (DEC-269).
+        let budget = interval
+            .saturating_mul(u64::from(CPU_TEMP_STALE_INTERVALS))
+            .min(CPU_TEMP_STALE_CEILING_MS)
+            // [SAFETY] Never below one poll period. The ceiling above is what
+            // stops a mistyped interval buying an unbounded trust window, but
+            // applied alone it fails the *other* way: with the cadence slower
+            // than the ceiling, every reading is older than its budget the
+            // moment it lands, so the 105 °C ladder — which only runs on a
+            // `Fresh` reading — is permanently disabled and fans sit at
+            // NO_SENSOR_SAFE_PCT on healthy hardware, with `/status` reporting a
+            // ticking engine throughout. `apply_runtime_overlay` clamps the
+            // interval to `MAX_SUPERVISABLE_POLL_INTERVAL_MS` so this floor is
+            // unreachable in practice; it is kept because this atomic is
+            // publicly settable and the invariant belongs where it is relied on,
+            // not only where it currently happens to hold.
+            .max(interval);
+        Duration::from_millis(budget)
     }
 
     /// Bump the profile-activation epoch (DEC-188). Called by

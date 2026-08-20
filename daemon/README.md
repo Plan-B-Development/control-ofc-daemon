@@ -104,18 +104,16 @@ For full upgrade details and the per-version contract changes, see `docs/USER_GU
 
 ## Quality gates
 
-Standard gates (run on every change):
+**The canonical command set lives in `CLAUDE.md § Quality gates` at the repo root.**
+Run it from there; it is not repeated here.
 
-```bash
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all --all-features
-```
+This section used to restate the commands and had drifted away from the canonical
+set — it specified `cargo test --all`, where CLAUDE.md specified
+`cargo test --all-targets`, and those are not equivalent (`--all-targets` suppresses
+doctests). Both also carried an `--all-features` flag that did nothing, since this
+crate has no `[features]` table. A second copy of a command list is a second thing to
+keep true, and this one was not.
 
-Release-time supply-chain gates (DEC-174): `deny.toml` encodes the project's
-license/advisory policy (DEC-043 no-LGPL, DEC-155 serialport MPL-2.0).
-
-```bash
-cargo audit
-cargo deny check
-```
+Release-time supply-chain gates are in the same CLAUDE.md block. For context on what
+they enforce: `deny.toml` encodes the project's license/advisory policy (DEC-043
+no-LGPL, DEC-155 serialport MPL-2.0).

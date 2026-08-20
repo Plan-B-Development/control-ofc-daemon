@@ -310,25 +310,55 @@ fn notify_repo_settles_before_dispatching() {
     );
 }
 
-/// The settle window must stay long enough to be worth having.
+/// The settle window must stay strong enough to be worth having.
 ///
-/// Measured against the two historical coordinated releases, the 180 s window had
-/// only **13–34 s of real slack** — so a shorter wait would have published a
-/// mismatched pair. This pins the order of magnitude rather than the exact value:
-/// trimming it to "a few seconds" because the wait feels slow in CI is the
-/// plausible future edit, and it would silently remove the protection.
+/// History: this was a fixed `sleep 180`, and this test pinned that number's order
+/// of magnitude. The fixed wait was then measured to be **inadequate** — on
+/// 2026-08-17 the two `notify-repo` jobs fired 9 m 29 s apart, so publish #1
+/// assembled daemon 2.18.0 with GUI 2.41.0 and `verify.yml` reported that pair
+/// green, because the GUI Release object did not exist yet. 180 s was never going
+/// to cover a nine-minute skew.
+///
+/// So the mechanism is now a **poll for the peer's release run**, and this test
+/// pins that instead. It deliberately asserts BOTH halves, because either one
+/// alone can be deleted while the step still looks correct in a diff:
+///
+/// 1. the step actually polls the peer's `release.yml` runs, and
+/// 2. the fail-open fallback is still a substantial wait, not a token one.
+///
+/// The plausible future edits this guards against are "drop the poll, it is
+/// slow" (which restores the mismatched-pair bug) and "trim the fallback to a few
+/// seconds" (which removes the protection whenever the API call fails).
 #[test]
 fn the_settle_window_is_not_trimmed_to_nothing() {
     let block = job_block(&release_workflow(), "notify-repo");
-    let secs: u32 = block
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("run: sleep "))
-        .and_then(|v| v.trim().parse().ok())
-        .expect("notify-repo's settle step must be a plain `sleep <seconds>`");
+
     assert!(
-        secs >= 120,
-        "the settle window is {secs}s; the two historical coordinated releases left \
-         only 13-34s of slack at 180s, so anything much shorter stops working (DEC-248)"
+        block.contains("actions/workflows/release.yml/runs"),
+        "notify-repo must POLL for a paired release run before dispatching — a fixed \
+         sleep was measured insufficient (9m29s observed skew vs a 180s wait, which \
+         published a mismatched pair behind a green verify.yml)"
+    );
+    assert!(
+        block.contains("PEER"),
+        "notify-repo's poll must name the peer repository it waits on"
+    );
+
+    // The fail-open fallback: any API problem must degrade to the old fixed wait,
+    // never to no wait at all.
+    let fallback_secs: u32 = block
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("sleep "))
+        .and_then(|v| v.trim().parse().ok())
+        .expect(
+            "notify-repo must retain a plain `sleep <seconds>` fallback for when the \
+             peer poll cannot run — failing open with no wait at all reintroduces the \
+             mismatched-pair window",
+        );
+    assert!(
+        fallback_secs >= 120,
+        "the fail-open fallback is {fallback_secs}s; it stands in for the old fixed \
+         window, so anything much shorter is not a fallback (DEC-248)"
     );
 }
 

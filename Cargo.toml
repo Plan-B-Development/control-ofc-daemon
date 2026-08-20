@@ -1,3 +1,25 @@
 [workspace]
 members = ["daemon"]
 resolver = "2"
+
+# Dev/test build weight.
+#
+# `target/debug` had grown to 22 GB and the lib test binary to ~100 MB, because
+# nothing here had ever set a profile and the default is `debug = true` (full
+# DWARF for the crate AND all 143 dependencies). Almost none of that is ever
+# read: what a failing test actually needs is a backtrace with file and line
+# numbers, which is exactly what "line-tables-only" keeps.
+#
+# Deliberately NOT touched: `overflow-checks` and `debug_assertions`. Both stay
+# at their dev defaults (on). This crate is the sole writer of PWM and owns the
+# 105 C thermal emergency, so debug-mode overflow panics on percent arithmetic
+# are a safety property, not build weight. Changing THOSE would be a real
+# behavioural change and needs its own decision — this is purely about how much
+# debug info gets emitted and linked.
+[profile.dev]
+debug = "line-tables-only"
+
+# Dependencies get no debug info at all — we never step into them, and they are
+# the bulk of the tree.
+[profile.dev.package."*"]
+debug = 0

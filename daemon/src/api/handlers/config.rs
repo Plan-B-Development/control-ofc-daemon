@@ -368,6 +368,14 @@ pub fn effective_on_disk_paths(
     if let Some(e) = runtime.enable_nvidia_telemetry() {
         cfg.detection.enable_nvidia_telemetry = e;
     }
+    // DEC-270: the same clamp `apply_runtime_overlay` applies, for the same
+    // reason the doc comment above gives. Without it this copy reports the
+    // hand-edited value while the process runs the clamped one, so
+    // `config_key`'s `pending = requires_restart && value != running` latches
+    // true forever and the GUI advises a restart that can never resolve it.
+    if cfg.polling.poll_interval_ms > crate::health::cache::MAX_SUPERVISABLE_POLL_INTERVAL_MS {
+        cfg.polling.poll_interval_ms = crate::health::cache::MAX_SUPERVISABLE_POLL_INTERVAL_MS;
+    }
     (cfg, runtime)
 }
 
@@ -625,10 +633,17 @@ pub async fn update_poll_interval_handler(
         //
         // [SAFETY] Ceiling of 2000 ms, deliberately tighter than what
         // `daemon.toml` accepts. This interval drives the sensor poll loop, and
-        // the thermal-safety leg reads the cache with no age filter — so it
-        // bounds how stale a temperature the 105 C emergency rule can act on.
-        // `StalenessConfig` is itself derived from this value, so raising it
-        // also widens what counts as "fresh" and nothing flags the degradation.
+        // the 105 C emergency rule's staleness budget is derived from it
+        // (5x, DEC-267) — so raising it directly widens how old a temperature
+        // that rule will still act on, and `StalenessConfig` moves with it.
+        //
+        // DEC-269 corrected the reasoning that used to sit here: it claimed the
+        // safety leg read the cache "with no age filter". That was true when
+        // written and is now false — there IS a filter, and this ceiling bounds
+        // its budget rather than substituting for it. A second, independent
+        // backstop caps the budget at `CPU_TEMP_STALE_CEILING_MS` regardless of how
+        // the admin file is set, so a hand-edited interval cannot silently
+        // disable the protection this endpoint is guarding.
         // The admin file has no ceiling, but this endpoint is reachable by any
         // local user (the socket is 0666, DEC-049), so the API caps what the
         // hand-edited file does not.

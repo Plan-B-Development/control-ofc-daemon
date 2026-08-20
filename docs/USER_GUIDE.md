@@ -120,7 +120,7 @@ Create `/etc/control-ofc/daemon.toml`:
 # timeout_ms = 500
 
 [polling]
-# poll_interval_ms = 1000
+# poll_interval_ms = 1000   # 100-6000; slower is clamped to 6000 (DEC-270)
 
 [ipc]
 # socket_path = "/run/control-ofc/control-ofc.sock"
@@ -491,7 +491,7 @@ After stopping the daemon, hwmon fans are automatically restored to automatic mo
 The daemon enforces the following safety rules:
 
 - **Thermal emergency override** — if the hottest CPU temperature sensor reaches 105°C, all OpenFan channels and writable motherboard (hwmon) fan headers are forced to 100%. The override holds until CPU temperature drops to 80°C (25°C hysteresis), then holds 60% for two cycles (the release cycle plus a one-cycle recovery floor) before returning control to the active profile. GPU fans are deliberately excluded: there is no GPU emergency threshold — AMD's PMFW firmware protects the GPU itself (junction-temperature throttling and its own fan ramp) independently of any OS fan control.
-- **Missing sensor fallback** — if no CPU temperature sensor reports for 5 consecutive polling cycles, all OpenFan and hwmon fans are forced to 40% as a defensive measure (GPU fans excluded, as above).
+- **Missing sensor fallback** — if no CPU temperature sensor reports for 5 consecutive polling cycles, all OpenFan and hwmon fans are forced to 40% as a defensive measure (GPU fans excluded, as above). A sensor that is still *listed* but has **stopped updating** counts as missing (DEC-267): a reading older than five polling intervals is not treated as current, because a frozen temperature can never rise and would otherwise hide a real emergency indefinitely. There are exceptions, all following one rule: losing sight of a sensor must never *reduce* cooling (DEC-269). If a thermal emergency is already active the 100% force continues; if the daemon is in its post-emergency recovery the 60% floor continues; and if the last reading before the sensor went quiet was at or above the 80°C release temperature, fan curves simply keep running on it. The 40% fallback applies when the last thing the daemon knew was that the system was *cool* — which is the case it was written for.
 - **Override visibility** — the current thermal-override state is reported as `thermal_state` in `GET /status` (`normal`, `recovery`, `emergency`, or `no_sensor_fallback`); the GUI shows a poll-driven thermal banner from it (DEC-165). The GUI has no fan-control loop of its own to pause — the daemon owns control throughout.
 - **OpenFanController stop timeout** — 0% PWM is allowed for a maximum of 8 seconds per channel, after which further 0% commands are rejected until a non-zero value is sent.
 - **Per-member minimum floors (DEC-162)** — the daemon reports no per-*header* floor (`min_pwm_percent: 0` for every hwmon header), but it **does** enforce the role-aware minimum the GUI bakes into each control's `minimum_pct`. A profile whose pump/CPU control drops below the hard `HARD_PUMP_CPU_FLOOR_PCT` (30%) is rejected at validation with `400 validation_error` (`FLOOR_TOO_LOW`), and the profile engine re-clamps every member to its effective floor on each eval tick (`member_effective_floor`). So floor safety is daemon-enforced, not merely a GUI profile constraint.

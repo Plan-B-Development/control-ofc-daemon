@@ -129,6 +129,17 @@ pub async fn hwmon_poll_loop(
     use crate::hwmon::SensorReadOutcome;
     use std::sync::atomic::Ordering;
 
+    // DEC-267/269: this loop owns the interval, so it publishes it — the profile
+    // engine derives its CPU-reading staleness budget from this value.
+    //
+    // Set HERE rather than in `main.rs` because nothing could pin the `main.rs`
+    // wiring: deleting that line left the whole suite green while the atomic
+    // silently kept its 1 s default, which on a slower-polling daemon under-
+    // states the budget and judges a healthy-but-slow loop dead — forcing every
+    // fan to NO_SENSOR_SAFE_PCT. Publishing from the loop makes the value
+    // self-correcting and puts it somewhere a test can reach.
+    cache.set_hwmon_poll_interval_ms(interval.as_millis() as u64);
+
     let hwmon_root = hwmon_root.to_path_buf();
     let headers = Arc::new(headers);
     let gpu_infos = Arc::new(gpu_infos);
@@ -214,10 +225,19 @@ pub async fn hwmon_poll_loop(
             // Like the sysfs reads below, these are blocking C calls with no
             // per-call timeout: an NVIDIA driver fault could stall this tick until
             // it returns. The existing backstops bound the blast radius (the
-            // shutdown-drain timeout still fires; the no-CPU-sensor 40% fallback
-            // covers stale readings). A timeout wrapper around the whole blocking
-            // leg — which would benefit the sysfs reads too — is a possible future
-            // hardening, deliberately out of scope for this read-only slice.
+            // shutdown-drain timeout still fires; and since DEC-267 the engine
+            // age-filters CPU readings, so a stall no longer leaves the 105 °C
+            // rule evaluating a frozen temperature forever).
+            //
+            // DEC-269: that backstop is narrower than this comment used to
+            // claim. A stall here leaves the task ALIVE, so `spawn_supervised`
+            // never fires — the freshness filter is the only thing covering it,
+            // and what it does depends on the last known temperature (hold the
+            // emergency, hold the recovery floor, keep curves running if it was
+            // hot, or fall to NO_SENSOR_SAFE_PCT if it was cool). A timeout
+            // wrapper around the whole blocking leg — which would benefit the
+            // sysfs reads too, and would turn a hang into a countable error —
+            // remains the real fix, and is deliberately still out of scope.
             let (nvml_temps, nvml_fans) = read_nvml_states(&*nvml);
             // Sensor leg: full discovery only when triggered; otherwise the
             // hot path reads each cached descriptor's temp*_input file only.
@@ -1001,6 +1021,57 @@ mod tests {
             .values()
             .find(|s| s.label == label)
             .cloned()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_poll_loop_publishes_its_interval_for_the_staleness_budget() {
+        // DEC-269. The engine derives its CPU-reading staleness budget from this
+        // value, and it used to be published by a line in `main.rs` that no test
+        // could reach — deleting it left the entire suite green while the budget
+        // silently reverted to its 1 s default. On a daemon polling slower than
+        // that, the understated budget judges a healthy loop dead and forces
+        // every fan to NO_SENSOR_SAFE_PCT. Publishing from the loop puts the
+        // wiring somewhere a test can stand.
+        let tmp = tempfile::tempdir().unwrap();
+        write_k10temp(tmp.path(), 55.0);
+
+        let cache = Arc::new(StateCache::new());
+        assert_eq!(
+            cache.cpu_temp_stale_after(),
+            Duration::from_secs(5),
+            "precondition: the default budget, before the loop publishes anything"
+        );
+
+        let rescan = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let history = Arc::new(crate::health::history::HistoryRing::new(16));
+        let (cache2, root) = (cache.clone(), tmp.path().to_path_buf());
+        let handle = tokio::spawn(async move {
+            hwmon_poll_loop(
+                cache2,
+                history,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Arc::new(crate::hwmon::nvml::DisabledNvml),
+                &root,
+                Duration::from_secs(4),
+                rescan,
+                shutdown_rx,
+            )
+            .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            cache.cpu_temp_stale_after(),
+            Duration::from_secs(20),
+            "the loop must publish its own interval (4 s x 5), not leave the default"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
 
     /// Per-tick reads must use the cached descriptor set: changing a label

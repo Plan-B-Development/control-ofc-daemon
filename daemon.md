@@ -136,11 +136,15 @@ inside the band cannot pin the pre-settle fan speed indefinitely.
    - Holds until CpuTemp <= 80C (25C hysteresis)
    - 60% recovery floor for two cycles after release (the release cycle + a
      one-cycle recovery floor), then control returns to the profile
-   - If no CpuTemp sensor found for 5 consecutive cycles, forces all
-     OpenFan+hwmon fans to 40%; a sensor dropout *while an emergency is
-     latched* forces 40% immediately (from the first missing cycle) and
-     reports `no_sensor_fallback` rather than dropping to profile control
-     (DEC-190)
+   - If no CpuTemp sensor is found — or none is still updating (DEC-267: a
+     reading older than 5 poll intervals counts as absent) — for 5 consecutive
+     cycles, forces all
+     OpenFan+hwmon fans to 40%; a sensor that *vanishes* while an emergency is
+     latched forces 40% immediately (from the first missing cycle) and reports
+     `no_sensor_fallback` rather than dropping to profile control (DEC-190),
+     whereas one that merely goes *stale* holds the emergency's own 100% output
+     — losing sight of a sensor must never lower an already-forced safety
+     output (DEC-269)
    - Override state is surfaced as `thermal_state` in `GET /status`
      (`normal` | `recovery` | `emergency` | `no_sensor_fallback`, DEC-132)
      so the GUI shows a poll-driven thermal banner (DEC-165 — there is no GUI

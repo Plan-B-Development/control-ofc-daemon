@@ -151,7 +151,7 @@ use control_ofc_daemon::api::handlers::AppState;
 use control_ofc_daemon::api::server;
 use control_ofc_daemon::config::DaemonConfig;
 use control_ofc_daemon::daemon_state;
-use control_ofc_daemon::health::cache::StateCache;
+use control_ofc_daemon::health::cache::{StateCache, MAX_SUPERVISABLE_POLL_INTERVAL_MS};
 use control_ofc_daemon::health::history::HistoryRing;
 use control_ofc_daemon::health::staleness::StalenessConfig;
 use control_ofc_daemon::hwmon::lease::LeaseManager;
@@ -393,6 +393,32 @@ fn apply_runtime_overlay(config: &mut DaemonConfig, runtime: &RuntimeConfig, adm
              edits to [profiles]/[startup] in {admin_path} are ignored \
              while runtime.toml exists. See docs/ADRs/002-runtime-config-split.md."
         );
+    }
+
+    // [SAFETY] DEC-270: last word on the poll cadence, after both the admin file
+    // and the runtime overlay have had theirs. This is the single point where the
+    // effective interval is settled — every consumer below reads the field — so
+    // the clamp belongs here rather than at the six read sites.
+    //
+    // `daemon.toml` bounds this only as `>= 100`; the 250–2000 ms clamp lives on
+    // the API route. Past `MAX_SUPERVISABLE_POLL_INTERVAL_MS` the 105 °C rule's
+    // staleness budget stops tracking the cadence (it is capped at
+    // `CPU_TEMP_STALE_CEILING_MS`), so the 5x headroom erodes towards 1x and a
+    // single missed poll starts reading as stale; past the 30 s ceiling it
+    // inverts and EVERY reading is stale on arrival, which silently disables the
+    // ladder — it runs only on a `Fresh` reading. Clamp rather than reject:
+    // refusing to boot over a config typo leaves the fans with no controller at
+    // all, which is strictly worse than polling faster than the admin asked for.
+    if config.polling.poll_interval_ms > MAX_SUPERVISABLE_POLL_INTERVAL_MS {
+        log::warn!(
+            "[polling] poll_interval_ms = {} is slower than the {} ms the \
+             thermal-safety rule can supervise; clamping. Past that the 105 C \
+             ladder's staleness budget stops tracking the poll cadence, so \
+             ordinary readings begin to look stale and the ladder stops firing.",
+            config.polling.poll_interval_ms,
+            MAX_SUPERVISABLE_POLL_INTERVAL_MS,
+        );
+        config.polling.poll_interval_ms = MAX_SUPERVISABLE_POLL_INTERVAL_MS;
     }
 }
 
@@ -819,12 +845,12 @@ async fn main() {
         engine_interval_ms: 1000,
     };
 
-    // DEC-267: the same poll interval, published to the cache so the profile
-    // engine can tell a stale CPU reading from a current one. Set HERE, beside
-    // `staleness_config`, precisely so the two derivations of "how fresh should
-    // hwmon data be" stay visibly the same value — the health rollup and the
-    // 105 °C rule disagreeing about that would be the worst of both.
-    cache.set_hwmon_poll_interval_ms(config.polling.poll_interval_ms);
+    // DEC-267/269: the engine's CPU-staleness budget also derives from
+    // `poll_interval_ms`, but `hwmon_poll_loop` publishes it rather than this
+    // function — the loop owns the interval, and a wiring line here was
+    // unpinnable by any test (deleting it left the whole suite green while the
+    // budget silently reverted to its 1 s default, understating it on a slower
+    // daemon and judging a healthy loop dead). See `polling::hwmon_poll_loop`.
 
     let history = Arc::new(HistoryRing::new(250));
 
@@ -989,11 +1015,20 @@ async fn main() {
     // DEC-146 P3-9: keep the JoinHandles for the poll/engine tasks so
     // shutdown can await them before restoring hardware to automatic.
     // DEC-267: supervised, for the same reason the engine is (DEC-266). This
-    // loop is the ONLY writer of the sensor map the 105 °C rule reads. Its death
-    // no longer blinds that rule — stale readings now present as absent, so the
-    // daemon falls back to NO_SENSOR_SAFE_PCT and says so — but "safe at 40 %
-    // forever, with no path back" is not a resting state to leave a machine in.
-    // Restore and exit so systemd brings the daemon back with a live poll loop.
+    // loop is the ONLY writer of the sensor map the 105 °C rule reads, so its
+    // death used to blind that rule silently.
+    //
+    // DEC-269 corrects what this comment used to claim. Stale readings do NOT
+    // simply "present as absent": a stale reading last seen at or above the
+    // release temperature keeps fan curves running on it, and one seen while an
+    // emergency or recovery floor was active holds that output. Only a stale-
+    // and-cool reading reaches NO_SENSOR_SAFE_PCT. Either way, none of those is
+    // a resting state to leave a machine in with no path back — hence the
+    // restore-and-exit, so systemd brings the daemon back with a live loop.
+    //
+    // Known limitation: this catches the loop *dying*, not *hanging*. A wedged
+    // blocking read leaves the task alive, so supervision never fires; the
+    // freshness filter is what covers that case.
     let (hwmon_poll_handle, hwmon_dead_rx) = spawn_supervised(async move {
         control_ofc_daemon::polling::hwmon_poll_loop(
             hwmon_cache,
@@ -1216,6 +1251,30 @@ async fn main() {
                 }
             }
         }
+
+        // DEC-269: `select!` reports one arm, but a shared root cause (blocking
+        // pool exhaustion, OOM pressure) can end both tasks in the same instant.
+        // Reporting only the winner sends an operator after the wrong subsystem.
+        //
+        // Checked UNCONDITIONALLY, not behind `must_restart`. Gating it there
+        // was a bug: if the IPC arm won the race while the engine had also died,
+        // the engine's death went unlogged AND `must_restart` stayed false, so
+        // the process exited 0 and `Restart=on-failure` never fired — silently
+        // losing the restart DEC-266 exists to produce.
+        if engine_dead_rx.try_recv().is_ok() {
+            log::error!(
+                "SAFETY: the profile engine task had also exited — restarting rather \
+                 than stopping cleanly"
+            );
+            must_restart = true;
+        }
+        if hwmon_dead_rx.try_recv().is_ok() {
+            log::error!(
+                "SAFETY: the hwmon poll task had also exited — restarting rather than \
+                 stopping cleanly"
+            );
+            must_restart = true;
+        }
     }
 
     // Ordered graceful shutdown (DEC-146 P3-9 + audit P1-A) — see
@@ -1437,6 +1496,55 @@ mod tests {
     }
 
     #[test]
+    fn overlay_clamps_a_poll_cadence_the_safety_rule_cannot_supervise() {
+        // DEC-270. `daemon.toml` bounds poll_interval_ms only as >= 100, so a
+        // hand-edited `poll_interval_ms = 3600000` used to reach the engine
+        // intact. The 105 C rule's staleness budget is capped at 30 s, so every
+        // reading arrived already older than its budget: `hottest_cpu_reading`
+        // never returned `Fresh`, the emergency ladder never ran, and the fans
+        // sat at NO_SENSOR_SAFE_PCT — with `/status` reporting a healthy engine.
+        let mut config = DaemonConfig::default();
+        config.polling.poll_interval_ms = 3_600_000;
+
+        apply_runtime_overlay(&mut config, &RuntimeConfig::default(), "/etc/x.toml");
+
+        assert_eq!(
+            config.polling.poll_interval_ms, MAX_SUPERVISABLE_POLL_INTERVAL_MS,
+            "an unsupervisable cadence must be clamped, not honoured"
+        );
+    }
+
+    #[test]
+    fn overlay_clamps_an_unsupervisable_cadence_from_the_runtime_overlay_too() {
+        // The overlay wins over the admin file, so the clamp has to run after it
+        // — not on the loaded config before the merge.
+        let mut config = DaemonConfig::default();
+        let mut runtime = RuntimeConfig::default();
+        runtime.set_poll_interval_ms(Some(600_000));
+
+        apply_runtime_overlay(&mut config, &runtime, "/etc/x.toml");
+
+        assert_eq!(
+            config.polling.poll_interval_ms,
+            MAX_SUPERVISABLE_POLL_INTERVAL_MS
+        );
+    }
+
+    #[test]
+    fn overlay_leaves_a_supervisable_cadence_untouched() {
+        // The clamp must not quietly speed up a legitimate slow-poll setup.
+        let mut config = DaemonConfig::default();
+        config.polling.poll_interval_ms = MAX_SUPERVISABLE_POLL_INTERVAL_MS;
+
+        apply_runtime_overlay(&mut config, &RuntimeConfig::default(), "/etc/x.toml");
+
+        assert_eq!(
+            config.polling.poll_interval_ms, MAX_SUPERVISABLE_POLL_INTERVAL_MS,
+            "exactly at the maximum is supervisable and must be honoured"
+        );
+    }
+
+    #[test]
     fn overlay_leaves_admin_values_alone_when_runtime_is_empty() {
         // "Not overridden" must be distinguishable from "set to the default",
         // or an untouched runtime.toml would silently shadow the admin file.
@@ -1467,6 +1575,43 @@ mod tests {
 
         apply_runtime_overlay(&mut config, &runtime, "/etc/x.toml");
         assert!(!config.detection.allow_port_probe);
+    }
+
+    #[test]
+    fn the_get_config_copy_clamps_an_unsupervisable_cadence_the_same_way() {
+        // DEC-270. The parity test below cannot catch this — its fixture is
+        // 1750 ms, well inside the supervisable range. Clamping in
+        // `apply_runtime_overlay` alone made `GET /config` report the
+        // hand-edited value while the process ran the clamped one, so
+        // `config_key`'s `pending = requires_restart && value != running`
+        // latched true forever and the GUI advised a restart that could never
+        // clear it: exactly the drift `effective_on_disk_paths`' own doc
+        // comment warns about.
+        let dir = tempfile::tempdir().unwrap();
+        let admin_path = dir.path().join("daemon.toml");
+        std::fs::write(&admin_path, "[polling]\npoll_interval_ms = 3600000\n").unwrap();
+        let runtime_path = dir.path().join("runtime.toml");
+
+        let mut via_overlay = DaemonConfig::load(admin_path.to_str().unwrap()).unwrap();
+        apply_runtime_overlay(
+            &mut via_overlay,
+            &RuntimeConfig::load_from(&runtime_path),
+            admin_path.to_str().unwrap(),
+        );
+
+        let (via_api, _) = control_ofc_daemon::api::handlers::config::effective_on_disk_paths(
+            admin_path.to_str().unwrap(),
+            &runtime_path,
+        );
+
+        assert_eq!(
+            via_overlay.polling.poll_interval_ms, MAX_SUPERVISABLE_POLL_INTERVAL_MS,
+            "the running config must be clamped"
+        );
+        assert_eq!(
+            via_api.polling.poll_interval_ms, via_overlay.polling.poll_interval_ms,
+            "GET /config must report what the daemon actually runs, or restart_pending never clears"
+        );
     }
 
     #[test]

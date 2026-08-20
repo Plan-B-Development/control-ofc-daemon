@@ -1,8 +1,90 @@
 # Changelog
 
-## [Unreleased]
+## [2.19.0] — 2026-08-20
 
 ### Fixed
+- **A poll interval the safety rule cannot supervise disabled the 105 °C ladder.**
+  DEC-269 capped the CPU staleness budget at 30 s so a hand-edited
+  `poll_interval_ms` could not buy the emergency rule a five-hour trust window.
+  Past a 6 s cadence, though, the cap stopped the budget tracking the poll
+  interval at all: the 5x headroom eroded towards 1x, so ordinary readings began
+  to look stale, and beyond the 30 s ceiling it inverted outright — every reading
+  stale the moment it landed, the ladder (which only runs on a fresh reading)
+  never firing, and every fan pinned at the 40% no-sensor floor while `/status`
+  reported a healthy ticking engine. Both directions silently disable thermal
+  protection. The budget now floors at one poll period, and the effective
+  interval is clamped to the slowest cadence the rule can actually supervise —
+  derived from the two constants rather than written down twice. Clamped
+  with a warning rather than rejected: a fan controller that will not boot over
+  a config typo is worse than one polling faster than it was told. Only the
+  hand-edited admin config file could reach this (there is no CLI flag for it);
+  the API's 250–2000 ms range is unaffected. DEC-270.
+- **A coordinated release waited 25 minutes for itself.** The paired-release wait
+  polled the peer repository's release *run*, but the step doing the waiting is
+  part of that same run on the other side — so in a GUI + daemon release each
+  repo blocked the other until both hit the ceiling, and the "solo release,
+  dispatch immediately" fast path was unreachable in exactly the case the wait
+  exists for. It fails open, so it never published a bad pair; it just never
+  worked. It now polls the peer's `GitHub Release` job, which is what actually
+  determines whether the Release object exists. DEC-270.
+- **Going blind must never reduce cooling — including when nothing is latched.**
+  The rule above was written for output the safety ladder was *already* forcing,
+  which left the commonest case out. With no emergency active, a wedged sensor
+  read at 104 °C dropped every fan from a curve output of ~85% to the 40%
+  no-sensor floor — a reduction in cooling caused purely by losing sight, and a
+  plausible route *to* 105 °C, at which point the emergency cannot fire because
+  the daemon is blind. While the last known temperature was at or above the
+  release threshold the fallback is now suppressed entirely and fan curves keep
+  running on that reading, exactly as they did before any of this existed. The
+  40% floor still applies once the last thing the daemon knew was that the
+  system was cool, which is the case it was written for. DEC-269.
+- **`thermal_state` could report one duty while the daemon forced another.** Past
+  the five-cycle debounce, a stale reading during recovery reported
+  "no_sensor_fallback" — which means 40% — while actually holding the 60%
+  recovery floor. The same ordering that decides the duty now decides the label,
+  so the two cannot disagree. DEC-269.
+- **The safety log stated a percentage it was not forcing.** It hardcoded "40%"
+  at the moment the debounce tripped, which became false as soon as anything
+  could outrank the fallback — at exactly the moment, a live emergency going
+  blind, when an operator most needs the log to be true. It is now written from
+  the decision rather than from the branch that proposed it, and names whether
+  the sensor is missing or merely no longer updating. DEC-269.
+- **A restart could be silently lost when two tasks died together.** The
+  both-causes reporting added alongside the supervision work was gated behind
+  the restart flag, so if the IPC server's death won the race while the profile
+  engine had also died, the engine's death went unlogged *and* the process
+  exited cleanly — leaving systemd with no reason to restart it. Both causes are
+  now checked unconditionally and either one demands the restart. DEC-269.
+- **Losing sight of a CPU sensor could *reduce* cooling mid-emergency.** The
+  freshness filter below treats a stale reading as no reading — which is right
+  for deciding whether to act, and wrong for deciding what to do while a 105 °C
+  emergency is already latched. A single poll leg overrunning the budget, with
+  the task still alive so nothing restarts, dropped every fan from 100% to the
+  40% no-sensor floor on a CPU last measured at 95 °C. It also flapped: at a
+  ~5 s leg against a 1 Hz engine the reading crosses the budget on alternate
+  ticks, oscillating 100/40/100 during a thermal emergency.
+
+  The cause was collapsing two different things into one. A vanished sensor is
+  evidence of nothing, and 40% was chosen for it deliberately; a six-second-old
+  reading of 95 °C is strong evidence the machine is still hot. The reading is
+  now classified three ways rather than two, and a stale one **holds whatever
+  the rule is already forcing** — 100% latched, 60% mid-recovery — while still
+  being barred from driving the rule's state machine, so it cannot clear a latch
+  however cool it reads. A sensor that genuinely vanishes mid-emergency still
+  forces 40%, exactly as before. The invariant, now stated in the code and
+  pinned by a test over the whole matrix: losing sight of a sensor must never
+  lower an already-forced safety output. DEC-269.
+- **`cpu_sensor_found` could contradict the state printed beside it.** It was
+  still answered from the raw sensor list while the state beside it came from
+  the age-filtered rule, so `{"state": "no_sensor_fallback", "cpu_sensor_found":
+  true}` became reachable — and the GUI renders both on one line. It now applies
+  the same freshness budget the rule applies. DEC-269.
+- **The staleness budget is now bounded.** `poll_interval_ms` is validated only
+  as `>= 100`; the 250–2000 ms clamp lives on the API route, not the config file.
+  An admin typo of `3600000` would otherwise have handed the 105 °C rule a
+  five-hour budget, silently disabling it. Capped at 30 s regardless, and the
+  multiply saturates rather than wrapping — a wrapped budget would have been the
+  worst possible direction, marking everything permanently stale. DEC-269.
 - **The 105 °C rule could be reading a temperature that had stopped changing.**
   It takes its input from a cached sensor map that carries no freshness filter,
   so if the hwmon poll task died the last reading was returned forever. Every

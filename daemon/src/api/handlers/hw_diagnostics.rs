@@ -190,12 +190,24 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
             }
         });
 
-    // Thermal safety — report thresholds and whether CPU sensor is present
+    // Thermal safety — report thresholds and whether a CPU sensor is USABLE.
+    //
+    // DEC-269: "present" is the wrong question now that the safety rule filters
+    // by age (DEC-267). Answering it from the raw snapshot made
+    // `{"state": "no_sensor_fallback", "cpu_sensor_found": true}` reachable —
+    // a self-contradicting response, rendered by the GUI as one line reading
+    // "State: no_sensor_fallback · CPU sensor: true". Apply the same freshness
+    // budget the rule applies, so this field answers the question the state
+    // beside it was decided on.
     let snap = state.cache.snapshot();
-    let cpu_sensor_found = snap
-        .sensors
-        .values()
-        .any(|s| s.kind == crate::hwmon::types::SensorKind::CpuTemp);
+    let cpu_sensor_found = !matches!(
+        crate::profile_engine::hottest_cpu_reading(
+            &snap.sensors,
+            std::time::Instant::now(),
+            state.cache.cpu_temp_stale_after(),
+        ),
+        crate::profile_engine::CpuReading::Absent | crate::profile_engine::CpuReading::Stale(_)
+    );
 
     let thermal_state = snap.thermal_override_state.as_deref().unwrap_or("normal");
 
