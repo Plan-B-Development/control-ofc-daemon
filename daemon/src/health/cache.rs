@@ -111,10 +111,12 @@ pub struct StateCache {
     ///
     /// Set from the same `polling.poll_interval_ms` that builds
     /// `StalenessConfig`, and deliberately set next to it in `main.rs` so the
-    /// two derivations cannot drift. `poll_interval_ms` has a lower bound of
-    /// 100 ms and **no upper bound**, which is why this is configured rather
-    /// than a constant: a fixed budget would permanently mark a legitimately
-    /// slow-polling system stale and pin its fans at `NO_SENSOR_SAFE_PCT`.
+    /// two derivations cannot drift. `poll_interval_ms` runs from 100 ms to
+    /// [`MAX_SUPERVISABLE_POLL_INTERVAL_MS`] (DEC-270 clamps the admin file; the
+    /// API route is tighter still at 250-2000), which is why this is configured
+    /// rather than a constant: a fixed budget would permanently mark a
+    /// legitimately slow-polling system stale and pin its fans at
+    /// `NO_SENSOR_SAFE_PCT`.
     hwmon_poll_interval_ms: AtomicU64,
     /// Serialises GPU fan writes between the profile engine and
     /// `POST /gpu/{id}/fan/reset` (DEC-255).

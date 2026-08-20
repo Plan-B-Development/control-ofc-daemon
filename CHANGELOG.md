@@ -19,14 +19,6 @@
   a config typo is worse than one polling faster than it was told. Only the
   hand-edited admin config file could reach this (there is no CLI flag for it);
   the API's 250–2000 ms range is unaffected. DEC-270.
-- **A coordinated release waited 25 minutes for itself.** The paired-release wait
-  polled the peer repository's release *run*, but the step doing the waiting is
-  part of that same run on the other side — so in a GUI + daemon release each
-  repo blocked the other until both hit the ceiling, and the "solo release,
-  dispatch immediately" fast path was unreachable in exactly the case the wait
-  exists for. It fails open, so it never published a bad pair; it just never
-  worked. It now polls the peer's `GitHub Release` job, which is what actually
-  determines whether the Release object exists. DEC-270.
 - **Going blind must never reduce cooling — including when nothing is latched.**
   The rule above was written for output the safety ladder was *already* forcing,
   which left the commonest case out. With no emergency active, a wedged sensor
@@ -105,6 +97,19 @@
   death is now treated the same way the engine's is — restore every fan to
   firmware control, then exit so systemd restarts the daemon with a live feed.
   DEC-267.
+
+### Changed
+- **A coordinated release no longer guesses how long to wait for its pair.**
+  `pacman-repo` assembles from whichever Release of each project is latest when
+  it runs, so in a joint GUI + daemon release the two `release.yml` runs finishing
+  minutes apart could publish this package against the other's *previous* version
+  and serve that pair as current. v2.18.0 handled it with a blind `sleep 180`,
+  which on 2026-08-17 was not close to enough — the two runs finished 9m29s apart
+  — and on a solo release was three idle minutes for nothing. The wait now polls
+  for the actual condition: whether the GUI repository has published its Release
+  yet, measured on its `GitHub Release` job. Solo releases dispatch immediately;
+  paired ones wait only as long as they must. Any API problem falls back to the
+  old fixed settle, so this can never turn a complete release red. DEC-270.
 
 ## [2.18.0] — 2026-08-17
 

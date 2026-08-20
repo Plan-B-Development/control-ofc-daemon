@@ -644,9 +644,12 @@ pub async fn update_poll_interval_handler(
         // backstop caps the budget at `CPU_TEMP_STALE_CEILING_MS` regardless of how
         // the admin file is set, so a hand-edited interval cannot silently
         // disable the protection this endpoint is guarding.
-        // The admin file has no ceiling, but this endpoint is reachable by any
-        // local user (the socket is 0666, DEC-049), so the API caps what the
-        // hand-edited file does not.
+        // DEC-270: the admin file is no longer unbounded either — it is clamped
+        // to `MAX_SUPERVISABLE_POLL_INTERVAL_MS` (6000 ms) in
+        // `apply_runtime_overlay`, because past that the staleness budget stops
+        // tracking the cadence. This API ceiling is still much tighter, because
+        // this endpoint is reachable by any local user (the socket is 0666,
+        // DEC-049) while the admin file needs root.
         Some(v) if (250..=2_000).contains(&v) => v,
         Some(v) => {
             return error_response(

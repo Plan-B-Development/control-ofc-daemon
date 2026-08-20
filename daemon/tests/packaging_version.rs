@@ -444,3 +444,55 @@ fn notify_repo_targets_the_pacman_repo_with_a_cross_repo_token() {
          ambient GITHUB_TOKEN cannot dispatch across repositories"
     );
 }
+
+/// [RELEASE] A nightly CI run must never be able to veto a release (DEC-270).
+///
+/// `ci-green` gates publication on the newest `ci.yml` run for the tagged SHA.
+/// `ci.yml` also runs on a nightly `schedule`, and that leg deliberately runs a
+/// WIDER matrix than the per-push path — it adds py3.14 and restores the canary's
+/// full loop count, neither `continue-on-error`. So without a filter the newest
+/// run for a tagged commit can be last night's cron, and a failure on a leg the
+/// push path never runs would block a release whose own CI was green.
+///
+/// Conditional on purpose, and currently INERT in this repo: the nightly lives in
+/// the GUI's `ci.yml`, not this one, so `has_nightly` is false here and the test
+/// returns early. It is kept because the two `release.yml` files are deliberately
+/// near-identical and the filter is carried for symmetry — this test is what makes
+/// the requirement fire automatically if a nightly is ever added here, instead of
+/// the gate silently becoming vetoable again.
+#[test]
+fn a_nightly_ci_run_cannot_veto_a_release() {
+    let ci = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../.github/workflows/ci.yml"
+    ))
+    .expect("read .github/workflows/ci.yml");
+
+    let has_nightly = ci
+        .lines()
+        .any(|l| l.trim_end() == "  schedule:" || l.trim() == "schedule:");
+    if !has_nightly {
+        return;
+    }
+
+    let block = job_block(&release_workflow(), "ci-green");
+    // Strip comments: the step explains *why* `event=push` is the wrong filter, so
+    // the negative check below would otherwise match that explanation.
+    let code: String = block
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        code.contains(r#"select(.event != "schedule")"#),
+        "ci.yml has a nightly `schedule` whose matrix is wider than the push path, so \
+         ci-green must exclude scheduled runs when picking the newest run for the \
+         tagged SHA — otherwise a py3.14-only nightly failure vetoes a green release"
+    );
+    assert!(
+        !code.contains("event=push"),
+        "filter on `.event != \"schedule\"`, not `event=push`: an operator \
+         re-dispatching ci.yml produces a `workflow_dispatch` run, and that is the \
+         documented escape hatch for tagging a docs-only commit"
+    );
+}
