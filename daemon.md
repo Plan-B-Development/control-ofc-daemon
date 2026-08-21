@@ -156,20 +156,37 @@ inside the band cannot pin the pre-settle fan speed indefinitely.
      reading older than the same freshness budget stops driving its curve, so a
      frozen GPU or coolant sensor can no longer command a fan forever while
      `thermal_state` reports `normal`
-   - A filtered-out sensor makes its curve unresolvable, so the control is
-     SKIPPED and its fans hold at their last commanded duty. Never 0%, and never
-     a lower value: a Mix curve with any unavailable input holds as a whole
-     rather than recombining the inputs that remain (losing an input must not
-     reduce cooling — DEC-269 applied one level out)
+   - A filtered-out sensor makes its curve unresolvable. For a single-sensor
+     curve the control is SKIPPED and its fans hold at their last commanded duty
+     — never 0%, and never a lower value
+   - A Mix curve combines whatever inputs it still has and is then forbidden to
+     COMMAND LESS than it last did, until every input is back. Both halves are
+     needed and neither alone is right: recombining the survivors on its own
+     lowers the duty when the lost input was the hot one (measured 100% -> 36% in
+     one tick), and skipping the control on its own freezes the fan when a
+     SURVIVING input is hot and rising — including a fresh CPU reading, because
+     `CpuTemp` is exempt from the filter and a Mix has one fan set, not one per
+     input. A Mix whose inputs never resolve at all still holds
+   - Consequently a Mix naming a sensor this machine does not have still drives
+     its fans from the inputs that do exist, rather than going silent
    - `CpuTemp` is deliberately EXEMPT. The thermal ladder above is the sole
      authority on a stale CPU reading and has already adjudicated both halves;
      filtering it here would freeze a control mid-ramp instead of letting it keep
      climbing toward a hot target
    - Readings for sensors that have genuinely VANISHED (driver unloaded, device
      removed) are evicted from the cache rather than ageing in it forever, which
-     is what makes the "no CpuTemp sensor" branch above reachable at all. A
-     scan that could not read some chip is treated as incomplete and evicts
-     nothing — "could not enumerate" is not "gone"
+     is what makes the "no CpuTemp sensor" branch above reachable at all
+   - "Could not read" is not "gone", and the distinction is drawn PER CHIP: a
+     scan that cannot read one chip protects that chip's cached readings and goes
+     on evicting every other chip's. Suspending eviction wholesale would be worse
+     than it sounds — a chip contributing no descriptors can never produce a read
+     failure and so never re-triggers a scan, so a single unreadable chip could
+     switch eviction off for the rest of the process. A chip whose sysfs
+     directory has gone is removed, not unreadable, and still evicts at once
+   - The same rule applies one level down: a `tempN_label` that exists but will
+     not read fails its whole chip for that scan rather than defaulting to an
+     empty label, because the label feeds both the sensor's stable id and its
+     CPU/motherboard classification
 
 3. **Lease system** (`lease.rs`): Exclusive hwmon write access
    - 60s TTL, holder must renew periodically
@@ -178,19 +195,19 @@ inside the band cannot pin the pre-settle fan speed indefinitely.
      verify, and the thermal-safety force. Not a client lease: the GUI holds nothing (DEC-165).
      A thermal force-take evicts a verify mid-scan, so the verify's stale token is refused.
 
-3. **Stop timeout** (`controller.rs`): OpenFan 0% wire-write limit
+4. **Stop timeout** (`controller.rs`): OpenFan 0% wire-write limit
    - Rejects a *wire-bound* 0% write against a stop timer older than 8 s.
      A steady 0% hold coalesces — same-value repeats never reach the wire or
      the timeout (CONC-2, 2026-07-21 audit; the old order errored every tick
      past 8 s, inflating failure streaks) — so this is defence-in-depth
      against channel-tracking drift, not a periodic re-arm requirement
 
-4. **ExecStopPost restore** (`packaging/control-ofc-restore-auto.sh`):
+5. **ExecStopPost restore** (`packaging/control-ofc-restore-auto.sh`):
    - Restores `pwm_enable=2` (auto) on ANY service stop (including SIGKILL)
    - Resets GPU fan curves to automatic
    - Re-enables `fan_zero_rpm_enable=1` for every GPU exposing it (DEC-100 — closes the SIGKILL/OOM path the panic hook can't cover)
 
-5. **Kernel-version regression catalogue** (`hwmon/kernel_warnings.rs`, DEC-098):
+6. **Kernel-version regression catalogue** (`hwmon/kernel_warnings.rs`, DEC-098):
    - Curated list of published amdgpu regressions keyed by kernel version + GPU PCI device ID
    - Currently flags `rdna_hang_kernel_6_18_6_19` (RDNA3/4 hard hang on **both** 6.18.x and 6.19.x, Phoronix-confirmed) and `smu_mismatch_navi48_r9700` (R9700-only SMU interface-version mismatch — no working fan-control path — across all current kernels, ROCm Issue #6101); see DEC-114 for the correctness fix
    - Surfaced via `GET /capabilities` (`devices.amd_gpu.kernel_warnings`); each entry carries `id` (stable knowledge-base key), `severity` (`info` / `medium` / `high` / `critical`), and `message` (pre-formatted user-visible text). The daemon owns the wording so a message update doesn't require coordinated GUI redeploys.
@@ -198,7 +215,7 @@ inside the band cannot pin the pre-settle fan speed indefinitely.
    - The GUI raises a one-time `QMessageBox` for `high` and `critical` warnings; the user's acknowledgement is persisted in `app_settings.acknowledged_kernel_warnings` so the popup does not re-fire on every reconnect
    - Adding a new regression entry is a 30-line PR against `kernel_warnings.rs`; no schema or contract change required
 
-6. **Pump-stop guard** (`profile.rs`, DEC-167): a control with a pump/CPU member
+7. **Pump-stop guard** (`profile.rs`, DEC-167): a control with a pump/CPU member
    may not be configured to stop. A non-zero `stop_pct` on such a control is
    rejected at profile-validate time (a `PUMP_STOP_FORBIDDEN` error in the
    validation report → `400 validation_error`); for any profile that reaches the
@@ -206,7 +223,7 @@ inside the band cannot pin the pre-settle fan speed indefinitely.
    for pump/CPU members. Stopping a pump risks coolant-flow loss and rapid thermal
    runaway. GPU- and chassis-only controls are unaffected.
 
-7. **AIO / coolant surface, no coolant safety rule** (`hwmon/aio.rs`, DEC-156):
+8. **AIO / coolant surface, no coolant safety rule** (`hwmon/aio.rs`, DEC-156):
    liquid-cooler coolant temperatures are classified as the `CoolantTemp` sensor
    kind and AIO PWM headers carry an `is_aio` flag (surfaced via the dynamic
    `aio_hwmon` capability). This is detection only — there is **deliberately no

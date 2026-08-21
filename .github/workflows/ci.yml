@@ -50,10 +50,18 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
+      # `--locked` is load-bearing, not tidiness (DEC-272 round 2). Without it
+      # cargo silently RE-RESOLVES and rewrites Cargo.lock on disk before doing
+      # anything else, so a commit that bumps daemon/Cargo.toml without running
+      # `cargo update -w` builds green here and only fails inside makepkg's
+      # `cargo fetch --locked` — in the clean-room build-test job, after the tag
+      # is already public, forcing a delete-and-retag. It also defeats any test
+      # that tries to catch the same thing by reading the lockfile, because the
+      # act of running the test repairs the file it is about to read (measured).
       - name: cargo clippy -D warnings
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: cargo test
-        run: cargo test --all-targets --all-features
+        run: cargo test --locked --all-targets --all-features
 
   deny:
     # DEC-174 supply-chain gate, moved from release-only to every PR. Runs in its

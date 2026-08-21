@@ -117,9 +117,9 @@ pub(crate) fn evaluate_trigger(
 
 /// Combine child-curve outputs for a Mix curve (DEC-150), clamped 0–100.
 ///
-/// `values` is non-empty and carries one entry per child: the caller skips the
-/// Mix entirely if ANY child fails to resolve (DEC-272 round 2), so `subtract`
-/// can rely on `values[0]` still being the first `mix_curve_ids` entry. Daemon-owned outright since the 2.0.0
+/// `values` is non-empty. Callers reach this through `combine_mix_partial`,
+/// which owns the missing-child handling and the positional guarantee `subtract`
+/// depends on; this function sees only present values. Daemon-owned outright since the 2.0.0
 /// cutover (DEC-165); pinned by the daemon-only `tuning_sequence` golden
 /// vectors in `parity_vectors.json` (DEC-126). `subtract` is the first input
 /// minus the sum of the rest, matching the ordered `mix_curve_ids`.
@@ -151,9 +151,10 @@ pub(crate) fn resolve_curve_output(
     profile: &DaemonProfile,
     sensors: &HashMap<String, CachedSensorReading>,
     visited: &mut HashSet<String>,
+    degraded: &mut bool,
 ) -> Option<f64> {
     match curve.curve_type.as_str() {
-        "mix" => resolve_mix(curve, profile, sensors, visited),
+        "mix" => resolve_mix(curve, profile, sensors, visited, degraded),
         "sync" => None, // Mix does not nest Sync (editor-prevented)
         _ => {
             let sensor = sensors.get(&curve.sensor_id)?;
@@ -166,11 +167,12 @@ pub(crate) fn resolve_curve_output(
 /// sensor and the values are combined by `mix_function`, clamped 0–100.
 ///
 /// Returns None — control skipped, fan holds — when the curve is part of a
-/// cycle, exceeds the depth backstop, has no children, or **any named child
-/// fails to resolve** (unknown id, missing/age-filtered sensor, unresolvable
-/// nested Mix). That last case is [SAFETY] DEC-272 round 2: children used to be
-/// dropped individually and the survivors combined, which lowered the commanded
-/// duty when the dropped input was the hot one. See the comment at the drop site.
+/// cycle, exceeds the depth backstop, or no value can be formed at all (no
+/// children, none resolvable, or a `subtract` whose minuend is missing).
+///
+/// When SOME children resolve, it combines those and sets `degraded`, which
+/// `curve_output_for_control` turns into "may rise, may not fall". Both halves
+/// are needed and neither is sufficient: see `combine_mix_partial`.
 ///
 /// Path-based `visited` (insert on entry, remove on exit) is a per-branch path
 /// set, so diamonds re-evaluate and only true cycles drop out.
@@ -179,6 +181,7 @@ pub(crate) fn resolve_mix(
     profile: &DaemonProfile,
     sensors: &HashMap<String, CachedSensorReading>,
     visited: &mut HashSet<String>,
+    degraded: &mut bool,
 ) -> Option<f64> {
     if visited.contains(&curve.id) {
         log::warn!(
@@ -203,43 +206,66 @@ pub(crate) fn resolve_mix(
         return None;
     }
     visited.insert(curve.id.clone());
-    let mut values: Vec<f64> = Vec::with_capacity(curve.mix_curve_ids.len());
+    // POSITIONAL: one slot per `mix_curve_ids` entry, `None` where the child did
+    // not resolve. Keeping the slot is what stops `subtract` re-indexing — the
+    // bug where dropping the first child silently promoted the second to minuend.
+    let mut values: Vec<Option<f64>> = Vec::with_capacity(curve.mix_curve_ids.len());
     for child_id in &curve.mix_curve_ids {
         let resolved = profile
             .curves
             .iter()
             .find(|c| &c.id == child_id)
-            .and_then(|child| resolve_curve_output(child, profile, sensors, visited));
-        match resolved {
-            Some(v) => values.push(v),
-            // [SAFETY] DEC-272 round 2. One unresolvable child skips the WHOLE
-            // Mix. Combining the survivors instead silently LOWERS the commanded
-            // duty: `max(cpu, gpu)` with the GPU sensor age-filtered out becomes
-            // `max(cpu)`, so the fan ramps down while the daemon is blind to the
-            // input that was driving it — measured 100% -> 36% in a single tick,
-            // because `default_step()` is 100 in both directions (profile.rs) and
-            // Mix bypasses the 2 C deadband by design (DEC-150). That is the
-            // "reduction in cooling caused by going blind" DEC-269 forbids.
-            // `subtract` was worse still: dropping the first child re-indexed
-            // `values[0]` and silently promoted the second child to minuend.
-            //
-            // Skipping instead leaves the fan at its last commanded duty, which
-            // is what `curve_eligible` (profile_engine/mod.rs) already promises
-            // for single-sensor curves — this makes the promise true for
-            // composites too. Not logged: a stale sensor persists, and this runs
-            // at 1 Hz.
-            None => {
-                visited.remove(&curve.id);
-                return None;
-            }
+            .and_then(|child| resolve_curve_output(child, profile, sensors, visited, degraded));
+        values.push(resolved);
+        if resolved.is_none() {
+            *degraded = true;
         }
     }
     visited.remove(&curve.id);
-    if values.is_empty() {
+    let function = curve.mix_function.as_deref().unwrap_or("max");
+    combine_mix_partial(function, &values)
+}
+
+/// Combine a Mix's children when some of them may be missing (DEC-272 round 2).
+///
+/// [SAFETY] The history here matters, because two obvious implementations are
+/// each wrong in an opposite direction and the project shipped both.
+///
+/// Originally unresolvable children were DROPPED and the survivors recombined.
+/// That silently LOWERS the duty when the dropped child was the hot one:
+/// `max(cpu, gpu)` with a frozen GPU sensor becomes `max(cpu)`, measured
+/// 100% -> 36% in a single tick. It also re-indexed `subtract`, promoting the
+/// second child to minuend.
+///
+/// The first fix skipped the whole Mix instead, on the reasoning that a skipped
+/// control holds its fans. That is worse in the mirror case, and measurably so:
+/// with a FRESH 95 C CPU child and the GPU child merely absent, the control
+/// issued no command at all and the fan sat at its old duty with a live hot
+/// reading in hand. `curve_eligible` deliberately EXEMPTS `CpuTemp` so that a
+/// single-sensor CPU control keeps climbing; a Mix has one fan set, not one per
+/// child, so skipping discards the surviving child's demand. The promise was
+/// made per-child and enforced per-control.
+///
+/// So: combine what IS available — a live child must still be able to drive the
+/// fan — and let the caller refuse to go DOWNWARD while anything is missing.
+/// Neither half is sufficient alone. See `curve_output_for_control`.
+///
+/// Returns None only when no value can be formed at all, which the caller treats
+/// as "skip, hold" — the correct floor when there is nothing to go on.
+pub(crate) fn combine_mix_partial(function: &str, values: &[Option<f64>]) -> Option<f64> {
+    if function == "subtract" {
+        // Ordered, so position is meaning: the first entry is the minuend. Without
+        // it the expression has none, and inventing one is how `A - B` became a
+        // bare `B`. Hold instead.
+        let minuend = (*values.first()?)?;
+        let rest: f64 = values.iter().skip(1).flatten().sum();
+        return Some((minuend - rest).clamp(0.0, 100.0));
+    }
+    let present: Vec<f64> = values.iter().flatten().copied().collect();
+    if present.is_empty() {
         return None;
     }
-    let function = curve.mix_function.as_deref().unwrap_or("max");
-    Some(combine_mix(function, &values))
+    Some(combine_mix(function, &present))
 }
 
 /// Mirror another control's current-tick tuned output (DEC-151).
@@ -280,7 +306,36 @@ pub(crate) fn curve_output_for_control(
     state: &mut ProfileEngineState,
 ) -> Option<f64> {
     match curve.curve_type.as_str() {
-        "mix" => resolve_curve_output(curve, profile, sensors, &mut HashSet::new()),
+        "mix" => {
+            let mut degraded = false;
+            let value =
+                resolve_curve_output(curve, profile, sensors, &mut HashSet::new(), &mut degraded)?;
+            if !degraded {
+                return Some(value);
+            }
+            // [SAFETY] DEC-272 round 2 — the other half of the rule above.
+            //
+            // An input is missing, so `value` was computed from a REDUCED set and
+            // may be lower than what the full set was commanding. Refuse to go
+            // downward while blind (DEC-269), but allow upward: a surviving child
+            // reading 95 C must still be able to drive the fan to 100%.
+            //
+            // The floor is the last TUNED output rather than the last raw curve
+            // value, because `last_curve_output` is only written by the deadband
+            // path and a Mix bypasses it. Comparing raw against tuned can only
+            // err on the high side (a floor-inflated previous value), and high is
+            // the safe side.
+            //
+            // Self-clearing: once every child resolves again `degraded` is false
+            // and the control is free to come down normally. It holds high only
+            // for as long as it cannot see.
+            Some(match state.last_output(&control.id) {
+                Some(prev) => value.max(prev),
+                // Nothing commanded yet — no duty to protect, and clamping to a
+                // phantom floor would be inventing one.
+                None => value,
+            })
+        }
         "sync" => resolve_sync_output(control, curve, tick_outputs),
         "trigger" => {
             let sensor = sensors.get(&curve.sensor_id)?;

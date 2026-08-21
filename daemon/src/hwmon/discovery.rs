@@ -188,10 +188,31 @@ use super::util::device_id_from_path;
 /// and is silently absent from `hwmon_dirs`, so it never increments this.
 pub struct SensorDiscovery {
     pub descriptors: Vec<SensorDescriptor>,
-    /// Chips present in sysfs whose own metadata could not be read this pass.
-    /// Non-zero means `descriptors` is known-incomplete and must not be treated
-    /// as an authoritative list of what exists.
-    pub skipped_chips: usize,
+    /// hwmon directories still PRESENT in sysfs whose own metadata could not be
+    /// read this pass — i.e. the chips this pass cannot speak for.
+    ///
+    /// Identities rather than a count, deliberately. A count can only say "the
+    /// whole list is untrustworthy", which forces eviction off wholesale and,
+    /// because nothing re-triggers discovery for a chip that contributes no
+    /// descriptors, could leave it off for the rest of the process. Naming the
+    /// chips lets the caller protect exactly their cached readings and keep
+    /// evicting everything else, so DEC-272 row 01-c goes on working for every
+    /// other chip and there is no wedgeable global state.
+    ///
+    /// DIRECTORIES rather than `device_id`s, also deliberately: a chip with no
+    /// `device` symlink yields the literal `"nodev"`, so matching cached ids on
+    /// device id alone silently protects EVERY such sensor — the global
+    /// suspension again, wearing a per-chip disguise. The caller resolves these
+    /// against the previous descriptor set's `input_path`s, which are real paths
+    /// under the real directory. (Caught by
+    /// `an_unreadable_chip_does_not_stop_other_sensors_being_evicted`, which
+    /// failed against the device-id version.)
+    ///
+    /// A chip whose directory has GONE is removed, not unreadable, and is
+    /// deliberately absent here so it still evicts at once — the "cannot read" vs
+    /// "gone" distinction the mechanism rests on, tested by re-checking the
+    /// directory rather than by parsing errno.
+    pub unreadable_dirs: Vec<PathBuf>,
 }
 
 /// Discover all temperature sensors under a given sysfs hwmon root.
@@ -208,7 +229,7 @@ pub fn discover_sensors(hwmon_root: &Path) -> Result<Vec<SensorDescriptor>, Hwmo
 /// As [`discover_sensors`], but reports how many present chips were skipped.
 pub fn discover_sensors_reporting_skips(hwmon_root: &Path) -> Result<SensorDiscovery, HwmonError> {
     let mut descriptors = Vec::new();
-    let mut skipped_chips = 0usize;
+    let mut unreadable_dirs: Vec<PathBuf> = Vec::new();
 
     let entries = std::fs::read_dir(hwmon_root).map_err(|e| HwmonError::ReadError {
         path: hwmon_root.display().to_string(),
@@ -231,27 +252,38 @@ pub fn discover_sensors_reporting_skips(hwmon_root: &Path) -> Result<SensorDisco
         match discover_device_sensors(&hwmon_dir) {
             Ok(sensors) => descriptors.extend(sensors),
             Err(e) => {
-                log::warn!("Skipping {}: {e}", hwmon_dir.display());
-                skipped_chips += 1;
+                // A chip whose directory vanished between `read_dir` and here was
+                // REMOVED; it must still evict. Only one that is still present but
+                // unreadable is "cannot tell". Tested by re-checking the directory
+                // rather than by matching errno text, which is not a stable API.
+                if hwmon_dir.exists() {
+                    log::warn!(
+                        "Skipping {} (present but unreadable): {e}",
+                        hwmon_dir.display()
+                    );
+                    unreadable_dirs.push(hwmon_dir.clone());
+                } else {
+                    log::info!("Skipping {} (removed during scan)", hwmon_dir.display());
+                }
             }
         }
     }
 
     Ok(SensorDiscovery {
         descriptors,
-        skipped_chips,
+        unreadable_dirs,
     })
 }
 
-/// Discover temperature sensors for a single hwmon device directory.
-fn discover_device_sensors(hwmon_dir: &Path) -> Result<Vec<SensorDescriptor>, HwmonError> {
-    let chip_name = read_sysfs_string(&hwmon_dir.join("name"))?
-        .trim()
-        .to_string();
-
-    // Read device symlink for stable ID
+/// The `device_id` half of a chip's stable ids, from its hwmon directory alone.
+///
+/// Extracted so the SKIP path can derive the same value the success path would
+/// have: a chip whose `name` will not read never reaches `discover_device_sensors`'
+/// body, but its already-cached sensor ids still embed this, which is what lets
+/// `polling.rs` protect exactly that chip's readings from eviction and no others.
+fn device_id_for_hwmon_dir(hwmon_dir: &Path) -> String {
     let device_link = hwmon_dir.join("device");
-    let device_id = if device_link.exists() {
+    if device_link.exists() {
         let resolved = std::fs::read_link(&device_link)
             .or_else(|_| std::fs::canonicalize(&device_link))
             .unwrap_or_else(|e| {
@@ -265,7 +297,16 @@ fn discover_device_sensors(hwmon_dir: &Path) -> Result<Vec<SensorDescriptor>, Hw
         device_id_from_path(&resolved)
     } else {
         "nodev".to_string()
-    };
+    }
+}
+
+/// Discover temperature sensors for a single hwmon device directory.
+fn discover_device_sensors(hwmon_dir: &Path) -> Result<Vec<SensorDescriptor>, HwmonError> {
+    let chip_name = read_sysfs_string(&hwmon_dir.join("name"))?
+        .trim()
+        .to_string();
+
+    let device_id = device_id_for_hwmon_dir(hwmon_dir);
 
     // Find all temp*_input files
     let mut sensors = Vec::new();
@@ -301,10 +342,23 @@ fn discover_device_sensors(hwmon_dir: &Path) -> Result<Vec<SensorDescriptor>, Hw
         // Try to read the label file (temp1_label, etc.)
         let label_path = input_path.with_file_name(format!("temp{index}_label"));
         let label = if label_path.exists() {
-            read_sysfs_string(&label_path)
-                .unwrap_or_default()
-                .trim()
-                .to_string()
+            // [SAFETY] DEC-272 round 2 — propagate, do NOT default to empty.
+            //
+            // The label is not decoration: `build_stable_id` embeds it, and
+            // `classify_sensor` derives `SensorKind` from it. Defaulting a
+            // present-but-unreadable label to "" therefore renames the sensor
+            // (`hwmon:chip:dev:Tctl` -> `hwmon:chip:dev:`) AND can reclassify it
+            // — on `nct6775`/`asus_ec_sensors` an empty label falls through to
+            // `MbTemp`. The chip still enumerates Ok, so the pass looks complete,
+            // eviction runs, and the old id is dropped on false evidence: exactly
+            // the "unreadable is not vanished" hole this round closed one level
+            // up, reached through an attribute instead of the chip name. On a
+            // CpuTemp that yields `CpuReading::Absent` and the 100/40 flap.
+            //
+            // Failing the whole chip costs one pass of its other sensors, whose
+            // cached readings are protected by `unreadable_dirs` in the meantime.
+            // That is the cheaper error.
+            read_sysfs_string(&label_path)?.trim().to_string()
         } else {
             format!("temp{index}")
         };

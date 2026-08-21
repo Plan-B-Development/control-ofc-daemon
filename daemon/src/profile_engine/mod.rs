@@ -526,13 +526,21 @@ pub(crate) fn hottest_cpu_reading(
 /// 0% — the outcome DEC-269 was right to worry about and the reason no new
 /// fallback constant is needed here.
 ///
-/// That holds for COMPOSITES only because DEC-272 round 2 made it hold. As first
-/// written this sentence was true of single-sensor curves alone: `resolve_mix`
-/// dropped the unresolvable child and combined the survivors, so `max(cpu, gpu)`
-/// with a stale GPU sensor became `max(cpu)` and the fan ramped DOWN while blind
-/// — measured 100% -> 36% in one tick. `resolve_mix` now skips the whole Mix if
-/// any named child fails to resolve. Pinned by
-/// `a_stale_mix_child_holds_the_control_instead_of_lowering_it`.
+/// COMPOSITES need more than this predicate to get there, and the way they get
+/// there is deliberately NOT "skip the control". As first written this sentence
+/// was true of single-sensor curves alone: `resolve_mix` dropped the unresolvable
+/// child and combined the survivors, so `max(cpu, gpu)` with a stale GPU sensor
+/// became `max(cpu)` and the fan ramped DOWN while blind (measured 100% -> 36%).
+/// Skipping the whole Mix instead is worse in the mirror case, because THIS
+/// EXEMPTION is what a Mix's surviving CpuTemp child relies on: a fresh 95 C CPU
+/// reading stayed in the snapshot while the control issued no command at all.
+/// A Mix has one fan set, not one per child.
+///
+/// So a Mix combines whatever resolved and then refuses to fall while anything is
+/// missing (`combine_mix_partial` + the clamp in `curve_output_for_control`).
+/// Pinned from both sides by
+/// `a_stale_mix_child_holds_the_control_instead_of_lowering_it` and
+/// `a_mix_still_climbs_on_a_live_child_when_another_drops_out`.
 ///
 /// `CpuTemp` is DELIBERATELY EXEMPT, and that is not an oversight to tidy up
 /// later. The thermal ladder is the sole authority on a stale CPU reading and has
@@ -1012,7 +1020,11 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let before = evaluate_profile(&profile, &fresh, &mut ProfileEngineState::new());
+        // ONE state across both ticks — the engine keeps `last_output` per control,
+        // and that carry-over is exactly what the never-lower rule stands on. A
+        // fresh state per tick would test a machine that does not exist.
+        let mut state = ProfileEngineState::new();
+        let before = evaluate_profile(&profile, &fresh, &mut state);
         assert_eq!(before.len(), 1, "the fresh arm must command something");
         assert_eq!(
             before[0].pwm_percent, 100,
@@ -1037,12 +1049,98 @@ mod tests {
             "the filter must drop the stale GPU sensor and keep the fresh CPU one"
         );
 
-        let after = evaluate_profile(&profile, &stale, &mut ProfileEngineState::new());
+        let after = evaluate_profile(&profile, &stale, &mut state);
+        assert_eq!(after.len(), 1, "the control must still be commanded");
         assert!(
-            after.is_empty(),
-            "a Mix with an age-filtered child must SKIP the control so its fan holds; \
-             combining the survivors instead commanded {:?} — a ramp DOWN while blind",
-            after.iter().map(|c| c.pwm_percent).collect::<Vec<_>>()
+            after[0].pwm_percent >= before[0].pwm_percent,
+            "losing the hot child must never LOWER the duty: was {}%, now {}% — \
+             combining the survivors alone yields 36%, which is the ramp-down \
+             DEC-269 forbids",
+            before[0].pwm_percent,
+            after[0].pwm_percent
+        );
+    }
+
+    /// [SAFETY] DEC-272 round 2 — the MIRROR of the test above, and the reason
+    /// "skip the whole Mix" was the wrong fix for it.
+    ///
+    /// Here the surviving child is the hot one. `curve_eligible` deliberately
+    /// exempts `CpuTemp`, so a single-sensor CPU control keeps climbing toward a
+    /// hot target rather than holding — that exemption is load-bearing for
+    /// DEC-269 round 2. A Mix has ONE fan set, not one per child, so skipping the
+    /// control because a DIFFERENT child dropped out discards the surviving
+    /// child's live demand: measured, a fresh 95 C CPU reading sat in the
+    /// snapshot while the control issued no command at all and the fan stayed at
+    /// its old duty, backstopped only by the 105 C emergency.
+    ///
+    /// The CPU here is FRESH. No staleness of the CPU is needed to reach it.
+    #[test]
+    fn a_mix_still_climbs_on_a_live_child_when_another_drops_out() {
+        let profile = DaemonProfile {
+            id: "mix".into(),
+            name: "Mix".into(),
+            version: 7,
+            description: "".into(),
+            controls: vec![openfan_control("c", "mx", "openfan:ch00")],
+            curves: vec![
+                linear_curve("cpu", "cpu"),
+                linear_curve("gpu", "gpu"),
+                mix_curve("mx", "max", &["cpu", "gpu"]),
+            ],
+        };
+        let now = Instant::now();
+        let budget = std::time::Duration::from_secs(5);
+        let mut state = ProfileEngineState::new();
+
+        // Tick 1: everything cool and fresh → a low duty to climb away from.
+        let cool: std::collections::HashMap<String, CachedSensorReading> = [
+            (
+                "cpu".to_string(),
+                reading_aged("cpu", SensorKind::CpuTemp, 40.0, std::time::Duration::ZERO),
+            ),
+            (
+                "gpu".to_string(),
+                reading_aged("gpu", SensorKind::GpuTemp, 40.0, std::time::Duration::ZERO),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let before = evaluate_profile(&profile, &cool, &mut state);
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].pwm_percent, 36, "40 C on 30→20/80→100");
+
+        // Tick 2: CPU is FRESH and hot; the GPU sensor has aged out.
+        let mut hot = cool.clone();
+        hot.insert(
+            "cpu".into(),
+            reading_aged("cpu", SensorKind::CpuTemp, 95.0, std::time::Duration::ZERO),
+        );
+        hot.insert(
+            "gpu".into(),
+            reading_aged(
+                "gpu",
+                SensorKind::GpuTemp,
+                40.0,
+                std::time::Duration::from_secs(6),
+            ),
+        );
+        hot.retain(|_, s| curve_eligible(s, now, budget));
+        assert!(
+            hot.contains_key("cpu") && !hot.contains_key("gpu"),
+            "precondition: a live CPU reading and no GPU one"
+        );
+
+        let after = evaluate_profile(&profile, &hot, &mut state);
+        assert_eq!(
+            after.len(),
+            1,
+            "a live 95 C CPU child must still command the fan — issuing nothing \
+             leaves it at {}% with a hot reading in hand",
+            before[0].pwm_percent
+        );
+        assert_eq!(
+            after[0].pwm_percent, 100,
+            "the surviving child must drive the fan to its target"
         );
     }
 
@@ -1083,7 +1181,8 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let before = evaluate_profile(&profile, &fresh, &mut ProfileEngineState::new());
+        let mut state = ProfileEngineState::new();
+        let before = evaluate_profile(&profile, &fresh, &mut state);
         assert_eq!(before.len(), 1);
         assert_eq!(before[0].pwm_percent, 64, "subtract: 100 - 36");
 
@@ -1100,11 +1199,12 @@ mod tests {
         );
         stale.retain(|_, s| curve_eligible(s, now, budget));
 
-        let after = evaluate_profile(&profile, &stale, &mut ProfileEngineState::new());
+        let after = evaluate_profile(&profile, &stale, &mut state);
         assert!(
-            after.is_empty(),
-            "losing the minuend must skip the control, not promote the subtrahend; \
-             got {:?}",
+            after.is_empty() || after[0].pwm_percent >= before[0].pwm_percent,
+            "losing the minuend must never promote the subtrahend into its place — \
+             `A - B` becoming a bare `B` changed 0% into 36%. Holding or rising is \
+             acceptable; falling is not. got {:?}",
             after.iter().map(|c| c.pwm_percent).collect::<Vec<_>>()
         );
     }
