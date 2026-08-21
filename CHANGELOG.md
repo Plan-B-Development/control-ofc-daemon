@@ -2,7 +2,32 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Stopping the daemon could hang for a minute and a half.** When a temperature
+  chip stops responding, the daemon deliberately leaves the outstanding read
+  alone rather than piling more on top of it — that is what keeps a wedged chip
+  from starving fan control. The cost was at shutdown: the runtime waited for
+  that read to finish before letting the process exit, and it never would. Under
+  systemd that meant `systemctl stop`, a reboot, or a package upgrade sat for
+  about 90 seconds before the daemon was killed outright; started from a
+  terminal, Ctrl-C hung with nothing to break the wait at all.
+  Shutdown is now bounded: the daemon gives any outstanding read two seconds and
+  then exits regardless. **Fan control was never at risk** — the hardware is
+  already handed back to firmware before this point, and a restart-forcing exit
+  never took this path — so what changes is only how long the machine waits.
+  The packaged service file also caps systemd's own patience at 20 seconds, as a
+  backstop rather than the mechanism. 273-b.
+
 ### Internal
+- **The exit that recovers from a dead fan-control engine is now tested.** If
+  the engine dies, the daemon restores the hardware and then exits non-zero so
+  systemd restarts it with a working engine — and that "and then" is the whole
+  point: exiting first would leave fans latched at whatever the dead engine last
+  set. Neither half was pinned by a test, because a process exit cannot be
+  observed from inside the process that performs it. Deleting the exit, or
+  moving it ahead of the hardware restore, left every test passing. Both are now
+  checked by running the real shutdown in a separate process and reading its
+  exit code and its effect on the hardware. 273-a.
 - A rejected publishing token now says so. When the token that tells the package
   repository about a new release expires, the release itself still succeeds and
   looks complete — only publication silently stops, and the next day's check

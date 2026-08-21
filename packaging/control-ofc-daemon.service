@@ -40,6 +40,16 @@ Environment=HOME=/root
 Restart=on-failure
 RestartSec=3
 
+# Defence in depth only — NOT the mechanism that bounds shutdown (273-b).
+# The daemon bounds its own teardown: `shutdown_sequence` allows 3 s per task
+# (IPC server + up to three poll/engine tasks) and the runtime teardown adds at
+# most RUNTIME_SHUTDOWN_TIMEOUT (2 s), so a clean stop completes in ~14 s worst
+# case. This caps how long systemd waits before SIGKILL if that ever fails,
+# instead of the ~90 s default. It is deliberately generous relative to the
+# daemon's own bound, so a legitimately slow stop is never killed mid-restore;
+# ExecStopPost=control-ofc-restore-auto backstops the SIGKILL case regardless.
+TimeoutStopSec=20
+
 # Privilege model: daemon runs as root, declared explicitly via User=root
 # (identical to the prior implicit default — root is what a User=-less system
 # service already gets — but it states intent).

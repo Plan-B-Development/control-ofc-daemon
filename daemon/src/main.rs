@@ -738,6 +738,23 @@ fn resolve_initial_profile(search_dirs: &[std::path::PathBuf]) -> Option<DaemonP
 /// shutdown before proceeding with the hardware restore anyway.
 const SHUTDOWN_TASK_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How long the runtime teardown waits for outstanding blocking work before
+/// giving up on it and letting the process exit (273-b).
+///
+/// DEC-272 made an outstanding wedged `spawn_blocking` sensor read a **designed
+/// steady state** — the read is single-flighted and re-awaited, never
+/// re-spawned, precisely so a wedged chip cannot exhaust the blocking pool. The
+/// cost is that such a read can still be outstanding when `main` returns, and
+/// tokio's `Runtime::drop` waits for spawned work *forever*
+/// (<https://docs.rs/tokio/1.50.0/tokio/runtime/struct.Runtime.html>). Under
+/// systemd that meant hanging until `TimeoutStopSec` SIGKILL; run from a
+/// terminal it meant hanging with no backstop at all.
+///
+/// `shutdown_sequence` has already restored the hardware by the time this is
+/// reached, so nothing about safety rides on the wait — only process exit does.
+/// Bound it and let the leaked thread die with the process.
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Ordered graceful shutdown (DEC-146 P3-9 + audit P1-A).
 ///
 /// Stops accepting IPC connections and drains in-flight requests FIRST, then
@@ -798,8 +815,82 @@ async fn shutdown_sequence<F>(
     restore_hardware();
 }
 
-#[tokio::main]
-async fn main() {
+/// `shutdown_sequence`, then the restart-forcing exit — deliberately ONE unit.
+///
+/// The ordering is the safety property (DEC-266/267): the hardware must be back
+/// under firmware control *before* the process goes away, because exiting first
+/// leaves fans latched at whatever duty the dead engine last wrote. Splitting
+/// that across two statements in `async_main` left it unpinnable —
+/// `std::process::exit` cannot be observed in-process, so deleting the exit (or
+/// hoisting it above the restore) kept the whole suite green and silently
+/// discarded DEC-266/267's point. Bundling both halves here gives the ordering a
+/// single testable unit; `must_restart_exits_nonzero_after_restoring_hardware`
+/// re-executes this very function in a child process and observes both.
+///
+/// Diverges (never returns) when `must_restart` is set.
+async fn finish_shutdown<F>(
+    poll_shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    server_shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    server_handle: tokio::task::JoinHandle<()>,
+    task_handles: Vec<(&'static str, tokio::task::JoinHandle<()>)>,
+    task_timeout: Duration,
+    must_restart: bool,
+    restore_hardware: F,
+) where
+    F: FnOnce(),
+{
+    shutdown_sequence(
+        poll_shutdown_tx,
+        server_shutdown_tx,
+        server_handle,
+        task_handles,
+        task_timeout,
+        restore_hardware,
+    )
+    .await;
+
+    log::info!("control-ofc-daemon v{VERSION} stopped");
+
+    // DEC-266/267. Deliberately after `shutdown_sequence`, so the hardware is
+    // back under firmware control before the process goes away: exiting first
+    // would leave fans latched at whatever duty the dead engine last wrote.
+    // Non-zero so `Restart=on-failure` brings the daemon back with a live engine
+    // and a live sensor feed — a clean exit here would look like a requested
+    // stop and systemd would leave the machine with no fan control.
+    //
+    // Exiting from inside the async body is also what skips the runtime drop, so
+    // a restart is never delayed by RUNTIME_SHUTDOWN_TIMEOUT (273-b).
+    if must_restart {
+        std::process::exit(1);
+    }
+}
+
+/// Real entry point: owns the runtime so its teardown can be **bounded**.
+///
+/// Deliberately not `#[tokio::main]`. That attribute expands to a runtime held
+/// as a temporary, dropped when `main` returns — and that drop blocks forever on
+/// an outstanding blocking task, which DEC-272 makes a designed steady state.
+/// See `RUNTIME_SHUTDOWN_TIMEOUT`.
+///
+/// The `must_restart` path in `finish_shutdown` calls `std::process::exit(1)`
+/// from inside the async body, so it never reaches this teardown at all. That is
+/// intentional: a restart must not be delayed by waiting on the very read that
+/// wedged, and exiting from inside the async body is what skips the drop.
+fn main() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build the tokio runtime");
+
+    runtime.block_on(async_main());
+
+    // Unblocks this thread after at most RUNTIME_SHUTDOWN_TIMEOUT, leaking any
+    // still-running blocking task rather than waiting on it. The leaked thread
+    // dies with the process, and the hardware was restored before we got here.
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+}
+
+async fn async_main() {
     install_panic_hook();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -1365,12 +1456,13 @@ async fn main() {
     .filter_map(|(name, handle)| handle.map(|h| (name, h)))
     .collect();
 
-    shutdown_sequence(
+    finish_shutdown(
         &poll_shutdown_tx,
         shutdown_tx,
         server_handle,
         task_handles,
         SHUTDOWN_TASK_TIMEOUT,
+        must_restart,
         || {
             // Reset GPU fans to automatic before shutting down (re-enables zero-RPM)
             for gpu in &app_state.amd_gpus {
@@ -1402,18 +1494,6 @@ async fn main() {
         },
     )
     .await;
-
-    log::info!("control-ofc-daemon v{VERSION} stopped");
-
-    // DEC-266/267. Deliberately after `shutdown_sequence`, so the hardware is
-    // back under firmware control before the process goes away: exiting first
-    // would leave fans latched at whatever duty the dead engine last wrote.
-    // Non-zero so `Restart=on-failure` brings the daemon back with a live engine
-    // and a live sensor feed — a clean exit here would look like a requested
-    // stop and systemd would leave the machine with no fan control.
-    if must_restart {
-        std::process::exit(1);
-    }
 }
 
 #[cfg(test)]
@@ -2154,6 +2234,225 @@ mod tests {
         assert!(
             *restored.lock().unwrap(),
             "the hardware restore must run even if the IPC server fails to stop in time"
+        );
+    }
+
+    // ── 273-b / 273-a: bounded process exit, and the restart exit's ordering ──
+
+    /// Env var carrying the marker path to the re-executed child (273-a).
+    /// Its presence is what puts the child on the probe branch.
+    const RESTART_PROBE_MARKER: &str = "CONTROL_OFC_RESTART_PROBE_MARKER";
+    /// Same, for the clean-stop control case.
+    const CLEAN_PROBE_MARKER: &str = "CONTROL_OFC_CLEAN_PROBE_MARKER";
+
+    /// Re-execute this test binary, running only `test_name`, with `var` set to
+    /// `marker`. Returns the child's exit status.
+    ///
+    /// `std::process::exit` cannot be observed in-process, so the only way to
+    /// assert on it is to be a different process. `current_exe()` here is this
+    /// bin target's own libtest harness, so `--exact` re-enters exactly one test
+    /// — which then takes its probe branch because the env var is set.
+    fn run_probe_child(
+        test_name: &str,
+        var: &str,
+        marker: &std::path::Path,
+    ) -> std::process::ExitStatus {
+        let exe = std::env::current_exe().expect("current_exe");
+        std::process::Command::new(exe)
+            .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+            .env(var, marker)
+            .output()
+            .expect("re-exec the test binary")
+            .status
+    }
+
+    /// Drive the real `finish_shutdown` with a restore closure that stamps
+    /// `marker`. Shared by both probe children so they differ only in the flag.
+    fn probe_finish_shutdown(marker: std::path::PathBuf, must_restart: bool) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("child runtime");
+        runtime.block_on(async move {
+            let (poll_tx, _poll_rx) = tokio::sync::watch::channel(false);
+            let (server_tx, server_rx) = tokio::sync::oneshot::channel::<()>();
+            let server_handle = tokio::spawn(async move {
+                let _ = server_rx.await;
+            });
+            finish_shutdown(
+                &poll_tx,
+                server_tx,
+                server_handle,
+                vec![],
+                Duration::from_secs(3),
+                must_restart,
+                move || std::fs::write(&marker, b"restored").expect("stamp the restore marker"),
+            )
+            .await;
+        });
+    }
+
+    /// [SAFETY] 273-a — `must_restart` must exit non-zero, and must do so only
+    /// AFTER the hardware has been restored.
+    ///
+    /// Both halves were unpinned: `std::process::exit` cannot be observed
+    /// in-process, so deleting the exit — or hoisting it above the restore —
+    /// left the entire suite green while silently discarding DEC-266/267.
+    ///
+    /// This runs the real `finish_shutdown` in a re-executed child and reads two
+    /// independent signals off it:
+    ///   * **exit code 1** — the exit ran at all. Delete it and the child falls
+    ///     through to `exit(97)` instead, so the assertion reds rather than
+    ///     passing vacuously (the DEC-272 "a test asserting an absence must first
+    ///     assert the presence" trap, applied to a diverging call).
+    ///   * **the marker file** — the restore ran BEFORE the exit. Hoist the exit
+    ///     above `shutdown_sequence` and the code is still 1, but the marker is
+    ///     gone. That file is the ordering assertion.
+    #[test]
+    fn must_restart_exits_nonzero_after_restoring_hardware() {
+        if let Ok(marker) = std::env::var(RESTART_PROBE_MARKER) {
+            probe_finish_shutdown(marker.into(), true);
+            // `finish_shutdown` must diverge when must_restart is set. Reaching
+            // here means the exit was removed; 97 is distinguishable from both
+            // the expected 1 and libtest's own 0/101.
+            std::process::exit(97);
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("restored");
+        let status = run_probe_child(
+            "tests::must_restart_exits_nonzero_after_restoring_hardware",
+            RESTART_PROBE_MARKER,
+            &marker,
+        );
+
+        assert_eq!(
+            status.code(),
+            Some(1),
+            "a must_restart shutdown must exit(1) so Restart=on-failure revives the daemon \
+             with a live engine; 97 means the exit was deleted, 0/101 that the child never \
+             reached it"
+        );
+        assert!(
+            marker.exists(),
+            "the hardware restore must have run BEFORE the exit — an exit hoisted above \
+             shutdown_sequence would leave fans latched at the dead engine's last duty"
+        );
+    }
+
+    /// The control case: a clean stop must NOT exit non-zero, and must still
+    /// restore. Without this, an unconditional `exit(1)` would satisfy the test
+    /// above — systemd would then see every requested stop as a failure and
+    /// restart the daemon forever.
+    #[test]
+    fn a_clean_stop_restores_hardware_and_does_not_force_a_restart() {
+        if let Ok(marker) = std::env::var(CLEAN_PROBE_MARKER) {
+            probe_finish_shutdown(marker.into(), false);
+            return; // must return normally → libtest exits 0
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("restored");
+        let status = run_probe_child(
+            "tests::a_clean_stop_restores_hardware_and_does_not_force_a_restart",
+            CLEAN_PROBE_MARKER,
+            &marker,
+        );
+
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "a clean stop must not force a restart — an unconditional exit(1) would make \
+             systemd restart the daemon after every requested stop"
+        );
+        assert!(
+            marker.exists(),
+            "a clean stop must still restore the hardware"
+        );
+    }
+
+    /// [SAFETY] 273-b — the mechanism `main` relies on to bound its own exit.
+    ///
+    /// DEC-272 made an outstanding wedged `spawn_blocking` read a *designed*
+    /// steady state, and tokio's `Runtime::drop` waits for spawned work forever
+    /// (<https://docs.rs/tokio/1.50.0/tokio/runtime/struct.Runtime.html>). This
+    /// pins that `shutdown_timeout` really does unblock the shutdown thread, so
+    /// the version-specific behaviour the fix depends on is executable rather
+    /// than remembered. That we *call* it is a separate assertion —
+    /// `main_owns_its_runtime_so_teardown_is_bounded` below.
+    ///
+    /// The wedge carries a SELF-RELEASE DEADLINE. A failed assertion skips this
+    /// test's own cleanup, and an unbounded blocked thread turns a red test into
+    /// a hung CI job (DEC-272 trap 3). 30 s is far outside the 5 s the assertion
+    /// allows, so it can never mask a real failure.
+    #[test]
+    fn a_wedged_blocking_task_cannot_stall_runtime_teardown() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let released = Arc::new(AtomicBool::new(false));
+        let wedge = released.clone();
+        runtime.spawn_blocking(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !wedge.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        // Let the blocking task actually reach the pool, so teardown has
+        // something outstanding to wait on rather than racing an empty queue.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let started = Instant::now();
+        runtime.shutdown_timeout(Duration::from_millis(100));
+        let elapsed = started.elapsed();
+        released.store(true, Ordering::SeqCst);
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "shutdown_timeout must abandon a wedged blocking task, not wait for it; \
+             took {elapsed:?}"
+        );
+    }
+
+    /// [SAFETY] 273-b — the call site, which behaviour cannot see.
+    ///
+    /// `main` returning from under `#[tokio::main]` drops the runtime, and that
+    /// drop blocks forever on the wedged read DEC-272 designs for. The bound only
+    /// exists if `main` owns the runtime and calls `shutdown_timeout` on it, and
+    /// no in-process test can observe a `main` that is never called. Same tool
+    /// and same reasoning as `polling.rs`'s biased-select pin.
+    #[test]
+    fn main_owns_its_runtime_so_teardown_is_bounded() {
+        let whole = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        // Production code only — scanning the whole file makes this test match
+        // its OWN string literals, which is how the polling.rs version of this
+        // guard first passed while the production selects were unbiased.
+        let src = whole
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .expect("main.rs has a #[cfg(test)] module");
+
+        // Matched in ATTRIBUTE POSITION, not as a substring: `fn main`'s own doc
+        // comment names the attribute to explain why it is gone, and a bare
+        // `contains` hit that comment and failed on the first run.
+        assert!(
+            !src.lines()
+                .any(|l| l.trim_start().starts_with("#[tokio::main]")),
+            "#[tokio::main] holds the runtime as a temporary and drops it when main \
+             returns — an unbounded wait on any outstanding blocking task"
+        );
+        assert!(
+            src.contains("runtime.block_on(async_main())"),
+            "main must drive async_main on a runtime it owns"
+        );
+        assert!(
+            src.contains("runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT)"),
+            "main must bound the runtime teardown; without this the process hangs \
+             until systemd's TimeoutStopSec SIGKILL, and forever outside systemd"
         );
     }
 
