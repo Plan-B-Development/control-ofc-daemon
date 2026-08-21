@@ -150,7 +150,28 @@ inside the band cannot pin the pre-settle fan speed indefinitely.
      so the GUI shows a poll-driven thermal banner (DEC-165 — there is no GUI
      loop to stand down; the daemon owns control)
 
-2. **Lease system** (`lease.rs`): Exclusive hwmon write access
+2. **Curve sensor freshness** (`profile_engine::curve_eligible`, DEC-272)
+   - The rule above is CPU-only. Every *other* sensor driving a fan curve — GPU
+     edge, coolant, VRM, drive — is age-filtered before curve evaluation: a
+     reading older than the same freshness budget stops driving its curve, so a
+     frozen GPU or coolant sensor can no longer command a fan forever while
+     `thermal_state` reports `normal`
+   - A filtered-out sensor makes its curve unresolvable, so the control is
+     SKIPPED and its fans hold at their last commanded duty. Never 0%, and never
+     a lower value: a Mix curve with any unavailable input holds as a whole
+     rather than recombining the inputs that remain (losing an input must not
+     reduce cooling — DEC-269 applied one level out)
+   - `CpuTemp` is deliberately EXEMPT. The thermal ladder above is the sole
+     authority on a stale CPU reading and has already adjudicated both halves;
+     filtering it here would freeze a control mid-ramp instead of letting it keep
+     climbing toward a hot target
+   - Readings for sensors that have genuinely VANISHED (driver unloaded, device
+     removed) are evicted from the cache rather than ageing in it forever, which
+     is what makes the "no CpuTemp sensor" branch above reachable at all. A
+     scan that could not read some chip is treated as incomplete and evicts
+     nothing — "could not enumerate" is not "gone"
+
+3. **Lease system** (`lease.rs`): Exclusive hwmon write access
    - 60s TTL, holder must renew periodically
    - A daemon-internal single-writer token (`HwmonWriter::{Engine,Verify,ThermalSafety}`,
      DEC-197) arbitrating the three in-process writers — the profile-engine tick, a hardware

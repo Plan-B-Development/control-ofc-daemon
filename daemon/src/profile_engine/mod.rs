@@ -526,6 +526,14 @@ pub(crate) fn hottest_cpu_reading(
 /// 0% — the outcome DEC-269 was right to worry about and the reason no new
 /// fallback constant is needed here.
 ///
+/// That holds for COMPOSITES only because DEC-272 round 2 made it hold. As first
+/// written this sentence was true of single-sensor curves alone: `resolve_mix`
+/// dropped the unresolvable child and combined the survivors, so `max(cpu, gpu)`
+/// with a stale GPU sensor became `max(cpu)` and the fan ramped DOWN while blind
+/// — measured 100% -> 36% in one tick. `resolve_mix` now skips the whole Mix if
+/// any named child fails to resolve. Pinned by
+/// `a_stale_mix_child_holds_the_control_instead_of_lowering_it`.
+///
 /// `CpuTemp` is DELIBERATELY EXEMPT, and that is not an oversight to tidy up
 /// later. The thermal ladder is the sole authority on a stale CPU reading and has
 /// already adjudicated both halves: stale-and-cool forces `NO_SENSOR_SAFE_PCT`
@@ -952,6 +960,153 @@ mod tests {
             &mut ProfileEngineState::new(),
         );
         assert_eq!(cmds[0].pwm_percent, 84); // max(52, 84)
+    }
+
+    /// [SAFETY] DEC-272 round 2 — the curve freshness filter must never LOWER a
+    /// composite's commanded duty.
+    ///
+    /// `curve_eligible` (`mod.rs`) drops a stale sensor from the snapshot, and its
+    /// own doc promises that makes the control *skip* and its fans *hold*. That
+    /// was true only for single-sensor curves: `resolve_mix` used to drop the
+    /// unresolvable child and combine the survivors, so `max(cpu, gpu)` with a
+    /// frozen GPU sensor became `max(cpu)` and the fan ramped DOWN while the
+    /// daemon was blind to the input that had been driving it — a reduction in
+    /// cooling caused by going blind, which DEC-269 forbids.
+    ///
+    /// Measured before the fix: 100% -> 36% in ONE tick. Nothing damped it —
+    /// `default_step()` is 100 in both directions, Mix bypasses the 2 C deadband
+    /// by design (DEC-150), and the openfan floor is 20%. The safety ladder cannot
+    /// catch it either: the CPU sensor is fresh, so no force is in play.
+    ///
+    /// The presence is asserted BEFORE the absence deliberately. "No command was
+    /// issued" passes vacuously against a profile that never commanded anything,
+    /// so the fresh arm has to prove the 100% first for the stale arm to mean
+    /// what it claims.
+    #[test]
+    fn a_stale_mix_child_holds_the_control_instead_of_lowering_it() {
+        let profile = DaemonProfile {
+            id: "mix".into(),
+            name: "Mix".into(),
+            version: 7,
+            description: "".into(),
+            controls: vec![openfan_control("c", "mx", "openfan:ch00")],
+            curves: vec![
+                linear_curve("cpu", "cpu"), // 30→20%, 80→100%: at 40 C → 36%
+                linear_curve("gpu", "gpu"), // at 85 C → clamped 100%
+                mix_curve("mx", "max", &["cpu", "gpu"]),
+            ],
+        };
+        let now = Instant::now();
+        let budget = std::time::Duration::from_secs(5);
+
+        // PRESENCE: both children fresh → the mix rides the hot GPU child at 100%.
+        let fresh: std::collections::HashMap<String, CachedSensorReading> = [
+            (
+                "cpu".to_string(),
+                reading_aged("cpu", SensorKind::CpuTemp, 40.0, std::time::Duration::ZERO),
+            ),
+            (
+                "gpu".to_string(),
+                reading_aged("gpu", SensorKind::GpuTemp, 85.0, std::time::Duration::ZERO),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let before = evaluate_profile(&profile, &fresh, &mut ProfileEngineState::new());
+        assert_eq!(before.len(), 1, "the fresh arm must command something");
+        assert_eq!(
+            before[0].pwm_percent, 100,
+            "with both children fresh the mix must ride the hot GPU child"
+        );
+
+        // ABSENCE: freeze the GPU sensor, then apply the production filter verbatim
+        // (`profile_engine/mod.rs` call site).
+        let mut stale = fresh.clone();
+        stale.insert(
+            "gpu".into(),
+            reading_aged(
+                "gpu",
+                SensorKind::GpuTemp,
+                85.0,
+                std::time::Duration::from_secs(6),
+            ),
+        );
+        stale.retain(|_, s| curve_eligible(s, now, budget));
+        assert!(
+            !stale.contains_key("gpu") && stale.contains_key("cpu"),
+            "the filter must drop the stale GPU sensor and keep the fresh CPU one"
+        );
+
+        let after = evaluate_profile(&profile, &stale, &mut ProfileEngineState::new());
+        assert!(
+            after.is_empty(),
+            "a Mix with an age-filtered child must SKIP the control so its fan holds; \
+             combining the survivors instead commanded {:?} — a ramp DOWN while blind",
+            after.iter().map(|c| c.pwm_percent).collect::<Vec<_>>()
+        );
+    }
+
+    /// [SAFETY] DEC-272 round 2, the sharpest edge of the same defect.
+    ///
+    /// `combine_mix` computes `subtract` as `values[0] - values[1..].sum()`. While
+    /// unresolvable children were dropped, losing the FIRST child re-indexed the
+    /// vector and silently promoted the second child to minuend — so `A - B`
+    /// became a bare `B`, and the commanded duty could JUMP rather than fall.
+    /// Measured before the fix: 0% -> 36%.
+    #[test]
+    fn a_stale_first_mix_child_does_not_reindex_subtract() {
+        let profile = DaemonProfile {
+            id: "mix".into(),
+            name: "Mix".into(),
+            version: 7,
+            description: "".into(),
+            controls: vec![openfan_control("c", "mx", "openfan:ch00")],
+            curves: vec![
+                linear_curve("gpu", "gpu"), // first child, at 85 C → 100%
+                linear_curve("cpu", "cpu"), // second child, at 40 C → 36%
+                mix_curve("mx", "subtract", &["gpu", "cpu"]),
+            ],
+        };
+        let now = Instant::now();
+        let budget = std::time::Duration::from_secs(5);
+
+        // PRESENCE: 100 - 36 = 64.
+        let fresh: std::collections::HashMap<String, CachedSensorReading> = [
+            (
+                "cpu".to_string(),
+                reading_aged("cpu", SensorKind::CpuTemp, 40.0, std::time::Duration::ZERO),
+            ),
+            (
+                "gpu".to_string(),
+                reading_aged("gpu", SensorKind::GpuTemp, 85.0, std::time::Duration::ZERO),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let before = evaluate_profile(&profile, &fresh, &mut ProfileEngineState::new());
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].pwm_percent, 64, "subtract: 100 - 36");
+
+        // ABSENCE: the MINUEND goes stale.
+        let mut stale = fresh.clone();
+        stale.insert(
+            "gpu".into(),
+            reading_aged(
+                "gpu",
+                SensorKind::GpuTemp,
+                85.0,
+                std::time::Duration::from_secs(6),
+            ),
+        );
+        stale.retain(|_, s| curve_eligible(s, now, budget));
+
+        let after = evaluate_profile(&profile, &stale, &mut ProfileEngineState::new());
+        assert!(
+            after.is_empty(),
+            "losing the minuend must skip the control, not promote the subtrahend; \
+             got {:?}",
+            after.iter().map(|c| c.pwm_percent).collect::<Vec<_>>()
+        );
     }
 
     #[test]

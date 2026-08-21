@@ -117,8 +117,9 @@ pub(crate) fn evaluate_trigger(
 
 /// Combine child-curve outputs for a Mix curve (DEC-150), clamped 0–100.
 ///
-/// `values` is non-empty (the caller drops unresolved children and skips the
-/// Mix entirely when nothing resolves). Daemon-owned outright since the 2.0.0
+/// `values` is non-empty and carries one entry per child: the caller skips the
+/// Mix entirely if ANY child fails to resolve (DEC-272 round 2), so `subtract`
+/// can rely on `values[0]` still being the first `mix_curve_ids` entry. Daemon-owned outright since the 2.0.0
 /// cutover (DEC-165); pinned by the daemon-only `tuning_sequence` golden
 /// vectors in `parity_vectors.json` (DEC-126). `subtract` is the first input
 /// minus the sum of the rest, matching the ordered `mix_curve_ids`.
@@ -162,11 +163,17 @@ pub(crate) fn resolve_curve_output(
 }
 
 /// Combine a Mix curve's children (DEC-150). Each child is evaluated at its own
-/// sensor; unresolved children are dropped; surviving values are combined by
-/// `mix_function` and clamped 0–100. Returns None when the curve is part of a
-/// cycle or no child resolves (control skipped — fan holds). Path-based
-/// `visited` (insert on entry, remove on exit) is a per-branch path set, so
-/// diamonds re-evaluate and only true cycles drop out.
+/// sensor and the values are combined by `mix_function`, clamped 0–100.
+///
+/// Returns None — control skipped, fan holds — when the curve is part of a
+/// cycle, exceeds the depth backstop, has no children, or **any named child
+/// fails to resolve** (unknown id, missing/age-filtered sensor, unresolvable
+/// nested Mix). That last case is [SAFETY] DEC-272 round 2: children used to be
+/// dropped individually and the survivors combined, which lowered the commanded
+/// duty when the dropped input was the hot one. See the comment at the drop site.
+///
+/// Path-based `visited` (insert on entry, remove on exit) is a per-branch path
+/// set, so diamonds re-evaluate and only true cycles drop out.
 pub(crate) fn resolve_mix(
     curve: &crate::profile::CurveConfig,
     profile: &DaemonProfile,
@@ -196,11 +203,34 @@ pub(crate) fn resolve_mix(
         return None;
     }
     visited.insert(curve.id.clone());
-    let mut values: Vec<f64> = Vec::new();
+    let mut values: Vec<f64> = Vec::with_capacity(curve.mix_curve_ids.len());
     for child_id in &curve.mix_curve_ids {
-        if let Some(child) = profile.curves.iter().find(|c| &c.id == child_id) {
-            if let Some(v) = resolve_curve_output(child, profile, sensors, visited) {
-                values.push(v);
+        let resolved = profile
+            .curves
+            .iter()
+            .find(|c| &c.id == child_id)
+            .and_then(|child| resolve_curve_output(child, profile, sensors, visited));
+        match resolved {
+            Some(v) => values.push(v),
+            // [SAFETY] DEC-272 round 2. One unresolvable child skips the WHOLE
+            // Mix. Combining the survivors instead silently LOWERS the commanded
+            // duty: `max(cpu, gpu)` with the GPU sensor age-filtered out becomes
+            // `max(cpu)`, so the fan ramps down while the daemon is blind to the
+            // input that was driving it — measured 100% -> 36% in a single tick,
+            // because `default_step()` is 100 in both directions (profile.rs) and
+            // Mix bypasses the 2 C deadband by design (DEC-150). That is the
+            // "reduction in cooling caused by going blind" DEC-269 forbids.
+            // `subtract` was worse still: dropping the first child re-indexed
+            // `values[0]` and silently promoted the second child to minuend.
+            //
+            // Skipping instead leaves the fan at its last commanded duty, which
+            // is what `curve_eligible` (profile_engine/mod.rs) already promises
+            // for single-sensor curves — this makes the promise true for
+            // composites too. Not logged: a stale sensor persists, and this runs
+            // at 1 Hz.
+            None => {
+                visited.remove(&curve.id);
+                return None;
             }
         }
     }

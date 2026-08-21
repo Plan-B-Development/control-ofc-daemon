@@ -38,6 +38,20 @@ use crate::hwmon::types::{SensorKind, SensorReading};
 use crate::serial::protocol::Command;
 use crate::serial::transport::{send_command, SerialTransport};
 
+/// One poll leg's sensor result.
+///
+/// The `usize` rides alongside a freshly discovered descriptor set and counts the
+/// chips that could not be enumerated on that pass — non-zero means the set is
+/// known-incomplete and must not be used as evidence that a sensor has vanished
+/// ([SAFETY] DEC-272 round 2).
+type SensorLegResult = Result<
+    (
+        Option<(Vec<crate::hwmon::types::SensorDescriptor>, usize)>,
+        crate::hwmon::SensorReadOutcome,
+    ),
+    crate::error::HwmonError,
+>;
+
 /// Convert hwmon `SensorReading` (with `SystemTime`) into cache `CachedSensorReading` (with `Instant`).
 fn to_cached(reading: &SensorReading) -> CachedSensorReading {
     use crate::hwmon::types::SensorSource;
@@ -151,11 +165,7 @@ pub async fn hwmon_poll_loop(
     let mut consecutive_errors: u32 = 0;
     // DEC-272: the in-flight blocking read, held across ticks so a wedged one is
     // re-awaited rather than re-spawned. See the [SAFETY] note at the await site.
-    type PollTickOutput = (
-        Result<(Option<Vec<SensorDescriptor>>, SensorReadOutcome), crate::error::HwmonError>,
-        Vec<HwmonFanState>,
-        Vec<AmdGpuFanState>,
-    );
+    type PollTickOutput = (SensorLegResult, Vec<HwmonFanState>, Vec<AmdGpuFanState>);
     let mut pending: Option<tokio::task::JoinHandle<PollTickOutput>> = None;
     // Set when the read now in flight was spawned with discovery enabled, and
     // read when that read's result is processed — which, since DEC-272, can be a
@@ -167,6 +177,11 @@ pub async fn hwmon_poll_loop(
     // DEC-133: cached sensor descriptor set. `Arc` so each tick's spawn_blocking
     // can borrow the set without cloning descriptor contents.
     let mut descriptors: Arc<Vec<SensorDescriptor>> = Arc::new(Vec::new());
+    // [SAFETY] DEC-272 round 2: whether `descriptors` is a COMPLETE enumeration.
+    // Only a complete pass may be used as evidence that a sensor has vanished —
+    // see the `retain_sensors` call below. Sticky across non-discovery ticks: a
+    // partial set stays untrusted until a clean pass replaces it.
+    let mut descriptors_complete = true;
     let mut discovered_once = false;
     // DEC-193: owns per-descriptor read-failure streaks, the re-discovery
     // throttle, and quarantine of present-but-unreadable sensors (e.g. an
@@ -177,11 +192,20 @@ pub async fn hwmon_poll_loop(
 
     loop {
         tokio::select! {
-            _ = tick.tick() => {}
+            // [SAFETY] DEC-272 round 2. `biased` — shutdown is polled FIRST.
+            // Unbiased, `select!` chooses randomly among ready branches, and after
+            // a wedged read's freshness budget elapses BOTH are ready (the tick is
+            // overdue, the shutdown flag is set). SIGTERM was therefore observed
+            // after 5 s x a geometric number of rounds — measured 4.5 s, 9.5 s,
+            // 4.5 s across three runs, with no bound on the tail. The daemon did
+            // stop, just unpredictably slowly, and that is the window in which
+            // systemd escalates to SIGKILL and the hardware is left where it lay.
+            biased;
             _ = shutdown.changed() => {
                 log::info!("hwmon poll loop shutting down");
                 return;
             }
+            _ = tick.tick() => {}
         }
 
         // Detect system suspend/resume via CLOCK_BOOTTIME vs CLOCK_MONOTONIC gap.
@@ -269,15 +293,15 @@ pub async fn hwmon_poll_loop(
                     // hot path reads each cached descriptor's temp*_input file only.
                     // The read returns successes *and* failures (DEC-193) — the loop owns
                     // logging/quarantine policy, so this blocking leg stays silent.
-                    let sensors: Result<
-                        (Option<Vec<SensorDescriptor>>, SensorReadOutcome),
-                        crate::error::HwmonError,
-                    > = if needs_discovery {
-                        crate::hwmon::discovery::discover_sensors(&root).map(|fresh| {
-                            let mut outcome = crate::hwmon::read_sensor_values(&fresh);
-                            outcome.readings.extend(nvml_temps.iter().cloned());
-                            (Some(fresh), outcome)
-                        })
+                    let sensors: SensorLegResult = if needs_discovery {
+                        crate::hwmon::discovery::discover_sensors_reporting_skips(&root).map(
+                            |found| {
+                                let mut outcome =
+                                    crate::hwmon::read_sensor_values(&found.descriptors);
+                                outcome.readings.extend(nvml_temps.iter().cloned());
+                                (Some((found.descriptors, found.skipped_chips)), outcome)
+                            },
+                        )
                     } else {
                         let mut outcome = crate::hwmon::read_sensor_values(&descs);
                         outcome.readings.extend(nvml_temps.iter().cloned());
@@ -336,10 +360,22 @@ pub async fn hwmon_poll_loop(
         match result {
             Ok((Ok((fresh_descriptors, outcome)), fan_states, gpu_fan_states)) => {
                 consecutive_errors = 0;
-                if let Some(fresh) = fresh_descriptors {
+                if let Some((fresh, skipped_chips)) = fresh_descriptors {
                     if !discovered_once || rescan_requested {
                         log::info!("Sensor discovery: {} sensor(s) cached", fresh.len());
                     }
+                    // [SAFETY] DEC-272 round 2. A pass that skipped a chip yields a
+                    // partial set; adopting it is fine (the readable sensors still
+                    // work), but it must not be trusted as proof that the missing
+                    // ones are GONE.
+                    if skipped_chips > 0 && descriptors_complete {
+                        log::warn!(
+                            "Sensor discovery skipped {skipped_chips} unreadable chip(s) — \
+                             treating the sensor list as incomplete and suspending \
+                             vanished-sensor eviction until a clean pass"
+                        );
+                    }
+                    descriptors_complete = skipped_chips == 0;
                     descriptors = Arc::new(fresh);
                     discovered_once = true;
                 }
@@ -393,7 +429,20 @@ pub async fn hwmon_poll_loop(
                 // descriptor that is simply gone, which the tracker forgets and so
                 // never reports — leaving its reading cached forever and keeping
                 // `CpuReading::Absent` unreachable.
-                cache.retain_sensors(&live);
+                //
+                // [SAFETY] DEC-272 round 2 — only ever on a COMPLETE descriptor set.
+                // `discover_sensors` logs and skips a chip whose own metadata cannot
+                // be read, so a transient sysfs failure returns Ok with that chip's
+                // sensors missing. Evicting on that evidence took a live CPU sensor
+                // to `CpuReading::Absent`, and `Absent` is deliberately excluded from
+                // DEC-269's stale-hold (`safety_tick.rs`) — so a latched 105 °C
+                // emergency fell from a forced 100% to NO_SENSOR_SAFE_PCT (40%), then
+                // back on rediscovery: the exact 100/40/100 flap DEC-269 removed.
+                // A genuinely removed chip has no sysfs directory at all, is never
+                // "skipped", and so still evicts on the very next pass.
+                if descriptors_complete {
+                    cache.retain_sensors(&live);
+                }
                 if let Some(aio) = aio_state {
                     cache.update_aio(aio);
                 }
@@ -1211,6 +1260,62 @@ mod tests {
         stop(h).await;
     }
 
+    /// [SAFETY] DEC-272 round 2 — the BOUND itself, which nothing pinned.
+    ///
+    /// `a_wedged_read_is_bounded_and_never_re_spawned` above pins the
+    /// single-flight half, but it passes with the `tokio::time::timeout` deleted
+    /// entirely (measured: replace it with a plain `(&mut handle).await` and the
+    /// test is still green). Its observations — `entered == 1`, no reading landing,
+    /// resumption after release — are all equally true of a loop that is simply
+    /// blocked on the join, so the freshness bound had no regression guard at all.
+    /// That is the failure mode CLAUDE.md names: a [SAFETY] mechanism whose test
+    /// measures its neighbour.
+    ///
+    /// The discriminator is LIVENESS. With the bound, the await returns after
+    /// `cpu_temp_stale_after()` (5 s floor), the loop `continue`s, re-enters its
+    /// `select!` and observes shutdown. Without it, the loop is parked inside the
+    /// join and cannot see shutdown until the read itself returns — so a wedged
+    /// sensor makes the daemon unstoppable, and systemd escalates to SIGKILL with
+    /// the hardware left wherever it was.
+    ///
+    /// The wedge self-releases at `WEDGE_SELF_RELEASE` (15 s) so a failure here is
+    /// a slow red, never a hung CI job.
+    #[tokio::test]
+    async fn a_wedged_read_does_not_make_the_loop_unstoppable() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_k10temp(tmp.path(), 55.0);
+
+        let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let nvml = Arc::new(WedgingNvml {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let h = spawn_poll_loop_with_nvml(tmp.path().to_path_buf(), nvml);
+
+        // Let tick 1 fire and wedge, then ask the loop to stop while it is stuck.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            entered.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "precondition: the read must actually be wedged before we signal stop"
+        );
+        let _ = h.shutdown_tx.send(true);
+
+        // 9 s sits between the two outcomes: bounded exits at ~5 s (the budget),
+        // unbounded cannot exit before the wedge self-releases at 15 s.
+        let exited = tokio::time::timeout(Duration::from_secs(9), h.handle).await;
+        // Release regardless so the blocking thread is not still running when the
+        // runtime is dropped — a failed assertion must not become a hung binary.
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            exited.is_ok(),
+            "the poll loop must observe shutdown while a blocking read is wedged; \
+             without the freshness bound it stays parked in the join and the daemon \
+             can only be stopped by SIGKILL"
+        );
+    }
+
     async fn stop(h: PollHarness) {
         let _ = h.shutdown_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(5), h.handle).await;
@@ -1411,6 +1516,70 @@ mod tests {
         assert!(
             sensor_by_label(&h.cache, "Tctl").is_some(),
             "eviction must be surgical: the surviving sensor stays"
+        );
+
+        stop(h).await;
+    }
+
+    /// [SAFETY] DEC-272 round 2 — a chip that cannot be ENUMERATED is not a chip
+    /// that is GONE, and only the second may evict.
+    ///
+    /// `discover_sensors` logs and skips a chip whose own metadata read fails, so
+    /// one bad chip cannot blind the daemon to the rest — but it then returns
+    /// `Ok` with a *partial* set that is indistinguishable from a complete one.
+    /// Row 01-c's eviction used that set as proof a sensor no longer exists, so a
+    /// single transient sysfs failure on the CPU chip evicted a live Tctl. That
+    /// matters far beyond a missing row on `/status`: the reading becomes
+    /// `CpuReading::Absent` rather than `Stale`, and `safety_tick` deliberately
+    /// excludes `Absent` from DEC-269's stale-hold — so a latched 105 °C emergency
+    /// drops from a forced 100% to `NO_SENSOR_SAFE_PCT` (40%) and back on
+    /// rediscovery. That is the 100/40/100 flap DEC-269 was written to remove,
+    /// reachable from one failed read.
+    ///
+    /// Phase 2 pins that the suspension is TEMPORARY, not a disabling of 01-c: a
+    /// later clean pass evicts a genuinely removed chip. The complementary half —
+    /// that a removed directory evicts immediately — is
+    /// `a_vanished_sensor_is_evicted_from_the_cache_on_rediscovery` above.
+    #[tokio::test(start_paused = true)]
+    async fn a_chip_that_failed_to_enumerate_is_not_treated_as_vanished() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_k10temp(tmp.path(), 55.0);
+        write_nvme(tmp.path());
+        let h = spawn_poll_loop(tmp.path().to_path_buf());
+
+        tokio::time::sleep(Duration::from_millis(500)).await; // tick 1
+        assert!(
+            sensor_by_label(&h.cache, "Tctl").is_some(),
+            "precondition: the CPU sensor was discovered"
+        );
+
+        // Phase 1: the CPU chip's own `name` read fails. The directory is still
+        // there — this is a transient sysfs error, not an unbind.
+        fs::remove_file(tmp.path().join("hwmon0/name")).unwrap();
+        h.rescan.store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(1000)).await; // tick 2
+
+        assert!(
+            sensor_by_label(&h.cache, "Tctl").is_some(),
+            "a chip that merely failed to enumerate must NOT be evicted — evicting \
+             it yields CpuReading::Absent, which DEC-269's stale-hold excludes, so a \
+             latched thermal emergency falls from 100% to the 40% no-sensor floor"
+        );
+
+        // Phase 2: the chip read recovers AND the nvme device is genuinely removed.
+        // The next pass is complete, so eviction resumes and takes the real casualty.
+        fs::write(tmp.path().join("hwmon0/name"), "k10temp\n").unwrap();
+        fs::remove_dir_all(tmp.path().join("hwmon1")).unwrap();
+        h.rescan.store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(1000)).await; // tick 3
+
+        assert!(
+            sensor_by_label(&h.cache, "Composite").is_none(),
+            "suspension must be temporary: a clean pass still evicts a vanished sensor"
+        );
+        assert!(
+            sensor_by_label(&h.cache, "Tctl").is_some(),
+            "the recovered CPU sensor stays"
         );
 
         stop(h).await;

@@ -496,3 +496,75 @@ fn a_nightly_ci_run_cannot_veto_a_release() {
          documented escape hatch for tagging a docs-only commit"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Release back-stops. Both failure modes below are invisible locally and only
+// bite AFTER the tag is public, forcing a delete-and-retag: `ci.yml` runs plain
+// `cargo clippy`/`cargo test` (no `--locked`), and the CHANGELOG is only read by
+// `release.yml`'s note extraction. The GUI has carried the CHANGELOG guard since
+// DEC-239; the daemon shipped without either.
+// ---------------------------------------------------------------------------
+
+/// `Cargo.lock` must agree with `daemon/Cargo.toml` about this crate's version.
+///
+/// `packaging/PKGBUILD` fetches `--locked` and builds/tests `--frozen`, so a lock
+/// whose own `control-ofc-daemon` entry lags the manifest fails inside `makepkg`
+/// with "the lock file needs to be updated but --locked was passed" — in the
+/// clean-room `build-test` job, after the tag exists. Nothing else catches it:
+/// the pkgver guard above compares PKGBUILD to Cargo.toml, and CI never passes
+/// `--locked`. Fix by running `cargo update -w` with the version bump and
+/// committing the regenerated lock alongside it.
+#[test]
+fn cargo_lock_matches_the_crate_version() {
+    let lock = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../Cargo.lock"))
+        .expect("read Cargo.lock");
+
+    // The workspace member's own [[package]] block: find its name line, then the
+    // first `version = ` that follows.
+    let mut lines = lock.lines();
+    let locked = loop {
+        let line = lines
+            .next()
+            .expect("Cargo.lock has no `name = \"control-ofc-daemon\"` package entry");
+        if line.trim() == "name = \"control-ofc-daemon\"" {
+            break lines
+                .by_ref()
+                .take(3)
+                .find_map(|l| l.trim().strip_prefix("version = "))
+                .map(|v| v.trim().trim_matches('"').to_string())
+                .expect("no `version =` within the control-ofc-daemon package block");
+        }
+    };
+
+    assert_eq!(
+        locked,
+        env!("CARGO_PKG_VERSION"),
+        "Cargo.lock records control-ofc-daemon {locked} but daemon/Cargo.toml is at {} — \
+         the PKGBUILD builds --frozen, so this fails the clean-room release build after \
+         the tag is pushed. Run `cargo update -w` and commit Cargo.lock with the bump.",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+/// `CHANGELOG.md` must carry a `## [X.Y.Z]` section for the current version.
+///
+/// `release.yml`'s `github-release` job extracts the Release notes from the
+/// section matching the pushed tag and FAILS when there is none — by which point
+/// the tag is public, no Release object exists, `notify-repo` never fires, and
+/// the pacman repository goes on serving the previous version from a run that
+/// looked fine until its last job.
+#[test]
+fn changelog_has_a_section_for_the_current_version() {
+    let changelog =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../CHANGELOG.md"))
+            .expect("read CHANGELOG.md");
+    let version = env!("CARGO_PKG_VERSION");
+    let heading = format!("## [{version}]");
+
+    assert!(
+        changelog.lines().any(|l| l.starts_with(&heading)),
+        "CHANGELOG.md has no '{heading}' section but daemon/Cargo.toml is at {version}. \
+         CI extracts the GitHub Release notes from that section and github-release fails \
+         without it — after the tag is already pushed. Add the section before tagging."
+    );
+}

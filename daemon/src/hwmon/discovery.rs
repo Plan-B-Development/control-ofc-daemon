@@ -176,12 +176,39 @@ fn build_stable_id(chip_name: &str, device_id: &str, label: &str) -> String {
 /// For PCI devices: extracts the PCI address (e.g. `0000:03:00.0`).
 use super::util::device_id_from_path;
 
+/// The outcome of one discovery pass, including whether it was COMPLETE.
+///
+/// [SAFETY] DEC-272 round 2. A per-chip failure is logged and skipped so one bad
+/// chip cannot blind the daemon to every other one — but that makes a *partial*
+/// result indistinguishable from a *complete* one at the call site, and
+/// `polling.rs` uses the descriptor set as evidence of which sensors still exist
+/// (`StateCache::retain_sensors`). Trusting a partial set evicts a live sensor
+/// that merely could not be enumerated this pass. `skipped_chips` is what lets
+/// the caller tell "gone" from "could not tell": a REMOVED chip has no directory
+/// and is silently absent from `hwmon_dirs`, so it never increments this.
+pub struct SensorDiscovery {
+    pub descriptors: Vec<SensorDescriptor>,
+    /// Chips present in sysfs whose own metadata could not be read this pass.
+    /// Non-zero means `descriptors` is known-incomplete and must not be treated
+    /// as an authoritative list of what exists.
+    pub skipped_chips: usize,
+}
+
 /// Discover all temperature sensors under a given sysfs hwmon root.
 ///
 /// The `hwmon_root` parameter allows injecting a test fixture directory
 /// instead of the real `/sys/class/hwmon`.
+///
+/// Discards the completeness signal; see [`discover_sensors_reporting_skips`]
+/// when the result is used as evidence that a sensor no longer exists.
 pub fn discover_sensors(hwmon_root: &Path) -> Result<Vec<SensorDescriptor>, HwmonError> {
+    discover_sensors_reporting_skips(hwmon_root).map(|d| d.descriptors)
+}
+
+/// As [`discover_sensors`], but reports how many present chips were skipped.
+pub fn discover_sensors_reporting_skips(hwmon_root: &Path) -> Result<SensorDiscovery, HwmonError> {
     let mut descriptors = Vec::new();
+    let mut skipped_chips = 0usize;
 
     let entries = std::fs::read_dir(hwmon_root).map_err(|e| HwmonError::ReadError {
         path: hwmon_root.display().to_string(),
@@ -205,11 +232,15 @@ pub fn discover_sensors(hwmon_root: &Path) -> Result<Vec<SensorDescriptor>, Hwmo
             Ok(sensors) => descriptors.extend(sensors),
             Err(e) => {
                 log::warn!("Skipping {}: {e}", hwmon_dir.display());
+                skipped_chips += 1;
             }
         }
     }
 
-    Ok(descriptors)
+    Ok(SensorDiscovery {
+        descriptors,
+        skipped_chips,
+    })
 }
 
 /// Discover temperature sensors for a single hwmon device directory.

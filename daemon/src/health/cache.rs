@@ -605,12 +605,29 @@ impl StateCache {
     ///
     /// A present-but-*failing* descriptor stays in the descriptor set, so it is
     /// retained here and continues through the quarantine path unchanged. This
-    /// evicts the vanished, not the unreadable.
+    /// evicts the vanished, not the unreadable — for descriptor-BEARING sensors.
+    /// NVML temps (see above) have no descriptor at all, so one that a tick could
+    /// not read is simply absent from `live` and is evicted; it returns on the
+    /// next good read with its session min/max reset. That is a monitoring wart on
+    /// an off-by-default experimental path, not a control-path defect: GPU temps
+    /// are excluded from the thermal ladder by design (DEC-130).
+    ///
+    /// The caller is responsible for only passing a COMPLETE `live` set. A
+    /// discovery pass that skipped an unreadable chip returns a partial descriptor
+    /// list, and evicting on that evidence took a live CPU sensor to
+    /// `CpuReading::Absent` — see the guard at the `polling.rs` call site
+    /// ([SAFETY] DEC-272 round 2).
     pub fn retain_sensors(&self, live: &HashSet<String>) {
         // Fast path mirrors `update_unavailable_sensors`: the steady-state tick
-        // evicts nothing and must not take the write lock to discover that. The
-        // read guard is dropped before the write is taken; re-checking under the
-        // write lock is what keeps that interleaving harmless.
+        // evicts nothing and must not take the write lock to discover that.
+        //
+        // The read guard is dropped before the write is taken, so the two are NOT
+        // atomic together. What makes that harmless is the single-writer
+        // invariant, not a re-check: the poll loop is the only production writer
+        // of `state.sensors` (the other `update_sensors` callers are #[cfg(test)]),
+        // and it is also the only caller of this method, so nothing can insert a
+        // sensor into the gap. If a second writer is ever added, this needs a
+        // re-check under the write lock — it does not have one today.
         if self.inner.read().sensors.keys().all(|id| live.contains(id)) {
             return;
         }
