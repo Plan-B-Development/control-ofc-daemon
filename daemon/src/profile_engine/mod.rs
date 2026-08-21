@@ -512,6 +512,43 @@ pub(crate) fn hottest_cpu_reading(
     }
 }
 
+/// Whether a sensor is current enough to drive a fan CURVE this tick.
+///
+/// [SAFETY] DEC-272 (register row 01-a). Curve evaluation used to read the raw
+/// snapshot while only the safety leg was age-filtered, so a frozen GPU-temp or
+/// coolant sensor drove its curve indefinitely under `thermal_state: "normal"` —
+/// the same silent-failure shape DEC-267/269 removed from the CPU ladder, one
+/// rung out and with no ladder of its own to catch it.
+///
+/// Dropping a stale sensor makes it *missing*, and `curve_eval` already resolves
+/// a missing sensor to `None`, which skips the control for the tick and leaves
+/// its fans at the last commanded duty. So "stale" degrades to "hold", never to
+/// 0% — the outcome DEC-269 was right to worry about and the reason no new
+/// fallback constant is needed here.
+///
+/// `CpuTemp` is DELIBERATELY EXEMPT, and that is not an oversight to tidy up
+/// later. The thermal ladder is the sole authority on a stale CPU reading and has
+/// already adjudicated both halves: stale-and-cool forces `NO_SENSOR_SAFE_PCT`
+/// (DEC-132/190), while stale-and-HOT deliberately suppresses that force and lets
+/// the tick fall through to curve evaluation on the frozen value, "which
+/// therefore keeps commanding a high duty" (DEC-269 round 2). Filtering CpuTemp
+/// here would silently break that second case: a control still climbing under
+/// `step_up_pct` would freeze at its current duty instead of continuing toward
+/// the hot target — a reduction in cooling caused by going blind, which is
+/// precisely what DEC-269 exists to forbid. Pinned by
+/// `a_stale_but_hot_cpu_curve_keeps_climbing_while_a_stale_gpu_curve_holds`.
+pub(crate) fn curve_eligible(
+    sensor: &CachedSensorReading,
+    now: std::time::Instant,
+    stale_after: std::time::Duration,
+) -> bool {
+    sensor.kind == SensorKind::CpuTemp
+        // `saturating_duration_since` for the same reason `hottest_cpu_reading`
+        // uses it: `updated_at` can sit marginally in the future across a clock
+        // read boundary, and that is a fresh reading, not an ancient one.
+        || now.saturating_duration_since(sensor.updated_at) <= stale_after
+}
+
 /// Run the profile engine loop as an async task.
 ///
 /// One tick per second: safety evaluation (forced overrides short-circuit
@@ -622,20 +659,29 @@ pub async fn profile_engine_loop(
         // leg and curve evaluation — halves the per-second map clone and
         // makes the tick internally consistent (both legs see one snapshot).
         let snapshot_taken_at = std::time::Instant::now();
-        let sensors = cache.sensors_snapshot();
+        let mut sensors = cache.sensors_snapshot();
+        let stale_after = cache.cpu_temp_stale_after();
         let (decision, hottest_cpu_c) = {
             // DEC-267/269: classify the reading before acting on it. `now` is
             // sampled BEFORE the snapshot above, so any reading written during
             // the gap saturates to age 0 (fresh) rather than being judged late —
             // the bias belongs on the fail-safe side.
-            let cpu_reading =
-                hottest_cpu_reading(&sensors, snapshot_taken_at, cache.cpu_temp_stale_after());
+            let cpu_reading = hottest_cpu_reading(&sensors, snapshot_taken_at, stale_after);
 
             let mut safety_guard = safety.lock();
             let decision =
                 evaluate_safety_tick(cpu_reading, &mut no_cpu_sensor_cycles, &mut safety_guard);
             (decision, cpu_reading)
         };
+
+        // DEC-272 (01-a): the safety leg above has had the raw snapshot; from here
+        // on, curve evaluation sees only sensors current enough to drive a fan.
+        // Filtered IN PLACE rather than into a second map so DEC-146 P3-6's
+        // one-clone-per-tick property survives — this removes entries, it does not
+        // copy them. Applied at the call site, never inside `evaluate_profile`,
+        // whose 3-arg form is the parity oracle's surface and must stay
+        // byte-identical (`parity_vectors.json`).
+        sensors.retain(|_, s| curve_eligible(s, snapshot_taken_at, stale_after));
 
         // Report thermal safety state for /status (DEC-132) + /diagnostics, and
         // stamp the engine liveness heartbeat in the same write (DEC-249). This
@@ -1242,6 +1288,50 @@ mod tests {
     }
 
     const BUDGET: Duration = Duration::from_secs(5);
+
+    fn gpu_reading(id: &str, temp_c: f64, updated_at: Instant) -> CachedSensorReading {
+        CachedSensorReading {
+            kind: SensorKind::GpuTemp,
+            ..cpu_reading(id, temp_c, updated_at)
+        }
+    }
+
+    #[test]
+    fn a_fresh_non_cpu_sensor_may_drive_a_curve() {
+        let now = Instant::now();
+        assert!(curve_eligible(&gpu_reading("gpu", 70.0, now), now, BUDGET));
+    }
+
+    /// The 01-a fix itself: a frozen GPU/coolant sensor stops driving its curve.
+    #[test]
+    fn a_stale_non_cpu_sensor_may_not_drive_a_curve() {
+        let now = Instant::now();
+        let old = now - Duration::from_secs(6);
+        assert!(!curve_eligible(&gpu_reading("gpu", 70.0, old), now, BUDGET));
+    }
+
+    /// The exemption, at the unit level. A stale CPU reading stays eligible so the
+    /// DEC-269 round 2 fall-through keeps working; the thermal ladder — not this
+    /// predicate — is the authority on what a stale CPU reading means.
+    #[test]
+    fn a_stale_cpu_sensor_stays_eligible_because_the_ladder_owns_that_case() {
+        let now = Instant::now();
+        let old = now - Duration::from_secs(600);
+        assert!(curve_eligible(&cpu_reading("cpu", 95.0, old), now, BUDGET));
+    }
+
+    /// Mirrors `hottest_cpu_reading`: a timestamp marginally in the future across
+    /// a clock-read boundary is a fresh reading, not an impossibly old one.
+    #[test]
+    fn a_future_dated_non_cpu_sensor_is_treated_as_fresh() {
+        let now = Instant::now();
+        let future = now + Duration::from_millis(5);
+        assert!(curve_eligible(
+            &gpu_reading("gpu", 70.0, future),
+            now,
+            BUDGET
+        ));
+    }
 
     #[test]
     fn a_fresh_cpu_reading_is_used() {
@@ -3161,6 +3251,203 @@ mod tests {
                 .pop_front()
                 .ok_or(crate::error::SerialError::Timeout { timeout_ms: 100 })
         }
+    }
+
+    /// One control on one curve, ramping under a deliberately SLOW
+    /// `step_up_pct` so the control is still mid-climb when its sensor freezes.
+    /// A control that has already settled would hold the same duty either way and
+    /// the test would prove nothing.
+    fn ramping_profile(sensor_id: &str) -> DaemonProfile {
+        DaemonProfile {
+            id: "ramp".into(),
+            name: "Ramp".into(),
+            version: 7,
+            description: String::new(),
+            controls: vec![LogicalControl {
+                id: "c".into(),
+                name: "c".into(),
+                mode: "curve".into(),
+                curve_id: "cv".into(),
+                manual_output_pct: 0.0,
+                members: vec![ControlMember {
+                    source: "openfan".into(),
+                    member_id: "openfan:ch00".into(),
+                    member_label: String::new(),
+                    fan_zero_rpm: false,
+                }],
+                step_up_pct: 3.0,
+                step_down_pct: 3.0,
+                offset_pct: 0.0,
+                minimum_pct: 0.0,
+                start_pct: 0.0,
+                stop_pct: 0.0,
+            }],
+            curves: vec![CurveConfig {
+                id: "cv".into(),
+                name: "cv".into(),
+                curve_type: "linear".into(),
+                sensor_id: sensor_id.into(),
+                start_temp_c: Some(30.0),
+                start_output_pct: Some(0.0),
+                end_temp_c: Some(95.0),
+                end_output_pct: Some(100.0),
+                ..Default::default()
+            }],
+        }
+    }
+
+    fn reading_aged(
+        id: &str,
+        kind: SensorKind,
+        temp_c: f64,
+        age: std::time::Duration,
+    ) -> CachedSensorReading {
+        CachedSensorReading {
+            id: id.into(),
+            kind,
+            label: id.into(),
+            value_c: temp_c,
+            source: DeviceLabel::Hwmon,
+            // Aged by construction, NOT by waiting. `updated_at` is a
+            // `std::time::Instant`, and tokio's `start_paused` clock does not
+            // advance that — 40 virtual seconds age a reading by ~0 ms, so a
+            // loop-level staleness test that waits for the budget can never see a
+            // stale sensor. Stamping the age directly is the only way to reach
+            // this state deterministically. (Cost of learning that the other way:
+            // a test where both arms passed identically.)
+            updated_at: Instant::now() - age,
+            rate_c_per_s: None,
+            session_min_c: None,
+            session_max_c: None,
+            chip_name: "chip".into(),
+            temp_type: None,
+            thresholds: None,
+        }
+    }
+
+    fn reading(id: &str, kind: SensorKind, temp_c: f64) -> CachedSensorReading {
+        reading_aged(id, kind, temp_c, std::time::Duration::ZERO)
+    }
+
+    /// Run the ramping profile against a sensor of `kind` that ramps hot and then
+    /// FREEZES mid-ramp, and return the PWM frames the loop commanded.
+    ///
+    /// A cool `CpuTemp` keepalive is refreshed for the whole run. Without it the
+    /// GPU variant has no CPU sensor at all, so DEC-132's five-cycle fallback
+    /// forces every one of the ten OpenFan channels to 40% and swamps the signal
+    /// this test is trying to read. Holding the safety ladder at "normal" in both
+    /// runs is what makes `kind` the only variable.
+    async fn frames_while_sensor_freezes_mid_ramp(kind: SensorKind) -> Vec<String> {
+        const STALE: std::time::Duration = std::time::Duration::from_secs(60);
+
+        let cache = Arc::new(StateCache::new());
+        cache.update_sensors(vec![
+            reading("cpu-keepalive", SensorKind::CpuTemp, 40.0),
+            reading("s", kind, 40.0),
+        ]);
+
+        let keepalive = {
+            let c = cache.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    c.update_sensors(vec![reading("cpu-keepalive", SensorKind::CpuTemp, 40.0)]);
+                }
+            })
+        };
+        let subject = {
+            let c = cache.clone();
+            tokio::spawn(async move {
+                // Five seconds hot and fresh — enough for the 3%/tick control to
+                // be climbing but nowhere near its 100% target.
+                for _ in 0..5 {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    c.update_sensors(vec![reading("s", kind, 95.0)]);
+                }
+                // Then it freezes: same hot value, stamped well past the budget.
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                c.update_sensors(vec![reading_aged("s", kind, 95.0, STALE)]);
+            })
+        };
+
+        let profile_arc = Arc::new(Mutex::new(Some(ramping_profile("s"))));
+        let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
+        let (transport, written) = LoopTestTransport::new(512);
+        let fan_ctrl = crate::serial::controller::FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            std::time::Duration::from_millis(500),
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(profile_engine_loop(
+            cache,
+            profile_arc,
+            Arc::new(parking_lot::RwLock::new(Some(Arc::new(Mutex::new(
+                fan_ctrl,
+            ))))),
+            None,
+            vec![],
+            safety,
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            shutdown_rx,
+        ));
+
+        // Long enough for a control that keeps evaluating to reach 100%.
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        shutdown_tx.send(true).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let _ = handle.await;
+        keepalive.abort();
+        subject.abort();
+
+        let frames = written.lock();
+        frames
+            .iter()
+            .filter(|f| f.starts_with(">0200"))
+            .map(|f| f.trim_end().to_ascii_lowercase())
+            .collect()
+    }
+
+    /// [SAFETY] DEC-272 (register row 01-a) — the call site, and the reason
+    /// `curve_eligible` exempts `CpuTemp`.
+    ///
+    /// Both halves in one test because the point is the CONTRAST, and the two runs
+    /// differ in exactly one variable: the sensor's `kind`. Everything else — the
+    /// profile, the ramp, the freeze point, the safety state — is identical.
+    ///
+    /// - A stale **GPU** sensor is dropped from curve evaluation, so the control
+    ///   is skipped and its duty stops advancing. That is the 01-a fix: a frozen
+    ///   GPU or coolant sensor no longer drives its curve forever under
+    ///   `thermal_state: "normal"`.
+    /// - A stale **CPU** sensor keeps evaluating, so a control caught mid-ramp
+    ///   goes on climbing toward the hot target. That is DEC-269 round 2, which
+    ///   deliberately lets a stale-but-hot tick fall through to curve evaluation.
+    ///   Filtering `CpuTemp` here would freeze that control instead — a reduction
+    ///   in cooling caused by going blind, which is the exact failure DEC-269
+    ///   exists to forbid. This test is why the exemption is there.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_but_hot_cpu_curve_keeps_climbing_while_a_stale_gpu_curve_holds() {
+        let gpu = frames_while_sensor_freezes_mid_ramp(SensorKind::GpuTemp).await;
+        let cpu = frames_while_sensor_freezes_mid_ramp(SensorKind::CpuTemp).await;
+
+        assert!(
+            !gpu.is_empty() && !cpu.is_empty(),
+            "both runs must ramp before their sensor freezes"
+        );
+        assert!(
+            cpu.len() > gpu.len(),
+            "a stale CPU curve must keep climbing (DEC-269 r2) while a stale GPU \
+             curve holds (DEC-272 01-a); cpu={cpu:?} gpu={gpu:?}"
+        );
+        // `>0200ff` is SetPwm ch0 at raw 255 = 100%, the curve's target at 95 C.
+        assert!(
+            cpu.iter().any(|f| f == ">0200ff"),
+            "a stale-but-hot CPU curve must still reach the target: {cpu:?}"
+        );
+        assert!(
+            !gpu.iter().any(|f| f == ">0200ff"),
+            "a stale GPU curve must NOT keep climbing to the target: {gpu:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -374,11 +374,26 @@ pub async fn hwmon_poll_loop(
                 // cache (DEC-156): keeps `subsystem_timestamps.aio` fresh and
                 // surfaces coolant temp on /status + /poll when a cooler exists.
                 let aio_state = derive_aio_state(&cached, Instant::now());
+                // DEC-272: the live sensor set for this tick, built BEFORE `cached`
+                // moves into the cache. Union of the descriptor set and the ids
+                // actually read — NVML temps (DEC-204) carry no descriptor, so
+                // descriptors alone would evict every NVIDIA sensor every tick.
+                let live: std::collections::HashSet<String> = descriptors
+                    .iter()
+                    .map(|d| d.id.clone())
+                    .chain(cached.iter().map(|r| r.id.clone()))
+                    .collect();
                 cache.update_sensors(cached);
                 // Sync the quarantine set into the cache: evicts any stale
                 // reading for an unavailable sensor and surfaces it on
                 // /status + /poll (display-only). Cheap no-op when none.
                 cache.update_unavailable_sensors(failure_tracker.unavailable());
+                // DEC-272 (01-c): evict readings whose sensor has VANISHED. The
+                // quarantine above covers present-but-unreadable; this covers the
+                // descriptor that is simply gone, which the tracker forgets and so
+                // never reports — leaving its reading cached forever and keeping
+                // `CpuReading::Absent` unreachable.
+                cache.retain_sensors(&live);
                 if let Some(aio) = aio_state {
                     cache.update_aio(aio);
                 }
@@ -1090,6 +1105,24 @@ mod tests {
     /// deleting the single-flight guard hangs the suite instead of failing it.
     const WEDGE_SELF_RELEASE: Duration = Duration::from_secs(15);
 
+    /// An NVML backend that always reports one GPU temperature.
+    struct StaticNvml;
+
+    impl crate::hwmon::nvml::NvmlBackend for StaticNvml {
+        fn read_all(&self) -> Vec<crate::hwmon::nvml::NvmlReading> {
+            vec![crate::hwmon::nvml::NvmlReading {
+                pci_bdf: "0000:03:00.0".into(),
+                temp_c: Some(61.0),
+                fan_duty_pct: None,
+                fan_rpm: None,
+            }]
+        }
+
+        fn devices(&self) -> Vec<crate::hwmon::nvml::NvmlDeviceIdentity> {
+            Vec::new()
+        }
+    }
+
     struct WedgingNvml {
         entered: Arc<std::sync::atomic::AtomicUsize>,
         release: Arc<std::sync::atomic::AtomicBool>,
@@ -1339,6 +1372,75 @@ mod tests {
         assert!(
             !h.rescan.load(std::sync::atomic::Ordering::SeqCst),
             "flag must be consumed"
+        );
+
+        stop(h).await;
+    }
+
+    /// [SAFETY] DEC-272 (register row 01-c) — the CALL SITE, not the helper.
+    ///
+    /// `StateCache::retain_sensors` has its own unit test; this asserts the poll
+    /// loop actually calls it. Deleting the call left that unit test green, which
+    /// is the recurring failure mode CLAUDE.md names: a thoroughly tested pure
+    /// helper that no production path invokes is an untested rule.
+    #[tokio::test(start_paused = true)]
+    async fn a_vanished_sensor_is_evicted_from_the_cache_on_rediscovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_k10temp(tmp.path(), 55.0);
+        write_nvme(tmp.path());
+        let h = spawn_poll_loop(tmp.path().to_path_buf());
+
+        tokio::time::sleep(Duration::from_millis(500)).await; // tick 1
+        assert!(
+            sensor_by_label(&h.cache, "Composite").is_some(),
+            "precondition: the nvme sensor was discovered"
+        );
+
+        // The device goes away entirely — a module unload, not a read failure.
+        // The DEC-193 tracker FORGETS a genuinely unbound descriptor, so nothing
+        // quarantines this and nothing used to evict it.
+        fs::remove_dir_all(tmp.path().join("hwmon1")).unwrap();
+        h.rescan.store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(1000)).await; // tick 2
+
+        assert!(
+            sensor_by_label(&h.cache, "Composite").is_none(),
+            "a vanished sensor's reading must not linger in the cache — that is \
+             what kept CpuReading::Absent unreachable"
+        );
+        assert!(
+            sensor_by_label(&h.cache, "Tctl").is_some(),
+            "eviction must be surgical: the surviving sensor stays"
+        );
+
+        stop(h).await;
+    }
+
+    /// [SAFETY] DEC-272 (register row 01-c) — the trap in the eviction, pinned.
+    ///
+    /// NVML temperatures (DEC-204) are merged into each tick's readings but have
+    /// NO entry in the descriptor set: they are minted from the driver, not
+    /// discovered from sysfs. Retaining on the descriptor set alone therefore
+    /// evicts every NVIDIA sensor on every single tick — the eviction would
+    /// silently delete a live sensor feed. The retain set has to be the union.
+    #[tokio::test(start_paused = true)]
+    async fn an_nvml_sensor_survives_eviction_despite_having_no_descriptor() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_k10temp(tmp.path(), 55.0);
+        let h = spawn_poll_loop_with_nvml(tmp.path().to_path_buf(), Arc::new(StaticNvml));
+
+        tokio::time::sleep(Duration::from_millis(500)).await; // tick 1
+        assert!(
+            sensor_by_label(&h.cache, "GPU").is_some(),
+            "precondition: the NVML sensor reached the cache"
+        );
+
+        // Several more ticks, each of which runs the eviction.
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+        assert!(
+            sensor_by_label(&h.cache, "GPU").is_some(),
+            "an NVML sensor has no descriptor, so retaining on descriptors alone \
+             would evict it every tick"
         );
 
         stop(h).await;

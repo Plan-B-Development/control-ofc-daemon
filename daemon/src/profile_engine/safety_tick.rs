@@ -116,6 +116,16 @@ pub(crate) fn evaluate_safety_tick(
     //
     // Note this cannot manufacture an emergency: it suppresses a force, never
     // adds one, and never touches the rule's state.
+    //
+    // DEC-272: "falls through to profile evaluation, which runs on that same
+    // stale value" is now a CROSS-MODULE dependency, not a local fact. Curve
+    // evaluation age-filters its sensors (`curve_eligible`, register row 01-a),
+    // and it only still runs on a stale CPU reading because that filter exempts
+    // `SensorKind::CpuTemp` for exactly this paragraph's sake. Remove the
+    // exemption and this fall-through silently becomes a hold: a control caught
+    // mid-ramp freezes at its current duty instead of climbing to the hot target,
+    // which is the reduction-in-cooling-while-blind that this ADR forbids. Pinned
+    // by `a_stale_but_hot_cpu_curve_keeps_climbing_while_a_stale_gpu_curve_holds`.
     let stale_but_hot = stale_cpu_c.is_some_and(|t| t >= safety.release_temp_c());
 
     // Suppressed rather than folded into `force_no_sensor` above, because the

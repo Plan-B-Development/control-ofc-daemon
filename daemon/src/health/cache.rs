@@ -4,7 +4,7 @@
 //! Updates are atomic at the batch boundary.
 
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -582,6 +582,41 @@ impl StateCache {
         }
         state.unavailable_sensors = unavailable;
     }
+
+    /// Drop cached readings for sensors that no longer exist.
+    ///
+    /// [SAFETY] DEC-272 (register row 01-c). [`update_sensors`] only ever
+    /// *inserts*, so a descriptor that disappears — a module unload, a rescan
+    /// that no longer finds it — left its last reading in this map forever. The
+    /// DEC-193 quarantine does not cover it: the failure tracker deliberately
+    /// *forgets* a descriptor that has genuinely unbound, so such a sensor is
+    /// never listed unavailable and so never evicted by
+    /// [`update_unavailable_sensors`]. Its reading therefore aged into
+    /// `CpuReading::Stale` and stayed there for the life of the process — which
+    /// is why DEC-190's `Absent` branch was largely dead for the very scenario it
+    /// was written for, and why a vanished CPU sensor could hold a fan output
+    /// rather than fall to the no-sensor floor.
+    ///
+    /// `live` MUST be the union of the poll loop's current descriptor set and the
+    /// ids it actually read this tick. Descriptors alone is wrong: NVML
+    /// temperatures (DEC-204) are merged into the readings without a descriptor
+    /// of their own, so retaining on the descriptor set would evict every NVIDIA
+    /// sensor on every tick.
+    ///
+    /// A present-but-*failing* descriptor stays in the descriptor set, so it is
+    /// retained here and continues through the quarantine path unchanged. This
+    /// evicts the vanished, not the unreadable.
+    pub fn retain_sensors(&self, live: &HashSet<String>) {
+        // Fast path mirrors `update_unavailable_sensors`: the steady-state tick
+        // evicts nothing and must not take the write lock to discover that. The
+        // read guard is dropped before the write is taken; re-checking under the
+        // write lock is what keeps that interleaving harmless.
+        if self.inner.read().sensors.keys().all(|id| live.contains(id)) {
+            return;
+        }
+        let mut state = self.inner.write();
+        state.sensors.retain(|id, _| live.contains(id));
+    }
 }
 
 impl Default for StateCache {
@@ -1043,6 +1078,57 @@ mod tests {
         assert_eq!(sensors.len(), 2);
         assert_eq!(sensors.len(), cache.snapshot().sensors.len());
         assert!((sensors["hwmon:k10temp:0000:00:18.3:Tctl"].value_c - 55.0).abs() < f64::EPSILON);
+    }
+
+    /// [SAFETY] DEC-272 (register row 01-c). `update_sensors` only inserts, so
+    /// without this a vanished sensor's reading lived in the map for the life of
+    /// the process, ageing into `Stale` and never reaching `Absent`.
+    #[test]
+    fn retain_sensors_evicts_only_what_is_no_longer_live() {
+        let cache = StateCache::new();
+        cache.update_sensors(vec![
+            make_sensor("hwmon:k10temp:nodev:Tctl", 55.0),
+            make_sensor("hwmon:nvme:nodev:Composite", 38.0),
+        ]);
+
+        let live: HashSet<String> = ["hwmon:k10temp:nodev:Tctl".to_string()]
+            .into_iter()
+            .collect();
+        cache.retain_sensors(&live);
+
+        let sensors = cache.sensors_snapshot();
+        assert_eq!(sensors.len(), 1, "the vanished sensor must be evicted");
+        assert!(
+            sensors.contains_key("hwmon:k10temp:nodev:Tctl"),
+            "the live sensor must survive"
+        );
+    }
+
+    /// The steady-state tick evicts nothing; that path must not mutate the map,
+    /// and in particular must not clear it when everything is live.
+    #[test]
+    fn retain_sensors_is_a_no_op_when_every_sensor_is_live() {
+        let cache = StateCache::new();
+        cache.update_sensors(vec![
+            make_sensor("hwmon:k10temp:nodev:Tctl", 55.0),
+            make_sensor("nvidia_gpu:0000:03:00.0:temp", 61.0),
+        ]);
+
+        let live: HashSet<String> = cache.sensors_snapshot().keys().cloned().collect();
+        cache.retain_sensors(&live);
+
+        assert_eq!(cache.sensors_snapshot().len(), 2);
+    }
+
+    /// An empty live set means "nothing is live", not "skip the sweep". A poll
+    /// tick that discovered nothing must not leave a full map of readings that
+    /// can no longer change.
+    #[test]
+    fn retain_sensors_with_an_empty_live_set_clears_the_map() {
+        let cache = StateCache::new();
+        cache.update_sensors(vec![make_sensor("hwmon:k10temp:nodev:Tctl", 55.0)]);
+        cache.retain_sensors(&HashSet::new());
+        assert!(cache.sensors_snapshot().is_empty());
     }
 
     #[test]
