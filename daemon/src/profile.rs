@@ -625,7 +625,8 @@ pub enum Severity {
     Error,
     /// Soft warning — the profile is accepted, but the condition is surfaced
     /// (e.g. it references a sensor not present on this machine, so a control
-    /// will sit at its safe fallback until the sensor appears).
+    /// using that sensor alone holds its last commanded duty until the sensor
+    /// appears, while a Mix runs on its surviving inputs — DEC-272).
     Warning,
 }
 
@@ -694,10 +695,13 @@ impl ValidationReport {
 ///   `sync_control_id` resolve), and Mix/Sync acyclicity. These are wrong on
 ///   any machine.
 /// * **Machine-dependent facts are warnings only** — a `sensor_id` not present
-///   on *this* host. The engine already tolerates a missing sensor at eval time
-///   (the control holds a safe fallback, and the 105 °C thermal force
-///   backstops), so a profile authored on another machine must still store,
-///   validate, and import.
+///   on *this* host. The engine tolerates a missing sensor at eval time without
+///   dropping cooling, so a profile authored on another machine must still
+///   store, validate, and import. What it actually does differs by curve shape
+///   (DEC-272): a curve naming the missing sensor **alone** is skipped and its
+///   fans hold their last commanded duty — never 0%, never lower — while a
+///   **Mix** runs on the inputs it does have. The 105 °C thermal force backstops
+///   either way.
 ///
 /// `known_sensor_ids` is the set of sensor entity ids currently discovered on
 /// this machine (the keys of `cache.sensors_snapshot()`).
@@ -795,8 +799,9 @@ pub fn validate(profile: &DaemonProfile, known_sensor_ids: &HashSet<String>) -> 
                 format!("{p}.sensor_id"),
                 "UNKNOWN_SENSOR",
                 format!(
-                    "sensor '{}' is not present on this machine; the control will hold a \
-                     safe fallback until it appears",
+                    "sensor '{}' is not present on this machine. A curve using it on its \
+                     own will not command its fans — they hold their last speed; a \
+                     combined (Mix) curve will run on the inputs it does have",
                     curve.sensor_id
                 ),
             );
@@ -2069,7 +2074,8 @@ mod tests {
     #[test]
     fn validate_unknown_sensor_is_warning_not_error() {
         // Portability: a profile authored on another machine references a sensor
-        // absent here. Must NOT be rejected — the engine holds a safe fallback.
+        // absent here. Must NOT be rejected — the engine keeps cooling either
+        // way (a lone curve holds, a Mix runs on its other inputs, DEC-272).
         let profile = mk_profile(
             vec![graph_curve("c", "ghost_sensor")],
             vec![curve_control("ctl", "c")],
@@ -2080,7 +2086,32 @@ mod tests {
             "unknown sensor must not block: {:?}",
             report.errors
         );
-        assert!(report.warnings.iter().any(|w| w.reason == "UNKNOWN_SENSOR"));
+        let warning = report
+            .warnings
+            .iter()
+            .find(|w| w.reason == "UNKNOWN_SENSOR")
+            .expect("an absent sensor must warn");
+
+        // 273-h. The text is user-facing and was untrue after DEC-272: it
+        // promised "the control will hold a safe fallback until it appears",
+        // which describes neither case the engine actually implements. Pinned
+        // because a warning nobody can act on correctly is worse than none —
+        // and because the wording drifted from the behaviour once already.
+        assert!(
+            !warning.description.contains("safe fallback"),
+            "the retired 'safe fallback' promise is back: {}",
+            warning.description
+        );
+        assert!(
+            warning.description.contains("hold their last speed"),
+            "the warning must say what a lone curve does — hold, not fall back: {}",
+            warning.description
+        );
+        assert!(
+            warning.description.contains("Mix"),
+            "the warning must say a Mix keeps running on its surviving inputs: {}",
+            warning.description
+        );
     }
 
     #[test]

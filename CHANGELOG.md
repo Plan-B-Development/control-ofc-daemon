@@ -18,6 +18,17 @@
   The packaged service file also caps systemd's own patience at 20 seconds, as a
   backstop rather than the mechanism. 273-b.
 
+### Changed
+- **The "sensor not found" warning now describes what actually happens.** Saving
+  or importing a profile that names a sensor your machine does not have is
+  allowed — moving a profile between machines is expected — and it warns. The
+  warning said the control would "hold a safe fallback until it appears", which
+  has not been true of either case since 2.20.1 and was never quite true of one
+  of them. A curve using the missing sensor on its own does not command its fans
+  at all: they hold their last speed. A combined (Mix) curve keeps running on
+  the inputs it does have. The warning now says both, because a warning you
+  cannot act on correctly is worse than no warning. 273-h.
+
 ### Internal
 - **The exit that recovers from a dead fan-control engine is now tested.** If
   the engine dies, the daemon restores the hardware and then exits non-zero so
