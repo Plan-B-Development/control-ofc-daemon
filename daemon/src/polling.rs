@@ -1416,6 +1416,67 @@ mod tests {
         stop(h).await;
     }
 
+    /// [SAFETY] DEC-272 — the adjudication of register row 01-d.
+    ///
+    /// 01-d's concern is that `hottest_cpu_reading` lets fresh win outright, so a
+    /// frozen Tctl at 106 C beside a fresh Tccd at 61 C yields `Fresh(61)` and
+    /// releases the emergency. That reduction is pinned as deliberate by
+    /// `a_stale_sensor_does_not_mask_a_fresh_hotter_one`; `max(fresh, stale)` is
+    /// explicitly NOT the fix, because it reinstates the frozen-value-holds-the-
+    /// latch bug DEC-269 removed.
+    ///
+    /// What makes that safe is that the frozen sibling cannot PERSIST, and this is
+    /// the test for that claim. A CPU sensor that reads fine and then stops is
+    /// quarantined and evicted within a bounded number of ticks, so it stops
+    /// contributing to the reduce rather than sitting in it at 106 C forever.
+    /// Together with `a_vanished_sensor_is_evicted_from_the_cache_on_rediscovery`
+    /// (the descriptor-disappears case, which nothing used to evict at all) the
+    /// window is bounded at both ends — which is why 01-d closes as NON-ISSUE
+    /// rather than growing a new threshold on the safety ladder.
+    ///
+    /// It has to start READABLE. A sensor that never reads is never cached, so
+    /// asserting it is absent afterwards would pass vacuously and prove nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_hot_cpu_sensor_that_stops_reading_cannot_linger_as_a_frozen_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_k10temp(tmp.path(), 55.0);
+
+        // A second CPU-chip sensor, initially readable and HOT — the frozen
+        // sibling 01-d is about.
+        let hot = tmp.path().join("hwmon2");
+        fs::create_dir_all(&hot).unwrap();
+        fs::write(hot.join("name"), "k10temp\n").unwrap();
+        fs::write(hot.join("temp1_input"), "106000\n").unwrap();
+        fs::write(hot.join("temp1_label"), "Tccd1\n").unwrap();
+
+        let h = spawn_poll_loop(tmp.path().to_path_buf());
+        tokio::time::sleep(Duration::from_millis(500)).await; // tick 1
+        let seeded = sensor_by_label(&h.cache, "Tccd1").expect("precondition: it was discovered");
+        assert!(
+            (seeded.value_c - 106.0).abs() < f64::EPSILON,
+            "precondition: it is cached at its hot value"
+        );
+
+        // Now it stops reading, without its descriptor going away.
+        fs::write(hot.join("temp1_input"), "garbage\n").unwrap();
+        let ticks = crate::constants::SENSOR_READ_FAIL_REDISCOVER_STREAK + 4;
+        for _ in 0..ticks {
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+        }
+
+        assert!(
+            sensor_by_label(&h.cache, "Tccd1").is_none(),
+            "a frozen hot CPU sibling must be evicted within the quarantine bound, \
+             not left in the reduce the 105 C rule runs over"
+        );
+        assert!(
+            sensor_by_label(&h.cache, "Tctl").is_some(),
+            "the readable CPU sensor stays in service"
+        );
+
+        stop(h).await;
+    }
+
     /// [SAFETY] DEC-272 (register row 01-c) — the trap in the eviction, pinned.
     ///
     /// NVML temperatures (DEC-204) are merged into each tick's readings but have

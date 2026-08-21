@@ -69,6 +69,146 @@ where
     (handle, rx)
 }
 
+/// Why the main loop stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StopReason {
+    /// A signal asked us to stop. Carries the signal name for the log.
+    Signal(&'static str),
+    /// The IPC server task ended; the daemon is useless without it.
+    IpcDead,
+    /// The profile engine — the sole PWM writer — ended (DEC-266).
+    EngineDead,
+    /// The hwmon poll loop — the sole writer of the sensor map the 105 C rule
+    /// reads — ended (DEC-267).
+    HwmonDead,
+}
+
+/// The main loop's verdict: why it stopped, and whether systemd must restart us.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StopOutcome {
+    reason: StopReason,
+    must_restart: bool,
+}
+
+/// Wait until something says the daemon should stop, and decide whether that
+/// warrants a restart.
+///
+/// [SAFETY] DEC-272 (register row 01-f). This was an inline `select!` in `main`,
+/// which meant the supervision properties every ADR from DEC-266 onward depends
+/// on were established by READING the code, never by test — the purest form of
+/// the recurring failure CLAUDE.md names. Extracted whole, including the
+/// post-loop sweep, so the decision is one testable unit rather than a shape a
+/// reviewer has to re-derive.
+///
+/// The post-loop `try_recv` sweep is INSIDE this function on purpose. It is
+/// DEC-269's own fix for a silent lost-restart bug: `select!` reports one arm,
+/// but a shared root cause (blocking-pool exhaustion, OOM pressure) can end
+/// several tasks in the same instant, and if the IPC arm won the race while the
+/// engine had also died, the engine's death went unlogged AND `must_restart`
+/// stayed false — so the process exited 0 and `Restart=on-failure` never fired.
+/// Leaving that sweep at the call site would have left the one property most
+/// worth pinning outside the tested unit.
+///
+/// `sighup`/`sigterm` are `Option` because registration is fail-soft on the real
+/// path; tests pass `None` and drive the death channels directly. `ctrl_c` has no
+/// such switch, and simply never fires under test.
+async fn wait_for_stop(
+    mut sighup: Option<tokio::signal::unix::Signal>,
+    mut sigterm: Option<tokio::signal::unix::Signal>,
+    ipc_dead_rx: tokio::sync::oneshot::Receiver<String>,
+    engine_dead_rx: tokio::sync::oneshot::Receiver<()>,
+    hwmon_dead_rx: tokio::sync::oneshot::Receiver<()>,
+    mut on_reload: impl FnMut(),
+) -> StopOutcome {
+    tokio::pin!(ipc_dead_rx);
+    tokio::pin!(engine_dead_rx);
+    tokio::pin!(hwmon_dead_rx);
+
+    let reason;
+    let mut must_restart = false;
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                log::info!("Received SIGINT — shutting down");
+                reason = StopReason::Signal("SIGINT");
+                break;
+            }
+            _ = async { sigterm.as_mut().expect("guarded by if predicate").recv().await }, if sigterm.is_some() => {
+                log::info!("Received SIGTERM — shutting down");
+                reason = StopReason::Signal("SIGTERM");
+                break;
+            }
+            _ = async { sighup.as_mut().expect("guarded by if predicate").recv().await }, if sighup.is_some() => {
+                log::info!("Received SIGHUP — reloading config");
+                on_reload();
+            }
+            res = &mut ipc_dead_rx => {
+                match res {
+                    Ok(msg) => log::error!(
+                        "IPC server task died unexpectedly ({msg}) — shutting down"
+                    ),
+                    Err(_) => log::error!(
+                        "IPC server task dropped its dead-signal channel — shutting down"
+                    ),
+                }
+                reason = StopReason::IpcDead;
+                break;
+            }
+            // DEC-266. Reached only while the main loop is still running, and
+            // shutdown is not requested until after it breaks — so the engine
+            // ending here is always unexpected, never the clean-exit path.
+            _ = &mut engine_dead_rx => {
+                log::error!(
+                    "SAFETY: the profile engine task exited unexpectedly — it is the sole \
+                     PWM writer, so fan control and the 105 \u{b0}C thermal emergency are \
+                     both gone. Restoring fans to firmware control and exiting so systemd \
+                     restarts the daemon."
+                );
+                must_restart = true;
+                reason = StopReason::EngineDead;
+                break;
+            }
+            // DEC-267. Same reasoning one level upstream: this task is the
+            // only writer of the sensor map the 105 C rule reads.
+            _ = &mut hwmon_dead_rx => {
+                log::error!(
+                    "SAFETY: the hwmon poll task exited unexpectedly — the sensor feed the \
+                     105 \u{b0}C rule reads is frozen, so the daemon is running on \
+                     readings that can no longer change. Restoring fans to firmware \
+                     control and exiting so systemd restarts the daemon."
+                );
+                must_restart = true;
+                reason = StopReason::HwmonDead;
+                break;
+            }
+        }
+    }
+
+    // DEC-269: checked UNCONDITIONALLY, not behind `must_restart`. See the doc
+    // comment — gating it there silently lost the restart DEC-266 exists to
+    // produce whenever another arm won the race.
+    if engine_dead_rx.try_recv().is_ok() {
+        log::error!(
+            "SAFETY: the profile engine task had also exited — restarting rather \
+             than stopping cleanly"
+        );
+        must_restart = true;
+    }
+    if hwmon_dead_rx.try_recv().is_ok() {
+        log::error!(
+            "SAFETY: the hwmon poll task had also exited — restarting rather than \
+             stopping cleanly"
+        );
+        must_restart = true;
+    }
+
+    StopOutcome {
+        reason,
+        must_restart,
+    }
+}
+
 fn install_panic_hook() {
     // Called as the first statement of `main`, so this IS the main thread.
     let _ = MAIN_THREAD.set(std::thread::current().id());
@@ -1170,18 +1310,17 @@ async fn main() {
     // function without ended — the profile engine (sole PWM writer) or the hwmon
     // poll loop (sole writer of the sensor map the 105 C rule reads). Drives a
     // non-zero exit AFTER the ordered restore has run, so systemd restarts us.
-    let mut must_restart = false;
-    {
+    let stop = {
         use tokio::signal::unix::SignalKind;
 
-        let mut sighup = match tokio::signal::unix::signal(SignalKind::hangup()) {
+        let sighup = match tokio::signal::unix::signal(SignalKind::hangup()) {
             Ok(stream) => Some(stream),
             Err(e) => {
                 log::warn!("Failed to register SIGHUP handler, config reload unavailable: {e}");
                 None
             }
         };
-        let mut sigterm = match tokio::signal::unix::signal(SignalKind::terminate()) {
+        let sigterm = match tokio::signal::unix::signal(SignalKind::terminate()) {
             Ok(stream) => Some(stream),
             Err(e) => {
                 log::warn!(
@@ -1192,93 +1331,26 @@ async fn main() {
             }
         };
 
-        tokio::pin!(ipc_dead_rx);
-        tokio::pin!(engine_dead_rx);
-        tokio::pin!(hwmon_dead_rx);
-
-        loop {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    log::info!("Received SIGINT — shutting down");
-                    break;
+        wait_for_stop(
+            sighup,
+            sigterm,
+            ipc_dead_rx,
+            engine_dead_rx,
+            hwmon_dead_rx,
+            || {
+                if let Err(e) = apply_config_reload(
+                    &config_path,
+                    &runtime_config_path,
+                    &app_state.profile_search_dirs,
+                ) {
+                    log::error!("{e}");
                 }
-                _ = async { sigterm.as_mut().expect("guarded by if predicate").recv().await }, if sigterm.is_some() => {
-                    log::info!("Received SIGTERM — shutting down");
-                    break;
-                }
-                _ = async { sighup.as_mut().expect("guarded by if predicate").recv().await }, if sighup.is_some() => {
-                    log::info!("Received SIGHUP — reloading config");
-                    if let Err(e) = apply_config_reload(
-                        &config_path,
-                        &runtime_config_path,
-                        &app_state.profile_search_dirs,
-                    ) {
-                        log::error!("{e}");
-                    }
-                }
-                res = &mut ipc_dead_rx => {
-                    match res {
-                        Ok(msg) => log::error!(
-                            "IPC server task died unexpectedly ({msg}) — shutting down"
-                        ),
-                        Err(_) => log::error!(
-                            "IPC server task dropped its dead-signal channel — shutting down"
-                        ),
-                    }
-                    break;
-                }
-                // DEC-266. Reached only while the main loop is still running, and
-                // shutdown is not requested until after it breaks — so the engine
-                // ending here is always unexpected, never the clean-exit path.
-                _ = &mut engine_dead_rx => {
-                    log::error!(
-                        "SAFETY: the profile engine task exited unexpectedly — it is the sole \
-                         PWM writer, so fan control and the 105 \u{b0}C thermal emergency are \
-                         both gone. Restoring fans to firmware control and exiting so systemd \
-                         restarts the daemon."
-                    );
-                    must_restart = true;
-                    break;
-                }
-                // DEC-267. Same reasoning one level upstream: this task is the
-                // only writer of the sensor map the 105 C rule reads.
-                _ = &mut hwmon_dead_rx => {
-                    log::error!(
-                        "SAFETY: the hwmon poll task exited unexpectedly — the sensor feed the \
-                         105 \u{b0}C rule reads is frozen, so the daemon is running on \
-                         readings that can no longer change. Restoring fans to firmware \
-                         control and exiting so systemd restarts the daemon."
-                    );
-                    must_restart = true;
-                    break;
-                }
-            }
-        }
-
-        // DEC-269: `select!` reports one arm, but a shared root cause (blocking
-        // pool exhaustion, OOM pressure) can end both tasks in the same instant.
-        // Reporting only the winner sends an operator after the wrong subsystem.
-        //
-        // Checked UNCONDITIONALLY, not behind `must_restart`. Gating it there
-        // was a bug: if the IPC arm won the race while the engine had also died,
-        // the engine's death went unlogged AND `must_restart` stayed false, so
-        // the process exited 0 and `Restart=on-failure` never fired — silently
-        // losing the restart DEC-266 exists to produce.
-        if engine_dead_rx.try_recv().is_ok() {
-            log::error!(
-                "SAFETY: the profile engine task had also exited — restarting rather \
-                 than stopping cleanly"
-            );
-            must_restart = true;
-        }
-        if hwmon_dead_rx.try_recv().is_ok() {
-            log::error!(
-                "SAFETY: the hwmon poll task had also exited — restarting rather than \
-                 stopping cleanly"
-            );
-            must_restart = true;
-        }
-    }
+            },
+        )
+        .await
+    };
+    let must_restart = stop.must_restart;
+    log::debug!("Main loop stopped: {:?}", stop.reason);
 
     // Ordered graceful shutdown (DEC-146 P3-9 + audit P1-A) — see
     // `shutdown_sequence`: stop the IPC server and drain the poll/engine tasks
@@ -1362,6 +1434,147 @@ mod tests {
     // keeps reporting restart_pending after every restart — a permanently
     // unclearable banner over a setting that does nothing. That exact shape had
     // to be fixed once already for profiles.search_dirs.
+
+    // ── DEC-272 (01-f): the main loop's stop decision ────────────────────
+    // These properties used to be established by READING `main`'s inline
+    // `select!`. Every ADR from DEC-266 on depends on them, and nothing pinned
+    // any of them.
+
+    /// Build the three death channels. The SENDERS must stay bound: dropping a
+    /// oneshot sender resolves its receiver with `Err`, which fires that arm — so
+    /// an unused `let _ = ` here would silently make every test race.
+    #[allow(clippy::type_complexity)]
+    fn stop_channels() -> (
+        (
+            tokio::sync::oneshot::Sender<String>,
+            tokio::sync::oneshot::Receiver<String>,
+        ),
+        (
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        ),
+        (
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        ),
+    ) {
+        (
+            tokio::sync::oneshot::channel::<String>(),
+            tokio::sync::oneshot::channel::<()>(),
+            tokio::sync::oneshot::channel::<()>(),
+        )
+    }
+
+    /// [SAFETY] DEC-266. The engine is the sole PWM writer; its death must exit
+    /// non-zero so `Restart=on-failure` brings the daemon back with a live one.
+    #[tokio::test]
+    async fn engine_death_stops_the_loop_and_demands_a_restart() {
+        let ((_ipc_tx, ipc_rx), (engine_tx, engine_rx), (_hw_tx, hw_rx)) = stop_channels();
+        engine_tx.send(()).unwrap();
+
+        let out = wait_for_stop(None, None, ipc_rx, engine_rx, hw_rx, || {}).await;
+
+        assert_eq!(out.reason, StopReason::EngineDead);
+        assert!(out.must_restart, "a dead engine must force a restart");
+    }
+
+    /// [SAFETY] DEC-267. Same one rung upstream: the poll loop is the sole writer
+    /// of the sensor map the 105 C rule reads.
+    #[tokio::test]
+    async fn hwmon_death_stops_the_loop_and_demands_a_restart() {
+        let ((_ipc_tx, ipc_rx), (_engine_tx, engine_rx), (hw_tx, hw_rx)) = stop_channels();
+        hw_tx.send(()).unwrap();
+
+        let out = wait_for_stop(None, None, ipc_rx, engine_rx, hw_rx, || {}).await;
+
+        assert_eq!(out.reason, StopReason::HwmonDead);
+        assert!(out.must_restart, "a dead poll loop must force a restart");
+    }
+
+    /// A dead IPC server is a clean stop, not a safety event: the fans are still
+    /// being driven correctly, there is just nobody to talk to. Exit 0.
+    #[tokio::test]
+    async fn ipc_death_stops_the_loop_without_demanding_a_restart() {
+        let ((ipc_tx, ipc_rx), (_engine_tx, engine_rx), (_hw_tx, hw_rx)) = stop_channels();
+        ipc_tx.send("socket closed".into()).unwrap();
+
+        let out = wait_for_stop(None, None, ipc_rx, engine_rx, hw_rx, || {}).await;
+
+        assert_eq!(out.reason, StopReason::IpcDead);
+        assert!(
+            !out.must_restart,
+            "losing IPC alone is a clean stop — fans are still under control"
+        );
+    }
+
+    /// [SAFETY] DEC-269's regression, pinned. A shared root cause (blocking-pool
+    /// exhaustion, OOM pressure) can end several tasks in the same instant.
+    /// `select!` reports ONE arm, and it chooses at random among ready arms — so
+    /// when IPC wins that race, only the unconditional post-loop sweep is left to
+    /// notice the engine also died. Without it the process exited 0 and
+    /// `Restart=on-failure` never fired, silently losing the restart DEC-266
+    /// exists to produce.
+    ///
+    /// Repeated because the arm is chosen randomly: one run cannot show that BOTH
+    /// the winning-arm path and the sweep path reach the same verdict.
+    #[tokio::test]
+    async fn a_simultaneous_engine_death_forces_a_restart_whichever_arm_wins() {
+        for i in 0..25 {
+            let ((ipc_tx, ipc_rx), (engine_tx, engine_rx), (_hw_tx, hw_rx)) = stop_channels();
+            ipc_tx.send("socket closed".into()).unwrap();
+            engine_tx.send(()).unwrap();
+
+            let out = wait_for_stop(None, None, ipc_rx, engine_rx, hw_rx, || {}).await;
+
+            assert!(
+                out.must_restart,
+                "run {i}: the engine had also died, so this must restart — got {out:?}"
+            );
+        }
+    }
+
+    /// SIGHUP reloads and keeps waiting. A regression that treated it like the
+    /// other arms would turn every config reload into a daemon shutdown.
+    #[tokio::test]
+    async fn sighup_reloads_the_config_without_stopping_the_loop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .expect("SIGHUP must be registerable");
+        let ((ipc_tx, ipc_rx), (_engine_tx, engine_rx), (_hw_tx, hw_rx)) = stop_channels();
+
+        let reloads = Arc::new(AtomicUsize::new(0));
+        let counter = reloads.clone();
+        let task = tokio::spawn(async move {
+            wait_for_stop(Some(sighup), None, ipc_rx, engine_rx, hw_rx, move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            })
+            .await
+        });
+
+        // Safe to raise: the handler above is installed process-wide by tokio, so
+        // this is caught rather than terminating the test binary.
+        unsafe { libc::raise(libc::SIGHUP) };
+        let mut seen = false;
+        for _ in 0..200 {
+            if reloads.load(Ordering::SeqCst) >= 1 {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(seen, "SIGHUP must trigger a config reload");
+
+        // Still waiting — so a real stop signal still works afterwards.
+        ipc_tx.send("done".into()).unwrap();
+        let out = task.await.unwrap();
+        assert_eq!(
+            out.reason,
+            StopReason::IpcDead,
+            "SIGHUP must not have ended the loop"
+        );
+        assert!(!out.must_restart);
+    }
 
     // ── DEC-266 panic classification + engine supervision ────────────────
     // Both halves decide whether fans go back to firmware control, and both
