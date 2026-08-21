@@ -12,8 +12,18 @@ struct PanicRestoreTargets {
 
 static PANIC_RESTORE: OnceLock<PanicRestoreTargets> = OnceLock::new();
 
-/// The thread `install_panic_hook` ran on — i.e. the one whose death ends the
-/// process. Used to tell a fatal panic from a contained one (DEC-265).
+/// The process's main thread — i.e. the one whose death ends the process. Used
+/// to tell a fatal panic from a contained one (DEC-265).
+///
+/// **Captured in `fn main`, before the runtime is built** — deliberately NOT in
+/// `install_panic_hook`, which is the first statement of `async_main` and so
+/// runs on whatever thread happens to be polling the future. `install_panic_hook`
+/// keeps a `set` of its own, but as a no-op backstop for a future direct caller;
+/// `fn main` always wins the `OnceLock`. Do not "tidy" the `fn main` capture
+/// away on the strength of the one in the hook.
+///
+/// An unset value fails **safe**: `panic_is_fatal` treats `None` as fatal, so the
+/// hardware restore runs rather than being skipped.
 static MAIN_THREAD: OnceLock<std::thread::ThreadId> = OnceLock::new();
 
 /// Does a panic on `current` end the process?
@@ -758,9 +768,20 @@ const SHUTDOWN_TASK_TIMEOUT: Duration = Duration::from_secs(3);
 /// systemd that meant hanging until `TimeoutStopSec` SIGKILL; run from a
 /// terminal it meant hanging with no backstop at all.
 ///
-/// `shutdown_sequence` has already restored the hardware by the time this is
-/// reached, so nothing about safety rides on the wait — only process exit does.
-/// Bound it and let the leaked thread die with the process.
+/// `shutdown_sequence` has already *attempted* the hardware restore by the time
+/// this is reached, so for the case this bound exists to cover — a wedged sensor
+/// READ — nothing about safety rides on the wait and only process exit does.
+///
+/// That is the whole of the claim, and it is narrower than it first reads. It
+/// does **not** say the hardware is provably back under firmware control: the
+/// restore itself takes an unbounded `hwmon_ctrl.lock()`, which the engine write
+/// path holds across an uncancellable `spawn_blocking` sysfs write, so a chip
+/// that wedges mid-WRITE stalls the restore *before* control ever arrives here.
+/// This timeout cannot bound that, and neither can any of the timeouts above it.
+/// Register row 277-b carries the fix; do not read this comment as evidence the
+/// shutdown path is totally bounded, because it is not.
+///
+/// Bound the read case and let the leaked thread die with the process.
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Ordered graceful shutdown (DEC-146 P3-9 + audit P1-A).

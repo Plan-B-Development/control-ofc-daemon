@@ -51,7 +51,7 @@ RestartSec=3
 # (`backends.rs`), which cannot be cancelled — so a chip that wedges mid-write can
 # stall the restore past every timeout above. `shutdown_sequence`'s own doc
 # comment has recorded that residual window since DEC-146. Capping systemd's
-# patience at 20 s rather than the ~90 s default bounds the stop-job case;
+# patience well below the ~90 s default bounds the stop-job case;
 # ExecStopPost=control-ofc-restore-auto then runs. Note what that does and does
 # NOT cover: the script restores hwmon `pwm*_enable` and GPU `fan_curve` only.
 # OpenFan channels are USB-serial with no firmware-auto to fall back to, so they
@@ -59,7 +59,16 @@ RestartSec=3
 # hold, never fall — but this is not a full hand-back and must not be read as one.
 # Register row 277-b tracks bounding the restore itself, which is the real fix
 # and the only one that also covers the no-stop-job (Restart=on-failure) path.
-TimeoutStopSec=20
+#
+# The number is DERIVED, not picked. An ordinary (non-wedged) stop costs up to
+# SHUTDOWN_TASK_TIMEOUT (3 s) per sequential task drain — four of them — plus
+# RUNTIME_SHUTDOWN_TIMEOUT (2 s): ~14 s worst case. At 20 s a loaded machine
+# whose drains each run near their cap would trip SIGKILL on every routine
+# `systemctl restart`, which is not a fault but WOULD make a genuine 277-b wedge
+# look routine in the journal. 30 s keeps a real margin over the ordinary path
+# while still cutting the wedged case to a third of the default. Raise this if
+# the drain budget above ever grows.
+TimeoutStopSec=30
 
 # Privilege model: daemon runs as root, declared explicitly via User=root
 # (identical to the prior implicit default — root is what a User=-less system

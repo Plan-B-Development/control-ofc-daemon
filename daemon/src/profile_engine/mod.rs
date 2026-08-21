@@ -1710,8 +1710,19 @@ mod tests {
         ))
         .await;
         // Then poll, bounded, for what the caller actually cares about.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !ready() && std::time::Instant::now() < deadline {
+        //
+        // Bounded by ITERATION COUNT, not by a wall-clock deadline. The obvious
+        // form — `std::time::Instant::now() < deadline` around a
+        // `tokio::time::sleep` — mixes two clocks: under `#[tokio::test(start_paused)]`
+        // tokio auto-advances each sleep instantly while `std::time::Instant`
+        // never moves, so the loop spins forever and CI HANGS instead of failing.
+        // That is DEC-272 traps 1 and 3 composed in a single helper, and it would
+        // be armed by any future caller adding `start_paused` — not by anything
+        // visible here. A counter cannot be fooled by either clock.
+        for _ in 0..200 {
+            if ready() {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         let _ = tx.send(true);

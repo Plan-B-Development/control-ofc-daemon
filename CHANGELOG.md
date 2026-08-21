@@ -32,8 +32,11 @@
   then exits regardless. **Fan control was never at risk** — the hardware is
   already handed back to firmware before this point, and a restart-forcing exit
   never took this path — so what changes is only how long the machine waits.
-  The packaged service file also caps systemd's own patience at 20 seconds, as a
-  backstop rather than the mechanism.
+  The packaged service file also caps systemd's own patience at 30 seconds
+  instead of its 90-second default, as a backstop rather than the mechanism —
+  chosen to stay clear of the roughly 14 seconds an ordinary stop can take on a
+  loaded machine, so that hitting the cap remains a signal that something is
+  actually wrong.
   One older case is not covered by either, and is not new here: the hand-back
   itself waits on the fan-control chip, so a chip that wedges *mid-write* can
   hold the daemon open past every limit above — and on the restart path there is
