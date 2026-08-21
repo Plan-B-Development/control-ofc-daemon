@@ -1,5 +1,39 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **A wedged sensor read froze the whole feed behind a healthy `/status`.** The
+  poll task is supervised, but supervision fires on a task *dying*, and a
+  blocking sysfs or NVIDIA-driver read that never returns leaves the task alive —
+  so nothing fired and the daemon went on controlling fans from readings that
+  could no longer change. The blocking read is now bounded by the same freshness
+  budget the safety ladder uses, past which a still-running read cannot produce a
+  value that rule would act on anyway. Crucially the loop does not start a second
+  read behind a stuck one: a blocking read cannot be cancelled, so one per tick
+  would exhaust the thread pool in minutes and starve every other blocking
+  operation in the process — including the fan writes. DEC-272.
+- **A sensor that disappeared was never forgotten.** Cached readings were only
+  ever added, so a sensor that vanished — a driver unloaded, hardware removed —
+  left its last temperature in place for as long as the daemon ran, ageing into
+  "stale" but never "gone". That kept the no-sensor safety branch from reaching
+  the very case it was written for. Vanished sensors are now evicted; ones that
+  are merely unreadable keep their existing quarantine path. DEC-272.
+- **Fan curves kept running on frozen sensors.** Only the CPU safety rule checked
+  whether a reading was still current. A frozen GPU or coolant sensor drove its
+  curve indefinitely with the system reporting normal — the same silent failure
+  already fixed for the CPU, one level out, on sensors with no thermal rule of
+  their own to catch it. A curve whose sensor has stopped updating now holds its
+  fans at their last speed instead of tracking a temperature that is no longer
+  real. CPU sensors are deliberately unaffected: the thermal ladder already
+  decides what a stale CPU reading means, and taking that over would have frozen
+  a fan mid-ramp instead of letting it keep climbing. DEC-272.
+
+### Internal
+- The main loop's shutdown decision — including whether a failure warrants a
+  restart — is extracted and covered by tests. Every safety behaviour built on it
+  since 2.15 was previously verified only by reading the code. DEC-272.
+
 ## [2.19.0] — 2026-08-20
 
 ### Fixed
