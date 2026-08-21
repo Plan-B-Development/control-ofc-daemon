@@ -353,6 +353,31 @@ pub(crate) fn curve_output_for_control(
     }
 }
 
+/// Classify WHY [`curve_output_for_control`] returned None (273-i).
+///
+/// Called only on the cold `None` path, so the hot path pays nothing for it.
+/// Deliberately a separate classifier rather than changing the resolver to
+/// return `Result<f64, SkipReason>`: that would touch every caller and every
+/// golden-vector test in the parity oracle for what is a display-only field.
+///
+/// The mapping lives here, beside the dispatcher it mirrors, so a new curve type
+/// added to `curve_output_for_control` has an obvious place to be classified —
+/// and `skip_reason_covers_every_curve_type_the_dispatcher_handles` fails if one
+/// is added there and forgotten here.
+///
+/// `CurveNotFound` is NOT produced here: it is decided at the call site, which is
+/// the only place that knows the curve lookup itself failed.
+pub(crate) fn skip_reason(curve: &crate::profile::CurveConfig) -> SkipReason {
+    match curve.curve_type.as_str() {
+        "mix" => SkipReason::MixUnresolvable,
+        "sync" => SkipReason::SyncUnresolvable,
+        // Every single-temperature type (graph, stepped, trigger) resolves
+        // unconditionally once its sensor is in the map — `sensors.get(...)?` is
+        // their only None path.
+        _ => SkipReason::SensorUnavailable,
+    }
+}
+
 /// The control id a Sync-driven control depends on, else None.
 pub(crate) fn sync_dependency<'a>(
     control: &'a LogicalControl,

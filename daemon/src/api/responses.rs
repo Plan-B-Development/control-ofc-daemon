@@ -42,6 +42,14 @@ pub struct StatusResponse {
     /// when none, so the common-case wire shape is unchanged (additive).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unavailable_sensors: Vec<UnavailableSensorEntry>,
+    /// Controls the profile engine cannot resolve, so is not commanding (273-i)
+    /// — e.g. a Mix naming a curve id the profile no longer has. Their fans hold
+    /// their last commanded duty; a skip never lowers a fan (DEC-269). Before
+    /// this field such a control was silent: no log at the shipped level, and
+    /// nothing on the API. Omitted when none, so the common-case wire shape is
+    /// unchanged (additive) — an older daemon omits it and a client reads `[]`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped_controls: Vec<SkippedControlEntry>,
     /// Active profile id + display name, mirrored onto the `/status` + `/poll`
     /// surface so an external activation (CLI `--profile`, another client,
     /// systemd) is reflected within one 1 Hz poll instead of the GUI's slow
@@ -74,6 +82,22 @@ pub struct UnavailableSensorEntry {
     pub reason: String,
     /// Milliseconds since the sensor was quarantined as unreadable.
     pub unavailable_for_ms: u64,
+}
+
+/// One control the profile engine cannot resolve, on the `/status` poll surface
+/// (273-i). Display-only: its fans are still reporting, they are simply not
+/// being commanded, and they hold their last duty rather than falling.
+#[derive(Debug, Clone, Serialize)]
+pub struct SkippedControlEntry {
+    pub control_id: String,
+    pub control_name: String,
+    /// Stable token, not prose: `curve_not_found` | `sensor_unavailable` |
+    /// `mix_unresolvable` | `sync_unresolvable`. The client renders the wording,
+    /// so it can be styled and localised there; the daemon's own sentence goes
+    /// to the journal. Adding a token is additive; renaming one is breaking.
+    pub reason: String,
+    /// Milliseconds since the control was first listed as skipped.
+    pub skipped_for_ms: u64,
 }
 
 /// One active manual override on the `/status` poll surface (DEC-163).
@@ -1627,6 +1651,7 @@ mod tests {
             overrides: Vec::new(),
             fan_identify: Vec::new(),
             unavailable_sensors: Vec::new(),
+            skipped_controls: Vec::new(),
             active_profile_id: None,
             active_profile_name: None,
             readiness: None,
@@ -1668,6 +1693,7 @@ mod tests {
             overrides: Vec::new(),
             fan_identify: Vec::new(),
             unavailable_sensors: Vec::new(),
+            skipped_controls: Vec::new(),
             active_profile_id: None,
             active_profile_name: None,
             readiness: Some(ReadinessRollup {
@@ -1690,6 +1716,64 @@ mod tests {
         );
     }
 
+    /// 273-i: additive means additive. An older client, and every healthy
+    /// machine, must see the exact wire shape they saw before this field
+    /// existed — so the key is absent, not `[]`.
+    #[test]
+    fn status_response_omits_skipped_controls_when_empty() {
+        let resp = StatusResponse {
+            api_version: API_VERSION,
+            daemon_version: "0.1.0".into(),
+            overall_status: "ok".into(),
+            subsystems: Vec::new(),
+            uptime_seconds: Some(1),
+            thermal_state: "normal".into(),
+            overrides: Vec::new(),
+            fan_identify: Vec::new(),
+            unavailable_sensors: Vec::new(),
+            skipped_controls: Vec::new(),
+            active_profile_id: None,
+            active_profile_name: None,
+            readiness: None,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(
+            json.get("skipped_controls").is_none(),
+            "an empty list must not appear on the wire at all: {json}"
+        );
+    }
+
+    /// 273-i: and when something IS skipped, every field the GUI needs is there
+    /// — including the stable `reason` token it branches on to render wording.
+    #[test]
+    fn status_response_serializes_skipped_controls_when_present() {
+        let resp = StatusResponse {
+            api_version: API_VERSION,
+            daemon_version: "0.1.0".into(),
+            overall_status: "ok".into(),
+            subsystems: Vec::new(),
+            uptime_seconds: Some(1),
+            thermal_state: "normal".into(),
+            overrides: Vec::new(),
+            fan_identify: Vec::new(),
+            unavailable_sensors: Vec::new(),
+            skipped_controls: vec![SkippedControlEntry {
+                control_id: "ctl-front".into(),
+                control_name: "Front intake".into(),
+                reason: "mix_unresolvable".into(),
+                skipped_for_ms: 9000,
+            }],
+            active_profile_id: None,
+            active_profile_name: None,
+            readiness: None,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["skipped_controls"][0]["control_id"], "ctl-front");
+        assert_eq!(json["skipped_controls"][0]["control_name"], "Front intake");
+        assert_eq!(json["skipped_controls"][0]["reason"], "mix_unresolvable");
+        assert_eq!(json["skipped_controls"][0]["skipped_for_ms"], 9000);
+    }
+
     #[test]
     fn status_response_serializes_unavailable_sensors_when_present() {
         // DEC-193: a quarantined sensor surfaces on /status (and /poll via the
@@ -1709,6 +1793,7 @@ mod tests {
                 reason: "read error: Network is down (os error 100)".into(),
                 unavailable_for_ms: 4200,
             }],
+            skipped_controls: Vec::new(),
             active_profile_id: None,
             active_profile_name: None,
             readiness: None,

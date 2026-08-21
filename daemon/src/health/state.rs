@@ -148,6 +148,63 @@ pub struct UnavailableSensor {
     pub since: Instant,
 }
 
+/// Why a control could not be resolved.
+///
+/// These are stable wire tokens — [`SkipReason::as_token`] is what reaches
+/// `/status`, and the GUI branches on it to render user-facing text. Renaming
+/// one is a contract change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    /// The control's `curve_id` names a curve the active profile does not have.
+    CurveNotFound,
+    /// The curve's sensor is absent from the map the engine was handed — either
+    /// not discovered on this machine, or age-filtered out by `curve_eligible`.
+    SensorUnavailable,
+    /// A Mix that produced no value at all: no children, none resolvable, a
+    /// `subtract` whose minuend is missing, a dependency cycle, or the depth
+    /// backstop. A Mix with *some* children resolvable is NOT skipped — it runs
+    /// on the survivors (DEC-272), so it never reaches here.
+    MixUnresolvable,
+    /// A Sync whose target is unset, is the control itself, or has not been
+    /// computed this tick (target skipped, or a cycle).
+    SyncUnresolvable,
+}
+
+impl SkipReason {
+    /// The stable token published on `/status`.
+    pub fn as_token(self) -> &'static str {
+        match self {
+            SkipReason::CurveNotFound => "curve_not_found",
+            SkipReason::SensorUnavailable => "sensor_unavailable",
+            SkipReason::MixUnresolvable => "mix_unresolvable",
+            SkipReason::SyncUnresolvable => "sync_unresolvable",
+        }
+    }
+
+    /// Operator-facing sentence for the journal. The API deliberately carries
+    /// only [`SkipReason::as_token`]; user-facing wording belongs in the GUI,
+    /// where it can be styled and worded for the person reading it.
+    pub fn describe(self) -> &'static str {
+        match self {
+            SkipReason::CurveNotFound => "its curve is not in the active profile",
+            SkipReason::SensorUnavailable => "its sensor is not available",
+            SkipReason::MixUnresolvable => "none of its combined inputs could be resolved",
+            SkipReason::SyncUnresolvable => "the control it mirrors was not computed",
+        }
+    }
+}
+
+/// One control currently being skipped, for the `/status` surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedControl {
+    pub control_id: String,
+    pub control_name: String,
+    pub reason: SkipReason,
+    /// When the control was first listed (i.e. when the debounce was satisfied),
+    /// not when it first skipped.
+    pub since: Instant,
+}
+
 /// Placeholder for AIO pump state (future implementation).
 #[derive(Debug, Clone, Default)]
 pub struct AioPumpState {
@@ -243,6 +300,11 @@ pub struct DaemonState {
     /// for display. Sensors listed here are evicted from `sensors` so a stale
     /// value is never served.
     pub unavailable_sensors: Vec<UnavailableSensor>,
+    /// Controls the profile engine cannot resolve, so is not commanding (273-i).
+    /// Maintained by the engine tick's `SkippedControlTracker`; surfaced on
+    /// `/status` + `/poll` for display. Their fans hold their last commanded
+    /// duty — a skip never lowers a fan (DEC-269).
+    pub skipped_controls: Vec<SkippedControl>,
 }
 
 impl Default for DaemonState {
@@ -260,6 +322,7 @@ impl Default for DaemonState {
             verify_active_until: None,
             relinquished_gpu_fans: HashSet::new(),
             unavailable_sensors: Vec::new(),
+            skipped_controls: Vec::new(),
         }
     }
 }

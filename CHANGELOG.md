@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Added
+- **A fan that has silently stopped being controlled now says so.** If a control
+  cannot work out what speed to ask for, it asks for nothing and its fans hold
+  their last speed. That is the right thing to do — going blind must never make
+  a fan slower — and for a passing cause it fixes itself within a second.
+  What was missing is the cause that never fixes itself: a combined curve
+  pointing at a curve you have since deleted, or a mirrored control whose target
+  is itself not running. That fan stops responding for good, and until now the
+  daemon said nothing at all about it: nothing in the log at its normal setting,
+  and nothing on the API. The only symptom was a fan that no longer changed
+  speed.
+  Such a control is now named in the log once, and listed on the status the GUI
+  polls, with the reason and how long it has been that way. It is reported after
+  three seconds rather than instantly, so a sensor hovering on the edge of its
+  freshness limit cannot fill the log. Nothing about fan control changes — this
+  only makes an existing silence audible. 273-i.
+
 ### Fixed
 - **Stopping the daemon could hang for a minute and a half.** When a temperature
   chip stops responding, the daemon deliberately leaves the outstanding read

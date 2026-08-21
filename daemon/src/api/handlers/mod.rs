@@ -100,6 +100,24 @@ pub(crate) fn build_unavailable_entries(
     entries
 }
 
+/// Build the sorted list of controls the engine cannot resolve (273-i) from a
+/// cache snapshot. Display-only, and empty in every healthy configuration —
+/// a non-empty list means some fan is not being commanded at all.
+pub(crate) fn build_skipped_entries(snap: &DaemonState, now: Instant) -> Vec<SkippedControlEntry> {
+    let mut entries: Vec<SkippedControlEntry> = snap
+        .skipped_controls
+        .iter()
+        .map(|c| SkippedControlEntry {
+            control_id: c.control_id.clone(),
+            control_name: c.control_name.clone(),
+            reason: c.reason.as_token().to_string(),
+            skipped_for_ms: now.duration_since(c.since).as_millis() as u64,
+        })
+        .collect();
+    entries.sort_by(|a, b| a.control_id.cmp(&b.control_id));
+    entries
+}
+
 /// Build the sorted list of fan entries from a cache snapshot.
 pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntry> {
     let mut fans: Vec<FanEntry> = Vec::new();
@@ -377,6 +395,7 @@ pub(crate) fn build_status_response(
     state: &AppState,
     thermal_state: String,
     unavailable_sensors: Vec<UnavailableSensorEntry>,
+    skipped_controls: Vec<SkippedControlEntry>,
     health: crate::health::staleness::HealthSummary,
 ) -> StatusResponse {
     let subsystems = health
@@ -442,6 +461,7 @@ pub(crate) fn build_status_response(
         overrides,
         fan_identify,
         unavailable_sensors,
+        skipped_controls,
         active_profile_id,
         active_profile_name,
         readiness,

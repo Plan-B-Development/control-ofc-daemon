@@ -24,9 +24,14 @@ use crate::profile::{
 
 mod curve_eval;
 mod safety_tick;
+pub mod skipped;
 mod tuning;
+
 pub(crate) use curve_eval::*;
 pub(crate) use safety_tick::*;
+pub use skipped::{
+    SkipEvent, SkipReason, SkipRecord, SkippedControl, SkippedControlTracker, SKIP_DEBOUNCE_TICKS,
+};
 pub(crate) use tuning::*;
 
 /// A single PWM write command produced by the profile engine.
@@ -106,11 +111,36 @@ pub struct ProfileEngineState {
     /// `None` until the first evaluate after a (re)activation; see
     /// [`StaticEvalCache`].
     static_cache: Option<StaticEvalCache>,
+    /// 273-i: controls this tick's evaluation could not resolve. Raw facts,
+    /// overwritten by every `evaluate_profile_with_overrides`; the debounce and
+    /// the `since` stamps live in `skipped_tracker`, which the tick body feeds
+    /// via [`ProfileEngineState::commit_skips`].
+    ///
+    /// Split this way so the evaluator stays clock-free and testable: it records
+    /// WHAT was skipped, the caller decides WHEN that becomes a log line.
+    skipped_this_tick: Vec<SkipRecord>,
+    /// 273-i: debounced skip state, surfaced on `/status`.
+    skipped_tracker: SkippedControlTracker,
 }
 
 impl ProfileEngineState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Feed this tick's skipped set into the debounce tracker and return the
+    /// transitions to log (273-i).
+    ///
+    /// Separate from `evaluate_profile_with_overrides` so the evaluator needs no
+    /// clock: `now` is the caller's, exactly as `SensorFailureTracker` takes it.
+    pub fn commit_skips(&mut self, now: std::time::Instant) -> Vec<SkipEvent> {
+        self.skipped_tracker
+            .record_tick(&self.skipped_this_tick, now)
+    }
+
+    /// Controls currently listed as skipped, sorted by id (273-i).
+    pub fn skipped_snapshot(&self) -> Vec<SkippedControl> {
+        self.skipped_tracker.snapshot()
     }
 
     /// Current last-output for a control id (pre-rounding, pre-u8 conversion).
@@ -139,6 +169,12 @@ impl ProfileEngineState {
         self.trigger_latch.clear();
         self.deadband_hold_cycles.clear();
         self.active_profile_id = None;
+        // 273-i: a deactivation is not a resolution. Clearing rather than
+        // draining means no bogus "resumed" line, and a control still
+        // unresolvable under whatever activates next is reported afresh —
+        // which is what an operator who just switched profiles needs to see.
+        self.skipped_this_tick.clear();
+        self.skipped_tracker.clear();
         // EFF-3: drop the cached eval plan so a re-anchor (epoch bump, thermal
         // force, or no-profile) rebuilds it against whatever activates next.
         // (Redundant with the sync_profile_id null below — deactivate also
@@ -262,6 +298,10 @@ pub fn evaluate_profile_with_overrides(
     // step-rate limiting, so it must not be reused for Sync (DEC-151). Mirrors
     // the GUI's `status.control_outputs`.
     let mut tick_outputs: HashMap<String, f64> = HashMap::new();
+    // 273-i: controls this tick could not resolve, with the reason. Collected
+    // locally and moved onto `engine_state` at the end so the per-control loop
+    // never needs a second mutable borrow of it.
+    let mut skipped_this_tick: Vec<SkipRecord> = Vec::new();
 
     // Evaluate in stable topological order so a Sync control's target is already
     // in `tick_outputs` when the Sync mirrors it (DEC-151). Sync-free profiles
@@ -301,11 +341,16 @@ pub fn evaluate_profile_with_overrides(
             continue;
         }
 
-        // Determine target output percentage. None → skip this control this tick
-        // (manual mode always resolves; curve mode skips on missing curve /
+        // Determine target output percentage. `Err` → skip this control this
+        // tick (manual mode always resolves; curve mode skips on missing curve /
         // sensor / unresolvable composite). The fan then holds its last value.
-        let raw_output = if control.mode == "manual" {
-            Some(control.manual_output_pct)
+        //
+        // 273-i: a skip now carries WHY, so the tick body can log it once and
+        // publish it on `/status` instead of the control going silently
+        // uncommanded. The classification runs only on this cold path — a
+        // resolved control pays nothing for it.
+        let raw_output: Result<f64, SkipReason> = if control.mode == "manual" {
+            Ok(control.manual_output_pct)
         } else {
             // Find the assigned curve (O(1) via the cached curve index, EFF-3),
             // then resolve via the shared dispatcher (deadband / trigger latch /
@@ -315,26 +360,36 @@ pub fn evaluate_profile_with_overrides(
                 .curve_index_of(&control.curve_id)
                 .map(|ci| &profile.curves[ci])
             {
-                None => {
-                    log::debug!(
-                        "Control '{}': curve '{}' not found, skipping",
-                        control.name,
-                        control.curve_id
-                    );
-                    None
+                // Classified here rather than in `curve_eval::skip_reason`: this
+                // is the only place that knows the curve LOOKUP is what failed.
+                None => Err(SkipReason::CurveNotFound),
+                Some(curve) => {
+                    // Classify before the call, while `curve` is still borrowed
+                    // immutably — `curve_output_for_control` takes
+                    // `engine_state` mutably and ends this borrow.
+                    let reason = curve_eval::skip_reason(curve);
+                    curve_output_for_control(
+                        control,
+                        curve,
+                        profile,
+                        sensors,
+                        &tick_outputs,
+                        engine_state,
+                    )
+                    .ok_or(reason)
                 }
-                Some(curve) => curve_output_for_control(
-                    control,
-                    curve,
-                    profile,
-                    sensors,
-                    &tick_outputs,
-                    engine_state,
-                ),
             }
         };
-        let Some(raw_output) = raw_output else {
-            continue;
+        let raw_output = match raw_output {
+            Ok(value) => value,
+            Err(reason) => {
+                skipped_this_tick.push(SkipRecord {
+                    control_id: control.id.clone(),
+                    control_name: control.name.clone(),
+                    reason,
+                });
+                continue;
+            }
         };
 
         // Full tuning pipeline — tracks pre-rounding f64 across cycles so
@@ -432,6 +487,11 @@ pub fn evaluate_profile_with_overrides(
             }
         }
     }
+
+    // 273-i: publish this tick's skipped set for the caller to debounce and log.
+    // Assigned unconditionally — an empty vec is the signal that every control
+    // resolved, and is what retires a previously-listed skip.
+    engine_state.skipped_this_tick = skipped_this_tick;
 
     commands
 }
@@ -711,6 +771,22 @@ pub async fn profile_engine_loop(
         // cannot. Do not conclude from the supervisor's existence that this is
         // redundant, or from this that the supervisor is.
         cache.record_engine_tick(decision.thermal_state);
+        // 273-i: clear the skipped-controls list HERE, unconditionally, before
+        // any of this tick's early exits.
+        //
+        // Every `continue` below (thermal force, no profile) leaves the tick
+        // without evaluating anything, and "nothing was evaluated" must publish
+        // as "nothing is skipped" rather than as last tick's list. Three explicit
+        // publishes — one per exit — were rejected: a fourth `continue` added
+        // later would silently freeze the list, and nothing would fail. Clearing
+        // once, up here, makes that failure mode unreachable instead of
+        // test-guarded. The real list is published after evaluation below; the
+        // empty/empty fast path makes this a shared read lock in the common case.
+        //
+        // Deliberately adjacent to the heartbeat: if a future `continue` is ever
+        // added ABOVE this point, both freeze together and the heartbeat reports
+        // the outage — which is DEC-249's whole argument.
+        cache.update_skipped_controls(Vec::new());
         // DEC-259: pairs the start stamp above with a completion stamp on every
         // exit from this body. Without the pair a *slow* tick was indistinguishable
         // from a *stopped* engine, and the surface reported the worse of the two —
@@ -799,6 +875,25 @@ pub async fn profile_engine_loop(
                 &override_snapshot,
             )
         };
+
+        // 273-i: fold this tick's skipped set into the debounce tracker, log the
+        // transitions, and publish the current list. Done before the shutdown
+        // check below so a control that went unresolvable is still reported on
+        // the tick the daemon is asked to stop — the operator stopping the
+        // daemon to investigate is exactly who needs the line.
+        for event in engine_state.commit_skips(std::time::Instant::now()) {
+            match event {
+                SkipEvent::Skipped { id, name, reason } => log::warn!(
+                    "Control '{name}' ({id}) is NOT being commanded: {} — its fans hold \
+                     their last speed until this resolves",
+                    reason.describe()
+                ),
+                SkipEvent::Resumed { id, name } => {
+                    log::info!("Control '{name}' ({id}) is being commanded again")
+                }
+            }
+        }
+        cache.update_skipped_controls(engine_state.skipped_snapshot());
 
         // If shutdown was signalled while this tick was computing (after the
         // `select!` arm, before the write phase), stop here so the engine does
@@ -1206,6 +1301,318 @@ mod tests {
              `A - B` becoming a bare `B` changed 0% into 36%. Holding or rising is \
              acceptable; falling is not. got {:?}",
             after.iter().map(|c| c.pwm_percent).collect::<Vec<_>>()
+        );
+    }
+
+    // ── 273-i: a control the engine cannot resolve is no longer silent ──
+
+    /// A Mix naming a curve id the profile does not have is unresolvable
+    /// forever — the canonical "config error, fan silently stops responding"
+    /// case this row exists for. It must be recorded with a reason.
+    #[test]
+    fn a_mix_naming_a_missing_child_curve_is_recorded_as_skipped() {
+        let profile = DaemonProfile {
+            id: "mix".into(),
+            name: "Mix".into(),
+            version: 7,
+            description: "".into(),
+            controls: vec![openfan_control("ctl", "mx", "openfan:ch00")],
+            // "deleted" is not among the profile's curves.
+            curves: vec![mix_curve("mx", "max", &["deleted"])],
+        };
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let mut state = ProfileEngineState::new();
+        let cmds = evaluate_profile(&profile, &cache.sensors_snapshot(), &mut state);
+
+        assert!(cmds.is_empty(), "an unresolvable Mix commands nothing");
+        assert_eq!(
+            state.skipped_this_tick,
+            vec![SkipRecord {
+                control_id: "ctl".into(),
+                control_name: "ctl".into(),
+                reason: SkipReason::MixUnresolvable,
+            }],
+            "the skip must be recorded WITH a reason — an empty list here is the \
+             defect this row describes: the fan stops and nothing says why"
+        );
+    }
+
+    /// A control whose own `curve_id` is missing is a different fault from a Mix
+    /// whose CHILD is missing, and an operator needs to tell them apart.
+    #[test]
+    fn a_control_naming_a_missing_curve_is_recorded_as_curve_not_found() {
+        let profile = DaemonProfile {
+            id: "p".into(),
+            name: "P".into(),
+            version: 7,
+            description: "".into(),
+            controls: vec![openfan_control("ctl", "gone", "openfan:ch00")],
+            curves: vec![linear_curve("present", "cpu")],
+        };
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let mut state = ProfileEngineState::new();
+        evaluate_profile(&profile, &cache.sensors_snapshot(), &mut state);
+
+        assert_eq!(
+            state.skipped_this_tick.len(),
+            1,
+            "the control must be recorded as skipped"
+        );
+        assert_eq!(
+            state.skipped_this_tick[0].reason,
+            SkipReason::CurveNotFound,
+            "a missing curve must not be reported as a missing sensor"
+        );
+    }
+
+    #[test]
+    fn a_control_whose_sensor_is_absent_is_recorded_as_sensor_unavailable() {
+        let profile = DaemonProfile {
+            id: "p".into(),
+            name: "P".into(),
+            version: 7,
+            description: "".into(),
+            controls: vec![openfan_control("ctl", "c", "openfan:ch00")],
+            curves: vec![linear_curve("c", "ghost")],
+        };
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let mut state = ProfileEngineState::new();
+        evaluate_profile(&profile, &cache.sensors_snapshot(), &mut state);
+
+        assert_eq!(state.skipped_this_tick.len(), 1);
+        assert_eq!(
+            state.skipped_this_tick[0].reason,
+            SkipReason::SensorUnavailable
+        );
+    }
+
+    /// The healthy case: nothing skipped means an EMPTY list, which is what
+    /// retires a previously-listed skip. A test that only ever asserted the
+    /// non-empty direction would pass with the list wired to always report.
+    #[test]
+    fn a_control_that_resolves_records_no_skip() {
+        let profile = DaemonProfile {
+            id: "p".into(),
+            name: "P".into(),
+            version: 7,
+            description: "".into(),
+            controls: vec![openfan_control("ctl", "c", "openfan:ch00")],
+            curves: vec![linear_curve("c", "cpu")],
+        };
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let mut state = ProfileEngineState::new();
+        let cmds = evaluate_profile(&profile, &cache.sensors_snapshot(), &mut state);
+
+        assert!(!cmds.is_empty(), "a resolvable control must command");
+        assert!(
+            state.skipped_this_tick.is_empty(),
+            "a healthy profile must report nothing skipped"
+        );
+    }
+
+    /// Reaching `/status` takes the debounce as well as the record, so pin the
+    /// whole path: record → commit → snapshot.
+    #[test]
+    fn a_persistent_skip_reaches_the_status_snapshot_after_the_debounce() {
+        let profile = DaemonProfile {
+            id: "mix".into(),
+            name: "Mix".into(),
+            version: 7,
+            description: "".into(),
+            controls: vec![openfan_control("ctl", "mx", "openfan:ch00")],
+            curves: vec![mix_curve("mx", "max", &["deleted"])],
+        };
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let mut state = ProfileEngineState::new();
+        let now = Instant::now();
+
+        let mut events = Vec::new();
+        for _ in 0..SKIP_DEBOUNCE_TICKS {
+            evaluate_profile(&profile, &cache.sensors_snapshot(), &mut state);
+            events.extend(state.commit_skips(now));
+        }
+
+        assert_eq!(events.len(), 1, "exactly one journal line, on entry");
+        let snapshot = state.skipped_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].control_id, "ctl");
+        assert_eq!(snapshot[0].reason, SkipReason::MixUnresolvable);
+    }
+
+    /// [SAFETY] 273-i / DEC-249 — the early-exit paths must publish an EMPTY
+    /// list, not leave the last one standing.
+    ///
+    /// A thermal emergency `continue`s before any control is evaluated. If the
+    /// publish only happened after evaluation, the list would freeze at whatever
+    /// it said before the emergency and keep asserting "this control is not
+    /// being commanded" about a machine that is now forcing every fan to 100%.
+    /// The fix is an unconditional clear at the top of the tick; this pins it by
+    /// seeding a stale list and requiring one emergency tick to clear it.
+    #[tokio::test]
+    async fn a_thermal_emergency_tick_clears_the_skipped_list() {
+        let cache = make_cache_with_sensor("cpu", 110.0); // over the 105 °C line
+        cache.update_skipped_controls(vec![SkippedControl {
+            control_id: "stale".into(),
+            control_name: "Stale".into(),
+            reason: SkipReason::MixUnresolvable,
+            since: Instant::now(),
+        }]);
+        assert!(
+            !cache.read_with(|s| s.skipped_controls.is_empty()),
+            "precondition: the list starts non-empty"
+        );
+
+        run_one_engine_tick(cache.clone(), None).await;
+
+        // Assert the PRESENCE before the absence: without this the test would
+        // still pass if the emergency never fired, silently degrading into a
+        // duplicate of the no-profile case below (DEC-272's vacuous-absence
+        // trap).
+        assert_eq!(
+            cache.read_with(|s| s.thermal_override_state.clone()),
+            Some("emergency".to_string()),
+            "precondition: this tick must actually take the thermal-force path"
+        );
+        assert!(
+            cache.read_with(|s| s.skipped_controls.is_empty()),
+            "a tick that exits early without evaluating must publish an empty list, \
+             not leave the previous one asserting a stale claim"
+        );
+    }
+
+    /// The other early exit: no profile loaded. Same reasoning.
+    #[tokio::test]
+    async fn a_no_profile_tick_clears_the_skipped_list() {
+        let cache = make_cache_with_sensor("cpu", 40.0); // nowhere near emergency
+        cache.update_skipped_controls(vec![SkippedControl {
+            control_id: "stale".into(),
+            control_name: "Stale".into(),
+            reason: SkipReason::CurveNotFound,
+            since: Instant::now(),
+        }]);
+
+        run_one_engine_tick(cache.clone(), None).await;
+
+        assert!(
+            cache.read_with(|s| s.skipped_controls.is_empty()),
+            "with no profile active nothing is skipped, because nothing is evaluated"
+        );
+    }
+
+    /// Drive `profile_engine_loop` for exactly one tick against no hardware.
+    ///
+    /// `tokio::time::interval` fires immediately, so the first tick runs at once;
+    /// the shutdown signal is then set and the loop exits at the next select.
+    /// Real time rather than `start_paused`, because DEC-272 records that paused
+    /// time does not advance `std::time::Instant` — which is what every age in
+    /// this engine is measured against.
+    async fn run_one_engine_tick(cache: Arc<StateCache>, profile: Option<DaemonProfile>) {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(profile_engine_loop(
+            cache,
+            Arc::new(Mutex::new(profile)),
+            Arc::new(parking_lot::RwLock::new(None)),
+            None,
+            Vec::new(),
+            Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new())),
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            rx,
+        ));
+        // Long enough for the immediate first tick to complete, short enough that
+        // the 1 Hz interval cannot produce a second one.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let _ = tx.send(true);
+        // Bounded: a hung join would turn a red test into a hung CI job
+        // (DEC-272 trap 3).
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
+
+    #[test]
+    fn skip_reason_classifies_each_curve_shape_distinctly() {
+        let mix = mix_curve("m", "max", &["a"]);
+        let sync = sync_curve("s", "target", 0.0);
+        let linear = linear_curve("l", "cpu");
+        assert_eq!(curve_eval::skip_reason(&mix), SkipReason::MixUnresolvable);
+        assert_eq!(curve_eval::skip_reason(&sync), SkipReason::SyncUnresolvable);
+        assert_eq!(
+            curve_eval::skip_reason(&linear),
+            SkipReason::SensorUnavailable
+        );
+    }
+
+    /// [SAFETY-adjacent] 273-i — a curve type added to the dispatcher but not to
+    /// the classifier would be misreported, not caught.
+    ///
+    /// `curve_output_for_control` and `skip_reason` are two matches over the same
+    /// vocabulary. Nothing links them, so a new type added to the first silently
+    /// falls into the second's `_` arm and every skip of that type reports
+    /// "sensor unavailable" regardless of the real cause — a wrong answer is
+    /// worse here than no answer, because it sends the operator to the wrong
+    /// place.
+    ///
+    /// The exemption list is the mechanism, in the same shape as the GUI's
+    /// `test_the_runtime_text_exemption_is_not_quietly_widening`: a type may fold
+    /// into the default, but only deliberately and in writing.
+    #[test]
+    fn skip_reason_covers_every_curve_type_the_dispatcher_handles() {
+        /// Types whose ONLY `None` path is a missing sensor, so the classifier's
+        /// default arm is the correct answer for them. Adding to this list is a
+        /// claim that must be true of the dispatcher arm.
+        const FOLDS_INTO_SENSOR_UNAVAILABLE: &[&str] = &["trigger"];
+
+        let src = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/profile_engine/curve_eval.rs"
+        ));
+
+        /// Literal match arms (`"name" =>`) inside one top-level fn body.
+        fn arms_of(src: &str, func: &str) -> std::collections::BTreeSet<String> {
+            let start = src
+                .find(func)
+                .unwrap_or_else(|| panic!("{func} not found in curve_eval.rs"));
+            // rustfmt puts a top-level fn's closing brace at column 0.
+            let len = src[start..]
+                .find("\n}\n")
+                .expect("unterminated function body");
+            let body = &src[start..start + len];
+            body.match_indices("\" =>")
+                .filter_map(|(i, _)| {
+                    let head = &body[..i];
+                    head.rfind('"').map(|q| head[q + 1..].to_string())
+                })
+                .collect()
+        }
+
+        let dispatcher = arms_of(src, "fn curve_output_for_control");
+        let classifier = arms_of(src, "fn skip_reason");
+
+        assert!(
+            !dispatcher.is_empty() && !classifier.is_empty(),
+            "the arm scanner found nothing — it has stopped testing anything \
+             (dispatcher: {dispatcher:?}, classifier: {classifier:?})"
+        );
+
+        let unclassified: Vec<&String> = dispatcher
+            .difference(&classifier)
+            .filter(|t| !FOLDS_INTO_SENSOR_UNAVAILABLE.contains(&t.as_str()))
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "curve type(s) {unclassified:?} are dispatched but not classified — every \
+             skip of one would be reported as 'sensor_unavailable' whatever the real \
+             cause. Give each an arm in `skip_reason`, or add it to \
+             FOLDS_INTO_SENSOR_UNAVAILABLE if a missing sensor really is its only \
+             unresolvable path"
+        );
+
+        let stale: Vec<&&str> = FOLDS_INTO_SENSOR_UNAVAILABLE
+            .iter()
+            .filter(|t| !dispatcher.contains(**t))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "exemption(s) {stale:?} name curve types the dispatcher no longer has — \
+             an exemption list that outlives its subject quietly widens"
         );
     }
 

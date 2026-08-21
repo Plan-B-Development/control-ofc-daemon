@@ -583,6 +583,34 @@ impl StateCache {
         state.unavailable_sensors = unavailable;
     }
 
+    /// Replace the set of controls the engine cannot resolve (273-i).
+    ///
+    /// Called by the engine tick on EVERY tick, including the early-return paths
+    /// — see the call sites. That unconditional discipline is the point: a
+    /// control listed here is "not being commanded right now", and a list that
+    /// froze because an early `continue` skipped the publish would keep asserting
+    /// that about a control the engine has since resumed, or has stopped
+    /// evaluating entirely. DEC-249 is the same lesson one surface over.
+    ///
+    /// Unlike [`Self::update_unavailable_sensors`] this evicts nothing: a skipped
+    /// control's *fans* are still real and still reporting RPM. What is unknown
+    /// is only whether anything is commanding them, which is exactly what this
+    /// list says.
+    ///
+    /// The common case (nothing skipped, nothing previously skipped) takes only a
+    /// shared read lock and returns — the engine calls this at 1 Hz.
+    pub fn update_skipped_controls(&self, skipped: Vec<SkippedControl>) {
+        // Same deliberate double-checked shape as `update_unavailable_sensors`:
+        // the fast-path read guard is dropped before the write lock is taken, and
+        // the interleaving is harmless because the write is idempotent. The fast
+        // path exists so the every-tick common case never contends for the write
+        // lock; do not collapse it into a single lock.
+        if skipped.is_empty() && self.inner.read().skipped_controls.is_empty() {
+            return;
+        }
+        self.inner.write().skipped_controls = skipped;
+    }
+
     /// Drop cached readings for sensors that no longer exist.
     ///
     /// [SAFETY] DEC-272 (register row 01-c). [`update_sensors`] only ever

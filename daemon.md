@@ -93,6 +93,7 @@ daemon/src/
     tuning.rs          — offset→floor→step-rate→stop-snap→start-kick→clamp + floor policy
     safety_tick.rs     — 105/80/60 °C thermal ladder + no-sensor fallback (DEC-190)
     backends.rs        — WriteBackend per fan backend (gating/coalescing)
+    skipped.rs         — debounced tracking of controls that cannot be resolved (273-i)
   control_override.rs  — manual-override + fan-identify state (expiring, fencing-guarded, deadman; DEC-163/166)
   daemon_state.rs      — persistent state (active profile pointer)
   safety.rs            — ThermalSafetyRule (CPU emergency override)
@@ -188,26 +189,54 @@ inside the band cannot pin the pre-settle fan speed indefinitely.
      empty label, because the label feeds both the sensor's stable id and its
      CPU/motherboard classification
 
-3. **Lease system** (`lease.rs`): Exclusive hwmon write access
+3. **Unresolvable controls are reported, not silent** (`profile_engine::skipped`, 273-i)
+   - A control the engine cannot resolve is SKIPPED: no command is produced and
+     its fans hold their last commanded duty. For a transient cause that is
+     correct and invisible by design — the next tick fixes it
+   - The case that never fixes itself was silent. A Mix naming a curve id the
+     profile no longer has, or a Sync whose target is skipped, is unresolvable
+     for as long as the profile says so, and the daemon said nothing: the one
+     skip that logged at all used `log::debug!`, below the shipped
+     `RUST_LOG=info`, and no API surface carried it. The fan simply stopped
+     responding
+   - After `SKIP_DEBOUNCE_TICKS` (3) consecutive skipped ticks the control is
+     logged once at WARN and listed on `/status` + `/poll` as
+     `skipped_controls[] = {control_id, control_name, reason, skipped_for_ms}`.
+     It is logged once more when it resolves. `reason` is a stable token —
+     `curve_not_found` | `sensor_unavailable` | `mix_unresolvable` |
+     `sync_unresolvable` — and the client owns the wording
+   - The debounce is load-bearing, not politeness: `curve_eligible`'s freshness
+     budget floors at 5 s, so a sensor on that boundary flaps, and edge-triggering
+     at 1 Hz would reproduce exactly the journal spam DEC-193 was written to stop
+   - The list is cleared UNCONDITIONALLY at the top of every tick, before the
+     thermal-force and no-profile early exits, so a tick that evaluates nothing
+     publishes "nothing skipped" rather than leaving the previous tick's claim
+     standing. Three explicit publishes were rejected: a fourth `continue` added
+     later would silently freeze the list. Same lesson as DEC-249
+   - Display-only. It changes no control decision, and a skipped control's fans
+     still report RPM — what is unknown is only whether anything is commanding
+     them, which is what the list says
+
+4. **Lease system** (`lease.rs`): Exclusive hwmon write access
    - 60s TTL, holder must renew periodically
    - A daemon-internal single-writer token (`HwmonWriter::{Engine,Verify,ThermalSafety}`,
      DEC-197) arbitrating the three in-process writers — the profile-engine tick, a hardware
      verify, and the thermal-safety force. Not a client lease: the GUI holds nothing (DEC-165).
      A thermal force-take evicts a verify mid-scan, so the verify's stale token is refused.
 
-4. **Stop timeout** (`controller.rs`): OpenFan 0% wire-write limit
+5. **Stop timeout** (`controller.rs`): OpenFan 0% wire-write limit
    - Rejects a *wire-bound* 0% write against a stop timer older than 8 s.
      A steady 0% hold coalesces — same-value repeats never reach the wire or
      the timeout (CONC-2, 2026-07-21 audit; the old order errored every tick
      past 8 s, inflating failure streaks) — so this is defence-in-depth
      against channel-tracking drift, not a periodic re-arm requirement
 
-5. **ExecStopPost restore** (`packaging/control-ofc-restore-auto.sh`):
+6. **ExecStopPost restore** (`packaging/control-ofc-restore-auto.sh`):
    - Restores `pwm_enable=2` (auto) on ANY service stop (including SIGKILL)
    - Resets GPU fan curves to automatic
    - Re-enables `fan_zero_rpm_enable=1` for every GPU exposing it (DEC-100 — closes the SIGKILL/OOM path the panic hook can't cover)
 
-6. **Kernel-version regression catalogue** (`hwmon/kernel_warnings.rs`, DEC-098):
+7. **Kernel-version regression catalogue** (`hwmon/kernel_warnings.rs`, DEC-098):
    - Curated list of published amdgpu regressions keyed by kernel version + GPU PCI device ID
    - Currently flags `rdna_hang_kernel_6_18_6_19` (RDNA3/4 hard hang on **both** 6.18.x and 6.19.x, Phoronix-confirmed) and `smu_mismatch_navi48_r9700` (R9700-only SMU interface-version mismatch — no working fan-control path — across all current kernels, ROCm Issue #6101); see DEC-114 for the correctness fix
    - Surfaced via `GET /capabilities` (`devices.amd_gpu.kernel_warnings`); each entry carries `id` (stable knowledge-base key), `severity` (`info` / `medium` / `high` / `critical`), and `message` (pre-formatted user-visible text). The daemon owns the wording so a message update doesn't require coordinated GUI redeploys.
@@ -215,7 +244,7 @@ inside the band cannot pin the pre-settle fan speed indefinitely.
    - The GUI raises a one-time `QMessageBox` for `high` and `critical` warnings; the user's acknowledgement is persisted in `app_settings.acknowledged_kernel_warnings` so the popup does not re-fire on every reconnect
    - Adding a new regression entry is a 30-line PR against `kernel_warnings.rs`; no schema or contract change required
 
-7. **Pump-stop guard** (`profile.rs`, DEC-167): a control with a pump/CPU member
+8. **Pump-stop guard** (`profile.rs`, DEC-167): a control with a pump/CPU member
    may not be configured to stop. A non-zero `stop_pct` on such a control is
    rejected at profile-validate time (a `PUMP_STOP_FORBIDDEN` error in the
    validation report → `400 validation_error`); for any profile that reaches the
@@ -223,7 +252,7 @@ inside the band cannot pin the pre-settle fan speed indefinitely.
    for pump/CPU members. Stopping a pump risks coolant-flow loss and rapid thermal
    runaway. GPU- and chassis-only controls are unaffected.
 
-8. **AIO / coolant surface, no coolant safety rule** (`hwmon/aio.rs`, DEC-156):
+9. **AIO / coolant surface, no coolant safety rule** (`hwmon/aio.rs`, DEC-156):
    liquid-cooler coolant temperatures are classified as the `CoolantTemp` sensor
    kind and AIO PWM headers carry an `is_aio` flag (surfaced via the dynamic
    `aio_hwmon` capability). This is detection only — there is **deliberately no
@@ -315,10 +344,10 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/status` | Subsystem health + freshness; `thermal_state`; `unavailable_sensors[]` (present-but-unreadable sensors, DEC-193); `active_profile_id`/`active_profile_name` (active profile, DEC-194); `readiness` (compact cached hardware-readiness rollup for the GUI Dashboard chip — `{overall, critical, warning, info, top_summary, top_code}`, DEC-206) |
+| GET | `/status` | Subsystem health + freshness; `thermal_state`; `unavailable_sensors[]` (present-but-unreadable sensors, DEC-193); `skipped_controls[]` (controls the engine cannot resolve, so is not commanding — 273-i); `active_profile_id`/`active_profile_name` (active profile, DEC-194); `readiness` (compact cached hardware-readiness rollup for the GUI Dashboard chip — `{overall, critical, warning, info, top_summary, top_code}`, DEC-206) |
 | GET | `/sensors` | All temperature readings (each entry optionally carries a curated hwmon `thresholds` object — DEC-117; each also carries `control_eligible: bool` — DEC-193) |
 | GET | `/fans` | Fan RPM + last commanded PWM (+ `stall_detected`) |
-| GET | `/poll` | Batch: status (incl. `unavailable_sensors[]`, `active_profile_*`, `readiness` rollup) + sensors (incl. `control_eligible`) + fans |
+| GET | `/poll` | Batch: status (incl. `unavailable_sensors[]`, `skipped_controls[]`, `active_profile_*`, `readiness` rollup) + sensors (incl. `control_eligible`) + fans |
 | GET | `/sensors/history` | Per-entity time-series (ring buffer) |
 | GET | `/capabilities` | Device list, feature flags, limits, `amd_gpu.kernel_warnings` (kernel-version regression catalogue, DEC-098) |
 | GET | `/config` | Effective merged configuration (DEC-243): per key its on-disk `value`, the `running_value` this process started with, `source` (`runtime`/`admin`/`default`), `mutable`, `requires_restart`, `restart_pending`, and `requires_privilege` where a drop-in is also needed. `/capabilities` carries no configuration at all — this is the only read side |
@@ -341,6 +370,16 @@ reason, unavailable_for_ms}`. Each live `sensors` entry also carries
 `control_eligible: bool` (derived from `is_wireless_phy_chip(chip_name)`). Both
 fields are additive — older clients ignore them; the GUI defaults
 `control_eligible = true` and `unavailable_sensors = []` when absent.
+
+**Controls that cannot be resolved (273-i).** A control whose curve will not
+resolve is skipped — no command, fans hold their last duty. After three
+consecutive skipped ticks it is logged once at WARN and surfaced on `/status` +
+`/poll` as `skipped_controls[] = {control_id, control_name, reason,
+skipped_for_ms}`, and logged once more when it resolves. `reason` is a stable
+token (`curve_not_found` | `sensor_unavailable` | `mix_unresolvable` |
+`sync_unresolvable`); the client owns the wording. Additive and omitted when
+empty, so an older client sees the wire shape it always did and a newer client
+reads `skipped_controls = []` from an older daemon. See Safety Model item 3.
 
 **Read-only hwmon discovery + readiness (DEC-200, additive, GUI-facing):** `GET
 /inventory/hwmon` returns a structured, read-only snapshot — temperature sensors
