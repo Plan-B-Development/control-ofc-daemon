@@ -1,5 +1,60 @@
 # Changelog
 
+## [2.20.1] — 2026-08-21
+
+### Fixed
+- **A fan could stop responding to a hot CPU when a different sensor went
+  quiet.** 2.20.0 stopped a combined (Mix) curve from quietly *lowering* its fan
+  speed while one of its inputs was unavailable — but it did so by switching the
+  control off entirely for as long as that input was missing. That is the right
+  answer only when the missing input was the one asking for speed. When the
+  *surviving* input is the hot one it is exactly wrong: a live CPU reading of
+  95 °C sat there while the fan stayed at its old speed, waiting for the 105 °C
+  emergency. Reaching it needed nothing unusual — one GPU or coolant sensor
+  falling behind, being dropped after a missed read, or being quarantined, is
+  enough, and a quarantine can last indefinitely.
+  A combined curve now runs on the inputs it still has, and is separately
+  forbidden to command *less* than it already was until they are all back. Both
+  halves are needed: the first lets a hot survivor drive the fan, the second is
+  what stops the speed falling while the daemon cannot see. Curves whose inputs
+  all disappear still hold, as before. DEC-272.
+- **A combined curve naming a sensor your machine does not have went silent.**
+  Same cause. Profiles are allowed to name sensors that are not present — moving
+  one between machines is expected, and an unknown sensor is a warning rather
+  than an error — but in 2.20.0 such a control was never commanded at all, where
+  before it ran on the sensors that do exist. It does again. DEC-272.
+- **One unreadable chip could switch off sensor cleanup for the whole session.**
+  2.20.0 stopped trusting a hardware scan that could not read some chip, so that
+  a momentary failure would not be mistaken for the chip being removed. But it
+  distrusted the *whole* scan, and a chip that fails to enumerate contributes
+  nothing that would trigger a re-scan — so with a persistently unreadable chip
+  present, readings for genuinely removed sensors were never cleaned up again,
+  which is the condition the missing-sensor safety fallback needs in order to
+  fire. The distinction is now drawn per chip: the unreadable chip's readings are
+  protected, everything else is cleaned up as normal. DEC-272.
+- **A sensor could be renamed by a failed label read.** A temperature sensor's
+  label is not decoration — it forms part of the sensor's identity and decides
+  whether it counts as a CPU sensor. If the label file existed but would not
+  read, it silently became empty, which renamed the sensor and, on some
+  motherboard chips, reclassified a CPU sensor as a generic one. The scan looked
+  clean, so the old reading was then discarded as though the sensor had gone.
+  A label that will not read now fails its chip for that scan, which protects its
+  readings instead of replacing them. DEC-272.
+- **`systemctl stop` could take an unpredictable time to finish** in the OpenFan
+  polling path, for the same reason it could in the sensor path — a stop request
+  and a due poll arriving together were chosen between at random. Stop requests
+  now always win in both. DEC-272.
+
+### Internal
+- Continuous integration now builds and tests against the committed lockfile. It
+  did not, and cargo quietly regenerates that file when it is out of date, so a
+  version bump that forgot to update it passed every check here and failed only
+  in the packaging build — after the release tag was already public. A test that
+  tried to catch the same thing by reading the lockfile could never have worked:
+  running it was what repaired the file it was inspecting. DEC-272.
+- The release changelog check now also rejects an empty section, which fails the
+  release the same way a missing one does, and equally late. DEC-272.
+
 ## [2.20.0] — 2026-08-21
 
 ### Fixed
