@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Internal
+- A rejected publishing token now says so. When the token that tells the package
+  repository about a new release expires, the release itself still succeeds and
+  looks complete — only publication silently stops, and the next day's check
+  reports it as "the repository is stale", which points at the wrong thing
+  entirely. That misdiagnosis has already cost two releases. The failure is now
+  named, along with the fact that no new tag is needed to recover. OPEN-07b.
+
 ## [2.20.1] — 2026-08-21
 
 ### Fixed

@@ -596,3 +596,45 @@ fn changelog_has_a_section_for_the_current_version() {
          public, so no Release is created and notify-repo never fires."
     );
 }
+
+/// A dead `PACMAN_REPO_TOKEN` must say so, not present as a mystery HTTP error.
+///
+/// OPEN-07b, and the second time this exact failure mode has cost a release:
+/// DEC-242 records a `notify-repo` 401 hiding across two of them. The mechanics
+/// are what make it expensive — the GitHub Release is created and correct, so the
+/// run *looks* finished, while the pacman repository goes on serving the previous
+/// version and the next `verify.yml` calls that "repo is stale". Everything points
+/// at the repository and nothing at the token.
+///
+/// Pinned rather than trusted because the diagnosis is pure prose: nothing breaks
+/// if it is deleted, and the step still "works" without it. A future edit that
+/// reinstates a bare `gh api` under `set -e` would restore the silent version.
+#[test]
+fn notify_repo_names_an_auth_failure_instead_of_reporting_a_mystery() {
+    let block = job_block(&release_workflow(), "notify-repo");
+
+    // Assert the case BRANCH, not the prose. The first version checked for the
+    // bare string, which stays true when only the branch pattern is deleted — the
+    // error message still names the code. Measured: that mutation passed.
+    for status in ["HTTP 401", "HTTP 403", "HTTP 404"] {
+        let pattern = format!("*\"{status}\"*");
+        assert!(
+            block.contains(&pattern),
+            "notify-repo must have a case branch matching {status} — a bare `gh api` \
+             failure reads as a URL typo when it is almost always the token \
+             (OPEN-07b). Naming the code in a message is not branching on it."
+        );
+    }
+    assert!(
+        block.contains("RE-RUN THIS JOB"),
+        "the 401 branch must tell the operator the release is intact and only this \
+         job needs re-running — the expensive part of this failure was people \
+         assuming a new tag was required"
+    );
+    // `set -e` would abort at the failed `gh api` before any of the above ran.
+    assert!(
+        !block.contains("set -euo pipefail") || block.matches("set -uo pipefail").count() > 0,
+        "the dispatch step must not run under `set -e`, which aborts before the \
+         diagnosis can be printed"
+    );
+}
