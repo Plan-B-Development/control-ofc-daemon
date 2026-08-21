@@ -355,7 +355,11 @@ pub(crate) fn curve_output_for_control(
 
 /// Classify WHY [`curve_output_for_control`] returned None (273-i).
 ///
-/// Called only on the cold `None` path, so the hot path pays nothing for it.
+/// Called by the tick body for every curve-mode control, resolved or not: the
+/// call site binds the result before calling the resolver (`Option::ok_or` is
+/// eager, and classifying afterwards would need `curve` re-borrowed past a
+/// mutable borrow of `engine_state`). Cheap — one `curve_type` match — but NOT
+/// free, which is what this comment used to claim.
 /// Deliberately a separate classifier rather than changing the resolver to
 /// return `Result<f64, SkipReason>`: that would touch every caller and every
 /// golden-vector test in the parity oracle for what is a display-only field.

@@ -347,8 +347,11 @@ pub fn evaluate_profile_with_overrides(
         //
         // 273-i: a skip now carries WHY, so the tick body can log it once and
         // publish it on `/status` instead of the control going silently
-        // uncommanded. The classification runs only on this cold path — a
-        // resolved control pays nothing for it.
+        // uncommanded. Note the classification is computed EAGERLY for every
+        // curve-mode control, resolved or not: `Option::ok_or` takes its argument
+        // by value, and the `let` below is unconditional. That is deliberate — see
+        // the borrow note at the binding — and it costs one `curve_type` match per
+        // curve-mode control per tick, not nothing.
         let raw_output: Result<f64, SkipReason> = if control.mode == "manual" {
             Ok(control.manual_output_pct)
         } else {
@@ -1465,8 +1468,13 @@ mod tests {
     /// publish only happened after evaluation, the list would freeze at whatever
     /// it said before the emergency and keep asserting "this control is not
     /// being commanded" about a machine that is now forcing every fan to 100%.
-    /// The fix is an unconditional clear at the top of the tick; this pins it by
-    /// seeding a stale list and requiring one emergency tick to clear it.
+    /// The fix is the single publish in `TickCompletion::drop`, which every exit
+    /// path runs through — NOT a clear at the top of the tick, which was tried and
+    /// withdrawn for opening a torn-read window. This pins it by seeding a stale
+    /// list and requiring one emergency tick to clear it. Stated precisely because
+    /// a maintainer debugging a failure here who trusted the old wording would go
+    /// looking for a top-of-tick clear, and adding one re-opens that window and
+    /// reds `the_skipped_list_is_published_exactly_once_per_tick`.
     #[tokio::test]
     async fn a_thermal_emergency_tick_clears_the_skipped_list() {
         let cache = make_cache_with_sensor("cpu", 110.0); // over the 105 °C line
@@ -1629,7 +1637,14 @@ mod tests {
         };
         let cache = make_cache_with_sensor("cpu", 40.0); // no thermal emergency
 
-        run_engine_ticks(cache.clone(), Some(profile), SKIP_DEBOUNCE_TICKS).await;
+        let observed = cache.clone();
+        run_engine_ticks_until(
+            cache.clone(),
+            Some(profile),
+            SKIP_DEBOUNCE_TICKS,
+            move || observed.read_with(|s| !s.skipped_controls.is_empty()),
+        )
+        .await;
 
         let skipped = cache.read_with(|s| s.skipped_controls.clone());
         assert_eq!(
@@ -1656,6 +1671,26 @@ mod tests {
 
     /// As above, but let `ticks` of the 1 Hz loop complete before stopping.
     async fn run_engine_ticks(cache: Arc<StateCache>, profile: Option<DaemonProfile>, ticks: u32) {
+        run_engine_ticks_until(cache, profile, ticks, || true).await;
+    }
+
+    /// As `run_engine_ticks`, but wait — bounded — until `ready` observes what the
+    /// caller is about to assert, instead of trusting a fixed wall-clock margin.
+    ///
+    /// The old form slept `200 + 1000*(ticks-1)` ms and assumed the Nth tick's
+    /// guard had dropped by then. On a loaded runner a final tick delayed past
+    /// 200 ms turns `a_real_tick_publishes_a_skipped_control_to_the_cache` — the
+    /// ONE test that pins the tick body actually handing its findings to the guard
+    /// — red for a reason that has nothing to do with the code, and a flaky guard
+    /// is a guard someone eventually deletes. Callers asserting an ABSENCE pass
+    /// `|| true`: there is nothing to wait for, and polling for "still empty"
+    /// would prove nothing.
+    async fn run_engine_ticks_until(
+        cache: Arc<StateCache>,
+        profile: Option<DaemonProfile>,
+        ticks: u32,
+        ready: impl Fn() -> bool,
+    ) {
         let (tx, rx) = tokio::sync::watch::channel(false);
         let handle = tokio::spawn(profile_engine_loop(
             cache,
@@ -1667,13 +1702,18 @@ mod tests {
             Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
             rx,
         ));
-        // The interval fires immediately, then once a second. 200 ms of slack
-        // past the last expected tick is enough for it to complete and not
-        // enough to admit another.
+        // The interval fires immediately, then once a second. `saturating_sub`
+        // rather than `- 1`: `ticks == 0` would underflow and sleep ~584 million
+        // years in debug... or panic. No caller passes 0 today.
         tokio::time::sleep(std::time::Duration::from_millis(
-            200 + 1000 * u64::from(ticks - 1),
+            200 + 1000 * u64::from(ticks.saturating_sub(1)),
         ))
         .await;
+        // Then poll, bounded, for what the caller actually cares about.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
         let _ = tx.send(true);
         // Bounded: a hung join would turn a red test into a hung CI job
         // (DEC-272 trap 3).

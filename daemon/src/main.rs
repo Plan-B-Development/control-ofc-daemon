@@ -210,7 +210,15 @@ async fn wait_for_stop(
 }
 
 fn install_panic_hook() {
-    // Called as the first statement of `main`, so this IS the main thread.
+    // MAIN_THREAD is captured by `fn main` BEFORE `block_on`, not here. This
+    // function is the first statement of `async_main`, so "the current thread" is
+    // whatever thread happens to be polling the future. That is the main thread
+    // today only because `block_on` polls on its caller and nothing `.await`s
+    // ahead of this call — neither of which is pinned by anything. The captured id
+    // gates `panic_is_fatal`, which gates the whole panic-time hardware restore:
+    // capture it on a worker and a fatal main-thread panic is classified
+    // "contained", so the fans are never restored. Belt-and-braces `set` here is
+    // a no-op once `main` has run (OnceLock), and covers any future direct caller.
     let _ = MAIN_THREAD.set(std::thread::current().id());
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -877,6 +885,11 @@ async fn finish_shutdown<F>(
 /// intentional: a restart must not be delayed by waiting on the very read that
 /// wedged, and exiting from inside the async body is what skips the drop.
 fn main() {
+    // Capture the main thread's identity HERE, before the runtime exists, so it
+    // cannot be recorded on a tokio worker. `panic_is_fatal` compares against it
+    // to decide whether a panic ends the process — and therefore whether the
+    // hardware restore runs at all.
+    let _ = MAIN_THREAD.set(std::thread::current().id());
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

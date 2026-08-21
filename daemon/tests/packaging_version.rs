@@ -597,6 +597,29 @@ fn changelog_has_a_section_for_the_current_version() {
     );
 }
 
+/// The single step in `notify-repo` whose `run:` performs the pacman-repo dispatch.
+///
+/// Scoping matters and this is not cosmetic. The peer-wait step earlier in the same
+/// job carries its own `set -uo pipefail`, so a whole-job scan is satisfied by THAT
+/// occurrence alone. Reinstating `set -euo pipefail` on the dispatch step — the exact
+/// OPEN-07b regression the guard below exists to catch — left the previous whole-job
+/// version of it green. Found by two reviewers independently in the v2.44.0
+/// pre-release review, and reproduced against the real job text before being fixed.
+fn dispatch_step(wf: &str) -> String {
+    let block = job_block(wf, "notify-repo");
+    let matching: Vec<&str> = block
+        .split("- name:")
+        .filter(|s| s.contains("repos/Plan-B-Development/pacman-repo/dispatches"))
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "expected exactly one dispatching step in notify-repo, got {}",
+        matching.len()
+    );
+    matching[0].to_string()
+}
+
 /// A dead `PACMAN_REPO_TOKEN` must say so, not present as a mystery HTTP error.
 ///
 /// OPEN-07b, and the second time this exact failure mode has cost a release:
@@ -611,7 +634,7 @@ fn changelog_has_a_section_for_the_current_version() {
 /// reinstates a bare `gh api` under `set -e` would restore the silent version.
 #[test]
 fn notify_repo_names_an_auth_failure_instead_of_reporting_a_mystery() {
-    let block = job_block(&release_workflow(), "notify-repo");
+    let block = dispatch_step(&release_workflow());
 
     // Assert the case BRANCH, not the prose. The first version checked for the
     // bare string, which stays true when only the branch pattern is deleted — the
@@ -631,10 +654,20 @@ fn notify_repo_names_an_auth_failure_instead_of_reporting_a_mystery() {
          job needs re-running — the expensive part of this failure was people \
          assuming a new tag was required"
     );
-    // `set -e` would abort at the failed `gh api` before any of the above ran.
+    // What actually keeps the diagnosis reachable is that `gh api` runs as an `if`
+    // CONDITION: bash never applies errexit to a command in that position, with or
+    // without `-e`. The previous assertion credited the absent `-e` instead, which is
+    // not the load-bearing part — it kept passing with the `if` unwrapped, and that
+    // is the edit that actually reintroduces the silent failure.
     assert!(
-        !block.contains("set -euo pipefail") || block.matches("set -uo pipefail").count() > 0,
-        "the dispatch step must not run under `set -e`, which aborts before the \
-         diagnosis can be printed"
+        block.contains("if err=$(gh api"),
+        "the `gh api` call must run as an `if` CONDITION so a failure falls through \
+         to the 401/403/404 diagnosis instead of aborting the step (OPEN-07b). This, \
+         not the absence of `set -e`, is what makes the diagnosis reachable."
+    );
+    assert!(
+        block.contains("set -uo pipefail") && !block.contains("set -euo pipefail"),
+        "the dispatch step must not run under `set -e` — belt-and-braces for any \
+         future command added here that is NOT wrapped in an `if` condition"
     );
 }

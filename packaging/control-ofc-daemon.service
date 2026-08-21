@@ -52,7 +52,11 @@ RestartSec=3
 # stall the restore past every timeout above. `shutdown_sequence`'s own doc
 # comment has recorded that residual window since DEC-146. Capping systemd's
 # patience at 20 s rather than the ~90 s default bounds the stop-job case;
-# ExecStopPost=control-ofc-restore-auto then runs and hands the fans back.
+# ExecStopPost=control-ofc-restore-auto then runs. Note what that does and does
+# NOT cover: the script restores hwmon `pwm*_enable` and GPU `fan_curve` only.
+# OpenFan channels are USB-serial with no firmware-auto to fall back to, so they
+# stay latched at the last commanded duty until a daemon owns them again. Fans
+# hold, never fall — but this is not a full hand-back and must not be read as one.
 # Register row 277-b tracks bounding the restore itself, which is the real fix
 # and the only one that also covers the no-stop-job (Restart=on-failure) path.
 TimeoutStopSec=20

@@ -208,11 +208,15 @@ inside the band cannot pin the pre-settle fan speed indefinitely.
    - The debounce is load-bearing, not politeness: `curve_eligible`'s freshness
      budget floors at 5 s, so a sensor on that boundary flaps, and edge-triggering
      at 1 Hz would reproduce exactly the journal spam DEC-193 was written to stop
-   - The list is cleared UNCONDITIONALLY at the top of every tick, before the
-     thermal-force and no-profile early exits, so a tick that evaluates nothing
-     publishes "nothing skipped" rather than leaving the previous tick's claim
-     standing. Three explicit publishes were rejected: a fourth `continue` added
-     later would silently freeze the list. Same lesson as DEC-249
+   - The list is published EXACTLY ONCE per tick, from `TickCompletion::drop`, so
+     every exit path — both `continue`s, the mid-tick `break` and the normal end —
+     publishes, and a tick that evaluates nothing publishes "nothing skipped"
+     rather than leaving the previous tick's claim standing. Two earlier shapes
+     were rejected: three explicit publishes (a fourth `continue` added later
+     would silently freeze the list), and then clear-at-top/refill-at-bottom,
+     which satisfied that but opened a window where a client polling mid-tick was
+     told nothing was wrong — two free-running 1 Hz clocks drift through each
+     other, so it is hit periodically rather than never. Same lesson as DEC-249
    - Display-only. It changes no control decision, and a skipped control's fans
      still report RPM — what is unknown is only whether anything is commanding
      them, which is what the list says

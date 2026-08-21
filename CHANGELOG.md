@@ -33,7 +33,12 @@
   already handed back to firmware before this point, and a restart-forcing exit
   never took this path — so what changes is only how long the machine waits.
   The packaged service file also caps systemd's own patience at 20 seconds, as a
-  backstop rather than the mechanism. 273-b.
+  backstop rather than the mechanism.
+  One older case is not covered by either, and is not new here: the hand-back
+  itself waits on the fan-control chip, so a chip that wedges *mid-write* can
+  hold the daemon open past every limit above — and on the restart path there is
+  no systemd stop job to cut that short. Fans hold their last speed throughout.
+  273-b.
 
 ### Changed
 - **The "sensor not found" warning now describes what actually happens.** Saving
