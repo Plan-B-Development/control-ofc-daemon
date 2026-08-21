@@ -40,14 +40,21 @@ Environment=HOME=/root
 Restart=on-failure
 RestartSec=3
 
-# Defence in depth only — NOT the mechanism that bounds shutdown (273-b).
-# The daemon bounds its own teardown: `shutdown_sequence` allows 3 s per task
-# (IPC server + up to three poll/engine tasks) and the runtime teardown adds at
-# most RUNTIME_SHUTDOWN_TIMEOUT (2 s), so a clean stop completes in ~14 s worst
-# case. This caps how long systemd waits before SIGKILL if that ever fails,
-# instead of the ~90 s default. It is deliberately generous relative to the
-# daemon's own bound, so a legitimately slow stop is never killed mid-restore;
-# ExecStopPost=control-ofc-restore-auto backstops the SIGKILL case regardless.
+# Defence in depth — NOT the mechanism that bounds shutdown (273-b).
+# The daemon bounds most of its own teardown: `shutdown_sequence` allows 3 s per
+# task (IPC server + up to three poll/engine tasks) and the runtime teardown adds
+# at most RUNTIME_SHUTDOWN_TIMEOUT (2 s). Those parts total ~14 s.
+#
+# It is NOT a total bound, and this line is what covers the gap. The hardware
+# restore itself takes the hwmon controller mutex with no timeout, and the engine
+# write path holds that same mutex across a sysfs write inside `spawn_blocking`
+# (`backends.rs`), which cannot be cancelled — so a chip that wedges mid-write can
+# stall the restore past every timeout above. `shutdown_sequence`'s own doc
+# comment has recorded that residual window since DEC-146. Capping systemd's
+# patience at 20 s rather than the ~90 s default bounds the stop-job case;
+# ExecStopPost=control-ofc-restore-auto then runs and hands the fans back.
+# Register row 277-b tracks bounding the restore itself, which is the real fix
+# and the only one that also covers the no-stop-job (Restart=on-failure) path.
 TimeoutStopSec=20
 
 # Privilege model: daemon runs as root, declared explicitly via User=root

@@ -47,6 +47,17 @@
   cannot act on correctly is worse than no warning. 273-h.
 
 ### Internal
+- **A crash while shutting down no longer reintroduces the hang.** The bound
+  added above covered the normal path only; a panic on the way out unwound
+  straight past it and went back to waiting forever — restoring the problem
+  precisely when something had already gone wrong. It is now bounded on both
+  paths.
+- **The "not being controlled" list can no longer be read half-written.** It was
+  cleared at the start of each cycle and refilled at the end, so a client asking
+  in between was told nothing was wrong. The daemon and the GUI both work on
+  one-second cycles that drift through each other, so that gap would be hit
+  periodically rather than never — the warning would blink off for a moment at a
+  time. It is now published once per cycle, as a single value.
 - **The exit that recovers from a dead fan-control engine is now tested.** If
   the engine dies, the daemon restores the hardware and then exits non-zero so
   systemd restarts it with a working engine — and that "and then" is the whole

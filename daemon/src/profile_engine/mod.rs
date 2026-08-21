@@ -504,11 +504,46 @@ pub fn evaluate_profile_with_overrides(
 /// that it took an exit somebody forgot to instrument. A panic mid-tick also
 /// drops it, which is correct: the task is dead either way and both stamps then
 /// freeze together.
-struct TickCompletion<'a>(&'a StateCache);
+struct TickCompletion<'a> {
+    cache: &'a StateCache,
+    /// 273-i: this tick's skipped-control list, published on drop.
+    ///
+    /// Carried here rather than published inline because the list is ONE logical
+    /// value and must reach the cache in ONE write. Clearing it at the top of the
+    /// tick and republishing at the bottom also satisfied "an early `continue`
+    /// cannot leave it stale", but opened a window: a `/poll` landing between the
+    /// two saw `skipped_controls: []` while a control was genuinely uncommanded.
+    /// The engine and the GUI are two free-running 1 Hz clocks whose phases drift
+    /// through each other, so that window is hit periodically — the warning would
+    /// blink off for one poll at a time.
+    ///
+    /// Dropping publishes on EVERY exit path (both early `continue`s, the
+    /// mid-tick shutdown `break`, and the normal end), so DEC-249's
+    /// unreachable-by-construction property is kept and the window is gone. A
+    /// tick that evaluated nothing publishes the empty default, which is correct:
+    /// nothing was evaluated, so nothing is skipped.
+    skipped: Vec<SkippedControl>,
+}
+
+impl<'a> TickCompletion<'a> {
+    fn new(cache: &'a StateCache) -> Self {
+        Self {
+            cache,
+            skipped: Vec::new(),
+        }
+    }
+
+    /// Record what this tick found. Not published until drop.
+    fn set_skipped(&mut self, skipped: Vec<SkippedControl>) {
+        self.skipped = skipped;
+    }
+}
 
 impl Drop for TickCompletion<'_> {
     fn drop(&mut self) {
-        self.0.record_engine_tick_complete();
+        self.cache
+            .update_skipped_controls(std::mem::take(&mut self.skipped));
+        self.cache.record_engine_tick_complete();
     }
 }
 
@@ -771,28 +806,12 @@ pub async fn profile_engine_loop(
         // cannot. Do not conclude from the supervisor's existence that this is
         // redundant, or from this that the supervisor is.
         cache.record_engine_tick(decision.thermal_state);
-        // 273-i: clear the skipped-controls list HERE, unconditionally, before
-        // any of this tick's early exits.
-        //
-        // Every `continue` below (thermal force, no profile) leaves the tick
-        // without evaluating anything, and "nothing was evaluated" must publish
-        // as "nothing is skipped" rather than as last tick's list. Three explicit
-        // publishes — one per exit — were rejected: a fourth `continue` added
-        // later would silently freeze the list, and nothing would fail. Clearing
-        // once, up here, makes that failure mode unreachable instead of
-        // test-guarded. The real list is published after evaluation below; the
-        // empty/empty fast path makes this a shared read lock in the common case.
-        //
-        // Deliberately adjacent to the heartbeat: if a future `continue` is ever
-        // added ABOVE this point, both freeze together and the heartbeat reports
-        // the outage — which is DEC-249's whole argument.
-        cache.update_skipped_controls(Vec::new());
         // DEC-259: pairs the start stamp above with a completion stamp on every
         // exit from this body. Without the pair a *slow* tick was indistinguishable
         // from a *stopped* engine, and the surface reported the worse of the two —
         // "fan control and thermal safety are stalled" while `force_all` was
         // actively driving the 105°C emergency below.
-        let _tick_done = TickCompletion(&cache);
+        let mut tick_done = TickCompletion::new(&cache);
 
         if let Some(forced_pct) = decision.forced_pct {
             // Forced safety override — all OpenFan channels and writable
@@ -893,7 +912,7 @@ pub async fn profile_engine_loop(
                 }
             }
         }
-        cache.update_skipped_controls(engine_state.skipped_snapshot());
+        tick_done.set_skipped(engine_state.skipped_snapshot());
 
         // If shutdown was signalled while this tick was computing (after the
         // `select!` arm, before the write phase), stop here so the engine does
@@ -1499,6 +1518,131 @@ mod tests {
         );
     }
 
+    /// [SAFETY-adjacent] 273-i — the skipped list must reach the cache in ONE
+    /// write per tick.
+    ///
+    /// The first version cleared it at the top of the tick and republished at the
+    /// bottom. That satisfied "an early `continue` cannot leave it stale", but a
+    /// `/poll` landing between the two saw `skipped_controls: []` while a control
+    /// was genuinely uncommanded — and since the engine and the GUI are two
+    /// free-running 1 Hz clocks whose phases drift through each other, that
+    /// window is hit periodically rather than never. The warning would blink off
+    /// for one poll at a time, which is worse than a warning that stays on.
+    ///
+    /// Behaviour cannot see a window that only exists between two statements, so
+    /// this asserts the structural property instead: exactly one call site, in
+    /// the guard's `drop`. Same tool and reasoning as `polling.rs`'s biased pin.
+    #[test]
+    fn the_skipped_list_is_published_exactly_once_per_tick() {
+        let whole = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/profile_engine/mod.rs"
+        ));
+        // Production half only — otherwise this matches its own literals, which
+        // is how the polling.rs version of this guard first passed.
+        let src = whole
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .expect("mod.rs has a #[cfg(test)] module");
+
+        let calls = src.matches("update_skipped_controls(").count();
+        assert_eq!(
+            calls, 1,
+            "the skipped list must reach the cache through exactly ONE call — a \
+             second one means it is published in two phases again, and a poll \
+             landing between them reports nothing skipped while a fan is \
+             uncommanded (found {calls})"
+        );
+        assert!(
+            src.contains("impl Drop for TickCompletion")
+                && src[src.find("impl Drop for TickCompletion").unwrap()..]
+                    .contains("update_skipped_controls"),
+            "the one call must live in TickCompletion::drop, so every exit path \
+             from the tick publishes exactly once"
+        );
+    }
+
+    /// The guard publishes an EMPTY list when the tick set nothing — which is
+    /// what makes an early `continue` correct rather than merely tolerated.
+    #[test]
+    fn the_tick_guard_publishes_empty_when_nothing_was_evaluated() {
+        let cache = Arc::new(StateCache::new());
+        cache.update_skipped_controls(vec![SkippedControl {
+            control_id: "stale".into(),
+            control_name: "Stale".into(),
+            reason: SkipReason::MixUnresolvable,
+            since: Instant::now(),
+        }]);
+
+        drop(TickCompletion::new(&cache));
+
+        assert!(
+            cache.read_with(|s| s.skipped_controls.is_empty()),
+            "a tick that recorded nothing must retire the previous list"
+        );
+    }
+
+    #[test]
+    fn the_tick_guard_publishes_what_the_tick_recorded() {
+        let cache = Arc::new(StateCache::new());
+        {
+            let mut guard = TickCompletion::new(&cache);
+            guard.set_skipped(vec![SkippedControl {
+                control_id: "ctl".into(),
+                control_name: "Ctl".into(),
+                reason: SkipReason::SyncUnresolvable,
+                since: Instant::now(),
+            }]);
+            assert!(
+                cache.read_with(|s| s.skipped_controls.is_empty()),
+                "nothing is published before the guard drops — that single write \
+                 at the end is what removes the torn-read window"
+            );
+        }
+        assert_eq!(cache.read_with(|s| s.skipped_controls.len()), 1);
+    }
+
+    /// [SAFETY-adjacent] 273-i — the END-TO-END path, which nothing else covers.
+    ///
+    /// Every other test here stops one step short: the tracker tests drive the
+    /// tracker, the evaluator tests read `engine_state`, and the two early-exit
+    /// loop tests only ever assert the list is EMPTY. Deleting
+    /// `tick_done.set_skipped(...)` from the tick body would leave all of them
+    /// green while the feature published nothing — the "extracting a rule does
+    /// not test the call site" trap this project has hit five times.
+    ///
+    /// So this runs the real loop against a real profile with an unresolvable
+    /// Mix and asserts the real cache ends up carrying it. It costs ~3.5 s of
+    /// wall clock because the debounce is three 1 Hz ticks and the tracker's
+    /// threshold is not injectable from here. That is the price of testing the
+    /// thing rather than a proxy for it, and it is one test.
+    #[tokio::test]
+    async fn a_real_tick_publishes_a_skipped_control_to_the_cache() {
+        let profile = DaemonProfile {
+            id: "mix".into(),
+            name: "Mix".into(),
+            version: 7,
+            description: "".into(),
+            controls: vec![openfan_control("ctl", "mx", "openfan:ch00")],
+            // "deleted" is not among the profile's curves → never resolvable.
+            curves: vec![mix_curve("mx", "max", &["deleted"])],
+        };
+        let cache = make_cache_with_sensor("cpu", 40.0); // no thermal emergency
+
+        run_engine_ticks(cache.clone(), Some(profile), SKIP_DEBOUNCE_TICKS).await;
+
+        let skipped = cache.read_with(|s| s.skipped_controls.clone());
+        assert_eq!(
+            skipped.len(),
+            1,
+            "after the debounce the cache must carry the skipped control — this \
+             is the only assertion that the tick body actually hands its findings \
+             to the guard"
+        );
+        assert_eq!(skipped[0].control_id, "ctl");
+        assert_eq!(skipped[0].reason, SkipReason::MixUnresolvable);
+    }
+
     /// Drive `profile_engine_loop` for exactly one tick against no hardware.
     ///
     /// `tokio::time::interval` fires immediately, so the first tick runs at once;
@@ -1507,6 +1651,11 @@ mod tests {
     /// time does not advance `std::time::Instant` — which is what every age in
     /// this engine is measured against.
     async fn run_one_engine_tick(cache: Arc<StateCache>, profile: Option<DaemonProfile>) {
+        run_engine_ticks(cache, profile, 1).await;
+    }
+
+    /// As above, but let `ticks` of the 1 Hz loop complete before stopping.
+    async fn run_engine_ticks(cache: Arc<StateCache>, profile: Option<DaemonProfile>, ticks: u32) {
         let (tx, rx) = tokio::sync::watch::channel(false);
         let handle = tokio::spawn(profile_engine_loop(
             cache,
@@ -1518,9 +1667,13 @@ mod tests {
             Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
             rx,
         ));
-        // Long enough for the immediate first tick to complete, short enough that
-        // the 1 Hz interval cannot produce a second one.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // The interval fires immediately, then once a second. 200 ms of slack
+        // past the last expected tick is enough for it to complete and not
+        // enough to admit another.
+        tokio::time::sleep(std::time::Duration::from_millis(
+            200 + 1000 * u64::from(ticks - 1),
+        ))
+        .await;
         let _ = tx.send(true);
         // Bounded: a hung join would turn a red test into a hung CI job
         // (DEC-272 trap 3).

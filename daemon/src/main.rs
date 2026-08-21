@@ -882,12 +882,26 @@ fn main() {
         .build()
         .expect("failed to build the tokio runtime");
 
-    runtime.block_on(async_main());
+    // Caught, not propagated, so the teardown below runs on the panic path too.
+    // Without this a panic on the main thread unwinds straight past
+    // `shutdown_timeout` and DROPS the runtime instead — the unbounded wait this
+    // whole function exists to remove, restored precisely when things are already
+    // going wrong. Reachable from `wait_for_stop`'s expects, `apply_config_reload`
+    // and the restore closure; neither crate sets `panic = "abort"`, so unwinding
+    // is live. The panic hook has already handed the hardware back by this point.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(async_main());
+    }));
 
     // Unblocks this thread after at most RUNTIME_SHUTDOWN_TIMEOUT, leaking any
     // still-running blocking task rather than waiting on it. The leaked thread
     // dies with the process, and the hardware was restored before we got here.
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+
+    // Re-raise so the process still exits non-zero and systemd still restarts it.
+    if let Err(payload) = outcome {
+        std::panic::resume_unwind(payload);
+    }
 }
 
 async fn async_main() {
@@ -2258,12 +2272,30 @@ mod tests {
         marker: &std::path::Path,
     ) -> std::process::ExitStatus {
         let exe = std::env::current_exe().expect("current_exe");
-        std::process::Command::new(exe)
+        let mut child = std::process::Command::new(exe)
             .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
             .env(var, marker)
-            .output()
-            .expect("re-exec the test binary")
-            .status
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("re-exec the test binary");
+
+        // Bounded wait, not `output()`. A wedged child would otherwise hang CI
+        // instead of failing it — the DEC-272 trap-3 shape, one process out.
+        // Today the child is bounded only incidentally by its own
+        // SHUTDOWN_TASK_TIMEOUT; nothing pinned that, so pin it here.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("probe child '{test_name}' did not exit within 30s");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Drive the real `finish_shutdown` with a restore closure that stamps
@@ -2448,6 +2480,12 @@ mod tests {
         assert!(
             src.contains("runtime.block_on(async_main())"),
             "main must drive async_main on a runtime it owns"
+        );
+        assert!(
+            src.contains("catch_unwind"),
+            "main must catch a panic from async_main, or the unwind drops the \
+             runtime and restores the unbounded wait on the very path where \
+             things are already going wrong"
         );
         assert!(
             src.contains("runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT)"),
