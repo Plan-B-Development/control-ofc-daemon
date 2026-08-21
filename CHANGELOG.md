@@ -1,13 +1,17 @@
 # Changelog
 
-## [Unreleased]
+## [2.20.0] — 2026-08-21
 
 ### Fixed
-- **A wedged sensor read froze the whole feed behind a healthy `/status`.** The
+- **A wedged sensor read froze the whole feed behind a ticking engine.** The
   poll task is supervised, but supervision fires on a task *dying*, and a
   blocking sysfs or NVIDIA-driver read that never returns leaves the task alive —
   so nothing fired and the daemon went on controlling fans from readings that
-  could no longer change. The blocking read is now bounded by the same freshness
+  could no longer change. `/status` was not silent about it: subsystem staleness
+  still crossed to `warn` and then `crit` as the readings aged. What stayed
+  reassuring was the engine heartbeat, which measures the control loop rather
+  than the feed underneath it, so the one indicator that looked healthiest was
+  the one least able to see the fault. The blocking read is now bounded by the same freshness
   budget the safety ladder uses, past which a still-running read cannot produce a
   value that rule would act on anyway. Crucially the loop does not start a second
   read behind a stuck one: a blocking read cannot be cancelled, so one per tick
@@ -29,10 +33,40 @@
   decides what a stale CPU reading means, and taking that over would have frozen
   a fan mid-ramp instead of letting it keep climbing. DEC-272.
 
+- **A frozen sensor could make a Mix curve command LESS cooling, not hold.** The
+  freshness rule above drops a stale sensor out of curve evaluation, and for an
+  ordinary curve that skips the control so its fans hold. A Mix curve instead
+  dropped just the unresolvable input and recombined whatever was left, so
+  `max(CPU, GPU)` with a frozen GPU sensor quietly became `max(CPU)` — and a fan
+  running at 100% for a GPU last seen at 85 °C fell to 36% in a single tick, with
+  nothing to damp it. `subtract` was stranger still: losing the first input
+  promoted the second to take its place, so the result could jump instead of
+  fall. A Mix now holds if *any* of its inputs is unavailable, which is what the
+  rest of the freshness work already promised. DEC-272.
+- **A sensor that could not be read was mistaken for one that had been removed.**
+  Discovery skips a chip whose own identity file will not read, so one bad chip
+  cannot hide every other one — but it then reported the shortened list as if it
+  were the whole truth, and the new vanished-sensor eviction believed it. A
+  single transient failure on the CPU chip therefore deleted a live CPU
+  temperature, which reads as *gone* rather than *stale* and so bypasses the rule
+  that holds a thermal emergency's fans up while a reading ages. A latched 105 °C
+  emergency dropped from 100% to the 40% no-sensor floor and back on the next
+  successful scan. Eviction is now suspended until a scan completes cleanly; a
+  genuinely removed chip leaves no directory behind, is never "skipped", and is
+  still evicted at once. DEC-272.
+- **A wedged sensor read made shutdown take an unpredictable amount of time.**
+  Once a stuck read's budget elapsed, the loop had a due tick and a pending stop
+  request ready at the same moment and chose between them at random, so
+  `systemctl stop` was observed taking 4.5 s, 9.5 s or longer with no upper
+  bound — the window in which systemd gives up and kills the process outright,
+  leaving the fans wherever they were. A stop request is now always taken first.
+  DEC-272.
+
 ### Internal
 - The main loop's shutdown decision — including whether a failure warrants a
   restart — is extracted and covered by tests. Every safety behaviour built on it
-  since 2.15 was previously verified only by reading the code. DEC-272.
+  since 2.18, when engine supervision landed, was previously verified only by
+  reading the code. DEC-272.
 
 ## [2.19.0] — 2026-08-20
 

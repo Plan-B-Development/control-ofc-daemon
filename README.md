@@ -1,6 +1,6 @@
 # control-ofc-daemon
 
-**Latest release:** v2.19.0 — 2026-08-20. Pairs with `control-ofc-gui` ≥ v2.23.0 (the recommended capability floor; the package itself only hard-blocks GUIs < 2.0.0, the sole-writer cutover). v2.42.0 or newer drives the new `POST /fans/openfan/rescan` route; older GUIs simply never call it. See [`CHANGELOG.md`](CHANGELOG.md) for the full history.
+**Latest release:** v2.20.0 — 2026-08-21. Pairs with `control-ofc-gui` ≥ v2.23.0 (the recommended capability floor; the package itself only hard-blocks GUIs < 2.0.0, the sole-writer cutover). v2.42.0 or newer drives the new `POST /fans/openfan/rescan` route; older GUIs simply never call it. See [`CHANGELOG.md`](CHANGELOG.md) for the full history.
 
 Rust workspace for the Control-OFC fan control daemon.
 
