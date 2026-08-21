@@ -149,6 +149,18 @@ pub async fn hwmon_poll_loop(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut consecutive_errors: u32 = 0;
+    // DEC-272: the in-flight blocking read, held across ticks so a wedged one is
+    // re-awaited rather than re-spawned. See the [SAFETY] note at the await site.
+    type PollTickOutput = (
+        Result<(Option<Vec<SensorDescriptor>>, SensorReadOutcome), crate::error::HwmonError>,
+        Vec<HwmonFanState>,
+        Vec<AmdGpuFanState>,
+    );
+    let mut pending: Option<tokio::task::JoinHandle<PollTickOutput>> = None;
+    // Set when the read now in flight was spawned with discovery enabled, and
+    // read when that read's result is processed — which, since DEC-272, can be a
+    // later tick than the one that spawned it.
+    let mut rescan_requested = false;
     let mut prev_boot: Option<Duration> = None;
     let mut prev_mono: Option<Instant> = None;
 
@@ -192,86 +204,134 @@ pub async fn hwmon_poll_loop(
         prev_boot = Some(now_boot);
         prev_mono = Some(now_mono);
 
-        // DEC-133/DEC-193: decide whether this tick re-runs sensor discovery.
-        // The failure tracker grants a still-failing descriptor exactly one
-        // re-discovery (the "did it actually unbind?" probe); once quarantined it
-        // no longer asks, which is what ends the per-`threshold` re-discovery spam.
-        let rescan_requested = sensor_rescan.swap(false, Ordering::SeqCst);
-        let wants_rediscovery = failure_tracker.wants_rediscovery();
-        let cpu_temp_missing = descriptors.iter().all(|d| d.kind != SensorKind::CpuTemp);
-        let needs_discovery =
-            !discovered_once || rescan_requested || wants_rediscovery || cpu_temp_missing;
-        if rescan_requested {
-            log::info!("Sensor descriptor refresh requested via /hwmon/rescan");
-        } else if wants_rediscovery && discovered_once {
-            log::warn!(
-                "Re-discovering sensors after persistent read failures on {:?}",
-                failure_tracker.rediscovery_ids()
-            );
-        }
+        // Wait for this tick's blocking read, starting one only if the previous
+        // tick's is not still running.
+        //
+        // [SAFETY] DEC-272 (register row 01-b). `spawn_blocking` CANNOT be
+        // cancelled: a timeout abandons the join, never the thread. Spawning a
+        // fresh read every tick while a wedged one still holds its thread fills
+        // tokio's blocking pool (512 by default) in roughly 8.5 minutes at 1 Hz,
+        // and once it is full EVERY `spawn_blocking` in the process starves —
+        // including the profile engine's PWM writes. That turns a stalled sensor
+        // feed into a dead sole writer, so single-flight here is load-bearing
+        // rather than tidiness. Re-awaiting `&mut handle` is cancel-safe, so an
+        // abandoned read is picked back up where it left off, not restarted.
+        let mut handle = match pending.take() {
+            Some(h) => h,
+            None => {
+                // DEC-133/DEC-193: decide whether this tick re-runs sensor discovery.
+                // The failure tracker grants a still-failing descriptor exactly one
+                // re-discovery (the "did it actually unbind?" probe); once quarantined it
+                // no longer asks, which is what ends the per-`threshold` re-discovery spam.
+                rescan_requested = sensor_rescan.swap(false, Ordering::SeqCst);
+                let wants_rediscovery = failure_tracker.wants_rediscovery();
+                let cpu_temp_missing = descriptors.iter().all(|d| d.kind != SensorKind::CpuTemp);
+                let needs_discovery =
+                    !discovered_once || rescan_requested || wants_rediscovery || cpu_temp_missing;
+                if rescan_requested {
+                    log::info!("Sensor descriptor refresh requested via /hwmon/rescan");
+                } else if wants_rediscovery && discovered_once {
+                    log::warn!(
+                        "Re-discovering sensors after persistent read failures on {:?}",
+                        failure_tracker.rediscovery_ids()
+                    );
+                }
 
-        // Run blocking sysfs I/O on the blocking thread pool
-        let root = hwmon_root.clone();
-        let hdrs = headers.clone();
-        let gpus = gpu_infos.clone();
-        let intel_gpus = intel_gpu_infos.clone();
-        let nouveau_gpus = nouveau_gpu_infos.clone();
-        let nvml = nvml_backend.clone();
-        let descs = descriptors.clone();
-        let result: Result<_, tokio::task::JoinError> = tokio::task::spawn_blocking(move || {
-            // NVIDIA NVML telemetry (opt-in, read-only, DEC-204): GPU temps merge
-            // into the sensor readings, fan states into the GPU fan set. Both are
-            // empty when NVML is disabled/absent (the default). Read once per tick.
-            // Like the sysfs reads below, these are blocking C calls with no
-            // per-call timeout: an NVIDIA driver fault could stall this tick until
-            // it returns. The existing backstops bound the blast radius (the
-            // shutdown-drain timeout still fires; and since DEC-267 the engine
-            // age-filters CPU readings, so a stall no longer leaves the 105 °C
-            // rule evaluating a frozen temperature forever).
-            //
-            // DEC-269: that backstop is narrower than this comment used to
-            // claim. A stall here leaves the task ALIVE, so `spawn_supervised`
-            // never fires — the freshness filter is the only thing covering it,
-            // and what it does depends on the last known temperature (hold the
-            // emergency, hold the recovery floor, keep curves running if it was
-            // hot, or fall to NO_SENSOR_SAFE_PCT if it was cool). A timeout
-            // wrapper around the whole blocking leg — which would benefit the
-            // sysfs reads too, and would turn a hang into a countable error —
-            // remains the real fix, and is deliberately still out of scope.
-            let (nvml_temps, nvml_fans) = read_nvml_states(&*nvml);
-            // Sensor leg: full discovery only when triggered; otherwise the
-            // hot path reads each cached descriptor's temp*_input file only.
-            // The read returns successes *and* failures (DEC-193) — the loop owns
-            // logging/quarantine policy, so this blocking leg stays silent.
-            let sensors: Result<
-                (Option<Vec<SensorDescriptor>>, SensorReadOutcome),
-                crate::error::HwmonError,
-            > = if needs_discovery {
-                crate::hwmon::discovery::discover_sensors(&root).map(|fresh| {
-                    let mut outcome = crate::hwmon::read_sensor_values(&fresh);
-                    outcome.readings.extend(nvml_temps.iter().cloned());
-                    (Some(fresh), outcome)
+                // Run blocking sysfs I/O on the blocking thread pool
+                let root = hwmon_root.clone();
+                let hdrs = headers.clone();
+                let gpus = gpu_infos.clone();
+                let intel_gpus = intel_gpu_infos.clone();
+                let nouveau_gpus = nouveau_gpu_infos.clone();
+                let nvml = nvml_backend.clone();
+                let descs = descriptors.clone();
+                tokio::task::spawn_blocking(move || {
+                    // NVIDIA NVML telemetry (opt-in, read-only, DEC-204): GPU temps merge
+                    // into the sensor readings, fan states into the GPU fan set. Both are
+                    // empty when NVML is disabled/absent (the default). Read once per tick.
+                    // Like the sysfs reads below, these are blocking C calls with no
+                    // per-call timeout: an NVIDIA driver fault could stall this tick until
+                    // it returns. The existing backstops bound the blast radius (the
+                    // shutdown-drain timeout still fires; and since DEC-267 the engine
+                    // age-filters CPU readings, so a stall no longer leaves the 105 °C
+                    // rule evaluating a frozen temperature forever).
+                    //
+                    // DEC-269 recorded that a stall here leaves the task ALIVE, so
+                    // `spawn_supervised` never fires, and named a timeout wrapper
+                    // around the whole blocking leg as the real fix while leaving it
+                    // out of scope. DEC-272 took it: the join is now bounded by
+                    // `cpu_temp_stale_after()` at the await site below, and the
+                    // outstanding handle is re-awaited rather than re-spawned. So a
+                    // stall here no longer stalls the LOOP — readings simply age out
+                    // and the freshness filters act on that.
+                    let (nvml_temps, nvml_fans) = read_nvml_states(&*nvml);
+                    // Sensor leg: full discovery only when triggered; otherwise the
+                    // hot path reads each cached descriptor's temp*_input file only.
+                    // The read returns successes *and* failures (DEC-193) — the loop owns
+                    // logging/quarantine policy, so this blocking leg stays silent.
+                    let sensors: Result<
+                        (Option<Vec<SensorDescriptor>>, SensorReadOutcome),
+                        crate::error::HwmonError,
+                    > = if needs_discovery {
+                        crate::hwmon::discovery::discover_sensors(&root).map(|fresh| {
+                            let mut outcome = crate::hwmon::read_sensor_values(&fresh);
+                            outcome.readings.extend(nvml_temps.iter().cloned());
+                            (Some(fresh), outcome)
+                        })
+                    } else {
+                        let mut outcome = crate::hwmon::read_sensor_values(&descs);
+                        outcome.readings.extend(nvml_temps.iter().cloned());
+                        Ok((None, outcome))
+                    };
+                    let fan_states: Vec<HwmonFanState> = read_hwmon_fan_states(&hdrs);
+                    // AMD + Intel + NVIDIA discrete GPU fans share the cache `gpu_fans`
+                    // map, distinguished by their ID prefix (`amd_gpu:` / `intel_gpu:` /
+                    // `nvidia_gpu:`). Intel + nouveau + NVML are read-only (last_commanded_pct None).
+                    let mut gpu_fan_states: Vec<AmdGpuFanState> = read_gpu_fan_states(&gpus);
+                    gpu_fan_states.extend(read_intel_fan_states(&intel_gpus));
+                    // nouveau and NVML both mint `nvidia_gpu:<BDF>` ids, but they can
+                    // never collide for the same BDF: nouveau (open) and the proprietary
+                    // driver that provides libnvidia-ml are mutually exclusive kernel
+                    // modules per GPU, so each BDF is produced by at most one of the two.
+                    gpu_fan_states.extend(read_nouveau_fan_states(&nouveau_gpus));
+                    gpu_fan_states.extend(nvml_fans);
+                    (sensors, fan_states, gpu_fan_states)
                 })
-            } else {
-                let mut outcome = crate::hwmon::read_sensor_values(&descs);
-                outcome.readings.extend(nvml_temps.iter().cloned());
-                Ok((None, outcome))
+            }
+        };
+
+        // Budget: `cpu_temp_stale_after()`, reused rather than duplicated as a new
+        // constant. It is already derived from the poll interval, already clamped
+        // and floored, and is by definition the instant the safety ladder stops
+        // trusting a reading — so a read still running past it cannot produce a
+        // value the 105 °C rule would act on. There is nothing left to wait for.
+        let result: Result<_, tokio::task::JoinError> =
+            match tokio::time::timeout(cache.cpu_temp_stale_after(), &mut handle).await {
+                Ok(joined) => joined,
+                Err(_) => {
+                    // Hold the handle so the next tick re-awaits THIS read instead
+                    // of stacking another one behind it.
+                    pending = Some(handle);
+                    consecutive_errors += 1;
+                    if consecutive_errors <= 3 {
+                        log::warn!(
+                            "hwmon poll read exceeded its freshness budget — readings will \
+                             age out until it returns"
+                        );
+                    } else if consecutive_errors == 4 {
+                        log::warn!(
+                            "hwmon poll read still overdue (suppressing until periodic \
+                             reminder)"
+                        );
+                    } else if consecutive_errors.is_multiple_of(60) {
+                        log::error!(
+                            "hwmon poll read wedged — {consecutive_errors} consecutive \
+                             ticks with no completed read; the sensor feed is frozen"
+                        );
+                    }
+                    continue;
+                }
             };
-            let fan_states: Vec<HwmonFanState> = read_hwmon_fan_states(&hdrs);
-            // AMD + Intel + NVIDIA discrete GPU fans share the cache `gpu_fans`
-            // map, distinguished by their ID prefix (`amd_gpu:` / `intel_gpu:` /
-            // `nvidia_gpu:`). Intel + nouveau + NVML are read-only (last_commanded_pct None).
-            let mut gpu_fan_states: Vec<AmdGpuFanState> = read_gpu_fan_states(&gpus);
-            gpu_fan_states.extend(read_intel_fan_states(&intel_gpus));
-            // nouveau and NVML both mint `nvidia_gpu:<BDF>` ids, but they can
-            // never collide for the same BDF: nouveau (open) and the proprietary
-            // driver that provides libnvidia-ml are mutually exclusive kernel
-            // modules per GPU, so each BDF is produced by at most one of the two.
-            gpu_fan_states.extend(read_nouveau_fan_states(&nouveau_gpus));
-            gpu_fan_states.extend(nvml_fans);
-            (sensors, fan_states, gpu_fan_states)
-        })
-        .await;
 
         match result {
             Ok((Ok((fresh_descriptors, outcome)), fan_states, gpu_fan_states)) => {
@@ -978,6 +1038,13 @@ mod tests {
     }
 
     fn spawn_poll_loop(root: std::path::PathBuf) -> PollHarness {
+        spawn_poll_loop_with_nvml(root, Arc::new(crate::hwmon::nvml::DisabledNvml))
+    }
+
+    fn spawn_poll_loop_with_nvml(
+        root: std::path::PathBuf,
+        nvml: Arc<dyn crate::hwmon::nvml::NvmlBackend>,
+    ) -> PollHarness {
         let cache = Arc::new(StateCache::new());
         let rescan = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -991,7 +1058,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
-                Arc::new(crate::hwmon::nvml::DisabledNvml),
+                nvml,
                 &root,
                 Duration::from_secs(1),
                 rescan2,
@@ -1005,6 +1072,110 @@ mod tests {
             shutdown_tx,
             handle,
         }
+    }
+
+    /// An NVML backend whose blocking read parks until released.
+    ///
+    /// This is the exact failure DEC-272 bounds: a driver fault stalls the
+    /// blocking leg with the *task still alive*, so `spawn_supervised` never
+    /// fires and nothing upstream notices.
+    ///
+    /// It polls a flag on a 20 ms sleep rather than parking on a channel purely
+    /// so the test can release it promptly. That is not a spin loop.
+    ///
+    /// The self-release cap is load-bearing, not belt-and-braces. Dropping a
+    /// tokio runtime BLOCKS until its outstanding blocking tasks finish, and a
+    /// failing assertion skips the test's own release — so an unbounded park
+    /// turns a red test into a hung one. Verified by mutation: without the cap,
+    /// deleting the single-flight guard hangs the suite instead of failing it.
+    const WEDGE_SELF_RELEASE: Duration = Duration::from_secs(15);
+
+    struct WedgingNvml {
+        entered: Arc<std::sync::atomic::AtomicUsize>,
+        release: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::hwmon::nvml::NvmlBackend for WedgingNvml {
+        fn read_all(&self) -> Vec<crate::hwmon::nvml::NvmlReading> {
+            self.entered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let deadline = std::time::Instant::now() + WEDGE_SELF_RELEASE;
+            while !self.release.load(std::sync::atomic::Ordering::SeqCst)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Vec::new()
+        }
+
+        fn devices(&self) -> Vec<crate::hwmon::nvml::NvmlDeviceIdentity> {
+            Vec::new()
+        }
+    }
+
+    /// [SAFETY] DEC-272 (register row 01-b). A wedged blocking read must never be
+    /// re-spawned while the previous one is still running — and bounding it must
+    /// not strand the loop on the abandoned handle either.
+    ///
+    /// `spawn_blocking` cannot be cancelled: a timeout abandons the join, never
+    /// the thread. A fresh read per tick therefore leaks one pool thread per
+    /// tick, and at tokio's default 512 the pool is exhausted in roughly 8.5
+    /// minutes at 1 Hz. After that EVERY `spawn_blocking` in the process starves,
+    /// including the profile engine's PWM writes — so the fix for a frozen sensor
+    /// feed would take out the sole writer. That is why single-flight is
+    /// load-bearing rather than tidiness.
+    ///
+    /// Real time, NOT `start_paused`: tokio will not auto-advance virtual time
+    /// while a blocking task is outstanding, which is precisely the state under
+    /// test — a paused-time version of this test hangs instead of failing. Both
+    /// halves share one test because the freshness budget floors at 5 s
+    /// (`cpu_temp_stale_after`: interval floored at 1 s, x5), so each wedge costs
+    /// real seconds and a second test would double that for no new coverage.
+    #[tokio::test]
+    async fn a_wedged_read_is_bounded_and_never_re_spawned() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_k10temp(tmp.path(), 55.0);
+
+        let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let nvml = Arc::new(WedgingNvml {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let h = spawn_poll_loop_with_nvml(tmp.path().to_path_buf(), nvml);
+
+        // Tick 1 fires at t=0 and wedges. Its budget elapses at t=5s, the next
+        // tick lands at t=6s (1 s interval, `Skip`). Asserting at t=7.5s means an
+        // unbounded loop has had two clear opportunities to spawn another read.
+        tokio::time::sleep(Duration::from_millis(7500)).await;
+        assert_eq!(
+            entered.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a wedged read must be re-awaited, never re-spawned — every extra \
+             spawn permanently leaks a blocking-pool thread"
+        );
+        assert!(
+            sensor_by_label(&h.cache, "Tctl").is_none(),
+            "precondition: nothing can land while the only read is wedged"
+        );
+
+        // The other half: releasing it must let the abandoned read complete and
+        // polling resume, rather than leaving the loop stuck on a dead handle.
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut resumed = false;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if sensor_by_label(&h.cache, "Tctl").is_some() {
+                resumed = true;
+                break;
+            }
+        }
+        assert!(
+            resumed,
+            "the loop must consume the abandoned read and resume polling"
+        );
+
+        stop(h).await;
     }
 
     async fn stop(h: PollHarness) {

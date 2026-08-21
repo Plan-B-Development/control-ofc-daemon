@@ -1026,9 +1026,12 @@ async fn main() {
     // a resting state to leave a machine in with no path back — hence the
     // restore-and-exit, so systemd brings the daemon back with a live loop.
     //
-    // Known limitation: this catches the loop *dying*, not *hanging*. A wedged
-    // blocking read leaves the task alive, so supervision never fires; the
-    // freshness filter is what covers that case.
+    // This catches the loop *dying*. A wedged blocking read leaves the task
+    // alive, so supervision never fires — that case is covered one level down by
+    // DEC-272, which bounds the blocking join with the freshness budget and holds
+    // the outstanding handle instead of stacking a new read behind it. The loop
+    // keeps ticking through a wedge; its readings age out and the freshness
+    // filters act on that.
     let (hwmon_poll_handle, hwmon_dead_rx) = spawn_supervised(async move {
         control_ofc_daemon::polling::hwmon_poll_loop(
             hwmon_cache,
