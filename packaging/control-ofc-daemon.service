@@ -45,36 +45,45 @@ RestartSec=3
 # task (IPC server + up to three poll/engine tasks) and the runtime teardown adds
 # at most RUNTIME_SHUTDOWN_TIMEOUT (2 s). Those parts total ~14 s.
 #
-# It is NOT a total bound, and this line is what covers the gap. The hardware
-# restore itself takes the hwmon controller mutex with no timeout, and the engine
-# write path holds that same mutex across a sysfs write inside `spawn_blocking`
-# (`backends.rs`), which cannot be cancelled — so a chip that wedges mid-write can
-# stall the restore past every timeout above. `shutdown_sequence`'s own doc
-# comment has recorded that residual window since DEC-146. Capping systemd's
-# patience well below the ~90 s default bounds the stop-job case;
-# ExecStopPost=control-ofc-restore-auto then runs. Note what that does and does
-# NOT cover: the script restores hwmon `pwm*_enable` and GPU `fan_curve` only.
-# OpenFan channels are USB-serial with no firmware-auto to fall back to, so they
-# stay latched at the last commanded duty until a daemon owns them again. Fans
-# hold, never fall — but this is not a full hand-back and must not be read as one.
-# Register row 277-b tracks bounding the restore itself, which is the real fix
-# and the only one that also covers the no-stop-job (Restart=on-failure) path.
+# Since 2.21.1 the restore is bounded too (277-b), in BOTH halves: it resolves the
+# header list under a SHUTDOWN_TASK_TIMEOUT (3 s) lock deadline, then performs the
+# writes on a detached thread under another 3 s deadline. The second bound is the
+# load-bearing one — the only reason the engine holds that mutex indefinitely is a
+# sysfs write wedged in the kernel, and most boards put every header on one
+# Super-I/O chip whose driver serialises attribute stores, so bounding just the
+# lock would move the hang to the kernel rather than remove it.
+#
+# Before that the restore took the mutex unconditionally and stalled past every
+# timeout above — including on the Restart=on-failure path, where systemd runs no
+# stop job and neither this line nor ExecStopPost applies at all. A wedged stop is
+# therefore now ~20 s for the hwmon hand-back, rather than unbounded. NOT yet a
+# total process bound: the GPU `fan_curve` reset runs FIRST in the same closure
+# and is still unbounded (register row 278-c), so a wedged PMFW write can hold
+# shutdown open ahead of any of this.
+# Note the honest limit: exiting is guaranteed, restoring the hardware is not. If
+# the chip is genuinely unresponsive nothing can restore it, and those fans hold
+# their last duty until something owns them again.
+#
+# This line remains as defence in depth, not as the mechanism. Note what
+# ExecStopPost=control-ofc-restore-auto does and does NOT cover: the script
+# restores hwmon `pwm*_enable` and GPU `fan_curve` only. OpenFan channels are
+# USB-serial with no firmware-auto to fall back to, so they stay latched at the
+# last commanded duty until a daemon owns them again. Fans hold, never fall — but
+# this is not a full hand-back and must not be read as one.
 #
 # The number is DERIVED, not picked. An ordinary (non-wedged) stop costs up to
 # SHUTDOWN_TASK_TIMEOUT (3 s) per sequential task drain — four of them — plus
-# RUNTIME_SHUTDOWN_TIMEOUT (2 s): ~14 s worst case. At 20 s a loaded machine
-# whose drains each run near their cap would trip SIGKILL on every routine
-# `systemctl restart`, which is not a fault but WOULD make a genuine 277-b wedge
-# look routine in the journal. 30 s keeps a real margin over the ordinary path
-# while still cutting the wedged case to a third of the default.
+# RUNTIME_SHUTDOWN_TIMEOUT (2 s): ~14 s worst case. The uncontended restore adds
+# nothing measurable — an uncontended `try_lock_for` returns immediately and the
+# writes complete — while a fully wedged chip adds at most 3 s for the lock plus
+# 3 s for the writes, so even the bad case is ~20 s. At 20 s a
+# loaded machine whose drains each run near their cap would trip SIGKILL on every
+# routine `systemctl restart` — not a fault, but it WOULD make a genuine wedge
+# look routine in the journal. 30 s keeps a real margin over both paths.
 #
-# The cost, stated so a future reduction is a visible choice rather than a
-# rediscovery: in the 277-b wedge this is 10 s LONGER than 20 s before SIGKILL
-# lets ExecStopPost run, i.e. 10 s more with the fans latched at whatever duty
-# the wedged engine last wrote. They hold rather than fall, and a stop is not a
-# thermal event, which is why the trade goes this way — but it is a trade.
-# Raise this if the drain budget above ever grows; lower it only against that
-# cost, not just for tidiness.
+# Raise this if the drain budget above ever grows. Lowering it is now a smaller
+# question than it was: with the restore bounded, SIGKILL is no longer what ends
+# a wedged stop, so this cap governs the margin rather than the outcome.
 TimeoutStopSec=30
 
 # Privilege model: daemon runs as root, declared explicitly via User=root

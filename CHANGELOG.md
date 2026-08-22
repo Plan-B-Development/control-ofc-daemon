@@ -1,5 +1,41 @@
 # Changelog
 
+## [2.21.1] — 2026-08-22
+
+### Fixed
+- **Stopping the daemon could still hang indefinitely if a fan-control chip
+  stopped responding mid-write.** The previous release bounded how long shutdown
+  waits for a stuck temperature *read*, and named the remaining case in its own
+  notes: handing the fans back to firmware waits on the fan-control chip, so a
+  chip that wedges while being *written* to could hold the daemon open past every
+  limit. That is the case this release closes.
+  Handing the fans back now has a time limit of its own — on both halves of the
+  job. The daemon gives the stuck chip three seconds to let it read which fan
+  headers exist, and another three seconds for the hand-back itself, then stops
+  waiting and moves on regardless. A motherboard chip that wedges now costs about
+  twenty seconds, instead of never returning at all.
+  **What that does and does not promise, stated plainly.** Two limits, both
+  deliberate. First, the hand-back is not guaranteed to succeed: if the chip has
+  stopped responding to writes, nothing can restore it, and those fans hold their
+  last speed until something takes them over again — what changes is that the
+  daemon no longer waits forever for it. Second, this covers the **motherboard**
+  fan headers. A graphics card whose fan-curve write wedges the same way can still
+  hold shutdown open, because that hand-back runs first and is not yet bounded.
+  That is a narrower, rarer path than the one fixed here, it is tracked, and it
+  will be closed on its own rather than bolted onto a safety fix at the last
+  minute.
+  **This mattered most where nothing else could rescue it.** When the daemon
+  restarts itself after an internal failure, systemd runs no stop job — so the
+  30-second cap and the backup restore script added last release do not apply.
+  On that path a wedged hand-back meant the daemon stayed alive with nothing
+  driving the fans and no way out. Fans held their last speed throughout, so this
+  was never a case of fans stopping; the risk was that they stayed pinned where
+  the failed run left them, with no thermal management, until the machine was
+  power-cycled.
+  One narrow case remains and is not claimed as fixed: if the stuck write is
+  itself the one that switches a header into manual mode, it can land after the
+  hand-back and re-latch that single header. 277-b.
+
 ## [2.21.0] — 2026-08-22
 
 ### Added

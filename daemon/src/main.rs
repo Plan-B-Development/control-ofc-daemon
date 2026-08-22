@@ -772,17 +772,171 @@ const SHUTDOWN_TASK_TIMEOUT: Duration = Duration::from_secs(3);
 /// this is reached, so for the case this bound exists to cover — a wedged sensor
 /// READ — nothing about safety rides on the wait and only process exit does.
 ///
-/// That is the whole of the claim, and it is narrower than it first reads. It
-/// does **not** say the hardware is provably back under firmware control: the
-/// restore itself takes an unbounded `hwmon_ctrl.lock()`, which the engine write
-/// path holds across an uncancellable `spawn_blocking` sysfs write, so a chip
-/// that wedges mid-WRITE stalls the restore *before* control ever arrives here.
-/// This timeout cannot bound that, and neither can any of the timeouts above it.
-/// Register row 277-b carries the fix; do not read this comment as evidence the
-/// shutdown path is totally bounded, because it is not.
+/// That is the whole of the claim, and it is narrower than it first reads. It is
+/// no longer narrowed by the restore itself, though: until 2.21.1 the restore
+/// took the hwmon controller lock **unbounded**, and the engine write path holds
+/// that same lock across an uncancellable `spawn_blocking` sysfs write — so a
+/// chip wedging mid-WRITE stalled the restore *before* control ever reached here,
+/// and no timeout below it could help. `restore_hwmon_to_auto` now bounds **both**
+/// the lock acquisition and the restore writes themselves (277-b) — bounding only
+/// the lock would have moved the hang to the kernel driver lock rather than
+/// removing it — so by the time this timeout applies the restore has been
+/// attempted and abandoned either way.
 ///
 /// Bound the read case and let the leaked thread die with the process.
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// What the restore actually did.
+///
+/// Returned rather than only logged so the benign/real distinction below is
+/// testable as an **outcome**: this repo has no log capture, and installing a
+/// global logger to assert a level would be process-wide and fragile.
+#[derive(Debug, PartialEq, Eq)]
+enum HwmonRestore {
+    /// No hwmon controller on this machine — nothing to do.
+    NoController,
+    /// Handed this many headers back to firmware.
+    Restored(usize),
+    /// The list was resolved authoritatively and no header exposes
+    /// `pwm*_enable`. **Benign**: `discover_pwm_headers` deliberately keeps a
+    /// header that has `pwmN` but no `pwmN_enable` (legacy nct67xx revisions),
+    /// and `set_pwm` never writes enable for one — so nothing was ever latched
+    /// into manual mode and there is nothing to hand back.
+    NothingToRestore,
+    /// Could not read the header list AND no lock-free fallback was recorded.
+    Unresolvable,
+    /// The writes did not finish within the deadline — a chip is not responding.
+    WritesTimedOut(usize),
+}
+
+/// Restore every hwmon PWM header to automatic mode (`pwm_enable=2`) so firmware
+/// regains thermal control — **bounded**, so a wedged chip cannot stall shutdown
+/// indefinitely (277-b).
+///
+/// The engine write path holds the controller mutex across an uncancellable
+/// `spawn_blocking` sysfs write (`profile_engine::backends`), so a chip that
+/// wedges mid-write holds that mutex for as long as it stays wedged. Taking the
+/// lock unconditionally here — as this did until 2.21.1 — stalled the restore
+/// past `SHUTDOWN_TASK_TIMEOUT`, past `RUNTIME_SHUTDOWN_TIMEOUT` and past the
+/// `must_restart` `exit(1)`, every one of which sits *after* it. On the
+/// `Restart=on-failure` path systemd runs no stop job, so neither
+/// `TimeoutStopSec` nor `ExecStopPost` backstops it: the daemon hangs alive with
+/// no PWM writer and fans latched wherever the dead engine left them.
+///
+/// So **both** halves are bounded, and the second one is the load-bearing half.
+///
+/// 1. *Resolving* the header list takes the mutex with a deadline, falling back to
+///    `fallback_enable_paths` — the lock-free list the panic hook already
+///    maintains (`PANIC_RESTORE`). That list is **the same set**, not an
+///    approximation: `HwmonPwmController`'s headers are built once at
+///    construction, and `POST /hwmon/rescan` explicitly does not replace the
+///    running controller (`hwmon_rescan_handler`), so it cannot drift.
+/// 2. *Performing* the writes is bounded too, on a detached thread. **Bounding
+///    only the lock would not have fixed anything**, and this is the subtle part:
+///    the sole reason the engine holds that mutex indefinitely is a
+///    `std::fs::write` wedged in the kernel (`RealSysfsWriter` is a bare
+///    `std::fs::write`). Most boards put every motherboard header on ONE
+///    Super-I/O chip, and hwmon drivers serialise attribute stores on a per-device
+///    lock — so a restore write to `pwm_enable` on that chip blocks on exactly
+///    what the engine's `pwm` write is stuck on. Moving the block from a userspace
+///    mutex to a kernel driver lock is not progress.
+///
+/// The leaked writer thread dies with the process, the same trade `shutdown_timeout`
+/// makes for the wedged-read case (DEC-275).
+///
+/// **What this does and does not promise.** It guarantees *this step* returns —
+/// which is the actual harm in 277-b, because on the `Restart=on-failure` path the
+/// daemon otherwise stays alive with no PWM writer and no route out. Two things it
+/// does NOT promise, and neither may be quietly upgraded:
+///
+/// - The hardware is **not** guaranteed to be back under firmware control. If the
+///   chip is genuinely unresponsive nothing can restore it, and the fans hold
+///   their last duty until something owns them again.
+/// - The **process** is not yet guaranteed to stop. `gpu_fan::reset_to_auto` runs
+///   earlier in the same shutdown closure and is still unbounded, so a wedged PMFW
+///   `fan_curve` write blocks before control ever reaches here (register row
+///   278-c).
+fn restore_hwmon_to_auto(
+    controller: Option<&Arc<Mutex<HwmonPwmController>>>,
+    lock_timeout: Duration,
+    fallback_enable_paths: Option<&[String]>,
+    write_timeout: Duration,
+) -> HwmonRestore {
+    let Some(ctrl_mutex) = controller else {
+        return HwmonRestore::NoController;
+    };
+
+    // Resolve the list under the lock, then DROP it — never write while holding
+    // the mutex, which is the very thing that made the engine able to block us.
+    // `known` is whether we actually determined the header set — NOT whether we
+    // got it from the lock. An empty list read from a populated `PANIC_RESTORE`
+    // is just as authoritative as one read from the controller, because both are
+    // the same `filter_map(enable_path)` over the same headers. Conflating the two
+    // is what made the round-1 error false; conflating them the other way would
+    // make it false one branch over.
+    let (enable_paths, known): (Vec<String>, bool) = match ctrl_mutex.try_lock_for(lock_timeout) {
+        Some(ctrl) => (
+            ctrl.headers()
+                .iter()
+                .filter_map(|h| h.enable_path.clone())
+                .collect(),
+            true,
+        ),
+        None => {
+            log::warn!(
+                "hwmon controller lock still held after {}s (a sysfs write has not \
+                 returned); using the lock-free path list instead",
+                lock_timeout.as_secs()
+            );
+            match fallback_enable_paths {
+                Some(paths) => (paths.to_vec(), true),
+                None => (Vec::new(), false),
+            }
+        }
+    };
+
+    if enable_paths.is_empty() {
+        // The two empty cases are NOT the same, and conflating them shipped a
+        // false error: on a board whose headers all lack `pwmN_enable` this fired
+        // `motherboard fans may be left in manual mode` on every clean stop, about
+        // headers that were never latched in the first place. Pre-2.21.1 that case
+        // was a silent no-op, so the error was a regression, not a new warning.
+        if known {
+            log::debug!("no hwmon header exposes pwm*_enable — nothing to restore to automatic");
+            return HwmonRestore::NothingToRestore;
+        }
+        log::error!(
+            "could not read the hwmon header list and no lock-free restore paths were \
+             recorded — motherboard fans may be left in manual mode"
+        );
+        return HwmonRestore::Unresolvable;
+    }
+
+    // The writes themselves can wedge in the kernel, so they get their own bound.
+    let count = enable_paths.len();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for enable_path in &enable_paths {
+            match std::fs::write(enable_path, "2\n") {
+                Ok(()) => log::info!("hwmon {enable_path} restored to auto mode"),
+                Err(e) => log::warn!("hwmon {enable_path} auto restore failed: {e}"),
+            }
+        }
+        let _ = done_tx.send(());
+    });
+
+    if done_rx.recv_timeout(write_timeout).is_err() {
+        log::error!(
+            "hwmon restore did not finish within {}s — a chip is not responding to \
+             writes. Proceeding with shutdown so the process can exit; up to {} \
+             header(s) may be left in manual mode until a daemon owns them again.",
+            write_timeout.as_secs(),
+            count
+        );
+        return HwmonRestore::WritesTimedOut(count);
+    }
+    HwmonRestore::Restored(count)
+}
 
 /// Ordered graceful shutdown (DEC-146 P3-9 + audit P1-A).
 ///
@@ -799,8 +953,12 @@ const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 /// its loop iteration ends, so draining its task handle here also drains those
 /// writes — a blocking write cannot be left in flight once the handle resolves.
 /// The only residual window is a single sysfs/serial write that hangs past
-/// `task_timeout` (a running `spawn_blocking` cannot be cancelled); the
-/// `ExecStopPost` restore backstops that pathological case.
+/// `task_timeout` (a running `spawn_blocking` cannot be cancelled). The hwmon
+/// restore no longer *blocks* on that case — `restore_hwmon_to_auto` bounds both
+/// its lock acquisition and its writes (277-b) — so the restore is attempted, and
+/// abandoned on a deadline, whether or not the wedged write ever returns. The
+/// `ExecStopPost` backstop remains, but note it does **not** cover the
+/// `Restart=on-failure` path, where systemd runs no stop job at all.
 async fn shutdown_sequence<F>(
     poll_shutdown_tx: &tokio::sync::watch::Sender<bool>,
     server_shutdown_tx: tokio::sync::oneshot::Sender<()>,
@@ -830,7 +988,10 @@ async fn shutdown_sequence<F>(
     }
 
     // Drain the poll/engine tasks (DEC-146 P3-9) so an in-flight engine
-    // spawn_blocking write cannot land after the restore.
+    // spawn_blocking write cannot land after the restore — in the UNCONTENDED
+    // case. When a write is wedged this drain times out rather than draining it
+    // (a `spawn_blocking` cannot be cancelled), so the guarantee below is
+    // conditional, not absolute. See `restore_hwmon_to_auto` for the residual.
     for (name, handle) in task_handles {
         if tokio::time::timeout(task_timeout, handle).await.is_err() {
             log::warn!(
@@ -840,7 +1001,11 @@ async fn shutdown_sequence<F>(
         }
     }
 
-    // Restore hardware to automatic — guaranteed last writer.
+    // Restore hardware to automatic — the last writer whenever the drain above
+    // actually drained. If it timed out, a wedged engine write is still
+    // outstanding and can land after this; that residual is documented on
+    // `restore_hwmon_to_auto` and in DEC-278, and must not be re-stated here as a
+    // guarantee.
     restore_hardware();
 }
 
@@ -934,7 +1099,8 @@ fn main() {
     // that used to live on this line ("the hardware was restored before we got
     // here") is the claim the constant was corrected to stop making: the restore
     // is *attempted* before this point, it can fail, and on a mid-write wedge it
-    // may not have completed at all (register row 277-b).
+    // may not have completed at all (DEC-278: the restore guarantees the process
+    // exits, not that the hardware was handed back).
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
 
     // Re-raise so the process still exits non-zero and systemd still restarts it.
@@ -1533,17 +1699,15 @@ async fn async_main() {
             // Restore hwmon headers to automatic mode (pwm_enable=2) so BIOS
             // regains thermal control. Without this, a daemon crash leaves
             // motherboard fans stuck in manual mode with no thermal management.
-            if let Some(ref hwmon_ctrl) = app_state.hwmon_controller {
-                let ctrl = hwmon_ctrl.lock();
-                for header in ctrl.headers() {
-                    if let Some(ref enable_path) = header.enable_path {
-                        match std::fs::write(enable_path, "2\n") {
-                            Ok(()) => log::info!("hwmon {} restored to auto mode", header.id),
-                            Err(e) => log::warn!("hwmon {} auto restore failed: {e}", header.id),
-                        }
-                    }
-                }
-            }
+            // Bounded since 277-b — the lock wait has a deadline and a lock-free
+            // fallback, because everything that could otherwise backstop a stall
+            // here runs *after* it. See `restore_hwmon_to_auto`.
+            let _ = restore_hwmon_to_auto(
+                app_state.hwmon_controller.as_ref(),
+                SHUTDOWN_TASK_TIMEOUT,
+                PANIC_RESTORE.get().map(|t| t.hwmon_enable_paths.as_slice()),
+                SHUTDOWN_TASK_TIMEOUT,
+            );
         },
     )
     .await;
@@ -2530,6 +2694,372 @@ mod tests {
             src.contains("runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT)"),
             "main must bound the runtime teardown; without this the process hangs \
              until systemd's TimeoutStopSec SIGKILL, and forever outside systemd"
+        );
+    }
+
+    // ── 277-b: the safety restore must be bounded ───────────────────────
+    // The engine write path holds the controller mutex across an uncancellable
+    // `spawn_blocking` sysfs write, so a chip wedged mid-write holds it for as
+    // long as it stays wedged. Everything that could otherwise backstop a stall
+    // in the restore — SHUTDOWN_TASK_TIMEOUT, RUNTIME_SHUTDOWN_TIMEOUT, the
+    // `must_restart` exit(1), TimeoutStopSec, ExecStopPost — runs AFTER it, and
+    // on the Restart=on-failure path systemd runs no stop job at all.
+
+    use control_ofc_daemon::hwmon::pwm_discovery::PwmHeaderDescriptor;
+
+    fn restore_test_header(id: &str, enable_path: Option<String>) -> PwmHeaderDescriptor {
+        PwmHeaderDescriptor {
+            id: id.to_string(),
+            label: id.to_string(),
+            chip_name: "testchip".to_string(),
+            device_id: "testdev".to_string(),
+            pwm_index: 1,
+            supports_enable: enable_path.is_some(),
+            pwm_path: "/nonexistent/pwm1".to_string(),
+            enable_path,
+            rpm_available: false,
+            rpm_path: None,
+            min_pwm_percent: 0,
+            max_pwm_percent: 100,
+            is_writable: true,
+            pwm_mode: None,
+            is_aio: false,
+        }
+    }
+
+    fn restore_test_controller(
+        headers: Vec<PwmHeaderDescriptor>,
+    ) -> Arc<parking_lot::Mutex<HwmonPwmController>> {
+        Arc::new(parking_lot::Mutex::new(HwmonPwmController::new(
+            headers,
+            LeaseManager::new(),
+            Box::new(RealSysfsWriter),
+            Arc::new(StateCache::new()),
+        )))
+    }
+
+    /// The uncontended path is unchanged: every header with an `enable_path` is
+    /// written back to automatic, and the lock-free fallback is not consulted.
+    #[test]
+    fn restore_writes_every_enable_path_when_the_lock_is_free() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("pwm1_enable");
+        let b = tmp.path().join("pwm2_enable");
+        let unused = tmp.path().join("fallback_only");
+        for f in [&a, &b, &unused] {
+            std::fs::write(f, "1\n").unwrap();
+        }
+
+        let ctrl = restore_test_controller(vec![
+            restore_test_header("a", Some(a.to_string_lossy().into_owned())),
+            restore_test_header("b", Some(b.to_string_lossy().into_owned())),
+            // A header with no pwmN_enable must be skipped, not panicked on.
+            restore_test_header("c", None),
+        ]);
+
+        let outcome = restore_hwmon_to_auto(
+            Some(&ctrl),
+            Duration::from_secs(5),
+            Some(&[unused.to_string_lossy().into_owned()]),
+            Duration::from_secs(5),
+        );
+        assert_eq!(outcome, HwmonRestore::Restored(2));
+
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "2\n");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "2\n");
+        assert_eq!(
+            std::fs::read_to_string(&unused).unwrap(),
+            "1\n",
+            "the lock-free fallback must not run when the lock was acquired"
+        );
+    }
+
+    /// [SAFETY] 277-b, half one: a HELD MUTEX must not stall the restore.
+    ///
+    /// This proves the lock bound only. It deliberately does NOT claim to model a
+    /// wedged chip — the fallback here writes to an ordinary temp file, which
+    /// cannot block, so this test would stay green even with the write unbounded.
+    /// `a_wedged_sysfs_write_cannot_stall_the_safety_restore` is the one that
+    /// covers that, and the distinction is the whole of round-1 finding 2.
+    ///
+    /// The wedge carries a SELF-RELEASE deadline (DEC-272 trap 3): a failed
+    /// assertion skips the test's own cleanup, so an unbounded hold would turn a
+    /// red test into a hung CI job. With it, reverting the bound makes this fail
+    /// at ~10s — red, not hung.
+    #[test]
+    fn a_held_controller_lock_cannot_stall_the_safety_restore() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let enable = tmp.path().join("pwm1_enable");
+        std::fs::write(&enable, "1\n").unwrap();
+        let enable_path = enable.to_string_lossy().into_owned();
+
+        let ctrl = restore_test_controller(vec![restore_test_header(
+            "wedged",
+            Some(enable_path.clone()),
+        )]);
+
+        // The fallback list is derived exactly as `async_main` derives it for
+        // PANIC_RESTORE, from the controller's own headers — so this also
+        // demonstrates the "same set" claim the fix rests on. It is not
+        // tautological: a filter added to one derivation and not the other
+        // would show up here as a missing write.
+        let fallback: Vec<String> = ctrl
+            .lock()
+            .headers()
+            .iter()
+            .filter_map(|h| h.enable_path.clone())
+            .collect();
+
+        let released = Arc::new(AtomicBool::new(false));
+        let wedge = released.clone();
+        let held = ctrl.clone();
+        let wedger = std::thread::spawn(move || {
+            let _guard = held.lock();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !wedge.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        // Let the wedger actually acquire the lock before we contend for it.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let started = Instant::now();
+        let outcome = restore_hwmon_to_auto(
+            Some(&ctrl),
+            Duration::from_millis(200),
+            Some(&fallback),
+            Duration::from_secs(5),
+        );
+        let elapsed = started.elapsed();
+        assert_eq!(outcome, HwmonRestore::Restored(1));
+
+        released.store(true, Ordering::SeqCst);
+        wedger.join().unwrap();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the restore must not wait on a wedged sysfs write; took {elapsed:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&enable).unwrap(),
+            "2\n",
+            "bounding the wait is not enough — the fan must still be handed back \
+             to firmware, via the lock-free path list"
+        );
+    }
+
+    /// 277-b round-1 regression: a board whose headers all lack `pwmN_enable`
+    /// must not be reported as a failed restore.
+    ///
+    /// `discover_pwm_headers` deliberately keeps a header exposing `pwmN` with no
+    /// `pwmN_enable` (legacy nct67xx revisions — see `discover_without_enable_file`),
+    /// and `hwmon_controller` is `Some` on a non-empty header list alone. `set_pwm`
+    /// never writes enable for such a header, so nothing is ever latched into
+    /// manual mode and there is nothing to hand back.
+    ///
+    /// The first version of this fix logged `motherboard fans may be left in manual
+    /// mode` at error level here, on EVERY clean stop on such a board, about a
+    /// condition that cannot occur. Before 2.21.1 it was a silent no-op, so that was
+    /// a regression introduced by the fix, not a newly surfaced warning. Asserted as
+    /// an outcome because the repo has no log capture.
+    #[test]
+    fn a_board_without_pwm_enable_is_not_reported_as_a_failed_restore() {
+        let ctrl = restore_test_controller(vec![
+            restore_test_header("no-enable-1", None),
+            restore_test_header("no-enable-2", None),
+        ]);
+
+        let outcome = restore_hwmon_to_auto(
+            Some(&ctrl),
+            Duration::from_secs(5),
+            Some(&[]),
+            Duration::from_secs(5),
+        );
+
+        assert_eq!(
+            outcome,
+            HwmonRestore::NothingToRestore,
+            "a board with no pwm*_enable has nothing to restore — reporting it as \
+             unresolvable claims fans may be stuck in manual mode when they cannot be"
+        );
+    }
+
+    /// Round 2, F2: a no-`pwm_enable` board whose lock is ALSO wedged must still
+    /// be benign. `PANIC_RESTORE` is populated unconditionally at startup from the
+    /// identical `filter_map(enable_path)`, so an empty fallback there means "this
+    /// board has no enable paths", not "we failed to find out" — and reporting it
+    /// as a failed restore would be the round-1 false error one branch over.
+    #[test]
+    fn a_wedged_lock_on_a_board_without_pwm_enable_is_still_benign() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let ctrl = restore_test_controller(vec![restore_test_header("no-enable", None)]);
+
+        let released = Arc::new(AtomicBool::new(false));
+        let wedge = released.clone();
+        let held = ctrl.clone();
+        let wedger = std::thread::spawn(move || {
+            let _guard = held.lock();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !wedge.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        std::thread::sleep(Duration::from_millis(100));
+
+        let outcome = restore_hwmon_to_auto(
+            Some(&ctrl),
+            Duration::from_millis(200),
+            Some(&[]),
+            Duration::from_secs(5),
+        );
+
+        released.store(true, Ordering::SeqCst);
+        wedger.join().unwrap();
+
+        assert_eq!(outcome, HwmonRestore::NothingToRestore);
+    }
+
+    /// The genuinely unresolvable case must still be loud: the list could not be
+    /// read AND no lock-free fallback was recorded.
+    #[test]
+    fn an_unreadable_header_list_with_no_fallback_is_reported_as_unresolvable() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let ctrl = restore_test_controller(vec![restore_test_header(
+            "unreachable",
+            Some("/nonexistent/pwm1_enable".to_string()),
+        )]);
+
+        let released = Arc::new(AtomicBool::new(false));
+        let wedge = released.clone();
+        let held = ctrl.clone();
+        let wedger = std::thread::spawn(move || {
+            let _guard = held.lock();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !wedge.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        std::thread::sleep(Duration::from_millis(100));
+
+        let outcome = restore_hwmon_to_auto(
+            Some(&ctrl),
+            Duration::from_millis(200),
+            // None = `PANIC_RESTORE` was never populated, so the set is genuinely
+            // unknown. `Some(&[])` would mean "known to be empty" and is the
+            // benign case — see the sibling test below.
+            None,
+            Duration::from_secs(5),
+        );
+
+        released.store(true, Ordering::SeqCst);
+        wedger.join().unwrap();
+
+        assert_eq!(outcome, HwmonRestore::Unresolvable);
+    }
+
+    /// [SAFETY] 277-b, half two — the archetype the row is actually about.
+    ///
+    /// Round 1 of the review caught that bounding the LOCK fixes nothing on its
+    /// own: the only reason the engine holds that mutex indefinitely is a
+    /// `std::fs::write` wedged in the kernel, and most boards put every header on
+    /// one Super-I/O chip whose driver serialises attribute stores — so the
+    /// restore write blocks on exactly what the engine write is stuck on. That
+    /// moves the hang from a userspace mutex to a kernel lock.
+    ///
+    /// A FIFO with no reader is the faithful model: `std::fs::write` is
+    /// `File::create` + `write_all`, and opening a FIFO `O_WRONLY` blocks in
+    /// `open(2)` until a reader appears — a real uninterruptible-looking write,
+    /// not a sleep pretending to be one.
+    #[test]
+    fn a_wedged_sysfs_write_cannot_stall_the_safety_restore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("pwm1_enable");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo must be available (coreutils)");
+        assert!(status.success(), "mkfifo failed for {}", fifo.display());
+        let fifo_path = fifo.to_string_lossy().into_owned();
+
+        let ctrl =
+            restore_test_controller(vec![restore_test_header("wedged-chip", Some(fifo_path))]);
+
+        // Self-release (DEC-272 trap 3). The reader must open the FIFO while it
+        // still EXISTS and the releaser must be joined BEFORE any assertion can
+        // panic — round 2 caught that an earlier version did neither: the test
+        // scope ended at ~200 ms, `tmp` removed the FIFO, and the 3 s reader then
+        // opened a deleted path and swallowed the ENOENT, leaving the writer
+        // parked in open(2) for the life of the test binary. The release was
+        // decorative.
+        let release = fifo.clone();
+        let releaser = std::thread::spawn(move || {
+            // Comfortably after the 200 ms write deadline the restore is asserted
+            // against, so the bound is what the test measures, not this sleep.
+            std::thread::sleep(Duration::from_millis(400));
+            let _ = std::fs::File::open(&release);
+        });
+
+        let started = Instant::now();
+        let outcome = restore_hwmon_to_auto(
+            Some(&ctrl),
+            Duration::from_secs(5),
+            Some(&[]),
+            Duration::from_millis(200),
+        );
+        let elapsed = started.elapsed();
+
+        // Join BEFORE asserting: a panicking assertion skips everything after it,
+        // which is how the previous version leaked its writer thread.
+        releaser.join().unwrap();
+
+        assert_eq!(outcome, HwmonRestore::WritesTimedOut(1));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "a sysfs write that never returns must not stall the restore — the \
+             process has to be able to exit, because on the Restart=on-failure \
+             path nothing else can rescue it; took {elapsed:?}"
+        );
+    }
+
+    /// [SAFETY] 277-b — the call site, which behaviour cannot see.
+    ///
+    /// The restore closure is inline in `async_main`, so no in-process test can
+    /// invoke it. Extracting the rule into a tested function does NOT test the
+    /// call site — the recurring failure named in `CLAUDE.md § Hard-won lessons`.
+    /// Same tool and reasoning as `main_owns_its_runtime_so_teardown_is_bounded`.
+    #[test]
+    fn the_shutdown_restore_goes_through_the_bounded_helper() {
+        let whole = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        // Production code only — scanning the whole file makes this test match
+        // its own string literals, the trap the polling.rs guard fell into.
+        let src = whole
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .expect("main.rs has a #[cfg(test)] module");
+
+        assert!(
+            src.contains("restore_hwmon_to_auto("),
+            "the shutdown restore must call the bounded helper"
+        );
+        assert!(
+            src.contains("done_rx.recv_timeout(write_timeout)"),
+            "the restore WRITES must be bounded, not just the lock acquisition — \
+             bounding only the lock moves the hang from a userspace mutex to the \
+             kernel driver lock the wedged write is already stuck on"
+        );
+        // Matched in STATEMENT position, not as a substring: the doc comments
+        // above discuss the old unbounded lock in prose, and a bare `contains`
+        // would hit that explanation rather than any code.
+        assert!(
+            !src.lines()
+                .any(|l| l.trim_start().starts_with("let ctrl = hwmon_ctrl.lock();")),
+            "the restore must not take the controller lock unbounded — the engine \
+             holds it across an uncancellable sysfs write, and every backstop for \
+             a stall here runs after it"
         );
     }
 
