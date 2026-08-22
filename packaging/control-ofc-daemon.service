@@ -66,8 +66,15 @@ RestartSec=3
 # whose drains each run near their cap would trip SIGKILL on every routine
 # `systemctl restart`, which is not a fault but WOULD make a genuine 277-b wedge
 # look routine in the journal. 30 s keeps a real margin over the ordinary path
-# while still cutting the wedged case to a third of the default. Raise this if
-# the drain budget above ever grows.
+# while still cutting the wedged case to a third of the default.
+#
+# The cost, stated so a future reduction is a visible choice rather than a
+# rediscovery: in the 277-b wedge this is 10 s LONGER than 20 s before SIGKILL
+# lets ExecStopPost run, i.e. 10 s more with the fans latched at whatever duty
+# the wedged engine last wrote. They hold rather than fall, and a stop is not a
+# thermal event, which is why the trade goes this way — but it is a trade.
+# Raise this if the drain budget above ever grows; lower it only against that
+# cost, not just for tidiness.
 TimeoutStopSec=30
 
 # Privilege model: daemon runs as root, declared explicitly via User=root

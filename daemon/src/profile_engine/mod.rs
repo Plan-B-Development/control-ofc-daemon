@@ -1713,12 +1713,21 @@ mod tests {
         //
         // Bounded by ITERATION COUNT, not by a wall-clock deadline. The obvious
         // form — `std::time::Instant::now() < deadline` around a
-        // `tokio::time::sleep` — mixes two clocks: under `#[tokio::test(start_paused)]`
-        // tokio auto-advances each sleep instantly while `std::time::Instant`
-        // never moves, so the loop spins forever and CI HANGS instead of failing.
-        // That is DEC-272 traps 1 and 3 composed in a single helper, and it would
-        // be armed by any future caller adding `start_paused` — not by anything
-        // visible here. A counter cannot be fooled by either clock.
+        // `tokio::time::sleep` — mixes two clocks, and `tokio::time::pause` moves
+        // only one of them: each sleep auto-advances virtual time instantly while
+        // `std::time::Instant` barely moves, so the loop hot-spins for five
+        // seconds of REAL time, advancing virtual time by hours and running
+        // thousands of engine ticks before returning a meaningless answer. (Not a
+        // hang — an earlier version of this comment said "spins forever and CI
+        // HANGS", which was wrong about the mechanism. A bogus green is worse.)
+        // DEC-272 trap 1, and it would be armed by any future caller adding
+        // `start_paused`, not by anything visible here.
+        //
+        // The counter fixes THAT. It does not make the helper `start_paused`-safe
+        // in general: trap 2 still applies — an outstanding `spawn_blocking`
+        // suspends auto-advance, so a sleep never completes and the counter never
+        // advances. Unreachable today only because this harness runs with no
+        // backend attached. Do not read the counter as a general all-clear.
         for _ in 0..200 {
             if ready() {
                 break;

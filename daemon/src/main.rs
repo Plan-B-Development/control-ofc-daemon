@@ -929,7 +929,12 @@ fn main() {
 
     // Unblocks this thread after at most RUNTIME_SHUTDOWN_TIMEOUT, leaking any
     // still-running blocking task rather than waiting on it. The leaked thread
-    // dies with the process, and the hardware was restored before we got here.
+    // dies with the process. See that constant's doc comment for what this does
+    // and does NOT bound — deliberately not restated here, because the sentence
+    // that used to live on this line ("the hardware was restored before we got
+    // here") is the claim the constant was corrected to stop making: the restore
+    // is *attempted* before this point, it can fail, and on a mid-write wedge it
+    // may not have completed at all (register row 277-b).
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
 
     // Re-raise so the process still exits non-zero and systemd still restarts it.
