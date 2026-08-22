@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [2.21.0] — 2026-08-22
 
 ### Added
 - **A fan that has silently stopped being controlled now says so.** If a control
@@ -81,6 +81,10 @@
   reports it as "the repository is stale", which points at the wrong thing
   entirely. That misdiagnosis has already cost two releases. The failure is now
   named, along with the fact that no new tag is needed to recover. OPEN-07b.
+
+Pairs with `control-ofc-gui` ≥ v2.23.0; **no wire, schema or API break** —
+`api_version` stays 1 and `skipped_controls[]` is purely additive, so existing
+GUIs need no upgrade. v2.44.0 or newer renders it as a "Not controlled" badge.
 
 ## [2.20.1] — 2026-08-21
 
