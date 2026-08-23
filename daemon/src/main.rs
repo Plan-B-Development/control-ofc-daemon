@@ -267,38 +267,19 @@ fn install_panic_hook() {
         }
         if let Some(targets) = PANIC_RESTORE.get() {
             eprintln!("PANIC: restoring fans to automatic mode before aborting");
-            for (curve_path, zero_rpm_path) in &targets.gpu_curves {
-                if let Err(e) = std::fs::write(curve_path, "r\n") {
-                    eprintln!(
-                        "  WARNING: failed to reset GPU curve {}: {e}",
-                        curve_path.display()
-                    );
-                }
-                if let Err(e) = std::fs::write(curve_path, "c\n") {
-                    eprintln!(
-                        "  WARNING: failed to commit GPU curve {}: {e}",
-                        curve_path.display()
-                    );
-                }
-                if let Some(zrp) = zero_rpm_path {
-                    if let Err(e) = std::fs::write(zrp, "1\n") {
-                        eprintln!(
-                            "  WARNING: failed to re-enable zero-RPM {}: {e}",
-                            zrp.display()
-                        );
-                    }
-                    if let Err(e) = std::fs::write(zrp, "c\n") {
-                        eprintln!(
-                            "  WARNING: failed to commit zero-RPM {}: {e}",
-                            zrp.display()
-                        );
-                    }
-                }
-            }
-            for enable_path in &targets.hwmon_enable_paths {
-                if let Err(e) = std::fs::write(enable_path, "2\n") {
-                    eprintln!("  WARNING: failed to restore hwmon auto mode {enable_path}: {e}");
-                }
+            // 278-a: bounded. These are bare sysfs writes, so a chip that has
+            // stopped acknowledging them used to block the hook and the process
+            // never reached `abort()` — a panicking daemon that neither controls
+            // fans nor dies. Proceed on the deadline; aborting with fans latched
+            // is strictly better than hanging with fans latched, because systemd
+            // can restart the former.
+            if !restore_panic_targets(targets, SHUTDOWN_TASK_TIMEOUT) {
+                eprintln!(
+                    "  WARNING: the restore did not finish within {}s — a chip is not \
+                     responding to writes. Aborting anyway so the process cannot hang; \
+                     fans may be left under daemon control until something owns them again.",
+                    SHUTDOWN_TASK_TIMEOUT.as_secs()
+                );
             }
         }
         default_hook(info);
@@ -809,6 +790,153 @@ enum HwmonRestore {
     WritesTimedOut(usize),
 }
 
+/// Run `f` on a detached thread and wait at most `timeout` for it to finish.
+/// `true` = it completed; `false` = the deadline passed (or the thread could not
+/// be started). The thread is left running and dies with the process.
+///
+/// **This is the only way to bound a sysfs write.** A `std::fs::write` that has
+/// wedged in the kernel cannot be cancelled or interrupted, so the sole remaining
+/// lever is to stop *waiting* for it — the same trade `shutdown_timeout` makes
+/// for the wedged-read case (DEC-275).
+///
+/// Extracted (DEC-279) because three hardware-restore paths need exactly this
+/// shape and only one of them had it: `restore_hwmon_to_auto` (277-b, fixed in
+/// 2.21.1), the shutdown closure's GPU reset (278-c) and the panic hook (278-a).
+/// Two near-copies of a safety bound is how the second one ends up missing.
+///
+/// `Builder::spawn` rather than `thread::spawn`, deliberately: the panic hook
+/// calls this **during a panic**, and `thread::spawn` *panics* if the OS refuses
+/// the thread — a panic inside a panic hook aborts immediately, turning a
+/// recoverable restore failure into a hard abort with no hardware handed back.
+/// A refused spawn reports `false` here instead, which lands the caller on the
+/// same "did not complete" branch as a timeout. The two are not distinguished
+/// because the operator's situation is identical: the writes did not land, and
+/// the process must proceed anyway.
+fn run_bounded<F>(name: &str, timeout: Duration, f: F) -> bool
+where
+    F: FnOnce() + Send + 'static,
+{
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name(format!("restore-{name}"))
+        .spawn(move || {
+            f();
+            let _ = done_tx.send(());
+        });
+    if spawned.is_err() {
+        return false;
+    }
+    done_rx.recv_timeout(timeout).is_ok()
+}
+
+/// Reset every AMD GPU fan curve to automatic (PMFW `fan_curve` `r` then `c`) —
+/// **bounded**, so a wedged PMFW write cannot stall shutdown (278-c).
+///
+/// The same hazard and the same remedy as `restore_hwmon_to_auto`, one device
+/// class over. `gpu_fan::reset_to_auto` is two bare `std::fs::write` calls, and
+/// amdgpu serialises PMFW attribute stores on the device — so a card that has
+/// stopped acknowledging them blocks the write for as long as it stays wedged.
+///
+/// This runs **first** in the shutdown closure, which is what made it matter:
+/// until 2.22.0 it could block before the already-bounded hwmon restore was ever
+/// reached, so bounding that one alone left the process just as stuck. Exactly
+/// 277-b's harm on a different device.
+///
+/// Bounded here at the call site rather than inside `gpu_fan::reset_to_auto`,
+/// which stays a plain synchronous write. That function has a non-shutdown
+/// caller (`POST /gpu/{id}/fan/reset`) for which a deadline would be wrong: a
+/// slow reset there must report an error to the client, not return `Ok` while
+/// the write is still outstanding.
+///
+/// **Promises exactly what its hwmon sibling promises**, and no more: this STEP
+/// returns. It does not promise the GPU is back under PMFW control — if the card
+/// is unresponsive nothing can restore it, and no doc may tighten that.
+fn restore_gpu_fans_to_auto(
+    curves: Vec<(PathBuf, Option<PathBuf>)>,
+    write_timeout: Duration,
+) -> bool {
+    if curves.is_empty() {
+        return true;
+    }
+    let count = curves.len();
+    let completed = run_bounded("gpu", write_timeout, move || {
+        for (curve_path, zero_rpm_path) in &curves {
+            match control_ofc_daemon::hwmon::gpu_fan::reset_to_auto(
+                curve_path,
+                zero_rpm_path.as_deref(),
+            ) {
+                Ok(()) => log::info!("GPU fan curve {} reset to auto", curve_path.display()),
+                Err(e) => log::warn!("GPU fan curve {} reset failed: {e}", curve_path.display()),
+            }
+        }
+    });
+    if !completed {
+        log::error!(
+            "GPU fan reset did not finish within {}s — a GPU is not responding to PMFW \
+             writes. Proceeding with shutdown so the process can exit; up to {count} GPU \
+             fan curve(s) may be left under daemon control until something owns them again.",
+            write_timeout.as_secs()
+        );
+    }
+    completed
+}
+
+/// The panic hook's last-resort hardware restore — **bounded** (278-a).
+///
+/// Carries the same unbounded-write shape 277-b fixed in the shutdown path and
+/// 278-c fixed for GPUs: bare `std::fs::write` calls to GPU `fan_curve` and
+/// hwmon `pwm*_enable`, no deadline. A chip that has stopped acknowledging
+/// writes blocked the hook, so the process never reached `abort()` — a panicking
+/// daemon that neither controls fans nor dies.
+///
+/// **Lower severity than 277-b, which is why this is a deadline and not a
+/// restructure**, and all three reasons were verified rather than assumed: this
+/// runs only on a *fatal* panic (`panic_is_fatal` returns early otherwise), it is
+/// already the last-resort path rather than the routine one, and it correctly
+/// takes no lock at all. There is nothing here to move out from under a mutex —
+/// only a wait to bound.
+///
+/// `eprintln!` rather than `log::`, matching the rest of the hook: a panic hook
+/// must not depend on a logger that may itself be mid-panic, or not yet
+/// installed.
+fn restore_panic_targets(targets: &'static PanicRestoreTargets, timeout: Duration) -> bool {
+    run_bounded("panic", timeout, move || {
+        for (curve_path, zero_rpm_path) in &targets.gpu_curves {
+            if let Err(e) = std::fs::write(curve_path, "r\n") {
+                eprintln!(
+                    "  WARNING: failed to reset GPU curve {}: {e}",
+                    curve_path.display()
+                );
+            }
+            if let Err(e) = std::fs::write(curve_path, "c\n") {
+                eprintln!(
+                    "  WARNING: failed to commit GPU curve {}: {e}",
+                    curve_path.display()
+                );
+            }
+            if let Some(zrp) = zero_rpm_path {
+                if let Err(e) = std::fs::write(zrp, "1\n") {
+                    eprintln!(
+                        "  WARNING: failed to re-enable zero-RPM {}: {e}",
+                        zrp.display()
+                    );
+                }
+                if let Err(e) = std::fs::write(zrp, "c\n") {
+                    eprintln!(
+                        "  WARNING: failed to commit zero-RPM {}: {e}",
+                        zrp.display()
+                    );
+                }
+            }
+        }
+        for enable_path in &targets.hwmon_enable_paths {
+            if let Err(e) = std::fs::write(enable_path, "2\n") {
+                eprintln!("  WARNING: failed to restore hwmon auto mode {enable_path}: {e}");
+            }
+        }
+    })
+}
+
 /// Restore every hwmon PWM header to automatic mode (`pwm_enable=2`) so firmware
 /// regains thermal control — **bounded**, so a wedged chip cannot stall shutdown
 /// indefinitely (277-b).
@@ -852,10 +980,12 @@ enum HwmonRestore {
 /// - The hardware is **not** guaranteed to be back under firmware control. If the
 ///   chip is genuinely unresponsive nothing can restore it, and the fans hold
 ///   their last duty until something owns them again.
-/// - The **process** is not yet guaranteed to stop. `gpu_fan::reset_to_auto` runs
-///   earlier in the same shutdown closure and is still unbounded, so a wedged PMFW
-///   `fan_curve` write blocks before control ever reaches here (register row
-///   278-c).
+/// - It bounds **this** step only. Every *other* step of the shutdown closure needs
+///   its own bound, and until 2.22.0 the GPU reset that runs ahead of this one had
+///   none — so a wedged PMFW `fan_curve` write blocked before control ever reached
+///   here, and bounding this half alone left the process exactly as stuck (278-c).
+///   `restore_gpu_fans_to_auto` now carries the same bound; both share
+///   `run_bounded` so a third restore step cannot quietly ship without one.
 fn restore_hwmon_to_auto(
     controller: Option<&Arc<Mutex<HwmonPwmController>>>,
     lock_timeout: Duration,
@@ -913,19 +1043,20 @@ fn restore_hwmon_to_auto(
     }
 
     // The writes themselves can wedge in the kernel, so they get their own bound.
+    // Shares `run_bounded` with the GPU and panic-hook restores (DEC-279) — this
+    // block WAS the original of that shape, and two later restore paths shipped
+    // without it precisely because it lived inline here.
     let count = enable_paths.len();
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    let completed = run_bounded("hwmon", write_timeout, move || {
         for enable_path in &enable_paths {
             match std::fs::write(enable_path, "2\n") {
                 Ok(()) => log::info!("hwmon {enable_path} restored to auto mode"),
                 Err(e) => log::warn!("hwmon {enable_path} auto restore failed: {e}"),
             }
         }
-        let _ = done_tx.send(());
     });
 
-    if done_rx.recv_timeout(write_timeout).is_err() {
+    if !completed {
         log::error!(
             "hwmon restore did not finish within {}s — a chip is not responding to \
              writes. Proceeding with shutdown so the process can exit; up to {} \
@@ -946,19 +1077,26 @@ fn restore_hwmon_to_auto(
 /// write can land after the restore and leave fans stuck in manual mode. Every
 /// await is bounded by `task_timeout` so a hung task or a lingering connection
 /// (e.g. a slow client holding a request open) can never block the safety restore; on timeout
-/// we log and proceed, and `ExecStopPost=control-ofc-restore-auto` backstops
-/// production regardless.
+/// we log and proceed. `ExecStopPost=control-ofc-restore-auto` backstops
+/// production on any path that has a systemd **stop job** — which is not every
+/// path; see the note at the foot of this comment.
 ///
 /// The engine task `.await`-joins every `spawn_blocking` backend write before
 /// its loop iteration ends, so draining its task handle here also drains those
 /// writes — a blocking write cannot be left in flight once the handle resolves.
 /// The only residual window is a single sysfs/serial write that hangs past
-/// `task_timeout` (a running `spawn_blocking` cannot be cancelled). The hwmon
-/// restore no longer *blocks* on that case — `restore_hwmon_to_auto` bounds both
-/// its lock acquisition and its writes (277-b) — so the restore is attempted, and
-/// abandoned on a deadline, whether or not the wedged write ever returns. The
-/// `ExecStopPost` backstop remains, but note it does **not** cover the
-/// `Restart=on-failure` path, where systemd runs no stop job at all.
+/// `task_timeout` (a running `spawn_blocking` cannot be cancelled). The restore
+/// no longer *blocks* on that case: **both** of its steps are bounded — the GPU
+/// `fan_curve` reset (278-c) and the hwmon hand-back, the latter on its lock
+/// acquisition as well as its writes (277-b) — so the restore is attempted, and
+/// abandoned on a deadline, whether or not the wedged write ever returns.
+/// Bounding only one of the two achieved nothing while the other ran first,
+/// which is why they now share `run_bounded` rather than each carrying a
+/// hand-rolled deadline (DEC-279).
+///
+/// The `ExecStopPost` backstop remains, but note it does **not** cover the
+/// `Restart=on-failure` path, where systemd runs no stop job at all — that path
+/// is covered in-process, by the two bounded steps above and nothing else.
 async fn shutdown_sequence<F>(
     poll_shutdown_tx: &tokio::sync::watch::Sender<bool>,
     server_shutdown_tx: tokio::sync::oneshot::Sender<()>,
@@ -1400,6 +1538,8 @@ async fn async_main() {
         active_profile: active_profile.clone(),
         calibrating: std::sync::atomic::AtomicBool::new(false),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
+        last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        adopted_poll_handles: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
         amd_gpus,
         intel_gpus,
         nvidia_gpus,
@@ -1666,7 +1806,7 @@ async fn async_main() {
     // `shutdown_sequence`: stop the IPC server and drain the poll/engine tasks
     // BEFORE restoring hardware to automatic, so neither a late client write nor
     // an in-flight engine write can land after the restore.
-    let task_handles: Vec<(&'static str, tokio::task::JoinHandle<()>)> = [
+    let mut task_handles: Vec<(&'static str, tokio::task::JoinHandle<()>)> = [
         ("hwmon-poll", Some(hwmon_poll_handle)),
         ("openfan-poll", openfan_poll_handle),
         ("profile-engine", Some(engine_handle)),
@@ -1674,6 +1814,19 @@ async fn async_main() {
     .into_iter()
     .filter_map(|(name, handle)| handle.map(|h| (name, h)))
     .collect();
+
+    // 277-c: an OpenFanController adopted after boot (DEC-265) spawned its own
+    // poll loop, and this list was built at startup — so that loop stopped via
+    // the shared shutdown watch but was never *joined*. Drain those handles in
+    // here, so "the restore is the guaranteed last writer" holds for a
+    // rescan-adopted controller on the same terms as a boot-time one.
+    task_handles.extend(
+        app_state
+            .adopted_poll_handles
+            .lock()
+            .drain(..)
+            .map(|h| ("openfan-poll (adopted)", h)),
+    );
 
     finish_shutdown(
         &poll_shutdown_tx,
@@ -1683,18 +1836,22 @@ async fn async_main() {
         SHUTDOWN_TASK_TIMEOUT,
         must_restart,
         || {
-            // Reset GPU fans to automatic before shutting down (re-enables zero-RPM)
-            for gpu in &app_state.amd_gpus {
-                if let Some(ref fan_curve_path) = gpu.fan_curve_path {
-                    match control_ofc_daemon::hwmon::gpu_fan::reset_to_auto(
-                        fan_curve_path,
-                        gpu.fan_zero_rpm_path.as_deref(),
-                    ) {
-                        Ok(()) => log::info!("GPU {} fan reset to auto", gpu.pci_bdf),
-                        Err(e) => log::warn!("GPU {} fan reset failed: {e}", gpu.pci_bdf),
-                    }
-                }
-            }
+            // Reset GPU fans to automatic before shutting down (re-enables
+            // zero-RPM). Bounded since 278-c: this step runs FIRST, so leaving it
+            // unbounded meant a wedged PMFW write blocked here and the bounded
+            // hwmon restore below was never reached — the process stayed just as
+            // stuck as before 277-b. Paths are collected here and moved into the
+            // bounded thread; nothing borrows `app_state` across the deadline.
+            let gpu_curves: Vec<(PathBuf, Option<PathBuf>)> = app_state
+                .amd_gpus
+                .iter()
+                .filter_map(|gpu| {
+                    gpu.fan_curve_path
+                        .clone()
+                        .map(|c| (c, gpu.fan_zero_rpm_path.clone()))
+                })
+                .collect();
+            let _ = restore_gpu_fans_to_auto(gpu_curves, SHUTDOWN_TASK_TIMEOUT);
 
             // Restore hwmon headers to automatic mode (pwm_enable=2) so BIOS
             // regains thermal control. Without this, a daemon crash leaves
@@ -3025,6 +3182,184 @@ mod tests {
         );
     }
 
+    /// Make a FIFO at `dir/name` and return it. Opening one `O_WRONLY` blocks in
+    /// `open(2)` until a reader appears, which is the only faithful in-process
+    /// model of a sysfs write wedged in a kernel driver: `std::fs::write` is
+    /// `File::create` + `write_all`, so the block happens at the same syscall a
+    /// real one does. A sleep, or a held userspace mutex, models the wedge the
+    /// author imagined rather than the one that happens — DEC-278 shipped three
+    /// passing tests that way against a fix which did not work.
+    fn wedged_fifo(dir: &Path, name: &str) -> PathBuf {
+        let fifo = dir.join(name);
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo must be available (coreutils)");
+        assert!(status.success(), "mkfifo failed for {}", fifo.display());
+        fifo
+    }
+
+    /// Open `fifo` `opens` times after `after`, unblocking whatever is parked in
+    /// `open(2)`.
+    ///
+    /// Self-release (DEC-272 trap 3): a failed assertion skips the test's own
+    /// cleanup, so a writer with no reader would park for the life of the test
+    /// binary and turn a red test into a hung CI job. Join the returned handle
+    /// BEFORE asserting, and while the FIFO still exists — a reader that opens a
+    /// path `tempdir` has already removed swallows the ENOENT and releases
+    /// nothing.
+    ///
+    /// **`opens` must match how many times the code under test opens the path,
+    /// not how many writes you think it does.** `gpu_fan::reset_to_auto` issues
+    /// two `std::fs::write` calls to the same path, and each is a separate
+    /// `File::create` — so one reader releases the first and leaves the writer
+    /// parked on the second forever. The bound still holds and the test still
+    /// passes, but the release becomes decorative: a regression that made
+    /// `run_bounded` wait for completion would then HANG this test instead of
+    /// failing it, which is the failure mode this helper exists to prevent. Each
+    /// open here rendezvouses with the next writer open, so the count is exact.
+    fn release_fifo_after(
+        fifo: &Path,
+        after: Duration,
+        opens: usize,
+    ) -> std::thread::JoinHandle<()> {
+        let path = fifo.to_path_buf();
+        std::thread::spawn(move || {
+            std::thread::sleep(after);
+            for _ in 0..opens {
+                let _ = std::fs::File::open(&path);
+            }
+        })
+    }
+
+    /// [SAFETY] 278-c. The GPU half of the same rule 277-b established for hwmon.
+    ///
+    /// `gpu_fan::reset_to_auto` is two bare `std::fs::write` calls and it runs
+    /// FIRST in the shutdown closure, so leaving it unbounded meant a wedged PMFW
+    /// write blocked *before* the bounded hwmon restore was ever reached — the
+    /// process stayed exactly as stuck as it was before 277-b, one device class
+    /// over. Bounding half a sequence bounds nothing.
+    #[test]
+    fn a_wedged_gpu_curve_write_cannot_stall_the_shutdown_restore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = wedged_fifo(tmp.path(), "fan_curve");
+        let releaser = release_fifo_after(&fifo, Duration::from_millis(400), 2);
+
+        let started = Instant::now();
+        let completed =
+            restore_gpu_fans_to_auto(vec![(fifo.clone(), None)], Duration::from_millis(200));
+        let elapsed = started.elapsed();
+
+        releaser.join().unwrap();
+
+        assert!(
+            !completed,
+            "a write parked in open(2) cannot have completed — if this reports \
+             success the deadline is not being observed at all"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "a PMFW write that never returns must not stall shutdown: it runs \
+             ahead of the hwmon restore, and on the Restart=on-failure path there \
+             is no stop job, so nothing downstream can rescue the process; took \
+             {elapsed:?}"
+        );
+    }
+
+    /// [SAFETY] 278-a. The panic hook carried the same unbounded shape.
+    ///
+    /// It runs only on a *fatal* panic and correctly takes no lock, which is why
+    /// this is a deadline rather than a restructure — but an unresponsive chip
+    /// still blocked the hook, so the process never reached `abort()`: a
+    /// panicking daemon that neither controls fans nor dies. Aborting with fans
+    /// latched is strictly better, because systemd can restart that.
+    #[test]
+    fn a_wedged_write_cannot_stall_the_panic_restore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = wedged_fifo(tmp.path(), "pwm1_enable");
+        let releaser = release_fifo_after(&fifo, Duration::from_millis(400), 1);
+
+        // `&'static` because `PANIC_RESTORE` is a static `OnceLock`, so the real
+        // call site always has one and the helper need not clone the path lists
+        // on the panic path.
+        let targets: &'static PanicRestoreTargets = Box::leak(Box::new(PanicRestoreTargets {
+            gpu_curves: Vec::new(),
+            hwmon_enable_paths: vec![fifo.to_string_lossy().into_owned()],
+        }));
+
+        let started = Instant::now();
+        let completed = restore_panic_targets(targets, Duration::from_millis(200));
+        let elapsed = started.elapsed();
+
+        releaser.join().unwrap();
+
+        assert!(
+            !completed,
+            "a write parked in open(2) cannot have completed"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the panic hook must not hang on an unresponsive chip — it sits \
+             between the panic and abort(), so a block here is a process that \
+             never dies; took {elapsed:?}"
+        );
+    }
+
+    /// 277-c — the adopted-poll-handle drain, which behaviour cannot see.
+    ///
+    /// The drain is inline in `async_main`, so no in-process test can invoke it;
+    /// and it shipped with no test at all, which is how a shutdown guarantee
+    /// quietly stops being one. Dropping the `.extend(...drain...)` line leaves
+    /// the whole suite green — an adopted OpenFan poll loop is then signalled but
+    /// never joined, and "the restore is the guaranteed last writer" stops being
+    /// established for a rescan-adopted controller.
+    ///
+    /// The ORDERING assertion is the load-bearing half. Draining after
+    /// `finish_shutdown` would compile, read plausibly, and do nothing whatsoever
+    /// — the handles would be collected after the drain that was supposed to
+    /// consume them.
+    ///
+    /// Harmless today: that loop only reads status and RPM (verified — it sends
+    /// `Command::ReadAllRpm` and its only mutation is a cache update), so there
+    /// is no PWM hazard now. The guard is pre-emptive, and it says so rather than
+    /// implying it is protecting live users.
+    #[test]
+    fn adopted_poll_handles_are_drained_before_shutdown() {
+        let whole = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let src = whole
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .expect("main.rs has a #[cfg(test)] module");
+
+        // Anchor on the FIELD ACCESS (`.adopted_poll_handles`), not on the bare
+        // name: the first bare occurrence in this file is the struct-construction
+        // site a few hundred lines earlier, so anchoring there asserted a window
+        // of source that never contains the drain, and the guard failed against
+        // correct code the moment it was written.
+        let drain_at = src
+            .find(".adopted_poll_handles")
+            .expect("the adopted poll handles must be drained into task_handles (277-c)");
+        assert!(
+            src[drain_at..drain_at + 200].contains("drain(..)"),
+            "the handles must be DRAINED, not merely referenced — a clone or a \
+             length check would leave the loops unjoined"
+        );
+        assert!(
+            src[..drain_at].contains("task_handles.extend("),
+            "the drained handles must go INTO task_handles, which is the list \
+             shutdown_sequence actually joins"
+        );
+        let finish_at = src
+            .find("finish_shutdown(")
+            .expect("async_main must call finish_shutdown");
+        assert!(
+            drain_at < finish_at,
+            "the drain must run BEFORE finish_shutdown — draining afterwards \
+             collects handles nothing will ever join, which compiles and reads \
+             fine while doing nothing at all"
+        );
+    }
+
     /// [SAFETY] 277-b — the call site, which behaviour cannot see.
     ///
     /// The restore closure is inline in `async_main`, so no in-process test can
@@ -3046,10 +3381,81 @@ mod tests {
             "the shutdown restore must call the bounded helper"
         );
         assert!(
-            src.contains("done_rx.recv_timeout(write_timeout)"),
+            src.contains("done_rx.recv_timeout(timeout)"),
             "the restore WRITES must be bounded, not just the lock acquisition — \
              bounding only the lock moves the hang from a userspace mutex to the \
              kernel driver lock the wedged write is already stuck on"
+        );
+        // 278-c / 278-a. Bounding the hwmon step alone was never sufficient: the
+        // GPU reset runs FIRST in the same closure, and the panic hook is a third
+        // copy of the same shape. Each must reach `run_bounded`, and each is
+        // asserted here because behaviour cannot see any of these call sites —
+        // the closure is inline in `async_main` and the hook body is inside
+        // `set_hook`.
+        //
+        // Matched in CALL position, not as a bare substring. `contains("foo(")`
+        // is satisfied by `fn foo(`, so the first version of this guard passed on
+        // the function DEFINITIONS and would have stayed green with every call
+        // site deleted — the exact "extracting a rule does not test the call site"
+        // trap its own docstring claims to defend against, and a sibling of the
+        // `polling.rs` self-matching guard. A call line is one that mentions the
+        // name and does not declare it.
+        let call_lines = |needle: &str| -> usize {
+            src.lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    l.contains(needle) && !t.starts_with("fn ") && !t.starts_with("//")
+                })
+                .count()
+        };
+        for (needle, why) in [
+            (
+                "restore_gpu_fans_to_auto(",
+                "the shutdown closure's GPU reset must be bounded — it runs BEFORE \
+                 the hwmon restore, so an unbounded PMFW write blocks the whole \
+                 closure and the bounded half below is never reached (278-c)",
+            ),
+            (
+                "restore_panic_targets(",
+                "the panic hook's restore must be bounded — an unresponsive chip \
+                 otherwise blocks the hook and the process never reaches abort(), \
+                 leaving a panicking daemon that neither controls fans nor dies \
+                 (278-a)",
+            ),
+            (
+                "restore_hwmon_to_auto(",
+                "the shutdown closure must still call the bounded hwmon restore \
+                 (277-b)",
+            ),
+        ] {
+            assert!(call_lines(needle) >= 1, "{why}");
+        }
+        // ORDERING, which nothing else pins. 278-c is that the GPU reset runs
+        // first: bounding the second of two sequential steps bounds nothing while
+        // the first can still block forever ahead of it. Swapping them would keep
+        // every assertion above green and silently restore that shape, so assert
+        // the relative position of the two call sites in the closure.
+        let gpu_at = src
+            .find("restore_gpu_fans_to_auto(app_state")
+            .or_else(|| src.find("let _ = restore_gpu_fans_to_auto("))
+            .expect("the shutdown closure must call restore_gpu_fans_to_auto");
+        let hwmon_at = src
+            .find("let _ = restore_hwmon_to_auto(")
+            .expect("the shutdown closure must call restore_hwmon_to_auto");
+        assert!(
+            gpu_at < hwmon_at,
+            "the GPU reset must stay AHEAD of the hwmon restore in the shutdown \
+             closure — the ordering is what makes bounding both necessary, and a \
+             reorder is invisible to every other assertion here"
+        );
+        // The helper the three of them share must still actually bound something.
+        // Without this, the three assertions above pass against a `run_bounded`
+        // that simply calls `f()` inline — the rule would be *named* everywhere
+        // and *enforced* nowhere.
+        assert!(
+            src.contains("fn run_bounded") && src.contains("recv_timeout"),
+            "run_bounded must impose a deadline — three restore paths now depend \
+             on it, so a version that merely calls f() disarms all of them at once"
         );
         // Matched in STATEMENT position, not as a substring: the doc comments
         // above discuss the old unbounded lock in prose, and a bare `contains`

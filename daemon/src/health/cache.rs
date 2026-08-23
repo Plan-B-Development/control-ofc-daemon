@@ -611,6 +611,51 @@ impl StateCache {
         self.inner.write().skipped_controls = skipped;
     }
 
+    /// Publish the engine's per-tick control state — which controls are skipped
+    /// (273-i) and what output each evaluated control applied (277-k) — in **one
+    /// write**.
+    ///
+    /// Called on EVERY tick from the single publish point in
+    /// `TickCompletion::drop`, including the early-`continue` paths. An output is
+    /// a *level*, and a level that froze because a `continue` skipped the publish
+    /// would keep reporting a duty the engine has since stopped applying.
+    /// Publishing empty is meaningful, not a gap — it says no control is being
+    /// evaluated right now (no profile, or a thermal force driving the fans
+    /// directly), which is exactly when a card must stop showing a number.
+    ///
+    /// **The two fields must move together, which is why this is one method and
+    /// not two.** They were separate `write()` takes for a while, and each was
+    /// individually atomic, but the *pair* was not: on a resolvability transition
+    /// a control leaves `tick_outputs` as it enters the skip list, so a `/poll`
+    /// landing in the gap saw the new skip entry beside the stale output and
+    /// listed one control on both surfaces when it belongs on exactly one. Both
+    /// readers take them together — `status_handler` and `poll_handler` build
+    /// both inside a single `read_with` — so one guard closes the window
+    /// completely. `docs/08` states that absence from `control_outputs` is
+    /// *meaningful*, so a torn read there contradicts the contract published in
+    /// the same release that introduced the field.
+    ///
+    /// It is also cheaper: with a profile active `control_outputs` is non-empty
+    /// every tick, so the two-call shape took the write lock twice per tick where
+    /// this takes it once.
+    ///
+    /// Same deliberate double-checked fast path as [`Self::update_skipped_controls`],
+    /// now spanning both fields: the read guard is dropped before the write lock
+    /// is taken, and the interleaving is harmless because the write is idempotent.
+    /// It exists so the common no-profile case never contends for the write lock
+    /// at 1 Hz; do not collapse it into a single lock.
+    pub fn update_control_state(&self, skipped: Vec<SkippedControl>, outputs: Vec<ControlOutput>) {
+        if skipped.is_empty() && outputs.is_empty() {
+            let snap = self.inner.read();
+            if snap.skipped_controls.is_empty() && snap.control_outputs.is_empty() {
+                return;
+            }
+        }
+        let mut state = self.inner.write();
+        state.skipped_controls = skipped;
+        state.control_outputs = outputs;
+    }
+
     /// Drop cached readings for sensors that no longer exist.
     ///
     /// [SAFETY] DEC-272 (register row 01-c). [`update_sensors`] only ever

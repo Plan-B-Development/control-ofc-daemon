@@ -118,6 +118,24 @@ pub(crate) fn build_skipped_entries(snap: &DaemonState, now: Instant) -> Vec<Ski
     entries
 }
 
+/// Build the per-control applied-output list from a cache snapshot (277-k).
+///
+/// Already sorted by `control_id` upstream (`ProfileEngineState::outputs_snapshot`)
+/// — re-sorted here anyway so the wire ordering is a property of this boundary
+/// and cannot silently depend on how the engine happened to build the map.
+pub(crate) fn build_control_output_entries(snap: &DaemonState) -> Vec<ControlOutputEntry> {
+    let mut entries: Vec<ControlOutputEntry> = snap
+        .control_outputs
+        .iter()
+        .map(|c| ControlOutputEntry {
+            control_id: c.control_id.clone(),
+            output_pct: c.output_pct,
+        })
+        .collect();
+    entries.sort_by(|a, b| a.control_id.cmp(&b.control_id));
+    entries
+}
+
 /// Build the sorted list of fan entries from a cache snapshot.
 pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntry> {
     let mut fans: Vec<FanEntry> = Vec::new();
@@ -187,6 +205,24 @@ pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntr
     fans
 }
 
+/// What the last completed OpenFan rescan probe saw (register row 10-e).
+///
+/// The candidate list is half the value. Rate-limiting on elapsed time alone
+/// refused the single most likely legitimate retry — plug a controller in, click
+/// rescan — because that is a human action measured in seconds. Recording which
+/// ports were probed lets the cooldown apply only while nothing has changed: a
+/// newly attached controller enumerates a new tty, so the sets differ and the
+/// retry proceeds immediately.
+#[derive(Debug, Clone)]
+pub struct LastRescan {
+    /// When the probe finished (stamped by `RescanGuard::drop`, so the quiet
+    /// period runs from the end of the last DTR assertion, not from the request
+    /// that started it).
+    pub at: Instant,
+    /// The candidate ports that probe actually walked.
+    pub candidates: Vec<String>,
+}
+
 /// Parameters needed to start an OpenFan poll loop for a late-adopted
 /// controller (DEC-265). Cloned from config at boot; never discovery-dependent.
 #[derive(Clone)]
@@ -238,6 +274,29 @@ pub struct AppState {
     /// a controller over the winner's — orphaning a poll loop on a transport
     /// nothing writes through.
     pub openfan_rescanning: AtomicBool,
+    /// What the last completed `POST /fans/openfan/rescan` probe saw (register
+    /// row 10-e). `openfan_rescanning` above bounds **concurrency**; this bounds
+    /// **repetition**, which is a different hazard: every probe asserts DTR on
+    /// each candidate tty, and that *resets* Arduino-class boards. A caller
+    /// looping on a failing rescan therefore holds unrelated hardware in reset.
+    ///
+    /// Carries the candidate set, not just a timestamp, because the cooldown is
+    /// conditional on the world being unchanged — see `OPENFAN_RESCAN_COOLDOWN`.
+    /// A successful adoption never reaches the check at all: the handler returns
+    /// early once a controller is connected.
+    pub last_openfan_rescan: Arc<Mutex<Option<LastRescan>>>,
+    /// Poll-loop handles for OpenFan controllers adopted *after* boot (DEC-265,
+    /// register row 277-c).
+    ///
+    /// `main` builds its `task_handles` list once at startup, long before a
+    /// rescan can adopt anything, so a poll loop spawned by the rescan path had
+    /// nowhere to be joined and `shutdown_sequence` never drained it. Harmless
+    /// as shipped — that loop only reads status and RPM, so there is no PWM
+    /// hazard — but "the restore is the guaranteed last writer" was simply not
+    /// established for a rescan-adopted controller, and any future write added
+    /// there would have fallen silently outside the drain invariant. Drained
+    /// alongside `task_handles` so the invariant holds for both.
+    pub adopted_poll_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     /// Detected AMD GPU info (populated at startup). Empty if no AMD GPU found.
     pub amd_gpus: Vec<crate::hwmon::gpu_detect::AmdGpuInfo>,
     /// Detected Intel discrete GPU info (populated at startup). Empty if none
@@ -396,6 +455,7 @@ pub(crate) fn build_status_response(
     thermal_state: String,
     unavailable_sensors: Vec<UnavailableSensorEntry>,
     skipped_controls: Vec<SkippedControlEntry>,
+    control_outputs: Vec<ControlOutputEntry>,
     health: crate::health::staleness::HealthSummary,
 ) -> StatusResponse {
     let subsystems = health
@@ -462,6 +522,7 @@ pub(crate) fn build_status_response(
         fan_identify,
         unavailable_sensors,
         skipped_controls,
+        control_outputs,
         active_profile_id,
         active_profile_name,
         readiness,

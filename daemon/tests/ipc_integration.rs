@@ -102,6 +102,8 @@ fn test_app_state_inner(engine_ticked: bool, runtime_cfg: std::path::PathBuf) ->
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
+        last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        adopted_poll_handles: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
         amd_gpus: Vec::new(),
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -738,6 +740,8 @@ async fn fans_endpoint_tags_intel_gpu_source_by_id_prefix() {
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
+        last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        adopted_poll_handles: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
         amd_gpus: Vec::new(),
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -902,6 +906,8 @@ fn test_app_state_with_nvidia_gpu(
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
+        last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        adopted_poll_handles: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
         amd_gpus: Vec::new(),
         intel_gpus: Vec::new(),
         nvidia_gpus: vec![gpu],
@@ -1174,6 +1180,8 @@ fn test_app_state_with_hwmon() -> Arc<AppState> {
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
+        last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        adopted_poll_handles: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
         amd_gpus: Vec::new(),
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -1437,6 +1445,8 @@ fn test_app_state_with_unsupported_gpu(pci_bdf: &str) -> Arc<AppState> {
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
+        last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        adopted_poll_handles: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
         amd_gpus: vec![unsupported],
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -1520,6 +1530,8 @@ fn test_app_state_with_read_only_gpu(pci_bdf: &str, pci_device_id: u16) -> Arc<A
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
+        last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        adopted_poll_handles: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
         amd_gpus: vec![read_only],
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -1593,6 +1605,8 @@ fn test_app_state_with_amd_gpu(
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
+        last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        adopted_poll_handles: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
         amd_gpus: vec![gpu],
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -2066,6 +2080,8 @@ async fn deactivate_profile_resets_hwmon_coalescing() {
         }))),
         calibrating: std::sync::atomic::AtomicBool::new(false),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
+        last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        adopted_poll_handles: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
         amd_gpus: Vec::new(),
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -2190,6 +2206,8 @@ fn test_app_state_with_writable_pmfw_gpu(pci_bdf: &str) -> (Arc<AppState>, tempf
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
+        last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        adopted_poll_handles: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
         amd_gpus: vec![pmfw],
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -2370,6 +2388,8 @@ async fn hwmon_discovery_excludes_amdgpu_end_to_end_via_ipc() {
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
+        last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        adopted_poll_handles: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
         amd_gpus: Vec::new(),
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -2441,6 +2461,8 @@ fn test_app_state_with_profile_dirs(dirs: Vec<std::path::PathBuf>) -> Arc<AppSta
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
+        last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        adopted_poll_handles: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
         amd_gpus: Vec::new(),
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
@@ -4067,11 +4089,125 @@ async fn openfan_rescan_releases_its_single_flight_flag_when_the_probe_ends() {
         "the single-flight flag must be clear once the probe has finished"
     );
 
+    // 10-e: clear the cooldown before the second probe. Without this the request
+    // below is rejected by the rate limit, which runs BEFORE the single-flight
+    // CAS — so it would never reach the flag at all and this test would assert
+    // nothing while still looking like it did. Gutting `RescanGuard::drop` must
+    // fail here, and it can only do that if the request gets far enough to try
+    // the CAS.
+    *state.last_openfan_rescan.lock() = None;
+
     let (code2, body2) = uds_post(&sock_str, "/fans/openfan/rescan", &serde_json::json!({})).await;
     assert_ne!(
         code2, 409,
         "a second rescan after the first completed must not be rejected as \
          'already in progress' — the flag leaked: {body2}"
+    );
+}
+
+#[tokio::test]
+async fn openfan_rescan_spaces_repeated_probes() {
+    // 10-e. `openfan_rescanning` bounds concurrency; nothing bounded repetition,
+    // and every probe asserts DTR across each candidate tty — which RESETS
+    // Arduino-class boards. So a client looping on a failing rescan was holding
+    // unrelated serial hardware in reset, indefinitely.
+    //
+    // Asserted as an OUTCOME (the second call is refused) rather than by reading
+    // the timestamp: a cooldown that records a stamp nothing consults would pass
+    // a state assertion and change no behaviour at all.
+    let state = test_app_state();
+    let (sock_str, _tx, _tmp) = start_test_server(state.clone()).await;
+
+    let (code, body) = uds_post(&sock_str, "/fans/openfan/rescan", &serde_json::json!({})).await;
+    assert_ne!(
+        code, 409,
+        "the first probe must not be rate-limited: {body}"
+    );
+    assert!(
+        state.last_openfan_rescan.lock().is_some(),
+        "a completed probe must stamp the cooldown, or nothing is ever spaced"
+    );
+
+    let (code2, body2) = uds_post(&sock_str, "/fans/openfan/rescan", &serde_json::json!({})).await;
+    assert_eq!(
+        code2, 409,
+        "an immediate second probe must be refused: {body2}"
+    );
+    // Distinguish the two 409s. They are the same status by design (docs/08's
+    // code set is a contract), so only the message separates "too soon" from
+    // "already running" — and a test that cannot tell them apart would pass
+    // against a cooldown that never fired but a leaked single-flight flag.
+    let msg = body2["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("moments ago"),
+        "the refusal must be the cooldown, not a leaked single-flight flag: {body2}"
+    );
+
+    // The 409 must advertise itself as RETRYABLE. This one clears on its own in
+    // seconds and the message says so, so reporting `retryable: false` — the
+    // default for `validation_error` — tells a client keying its backoff off that
+    // field, which is the field's documented purpose, that the wait is permanent.
+    assert_eq!(
+        body2["error"]["retryable"], true,
+        "a cooldown that expires in seconds must not present as permanent: {body2}"
+    );
+
+    // And it must expire rather than latch — a rate limit that never lifts is
+    // the same wedged route DEC-266's guard exists to prevent.
+    *state.last_openfan_rescan.lock() = Some(control_ofc_daemon::api::handlers::LastRescan {
+        at: std::time::Instant::now() - std::time::Duration::from_secs(3600),
+        candidates: Vec::new(),
+    });
+    let (code3, body3) = uds_post(&sock_str, "/fans/openfan/rescan", &serde_json::json!({})).await;
+    assert_ne!(
+        code3, 409,
+        "the cooldown must lapse, not latch the route closed: {body3}"
+    );
+}
+
+#[tokio::test]
+async fn openfan_rescan_cooldown_yields_when_the_ports_change() {
+    // 10-e, round 2. Rate-limiting on elapsed time ALONE refused the single most
+    // likely legitimate retry: plug a controller in, click rescan. That is a
+    // human action measured in seconds, so the device went unadopted and the GUI
+    // showed nothing — transiently re-opening the "restart the daemon" mis-advice
+    // DEC-265/266 exists to remove, on the one endpoint whose whole purpose is
+    // recovery without a restart.
+    //
+    // The cooldown therefore applies only while the candidate port set is
+    // UNCHANGED. A newly attached controller enumerates a new tty, so the sets
+    // differ and the retry proceeds at once.
+    let state = test_app_state();
+    let (sock_str, _tx, _tmp) = start_test_server(state.clone()).await;
+
+    let (code, body) = uds_post(&sock_str, "/fans/openfan/rescan", &serde_json::json!({})).await;
+    assert_ne!(
+        code, 409,
+        "the first probe must not be rate-limited: {body}"
+    );
+
+    // Establish the PRESENCE of the cooldown before asserting it yields —
+    // otherwise this passes against a build where the cooldown never fires at
+    // all, proving nothing about the bypass (DEC-272).
+    let (blocked, blocked_body) =
+        uds_post(&sock_str, "/fans/openfan/rescan", &serde_json::json!({})).await;
+    assert_eq!(
+        blocked, 409,
+        "precondition: an unchanged port set must still be spaced: {blocked_body}"
+    );
+
+    // Now claim the last probe walked a DIFFERENT set — the state a freshly
+    // attached controller produces — with the clock left well inside the window.
+    *state.last_openfan_rescan.lock() = Some(control_ofc_daemon::api::handlers::LastRescan {
+        at: std::time::Instant::now(),
+        candidates: vec!["/dev/ttyUSB-was-not-here-before".to_string()],
+    });
+    let (code2, body2) = uds_post(&sock_str, "/fans/openfan/rescan", &serde_json::json!({})).await;
+    assert_ne!(
+        code2, 409,
+        "a changed candidate set must bypass the cooldown — otherwise plugging a \
+         controller in and rescanning immediately is refused, which is exactly \
+         the recovery this endpoint exists for: {body2}"
     );
 }
 

@@ -1,5 +1,115 @@
 # Changelog
 
+## [2.22.0] — 2026-08-23
+
+### Added
+- **The status the GUI polls now reports what speed each control is actually
+  asking for.** Until now it reported which controls had stopped working, but
+  never what the working ones were doing — so a live Controls card had no way to
+  show a running figure and simply showed a dash forever. The daemon now
+  publishes each control's applied output once per tick, whether that came from
+  its curve or from a manual override, because the question a card is trying to
+  answer is "what are the fans doing?" and an override is just as real an answer
+  as a curve.
+  Read it as a *control-wide* figure, not a per-fan one: an individual fan can
+  sit above it on a safety floor, or below it on a graphics card that diverges,
+  and each fan already reports its own commanded duty separately. A control that
+  is not being evaluated is simply absent from the list rather than reported as
+  zero — including for the whole of a thermal emergency, which drives the fans
+  directly and bypasses controls entirely. Older clients are unaffected: the
+  field is omitted when empty, so nothing about the existing shape changes. 277-k.
+- **A control nothing can drive now shows up in the daemon's overall health.**
+  A live engine ticking perfectly over a control whose curve cannot be resolved
+  used to report as a completely healthy daemon, while the fans on that control
+  sat holding their last speed. The only signs were one line in the log and a
+  chip on one page — and that chip is hidden whenever a manual or external
+  override is showing.
+  Health now carries a `controls` entry that goes to *warn* while any control is
+  unresolvable, and says how many and for how long. Deliberately **warn and not
+  critical**: those fans are not stopped, and the 105 °C emergency does not go
+  through controls at all, so it still reaches every OpenFan channel and writable
+  motherboard header regardless. Critical stays reserved for a subsystem that has
+  genuinely failed.
+  Note this is louder than the equivalent treatment of unreadable *sensors*,
+  which deliberately does not affect overall health. That difference is
+  intentional: an unreadable sensor is a cause, is often harmless (a WiFi radio
+  that is switched off), and frequently drives nothing — whereas a skipped
+  control is the consequence, and always means a real fan is uncommanded. 277-j.
+
+### Fixed
+- **A graphics card that stops responding could still hang shutdown — the case
+  the last release named and left open.** v2.21.1 put a time limit on handing
+  the motherboard fan headers back to firmware, and said plainly that a graphics
+  card whose fan-curve write wedged the same way could still hold shutdown open
+  because that step runs first. This release closes it.
+  Both steps now share one time limit instead of one of them having a
+  hand-rolled limit and the other having none. That distinction mattered more
+  than it sounds: bounding only the *second* of two steps achieves nothing at all
+  while the first one can block forever ahead of it, which is exactly the shape
+  that shipped. A wedged machine now costs about twenty-three seconds to stop,
+  rather than never returning.
+  The honest limits are unchanged and are not quietly upgraded here: stopping is
+  guaranteed, **restoring the hardware is not**. If a chip or card has genuinely
+  stopped accepting writes then nothing can restore it, and those fans hold their
+  last speed until something takes them over again. 278-c.
+- **The same unbounded write could also hang the daemon while it was crashing.**
+  When a fatal error takes the daemon down, it tries to hand the fans back to
+  firmware before it goes. Those writes had no time limit either, so a chip that
+  had stopped responding could park the daemon mid-crash: a process that neither
+  controlled the fans nor finished dying, which is the worse of the two outcomes
+  because systemd can restart a daemon that has actually exited. It now gives up
+  after three seconds and exits anyway. 278-a.
+- **A control that stopped working no longer goes quiet during a thermal
+  emergency.** The list of controls the daemon cannot resolve was being wiped for
+  the entire duration of a 105 °C event, and stayed empty for a further three
+  seconds after recovery — so the one place that says "nothing is commanding
+  these fans" went silent exactly when someone was most likely to be looking at
+  it, and the chip in the GUI blinked off and back.
+  The cause was that the emergency reused the same reset as switching profiles,
+  which correctly forgets that list because the next profile's controls are
+  different. An emergency is not a profile switch: it says nothing about whether
+  a curve resolves. The list now holds steady across the event.
+  Worth knowing how to read it during one: a control listed here means *its curve
+  cannot be resolved*, not *this fan is stopped*. The emergency drives OpenFan
+  channels and writable motherboard headers directly — graphics-card fans are
+  excluded from it by design — so a graphics-bound control with a broken curve
+  genuinely is uncommanded throughout, which is precisely the case that must not
+  go silent. 277-i.
+- **Repeatedly asking the daemon to re-scan for an OpenFan controller now has to
+  wait between attempts — unless something actually changed.** Two scans could
+  never run at once, but nothing stopped a client firing them back to back forever,
+  and each scan asserts DTR on every candidate serial port, which *resets*
+  Arduino-class boards. So a client looping on a failing scan was holding unrelated
+  hardware in reset.
+  Scans against the *same* set of ports are now spaced ten seconds apart. Plugging
+  a controller in and scanning again straight away is **not** delayed: a new device
+  means a new port, and that is the case this button exists for. A successful scan
+  never meets the wait at all, because the request returns immediately once a
+  controller is connected. If you do hit the wait, the message says how long is
+  left. 10-e.
+
+### Internal
+- A poll loop for an OpenFan controller adopted *after* startup is now drained at
+  shutdown along with the rest, instead of merely being told to stop. No
+  behaviour change today — that loop only reads status and RPM, so there was no
+  risk of a late write — but "the restore is the last thing to touch the
+  hardware" was simply not established for a controller adopted this way, and any
+  future write added there would have broken that silently. 277-c.
+- The release workflow built its cross-repo notification with a shell here-doc
+  that expanded the tag before sending it. A tag containing shell substitution
+  would have been executed, in a job holding the publishing token. Pushing a tag
+  already requires write access, so this was not an escalation — but it was a
+  shell-injection sink next to a credential. It is now built with `jq`, which
+  also escapes the value properly. 277-p.
+- Re-checked whether the IT8689E chip should start reporting as mainline-supported
+  now that kernel 7.1 carries fan control for it. **Still no, and the schedule
+  moved further out rather than closer**: the 6.12 and 6.18 long-term kernels were
+  both extended to December 2028, and 6.12 is what Debian 13 and RHEL 10 ship, so
+  "7.1 or newer is the common baseline" cannot become true before then. Saying
+  "mainline: yes" today would steer people off the DKMS driver they still need.
+  Next re-check scheduled for 2027-08, so this stops being re-derived at every
+  audit. 10-a.
+
 ## [2.21.1] — 2026-08-22
 
 ### Fixed

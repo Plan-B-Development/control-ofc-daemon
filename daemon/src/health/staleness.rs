@@ -242,6 +242,65 @@ fn subsystem_health(
     }
 }
 
+/// Health of the *controls* the engine is responsible for, as distinct from
+/// whether the engine is ticking (277-j).
+///
+/// A live engine ticking on schedule over a control whose curve will not resolve
+/// is a healthy `engine` entry and an unhealthy machine: nothing is commanding
+/// those fans, they hold their last duty indefinitely (DEC-269), and until this
+/// entry existed `/status.overall_status` stayed `"ok"` throughout. The GUI
+/// ribbon, Dashboard and System State all read that rollup, so the only signals
+/// were one journal WARN and a Controls-card chip — itself suppressed while a
+/// Manual or External override is showing.
+///
+/// **`Warn`, never `Crit`.** The fans are not stopped and there is no thermal
+/// hazard: the 105 °C rule is a separate path that bypasses controls entirely
+/// (`force_all`), so it still reaches every OpenFan channel and writable hwmon
+/// header regardless of what is listed here. `Crit` is reserved for a subsystem
+/// that has actually failed, and escalating this one would drown that
+/// distinction on a machine with one mis-authored profile.
+///
+/// **This is deliberately louder than DEC-193's `unavailable_sensors`**, which
+/// does not move `overall_status` at all, and the asymmetry is the point rather
+/// than an inconsistency: an unavailable sensor is a *cause*, is frequently
+/// benign (a WiFi radio powered down), and very often drives nothing. A skipped
+/// control is the *consequence*, is never benign, and by construction means a
+/// real fan is uncommanded right now.
+///
+/// `age_ms` is the LONGEST `skipped_for_ms` in the list — the oldest unresolved
+/// control, which is the one an operator most needs to know has been sitting
+/// there. Reporting the newest would let a flapping control mask a permanent one.
+fn controls_health(state: &DaemonState, now: Instant) -> SubsystemHealth {
+    let entry = |status, reason: String, age: Option<u64>| SubsystemHealth {
+        name: "controls".into(),
+        status,
+        age_ms: age,
+        reason,
+    };
+
+    let oldest = state
+        .skipped_controls
+        .iter()
+        .map(|c| now.saturating_duration_since(c.since).as_millis() as u64)
+        .max();
+
+    let Some(age) = oldest else {
+        return entry(
+            HealthStatus::Ok,
+            "every control resolves to a curve".into(),
+            None,
+        );
+    };
+
+    let n = state.skipped_controls.len();
+    let noun = if n == 1 { "control" } else { "controls" };
+    entry(
+        HealthStatus::Warn,
+        format!("{n} {noun} not being commanded — their fans hold their last speed"),
+        Some(age),
+    )
+}
+
 /// Compute the health summary for the daemon.
 ///
 /// This function is pure: it takes the current state, config, and a reference
@@ -285,6 +344,10 @@ pub fn compute_health(
             now,
             config.engine_interval_ms,
         ),
+        // 277-j: APPENDED at index 3, never inserted — see the wire-shape note
+        // above. "The engine is ticking" and "the engine is commanding every
+        // control" are different questions, and only the first had an entry.
+        controls_health(state, now),
     ];
 
     // Overall: worst of all subsystems
@@ -303,7 +366,7 @@ pub fn compute_health(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::health::state::{DaemonState, SubsystemTimestamps};
+    use crate::health::state::{DaemonState, SkipReason, SkippedControl, SubsystemTimestamps};
     use std::time::Duration;
 
     fn base_state() -> DaemonState {
@@ -434,13 +497,132 @@ mod tests {
         let health = compute_health(&state, &default_config(), now);
 
         // Appended, never inserted — clients index openfan at 0 and hwmon at 1.
-        assert_eq!(health.subsystems.len(), 3);
+        // 277-j added `controls` at 3 on the same terms; this assertion is the
+        // pin that makes an *insertion* fail rather than silently reshuffle a
+        // wire position a client is indexing by number.
+        assert_eq!(health.subsystems.len(), 4);
         assert_eq!(health.subsystems[0].name, "openfan");
         assert_eq!(health.subsystems[1].name, "hwmon");
         let engine = &health.subsystems[2];
         assert_eq!(engine.name, "engine");
         assert_eq!(engine.status, HealthStatus::Ok);
         assert_eq!(engine.reason, "evaluating on schedule");
+        assert_eq!(health.subsystems[3].name, "controls");
+    }
+
+    // ── 277-j: a control nothing can drive is a health signal ───────
+
+    /// The gap this entry closes: a live engine ticking on schedule over a
+    /// control whose curve will not resolve was a fully green `/status`. Nothing
+    /// commands those fans, they hold their last duty indefinitely (DEC-269), and
+    /// the GUI ribbon, Dashboard and System State all read `overall_status`.
+    #[test]
+    fn a_skipped_control_degrades_overall_status() {
+        let now = Instant::now();
+        let mut state = state_with_live_engine(now);
+        state.subsystem_timestamps.openfan = Some(now);
+        state.subsystem_timestamps.hwmon = Some(now);
+
+        // Assert the PRESENCE before the absence (DEC-272's vacuous-absence
+        // trap): without this, a change that made every subsystem Warn would let
+        // the assertion below pass while proving nothing about skipped controls.
+        let healthy = compute_health(&state, &default_config(), now);
+        assert_eq!(
+            healthy.overall,
+            HealthStatus::Ok,
+            "precondition: with nothing skipped this state must be fully green"
+        );
+
+        state.skipped_controls = vec![SkippedControl {
+            control_id: "ctl".into(),
+            control_name: "Front intake".into(),
+            reason: SkipReason::CurveNotFound,
+            since: now - Duration::from_secs(30),
+        }];
+
+        let health = compute_health(&state, &default_config(), now);
+        let controls = health
+            .subsystems
+            .iter()
+            .find(|s| s.name == "controls")
+            .expect("the controls subsystem must be present");
+
+        assert_eq!(controls.status, HealthStatus::Warn);
+        assert_eq!(
+            health.overall,
+            HealthStatus::Warn,
+            "the rollup must carry it — an entry that never reaches `overall` \
+             leaves every existing consumer just as blind as before"
+        );
+        assert!(
+            controls.reason.contains("not being commanded"),
+            "the reason must say what is wrong in the operator's terms: {}",
+            controls.reason
+        );
+        assert_eq!(
+            controls.age_ms,
+            Some(30_000),
+            "age is the LONGEST skipped_for_ms — a flapping control must not \
+             mask one that has been sitting unresolved"
+        );
+    }
+
+    /// Warn, not Crit. The fans are not stopped and there is no thermal hazard:
+    /// the 105 °C rule bypasses controls entirely (`force_all`), so it still
+    /// reaches every OpenFan channel and writable hwmon header. Escalating this
+    /// to Crit would drown the distinction that a subsystem has actually failed.
+    #[test]
+    fn a_skipped_control_does_not_report_as_a_failed_subsystem() {
+        let now = Instant::now();
+        let mut state = state_with_live_engine(now);
+        state.subsystem_timestamps.openfan = Some(now);
+        state.subsystem_timestamps.hwmon = Some(now);
+        state.skipped_controls = (0..5)
+            .map(|i| SkippedControl {
+                control_id: format!("ctl{i}"),
+                control_name: format!("Control {i}"),
+                reason: SkipReason::SensorUnavailable,
+                since: now - Duration::from_secs(3600),
+            })
+            .collect();
+
+        let health = compute_health(&state, &default_config(), now);
+        assert_ne!(
+            health.overall,
+            HealthStatus::Crit,
+            "five controls skipped for an hour is still not a FAILED daemon — \
+             Crit is reserved for a subsystem that has stopped working"
+        );
+    }
+
+    /// The oldest wins, so a control that keeps recovering and re-skipping cannot
+    /// hide one that has been unresolved since boot.
+    #[test]
+    fn controls_age_reports_the_oldest_skip() {
+        let now = Instant::now();
+        let mut state = state_with_live_engine(now);
+        state.skipped_controls = vec![
+            SkippedControl {
+                control_id: "recent".into(),
+                control_name: "Recent".into(),
+                reason: SkipReason::CurveNotFound,
+                since: now - Duration::from_secs(2),
+            },
+            SkippedControl {
+                control_id: "old".into(),
+                control_name: "Old".into(),
+                reason: SkipReason::CurveNotFound,
+                since: now - Duration::from_secs(900),
+            },
+        ];
+
+        let controls = controls_health(&state, now);
+        assert_eq!(controls.age_ms, Some(900_000));
+        assert!(
+            controls.reason.starts_with("2 controls"),
+            "the count must be plural and accurate: {}",
+            controls.reason
+        );
     }
 
     #[test]

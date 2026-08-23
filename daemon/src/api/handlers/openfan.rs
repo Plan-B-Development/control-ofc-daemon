@@ -3,15 +3,31 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 
-use super::{error_response, json_ok, AppState};
+use super::{error_response, json_ok, AppState, LastRescan};
 use crate::api::responses::*;
 use crate::serial::controller::FanControlError;
+
+/// Minimum spacing between `POST /fans/openfan/rescan` probes (register row
+/// 10-e).
+///
+/// This bounds **repetition**, which `openfan_rescanning` does not: that flag
+/// stops two probes running *at once*, and nothing stopped a client from firing
+/// them back to back forever. Each probe asserts DTR across every candidate tty,
+/// which **resets Arduino-class boards** — so a loop on a failing rescan is not
+/// merely wasted work, it holds unrelated serial hardware in reset.
+///
+/// Ten seconds is chosen against the cost of being wrong in each direction: a
+/// genuine "I just plugged it in, try again" retry is a human action and tolerates
+/// it easily, while a runaway client is cut from unbounded to six probes a minute.
+/// A successful adoption never reaches this check at all — the handler returns
+/// early once a controller is connected — so only failing probes are spaced.
+const OPENFAN_RESCAN_COOLDOWN: Duration = Duration::from_secs(10);
 
 /// RAII guard that resets the calibrating flag on drop, ensuring cleanup
 /// even on early return or panic.
@@ -215,6 +231,60 @@ pub async fn openfan_rescan_handler(
         );
     }
 
+    let timeout = state.openfan_runtime.timeout;
+    let configured = state.running_config.serial.port.clone();
+    // Enumerating candidates is a config read plus a sysfs/dev scan. It does NOT
+    // open anything, and DTR is asserted on open — so this costs nothing of what
+    // the cooldown below exists to ration.
+    let candidates = serial_port_candidates(configured.as_deref(), || auto_detect_port(timeout));
+
+    // 10-e: space repeated probes. Placed AFTER the already-connected return
+    // above, so the common success path never meets a cooldown — only a client
+    // retrying a *failing* rescan is spaced, which is the case that keeps
+    // re-asserting DTR and resetting Arduino-class boards.
+    //
+    // **The cooldown applies only while the world has not changed.** Rate-limiting
+    // on time alone was wrong in the one case that matters most: plug a controller
+    // in and immediately click rescan — which is a human action measured in
+    // seconds, not tens of seconds — and the request was refused, so the device
+    // was not adopted and the GUI showed nothing. That transiently re-opens the
+    // "you need to restart the daemon" mis-advice DEC-265/266 exists to remove, on
+    // the one endpoint whose entire purpose is recovery without a restart.
+    //
+    // Comparing the candidate set separates the two cases by what actually
+    // differs. A newly attached controller enumerates a new tty, so a genuine
+    // retry proceeds at once; a client looping against unchanged hardware learns
+    // nothing new by probing again and is spaced.
+    if let Some(last) = state.last_openfan_rescan.lock().as_ref() {
+        let elapsed = last.at.elapsed();
+        if elapsed < OPENFAN_RESCAN_COOLDOWN && last.candidates == candidates {
+            let wait = (OPENFAN_RESCAN_COOLDOWN - elapsed).as_secs() + 1;
+            return error_response(
+                StatusCode::CONFLICT,
+                &ErrorEnvelope {
+                    error: ErrorBody {
+                        code: "validation_error".into(),
+                        message: format!(
+                            "an OpenFan rescan over the same ports was attempted moments \
+                             ago and found nothing — each probe resets Arduino-class \
+                             boards, so retry in {wait}s, or attach a controller and \
+                             retry immediately"
+                        ),
+                        // retryable: TRUE, unlike the sibling 409s. This condition
+                        // clears on its own within seconds and the message says so;
+                        // reporting `false` here — the default for
+                        // `validation_error` — would tell a client keying its
+                        // backoff off this field, which is the field's documented
+                        // purpose, that a ten-second wait is permanent.
+                        retryable: true,
+                        source: "validation".into(),
+                        details: None,
+                    },
+                },
+            );
+        }
+    }
+
     // Single-flight. Two concurrent rescans would both probe the same tty — and
     // the loser would install a second controller over the winner's, leaving an
     // orphaned poll loop reading a transport nothing writes through.
@@ -234,10 +304,7 @@ pub async fn openfan_rescan_handler(
     // — or the task being dropped before its first poll, which `tokio::spawn` does
     // at runtime shutdown — would wedge the route at 409 for the process lifetime,
     // on the one endpoint whose purpose is recovery without a restart.
-    let guard = RescanGuard(state.clone());
-
-    let timeout = state.openfan_runtime.timeout;
-    let configured = state.running_config.serial.port.clone();
+    let guard = RescanGuard(state.clone(), candidates.clone());
 
     // Everything below runs detached, so dropping the handler future (client
     // disconnect, read timeout) cancels neither the probe nor the adoption, and
@@ -251,8 +318,9 @@ pub async fn openfan_rescan_handler(
 
         // Serial probing is blocking and can take seconds across several candidates.
         let probe = tokio::task::spawn_blocking(move || {
-            let candidates =
-                serial_port_candidates(configured.as_deref(), || auto_detect_port(timeout));
+            // The SAME list the cooldown was evaluated against — recomputing it
+            // here could probe a set the cooldown never saw, and stamp a set that
+            // was never probed.
             first_openfan_port(&candidates, timeout, |p| {
                 RealSerialTransport::open(p, timeout)
             })
@@ -302,7 +370,7 @@ pub async fn openfan_rescan_handler(
                 } else {
                     let rt = task_state.openfan_runtime.clone();
                     let poll_cache = task_state.cache.clone();
-                    tokio::spawn(async move {
+                    let poll_handle = tokio::spawn(async move {
                         crate::polling::openfan_poll_loop(
                             poll_cache,
                             shared,
@@ -312,6 +380,14 @@ pub async fn openfan_rescan_handler(
                         )
                         .await;
                     });
+                    // 277-c: register the handle so `shutdown_sequence` DRAINS
+                    // this loop, not merely signals it. `main`'s `task_handles`
+                    // was built at boot and cannot know about a loop started
+                    // here. Nothing in this loop writes PWM today, so the fix is
+                    // pre-emptive — but the drain invariant is what makes the
+                    // restore the guaranteed last writer, and a loop outside it
+                    // would break that silently the first time one did.
+                    task_state.adopted_poll_handles.lock().push(poll_handle);
 
                     log::info!("OpenFanController adopted on {port} via rescan");
                     RescanOutcome::Adopted(port)
@@ -389,10 +465,20 @@ enum RescanOutcome {
 /// detached task. A borrow-based guard lives on the handler's stack and is
 /// therefore dropped by client disconnect — clearing the flag while the probe it
 /// guards is still holding a tty open (DEC-266).
-struct RescanGuard(Arc<AppState>);
+struct RescanGuard(Arc<AppState>, Vec<String>);
 
 impl Drop for RescanGuard {
     fn drop(&mut self) {
+        // 10-e: stamp the cooldown from HERE — the guard drops when the probe
+        // task actually finishes, so the window is measured from the end of the
+        // last DTR assertion rather than from the request that started it. A
+        // probe that takes 8 s to time out therefore still gets a full quiet
+        // period afterwards. Stamped before the flag is released so no racing
+        // request can pass the CAS while the cooldown is still unset.
+        *self.0.last_openfan_rescan.lock() = Some(LastRescan {
+            at: Instant::now(),
+            candidates: std::mem::take(&mut self.1),
+        });
         self.0.openfan_rescanning.store(false, Ordering::SeqCst);
     }
 }

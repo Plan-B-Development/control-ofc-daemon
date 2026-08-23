@@ -27,6 +27,7 @@ mod safety_tick;
 pub mod skipped;
 mod tuning;
 
+pub use crate::health::state::ControlOutput;
 pub(crate) use curve_eval::*;
 pub(crate) use safety_tick::*;
 pub use skipped::{
@@ -121,6 +122,17 @@ pub struct ProfileEngineState {
     skipped_this_tick: Vec<SkipRecord>,
     /// 273-i: debounced skip state, surfaced on `/status`.
     skipped_tracker: SkippedControlTracker,
+    /// 277-k: this tick's applied output per control id, for the `/status` and
+    /// `/poll` surfaces. Overwritten by every `evaluate_profile_with_overrides`,
+    /// exactly like `skipped_this_tick` above and for the same reason — the
+    /// evaluator records the facts, the tick body decides when to publish them.
+    ///
+    /// This is the *applied* control-wide value whatever drove it, curve or
+    /// override, because the question the Controls card answers is "what are the
+    /// fans doing?". Distinct from `last_output`, which is the PREVIOUS tick and
+    /// is entangled with step-rate limiting (DEC-151), and which an override
+    /// deliberately does not advance at all.
+    tick_outputs: HashMap<String, f64>,
 }
 
 impl ProfileEngineState {
@@ -143,6 +155,24 @@ impl ProfileEngineState {
         self.skipped_tracker.snapshot()
     }
 
+    /// This tick's applied output per control, sorted by id (277-k).
+    ///
+    /// Sorted here rather than at the wire boundary so the ordering is a property
+    /// of the value, not of one serialiser — `/status` and `/poll` both render it
+    /// and must not disagree.
+    pub fn outputs_snapshot(&self) -> Vec<ControlOutput> {
+        let mut out: Vec<ControlOutput> = self
+            .tick_outputs
+            .iter()
+            .map(|(control_id, pct)| ControlOutput {
+                control_id: control_id.clone(),
+                output_pct: *pct,
+            })
+            .collect();
+        out.sort_by(|a, b| a.control_id.cmp(&b.control_id));
+        out
+    }
+
     /// Current last-output for a control id (pre-rounding, pre-u8 conversion).
     pub fn last_output(&self, control_id: &str) -> Option<f64> {
         self.last_output.get(control_id).copied()
@@ -160,27 +190,66 @@ impl ProfileEngineState {
         self.last_transition_temp.get(control_id).copied()
     }
 
-    /// Reset state to a profile-less state (call when active profile is
-    /// cleared). The next `evaluate_profile` call starts fresh.
-    pub fn deactivate(&mut self) {
+    /// Drop the cross-tick *tuning* state — deadband anchors, step-rate history,
+    /// the trigger latch and the cached eval plan — so the next evaluation
+    /// re-anchors fresh, **without forgetting which controls are unresolvable**
+    /// (277-i).
+    ///
+    /// This is the half the thermal-force path actually wants, and separating it
+    /// is the whole of 277-i. `force_all` puts the fans at a known duty, so P3-2's
+    /// reasoning holds: a resumed curve must not step-rate-clamp from a
+    /// pre-emergency anchor. But a thermal emergency says nothing about whether a
+    /// control's *curve* resolves, and the full [`Self::deactivate`] also clears
+    /// the skip tracker — correct for a profile switch, where the next profile's
+    /// controls are genuinely different, and wrong here. The cost of conflating
+    /// them was that a 105 °C event published an empty `skipped_controls[]` for
+    /// its entire duration and for a further 3-tick debounce after recovery, so
+    /// the one surface that says "nothing is commanding these fans" went silent
+    /// exactly while an operator was most likely to be reading it.
+    ///
+    /// Note what this does NOT do: it does not touch `skipped_this_tick` or
+    /// `skipped_tracker` at all, so the list simply *freezes* for the duration of
+    /// a forced tick. That is the intended reading — a forced tick evaluates no
+    /// curves, so it learns nothing new about resolvability, and the last thing
+    /// it did learn stays true until it evaluates again.
+    fn deactivate_tuning_only(&mut self) {
         self.last_output.clear();
         self.last_curve_output.clear();
         self.last_transition_temp.clear();
         self.trigger_latch.clear();
         self.deadband_hold_cycles.clear();
         self.active_profile_id = None;
-        // 273-i: a deactivation is not a resolution. Clearing rather than
-        // draining means no bogus "resumed" line, and a control still
-        // unresolvable under whatever activates next is reported afresh —
-        // which is what an operator who just switched profiles needs to see.
-        self.skipped_this_tick.clear();
-        self.skipped_tracker.clear();
+        // 277-k: this tick's outputs are facts about an evaluation that is being
+        // abandoned, so they go with the tuning state. A forced tick publishes no
+        // per-control output — `force_all` drives the fans directly and bypasses
+        // every control, so there is no control-wide output to report.
+        self.tick_outputs.clear();
         // EFF-3: drop the cached eval plan so a re-anchor (epoch bump, thermal
         // force, or no-profile) rebuilds it against whatever activates next.
         // (Redundant with the sync_profile_id null below — deactivate also
         // clears active_profile_id, so the next evaluate rebuilds anyway — but
         // kept so a deactivated state is internally consistent, not half-cleared.)
         self.static_cache = None;
+    }
+
+    /// Reset state to a profile-less state (call when active profile is
+    /// cleared). The next `evaluate_profile` call starts fresh.
+    ///
+    /// Everything [`Self::deactivate_tuning_only`] does, **plus** forgetting the
+    /// skip state. Keep the two in this relationship rather than duplicating the
+    /// field list: a field added to one and not the other is a half-cleared state,
+    /// which is the bug class this split could otherwise introduce.
+    pub fn deactivate(&mut self) {
+        self.deactivate_tuning_only();
+        // 273-i: a deactivation is not a resolution. Clearing rather than
+        // draining means no bogus "resumed" line, and a control still
+        // unresolvable under whatever activates next is reported afresh —
+        // which is what an operator who just switched profiles needs to see.
+        //
+        // 277-i: this is the half a *thermal force* must not inherit — see
+        // `deactivate_tuning_only`, which exists precisely to leave it alone.
+        self.skipped_this_tick.clear();
+        self.skipped_tracker.clear();
     }
 
     /// Drop all cross-tick state for a single control so its next evaluation
@@ -496,6 +565,12 @@ pub fn evaluate_profile_with_overrides(
     // resolved, and is what retires a previously-listed skip.
     engine_state.skipped_this_tick = skipped_this_tick;
 
+    // 277-k: hand this tick's applied outputs to the caller the same way, and for
+    // the same reason — the return type stays `Vec<PwmCommand>`. Widening it to a
+    // tuple would churn every caller, including the DEC-126 parity oracle and the
+    // `evaluate_profile` wrapper above, for a value only the tick body wants.
+    engine_state.tick_outputs = tick_outputs;
+
     commands
 }
 
@@ -526,6 +601,15 @@ struct TickCompletion<'a> {
     /// tick that evaluated nothing publishes the empty default, which is correct:
     /// nothing was evaluated, so nothing is skipped.
     skipped: Vec<SkippedControl>,
+    /// 277-k: this tick's per-control applied outputs, published on drop.
+    ///
+    /// Carried here for exactly the reasons documented on `skipped` above — it is
+    /// ONE logical value, it must reach the cache in ONE write, and every exit
+    /// path must publish it or a card keeps rendering a duty the engine has
+    /// stopped applying. A tick that evaluated nothing publishes the empty
+    /// default, which is correct: nothing was evaluated, so no control has an
+    /// output to report.
+    outputs: Vec<ControlOutput>,
 }
 
 impl<'a> TickCompletion<'a> {
@@ -533,6 +617,7 @@ impl<'a> TickCompletion<'a> {
         Self {
             cache,
             skipped: Vec::new(),
+            outputs: Vec::new(),
         }
     }
 
@@ -540,12 +625,23 @@ impl<'a> TickCompletion<'a> {
     fn set_skipped(&mut self, skipped: Vec<SkippedControl>) {
         self.skipped = skipped;
     }
+
+    /// Record this tick's applied outputs (277-k). Not published until drop.
+    fn set_outputs(&mut self, outputs: Vec<ControlOutput>) {
+        self.outputs = outputs;
+    }
 }
 
 impl Drop for TickCompletion<'_> {
     fn drop(&mut self) {
-        self.cache
-            .update_skipped_controls(std::mem::take(&mut self.skipped));
+        // ONE call, publishing both fields under one write guard. Two calls made
+        // each field individually atomic but left the PAIR torn: a poll landing
+        // between them saw a control's new skip entry beside its stale output and
+        // listed it on both surfaces at once.
+        self.cache.update_control_state(
+            std::mem::take(&mut self.skipped),
+            std::mem::take(&mut self.outputs),
+        );
         self.cache.record_engine_tick_complete();
     }
 }
@@ -850,7 +946,32 @@ pub async fn profile_engine_loop(
             // evaluation starts fresh instead of step-rate-clamping from a
             // pre-emergency anchor — the fans are physically at
             // `forced_pct`, not at the stale `last_output`.
-            engine_state.deactivate();
+            //
+            // 277-i: the TUNING half only. The full `deactivate()` also clears
+            // the skip tracker, which is right for a profile switch and wrong
+            // here: an emergency says nothing about whether a control's curve
+            // resolves, and inheriting that clear meant this surface published an
+            // empty list for the entire 105 °C → 80 °C hold plus a 3-tick
+            // debounce blackout after recovery.
+            engine_state.deactivate_tuning_only();
+            // Publish before the `continue`, so the list survives the event
+            // rather than being dropped by `TickCompletion::drop`'s empty
+            // default. It FREEZES for the duration — a forced tick evaluates no
+            // curves, so it learns nothing new to report.
+            //
+            // Read a listed control correctly during an event: it means "this
+            // control's curve is unresolvable", NOT "this fan is stopped".
+            // `force_all` reaches OpenFan channels and writable hwmon headers but
+            // excludes GPU fans by design (DEC-130), so a GPU-bound control with
+            // an unresolvable curve genuinely is uncommanded throughout — which
+            // is precisely the case that must not go silent. The thermal banner
+            // already explains the override for everything else.
+            tick_done.set_skipped(engine_state.skipped_snapshot());
+            // 277-k: outputs are NOT published here, and the asymmetry is
+            // deliberate. `force_all` drives the fans directly and bypasses every
+            // control, so there is no control-wide output to report — an empty
+            // list is the honest answer, and `deactivate_tuning_only` has already
+            // cleared them. A card falls back to "—" for the event, which is true.
             continue;
         }
 
@@ -916,6 +1037,11 @@ pub async fn profile_engine_loop(
             }
         }
         tick_done.set_skipped(engine_state.skipped_snapshot());
+        // 277-k: published beside the skip list, through the same single
+        // `TickCompletion::drop` point. Both answer the Controls page's two
+        // questions — "is anything commanding this?" and "at what duty?" — and
+        // they must not be able to disagree by a tick.
+        tick_done.set_outputs(engine_state.outputs_snapshot());
 
         // If shutdown was signalled while this tick was computing (after the
         // `select!` arm, before the write phase), stop here so the engine does
@@ -1461,22 +1587,32 @@ mod tests {
         assert_eq!(snapshot[0].reason, SkipReason::MixUnresolvable);
     }
 
-    /// [SAFETY] 273-i / DEC-249 — the early-exit paths must publish an EMPTY
-    /// list, not leave the last one standing.
+    /// [SAFETY] 273-i / DEC-249 — an early-exit tick publishes the ENGINE'S
+    /// current view, never whatever the cache happened to be holding.
     ///
-    /// A thermal emergency `continue`s before any control is evaluated. If the
-    /// publish only happened after evaluation, the list would freeze at whatever
-    /// it said before the emergency and keep asserting "this control is not
-    /// being commanded" about a machine that is now forcing every fan to 100%.
-    /// The fix is the single publish in `TickCompletion::drop`, which every exit
-    /// path runs through — NOT a clear at the top of the tick, which was tried and
-    /// withdrawn for opening a torn-read window. This pins it by seeding a stale
-    /// list and requiring one emergency tick to clear it. Stated precisely because
-    /// a maintainer debugging a failure here who trusted the old wording would go
-    /// looking for a top-of-tick clear, and adding one re-opens that window and
-    /// reds `the_skipped_list_is_published_exactly_once_per_tick`.
+    /// **Reworded by 277-i, which narrowed the rule this test pins.** It used to
+    /// be called "…clears the skipped list" and read as though a thermal
+    /// emergency always empties it. That is no longer true and, read as a general
+    /// rule, was always too strong: what an early-exit tick guarantees is that
+    /// `TickCompletion::drop` publishes the engine's own tracker, so nothing stale
+    /// survives *that the engine does not still believe*. Here the tracker is
+    /// empty — a fresh `ProfileEngineState` that has evaluated nothing — so the
+    /// published list is empty and the value seeded directly into the cache is
+    /// correctly overwritten.
+    ///
+    /// When the engine HAS tracked a skip through real evaluation, that skip now
+    /// survives the emergency instead: see
+    /// `a_thermal_emergency_does_not_erase_the_skipped_list`. The two are not in
+    /// tension — this one is about a cache value the engine never put there.
+    ///
+    /// The mechanism is still the single publish in `TickCompletion::drop`, which
+    /// every exit path runs through — NOT a clear at the top of the tick, which
+    /// was tried and withdrawn for opening a torn-read window. A maintainer
+    /// debugging a failure here who goes looking for a top-of-tick clear will
+    /// re-open that window and red
+    /// `the_skipped_list_is_published_exactly_once_per_tick`.
     #[tokio::test]
-    async fn a_thermal_emergency_tick_clears_the_skipped_list() {
+    async fn a_thermal_emergency_tick_drops_a_stale_cached_skip() {
         let cache = make_cache_with_sensor("cpu", 110.0); // over the 105 °C line
         cache.update_skipped_controls(vec![SkippedControl {
             control_id: "stale".into(),
@@ -1502,8 +1638,9 @@ mod tests {
         );
         assert!(
             cache.read_with(|s| s.skipped_controls.is_empty()),
-            "a tick that exits early without evaluating must publish an empty list, \
-             not leave the previous one asserting a stale claim"
+            "an early-exit tick must publish the engine's own (here empty) view, \
+             not leave a cached value the engine never recorded asserting a stale \
+             claim"
         );
     }
 
@@ -1553,10 +1690,10 @@ mod tests {
             .map(|(before, _)| before)
             .expect("mod.rs has a #[cfg(test)] module");
 
-        let calls = src.matches("update_skipped_controls(").count();
+        let calls = src.matches("update_control_state(").count();
         assert_eq!(
             calls, 1,
-            "the skipped list must reach the cache through exactly ONE call — a \
+            "the control state must reach the cache through exactly ONE call — a \
              second one means it is published in two phases again, and a poll \
              landing between them reports nothing skipped while a fan is \
              uncommanded (found {calls})"
@@ -1564,10 +1701,24 @@ mod tests {
         assert!(
             src.contains("impl Drop for TickCompletion")
                 && src[src.find("impl Drop for TickCompletion").unwrap()..]
-                    .contains("update_skipped_controls"),
+                    .contains("update_control_state"),
             "the one call must live in TickCompletion::drop, so every exit path \
              from the tick publishes exactly once"
         );
+        // 277-k, DEC-279 round 2: the skipped list and the outputs must also
+        // travel TOGETHER. Publishing them through two single-field methods would
+        // satisfy every assertion above while re-opening a cross-field torn read
+        // — a control appearing in both arrays at once, which `docs/08` says
+        // cannot happen. Naming the single-field publishers here is what makes
+        // that regression loud instead of silent.
+        for banned in ["update_skipped_controls(", "update_control_outputs("] {
+            assert!(
+                !src.contains(banned),
+                "the tick must not publish either field on its own ({banned}) — \
+                 both go through update_control_state so a reader can never see \
+                 one updated and the other stale"
+            );
+        }
     }
 
     /// The guard publishes an EMPTY list when the tick set nothing — which is
@@ -1656,6 +1807,213 @@ mod tests {
         );
         assert_eq!(skipped[0].control_id, "ctl");
         assert_eq!(skipped[0].reason, SkipReason::MixUnresolvable);
+    }
+
+    /// [SAFETY-adjacent] 277-i — the skipped list must survive a thermal event.
+    ///
+    /// The forced path called the full `deactivate()`, which also clears the skip
+    /// tracker, and then `continue`d before the publish — so `TickCompletion::drop`
+    /// published its empty default for the ENTIRE 105 °C → 80 °C hold, plus a
+    /// fresh 3-tick debounce blackout on recovery. The one surface that says
+    /// "nothing is commanding these fans" went silent exactly while an operator
+    /// was most likely to be reading it, and the GUI chip blinked off.
+    ///
+    /// This must be driven as a TRANSITION. A cache seeded hot from the start
+    /// never lists a skip in the first place (the debounce never completes), so
+    /// it would assert nothing at all — which is why the temperature is raised
+    /// from inside `ready`: that is the only hook this harness offers to change
+    /// the world mid-run, and the change is the whole subject of the test.
+    #[tokio::test]
+    async fn a_thermal_emergency_does_not_erase_the_skipped_list() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        let profile = DaemonProfile {
+            id: "mix".into(),
+            name: "Mix".into(),
+            version: 7,
+            description: "".into(),
+            controls: vec![openfan_control("ctl", "mx", "openfan:ch00")],
+            curves: vec![mix_curve("mx", "max", &["deleted"])],
+        };
+        let cache = make_cache_with_sensor("cpu", 40.0);
+
+        let observed = cache.clone();
+        let phase = Arc::new(AtomicU8::new(0));
+        let p = phase.clone();
+        run_engine_ticks_until(
+            cache.clone(),
+            Some(profile),
+            // +2: let the base sleep cover the debounce, so the whole shared poll
+            // budget is left for the transition and the emergency. With the bare
+            // debounce count all three had to fit one 5 s budget — fine on an idle
+            // machine, a flaky red on a saturated runner, and a flaky red is a
+            // test someone eventually deletes.
+            SKIP_DEBOUNCE_TICKS + 2,
+            move || {
+                if p.load(Ordering::SeqCst) == 0 {
+                    if observed.read_with(|s| !s.skipped_controls.is_empty()) {
+                        // Listed. Now push the CPU past the 105 °C threshold.
+                        observed.update_sensors(vec![CachedSensorReading {
+                            id: "cpu".into(),
+                            kind: SensorKind::CpuTemp,
+                            label: "Tctl".into(),
+                            value_c: 110.0,
+                            source: DeviceLabel::Hwmon,
+                            updated_at: Instant::now(),
+                            rate_c_per_s: None,
+                            session_min_c: None,
+                            session_max_c: None,
+                            chip_name: "k10temp".into(),
+                            temp_type: None,
+                            thresholds: None,
+                        }]);
+                        p.store(1, Ordering::SeqCst);
+                    }
+                    return false;
+                }
+                // Wait until the engine has actually taken the forced path, so the
+                // assertion below is about an emergency and not about a tick that
+                // simply had not noticed the heat yet.
+                observed.read_with(|s| s.thermal_override_state.as_deref() == Some("emergency"))
+            },
+        )
+        .await;
+
+        assert_eq!(
+            cache.read_with(|s| s.thermal_override_state.clone()),
+            Some("emergency".to_string()),
+            "precondition: the engine must actually be in the forced path, or \
+             this test asserts nothing about emergencies"
+        );
+        let skipped = cache.read_with(|s| s.skipped_controls.clone());
+        assert_eq!(
+            skipped.len(),
+            1,
+            "the skipped list must survive the emergency — a forced tick \
+             evaluates no curves, so it learns nothing new about resolvability \
+             and must not discard what it already knew"
+        );
+        assert_eq!(skipped[0].control_id, "ctl");
+    }
+
+    /// 277-k — the call site, on the same terms as the skipped-list test above.
+    ///
+    /// `outputs_snapshot()` can be perfect and the feature still publish nothing:
+    /// deleting `tick_done.set_outputs(...)` from the tick body leaves every unit
+    /// test of the snapshot green. So this drives the real loop and asserts the
+    /// real cache carries the value.
+    #[tokio::test]
+    async fn a_real_tick_publishes_control_outputs_to_the_cache() {
+        let profile = DaemonProfile {
+            id: "p".into(),
+            name: "P".into(),
+            version: 7,
+            description: "".into(),
+            controls: vec![openfan_control("ctl", "lin", "openfan:ch00")],
+            curves: vec![linear_curve("lin", "cpu")],
+        };
+        let cache = make_cache_with_sensor("cpu", 40.0);
+
+        let observed = cache.clone();
+        run_engine_ticks_until(cache.clone(), Some(profile), 1, move || {
+            observed.read_with(|s| !s.control_outputs.is_empty())
+        })
+        .await;
+
+        let outputs = cache.read_with(|s| s.control_outputs.clone());
+        assert_eq!(
+            outputs.len(),
+            1,
+            "the tick body must hand its per-control outputs to the guard — \
+             without this the live Controls card has no output feed at all"
+        );
+        assert_eq!(outputs[0].control_id, "ctl");
+        assert!(
+            outputs[0].output_pct > 0.0,
+            "a 40 °C linear curve must produce a real duty, not a placeholder: {:?}",
+            outputs[0]
+        );
+    }
+
+    /// 277-k — a forced tick publishes NO output, and that is the honest answer.
+    ///
+    /// `force_all` drives the fans directly and bypasses every control, so there
+    /// is no control-wide output to report. Publishing the pre-emergency value
+    /// would have a card confidently display a duty nothing is applying.
+    ///
+    /// **Driven as a TRANSITION, and that is the whole point of the test.** The
+    /// first version seeded the cache hot at 110 °C, so no normal evaluation ever
+    /// ran and `control_outputs` was empty because nothing had ever populated it
+    /// — the DEC-272 vacuous-absence trap. It could not have caught the
+    /// regression it names: if the forced path republished the pre-emergency
+    /// duty, there was no pre-emergency duty to republish, so it passed either
+    /// way. Establishing the value FIRST is what gives the absence meaning.
+    #[tokio::test]
+    async fn a_thermal_emergency_publishes_no_control_output() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        let profile = DaemonProfile {
+            id: "p".into(),
+            name: "P".into(),
+            version: 7,
+            description: "".into(),
+            controls: vec![openfan_control("ctl", "lin", "openfan:ch00")],
+            curves: vec![linear_curve("lin", "cpu")],
+        };
+        let cache = make_cache_with_sensor("cpu", 40.0); // nowhere near emergency
+
+        let observed = cache.clone();
+        let phase = Arc::new(AtomicU8::new(0));
+        let p = phase.clone();
+        let saw_output = Arc::new(AtomicU8::new(0));
+        let saw = saw_output.clone();
+        run_engine_ticks_until(cache.clone(), Some(profile), 1, move || {
+            if p.load(Ordering::SeqCst) == 0 {
+                if observed.read_with(|s| !s.control_outputs.is_empty()) {
+                    // A real duty is on the wire. Record that we saw it — the
+                    // assertion below cannot check it afterwards, because the
+                    // whole point is that the emergency clears it.
+                    saw.store(1, Ordering::SeqCst);
+                    observed.update_sensors(vec![CachedSensorReading {
+                        id: "cpu".into(),
+                        kind: SensorKind::CpuTemp,
+                        label: "Tctl".into(),
+                        value_c: 110.0,
+                        source: DeviceLabel::Hwmon,
+                        updated_at: Instant::now(),
+                        rate_c_per_s: None,
+                        session_min_c: None,
+                        session_max_c: None,
+                        chip_name: "k10temp".into(),
+                        temp_type: None,
+                        thresholds: None,
+                    }]);
+                    p.store(1, Ordering::SeqCst);
+                }
+                return false;
+            }
+            observed.read_with(|s| s.thermal_override_state.as_deref() == Some("emergency"))
+        })
+        .await;
+
+        // Assert the PRESENCE before the absence (DEC-272).
+        assert_eq!(
+            saw_output.load(Ordering::SeqCst),
+            1,
+            "precondition: a real per-control output must have been published \
+             BEFORE the emergency, or the emptiness asserted below proves nothing"
+        );
+        assert_eq!(
+            cache.read_with(|s| s.thermal_override_state.clone()),
+            Some("emergency".to_string()),
+            "precondition: the forced path must actually have run"
+        );
+        assert!(
+            cache.read_with(|s| s.control_outputs.is_empty()),
+            "a forced tick evaluates no control, so it has no control-wide output \
+             to report — republishing the pre-emergency duty would be a card lying \
+             about what the fans are doing"
+        );
     }
 
     /// Drive `profile_engine_loop` for exactly one tick against no hardware.

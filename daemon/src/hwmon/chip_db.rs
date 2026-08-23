@@ -183,12 +183,23 @@ fn expected_driver_for_chip(chip_name: &str) -> &'static str {
 /// The ITE list mirrors mainline `it87` chip support
 /// (`drivers/hwmon/it87.c` enum + docs.kernel.org/hwmon/it87.html,
 /// verified against v7.1 / 7.2-rc4, master 2026-07-21). `it8622` added in DEC-144. `it8689`
-/// is deliberately NOT listed (DEC-144, re-evaluated 2026-07): mainline 7.1
-/// added IT8689E fan *control* (commit 66b8eaf — six PWM, FEAT_FANCTL_ONOFF,
-/// not just sensors; released 2026-06-14), but 7.1 is not yet the common
-/// kernel (the 6.12/6.18 LTS lines are) and some Gigabyte Rev 1 boards
-/// still have EC quirks — reporting "mainline: yes" would steer users off
-/// the DKMS build they still need. Revisit once 7.1+ is the common floor.
+/// is deliberately NOT listed (DEC-144, re-evaluated 2026-07 and again
+/// 2026-08-23): mainline 7.1 added IT8689E fan *control* (commit 66b8eaf — six
+/// PWM, FEAT_FANCTL_ONOFF, not just sensors; released 2026-06-14), but 7.1 is
+/// not the common kernel and some Gigabyte Rev 1 boards still have EC quirks —
+/// reporting "mainline: yes" would steer users off the DKMS build they still
+/// need.
+///
+/// **The 2026-08-23 re-check changed the schedule, not the flag**, and that is
+/// the useful outcome: the LTS lines this waits on were *extended*, so the
+/// trigger moved further away rather than closer. 6.12 and 6.18 are both now
+/// supported to **December 2028** (6.12 underpins Debian 13 and RHEL 10), so
+/// "7.1+ is the common floor" cannot plausibly become true before then.
+///
+/// So stop re-deriving this every audit. **Next scheduled re-check: 2027-08**,
+/// and the question to ask then is whether a mainstream distro has actually
+/// shipped 7.1+ as its default — not whether 7.1 exists, which has been true
+/// since 2026-06-14 and is not the condition that matters.
 pub fn chip_driver_in_mainline(chip_name: &str) -> bool {
     let driver = expected_driver_for_chip(chip_name);
     // ITE chips IT8625E+ require out-of-tree frankcrawford/it87
@@ -1020,13 +1031,17 @@ mod tests {
 
     #[test]
     fn it8689_stays_out_of_mainline_pending_common_7_1() {
-        // DEC-144 intent lock (re-evaluated 2026-07): mainline 7.1 added
-        // IT8689E fan *control* (commit 66b8eaf — six PWM, FEAT_FANCTL_ONOFF;
-        // released 2026-06-14), not just sensors. We still report it as NOT
-        // mainline because 7.1 is not yet the common kernel (the 6.12/6.18
-        // LTS lines are) and some Gigabyte Rev 1 boards still have EC quirks
-        // — flipping this to true would steer users off the DKMS build they
-        // still need. Do not change without revisiting DEC-144.
+        // DEC-144 intent lock (re-evaluated 2026-07, and again 2026-08-23):
+        // mainline 7.1 added IT8689E fan *control* (commit 66b8eaf — six PWM,
+        // FEAT_FANCTL_ONOFF; released 2026-06-14), not just sensors. We still
+        // report it as NOT mainline because 7.1 is not the common kernel and
+        // some Gigabyte Rev 1 boards still have EC quirks — flipping this to
+        // true would steer users off the DKMS build they still need.
+        //
+        // 2026-08-23: the 6.12 and 6.18 LTS lines were EXTENDED to December
+        // 2028, so the condition this waits on moved further away, not closer.
+        // Next scheduled re-check 2027-08 — see `chip_driver_in_mainline`.
+        // Do not change without revisiting DEC-144.
         assert!(!chip_driver_in_mainline("it8689"));
     }
 

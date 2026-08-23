@@ -236,9 +236,10 @@ inside the band cannot pin the pre-settle fan speed indefinitely.
      against channel-tracking drift, not a periodic re-arm requirement
 
 6. **ExecStopPost restore** (`packaging/control-ofc-restore-auto.sh`):
-   - Restores `pwm_enable=2` (auto) on ANY service stop (including SIGKILL)
+   - Restores `pwm_enable=2` (auto) on any service **stop job**, including SIGKILL
    - Resets GPU fan curves to automatic
    - Re-enables `fan_zero_rpm_enable=1` for every GPU exposing it (DEC-100 — closes the SIGKILL/OOM path the panic hook can't cover)
+   - **It is not a universal backstop, and this qualification is load-bearing (278-b).** `ExecStopPost` runs as part of a *stop job*, and the `Restart=on-failure` path has none — so when the daemon exits non-zero and systemd restarts it, this script does not run at all. That path is covered **in-process** instead, by the bounded restore in `main.rs` (DEC-278/279): `restore_gpu_fans_to_auto` then `restore_hwmon_to_auto`, each on its own deadline. Read this bullet as "any stop", never as "any exit"; the earlier wording said "ANY service stop (including SIGKILL)", which invited the second reading on the one path where it is false.
 
 7. **Kernel-version regression catalogue** (`hwmon/kernel_warnings.rs`, DEC-098):
    - Curated list of published amdgpu regressions keyed by kernel version + GPU PCI device ID

@@ -56,10 +56,16 @@ RestartSec=3
 # Before that the restore took the mutex unconditionally and stalled past every
 # timeout above — including on the Restart=on-failure path, where systemd runs no
 # stop job and neither this line nor ExecStopPost applies at all. A wedged stop is
-# therefore now ~20 s for the hwmon hand-back, rather than unbounded. NOT yet a
-# total process bound: the GPU `fan_curve` reset runs FIRST in the same closure
-# and is still unbounded (register row 278-c), so a wedged PMFW write can hold
-# shutdown open ahead of any of this.
+# therefore now ~20 s for the hwmon hand-back, rather than unbounded.
+#
+# As of 2.22.0 that IS a total bound on the restore closure: the GPU `fan_curve`
+# reset runs FIRST in the same closure and used to be unbounded (278-c), so a
+# wedged PMFW write could hold shutdown open ahead of everything above and
+# bounding the hwmon half alone achieved nothing. Each step now runs through the
+# shared `run_bounded` helper with its OWN 3 s deadline (DEC-279) — they do not
+# share one deadline between them, so the restore closure's worst case is the
+# SUM: 3 s GPU + 3 s hwmon lock + 3 s hwmon writes = 9 s. See the arithmetic
+# below; reading "bounded" here as a single 3 s step would understate it by 6 s.
 # Note the honest limit: exiting is guaranteed, restoring the hardware is not. If
 # the chip is genuinely unresponsive nothing can restore it, and those fans hold
 # their last duty until something owns them again.
@@ -75,11 +81,23 @@ RestartSec=3
 # SHUTDOWN_TASK_TIMEOUT (3 s) per sequential task drain — four of them — plus
 # RUNTIME_SHUTDOWN_TIMEOUT (2 s): ~14 s worst case. The uncontended restore adds
 # nothing measurable — an uncontended `try_lock_for` returns immediately and the
-# writes complete — while a fully wedged chip adds at most 3 s for the lock plus
-# 3 s for the writes, so even the bad case is ~20 s. At 20 s a
-# loaded machine whose drains each run near their cap would trip SIGKILL on every
-# routine `systemctl restart` — not a fault, but it WOULD make a genuine wedge
-# look routine in the journal. 30 s keeps a real margin over both paths.
+# writes complete — while a fully wedged machine adds at most 3 s for the GPU
+# curve reset (278-c), plus 3 s for the hwmon lock, plus 3 s for the hwmon
+# writes: ~23 s in the worst case. (It was ~20 s before 2.22.0 bounded the GPU
+# step — that step was previously unbounded, so the old figure described a case
+# that could not actually be exceeded because it could not actually terminate.)
+# At 23 s a loaded machine whose drains each run near their cap would trip
+# SIGKILL on every routine `systemctl restart` — not a fault, but it WOULD make a
+# genuine wedge look routine in the journal. 30 s keeps a real margin over both
+# paths, and the margin over the new worst case is now 7 s rather than 10 s.
+#
+# The drain count stays at four despite 277-c adding rescan-adopted OpenFan poll
+# loops to that same list, and this is worth stating because it looks like it
+# should grow: adoption is guarded by `slot.is_none()` and nothing ever clears
+# the slot, so at most ONE controller is ever adopted per process — and it can
+# only be adopted when boot found none, which is exactly when the boot-time
+# openfan-poll handle is absent. The adopted drain replaces that budget line, it
+# does not add to it.
 #
 # Raise this if the drain budget above ever grows. Lowering it is now a smaller
 # question than it was: with the restore bounded, SIGKILL is no longer what ends

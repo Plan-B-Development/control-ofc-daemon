@@ -205,6 +205,22 @@ pub struct SkippedControl {
     pub since: Instant,
 }
 
+/// One control's applied output this tick, for the `/status` surface (277-k).
+///
+/// The value the engine actually applied, whatever produced it — a curve
+/// evaluation or a live manual override. No `since` stamp and no debounce,
+/// unlike [`SkippedControl`]: this is a *level*, republished every tick, and a
+/// level that stopped being republished is meaningfully absent rather than
+/// stale. A control the engine did not evaluate simply does not appear.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ControlOutput {
+    pub control_id: String,
+    /// Applied control-wide output, 0-100. Per-member duty can differ (a floor,
+    /// or the DEC-119 GPU divergence) — those come from each fan's own
+    /// `last_commanded_pwm`, never from this field.
+    pub output_pct: f64,
+}
+
 /// Placeholder for AIO pump state (future implementation).
 #[derive(Debug, Clone, Default)]
 pub struct AioPumpState {
@@ -305,6 +321,13 @@ pub struct DaemonState {
     /// `/status` + `/poll` for display. Their fans hold their last commanded
     /// duty — a skip never lowers a fan (DEC-269).
     pub skipped_controls: Vec<SkippedControl>,
+    /// Per-control applied output from the engine's last evaluating tick (277-k).
+    /// Surfaced on `/status` + `/poll` so a live Controls card can answer "what
+    /// are the fans doing?" — before this it had no live output feed at all and
+    /// sat at "—" forever, with `set_output` reachable only in demo mode.
+    /// Empty whenever no profile is evaluating, including for the duration of a
+    /// thermal force (which drives fans directly, bypassing every control).
+    pub control_outputs: Vec<ControlOutput>,
 }
 
 impl Default for DaemonState {
@@ -323,6 +346,7 @@ impl Default for DaemonState {
             relinquished_gpu_fans: HashSet::new(),
             unavailable_sensors: Vec::new(),
             skipped_controls: Vec::new(),
+            control_outputs: Vec::new(),
         }
     }
 }

@@ -50,6 +50,12 @@ pub struct StatusResponse {
     /// unchanged (additive) — an older daemon omits it and a client reads `[]`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped_controls: Vec<SkippedControlEntry>,
+    /// Per-control applied output from the engine's last evaluating tick (277-k).
+    /// Omitted when empty, so the common-case wire shape is unchanged (additive)
+    /// — an older daemon omits it and a client reads `[]`, leaving its cards on
+    /// whatever they render for "no value", which is what they already did.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub control_outputs: Vec<ControlOutputEntry>,
     /// Active profile id + display name, mirrored onto the `/status` + `/poll`
     /// surface so an external activation (CLI `--profile`, another client,
     /// systemd) is reflected within one 1 Hz poll instead of the GUI's slow
@@ -98,6 +104,27 @@ pub struct SkippedControlEntry {
     pub reason: String,
     /// Milliseconds since the control was first listed as skipped.
     pub skipped_for_ms: u64,
+}
+
+/// One control's applied output on the `/status` poll surface (277-k).
+///
+/// The value the engine actually applied this tick, whatever produced it — a
+/// curve evaluation or a live manual override — because the question the client
+/// renders it to answer is "what are the fans doing?".
+///
+/// Display-only, and **not** a per-fan duty: a member can sit below this (a
+/// role-aware floor, or the DEC-119 GPU divergence). Per-fan duty comes from each
+/// fan's own `last_commanded_pwm` on `/fans` + `/poll`.
+///
+/// A control absent from this list is not being evaluated — no profile active, a
+/// thermal force driving the fans directly, or the control is listed in
+/// `skipped_controls`. Absence is meaningful; the client must not carry a
+/// previous value forward.
+#[derive(Debug, Clone, Serialize)]
+pub struct ControlOutputEntry {
+    pub control_id: String,
+    /// Applied control-wide output, 0-100.
+    pub output_pct: f64,
 }
 
 /// One active manual override on the `/status` poll surface (DEC-163).
@@ -1652,6 +1679,7 @@ mod tests {
             fan_identify: Vec::new(),
             unavailable_sensors: Vec::new(),
             skipped_controls: Vec::new(),
+            control_outputs: Vec::new(),
             active_profile_id: None,
             active_profile_name: None,
             readiness: None,
@@ -1694,6 +1722,7 @@ mod tests {
             fan_identify: Vec::new(),
             unavailable_sensors: Vec::new(),
             skipped_controls: Vec::new(),
+            control_outputs: Vec::new(),
             active_profile_id: None,
             active_profile_name: None,
             readiness: Some(ReadinessRollup {
@@ -1732,6 +1761,7 @@ mod tests {
             fan_identify: Vec::new(),
             unavailable_sensors: Vec::new(),
             skipped_controls: Vec::new(),
+            control_outputs: Vec::new(),
             active_profile_id: None,
             active_profile_name: None,
             readiness: None,
@@ -1763,6 +1793,7 @@ mod tests {
                 reason: "mix_unresolvable".into(),
                 skipped_for_ms: 9000,
             }],
+            control_outputs: Vec::new(),
             active_profile_id: None,
             active_profile_name: None,
             readiness: None,
@@ -1794,6 +1825,7 @@ mod tests {
                 unavailable_for_ms: 4200,
             }],
             skipped_controls: Vec::new(),
+            control_outputs: Vec::new(),
             active_profile_id: None,
             active_profile_name: None,
             readiness: None,
