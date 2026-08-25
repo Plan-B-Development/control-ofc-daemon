@@ -182,7 +182,8 @@ fn expected_driver_for_chip(chip_name: &str) -> &'static str {
 ///
 /// The ITE list mirrors mainline `it87` chip support
 /// (`drivers/hwmon/it87.c` enum + docs.kernel.org/hwmon/it87.html,
-/// verified against v7.1 / 7.2-rc4, master 2026-07-21). `it8622` added in DEC-144. `it8689`
+/// verified at the v7.2 release tag, 2026-08-25 — enum unchanged from the
+/// 7.2-rc4 reading). `it8622` added in DEC-144. `it8689`
 /// is deliberately NOT listed (DEC-144, re-evaluated 2026-07 and again
 /// 2026-08-23): mainline 7.1 added IT8689E fan *control* (commit 66b8eaf — six
 /// PWM, FEAT_FANCTL_ONOFF, not just sensors; released 2026-06-14), but 7.1 is
@@ -1023,7 +1024,8 @@ mod tests {
     #[test]
     fn it8622_is_mainline() {
         // DEC-144: it8622 is in the mainline it87 `enum chips` (verified
-        // against torvalds/linux drivers/hwmon/it87.c v7.1 / 7.2-rc4) but was
+        // against torvalds/linux drivers/hwmon/it87.c at the v7.2 release
+        // tag, 2026-08-25) but was
         // missing from our list — the chips table falsely told IT8622E
         // owners they needed the DKMS build.
         assert!(chip_driver_in_mainline("it8622"));
