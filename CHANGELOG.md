@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [2.23.0] — 2026-08-27
 
 ### Added
 - **A profile search directory can now be removed, not only added.**
@@ -60,6 +60,13 @@
 - `GET /config`'s key set and per-key mutability are now pinned by a test, so a
   new daemon config key cannot arrive unnoticed by the GUI. That gap is what let
   `profiles.search_dirs` sit writable-but-unsurfaced since the endpoint shipped.
+
+Pairs with `control-ofc-gui` ≥ v2.23.0; **no wire, schema or API break** —
+`api_version` stays 1 and every change is additive. `remove` on
+`POST /config/profile-search-dirs` is advertised as
+`control.profile_search_dir_remove` in `GET /capabilities`; v2.49.0 or newer
+drives it from the Settings ▸ Daemon Configuration card, and older GUIs simply
+never send it.
 
 ## [2.22.0] — 2026-08-23
 
