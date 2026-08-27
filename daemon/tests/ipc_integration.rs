@@ -3543,6 +3543,290 @@ async fn profile_search_dirs_confines_non_root_to_home() {
     let _ = std::fs::remove_file(&path);
 }
 
+// ── Search-dir removal (2.23.0) ──────────────────────────────────────────
+// `POST /config/profile-search-dirs` was add-only and merge-only, so the list
+// could only grow: the GUI re-registers on every connect and added a fresh entry
+// every time the user repointed their profiles directory, leaving stale entries
+// in runtime.toml that no UI could reach and only a root hand-edit could remove.
+
+/// The home directory the search-dir confinement resolves for this test process.
+///
+/// The handler resolves it from the passwd database (`getpwuid_r`), not from the
+/// environment; `$HOME` is the same value on any normal Linux host and in CI. If
+/// the two ever diverged these tests would fail loudly rather than pass
+/// vacuously, which is the failure mode worth having.
+fn confinement_home() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("HOME").expect("HOME must be set to run these tests"))
+}
+
+/// A real directory the *add* path will accept: inside this user's home, because
+/// `confine_added_dirs` requires both. Root is exempt from confinement, so the
+/// system temp dir is fine there and avoids writing into `/root`.
+fn addable_dir() -> (tempfile::TempDir, String) {
+    // SAFETY: getuid() takes no arguments and always succeeds.
+    let dir = if unsafe { libc::getuid() } == 0 {
+        tempfile::tempdir().unwrap()
+    } else {
+        tempfile::Builder::new()
+            .prefix(".control-ofc-test-")
+            .tempdir_in(confinement_home())
+            .unwrap()
+    };
+    let path = dir.path().to_string_lossy().into_owned();
+    (dir, path)
+}
+
+/// A path inside this user's home that does NOT exist — the stale entry a user
+/// actually needs to prune.
+fn vanished_dir() -> String {
+    // SAFETY: getuid() takes no arguments and always succeeds.
+    let root = if unsafe { libc::getuid() } == 0 {
+        std::path::PathBuf::from("/root")
+    } else {
+        confinement_home()
+    };
+    root.join(format!(
+        ".control-ofc-vanished-{}/profiles",
+        std::process::id()
+    ))
+    .to_string_lossy()
+    .into_owned()
+}
+
+#[tokio::test]
+async fn profile_search_dirs_requires_add_or_remove() {
+    let (state, _tmp) = config_test_state("");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) =
+        uds_post(&path, "/config/profile-search-dirs", &serde_json::json!({})).await;
+    assert_eq!(status, 400, "an empty edit must be rejected: {json}");
+    assert_eq!(json["error"]["code"], "validation_error");
+    let msg = json["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("add") && msg.contains("remove"),
+        "the rejection must name both operations: {msg}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn profile_search_dirs_rejects_a_non_string_entry() {
+    // REGRESSION: the old parser silently dropped non-strings, so `[null]` was
+    // indistinguishable from `[]` and the handler reported success having done
+    // nothing at all.
+    let (state, _tmp) = config_test_state("");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_post(
+        &path,
+        "/config/profile-search-dirs",
+        &serde_json::json!({ "add": [serde_json::Value::Null] }),
+    )
+    .await;
+    assert_eq!(status, 400, "a non-string entry must be rejected: {json}");
+    assert_eq!(json["error"]["code"], "validation_error");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn profile_search_dirs_refuses_to_remove_the_system_dir() {
+    // Checked before confinement, so the message is the useful one at any uid:
+    // "the system profile directory cannot be removed", not "not in your home".
+    let (state, _tmp) = config_test_state("");
+    *state.profile_search_dirs.write() = vec![std::path::PathBuf::from(
+        control_ofc_daemon::config::SYSTEM_PROFILE_DIR,
+    )];
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_post(
+        &path,
+        "/config/profile-search-dirs",
+        &serde_json::json!({ "remove": [control_ofc_daemon::config::SYSTEM_PROFILE_DIR] }),
+    )
+    .await;
+    assert_eq!(status, 400, "the system dir must be protected: {json}");
+    let msg = json["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains(control_ofc_daemon::config::SYSTEM_PROFILE_DIR),
+        "the rejection must name the directory: {msg}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn profile_search_dirs_removes_an_entry_that_no_longer_exists() {
+    // THE case the feature exists for, end to end over the socket: a stale entry
+    // whose directory is gone must be prunable. Reusing the *add* confinement
+    // predicate (which canonicalizes, and so requires existence) would reject
+    // exactly this request.
+    let (state, tmp) = config_test_state("");
+    let stale = vanished_dir();
+    *state.profile_search_dirs.write() = vec![
+        std::path::PathBuf::from(control_ofc_daemon::config::SYSTEM_PROFILE_DIR),
+        std::path::PathBuf::from(&stale),
+    ];
+    let runtime_path = tmp.path().join("runtime.toml");
+    let (path, shutdown, _dir) = start_test_server(state.clone()).await;
+
+    let (status, json) = uds_post(
+        &path,
+        "/config/profile-search-dirs",
+        &serde_json::json!({ "remove": [stale] }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a vanished in-home entry must be prunable: {json}"
+    );
+    assert_eq!(
+        json["search_dirs"],
+        serde_json::json!([control_ofc_daemon::config::SYSTEM_PROFILE_DIR]),
+        "the response must report the pruned list"
+    );
+
+    // In-memory state committed…
+    let live: Vec<String> = state
+        .profile_search_dirs
+        .read()
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    assert_eq!(live, vec![control_ofc_daemon::config::SYSTEM_PROFILE_DIR]);
+    // …and persisted, or the entry returns on the next restart.
+    let persisted = std::fs::read_to_string(&runtime_path).expect("runtime.toml must be written");
+    assert!(
+        !persisted.contains(&stale),
+        "the pruned dir must be gone from runtime.toml:\n{persisted}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn profile_search_dirs_add_and_remove_is_a_single_move() {
+    // What the GUI sends when the user repoints their profiles directory. Before
+    // this, only the `add` half happened and the old entry accumulated forever.
+    let (state, _tmp) = config_test_state("");
+    let old = vanished_dir();
+    let (_keep_alive, new) = addable_dir();
+    *state.profile_search_dirs.write() = vec![
+        std::path::PathBuf::from(control_ofc_daemon::config::SYSTEM_PROFILE_DIR),
+        std::path::PathBuf::from(&old),
+    ];
+    let (path, shutdown, _dir) = start_test_server(state.clone()).await;
+
+    let (status, json) = uds_post(
+        &path,
+        "/config/profile-search-dirs",
+        &serde_json::json!({ "add": [new], "remove": [old] }),
+    )
+    .await;
+    assert_eq!(status, 200, "the move must be accepted: {json}");
+    assert_eq!(
+        json["search_dirs"],
+        serde_json::json!([control_ofc_daemon::config::SYSTEM_PROFILE_DIR, new]),
+        "the old entry must be gone and the new one present"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn profile_search_dirs_refuses_an_edit_that_would_empty_the_path() {
+    // `activate_profile` resolves against this list; emptying it would be an
+    // unrecoverable soft-lock reachable from an unprivileged API call.
+    let (state, _tmp) = config_test_state("");
+    let only = vanished_dir();
+    *state.profile_search_dirs.write() = vec![std::path::PathBuf::from(&only)];
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_post(
+        &path,
+        "/config/profile-search-dirs",
+        &serde_json::json!({ "remove": [only] }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "emptying the search path must be refused: {json}"
+    );
+    let msg = json["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("at least one"), "unexpected message: {msg}");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn profile_search_dirs_refuses_to_remove_the_profile_store() {
+    // REGRESSION (DEC-285 self-review P1). `profile.rs::store_dir()` is
+    // `profile_search_dirs.first()` and it is the write target for profile
+    // create and delete, so dropping it would silently redirect every profile
+    // write for the rest of the process's life. Root/CLI callers are exempt from
+    // peer-uid confinement, so the guard has to be in the merge, not in the
+    // confinement.
+    let (state, _tmp) = config_test_state("");
+    let store = "/var/lib/control-ofc/profiles";
+    *state.profile_search_dirs.write() = vec![
+        std::path::PathBuf::from(store),
+        std::path::PathBuf::from(control_ofc_daemon::config::SYSTEM_PROFILE_DIR),
+        std::path::PathBuf::from(vanished_dir()),
+    ];
+    let (path, shutdown, _dir) = start_test_server(state.clone()).await;
+
+    let (status, json) = uds_post(
+        &path,
+        "/config/profile-search-dirs",
+        &serde_json::json!({ "remove": [store] }),
+    )
+    .await;
+    assert_eq!(status, 400, "the profile store must be protected: {json}");
+    let msg = json["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains(store), "the rejection must name it: {msg}");
+
+    // …and the live list is untouched, so profile writes still land where they did.
+    assert_eq!(
+        state
+            .profile_search_dirs
+            .read()
+            .first()
+            .map(|p| p.display().to_string())
+            .as_deref(),
+        Some(store)
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn capabilities_advertise_search_dir_removal() {
+    // A client MUST gate on this flag: an older daemon does not 404 a `remove`,
+    // it parses only `add` and ignores the rest, so probing reads a partial
+    // success as a whole one.
+    let state = test_app_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/capabilities").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        json["control"]["profile_search_dir_remove"], true,
+        "this daemon supports removal and must say so: {json}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
 // ── DEC-243: readable + extended-writable daemon configuration ───────────
 // `GET /config` exists because the writable knobs were previously write-only:
 // the GUI kept a local mirror and pushed it on save, so a fresh client against a
@@ -3585,6 +3869,90 @@ async fn get_config_reports_defaults_with_source() {
     assert_eq!(delay["source"], "default", "nothing set it — not 'admin'");
     assert_eq!(delay["mutable"], true);
     assert_eq!(delay["restart_pending"], false);
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn get_config_key_set_and_mutability_are_pinned() {
+    // The GUI's Settings page must offer a control for every `mutable: true` key
+    // — `tests/test_daemon_config_coverage.py` over there enforces that against a
+    // declared fixture. Nothing on THIS side stopped a key arriving unnoticed,
+    // which is how `profiles.search_dirs` came to be editable over the API with
+    // no UI anywhere and no way to prune what the GUI kept adding.
+    //
+    // Adding a key is deliberate work: update this list, the GUI's
+    // `tests/fixtures/daemon_config_keys.json`, and `docs/08` § Config
+    // management. Order is asserted too — `keys[]` is a list, and the GUI's
+    // fixture is diffed against it.
+    let (state, _tmp) = config_test_state("");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (_status, json) = uds_get(&path, "/config").await;
+    let reported: Vec<(String, bool)> = json["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| {
+            (
+                k["key"].as_str().unwrap().to_string(),
+                k["mutable"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+
+    let expected: Vec<(String, bool)> = [
+        ("profiles.search_dirs", true),
+        ("startup.delay_secs", true),
+        ("polling.poll_interval_ms", true),
+        ("serial.port", true),
+        ("serial.timeout_ms", true),
+        ("detection.allow_port_probe", true),
+        ("detection.enable_nvidia_telemetry", true),
+        // Read-only by design: a bad socket path locks every client out
+        // permanently, and moving the state dir orphans runtime.toml and the
+        // profile store.
+        ("ipc.socket_path", false),
+        ("state.state_dir", false),
+    ]
+    .iter()
+    .map(|(k, m)| (k.to_string(), *m))
+    .collect();
+
+    assert_eq!(
+        reported, expected,
+        "GET /config's key set changed — update the GUI fixture and docs/08 too"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn startup_delay_response_carries_the_shared_setter_shape() {
+    // `POST /config/startup-delay` predates DEC-243 and answered with only
+    // `delay_secs`, so it could not go through the same client-side parser as
+    // every other `POST /config/*` — which is why the GUI drove it from a local
+    // mirror instead of the shared write path. `delay_secs` is retained for
+    // older clients.
+    let (state, _tmp) = config_test_state("");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_post(
+        &path,
+        "/config/startup-delay",
+        &serde_json::json!({ "delay_secs": 7 }),
+    )
+    .await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json["key"], "startup.delay_secs");
+    assert_eq!(json["value"], 7);
+    assert_eq!(json["delay_secs"], 7, "the legacy field must remain");
+    assert!(json["note"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("restart"));
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);

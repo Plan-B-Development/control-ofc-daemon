@@ -296,6 +296,7 @@ pub async fn capabilities_handler(
             autonomous_control: true,
             min_supported_gui: "2.0.0".into(),
             openfan_rescan: true,
+            profile_search_dir_remove: true,
         },
     })
 }

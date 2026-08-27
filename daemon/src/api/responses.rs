@@ -592,6 +592,17 @@ pub struct ControlCapability {
     /// rather than offering a button that 404s.
     #[serde(default)]
     pub openfan_rescan: bool,
+    /// `POST /config/profile-search-dirs` accepts a `remove` array, so a client
+    /// can prune a stale profile search directory instead of only ever adding
+    /// one. True since 2.23.0 (DEC-285).
+    ///
+    /// This flag is load-bearing in a way `openfan_rescan`'s is not: an older
+    /// daemon does not 404 a `remove`, it parses only `add` and **silently
+    /// ignores** the rest. A client that probed instead of checking would read
+    /// that partial success as a whole one and tell the user a directory had
+    /// been pruned when it had not.
+    #[serde(default)]
+    pub profile_search_dir_remove: bool,
 }
 
 /// Per-device-group capability info.
@@ -2071,6 +2082,7 @@ mod tests {
                 autonomous_control: false,
                 min_supported_gui: String::new(),
                 openfan_rescan: false,
+                profile_search_dir_remove: false,
             },
         };
         let json = serde_json::to_value(&resp).unwrap();

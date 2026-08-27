@@ -175,7 +175,7 @@ The profile engine is the **sole writer** as of 2.0.0 (DEC-159/DEC-165); the GUI
 | `POST /gpu/{gpu_id}/fan/reset` | Reset GPU fan to automatic |
 | `POST /hwmon/rescan` | Re-enumerate hwmon devices |
 | `POST /fans/openfan/rescan` | Adopt an OpenFanController found after boot (DEC-265) |
-| `POST /config/profile-search-dirs` | Register additional profile search dirs (persists to `runtime.toml`) |
+| `POST /config/profile-search-dirs` | Add and/or remove profile search dirs (persists to `runtime.toml`); `remove` is >= 2.23.0, gated by `control.profile_search_dir_remove` (DEC-285) |
 | `POST /config/startup-delay` | Set startup delay seconds (persists to `runtime.toml`) |
 | `POST /inventory/superio/probe` | Opt-in active Super-I/O `/dev/port` probe (DEC-203) |
 | `POST /config/preferred-cpu-sensor` | Persist the preferred CPU temp sensor (DEC-200) |

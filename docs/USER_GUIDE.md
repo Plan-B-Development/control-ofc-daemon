@@ -203,7 +203,7 @@ As of 2.0.0 the profile engine is the **sole writer** (DEC-159 / DEC-165) — th
 | `POST /fans/openfan/rescan` | Look for an OpenFanController and adopt it without restarting the daemon |
 | `POST /gpu/{gpu_id}/fan/reset` | Restore GPU fan to firmware automatic and re-enable zero-RPM |
 | `POST /gpu/{gpu_id}/fan/verify` | Behavioural test of GPU fan-control effectiveness; ~6 s, no lease (DEC-120). Drives a test speed biased upward, reads back the applied PMFW `fan_curve`/`pwm1` + RPM, then restores. Detects the silent failures static checks miss (`ppfeaturemask` bit 14 unset, SMU mismatch, BIOS overdrive lock). |
-| `POST /config/profile-search-dirs` | Add directories to the profile search path (immediate; persists to `runtime.toml`) |
+| `POST /config/profile-search-dirs` | Add and/or remove directories in the profile search path (immediate; persists to `runtime.toml`). `remove` needs ≥ 2.23.0 (DEC-285) |
 | `POST /config/startup-delay` | Set startup-delay seconds (persisted to `runtime.toml`, takes effect on restart) |
 | `POST /inventory/superio/probe` | Opt-in active Super-I/O `/dev/port` probe — off by default, needs `allow_port_probe` (DEC-203) |
 | `POST /config/preferred-cpu-sensor` | Persist the preferred CPU temp sensor (persists to `runtime.toml`; DEC-200) |
@@ -417,6 +417,23 @@ curl --unix-socket /run/control-ofc/control-ofc.sock \
   -d '{"add": ["/home/user/.config/control-ofc/profiles"]}' \
   http://localhost/config/profile-search-dirs | jq .
 ```
+
+A stale directory can be pruned the same way (daemon >= 2.23.0), and the two
+operations combine into a single atomic "move" — removals are applied first:
+
+```bash
+curl --unix-socket /run/control-ofc/control-ofc.sock \
+  -X POST -H "Content-Type: application/json" \
+  -d '{"add": ["/home/user/profiles-new"], "remove": ["/home/user/profiles-old"]}' \
+  http://localhost/config/profile-search-dirs | jq .
+```
+
+`/etc/control-ofc/profiles` cannot be removed, and neither can the last
+remaining entry — profile activation resolves against this list, so an empty one
+would leave the daemon unable to find any profile at all. Both are
+`400 validation_error`. A non-root caller may only touch directories under its
+own home (DEC-205); removal does **not** require the directory to still exist,
+which is the point — a stale entry usually no longer does.
 
 ### Profile engine ownership
 

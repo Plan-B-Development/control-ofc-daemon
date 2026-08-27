@@ -117,6 +117,16 @@ fn default_state_dir() -> String {
     "/var/lib/control-ofc".into()
 }
 
+/// The admin-owned system profile directory.
+///
+/// Always present in the search path: the defaults include it, and
+/// `POST /config/profile-search-dirs` refuses to prune it, so an unprivileged
+/// client cannot orphan admin-installed profiles. Kept here as a constant
+/// because two modules now depend on the exact string — the defaults below and
+/// the search-dir editor in `api::handlers::config` — and a second literal is
+/// how the two would drift.
+pub const SYSTEM_PROFILE_DIR: &str = "/etc/control-ofc/profiles";
+
 /// Profile search directory configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -143,7 +153,7 @@ fn default_profile_search_dirs() -> Vec<String> {
 }
 
 fn profile_search_dirs_for(home: Option<&str>, xdg_config: Option<&str>) -> Vec<String> {
-    let mut dirs = vec!["/etc/control-ofc/profiles".to_string()];
+    let mut dirs = vec![SYSTEM_PROFILE_DIR.to_string()];
     if let Some(xdg) = xdg_config {
         dirs.push(format!("{xdg}/control-ofc/profiles"));
     } else if let Some(h) = home {

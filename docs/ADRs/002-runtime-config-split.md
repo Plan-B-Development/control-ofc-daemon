@@ -64,7 +64,7 @@ Widened by **DEC-243**. The original set was `[profiles] search_dirs` and
 
 | `runtime.toml` section | Keys | Setter |
 |---|---|---|
-| `[profiles]` | `search_dirs` | `POST /config/profile-search-dirs` |
+| `[profiles]` | `search_dirs` | `POST /config/profile-search-dirs` (`add` and/or `remove`; `remove` since 2.23.0, DEC-285) |
 | `[startup]` | `delay_secs` | `POST /config/startup-delay` |
 | `[hardware]` | `preferred_cpu_sensor`, `preferred_mb_sensor` | `POST /config/preferred-{cpu,mb}-sensor` |
 | `[polling]` | `poll_interval_ms` | `POST /config/poll-interval` |

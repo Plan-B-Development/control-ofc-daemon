@@ -18,49 +18,172 @@ use crate::api::responses::*;
 use crate::api::server::UdsConnectInfo;
 use crate::runtime_config::RuntimeConfig;
 
-/// POST /config/profile-search-dirs — add directories to the profile search path.
+/// Pull one optional array-of-strings field out of a request body.
 ///
-/// Accepts `{"add": ["/path/to/profiles"]}` — each directory must be an absolute path.
-/// The system directory `/etc/control-ofc/profiles` is always preserved.
+/// `Ok(None)` means the key was absent. A present-but-wrong-shaped value is an
+/// error rather than a silent drop: the previous `filter_map(as_str)` quietly
+/// discarded every non-string entry, so `{"add": [null]}` was indistinguishable
+/// from `{"add": []}` and reported success having done nothing.
+fn dir_list_field(body: &serde_json::Value, field: &str) -> Result<Option<Vec<String>>, String> {
+    match body.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Array(arr)) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for v in arr {
+                match v.as_str() {
+                    Some(s) => out.push(s.to_string()),
+                    None => {
+                        return Err(format!("'{field}' must be an array of strings"));
+                    }
+                }
+            }
+            Ok(Some(out))
+        }
+        Some(_) => Err(format!(
+            "'{field}' must be an array of absolute directory paths"
+        )),
+    }
+}
+
+/// Shape rules every search-dir path must satisfy, plus the one entry that may
+/// never be pruned.
 ///
-/// Flow: persist runtime.toml first, then update in-memory state. If the
-/// persist fails, the in-memory state is left untouched and the handler
-/// returns 503 `persistence_failed` so the GUI can retry or surface the
-/// error to the user. See ADR-002 for the rationale behind the two-file
-/// config split.
+/// Pure so the rules are unit-testable without a socket. The `..` rejection is
+/// what lets `confine_removed_dirs` compare lexically.
+pub(crate) fn validate_search_dir_edit(add: &[String], remove: &[String]) -> Result<(), String> {
+    for d in add.iter().chain(remove.iter()) {
+        if !d.starts_with('/') {
+            return Err(format!("search dir must be absolute: {d}"));
+        }
+        if d.contains("..") {
+            return Err(format!(
+                "search dir must not contain path traversal (..): {d}"
+            ));
+        }
+    }
+    if remove
+        .iter()
+        .any(|d| d == crate::config::SYSTEM_PROFILE_DIR)
+    {
+        return Err(format!(
+            "the system profile directory cannot be removed: {}",
+            crate::config::SYSTEM_PROFILE_DIR
+        ));
+    }
+    Ok(())
+}
+
+/// Apply one edit to the search-dir list: removals first, then additions.
+///
+/// Removals run first so `{"add": [new], "remove": [old]}` is a single atomic
+/// "move" — that is the request the GUI sends when the user repoints their
+/// profiles directory, and it is what stops the list growing by one entry every
+/// time they do. A path named in *both* lists therefore ends up present: add is
+/// the positive intent, and keeping it is the outcome that cannot lose a
+/// directory the caller still wants.
+///
+/// Rejects two results outright.
+///
+/// **An empty search path.** `activate_profile` resolves a profile path against
+/// this list, so an empty one is an unrecoverable soft-lock reachable from an
+/// unprivileged API call.
+///
+/// **A result whose FIRST entry is no longer `store_dir`.** The daemon's profile
+/// store of record (DEC-160) is *defined* as the first search dir —
+/// `profile.rs`'s `store_dir()` is literally `profile_search_dirs.first()`, and
+/// it is the write target for profile create and delete. Displacing it would
+/// silently redirect every profile write to whatever became first, for the rest
+/// of the process's life, and `with_store_dir` only re-prepends it at boot and
+/// on SIGHUP.
+///
+/// **Position, not membership** — and this is the second attempt. Checking
+/// merely that the store dir *survived* looked sufficient and was not: this
+/// function filters removals out and **appends** additions, so
+/// `{"remove": [store], "add": [store]}` deletes it from index 0 and re-adds it
+/// at the end. Present, displaced, accepted. The first cut of this guard shipped
+/// with a test that blessed exactly that request (`is_ok()`, no order assertion)
+/// and a comment claiming "a future reordering cannot slip past" — it did, and a
+/// contract review found it. Assert what `store_dir()` actually reads.
+pub(crate) fn merge_search_dirs(
+    current: &[String],
+    add: &[String],
+    remove: &[String],
+    store_dir: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut merged: Vec<String> = current
+        .iter()
+        .filter(|d| !remove.contains(d))
+        .cloned()
+        .collect();
+    for d in add {
+        if !merged.contains(d) {
+            merged.push(d.clone());
+        }
+    }
+    if merged.is_empty() {
+        return Err(
+            "at least one profile search directory must remain; refusing an edit that \
+             would empty the search path"
+                .to_string(),
+        );
+    }
+    if let Some(store) = store_dir {
+        if merged.first().map(String::as_str) != Some(store) {
+            return Err(format!(
+                "the daemon's profile store directory must remain first in the \
+                 search path and cannot be removed or displaced: {store}"
+            ));
+        }
+    }
+    Ok(merged)
+}
+
+/// POST /config/profile-search-dirs — edit the daemon's profile search path (DEC-285).
+///
+/// Body: `{"add": [...]}` and/or `{"remove": [...]}`, each an array of absolute
+/// directory paths. At least one of the two must be present.
+///
+/// `remove` is **daemon >= 2.23.0** and is advertised as
+/// `control.profile_search_dir_remove` in `GET /capabilities`. An older daemon
+/// parses only `add` and ignores `remove` **silently** — a partial success that
+/// looks like a whole one — which is exactly why the flag exists and why a
+/// client must check it rather than probing.
+///
+/// The system directory `/etc/control-ofc/profiles` can never be removed, and
+/// neither can the last remaining entry.
+///
+/// Flow: validate, confine, merge, then persist runtime.toml *first* and only
+/// then update in-memory state. If the persist fails, the in-memory state is
+/// left untouched and the handler returns 503 `persistence_failed` so the GUI
+/// can retry or surface the error to the user. See ADR-002 for the rationale
+/// behind the two-file config split.
 pub async fn update_profile_search_dirs_handler(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer): ConnectInfo<UdsConnectInfo>,
     Json(body): Json<serde_json::Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let add = body.get("add").and_then(|v| v.as_array()).map(|arr| {
-        arr.iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect::<Vec<_>>()
-    });
-
-    let Some(new_dirs) = add else {
+    let (add, remove) = match (
+        dir_list_field(&body, "add"),
+        dir_list_field(&body, "remove"),
+    ) {
+        (Ok(a), Ok(r)) => (a, r),
+        (Err(msg), _) | (_, Err(msg)) => {
+            return error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(msg));
+        }
+    };
+    if add.is_none() && remove.is_none() {
         return error_response(
             StatusCode::BAD_REQUEST,
-            &ErrorEnvelope::validation("missing 'add' array of absolute directory paths"),
+            &ErrorEnvelope::validation(
+                "missing 'add' and/or 'remove' array of absolute directory paths",
+            ),
         );
-    };
+    }
+    let add = add.unwrap_or_default();
+    let remove = remove.unwrap_or_default();
 
-    for d in &new_dirs {
-        if !d.starts_with('/') {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                &ErrorEnvelope::validation(format!("search dir must be absolute: {d}")),
-            );
-        }
-        if d.contains("..") {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                &ErrorEnvelope::validation(format!(
-                    "search dir must not contain path traversal (..): {d}"
-                )),
-            );
-        }
+    if let Err(msg) = validate_search_dir_edit(&add, &remove) {
+        return error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(msg));
     }
 
     // Multi-user confinement (DEC-205): a non-root client may only add search
@@ -68,7 +191,18 @@ pub async fn update_profile_search_dirs_handler(
     // are exempt. The peer uid comes from SO_PEERCRED via the connect-info
     // layer; an unresolvable uid/home fails closed.
     if let Err(msg) = super::path_confine::confine_added_dirs(
-        &new_dirs,
+        &add,
+        peer.uid,
+        super::path_confine::home_dir_for_uid,
+    ) {
+        return error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(msg));
+    }
+    // Removal is confined the same way — otherwise any local user could prune
+    // another user's search dir and quietly stop their profiles resolving — but
+    // by a predicate that does NOT require the directory to still exist. See
+    // `confine_removed_dirs`.
+    if let Err(msg) = super::path_confine::confine_removed_dirs(
+        &remove,
         peer.uid,
         super::path_confine::home_dir_for_uid,
     ) {
@@ -86,16 +220,20 @@ pub async fn update_profile_search_dirs_handler(
     // peer-uid confinement of activation (a change to the pre-existing activation
     // path), deferred as out of Wave-2 scope.
 
-    // Merge with existing dirs (dedup, always keep /etc/control-ofc/profiles)
-    let mut merged: Vec<String> = {
-        let current = state.profile_search_dirs.read();
-        current.iter().map(|p| p.display().to_string()).collect()
+    let current: Vec<String> = {
+        let dirs = state.profile_search_dirs.read();
+        dirs.iter().map(|p| p.display().to_string()).collect()
     };
-    for d in &new_dirs {
-        if !merged.contains(d) {
-            merged.push(d.clone());
+    // The store of record is the FIRST search dir — read from the same place
+    // `profile.rs::store_dir()` reads it, so the two cannot disagree about which
+    // directory profile writes land in.
+    let store = current.first().cloned();
+    let merged = match merge_search_dirs(&current, &add, &remove, store.as_deref()) {
+        Ok(m) => m,
+        Err(msg) => {
+            return error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(msg));
         }
-    }
+    };
 
     // Persist first. On failure, leave in-memory state alone and return 503
     // so the caller sees a durable, actionable error rather than a silent
@@ -187,6 +325,13 @@ pub async fn update_startup_delay_handler(
         Json(serde_json::json!({
             "api_version": API_VERSION,
             "updated": true,
+            // `key`/`value` match the DEC-243 setter shape, so one client-side
+            // parser covers every `POST /config/*` route. `delay_secs` predates
+            // that shape and is kept for older clients — this route is the one
+            // DEC-243 did not harmonise, which is why it was the one key the GUI
+            // still drove from a local mirror instead of the shared write path.
+            "key": "startup.delay_secs",
+            "value": delay,
             "delay_secs": delay,
             "note": "Takes effect on next daemon restart",
         })),
@@ -862,4 +1007,190 @@ pub async fn update_nvidia_telemetry_handler(
         }
     }
     (status, resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SYSTEM_PROFILE_DIR;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    // ── dir_list_field ────────────────────────────────────────────────
+
+    #[test]
+    fn absent_and_null_fields_read_as_none() {
+        let body = serde_json::json!({ "remove": null });
+        assert_eq!(dir_list_field(&body, "add").unwrap(), None);
+        assert_eq!(dir_list_field(&body, "remove").unwrap(), None);
+    }
+
+    #[test]
+    fn a_non_string_entry_is_an_error_not_a_silent_drop() {
+        // REGRESSION: the previous `filter_map(as_str)` made `{"add": [null]}`
+        // indistinguishable from `{"add": []}` — the handler reported success
+        // having applied nothing.
+        let body = serde_json::json!({ "add": ["/a", 7] });
+        let msg = dir_list_field(&body, "add").expect_err("a non-string entry must be rejected");
+        assert!(
+            msg.contains("array of strings"),
+            "unexpected message: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_non_array_value_is_rejected() {
+        let body = serde_json::json!({ "add": "/a" });
+        assert!(dir_list_field(&body, "add").is_err());
+    }
+
+    #[test]
+    fn an_empty_array_is_an_explicit_empty_list() {
+        let body = serde_json::json!({ "add": [] });
+        assert_eq!(dir_list_field(&body, "add").unwrap(), Some(vec![]));
+    }
+
+    // ── validate_search_dir_edit ──────────────────────────────────────
+
+    #[test]
+    fn shape_rules_apply_to_removals_too() {
+        // The lexical containment check in `confine_removed_dirs` is only sound
+        // because `..` never reaches it.
+        assert!(validate_search_dir_edit(&[], &v(&["relative/path"])).is_err());
+        assert!(validate_search_dir_edit(&[], &v(&["/a/../../etc"])).is_err());
+        assert!(validate_search_dir_edit(&v(&["/a/../b"]), &[]).is_err());
+        assert!(validate_search_dir_edit(&v(&["/ok"]), &v(&["/also/ok"])).is_ok());
+    }
+
+    #[test]
+    fn the_system_profile_dir_may_never_be_removed() {
+        let msg = validate_search_dir_edit(&[], &v(&[SYSTEM_PROFILE_DIR]))
+            .expect_err("the system dir must be protected");
+        assert!(
+            msg.contains(SYSTEM_PROFILE_DIR),
+            "the rejection must name the directory: {msg}"
+        );
+        // Adding it back is fine — only removal is refused.
+        assert!(validate_search_dir_edit(&v(&[SYSTEM_PROFILE_DIR]), &[]).is_ok());
+    }
+
+    // ── merge_search_dirs ─────────────────────────────────────────────
+
+    #[test]
+    fn removal_prunes_and_addition_appends() {
+        let current = v(&[SYSTEM_PROFILE_DIR, "/home/u/old", "/home/u/keep"]);
+        let out =
+            merge_search_dirs(&current, &v(&["/home/u/new"]), &v(&["/home/u/old"]), None).unwrap();
+        assert_eq!(out, v(&[SYSTEM_PROFILE_DIR, "/home/u/keep", "/home/u/new"]));
+    }
+
+    #[test]
+    fn removing_an_absent_dir_is_a_no_op_not_an_error() {
+        let current = v(&[SYSTEM_PROFILE_DIR]);
+        let out = merge_search_dirs(&current, &[], &v(&["/never/registered"]), None).unwrap();
+        assert_eq!(out, current, "an idempotent remove must succeed unchanged");
+    }
+
+    #[test]
+    fn adding_an_existing_dir_does_not_duplicate_it() {
+        let current = v(&[SYSTEM_PROFILE_DIR, "/home/u/p"]);
+        let out = merge_search_dirs(&current, &v(&["/home/u/p"]), &[], None).unwrap();
+        assert_eq!(out, current);
+    }
+
+    #[test]
+    fn a_path_in_both_lists_survives() {
+        // Removals run first, so `add` wins. Re-registering the directory you
+        // are already using must never be able to un-register it.
+        let current = v(&[SYSTEM_PROFILE_DIR, "/home/u/p"]);
+        let out =
+            merge_search_dirs(&current, &v(&["/home/u/p"]), &v(&["/home/u/p"]), None).unwrap();
+        assert!(
+            out.contains(&"/home/u/p".to_string()),
+            "add must win: {out:?}"
+        );
+    }
+
+    #[test]
+    fn an_edit_that_would_empty_the_search_path_is_rejected() {
+        // `activate_profile` resolves against this list; emptying it is an
+        // unrecoverable soft-lock reachable from an unprivileged API call.
+        let current = v(&["/home/u/only"]);
+        let msg = merge_search_dirs(&current, &[], &v(&["/home/u/only"]), None)
+            .expect_err("emptying the search path must be refused");
+        assert!(msg.contains("at least one"), "unexpected message: {msg}");
+        // …but the same removal paired with a replacement is fine.
+        assert!(
+            merge_search_dirs(&current, &v(&["/home/u/new"]), &v(&["/home/u/only"]), None).is_ok()
+        );
+    }
+
+    #[test]
+    fn the_profile_store_directory_cannot_be_removed() {
+        // REGRESSION (self-review P1): `profile.rs::store_dir()` is
+        // `profile_search_dirs.first()`, and it is the write target for profile
+        // create and delete. Dropping it from the live list would silently
+        // redirect every profile write to whatever became first, for the rest of
+        // the process's life — `with_store_dir` only re-prepends it at boot and
+        // on SIGHUP. Reachable by root/CLI, which `confine_removed_dirs` exempts.
+        let store = "/var/lib/control-ofc/profiles";
+        let current = v(&[store, SYSTEM_PROFILE_DIR, "/home/u/p"]);
+
+        let msg = merge_search_dirs(&current, &[], &v(&[store]), Some(store))
+            .expect_err("the store dir must be protected");
+        assert!(msg.contains(store), "the rejection must name it: {msg}");
+
+        // Removing something else is unaffected, and the store stays first.
+        let out = merge_search_dirs(&current, &[], &v(&["/home/u/p"]), Some(store)).unwrap();
+        assert_eq!(out.first().map(String::as_str), Some(store));
+
+        // REGRESSION (contract review P1): removing and re-adding it in ONE
+        // request must be refused, not blessed. The first cut of this guard
+        // checked membership, and this exact request passed it — the filter
+        // drops the store from index 0 and the append puts it back at the END,
+        // so it survives, is displaced, and `store_dir()` silently starts
+        // returning a different directory. The old test asserted `is_ok()` here
+        // and no order at all, which is how the hole shipped.
+        let msg = merge_search_dirs(&current, &v(&[store]), &v(&[store]), Some(store))
+            .expect_err("displacing the store dir must be refused, not merely surviving it");
+        assert!(msg.contains(store), "the rejection must name it: {msg}");
+
+        // Position is the property, so assert it directly on every accepted
+        // edit — membership alone is what let this through the first time.
+        for (add, remove) in [
+            (v(&["/home/u/new"]), vec![]),
+            (vec![], v(&["/home/u/p"])),
+            (v(&["/home/u/new"]), v(&["/home/u/p"])),
+        ] {
+            let out = merge_search_dirs(&current, &add, &remove, Some(store)).unwrap();
+            assert_eq!(
+                out.first().map(String::as_str),
+                Some(store),
+                "the store dir must stay at index 0 for add={add:?} remove={remove:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn emptying_is_reported_as_emptying_even_when_the_store_dir_is_the_casualty() {
+        // Both guards apply when the sole entry IS the store dir. The empty
+        // check runs first because "you cannot remove the last one" is the
+        // message that explains the situation; naming the store dir there would
+        // be true but less useful.
+        let only = v(&["/var/lib/control-ofc/profiles"]);
+        let msg = merge_search_dirs(&only, &[], &only, Some(&only[0]))
+            .expect_err("removing the sole entry must be refused");
+        assert!(msg.contains("at least one"), "unexpected message: {msg}");
+    }
+
+    #[test]
+    fn order_of_the_surviving_entries_is_preserved() {
+        // The daemon searches in order, so a reshuffle would silently change
+        // which copy of a duplicated profile id wins.
+        let current = v(&["/a", "/b", "/c", "/d"]);
+        let out = merge_search_dirs(&current, &[], &v(&["/c"]), None).unwrap();
+        assert_eq!(out, v(&["/a", "/b", "/d"]));
+    }
 }

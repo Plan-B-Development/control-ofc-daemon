@@ -1,5 +1,66 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **A profile search directory can now be removed, not only added.**
+  `POST /config/profile-search-dirs` accepts `{"remove": [...]}` alongside
+  `{"add": [...]}`; at least one is required. The endpoint was add-only and
+  merge-only, so the list could only grow — a client that re-registered a moved
+  profiles directory left the old entry behind permanently, invisible to any UI
+  and removable only by hand-editing a root-owned `runtime.toml`. Removals are
+  applied **before** additions, so `{"add": [new], "remove": [old]}` is a single
+  atomic "move"; a path named in both ends up present, because losing a
+  directory the caller still wants is the worse outcome. Advertised as
+  `control.profile_search_dir_remove` in `GET /capabilities` — **check the flag,
+  do not probe**: an older daemon does not `404` a `remove`, it parses only
+  `add` and silently ignores the rest, so an ungated call reports success having
+  pruned nothing.
+- Three edits are refused outright, all `400 validation_error`: removing
+  `/etc/control-ofc/profiles` (it holds the admin-installed profiles); any edit
+  whose result would be an **empty** search path — `activate_profile` resolves
+  against that list, so emptying it is an unrecoverable soft-lock reachable from
+  an unprivileged call; and any edit whose result no longer contains the
+  daemon's **profile store of record**. That last one matters more than it
+  looks: the store of record is *defined* as the first search dir, and it is the
+  write target for profile create and delete, so dropping it would silently
+  redirect every profile write for the rest of the process's life. It is
+  asserted on the result rather than on the request, so removing and re-adding
+  it in one call is still fine.
+- Removal is peer-uid confined like addition (DEC-205), but by a predicate that
+  does **not** require the directory to still exist. Reusing the add predicate
+  would have refused exactly the entries this feature exists to clean up: a
+  stale search dir is usually stale *because* the directory is gone. It accepts
+  the raw path, falling back to its canonical form when that resolves — the add
+  path validates canonically but persists the raw string, so without both legs a
+  directory added through a symlink was storable and permanently unremovable.
+
+### Fixed
+- **A home directory of `/` confined nothing.** `path_is_within` is
+  component-wise and every absolute path starts with the root component, so `/`
+  as a confinement root accepted anything — and 26 accounts on a stock Arch
+  install have `/` as their home (`nobody`, `http`, `cups`, `dbus`, `polkitd`,
+  `qemu`, `git`…) while the socket is 0666. Pre-existing in the DEC-205 add
+  path; `remove` would have made it destructive. `/` and `/nonexistent` are now
+  treated as unresolvable and fail closed, in both predicates and in the
+  resolver.
+- A `remove`-only request from a caller whose uid or home cannot be resolved no
+  longer reports "refusing to **add** profile search directories".
+
+### Changed
+- `POST /config/startup-delay` now answers with the shared DEC-243 setter shape
+  (`key` / `value`) alongside the original `delay_secs`, so one client-side
+  parser covers every `POST /config/*`. It was the one config route that
+  predated that shape, which is why the GUI could not drive it through the same
+  guarded write path as its siblings and kept a local mirror instead.
+- `POST /config/profile-search-dirs` now rejects a wrong-shaped payload instead
+  of silently dropping it: a non-array, or an array holding a non-string, is
+  `400 validation_error`. Previously `{"add": [null]}` was indistinguishable
+  from `{"add": []}` and reported success having applied nothing.
+- `GET /config`'s key set and per-key mutability are now pinned by a test, so a
+  new daemon config key cannot arrive unnoticed by the GUI. That gap is what let
+  `profiles.search_dirs` sit writable-but-unsurfaced since the endpoint shipped.
+
 ## [2.22.0] — 2026-08-23
 
 ### Added
