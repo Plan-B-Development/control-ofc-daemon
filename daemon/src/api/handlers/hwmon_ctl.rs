@@ -143,7 +143,12 @@ const VERIFY_WAIT_SECONDS: u8 = crate::constants::VERIFY_WAIT_SECONDS;
 /// `on_lease_released()`: the verify restores the header to its pre-verify value
 /// itself, so the controller's coalescing state already matches the hardware;
 /// resetting it would force a pure-churn pwm_enable+PWM re-write on the engine's
-/// next tick, every verify (P3-3).
+/// next tick, every verify (P3-3). **That premise is only sound because the
+/// restore is uncancellable** (DEC-290): this guard is moved into the verify's
+/// blocking task, so it cannot release before the restore has run. If the
+/// sequence is ever made cancellable again, this reasoning fails with it — the
+/// coalescing state would then claim the pre-verify duty while the hardware sat
+/// at the test duty.
 struct VerifyLeaseGuard {
     controller: std::sync::Arc<parking_lot::Mutex<crate::hwmon::pwm_control::HwmonPwmController>>,
     lease_id: String,
@@ -213,7 +218,7 @@ pub async fn hwmon_verify_handler(
     // (reject a concurrent verify with 409), then force-take a daemon-owned
     // "verify" lease for our own controlled writes. The engine is the sole
     // writer now (DEC-165) — no client lease.
-    let Some(_verify_guard) =
+    let Some(verify_guard) =
         super::begin_verify_pause(&state.cache, crate::constants::VERIFY_PAUSE_DEADMAN)
     else {
         return error_response(
@@ -230,81 +235,161 @@ pub async fn hwmon_verify_handler(
             .force_take_lease(HwmonWriter::Verify)
             .lease_id
     };
-    let _verify_lease = VerifyLeaseGuard {
+    let verify_lease = VerifyLeaseGuard {
         controller: controller.clone(),
         lease_id: verify_lease_id.clone(),
     };
 
-    let read_state = |pwm: &str, en: &Option<String>, rpm: &Option<String>| -> HwmonVerifyState {
-        let pwm_raw = std::fs::read_to_string(pwm)
-            .ok()
-            .and_then(|s| s.trim().parse::<u8>().ok());
-        let pwm_enable = en.as_ref().and_then(|p| {
-            std::fs::read_to_string(p)
-                .ok()
-                .and_then(|s| s.trim().parse::<u8>().ok())
-        });
-        let rpm_val = rpm.as_ref().and_then(|p| {
-            std::fs::read_to_string(p)
-                .ok()
-                .and_then(|s| s.trim().parse::<u16>().ok())
-        });
-        HwmonVerifyState {
-            pwm_enable,
-            pwm_raw,
-            pwm_percent: pwm_raw.map(crate::pwm::raw_to_percent),
-            rpm: rpm_val,
+    // DEC-290: the ENTIRE test-write -> settle -> restore sequence runs inside a
+    // single `spawn_blocking`, and BOTH guards are moved into it.
+    //
+    // It used to run inline, with `tokio::time::sleep(...).await` between the
+    // test write and the restore. That `.await` is a cancellation point: if the
+    // client disconnected — or the GUI's own 12 s timeout fired — axum dropped
+    // the handler future, both RAII guards ran their `Drop`, and **the restore
+    // simply never happened**. The header stayed at the test duty, which for any
+    // header above 50% means it was dropped to 20% and left there. Nothing
+    // recovers it when no active profile owns that header, because then nothing
+    // else ever writes it.
+    //
+    // A `spawn_blocking` task is NOT cancelled when its `JoinHandle` is dropped;
+    // it runs to completion. So the restore now happens whether or not anyone is
+    // still listening. This is the DEC-255 shape already used for GPU writes, and
+    // the guards must move in for the same reason they do there: leaving them on
+    // the handler would release the lease and the engine pause *while the
+    // blocking write was still in flight*, and the restore would then fail
+    // `InvalidLease` — trading a stranded duty for a failed one.
+    let bg_controller = controller.clone();
+    // DEC-290 review: the shared shutdown watch, read by the task before its
+    // restore. Making the sequence uncancellable also made it survive the
+    // shutdown that used to cancel it, and `main.rs` guarantees "the restore is
+    // the guaranteed last writer" (277-c). Without this check a verify caught by
+    // SIGTERM writes its duty AFTER `restore_hwmon_to_auto` has handed the
+    // header back — and `set_pwm`'s enable watchdog reads the `pwm_enable=2` that
+    // restore just wrote, classifies it as a BIOS reclaim, and re-asserts
+    // `pwm_enable=1`. The daemon then exits with the header latched in manual at
+    // a fixed duty and nothing left to drive it.
+    let bg_shutdown = state.openfan_runtime.shutdown.clone();
+    let bg_header_id = header_id.clone();
+    let bg_lease_id = verify_lease_id.clone();
+    let join = tokio::task::spawn_blocking(move || {
+        // Moved, not borrowed: dropped only when this task finishes, so the
+        // pause and the lease outlive every write below on every path.
+        let _verify_guard = verify_guard;
+        let _verify_lease = verify_lease;
+
+        let read_state =
+            |pwm: &str, en: &Option<String>, rpm: &Option<String>| -> HwmonVerifyState {
+                let pwm_raw = std::fs::read_to_string(pwm)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u8>().ok());
+                let pwm_enable = en.as_ref().and_then(|p| {
+                    std::fs::read_to_string(p)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u8>().ok())
+                });
+                let rpm_val = rpm.as_ref().and_then(|p| {
+                    std::fs::read_to_string(p)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u16>().ok())
+                });
+                HwmonVerifyState {
+                    pwm_enable,
+                    pwm_raw,
+                    pwm_percent: pwm_raw.map(crate::pwm::raw_to_percent),
+                    rpm: rpm_val,
+                }
+            };
+
+        let initial = read_state(&pwm_path, &enable_path, &rpm_path);
+
+        // Test PWM: a significant delta from current, in whichever direction has room.
+        let current_pct = initial.pwm_percent.unwrap_or(50);
+        let test_pct: u8 = if current_pct > 50 { 20 } else { 80 };
+
+        // Write test value via controller (sets pwm_enable=1 + PWM).
+        // Route errors through the shared HwmonControlError mapper: if the daemon's
+        // own force-taken "verify" lease lapses between here and the write, that is
+        // an internal race, surfaced as a retryable 503 hardware_unavailable
+        // (DEC-170) — not a client lease error and not a 500 internal_error.
+        {
+            let mut ctrl = bg_controller.lock();
+            ctrl.set_pwm(&bg_header_id, test_pct, &bg_lease_id)?;
         }
-    };
 
-    // Read initial state
-    let initial = read_state(&pwm_path, &enable_path, &rpm_path);
+        // Blocking sleep, deliberately: this task is the uncancellable unit, and
+        // an async sleep here would reintroduce the cancellation point the whole
+        // restructure exists to remove.
+        std::thread::sleep(std::time::Duration::from_secs(VERIFY_WAIT_SECONDS as u64));
 
-    // Calculate test PWM: ensure a significant delta from current
-    let current_pct = initial.pwm_percent.unwrap_or(50);
-    let test_pct: u8 = if current_pct > 50 { 20 } else { 80 };
+        let final_state = read_state(&pwm_path, &enable_path, &rpm_path);
 
-    // Write test value via controller (sets pwm_enable=1 + PWM).
-    // Route errors through the shared HwmonControlError mapper: if the daemon's
-    // own force-taken "verify" lease lapses between here and the write, that is
-    // an internal race, surfaced as a retryable 503 hardware_unavailable
-    // (DEC-170) — not a client lease error and not a 500 internal_error.
-    {
-        let mut ctrl = controller.lock();
-        if let Err(e) = ctrl.set_pwm(&header_id, test_pct, &verify_lease_id) {
-            return hwmon_control_error_response(e);
+        // Restore original PWM. Failures here are surfaced via ``restore_failed``
+        // rather than overwriting the diagnostic verify outcome — a successful
+        // verify with a failed restore is its own condition the caller can act on
+        // (typically: re-write the desired PWM).
+        // Skip the restore entirely if the daemon is going down: firmware
+        // control — which the shutdown restore has either already applied or is
+        // about to — is strictly safer than re-asserting a fixed duty that no
+        // writer will ever revise. Signalled at `main.rs:1117`, well before
+        // `restore_hardware()` at `:1153`, so this check cannot lose the race.
+        if *bg_shutdown.borrow() {
+            log::info!(
+                "verify: skipping restore of {bg_header_id} — the daemon is \
+                 shutting down and the hardware restore owns the header"
+            );
+            return Ok((initial, final_state, test_pct, true));
         }
-    }
 
-    // Wait for hardware to respond
-    tokio::time::sleep(std::time::Duration::from_secs(VERIFY_WAIT_SECONDS as u64)).await;
-
-    // Read back state after wait
-    let final_state = read_state(&pwm_path, &enable_path, &rpm_path);
-
-    // Restore original PWM. Failures here are surfaced via
-    // ``restore_failed`` rather than overwriting the diagnostic verify
-    // outcome — a successful verify with a failed restore is its own
-    // condition the caller can act on (typically: re-write the desired
-    // PWM). Previously the error was silently swallowed.
-    let restore_failed = {
-        let mut ctrl = controller.lock();
-        match ctrl.set_pwm(&header_id, current_pct, &verify_lease_id) {
-            Ok(_) => false,
-            Err(e) => {
-                log::warn!(
-                    "verify: restore PWM to {current_pct}% on {header_id} \
-                     failed (header left at test value {test_pct}%): {e}"
-                );
-                true
+        let restore_failed = {
+            let mut ctrl = bg_controller.lock();
+            match ctrl.set_pwm(&bg_header_id, current_pct, &bg_lease_id) {
+                Ok(_) => false,
+                Err(e) => {
+                    log::warn!(
+                        "verify: restore PWM to {current_pct}% on {bg_header_id} \
+                         failed (header left at test value {test_pct}%): {e}"
+                    );
+                    true
+                }
             }
+        };
+
+        Ok::<_, HwmonControlError>((initial, final_state, test_pct, restore_failed))
+    });
+
+    // If the caller has gone away this `.await` resolves with a JoinError only
+    // when the task itself panicked — the task keeps running either way, and its
+    // restore lands regardless. That is the point.
+    let (initial, final_state, test_pct, restore_failed) = match join.await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return hwmon_control_error_response(e),
+        // `JoinError` is also returned when the runtime shuts down before the
+        // task is polled. Logging that as a panic would put a false `error!` in
+        // the one log a future verify investigation would trust.
+        Err(e) if e.is_cancelled() => {
+            log::info!("verify: hwmon verify task cancelled during shutdown");
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &ErrorEnvelope::hardware_unavailable("daemon is shutting down"),
+            );
+        }
+        Err(e) => {
+            log::error!("verify: hwmon verify task panicked: {e}");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorEnvelope::internal("hwmon verify failed"),
+            );
         }
     };
 
-    // The "verify" lease is released by `_verify_lease`'s RAII guard on every
-    // exit path (see its definition above), and the engine's write pause by
-    // `_verify_guard` — both on scope exit, so a cancelled/panicked verify can
-    // never strand hwmon control.
+    // Both guards live inside the blocking task above, so they release only when
+    // the whole sequence — including the restore — has finished. A cancelled or
+    // panicked verify therefore strands neither the lease, the engine pause, nor
+    // the header's duty. The comment that used to sit here claimed that last part
+    // while the restore sat after an `.await` and was skipped on cancellation; it
+    // is true now because the sequence is uncancellable, not because it ever was
+    // (DEC-290).
 
     // Classify result
     let (result, details) = classify_verify_result(&initial, &final_state, test_pct);
@@ -402,6 +487,215 @@ mod tests {
     use super::*;
     use crate::hwmon::lease::LeaseError;
     use crate::hwmon::pwm_control::HwmonControlError;
+
+    type WriteLog = Arc<parking_lot::Mutex<Vec<(String, String)>>>;
+
+    /// Records every sysfs write so a test can see whether the restore landed.
+    struct RecordingWriter(WriteLog);
+    impl crate::hwmon::pwm_control::SysfsWriter for RecordingWriter {
+        fn write_file(&mut self, p: &str, v: &str) -> Result<(), crate::error::HwmonError> {
+            self.0.lock().push((p.to_string(), v.to_string()));
+            Ok(())
+        }
+        fn read_file(&self, _p: &str) -> Result<String, crate::error::HwmonError> {
+            Ok("1".into())
+        }
+    }
+
+    fn verify_test_state() -> (Arc<AppState>, WriteLog, tokio::sync::watch::Sender<bool>) {
+        let header = crate::hwmon::pwm_discovery::PwmHeaderDescriptor {
+            id: "hwmon:test:dev:pwm1".into(),
+            label: "SYS_FAN".into(),
+            chip_name: "test".into(),
+            device_id: "dev".into(),
+            pwm_index: 1,
+            supports_enable: true,
+            // Paths need not exist: the state reads are best-effort `.ok()` and a
+            // missing file simply yields `None`, which is all this test needs.
+            pwm_path: "/nonexistent/pwm1".into(),
+            enable_path: Some("/nonexistent/pwm1_enable".into()),
+            rpm_available: false,
+            rpm_path: None,
+            min_pwm_percent: 0,
+            max_pwm_percent: 100,
+            is_writable: true,
+            pwm_mode: None,
+            is_aio: false,
+        };
+        let cache = Arc::new(crate::health::cache::StateCache::new());
+        let writes: WriteLog = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let ctrl = crate::hwmon::pwm_control::HwmonPwmController::new(
+            vec![header],
+            crate::hwmon::lease::LeaseManager::new(),
+            Box::new(RecordingWriter(writes.clone())),
+            cache.clone(),
+        );
+        let readiness_rollup = Arc::new(parking_lot::Mutex::new(None));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let state = Arc::new(AppState {
+            cache,
+            staleness_config: crate::health::staleness::StalenessConfig::default(),
+            daemon_version: "0.0.0-test".into(),
+            fan_controller: Arc::new(parking_lot::RwLock::new(None)),
+            openfan_runtime: crate::api::handlers::OpenFanRuntime {
+                timeout: std::time::Duration::from_millis(500),
+                interval: std::time::Duration::from_millis(1000),
+                shutdown: shutdown_rx,
+            },
+            hwmon_controller: Some(Arc::new(parking_lot::Mutex::new(ctrl))),
+            start_time: std::time::Instant::now(),
+            history: Arc::new(crate::health::history::HistoryRing::new(250)),
+            active_profile: Arc::new(parking_lot::Mutex::new(None)),
+            calibrating: std::sync::atomic::AtomicBool::new(false),
+            openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
+            last_openfan_rescan: Arc::new(parking_lot::Mutex::new(None)),
+            adopted_poll_handles: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            amd_gpus: Vec::new(),
+            intel_gpus: Vec::new(),
+            nvidia_gpus: Vec::new(),
+            profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
+            config_path: String::new(),
+            runtime_config_path: std::path::PathBuf::new(),
+            sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            override_table: Arc::new(parking_lot::Mutex::new(
+                crate::control_override::OverrideTable::new(),
+            )),
+            allow_port_probe: false,
+            running_config: Default::default(),
+            readiness_rollup: readiness_rollup.clone(),
+            assessment: Arc::new(crate::api::handlers::AssessmentCache::new(readiness_rollup)),
+        });
+        (state, writes, shutdown_tx)
+    }
+
+    /// DEC-290 regression. The verify used to run inline with an `.await` between
+    /// the test write and the restore, so dropping the handler future — a client
+    /// disconnect, or the GUI's own 12 s timeout — ran both RAII guards' `Drop`
+    /// and skipped the restore entirely, stranding the header at the test duty.
+    ///
+    /// The whole sequence now runs in one `spawn_blocking`, which is NOT cancelled
+    /// when its `JoinHandle` is dropped, and **both guards are moved into it**. So
+    /// the observable proof that cancellation no longer strands anything is that
+    /// the verify pause is STILL held after the future is dropped: the guards can
+    /// only release when the task — restore included — has finished.
+    ///
+    /// Asserts BOTH halves: the guards are still held immediately after the drop,
+    /// and the restore write actually lands afterwards. Waiting out the settle is
+    /// free here — dropping the test's runtime blocks on the detached blocking
+    /// task regardless, so the 6 s is paid whether or not the assertion is made.
+    #[tokio::test]
+    async fn a_cancelled_verify_still_restores_the_header() {
+        let (state, writes, _shutdown_tx) = verify_test_state();
+        let cache = state.cache.clone();
+
+        {
+            let fut = hwmon_verify_handler(
+                axum::extract::State(state.clone()),
+                axum::extract::Path("hwmon:test:dev:pwm1".to_string()),
+            );
+            tokio::pin!(fut);
+            // Let it get past the test write and into the settle, then abandon it
+            // exactly the way axum does when a client goes away: drop the future.
+            tokio::select! {
+                _ = &mut fut => panic!("the verify completed too fast to model a cancellation"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+            }
+        } // <- future dropped here
+
+        assert!(
+            cache.verify_active(),
+            "the engine pause was released when the handler future was dropped — \
+             the guards are back on the handler, so the restore is skipped again \
+             and the header stays at the test duty"
+        );
+
+        // The abandoned task keeps running. Poll until it finishes rather than
+        // sleeping a fixed span, so this is not a timing guess; the bound is a
+        // backstop, not the expected path.
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(VERIFY_WAIT_SECONDS as u64 + 6);
+        while cache.verify_active() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            !cache.verify_active(),
+            "the abandoned verify never finished — it should run to completion"
+        );
+
+        // pwm_percent reads come back `None` (the paths do not exist), so the
+        // verify takes current=50 and therefore test=80. The restore writes 50.
+        let pwm_writes: Vec<String> = writes
+            .lock()
+            .iter()
+            .filter(|(path, _)| path.ends_with("/pwm1"))
+            .map(|(_, v)| v.clone())
+            .collect();
+        let expect_test = crate::pwm::percent_to_raw(80).to_string();
+        let expect_restore = crate::pwm::percent_to_raw(50).to_string();
+        assert_eq!(
+            pwm_writes.first(),
+            Some(&expect_test),
+            "the verify should have written its test duty first: {pwm_writes:?}"
+        );
+        assert_eq!(
+            pwm_writes.last(),
+            Some(&expect_restore),
+            "the header was left at the TEST duty after the client went away — \
+             this is exactly the DEC-290 defect: {pwm_writes:?}"
+        );
+    }
+
+    /// DEC-290 review regression. Making the verify uncancellable also made it
+    /// survive the shutdown that used to cancel it — and `main.rs` guarantees
+    /// "the restore is the guaranteed last writer" (277-c). Without the shutdown
+    /// check, a verify caught by SIGTERM writes its duty AFTER
+    /// `restore_hwmon_to_auto` hands the header back, and `set_pwm`'s enable
+    /// watchdog then reads that restore's `pwm_enable=2`, calls it a BIOS reclaim,
+    /// and re-asserts `pwm_enable=1` — leaving the header latched in manual at a
+    /// fixed duty with no writer left in the process.
+    ///
+    /// Firmware control is strictly safer than a duty nothing will ever revise,
+    /// so the restore is skipped once shutdown is signalled.
+    #[tokio::test]
+    async fn a_verify_running_into_shutdown_does_not_rewrite_the_header() {
+        let (state, writes, shutdown_tx) = verify_test_state();
+        let cache = state.cache.clone();
+
+        {
+            let fut = hwmon_verify_handler(
+                axum::extract::State(state.clone()),
+                axum::extract::Path("hwmon:test:dev:pwm1".to_string()),
+            );
+            tokio::pin!(fut);
+            tokio::select! {
+                _ = &mut fut => panic!("the verify completed too fast to model shutdown"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+            }
+            // The daemon starts shutting down while the verify is mid-settle.
+            shutdown_tx.send(true).unwrap();
+        }
+
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(VERIFY_WAIT_SECONDS as u64 + 6);
+        while cache.verify_active() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(!cache.verify_active(), "the verify task never finished");
+
+        let pwm_writes: Vec<String> = writes
+            .lock()
+            .iter()
+            .filter(|(path, _)| path.ends_with("/pwm1"))
+            .map(|(_, v)| v.clone())
+            .collect();
+        assert_eq!(
+            pwm_writes.len(),
+            1,
+            "the verify wrote the header again during shutdown — its restore \
+             would land after the hardware restore and re-latch manual mode: \
+             {pwm_writes:?}"
+        );
+    }
 
     /// DEC-170 regression: post-2.0.0 the client holds no hwmon lease, so a
     /// `HwmonControlError::Lease(_)` from a verify write is an internal race

@@ -1,5 +1,41 @@
 # Changelog
 
+## [2.23.3] — 2026-08-28
+
+### Fixed
+- **A hardware verify abandoned mid-flight left the fan header stuck at its test
+  duty.** `POST /hwmon/{id}/verify` writes a deliberately different PWM, waits six
+  seconds for the fan to settle, then restores the original. The wait was an
+  `await`, and the restore sat after it — so if the client disconnected, or the
+  GUI's own 12-second timeout fired first, the request future was dropped and the
+  restore simply never ran. Both RAII guards released cleanly, which is why this
+  looked safe; the *duty* had no such protection. For any header previously above
+  50% the test value is **20%**, so a pump or fan could be left at 20% with
+  nothing to put it back — permanently, whenever no active profile owned that
+  header, because then nothing else ever writes it.
+
+  The whole sequence — test write, settle, read-back, restore — now runs as a
+  single uncancellable unit, with the lease and engine-pause guards moved inside
+  it. A dropped request no longer stops any of it. Clients need no change; what
+  changed is that the old behaviour was unsafe to rely on. (DEC-290)
+
+- **A verify caught by daemon shutdown no longer re-latches the header into
+  manual mode.** Making the sequence uncancellable also made it survive the
+  shutdown that used to cancel it, and the daemon's hardware restore is supposed
+  to be the last writer. Left alone, a verify interrupted by SIGTERM would write
+  its duty *after* the restore had handed the header back to firmware — and the
+  PWM watchdog, seeing the restore's `pwm_enable=2`, would read it as a BIOS
+  reclaim and re-assert manual mode, leaving the fan latched at a fixed duty with
+  no writer left. The restore is now skipped once shutdown is signalled;
+  `restore_failed` reports it, so a caller still knows the header was not put
+  back. Firmware control is the safer end state. (DEC-290)
+
+### Changed
+- The engine write-pause is now held for the remainder of a verify's settle even
+  if the caller disconnects, rather than releasing early — the direct consequence
+  of making the sequence uncancellable. **The 105 °C emergency is unaffected:**
+  `force_all` runs before the pause gate and always has.
+
 ## [2.23.2] — 2026-08-28
 
 ### Fixed
