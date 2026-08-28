@@ -214,8 +214,12 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
     let thermal_safety = ThermalSafetyInfo {
         state: thermal_state.to_string(),
         cpu_sensor_found,
-        emergency_threshold_c: 105.0,
-        release_threshold_c: 80.0,
+        // DEC-292: read the single source, never a literal. These were bare
+        // `105.0` / `80.0` here, so moving the trip point in `safety.rs` would
+        // have left the daemon REPORTING the old value while ACTING on the new
+        // one — and the GUI renders this field verbatim as "Limit: N °C".
+        emergency_threshold_c: crate::constants::THERMAL_EMERGENCY_TRIGGER_C,
+        release_threshold_c: crate::constants::THERMAL_EMERGENCY_RELEASE_C,
     };
 
     // Kernel module detection

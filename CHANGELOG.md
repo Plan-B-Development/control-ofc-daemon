@@ -1,5 +1,30 @@
 # Changelog
 
+## [2.23.5] — 2026-08-28
+
+### Fixed
+- **`GET /diagnostics/hardware` reported the thermal thresholds from a different
+  place than the daemon acts on.** `emergency_threshold_c` and
+  `release_threshold_c` were bare literals in the response builder, independent of
+  the `ThermalSafetyRule` that actually latches and releases the emergency — so
+  moving the trip point would have left the daemon *reporting* 105 °C while
+  *acting* on something else, with a compile-time assert still guarding the old
+  value and the GUI rendering the stale number verbatim as "Limit: N °C".
+  Latent, not live: every copy agreed. That is exactly why it would have been
+  found the hard way.
+
+  The trip point and release point now have one definition, in `constants.rs`
+  (where the daemon's own architecture rule says constants live). The rule reads
+  it, the API response reads it, and the compile-time assert that calibration
+  aborts below the emergency reads it. **No threshold changed value.** (DEC-292)
+
+### Changed
+- The integration test for that endpoint asserted the reported values against
+  literals, which pinned the numbers but not the link. It now asserts the
+  reported values equal what a `ThermalSafetyRule` actually acts on, so the two
+  cannot drift apart again — with the literal check kept alongside as a
+  deliberate tripwire, so the trip point still cannot be moved silently.
+
 ## [2.23.4] — 2026-08-28
 
 ### Fixed

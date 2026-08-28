@@ -13,7 +13,11 @@
 
 /// Emergency thermal safety override for CPU temperature.
 ///
-/// Uses hysteresis (trigger at 105°C, release at 80°C) to prevent flapping.
+/// Uses hysteresis to prevent flapping — see
+/// [`crate::constants::THERMAL_EMERGENCY_TRIGGER_C`] and
+/// [`crate::constants::THERMAL_EMERGENCY_RELEASE_C`] for the values, which are
+/// deliberately not restated here (DEC-292: this doc used to name them, and a doc
+/// that restates a threshold drifts from it exactly like a duplicated literal).
 /// Edge-triggered logging — only logs on state transitions.
 pub struct ThermalSafetyRule {
     trigger_temp_c: f64,
@@ -28,8 +32,8 @@ impl ThermalSafetyRule {
     /// Create the default CPU Tctl emergency rule.
     pub fn new() -> Self {
         Self {
-            trigger_temp_c: 105.0,
-            release_temp_c: 80.0,
+            trigger_temp_c: crate::constants::THERMAL_EMERGENCY_TRIGGER_C,
+            release_temp_c: crate::constants::THERMAL_EMERGENCY_RELEASE_C,
             forced_output_pct: 100,
             recovery_output_pct: 60,
             active: false,
@@ -97,6 +101,16 @@ impl ThermalSafetyRule {
     /// matter?" without duplicating the threshold (DEC-269).
     pub fn release_temp_c(&self) -> f64 {
         self.release_temp_c
+    }
+
+    /// The temperature at or above which the emergency latches.
+    ///
+    /// Sibling of [`Self::release_temp_c`], added by DEC-292 so a test can assert
+    /// that what `/diagnostics/hardware` REPORTS equals what this rule ACTS on.
+    /// Without it the two could only be compared against a literal, which is the
+    /// duplication the ADR removes.
+    pub fn trigger_temp_c(&self) -> f64 {
+        self.trigger_temp_c
     }
 
     /// The output this rule is already holding, read **without** a temperature.

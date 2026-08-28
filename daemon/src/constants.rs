@@ -171,17 +171,37 @@ pub const HWMON_FAIL_SUMMARY_INTERVAL: u32 = 300;
 /// every tick.
 pub const SENSOR_READ_FAIL_REDISCOVER_STREAK: u32 = 5;
 
+// ── Thermal emergency ────────────────────────────────────────────────
+
+/// CPU temperature (°C) at which the thermal emergency latches, forcing every
+/// OpenFan channel and writable hwmon header to 100%.
+///
+/// **This is the single source for the trip point (DEC-292).** It had been
+/// written out four times — here in a compile-time assert, in
+/// `ThermalSafetyRule::new`, in the `/diagnostics/hardware` response, and in that
+/// rule's own doc comment. The dangerous copy was the API response: it was a bare
+/// literal, so moving the trip point would have left the daemon *reporting* 105
+/// while *acting* on something else, with the assert still guarding the old value.
+/// Everything that needs this number now reads it from here.
+pub const THERMAL_EMERGENCY_TRIGGER_C: f64 = 105.0;
+
+/// CPU temperature (°C) at which a latched thermal emergency releases into its
+/// recovery floor. Deliberately far below the trigger: the gap is the hysteresis
+/// that stops the emergency flapping. See [`THERMAL_EMERGENCY_TRIGGER_C`].
+pub const THERMAL_EMERGENCY_RELEASE_C: f64 = 80.0;
+
 // ── Calibration ──────────────────────────────────────────────────────
 
 /// Maximum temperature (°C) during calibration before aborting the
-/// sweep. Separate from (and lower than) the safety.rs trigger
-/// temperature (105°C) because calibration is a voluntary operation
-/// and should abort with more headroom.
+/// sweep. Separate from (and lower than) [`THERMAL_EMERGENCY_TRIGGER_C`]
+/// because calibration is a voluntary operation and should abort with
+/// more headroom.
 pub const CALIBRATION_MAX_TEMP_C: f64 = 85.0;
 
 // Compile-time invariant checks — these fail the build if someone changes a
 // constant to an unsafe value.
-const _: () = assert!(CALIBRATION_MAX_TEMP_C < 105.0);
+const _: () = assert!(CALIBRATION_MAX_TEMP_C < THERMAL_EMERGENCY_TRIGGER_C);
+const _: () = assert!(THERMAL_EMERGENCY_RELEASE_C < THERMAL_EMERGENCY_TRIGGER_C);
 const _: () = assert!(NO_SENSOR_SAFE_PCT > 0);
 const _: () = assert!(DEADBAND_MAX_HOLD_CYCLES > 0);
 // The renew interval must leave room for ~3 attempts inside the TTL, and the

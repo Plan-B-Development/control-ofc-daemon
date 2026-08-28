@@ -495,6 +495,28 @@ async fn hardware_diagnostics_endpoint_returns_report() {
     assert_eq!(json["api_version"], 1);
     assert!(json["hwmon"].is_object());
     assert!(json["thermal_safety"].is_object());
+
+    // DEC-292: assert what the endpoint REPORTS equals what the rule ACTS on.
+    // These were two bare literals, which pinned the value but not the link — the
+    // response built its numbers independently of `ThermalSafetyRule`, so moving
+    // the trip point would have left the daemon reporting the old one while
+    // acting on the new one, and this test would have gone green against the
+    // stale value it had been given.
+    let acting = control_ofc_daemon::safety::ThermalSafetyRule::new();
+    assert_eq!(
+        json["thermal_safety"]["emergency_threshold_c"],
+        acting.trigger_temp_c(),
+        "the reported emergency threshold has drifted from the one that acts"
+    );
+    assert_eq!(
+        json["thermal_safety"]["release_threshold_c"],
+        acting.release_temp_c(),
+        "the reported release threshold has drifted from the one that acts"
+    );
+
+    // And a deliberate tripwire on the values themselves, so the trip point
+    // cannot be moved silently — a safety threshold change should have to edit a
+    // test that says so out loud.
     assert_eq!(json["thermal_safety"]["emergency_threshold_c"], 105.0);
     assert_eq!(json["thermal_safety"]["release_threshold_c"], 80.0);
     assert!(json["kernel_modules"].is_array());
