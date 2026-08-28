@@ -1,143 +1,11 @@
 # Changelog
-
 ## [2.23.5] — 2026-08-28
 
-### Fixed
-- **`GET /diagnostics/hardware` reported the thermal thresholds from a different
-  place than the daemon acts on.** `emergency_threshold_c` and
-  `release_threshold_c` were bare literals in the response builder, independent of
-  the `ThermalSafetyRule` that actually latches and releases the emergency — so
-  moving the trip point would have left the daemon *reporting* 105 °C while
-  *acting* on something else, with a compile-time assert still guarding the old
-  value and the GUI rendering the stale number verbatim as "Limit: N °C".
-  Latent, not live: every copy agreed. That is exactly why it would have been
-  found the hard way.
-
-  The trip point and release point now have one definition, in `constants.rs`
-  (where the daemon's own architecture rule says constants live). The rule reads
-  it, the API response reads it, and the compile-time assert that calibration
-  aborts below the emergency reads it. **No threshold changed value.** (DEC-292)
-
-### Changed
-- The integration test for that endpoint asserted the reported values against
-  literals, which pinned the numbers but not the link. It now asserts the
-  reported values equal what a `ThermalSafetyRule` actually acts on, so the two
-  cannot drift apart again — with the literal check kept alongside as a
-  deliberate tripwire, so the trip point still cannot be moved silently.
-
-## [2.23.4] — 2026-08-28
-
-### Fixed
-- **Every OpenFan rescan reset the attached controller, including the ones it
-  refused.** The rescan cooldown (added so a client looping on a failing rescan
-  could not hold Arduino-class boards in reset) compared the list of candidate
-  serial ports — and building that list called `auto_detect_port`, which
-  *opens* each candidate to identify it. Opening asserts DTR, which is the reset.
-  So the board was already reset by the time the cooldown decided to refuse, and
-  the cooldown rationed nothing. The handler's own comment asserted the opposite
-  — "it does NOT open anything" — which is why this stood.
-
-  Enumeration and identification are now separate. The cooldown compares ports
-  listed by a libudev/sysfs scan that opens nothing; the single identifying probe
-  happens afterwards, past the cooldown and the single-flight guard, where it
-  always belonged. **A refused rescan now opens no `ttyACM`/`ttyUSB` candidate.**
-  Stated that precisely on purpose: `available_ports()` still opens the devnode of
-  any tty whose parent driver is `serial8250`, which the shipped unit blocks via
-  `DeviceAllow`, so "touches no hardware at all" would be the same kind of
-  over-broad claim that hid this defect in the first place. (DEC-291)
-- **The cooldown is now evaluated before the already-connected no-op**, so a
-  repeated probe meets it first rather than having two earlier branches step in
-  front. Trade-off, stated plainly: a client that has just adopted a controller
-  and asks again within the cooldown window gets `409` instead of the
-  informative `already_connected` payload. The refusal message no longer claims
-  the earlier probe "found nothing", because under this ordering that is not
-  something it can know. (DEC-291)
-
-### Fixed (tests)
-- The three OpenFan-rescan integration tests were **non-deterministic on any
-  machine with real serial hardware** — measured 7 of 10 runs failing. Both
-  fixes above were needed: with only the reordering they still failed 1 in 10,
-  and with only the enumeration split they failed every run. Now **10 of 10
-  green**. They still open the port once on the paths that legitimately adopt a
-  controller; only the refused paths are now hardware-free.
-
-## [2.23.3] — 2026-08-28
-
-### Fixed
-- **A hardware verify abandoned mid-flight left the fan header stuck at its test
-  duty.** `POST /hwmon/{id}/verify` writes a deliberately different PWM, waits six
-  seconds for the fan to settle, then restores the original. The wait was an
-  `await`, and the restore sat after it — so if the client disconnected, or the
-  GUI's own 12-second timeout fired first, the request future was dropped and the
-  restore simply never ran. Both RAII guards released cleanly, which is why this
-  looked safe; the *duty* had no such protection. For any header previously above
-  50% the test value is **20%**, so a pump or fan could be left at 20% with
-  nothing to put it back — permanently, whenever no active profile owned that
-  header, because then nothing else ever writes it.
-
-  The whole sequence — test write, settle, read-back, restore — now runs as a
-  single uncancellable unit, with the lease and engine-pause guards moved inside
-  it. A dropped request no longer stops any of it. Clients need no change; what
-  changed is that the old behaviour was unsafe to rely on. (DEC-290)
-
-- **A verify caught by daemon shutdown no longer re-latches the header into
-  manual mode.** Making the sequence uncancellable also made it survive the
-  shutdown that used to cancel it, and the daemon's hardware restore is supposed
-  to be the last writer. Left alone, a verify interrupted by SIGTERM would write
-  its duty *after* the restore had handed the header back to firmware — and the
-  PWM watchdog, seeing the restore's `pwm_enable=2`, would read it as a BIOS
-  reclaim and re-assert manual mode, leaving the fan latched at a fixed duty with
-  no writer left. The restore is now skipped once shutdown is signalled;
-  `restore_failed` reports it, so a caller still knows the header was not put
-  back. Firmware control is the safer end state. (DEC-290)
-
-### Changed
-- The engine write-pause is now held for the remainder of a verify's settle even
-  if the caller disconnects, rather than releasing early — the direct consequence
-  of making the sequence uncancellable. **The 105 °C emergency is unaffected:**
-  `force_all` runs before the pause gate and always has.
-
-## [2.23.2] — 2026-08-28
-
-### Fixed
-- **A fan write wedged in a kernel driver froze the entire profile engine — and
-  with it the 105 °C thermal emergency.** The engine awaited every backend's
-  blocking write without a bound, so a sysfs write that blocked in the driver
-  meant the tick never finished, the loop never came round again, and
-  `force_all` never ran for *any* backend — not just the stuck one. Nothing
-  recovered it: DEC-266's supervision fires when the engine task **dies**, and a
-  wedged task is very much alive, so the daemon sat there indefinitely holding
-  the fans at whatever duty they happened to have.
-
-  Each backend's join is now bounded to one tick, so one stuck device can no
-  longer hold the loop: thermal safety and the other backends keep running. The
-  wedged write is **not** abandoned — its handle is held and re-awaited on the
-  next tick, never re-issued. That detail is the fix's load-bearing half:
-  `spawn_blocking` work cannot be cancelled, so retrying each second would strand
-  one blocking thread per tick and exhaust tokio's pool in about eight minutes,
-  starving the very writer this protects.
-
-  This mirrors the read side, bounded the same way in DEC-272; the write path was
-  simply never swept. (DEC-289)
-
-### Changed
-- **`/status` gained two engine reasons**, because the fix above would otherwise
-  have *hidden* the problem it fixes: with the loop no longer frozen, both engine
-  timestamps advance normally and a wedged writer would present as a healthy
-  engine. The `engine` subsystem now reports `warn` / "a backend write has not
-  returned — fans are holding their last duty" and, past the same wedged
-  threshold DEC-259 derived, `crit` / "writes wedged — the engine is ticking but
-  nothing is reaching the fans". No new field and no shape change — `reason` is
-  free text and always has been. (DEC-289)
-
-### Known limitation
-- The **GPU** backend's write join is still unbounded, so a wedge there can still
-  hold the loop. Its blocking task carries an owned lock guard, so bounding it
-  needs a different design (`try_lock` semantics that also touch the GPU verify
-  path) and it was deliberately left out of a `[SAFETY]` change about blocking
-  joins rather than rushed. Tracked as `AUD-a2`.
-
-## [2.23.1] — 2026-08-28
+Five fixes from a cross-stack audit, **two of them on the thermal-safety path**.
+Every one was latent rather than live — each needed a second thing to go wrong
+first — which is exactly why they had survived. Released as one version: 2.23.1
+through 2.23.4 were incremental steps during the same session and were never
+tagged or published.
 
 ### Fixed
 - **A CPU sensor reporting a wildly out-of-range value could pin every fan at
@@ -182,6 +50,129 @@
   on **every** read of a faulty sensor. The DEC-193 tracker now owns that
   logging, once per quarantine transition — which is the spam it was built to
   collapse.
+
+- **A fan write wedged in a kernel driver froze the entire profile engine — and
+  with it the 105 °C thermal emergency.** The engine awaited every backend's
+  blocking write without a bound, so a sysfs write that blocked in the driver
+  meant the tick never finished, the loop never came round again, and
+  `force_all` never ran for *any* backend — not just the stuck one. Nothing
+  recovered it: DEC-266's supervision fires when the engine task **dies**, and a
+  wedged task is very much alive, so the daemon sat there indefinitely holding
+  the fans at whatever duty they happened to have.
+
+  Each backend's join is now bounded to one tick, so one stuck device can no
+  longer hold the loop: thermal safety and the other backends keep running. The
+  wedged write is **not** abandoned — its handle is held and re-awaited on the
+  next tick, never re-issued. That detail is the fix's load-bearing half:
+  `spawn_blocking` work cannot be cancelled, so retrying each second would strand
+  one blocking thread per tick and exhaust tokio's pool in about eight minutes,
+  starving the very writer this protects.
+
+  This mirrors the read side, bounded the same way in DEC-272; the write path was
+  simply never swept. (DEC-289)
+
+- **A hardware verify abandoned mid-flight left the fan header stuck at its test
+  duty.** `POST /hwmon/{id}/verify` writes a deliberately different PWM, waits six
+  seconds for the fan to settle, then restores the original. The wait was an
+  `await`, and the restore sat after it — so if the client disconnected, or the
+  GUI's own 12-second timeout fired first, the request future was dropped and the
+  restore simply never ran. Both RAII guards released cleanly, which is why this
+  looked safe; the *duty* had no such protection. For any header previously above
+  50% the test value is **20%**, so a pump or fan could be left at 20% with
+  nothing to put it back — permanently, whenever no active profile owned that
+  header, because then nothing else ever writes it.
+
+  The whole sequence — test write, settle, read-back, restore — now runs as a
+  single uncancellable unit, with the lease and engine-pause guards moved inside
+  it. A dropped request no longer stops any of it. Clients need no change; what
+  changed is that the old behaviour was unsafe to rely on. (DEC-290)
+
+- **A verify caught by daemon shutdown no longer re-latches the header into
+  manual mode.** Making the sequence uncancellable also made it survive the
+  shutdown that used to cancel it, and the daemon's hardware restore is supposed
+  to be the last writer. Left alone, a verify interrupted by SIGTERM would write
+  its duty *after* the restore had handed the header back to firmware — and the
+  PWM watchdog, seeing the restore's `pwm_enable=2`, would read it as a BIOS
+  reclaim and re-assert manual mode, leaving the fan latched at a fixed duty with
+  no writer left. The restore is now skipped once shutdown is signalled;
+  `restore_failed` reports it, so a caller still knows the header was not put
+  back. Firmware control is the safer end state. (DEC-290)
+
+- **Every OpenFan rescan reset the attached controller, including the ones it
+  refused.** The rescan cooldown (added so a client looping on a failing rescan
+  could not hold Arduino-class boards in reset) compared the list of candidate
+  serial ports — and building that list called `auto_detect_port`, which
+  *opens* each candidate to identify it. Opening asserts DTR, which is the reset.
+  So the board was already reset by the time the cooldown decided to refuse, and
+  the cooldown rationed nothing. The handler's own comment asserted the opposite
+  — "it does NOT open anything" — which is why this stood.
+
+  Enumeration and identification are now separate. The cooldown compares ports
+  listed by a libudev/sysfs scan that opens nothing; the single identifying probe
+  happens afterwards, past the cooldown and the single-flight guard, where it
+  always belonged. **A refused rescan now opens no `ttyACM`/`ttyUSB` candidate.**
+  Stated that precisely on purpose: `available_ports()` still opens the devnode of
+  any tty whose parent driver is `serial8250`, which the shipped unit blocks via
+  `DeviceAllow`, so "touches no hardware at all" would be the same kind of
+  over-broad claim that hid this defect in the first place. (DEC-291)
+- **The cooldown is now evaluated before the already-connected no-op**, so a
+  repeated probe meets it first rather than having two earlier branches step in
+  front. Trade-off, stated plainly: a client that has just adopted a controller
+  and asks again within the cooldown window gets `409` instead of the
+  informative `already_connected` payload. The refusal message no longer claims
+  the earlier probe "found nothing", because under this ordering that is not
+  something it can know. (DEC-291)
+
+- **`GET /diagnostics/hardware` reported the thermal thresholds from a different
+  place than the daemon acts on.** `emergency_threshold_c` and
+  `release_threshold_c` were bare literals in the response builder, independent of
+  the `ThermalSafetyRule` that actually latches and releases the emergency — so
+  moving the trip point would have left the daemon *reporting* 105 °C while
+  *acting* on something else, with a compile-time assert still guarding the old
+  value and the GUI rendering the stale number verbatim as "Limit: N °C".
+  Latent, not live: every copy agreed. That is exactly why it would have been
+  found the hard way.
+
+  The trip point and release point now have one definition, in `constants.rs`
+  (where the daemon's own architecture rule says constants live). The rule reads
+  it, the API response reads it, and the compile-time assert that calibration
+  aborts below the emergency reads it. **No threshold changed value.** (DEC-292)
+
+### Fixed (tests)
+- The three OpenFan-rescan integration tests were **non-deterministic on any
+  machine with real serial hardware** — measured 7 of 10 runs failing. Both
+  fixes above were needed: with only the reordering they still failed 1 in 10,
+  and with only the enumeration split they failed every run. Now **10 of 10
+  green**. They still open the port once on the paths that legitimately adopt a
+  controller; only the refused paths are now hardware-free.
+
+### Changed
+- **`/status` gained two engine reasons**, because the fix above would otherwise
+  have *hidden* the problem it fixes: with the loop no longer frozen, both engine
+  timestamps advance normally and a wedged writer would present as a healthy
+  engine. The `engine` subsystem now reports `warn` / "a backend write has not
+  returned — fans are holding their last duty" and, past the same wedged
+  threshold DEC-259 derived, `crit` / "writes wedged — the engine is ticking but
+  nothing is reaching the fans". No new field and no shape change — `reason` is
+  free text and always has been. (DEC-289)
+
+- The engine write-pause is now held for the remainder of a verify's settle even
+  if the caller disconnects, rather than releasing early — the direct consequence
+  of making the sequence uncancellable. **The 105 °C emergency is unaffected:**
+  `force_all` runs before the pause gate and always has.
+
+- The integration test for that endpoint asserted the reported values against
+  literals, which pinned the numbers but not the link. It now asserts the
+  reported values equal what a `ThermalSafetyRule` actually acts on, so the two
+  cannot drift apart again — with the literal check kept alongside as a
+  deliberate tripwire, so the trip point still cannot be moved silently.
+
+### Known limitation
+- The **GPU** backend's write join is still unbounded, so a wedge there can still
+  hold the loop. Its blocking task carries an owned lock guard, so bounding it
+  needs a different design (`try_lock` semantics that also touch the GPU verify
+  path) and it was deliberately left out of a `[SAFETY]` change about blocking
+  joins rather than rushed. Tracked as `AUD-a2`.
 
 ## [2.23.0] — 2026-08-27
 
