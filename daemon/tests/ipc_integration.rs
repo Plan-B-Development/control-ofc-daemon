@@ -4428,6 +4428,74 @@ async fn openfan_rescan_short_circuits_when_a_controller_is_already_adopted() {
     );
 }
 
+/// DEC-291: the cooldown is checked BEFORE the already-connected return.
+///
+/// This ordering was deliberately the other way round until 2026-08-28 — the
+/// original comment said so explicitly, so that the common success path never met
+/// a cooldown. Reversing it is a knowing trade (see DEC-291), and this test is
+/// what stops it being silently reverted by someone reading the old rationale.
+///
+/// Deterministic despite the host's real serial hardware: the stamped candidate
+/// set is computed exactly the way the handler computes it, so the two match by
+/// construction whatever is actually plugged in.
+#[tokio::test]
+async fn openfan_rescan_cooldown_outranks_the_already_connected_return() {
+    let state = test_app_state();
+
+    struct DeadTransport;
+    impl control_ofc_daemon::serial::transport::SerialTransport for DeadTransport {
+        fn write_line(&mut self, _d: &str) -> Result<(), control_ofc_daemon::error::SerialError> {
+            Ok(())
+        }
+        fn read_line(
+            &mut self,
+            _t: std::time::Duration,
+        ) -> Result<String, control_ofc_daemon::error::SerialError> {
+            Err(control_ofc_daemon::error::SerialError::Timeout { timeout_ms: 1 })
+        }
+    }
+    let ctrl = control_ofc_daemon::serial::controller::FanController::new(
+        Box::new(DeadTransport),
+        state.cache.clone(),
+        std::time::Duration::from_millis(50),
+    );
+    *state.fan_controller.write() = Some(Arc::new(parking_lot::Mutex::new(ctrl)));
+
+    // Stamp a rescan that just happened over the SAME ports the handler will see.
+    // Built exactly as the handler builds it (DEC-291): NON-opening enumeration,
+    // not the probing `auto_detect_port`. Using the probing one here made this
+    // test's set differ from the handler's, so the cooldown never fired — which is
+    // precisely the confusion DEC-291 removed from production.
+    let configured = state.running_config.serial.port.clone();
+    let candidates = control_ofc_daemon::serial::adoption::serial_port_candidates_enumerated(
+        configured.as_deref(),
+        control_ofc_daemon::serial::real_transport::enumerate_serial_candidates,
+    );
+    *state.last_openfan_rescan.lock() = Some(control_ofc_daemon::api::handlers::LastRescan {
+        at: std::time::Instant::now(),
+        candidates,
+    });
+
+    let (sock_str, _tx, _tmp) = start_test_server(state.clone()).await;
+    let (code, body) = uds_post(&sock_str, "/fans/openfan/rescan", &serde_json::json!({})).await;
+
+    assert_eq!(
+        code, 409,
+        "the cooldown must be checked before the already-connected return: {body}"
+    );
+    let msg = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("moments ago"),
+        "must be the cooldown refusal, not a leaked single-flight flag: {body}"
+    );
+    // The message must not claim the earlier probe found nothing — under this
+    // ordering a controller may well be connected when the cooldown fires.
+    assert!(
+        !msg.contains("found nothing"),
+        "the refusal states something it cannot know, and which is false here: {body}"
+    );
+}
+
 #[tokio::test]
 async fn openfan_rescan_releases_its_single_flight_flag_when_the_probe_ends() {
     // DEC-266. The flag is set by a CAS in the handler and cleared by a `Drop`

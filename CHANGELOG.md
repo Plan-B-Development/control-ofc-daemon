@@ -1,5 +1,41 @@
 # Changelog
 
+## [2.23.4] — 2026-08-28
+
+### Fixed
+- **Every OpenFan rescan reset the attached controller, including the ones it
+  refused.** The rescan cooldown (added so a client looping on a failing rescan
+  could not hold Arduino-class boards in reset) compared the list of candidate
+  serial ports — and building that list called `auto_detect_port`, which
+  *opens* each candidate to identify it. Opening asserts DTR, which is the reset.
+  So the board was already reset by the time the cooldown decided to refuse, and
+  the cooldown rationed nothing. The handler's own comment asserted the opposite
+  — "it does NOT open anything" — which is why this stood.
+
+  Enumeration and identification are now separate. The cooldown compares ports
+  listed by a libudev/sysfs scan that opens nothing; the single identifying probe
+  happens afterwards, past the cooldown and the single-flight guard, where it
+  always belonged. **A refused rescan now opens no `ttyACM`/`ttyUSB` candidate.**
+  Stated that precisely on purpose: `available_ports()` still opens the devnode of
+  any tty whose parent driver is `serial8250`, which the shipped unit blocks via
+  `DeviceAllow`, so "touches no hardware at all" would be the same kind of
+  over-broad claim that hid this defect in the first place. (DEC-291)
+- **The cooldown is now evaluated before the already-connected no-op**, so a
+  repeated probe meets it first rather than having two earlier branches step in
+  front. Trade-off, stated plainly: a client that has just adopted a controller
+  and asks again within the cooldown window gets `409` instead of the
+  informative `already_connected` payload. The refusal message no longer claims
+  the earlier probe "found nothing", because under this ordering that is not
+  something it can know. (DEC-291)
+
+### Fixed (tests)
+- The three OpenFan-rescan integration tests were **non-deterministic on any
+  machine with real serial hardware** — measured 7 of 10 runs failing. Both
+  fixes above were needed: with only the reordering they still failed 1 in 10,
+  and with only the enumeration split they failed every run. Now **10 of 10
+  green**. They still open the port once on the paths that legitimately adopt a
+  controller; only the refused paths are now hardware-free.
+
 ## [2.23.3] — 2026-08-28
 
 ### Fixed

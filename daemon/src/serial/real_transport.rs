@@ -110,11 +110,62 @@ impl SerialTransport for RealSerialTransport {
     }
 }
 
-/// Auto-detect the OpenFanController serial port.
+/// List candidate serial ports without opening any `ttyACM`/`ttyUSB` (DEC-291).
+///
+/// The other half of [`auto_detect_port`], split out because the difference
+/// matters: this enumerates, that one *identifies*, and identifying means
+/// `open(2)`, which asserts DTR and resets Arduino-class boards.
+///
+/// The rescan endpoint's cooldown exists to ration exactly that reset. It could
+/// not, because the candidate list it compares was built by `auto_detect_port` —
+/// so every refused rescan had already reset the board before the refusal was
+/// decided, and the handler's own comment asserted the opposite. Enumeration is a
+/// libudev/sysfs read plus `Path::exists`.
+///
+/// **Precisely what "opens nothing" means here**, because the over-broad version
+/// of this claim is what caused the defect: `available_ports()` does open the
+/// devnode of any tty whose parent driver is `serial8250`, before this function's
+/// `ttyACM`/`ttyUSB` filter ever runs. No candidate this function *returns* is
+/// opened, which is what the cooldown needs; but do not restate this as "touches
+/// no hardware". The shipped unit blocks those opens anyway
+/// (`DeviceAllow=char-ttyACM/ttyUSB`), so they are reachable only in a dev or
+/// container run.
+pub fn enumerate_serial_candidates() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    match serialport::available_ports() {
+        Ok(ports) => out.extend(
+            ports
+                .into_iter()
+                .filter(|p| p.port_name.contains("ttyACM") || p.port_name.contains("ttyUSB"))
+                .map(|p| p.port_name),
+        ),
+        Err(e) => {
+            log::warn!("serialport::available_ports() failed: {e} — falling back to path scan");
+        }
+    }
+    // Same fallback shape as `auto_detect_port`, and for the same reason: it works
+    // without libudev. `exists()` stats; it does not open.
+    for prefix in &["/dev/ttyACM", "/dev/ttyUSB"] {
+        for i in constants::SERIAL_PROBE_RANGE {
+            let path = format!("{prefix}{i}");
+            if Path::new(&path).exists() && !out.contains(&path) {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// Auto-detect the OpenFanController serial port **by opening and identifying**
+/// each candidate.
 ///
 /// First tries `serialport::available_ports()` (libudev). If that fails
 /// (e.g. in a sandboxed systemd unit), falls back to probing
 /// `/dev/ttyACM0` through `/dev/ttyACM9` directly.
+///
+/// Opening asserts DTR, which resets Arduino-class boards — so this is NOT the
+/// function to call merely to learn what ports exist. Use
+/// [`enumerate_serial_candidates`] for that (DEC-291).
 pub fn auto_detect_port(timeout: Duration) -> Option<String> {
     // Try libudev enumeration first
     match serialport::available_ports() {

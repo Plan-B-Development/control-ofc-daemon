@@ -201,8 +201,10 @@ pub async fn calibrate_openfan_handler(
 /// controller is installed and a poll loop is started for it; the profile engine
 /// picks it up on its next tick.
 ///
-/// Idempotent: rescanning while a controller is already adopted reports the
-/// existing one and probes nothing.
+/// Rescanning while a controller is already adopted reports the existing one and
+/// probes nothing — **unless the cooldown fires first** (DEC-291), which it may,
+/// because the cooldown is now checked before that return. So this is idempotent
+/// in effect (it never re-probes or re-adopts) but not in status code.
 ///
 /// [SAFETY] The adoption is deliberately **not** performed by the handler's own
 /// future (DEC-266). Serial probing can outlast the client's HTTP timeout, and a
@@ -213,35 +215,43 @@ pub async fn calibrate_openfan_handler(
 pub async fn openfan_rescan_handler(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    use crate::serial::adoption::{first_openfan_port, serial_port_candidates};
+    use crate::serial::adoption::{
+        first_openfan_port, same_port_set, serial_port_candidates_enumerated,
+    };
     use crate::serial::controller::FanController;
-    use crate::serial::real_transport::{auto_detect_port, RealSerialTransport};
+    use crate::serial::real_transport::{enumerate_serial_candidates, RealSerialTransport};
     use crate::serial::transport::SerialTransport;
-
-    if state.openfan().is_some() {
-        return json_ok(
-            StatusCode::OK,
-            OpenFanRescanResponse {
-                api_version: API_VERSION,
-                adopted: false,
-                already_connected: true,
-                port: None,
-                message: "an OpenFanController is already connected".into(),
-            },
-        );
-    }
 
     let timeout = state.openfan_runtime.timeout;
     let configured = state.running_config.serial.port.clone();
     // Enumerating candidates is a config read plus a sysfs/dev scan. It does NOT
     // open anything, and DTR is asserted on open — so this costs nothing of what
     // the cooldown below exists to ration.
-    let candidates = serial_port_candidates(configured.as_deref(), || auto_detect_port(timeout));
+    //
+    // **That claim was false until DEC-291 and is now true.** This used to call
+    // `auto_detect_port`, which probes each candidate by *opening* it — so every
+    // rescan reset the board before the cooldown was even consulted, and the
+    // cooldown rationed nothing. Identification still happens, once, in
+    // `first_openfan_port` below, on the far side of the cooldown and the
+    // single-flight guard. Keep enumeration non-opening: it is load-bearing.
+    let candidates =
+        serial_port_candidates_enumerated(configured.as_deref(), enumerate_serial_candidates);
 
-    // 10-e: space repeated probes. Placed AFTER the already-connected return
-    // above, so the common success path never meets a cooldown — only a client
-    // retrying a *failing* rescan is spaced, which is the case that keeps
-    // re-asserting DTR and resetting Arduino-class boards.
+    // 10-e: space repeated probes. **Checked BEFORE the already-connected return
+    // below (DEC-291) — this ordering was deliberately the other way round until
+    // 2026-08-28, and the reversal is a knowing trade.**
+    //
+    // The original order let the common success path skip the cooldown entirely,
+    // which is better UX: a client that has just adopted a controller and asks
+    // again gets the informative `already_connected` payload rather than a
+    // refusal. Checking the cooldown first means that client gets a 409 instead,
+    // for up to `OPENFAN_RESCAN_COOLDOWN`, even though a controller is present.
+    //
+    // It is ordered this way so that the cooldown is the FIRST thing a repeated
+    // probe meets, unconditionally, rather than a rule two earlier branches can
+    // step in front of. The accepted cost is the case above; the message below is
+    // worded so it stays true in it. See DEC-291 for the full reasoning and for
+    // what this does NOT fix.
     //
     // **The cooldown applies only while the world has not changed.** Rate-limiting
     // on time alone was wrong in the one case that matters most: plug a controller
@@ -257,7 +267,7 @@ pub async fn openfan_rescan_handler(
     // nothing new by probing again and is spaced.
     if let Some(last) = state.last_openfan_rescan.lock().as_ref() {
         let elapsed = last.at.elapsed();
-        if elapsed < OPENFAN_RESCAN_COOLDOWN && last.candidates == candidates {
+        if elapsed < OPENFAN_RESCAN_COOLDOWN && same_port_set(&last.candidates, &candidates) {
             let wait = (OPENFAN_RESCAN_COOLDOWN - elapsed).as_secs() + 1;
             return error_response(
                 StatusCode::CONFLICT,
@@ -265,10 +275,10 @@ pub async fn openfan_rescan_handler(
                     error: ErrorBody {
                         code: "validation_error".into(),
                         message: format!(
-                            "an OpenFan rescan over the same ports was attempted moments \
-                             ago and found nothing — each probe resets Arduino-class \
-                             boards, so retry in {wait}s, or attach a controller and \
-                             retry immediately"
+                            "an OpenFan rescan over the same ports was attempted \
+                             moments ago — each probe resets Arduino-class boards, so \
+                             retry in {wait}s, or retry immediately once the attached \
+                             hardware changes"
                         ),
                         // retryable: TRUE, unlike the sibling 409s. This condition
                         // clears on its own within seconds and the message says so;
@@ -283,6 +293,22 @@ pub async fn openfan_rescan_handler(
                 },
             );
         }
+    }
+
+    // Now that the cooldown has had first refusal (DEC-291), report an existing
+    // connection. Reaching here means either no probe has run recently or the
+    // candidate set has changed since one did.
+    if state.openfan().is_some() {
+        return json_ok(
+            StatusCode::OK,
+            OpenFanRescanResponse {
+                api_version: API_VERSION,
+                adopted: false,
+                already_connected: true,
+                port: None,
+                message: "an OpenFanController is already connected".into(),
+            },
+        );
     }
 
     // Single-flight. Two concurrent rescans would both probe the same tty — and
