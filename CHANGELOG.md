@@ -1,5 +1,51 @@
 # Changelog
 
+## [2.23.1] — 2026-08-28
+
+### Fixed
+- **A CPU sensor reporting a wildly out-of-range value could pin every fan at
+  100% until reboot.** An hwmon temperature outside the plausible range was
+  **clamped to 250.0 °C**
+  rather than rejected — and the log line calling it "almost certainly garbage"
+  was written immediately before the code went on to use it anyway. 250 °C then
+  won every comparison downstream: the thermal ladder takes the **hottest** CPU
+  sensor, so one faulty chip outranked every healthy one; the emergency latches
+  at 105 °C and only releases at 80 °C, which 250 never reaches. The result was a
+  permanent, unrecoverable thermal emergency — all OpenFan and writable hwmon
+  fans forced to 100%, profile evaluation skipped, no way back short of a
+  restart. It was also invisible: the DEC-193 quarantine evicts a sensor that
+  fails to *read*, and a clamped read is a success, so the faulty sensor never
+  appeared in `unavailable_sensors[]`.
+
+  An implausible reading is now a **read error**. The sensor goes into the
+  existing DEC-193 quarantine — logged once, surfaced on `/status` + `/poll` as
+  `unavailable_sensors[]`, evicted from the live set, and **un-quarantined
+  automatically as soon as it reads sanely again**. A transient glitch therefore
+  costs nothing, and a persistently faulty sensor becomes visible instead of
+  silently deafening. If it was the only CPU sensor, the already-adjudicated
+  absent-sensor path applies its 40% floor, which is recoverable; the old
+  behaviour was not. Triggered by any `temp*_input` returning garbage — a
+  misprobed it87/nct6775, or a post-resume `k10temp` glitch. (DEC-288)
+
+  **Scope of the fix, stated precisely:** this covers garbage *outside*
+  [-50, 250] °C. A faulty reading that lands *inside* [105, 250] °C — a saturated
+  8-bit thermistor reporting 127 °C, say — is indistinguishable from a genuine
+  over-temperature and still latches the emergency indefinitely. Widening the
+  bound is not the answer, because 105-125 °C are legitimate readings. That
+  residual is recorded, not fixed here.
+
+  Two consequences worth knowing. A latched emergency whose **sole** CPU sensor
+  then breaks now falls from 100% to the 40% no-sensor floor after roughly seven
+  seconds, rather than holding 100% forever — the daemon can no longer confirm
+  the emergency is live, and DEC-190 already chose the safe floor for exactly
+  that blindness. And a sensor that glitches *intermittently* (never five
+  consecutive failures) no longer logs at all, because the per-read warning was
+  removed; it will not appear in `unavailable_sensors[]` either.
+- Removed a 1 Hz journal warning in the same path: the implausible-value log ran
+  on **every** read of a faulty sensor. The DEC-193 tracker now owns that
+  logging, once per quarantine transition — which is the spam it was built to
+  collapse.
+
 ## [2.23.0] — 2026-08-27
 
 ### Added

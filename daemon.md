@@ -369,7 +369,8 @@ As of 2.0.0 the profile engine is the **sole writer** (DEC-159/DEC-165); the GUI
 
 **Sensor quarantine (DEC-193, additive):** a sensor that is discovered but fails
 every read (canonically an `ath12k`/`iwlwifi` WiFi temperature returning
-`ENETDOWN` while the radio is off) is logged once, then evicted from `sensors`
+`ENETDOWN` while the radio is off, or — since DEC-288 — one reporting an
+implausible temperature outside [-50, 250]°C) is logged once, then evicted from `sensors`
 and surfaced on `/status` + `/poll` as `unavailable_sensors[] = {id, label,
 reason, unavailable_for_ms}`. Each live `sensors` entry also carries
 `control_eligible: bool` (derived from `is_wireless_phy_chip(chip_name)`). Both

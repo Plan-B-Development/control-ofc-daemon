@@ -145,6 +145,124 @@ mod tests {
         assert!(outcome.failures[0].reason.contains("invalid temperature"));
     }
 
+    /// DEC-288 (end-to-end, sysfs bytes -> the thermal ladder's verdict).
+    ///
+    /// This is the test that pins the actual defect. `read_temp` used to CLAMP an
+    /// implausible reading to 250.0°C; `hottest_cpu_reading` max-reduces across
+    /// CpuTemp sensors, so that one broken sensor outranked every healthy one, and
+    /// `ThermalSafetyRule` latches at >=105°C while releasing only at <=80°C —
+    /// which 250 never reaches. The result was every fan forced to 100% until
+    /// reboot. Unit-testing `read_temp` alone would NOT have caught that, because
+    /// the damage is done by what the call site does with the value.
+    #[test]
+    fn an_implausible_cpu_reading_never_reaches_the_thermal_ladder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hwmon0 = tmp.path().join("hwmon0");
+        fs::create_dir_all(&hwmon0).unwrap();
+        fs::write(hwmon0.join("name"), "k10temp\n").unwrap();
+        // Healthy CPU sensor, comfortably below the 105°C trip point.
+        fs::write(hwmon0.join("temp1_input"), "45000\n").unwrap();
+        fs::write(hwmon0.join("temp1_label"), "Tctl\n").unwrap();
+        // Broken one: i32::MAX millidegrees, the canonical misprobed-chip value.
+        fs::write(hwmon0.join("temp2_input"), "2147483647\n").unwrap();
+        fs::write(hwmon0.join("temp2_label"), "Tccd1\n").unwrap();
+
+        let descriptors = discovery::discover_sensors(tmp.path()).unwrap();
+        // Both are discovered: discovery never reads the value, so the fault can
+        // only be caught at read time. If this fails, the fixture is wrong.
+        assert_eq!(descriptors.len(), 2, "both sensors should be discovered");
+        assert!(
+            descriptors
+                .iter()
+                .all(|d| d.kind == crate::hwmon::types::SensorKind::CpuTemp),
+            "fixture must classify as CpuTemp for this test to mean anything"
+        );
+
+        let outcome = read_sensor_values(&descriptors);
+
+        // The broken sensor is a *failure*, which is what lets DEC-193 quarantine
+        // it, surface it as `unavailable_sensors[]`, and recover it later.
+        assert_eq!(
+            outcome.failures.len(),
+            1,
+            "the garbage sensor must fail to read"
+        );
+        assert_eq!(outcome.failures[0].label, "Tccd1");
+        // Pin the EXACT reason string: it is what ships to clients as
+        // `unavailable_sensors[].reason` and what `docs/08` documents.
+        let reason = &outcome.failures[0].reason;
+        assert!(
+            reason.ends_with("implausible temperature 2147483.6\u{b0}C outside [-50, 250]\u{b0}C"),
+            "reason not as documented: {reason:?}"
+        );
+        assert!(
+            reason.contains("temp2_input"),
+            "reason must name the path: {reason:?}"
+        );
+
+        // It must not appear as a reading at all — and specifically never as
+        // 250.0, the exact value the old clamp produced.
+        assert!(
+            outcome.readings.iter().all(|r| r.value_c != 250.0),
+            "a clamped 250.0°C reading leaked through: {:?}",
+            outcome
+                .readings
+                .iter()
+                .map(|r| r.value_c)
+                .collect::<Vec<_>>()
+        );
+
+        // Drive the REAL reduction — `profile_engine::hottest_cpu_reading` — not a
+        // local reimplementation of it. Re-deriving the filter/max here would leave
+        // this test green if that function lost its `CpuTemp` filter, which is the
+        // very trap this test's name claims to avoid.
+        let now = std::time::Instant::now();
+        let sensors: std::collections::HashMap<String, crate::health::state::CachedSensorReading> =
+            outcome
+                .readings
+                .iter()
+                .map(|r| {
+                    (
+                        r.id.clone(),
+                        crate::health::state::CachedSensorReading {
+                            id: r.id.clone(),
+                            kind: r.kind,
+                            label: r.label.clone(),
+                            value_c: r.value_c,
+                            source: crate::health::state::DeviceLabel::Hwmon,
+                            updated_at: now,
+                            rate_c_per_s: None,
+                            session_min_c: None,
+                            session_max_c: None,
+                            chip_name: r.chip_name.clone(),
+                            temp_type: r.temp_type,
+                            thresholds: r.thresholds.clone(),
+                        },
+                    )
+                })
+                .collect();
+
+        let reading = crate::profile_engine::hottest_cpu_reading(
+            &sensors,
+            now,
+            std::time::Duration::from_secs(5),
+        );
+        assert_eq!(
+            reading,
+            crate::profile_engine::CpuReading::Fresh(45.0),
+            "the healthy sensor must be what the ladder sees"
+        );
+
+        // The ladder sees 45°C and stays quiet. Before the fix it saw 250°C and
+        // latched a 100% force with no path back below 80°C.
+        let mut rule = crate::safety::ThermalSafetyRule::new();
+        assert_eq!(
+            rule.evaluate(45.0),
+            None,
+            "no emergency may fire from a healthy 45°C system"
+        );
+    }
+
     #[test]
     fn is_wireless_phy_chip_recognises_radio_thermals() {
         // Qualcomm Atheros WiFi (the reported case) + Intel.
