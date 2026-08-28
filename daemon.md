@@ -377,6 +377,18 @@ reason, unavailable_for_ms}`. Each live `sensors` entry also carries
 fields are additive — older clients ignore them; the GUI defaults
 `control_eligible = true` and `unavailable_sensors = []` when absent.
 
+**Bounded backend writes (DEC-289, daemon >= 2.23.2).** Each backend's blocking
+write join is bounded to one tick, so a write wedged in a kernel driver cannot
+freeze the engine loop — previously it did, and took thermal safety and *every
+other backend* down with it while DEC-266's death supervision stayed silent (a
+wedged task is alive, not dead). The wedged write is held and re-awaited, never
+re-issued: `spawn_blocking` is uncancellable, so retrying each tick would strand
+one blocking thread per tick. While a write is outstanding the engine records
+`engine_writes_stalled_since`, and `/status`'s `engine` subsystem reports `warn`
+then `crit` — without it a wedged writer would look healthy, because the loop is
+now still ticking. **The GPU backend is not covered** (its task holds an owned
+write lock, so handle retention would just move the freeze); tracked as `AUD-a2`.
+
 **Controls that cannot be resolved (273-i).** A control whose curve will not
 resolve is skipped — no command, fans hold their last duty. After three
 consecutive skipped ticks it is logged once at WARN and surfaced on `/status` +

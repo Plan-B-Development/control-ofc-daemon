@@ -247,6 +247,15 @@ pub struct SubsystemTimestamps {
     pub hwmon: Option<Instant>,
     /// Last time AIO data was updated.
     pub aio: Option<Instant>,
+    /// When a backend write first went outstanding and stayed that way (DEC-289).
+    ///
+    /// `None` while writes are landing normally. Distinct from the two engine
+    /// stamps on purpose: bounding the backend joins means the loop keeps
+    /// ticking through a wedged device, so both `engine_started` and
+    /// `engine_completed` keep advancing and correctly report a live engine —
+    /// while nothing is actually reaching the hardware. That is a third state,
+    /// and it needs its own stamp rather than a distortion of the other two.
+    pub engine_writes_stalled_since: Option<Instant>,
     /// Last time the profile engine *began* a tick (DEC-249, split DEC-259).
     ///
     /// Liveness for the sole PWM writer. The other fields track *data* freshness

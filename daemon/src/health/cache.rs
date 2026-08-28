@@ -427,6 +427,22 @@ impl StateCache {
         self.inner.write().subsystem_timestamps.engine_completed = Some(Instant::now());
     }
 
+    /// Record whether a backend write is still outstanding (DEC-289).
+    ///
+    /// Edge-triggered: the stamp is set on the first stalled tick and left alone
+    /// while the stall persists, so it answers "since when", not "as of when" —
+    /// which is what `engine_health` needs to tell a slow write from a wedged
+    /// one. Cleared the moment a write lands again.
+    pub fn record_engine_write_stall(&self, outstanding: bool) {
+        let mut state = self.inner.write();
+        let stamp = &mut state.subsystem_timestamps.engine_writes_stalled_since;
+        match (outstanding, *stamp) {
+            (true, None) => *stamp = Some(Instant::now()),
+            (true, Some(_)) => {}
+            (false, _) => *stamp = None,
+        }
+    }
+
     /// Acquire exclusive access to the GPU fan write path (DEC-255).
     ///
     /// Returns an **owned** guard so it can be moved into the `spawn_blocking`

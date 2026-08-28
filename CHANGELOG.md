@@ -1,5 +1,45 @@
 # Changelog
 
+## [2.23.2] — 2026-08-28
+
+### Fixed
+- **A fan write wedged in a kernel driver froze the entire profile engine — and
+  with it the 105 °C thermal emergency.** The engine awaited every backend's
+  blocking write without a bound, so a sysfs write that blocked in the driver
+  meant the tick never finished, the loop never came round again, and
+  `force_all` never ran for *any* backend — not just the stuck one. Nothing
+  recovered it: DEC-266's supervision fires when the engine task **dies**, and a
+  wedged task is very much alive, so the daemon sat there indefinitely holding
+  the fans at whatever duty they happened to have.
+
+  Each backend's join is now bounded to one tick, so one stuck device can no
+  longer hold the loop: thermal safety and the other backends keep running. The
+  wedged write is **not** abandoned — its handle is held and re-awaited on the
+  next tick, never re-issued. That detail is the fix's load-bearing half:
+  `spawn_blocking` work cannot be cancelled, so retrying each second would strand
+  one blocking thread per tick and exhaust tokio's pool in about eight minutes,
+  starving the very writer this protects.
+
+  This mirrors the read side, bounded the same way in DEC-272; the write path was
+  simply never swept. (DEC-289)
+
+### Changed
+- **`/status` gained two engine reasons**, because the fix above would otherwise
+  have *hidden* the problem it fixes: with the loop no longer frozen, both engine
+  timestamps advance normally and a wedged writer would present as a healthy
+  engine. The `engine` subsystem now reports `warn` / "a backend write has not
+  returned — fans are holding their last duty" and, past the same wedged
+  threshold DEC-259 derived, `crit` / "writes wedged — the engine is ticking but
+  nothing is reaching the fans". No new field and no shape change — `reason` is
+  free text and always has been. (DEC-289)
+
+### Known limitation
+- The **GPU** backend's write join is still unbounded, so a wedge there can still
+  hold the loop. Its blocking task carries an owned lock guard, so bounding it
+  needs a different design (`try_lock` semantics that also touch the GPU verify
+  path) and it was deliberately left out of a `[SAFETY]` change about blocking
+  joins rather than rushed. Tracked as `AUD-a2`.
+
 ## [2.23.1] — 2026-08-28
 
 ### Fixed

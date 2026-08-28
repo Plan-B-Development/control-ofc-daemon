@@ -135,6 +135,7 @@ const WEDGED_TICK_MULTIPLE: u32 = 30;
 fn engine_health(
     started: Option<Instant>,
     completed: Option<Instant>,
+    writes_stalled_since: Option<Instant>,
     now: Instant,
     interval_ms: u64,
 ) -> SubsystemHealth {
@@ -144,6 +145,46 @@ fn engine_health(
         age_ms: age,
         reason: reason.into(),
     };
+
+    // DEC-289: checked FIRST, because it outranks the liveness question. Since
+    // the backend joins were bounded, a wedged device no longer freezes the loop
+    // — which is the fix, but it means a wedged writer now presents as a
+    // perfectly live engine on both stamps below. It is not: nothing is reaching
+    // the hardware. Judged on the same slow-vs-stuck thresholds as a long tick,
+    // because it is the same underlying event (a write that has not returned)
+    // seen from the other side of the bound.
+    if let Some(stalled_since) = writes_stalled_since {
+        let stalled_ms = now.saturating_duration_since(stalled_since).as_millis() as u64;
+        let age = age_ms(completed.or(started), now);
+        // Both strings are deliberately narrow about what they assert.
+        //
+        // "the engine is ticking" was removed from the Crit text: this branch
+        // returns BEFORE the liveness ladder, and the GPU join is still unbounded
+        // (AUD-a2), so a loop frozen in the GPU leg leaves a stale stall stamp
+        // that still satisfies this branch — the text would then claim liveness
+        // for a frozen engine.
+        //
+        // "fans are holding their last duty" was removed from the Warn text: the
+        // 30x threshold above is derived (DEC-259) from a *legitimate* thermal
+        // `force_all` over a degraded serial link taking ~10s, which crosses this
+        // 2x line within three seconds. The old wording therefore said fans were
+        // holding while `force_all` was actively driving them to 100% — the exact
+        // surface-contradicts-reality failure DEC-259 exists to remove.
+        if stalled_ms > interval_ms * u64::from(WEDGED_TICK_MULTIPLE) {
+            return entry(
+                HealthStatus::Crit,
+                "writes wedged — a backend write has not returned and nothing is \
+                 reaching those fans",
+                age,
+            );
+        } else if stalled_ms > interval_ms * 2 {
+            return entry(
+                HealthStatus::Warn,
+                "a backend write has not returned yet — it is still in flight",
+                age,
+            );
+        }
+    }
 
     let Some(started_at) = started else {
         return entry(HealthStatus::Crit, ENGINE_REASONS.never, None);
@@ -341,6 +382,7 @@ pub fn compute_health(
         engine_health(
             ts.engine_started,
             ts.engine_completed,
+            ts.engine_writes_stalled_since,
             now,
             config.engine_interval_ms,
         ),
@@ -395,6 +437,74 @@ mod tests {
         StalenessConfig::default()
     }
 
+    fn engine_of(h: &HealthSummary) -> &SubsystemHealth {
+        h.subsystems
+            .iter()
+            .find(|s| s.name == "engine")
+            .expect("engine is part of the wire shape")
+    }
+
+    /// DEC-289. Since the backend joins were bounded, a wedged device no longer
+    /// freezes the loop — so both engine stamps keep advancing and the engine
+    /// looks perfectly alive. It is not: nothing is reaching the fans.
+    ///
+    /// The control case is load-bearing. Without it this test would pass for the
+    /// wrong reason (an old `completed` stamp is stale on its own), which is
+    /// exactly how its first draft passed with the fix removed.
+    #[test]
+    fn a_wedged_writer_is_unhealthy_even_while_the_loop_ticks_normally() {
+        let now = Instant::now();
+        let cfg = default_config();
+
+        // Control: identical state, no stall — demonstrably healthy.
+        let control = compute_health(&state_with_live_engine(now), &cfg, now);
+        assert_eq!(
+            engine_of(&control).status,
+            HealthStatus::Ok,
+            "control must be healthy or the assertion below proves nothing"
+        );
+
+        let mut state = state_with_live_engine(now);
+        // Derived from the production constant, not a literal: a future bump of
+        // WEDGED_TICK_MULTIPLE past a hardcoded 40 would silently move this test
+        // into the wrong band and fail with a confusing diff.
+        state.subsystem_timestamps.engine_writes_stalled_since = Some(
+            now - Duration::from_millis(
+                cfg.engine_interval_ms * (u64::from(WEDGED_TICK_MULTIPLE) + 10),
+            ),
+        );
+        let health = compute_health(&state, &cfg, now);
+        assert_eq!(
+            engine_of(&health).status,
+            HealthStatus::Crit,
+            "a wedged writer reported as healthy: {}",
+            engine_of(&health).reason
+        );
+        assert!(engine_of(&health).reason.contains("wedged"));
+    }
+
+    /// A write that is merely slow must not read as wedged — the same
+    /// slow-vs-stuck distinction DEC-259 drew for a long tick.
+    #[test]
+    fn a_briefly_stalled_write_warns_rather_than_alarming() {
+        let now = Instant::now();
+        let cfg = default_config();
+        let mut state = state_with_live_engine(now);
+        // Strictly inside the (2x, WEDGED_TICK_MULTIPLE) band, expressed from the
+        // constant so the band cannot silently invert.
+        let mid = 2 + (u64::from(WEDGED_TICK_MULTIPLE) - 2) / 2;
+        assert!(
+            mid > 2 && mid < u64::from(WEDGED_TICK_MULTIPLE),
+            "band is empty"
+        );
+        state.subsystem_timestamps.engine_writes_stalled_since =
+            Some(now - Duration::from_millis(cfg.engine_interval_ms * mid));
+        assert_eq!(
+            engine_of(&compute_health(&state, &cfg, now)).status,
+            HealthStatus::Warn
+        );
+    }
+
     // ── Basic staleness transitions ─────────────────────────────────
 
     #[test]
@@ -421,6 +531,7 @@ mod tests {
             aio: None,
             engine_started: Some(now),
             engine_completed: Some(now),
+            engine_writes_stalled_since: None,
         };
 
         let health = compute_health(&state, &default_config(), now);

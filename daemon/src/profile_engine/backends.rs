@@ -28,6 +28,124 @@ use crate::hwmon::lease::HwmonWriter;
 use crate::hwmon::pwm_control::HwmonControlError;
 use crate::serial::protocol::NUM_CHANNELS;
 
+/// How long the engine will wait for one backend's blocking write before it
+/// stops waiting and carries on with the tick (DEC-289).
+///
+/// One nominal tick. The point of the bound is **not** to decide that a write is
+/// broken — `health::staleness::engine_health` already distinguishes a slow tick
+/// from a stuck one, using thresholds derived in DEC-259 — it is to stop one
+/// backend's slow or wedged write from holding the loop, and with it thermal
+/// safety and every *other* backend. A write that has not returned within a tick
+/// has already missed the tick it belonged to, so there is nothing left to wait
+/// for.
+const WRITE_JOIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A `spawn_blocking` write whose join is **bounded**, so a write wedged in the
+/// kernel cannot freeze the engine loop (DEC-289).
+///
+/// Before this existed the engine awaited every backend join unconditionally. A
+/// sysfs write blocked in a driver therefore froze the *whole* loop: the tick
+/// never completed, so the 105 °C `force_all` never ran again — and because the
+/// task was still **alive**, DEC-266's death supervision never fired either. The
+/// daemon sat there holding the fans at whatever duty they happened to have.
+///
+/// The critical detail is that the handle is **held and re-awaited**, never
+/// re-spawned. `spawn_blocking` cannot be cancelled, so issuing a fresh write
+/// each tick against a wedged device would strand one blocking thread per tick
+/// and exhaust tokio's 512-thread pool in ~8.5 minutes — starving the very
+/// writer this guards. That is the DEC-272 trap, and it is why `run` returns
+/// `None` rather than retrying: while a write is outstanding the caller must not
+/// issue another one.
+///
+/// This mirrors the read side, which DEC-272 bounded the same way in
+/// `polling.rs`; the write path was simply never swept.
+pub(crate) struct BoundedWrite<T> {
+    /// A write issued on an earlier tick that has not returned yet. Held so the
+    /// next tick re-awaits THIS write instead of stacking another behind it.
+    pending: Option<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> Default for BoundedWrite<T> {
+    fn default() -> Self {
+        Self { pending: None }
+    }
+}
+
+impl<T: Send + 'static> BoundedWrite<T> {
+    /// True while a write issued earlier has still not returned.
+    ///
+    /// The engine reads this to decide whether to stamp the tick as *completed*:
+    /// a tick with a write still in flight has not finished its work, and saying
+    /// otherwise would erase the one signal `/status` already gives an operator
+    /// for this condition.
+    pub(crate) fn outstanding(&self) -> bool {
+        // `is_finished`, NOT `is_some`. A handle is only harvested by the next
+        // `run()`, and several loop paths skip the write phase entirely — no
+        // profile loaded, a verify in progress. Reporting "held" as "still
+        // running" there would pin `/status` at "writes wedged" forever for a
+        // daemon that is idle by design and whose write completed seconds ago,
+        // clearing only on re-activation or restart.
+        self.pending.as_ref().is_some_and(|h| !h.is_finished())
+    }
+
+    /// Await any outstanding write, bounded by `deadline`, at shutdown.
+    ///
+    /// Load-bearing for hardware restore, not tidiness. `main.rs`'s shutdown
+    /// drains the engine's task handle and previously got the backend writes for
+    /// free, because the loop could not end a tick with a write in flight. It can
+    /// now — that is the whole point of the bound — so without this the drain
+    /// resolves instantly while a detached write still holds the controller
+    /// mutex. `restore_hwmon_to_auto` would then miss its `try_lock_for`, take
+    /// the fallback path, and the still-running `set_pwm` would re-assert manual
+    /// mode *after* the restore handed the fans back: fans latched in manual
+    /// after exit, silently, on the `Restart=on-failure` path where
+    /// `ExecStopPost` never runs.
+    pub(crate) async fn drain(&mut self, deadline: std::time::Duration) {
+        let Some(handle) = self.pending.take() else {
+            return;
+        };
+        if tokio::time::timeout(deadline, handle).await.is_err() {
+            log::warn!(
+                "shutdown: a backend write did not return within {}s — it still \
+                 holds the controller lock, so the hardware restore may fall back",
+                deadline.as_secs()
+            );
+        }
+    }
+
+    /// Await the outstanding write, or issue `f` and await that, bounded by
+    /// `budget`.
+    ///
+    /// `Some(_)` — a write completed on this call; the value is its join result.
+    /// `None` — a write is still in flight. The caller must not issue another,
+    /// and this tick's commands are simply not written; the next tick re-awaits
+    /// the same one. `f` is dropped unused in that case, by design: building a
+    /// command list is cheap next to a wedged device, and pre-checking at every
+    /// call site is the kind of duplication that drifts.
+    pub(crate) async fn run<F>(
+        &mut self,
+        budget: std::time::Duration,
+        f: F,
+    ) -> Option<Result<T, tokio::task::JoinError>>
+    where
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let mut handle = match self.pending.take() {
+            Some(outstanding) => outstanding,
+            None => tokio::task::spawn_blocking(f),
+        };
+        // `&mut handle` so a timeout does not consume the handle — that is what
+        // makes "hold and re-await" possible rather than "re-spawn".
+        match tokio::time::timeout(budget, &mut handle).await {
+            Ok(joined) => Some(joined),
+            Err(_) => {
+                self.pending = Some(handle);
+                None
+            }
+        }
+    }
+}
+
 /// One fan-control backend the profile engine writes through.
 ///
 /// To add a backend: implement this trait, give the implementation sole
@@ -71,6 +189,18 @@ pub(crate) struct OpenFanBackend {
     /// (DEC-191) so an OpenFan calibration sweep that claims the pause mid-tick
     /// is not overwritten by an engine tick already in flight.
     cache: Arc<StateCache>,
+    /// Bounded join for this backend's blocking writes (DEC-289).
+    ///
+    /// Shared by `apply` and `force_all` deliberately. They never run in the same
+    /// tick — the emergency path `continue`s before the apply phase — but they do
+    /// run in *consecutive* ticks, and a `force_all` still wedged when the
+    /// emergency clears must not let `apply` strand a second blocking thread
+    /// against the same stuck device.
+    writes: BoundedWrite<Vec<(u8, Result<(), String>)>>,
+    /// Edge-trigger for the "write still in flight" safety log (DEC-289), so a
+    /// legitimately slow emergency write reports its transition once instead of
+    /// once per tick for the whole 105->80 hold.
+    stall_logged: bool,
 }
 
 impl OpenFanBackend {
@@ -83,7 +213,19 @@ impl OpenFanBackend {
             channel_failures: HashMap::new(),
             link_down_streak: 0,
             cache,
+            writes: BoundedWrite::default(),
+            stall_logged: false,
         }
+    }
+
+    /// True while a write issued on an earlier tick has not returned (DEC-289).
+    pub(crate) fn writes_outstanding(&self) -> bool {
+        self.writes.outstanding()
+    }
+
+    /// Await any in-flight write at shutdown (DEC-289). See [`BoundedWrite::drain`].
+    pub(crate) async fn drain_writes(&mut self, deadline: std::time::Duration) {
+        self.writes.drain(deadline).await;
     }
 
     /// Record this tick's per-channel write outcomes and fire SAFETY alerts
@@ -203,40 +345,52 @@ impl WriteBackend for OpenFanBackend {
                 Some((ch, cmd.pwm_percent))
             })
             .collect();
-        if chans.is_empty() {
+        // DEC-289: only a true no-op when nothing is outstanding either. With a
+        // write still pending, this call is what re-awaits it — returning here
+        // would leave a finished write unharvested and its stall stamp set
+        // forever, reporting `crit` for a device that had recovered.
+        if chans.is_empty() && !self.writes.outstanding() {
             return;
         }
         let ctrl = self.ctrl.clone();
         let cache = self.cache.clone();
-        let join = tokio::task::spawn_blocking(move || {
-            chans
-                .into_iter()
-                .filter_map(|(ch, pct)| {
-                    // Lock per command (DEC-099) so GUI API requests can
-                    // interleave between channel writes.
-                    let mut guard = ctrl.lock();
-                    // DEC-191: re-check the engine write-pause while HOLDING the
-                    // controller lock, so the check-and-write is atomic against a
-                    // concurrent OpenFan calibration sweep (whose test writes take
-                    // this same lock). An engine tick already in flight when the
-                    // sweep claims the pause must not overwrite the sweep's test
-                    // PWM; checking before the lock left a narrow window where one
-                    // channel's write could still land just after the sweep
-                    // claimed the pause, corrupting its first RPM readback. A
-                    // skipped channel records no outcome (it was not attempted),
-                    // so it neither counts as a failure nor resets a streak.
-                    if cache.verify_active() {
-                        return None;
-                    }
-                    let res = guard
-                        .set_pwm(ch, pct)
-                        .map(|_| ())
-                        .map_err(|e| e.to_string());
-                    Some((ch, res))
-                })
-                .collect::<Vec<(u8, Result<(), String>)>>()
-        })
-        .await;
+        let join = self
+            .writes
+            .run(WRITE_JOIN_BUDGET, move || {
+                chans
+                    .into_iter()
+                    .filter_map(|(ch, pct)| {
+                        // Lock per command (DEC-099) so GUI API requests can
+                        // interleave between channel writes.
+                        let mut guard = ctrl.lock();
+                        // DEC-191: re-check the engine write-pause while HOLDING the
+                        // controller lock, so the check-and-write is atomic against a
+                        // concurrent OpenFan calibration sweep (whose test writes take
+                        // this same lock). An engine tick already in flight when the
+                        // sweep claims the pause must not overwrite the sweep's test
+                        // PWM; checking before the lock left a narrow window where one
+                        // channel's write could still land just after the sweep
+                        // claimed the pause, corrupting its first RPM readback. A
+                        // skipped channel records no outcome (it was not attempted),
+                        // so it neither counts as a failure nor resets a streak.
+                        if cache.verify_active() {
+                            return None;
+                        }
+                        let res = guard
+                            .set_pwm(ch, pct)
+                            .map(|_| ())
+                            .map_err(|e| e.to_string());
+                        Some((ch, res))
+                    })
+                    .collect::<Vec<(u8, Result<(), String>)>>()
+            })
+            .await;
+        // DEC-289: `None` = an earlier write is still in flight. Issue nothing
+        // and record no outcome — the channel was not attempted, so its failure
+        // streak must neither advance nor reset.
+        let Some(join) = join else {
+            return;
+        };
         let results = match join {
             Ok(results) => results,
             Err(e) => {
@@ -270,19 +424,54 @@ impl SafetyWriteBackend for OpenFanBackend {
     /// to pin a tokio worker during a thermal emergency.
     async fn force_all(&mut self, pct: u8) {
         let ctrl = self.ctrl.clone();
-        if let Err(e) = tokio::task::spawn_blocking(move || {
-            for ch in 0..NUM_CHANNELS {
-                let mut guard = ctrl.lock();
-                if let Err(e) = guard.set_pwm(ch, pct) {
-                    log::error!("THERMAL SAFETY: OpenFan ch{ch} write FAILED: {e}");
+        // Returns the same outcome type as `apply` so both share one
+        // `BoundedWrite` (DEC-289); the emergency path logs inline, so the vec is
+        // always empty and nothing consumes it.
+        let join = self
+            .writes
+            .run(WRITE_JOIN_BUDGET, move || {
+                for ch in 0..NUM_CHANNELS {
+                    let mut guard = ctrl.lock();
+                    if let Err(e) = guard.set_pwm(ch, pct) {
+                        log::error!("THERMAL SAFETY: OpenFan ch{ch} write FAILED: {e}");
+                    }
                 }
-            }
-        })
-        .await
-        {
+                Vec::new()
+            })
+            .await;
+        match join {
             // Concurrency review D3: never swallow a panicked safety write —
             // the next 1 Hz tick retries, but the operator must see this.
-            log::error!("THERMAL SAFETY: OpenFan force_all task panicked: {e}");
+            Some(Err(e)) => {
+                log::error!("THERMAL SAFETY: OpenFan force_all task panicked: {e}");
+            }
+            // DEC-289: still in flight. The write was NOT abandoned — the handle
+            // is held and re-awaited next tick — but the loop is released so the
+            // safety ladder and the other backends keep running instead of
+            // freezing behind this one device.
+            //
+            // Edge-triggered: a legitimately slow force_all spans several ticks
+            // over a degraded link, and the 105->80 hold can last minutes, so a
+            // per-tick line would bury the transition it exists to report. Every
+            // other safety log in this file is throttled the same way.
+            None => {
+                if !self.stall_logged {
+                    self.stall_logged = true;
+                    log::error!(
+                        "THERMAL SAFETY: OpenFan force_all still in flight after \
+                         {}s — the emergency write has not reached the controller yet",
+                        WRITE_JOIN_BUDGET.as_secs()
+                    );
+                }
+            }
+            // A harvested `apply` result arrives here when force_all re-awaits a
+            // pending ordinary write. Route it through the normal accounting
+            // rather than dropping it, or a failing channel's streak is neither
+            // advanced nor reset for that tick.
+            Some(Ok(outcomes)) => {
+                self.stall_logged = false;
+                self.note_outcomes(&outcomes);
+            }
         }
     }
 }
@@ -524,6 +713,15 @@ pub(crate) struct HwmonBackend {
     /// by its own success, so a single stuck header among healthy ones is tracked
     /// in isolation (mirrors [`OpenFanBackend`]'s `channel_failures`, audit P3-5).
     member_failures: HashMap<String, u32>,
+    /// Bounded join for this backend's blocking writes (DEC-289). Shared by
+    /// `apply` and `force_all` for the reason documented on
+    /// [`OpenFanBackend::writes`]: a wedged emergency write must not let the next
+    /// tick's ordinary write strand a second blocking thread on the same header.
+    writes: BoundedWrite<Vec<(String, Result<(), String>)>>,
+    /// Edge-trigger for the "write still in flight" safety log (DEC-289), so a
+    /// legitimately slow emergency write reports its transition once instead of
+    /// once per tick for the whole 105->80 hold.
+    stall_logged: bool,
 }
 
 impl HwmonBackend {
@@ -531,7 +729,19 @@ impl HwmonBackend {
         Self {
             ctrl,
             member_failures: HashMap::new(),
+            writes: BoundedWrite::default(),
+            stall_logged: false,
         }
+    }
+
+    /// True while a write issued on an earlier tick has not returned (DEC-289).
+    pub(crate) fn writes_outstanding(&self) -> bool {
+        self.writes.outstanding()
+    }
+
+    /// Await any in-flight write at shutdown (DEC-289). See [`BoundedWrite::drain`].
+    pub(crate) async fn drain_writes(&mut self, deadline: std::time::Duration) {
+        self.writes.drain(deadline).await;
     }
 
     /// Record this tick's per-member hwmon write outcomes and throttle the log
@@ -594,93 +804,101 @@ impl WriteBackend for HwmonBackend {
             .filter(|c| c.source == "hwmon")
             .map(|c| (c.member_id.clone(), c.pwm_percent))
             .collect();
-        if hwmon_cmds.is_empty() {
+        // DEC-289: see the note on `OpenFanBackend::apply` — an outstanding write
+        // must still be re-awaited on a tick that has no commands of its own.
+        if hwmon_cmds.is_empty() && !self.writes.outstanding() {
             return;
         }
         let ctrl = self.ctrl.clone();
-        let join = tokio::task::spawn_blocking(move || {
-            // Phase 1: acquire (or reuse) the profile-engine lease under a brief
-            // lock, then release it so concurrent API requests can interleave
-            // with the per-header writes below.
-            let lease_id: Option<String> = {
-                let mut guard = ctrl.lock();
-                let existing = {
-                    let mgr = guard.lease_manager();
-                    // P2-1: reuse the engine's own lease or a transient
-                    // thermal-safety force-take, but NEVER a hardware verify's
-                    // lease. A verify force-takes the lease as "verify"
-                    // (hwmon_ctl.rs) and sets the engine write-pause; if it
-                    // starts *after* this tick passed the loop-level
-                    // `verify_active` gate (mod.rs), the engine still reaches
-                    // here. Adopting the verify's lease would let the engine
-                    // write through it and clobber the test value — the bug the
-                    // single up-front check did not close. Excluding the
-                    // `Verify` owner makes `take_lease` below return AlreadyHeld ⇒
-                    // `lease_id = None` ⇒ the engine skips its hwmon writes this
-                    // tick; the verify's RAII guard releases the lease when it
-                    // ends and the next tick re-acquires. Thermal-safety is NOT
-                    // excluded — after an emergency the engine adopts and renews
-                    // that lease as before, so there is no post-thermal stall.
-                    // `None` ⇒ acquire.
-                    mgr.active_lease()
-                        .filter(|lease| lease.owner != HwmonWriter::Verify)
-                        .map(|lease| lease.lease_id.clone())
+        let join = self
+            .writes
+            .run(WRITE_JOIN_BUDGET, move || {
+                // Phase 1: acquire (or reuse) the profile-engine lease under a brief
+                // lock, then release it so concurrent API requests can interleave
+                // with the per-header writes below.
+                let lease_id: Option<String> = {
+                    let mut guard = ctrl.lock();
+                    let existing = {
+                        let mgr = guard.lease_manager();
+                        // P2-1: reuse the engine's own lease or a transient
+                        // thermal-safety force-take, but NEVER a hardware verify's
+                        // lease. A verify force-takes the lease as "verify"
+                        // (hwmon_ctl.rs) and sets the engine write-pause; if it
+                        // starts *after* this tick passed the loop-level
+                        // `verify_active` gate (mod.rs), the engine still reaches
+                        // here. Adopting the verify's lease would let the engine
+                        // write through it and clobber the test value — the bug the
+                        // single up-front check did not close. Excluding the
+                        // `Verify` owner makes `take_lease` below return AlreadyHeld ⇒
+                        // `lease_id = None` ⇒ the engine skips its hwmon writes this
+                        // tick; the verify's RAII guard releases the lease when it
+                        // ends and the next tick re-acquires. Thermal-safety is NOT
+                        // excluded — after an emergency the engine adopts and renews
+                        // that lease as before, so there is no post-thermal stall.
+                        // `None` ⇒ acquire.
+                        mgr.active_lease()
+                            .filter(|lease| lease.owner != HwmonWriter::Verify)
+                            .map(|lease| lease.lease_id.clone())
+                    };
+                    existing.or_else(|| {
+                        guard
+                            .lease_manager_mut()
+                            .take_lease(HwmonWriter::Engine)
+                            .ok()
+                            .map(|l| l.lease_id)
+                    })
                 };
-                existing.or_else(|| {
-                    guard
-                        .lease_manager_mut()
-                        .take_lease(HwmonWriter::Engine)
-                        .ok()
-                        .map(|l| l.lease_id)
-                })
-            };
-            // No lease this tick (e.g. a hardware verify holds it) ⇒ nothing was
-            // attempted; return an empty outcome set so no member's failure
-            // streak is advanced or reset.
-            let Some(lease_id) = lease_id else {
-                return Vec::new();
-            };
+                // No lease this tick (e.g. a hardware verify holds it) ⇒ nothing was
+                // attempted; return an empty outcome set so no member's failure
+                // streak is advanced or reset.
+                let Some(lease_id) = lease_id else {
+                    return Vec::new();
+                };
 
-            // Phase 2: one lock per header (DEC-154) so a concurrent reader or
-            // lease op is not starved for the whole batch. A GUI/thermal
-            // force-take mid-scan fails the remaining writes with InvalidLease;
-            // the next 1 Hz tick re-acquires. Outcomes are collected here and the
-            // (throttled) failure logging runs on `&mut self` after the join
-            // (DEC-199) — the `'static` blocking closure cannot borrow self.
-            let mut outcomes: Vec<(String, Result<(), String>)> =
-                Vec::with_capacity(hwmon_cmds.len());
-            for (member_id, pwm_percent) in &hwmon_cmds {
-                let mut guard = ctrl.lock();
-                // DEC-102 backstop on the engine path: never attempt a write to
-                // a header discovered read-only (`is_writable == false`). The GUI
-                // member-picker and profile load drop these, but the un-validated
-                // boot-load path does not, so the engine must skip them itself —
-                // otherwise every tick would EACCES-spam the log and the member
-                // would silently never take effect. A skipped header records no
-                // outcome (it was not attempted).
-                if guard.header(member_id).is_some_and(|h| !h.is_writable) {
-                    continue;
+                // Phase 2: one lock per header (DEC-154) so a concurrent reader or
+                // lease op is not starved for the whole batch. A GUI/thermal
+                // force-take mid-scan fails the remaining writes with InvalidLease;
+                // the next 1 Hz tick re-acquires. Outcomes are collected here and the
+                // (throttled) failure logging runs on `&mut self` after the join
+                // (DEC-199) — the `'static` blocking closure cannot borrow self.
+                let mut outcomes: Vec<(String, Result<(), String>)> =
+                    Vec::with_capacity(hwmon_cmds.len());
+                for (member_id, pwm_percent) in &hwmon_cmds {
+                    let mut guard = ctrl.lock();
+                    // DEC-102 backstop on the engine path: never attempt a write to
+                    // a header discovered read-only (`is_writable == false`). The GUI
+                    // member-picker and profile load drop these, but the un-validated
+                    // boot-load path does not, so the engine must skip them itself —
+                    // otherwise every tick would EACCES-spam the log and the member
+                    // would silently never take effect. A skipped header records no
+                    // outcome (it was not attempted).
+                    if guard.header(member_id).is_some_and(|h| !h.is_writable) {
+                        continue;
+                    }
+                    let res = guard
+                        .set_pwm(member_id, *pwm_percent, &lease_id)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string());
+                    outcomes.push((member_id.clone(), res));
                 }
-                let res = guard
-                    .set_pwm(member_id, *pwm_percent, &lease_id)
-                    .map(|_| ())
-                    .map_err(|e| e.to_string());
-                outcomes.push((member_id.clone(), res));
-            }
 
-            // Phase 3: renew under a brief lock to keep it alive for next cycle.
-            if let Err(e) = ctrl.lock().lease_manager_mut().renew_lease(&lease_id) {
-                log::debug!("lease renewal failed (will re-acquire next cycle): {e}");
-            }
-            outcomes
-        })
-        .await;
+                // Phase 3: renew under a brief lock to keep it alive for next cycle.
+                if let Err(e) = ctrl.lock().lease_manager_mut().renew_lease(&lease_id) {
+                    log::debug!("lease renewal failed (will re-acquire next cycle): {e}");
+                }
+                outcomes
+            })
+            .await;
         match join {
-            Ok(outcomes) => self.note_outcomes(&outcomes),
-            Err(e) => {
+            Some(Ok(outcomes)) => self.note_outcomes(&outcomes),
+            Some(Err(e)) => {
                 // Concurrency review D3: surface panicked write tasks.
                 log::error!("Profile engine: hwmon write task panicked: {e}");
             }
+            // DEC-289: an earlier write is still in flight. Nothing was attempted
+            // this tick, so record no outcomes — a member's failure streak must
+            // neither advance nor reset for a write that never happened.
+            None => {}
         }
     }
 }
@@ -700,7 +918,9 @@ impl SafetyWriteBackend for HwmonBackend {
     /// (DEC-099) is preserved inside the closure.
     async fn force_all(&mut self, pct: u8) {
         let ctrl = self.ctrl.clone();
-        let join = tokio::task::spawn_blocking(move || {
+        // Same outcome type as `apply` so both share one `BoundedWrite`
+        // (DEC-289); this path logs inline, so the vec is always empty.
+        let join = self.writes.run(WRITE_JOIN_BUDGET, move || {
             let (hdr_ids, mut lease_id) = {
                 let mut guard = ctrl.lock();
                 let hdr_ids: Vec<String> = guard.headers().iter().map(|h| h.id.clone()).collect();
@@ -747,11 +967,33 @@ impl SafetyWriteBackend for HwmonBackend {
                     }
                 }
             }
+            Vec::new()
         })
         .await;
-        if let Err(e) = join {
+        match join {
             // Concurrency review D3: never swallow a panicked safety write.
-            log::error!("THERMAL SAFETY: hwmon force_all task panicked: {e}");
+            Some(Err(e)) => {
+                log::error!("THERMAL SAFETY: hwmon force_all task panicked: {e}");
+            }
+            // DEC-289: still in flight — held and re-awaited next tick, never
+            // re-issued. The loop is released so the ladder and the other
+            // backends keep running instead of freezing behind this header.
+            // Edge-triggered for the reason given on `OpenFanBackend::force_all`.
+            None => {
+                if !self.stall_logged {
+                    self.stall_logged = true;
+                    log::error!(
+                        "THERMAL SAFETY: hwmon force_all still in flight after {}s — \
+                         the emergency write has not reached the header yet",
+                        WRITE_JOIN_BUDGET.as_secs()
+                    );
+                }
+            }
+            // A harvested `apply` result — see the OpenFan note.
+            Some(Ok(outcomes)) => {
+                self.stall_logged = false;
+                self.note_outcomes(&outcomes);
+            }
         }
     }
 }
@@ -763,6 +1005,147 @@ mod tests {
     use crate::hwmon::lease::LeaseManager;
     use crate::hwmon::pwm_control::{HwmonPwmController, SysfsWriter};
     use crate::hwmon::pwm_discovery::PwmHeaderDescriptor;
+
+    // ── DEC-289: bounded write joins ────────────────────────────────
+    //
+    // The wedge is a real FIFO, not a sleep and not a held mutex. Opening a FIFO
+    // for WRITE blocks in `open(2)` until a reader appears, which is the same
+    // kind of uncancellable kernel block a sysfs write hits — the DEC-278 model.
+    // A sleep would prove nothing here: the defect being guarded is precisely
+    // that `spawn_blocking` work cannot be cancelled, and a sleep ends by itself.
+
+    /// Create a FIFO on a path that OUTLIVES a panicking test.
+    ///
+    /// Deliberately NOT inside a `TempDir`. A failing assertion unwinds and drops
+    /// the `TempDir`, which unlinks the FIFO — and a writer already blocked in
+    /// `open(2)` can then never be paired with a reader, because the name it
+    /// would be reached by is gone. The release backstop below is powerless at
+    /// that point and the red test becomes a hung one. Measured, not theorised:
+    /// that is exactly what a validity check of these tests did before this
+    /// changed. The happy path unlinks it; a panicking run leaves one empty FIFO
+    /// in the temp dir, which is the cheaper failure.
+    fn make_fifo(tag: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("ofc-dec289-{tag}-{}.fifo", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+            0,
+            "mkfifo failed"
+        );
+        path
+    }
+
+    /// Unconditional self-release backstop (DEC-272 trap 3).
+    ///
+    /// Dropping a tokio runtime blocks until its blocking tasks finish, and a
+    /// failed assertion skips the test's own cleanup — so an unbounded wedge
+    /// turns a RED test into a HUNG CI job. Deliberately not joined: it exists
+    /// for the assertion-failure path, and the happy path releases sooner.
+    fn release_backstop(path: std::path::PathBuf) {
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            // Opened REPEATEDLY, not once. A reader open releases the writers
+            // blocked at that instant and then closes again, so a single open
+            // cannot free a pile-up. Found the hard way: bypassing the fix to
+            // validate this test spawns one wedged writer per call, and a
+            // one-shot backstop turned that red into a 90-second hang — the
+            // DEC-272 trap 3 this backstop exists to prevent, in the harness
+            // itself.
+            for _ in 0..40 {
+                let _ = std::fs::File::open(&path);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+    }
+
+    fn wedge_on(path: std::path::PathBuf) -> impl FnOnce() + Send + 'static {
+        move || {
+            let _ = std::fs::OpenOptions::new().write(true).open(&path);
+        }
+    }
+
+    /// The whole point: a write wedged in the kernel must not hold the caller.
+    /// Before DEC-289 this join was unconditional, so the engine loop froze — and
+    /// with it the 105 °C `force_all`, on every backend, not just the stuck one.
+    #[tokio::test]
+    async fn a_wedged_write_releases_the_caller_instead_of_freezing_it() {
+        let fifo = make_fifo("release");
+        release_backstop(fifo.clone());
+
+        let mut bw: BoundedWrite<()> = BoundedWrite::default();
+        let started = std::time::Instant::now();
+        let out = bw
+            .run(
+                std::time::Duration::from_millis(200),
+                wedge_on(fifo.clone()),
+            )
+            .await;
+        let waited = started.elapsed();
+
+        assert!(out.is_none(), "a wedged write must not report as completed");
+        assert!(
+            bw.outstanding(),
+            "the handle must be retained for the next tick"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "the caller waited {waited:?} — the join is not bounded"
+        );
+        let _reader = std::fs::File::open(&fifo).unwrap();
+        let _ = std::fs::remove_file(&fifo);
+    }
+
+    /// The trap this fix could easily have introduced. `spawn_blocking` cannot be
+    /// cancelled, so re-issuing the write each tick against a wedged device would
+    /// strand one blocking thread per tick and exhaust tokio's 512-thread pool in
+    /// ~8.5 minutes — starving the very writer the bound exists to protect
+    /// (DEC-272). The handle must be HELD and RE-AWAITED.
+    #[tokio::test]
+    async fn a_wedged_write_is_held_and_re_awaited_never_re_spawned() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let fifo = make_fifo("respawn");
+        release_backstop(fifo.clone());
+
+        let spawned = Arc::new(AtomicUsize::new(0));
+        let mut bw: BoundedWrite<()> = BoundedWrite::default();
+        let budget = std::time::Duration::from_millis(150);
+
+        for _ in 0..4 {
+            let n = spawned.clone();
+            let f = fifo.clone();
+            let out = bw
+                .run(budget, move || {
+                    n.fetch_add(1, Ordering::SeqCst);
+                    let _ = std::fs::OpenOptions::new().write(true).open(&f);
+                })
+                .await;
+            assert!(out.is_none(), "the wedge should still be outstanding");
+        }
+
+        assert_eq!(
+            spawned.load(Ordering::SeqCst),
+            1,
+            "the write was RE-SPAWNED once per call — this is the DEC-272 \
+             thread-leak trap, and it would exhaust the blocking pool"
+        );
+        let _reader = std::fs::File::open(&fifo).unwrap();
+        let _ = std::fs::remove_file(&fifo);
+    }
+
+    /// The bound must not break the ordinary path: a write that completes inside
+    /// its budget returns its value and leaves nothing outstanding.
+    #[tokio::test]
+    async fn a_write_that_completes_reports_its_result_and_clears_outstanding() {
+        let mut bw: BoundedWrite<u8> = BoundedWrite::default();
+        let out = bw
+            .run(std::time::Duration::from_secs(5), || 42u8)
+            .await
+            .expect("a fast write must report as completed");
+        assert_eq!(out.unwrap(), 42);
+        assert!(!bw.outstanding(), "nothing should remain outstanding");
+    }
 
     fn cmd(member_id: &str, source: &str, pct: u8) -> PwmCommand {
         PwmCommand {
@@ -956,6 +1339,116 @@ mod tests {
             pwm_mode: None,
             is_aio: false,
         }
+    }
+
+    /// A writer that WEDGES on its first write by blocking in `open(2)` on a
+    /// FIFO — the DEC-278 model. Counts entries so a test can prove how many
+    /// blocking tasks were actually started.
+    struct WedgingWriter {
+        fifo: std::path::PathBuf,
+        entered: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl SysfsWriter for WedgingWriter {
+        fn write_file(&mut self, _path: &str, _value: &str) -> Result<(), HwmonError> {
+            self.entered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = std::fs::OpenOptions::new().write(true).open(&self.fifo);
+            Ok(())
+        }
+        fn read_file(&self, _path: &str) -> Result<String, HwmonError> {
+            Ok("1".into())
+        }
+    }
+
+    /// DEC-289: `apply` and `force_all` deliberately SHARE one `BoundedWrite` per
+    /// backend. They never run in the same tick, but they do run in consecutive
+    /// ticks, and a `force_all` still wedged when an emergency clears must not let
+    /// the next `apply` start a SECOND uncancellable blocking task on the same
+    /// device — that is the DEC-272 thread-leak trap.
+    ///
+    /// Without this test, a plausible "cleanup" giving `force_all` its own field
+    /// would reintroduce that trap and every other test would stay green.
+    #[tokio::test]
+    async fn force_all_and_apply_share_one_bounded_write_so_a_wedge_starts_one_task() {
+        let fifo = make_fifo("shared");
+        release_backstop(fifo.clone());
+        let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let cache = Arc::new(StateCache::new());
+        let ctrl = HwmonPwmController::new(
+            vec![make_header("hwmon:t:d:pwm1")],
+            LeaseManager::new(),
+            Box::new(WedgingWriter {
+                fifo: fifo.clone(),
+                entered: entered.clone(),
+            }),
+            cache,
+        );
+        let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl)));
+
+        // Tick 1: an emergency force_all wedges.
+        be.force_all(100).await;
+        assert!(be.writes_outstanding(), "the force_all should be wedged");
+
+        // Tick 2: the emergency clears and ordinary control resumes.
+        be.apply(&[cmd("hwmon:t:d:pwm1", "hwmon", 40)]).await;
+
+        assert_eq!(
+            entered.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a second blocking task was started against a device already wedged — \
+             apply and force_all are no longer sharing one BoundedWrite, which is \
+             the DEC-272 thread-leak trap"
+        );
+        let _reader = std::fs::File::open(&fifo).unwrap();
+        let _ = std::fs::remove_file(&fifo);
+    }
+
+    /// DEC-289: `outstanding()` must mean "still running", not "handle held".
+    /// Several loop paths skip the write phase entirely (no profile loaded, a
+    /// verify in progress), and nothing harvests the handle there — so reporting
+    /// a finished write as outstanding would pin `/status` at "writes wedged"
+    /// until the next activation or a restart.
+    #[tokio::test]
+    async fn a_finished_write_is_not_outstanding_even_before_it_is_harvested() {
+        let mut bw: BoundedWrite<u8> = BoundedWrite::default();
+        // Wedge just long enough to time out, then let it finish on its own.
+        bw.run(std::time::Duration::from_millis(1), || {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            7u8
+        })
+        .await;
+        assert!(bw.outstanding(), "it really was still running at first");
+
+        // Give the blocking task time to finish. Nothing harvests it: this models
+        // a tick that skipped the write phase entirely.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(
+            !bw.outstanding(),
+            "a FINISHED write still reports as outstanding — /status would sit at \
+             'writes wedged' for a device that recovered"
+        );
+    }
+
+    /// DEC-289: a write in flight at shutdown must be drained, not detached.
+    /// `main.rs` drains the engine task handle and relies on that also draining
+    /// backend writes; a detached write still holds the controller lock and would
+    /// make the hardware restore fall back and then be overwritten.
+    #[tokio::test]
+    async fn shutdown_drains_an_in_flight_write_rather_than_detaching_it() {
+        let mut bw: BoundedWrite<u8> = BoundedWrite::default();
+        bw.run(std::time::Duration::from_millis(1), || {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            3u8
+        })
+        .await;
+        assert!(bw.outstanding());
+
+        bw.drain(std::time::Duration::from_secs(5)).await;
+        assert!(
+            !bw.outstanding(),
+            "drain left a write in flight — the restore would race it"
+        );
     }
 
     fn hwmon_backend(headers: Vec<PwmHeaderDescriptor>) -> (HwmonBackend, WriteLog) {

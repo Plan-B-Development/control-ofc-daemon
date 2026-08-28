@@ -610,6 +610,18 @@ struct TickCompletion<'a> {
     /// default, which is correct: nothing was evaluated, so no control has an
     /// output to report.
     outputs: Vec<ControlOutput>,
+    /// DEC-289: a backend write issued this tick (or an earlier one) has still
+    /// not returned, so this tick has NOT finished its work.
+    ///
+    /// Bounding the backend joins means the loop no longer freezes behind a
+    /// wedged device — but it also means the tick now *completes*, and a
+    /// completed tick is exactly what `health::staleness::engine_health` reads to
+    /// decide the engine is healthy. Stamping completion here would therefore
+    /// have deleted the one signal `/status` already gives an operator for this
+    /// condition ("tick still running — a slow write is holding it up", then
+    /// "tick stuck"). Withholding the stamp keeps that surface behaving exactly
+    /// as it did before the bound, with no new field and no wire change.
+    writes_outstanding: bool,
 }
 
 impl<'a> TickCompletion<'a> {
@@ -618,7 +630,16 @@ impl<'a> TickCompletion<'a> {
             cache,
             skipped: Vec::new(),
             outputs: Vec::new(),
+            writes_outstanding: false,
         }
+    }
+
+    /// Record that a backend write is still in flight (DEC-289). Suppresses only
+    /// the completion stamp — the skipped/outputs publication is unconditional,
+    /// because those describe what this tick *decided*, which is true regardless
+    /// of whether the write has landed yet.
+    fn set_writes_outstanding(&mut self, outstanding: bool) {
+        self.writes_outstanding = outstanding;
     }
 
     /// Record what this tick found. Not published until drop.
@@ -643,6 +664,14 @@ impl Drop for TickCompletion<'_> {
             std::mem::take(&mut self.outputs),
         );
         self.cache.record_engine_tick_complete();
+        // DEC-289: the loop DID complete a pass — that stamp is truthful and
+        // stays unconditional. Whether the writes it issued actually landed is a
+        // separate question, and it gets its own stamp. Withholding the
+        // completion stamp instead was tried and measured wrong: the loop keeps
+        // ticking through a wedge, so `engine_started` refreshes every second and
+        // the "tick still running" ladder never fires.
+        self.cache
+            .record_engine_write_stall(self.writes_outstanding);
     }
 }
 
@@ -911,6 +940,22 @@ pub async fn profile_engine_loop(
         // "fan control and thermal safety are stalled" while `force_all` was
         // actively driving the 105°C emergency below.
         let mut tick_done = TickCompletion::new(&cache);
+        // DEC-289: publish the backends' write-stall state HERE, before any
+        // branch. Every exit from this body — the emergency `continue`, the
+        // mid-tick shutdown `break`, the verify skip, the normal end — passes
+        // this point, so a wedge cannot be under-reported by a path that simply
+        // did not think about it. It reflects what the PREVIOUS tick left
+        // outstanding, which is one tick behind; that is immaterial against
+        // `engine_health`'s 2x/30x thresholds and is the price of covering every
+        // path with one call instead of auditing them all forever.
+        tick_done.set_writes_outstanding(
+            openfan_be
+                .as_ref()
+                .is_some_and(OpenFanBackend::writes_outstanding)
+                || hwmon_be
+                    .as_ref()
+                    .is_some_and(HwmonBackend::writes_outstanding),
+        );
 
         if let Some(forced_pct) = decision.forced_pct {
             // Forced safety override — all OpenFan channels and writable
@@ -1081,6 +1126,35 @@ pub async fn profile_engine_loop(
                 be.apply(&commands).await;
             }
         }
+        // DEC-289: refresh after the write phase so a wedge starting THIS tick is
+        // reported now rather than next tick. Deliberately OUTSIDE the
+        // `verify_active` gate above: a verify skips the write phase, and
+        // clearing the stall there would reset a genuine wedge's age every time
+        // maintenance ran. GPU is not consulted — its join is still unbounded
+        // (AUD-a2), so a wedge there holds the loop and there is nothing to report.
+        tick_done.set_writes_outstanding(
+            openfan_be
+                .as_ref()
+                .is_some_and(OpenFanBackend::writes_outstanding)
+                || hwmon_be
+                    .as_ref()
+                    .is_some_and(HwmonBackend::writes_outstanding),
+        );
+    }
+
+    // DEC-289: drain any write still in flight before this task ends. Placed
+    // after the loop so it covers every `break` above without each one having to
+    // remember. `main.rs`'s shutdown drains this task's handle and used to get
+    // the backend writes for free — the loop could not end a tick with a write
+    // outstanding. Bounding the joins made that possible, so the guarantee has to
+    // be restored explicitly here or the restore races a detached write still
+    // holding the controller lock.
+    let drain_budget = std::time::Duration::from_secs(2);
+    if let Some(be) = openfan_be.as_mut() {
+        be.drain_writes(drain_budget).await;
+    }
+    if let Some(be) = hwmon_be.as_mut() {
+        be.drain_writes(drain_budget).await;
     }
 }
 
@@ -2890,6 +2964,69 @@ mod tests {
             (d.forced_pct, d.thermal_state),
             (None, "normal"),
             "the emergency must end — a stale-hold that cannot clear is a stuck force"
+        );
+    }
+
+    // ── DEC-289: a wedged write must stay visible on /status ────────
+    //
+    // Bounding the backend joins means the loop keeps running through a wedge —
+    // which is the fix, and which is also why a wedged writer now presents as a
+    // perfectly live engine on both tick stamps. The stall stamp is the only
+    // thing that still distinguishes it, so these pin its edge behaviour.
+
+    #[test]
+    fn a_stalled_write_is_stamped_once_and_cleared_only_when_one_lands() {
+        let cache = StateCache::new();
+
+        // Several consecutive ticks, each with a write still outstanding — the
+        // shape a wedged device now produces, because the loop no longer freezes.
+        for _ in 0..3 {
+            cache.record_engine_tick("normal");
+            let mut t = TickCompletion::new(&cache);
+            t.set_writes_outstanding(true);
+        }
+        let first = cache
+            .snapshot()
+            .subsystem_timestamps
+            .engine_writes_stalled_since
+            .expect("a stalled write must be stamped");
+
+        cache.record_engine_tick("normal");
+        {
+            let mut t = TickCompletion::new(&cache);
+            t.set_writes_outstanding(true);
+        }
+        assert_eq!(
+            cache
+                .snapshot()
+                .subsystem_timestamps
+                .engine_writes_stalled_since,
+            Some(first),
+            "the stamp must answer 'since when', not 'as of when' — re-stamping \
+             each tick would reset the age and the wedge would never be reported"
+        );
+
+        // The loop's own liveness stamps keep advancing throughout. That is the
+        // whole point of the fix and it is why the stall needs its own stamp.
+        assert!(
+            cache
+                .snapshot()
+                .subsystem_timestamps
+                .engine_completed
+                .is_some(),
+            "the loop completed passes while the write was stalled"
+        );
+
+        // A write that lands clears it.
+        cache.record_engine_tick("normal");
+        drop(TickCompletion::new(&cache));
+        assert!(
+            cache
+                .snapshot()
+                .subsystem_timestamps
+                .engine_writes_stalled_since
+                .is_none(),
+            "a landed write must clear the stall"
         );
     }
 

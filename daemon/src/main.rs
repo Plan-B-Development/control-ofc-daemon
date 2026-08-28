@@ -1081,9 +1081,15 @@ fn restore_hwmon_to_auto(
 /// production on any path that has a systemd **stop job** — which is not every
 /// path; see the note at the foot of this comment.
 ///
-/// The engine task `.await`-joins every `spawn_blocking` backend write before
-/// its loop iteration ends, so draining its task handle here also drains those
-/// writes — a blocking write cannot be left in flight once the handle resolves.
+/// The engine task drains its backend writes before it ends, so draining its
+/// task handle here also drains those writes — a blocking write cannot be left
+/// in flight once the handle resolves. **That is no longer free.** Until
+/// DEC-289 it held because the loop `.await`-joined every `spawn_blocking` write
+/// unconditionally and so could not end a tick with one outstanding; bounding
+/// those joins made it possible, and the guarantee is now restored explicitly by
+/// the post-loop `drain_writes` in `profile_engine_loop`. If that drain is ever
+/// removed, this paragraph becomes false and the restore below starts racing a
+/// detached write that still holds the controller lock.
 /// The only residual window is a single sysfs/serial write that hangs past
 /// `task_timeout` (a running `spawn_blocking` cannot be cancelled). The restore
 /// no longer *blocks* on that case: **both** of its steps are bounded — the GPU
