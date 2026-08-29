@@ -2980,12 +2980,40 @@ async fn hwmon_verify_rejects_concurrent_with_409() {
     let state = test_app_state_with_hwmon();
     assert!(state
         .cache
-        .try_begin_verify(std::time::Duration::from_secs(30)));
+        .try_begin_verify(std::time::Duration::from_secs(30))
+        .is_some());
     let (path, shutdown, _dir) = start_test_server(state).await;
 
     let (status, json) = uds_post(&path, "/hwmon/h1/verify", &serde_json::json!({})).await;
     assert_eq!(status, 409, "concurrent verify must be rejected: {json}");
     assert_eq!(json["error"]["code"], "validation_error");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn hwmon_verify_is_not_rejected_once_the_slot_deadman_elapsed() {
+    // DEC-296, and the mirror of the test above: the 409 must be BOUNDED.
+    //
+    // Pre-DEC-296 a slot whose holder never released it rejected every later
+    // verify and calibration for the process lifetime. The three unit tests for
+    // this live on `StateCache`; this one pins it where it was user-visible — at
+    // the HTTP layer — so a regression at a CALL SITE (a caller passing a wrong
+    // epoch, or `begin_verify_pause` reverting to a bool) cannot leave them all
+    // green. `Duration::ZERO` is elapsed by construction, so no sleep is needed.
+    let state = test_app_state_with_hwmon();
+    assert!(state
+        .cache
+        .try_begin_verify(std::time::Duration::ZERO)
+        .is_some());
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_post(&path, "/hwmon/h1/verify", &serde_json::json!({})).await;
+    assert_ne!(
+        status, 409,
+        "an elapsed verify deadman must free the slot, not reject forever: {json}"
+    );
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);

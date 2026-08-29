@@ -363,28 +363,95 @@ impl StateCache {
     }
 
     /// Try to claim the single hardware-verify slot, pausing the profile
-    /// engine's write phase for the verify's lifetime. Returns `false` if a
-    /// verify is already in progress (the caller must reject with 409) — this
-    /// single-flight guard stops two concurrent verifies from clobbering each
-    /// other's pause or lease (DEC-165). `window` is a generous deadman
-    /// backstop: the caller's RAII guard clears the flag on drop/panic/cancel,
-    /// but if it somehow does not, the pause self-clears after `window` so a
-    /// verify can never strand fan control.
-    pub fn try_begin_verify(&self, window: Duration) -> bool {
+    /// engine's write phase for the verify's lifetime. Returns the claimed
+    /// **epoch**, or `None` if a verify is genuinely in progress (the caller
+    /// must reject with 409) — this single-flight guard stops two concurrent
+    /// verifies from clobbering each other's pause or lease (DEC-165).
+    ///
+    /// `window` is a deadman backstop, and DEC-296 made it two-sided. It always
+    /// bounded the ENGINE half: [`Self::verify_active`] expires against
+    /// `verify_active_until`, so the engine resumes writing after `window` even
+    /// if the guard leaks. It did **not** bound the SLOT half — nothing cleared
+    /// `verify_in_progress` on expiry, so a single leaked guard made every later
+    /// verify *and* calibration return 409 for the rest of the process lifetime.
+    /// An expired window now counts as free.
+    ///
+    /// That alone would be unsafe, which is why the epoch exists: a claimant
+    /// whose window expired may still be alive (DEC-290 moved the guard inside a
+    /// `spawn_blocking` task, so a wedged sysfs write holds it), and when it
+    /// finally returns its `Drop` must not release the *successor's* pause
+    /// mid-test-write. See [`Self::end_verify`].
+    pub fn try_begin_verify(&self, window: Duration) -> Option<u64> {
         let mut state = self.inner.write();
+        let now = Instant::now();
+        let genuinely_held = state.verify_in_progress
+            && state
+                .verify_active_until
+                .is_some_and(|deadline| now < deadline);
+        if genuinely_held {
+            return None;
+        }
         if state.verify_in_progress {
+            // DEC-296: we are STEALING an expired claim, not taking a free one.
+            // Log it: the previous holder may still be alive and about to fail
+            // its restore, and `force_take_lease` logs the eviction that causes
+            // without logging the supersession that explains it.
+            log::warn!(
+                "verify slot: claiming a slot whose deadman elapsed (epoch {} superseded). \
+                 The previous holder did not release it; if it is still running, its \
+                 restore may fail.",
+                state.verify_epoch
+            );
+        }
+        // `wrapping_add` to be non-panicking rather than because wrapping is
+        // reachable: at one increment per verify, u64 does not wrap.
+        state.verify_epoch = state.verify_epoch.wrapping_add(1);
+        state.verify_in_progress = true;
+        state.verify_active_until = Some(now + window);
+        Some(state.verify_epoch)
+    }
+
+    /// Release the hardware-verify slot (the engine resumes writing next tick),
+    /// but **only if `epoch` is still the current claim** (DEC-296).
+    ///
+    /// A stranded claimant that returns after its deadman expired no longer owns
+    /// the slot; releasing unconditionally would clear a *successor's* pause
+    /// while that successor is mid-test-write, letting the engine overwrite its
+    /// test duty and making its verdict false. Ignoring the stale release is the
+    /// whole reason the claim returns a token.
+    pub fn end_verify(&self, epoch: u64) -> bool {
+        let mut state = self.inner.write();
+        if state.verify_epoch != epoch {
+            log::warn!(
+                "verify slot: ignoring a release from superseded epoch {epoch} \
+                 (current {}) — its deadman elapsed and another diagnostic owns the slot",
+                state.verify_epoch
+            );
             return false;
         }
-        state.verify_in_progress = true;
-        state.verify_active_until = Some(Instant::now() + window);
+        state.verify_in_progress = false;
+        state.verify_active_until = None;
         true
     }
 
-    /// Release the hardware-verify slot (the engine resumes writing next tick).
-    pub fn end_verify(&self) {
+    /// Extend this claim's deadman, but only while `epoch` still owns the slot
+    /// (DEC-296). Returns `false` if it has been superseded.
+    ///
+    /// The deadman measures **liveness**, not total duration. Without this a
+    /// claimant that is merely slow — the hwmon verify's post-settle `read_state`
+    /// is plain `fs::read_to_string` on sysfs and can block — is superseded at
+    /// the window, its lease is force-taken by the successor, and its restore
+    /// then fails with an opaque `InvalidLease`, stranding the header at the test
+    /// duty. A claimant that reaches a checkpoint proves it is alive and keeps
+    /// its slot; one that never reaches one is genuinely wedged and is correctly
+    /// superseded.
+    pub fn renew_verify(&self, epoch: u64, window: Duration) -> bool {
         let mut state = self.inner.write();
-        state.verify_in_progress = false;
-        state.verify_active_until = None;
+        if state.verify_epoch != epoch {
+            return false;
+        }
+        state.verify_active_until = Some(Instant::now() + window);
+        true
     }
 
     /// True while a hardware verify is in progress — held for the verify's
@@ -1148,18 +1215,22 @@ mod tests {
         // Fresh cache: no verify in progress.
         assert!(!cache.verify_active());
         // Claiming the slot → active.
-        assert!(cache.try_begin_verify(Duration::from_secs(60)));
+        let e1 = cache
+            .try_begin_verify(Duration::from_secs(60))
+            .expect("free slot must be claimable");
         assert!(cache.verify_active());
         // Single-flight: a second concurrent claim is rejected.
         assert!(
-            !cache.try_begin_verify(Duration::from_secs(60)),
+            cache.try_begin_verify(Duration::from_secs(60)).is_none(),
             "a second concurrent verify must be rejected (single-flight)"
         );
         // end_verify releases the slot; it can be claimed again.
-        cache.end_verify();
+        cache.end_verify(e1);
         assert!(!cache.verify_active());
-        assert!(cache.try_begin_verify(Duration::from_secs(60)));
-        cache.end_verify();
+        let e2 = cache
+            .try_begin_verify(Duration::from_secs(60))
+            .expect("released slot must be re-claimable");
+        cache.end_verify(e2);
         // Deadman: even with the flag still set, an elapsed deadline reads
         // inactive, so a leaked guard can never strand the engine paused.
         {
@@ -1171,6 +1242,115 @@ mod tests {
             !cache.verify_active(),
             "an expired verify deadman must read inactive even with the flag set"
         );
+        // DEC-296: the half this test did NOT cover, which is why the defect
+        // survived it. The assertion above is the ENGINE half — the pause reads
+        // inactive. The SLOT half was never checked, and nothing cleared
+        // `verify_in_progress`, so with the state left exactly as above every
+        // later verify and calibration was rejected for the process lifetime.
+        assert!(
+            cache.try_begin_verify(Duration::from_secs(60)).is_some(),
+            "an expired deadman must free the SLOT too, not only the pause"
+        );
+    }
+
+    /// DEC-296: the deadman frees the slot, using an already-elapsed window so
+    /// the test is deterministic rather than sleeping.
+    #[test]
+    fn an_expired_verify_deadman_frees_the_slot_for_the_next_claimant() {
+        use std::time::Duration;
+        let cache = StateCache::new();
+        let _stranded = cache
+            .try_begin_verify(Duration::ZERO)
+            .expect("first claim must succeed");
+        // A zero window is already elapsed, so the claim is no longer genuinely
+        // held even though `verify_in_progress` is still set.
+        assert!(!cache.verify_active());
+        assert!(
+            cache.try_begin_verify(Duration::from_secs(60)).is_some(),
+            "the next verify must be able to claim the slot once the deadman expired"
+        );
+        assert!(cache.verify_active(), "the new claim must pause the engine");
+    }
+
+    /// DEC-296 remediation: the deadman measures LIVENESS, not total duration.
+    ///
+    /// Found by review: "an expired window is free" alone supersedes a claimant
+    /// that is merely SLOW, not dead. The hwmon verify's post-settle `read_state`
+    /// is plain `fs::read_to_string` on sysfs with no lock held, so it can outlast
+    /// the 30 s window; the successor then force-takes the hwmon lease and the
+    /// original's restore fails, parking the header at the test duty. Renewing at
+    /// a checkpoint keeps a live claimant's slot; a wedged one never reaches the
+    /// checkpoint and is still correctly superseded.
+    #[test]
+    fn renewing_keeps_a_slow_but_live_claim_and_a_stale_renew_is_refused() {
+        use std::time::Duration;
+        let cache = StateCache::new();
+        let slow = cache
+            .try_begin_verify(Duration::ZERO)
+            .expect("first claim must succeed");
+        // Elapsed by construction — without a renew, the slot is stealable.
+        assert!(!cache.verify_active());
+        assert!(
+            cache.renew_verify(slow, Duration::from_secs(60)),
+            "the owner must be able to prove it is alive and keep its slot"
+        );
+        assert!(cache.verify_active(), "renewing must re-arm the pause");
+        assert!(
+            cache.try_begin_verify(Duration::from_secs(60)).is_none(),
+            "a renewed claim must NOT be stealable — this is the whole point"
+        );
+
+        // A superseded claimant's renew is refused, so it can report the
+        // supersession instead of attempting a write whose lease is already gone.
+        let cache2 = StateCache::new();
+        let stranded = cache2
+            .try_begin_verify(Duration::ZERO)
+            .expect("first claim");
+        let _live = cache2
+            .try_begin_verify(Duration::from_secs(60))
+            .expect("expired slot is claimable");
+        assert!(
+            !cache2.renew_verify(stranded, Duration::from_secs(60)),
+            "a superseded claimant must not be able to re-arm the slot it lost"
+        );
+    }
+
+    /// DEC-296, and the reason the claim returns a token rather than a bool.
+    ///
+    /// The fix recorded in the register — "treat an expired deadline as free" —
+    /// is not sufficient on its own, and this test is what distinguishes the two.
+    /// A stranded claimant can still be ALIVE: DEC-290 moved the guard inside a
+    /// `spawn_blocking` task, so a wedged sysfs write holds it indefinitely. When
+    /// it finally returns, its `Drop` must not release the successor's pause —
+    /// otherwise the engine resumes writing over the successor's test duty and
+    /// that verify's verdict is silently false. That is the DEC-278
+    /// "fix to the fix" shape.
+    #[test]
+    fn a_stranded_verify_returning_late_cannot_release_its_successors_pause() {
+        use std::time::Duration;
+        let cache = StateCache::new();
+        // A claims and its deadman expires immediately.
+        let stranded = cache
+            .try_begin_verify(Duration::ZERO)
+            .expect("first claim must succeed");
+        // B claims the freed slot and holds a real window.
+        let live = cache
+            .try_begin_verify(Duration::from_secs(60))
+            .expect("expired slot must be claimable");
+        assert_ne!(stranded, live, "each claim must get a distinct epoch");
+        assert!(cache.verify_active());
+
+        // A finally returns and drops. It no longer owns the slot.
+        cache.end_verify(stranded);
+
+        assert!(
+            cache.verify_active(),
+            "a stale release must NOT clear the live claimant's pause — the engine \
+             would resume writing over its test duty and its verdict would be false"
+        );
+        // B's own release still works.
+        cache.end_verify(live);
+        assert!(!cache.verify_active());
     }
 
     #[test]

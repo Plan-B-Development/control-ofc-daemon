@@ -275,7 +275,7 @@ pub async fn hwmon_verify_handler(
     let join = tokio::task::spawn_blocking(move || {
         // Moved, not borrowed: dropped only when this task finishes, so the
         // pause and the lease outlive every write below on every path.
-        let _verify_guard = verify_guard;
+        let verify_guard = verify_guard;
         let _verify_lease = verify_lease;
 
         let read_state =
@@ -323,6 +323,29 @@ pub async fn hwmon_verify_handler(
         std::thread::sleep(std::time::Duration::from_secs(VERIFY_WAIT_SECONDS as u64));
 
         let final_state = read_state(&pwm_path, &enable_path, &rpm_path);
+
+        // DEC-296: prove we are still alive before restoring, and keep the slot.
+        // The settle and the reads above are blocking sysfs work with no lock
+        // held, and `read_state` is plain `fs::read_to_string` — on a wedged chip
+        // it can outlast VERIFY_PAUSE_DEADMAN. Without this checkpoint a merely
+        // SLOW verify is superseded at the window, the successor force-takes the
+        // hwmon lease, and the restore below then fails with an opaque
+        // InvalidLease, leaving the header parked at the test duty. Renewing here
+        // makes the deadman measure liveness rather than total duration.
+        //
+        // If we HAVE been superseded, the restore cannot succeed — our lease is
+        // already gone — so say why, rather than emitting a lease error that
+        // reads like an internal race.
+        if !verify_guard.renew(crate::constants::VERIFY_PAUSE_DEADMAN) {
+            log::warn!(
+                "verify: {bg_header_id} was superseded by a later diagnostic while \
+                 settling, so its lease is gone and the restore to {}% cannot land. \
+                 The header is left at the test duty for the new owner or the next \
+                 engine tick to correct.",
+                initial.pwm_percent.unwrap_or(50)
+            );
+            return Ok((initial, final_state, test_pct, true));
+        }
 
         // Restore original PWM. Failures here are surfaced via ``restore_failed``
         // rather than overwriting the diagnostic verify outcome — a successful

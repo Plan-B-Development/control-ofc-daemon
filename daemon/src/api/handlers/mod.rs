@@ -368,11 +368,23 @@ impl AppState {
 /// Construct via [`begin_verify_pause`].
 pub(crate) struct VerifyPauseGuard {
     cache: Arc<crate::health::cache::StateCache>,
+    /// The claim this guard owns (DEC-296). `end_verify` ignores a release from
+    /// a guard whose claim has since been superseded.
+    epoch: u64,
+}
+
+impl VerifyPauseGuard {
+    /// Prove this verify is still alive and keep the slot (DEC-296). `false`
+    /// means the deadman already elapsed and another diagnostic superseded us —
+    /// our lease has been force-taken and any write we still attempt will fail.
+    pub(crate) fn renew(&self, window: std::time::Duration) -> bool {
+        self.cache.renew_verify(self.epoch, window)
+    }
 }
 
 impl Drop for VerifyPauseGuard {
     fn drop(&mut self) {
-        self.cache.end_verify();
+        self.cache.end_verify(self.epoch);
     }
 }
 
@@ -386,13 +398,12 @@ pub(crate) fn begin_verify_pause(
     cache: &Arc<crate::health::cache::StateCache>,
     window: std::time::Duration,
 ) -> Option<VerifyPauseGuard> {
-    if cache.try_begin_verify(window) {
-        Some(VerifyPauseGuard {
+    cache
+        .try_begin_verify(window)
+        .map(|epoch| VerifyPauseGuard {
             cache: cache.clone(),
+            epoch,
         })
-    } else {
-        None
-    }
 }
 
 /// Phase 6 (DEC-201): refuse to START a hardware fan verify while the system is

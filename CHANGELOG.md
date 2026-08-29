@@ -90,6 +90,31 @@
   its pre-calibration value. Re-running calibration, or activating a profile,
   restores normal control. (DEC-295)
 
+- **One abandoned fan diagnostic could disable every later one until the daemon
+  restarted.** The verify slot — shared by the hwmon verify, the GPU fan verify
+  and OpenFan calibration — carries a deadman so that an abandoned diagnostic
+  cannot pause fan control forever. That deadman only ever did half its job: it
+  released the engine, which resumed writing on schedule, but it never released
+  the *slot*. So a single diagnostic whose cleanup did not run left the daemon
+  believing one was permanently in progress, and every subsequent verify and
+  calibration was refused with "already in progress" — for the life of the
+  process, with nothing actually running.
+
+  This became reachable rather than theoretical in 2.23.3, which moved the
+  cleanup inside the blocking write task so it could not be skipped by a client
+  disconnect. That is the right place for it, but it means a write wedged in the
+  kernel now holds the slot too.
+
+  An elapsed deadman now frees the slot as well. Two things make that safe.
+  Releasing is ownership-checked, so a wedged diagnostic that finally returns
+  minutes later cannot cancel the pause belonging to whichever diagnostic started
+  after it — which would have let the engine write over that one's test value and
+  report a false result. And the deadman measures whether a diagnostic is still
+  *alive* rather than how long it has run: a verify checks in after its settle
+  period, so one that is merely slow keeps its slot instead of being superseded
+  and having its restore fail. Both decisions are logged, because the situation
+  they exist to survive should not be silent. (DEC-296)
+
 ### Notes
 - The reader's plausible-range check is unchanged, and deliberately so. It still
   cannot separate a real 105-125 °C over-temperature from a stuck sensor reading

@@ -312,6 +312,11 @@ pub struct DaemonState {
     /// outlasts a slow verify rather than expiring on a fixed timer. Single-
     /// flight: a second verify is rejected (409) while this is set (DEC-165).
     pub verify_in_progress: bool,
+    /// Monotonic ownership token for the verify slot (DEC-296). Incremented on
+    /// every successful claim; `end_verify` releases only if the caller still
+    /// holds the current one, so a stranded claimant returning late cannot
+    /// release its SUCCESSOR's pause.
+    pub verify_epoch: u64,
     /// Generous deadman backing `verify_in_progress`: the RAII guard always
     /// clears the flag on drop/panic/cancel, but if it somehow does not, the
     /// pause self-clears after this instant so a verify can never strand control.
@@ -351,6 +356,7 @@ impl Default for DaemonState {
             subsystem_timestamps: SubsystemTimestamps::default(),
             thermal_override_state: None,
             verify_in_progress: false,
+            verify_epoch: 0,
             verify_active_until: None,
             relinquished_gpu_fans: HashSet::new(),
             unavailable_sensors: Vec::new(),

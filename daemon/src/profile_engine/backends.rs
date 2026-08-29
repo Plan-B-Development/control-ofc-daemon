@@ -2231,14 +2231,16 @@ mod tests {
         // sweep's test PWM survives), then resume when the pause clears.
         let (mut be, written, cache) = openfan_backend();
 
-        assert!(cache.try_begin_verify(std::time::Duration::from_secs(30)));
+        let verify_epoch = cache
+            .try_begin_verify(std::time::Duration::from_secs(30))
+            .expect("free slot");
         be.apply(&[cmd("openfan:ch00", "openfan", 50)]).await;
         assert!(
             written.lock().is_empty(),
             "no OpenFan write may land while the engine is paused (DEC-191)"
         );
 
-        cache.end_verify();
+        cache.end_verify(verify_epoch);
         be.apply(&[cmd("openfan:ch00", "openfan", 50)]).await;
         assert!(
             written.lock().iter().any(|c| c.starts_with(">02")),
@@ -2346,7 +2348,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (gpu, curve_path) = fake_gpu(&dir);
         let cache = Arc::new(StateCache::new());
-        assert!(cache.try_begin_verify(std::time::Duration::from_secs(30)));
+        let verify_epoch = cache
+            .try_begin_verify(std::time::Duration::from_secs(30))
+            .expect("free slot");
         let mut be = GpuBackend::new(cache.clone(), Arc::new(vec![gpu]));
 
         be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 70)])
@@ -2356,7 +2360,7 @@ mod tests {
             "engine must not write a GPU fan while a verify holds the pause (P2-1)"
         );
 
-        cache.end_verify();
+        cache.end_verify(verify_epoch);
         be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 70)])
             .await;
         assert!(
@@ -2376,7 +2380,9 @@ mod tests {
         let (gpu, curve_path) = fake_gpu(&dir);
         let cache = StateCache::new();
 
-        assert!(cache.try_begin_verify(std::time::Duration::from_secs(30)));
+        let verify_epoch = cache
+            .try_begin_verify(std::time::Duration::from_secs(30))
+            .expect("free slot");
         let out = gpu_blocking_write(
             &cache,
             gpu.fan_curve_path.as_deref().unwrap(),
@@ -2391,7 +2397,7 @@ mod tests {
             "the in-task guard must stop the write, not just relabel it"
         );
 
-        cache.end_verify();
+        cache.end_verify(verify_epoch);
         let out = gpu_blocking_write(
             &cache,
             gpu.fan_curve_path.as_deref().unwrap(),

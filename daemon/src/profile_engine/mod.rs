@@ -5254,7 +5254,9 @@ mod tests {
         // Claim the verify slot for a long window. The deadman uses the real
         // wall clock, which the test's simulated tokio time barely advances, so
         // the pause stays active for the whole run.
-        assert!(cache.try_begin_verify(std::time::Duration::from_secs(60)));
+        assert!(cache
+            .try_begin_verify(std::time::Duration::from_secs(60))
+            .is_some());
 
         let profile = make_profile("curve", "graph", 50.0);
         let profile_arc = Arc::new(Mutex::new(Some(profile)));
