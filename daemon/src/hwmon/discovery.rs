@@ -98,11 +98,86 @@ fn read_thresholds(hwmon_dir: &Path, index: &str, chip_name: &str) -> Option<Sen
     }
 }
 
+/// Report, at most once per process, the two ways the DEC-294 mitigation can be
+/// silently absent. Both conditions are static — the board does not change —
+/// so `Once` is the correct throttle, and it matters: `cpu_temp_missing` makes
+/// the poll loop re-run full discovery every tick, so an unthrottled line would
+/// spam at 1 Hz in precisely the degraded state a reader is diagnosing.
+fn warn_once_about_cpu_classification(descriptors: &[SensorDescriptor], board_vendor: &str) {
+    static NO_VENDOR: std::sync::Once = std::sync::Once::new();
+    static SOLE_PROXY: std::sync::Once = std::sync::Once::new();
+
+    // (1) The mitigation FAILS OPEN when the vendor is unreadable — a container,
+    // a DMI-less platform — and the pre-DEC-294 permanent-100% latch returns
+    // with nothing to distinguish "evaluated and declined" from "never ran".
+    if board_vendor.is_empty()
+        && descriptors.iter().any(|d| {
+            ASUS_CPUTIN_BOGUS_CHIPS.contains(&d.chip_name.as_str())
+                && d.label.to_lowercase() == "cputin"
+        })
+    {
+        NO_VENDOR.call_once(|| {
+            log::warn!(
+                "DMI board vendor is unreadable, so the known-bogus-CPUTIN check could not \
+                 run for chip in {ASUS_CPUTIN_BOGUS_CHIPS:?}. If this board is an ASUS one, \
+                 CPUTIN may report a false high temperature and hold every fan at 100%."
+            );
+        });
+    }
+
+    // (2) The residual accepted with DEC-294's second half: a PECI/TSI channel is
+    // the kernel's prescribed CPU source on these boards, but is reported on some
+    // boards to read 0 C or ~10 C low. As the SOLE CpuTemp a bogus-low value is a
+    // silent false negative — it suppresses the DEC-190 absent-sensor floor,
+    // because a sensor *is* present.
+    let cpu: Vec<&SensorDescriptor> = descriptors
+        .iter()
+        .filter(|d| d.kind == SensorKind::CpuTemp)
+        .collect();
+    if let [only] = cpu.as_slice() {
+        let l = only.label.to_lowercase();
+        if l.contains("peci") || l.contains("tsi") {
+            SOLE_PROXY.call_once(|| {
+                log::warn!(
+                    "the only CPU temperature sensor is {} on {}, a Super-I/O CPU-temperature \
+                     proxy. These are reported to read 0 C or several degrees low on some \
+                     boards; if it does, fan control will run cold with no other CPU sensor \
+                     to contradict it.",
+                    only.label,
+                    only.chip_name
+                );
+            });
+        }
+    }
+}
+
+/// Chips whose `CPUTIN` pin is documented as frequently unconnected on ASUS
+/// boards. A set rather than a literal so a second chip can be added without
+/// touching the predicate. Mirrors `_ASUS_CPUTIN_BOGUS_CHIPS` in the GUI's
+/// `knowledge/sensor_knowledge.py`; the two must stay in step.
+const ASUS_CPUTIN_BOGUS_CHIPS: &[&str] = &["nct6776"];
+
+/// True for a sensor the kernel documents as reporting a bogus temperature on
+/// this board, which must therefore never be treated as a CPU temperature
+/// (DEC-294).
+///
+/// **Vendor-gated on purpose.** The same chip on a non-ASUS board wires CPUTIN
+/// normally, so demoting it unconditionally would discard a real CPU sensor —
+/// the opposite fault, and a worse one.
+fn is_known_bogus_cpu_sensor(chip_name: &str, lower_label: &str, board_vendor: &str) -> bool {
+    ASUS_CPUTIN_BOGUS_CHIPS.contains(&chip_name)
+        && board_vendor.to_lowercase().contains("asus")
+        && lower_label == "cputin"
+}
+
 /// Known chip name → sensor kind classification.
 ///
 /// `pub(crate)` so the Phase-2 fine classifier (`hwmon::classify`) can refine
 /// *within* this coarse decision and never contradict the sensor's `kind`.
-pub(crate) fn classify_chip(chip_name: &str, label: &str) -> SensorKind {
+///
+/// `board_vendor` is the DMI board vendor (empty when unknown); it gates the
+/// DEC-294 bogus-sensor demotion only, and no other decision here reads it.
+pub(crate) fn classify_chip(chip_name: &str, label: &str, board_vendor: &str) -> SensorKind {
     // Liquid-cooler coolant temperature takes priority over the generic
     // chip/label heuristics below: an NZXT Kraken `temp1` is coolant, and any
     // sensor a vendor labels coolant/water/liquid is coolant regardless of chip
@@ -112,6 +187,20 @@ pub(crate) fn classify_chip(chip_name: &str, label: &str) -> SensorKind {
         return SensorKind::CoolantTemp;
     }
     let lower = label.to_lowercase();
+    // DEC-294: a known-bogus sensor is demoted BEFORE the chip dispatch below,
+    // for the same reason the coolant check sits above it — the dispatch would
+    // otherwise match on `contains("cpu")` and hand a disconnected pin to the
+    // thermal ladder. Kernel docs (`hwmon/nct6775`): on various ASUS boards with
+    // the NCT6776F, CPUTIN is not connected and reports unreasonable
+    // temperatures, canonically a near-constant ~115C on an idle machine.
+    // Classified CpuTemp it max-reduces over every healthy CPU sensor in
+    // `profile_engine::hottest_cpu_reading` and latches the 105C emergency,
+    // which releases only at <=80C — a permanent, unrecoverable 100% fan state
+    // on a cold CPU. The GUI has flagged this exact triple as bogus for
+    // display since long before the daemon could act on it.
+    if is_known_bogus_cpu_sensor(chip_name, &lower, board_vendor) {
+        return SensorKind::MbTemp;
+    }
     match chip_name {
         "k10temp" => SensorKind::CpuTemp,
         "coretemp" => SensorKind::CpuTemp,
@@ -125,7 +214,7 @@ pub(crate) fn classify_chip(chip_name: &str, label: &str) -> SensorKind {
         "sbtsi_temp" => SensorKind::CpuTemp,
         _ if chip_name.starts_with("it87") => SensorKind::MbTemp,
         // Nuvoton Super I/O families: default MbTemp, but TSI/PECI labels indicate CPU
-        "nct6775" | "nct6683" | "nct6686" | "nct6687" => {
+        "nct6775" | "nct6776" | "nct6683" | "nct6686" | "nct6687" => {
             if lower.contains("amd tsi")
                 || lower.contains("tsi")
                 || lower.contains("peci")
@@ -222,12 +311,32 @@ pub struct SensorDiscovery {
 ///
 /// Discards the completeness signal; see [`discover_sensors_reporting_skips`]
 /// when the result is used as evidence that a sensor no longer exists.
+///
+/// Classifies with an **unknown board vendor**, so the DEC-294 vendor-gated
+/// bogus-sensor demotion never fires. That is correct for a caller that has no
+/// DMI context — and it is why the production path does not use this function.
+/// Use [`discover_sensors_with_vendor`] when the vendor is known.
 pub fn discover_sensors(hwmon_root: &Path) -> Result<Vec<SensorDescriptor>, HwmonError> {
-    discover_sensors_reporting_skips(hwmon_root).map(|d| d.descriptors)
+    discover_sensors_with_vendor(hwmon_root, "")
 }
 
-/// As [`discover_sensors`], but reports how many present chips were skipped.
-pub fn discover_sensors_reporting_skips(hwmon_root: &Path) -> Result<SensorDiscovery, HwmonError> {
+/// As [`discover_sensors`], but with the DMI board vendor supplied, so the
+/// DEC-294 bogus-sensor rule can apply. Injectable for tests, which must never
+/// read the host's own `/sys/class/dmi/id` — the rule is vendor-gated, so a
+/// suite that read real DMI would behave differently on an ASUS machine.
+pub fn discover_sensors_with_vendor(
+    hwmon_root: &Path,
+    board_vendor: &str,
+) -> Result<Vec<SensorDescriptor>, HwmonError> {
+    discover_sensors_reporting_skips(hwmon_root, board_vendor).map(|d| d.descriptors)
+}
+
+/// As [`discover_sensors_with_vendor`], but reports how many present chips were
+/// skipped. This is the production entry point.
+pub fn discover_sensors_reporting_skips(
+    hwmon_root: &Path,
+    board_vendor: &str,
+) -> Result<SensorDiscovery, HwmonError> {
     let mut descriptors = Vec::new();
     let mut unreadable_dirs: Vec<PathBuf> = Vec::new();
 
@@ -249,7 +358,7 @@ pub fn discover_sensors_reporting_skips(hwmon_root: &Path) -> Result<SensorDisco
     hwmon_dirs.sort();
 
     for hwmon_dir in hwmon_dirs {
-        match discover_device_sensors(&hwmon_dir) {
+        match discover_device_sensors(&hwmon_dir, board_vendor) {
             Ok(sensors) => descriptors.extend(sensors),
             Err(e) => {
                 // A chip whose directory vanished between `read_dir` and here was
@@ -269,6 +378,7 @@ pub fn discover_sensors_reporting_skips(hwmon_root: &Path) -> Result<SensorDisco
         }
     }
 
+    warn_once_about_cpu_classification(&descriptors, board_vendor);
     Ok(SensorDiscovery {
         descriptors,
         unreadable_dirs,
@@ -301,7 +411,10 @@ fn device_id_for_hwmon_dir(hwmon_dir: &Path) -> String {
 }
 
 /// Discover temperature sensors for a single hwmon device directory.
-fn discover_device_sensors(hwmon_dir: &Path) -> Result<Vec<SensorDescriptor>, HwmonError> {
+fn discover_device_sensors(
+    hwmon_dir: &Path,
+    board_vendor: &str,
+) -> Result<Vec<SensorDescriptor>, HwmonError> {
     let chip_name = read_sysfs_string(&hwmon_dir.join("name"))?
         .trim()
         .to_string();
@@ -380,7 +493,7 @@ fn discover_device_sensors(hwmon_dir: &Path) -> Result<Vec<SensorDescriptor>, Hw
         // streak, or while no CpuTemp sensor is cached.
         let thresholds = read_thresholds(hwmon_dir, index, &chip_name);
 
-        let kind = classify_chip(&chip_name, &label);
+        let kind = classify_chip(&chip_name, &label, board_vendor);
         let id = build_stable_id(&chip_name, &device_id, &label);
         let source = match chip_name.as_str() {
             "amdgpu" => SensorSource::AmdGpu,
@@ -1098,8 +1211,10 @@ mod tests {
             ("unknown_chip", "", SensorKind::MbTemp),    // empty label
         ];
 
+        // Vendor-independent cases: passing an empty vendor keeps the DEC-294
+        // bogus-sensor rule out of the way, which is what every row here means.
         for (chip, label, expected) in cases {
-            let got = classify_chip(chip, label);
+            let got = classify_chip(chip, label, "");
             assert_eq!(
                 got, *expected,
                 "classify_chip({chip:?}, {label:?}) expected {expected:?}, got {got:?}",
@@ -1116,13 +1231,57 @@ mod tests {
     fn classify_chip_fallback_cpu_keyword_wins_over_gpu_keyword() {
         // "cpu" wins over "gpu" by appearing first in the if-chain.
         assert_eq!(
-            classify_chip("unknown_chip", "CPU and GPU combined sensor"),
+            classify_chip("unknown_chip", "CPU and GPU combined sensor", ""),
             SensorKind::CpuTemp,
         );
         // Same precedence test using Tctl + edge.
         assert_eq!(
-            classify_chip("unknown_chip", "Tctl-edge"),
+            classify_chip("unknown_chip", "Tctl-edge", ""),
             SensorKind::CpuTemp,
         );
+    }
+
+    /// DEC-294. The rule is gated on all three of chip, vendor and label, so
+    /// every gate gets a negative case — a rule that fires too widely discards a
+    /// real CPU sensor, which is the worse fault of the two.
+    ///
+    /// Rows 3 and 4 are the second half of DEC-294: `nct6776` was absent from
+    /// the Nuvoton arm entirely, so it fell to the generic fallback, whose
+    /// keyword list has no `peci`/`tsi` — the two sources the kernel docs tell
+    /// you to PREFER on this chip were classified MbTemp and unusable.
+    #[test]
+    fn classify_chip_demotes_the_documented_bogus_asus_cputin() {
+        let asus = "ASUSTeK COMPUTER INC.";
+        let cases: &[(&str, &str, &str, SensorKind)] = &[
+            // The defect: a disconnected pin must not reach the thermal ladder.
+            ("nct6776", "CPUTIN", asus, SensorKind::MbTemp),
+            // Label match is case-insensitive, vendor match is a substring.
+            ("nct6776", "cputin", "asusteknope", SensorKind::MbTemp),
+            // Part (b): the labels the kernel docs say to prefer instead.
+            ("nct6776", "PECI Agent 0", asus, SensorKind::CpuTemp),
+            ("nct6776", "TSI0_TEMP", asus, SensorKind::CpuTemp),
+            // VENDOR gate: same chip, same label, different board — the pin is
+            // wired normally there and must stay a CPU sensor.
+            (
+                "nct6776",
+                "CPUTIN",
+                "Gigabyte Technology Co., Ltd.",
+                SensorKind::CpuTemp,
+            ),
+            ("nct6776", "CPUTIN", "", SensorKind::CpuTemp),
+            // CHIP gate: only nct6776 is documented; its siblings are unaffected.
+            ("nct6775", "CPUTIN", asus, SensorKind::CpuTemp),
+            ("nct6687", "CPUTIN", asus, SensorKind::CpuTemp),
+            // LABEL gate: the board's other Nuvoton pins are untouched.
+            ("nct6776", "SYSTIN", asus, SensorKind::MbTemp),
+            ("nct6776", "AUXTIN", asus, SensorKind::MbTemp),
+        ];
+        for (chip, label, vendor, expected) in cases {
+            let got = classify_chip(chip, label, vendor);
+            assert_eq!(
+                got, *expected,
+                "classify_chip({chip:?}, {label:?}, {vendor:?}) expected {expected:?}, got {got:?}",
+            );
+        }
     }
 }

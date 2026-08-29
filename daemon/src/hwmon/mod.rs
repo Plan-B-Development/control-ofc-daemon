@@ -120,6 +120,7 @@ pub fn is_gpu_owned_hwmon_chip(chip_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hwmon::types::SensorKind;
     use std::fs;
 
     /// DEC-193: `read_sensor_values` surfaces failures instead of logging, so a
@@ -260,6 +261,123 @@ mod tests {
             rule.evaluate(45.0),
             None,
             "no emergency may fire from a healthy 45°C system"
+        );
+    }
+
+    /// DEC-294 (end-to-end, sysfs bytes -> the thermal ladder's verdict).
+    ///
+    /// The companion to the test above, for the fault that one *cannot* catch.
+    /// 115°C is perfectly plausible, so `read_temp` accepts it, the read
+    /// SUCCEEDS, and the DEC-193 quarantine — which only ever sees read
+    /// failures — never gets a chance. The kernel documents this exact pin as
+    /// frequently unconnected on ASUS NCT6776F boards, reporting a near-constant
+    /// unreasonable value. Classified `CpuTemp` it max-reduces over every
+    /// healthy CPU sensor and latches the 105°C emergency, which releases only
+    /// at <=80°C: every fan at 100% on a cold machine, until reboot.
+    ///
+    /// **The non-ASUS half is not decoration.** It proves the fixture is
+    /// genuinely capable of latching the ladder, so the ASUS half asserts a real
+    /// absence rather than passing vacuously — `CLAUDE.md § Hard-won lessons`,
+    /// "a test asserting an absence must first assert the presence".
+    #[test]
+    fn a_bogus_asus_cputin_never_reaches_the_thermal_ladder() {
+        fn ladder_verdict(vendor: &str) -> (Vec<SensorDescriptor>, Option<u8>) {
+            let tmp = tempfile::tempdir().unwrap();
+            let hwmon0 = tmp.path().join("hwmon0");
+            fs::create_dir_all(&hwmon0).unwrap();
+            fs::write(hwmon0.join("name"), "nct6776\n").unwrap();
+            // The documented-bogus pin: a constant, plausible, wrong 115°C.
+            fs::write(hwmon0.join("temp1_input"), "115000\n").unwrap();
+            fs::write(hwmon0.join("temp1_label"), "CPUTIN\n").unwrap();
+            // The pin the kernel docs tell you to prefer, reading correctly.
+            fs::write(hwmon0.join("temp2_input"), "45000\n").unwrap();
+            fs::write(hwmon0.join("temp2_label"), "PECI Agent 0\n").unwrap();
+
+            let descriptors = discovery::discover_sensors_with_vendor(tmp.path(), vendor).unwrap();
+            let outcome = read_sensor_values(&descriptors);
+            // Both read fine — that is the whole point: nothing upstream of
+            // classification can tell these two apart.
+            assert_eq!(outcome.failures.len(), 0, "both reads must succeed");
+            assert_eq!(outcome.readings.len(), 2);
+
+            let now = std::time::Instant::now();
+            let sensors: std::collections::HashMap<
+                String,
+                crate::health::state::CachedSensorReading,
+            > = outcome
+                .readings
+                .iter()
+                .map(|r| {
+                    (
+                        r.id.clone(),
+                        crate::health::state::CachedSensorReading {
+                            id: r.id.clone(),
+                            kind: r.kind,
+                            label: r.label.clone(),
+                            value_c: r.value_c,
+                            source: crate::health::state::DeviceLabel::Hwmon,
+                            updated_at: now,
+                            rate_c_per_s: None,
+                            session_min_c: None,
+                            session_max_c: None,
+                            chip_name: r.chip_name.clone(),
+                            temp_type: r.temp_type,
+                            thresholds: r.thresholds.clone(),
+                        },
+                    )
+                })
+                .collect();
+
+            // Drive the REAL reduction and the REAL rule, never a local copy of
+            // either — re-deriving them here would leave this green if
+            // `hottest_cpu_reading` lost its `CpuTemp` filter.
+            let reading = crate::profile_engine::hottest_cpu_reading(
+                &sensors,
+                now,
+                std::time::Duration::from_secs(5),
+            );
+            let tctl = match reading {
+                crate::profile_engine::CpuReading::Fresh(c) => c,
+                other => panic!("expected a fresh CPU reading, got {other:?}"),
+            };
+            let mut rule = crate::safety::ThermalSafetyRule::new();
+            (descriptors, rule.evaluate(tctl))
+        }
+
+        // ── Presence: the fixture CAN latch the ladder. ──
+        // Same bytes, non-ASUS board, where the pin is wired normally. CPUTIN is
+        // a CpuTemp, outranks the healthy 45°C by `max`, and trips the emergency.
+        let (descs, verdict) = ladder_verdict("Gigabyte Technology Co., Ltd.");
+        assert!(
+            descs
+                .iter()
+                .any(|d| d.label == "CPUTIN" && d.kind == SensorKind::CpuTemp),
+            "fixture must classify CPUTIN as CpuTemp off-ASUS, or the absence below proves nothing"
+        );
+        assert_eq!(
+            verdict,
+            Some(100),
+            "the fixture must be capable of latching a 100% emergency"
+        );
+
+        // ── Absence: on the documented-bogus board it does not. ──
+        let (descs, verdict) = ladder_verdict("ASUSTeK COMPUTER INC.");
+        assert!(
+            descs
+                .iter()
+                .any(|d| d.label == "CPUTIN" && d.kind == SensorKind::MbTemp),
+            "the bogus pin must be demoted out of CpuTemp"
+        );
+        assert!(
+            descs
+                .iter()
+                .any(|d| d.label == "PECI Agent 0" && d.kind == SensorKind::CpuTemp),
+            "the preferred pin must still BE a CPU sensor — demoting the bogus one \
+             is worthless if it leaves the board with no CPU temperature at all"
+        );
+        assert_eq!(
+            verdict, None,
+            "a cold CPU reading 45°C on its good sensor must not latch an emergency"
         );
     }
 

@@ -1,4 +1,57 @@
 # Changelog
+
+## [Unreleased]
+
+### Fixed
+- **A motherboard sensor that is documented as "not connected" could pin every
+  fan at 100% until the daemon restarted — on a cold machine.** The kernel's own
+  hwmon documentation says that on various ASUS boards with the NCT6776F, the
+  `CPUTIN` pin is not really connected and reports unreasonable temperatures; the
+  canonical symptom is a near-constant ~115 °C at idle. The daemon classified that
+  channel as a **CPU** temperature, and the thermal ladder takes the *hottest* CPU
+  sensor — so one disconnected pin outranked every healthy sensor on the board,
+  tripped the 105 °C emergency, and never released, because release requires a
+  reading at or below 80 °C and a stuck 115 never gets there. Fans forced to 100%,
+  profile evaluation skipped, no way back short of a restart.
+
+  Nothing upstream could catch it. 115 °C is a *plausible* reading, so the range
+  check added in 2.23.1 accepts it and the read **succeeds** — and the DEC-193
+  quarantine only ever sees sensors that fail to read. The value was wrong, not
+  malformed.
+
+  That chip, on that vendor, with that label is now classified as a motherboard
+  temperature, so it never reaches the ladder at all. The rule is gated on all
+  three: the same chip on a non-ASUS board wires the pin normally and keeps its
+  CPU classification, because discarding a real CPU sensor is the worse fault of
+  the two. The GUI has flagged this exact combination as bogus in its sensor
+  detail view for a long time — it simply had no way to tell the daemon, which is
+  the part this fixes. (DEC-294)
+
+- **`nct6776`'s `PECI` and `TSI` channels were not recognised as CPU
+  temperatures.** The chip was missing from the Nuvoton family branch entirely, so
+  it fell through to a generic label fallback that matches `cpu`/`tctl`/`tccd` and
+  knows nothing about `peci` or `tsi` — meaning the two sources the kernel
+  documentation tells you to *prefer* on this chip were treated as motherboard
+  sensors and were unusable for CPU-driven fan curves. They now classify as CPU
+  temperatures, as they already did on every sibling chip. Without this, the fix
+  above would have demoted the bad sensor and left an affected board with no
+  usable CPU temperature at all. (DEC-294)
+
+- **A curve bound to the demoted sensor now holds instead of driving on a frozen
+  value.** CPU-kind sensors are exempt from the curve evaluator's staleness check;
+  a motherboard-kind one is not. So if you had a fan curve pointed at that
+  `CPUTIN` channel and its readings go stale, the control is now skipped and its
+  fans hold their last duty — where previously it kept driving on the frozen
+  number. Fans never go *down* as a result, and the control is listed in
+  `skipped_controls` so the GUI shows why. (DEC-294)
+
+### Notes
+- The reader's plausible-range check is unchanged, and deliberately so. It still
+  cannot separate a real 105-125 °C over-temperature from a stuck sensor reading
+  the same value — no reader-level bound can. This release removes the one
+  instance of that class which is kernel-documented and reachable; the general
+  case remains open and is tracked as `AUD-x`.
+
 ## [2.23.5] — 2026-08-28
 
 Five fixes from a cross-stack audit, **two of them on the thermal-safety path**.

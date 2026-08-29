@@ -105,9 +105,13 @@ impl TempClassification {
 /// Reuses the coarse [`classify_chip`](crate::hwmon::discovery::classify_chip)
 /// decision and only refines *within* it, so the result can never contradict
 /// the sensor's `kind`.
-pub fn classify_temp_sensor(chip_name: &str, label: &str) -> TempClassification {
+pub fn classify_temp_sensor(
+    chip_name: &str,
+    label: &str,
+    board_vendor: &str,
+) -> TempClassification {
     let l = label.to_lowercase();
-    match crate::hwmon::discovery::classify_chip(chip_name, label) {
+    match crate::hwmon::discovery::classify_chip(chip_name, label, board_vendor) {
         SensorKind::CpuTemp => refine_cpu(chip_name, &l),
         SensorKind::MbTemp => refine_mb(chip_name, &l),
         SensorKind::GpuTemp => TempClassification::new(
@@ -286,8 +290,10 @@ pub fn select_default_cpu<'a>(
 mod tests {
     use super::*;
 
+    /// Vendor-unknown, so the DEC-294 bogus-sensor rule never fires here — these
+    /// cases are about label/chip refinement, not the board quirk.
     fn cls(chip: &str, label: &str) -> TempClassification {
-        classify_temp_sensor(chip, label)
+        classify_temp_sensor(chip, label, "")
     }
 
     #[test]

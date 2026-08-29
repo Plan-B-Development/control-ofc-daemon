@@ -149,10 +149,13 @@ fn classify_cache_sensors(
     snap: &DaemonState,
     now: std::time::Instant,
 ) -> Vec<(SensorEntry, TempClassification)> {
+    // DEC-294: read DMI once per request, never per sensor. Classification is
+    // vendor-gated, so this view must agree with what discovery decided.
+    let board_vendor = crate::hwmon::chip_db::read_board_info().vendor;
     build_sensor_entries(snap, now)
         .into_iter()
         .map(|s| {
-            let c = classify_temp_sensor(&s.chip_name, &s.label);
+            let c = classify_temp_sensor(&s.chip_name, &s.label, &board_vendor);
             (s, c)
         })
         .collect()
@@ -749,7 +752,12 @@ mod tests {
     fn classified(pairs: &[(&str, &str, &str)]) -> Vec<(SensorEntry, TempClassification)> {
         pairs
             .iter()
-            .map(|(id, chip, label)| (sensor(id, chip, label), classify_temp_sensor(chip, label)))
+            .map(|(id, chip, label)| {
+                (
+                    sensor(id, chip, label),
+                    classify_temp_sensor(chip, label, ""),
+                )
+            })
             .collect()
     }
 

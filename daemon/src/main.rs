@@ -1638,6 +1638,9 @@ async fn async_main() {
             nouveau_gpus_for_poll,
             nvml_backend,
             hwmon_root,
+            // DEC-294: the real DMI root. The loop reads the board vendor from
+            // it once, to gate the bogus-sensor demotion.
+            std::path::Path::new("/sys/class/dmi/id"),
             hwmon_interval,
             sensor_rescan_for_poll,
             hwmon_shutdown,

@@ -19,11 +19,21 @@ const PLAUSIBLE_MIN_C: f64 = -50.0;
 /// (`tempN_crit`), this one bounds a live *reading*. They answer different
 /// questions and their values are independent.
 ///
-/// **This bound cannot catch every fault.** Garbage that lands inside
-/// [105, 250]°C — e.g. a saturated 8-bit thermistor reading 127°C — is
-/// indistinguishable from a real over-temperature here and still latches the
-/// emergency. Widening the check is not the answer: 105-125°C are legitimate
-/// readings. Tracked as `AUD-x` in `DECISIONS_OPEN_ITEMS.md`.
+/// **This bound cannot catch every fault, and still does not.** Garbage that
+/// lands inside [105, 250]°C — e.g. a saturated 8-bit thermistor reading 127°C —
+/// is indistinguishable from a real over-temperature *here* and would still
+/// latch the emergency. Widening the check is not the answer: 105-125°C are
+/// legitimate readings, so no reader-level bound can separate a real
+/// over-temperature from a stuck one.
+///
+/// DEC-294 removed the one instance of this that is kernel-documented and
+/// reachable — an ASUS NCT6776F `CPUTIN`, which is frequently unconnected and
+/// reports a plausible-looking constant — but it did so **at classification,
+/// not here**: that sensor is no longer a `CpuTemp`, so it never reaches the
+/// ladder. The general class is untouched and remains `AUD-x` in
+/// `DECISIONS_OPEN_ITEMS.md`; closing it needs a change to the ladder itself
+/// (bounding how long a latch may persist without a release-eligible reading),
+/// which was considered and deliberately deferred.
 const PLAUSIBLE_MAX_C: f64 = 250.0;
 
 /// Read a temperature value from a `temp*_input` sysfs file.

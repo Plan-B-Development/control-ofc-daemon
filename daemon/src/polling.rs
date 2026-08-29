@@ -136,6 +136,10 @@ pub async fn hwmon_poll_loop(
     nouveau_gpu_infos: Vec<NouveauGpuInfo>,
     nvml_backend: Arc<dyn NvmlBackend>,
     hwmon_root: &Path,
+    // DEC-294: injectable for the same reason `hwmon_root` is. The vendor gates
+    // the bogus-sensor demotion, so a test that read the host's own DMI would
+    // pass on this machine and fail on an ASUS one.
+    dmi_root: &Path,
     interval: Duration,
     sensor_rescan: Arc<std::sync::atomic::AtomicBool>,
     mut shutdown: watch::Receiver<bool>,
@@ -156,6 +160,13 @@ pub async fn hwmon_poll_loop(
     // self-correcting and puts it somewhere a test can reach.
     cache.set_hwmon_poll_interval_ms(interval.as_millis() as u64);
 
+    // DEC-294: read the board vendor ONCE here, not per discovery. It is a
+    // property of the physical board and cannot change while the process runs,
+    // and reading it in the loop (rather than at the `main.rs` call site) is
+    // what makes the wiring reachable from a test — the identical reasoning as
+    // `set_hwmon_poll_interval_ms` above, which was moved here after deleting
+    // its `main.rs` line left the whole suite green.
+    let board_vendor = crate::hwmon::chip_db::read_board_info_from(dmi_root).vendor;
     let hwmon_root = hwmon_root.to_path_buf();
     let headers = Arc::new(headers);
     let gpu_infos = Arc::new(gpu_infos);
@@ -267,6 +278,7 @@ pub async fn hwmon_poll_loop(
 
                 // Run blocking sysfs I/O on the blocking thread pool
                 let root = hwmon_root.clone();
+                let vendor = board_vendor.clone();
                 let hdrs = headers.clone();
                 let gpus = gpu_infos.clone();
                 let intel_gpus = intel_gpu_infos.clone();
@@ -298,14 +310,13 @@ pub async fn hwmon_poll_loop(
                     // The read returns successes *and* failures (DEC-193) — the loop owns
                     // logging/quarantine policy, so this blocking leg stays silent.
                     let sensors: SensorLegResult = if needs_discovery {
-                        crate::hwmon::discovery::discover_sensors_reporting_skips(&root).map(
-                            |found| {
+                        crate::hwmon::discovery::discover_sensors_reporting_skips(&root, &vendor)
+                            .map(|found| {
                                 let mut outcome =
                                     crate::hwmon::read_sensor_values(&found.descriptors);
                                 outcome.readings.extend(nvml_temps.iter().cloned());
                                 (Some((found.descriptors, found.unreadable_dirs)), outcome)
-                            },
-                        )
+                            })
                     } else {
                         let mut outcome = crate::hwmon::read_sensor_values(&descs);
                         outcome.readings.extend(nvml_temps.iter().cloned());
@@ -1147,8 +1158,33 @@ mod tests {
         spawn_poll_loop_with_nvml(root, Arc::new(crate::hwmon::nvml::DisabledNvml))
     }
 
+    /// DEC-294: a path that does not exist, so `read_board_info_from` yields an
+    /// empty vendor. Every pre-existing test wants exactly that — vendor-unknown
+    /// means the bogus-sensor demotion cannot fire and their behaviour is
+    /// unchanged. It is a fixture path, never the host's `/sys/class/dmi/id`.
+    fn no_dmi() -> std::path::PathBuf {
+        std::path::PathBuf::from("/nonexistent/dmi")
+    }
+
+    /// DEC-294: spawn with a fixture DMI directory, so the vendor the loop
+    /// actually passes into discovery is observable from a test.
+    fn spawn_poll_loop_with_dmi(
+        root: std::path::PathBuf,
+        dmi_root: std::path::PathBuf,
+    ) -> PollHarness {
+        spawn_poll_loop_full(root, dmi_root, Arc::new(crate::hwmon::nvml::DisabledNvml))
+    }
+
     fn spawn_poll_loop_with_nvml(
         root: std::path::PathBuf,
+        nvml: Arc<dyn crate::hwmon::nvml::NvmlBackend>,
+    ) -> PollHarness {
+        spawn_poll_loop_full(root, no_dmi(), nvml)
+    }
+
+    fn spawn_poll_loop_full(
+        root: std::path::PathBuf,
+        dmi_root: std::path::PathBuf,
         nvml: Arc<dyn crate::hwmon::nvml::NvmlBackend>,
     ) -> PollHarness {
         let cache = Arc::new(StateCache::new());
@@ -1166,6 +1202,7 @@ mod tests {
                 Vec::new(),
                 nvml,
                 &root,
+                &dmi_root,
                 Duration::from_secs(1),
                 rescan2,
                 shutdown_rx,
@@ -1468,6 +1505,7 @@ mod tests {
                 Vec::new(),
                 Arc::new(crate::hwmon::nvml::DisabledNvml),
                 &root,
+                &no_dmi(),
                 Duration::from_secs(4),
                 rescan,
                 shutdown_rx,
@@ -1998,6 +2036,55 @@ mod tests {
         assert!(
             sensor_by_label(&h.cache, "Tctl").is_some(),
             "missing-CpuTemp trigger must re-discover every tick"
+        );
+
+        stop(h).await;
+    }
+
+    /// DEC-294: pins the PRODUCTION wiring, not the rule.
+    ///
+    /// `classify_chip` and `discover_sensors_with_vendor` are unit-tested
+    /// elsewhere. Neither proves the poll loop actually *passes* a DMI-derived
+    /// vendor into discovery — and if it stopped doing so (a refactor passing
+    /// `""`, which `discover_sensors` still offers), the whole mitigation would
+    /// be off on every real machine with the suite fully green. That is the
+    /// "extracting a rule into a testable function does NOT test the call site"
+    /// failure recorded in `CLAUDE.md § Hard-won lessons`, which has recurred
+    /// five times; both reviewers raised it independently on this change.
+    ///
+    /// Asserts the PECI half too: demoting CPUTIN is only correct because the
+    /// board keeps a usable CPU sensor.
+    #[tokio::test]
+    async fn poll_loop_passes_the_dmi_vendor_into_classification() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hwmon0 = tmp.path().join("hwmon0");
+        fs::create_dir_all(&hwmon0).unwrap();
+        fs::write(hwmon0.join("name"), "nct6776\n").unwrap();
+        fs::write(hwmon0.join("temp1_input"), "115000\n").unwrap();
+        fs::write(hwmon0.join("temp1_label"), "CPUTIN\n").unwrap();
+        fs::write(hwmon0.join("temp2_input"), "45000\n").unwrap();
+        fs::write(hwmon0.join("temp2_label"), "PECI Agent 0\n").unwrap();
+
+        // A fixture DMI tree, never the host's — the rule is vendor-gated, so a
+        // test reading real DMI would behave differently on an ASUS machine.
+        let dmi = tempfile::tempdir().unwrap();
+        fs::write(dmi.path().join("board_vendor"), "ASUSTeK COMPUTER INC.\n").unwrap();
+
+        let h = spawn_poll_loop_with_dmi(tmp.path().to_path_buf(), dmi.path().to_path_buf());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let cputin = sensor_by_label(&h.cache, "CPUTIN").expect("CPUTIN must be discovered");
+        assert_eq!(
+            cputin.kind,
+            SensorKind::MbTemp,
+            "the loop did not pass the DMI vendor into discovery — the DEC-294 \
+             demotion is off on every real machine"
+        );
+        let peci = sensor_by_label(&h.cache, "PECI Agent 0").expect("PECI must be discovered");
+        assert_eq!(
+            peci.kind,
+            SensorKind::CpuTemp,
+            "demoting CPUTIN is only safe while the board keeps a usable CPU sensor"
         );
 
         stop(h).await;
