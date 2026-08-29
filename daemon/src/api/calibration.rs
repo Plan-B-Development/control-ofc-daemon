@@ -56,6 +56,14 @@ pub enum CalibrationError {
         temp_c: f64,
         limit_c: f64,
     },
+    /// The thermal ladder is forcing a duty, so calibration must not write
+    /// (DEC-295). Deliberately NOT `ThermalAbort`: that means "too hot to
+    /// calibrate", and this fires on a machine that may be perfectly cool —
+    /// the emergency latches at 105C and releases only at <=80C, and
+    /// `no_sensor_fallback` forces indefinitely on a machine with no CPU
+    /// sensor at all. Carries the state so the message can name it.
+    #[error("thermal safety is forcing fan output ({state}); calibration cannot run")]
+    ThermalForceActive { state: String },
     #[error("validation: {0}")]
     Validation(String),
     #[error("hardware: {0}")]
@@ -78,6 +86,28 @@ pub fn check_thermal_safety(cache: &StateCache) -> Result<(), CalibrationError> 
     Ok(())
 }
 
+/// The thermal ladder's forcing state, or `None` when it is not forcing
+/// (DEC-295).
+///
+/// Deliberately a SEPARATE predicate rather than a new arm inside
+/// [`check_thermal_safety`], even though every caller of that function wants
+/// this too: it is also the verify gate (`api/handlers/mod.rs`), and widening
+/// its meaning would change `/hwmon/{id}/verify` and `/gpu/{id}/fan/verify`
+/// behaviour from a change scoped to calibration. The verify path has the same
+/// exposure and it is recorded as its own register row, not fixed here.
+///
+/// All three non-normal states force a duty — `emergency` 100%, `recovery` 60%,
+/// `no_sensor_fallback` 40% — so any of them means the engine is writing a
+/// value this sweep must not fight. `None` is a cache that has never published
+/// a state, which is normal.
+pub fn thermal_force_state(cache: &StateCache) -> Option<String> {
+    match cache.snapshot().thermal_override_state {
+        None => None,
+        Some(s) if s == "normal" => None,
+        Some(s) => Some(s),
+    }
+}
+
 /// Run an OpenFan calibration sweep on a single channel.
 ///
 /// The single sweep implementation — the `/fans/openfan/{ch}/calibrate`
@@ -86,9 +116,11 @@ pub fn check_thermal_safety(cache: &StateCache) -> Result<(), CalibrationError> 
 /// 1. Reads the current PWM (for restore)
 /// 2. Sweeps from 0% to 100% in `steps` increments
 /// 3. Holds each step for `hold_seconds`, then reads RPM from cache
-/// 4. Restores the pre-calibration PWM on EVERY exit path — success,
-///    thermal abort, or a failed PWM write mid-sweep (DEC-134; previously
-///    an early `?` could park the fan at a sweep step)
+/// 4. Restores the pre-calibration PWM on every exit path — success, thermal
+///    abort, or a failed PWM write mid-sweep (DEC-134; previously an early `?`
+///    could park the fan at a sweep step) — **except while thermal safety is
+///    forcing a duty**, where the channel is deliberately left at the forced
+///    value rather than lowered back under it (DEC-295)
 /// 5. Derives start_pwm (lowest PWM with RPM > 0) and stop_pwm
 ///
 /// # Safety
@@ -137,6 +169,17 @@ pub async fn calibrate_openfan_channel(
             // Thermal check before each step
             check_thermal_safety(&cache)?;
 
+            // DEC-295: the check above is a pure temperature test at
+            // CALIBRATION_MAX_TEMP_C (85C), but the thermal emergency LATCHES at
+            // 105C and releases only at <=80C. The band 80 < T <= 85 therefore
+            // passes it while the engine is still forcing 100% every tick — and
+            // this sweep starts at 0%, so without this guard it would fight the
+            // emergency at 1 Hz for the whole sweep. Abort rather than skip: a
+            // sweep with holes in it produces a wrong curve, not a partial one.
+            if let Some(state) = thermal_force_state(&cache) {
+                return Err(CalibrationError::ThermalForceActive { state });
+            }
+
             // Set PWM
             write_fn(channel, pwm)?;
 
@@ -157,8 +200,32 @@ pub async fn calibrate_openfan_channel(
     let sweep_result = sweep.await;
 
     // Restore pre-calibration PWM — best-effort, on every exit path.
+    //
+    // DEC-295: unless thermal safety is forcing. The restore is an
+    // unconditional write of a value read BEFORE the sweep (e.g. 30%), and the
+    // engine may since have latched an emergency and forced 100%; writing the
+    // old value through the same controller would lower the channel below the
+    // forced duty. It self-heals on the next 1 Hz tick — the values differ, so
+    // write-coalescing does not suppress the re-force — but a second at 30%
+    // during a 105C event is not a second to give away. Skipping leaves the
+    // channel at the FORCED duty, which is correct but looks like a stuck fan
+    // to anyone reading RPM, so say so.
     if let Some(restore) = pre_cal_pwm {
-        if let Err(e) = write_fn(channel, restore) {
+        if let Some(state) = thermal_force_state(&cache) {
+            // NOTE the residual, and it is not small: nothing retries this. The
+            // engine keeps writing the forced duty while the state holds, so the
+            // channel ends at that duty — but once the ladder releases, an
+            // idle daemon (no active profile) commands nothing, so the channel
+            // stays there rather than returning to {restore}%. That is the
+            // accepted trade against writing UNDER an active force; a re-check
+            // loop would mean holding a request open for the length of an
+            // emergency. Recorded as its own register row.
+            log::warn!(
+                "ch{channel} left at the thermal-safety forced duty instead of restoring \
+                 {restore}% — thermal safety is active ({state}) and outranks calibration. \
+                 It will not be restored automatically once the force clears."
+            );
+        } else if let Err(e) = write_fn(channel, restore) {
             log::warn!("failed to restore pre-calibration PWM on ch{channel}: {e}");
         }
     }
@@ -326,6 +393,129 @@ mod tests {
             w.as_slice(),
             &[(0u8, 50u8)],
             "abort must restore (and nothing else was written)"
+        );
+    }
+
+    /// DEC-295: while thermal safety is forcing a duty, calibration must not
+    /// write at all — not its sweep steps, and not its restore.
+    ///
+    /// `check_thermal_safety` alone does NOT cover this. It is a pure
+    /// temperature test at 85C, while the emergency latches at 105C and releases
+    /// only at <=80C — so the whole band 80 < T <= 85 passes it with the engine
+    /// still forcing 100% every tick. This fixture sits at 50C precisely to
+    /// prove the new guard fires on the FORCED STATE and not on temperature;
+    /// if it keyed on temperature this test could not fail.
+    #[tokio::test(start_paused = true)]
+    async fn calibration_refuses_to_run_while_thermal_safety_is_forcing() {
+        let cache = make_cache(50.0, 0, 800); // comfortably under the 85C limit
+        cache.record_engine_tick("emergency");
+        let (write_fn, writes) = recording_write_fn(None);
+
+        let result = calibrate_openfan_channel(cache, 0, 3, 0, write_fn).await;
+
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                CalibrationError::ThermalForceActive { ref state } if state == "emergency"
+            ),
+            "a forced thermal state must abort the sweep, naming the state"
+        );
+        let w = writes.lock().unwrap();
+        assert!(
+            w.is_empty(),
+            "no write may reach the channel while thermal safety is forcing — \
+             not a sweep step, and not the restore; got {w:?}"
+        );
+    }
+
+    /// DEC-295, finding 1 of the review: pins that the step guard is INSIDE the
+    /// sweep loop, which is the whole point of it.
+    ///
+    /// The two tests either side of this one both stay green if the guard is
+    /// hoisted out of the loop — one sets the state before the call, the other
+    /// after the last step. Neither exercises the case the in-loop placement
+    /// exists for: an emergency latching PART WAY through a sweep, which is the
+    /// realistic one, since a sweep runs for steps x hold_seconds (up to 300 s).
+    #[tokio::test(start_paused = true)]
+    async fn calibration_aborts_mid_sweep_when_thermal_safety_latches() {
+        let cache = make_cache(50.0, 0, 800);
+        let log: WriteLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (log2, cache2) = (log.clone(), cache.clone());
+        // 3 steps -> 0, 33, 67, 100. Latch on the 33% write.
+        let write_fn = move |ch: u8, pwm: u8| -> Result<(), CalibrationError> {
+            log2.lock().unwrap().push((ch, pwm));
+            if pwm == 33 {
+                cache2.record_engine_tick("emergency");
+            }
+            Ok(())
+        };
+
+        let result = calibrate_openfan_channel(cache, 0, 3, 0, write_fn).await;
+
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                CalibrationError::ThermalForceActive { .. }
+            ),
+            "a mid-sweep latch must abort the remaining steps"
+        );
+        let w = log.lock().unwrap();
+        assert_eq!(
+            w.as_slice(),
+            &[(0u8, 0u8), (0u8, 33u8)],
+            "no step beyond the latch may be written, and no restore; got {w:?}"
+        );
+    }
+
+    /// DEC-295: the restore guard in isolation.
+    ///
+    /// The test above aborts at the first step, so it never reaches the restore.
+    /// Here the sweep runs to completion and the emergency latches during the
+    /// final step — the real sequence, since the engine ticks concurrently — so
+    /// the restore is the only guarded site left. Asserts the PRESENCE first:
+    /// the identical sweep with no forced state DOES restore, so the absence
+    /// below is a real one (`CLAUDE.md § Hard-won lessons`).
+    #[tokio::test(start_paused = true)]
+    async fn calibration_leaves_the_channel_forced_rather_than_restoring_under_it() {
+        // Presence: no forced state -> the restore happens.
+        let cache = make_cache(50.0, 0, 800);
+        let (write_fn, writes) = recording_write_fn(None);
+        calibrate_openfan_channel(cache, 0, 3, 0, write_fn)
+            .await
+            .unwrap();
+        assert_eq!(
+            writes.lock().unwrap().last(),
+            Some(&(0u8, 50u8)),
+            "control case: an unforced sweep must end by restoring 50%"
+        );
+
+        // Absence: the emergency latches during the last step write.
+        let cache = make_cache(50.0, 0, 800);
+        let log: WriteLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (log2, cache2) = (log.clone(), cache.clone());
+        let write_fn = move |ch: u8, pwm: u8| -> Result<(), CalibrationError> {
+            log2.lock().unwrap().push((ch, pwm));
+            if pwm == 100 {
+                cache2.record_engine_tick("emergency");
+            }
+            Ok(())
+        };
+
+        calibrate_openfan_channel(cache, 0, 3, 0, write_fn)
+            .await
+            .unwrap();
+
+        let w = log.lock().unwrap();
+        assert_eq!(
+            w.last(),
+            Some(&(0u8, 100u8)),
+            "the sweep must complete; the last write is its final step, not a restore"
+        );
+        assert!(
+            !w.iter()
+                .skip_while(|(_, p)| *p != 100)
+                .any(|(_, p)| *p == 50),
+            "the pre-cal 50% must NOT be written back under an active force; got {w:?}"
         );
     }
 

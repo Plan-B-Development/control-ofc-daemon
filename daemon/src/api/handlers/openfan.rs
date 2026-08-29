@@ -173,6 +173,24 @@ pub async fn calibrate_openfan_handler(
                 },
             },
         ),
+        // DEC-295: 409 + `validation_error`, matching the DEC-191 single-flight
+        // refusal two functions up rather than inventing a shape. `retryable`
+        // is TRUE like the rescan cooldown's 409 and unlike the sibling
+        // single-flight ones: the condition clears by itself when the ladder
+        // releases. A 400 would have told the client its REQUEST was malformed
+        // and not to retry, which is wrong on both counts.
+        Err(e @ CalibrationError::ThermalForceActive { .. }) => error_response(
+            StatusCode::CONFLICT,
+            &ErrorEnvelope {
+                error: ErrorBody {
+                    code: "validation_error".into(),
+                    message: e.to_string(),
+                    retryable: true,
+                    source: "validation".into(),
+                    details: None,
+                },
+            },
+        ),
         Err(CalibrationError::Validation(msg)) => {
             error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(msg))
         }

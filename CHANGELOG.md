@@ -45,6 +45,51 @@
   number. Fans never go *down* as a result, and the control is listed in
   `skipped_controls` so the GUI shows why. (DEC-294)
 
+- **A thermal emergency no longer floods the journal with failures it was never
+  going to avoid.** During a 105 °C hold the emergency writes every hwmon header
+  it can find — including ones discovered read-only, which can only ever fail
+  with a permission error. The ordinary control path has skipped those for a long
+  time; the emergency path did not, and unlike the ordinary path its failures are
+  logged immediately rather than through a throttle. One read-only header
+  therefore produced one `THERMAL SAFETY … FAILED` line every second for the
+  entire 105 → 80 °C hold, burying any genuine write failure at exactly the moment
+  it mattered. Read-only headers are now skipped, as they already were elsewhere.
+  This does not change what the emergency can actually drive, with one honest
+  exception: `is_writable` is decided by a probe at startup and defaults to
+  "no" if that probe errors, and the header set is not rebuilt afterwards. A
+  header whose probe failed at boot is now permanently outside the emergency,
+  where before it was attempted every second. Such a header was already
+  excluded from *all* normal fan control for the same reason, so the two paths
+  now agree — but the exclusion is real and is recorded rather than glossed.
+  (DEC-295)
+
+- **An OpenFan calibration can no longer fight thermal safety for the fan.**
+  Calibration refused to run above 85 °C, but the thermal emergency triggers at
+  105 °C and does not release until 80 °C — so in the whole band between 80 and
+  85 °C the temperature check passed while the daemon was still forcing every fan
+  to 100 %. A sweep starting there would drive the channel through its steps
+  beginning at 0 %, with the emergency re-forcing 100 % a second later, for the
+  length of the sweep. Separately, the sweep's final act is to restore the duty it
+  recorded before starting, which could put a channel back to (say) 30 % under an
+  active emergency.
+
+  Calibration now refuses to start or continue while thermal safety is forcing a
+  duty, and skips the restore in that case, leaving the fan at the forced duty and
+  logging why — otherwise it reads as a stuck fan. Aborting above 85 °C is
+  unchanged, and a normal abort still restores as before.
+
+  The refusal is a `409` telling the client it may retry, not a `400` — the
+  condition is a transient state of the daemon, not a bad request, and it clears
+  on its own. **Two consequences worth knowing.** On a machine with no CPU
+  temperature sensor at all the daemon holds a permanent 40 % fallback, so
+  calibration is refused indefinitely there; the message names the state so it
+  does not read as an unexplained failure on a cool machine. And a skipped
+  restore is not retried later: while the force holds, the engine keeps writing
+  the forced duty, but once it releases an idle daemon with no active profile
+  commands nothing, so the channel stays at that duty instead of returning to
+  its pre-calibration value. Re-running calibration, or activating a profile,
+  restores normal control. (DEC-295)
+
 ### Notes
 - The reader's plausible-range check is unchanged, and deliberately so. It still
   cannot separate a real 105-125 °C over-temperature from a stuck sensor reading

@@ -923,7 +923,23 @@ impl SafetyWriteBackend for HwmonBackend {
         let join = self.writes.run(WRITE_JOIN_BUDGET, move || {
             let (hdr_ids, mut lease_id) = {
                 let mut guard = ctrl.lock();
-                let hdr_ids: Vec<String> = guard.headers().iter().map(|h| h.id.clone()).collect();
+                // DEC-295: skip headers discovered read-only, exactly as `apply`
+                // does via the DEC-102 backstop a few hundred lines up. Without
+                // it every read-only header attempted a write that could only
+                // EACCES, and this path logs INLINE and unthrottled (see the
+                // `Vec::new()` at the end of this closure) rather than through
+                // `note_outcomes`' per-member streak throttle — so a single
+                // read-only header emitted one THERMAL SAFETY ... FAILED line
+                // per second for the whole 105->80C hold, burying real failures
+                // at the moment they matter most. Not a loss of reach: the rule
+                // is scoped to writable headers (`safety.rs`), so a read-only
+                // one was never going to be driven.
+                let hdr_ids: Vec<String> = guard
+                    .headers()
+                    .iter()
+                    .filter(|h| h.is_writable)
+                    .map(|h| h.id.clone())
+                    .collect();
                 let lease_id = guard
                     .lease_manager_mut()
                     .force_take_lease(HwmonWriter::ThermalSafety)
@@ -1823,6 +1839,46 @@ mod tests {
         h.pwm_path = format!("/sys/class/hwmon/hwmon0/pwm{i}");
         h.enable_path = Some(format!("/sys/class/hwmon/hwmon0/pwm{i}_enable"));
         h
+    }
+
+    /// DEC-295: the `force_all` twin of `hwmon_apply_skips_read_only_header`.
+    ///
+    /// `apply` has had the DEC-102 read-only backstop for a long time;
+    /// `force_all` did not, so during a 105C hold every read-only header
+    /// attempted a write that could only EACCES — and this path logs INLINE,
+    /// bypassing `note_outcomes`' streak throttle, so it emitted one
+    /// `THERMAL SAFETY ... FAILED` line per second for the whole 105->80C hold.
+    ///
+    /// The writable-sibling half is the load-bearing one. This is the thermal
+    /// path, and a filter that over-filtered would remove the emergency's REACH
+    /// — the v2.38.0 P1 failure mode, which took OpenFan fans out of `force_all`
+    /// and was caught only by a review pass that no longer runs unconditionally.
+    #[tokio::test]
+    async fn hwmon_force_all_skips_read_only_headers_but_still_forces_writable_ones() {
+        let mut ro = header_with_paths(1);
+        ro.is_writable = false;
+        let rw = header_with_paths(2);
+        let (mut be, writes) = hwmon_backend(vec![ro, rw]);
+
+        be.force_all(100).await;
+
+        let w = writes.lock();
+        assert!(
+            !w.iter().any(|(p, _)| *p == "/sys/class/hwmon/hwmon0/pwm1"),
+            "read-only header must not be written during a thermal force; got {w:?}"
+        );
+        // REACH: the writable sibling must still be driven, and to the forced
+        // VALUE — a filter that dropped everything would pass a presence-only
+        // assertion.
+        let vals: Vec<_> = w
+            .iter()
+            .filter(|(p, _)| *p == "/sys/class/hwmon/hwmon0/pwm2")
+            .map(|(_, v)| v.trim())
+            .collect();
+        assert!(
+            vals.contains(&"255"),
+            "writable header must still be forced to 100% (raw 255); got {vals:?}"
+        );
     }
 
     #[tokio::test]
