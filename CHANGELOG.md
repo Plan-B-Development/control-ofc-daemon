@@ -163,6 +163,27 @@
   stuck write froze the engine and the forced write never went out at all.
   (DEC-298)
 
+- **A wedged GPU fan write could still freeze fan control entirely — the last of
+  the three write paths to be fixed.** 2.23.2 bounded the motherboard and OpenFan
+  write paths so a device that stops responding cannot stall the daemon's control
+  loop; the GPU path was left, and said so. It is now bounded too. Until this, a
+  GPU write stuck in the driver meant the loop never completed another pass: the
+  105 °C emergency never ran again, and because the task was still *alive* the
+  daemon's own death-detection never fired either.
+
+  Two things blocked it, and the second was not in the original report. The
+  obvious one is the write itself. The other is that the loop waited
+  **indefinitely for the GPU write lock**, which a GPU fan verify holds for its
+  whole multi-second window — so a verify starting at the wrong moment froze the
+  loop with no stuck device involved at all, and 2.23.5's cancel-safety work made
+  that window more reachable. The loop now waits a bounded time for that lock and
+  skips the GPU for that tick if it cannot have it, which is also what keeps the
+  bound honest: a stuck write keeps the lock, so the next tick cannot start a
+  second one.
+
+  A stalled GPU write is now reported like the other two, so `/status` says so
+  instead of showing a healthy daemon while fans hold their last duty. (DEC-299)
+
 ### Notes
 - The reader's plausible-range check is unchanged, and deliberately so. It still
   cannot separate a real 105-125 °C over-temperature from a stuck sensor reading

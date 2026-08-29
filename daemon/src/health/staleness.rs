@@ -158,11 +158,17 @@ fn engine_health(
         let age = age_ms(completed.or(started), now);
         // Both strings are deliberately narrow about what they assert.
         //
-        // "the engine is ticking" was removed from the Crit text: this branch
-        // returns BEFORE the liveness ladder, and the GPU join is still unbounded
-        // (AUD-a2), so a loop frozen in the GPU leg leaves a stale stall stamp
-        // that still satisfies this branch — the text would then claim liveness
-        // for a frozen engine.
+        // "the engine is ticking" was removed from the Crit text because this
+        // branch returns BEFORE the liveness ladder, so a stale stall stamp
+        // satisfies it whether or not the loop is alive — the text would then
+        // claim liveness this branch has not established.
+        //
+        // DEC-299 note: the concrete example this comment used to give — "the
+        // GPU join is still unbounded (AUD-a2), so a loop frozen in the GPU leg"
+        // — is discharged; all three backend joins are bounded now. The narrow
+        // wording stays regardless, because the structural reason above is
+        // independent of any one freeze path. Restoring the liveness claim would
+        // be a separate decision needing its own evidence.
         //
         // "fans are holding their last duty" was removed from the Warn text: the
         // 30x threshold above is derived (DEC-259) from a *legitimate* thermal

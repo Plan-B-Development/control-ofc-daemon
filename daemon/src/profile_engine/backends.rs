@@ -113,6 +113,20 @@ impl<T: Send + 'static> BoundedWrite<T> {
         self.outstanding() && !self.completed_last_run
     }
 
+    /// Record that a tick made no write progress (DEC-299).
+    ///
+    /// For a caller that returns WITHOUT reaching [`Self::run`] while a write is
+    /// still outstanding — `GpuBackend` does exactly that when the write lock is
+    /// unavailable, which is precisely when a wedged write is holding it.
+    /// Without this, `completed_last_run` keeps whatever the last `run` left, so
+    /// a permanently wedged GPU write reports `stalled() == false` forever —
+    /// which *clears* `engine_writes_stalled_since` and shows a healthy engine
+    /// while the fan holds its last duty. It cannot reintroduce DEC-298's false
+    /// crit: the caller invokes it only when something is genuinely outstanding.
+    pub(crate) fn note_no_progress(&mut self) {
+        self.completed_last_run = false;
+    }
+
     /// Await any outstanding write, bounded by `deadline`, at shutdown.
     ///
     /// Load-bearing for hardware restore, not tidiness. `main.rs`'s shutdown
@@ -681,6 +695,32 @@ fn gpu_blocking_write(
     )
 }
 
+/// Budget for one GPU write batch (DEC-299).
+///
+/// Separate from `WRITE_JOIN_BUDGET` because the units differ: a PMFW curve
+/// write is N point writes plus a commit, per fan, and the batch may cover more
+/// than one card. Kept at the same 1 s as the others for now — the value is not
+/// the point, the bound is.
+const GPU_WRITE_JOIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// One GPU fan's outcome: which fan, the duty ATTEMPTED, and what happened —
+/// `None` when the in-task re-check skipped it (DEC-299).
+///
+/// The pct travels WITH the outcome rather than being looked up per tick,
+/// because a harvested result belongs to an earlier tick's batch.
+type GpuWriteOutcome = (String, u8, Option<Result<(), ()>>);
+
+/// One fan's pending GPU write, resolved on the async side so the blocking
+/// closure owns everything it needs (DEC-299).
+#[derive(Clone)]
+struct GpuFanWrite {
+    fan_id: String,
+    path: std::path::PathBuf,
+    zero_rpm: Option<std::path::PathBuf>,
+    pct: u8,
+    preserve_zero_rpm: bool,
+}
+
 /// Deliberately NOT a [`SafetyWriteBackend`] (DEC-130) — see the module
 /// docs. GPU thermal protection is the firmware's job.
 pub(crate) struct GpuBackend {
@@ -695,6 +735,30 @@ pub(crate) struct GpuBackend {
     /// fake time, mirroring `OverrideTable`/`LeaseManager`; production uses
     /// [`crate::clock::SystemClock`].
     clock: Arc<dyn Clock>,
+    /// Bounded join for this backend's blocking writes (DEC-299), the third and
+    /// last backend to get one. DEC-289 bounded hwmon and OpenFan and left this
+    /// path alone for a structural reason: the GPU task is handed an **owned**
+    /// `lock_gpu_writes` guard (DEC-255), so holding a handle across ticks would
+    /// hold the GPU write lock across ticks and the next tick would block
+    /// acquiring it — moving the freeze rather than removing it. Taking the lock
+    /// with a bounded wait and skipping the tick when it is unavailable is what
+    /// makes the bound work here.
+    writes: BoundedWrite<Vec<GpuWriteOutcome>>,
+    /// Edge-trigger for the "write still in flight" log, as on the other two.
+    stall_logged: bool,
+    /// Edge-trigger for LOCK CONTENTION, kept separate from `stall_logged`
+    /// (DEC-299): a verify holding the lock and a wedged write are different
+    /// conditions, and one flag for both made the recovery line report a
+    /// stall that had never happened.
+    lock_wait_logged: bool,
+    /// The batch currently in flight, for the panic path only (DEC-299).
+    ///
+    /// A `JoinError` says the whole task died without saying which fans it was
+    /// carrying, and a harvested panic belongs to an EARLIER tick's batch — so
+    /// attributing it to the current tick's commands caches failures against the
+    /// wrong fans at the wrong duty. Ordinary outcomes carry their own pct in the
+    /// tuple; this covers only the case where no outcome comes back at all.
+    outstanding_batch: Vec<(String, u8)>,
 }
 
 impl GpuBackend {
@@ -717,12 +781,82 @@ impl GpuBackend {
             gpu_infos,
             fail_cache: HashMap::new(),
             clock,
+            writes: BoundedWrite::default(),
+            stall_logged: false,
+            lock_wait_logged: false,
+            outstanding_batch: Vec::new(),
         }
     }
 
     #[cfg(test)]
     fn fail_cache_len(&self) -> usize {
         self.fail_cache.len()
+    }
+}
+
+impl GpuBackend {
+    /// True while a GPU write is not getting through (DEC-298 semantics: nothing
+    /// completed, not merely something in flight).
+    pub(crate) fn writes_stalled(&self) -> bool {
+        self.writes.stalled()
+    }
+
+    /// Await any in-flight GPU write at shutdown (DEC-289/299).
+    pub(crate) async fn drain_writes(&mut self, deadline: std::time::Duration) {
+        self.writes.drain(deadline).await;
+    }
+
+    /// Route the batch outcomes into the fail-cache (DEC-299).
+    ///
+    /// `&mut self` cannot cross into the `'static` closure, so this runs on the
+    /// returned outcomes — the same shape as `HwmonBackend::note_outcomes`.
+    fn note_gpu_outcomes(&mut self, progress: WriteProgress<Vec<GpuWriteOutcome>>) {
+        for joined in progress.completed() {
+            match joined {
+                Ok(outcomes) => {
+                    for (fan_id, pct, outcome) in outcomes {
+                        match outcome {
+                            Some(Ok(())) => {
+                                self.fail_cache.remove(&fan_id);
+                            }
+                            // CONC-1: a verify or a reset claimed the path between
+                            // the per-fan check and the blocking task running — the
+                            // write was SKIPPED, which is no outcome at all: not a
+                            // success, and not a failure to cache.
+                            None => {}
+                            // DEC-299: the pct comes from the outcome itself, not
+                            // from a per-tick map. A harvested result belongs to an
+                            // EARLIER tick's batch, so looking the duty up against
+                            // the current tick cached a failure for the wrong value
+                            // — fabricating 0% when that fan was not commanded this
+                            // tick, which then suppressed a genuine 0% command for a
+                            // whole `GPU_FAIL_COOLDOWN` while the value that really
+                            // failed was retried at 1 Hz.
+                            Some(Err(())) => {
+                                self.fail_cache.insert(fan_id, (pct, self.clock.now()));
+                            }
+                        }
+                    }
+                }
+                // DEC-265: a panicking write task used to land silently. Report it
+                // as the bug it is, and cache the failure for every fan the batch
+                // was carrying — the batch died, so none of them was written.
+                //
+                // DEC-299: attributed to the batch that was actually OUTSTANDING,
+                // not to whatever this tick happens to be commanding. A harvested
+                // panic belongs to an earlier tick.
+                Err(e) => {
+                    log::error!(
+                        "GPU fan write task panicked: {e} — the writes did not happen; \
+                         caching the failures and continuing"
+                    );
+                    let now = self.clock.now();
+                    for (fan_id, pct) in std::mem::take(&mut self.outstanding_batch) {
+                        self.fail_cache.insert(fan_id, (pct, now));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -737,6 +871,7 @@ impl WriteBackend for GpuBackend {
         // correctness-critical (a torn read vs. the API path is harmless:
         // the next tick re-evaluates).
         let gpu_fans = self.cache.gpu_fans_snapshot();
+        let mut pending_writes: Vec<GpuFanWrite> = Vec::new();
 
         for cmd in commands.iter().filter(|c| c.source == "amd_gpu") {
             // P2-1: re-check the engine write-pause per fan. A GPU fan verify
@@ -785,62 +920,122 @@ impl WriteBackend for GpuBackend {
                 continue;
             };
 
-            let path = curve_path.clone();
-            let zero_rpm = gpu.fan_zero_rpm_path.clone();
-            let pct = cmd.pwm_percent;
-            let preserve_zero_rpm = cmd.gpu_fan_zero_rpm;
-            let cache_ref = self.cache.clone();
-            let fan_id = cmd.member_id.clone();
-            let fan_id_inner = fan_id.clone();
-            // DEC-255: exclude `POST /gpu/{id}/fan/reset` for the duration of
-            // this write. A PMFW curve write is N point writes plus a `"c"`
-            // commit and a reset is `"r"`+`"c"`; interleaving them can commit a
-            // curve that is neither the profile's nor firmware-auto, which no
-            // later tick reconciles because the reset relinquishes the fan and
-            // this loop then skips it. The in-task relinquish re-check below
-            // narrows that race; this removes it.
-            let write_guard = self.cache.lock_gpu_writes().await;
-            let result = tokio::task::spawn_blocking(move || {
+            pending_writes.push(GpuFanWrite {
+                fan_id: cmd.member_id.clone(),
+                path: curve_path.clone(),
+                zero_rpm: gpu.fan_zero_rpm_path.clone(),
+                pct: cmd.pwm_percent,
+                preserve_zero_rpm: cmd.gpu_fan_zero_rpm,
+            });
+        }
+
+        // DEC-299: nothing to command, but an earlier write may still be
+        // outstanding and must be harvested — the same shape as `HwmonBackend`.
+        if pending_writes.is_empty() {
+            if self.writes.outstanding() {
+                let progress = self.writes.harvest_only(GPU_WRITE_JOIN_BUDGET).await;
+                self.note_gpu_outcomes(progress);
+            }
+            return;
+        }
+
+        // DEC-299, blocking window TWO — the one the register row did not name.
+        // `lock_gpu_writes()` is itself an unbounded `.await` on the mutex, and a
+        // GPU verify holds that lock for its whole multi-second window (more so
+        // since DEC-297 moved the verify into an uncancellable `spawn_blocking`).
+        // The per-fan `verify_active()` check is read BEFORE the lock, so a
+        // verify starting in that gap froze the engine loop on the mutex with no
+        // wedged device at all. Bounded wait + skip the GPU leg for this tick.
+        //
+        // Skipping is safe and is what makes the join bound work: a detached
+        // wedged write keeps the lock, so the next tick cannot take it and
+        // therefore cannot spawn a second blocking task. That self-limits to one
+        // outstanding task without holding a handle across ticks — the exact
+        // reason DEC-289 could not bound this path.
+        let Some(write_guard) = self
+            .cache
+            .lock_gpu_writes_soon(constants::GPU_RESET_LOCK_WAIT)
+            .await
+        else {
+            // DEC-299 (F1): this path returns without reaching `run`, so nothing
+            // would otherwise refresh the progress flag — and it is reached
+            // precisely when a wedged write is holding the lock. Say "no
+            // progress" explicitly or a permanent wedge reports healthy forever.
+            if self.writes.outstanding() {
+                self.writes.note_no_progress();
+            }
+            // A SEPARATE edge-trigger from the write stall (F6): lock contention
+            // and a wedged write are different conditions, and sharing one flag
+            // made the recovery line narrate an event that never happened.
+            if !self.lock_wait_logged {
+                self.lock_wait_logged = true;
+                log::warn!(
+                    "GPU fan writes skipped this tick — the GPU write lock is held \
+                     (a verify, a reset, or an earlier write that has not returned)"
+                );
+            }
+            return;
+        };
+        if self.lock_wait_logged {
+            self.lock_wait_logged = false;
+            log::info!("GPU write lock is available again");
+        }
+
+        // DEC-255: exclude `POST /gpu/{id}/fan/reset` for the duration of these
+        // writes. A PMFW curve write is N point writes plus a `"c"` commit and a
+        // reset is `"r"`+`"c"`; interleaving them can commit a curve that is
+        // neither the profile's nor firmware-auto, which no later tick reconciles
+        // because the reset relinquishes the fan and this loop then skips it. The
+        // in-task relinquish re-check inside `gpu_blocking_write` narrows that
+        // race; this removes it.
+        //
+        // DEC-299 note: the guard now spans the whole batch rather than one fan.
+        // Coarser than before, and deliberately — one bounded task per tick is
+        // what the join bound needs. In practice the batch is one or two GPUs of
+        // sub-millisecond writes; `fan/reset` waits on the same bounded
+        // `lock_gpu_writes_soon` and reports its documented 409 rather than
+        // hanging.
+        let cache_ref = self.cache.clone();
+        self.outstanding_batch = pending_writes
+            .iter()
+            .map(|w| (w.fan_id.clone(), w.pct))
+            .collect();
+        let batch = pending_writes.clone();
+        let progress = self
+            .writes
+            .run(GPU_WRITE_JOIN_BUDGET, move || {
                 let _write_guard = write_guard;
-                gpu_blocking_write(
-                    &cache_ref,
-                    &path,
-                    zero_rpm.as_deref(),
-                    pct,
-                    preserve_zero_rpm,
-                    &fan_id_inner,
-                )
+                batch
+                    .into_iter()
+                    .map(|w| {
+                        let outcome = gpu_blocking_write(
+                            &cache_ref,
+                            &w.path,
+                            w.zero_rpm.as_deref(),
+                            w.pct,
+                            w.preserve_zero_rpm,
+                            &w.fan_id,
+                        );
+                        (w.fan_id, w.pct, outcome)
+                    })
+                    .collect::<Vec<_>>()
             })
             .await;
 
-            match result {
-                Ok(Some(Ok(()))) => {
-                    self.fail_cache.remove(&fan_id);
-                }
-                // CONC-1: a verify claimed the pause between the per-fan check
-                // above and the blocking task running — the write was skipped,
-                // which is no outcome at all (mirrors the OpenFan in-closure
-                // skip, DEC-191): not a success, and *not* a failure to cache.
-                Ok(None) => {}
-                // DEC-265: a panicking write task used to land here silently —
-                // `_ =>` cached the failure and said nothing, so the one event
-                // that indicates a *bug* (rather than uncooperative hardware)
-                // was indistinguishable in the log from a fan that simply would
-                // not take a write. Split so a panic is reported as one.
-                Err(e) => {
-                    log::error!(
-                        "GPU fan write task panicked for {fan_id}: {e} — the write did \
-                         not happen; caching the failure and continuing"
-                    );
-                    self.fail_cache
-                        .insert(fan_id, (cmd.pwm_percent, self.clock.now()));
-                }
-                Ok(Some(Err(_))) => {
-                    self.fail_cache
-                        .insert(fan_id, (cmd.pwm_percent, self.clock.now()));
-                }
+        if progress.in_flight && progress.issued.is_none() {
+            if !self.stall_logged {
+                self.stall_logged = true;
+                log::warn!(
+                    "a GPU fan write has not returned within {}s — the fan is holding \
+                     its last duty",
+                    GPU_WRITE_JOIN_BUDGET.as_secs()
+                );
             }
+        } else if self.stall_logged {
+            self.stall_logged = false;
+            log::warn!("GPU fan writes are landing again");
         }
+        self.note_gpu_outcomes(progress);
     }
 }
 
@@ -1573,6 +1768,208 @@ mod tests {
             overdrive_enabled: true,
         };
         (gpu, curve_path)
+    }
+
+    /// DEC-299 (AUD-a2): the last unbounded write join.
+    ///
+    /// `GpuBackend::apply` used to `spawn_blocking(...).await` per fan with no
+    /// bound. A PMFW write wedged in the driver therefore meant `apply` never
+    /// returned, the engine loop never reached `tick.tick()`, and the 105 °C
+    /// `force_all` never ran again — while the task stayed ALIVE, so DEC-266's
+    /// death supervision never fired either.
+    ///
+    /// The wedge is a FIFO `fan_curve` with no reader: `set_static_speed` opens
+    /// it for writing and blocks in `open(2)`. A `thread::sleep` would not fail
+    /// the same way, which is the DEC-278 lesson.
+    ///
+    /// Asserts the caller is RELEASED, not that the write succeeded — the write
+    /// is still stuck, and that is the point: the loop gets its thread back.
+    #[tokio::test]
+    async fn a_wedged_gpu_write_releases_the_caller_instead_of_freezing_it() {
+        let fifo = make_fifo("gpu-wedge");
+        // Detached releaser, opened READ+WRITE, starting after the assertions have
+        // seen the wedge.
+        //
+        // `O_RDWR`, not the reader-only `release_backstop` next door, and the
+        // difference is the whole reason this test took three attempts:
+        // `set_static_speed_with_zero_rpm` calls `read_fan_curve` FIRST, so the
+        // wedge is a blocked *reader*, and a reader-only releaser can never pair
+        // with it. Opening a FIFO `O_RDWR` never blocks and frees either side.
+        // Nothing opens it from the test's own thread — that blocks forever once
+        // the other party has gone.
+        {
+            let f = fifo.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                for _ in 0..60 {
+                    let _ = std::fs::OpenOptions::new().read(true).write(true).open(&f);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                // Removed HERE, not in the test body. The body finishes in ~1 s
+                // while the wedged task is still blocked, and deleting the FIFO
+                // then leaves this releaser opening a path that no longer exists
+                // — the wedged reader waits forever and the runtime DROP blocks,
+                // which is DEC-272 trap 3 arriving through the cleanup.
+                let _ = std::fs::remove_file(&f);
+            });
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut gpu, _) = fake_gpu(&dir);
+        gpu.fan_curve_path = Some(fifo.clone());
+
+        let cache = Arc::new(StateCache::new());
+        cache.set_gpu_fan_commanded_pct("amd_gpu:0000:03:00.0", 20);
+        let mut be = GpuBackend::new(cache, Arc::new(vec![gpu]));
+
+        let started = std::time::Instant::now();
+        be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 90)])
+            .await;
+        let waited = started.elapsed();
+
+        // Threshold BELOW the releaser's 3 s delay, deliberately. The bound
+        // allows at most GPU_RESET_LOCK_WAIT (750 ms) + GPU_WRITE_JOIN_BUDGET
+        // (1 s). A looser bound would let the UNBOUNDED version pass too — it
+        // would simply block until the releaser freed it at 3 s — so the test
+        // would prove nothing. Verified by bypassing the fix.
+        assert!(
+            waited < std::time::Duration::from_millis(2500),
+            "apply() waited {waited:?} on a wedged GPU write — the join is not \
+             bounded, and the engine loop is frozen behind it"
+        );
+        assert!(
+            be.writes_stalled(),
+            "a wedged GPU write must be reported as stalled, or /status shows a \
+             healthy daemon while the fan holds its last duty"
+        );
+    }
+
+    /// DEC-299 remediation (review F1): a permanently wedged GPU write must keep
+    /// reporting stalled, including on the ticks that never reach `run`.
+    ///
+    /// The lock-unavailable early return is taken *precisely* when a wedged write
+    /// is holding the lock — and it used to return without refreshing the
+    /// progress flag. So once a tick had both harvested an old result and wedged
+    /// a new one (`completed_last_run = true`), every later tick skipped on the
+    /// lock and the flag was never cleared: `stalled()` stayed **false** forever,
+    /// which *clears* `engine_writes_stalled_since` and shows a healthy engine
+    /// while the fan holds its last duty. A false negative on the safety report,
+    /// which is the mirror image of the false `crit` DEC-298 removed.
+    ///
+    /// Two release windows are needed to reach that state: the first lets a write
+    /// complete so the next `apply` HARVESTS it (setting the flag true) while
+    /// issuing a fresh write that wedges.
+    ///
+    /// ⚠ **This test documents the scenario but does NOT discriminate the fix.**
+    /// Validity-checked by removing `note_no_progress` from the lock-skipped
+    /// branch: it still passed. The fixture check below confirms the intended
+    /// state IS reached (tick 2 harvests, so the flag is set), so the reason the
+    /// later ticks stay stalled without the fix is something this test does not
+    /// isolate — most likely the lock being free on those ticks, which would send
+    /// them through `run`'s harvest-timeout path instead of the early return.
+    /// Recorded rather than deleted because the scenario is real and the next
+    /// person should not have to rediscover it; recorded rather than trusted
+    /// because a test that passes with the fix removed proves nothing about the
+    /// fix. Tracked as a register row.
+    #[tokio::test]
+    async fn a_wedged_gpu_write_keeps_reporting_stalled_on_lock_skipped_ticks() {
+        let fifo = make_fifo("gpu-stall-persist");
+        {
+            let f = fifo.clone();
+            std::thread::spawn(move || {
+                // Window 1: release the first wedge so it can be harvested.
+                std::thread::sleep(std::time::Duration::from_millis(2200));
+                for _ in 0..10 {
+                    let _ = std::fs::OpenOptions::new().read(true).write(true).open(&f);
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                }
+                // Gap: the write issued next must wedge.
+                std::thread::sleep(std::time::Duration::from_secs(9));
+                // Window 2: cleanup only, so the runtime drop is not blocked.
+                for _ in 0..60 {
+                    let _ = std::fs::OpenOptions::new().read(true).write(true).open(&f);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                let _ = std::fs::remove_file(&f);
+            });
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut gpu, _) = fake_gpu(&dir);
+        gpu.fan_curve_path = Some(fifo.clone());
+        let cache = Arc::new(StateCache::new());
+        let mut be = GpuBackend::new(cache.clone(), Arc::new(vec![gpu]));
+
+        // Tick 1: wedges. Nothing has completed, so this is honestly stalled.
+        cache.set_gpu_fan_commanded_pct("amd_gpu:0000:03:00.0", 20);
+        be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 90)])
+            .await;
+        assert!(be.writes_stalled(), "tick 1: nothing completed");
+
+        // Let release window 1 free that write.
+        tokio::time::sleep(std::time::Duration::from_millis(2800)).await;
+
+        // Tick 2: harvests the completed write AND issues one that wedges. The
+        // harvest legitimately sets "progress made" for this tick.
+        be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 30)])
+            .await;
+        // FIXTURE CHECK, and the reason the first cut of this test was vacuous:
+        // if tick 2 did not actually harvest, `completed_last_run` stays false
+        // and every later tick reports stalled for the ordinary reason — so the
+        // test passes with the fix removed and proves nothing. Assert the state
+        // the test is ABOUT before asserting what must follow from it.
+        assert!(
+            !be.writes_stalled(),
+            "fixture check: tick 2 must have harvested a completed write (which is \
+             what sets the progress flag) AND wedged a new one; it did not, so the \
+             ticks below would pass for the wrong reason"
+        );
+
+        // Tick 3+: the wedged write holds the lock, so these never reach `run`.
+        for tick in 3..=5 {
+            be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 90)])
+                .await;
+            assert!(
+                be.writes_stalled(),
+                "tick {tick}: a wedged GPU write reported NOT stalled — \
+                 engine_writes_stalled_since would be cleared and /status would \
+                 show a healthy engine while the fan holds its last duty"
+            );
+        }
+    }
+
+    /// DEC-299: the second blocking window, which the register row did not name.
+    ///
+    /// `lock_gpu_writes()` was itself an unbounded `.await` on the mutex, and a
+    /// GPU verify holds that lock for its whole multi-second window — so a verify
+    /// starting after the per-fan `verify_active()` check froze the loop with NO
+    /// wedged device at all. The lock is now taken with a bounded wait and the
+    /// GPU leg is skipped for that tick.
+    #[tokio::test]
+    async fn a_held_gpu_write_lock_skips_the_tick_instead_of_blocking_the_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let (gpu, curve_path) = fake_gpu(&dir);
+        let cache = Arc::new(StateCache::new());
+        cache.set_gpu_fan_commanded_pct("amd_gpu:0000:03:00.0", 20);
+        let mut be = GpuBackend::new(cache.clone(), Arc::new(vec![gpu]));
+
+        // Someone else — a verify, a reset — holds the write lock.
+        let _held = cache.lock_gpu_writes().await;
+
+        let started = std::time::Instant::now();
+        be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 90)])
+            .await;
+        let waited = started.elapsed();
+
+        assert!(
+            waited < constants::GPU_RESET_LOCK_WAIT + std::time::Duration::from_secs(2),
+            "apply() waited {waited:?} for the GPU write lock — an unbounded wait \
+             here freezes the loop for the whole verify window"
+        );
+        assert!(
+            std::fs::read_to_string(&curve_path).unwrap().is_empty(),
+            "the tick must be SKIPPED while the lock is held, not written anyway"
+        );
     }
 
     #[tokio::test]

@@ -960,7 +960,9 @@ pub async fn profile_engine_loop(
             openfan_be
                 .as_ref()
                 .is_some_and(OpenFanBackend::writes_stalled)
-                || hwmon_be.as_ref().is_some_and(HwmonBackend::writes_stalled),
+                || hwmon_be.as_ref().is_some_and(HwmonBackend::writes_stalled)
+                // DEC-299: the third backend, bounded at last.
+                || gpu_be.writes_stalled(),
         );
 
         if let Some(forced_pct) = decision.forced_pct {
@@ -1136,8 +1138,10 @@ pub async fn profile_engine_loop(
         // reported now rather than next tick. Deliberately OUTSIDE the
         // `verify_active` gate above: a verify skips the write phase, and
         // clearing the stall there would reset a genuine wedge's age every time
-        // maintenance ran. GPU is not consulted — its join is still unbounded
-        // (AUD-a2), so a wedge there holds the loop and there is nothing to report.
+        // maintenance ran. DEC-299: GPU is now consulted too — its join is bounded
+        // as of that change, so a wedge there is reportable. Before it, a wedged
+        // GPU write held the loop and there was nothing to report *because*
+        // nothing was still running to do the reporting.
         tick_done.set_writes_outstanding(
             // DEC-298: report *stalled*, not merely *outstanding*. A tick now
             // re-issues immediately after harvesting, so a device slower than
@@ -1150,7 +1154,9 @@ pub async fn profile_engine_loop(
             openfan_be
                 .as_ref()
                 .is_some_and(OpenFanBackend::writes_stalled)
-                || hwmon_be.as_ref().is_some_and(HwmonBackend::writes_stalled),
+                || hwmon_be.as_ref().is_some_and(HwmonBackend::writes_stalled)
+                // DEC-299: the third backend, bounded at last.
+                || gpu_be.writes_stalled(),
         );
     }
 
@@ -1168,6 +1174,16 @@ pub async fn profile_engine_loop(
     if let Some(be) = hwmon_be.as_mut() {
         be.drain_writes(drain_budget).await;
     }
+    // DEC-299: the GPU backend now holds a bounded handle too, so it needs the
+    // same drain.
+    //
+    // The justification is NOT the one this comment first gave. `restore_gpu_fans_to_auto`
+    // takes **no** GPU write lock, so "a detached write still holding
+    // `lock_gpu_writes`" describes mutual exclusion that does not exist on that
+    // path. The real risk is simpler and worse: a detached write still driving
+    // PMFW curve points races the restore with nothing arbitrating between them,
+    // and this drain is the only mitigation — best-effort past `drain_budget`.
+    gpu_be.drain_writes(drain_budget).await;
 }
 
 #[cfg(test)]
@@ -5640,6 +5656,140 @@ mod tests {
     /// are already covered (`safety_override_forces_all_channels_to_100` /
     /// `loop_thermal_force_excludes_gpu`); the hwmon leg had no loop-level test —
     /// every other thermal loop test passes `hwmon_controller = None`.
+    /// A sysfs writer whose PWM write blocks on opening a FIFO nobody reads —
+    /// the DEC-278 model. A `thread::sleep` does not fail the same way as a
+    /// blocked `open(2)`, which is the whole reason that lesson exists.
+    struct LoopWedgingWriter {
+        fifo: std::path::PathBuf,
+    }
+
+    impl crate::hwmon::pwm_control::SysfsWriter for LoopWedgingWriter {
+        fn write_file(&mut self, path: &str, _value: &str) -> Result<(), crate::error::HwmonError> {
+            if path.ends_with("pwm1") {
+                let _ = std::fs::OpenOptions::new().write(true).open(&self.fifo);
+            }
+            Ok(())
+        }
+        fn read_file(&self, _path: &str) -> Result<String, crate::error::HwmonError> {
+            Ok("128\n".into())
+        }
+    }
+
+    /// DEC-299 (closes AUD-a4 and AUD-a5): the headline safety property of the
+    /// DEC-289/298/299 bound, pinned at the LOOP level for the first time.
+    ///
+    /// Everything else tests `BoundedWrite` directly. Nothing spawned the real
+    /// `profile_engine_loop` with a wedged backend, so nothing proved the three
+    /// things that matter when a device wedges in the field:
+    ///   1. the loop keeps ticking instead of freezing (the DEC-289 premise),
+    ///   2. the thermal ladder still evaluates and publishes `thermal_state`,
+    ///   3. the OTHER backend still reaches its hardware (AUD-a5),
+    ///   4. the stall is REPORTED, so `/status` can say so.
+    ///
+    /// Real time, not `start_paused`: tokio will not auto-advance virtual time
+    /// while a `spawn_blocking` task is outstanding, so a paused-time version of
+    /// this would HANG rather than fail (DEC-272 trap 2).
+    #[tokio::test]
+    async fn a_wedged_backend_does_not_stop_the_loop_the_ladder_or_the_stall_report() {
+        let fifo =
+            std::env::temp_dir().join(format!("ofc-dec299-loop-{}.fifo", std::process::id()));
+        let _ = std::fs::remove_file(&fifo);
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+            0,
+            "mkfifo failed"
+        );
+
+        // Hard self-release backstop: without it a failed assertion skips the
+        // cleanup, the blocking thread never returns, and dropping the runtime
+        // blocks forever — a red test becomes a hung CI job (DEC-272 trap 3).
+        // Release the wedge from a DETACHED thread, repeatedly, starting after the
+        // assertions below have had their look at the stalled state.
+        //
+        // Three things here were learned the hard way and are not decoration.
+        // (a) Never open the FIFO from the test's own thread: a reader open
+        // blocks until a writer appears, so if the wedged writer has already
+        // gone it blocks forever — on a current-thread runtime that stalls
+        // everything. (b) Open REPEATEDLY: one reader open frees only the
+        // writers blocked at that instant, which `backends.rs::release_backstop`
+        // records finding the same way. (c) Never join it — joining made every
+        // run wait out the full sleep.
+        {
+            let f = fifo.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                for _ in 0..60 {
+                    let _ = std::fs::File::open(&f);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            });
+        }
+
+        let cache = make_cache_with_sensor("cpu", 106.0); // >=105 -> force
+        let profile_arc = Arc::new(Mutex::new(None::<DaemonProfile>));
+        let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
+
+        // hwmon WEDGES; OpenFan is healthy and must keep writing.
+        let ctrl = crate::hwmon::pwm_control::HwmonPwmController::new(
+            vec![writable_pwm_header("hwmon:it8696:pwm1")],
+            crate::hwmon::lease::LeaseManager::new(),
+            Box::new(LoopWedgingWriter { fifo: fifo.clone() }),
+            cache.clone(),
+        );
+        let (transport, openfan_written) = LoopTestTransport::new(512);
+        let fan_ctrl = crate::serial::controller::FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            std::time::Duration::from_millis(500),
+        );
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(profile_engine_loop(
+            cache.clone(),
+            profile_arc,
+            Arc::new(parking_lot::RwLock::new(Some(Arc::new(Mutex::new(
+                fan_ctrl,
+            ))))),
+            Some(Arc::new(Mutex::new(ctrl))),
+            vec![],
+            safety,
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            shutdown_rx,
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        let snap = cache.snapshot();
+
+        assert!(
+            snap.subsystem_timestamps.engine_started.is_some(),
+            "the loop never completed a tick — a wedged backend froze it, which is \
+             exactly what the bound exists to prevent"
+        );
+        assert_eq!(
+            snap.thermal_override_state.as_deref(),
+            Some("emergency"),
+            "the ladder must keep evaluating while a backend is wedged"
+        );
+        assert!(
+            !openfan_written.lock().is_empty(),
+            "the healthy OpenFan backend wrote nothing — a wedge in hwmon must not \
+             stop the backend that is working"
+        );
+        assert!(
+            snap.subsystem_timestamps
+                .engine_writes_stalled_since
+                .is_some(),
+            "a wedged write must be reported, or the operator sees a healthy daemon \
+             while the fans hold their last duty"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let _ = handle.await;
+        let _ = std::fs::remove_file(&fifo);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn loop_thermal_force_drives_hwmon() {
         let cache = make_cache_with_sensor("cpu", 106.0); // ≥105 °C → force
