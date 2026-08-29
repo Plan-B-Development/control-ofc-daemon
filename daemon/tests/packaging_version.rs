@@ -98,7 +98,9 @@ fn job_block(wf: &str, job: &str) -> String {
             out.push('\n');
         }
     }
-    assert!(!out.is_empty(), "no `{job}:` job found in release.yml");
+    // Names no file: DEC-300 calls this with ci.yml too, and a message that says
+    // "release.yml" would misdirect whoever hits it.
+    assert!(!out.is_empty(), "no `{job}:` job found in the workflow");
     out
 }
 
@@ -235,11 +237,8 @@ fn release_attests_build_provenance_with_required_permissions() {
 /// A mutable tag on a step holding `contents: write` and `id-token: write` is a
 /// supply-chain hole: an upstream tag move would run unreviewed code able to
 /// sign artifacts and publish Releases under this repo's name.
-#[test]
-fn release_actions_are_pinned_to_a_sha() {
-    let wf = release_workflow();
-    let unpinned: Vec<&str> = wf
-        .lines()
+fn unpinned_actions(wf: &str) -> Vec<String> {
+    wf.lines()
         .map(str::trim)
         .filter(|l| l.starts_with("uses:") || l.starts_with("- uses:"))
         .filter(|l| {
@@ -248,10 +247,36 @@ fn release_actions_are_pinned_to_a_sha() {
             let reference = reference.split('#').next().unwrap_or("").trim();
             !(reference.len() == 40 && reference.chars().all(|c| c.is_ascii_hexdigit()))
         })
-        .collect();
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn release_actions_are_pinned_to_a_sha() {
+    let unpinned = unpinned_actions(&release_workflow());
     assert!(
         unpinned.is_empty(),
         "release.yml actions must be pinned to a 40-char commit SHA; found {unpinned:?}"
+    );
+}
+
+/// `ci.yml`'s own header asserts "Third-party actions are SHA-pinned for
+/// supply-chain hygiene" — and until DEC-300 nothing enforced it there. Only
+/// `release.yml` was guarded, so ci.yml's claim was prose.
+///
+/// The gap mattered the moment DEC-300 introduced a NEW third-party action into
+/// this workflow (`actions-rust-lang/setup-rust-toolchain`, which reads the
+/// toolchain pin). An action installing the compiler that then builds the release
+/// binary is about as supply-chain-load-bearing as a step gets, and a floating
+/// `@v1` there would be a silent downgrade of the stated posture.
+#[test]
+fn ci_actions_are_pinned_to_a_sha() {
+    let unpinned = unpinned_actions(&ci_workflow());
+    assert!(
+        unpinned.is_empty(),
+        "ci.yml actions must be pinned to a 40-char commit SHA — the file's own header \
+         claims they are, and one of them now installs the toolchain that compiles the \
+         release binary; found {unpinned:?}"
     );
 }
 
@@ -669,5 +694,210 @@ fn notify_repo_names_an_auth_failure_instead_of_reporting_a_mystery() {
         block.contains("set -uo pipefail") && !block.contains("set -euo pipefail"),
         "the dispatch step must not run under `set -e` — belt-and-braces for any \
          future command added here that is NOT wrapped in an `if` condition"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// DEC-300 — the toolchain pin. `cargo clippy -- -D warnings` makes every new
+// clippy lint a hard error, so an unpinned toolchain meant the local gate and CI
+// compiled with different compilers and a lint the developer's rustc could not
+// emit first appeared in CI. Measured: 15 of the daemon's 16 CI failures were the
+// same lint across three rustc versions, almost all on release commits.
+//
+// Each guard below pins a property that is INVISIBLE when broken: the pin still
+// looks present, the job still runs, the log still says ok. They exist because
+// this failure class is only ever observed at release time.
+// ---------------------------------------------------------------------------
+
+fn ci_workflow() -> String {
+    std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../.github/workflows/ci.yml"
+    ))
+    .expect("read .github/workflows/ci.yml")
+}
+
+/// Strip full-line comments before asserting on workflow text.
+///
+/// Not optional here, and the reason is a recorded failure mode in this repo: a
+/// source-scanning guard matches its OWN explanation. Every block below is
+/// commented with the thing it forbids — the `test` job explains why
+/// `dtolnay/rust-toolchain` was swapped out, and `clippy-next` explains what
+/// `RUSTUP_TOOLCHAIN` is for — so a substring scan over raw text would find the
+/// prose and pass with the code deleted.
+fn strip_comments(block: &str) -> String {
+    block
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The pin must name a CONCRETE version, and must carry the components the gate
+/// uses.
+///
+/// A `channel` of "stable" would satisfy any "the file exists" check while
+/// restoring exactly the floating behaviour the file was added to remove — the
+/// pin would be decorative. And a pin without `clippy` leaves CI installing a
+/// toolchain whose clippy is missing, which fails late and confusingly.
+#[test]
+fn the_rust_toolchain_pin_names_a_concrete_version_and_its_components() {
+    let pin = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../rust-toolchain.toml"
+    ))
+    .expect(
+        "read rust-toolchain.toml — the pin is what keeps the local gate and CI on \
+         one compiler (DEC-300); without it a new clippy lint cannot be caught \
+         locally at any level of diligence",
+    );
+    let code = strip_comments(&pin);
+
+    let channel = code
+        .lines()
+        .map(str::trim)
+        .find_map(|l| l.strip_prefix("channel"))
+        .and_then(|rest| rest.trim().strip_prefix('='))
+        .map(|v| v.trim().trim_matches('"').to_string())
+        .expect("rust-toolchain.toml must set `channel`");
+
+    // A concrete X.Y.Z. Rejects "stable"/"beta"/"nightly" and any dated nightly.
+    let concrete = channel.split('.').count() == 3
+        && channel
+            .split('.')
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+    assert!(
+        concrete,
+        "rust-toolchain.toml `channel` must be a concrete version like \"1.98.0\", \
+         got {channel:?}. A floating channel re-creates the drift the pin exists to \
+         close while still looking pinned: the gate would once again compile with a \
+         different clippy from the one that ran when the code was written."
+    );
+
+    for component in ["clippy", "rustfmt"] {
+        assert!(
+            code.contains(&format!("\"{component}\"")),
+            "rust-toolchain.toml must list `{component}` in components — CI installs \
+             the toolchain from this file and runs it, so a missing component fails \
+             in CI rather than here"
+        );
+    }
+}
+
+/// CI must install the toolchain FROM the pin file, never by restating a version.
+///
+/// The restated form is the failure DEC-258 recorded one stack over for the GUI's
+/// ruff pin: two sources of truth drifted, CI resolved a different version from
+/// the dev environment, and lint went red on a commit whose local check was green.
+/// `dtolnay/rust-toolchain` does not read `rust-toolchain.toml` at all, so reverting
+/// to it silently restores floating-stable in the gate job.
+#[test]
+fn ci_installs_the_pinned_toolchain_rather_than_restating_a_version() {
+    let block = strip_comments(&job_block(&ci_workflow(), "test"));
+
+    assert!(
+        block.contains("actions-rust-lang/setup-rust-toolchain@"),
+        "the `test` job must install via actions-rust-lang/setup-rust-toolchain, \
+         which reads rust-toolchain.toml when given no `toolchain:` input (DEC-300)"
+    );
+    assert!(
+        !block.contains("dtolnay/rust-toolchain"),
+        "the `test` job must NOT use dtolnay/rust-toolchain: it ignores \
+         rust-toolchain.toml, so the gate would float to latest stable again while \
+         the pin file sat in the repo looking authoritative"
+    );
+
+    // Key position, not substring. The comment above this step in ci.yml discusses
+    // the `toolchain:` input by name, and a substring scan would match that prose.
+    let restated: Vec<&str> = block
+        .lines()
+        .filter(|l| l.trim_start().starts_with("toolchain:"))
+        .collect();
+    assert!(
+        restated.is_empty(),
+        "the `test` job must not restate a `toolchain:` version — rust-toolchain.toml \
+         is the single source of truth, and a second one is exactly what DEC-258 \
+         recorded going wrong for ruff; found: {restated:?}"
+    );
+}
+
+/// The advisory `clippy-next` job must force floating stable, or it is INERT.
+///
+/// This is the whole correctness of that job. With `rust-toolchain.toml` present
+/// the rustup shim overrides whatever the action installed, so without
+/// `RUSTUP_TOOLCHAIN` the job re-runs clippy on the PINNED toolchain: it goes
+/// green, reports nothing, and is indistinguishable from a working early-warning
+/// job — the "a filter that matches nothing still prints ok" trap, one layer down.
+/// The env var beats the file (verified in both directions), and that precedence
+/// is the only reason this job can see a compiler the pin does not name.
+#[test]
+fn the_early_warning_job_actually_runs_a_newer_toolchain() {
+    let block = strip_comments(&job_block(&ci_workflow(), "clippy-next"));
+
+    // Count both sides rather than asserting mere presence: one `env:` covers one
+    // step, so a second cargo/rustc step added without its own would silently run
+    // on the pin. Presence alone would not notice.
+    let forced = block
+        .lines()
+        .filter(|l| l.trim_start().starts_with("RUSTUP_TOOLCHAIN:"))
+        .filter(|l| l.contains("stable"))
+        .count();
+    let toolchain_steps = block
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("run:"))
+        .filter(|l| l.contains("cargo ") || l.contains("rustc "))
+        .count();
+
+    assert!(
+        toolchain_steps > 0,
+        "clippy-next must actually invoke cargo — an advisory job that runs nothing \
+         is worse than no job, because it reports green"
+    );
+    assert!(
+        forced >= toolchain_steps,
+        "every cargo/rustc step in clippy-next needs `RUSTUP_TOOLCHAIN: stable`, or \
+         the repo's rust-toolchain.toml overrides the installed toolchain and the \
+         job silently re-tests the pin instead of the newer compiler it exists to \
+         probe ({forced} forced vs {toolchain_steps} steps)"
+    );
+    assert!(
+        block.contains("continue-on-error: true"),
+        "clippy-next is advisory: a lint from a compiler the project has not adopted \
+         yet must never block a merge or a release"
+    );
+}
+
+/// CI's cargo invocations must match the documented canonical gate (row AUD-t).
+///
+/// `CLAUDE.md § Quality gates` calls itself the single source of truth and was not
+/// what ran: CI passed `--all-features` (a literal no-op — `daemon/Cargo.toml` has
+/// no `[features]` table) and never ran `cargo test --doc`, which `--all-targets`
+/// suppresses. Nothing was missed while the crate has zero doctests; what was
+/// missing was the signal that the first doctest anyone wrote had no CI coverage.
+#[test]
+fn ci_matches_the_documented_canonical_gate() {
+    let block = strip_comments(&job_block(&ci_workflow(), "test"));
+    let cargo_steps: Vec<&str> = block
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("run: cargo "))
+        .collect();
+
+    let bogus: Vec<&&str> = cargo_steps
+        .iter()
+        .filter(|l| l.contains("--all-features"))
+        .collect();
+    assert!(
+        bogus.is_empty(),
+        "`--all-features` selects nothing (daemon/Cargo.toml declares no [features]) \
+         and is absent from the documented gate, so carrying it here only makes CI \
+         look meaningfully different from what CLAUDE.md says runs: {bogus:?}"
+    );
+    assert!(
+        cargo_steps.iter().any(|l| l.contains("--doc")),
+        "CI must run `cargo test --doc` as its own step: `--all-targets` SUPPRESSES \
+         doctests, so without it a doctest gets no CI coverage and nothing says so. \
+         Steps found: {cargo_steps:?}"
     );
 }

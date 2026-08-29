@@ -43,10 +43,24 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libudev-dev pkg-config
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      # DEC-300. The toolchain and its components come from `rust-toolchain.toml`
+      # at the repo root and are deliberately NOT restated here: a second source
+      # of truth is the exact failure DEC-258 recorded for the GUI's ruff pin,
+      # where CI resolved a different version from the dev environment and lint
+      # went red on a commit whose local check was green. This action reads that
+      # file when no `toolchain:` input is given; `dtolnay/rust-toolchain` does
+      # not, which is why it was swapped out.
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
-          toolchain: stable
-          components: rustfmt, clippy
+          # This action's own default is `rustflags: -D warnings`, which it
+          # EXPORTS globally — that would apply `-D warnings` to `cargo build`
+          # and `cargo test` as well, widening the very problem the pin exists to
+          # close. Clippy's own `-- -D warnings` below stays the only gate.
+          rustflags: ''
+          # It also bundles Swatinem/rust-cache. This repo pins its own copy by
+          # SHA on the next line, per the supply-chain note at the top of the
+          # file, so the bundled one is turned off rather than layered on top.
+          cache: false
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -58,10 +72,73 @@ jobs:
       # is already public, forcing a delete-and-retag. It also defeats any test
       # that tries to catch the same thing by reading the lockfile, because the
       # act of running the test repairs the file it is about to read (measured).
+      #
+      # `--all-features` was dropped and `--doc` added to reconcile this job with
+      # CLAUDE.md § Quality gates, which calls itself the single source of truth
+      # and was not what ran (register row AUD-t). `daemon/Cargo.toml` has no
+      # `[features]` table, so `--all-features` never selected anything — it only
+      # made this job look meaningfully different from the documented one. And
+      # `--all-targets` SUPPRESSES doctests, so without the separate `--doc` step
+      # CI ran no doctests at all: harmless today (the crate has none) but it
+      # meant the first doctest anyone wrote would have had no CI coverage and no
+      # signal saying so. `--locked` is the one deliberate CI-only addition, for
+      # the reason directly above.
       - name: cargo clippy -D warnings
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: cargo test
-        run: cargo test --locked --all-targets --all-features
+        run: cargo test --locked --all-targets
+      - name: cargo test --doc
+        run: cargo test --locked --doc
+
+  clippy-next:
+    # DEC-300 early warning. `rust-toolchain.toml` makes the gate above
+    # deterministic, but a pin nobody bumps quietly accumulates lint debt and
+    # then breaks loudly, all at once, with no attribution to any one commit.
+    # This job runs clippy against FLOATING latest stable so a new lint is
+    # discovered on an ordinary push instead of at a tagged release.
+    #
+    # Advisory ONLY: `continue-on-error` keeps it out of the job's conclusion, so
+    # it can never block a merge or a release. When it goes red, a pin bump is
+    # due — see the "HOW TO BUMP IT" section of rust-toolchain.toml.
+    name: clippy on latest stable (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libudev-dev pkg-config
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+          components: clippy
+      # No `shared-key` here on purpose. This job's artifacts are built by a
+      # different compiler from the `test` job's, but rust-cache already separates
+      # them twice over: its default key is job-based, and it hashes the rust
+      # environment into the key as well. `shared-key` REPLACES the job-based key
+      # with one deliberately stable across jobs, which is the opposite of what is
+      # wanted — it was set here briefly with a comment claiming it provided the
+      # separation the default already provides.
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # Both steps below set RUSTUP_TOOLCHAIN, and it is load-bearing rather than
+      # belt-and-braces. The rustup shim reads the repo's pin file and would
+      # override whatever the action above installed, so WITHOUT this the job
+      # silently re-runs clippy on the pinned toolchain and asserts nothing about
+      # a newer one — green, inert, and indistinguishable from working. The env
+      # var beats the file (verified in both directions); that precedence is the
+      # only reason this job can see a compiler the pin does not name.
+      - name: Show the toolchain actually in use
+        env:
+          RUSTUP_TOOLCHAIN: stable
+        # Printed, not asserted: when the pin IS the newest stable these agree
+        # legitimately, so a difference cannot be required. A human reading a red
+        # run needs to know which compiler produced it.
+        run: rustc --version && cargo --version
+      - name: cargo clippy on latest stable
+        env:
+          RUSTUP_TOOLCHAIN: stable
+        run: cargo clippy --locked --all-targets -- -D warnings
 
   deny:
     # DEC-174 supply-chain gate, moved from release-only to every PR. Runs in its

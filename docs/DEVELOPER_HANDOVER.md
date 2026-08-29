@@ -221,5 +221,7 @@ The suite is comprehensive and grows release-by-release; no test
 requires real hardware (everything is mocked or driven against tempdirs).
 For the current count consult the most recent `CHANGELOG.md` entry —
 release notes record the exact `cargo test` totals for the matching
-daemon version. Run `cargo test --all-targets --all-features` to see
-the live count locally.
+daemon version. To see the live count locally, run the test commands from
+`CLAUDE.md § Quality gates` — deliberately not restated here, for the same
+reason the section above gives: this line had drifted to `--all-features`,
+which selects nothing and is absent from the canonical set (DEC-300).

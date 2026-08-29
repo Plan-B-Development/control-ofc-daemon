@@ -1,0 +1,40 @@
+# Pinned Rust toolchain for the daemon (DEC-300).
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# `cargo clippy -- -D warnings` promotes EVERY lint to a hard error, and clippy
+# ships new and widened lints in every six-week release. Without a pin the local
+# canonical gate ran whatever rustup `stable` happened to be, while CI's
+# `dtolnay/rust-toolchain@stable` floated to the newest stable — so a lint that
+# did not exist in the developer's compiler could not be caught locally at any
+# level of diligence, and first appeared in CI.
+#
+# That is not hypothetical: 15 of the daemon's 16 CI failures were the SAME lint
+# (`clippy::collapsible-match`, daemon/src/profile.rs), across rustc 1.96.1 /
+# 1.97.0 / 1.97.1, 2026-07-01 to 2026-07-21, almost all on release commits. It
+# was finally cleared by 9d6077e, titled "fix(profile): unblock CI clippy".
+#
+# It became a RELEASE BLOCKER with DEC-263, which made `ci-green` a fail-closed
+# gate on `github-release`: the same drift now stops publication after the tag is
+# already public, forcing a delete-and-retag.
+#
+# HOW TO BUMP IT
+# --------------
+# Deliberately, with a lint-fix pass attached — never implicitly. Bump `channel`,
+# run the § Quality gates locally, fix whatever the new clippy finds, and land it
+# as one change. The advisory `clippy-next` job in .github/workflows/ci.yml runs
+# clippy against floating stable on every push precisely so that pass is never a
+# surprise: when it goes red, a bump is due.
+#
+# SCOPE — what this does NOT govern
+# ---------------------------------
+# `RUSTUP_TOOLCHAIN` (an env var) OVERRIDES this file. packaging/PKGBUILD exports
+# `RUSTUP_TOOLCHAIN=stable` in prepare()/build()/check(), so the Arch clean-room
+# package build is deliberately unaffected and keeps building against whatever
+# `rust` Arch ships — correct for a distro package. A non-rustup cargo (Arch's
+# /usr/bin/cargo) ignores this file entirely. Neither matters for the failure
+# above: the clean room runs only `cargo build`/`cargo test`, never clippy, so
+# `-D warnings` cannot bite there.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]

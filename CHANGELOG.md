@@ -1,5 +1,52 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- **The Rust toolchain is pinned, so the local quality gate and CI compile with the
+  same compiler (DEC-300).** `cargo clippy -- -D warnings` makes every new clippy
+  lint a hard error, and clippy ships new lints every six weeks. Nothing pinned a
+  toolchain, so the local gate ran rustup `stable` while CI's
+  `dtolnay/rust-toolchain@stable` floated to the newest release — on 2026-08-29 that
+  was 1.97.1 locally against 1.98.0 in CI. A lint that does not exist in the
+  developer's compiler cannot be caught locally at any level of diligence: the gate
+  passes, then CI fails.
+
+  This was most of the CI failure history rather than a hypothetical. **15 of the
+  daemon's 16 CI failures were the same lint** — `clippy::collapsible-match` in
+  `daemon/src/profile.rs` — across three rustc versions between 2026-07-01 and
+  2026-07-21, almost all on release commits. Since DEC-263 made `ci-green` a
+  fail-closed gate on `github-release`, that drift no longer merely reds a run: it
+  blocks publication *after the tag is already public*, forcing a delete-and-retag.
+
+  A new `rust-toolchain.toml` pins the compiler and its components; the rustup shim
+  installs it automatically, so the local gate self-corrects. CI installs from that
+  file rather than restating a version — a second source of truth is the exact
+  failure DEC-258 recorded for the GUI's `ruff` pin.
+
+  **The Arch package build is deliberately unaffected** and keeps building against
+  whatever `rust` Arch ships, which is correct for a distro package: `PKGBUILD`
+  exports `RUSTUP_TOOLCHAIN=stable`, which overrides the file, and a non-rustup cargo
+  ignores it entirely. The clean room also runs only `cargo build`/`cargo test`,
+  never clippy.
+
+### Added
+- **An advisory `clippy-next` CI job runs clippy against floating latest stable
+  (DEC-300).** A pin nobody bumps accumulates lint debt and then breaks loudly with
+  no attribution to any single commit. This job is `continue-on-error`, so it can
+  never block a merge or a release; when it goes red, a toolchain bump is due. It
+  forces `RUSTUP_TOOLCHAIN=stable` because the repo's own pin file would otherwise
+  override it and the job would silently re-test the pinned compiler.
+
+### Fixed
+- **CI now runs the gate the documentation says it runs (register row AUD-t).**
+  `.github/workflows/ci.yml` passed `--all-features`, which selects nothing because
+  the crate declares no `[features]` table, and never ran `cargo test --doc`, which
+  `--all-targets` suppresses — while `CLAUDE.md § Quality gates` called itself the
+  single source of truth. No coverage was lost (the crate has zero doctests, verified
+  again here); what was missing was any signal that the first doctest anyone wrote
+  would have had no CI coverage.
+
 ## [2.24.0] — 2026-08-29
 
 ### Fixed
