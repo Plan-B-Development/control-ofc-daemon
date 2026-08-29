@@ -949,12 +949,18 @@ pub async fn profile_engine_loop(
         // `engine_health`'s 2x/30x thresholds and is the price of covering every
         // path with one call instead of auditing them all forever.
         tick_done.set_writes_outstanding(
+            // DEC-298: report *stalled*, not merely *outstanding*. A tick now
+            // re-issues immediately after harvesting, so a device slower than
+            // the write budget always has something in flight here — and
+            // `record_engine_write_stall` only clears its stamp on `false`, so
+            // reporting outstanding-ness would pin `engine_writes_stalled_since`
+            // and trip the 30x `crit` "writes wedged" on a device writing every
+            // 1.5 s. Per backend, so a wedged hwmon is not masked by a healthy
+            // OpenFan.
             openfan_be
                 .as_ref()
-                .is_some_and(OpenFanBackend::writes_outstanding)
-                || hwmon_be
-                    .as_ref()
-                    .is_some_and(HwmonBackend::writes_outstanding),
+                .is_some_and(OpenFanBackend::writes_stalled)
+                || hwmon_be.as_ref().is_some_and(HwmonBackend::writes_stalled),
         );
 
         if let Some(forced_pct) = decision.forced_pct {
@@ -1133,12 +1139,18 @@ pub async fn profile_engine_loop(
         // maintenance ran. GPU is not consulted — its join is still unbounded
         // (AUD-a2), so a wedge there holds the loop and there is nothing to report.
         tick_done.set_writes_outstanding(
+            // DEC-298: report *stalled*, not merely *outstanding*. A tick now
+            // re-issues immediately after harvesting, so a device slower than
+            // the write budget always has something in flight here — and
+            // `record_engine_write_stall` only clears its stamp on `false`, so
+            // reporting outstanding-ness would pin `engine_writes_stalled_since`
+            // and trip the 30x `crit` "writes wedged" on a device writing every
+            // 1.5 s. Per backend, so a wedged hwmon is not masked by a healthy
+            // OpenFan.
             openfan_be
                 .as_ref()
-                .is_some_and(OpenFanBackend::writes_outstanding)
-                || hwmon_be
-                    .as_ref()
-                    .is_some_and(HwmonBackend::writes_outstanding),
+                .is_some_and(OpenFanBackend::writes_stalled)
+                || hwmon_be.as_ref().is_some_and(HwmonBackend::writes_stalled),
         );
     }
 

@@ -147,6 +147,22 @@
   force. It now refuses, with the same retryable `409` and the same
   state-naming message calibration uses. (DEC-297)
 
+- **A thermal emergency could take an extra second to reach a slow fan device.**
+  When a fan write from the previous second had not finished, the next tick
+  waited for it — and then issued nothing of its own, dropping the commands it
+  had just computed. If that was the tick where the CPU crossed 105 °C, the first
+  forced write did not go out until the tick after; against a device
+  consistently slower than the one-second write budget, forced writes went out
+  every *other* second. Each tick now issues its own write after collecting the
+  previous one, and the two share a single budget so the tick still costs no
+  more than it did.
+
+  This was a delay, not a loss of reach: a write stuck in a driver holds the
+  device lock, so an emergency write issued alongside it would have queued behind
+  it anyway. It is also strictly better than the behaviour before 2.23.2, where a
+  stuck write froze the engine and the forced write never went out at all.
+  (DEC-298)
+
 ### Notes
 - The reader's plausible-range check is unchanged, and deliberately so. It still
   cannot separate a real 105-125 °C over-temperature from a stuck sensor reading

@@ -63,11 +63,25 @@ pub(crate) struct BoundedWrite<T> {
     /// A write issued on an earlier tick that has not returned yet. Held so the
     /// next tick re-awaits THIS write instead of stacking another behind it.
     pending: Option<tokio::task::JoinHandle<T>>,
+    /// Did the most recent [`Self::run`] see any write COMPLETE? (DEC-298)
+    ///
+    /// Load-bearing, not bookkeeping. Since DEC-298 a tick re-issues immediately
+    /// after harvesting, so against a device slower than the budget `pending` is
+    /// never `None` at the point the loop samples it — and
+    /// `record_engine_write_stall` only clears its stamp on `false`. Reporting
+    /// raw outstanding-ness would therefore pin `engine_writes_stalled_since`
+    /// forever and trip the 30x `crit` "writes wedged" on a device that is
+    /// writing perfectly well, every 1.5 s. "Wedged" has to mean *nothing is
+    /// completing*, not *something is in flight*.
+    completed_last_run: bool,
 }
 
 impl<T> Default for BoundedWrite<T> {
     fn default() -> Self {
-        Self { pending: None }
+        Self {
+            pending: None,
+            completed_last_run: false,
+        }
     }
 }
 
@@ -86,6 +100,17 @@ impl<T: Send + 'static> BoundedWrite<T> {
         // daemon that is idle by design and whose write completed seconds ago,
         // clearing only on re-activation or restart.
         self.pending.as_ref().is_some_and(|h| !h.is_finished())
+    }
+
+    /// True when writes are **not getting through**: something is outstanding and
+    /// nothing completed on the last run (DEC-298).
+    ///
+    /// This, not [`Self::outstanding`], is what the engine reports as the write
+    /// stall — see `completed_last_run`. A device merely slower than the budget
+    /// completes a write every run and is therefore never stalled; a wedged one
+    /// completes nothing and is stalled from the first tick.
+    pub(crate) fn stalled(&self) -> bool {
+        self.outstanding() && !self.completed_last_run
     }
 
     /// Await any outstanding write, bounded by `deadline`, at shutdown.
@@ -113,36 +138,148 @@ impl<T: Send + 'static> BoundedWrite<T> {
         }
     }
 
-    /// Await the outstanding write, or issue `f` and await that, bounded by
-    /// `budget`.
+    /// Harvest an outstanding write without issuing a new one (DEC-298).
     ///
-    /// `Some(_)` — a write completed on this call; the value is its join result.
-    /// `None` — a write is still in flight. The caller must not issue another,
-    /// and this tick's commands are simply not written; the next tick re-awaits
-    /// the same one. `f` is dropped unused in that case, by design: building a
-    /// command list is cheap next to a wedged device, and pre-checking at every
-    /// call site is the kind of duplication that drifts.
-    pub(crate) async fn run<F>(
-        &mut self,
-        budget: std::time::Duration,
-        f: F,
-    ) -> Option<Result<T, tokio::task::JoinError>>
+    /// For a tick that genuinely has nothing to command. `run` would otherwise
+    /// spawn a closure that does setup — taking and renewing a lease — for a
+    /// write that commands nothing.
+    pub(crate) async fn harvest_only(&mut self, budget: std::time::Duration) -> WriteProgress<T> {
+        let Some(mut outstanding) = self.pending.take() else {
+            self.completed_last_run = false;
+            return WriteProgress {
+                harvested: None,
+                issued: None,
+                in_flight: false,
+            };
+        };
+        match tokio::time::timeout(budget, &mut outstanding).await {
+            Ok(joined) => {
+                self.completed_last_run = true;
+                WriteProgress {
+                    harvested: Some(joined),
+                    issued: None,
+                    in_flight: false,
+                }
+            }
+            Err(_) => {
+                self.pending = Some(outstanding);
+                self.completed_last_run = false;
+                WriteProgress {
+                    harvested: None,
+                    issued: None,
+                    in_flight: true,
+                }
+            }
+        }
+    }
+
+    /// Harvest any outstanding write, then issue `f`, all bounded by `budget`.
+    ///
+    /// **DEC-298 changed this.** It used to drop `f` unread whenever it harvested
+    /// a pending handle, even when that handle completed immediately — so a tick
+    /// that cleared a slow write issued nothing of its own. Concretely: an
+    /// ordinary `apply` is pending at tick N, the CPU crosses 105 °C at N+1,
+    /// `force_all` harvests the apply's result and returns having written
+    /// nothing, and the first forced write is issued at N+2. Against a device
+    /// consistently slower than `budget`, forced writes alternated every other
+    /// tick. A delay, not a loss of reach — a wedged write holds the controller
+    /// mutex, so a separately spawned `force_all` would have blocked on
+    /// `ctrl.lock()` and reached no header either — but a delay on the emergency
+    /// path is worth removing.
+    ///
+    /// **The tick cost is unchanged**: the harvest and the newly issued write
+    /// share ONE budget, so `run` still returns within `budget`.
+    ///
+    /// **The DEC-272 invariant is unchanged and is the reason for the shape**:
+    /// `spawn_blocking` cannot be cancelled, so issuing a fresh write each tick
+    /// against a wedged device would strand one blocking thread per tick and
+    /// exhaust tokio's 512-thread pool in ~8.5 minutes — starving the very writer
+    /// this guards. `f` is therefore spawned **only when `pending` is `None`
+    /// after the harvest**, so at most one write is ever outstanding. A harvest
+    /// that times out still drops `f`, exactly as before.
+    pub(crate) async fn run<F>(&mut self, budget: std::time::Duration, f: F) -> WriteProgress<T>
     where
         F: FnOnce() -> T + Send + 'static,
     {
-        let mut handle = match self.pending.take() {
-            Some(outstanding) => outstanding,
-            None => tokio::task::spawn_blocking(f),
-        };
-        // `&mut handle` so a timeout does not consume the handle — that is what
-        // makes "hold and re-await" possible rather than "re-spawn".
-        match tokio::time::timeout(budget, &mut handle).await {
-            Ok(joined) => Some(joined),
-            Err(_) => {
-                self.pending = Some(handle);
-                None
+        let started = std::time::Instant::now();
+        let mut harvested = None;
+
+        if let Some(mut outstanding) = self.pending.take() {
+            // `&mut outstanding` so a timeout does not consume the handle — that
+            // is what makes "hold and re-await" possible rather than "re-spawn".
+            match tokio::time::timeout(budget, &mut outstanding).await {
+                Ok(joined) => harvested = Some(joined),
+                Err(_) => {
+                    self.pending = Some(outstanding);
+                    self.completed_last_run = false;
+                    return WriteProgress {
+                        harvested: None,
+                        issued: None,
+                        in_flight: true,
+                    };
+                }
             }
         }
+
+        debug_assert!(
+            self.pending.is_none(),
+            "DEC-272: never spawn while a write is still outstanding"
+        );
+        // Residual, not a fresh budget: the whole call stays within `budget`. It
+        // can be zero when the harvest used it all, and that is fine — the point
+        // of this phase is that the write is ISSUED (`spawn_blocking` starts
+        // running immediately), not that this tick waits for it.
+        let residual = budget.saturating_sub(started.elapsed());
+        let mut handle = tokio::task::spawn_blocking(f);
+        match tokio::time::timeout(residual, &mut handle).await {
+            Ok(joined) => {
+                self.completed_last_run = true;
+                WriteProgress {
+                    harvested,
+                    issued: Some(joined),
+                    in_flight: false,
+                }
+            }
+            Err(_) => {
+                self.pending = Some(handle);
+                // A harvest counts: a write DID complete on this run, even though
+                // the one just issued has not.
+                self.completed_last_run = harvested.is_some();
+                WriteProgress {
+                    harvested,
+                    issued: None,
+                    in_flight: true,
+                }
+            }
+        }
+    }
+}
+
+/// What one [`BoundedWrite::run`] call did (DEC-298).
+///
+/// Two results can land in a single call — a harvested write from an earlier
+/// tick and the one issued now — which is why this is a struct rather than the
+/// `Option<Result<..>>` it replaced. Callers must route **both**, or a failing
+/// member's streak is neither advanced nor reset for that tick.
+pub(crate) struct WriteProgress<T> {
+    /// A write issued on an earlier tick that completed during this call.
+    pub(crate) harvested: Option<Result<T, tokio::task::JoinError>>,
+    /// This call's own write, if it also completed within the residual budget.
+    pub(crate) issued: Option<Result<T, tokio::task::JoinError>>,
+    /// A write is still outstanding after this call. The caller must not issue
+    /// another; the next `run` re-awaits it.
+    pub(crate) in_flight: bool,
+}
+
+impl<T> WriteProgress<T> {
+    /// Every write that completed during this call, oldest first.
+    ///
+    /// One accessor so the two fields cannot be routed inconsistently by four
+    /// call sites — the harvested result was dropped on the floor once already
+    /// (DEC-289 fixed that for one arm), and this makes the same omission
+    /// impossible to write.
+    pub(crate) fn completed(self) -> impl Iterator<Item = Result<T, tokio::task::JoinError>> {
+        [self.harvested, self.issued].into_iter().flatten()
     }
 }
 
@@ -219,8 +356,8 @@ impl OpenFanBackend {
     }
 
     /// True while a write issued on an earlier tick has not returned (DEC-289).
-    pub(crate) fn writes_outstanding(&self) -> bool {
-        self.writes.outstanding()
+    pub(crate) fn writes_stalled(&self) -> bool {
+        self.writes.stalled()
     }
 
     /// Await any in-flight write at shutdown (DEC-289). See [`BoundedWrite::drain`].
@@ -385,30 +522,29 @@ impl WriteBackend for OpenFanBackend {
                     .collect::<Vec<(u8, Result<(), String>)>>()
             })
             .await;
-        // DEC-289: `None` = an earlier write is still in flight. Issue nothing
-        // and record no outcome — the channel was not attempted, so its failure
-        // streak must neither advance nor reset.
-        let Some(join) = join else {
-            return;
-        };
-        let results = match join {
-            Ok(results) => results,
-            Err(e) => {
-                // Concurrency review D3: a panic inside the blocking task must
-                // not be silent. The whole write task died, so account it as a
-                // whole-link failure (audit P3-5) and alert immediately.
-                let n = self.note_task_panic();
-                log::error!(
-                    "SAFETY: Profile engine OpenFan write task panicked: {e} \
-                     (link-down streak {n})"
-                );
-                return;
-            }
-        };
+        // DEC-298: route EVERY write that completed — a harvested one from an
+        // earlier tick and this call's own. A channel that was not attempted
+        // (nothing completed) records no outcome, so its failure streak neither
+        // advances nor resets, exactly as DEC-289 intended.
+        //
         // `&mut self` state can't cross into the 'static closure, so the
         // per-channel + whole-link failure bookkeeping runs here on the returned
         // results (audit P3-5).
-        self.note_outcomes(&results);
+        for joined in join.completed() {
+            match joined {
+                Ok(results) => self.note_outcomes(&results),
+                Err(e) => {
+                    // Concurrency review D3: a panic inside the blocking task
+                    // must not be silent. The whole write task died, so account
+                    // it as a whole-link failure (audit P3-5) and alert now.
+                    let n = self.note_task_panic();
+                    log::error!(
+                        "SAFETY: Profile engine OpenFan write task panicked: {e} \
+                         (link-down streak {n})"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -439,39 +575,48 @@ impl SafetyWriteBackend for OpenFanBackend {
                 Vec::new()
             })
             .await;
-        match join {
-            // Concurrency review D3: never swallow a panicked safety write —
-            // the next 1 Hz tick retries, but the operator must see this.
-            Some(Err(e)) => {
-                log::error!("THERMAL SAFETY: OpenFan force_all task panicked: {e}");
+        // DEC-298: "stalled" is *nothing completed*, not *something in flight* —
+        // the same distinction the write-stall stamp draws. A device merely
+        // slower than the budget completes a write every tick and must not be
+        // reported as stalled.
+        let stalled = join.in_flight && join.harvested.is_none() && join.issued.is_none();
+        // A harvested `apply` result arrives here when force_all re-awaits a
+        // pending ordinary write. Route it through the normal accounting rather
+        // than dropping it, or a failing channel's streak is neither advanced nor
+        // reset for that tick (DEC-289). Since DEC-298 this call can also have
+        // issued and completed its OWN write, so both are routed.
+        for joined in join.completed() {
+            match joined {
+                Ok(outcomes) => self.note_outcomes(&outcomes),
+                // Concurrency review D3: never swallow a panicked safety write —
+                // the next 1 Hz tick retries, but the operator must see this.
+                Err(e) => log::error!("THERMAL SAFETY: OpenFan force_all task panicked: {e}"),
             }
-            // DEC-289: still in flight. The write was NOT abandoned — the handle
-            // is held and re-awaited next tick — but the loop is released so the
-            // safety ladder and the other backends keep running instead of
-            // freezing behind this one device.
-            //
-            // Edge-triggered: a legitimately slow force_all spans several ticks
-            // over a degraded link, and the 105->80 hold can last minutes, so a
-            // per-tick line would bury the transition it exists to report. Every
-            // other safety log in this file is throttled the same way.
-            None => {
-                if !self.stall_logged {
-                    self.stall_logged = true;
-                    log::error!(
-                        "THERMAL SAFETY: OpenFan force_all still in flight after \
-                         {}s — the emergency write has not reached the controller yet",
-                        WRITE_JOIN_BUDGET.as_secs()
-                    );
-                }
+        }
+        // DEC-289: still in flight. The write was NOT abandoned — the handle is
+        // held and re-awaited next tick — but the loop is released so the safety
+        // ladder and the other backends keep running instead of freezing behind
+        // this one device.
+        //
+        // Edge-triggered: a legitimately slow force_all spans several ticks over
+        // a degraded link, and the 105->80 hold can last minutes, so a per-tick
+        // line would bury the transition it exists to report. Every other safety
+        // log in this file is throttled the same way.
+        if stalled {
+            if !self.stall_logged {
+                self.stall_logged = true;
+                log::error!(
+                    "THERMAL SAFETY: OpenFan force_all still in flight after \
+                     {}s — the emergency write has not reached the controller yet",
+                    WRITE_JOIN_BUDGET.as_secs()
+                );
             }
-            // A harvested `apply` result arrives here when force_all re-awaits a
-            // pending ordinary write. Route it through the normal accounting
-            // rather than dropping it, or a failing channel's streak is neither
-            // advanced nor reset for that tick.
-            Some(Ok(outcomes)) => {
-                self.stall_logged = false;
-                self.note_outcomes(&outcomes);
-            }
+        } else if self.stall_logged {
+            // DEC-298: the falling edge. Without it the journal asserted a
+            // condition that had cleared minutes earlier, and a 105->80 hold can
+            // last minutes.
+            self.stall_logged = false;
+            log::warn!("THERMAL SAFETY: OpenFan force_all writes are landing again");
         }
     }
 }
@@ -735,8 +880,8 @@ impl HwmonBackend {
     }
 
     /// True while a write issued on an earlier tick has not returned (DEC-289).
-    pub(crate) fn writes_outstanding(&self) -> bool {
-        self.writes.outstanding()
+    pub(crate) fn writes_stalled(&self) -> bool {
+        self.writes.stalled()
     }
 
     /// Await any in-flight write at shutdown (DEC-289). See [`BoundedWrite::drain`].
@@ -807,6 +952,23 @@ impl WriteBackend for HwmonBackend {
         // DEC-289: see the note on `OpenFanBackend::apply` — an outstanding write
         // must still be re-awaited on a tick that has no commands of its own.
         if hwmon_cmds.is_empty() && !self.writes.outstanding() {
+            return;
+        }
+        // DEC-298: harvest the outstanding write, but do NOT issue a new one when
+        // there is nothing to command. Before this change `run` dropped the
+        // closure on a harvest, so an empty command list cost nothing; now it
+        // would be spawned, and it takes an Engine hwmon lease and renews it for
+        // a tick that writes no PWM at all. No hardware effect — `take_lease` is
+        // bookkeeping — but a 60 s lease acquired to command nothing is a lie
+        // about who owns the header.
+        if hwmon_cmds.is_empty() {
+            let progress = self.writes.harvest_only(WRITE_JOIN_BUDGET).await;
+            for joined in progress.completed() {
+                match joined {
+                    Ok(outcomes) => self.note_outcomes(&outcomes),
+                    Err(e) => log::error!("Profile engine: hwmon write task panicked: {e}"),
+                }
+            }
             return;
         }
         let ctrl = self.ctrl.clone();
@@ -889,16 +1051,16 @@ impl WriteBackend for HwmonBackend {
                 outcomes
             })
             .await;
-        match join {
-            Some(Ok(outcomes)) => self.note_outcomes(&outcomes),
-            Some(Err(e)) => {
+        // DEC-298: route every completed write — a harvested one and this
+        // call's own. Nothing completed means nothing was attempted, so record
+        // no outcomes: a member's failure streak must neither advance nor reset
+        // for a write that never happened (DEC-289).
+        for joined in join.completed() {
+            match joined {
+                Ok(outcomes) => self.note_outcomes(&outcomes),
                 // Concurrency review D3: surface panicked write tasks.
-                log::error!("Profile engine: hwmon write task panicked: {e}");
+                Err(e) => log::error!("Profile engine: hwmon write task panicked: {e}"),
             }
-            // DEC-289: an earlier write is still in flight. Nothing was attempted
-            // this tick, so record no outcomes — a member's failure streak must
-            // neither advance nor reset for a write that never happened.
-            None => {}
         }
     }
 }
@@ -986,30 +1148,37 @@ impl SafetyWriteBackend for HwmonBackend {
             Vec::new()
         })
         .await;
-        match join {
-            // Concurrency review D3: never swallow a panicked safety write.
-            Some(Err(e)) => {
-                log::error!("THERMAL SAFETY: hwmon force_all task panicked: {e}");
+        // DEC-298: "stalled" is *nothing completed*, not *something in flight* —
+        // the same distinction the write-stall stamp draws. A device merely
+        // slower than the budget completes a write every tick and must not be
+        // reported as stalled.
+        let stalled = join.in_flight && join.harvested.is_none() && join.issued.is_none();
+        // A harvested `apply` result — see the OpenFan note. Since DEC-298 this
+        // call may also have issued and completed its own write, so both route.
+        for joined in join.completed() {
+            match joined {
+                Ok(outcomes) => self.note_outcomes(&outcomes),
+                // Concurrency review D3: never swallow a panicked safety write.
+                Err(e) => log::error!("THERMAL SAFETY: hwmon force_all task panicked: {e}"),
             }
-            // DEC-289: still in flight — held and re-awaited next tick, never
-            // re-issued. The loop is released so the ladder and the other
-            // backends keep running instead of freezing behind this header.
-            // Edge-triggered for the reason given on `OpenFanBackend::force_all`.
-            None => {
-                if !self.stall_logged {
-                    self.stall_logged = true;
-                    log::error!(
-                        "THERMAL SAFETY: hwmon force_all still in flight after {}s — \
-                         the emergency write has not reached the header yet",
-                        WRITE_JOIN_BUDGET.as_secs()
-                    );
-                }
+        }
+        // DEC-289: still in flight — held and re-awaited next tick, never
+        // re-issued. The loop is released so the ladder and the other backends
+        // keep running instead of freezing behind this header.
+        // Edge-triggered for the reason given on `OpenFanBackend::force_all`.
+        if stalled {
+            if !self.stall_logged {
+                self.stall_logged = true;
+                log::error!(
+                    "THERMAL SAFETY: hwmon force_all still in flight after {}s — \
+                     the emergency write has not reached the header yet",
+                    WRITE_JOIN_BUDGET.as_secs()
+                );
             }
-            // A harvested `apply` result — see the OpenFan note.
-            Some(Ok(outcomes)) => {
-                self.stall_logged = false;
-                self.note_outcomes(&outcomes);
-            }
+        } else if self.stall_logged {
+            // DEC-298: the falling edge — see `OpenFanBackend::force_all`.
+            self.stall_logged = false;
+            log::warn!("THERMAL SAFETY: hwmon force_all writes are landing again");
         }
     }
 }
@@ -1100,7 +1269,15 @@ mod tests {
             .await;
         let waited = started.elapsed();
 
-        assert!(out.is_none(), "a wedged write must not report as completed");
+        assert!(
+            out.in_flight,
+            "a wedged write must report as still in flight"
+        );
+        assert_eq!(
+            out.completed().count(),
+            0,
+            "nothing completed, so nothing may be routed as an outcome"
+        );
         assert!(
             bw.outstanding(),
             "the handle must be retained for the next tick"
@@ -1137,7 +1314,7 @@ mod tests {
                     let _ = std::fs::OpenOptions::new().write(true).open(&f);
                 })
                 .await;
-            assert!(out.is_none(), "the wedge should still be outstanding");
+            assert!(out.in_flight, "the wedge should still be outstanding");
         }
 
         assert_eq!(
@@ -1150,16 +1327,217 @@ mod tests {
         let _ = std::fs::remove_file(&fifo);
     }
 
+    /// DEC-298, and the whole point of it: harvesting a pending write must not
+    /// swallow the write this tick wanted to make.
+    ///
+    /// Before this, `run` took the pending handle and **dropped `f` unread** even
+    /// when that handle completed immediately. So a tick that cleared a slow
+    /// `apply` issued nothing of its own — and if that tick was the one where the
+    /// CPU crossed 105 °C, the first forced write was not issued until the tick
+    /// after. `ran == 2` is the discriminator: before the fix it was 1.
+    #[tokio::test]
+    async fn a_harvested_write_still_issues_this_ticks_own_write() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let ran = Arc::new(AtomicUsize::new(0));
+        let mut bw: BoundedWrite<u8> = BoundedWrite::default();
+
+        // Tick N: a write slower than its budget, so it is left pending.
+        let r1 = ran.clone();
+        let first = bw
+            .run(std::time::Duration::from_millis(20), move || {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                r1.fetch_add(1, Ordering::SeqCst);
+                1u8
+            })
+            .await;
+        assert!(
+            first.in_flight,
+            "fixture check: the first write must outlast its budget, or this test \
+             never exercises the harvest path"
+        );
+        assert_eq!(first.completed().count(), 0);
+
+        // Let it finish, so the next call HARVESTS rather than timing out again.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        // Tick N+1: the harvest succeeds — and this tick's own write must also be
+        // issued, in the same call.
+        let r2 = ran.clone();
+        let second = bw
+            .run(std::time::Duration::from_millis(500), move || {
+                r2.fetch_add(1, Ordering::SeqCst);
+                2u8
+            })
+            .await;
+
+        assert!(!second.in_flight, "both writes completed inside the budget");
+        assert_eq!(
+            second
+                .harvested
+                .expect("the pending write must be harvested")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            second
+                .issued
+                .expect(
+                    "this tick's write must ALSO be issued — before DEC-298 it was dropped unread"
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            2,
+            "both closures must have actually run"
+        );
+    }
+
+    /// DEC-298 remediation, and the defect review found in the first cut.
+    ///
+    /// Because a tick now re-issues immediately after harvesting, `pending` is
+    /// never `None` at the point the loop samples it — so reporting raw
+    /// outstanding-ness pinned `engine_writes_stalled_since` forever for any
+    /// device slower than the budget. `record_engine_write_stall` only clears its
+    /// stamp on `false`, so after 30x the tick interval `engine_health` would
+    /// return `crit` "writes wedged" for a device writing perfectly well every
+    /// 1.5 s — the exact false alarm `staleness.rs` says its 30x threshold was
+    /// chosen to avoid.
+    ///
+    /// "Stalled" therefore means *nothing completed*, not *something is in
+    /// flight*.
+    #[tokio::test]
+    async fn a_slow_but_completing_write_clears_the_stall_flag_periodically() {
+        let mut bw: BoundedWrite<u8> = BoundedWrite::default();
+        let budget = std::time::Duration::from_millis(60);
+        // 1.5x the budget — the reviewer's degraded-link case. Writes DO land,
+        // just not within one budget, so harvests succeed on alternate calls.
+        let slow = || {
+            std::thread::sleep(std::time::Duration::from_millis(90));
+            7u8
+        };
+
+        let mut harvests = 0;
+        let mut clears = 0;
+        for _ in 0..8 {
+            let progress = bw.run(budget, slow).await;
+            if progress.harvested.is_some() {
+                harvests += 1;
+            }
+            if !bw.stalled() {
+                clears += 1;
+            }
+        }
+
+        assert!(
+            harvests >= 2,
+            "fixture check: writes must actually be landing ({harvests} harvests), \
+             or this test is measuring a wedge"
+        );
+        // The property that matters is not "never stalled" — it is that the flag
+        // CLEARS, because `record_engine_write_stall` only resets its stamp on
+        // `false`. A flag that never clears accumulates to the 30x `crit`
+        // "writes wedged" on a device that is writing fine.
+        assert!(
+            clears >= 2,
+            "the stall flag never cleared ({clears} clears in 8 ticks) — \
+             engine_writes_stalled_since would accumulate to a false `crit`"
+        );
+    }
+
+    /// DEC-298: a genuinely wedged device must still report stalled, or the fix
+    /// for the false positive would have created a false negative.
+    #[tokio::test]
+    async fn a_wedged_write_is_stalled_from_the_first_tick() {
+        let fifo = make_fifo("stalled");
+        release_backstop(fifo.clone());
+
+        let mut bw: BoundedWrite<()> = BoundedWrite::default();
+        for tick in 0..3 {
+            let out = bw
+                .run(std::time::Duration::from_millis(80), wedge_on(fifo.clone()))
+                .await;
+            assert!(out.in_flight, "tick {tick}");
+            assert!(
+                bw.stalled(),
+                "tick {tick}: nothing has ever completed — this is what wedged means"
+            );
+        }
+        let _reader = std::fs::File::open(&fifo).unwrap();
+        let _ = std::fs::remove_file(&fifo);
+    }
+
+    /// DEC-298: the harvest and the newly issued write share ONE budget, so a
+    /// harvest that consumes it all leaves no time to wait — but the write is
+    /// still ISSUED, which is what the fix is about. `spawn_blocking` starts
+    /// running the moment it is spawned; waiting for it is a separate question.
+    ///
+    /// Also pins that `run` stays within its budget, i.e. the tick cost did not
+    /// double when this gained a second phase.
+    #[tokio::test]
+    async fn a_harvest_that_eats_the_budget_still_issues_the_write_within_budget() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let issued = Arc::new(AtomicBool::new(false));
+        let mut bw: BoundedWrite<u8> = BoundedWrite::default();
+
+        // Leave a write pending that will take ~150 ms to finish.
+        let first = bw
+            .run(std::time::Duration::from_millis(10), || {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                1u8
+            })
+            .await;
+        assert!(first.in_flight, "fixture check: must be left pending");
+
+        // Budget generous enough to harvest but nearly all consumed doing so.
+        let flag = issued.clone();
+        let started = std::time::Instant::now();
+        let budget = std::time::Duration::from_millis(300);
+        let second = bw
+            .run(budget, move || {
+                flag.store(true, Ordering::SeqCst);
+                2u8
+            })
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            second.harvested.is_some(),
+            "the pending write should have been harvested"
+        );
+        assert!(
+            elapsed <= budget + std::time::Duration::from_millis(150),
+            "run took {elapsed:?} against a {budget:?} budget — the harvest and the \
+             issued write must SHARE one budget, not take one each"
+        );
+
+        // Whether it completed inside the residual is timing-dependent; that it
+        // was issued at all is not. Poll rather than assume.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !issued.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            issued.load(Ordering::SeqCst),
+            "this tick's write was never issued — it was dropped, which is the defect"
+        );
+    }
+
     /// The bound must not break the ordinary path: a write that completes inside
     /// its budget returns its value and leaves nothing outstanding.
     #[tokio::test]
     async fn a_write_that_completes_reports_its_result_and_clears_outstanding() {
         let mut bw: BoundedWrite<u8> = BoundedWrite::default();
-        let out = bw
-            .run(std::time::Duration::from_secs(5), || 42u8)
-            .await
-            .expect("a fast write must report as completed");
-        assert_eq!(out.unwrap(), 42);
+        let out = bw.run(std::time::Duration::from_secs(5), || 42u8).await;
+        assert!(!out.in_flight, "a fast write must not report as in flight");
+        assert!(out.harvested.is_none(), "nothing was pending to harvest");
+        assert_eq!(
+            out.issued
+                .expect("a fast write must report as completed")
+                .unwrap(),
+            42
+        );
         assert!(!bw.outstanding(), "nothing should remain outstanding");
     }
 
@@ -1404,7 +1782,11 @@ mod tests {
 
         // Tick 1: an emergency force_all wedges.
         be.force_all(100).await;
-        assert!(be.writes_outstanding(), "the force_all should be wedged");
+        // DEC-298: `writes_stalled` rather than the old `writes_outstanding` —
+        // a STRONGER assertion for this test's intent. "Outstanding" is merely
+        // "something is in flight"; "stalled" additionally requires that nothing
+        // completed, which is what "wedged" means here.
+        assert!(be.writes_stalled(), "the force_all should be wedged");
 
         // Tick 2: the emergency clears and ordinary control resumes.
         be.apply(&[cmd("hwmon:t:d:pwm1", "hwmon", 40)]).await;
