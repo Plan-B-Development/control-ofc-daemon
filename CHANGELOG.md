@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [2.24.0] — 2026-08-29
 
 ### Fixed
 - **A motherboard sensor that is documented as "not connected" could pin every
@@ -190,6 +190,15 @@
   the same value — no reader-level bound can. This release removes the one
   instance of that class which is kernel-documented and reachable; the general
   case remains open and is tracked as `AUD-x`.
+
+Pairs with `control-ofc-gui` ≥ v2.23.0; **no wire, schema or API break** —
+`api_version` stays 1 and the error envelope is unchanged. Two endpoints
+(`POST /hwmon/{id}/verify` and `POST /gpu/{id}/fan/verify`) and the OpenFan
+calibrate endpoint can now return a refusal they never returned before —
+`409 validation_error` with `retryable: true` — while the thermal ladder is
+forcing a duty. That is an additive *outcome*, not a shape change: v2.49.2 or
+newer presents it as the soft "let it cool, then retry" notice it is, and older
+GUIs still show it, but worded as a verify error.
 
 ## [2.23.5] — 2026-08-28
 

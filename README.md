@@ -1,6 +1,6 @@
 # control-ofc-daemon
 
-**Latest release:** v2.23.5 — 2026-08-28. Pairs with `control-ofc-gui` ≥ v2.23.0 (the recommended capability floor; the package itself only hard-blocks GUIs < 2.0.0, the sole-writer cutover). v2.42.0 or newer drives the `POST /fans/openfan/rescan` route, v2.44.0 or newer surfaces the `skipped_controls[]` field as a "Not controlled" badge, v2.45.0 or newer consumes the `control_outputs[]` field and the `controls` health subsystem, and v2.49.0 or newer removes a profile search directory via `control.profile_search_dir_remove`; older GUIs simply ignore all of them. See [`CHANGELOG.md`](CHANGELOG.md) for the full history.
+**Latest release:** v2.24.0 — 2026-08-29. Pairs with `control-ofc-gui` ≥ v2.23.0 (the recommended capability floor; the package itself only hard-blocks GUIs < 2.0.0, the sole-writer cutover). v2.42.0 or newer drives the `POST /fans/openfan/rescan` route, v2.44.0 or newer surfaces the `skipped_controls[]` field as a "Not controlled" badge, v2.45.0 or newer consumes the `control_outputs[]` field and the `controls` health subsystem, v2.49.0 or newer removes a profile search directory via `control.profile_search_dir_remove`, and v2.49.2 or newer shows the new thermal-forcing verify refusal as a soft notice rather than an error; older GUIs ignore or mis-word them but keep working. See [`CHANGELOG.md`](CHANGELOG.md) for the full history.
 
 Rust workspace for the Control-OFC fan control daemon.
 
