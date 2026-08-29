@@ -178,6 +178,56 @@ pub async fn gpu_reset_fan_handler(
     }
 }
 
+/// Record what a completed GPU restore left the hardware at (DEC-297).
+///
+/// **This must mirror `restore_pmfw`/`restore_legacy`'s own match arms.** Both
+/// treat `Some(p) if p > 0` as "put the static speed back" and everything else
+/// as "hand the fan to firmware-auto" — so stamping only the `Some(p)` case left
+/// an auto-restored fan reporting the TEST SPEED forever, which is worse than not
+/// stamping at all: `GpuBackend::apply` coalesces within `GPU_COALESCE_DELTA_PCT`,
+/// so a later profile command near that value is skipped and the card silently
+/// stays on the firmware curve. `0` for the auto branch matches
+/// `gpu_reset_fan_handler`, which has always stamped it that way.
+///
+/// A FAILED restore is deliberately not stamped: the hardware is still at the
+/// test speed, the cache already says so, and it must keep saying so or the
+/// engine's coalescing will not correct it.
+fn stamp_restored_pct(
+    cache: &crate::health::cache::StateCache,
+    fan_id: &str,
+    prior_pct: Option<u8>,
+    restore_failed: bool,
+) {
+    if restore_failed {
+        return;
+    }
+    cache.set_gpu_fan_commanded_pct(fan_id, prior_pct.filter(|p| *p > 0).unwrap_or(0));
+}
+
+/// What a GPU verify's uncancellable sequence produced (DEC-297).
+///
+/// The whole test-write -> settle -> read-back -> restore sequence runs inside one
+/// `spawn_blocking`, so it cannot `return` a response directly. It reports what
+/// happened and the handler builds the response from it.
+enum GpuVerifySequence {
+    /// The test write itself was rejected; `final_state` is the post-restore read.
+    WriteFailed {
+        initial: GpuVerifyState,
+        final_state: GpuVerifyState,
+        test_speed: u8,
+        restore_failed: bool,
+        /// The complete, arm-specific message for the response — PMFW and legacy
+        /// word their rejection differently.
+        details: String,
+    },
+    Completed {
+        initial: GpuVerifyState,
+        final_state: GpuVerifyState,
+        test_speed: u8,
+        restore_failed: bool,
+    },
+}
+
 /// POST /gpu/{gpu_id}/fan/verify — behavioural test of GPU fan-control
 /// effectiveness (the GPU analogue of `hwmon_verify_handler`). Drives a test
 /// speed (biased *upward* so cooling is never reduced), waits
@@ -215,7 +265,9 @@ pub async fn gpu_verify_handler(
     // Single-flight + pause the engine's write phase for the verify's lifetime
     // so the engine's GPU backend does not overwrite our controlled test speed.
     // GPU writes need no lease (DEC-045); the pause is the only coordination.
-    let Some(_verify_guard) =
+    // NOT a suppression of the 105 °C `force_all` — that runs before the engine's
+    // `verify_active()` gate and always outranks a verify (corrected in DEC-297).
+    let Some(verify_guard) =
         super::begin_verify_pause(&state.cache, constants::VERIFY_PAUSE_DEADMAN)
     else {
         return error_response(
@@ -236,7 +288,7 @@ pub async fn gpu_verify_handler(
     // across that sleep would reopen the exact gap. `reset` waits only
     // briefly for it (see `lock_gpu_writes_soon`) and reports a clear conflict
     // rather than hanging past the GUI's 5 s timeout.
-    let _gpu_write_guard = state.cache.lock_gpu_writes().await;
+    let gpu_write_guard = state.cache.lock_gpu_writes().await;
 
     let fan_id = format!("amd_gpu:{gpu_id}");
     let prior_pct = state
@@ -246,187 +298,264 @@ pub async fn gpu_verify_handler(
         .get(&fan_id)
         .and_then(|f| f.last_commanded_pct);
 
-    let read_rpm = |hwmon: &std::path::Path| -> Option<u16> {
-        std::fs::read_to_string(hwmon.join("fan1_input"))
-            .ok()
-            .and_then(|s| s.trim().parse::<u16>().ok())
-    };
+    // DEC-297: the ENTIRE test-write -> settle -> read-back -> restore sequence
+    // runs inside one `spawn_blocking`, and BOTH guards are moved into it. This
+    // is the DEC-290 shape, applied to the GPU analogue a release later.
+    //
+    // It used to run inline with `tokio::time::sleep(...).await` between the test
+    // write and the restore. That `.await` is a cancellation point: a client
+    // disconnect (or the GUI's own timeout) dropped the handler future, both
+    // guards ran their `Drop`, and the restore never happened — leaving the fan
+    // pinned at the test speed. `spawn_blocking` is not cancelled when its
+    // `JoinHandle` is dropped, so the sequence always completes.
+    //
+    // NOT a copy of the hwmon fix: this path also holds an OWNED
+    // `lock_gpu_writes` guard (DEC-255) for the whole window, which must move
+    // inside too, and it takes no hwmon lease (GPU writes need none, DEC-045).
+    let task_cache = state.cache.clone();
+    let task_fan_id = fan_id.clone();
 
-    if let Some(fan_curve_path) = gpu.fan_curve_path.clone() {
+    let join = if let Some(fan_curve_path) = gpu.fan_curve_path.clone() {
         // ── PMFW fan_curve path (RDNA3+) ──────────────────────────────
         let zero_rpm_path = gpu.fan_zero_rpm_path.clone();
         let hwmon_path = gpu.hwmon_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let verify_guard = verify_guard;
+            let _gpu_write_guard = gpu_write_guard;
+            let read_rpm = |hwmon: &std::path::Path| -> Option<u16> {
+                std::fs::read_to_string(hwmon.join("fan1_input"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u16>().ok())
+            };
 
-        let initial_curve = crate::hwmon::gpu_fan::read_fan_curve(&fan_curve_path).ok();
-        let (od_min, od_max) = initial_curve
-            .as_ref()
-            .and_then(|c| c.speed_range)
-            .unwrap_or((15, 100));
-        let initial_state = GpuVerifyState {
-            applied_speed_pct: initial_curve
+            let initial_curve = crate::hwmon::gpu_fan::read_fan_curve(&fan_curve_path).ok();
+            let (od_min, od_max) = initial_curve
                 .as_ref()
-                .and_then(crate::hwmon::gpu_fan::flat_speed_pct),
-            rpm: read_rpm(&hwmon_path),
-            pwm_enable: None,
-            zero_rpm_enabled: zero_rpm_path
-                .as_deref()
-                .and_then(crate::hwmon::gpu_fan::read_zero_rpm_enabled),
-        };
+                .and_then(|c| c.speed_range)
+                .unwrap_or((15, 100));
+            let initial_state = GpuVerifyState {
+                applied_speed_pct: initial_curve
+                    .as_ref()
+                    .and_then(crate::hwmon::gpu_fan::flat_speed_pct),
+                rpm: read_rpm(&hwmon_path),
+                pwm_enable: None,
+                zero_rpm_enabled: zero_rpm_path
+                    .as_deref()
+                    .and_then(crate::hwmon::gpu_fan::read_zero_rpm_enabled),
+            };
 
-        let test_speed = select_gpu_test_speed(
-            prior_pct.or(initial_state.applied_speed_pct),
-            od_min,
-            od_max,
-        );
+            let test_speed = select_gpu_test_speed(
+                prior_pct.or(initial_state.applied_speed_pct),
+                od_min,
+                od_max,
+            );
 
-        // Drive the test speed (disables zero-RPM, clamps to OD_RANGE, commits).
-        if let Err(e) = crate::hwmon::gpu_fan::set_static_speed(
-            &fan_curve_path,
-            zero_rpm_path.as_deref(),
-            test_speed,
-            constants::GPU_PMFW_NUM_CURVE_POINTS,
-        ) {
-            let restore_failed = restore_pmfw(prior_pct, &fan_curve_path, zero_rpm_path.as_deref());
-            return json_ok(
-                StatusCode::OK,
-                GpuVerifyResponse {
-                    gpu_id,
-                    result: "write_failed".into(),
-                    initial_state,
+            // Drive the test speed (disables zero-RPM, clamps to OD_RANGE, commits).
+            if let Err(e) = crate::hwmon::gpu_fan::set_static_speed(
+                &fan_curve_path,
+                zero_rpm_path.as_deref(),
+                test_speed,
+                constants::GPU_PMFW_NUM_CURVE_POINTS,
+            ) {
+                let restore_failed =
+                    restore_pmfw(prior_pct, &fan_curve_path, zero_rpm_path.as_deref());
+                stamp_restored_pct(&task_cache, &task_fan_id, prior_pct, restore_failed);
+                return GpuVerifySequence::WriteFailed {
+                    initial: initial_state,
                     final_state: GpuVerifyState {
                         applied_speed_pct: None,
                         rpm: read_rpm(&hwmon_path),
                         pwm_enable: None,
                         zero_rpm_enabled: None,
                     },
-                    test_speed_pct: test_speed,
-                    wait_seconds: 0,
-                    fan_control_method: method.into(),
+                    test_speed,
+                    restore_failed,
                     details: format!(
                         "The PMFW fan_curve write was rejected by the driver/firmware: {e}. \
                          Manual fan control is not functional in this state."
                     ),
-                    restore_failed,
-                },
-            );
-        }
+                };
+            }
+            // DEC-297: keep the cache truthful about what was last COMMANDED.
+            // The engine's `apply` coalesces against this value (5% band), so a
+            // cache still reporting the pre-verify duty would suppress the
+            // engine's correction if the restore below ever fails — the strand
+            // would then survive even under an active profile, which is the
+            // opposite of what the register row assumed.
+            task_cache.set_gpu_fan_commanded_pct(&task_fan_id, test_speed);
 
-        tokio::time::sleep(std::time::Duration::from_secs(
-            constants::VERIFY_WAIT_SECONDS as u64,
-        ))
-        .await;
+            // Blocking sleep, deliberately: this task is the uncancellable unit,
+            // and an async sleep would reintroduce the cancellation point the
+            // restructure exists to remove.
+            std::thread::sleep(std::time::Duration::from_secs(
+                constants::VERIFY_WAIT_SECONDS as u64,
+            ));
 
-        let final_curve = crate::hwmon::gpu_fan::read_fan_curve(&fan_curve_path).ok();
-        let final_state = GpuVerifyState {
-            applied_speed_pct: final_curve
-                .as_ref()
-                .and_then(crate::hwmon::gpu_fan::flat_speed_pct),
-            rpm: read_rpm(&hwmon_path),
-            pwm_enable: None,
-            zero_rpm_enabled: zero_rpm_path
-                .as_deref()
-                .and_then(crate::hwmon::gpu_fan::read_zero_rpm_enabled),
-        };
+            let final_curve = crate::hwmon::gpu_fan::read_fan_curve(&fan_curve_path).ok();
+            let final_state = GpuVerifyState {
+                applied_speed_pct: final_curve
+                    .as_ref()
+                    .and_then(crate::hwmon::gpu_fan::flat_speed_pct),
+                rpm: read_rpm(&hwmon_path),
+                pwm_enable: None,
+                zero_rpm_enabled: zero_rpm_path
+                    .as_deref()
+                    .and_then(crate::hwmon::gpu_fan::read_zero_rpm_enabled),
+            };
 
-        let restore_failed = restore_pmfw(prior_pct, &fan_curve_path, zero_rpm_path.as_deref());
-        let (result, details) =
-            classify_gpu_verify_result(&initial_state, &final_state, test_speed);
+            // DEC-296 liveness: prove we are still alive and keep the pause for
+            // the restore. Unlike the hwmon verify we hold no lease to lose, so
+            // a supersession cannot break the restore itself — but if the window
+            // lapses with no successor the engine resumes writing and the
+            // restore below races its curve output.
+            let _ = verify_guard.renew(constants::VERIFY_PAUSE_DEADMAN);
 
-        json_ok(
-            StatusCode::OK,
-            GpuVerifyResponse {
-                gpu_id,
-                result,
-                initial_state,
+            let restore_failed = restore_pmfw(prior_pct, &fan_curve_path, zero_rpm_path.as_deref());
+            stamp_restored_pct(&task_cache, &task_fan_id, prior_pct, restore_failed);
+            GpuVerifySequence::Completed {
+                initial: initial_state,
                 final_state,
-                test_speed_pct: test_speed,
-                wait_seconds: constants::VERIFY_WAIT_SECONDS,
-                fan_control_method: method.into(),
-                details,
+                test_speed,
                 restore_failed,
-            },
-        )
+            }
+        })
     } else {
         // ── Legacy hwmon pwm1 path (pre-RDNA3) ────────────────────────
         let hwmon_path = gpu.hwmon_path.clone();
-        let read_pwm_pct = |hwmon: &std::path::Path| -> Option<u8> {
-            std::fs::read_to_string(hwmon.join("pwm1"))
-                .ok()
-                .and_then(|s| s.trim().parse::<u8>().ok())
-                .map(crate::pwm::raw_to_percent)
-        };
-        let read_enable = |hwmon: &std::path::Path| -> Option<u8> {
-            std::fs::read_to_string(hwmon.join("pwm1_enable"))
-                .ok()
-                .and_then(|s| s.trim().parse::<u8>().ok())
-        };
+        tokio::task::spawn_blocking(move || {
+            let verify_guard = verify_guard;
+            let _gpu_write_guard = gpu_write_guard;
+            let read_rpm = |hwmon: &std::path::Path| -> Option<u16> {
+                std::fs::read_to_string(hwmon.join("fan1_input"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u16>().ok())
+            };
+            let read_pwm_pct = |hwmon: &std::path::Path| -> Option<u8> {
+                std::fs::read_to_string(hwmon.join("pwm1"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u8>().ok())
+                    .map(crate::pwm::raw_to_percent)
+            };
+            let read_enable = |hwmon: &std::path::Path| -> Option<u8> {
+                std::fs::read_to_string(hwmon.join("pwm1_enable"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u8>().ok())
+            };
 
-        let initial_state = GpuVerifyState {
-            applied_speed_pct: read_pwm_pct(&hwmon_path),
-            rpm: read_rpm(&hwmon_path),
-            pwm_enable: read_enable(&hwmon_path),
-            zero_rpm_enabled: None,
-        };
+            let initial_state = GpuVerifyState {
+                applied_speed_pct: read_pwm_pct(&hwmon_path),
+                rpm: read_rpm(&hwmon_path),
+                pwm_enable: read_enable(&hwmon_path),
+                zero_rpm_enabled: None,
+            };
 
-        let test_speed =
-            select_gpu_test_speed(prior_pct.or(initial_state.applied_speed_pct), 0, 100);
+            let test_speed =
+                select_gpu_test_speed(prior_pct.or(initial_state.applied_speed_pct), 0, 100);
 
-        if let Err(e) = crate::hwmon::gpu_fan::set_legacy_pwm(&hwmon_path, test_speed) {
-            let restore_failed = restore_legacy(prior_pct, &hwmon_path);
-            return json_ok(
-                StatusCode::OK,
-                GpuVerifyResponse {
-                    gpu_id,
-                    result: "write_failed".into(),
-                    initial_state,
+            if let Err(e) = crate::hwmon::gpu_fan::set_legacy_pwm(&hwmon_path, test_speed) {
+                let restore_failed = restore_legacy(prior_pct, &hwmon_path);
+                stamp_restored_pct(&task_cache, &task_fan_id, prior_pct, restore_failed);
+                return GpuVerifySequence::WriteFailed {
+                    initial: initial_state,
                     final_state: GpuVerifyState {
                         applied_speed_pct: read_pwm_pct(&hwmon_path),
                         rpm: read_rpm(&hwmon_path),
                         pwm_enable: read_enable(&hwmon_path),
                         zero_rpm_enabled: None,
                     },
-                    test_speed_pct: test_speed,
-                    wait_seconds: 0,
-                    fan_control_method: method.into(),
+                    test_speed,
+                    restore_failed,
                     details: format!(
                         "The legacy pwm1 write was rejected: {e}. Manual fan control is not \
                          functional in this state."
                     ),
-                    restore_failed,
-                },
+                };
+            }
+            task_cache.set_gpu_fan_commanded_pct(&task_fan_id, test_speed);
+
+            std::thread::sleep(std::time::Duration::from_secs(
+                constants::VERIFY_WAIT_SECONDS as u64,
+            ));
+
+            let final_state = GpuVerifyState {
+                applied_speed_pct: read_pwm_pct(&hwmon_path),
+                rpm: read_rpm(&hwmon_path),
+                pwm_enable: read_enable(&hwmon_path),
+                zero_rpm_enabled: None,
+            };
+
+            let _ = verify_guard.renew(constants::VERIFY_PAUSE_DEADMAN);
+
+            let restore_failed = restore_legacy(prior_pct, &hwmon_path);
+            stamp_restored_pct(&task_cache, &task_fan_id, prior_pct, restore_failed);
+            GpuVerifySequence::Completed {
+                initial: initial_state,
+                final_state,
+                test_speed,
+                restore_failed,
+            }
+        })
+    };
+
+    let sequence = match join.await {
+        Ok(seq) => seq,
+        Err(e) => {
+            // The sequence panicked. Both guards were owned by the task and have
+            // been dropped by the unwind, so nothing is stranded held — but the
+            // fan may still be at the test speed, which the caller must be told.
+            log::error!("GPU verify task panicked for {fan_id}: {e}");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorEnvelope::internal(format!(
+                    "the GPU verify sequence panicked; the fan may be left at its test speed: {e}"
+                )),
             );
         }
+    };
 
-        tokio::time::sleep(std::time::Duration::from_secs(
-            constants::VERIFY_WAIT_SECONDS as u64,
-        ))
-        .await;
-
-        let final_state = GpuVerifyState {
-            applied_speed_pct: read_pwm_pct(&hwmon_path),
-            rpm: read_rpm(&hwmon_path),
-            pwm_enable: read_enable(&hwmon_path),
-            zero_rpm_enabled: None,
-        };
-
-        let restore_failed = restore_legacy(prior_pct, &hwmon_path);
-        let (result, details) =
-            classify_gpu_verify_result(&initial_state, &final_state, test_speed);
-
-        json_ok(
+    match sequence {
+        GpuVerifySequence::WriteFailed {
+            initial,
+            final_state,
+            test_speed,
+            restore_failed,
+            details,
+        } => json_ok(
             StatusCode::OK,
             GpuVerifyResponse {
                 gpu_id,
-                result,
-                initial_state,
+                result: "write_failed".into(),
+                initial_state: initial,
                 final_state,
                 test_speed_pct: test_speed,
-                wait_seconds: constants::VERIFY_WAIT_SECONDS,
+                wait_seconds: 0,
                 fan_control_method: method.into(),
                 details,
                 restore_failed,
             },
-        )
+        ),
+        GpuVerifySequence::Completed {
+            initial,
+            final_state,
+            test_speed,
+            restore_failed,
+        } => {
+            let (result, details) = classify_gpu_verify_result(&initial, &final_state, test_speed);
+            json_ok(
+                StatusCode::OK,
+                GpuVerifyResponse {
+                    gpu_id,
+                    result,
+                    initial_state: initial,
+                    final_state,
+                    test_speed_pct: test_speed,
+                    wait_seconds: constants::VERIFY_WAIT_SECONDS,
+                    fan_control_method: method.into(),
+                    details,
+                    restore_failed,
+                },
+            )
+        }
     }
 }
 
@@ -618,6 +747,185 @@ fn unsupported_fan_control_message(gpu: &crate::hwmon::gpu_detect::AmdGpuInfo) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AppState carrying one PMFW GPU whose `fan_curve` is a real temp file, so
+    /// the verify's writes and its restore are observable.
+    fn pmfw_verify_state(curve: std::path::PathBuf) -> Arc<AppState> {
+        use crate::hwmon::gpu_detect::AmdGpuInfo;
+        let cache = Arc::new(crate::health::cache::StateCache::new());
+        let readiness_rollup = Arc::new(parking_lot::Mutex::new(None));
+        let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let gpu = AmdGpuInfo {
+            pci_bdf: "0000:03:00.0".into(),
+            pci_device_id: 0x7550,
+            pci_revision: 0xC0,
+            pci_class: 0x030000,
+            marketing_name: Some("RX 9070 XT".into()),
+            hwmon_path: std::path::PathBuf::from("/nonexistent/hwmon"),
+            fan_curve_path: Some(curve),
+            fan_zero_rpm_path: None,
+            is_discrete: true,
+            has_fan_rpm: false,
+            has_pwm: false,
+            has_pwm_enable: false,
+            overdrive_enabled: true,
+        };
+        Arc::new(AppState {
+            cache,
+            staleness_config: crate::health::staleness::StalenessConfig::default(),
+            daemon_version: "0.0.0-test".into(),
+            fan_controller: Arc::new(parking_lot::RwLock::new(None)),
+            openfan_runtime: crate::api::handlers::OpenFanRuntime {
+                timeout: std::time::Duration::from_millis(500),
+                interval: std::time::Duration::from_millis(1000),
+                shutdown: shutdown_rx,
+            },
+            hwmon_controller: None,
+            start_time: std::time::Instant::now(),
+            history: Arc::new(crate::health::history::HistoryRing::new(250)),
+            active_profile: Arc::new(parking_lot::Mutex::new(None)),
+            calibrating: std::sync::atomic::AtomicBool::new(false),
+            openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
+            last_openfan_rescan: Arc::new(parking_lot::Mutex::new(None)),
+            adopted_poll_handles: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            amd_gpus: vec![gpu],
+            intel_gpus: Vec::new(),
+            nvidia_gpus: Vec::new(),
+            profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
+            config_path: String::new(),
+            runtime_config_path: std::path::PathBuf::new(),
+            sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            override_table: Arc::new(parking_lot::Mutex::new(
+                crate::control_override::OverrideTable::new(),
+            )),
+            allow_port_probe: false,
+            running_config: Default::default(),
+            readiness_rollup: readiness_rollup.clone(),
+            assessment: Arc::new(crate::api::handlers::AssessmentCache::new(readiness_rollup)),
+        })
+    }
+
+    /// DEC-297 remediation. Both reviewers independently found that the restore's
+    /// **auto** branch was never stamped into the cache, and the test above misses
+    /// it because it seeds a prior duty (40) and so always takes the `Some(p)`
+    /// branch.
+    ///
+    /// This is the common Hardware-page case: a GPU no profile has commanded yet.
+    /// The restore correctly hands the card back to firmware-auto, but the cache
+    /// was left reporting the TEST SPEED — so `/fans` and `/poll` claimed a manual
+    /// duty for a card on the firmware curve, and `GpuBackend::apply`'s 5% coalescing
+    /// would then skip a later profile command near that value, leaving the GPU on
+    /// firmware-auto while the daemon believed it was commanding.
+    #[tokio::test]
+    async fn a_gpu_verify_with_no_prior_duty_records_the_auto_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let curve = dir.path().join("fan_curve");
+        std::fs::write(&curve, "0: 0C 40%\n").unwrap();
+        let state = pmfw_verify_state(curve);
+        let cache = state.cache.clone();
+        let fan_id = "amd_gpu:0000:03:00.0";
+
+        // No `set_gpu_fan_commanded_pct` seed: `prior_pct` is None, so the restore
+        // takes the reset-to-auto branch.
+        assert!(
+            cache
+                .snapshot()
+                .gpu_fans
+                .get(fan_id)
+                .and_then(|f| f.last_commanded_pct)
+                .is_none(),
+            "fixture check: this test is about the NO-prior-duty path"
+        );
+
+        let _ = gpu_verify_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("0000:03:00.0".to_string()),
+        )
+        .await;
+
+        let commanded = cache
+            .snapshot()
+            .gpu_fans
+            .get(fan_id)
+            .and_then(|f| f.last_commanded_pct);
+        assert_eq!(
+            commanded,
+            Some(0),
+            "an auto-restore must be recorded as 0 (the convention gpu_reset_fan_handler \
+             already uses), not left at the test speed — otherwise the GUI shows a manual \
+             duty for a firmware-controlled card and the engine coalesces away its own \
+             correction"
+        );
+    }
+
+    /// DEC-297 (AUD-b2). The GPU verify used to run inline with a
+    /// `tokio::time::sleep(...).await` between the test write and the restore, so
+    /// dropping the handler future — a client disconnect, or the GUI's own
+    /// timeout — skipped the restore and left the fan pinned at the test speed.
+    /// This is the same defect DEC-290 fixed for the hwmon verify, one endpoint
+    /// over, and the handler's own doc claimed it already "mirrors" that one.
+    ///
+    /// Less severe than the hwmon case on purpose — `select_gpu_test_speed`
+    /// biases UPWARD, so a strand leaves the fan too fast rather than too slow —
+    /// but a strand it is: with no active profile nothing rewrites it.
+    #[tokio::test]
+    async fn a_cancelled_gpu_verify_still_restores_the_curve() {
+        let dir = tempfile::tempdir().unwrap();
+        let curve = dir.path().join("fan_curve");
+        std::fs::write(&curve, "0: 0C 40%\n").unwrap();
+        let state = pmfw_verify_state(curve.clone());
+        let cache = state.cache.clone();
+        let fan_id = "amd_gpu:0000:03:00.0";
+
+        // Seed the prior duty. This is what the restore must put back, and it is
+        // ALSO the only observable: `fan_curve` is a PMFW command channel, not a
+        // state file — each write replaces the last, so after a run the file
+        // holds only the trailing commit token and reading it back proves
+        // nothing. The cache is where "what was last commanded" actually lives.
+        cache.set_gpu_fan_commanded_pct(fan_id, 40);
+        let test_speed = select_gpu_test_speed(Some(40), 15, 100);
+        assert_ne!(
+            test_speed, 40,
+            "fixture check: the test speed must differ from the prior duty, or the \
+             assertion below cannot discriminate a restore from its absence"
+        );
+
+        {
+            let fut = gpu_verify_handler(
+                axum::extract::State(state.clone()),
+                axum::extract::Path("0000:03:00.0".to_string()),
+            );
+            tokio::pin!(fut);
+            tokio::select! {
+                _ = &mut fut => panic!("the verify completed too fast to model a cancellation"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+            }
+        } // <- handler future dropped, exactly as axum does on a client disconnect
+
+        // The abandoned `spawn_blocking` keeps running. Poll for it rather than
+        // sleeping a fixed span; the bound is a backstop, not the expected path.
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(constants::VERIFY_WAIT_SECONDS as u64 + 6);
+        while cache.verify_active() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            !cache.verify_active(),
+            "the abandoned verify never finished — it must run to completion"
+        );
+
+        let commanded = cache
+            .snapshot()
+            .gpu_fans
+            .get(fan_id)
+            .and_then(|f| f.last_commanded_pct);
+        assert_eq!(
+            commanded,
+            Some(40),
+            "a cancelled GPU verify must still restore the prior duty; \
+             {test_speed:?} means it was left at the test speed"
+        );
+    }
 
     fn st(
         applied: Option<u8>,

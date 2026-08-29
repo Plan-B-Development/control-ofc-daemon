@@ -115,6 +115,38 @@
   and having its restore fail. Both decisions are logged, because the situation
   they exist to survive should not be silent. (DEC-296)
 
+- **An abandoned GPU fan verify left the card's fan pinned at its test speed.**
+  The GPU verify writes a test speed, waits, reads back, then restores — but the
+  wait was an async pause, so if the client went away (or the GUI's own timeout
+  fired) the request was dropped mid-wait and the restore never ran. This is the
+  same defect fixed for the motherboard fan verify in 2.23.3, one endpoint over,
+  in a handler whose own notes claimed it already mirrored that one. The whole
+  sequence now runs as a unit that cannot be abandoned part-way.
+
+  Two things made it worse than it looked. The verify never told the daemon's
+  cache what it had commanded, so the cache still reported the pre-verify duty —
+  and the fan-control engine skips writes within 5% of what it believes is
+  already set, meaning even an active profile would not have corrected the
+  stranded fan. And with no prior duty recorded, the skipped restore was the one
+  that hands the fan back to firmware control, so the card was left on a flat
+  manual curve instead. The direction is at least the safe one: the test speed is
+  deliberately biased upward, so a stranded fan runs fast, never slow. (DEC-297)
+
+- **An abandoned OpenFan calibration left the channel at whatever step it had
+  reached** — and the early steps are 0%, so that one strands a fan SLOW. The
+  sweep now restores the pre-calibration duty on every exit, including
+  cancellation. Deliberately not by making the sweep uncancellable: a sweep runs
+  up to five minutes, and forcing it to completion after the client has gone would
+  hold the fan-diagnostic slot for that whole time. (DEC-297)
+
+- **A fan verify could start while thermal safety was forcing every fan.** Verify
+  refused to run above 85 °C, but the thermal emergency triggers at 105 °C and does
+  not release until 80 °C — so, exactly as for calibration in this same release,
+  the band between 80 and 85 °C passed the check while the daemon was still forcing
+  100%. A verify starting there drives its target fan to a test duty against that
+  force. It now refuses, with the same retryable `409` and the same
+  state-naming message calibration uses. (DEC-297)
+
 ### Notes
 - The reader's plausible-range check is unchanged, and deliberately so. It still
   cannot separate a real 105-125 °C over-temperature from a stuck sensor reading

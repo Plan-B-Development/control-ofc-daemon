@@ -177,8 +177,11 @@ pub async fn hwmon_verify_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(header_id): axum::extract::Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // Phase 6 (DEC-201): refuse to start a verify while the system is hot — the
-    // verify pauses the engine (incl. the thermal force_all) for its window.
+    // DEC-201/DEC-297: refuse to start a verify while the system is hot, OR while
+    // the ladder is forcing — a verify drives the header AWAY from its commanded
+    // duty. NOT because it suppresses the thermal `force_all`, which is what this
+    // comment used to claim: `force_all` runs before the engine's
+    // `verify_active()` gate and always outranks a verify.
     if let Some(resp) = super::verify_thermal_guard(&state.cache) {
         return resp;
     }

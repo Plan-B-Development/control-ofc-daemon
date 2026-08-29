@@ -1395,8 +1395,10 @@ async fn hwmon_verify_refused_when_hot() {
 
 #[tokio::test]
 async fn gpu_verify_refused_when_hot() {
-    // The GPU verify also pauses the engine (suppressing the CPU thermal
-    // force_all), so it too must refuse to start while hot (DEC-201).
+    // The GPU verify drives the fan away from its commanded duty, so it must
+    // refuse to start while hot (DEC-201). NOT because it suppresses the thermal
+    // force_all — it does not, and DEC-297 corrected that claim wherever it
+    // appeared; `force_all` runs before the `verify_active()` gate.
     let state = test_app_state();
     make_hot(&state);
     let (path, shutdown, _dir) = start_test_server(state).await;
@@ -1410,6 +1412,62 @@ async fn gpu_verify_refused_when_hot() {
 
     assert_eq!(status, 409);
     assert_eq!(json["error"]["code"], "thermal_abort");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn verify_refused_while_thermal_safety_is_forcing() {
+    // DEC-297 (295-a). `verify_thermal_guard` tested TEMPERATURE only, at 85C.
+    // The emergency latches at 105C and releases at <=80C, so the band
+    // 80 < T <= 85 passed it while the engine was still forcing every fan — and
+    // a verify then drives its target to a test duty against that force.
+    //
+    // The fixture sits at a NORMAL temperature on purpose: it proves the guard
+    // keys on the forced STATE, and could not fail if it keyed on temperature.
+    let state = test_app_state_with_hwmon();
+    state.cache.record_engine_tick("emergency");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_post(&path, "/hwmon/h1/verify", &serde_json::json!({})).await;
+    assert_eq!(
+        status, 409,
+        "a forced thermal state must refuse a verify: {json}"
+    );
+    assert_eq!(json["error"]["code"], "validation_error");
+    assert_eq!(
+        json["error"]["retryable"], true,
+        "the force clears by itself, so the client may retry"
+    );
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("emergency"),
+        "the message must name the state, or it reads as an unexplained refusal \
+         on a cool machine: {json}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn gpu_verify_refused_while_thermal_safety_is_forcing() {
+    // DEC-297 (295-a), the GPU arm of the same gate.
+    let state = test_app_state();
+    state.cache.record_engine_tick("recovery");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_post(
+        &path,
+        "/gpu/0000:99:00.0/fan/verify",
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, 409, "{json}");
+    assert_eq!(json["error"]["code"], "validation_error");
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);

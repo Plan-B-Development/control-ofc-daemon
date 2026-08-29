@@ -90,11 +90,12 @@ pub fn check_thermal_safety(cache: &StateCache) -> Result<(), CalibrationError> 
 /// (DEC-295).
 ///
 /// Deliberately a SEPARATE predicate rather than a new arm inside
-/// [`check_thermal_safety`], even though every caller of that function wants
-/// this too: it is also the verify gate (`api/handlers/mod.rs`), and widening
-/// its meaning would change `/hwmon/{id}/verify` and `/gpu/{id}/fan/verify`
-/// behaviour from a change scoped to calibration. The verify path has the same
-/// exposure and it is recorded as its own register row, not fixed here.
+/// [`check_thermal_safety`]: that function is also the verify gate, and DEC-295
+/// was scoped to calibration, so widening its meaning would have changed
+/// `/hwmon/{id}/verify` and `/gpu/{id}/fan/verify` behaviour from a change that
+/// had not reviewed them. **DEC-297 then used this predicate to close exactly
+/// that gap** in `verify_thermal_guard` — which is why it was separated rather
+/// than folded in: the two callers wanted the rule at different times.
 ///
 /// All three non-normal states force a duty — `emergency` 100%, `recovery` 60%,
 /// `no_sensor_fallback` 40% — so any of them means the engine is writing a
@@ -105,6 +106,70 @@ pub fn thermal_force_state(cache: &StateCache) -> Option<String> {
         None => None,
         Some(s) if s == "normal" => None,
         Some(s) => Some(s),
+    }
+}
+
+/// Restore the pre-calibration duty, unless thermal safety is forcing (DEC-295).
+///
+/// [`RestoreOnDrop`] is now its ONLY caller — the normal-path call was deleted in
+/// the same change, because scope exit covers completion and cancellation alike.
+/// Kept as a named function rather than inlined into `Drop` so the thermal rule
+/// is readable and testable on its own.
+fn restore_pre_cal<F>(
+    channel: u8,
+    pre_cal_pwm: Option<u8>,
+    write_fn: &F,
+    cache: &StateCache,
+    why: &str,
+) where
+    F: Fn(u8, u8) -> Result<(), CalibrationError>,
+{
+    let Some(restore) = pre_cal_pwm else {
+        return;
+    };
+    if let Some(state) = thermal_force_state(cache) {
+        log::warn!(
+            "ch{channel} left at the thermal-safety forced duty instead of restoring \
+             {restore}% ({why}) — thermal safety is active ({state}) and outranks \
+             calibration. It will not be restored automatically once the force clears."
+        );
+        return;
+    }
+    if let Err(e) = write_fn(channel, restore) {
+        log::warn!("failed to restore pre-calibration PWM on ch{channel} ({why}): {e}");
+    }
+}
+
+/// Restores the pre-calibration duty on drop (DEC-297, 295-e).
+///
+/// The sweep holds each step with `tokio::time::sleep(...).await`, which is a
+/// cancellation point: a client disconnect drops the handler future mid-hold and
+/// the channel is left at that step — **0 % for the early steps**, i.e. stranded
+/// SLOW, unlike the GPU verify which biases its test speed upward on purpose.
+/// `CalibrationGuard` only clears the single-flight flag; it does not restore.
+///
+/// Deliberately NOT the DEC-290 `spawn_blocking` shape used for the verifies. A
+/// verify is ~6 s and makes a fine uncancellable unit; a sweep is
+/// `steps x hold_seconds` — up to 300 s — and making that uncancellable would pin
+/// a blocking thread and hold both single-flight flags for five minutes after the
+/// client has gone. A drop guard restores the hardware without extending the
+/// work's lifetime, which is the property that actually matters here.
+struct RestoreOnDrop<'a, F: Fn(u8, u8) -> Result<(), CalibrationError>> {
+    channel: u8,
+    pre_cal_pwm: Option<u8>,
+    write_fn: &'a F,
+    cache: &'a StateCache,
+}
+
+impl<F: Fn(u8, u8) -> Result<(), CalibrationError>> Drop for RestoreOnDrop<'_, F> {
+    fn drop(&mut self) {
+        restore_pre_cal(
+            self.channel,
+            self.pre_cal_pwm,
+            self.write_fn,
+            self.cache,
+            "sweep ended",
+        );
     }
 }
 
@@ -197,39 +262,21 @@ pub async fn calibrate_openfan_channel(
         }
         Ok::<Vec<CalPoint>, CalibrationError>(points)
     };
-    let sweep_result = sweep.await;
-
-    // Restore pre-calibration PWM — best-effort, on every exit path.
+    // DEC-297 (295-e): the restore now runs on EVERY exit including cancellation.
+    // Constructed before the sweep is awaited, so a dropped handler future still
+    // restores; DEC-295's rule that the restore is skipped under an active
+    // thermal force lives in `restore_pre_cal`, shared by both paths.
     //
-    // DEC-295: unless thermal safety is forcing. The restore is an
-    // unconditional write of a value read BEFORE the sweep (e.g. 30%), and the
-    // engine may since have latched an emergency and forced 100%; writing the
-    // old value through the same controller would lower the channel below the
-    // forced duty. It self-heals on the next 1 Hz tick — the values differ, so
-    // write-coalescing does not suppress the re-force — but a second at 30%
-    // during a 105C event is not a second to give away. Skipping leaves the
-    // channel at the FORCED duty, which is correct but looks like a stuck fan
-    // to anyone reading RPM, so say so.
-    if let Some(restore) = pre_cal_pwm {
-        if let Some(state) = thermal_force_state(&cache) {
-            // NOTE the residual, and it is not small: nothing retries this. The
-            // engine keeps writing the forced duty while the state holds, so the
-            // channel ends at that duty — but once the ladder releases, an
-            // idle daemon (no active profile) commands nothing, so the channel
-            // stays there rather than returning to {restore}%. That is the
-            // accepted trade against writing UNDER an active force; a re-check
-            // loop would mean holding a request open for the length of an
-            // emergency. Recorded as its own register row.
-            log::warn!(
-                "ch{channel} left at the thermal-safety forced duty instead of restoring \
-                 {restore}% — thermal safety is active ({state}) and outranks calibration. \
-                 It will not be restored automatically once the force clears."
-            );
-        } else if let Err(e) = write_fn(channel, restore) {
-            log::warn!("failed to restore pre-calibration PWM on ch{channel}: {e}");
-        }
-    }
+    // The residual DEC-295 recorded still stands and is unchanged: nothing
+    // retries a restore that was skipped because the ladder was forcing.
+    let _restore = RestoreOnDrop {
+        channel,
+        pre_cal_pwm,
+        write_fn: &write_fn,
+        cache: &cache,
+    };
 
+    let sweep_result = sweep.await;
     let points = sweep_result?;
 
     // Derive start_pwm and stop_pwm
@@ -464,6 +511,42 @@ mod tests {
             w.as_slice(),
             &[(0u8, 0u8), (0u8, 33u8)],
             "no step beyond the latch may be written, and no restore; got {w:?}"
+        );
+    }
+
+    /// DEC-297 (295-e). The sweep holds each step with an `.await`, which is a
+    /// cancellation point: a client disconnect dropped the handler future
+    /// mid-hold and the restore never ran, leaving the channel at that step —
+    /// **0% for the early steps**, i.e. stranded SLOW. `CalibrationGuard` only
+    /// clears the single-flight flag; it does not restore.
+    ///
+    /// Fixed with a drop guard rather than DEC-290's `spawn_blocking` shape: a
+    /// sweep runs up to 300 s, and making that uncancellable would pin a blocking
+    /// thread and hold both single-flight flags long after the client has gone.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_calibration_still_restores_the_channel() {
+        let cache = make_cache(50.0, 0, 800);
+        let (write_fn, writes) = recording_write_fn(None);
+        {
+            let fut = calibrate_openfan_channel(cache.clone(), 0, 3, 0, write_fn);
+            tokio::pin!(fut);
+            // Abandon it mid-hold, exactly as axum does on a client disconnect.
+            tokio::select! {
+                _ = &mut fut => panic!("the sweep completed too fast to model a cancellation"),
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        } // <- future dropped here; the drop guard must still restore
+
+        let w = writes.lock().unwrap();
+        assert!(
+            w.contains(&(0u8, 0u8)),
+            "fixture check: the sweep must have written its first step before we \
+             cancelled, or this test proves nothing; got {w:?}"
+        );
+        assert_eq!(
+            w.last(),
+            Some(&(0u8, 50u8)),
+            "a cancelled sweep must still restore the pre-calibration duty; got {w:?}"
         );
     }
 

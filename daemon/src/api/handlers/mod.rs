@@ -406,12 +406,30 @@ pub(crate) fn begin_verify_pause(
         })
 }
 
-/// Phase 6 (DEC-201): refuse to START a hardware fan verify while the system is
-/// hot. A verify pauses the engine's write phase for its window, which also
-/// suppresses the 105 °C thermal `force_all` — so a fan diagnostic must never run
-/// during a thermal event. Returns `Some(409 thermal_abort)` when any sensor
-/// exceeds the calibrate/verify limit (reuses `check_thermal_safety`, matching
-/// the calibrate sweep — DEC-134); `None` when it is safe to proceed.
+/// Refuse to START a hardware fan verify when it would fight thermal safety.
+///
+/// **Corrected in DEC-297 (AUD-l).** This comment used to say a verify "pauses
+/// the engine's write phase for its window, which also suppresses the 105 °C
+/// thermal `force_all`". **It does not, and never did.** `force_all` runs at
+/// `profile_engine/mod.rs:970/973` and `continue`s well BEFORE the
+/// `verify_active()` gate at `:1120`, so an emergency outranks a verify and is
+/// unaffected by the pause — which `profile_engine/mod.rs:1072-1074` has always
+/// said. The guard is still worth having; its real justification is that a
+/// verify drives a header AWAY from its commanded duty, which must not happen
+/// while the system is hot or while the ladder is actively forcing.
+///
+/// Two conditions, and they are not the same test (DEC-297):
+/// 1. **Too hot** — any sensor above the calibrate/verify limit (85 °C), via
+///    `check_thermal_safety`, matching the calibrate sweep (DEC-201/DEC-134).
+///    Returns `409 thermal_abort`.
+/// 2. **The ladder is forcing** — `thermal_force_state` is `Some`. The
+///    temperature test above does NOT cover this: the emergency latches at
+///    105 °C and releases only at ≤80 °C, so the band 80 < T ≤ 85 passes it while
+///    every fan is still being forced. Returns `409 validation_error` with
+///    `retryable: true`, the shape DEC-295 established for the same refusal on
+///    the calibrate endpoint.
+///
+/// `None` when it is safe to proceed.
 pub(crate) fn verify_thermal_guard(
     cache: &crate::health::cache::StateCache,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
@@ -427,6 +445,24 @@ pub(crate) fn verify_thermal_guard(
                 "Cannot run a fan verify while hot: {sensor_id} at {temp_c:.1}°C \
                  (limit {limit_c:.0}°C). Let the system cool, then retry."
             )),
+        ));
+    }
+    // DEC-297 (295-a): the latched band the temperature test above cannot see.
+    if let Some(state) = crate::api::calibration::thermal_force_state(cache) {
+        return Some(error_response(
+            StatusCode::CONFLICT,
+            &ErrorEnvelope {
+                error: ErrorBody {
+                    code: "validation_error".into(),
+                    message: format!(
+                        "thermal safety is forcing fan output ({state}); a fan verify \
+                         cannot run"
+                    ),
+                    retryable: true,
+                    source: "validation".into(),
+                    details: None,
+                },
+            },
         ));
     }
     None
