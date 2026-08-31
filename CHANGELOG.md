@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [2.24.3] — 2026-08-31
 
 No behaviour change — a test correction and three documentation corrections.
 
