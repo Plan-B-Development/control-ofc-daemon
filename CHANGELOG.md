@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [2.24.1] — 2026-08-31
 
 ### Fixed
 - **The OpenFan serial link now correlates each reply with the command it answers,
@@ -95,6 +95,16 @@
   single source of truth. No coverage was lost (the crate has zero doctests, verified
   again here); what was missing was any signal that the first doctest anyone wrote
   would have had no CI coverage.
+
+Pairs with `control-ofc-gui` ≥ v2.23.0; **no wire, schema or API break** —
+`api_version` stays 1, the error envelope is unchanged, and no request or
+response shape moved. Both changes are internal to the daemon: one pins the
+Rust toolchain so the local gate and CI share a compiler, the other corrects
+the OpenFan serial link's request/response correlation. The GUI needs no
+change to benefit — `rpm` for OpenFan channels simply stops carrying
+occasional echoed PWM values. Operators may see OpenFan write failures
+reported that were previously swallowed; that is the fix working, not a
+regression.
 
 ## [2.24.0] — 2026-08-29
 
