@@ -275,9 +275,34 @@ impl StateCache {
     /// from the controller) — mirroring `update_gpu_fans`, so the poll loop
     /// no longer needs a full `snapshot()` clone every second just to copy
     /// this one field forward (DEC-146 P3-7).
-    pub fn update_openfan_fans(&self, fans: Vec<OpenFanState>) {
+    /// Returns how many already-known channels this batch did **not** cover
+    /// (OFS-b) — for the poll loop's short-frame log, not for the stamp.
+    ///
+    /// The stamp below stays unconditional on purpose. It answers *liveness*
+    /// ("a `ReadAllRpm` returned Ok"), which a short frame does not falsify, and
+    /// gating it on coverage would leave it meaning neither liveness nor
+    /// freshness. Freshness is answered separately by `poll_subsystem_health`,
+    /// which reduces over each channel's own `updated_at` — a channel this batch
+    /// skipped keeps its old timestamp and ages on its own, so partial coverage
+    /// surfaces there with nothing needing to detect it.
+    ///
+    /// The count is still worth returning, because a *log line* is exactly the
+    /// thing that needs the detection: before this, a short frame produced no
+    /// journal evidence at all.
+    pub fn update_openfan_fans(&self, fans: Vec<OpenFanState>) -> usize {
         let now = Instant::now();
         let mut state = self.inner.write();
+        let covered: std::collections::HashSet<u8> = fans.iter().map(|f| f.channel).collect();
+        // F6: count only channels a poll has actually MEASURED. `force_all` writes
+        // `0..NUM_CHANNELS` unconditionally, so one 105 °C emergency mints an entry
+        // for every channel the firmware does not report; those can never be
+        // covered by a later frame, so counting them would latch the short-frame
+        // warning on for the process lifetime and never emit the recovery line.
+        let uncovered = state
+            .openfan_fans
+            .values()
+            .filter(|f| f.rpm_polled && !covered.contains(&f.channel))
+            .count();
         for mut fan in fans {
             if fan.last_commanded_pwm.is_none() {
                 if let Some(existing) = state.openfan_fans.get(&fan.channel) {
@@ -288,6 +313,7 @@ impl StateCache {
         }
         state.subsystem_timestamps.openfan = Some(now);
         state.snapshot_at = now;
+        uncovered
     }
 
     /// Update all hwmon fan readings as a batch.
@@ -569,7 +595,16 @@ impl StateCache {
         let mut state = self.inner.write();
         if let Some(fan) = state.openfan_fans.get_mut(&channel) {
             fan.last_commanded_pwm = Some(pwm);
-            fan.updated_at = now;
+            // OFS-i: deliberately does NOT touch `updated_at`. That field is when
+            // this channel's RPM was last READ, and `build_fan_entries` publishes
+            // it as the reading's `age_ms`. Refreshing it here made a *command*
+            // present as fresh *telemetry*: the fan reported `age_ms` near zero
+            // beside an `rpm` frozen at whatever the last real poll saw, and
+            // `stall_detected` was then computed from that frozen value. Widest
+            // exactly where it matters — a 105 °C `force_all` writes every
+            // channel, and a ~10-byte `SetPwm` completes on a degraded link far
+            // more readily than an ~80-byte `ReadAllRpm`, so "poll dead, writes
+            // still acking" showed every fan FRESH while nothing was measuring.
         } else {
             state.openfan_fans.insert(
                 channel,
@@ -1488,5 +1523,119 @@ mod tests {
         cache.set_resume_detected();
         assert!(cache.take_resume_flag(), "first take after resume is true");
         assert!(!cache.take_resume_flag(), "flag cleared after take");
+    }
+
+    /// OFS-i. `build_fan_entries` publishes `OpenFanState.updated_at` as the
+    /// fan's telemetry `age_ms`, and `set_openfan_commanded_pwm` used to refresh
+    /// it — so a *command* made a *reading* look fresh. The rpm stayed frozen at
+    /// whatever the last real poll saw, and `stall_detected` was then computed
+    /// from that frozen value.
+    ///
+    /// **The discriminator is exact `Instant` equality, deliberately.** The first
+    /// draft asserted a published `age_ms >= 4000` against a synthetic `now`, and
+    /// the defect reproduced it at 3999 — a one-millisecond margin that is really
+    /// just the gap between two `Instant::now()` calls, so on a slower machine it
+    /// would have passed WITH the bug present. `before == after` cannot drift:
+    /// either the command moved the timestamp or it did not.
+    #[test]
+    fn a_pwm_command_does_not_make_a_stale_rpm_reading_look_fresh() {
+        let cache = StateCache::new();
+        cache.update_openfan_fans(vec![make_openfan(3, 1200)]);
+        let before = cache.snapshot().openfan_fans[&3].updated_at;
+
+        // The link stops answering RPM polls, but writes still ack — a ~10-byte
+        // SetPwm completes on a degraded link where an ~80-byte ReadAllRpm does
+        // not, which is why this is the reachable shape rather than a contrived one.
+        cache.set_openfan_commanded_pwm(3, 200);
+
+        let snap = cache.snapshot();
+        let after = snap.openfan_fans[&3].updated_at;
+        assert_eq!(
+            before, after,
+            "a command must not move the timestamp of a reading it did not take"
+        );
+
+        // The command must still have landed — otherwise this test would also
+        // pass against a `set_openfan_commanded_pwm` that did nothing at all.
+        let fans = crate::api::handlers::build_fan_entries(&snap, after);
+        let fan = fans
+            .iter()
+            .find(|f| f.id == "openfan:ch03")
+            .expect("channel 3 is cached");
+        assert_eq!(fan.last_commanded_pwm, Some(200));
+        assert_eq!(
+            fan.rpm,
+            Some(1200),
+            "the reading is unchanged — nothing new was measured"
+        );
+
+        // And the published age is sourced from that reading time, so once the
+        // poll stops the fan ages honestly instead of being held at zero.
+        let later = crate::api::handlers::build_fan_entries(
+            &snap,
+            before + std::time::Duration::from_millis(4000),
+        );
+        assert_eq!(
+            later
+                .iter()
+                .find(|f| f.id == "openfan:ch03")
+                .expect("channel 3 is cached")
+                .age_ms,
+            4000
+        );
+    }
+
+    /// OFS-b's detection half. The stamp stays unconditional on purpose (it
+    /// answers liveness, which a short frame does not falsify) — what the poll
+    /// loop needs is the *count*, so an incomplete frame can be logged at all.
+    #[test]
+    fn update_openfan_fans_reports_how_many_known_channels_a_frame_missed() {
+        let cache = StateCache::new();
+        let all: Vec<OpenFanState> = (0..10u8).map(|ch| make_openfan(ch, 900)).collect();
+        assert_eq!(
+            cache.update_openfan_fans(all),
+            0,
+            "the first full frame covers everything it knows about"
+        );
+
+        let short: Vec<OpenFanState> = (0..3u8).map(|ch| make_openfan(ch, 900)).collect();
+        assert_eq!(
+            cache.update_openfan_fans(short),
+            7,
+            "three of ten leaves seven known channels unrefreshed"
+        );
+
+        // A frame introducing a channel the cache has never seen is not a miss.
+        let cache2 = StateCache::new();
+        assert_eq!(cache2.update_openfan_fans(vec![make_openfan(0, 900)]), 0);
+    }
+
+    /// F6. A channel that only ever got WRITTEN — `force_all` walks
+    /// `0..NUM_CHANNELS` unconditionally, so a 105 °C emergency mints one for every
+    /// channel the firmware does not report — must not count as uncovered.
+    ///
+    /// It can never be covered by a later frame, so counting it would latch the
+    /// short-frame warning on for the process lifetime and suppress the recovery
+    /// line forever, on exactly the hardware this change is for.
+    #[test]
+    fn a_write_created_channel_is_not_counted_as_a_missed_reading() {
+        let cache = StateCache::new();
+        cache.update_openfan_fans(vec![make_openfan(0, 900), make_openfan(1, 900)]);
+        // The thermal force writes a channel the controller never reports.
+        cache.set_openfan_commanded_pwm(9, 255);
+        assert!(!cache.snapshot().openfan_fans[&9].rpm_polled);
+
+        assert_eq!(
+            cache.update_openfan_fans(vec![make_openfan(0, 900), make_openfan(1, 900)]),
+            0,
+            "a full frame must report zero missed even with a write-only channel cached"
+        );
+
+        // Control: a genuinely polled channel that the frame drops still counts.
+        assert_eq!(
+            cache.update_openfan_fans(vec![make_openfan(0, 900)]),
+            1,
+            "channel 1 was measured before and is missing now"
+        );
     }
 }

@@ -29,6 +29,23 @@ impl std::fmt::Display for HealthStatus {
     }
 }
 
+/// Whether an OpenFanController is actually attached (OFS-j).
+///
+/// `compute_health` is pure over `DaemonState`, and that struct cannot answer
+/// this: `openfan_fans` is empty both for a machine with no controller AND for
+/// one whose controller was adopted a moment ago and has not completed its first
+/// poll. Only the caller knows (`AppState::openfan()`), so it is threaded in.
+///
+/// A named enum rather than a bare `bool` because it appears at ~20 call sites,
+/// where `compute_health(&state, &cfg, now, true)` says nothing to a reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenFanPresence {
+    /// A controller is attached, so its poll loop is expected to be running.
+    Present,
+    /// No controller on this machine. Nothing polls, so nothing can be stale.
+    Absent,
+}
+
 /// Health status for a single subsystem.
 #[derive(Debug, Clone)]
 pub struct SubsystemHealth {
@@ -260,32 +277,119 @@ fn age_ms(last_update: Option<Instant>, now: Instant) -> Option<u64> {
     last_update.map(|t| now.duration_since(t).as_millis() as u64)
 }
 
-/// Build one subsystem's health entry from its last-update instant.
+/// Health of a polling subsystem's DATA, as distinct from whether its poll loop
+/// is alive (OFS-b).
 ///
-/// Extracted when the engine became a third subsystem (DEC-249) — the two
-/// existing blocks were already identical apart from their name, threshold and
-/// wording, and a third copy of the same twenty lines would have made the
-/// duplication the dominant shape of this function.
-fn subsystem_health(
+/// `subsystem_timestamps` records **liveness** — "a poll returned Ok" — while
+/// `docs/08` publishes the same number as **data freshness**. Those are different
+/// questions and they diverge whenever a pass is incomplete: the stamp is
+/// refreshed by a frame covering three channels exactly as by one covering ten,
+/// so `/status` reported `openfan: ok — readings fresh` while `/poll` showed
+/// individual channels whose `age_ms` climbed without bound. Nothing detected it,
+/// because a short frame is a *successful* read.
+///
+/// The fix is not to corrupt the stamp into a coverage flag — that would leave it
+/// meaning neither thing. It is to answer both questions and report the **worse**,
+/// which is the same shape DEC-259/DEC-289 gave `engine` (liveness vs writes
+/// landing) and 277-j gave `controls`.
+///
+/// **An empty item set contributes nothing.** A subsystem that has cached no
+/// items yet is judged on its poll loop alone — reporting `Crit` because there is
+/// nothing to be stale would fire on every daemon between adoption and first poll.
+///
+/// **Why this needs no per-subsystem coverage check.** An item the poll stopped
+/// covering stays in the cache with its old timestamp and ages on its own, so
+/// partial coverage surfaces here without anything having to *detect* it.
+///
+/// **That reasoning holds ONLY where every cached item is expected to be refreshed
+/// by every pass.** It is true of OpenFan channels, which nothing else prunes. It is
+/// NOT true of hwmon, which deliberately freezes some cached readings (DEC-272
+/// `protected_ids`, DEC-193's quarantine latency) — so hwmon passes an empty
+/// iterator here and is judged on liveness alone. See the call site in
+/// `compute_health`, which spells out why; DEC-302's first draft got this wrong and
+/// the review caught it.
+fn poll_subsystem_health(
     name: &str,
     last_update: Option<Instant>,
+    item_times: impl Iterator<Item = Instant>,
     now: Instant,
     interval_ms: u64,
     reasons: &SubsystemReasons,
 ) -> SubsystemHealth {
-    let status = evaluate_staleness(last_update, now, interval_ms);
+    let liveness = evaluate_staleness(last_update, now, interval_ms);
+
+    // One pass for all three facts. Takes an iterator rather than a slice so the
+    // caller need not collect: this runs under the cache read guard on every
+    // /status and /poll, which is the path EFF-1 exists to keep allocation-free.
+    let mut oldest: Option<Instant> = None;
+    let mut stale_items = 0usize;
+    let mut total = 0usize;
+    for t in item_times {
+        total += 1;
+        if evaluate_staleness(Some(t), now, interval_ms) != HealthStatus::Ok {
+            stale_items += 1;
+        }
+        if oldest.is_none_or(|o| t < o) {
+            oldest = Some(t);
+        }
+    }
+    let freshness = oldest.map_or(HealthStatus::Ok, |t| {
+        evaluate_staleness(Some(t), now, interval_ms)
+    });
+
+    let status = liveness.max(freshness);
+
+    // Age: the larger of the two, EXCEPT that a stamp which was never set reports
+    // no age at all.
+    //
+    // Both halves are load-bearing and each killed a draft. A plain max is wrong
+    // for the never-set stamp — that is `Crit` with NO age, so max silently
+    // substitutes an item's age and pairs "never received data" with `age_ms: 0`
+    // (reachable: `set_openfan_commanded_pwm` inserts a channel on a write, so an
+    // engine write before the first completed poll produces exactly it). But
+    // branching purely on `freshness > liveness` is wrong on the TIE: with both
+    // limbs Crit it reported the stamp's age, so a poll 5.1 s stale beside
+    // coverage broken for 300 s published `age_ms: 5100` — understating the thing
+    // the operator needs by two orders of magnitude.
+    let age = match (age_ms(last_update, now), age_ms(oldest, now)) {
+        (None, _) => None,
+        (Some(stamp), None) => Some(stamp),
+        (Some(stamp), Some(item)) => Some(stamp.max(item)),
+    };
+
+    // Name which limb fired. A caller told "readings stale" when the poll loop is
+    // running fine has been sent to look in the wrong place — that misdirection is
+    // most of what made OFS-b expensive to find.
+    //
+    // The "poll loop is running" half is asserted ONLY when liveness is actually
+    // Ok. `freshness > liveness` also holds for a Warn liveness, and claiming a
+    // healthy loop there would be the exact trap already removed from
+    // `engine_health` above ("the text would then claim liveness this branch has
+    // not established") — on a degraded link it would send the operator to the
+    // channels when the link is the fault.
+    let reason = if freshness > liveness && liveness == HealthStatus::Ok {
+        format!(
+            "{stale_items} of {total} readings stale — the poll loop is running but \
+             is not refreshing them"
+        )
+    } else if freshness > liveness {
+        format!("{stale_items} of {total} readings older than the poll itself")
+    } else {
+        match status {
+            HealthStatus::Ok => reasons.fresh.to_string(),
+            HealthStatus::Warn => reasons.stale.to_string(),
+            HealthStatus::Crit => match last_update {
+                None => reasons.never.to_string(),
+                Some(_) => reasons.critical.to_string(),
+            },
+        }
+    };
+
     SubsystemHealth {
         name: name.into(),
         status,
-        age_ms: age_ms(last_update, now),
-        reason: match status {
-            HealthStatus::Ok => reasons.fresh.into(),
-            HealthStatus::Warn => reasons.stale.into(),
-            HealthStatus::Crit => match last_update {
-                None => reasons.never.into(),
-                Some(_) => reasons.critical.into(),
-            },
-        },
+        age_ms: age,
+        reason,
     }
 }
 
@@ -356,22 +460,87 @@ pub fn compute_health(
     state: &DaemonState,
     config: &StalenessConfig,
     now: Instant,
+    openfan: OpenFanPresence,
 ) -> HealthSummary {
     let ts = &state.subsystem_timestamps;
 
+    // OFS-b: per-item reading times, so freshness is answered from the DATA rather
+    // than from the poll loop's stamp. Small (≤10 channels, tens of sensors) and
+    // built once per request — nothing like the `DaemonState` clone EFF-1 removed.
     // Order is part of the wire shape: existing clients read `subsystems[0]` as
     // openfan and `[1]` as hwmon. Engine is appended, never inserted.
     let subsystems = vec![
-        subsystem_health(
-            "openfan",
-            ts.openfan,
-            now,
-            config.openfan_interval_ms,
-            &POLL_REASONS,
-        ),
-        subsystem_health(
+        // OFS-j: on a machine with no controller the poll loop is never spawned,
+        // so the stamp is never set and the old unconditional entry reported
+        // `Crit — never received data` for the process lifetime, pinning
+        // `overall_status` to "crit" on every hwmon-only machine. The entry stays
+        // (dropping it would shift hwmon to index 0 and break the wire shape); it
+        // reports the truth instead, which is that there is nothing here to poll.
+        match openfan {
+            OpenFanPresence::Present => poll_subsystem_health(
+                "openfan",
+                ts.openfan,
+                // F6: only channels a poll has actually MEASURED. `force_all`
+                // writes `0..NUM_CHANNELS` unconditionally, so one 105 °C
+                // emergency mints an entry for every channel the firmware does
+                // not report — and those can never be covered by a later poll, so
+                // counting them would latch openfan at Crit for the process
+                // lifetime on exactly the short-frame hardware this fix targets.
+                // `rpm_polled` already exists for this "never actually measured"
+                // distinction and already gates `stall_detected`.
+                state
+                    .openfan_fans
+                    .values()
+                    .filter(|f| f.rpm_polled)
+                    .map(|f| f.updated_at),
+                now,
+                config.openfan_interval_ms,
+                &POLL_REASONS,
+            ),
+            OpenFanPresence::Absent => SubsystemHealth {
+                name: "openfan".into(),
+                status: HealthStatus::Ok,
+                age_ms: None,
+                reason: "no OpenFanController connected".into(),
+            },
+        },
+        // hwmon is judged on LIVENESS ALONE, and the empty iterator is the whole
+        // reason this is written out rather than mirroring the openfan arm.
+        //
+        // DEC-302's first draft reduced over `state.sensors` here, on the reading
+        // that hwmon had the same defect as openfan. It does not, and
+        // `ofc:concurrency-reviewer` disproved it with three paths: hwmon
+        // deliberately holds cached readings frozen, so their age is not a
+        // freshness signal.
+        //   * DEC-272 round 2 EXEMPTS readings from eviction when a chip's own
+        //     metadata will not read (`polling.rs` `protected_ids`) — deliberately,
+        //     to stop a transient sysfs failure dropping a live CpuTemp to
+        //     `Absent` and flapping the thermal ladder 100/40/100. Such a reading
+        //     is never refreshed and never evicted, and a skipped chip contributes
+        //     no descriptors so it cannot even reach `wants_rediscovery()` — it
+        //     would have aged to Crit with no guaranteed recovery, reporting the
+        //     safety machinery's own protective state as a fault.
+        //   * DEC-193 quarantines only on the 6th consecutive failure
+        //     (`SENSOR_READ_FAIL_REDISCOVER_STREAK = 5`), so every routine read
+        //     failure would drag `overall_status` through warn on its way to being
+        //     explained — on a WiFi radio toggle, the exact event DEC-193 exists
+        //     to keep quiet.
+        //
+        // The asymmetry with openfan is real, not an oversight: every cached
+        // OpenFan channel is expected to be refreshed by every poll and nothing
+        // else prunes them, whereas hwmon coverage is owned end to end by
+        // descriptors -> `live` -> `retain_sensors` -> the quarantine, which
+        // publishes `unavailable_sensors[]`. Adding a second opinion here bought
+        // three false positives and no new signal.
+        //
+        // The genuinely unmanaged surface is `hwmon_fans`, which freezes when
+        // headers stop reading and is never pruned — recorded as its own register
+        // row rather than fixed by chaining it in here, because an un-pruned map
+        // would latch Crit forever for a removed header.
+        poll_subsystem_health(
             "hwmon",
             ts.hwmon,
+            std::iter::empty(),
             now,
             config.hwmon_interval_ms,
             &POLL_REASONS,
@@ -414,7 +583,11 @@ pub fn compute_health(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::health::state::{DaemonState, SkipReason, SkippedControl, SubsystemTimestamps};
+    use crate::health::state::{
+        CachedSensorReading, DaemonState, DeviceLabel, OpenFanState, SkipReason, SkippedControl,
+        SubsystemTimestamps,
+    };
+    use crate::hwmon::types::SensorKind;
     use std::time::Duration;
 
     fn base_state() -> DaemonState {
@@ -437,6 +610,40 @@ mod tests {
             },
             ..DaemonState::default()
         }
+    }
+
+    fn openfan_at(channel: u8, when: Instant) -> OpenFanState {
+        OpenFanState {
+            channel,
+            rpm: 900,
+            last_commanded_pwm: Some(128),
+            updated_at: when,
+            rpm_polled: true,
+        }
+    }
+
+    fn sensor_at(id: &str, when: Instant) -> CachedSensorReading {
+        CachedSensorReading {
+            id: id.into(),
+            kind: SensorKind::CpuTemp,
+            label: id.into(),
+            value_c: 45.0,
+            source: DeviceLabel::Hwmon,
+            updated_at: when,
+            rate_c_per_s: None,
+            session_min_c: None,
+            session_max_c: None,
+            chip_name: "k10temp".into(),
+            temp_type: None,
+            thresholds: None,
+        }
+    }
+
+    fn named<'a>(h: &'a HealthSummary, name: &str) -> &'a SubsystemHealth {
+        h.subsystems
+            .iter()
+            .find(|s| s.name == name)
+            .expect("subsystem is part of the wire shape")
     }
 
     fn default_config() -> StalenessConfig {
@@ -463,7 +670,12 @@ mod tests {
         let cfg = default_config();
 
         // Control: identical state, no stall — demonstrably healthy.
-        let control = compute_health(&state_with_live_engine(now), &cfg, now);
+        let control = compute_health(
+            &state_with_live_engine(now),
+            &cfg,
+            now,
+            OpenFanPresence::Present,
+        );
         assert_eq!(
             engine_of(&control).status,
             HealthStatus::Ok,
@@ -479,7 +691,7 @@ mod tests {
                 cfg.engine_interval_ms * (u64::from(WEDGED_TICK_MULTIPLE) + 10),
             ),
         );
-        let health = compute_health(&state, &cfg, now);
+        let health = compute_health(&state, &cfg, now, OpenFanPresence::Present);
         assert_eq!(
             engine_of(&health).status,
             HealthStatus::Crit,
@@ -506,7 +718,7 @@ mod tests {
         state.subsystem_timestamps.engine_writes_stalled_since =
             Some(now - Duration::from_millis(cfg.engine_interval_ms * mid));
         assert_eq!(
-            engine_of(&compute_health(&state, &cfg, now)).status,
+            engine_of(&compute_health(&state, &cfg, now, OpenFanPresence::Present)).status,
             HealthStatus::Warn
         );
     }
@@ -517,7 +729,7 @@ mod tests {
     fn never_updated_is_crit() {
         let state = base_state();
         let now = Instant::now();
-        let health = compute_health(&state, &default_config(), now);
+        let health = compute_health(&state, &default_config(), now, OpenFanPresence::Present);
 
         assert_eq!(health.overall, HealthStatus::Crit);
 
@@ -540,7 +752,7 @@ mod tests {
             engine_writes_stalled_since: None,
         };
 
-        let health = compute_health(&state, &default_config(), now);
+        let health = compute_health(&state, &default_config(), now, OpenFanPresence::Present);
         assert_eq!(health.overall, HealthStatus::Ok);
         assert_eq!(health.subsystems[0].status, HealthStatus::Ok);
         assert_eq!(health.subsystems[1].status, HealthStatus::Ok);
@@ -557,7 +769,7 @@ mod tests {
         state.subsystem_timestamps.openfan = Some(update_time);
         state.subsystem_timestamps.hwmon = Some(now);
 
-        let health = compute_health(&state, &config, now);
+        let health = compute_health(&state, &config, now, OpenFanPresence::Present);
         assert_eq!(health.subsystems[0].status, HealthStatus::Ok);
     }
 
@@ -570,7 +782,7 @@ mod tests {
         state.subsystem_timestamps.openfan = Some(update_time);
         state.subsystem_timestamps.hwmon = Some(now);
 
-        let health = compute_health(&state, &config, now);
+        let health = compute_health(&state, &config, now, OpenFanPresence::Present);
         assert_eq!(health.subsystems[0].status, HealthStatus::Warn);
         assert_eq!(health.overall, HealthStatus::Warn);
     }
@@ -584,7 +796,7 @@ mod tests {
         state.subsystem_timestamps.openfan = Some(update_time);
         state.subsystem_timestamps.hwmon = Some(now);
 
-        let health = compute_health(&state, &config, now);
+        let health = compute_health(&state, &config, now, OpenFanPresence::Present);
         assert_eq!(health.subsystems[0].status, HealthStatus::Warn);
     }
 
@@ -597,7 +809,7 @@ mod tests {
         state.subsystem_timestamps.openfan = Some(update_time);
         state.subsystem_timestamps.hwmon = Some(now);
 
-        let health = compute_health(&state, &config, now);
+        let health = compute_health(&state, &config, now, OpenFanPresence::Present);
         assert_eq!(health.subsystems[0].status, HealthStatus::Crit);
         assert_eq!(health.overall, HealthStatus::Crit);
     }
@@ -611,7 +823,7 @@ mod tests {
         state.subsystem_timestamps.openfan = Some(now);
         state.subsystem_timestamps.hwmon = Some(now);
 
-        let health = compute_health(&state, &default_config(), now);
+        let health = compute_health(&state, &default_config(), now, OpenFanPresence::Present);
 
         // Appended, never inserted — clients index openfan at 0 and hwmon at 1.
         // 277-j added `controls` at 3 on the same terms; this assertion is the
@@ -643,7 +855,7 @@ mod tests {
         // Assert the PRESENCE before the absence (DEC-272's vacuous-absence
         // trap): without this, a change that made every subsystem Warn would let
         // the assertion below pass while proving nothing about skipped controls.
-        let healthy = compute_health(&state, &default_config(), now);
+        let healthy = compute_health(&state, &default_config(), now, OpenFanPresence::Present);
         assert_eq!(
             healthy.overall,
             HealthStatus::Ok,
@@ -657,7 +869,7 @@ mod tests {
             since: now - Duration::from_secs(30),
         }];
 
-        let health = compute_health(&state, &default_config(), now);
+        let health = compute_health(&state, &default_config(), now, OpenFanPresence::Present);
         let controls = health
             .subsystems
             .iter()
@@ -703,7 +915,7 @@ mod tests {
             })
             .collect();
 
-        let health = compute_health(&state, &default_config(), now);
+        let health = compute_health(&state, &default_config(), now, OpenFanPresence::Present);
         assert_ne!(
             health.overall,
             HealthStatus::Crit,
@@ -758,7 +970,7 @@ mod tests {
         state.subsystem_timestamps.engine_started = Some(now - Duration::from_millis(6100));
         state.subsystem_timestamps.engine_completed = Some(now - Duration::from_millis(6000));
 
-        let health = compute_health(&state, &default_config(), now);
+        let health = compute_health(&state, &default_config(), now, OpenFanPresence::Present);
 
         assert_eq!(health.subsystems[0].status, HealthStatus::Ok);
         assert_eq!(health.subsystems[1].status, HealthStatus::Ok);
@@ -786,7 +998,8 @@ mod tests {
         state.subsystem_timestamps.engine_started = Some(now - Duration::from_millis(8000));
         state.subsystem_timestamps.engine_completed = Some(now - Duration::from_millis(9000));
 
-        let engine = &compute_health(&state, &default_config(), now).subsystems[2];
+        let engine =
+            &compute_health(&state, &default_config(), now, OpenFanPresence::Present).subsystems[2];
 
         assert_eq!(
             engine.status,
@@ -813,7 +1026,8 @@ mod tests {
         state.subsystem_timestamps.engine_started = Some(now - Duration::from_millis(ms));
         state.subsystem_timestamps.engine_completed = Some(now - Duration::from_millis(ms + 1000));
 
-        let engine = &compute_health(&state, &default_config(), now).subsystems[2];
+        let engine =
+            &compute_health(&state, &default_config(), now, OpenFanPresence::Present).subsystems[2];
         assert_eq!(engine.status, HealthStatus::Crit);
         assert!(engine.reason.contains("stuck"), "{}", engine.reason);
     }
@@ -829,7 +1043,8 @@ mod tests {
         state.subsystem_timestamps.engine_started = Some(now - Duration::from_millis(5));
         state.subsystem_timestamps.engine_completed = Some(now - Duration::from_millis(1005));
 
-        let engine = &compute_health(&state, &default_config(), now).subsystems[2];
+        let engine =
+            &compute_health(&state, &default_config(), now, OpenFanPresence::Present).subsystems[2];
         assert_eq!(engine.status, HealthStatus::Ok, "{}", engine.reason);
     }
 
@@ -852,7 +1067,7 @@ mod tests {
         state.subsystem_timestamps.engine_started = Some(stamp);
         state.subsystem_timestamps.engine_completed = Some(stamp);
 
-        let health = compute_health(&state, &config, now);
+        let health = compute_health(&state, &config, now, OpenFanPresence::Present);
 
         assert_eq!(health.subsystems[0].status, HealthStatus::Ok);
         assert_eq!(health.subsystems[2].status, HealthStatus::Warn);
@@ -870,7 +1085,7 @@ mod tests {
         // hwmon: critically stale (CRIT)
         state.subsystem_timestamps.hwmon = Some(now - Duration::from_millis(6000));
 
-        let health = compute_health(&state, &config, now);
+        let health = compute_health(&state, &config, now, OpenFanPresence::Present);
         assert_eq!(health.subsystems[0].status, HealthStatus::Ok); // openfan
         assert_eq!(health.subsystems[1].status, HealthStatus::Crit); // hwmon
         assert_eq!(health.overall, HealthStatus::Crit);
@@ -886,7 +1101,7 @@ mod tests {
         state.subsystem_timestamps.openfan = Some(update_time);
         state.subsystem_timestamps.hwmon = Some(now);
 
-        let health = compute_health(&state, &default_config(), now);
+        let health = compute_health(&state, &default_config(), now, OpenFanPresence::Present);
         let openfan_age = health.subsystems[0].age_ms.unwrap();
         // Allow small tolerance for test execution time
         assert!((1499..=1510).contains(&openfan_age));
@@ -896,7 +1111,7 @@ mod tests {
     fn never_updated_has_no_age() {
         let state = base_state();
         let now = Instant::now();
-        let health = compute_health(&state, &default_config(), now);
+        let health = compute_health(&state, &default_config(), now, OpenFanPresence::Present);
         assert!(health.subsystems[0].age_ms.is_none());
     }
 
@@ -918,5 +1133,313 @@ mod tests {
         assert_eq!(HealthStatus::Ok.to_string(), "ok");
         assert_eq!(HealthStatus::Warn.to_string(), "warn");
         assert_eq!(HealthStatus::Crit.to_string(), "crit");
+    }
+
+    /// OFS-b. The defect: `subsystem_timestamps.openfan` is stamped by ANY
+    /// successful frame, so a frame covering three of ten channels reported
+    /// `openfan: ok — readings fresh` while seven channels aged without bound.
+    /// Nothing detected it, because a short frame is a *successful* read.
+    ///
+    /// Asserts the freshness limb specifically, not merely "something is wrong":
+    /// the status must move, the age must be the OLDEST channel's (not the
+    /// stamp's, which is zero here), and the reason must say the poll loop is
+    /// running — sending a reader to the channels rather than to the link.
+    #[test]
+    fn a_short_frame_leaves_uncovered_channels_ageing_and_openfan_reports_it() {
+        let now = Instant::now();
+        let mut state = state_with_live_engine(now);
+        // Ten channels last covered 4 s ago; three refreshed this instant. This
+        // is the field shape from the OFS-b report ("the update covered 1 of 10").
+        for ch in 0..10u8 {
+            let when = if ch < 3 {
+                now
+            } else {
+                now - Duration::from_millis(4000)
+            };
+            state.openfan_fans.insert(ch, openfan_at(ch, when));
+        }
+        // Liveness is PERFECT — the poll returned Ok this instant. That is what
+        // made the old code report `ok`, and it is what this test exists to
+        // prove is not sufficient.
+        state.subsystem_timestamps.openfan = Some(now);
+        state.subsystem_timestamps.hwmon = Some(now);
+
+        let health = compute_health(&state, &default_config(), now, OpenFanPresence::Present);
+        let openfan = named(&health, "openfan");
+
+        assert_eq!(
+            openfan.status,
+            HealthStatus::Warn,
+            "seven channels 4 s stale must not report as fresh; reason was {:?}",
+            openfan.reason
+        );
+        assert_eq!(
+            openfan.age_ms,
+            Some(4000),
+            "age must be the oldest READING, not the poll stamp"
+        );
+        assert!(
+            openfan.reason.contains("7 of 10"),
+            "the reason must name the uncovered channels, got {:?}",
+            openfan.reason
+        );
+        assert!(
+            openfan.reason.contains("poll loop is running"),
+            "the reason must not send the reader to the link, got {:?}",
+            openfan.reason
+        );
+    }
+
+    /// The control for the test above: a FULL frame at the same instant must
+    /// still report fresh. Without this, the test above would also pass if
+    /// `poll_subsystem_health` simply reported Warn unconditionally.
+    #[test]
+    fn a_full_frame_still_reports_fresh() {
+        let now = Instant::now();
+        let mut state = state_with_live_engine(now);
+        for ch in 0..10u8 {
+            state.openfan_fans.insert(ch, openfan_at(ch, now));
+        }
+        state.subsystem_timestamps.openfan = Some(now);
+        state.subsystem_timestamps.hwmon = Some(now);
+
+        let health = compute_health(&state, &default_config(), now, OpenFanPresence::Present);
+        assert_eq!(named(&health, "openfan").status, HealthStatus::Ok);
+        assert_eq!(health.overall, HealthStatus::Ok);
+    }
+
+    /// A subsystem that has cached nothing yet is judged on its poll loop alone.
+    /// Guards the `oldest.map_or(Ok, ..)` branch: reducing over an empty set must
+    /// not synthesise a Crit, or every daemon would be unhealthy between adoption
+    /// and its first completed poll.
+    #[test]
+    fn an_empty_item_set_does_not_manufacture_staleness() {
+        let now = Instant::now();
+        let mut state = state_with_live_engine(now);
+        state.subsystem_timestamps.openfan = Some(now);
+        state.subsystem_timestamps.hwmon = Some(now);
+        assert!(state.openfan_fans.is_empty() && state.sensors.is_empty());
+
+        let health = compute_health(&state, &default_config(), now, OpenFanPresence::Present);
+        assert_eq!(named(&health, "openfan").status, HealthStatus::Ok);
+        assert_eq!(named(&health, "hwmon").status, HealthStatus::Ok);
+    }
+
+    /// The hwmon decision, pinned — and it is a decision to do NOTHING here.
+    ///
+    /// DEC-302's first draft reduced hwmon freshness over `state.sensors`, and
+    /// `ofc:concurrency-reviewer` disproved that with three false-positive paths.
+    /// hwmon deliberately holds cached readings frozen — DEC-272 round 2 exempts
+    /// a chip's readings from eviction when its metadata will not read, and DEC-193
+    /// quarantines only on the 6th consecutive failure — so a cached reading's age
+    /// is not a freshness signal there the way it is for an OpenFan channel.
+    ///
+    /// This test is the guard against re-adding it. If someone "generalises" the
+    /// openfan limb to hwmon again, this reds.
+    #[test]
+    fn hwmon_is_judged_on_poll_liveness_alone_not_on_cached_reading_age() {
+        let now = Instant::now();
+        let mut state = state_with_live_engine(now);
+        state.subsystem_timestamps.openfan = Some(now);
+        state.subsystem_timestamps.hwmon = Some(now);
+        state.sensors.insert("good".into(), sensor_at("good", now));
+        // A sensor mid-failure-streak (DEC-193 has not evicted it yet), and one a
+        // DEC-272 `protected_ids` exemption is holding frozen indefinitely. Both
+        // are states the daemon creates ON PURPOSE.
+        state.sensors.insert(
+            "ath12k".into(),
+            sensor_at("ath12k", now - Duration::from_millis(4000)),
+        );
+        state.sensors.insert(
+            "protected".into(),
+            sensor_at("protected", now - Duration::from_millis(600_000)),
+        );
+
+        let health = compute_health(&state, &default_config(), now, OpenFanPresence::Present);
+        let hwmon = named(&health, "hwmon");
+
+        assert_eq!(
+            hwmon.status,
+            HealthStatus::Ok,
+            "a deliberately frozen reading must not degrade hwmon — DEC-193 and \
+             DEC-272 own that state and report it via unavailable_sensors[]; got {:?}",
+            hwmon.reason
+        );
+        assert_eq!(
+            hwmon.age_ms,
+            Some(0),
+            "hwmon age is the POLL's age, not the oldest reading's"
+        );
+        assert_eq!(health.overall, HealthStatus::Ok);
+
+        // Control: hwmon must still be able to report a dead poll loop.
+        state.subsystem_timestamps.hwmon = Some(now - Duration::from_millis(9000));
+        let dead = compute_health(&state, &default_config(), now, OpenFanPresence::Present);
+        assert_eq!(named(&dead, "hwmon").status, HealthStatus::Crit);
+    }
+
+    /// F6. `force_all` writes `0..NUM_CHANNELS` unconditionally, so one 105 °C
+    /// emergency mints an `OpenFanState` for every channel the firmware does not
+    /// report — with `rpm_polled: false`, because nothing ever measured it.
+    ///
+    /// Those entries can never be covered by a later frame. Counting them would
+    /// latch openfan at Crit for the process lifetime on exactly the short-frame
+    /// hardware OFS-b was reported against, turning the fix into a worse bug.
+    #[test]
+    fn a_channel_only_ever_written_never_counts_as_a_stale_reading() {
+        let now = Instant::now();
+        let mut state = state_with_live_engine(now);
+        state.subsystem_timestamps.openfan = Some(now);
+        state.subsystem_timestamps.hwmon = Some(now);
+        // Two real, freshly polled channels.
+        state.openfan_fans.insert(0, openfan_at(0, now));
+        state.openfan_fans.insert(1, openfan_at(1, now));
+        // A channel a thermal force wrote long ago and no poll has ever reported.
+        let mut written = openfan_at(7, now - Duration::from_millis(600_000));
+        written.rpm_polled = false;
+        state.openfan_fans.insert(7, written);
+
+        let health = compute_health(&state, &default_config(), now, OpenFanPresence::Present);
+        assert_eq!(
+            named(&health, "openfan").status,
+            HealthStatus::Ok,
+            "a never-measured channel is not a stale reading; got {:?}",
+            named(&health, "openfan").reason
+        );
+
+        // Control: the moment a poll DOES measure it, it counts like any other.
+        let mut polled = openfan_at(7, now - Duration::from_millis(600_000));
+        polled.rpm_polled = true;
+        state.openfan_fans.insert(7, polled);
+        assert_eq!(
+            named(
+                &compute_health(&state, &default_config(), now, OpenFanPresence::Present),
+                "openfan"
+            )
+            .status,
+            HealthStatus::Crit,
+        );
+    }
+
+    /// F4. `freshness > liveness` also holds when liveness is Warn, so the
+    /// partial-coverage wording must not assert a healthy poll loop there — the
+    /// identical trap `engine_health` already had removed from its Crit text.
+    #[test]
+    fn a_degraded_link_is_not_described_as_a_running_poll_loop() {
+        let now = Instant::now();
+        let mut state = state_with_live_engine(now);
+        state.subsystem_timestamps.hwmon = Some(now);
+        // Liveness Warn (poll 3 s old), freshness Crit (a channel 9 s old).
+        state.subsystem_timestamps.openfan = Some(now - Duration::from_millis(3000));
+        state
+            .openfan_fans
+            .insert(0, openfan_at(0, now - Duration::from_millis(9000)));
+
+        let health = compute_health(&state, &default_config(), now, OpenFanPresence::Present);
+        let openfan = named(&health, "openfan");
+
+        assert_eq!(openfan.status, HealthStatus::Crit);
+        assert!(
+            !openfan.reason.contains("poll loop is running"),
+            "the poll loop is NOT running normally here — got {:?}",
+            openfan.reason
+        );
+        assert!(
+            openfan.reason.contains("older than the poll itself"),
+            "it should still say the readings outrank the poll — got {:?}",
+            openfan.reason
+        );
+    }
+
+    /// F5. On a TIE — both limbs Crit — the age must be the larger of the two.
+    /// The draft branched on `freshness > liveness` alone and so reported the
+    /// stamp's, publishing `age_ms: 5100` for coverage that had been broken for
+    /// five minutes.
+    #[test]
+    fn a_tie_reports_the_larger_age_not_the_polls() {
+        let now = Instant::now();
+        let mut state = state_with_live_engine(now);
+        state.subsystem_timestamps.hwmon = Some(now);
+        state.subsystem_timestamps.openfan = Some(now - Duration::from_millis(5100));
+        state
+            .openfan_fans
+            .insert(0, openfan_at(0, now - Duration::from_millis(300_000)));
+
+        let health = compute_health(&state, &default_config(), now, OpenFanPresence::Present);
+        let openfan = named(&health, "openfan");
+
+        assert_eq!(openfan.status, HealthStatus::Crit, "both limbs are Crit");
+        assert_eq!(
+            openfan.age_ms,
+            Some(300_000),
+            "the tie must not hide the data age behind the poll's"
+        );
+    }
+
+    /// Regression for a defect introduced by DEC-302's own first draft, caught in
+    /// self-review. The age was reported as `max(stamp_age, oldest_item_age)` on
+    /// the reasoning that the worse status always carries the larger age — true of
+    /// two *present* timestamps, and false for the one that is `None`.
+    ///
+    /// A stamp that was never set is `Crit` with NO age, so the max silently
+    /// substituted an item's age and paired "never received data" with
+    /// `age_ms: 0`. The state is reachable, not theoretical:
+    /// `set_openfan_commanded_pwm` inserts a channel on a write, so an engine
+    /// write landing before the first completed poll produces exactly it.
+    #[test]
+    fn a_never_polled_subsystem_reports_no_age_even_when_a_write_cached_an_item() {
+        let now = Instant::now();
+        let mut state = state_with_live_engine(now);
+        state.subsystem_timestamps.hwmon = Some(now);
+        // A PWM write cached this channel; no poll has ever completed.
+        state.openfan_fans.insert(0, openfan_at(0, now));
+        assert!(state.subsystem_timestamps.openfan.is_none());
+
+        let health = compute_health(&state, &default_config(), now, OpenFanPresence::Present);
+        let openfan = named(&health, "openfan");
+
+        assert_eq!(openfan.status, HealthStatus::Crit);
+        assert_eq!(
+            openfan.reason, "never received data",
+            "the poll loop is what has never reported"
+        );
+        assert_eq!(
+            openfan.age_ms, None,
+            "\"never received data\" must not be paired with an age — there is no \
+             poll to age, and the cached item's age is answering a different question"
+        );
+    }
+
+    /// OFS-j. With no controller the poll loop is never spawned, so the stamp is
+    /// never set and the old unconditional entry reported `Crit — never received
+    /// data` for the process lifetime, pinning `overall_status` to "crit" on every
+    /// hwmon-only machine.
+    ///
+    /// The `Present` control case is load-bearing: it proves the entry is still
+    /// capable of reporting Crit, so this is a presence gate and not a blanket
+    /// suppression.
+    #[test]
+    fn with_no_controller_openfan_is_not_a_dead_subsystem() {
+        let now = Instant::now();
+        let mut state = state_with_live_engine(now);
+        state.subsystem_timestamps.hwmon = Some(now);
+        // openfan stamp deliberately left None: nothing polls it on this machine.
+
+        let absent = compute_health(&state, &default_config(), now, OpenFanPresence::Absent);
+        assert_eq!(absent.subsystems[0].name, "openfan", "wire shape: index 0");
+        assert_eq!(absent.subsystems[0].status, HealthStatus::Ok);
+        assert_eq!(absent.subsystems[0].age_ms, None);
+        assert_eq!(
+            absent.overall,
+            HealthStatus::Ok,
+            "an absent controller must not pin overall_status to crit"
+        );
+
+        let present = compute_health(&state, &default_config(), now, OpenFanPresence::Present);
+        assert_eq!(
+            present.subsystems[0].status,
+            HealthStatus::Crit,
+            "with a controller attached the same state is genuinely unhealthy"
+        );
     }
 }

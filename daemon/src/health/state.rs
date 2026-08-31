@@ -51,7 +51,15 @@ pub struct OpenFanState {
     pub rpm: u16,
     /// Last PWM value commanded by the daemon (firmware doesn't report this).
     pub last_commanded_pwm: Option<u8>,
-    /// When this reading was taken.
+    /// When this channel's RPM was last READ.
+    ///
+    /// Published as the fan's `age_ms` by `build_fan_entries`, and reduced over
+    /// by `poll_subsystem_health` to answer openfan data freshness. **A command
+    /// must never refresh it** — `set_openfan_commanded_pwm` deliberately leaves
+    /// it alone (OFS-i). This comment said only "when this reading was taken"
+    /// from the initial import while the code refreshed it on writes too, which
+    /// is how the contradiction survived: the field's own doc was right and
+    /// nothing enforced it.
     pub updated_at: Instant,
     /// True after the first real RPM poll. Prevents false stall alerts
     /// when a PWM write creates the entry before any RPM data arrives.

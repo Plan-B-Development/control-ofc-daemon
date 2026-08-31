@@ -849,6 +849,9 @@ async fn openfan_poll_loop_with<F>(
     let mut consecutive_errors: u32 = 0;
     let reconnect_threshold: u32 = RECONNECT_THRESHOLD;
     let mut reconnect_backoff: u32 = 1;
+    // OFS-b: edge state for the short-frame log, so an incomplete frame is
+    // reported once rather than at 1 Hz for as long as it persists.
+    let mut short_frame_logged = false;
 
     loop {
         tokio::select! {
@@ -939,8 +942,31 @@ async fn openfan_poll_loop_with<F>(
                             })
                             .collect();
                         let count = fans.len();
-                        cache.update_openfan_fans(fans);
+                        let uncovered = cache.update_openfan_fans(fans);
                         log::debug!("openfan poll: {count} channels updated");
+                        // OFS-b: a frame that covers fewer channels than the cache
+                        // already knows leaves the rest ageing, and it is NOT an
+                        // error — `send_command` returned Ok, so `poll_attempt_failed`
+                        // counts it a success and the reconnect ladder is not armed.
+                        // That is deliberate (a short frame is not evidence the link
+                        // is down, and a reconnect resets Arduino-class boards —
+                        // DEC-291 rationed exactly that). Before this there was no
+                        // journal evidence of it at all.
+                        //
+                        // Edge-triggered, like DEC-298's write-stall pair: one line
+                        // when coverage breaks and one when it returns, never 1 Hz
+                        // for the duration.
+                        if uncovered > 0 && !short_frame_logged {
+                            log::warn!(
+                                "openfan poll returned {count} channels, leaving {uncovered} \
+                                 known channel(s) unrefreshed — their readings will age; \
+                                 the link is still answering, so no reconnect is attempted"
+                            );
+                            short_frame_logged = true;
+                        } else if uncovered == 0 && short_frame_logged {
+                            log::info!("openfan poll is covering every known channel again");
+                            short_frame_logged = false;
+                        }
                     }
                 }
             }
@@ -2458,6 +2484,29 @@ mod tests {
         assert!(
             poll_attempt_failed(&refused),
             "a refused read must count toward the reconnect threshold"
+        );
+    }
+
+    /// OFS-b, the decision half. A short frame is a *successful* read — the
+    /// controller answered — so it must NOT arm the reconnect ladder. That was
+    /// chosen deliberately over the more "correct-looking" alternative: a
+    /// reconnect resets Arduino-class boards, and DEC-291 spent real effort
+    /// rationing exactly that, so treating incomplete coverage as a dead link
+    /// would reset the controller every time a frame came up short.
+    ///
+    /// The visibility this case does get is the edge-triggered log beside
+    /// `update_openfan_fans`, driven by the uncovered count that method returns —
+    /// never the failure counter this test pins.
+    #[test]
+    fn a_short_frame_is_a_successful_poll_and_never_arms_the_reconnect_ladder() {
+        // A frame carrying three readings where ten were expected is still
+        // `Ok(Ok(_))`: `send_command` returned, the link answered.
+        let short: Result<Result<Vec<u8>, crate::error::SerialError>, tokio::task::JoinError> =
+            Ok(Ok(vec![0, 1, 2]));
+        assert!(
+            !poll_attempt_failed(&short),
+            "an incomplete frame is not a failed poll — it must not count toward \
+             RECONNECT_THRESHOLD, because a reconnect resets the board (DEC-291)"
         );
     }
 

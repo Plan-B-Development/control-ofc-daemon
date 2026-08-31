@@ -12,7 +12,7 @@ use super::{
     build_status_response, build_unavailable_entries, error_response, json_ok, AppState,
 };
 use crate::api::responses::*;
-use crate::health::staleness::compute_health;
+use crate::health::staleness::{compute_health, OpenFanPresence};
 
 /// Thermal-state field for a status response, defaulting to `"normal"` before
 /// the engine's first tick. Extracted under the cache read guard so
@@ -24,15 +24,32 @@ fn thermal_state_of(snap: &crate::health::state::DaemonState) -> String {
         .unwrap_or_else(|| "normal".to_string())
 }
 
+/// Whether an OpenFanController is attached (OFS-j).
+///
+/// The same signal `GET /capabilities` reports as `devices.openfan.present`. It
+/// lives on `AppState` because adoption owns it; `compute_health` is pure over
+/// `DaemonState` and must be told.
+fn openfan_presence(state: &AppState) -> OpenFanPresence {
+    if state.openfan().is_some() {
+        OpenFanPresence::Present
+    } else {
+        OpenFanPresence::Absent
+    }
+}
+
 /// GET /status — overall health and subsystem freshness.
 pub async fn status_handler(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     let now = Instant::now();
+    // OFS-j: resolved outside the cache guard — controller presence is AppState,
+    // not `DaemonState`, and cannot be derived from the latter (an empty
+    // `openfan_fans` also describes a controller adopted but not yet polled).
+    let openfan = openfan_presence(&state);
     // EFF-1: read the state once under a shared guard instead of cloning the
     // whole `DaemonState`. Only pure reads happen inside; the override_table
     // lock in `build_status_response` stays outside the guard.
     let (health, thermal_state, unavailable, skipped, outputs) = state.cache.read_with(|snap| {
         (
-            compute_health(snap, &state.staleness_config, now),
+            compute_health(snap, &state.staleness_config, now, openfan),
             thermal_state_of(snap),
             build_unavailable_entries(snap, now),
             build_skipped_entries(snap, now),
@@ -76,10 +93,11 @@ pub async fn poll_handler(State(state): State<Arc<AppState>>) -> Json<PollRespon
     // the most frequent request (the GUI polls /poll at 1 Hz) no longer clones
     // the entire state. The `override_table` lock lives in
     // `build_status_response`, kept outside this guard to preserve lock order.
+    let openfan = openfan_presence(&state);
     let (health, thermal_state, unavailable, skipped, outputs, sensors, fans) =
         state.cache.read_with(|snap| {
             (
-                compute_health(snap, &state.staleness_config, now),
+                compute_health(snap, &state.staleness_config, now, openfan),
                 thermal_state_of(snap),
                 build_unavailable_entries(snap, now),
                 build_skipped_entries(snap, now),

@@ -1,5 +1,48 @@
 # Changelog
 
+## [2.24.2] — 2026-08-31
+
+### Fixed
+- **Subsystem health said "readings fresh" while readings were ageing (DEC-302).**
+  `/status` reports a freshness figure for the `openfan` and `hwmon` subsystems, but
+  the number behind it only ever recorded whether the poll loop *returned* — not
+  whether the data it returned covered anything. A frame carrying three of ten
+  OpenFan channels refreshed that timestamp exactly like a full one, so `/status`
+  reported `openfan: ok — readings fresh` while `/poll` showed seven channels whose
+  age climbed without bound. Nothing caught it: a short frame is a *successful*
+  read, so it never counted as a failed poll and never produced a log line.
+
+  The `openfan` entry now answers the two questions separately — is the poll loop
+  alive, and is the data fresh — and reports the worse of the two, with a reason
+  naming which one fired. An incomplete frame is also logged now, once when coverage
+  breaks and once when it returns. It still does **not** count as a failed poll: the
+  link answered, and a reconnect would reset the controller (DEC-291).
+
+  `hwmon` deliberately still reports poll liveness alone. Its coverage is already
+  owned by sensor discovery and the DEC-193 quarantine, and it holds some readings
+  frozen **on purpose** (DEC-272), so a reading's age is not a freshness signal
+  there — applying the same rule to it reported the safety machinery's own
+  protective state as a fault. For per-sensor hwmon freshness, read
+  `sensors[].age_ms` and `unavailable_sensors[]`, which answer it directly.
+
+- **A PWM command made a stale fan reading look fresh (DEC-302).** Commanding a duty
+  on an OpenFan channel refreshed that channel's *reading* timestamp, which `/fans`
+  and `/poll` publish as the fan's `age_ms`. The fan therefore reported an age near
+  zero beside an RPM frozen at whatever the last real poll had measured — and the
+  stall verdict was computed from that frozen value.
+
+  This was widest exactly where it mattered least tolerable: a 105 °C thermal force
+  writes every channel, and a short write acknowledgement completes on a degraded
+  link far more readily than a full RPM read, so "poll dead, writes still acking"
+  showed every fan as freshly measured while nothing was measuring.
+
+- **A machine with no OpenFanController reported itself permanently unhealthy
+  (DEC-302).** With no controller attached, nothing ever polls one, so the `openfan`
+  subsystem sat at `crit — "never received data"` for the life of the process and
+  dragged `overall_status` to `"crit"` with it. Every hwmon-only machine showed a
+  permanently red health ribbon. The entry now says there is no controller, and
+  still reports `crit` normally when one is attached and its poll loop has died.
+
 ## [2.24.1] — 2026-08-31
 
 ### Fixed
