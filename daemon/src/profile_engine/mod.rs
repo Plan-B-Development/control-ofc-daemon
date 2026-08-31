@@ -4620,10 +4620,11 @@ mod tests {
     impl LoopTestTransport {
         fn new(response_count: usize) -> (Self, Arc<parking_lot::Mutex<Vec<String>>>) {
             let written = Arc::new(parking_lot::Mutex::new(Vec::new()));
-            // Pre-populate with generic SetPwm ACKs (command code 02)
-            let responses: std::collections::VecDeque<String> = (0..response_count)
-                .map(|_| "<02|00:0400;>\r\n".to_string())
-                .collect();
+            // A budget of successful exchanges, not canned text: `read_line`
+            // synthesises each reply from the command actually written, so the
+            // ack's channel matches the write's (DEC-301).
+            let responses: std::collections::VecDeque<String> =
+                (0..response_count).map(|_| String::new()).collect();
             (
                 Self {
                     written: written.clone(),
@@ -4644,9 +4645,18 @@ mod tests {
             &mut self,
             _timeout: std::time::Duration,
         ) -> Result<String, crate::error::SerialError> {
+            // Consume the budget the test allotted, then answer the way the
+            // firmware does: same opcode, SAME CHANNEL. The old fixed
+            // "<02|00:0400;>" answered channel 0 to every write, so it could not
+            // tell one channel's ack from the next one's — the exact blind spot
+            // DEC-301 closed in production. Shared helper so a fourth mock cannot
+            // reintroduce it.
             self.responses
                 .lock()
                 .pop_front()
+                .ok_or(crate::error::SerialError::Timeout { timeout_ms: 100 })?;
+            let last = self.written.lock().last().cloned();
+            last.map(|cmd| crate::serial::protocol::firmware_echo_for(&cmd))
                 .ok_or(crate::error::SerialError::Timeout { timeout_ms: 100 })
         }
     }

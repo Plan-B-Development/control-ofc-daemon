@@ -44,12 +44,56 @@ pub enum Command {
 }
 
 impl Command {
+    /// The opcode byte identifying this command on the wire.
+    ///
+    /// It appears **twice** on the link: as the first hex byte pair of what
+    /// [`Self::encode`] sends, and echoed back as the `command_code` of the
+    /// controller's reply. [`crate::serial::transport::send_command`] correlates
+    /// the two, so one definition here is what stops the request encoding and the
+    /// reply correlation from drifting apart (the DEC-292 shape — the value that
+    /// acts and the value that is reported must be the same value).
+    pub fn opcode(&self) -> u8 {
+        match self {
+            Command::ReadAllRpm => 0x00,
+            Command::ReadRpm(_) => 0x01,
+            Command::SetPwm(..) => 0x02,
+        }
+    }
+
+    /// Does `response` answer *this* command?
+    ///
+    /// **The opcode alone is not enough, and assuming it was is the defect both
+    /// DEC-301 reviewers found independently.** Every per-channel write carries
+    /// opcode `0x02`, so a one-frame offset *within* a tick's `ch0..ch9` burst —
+    /// which is exactly the shape of `force_all` at 105 °C — matches on opcode and
+    /// slips straight through: each write confirmed by its predecessor's ack, and
+    /// the last write never acknowledged at all.
+    ///
+    /// The firmware echoes the channel it applied the command to, so that is the
+    /// discriminator that actually separates one write from the next. Membership
+    /// (`mentions_channel`) rather than an exact single-reading match: the shipped
+    /// firmware answers a `SetPwm` with exactly one pair, but correlation should
+    /// not become brittle about the *count* when what it needs to know is whether
+    /// this frame is about the channel we addressed.
+    pub fn matches_reply(&self, response: &Response) -> bool {
+        if response.command_code() != self.opcode() {
+            return false;
+        }
+        match self {
+            Command::ReadAllRpm => true,
+            Command::ReadRpm(ch) | Command::SetPwm(ch, _) => response.mentions_channel(ch.index()),
+        }
+    }
+
     /// Encode this command into the on-wire ASCII string (including trailing `\n`).
     pub fn encode(&self) -> String {
+        let op = self.opcode();
         match self {
-            Command::ReadAllRpm => ">00\n".to_string(),
-            Command::ReadRpm(ch) => format!(">01{:02X}\n", ch.index()),
-            Command::SetPwm(ch, pwm) => format!(">02{:02X}{:02X}\n", ch.index(), pwm),
+            Command::ReadAllRpm => format!(">{op:02X}\n"),
+            Command::ReadRpm(ch) => format!(">{:02X}{:02X}\n", op, ch.index()),
+            Command::SetPwm(ch, pwm) => {
+                format!(">{:02X}{:02X}{:02X}\n", op, ch.index(), pwm)
+            }
         }
     }
 }
@@ -69,6 +113,63 @@ pub enum Response {
         command_code: u8,
         readings: Vec<ChannelRpm>,
     },
+}
+
+impl Response {
+    /// The command code the controller echoed in this frame.
+    ///
+    /// This is the discriminator that says *which request* the frame answers.
+    /// It was parsed but never read outside tests until DEC-301; the link had no
+    /// request/response correlation and a caller took whatever frame arrived next.
+    pub fn command_code(&self) -> u8 {
+        match self {
+            Response::Rpm { command_code, .. } => *command_code,
+        }
+    }
+
+    /// Does this frame carry a reading for `channel`?
+    ///
+    /// The comparison is against the **parsed `u8`**, deliberately. The firmware
+    /// emits the channel as `%02X` while [`parse_rpm_pairs`] reads it as decimal —
+    /// identical for the whole hardware range (`NUM_CHANNELS == 10`), but only
+    /// because the range is single-digit. Comparing strings would bake that
+    /// coincidence in.
+    pub fn mentions_channel(&self, channel: u8) -> bool {
+        match self {
+            Response::Rpm { readings, .. } => readings.iter().any(|r| r.channel == channel),
+        }
+    }
+}
+
+/// Build the reply the real controller would send for the encoded `command`.
+///
+/// **Test-only, and shared on purpose.** Three separate mocks (`serial::transport`,
+/// `serial::controller`, `profile_engine`) each answered `<02|00:0400;>` to *every*
+/// write, whatever channel it addressed. That was invisible while nothing correlated
+/// replies and wrong the moment DEC-301 did — a mock that answers channel 0 to
+/// everything cannot distinguish one channel's ack from the next one's, which is the
+/// exact defect both DEC-301 reviewers found in the production code. One definition
+/// so a fourth mock cannot reintroduce it.
+///
+/// Wire shape is the firmware's, not the idealised fixture's: the payload byte is
+/// `%02X` with no trailing `;` and no closing `>`.
+#[cfg(test)]
+pub(crate) fn firmware_echo_for(command: &str) -> String {
+    let body = command.trim_start_matches('>').trim_end();
+    let opcode = &body[0..2];
+    match opcode {
+        // ReadAllRpm — every channel answers.
+        "00" => {
+            let pairs: Vec<String> = (0..NUM_CHANNELS).map(|c| format!("{c:02}:04B0")).collect();
+            format!("<00|{};>\r\n", pairs.join(";"))
+        }
+        // ReadRpm / SetPwm — only the addressed channel answers.
+        _ => {
+            let ch = u8::from_str_radix(&body[2..4], 16).expect("channel hex");
+            let payload = body.get(4..6).unwrap_or("04B0");
+            format!("<{opcode}|{ch:02}:{payload}\r\n")
+        }
+    }
 }
 
 /// Result of attempting to decode a line from the controller.
@@ -276,7 +377,13 @@ mod tests {
 
     #[test]
     fn decode_set_pwm_response() {
-        // After a set command, firmware echoes back RPM readings
+        // After a set command the firmware echoes back a SINGLE-channel frame.
+        // Its payload is NOT an RPM: on real hardware it is the raw PWM byte just
+        // commanded (DEC-301 measured 35% -> 89, 34% -> 87, 28% -> 71, 29% -> 74,
+        // exactly `pwm::percent_to_raw()`). This fixture's 0x04B0 is an idealised
+        // value kept only to exercise the parser; the SHAPE (code 0x02, one
+        // channel) is the part that matches the wire. Reading this frame as a
+        // tachometer value is the defect DEC-301 fixed.
         let line = "<02|05:04B0;>";
         let result = decode_line(line).unwrap();
         match result {
@@ -431,6 +538,41 @@ mod tests {
                 encoded.starts_with('>'),
                 "command must start with '>': {encoded}"
             );
+        }
+    }
+
+    // ── Opcode single-definition invariant (DEC-301) ────────────────
+
+    #[test]
+    fn opcode_matches_the_encoded_command_prefix() {
+        // `opcode()` is the value `send_command` correlates the reply against, and
+        // `encode()` is what goes on the wire. If they ever disagree, correlation
+        // rejects every reply to that command and the link dies silently. Pin the
+        // pair for every variant so a new command cannot be added with only one
+        // half defined.
+        let ch = Channel::new(7).unwrap();
+        for cmd in [
+            Command::ReadAllRpm,
+            Command::ReadRpm(ch),
+            Command::SetPwm(ch, 0x80),
+        ] {
+            let encoded = cmd.encode();
+            let prefix = &encoded[1..3];
+            let from_wire = u8::from_str_radix(prefix, 16).expect("opcode prefix is hex");
+            assert_eq!(
+                from_wire,
+                cmd.opcode(),
+                "encode() prefix and opcode() disagree for {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn response_command_code_accessor_reports_the_parsed_code() {
+        let line = "<02|05:0059;>";
+        match decode_line(line).unwrap() {
+            DecodedLine::Response(resp) => assert_eq!(resp.command_code(), 0x02),
+            _ => panic!("expected Response"),
         }
     }
 }

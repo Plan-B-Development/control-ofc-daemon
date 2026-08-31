@@ -235,6 +235,17 @@ mod tests {
     /// Mock transport that records writes via shared state and returns canned responses.
     struct MockTransport {
         responses: VecDeque<Result<String, SerialError>>,
+        /// Budget of acks to synthesise from the last written command instead of
+        /// replaying a canned line.
+        ///
+        /// The old fixture answered `<02|00:0400;>` to *every* write, whatever
+        /// channel it addressed. That was harmless while nothing correlated replies
+        /// and actively misleading once DEC-301 did: real firmware echoes the opcode
+        /// **and the channel it acted on** (`host_comm_process_request`), which is
+        /// exactly the discriminator that stops one channel's ack confirming the
+        /// next channel's write. A mock that answers channel 0 to everything could
+        /// never have caught that.
+        echo_acks_remaining: usize,
         written: Arc<parking_lot::Mutex<Vec<String>>>,
     }
 
@@ -246,17 +257,20 @@ mod tests {
             (
                 Self {
                     responses: responses.into(),
+                    echo_acks_remaining: 0,
                     written: written.clone(),
                 },
                 written,
             )
         }
 
+        /// `count` successful exchanges, each answered the way the firmware answers:
+        /// same opcode, same channel. After the budget is spent, reads time out —
+        /// preserving the count semantics the callers rely on.
         fn with_ok_responses(count: usize) -> (Self, Arc<parking_lot::Mutex<Vec<String>>>) {
-            let responses = (0..count)
-                .map(|_| Ok("<02|00:0400;>\r\n".to_string()))
-                .collect();
-            Self::with_responses(responses)
+            let (mut t, written) = Self::with_responses(vec![]);
+            t.echo_acks_remaining = count;
+            (t, written)
         }
     }
 
@@ -267,6 +281,14 @@ mod tests {
         }
 
         fn read_line(&mut self, _timeout: Duration) -> Result<String, SerialError> {
+            if self.echo_acks_remaining > 0 {
+                self.echo_acks_remaining -= 1;
+                let last = self.written.lock().last().cloned();
+                return match last {
+                    Some(cmd) => Ok(crate::serial::protocol::firmware_echo_for(&cmd)),
+                    None => Err(SerialError::Timeout { timeout_ms: 500 }),
+                };
+            }
             self.responses
                 .pop_front()
                 .unwrap_or(Err(SerialError::Timeout { timeout_ms: 500 }))

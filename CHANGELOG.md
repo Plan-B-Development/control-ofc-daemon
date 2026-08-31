@@ -2,6 +2,55 @@
 
 ## [Unreleased]
 
+### Fixed
+- **The OpenFan serial link now correlates each reply with the command it answers,
+  so a `SetPwm` acknowledgement can no longer be cached as a fan's RPM (DEC-301).**
+  `send_command` accepted the first `<`-prefixed frame it read, whatever request that
+  frame actually answered. The link has two independent 1 Hz users behind one mutex
+  sharing one stateful reader — the poll loop's `ReadAllRpm` and the profile engine's
+  per-channel `SetPwm` — so a single reply left unread put the pipeline permanently one
+  frame behind, and every later reply was misattributed until it drained.
+
+  The visible consequence was **fabricated fan telemetry**. A `SetPwm` ack is a
+  *single*-channel frame whose payload is the echoed raw PWM byte, so the poll loop
+  periodically cached one channel with an "RPM" that was really its commanded duty.
+  Measured against a running daemon at idle: **154 of 1600 fan readings (~10%)** carried
+  an echo-fabricated RPM, with values that were exactly `percent_to_raw()` of that
+  channel's commanded percent (35% -> 89, 34% -> 87, 28% -> 71, 29% -> 74). This broke the
+  project's standing rule that `rpm` is hardware-measured and `last_commanded_pwm` is
+  daemon-tracked and the two are never conflated.
+
+  The discriminator needed to prevent this was already on the wire and already parsed —
+  `decode_line` has always returned `command_code` — but until now **nothing outside the
+  test suite read it**.
+
+  Correlation is on the opcode **and, for a per-channel command, the channel the
+  controller echoes back**. The opcode alone is not sufficient and assuming it was is
+  the one defect both DEC-301 reviewers found independently: every per-channel write
+  carries opcode `0x02`, so a one-frame offset *within* a tick's ten back-to-back
+  writes — exactly the shape of `force_all` at 105 °C — would match on opcode and slip
+  through, each write confirmed by its predecessor's acknowledgement and the last one
+  never acknowledged at all.
+
+  A reply that does not answer the command is now drained rather than returned, which
+  *resynchronises* the link within a single exchange instead of erroring (an error would
+  never heal: the next exchange would inherit the same offset). The drain is bounded by
+  the existing wall-clock deadline and by a new `MAX_STALE_FRAMES` cap, reported as a
+  distinct "did not resynchronise" protocol error so it cannot be mistaken for the
+  debug-line error.
+
+  **This also restores the meaning of a write acknowledgement, including on the
+  emergency path.** `set_pwm` discards the response and treats `Ok` as "the controller
+  took it", and the 105 C `force_all` writes through that same path — so an OpenFan
+  emergency write used to be confirmed by whatever frame happened to be next in the
+  buffer. It is now confirmed only by an acknowledgement for **that channel**.
+  **Operators should expect
+  this to surface genuine write failures that were previously swallowed**: a write the
+  controller never acknowledges now times out and is reported, where before a stale frame
+  could stand in for the missing ack. That is the intended direction — it is the same
+  failure mode DEC-250 closed for the wrong-device case, reopened here by framing desync
+  on the right device.
+
 ### Changed
 - **The Rust toolchain is pinned, so the local quality gate and CI compile with the
   same compiler (DEC-300).** `cargo clippy -- -D warnings` makes every new clippy
