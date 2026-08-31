@@ -1,5 +1,41 @@
 # Changelog
 
+## [Unreleased]
+
+No behaviour change — a test correction and three documentation corrections.
+
+### Fixed
+- **The test guarding a false "healthy engine" report did not actually test it.**
+  DEC-299 fixed `GpuBackend::apply`'s lock-unavailable early return, which is
+  taken precisely when a wedged GPU write is holding the write lock and which
+  used to return without refreshing the write-progress flag — so `/status` would
+  report a healthy engine indefinitely while a fan held its last duty. The fix
+  was right; its regression test was not. Validity-checked by removing the fix,
+  the test still passed.
+
+  The reason was not what the register row guessed. Ticks 3-5 never reached the
+  lock at all: they re-commanded the same duty tick 1 had already failed, so the
+  60s failure cooldown emptied the pending writes and the tick returned down a
+  different path that reports "stalled" for an unrelated reason. They now command
+  a duty that escapes both the failure cache and the 5% coalescer, and the test
+  asserts a new `#[cfg(test)]` accessor proving each tick took the lock-skipped
+  branch — the path, not merely the outcome. Re-validity-checked: with the fix
+  removed it now fails at tick 3, as it always should have. No production
+  behaviour changed. (299-a)
+
+### Documentation
+- `daemon.md` gated bounded backend writes on daemon `>= 2.23.2`, a version that
+  was never tagged. That work shipped in **2.23.5**. (298-a)
+- The `[2.23.5]` entry below quoted two engine-health reason strings that this
+  daemon has never emitted — draft wording that was narrowed before release. It
+  now quotes what `health/staleness.rs` actually returns. (298-a)
+- The comment in `health/staleness.rs` explaining why both strings are worded
+  narrowly said they "were removed", which reads as a reword of shipped text.
+  They were removed *in draft*, before DEC-289 shipped at all. That distinction
+  is why the GUI contract's copy of the wider wording looked like drift to be
+  reconciled for the whole life of the feature, rather than text that was never
+  emitted. (298-a)
+
 ## [2.24.2] — 2026-08-31
 
 ### Fixed
@@ -501,10 +537,10 @@ tagged or published.
   have *hidden* the problem it fixes: with the loop no longer frozen, both engine
   timestamps advance normally and a wedged writer would present as a healthy
   engine. The `engine` subsystem now reports `warn` / "a backend write has not
-  returned — fans are holding their last duty" and, past the same wedged
-  threshold DEC-259 derived, `crit` / "writes wedged — the engine is ticking but
-  nothing is reaching the fans". No new field and no shape change — `reason` is
-  free text and always has been. (DEC-289)
+  returned yet — it is still in flight" and, past the same wedged threshold
+  DEC-259 derived, `crit` / "writes wedged — a backend write has not returned
+  and nothing is reaching those fans". No new field and no shape change —
+  `reason` is free text and always has been. (DEC-289)
 
 - The engine write-pause is now held for the remainder of a verify's settle even
   if the caller disconnects, rather than releasing early — the direct consequence

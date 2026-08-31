@@ -377,7 +377,7 @@ reason, unavailable_for_ms}`. Each live `sensors` entry also carries
 fields are additive — older clients ignore them; the GUI defaults
 `control_eligible = true` and `unavailable_sensors = []` when absent.
 
-**Bounded backend writes (DEC-289, daemon >= 2.23.2).** Each backend's blocking
+**Bounded backend writes (DEC-289, daemon >= 2.23.5).** Each backend's blocking
 write join is bounded to one tick, so a write wedged in a kernel driver cannot
 freeze the engine loop — previously it did, and took thermal safety and *every
 other backend* down with it while DEC-266's death supervision stayed silent (a

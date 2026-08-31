@@ -792,6 +792,20 @@ impl GpuBackend {
     fn fail_cache_len(&self) -> usize {
         self.fail_cache.len()
     }
+
+    /// True when the last `apply` returned through the LOCK-SKIPPED branch.
+    ///
+    /// A fixture check, not a behaviour: `lock_wait_logged` is set only in that
+    /// branch and cleared only after a successful acquire, so reading it is a
+    /// zero-cost way for a test to prove the tick it just drove actually took
+    /// the path under test. Without it, a test can assert the *outcome*
+    /// (`writes_stalled()`) while the tick reached it down some other path —
+    /// which is exactly how the DEC-299 F1 test came to pass with its own fix
+    /// removed (register row 299-a).
+    #[cfg(test)]
+    fn took_lock_skip(&self) -> bool {
+        self.lock_wait_logged
+    }
 }
 
 impl GpuBackend {
@@ -1860,17 +1874,28 @@ mod tests {
     /// complete so the next `apply` HARVESTS it (setting the flag true) while
     /// issuing a fresh write that wedges.
     ///
-    /// ⚠ **This test documents the scenario but does NOT discriminate the fix.**
-    /// Validity-checked by removing `note_no_progress` from the lock-skipped
-    /// branch: it still passed. The fixture check below confirms the intended
-    /// state IS reached (tick 2 harvests, so the flag is set), so the reason the
-    /// later ticks stay stalled without the fix is something this test does not
-    /// isolate — most likely the lock being free on those ticks, which would send
-    /// them through `run`'s harvest-timeout path instead of the early return.
-    /// Recorded rather than deleted because the scenario is real and the next
-    /// person should not have to rediscover it; recorded rather than trusted
-    /// because a test that passes with the fix removed proves nothing about the
-    /// fix. Tracked as a register row.
+    /// The first cut of this test did NOT discriminate the fix — it passed with
+    /// `note_no_progress` removed — and the reason was not the one the register
+    /// row guessed (register row 299-a). It was not the lock: ticks 3-5 never
+    /// reached the lock at all. They re-commanded the SAME duty that tick 1 had
+    /// already failed, so the `GPU_FAIL_COOLDOWN` suppression at the top of
+    /// `apply` emptied `pending_writes` and the tick returned through the
+    /// `is_empty()` -> `harvest_only` arm — which sets `completed_last_run =
+    /// false` on its own timeout, making `stalled()` true for a reason that has
+    /// nothing to do with the branch under test.
+    ///
+    /// Two things fix that, and both are load-bearing:
+    ///
+    /// * Ticks 3-5 command a duty that escapes BOTH suppressors — different from
+    ///   the cached failure (90) and at least `GPU_COALESCE_DELTA_PCT` from the
+    ///   last commanded value (20). The wedged tick-2 task still owns
+    ///   `lock_gpu_writes` via the guard moved into its closure, so the lock
+    ///   genuinely is unavailable and the tick genuinely does skip on it.
+    /// * `took_lock_skip()` is asserted inside the loop, so the test proves it
+    ///   took the lock-skipped path rather than merely reaching the outcome. An
+    ///   outcome assertion alone is what let the first cut pass down a different
+    ///   path — the same trap as asserting a payload instead of the signal that
+    ///   produced it.
     #[tokio::test]
     async fn a_wedged_gpu_write_keeps_reporting_stalled_on_lock_skipped_ticks() {
         let fifo = make_fifo("gpu-stall-persist");
@@ -1926,9 +1951,23 @@ mod tests {
         );
 
         // Tick 3+: the wedged write holds the lock, so these never reach `run`.
+        //
+        // 50, not 90: 90 is what tick 1 failed at, so re-commanding it hits the
+        // 60 s `GPU_FAIL_COOLDOWN` and the tick never gets as far as the lock.
+        // 50 differs from the cached failure AND clears `GPU_COALESCE_DELTA_PCT`
+        // against the last commanded 20, so a write is genuinely pending and the
+        // lock is genuinely what stops it.
         for tick in 3..=5 {
-            be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 90)])
+            be.apply(&[cmd("amd_gpu:0000:03:00.0", "amd_gpu", 50)])
                 .await;
+            // Prove the PATH, not just the outcome — see the doc comment.
+            assert!(
+                be.took_lock_skip(),
+                "fixture check, tick {tick}: this tick must have returned through \
+                 the lock-skipped branch (a wedged write holds the lock). It did \
+                 not, so the stall assertion below would pass down some other \
+                 path and prove nothing about the fix"
+            );
             assert!(
                 be.writes_stalled(),
                 "tick {tick}: a wedged GPU write reported NOT stalled — \

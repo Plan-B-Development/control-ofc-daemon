@@ -175,6 +175,13 @@ fn engine_health(
         let age = age_ms(completed.or(started), now);
         // Both strings are deliberately narrow about what they assert.
         //
+        // "Removed" below means removed IN DRAFT, before DEC-289 ever shipped —
+        // no released daemon has emitted either of the wider phrasings. Worth
+        // stating because it was read the other way: the GUI contract quoted the
+        // draft wording, and for the whole life of the feature that looked like
+        // later drift to be reconciled rather than text that was never emitted
+        // at all (register row 298-a).
+        //
         // "the engine is ticking" was removed from the Crit text because this
         // branch returns BEFORE the liveness ladder, so a stale stall stamp
         // satisfies it whether or not the loop is alive — the text would then
