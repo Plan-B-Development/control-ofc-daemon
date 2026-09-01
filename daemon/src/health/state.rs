@@ -315,6 +315,11 @@ pub struct DaemonState {
     pub subsystem_timestamps: SubsystemTimestamps,
     /// Thermal safety override state: "normal", "emergency", or "recovery".
     pub thermal_override_state: Option<String>,
+    /// The emergency trip point the engine ACTED on at its last tick (DEC-308).
+    /// Per-machine since the trigger is derived from the CPU's own reported
+    /// design ceiling; `None` until the first tick, where readers fall back to
+    /// `constants::THERMAL_EMERGENCY_TRIGGER_C`.
+    pub thermal_emergency_trigger_c: Option<f64>,
     /// True while a hardware verify (hwmon or GPU) is in progress. Held for the
     /// verify's entire lifetime by the handler's RAII guard, so the engine pause
     /// outlasts a slow verify rather than expiring on a fixed timer. Single-
@@ -363,6 +368,7 @@ impl Default for DaemonState {
             aio: AioPumpState::default(),
             subsystem_timestamps: SubsystemTimestamps::default(),
             thermal_override_state: None,
+            thermal_emergency_trigger_c: None,
             verify_in_progress: false,
             verify_epoch: 0,
             verify_active_until: None,

@@ -218,7 +218,15 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
         // the threshold values here, so moving the trip point in `safety.rs` would
         // have left the daemon REPORTING the old value while ACTING on the new
         // one — and the GUI renders this field verbatim as "Limit: N °C".
-        emergency_threshold_c: crate::constants::THERMAL_EMERGENCY_TRIGGER_C,
+        //
+        // DEC-308 makes that invariant load-bearing rather than merely tidy: the
+        // trip point is now derived per machine from the CPU's own reported design
+        // ceiling, so the constant is only the floor. Report what the engine
+        // actually acted on, published in the same write as the state beside it,
+        // and fall back to the constant only before the first tick.
+        emergency_threshold_c: snap
+            .thermal_emergency_trigger_c
+            .unwrap_or(crate::constants::THERMAL_EMERGENCY_TRIGGER_C),
         release_threshold_c: crate::constants::THERMAL_EMERGENCY_RELEASE_C,
     };
 

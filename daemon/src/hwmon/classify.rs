@@ -147,6 +147,23 @@ fn is_superio_chip(chip: &str) -> bool {
     chip.starts_with("nct6") || chip.starts_with("it8")
 }
 
+/// Whether `chip` is a CPU's own on-die temperature sensor, as opposed to a
+/// motherboard proxy that merely carries a CPU-ish label.
+///
+/// This is the same set `refine_cpu` grades `Confidence::High` — kept as one
+/// definition so the two cannot drift, since both answer "is this the silicon
+/// talking about itself?".
+///
+/// [SAFETY] DEC-308 uses it to decide whose `tempN_crit` may raise the thermal
+/// emergency trigger. A motherboard Super-I/O `CPUTIN` channel also publishes a
+/// `crit`, and it means something else entirely — a board-defined alarm point,
+/// not the CPU's design ceiling. Getting this predicate wrong can only fail to
+/// raise the trigger (the derivation is raise-only and floors at the global
+/// constant), never lower it.
+pub fn is_authoritative_cpu_chip(chip: &str) -> bool {
+    matches!(chip, "k10temp" | "coretemp" | "sbtsi_temp")
+}
+
 /// Refine a coarse `CpuTemp` into a specific CPU sub-class. Sub-class from the
 /// label; confidence from the source authority (k10temp / coretemp / sbtsi are
 /// authoritative CPU sensors; a Super-I/O chip reads the CPU via PECI/TSI at
@@ -166,7 +183,7 @@ fn refine_cpu(chip: &str, l: &str) -> TempClassification {
         (TempClass::CpuPackage, "CPU temperature")
     };
     let (confidence, src) = match chip {
-        "k10temp" | "coretemp" | "sbtsi_temp" => (Confidence::High, "authoritative CPU sensor"),
+        c if is_authoritative_cpu_chip(c) => (Confidence::High, "authoritative CPU sensor"),
         c if is_superio_chip(c) => (Confidence::Medium, "motherboard Super-I/O CPU reading"),
         _ => (
             Confidence::Low,

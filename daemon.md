@@ -138,8 +138,20 @@ inside the band cannot pin the pre-settle fan speed indefinitely.
      were replacements, so the 60% and 40% rungs could drive a fan *below* what
      its curve was asking for; the 100% emergency was never affected, because
      100 is the maximum
-   - Triggers at hottest CpuTemp >= 105C, forces all OpenFan channels and
-     writable hwmon headers to 100%
+   - Triggers at hottest CpuTemp >= the trip point, forcing all OpenFan channels
+     and writable hwmon headers to 100%
+   - **The trip point is per-machine (DEC-308).** 105C is the floor and the
+     fallback; where the kernel publishes the CPU's own design ceiling
+     (`tempN_crit` — `coretemp` documents it as the maximum junction temperature)
+     the engine derives `min(ceiling + 5, 115)` and uses that instead. A part is
+     *designed* to hold its ceiling under sustained load, so a trip point at or
+     below it fires on a healthy machine and then latches forever, because
+     release needs a reading the part never produces. Raise-only, capped, and
+     gated on authoritative CPU chips (`k10temp`/`coretemp`/`sbtsi_temp`) — a
+     Super-I/O `CPUTIN` publishes a `crit` too and it means something else.
+     Intel-only in practice: `k10temp` on Zen publishes no `crit`, so AMD keeps
+     the 105 floor, which is right — with a ~95C ceiling it was never the broken
+     case. `/diagnostics/hardware` reports the value actually acted on
    - GPU fans are deliberately excluded (DEC-130) — there is no GPU emergency
      threshold; AMD PMFW firmware owns GPU thermal protection (junction-temp
      throttling, firmware fan ramp) independently of OS fan control

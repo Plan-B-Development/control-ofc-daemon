@@ -12,7 +12,7 @@ resolver = "2"
 #
 # Deliberately NOT touched: `overflow-checks` and `debug_assertions`. Both stay
 # at their dev defaults (on). This crate is the sole writer of PWM and owns the
-# 105 C thermal emergency, so debug-mode overflow panics on percent arithmetic
+# thermal emergency, so debug-mode overflow panics on percent arithmetic
 # are a safety property, not build weight. Changing THOSE would be a real
 # behavioural change and needs its own decision — this is purely about how much
 # debug info gets emitted and linked.

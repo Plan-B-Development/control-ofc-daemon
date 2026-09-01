@@ -424,7 +424,8 @@ pub(crate) fn begin_verify_pause(
 ///    Returns `409 thermal_abort`.
 /// 2. **The ladder is forcing** — `thermal_force_state` is `Some`. The
 ///    temperature test above does NOT cover this: the emergency latches at
-///    105 °C and releases only at ≤80 °C, so the band 80 < T ≤ 85 passes it while
+///    at least 105 °C (per-machine since DEC-308) and releases only at ≤80 °C,
+///    so the band 80 < T ≤ 85 passes it while
 ///    every fan is still being forced. Returns `409 validation_error` with
 ///    `retryable: true`, the shape DEC-295 established for the same refusal on
 ///    the calibrate endpoint.

@@ -447,7 +447,8 @@ mod tests {
     /// write at all — not its sweep steps, and not its restore.
     ///
     /// `check_thermal_safety` alone does NOT cover this. It is a pure
-    /// temperature test at 85C, while the emergency latches at 105C and releases
+    /// temperature test at 85C, while the emergency latches at 105C or higher
+    /// (per-machine since DEC-308) and releases
     /// only at <=80C — so the whole band 80 < T <= 85 passes it with the engine
     /// still forcing 100% every tick. This fixture sits at 50C precisely to
     /// prove the new guard fires on the FORCED STATE and not on temperature;
@@ -455,7 +456,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn calibration_refuses_to_run_while_thermal_safety_is_forcing() {
         let cache = make_cache(50.0, 0, 800); // comfortably under the 85C limit
-        cache.record_engine_tick("emergency");
+        cache.record_engine_tick("emergency", crate::constants::THERMAL_EMERGENCY_TRIGGER_C);
         let (write_fn, writes) = recording_write_fn(None);
 
         let result = calibrate_openfan_channel(cache, 0, 3, 0, write_fn).await;
@@ -492,7 +493,8 @@ mod tests {
         let write_fn = move |ch: u8, pwm: u8| -> Result<(), CalibrationError> {
             log2.lock().unwrap().push((ch, pwm));
             if pwm == 33 {
-                cache2.record_engine_tick("emergency");
+                cache2
+                    .record_engine_tick("emergency", crate::constants::THERMAL_EMERGENCY_TRIGGER_C);
             }
             Ok(())
         };
@@ -579,7 +581,8 @@ mod tests {
         let write_fn = move |ch: u8, pwm: u8| -> Result<(), CalibrationError> {
             log2.lock().unwrap().push((ch, pwm));
             if pwm == 100 {
-                cache2.record_engine_tick("emergency");
+                cache2
+                    .record_engine_tick("emergency", crate::constants::THERMAL_EMERGENCY_TRIGGER_C);
             }
             Ok(())
         };

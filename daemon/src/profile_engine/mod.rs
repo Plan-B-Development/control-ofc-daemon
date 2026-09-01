@@ -778,6 +778,76 @@ pub(crate) fn hottest_cpu_reading(
     }
 }
 
+/// The emergency trigger to use this tick, derived from the CPU's own reported
+/// design ceiling where the kernel publishes one (DEC-308).
+///
+/// [SAFETY] `constants::THERMAL_EMERGENCY_TRIGGER_C` is a single global number,
+/// and no single number is right for every CPU: a part is *designed* to hold its
+/// Tjmax under sustained load, so 105 fires on a healthy Arrow Lake desktop
+/// (ceiling ~105) and sits *below* a Core Ultra laptop's ceiling (~110) — and on
+/// both the emergency then latches and can never release, because release needs
+/// a reading at or under `THERMAL_EMERGENCY_RELEASE_C` that a part holding Tjmax
+/// never produces.
+///
+/// So ask the silicon instead of hardcoding a family table. `coretemp` documents
+/// `tempN_crit` as the maximum junction temperature, read from a model-specific
+/// register; the daemon already discovers it (DEC-117) and already caches it on
+/// every reading. The trigger is that ceiling plus
+/// [`constants::THERMAL_TRIGGER_MARGIN_C`], because the ceiling itself is a
+/// temperature the part reaches *legitimately*.
+///
+/// Four properties, each load-bearing:
+///
+/// 1. **Raise-only.** The fold seeds with the global constant, so the result is
+///    never below it. A machine whose kernel says nothing, says something
+///    implausible, or says something lower keeps exactly today's behaviour, and
+///    no user can regress.
+/// 2. **Authoritative chips only.** A Super-I/O `CPUTIN` channel publishes a
+///    `crit` too, and it is a board-defined alarm point rather than the CPU's
+///    ceiling. Gated on [`crate::hwmon::classify::is_authoritative_cpu_chip`].
+/// 3. **Capped.** Hardware lies; an absurd `crit` would push the trigger past the
+///    CPU's own THERMTRIP and silently disable the emergency, which is worse than
+///    the global value. Clamped to [`constants::THERMAL_TRIGGER_MAX_C`].
+/// 4. **Recomputed per tick** — a pure function of the snapshot the safety leg is
+///    already holding. Note what that does *not* mean: this deliberately applies
+///    no freshness filter, unlike `hottest_cpu_reading`, which partitions the
+///    same map into Fresh/Stale. It does not need one. `crit_c` is a static
+///    property of the silicon read once at discovery, not a live measurement, so
+///    a stale entry still carries the right ceiling for that machine; and since
+///    the derivation is raise-only, the worst a departed sensor can do is hold
+///    the trigger high until `retain_sensors` drops it at the next rediscovery.
+///    Filtering on freshness here would instead let a transient poll failure
+///    silently LOWER the trip point mid-run, which is the worse direction.
+///
+/// **This is Intel-only in practice, and that is the honest description.**
+/// Measured 2026-09-01 on a Zen machine: `k10temp` exposes `temp1_input` and
+/// `temp1_label` and nothing else — no `crit`, no `max`. The kernel's own
+/// `k10temp.rst` documents those attributes for the older families, not for
+/// Family 17h+. AMD therefore keeps the 105 fallback, which is the correct
+/// outcome rather than a gap: with a ~95 °C ceiling it already has 10 °C of
+/// headroom, so AMD is the case that was never broken.
+pub(crate) fn effective_trigger_c(sensors: &HashMap<String, CachedSensorReading>) -> f64 {
+    sensors
+        .values()
+        .filter(|s| s.kind == SensorKind::CpuTemp)
+        .filter(|s| crate::hwmon::classify::is_authoritative_cpu_chip(&s.chip_name))
+        .filter_map(|s| s.thresholds.as_ref().and_then(|t| t.crit_c))
+        // Explicit, because the IEEE-754 defaults here are a trap rather than a
+        // safety net: `f64::min`/`max` return the *other* operand when one is NaN,
+        // so a NaN ceiling would sail through the clamp below and come out as the
+        // CAP — the highest trigger available — rather than being ignored. Not
+        // reachable from the sysfs parser today (it parses an `i64` of
+        // millidegrees), which is exactly why it would go unnoticed if that ever
+        // changed.
+        .filter(|crit| crit.is_finite())
+        .map(|crit| {
+            (crit + constants::THERMAL_TRIGGER_MARGIN_C).min(constants::THERMAL_TRIGGER_MAX_C)
+        })
+        // Seeded with the global floor, so this is a max over {floor} ∪ candidates
+        // — the raise-only property, expressed rather than asserted.
+        .fold(constants::THERMAL_EMERGENCY_TRIGGER_C, f64::max)
+}
+
 /// Whether a sensor is current enough to drive a fan CURVE this tick.
 ///
 /// [SAFETY] DEC-272 (register row 01-a). Curve evaluation used to read the raw
@@ -943,7 +1013,7 @@ pub async fn profile_engine_loop(
         let snapshot_taken_at = std::time::Instant::now();
         let mut sensors = cache.sensors_snapshot();
         let stale_after = cache.cpu_temp_stale_after();
-        let (decision, hottest_cpu_c) = {
+        let (decision, hottest_cpu_c, effective_trigger) = {
             // DEC-267/269: classify the reading before acting on it. `now` is
             // sampled BEFORE the snapshot above, so any reading written during
             // the gap saturates to age 0 (fresh) rather than being judged late —
@@ -951,9 +1021,15 @@ pub async fn profile_engine_loop(
             let cpu_reading = hottest_cpu_reading(&sensors, snapshot_taken_at, stale_after);
 
             let mut safety_guard = safety.lock();
+            // DEC-308: derive this tick's trip point from the CPU's own reported
+            // design ceiling before evaluating against it. Raise-only and capped
+            // — see `effective_trigger_c`. Set unconditionally rather than on
+            // change, because it is a pure function of this snapshot and setting
+            // it cannot disturb a latched emergency (only `release_temp_c` can).
+            safety_guard.set_trigger_temp_c(effective_trigger_c(&sensors));
             let decision =
                 evaluate_safety_tick(cpu_reading, &mut no_cpu_sensor_cycles, &mut safety_guard);
-            (decision, cpu_reading)
+            (decision, cpu_reading, safety_guard.trigger_temp_c())
         };
 
         // DEC-272 (01-a): the safety leg above has had the raw snapshot; from here
@@ -976,7 +1052,7 @@ pub async fn profile_engine_loop(
         // distinguishes a *slow* tick from a stopped one, which supervision
         // cannot. Do not conclude from the supervisor's existence that this is
         // redundant, or from this that the supervisor is.
-        cache.record_engine_tick(decision.thermal_state);
+        cache.record_engine_tick(decision.thermal_state, effective_trigger);
         // DEC-259: pairs the start stamp above with a completion stamp on every
         // exit from this body. Without the pair a *slow* tick was indistinguishable
         // from a *stopped* engine, and the surface reported the worse of the two —
@@ -3246,7 +3322,7 @@ mod tests {
         // Several consecutive ticks, each with a write still outstanding — the
         // shape a wedged device now produces, because the loop no longer freezes.
         for _ in 0..3 {
-            cache.record_engine_tick("normal");
+            cache.record_engine_tick("normal", crate::constants::THERMAL_EMERGENCY_TRIGGER_C);
             let mut t = TickCompletion::new(&cache);
             t.set_writes_outstanding(true);
         }
@@ -3256,7 +3332,7 @@ mod tests {
             .engine_writes_stalled_since
             .expect("a stalled write must be stamped");
 
-        cache.record_engine_tick("normal");
+        cache.record_engine_tick("normal", crate::constants::THERMAL_EMERGENCY_TRIGGER_C);
         {
             let mut t = TickCompletion::new(&cache);
             t.set_writes_outstanding(true);
@@ -3283,7 +3359,7 @@ mod tests {
         );
 
         // A write that lands clears it.
-        cache.record_engine_tick("normal");
+        cache.record_engine_tick("normal", crate::constants::THERMAL_EMERGENCY_TRIGGER_C);
         drop(TickCompletion::new(&cache));
         assert!(
             cache
@@ -6439,6 +6515,222 @@ mod tests {
             Some(hex(80).as_str()),
             "the controlled channel must hold max(load_pct 80, floor 40) = 80 for \
              the whole hold; ch0 writes: {ch0:?}"
+        );
+    }
+
+    // ── DEC-308: the trip point is derived from the CPU's own ceiling ────────
+
+    /// A CpuTemp reading on `chip`, optionally carrying a `tempN_crit`.
+    fn cpu_with_crit(
+        id: &str,
+        chip: &str,
+        temp_c: f64,
+        crit_c: Option<f64>,
+    ) -> CachedSensorReading {
+        CachedSensorReading {
+            id: id.into(),
+            kind: SensorKind::CpuTemp,
+            label: id.into(),
+            value_c: temp_c,
+            source: DeviceLabel::Hwmon,
+            updated_at: Instant::now(),
+            rate_c_per_s: None,
+            session_min_c: None,
+            session_max_c: None,
+            chip_name: chip.into(),
+            temp_type: None,
+            thresholds: crit_c.map(|c| crate::hwmon::types::SensorThresholds {
+                crit_c: Some(c),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn trigger_for(sensors: Vec<CachedSensorReading>) -> f64 {
+        let map: HashMap<String, CachedSensorReading> =
+            sensors.into_iter().map(|s| (s.id.clone(), s)).collect();
+        effective_trigger_c(&map)
+    }
+
+    /// [SAFETY] DEC-308 — every branch of the derivation, stated as behaviour.
+    ///
+    /// The numbers are asserted against `constants::` rather than spelled out,
+    /// except where a literal IS the subject (the family ceilings feeding in).
+    /// DEC-292's lesson: a threshold written out in a test drifts from the one
+    /// the code uses, and then the test fails on a consequence rather than on its
+    /// premise.
+    #[test]
+    fn the_emergency_trigger_is_derived_from_the_cpu_reported_ceiling() {
+        let default = constants::THERMAL_EMERGENCY_TRIGGER_C;
+
+        assert_eq!(
+            trigger_for(vec![]),
+            default,
+            "no sensors at all must fall back to the global constant"
+        );
+
+        // The AMD reality, measured on real hardware 2026-09-01: k10temp on Zen
+        // publishes no crit, so AMD keeps today's behaviour exactly.
+        assert_eq!(
+            trigger_for(vec![cpu_with_crit("tctl", "k10temp", 50.0, None)]),
+            default,
+            "a CPU sensor with no reported ceiling must not move the trigger"
+        );
+
+        // Mainstream Intel desktop: ceiling 100 + margin 5 == the historical 105,
+        // so the overwhelmingly common case sees no change. This is the whole
+        // argument for the margin being 5.
+        assert_eq!(
+            trigger_for(vec![cpu_with_crit("pkg", "coretemp", 50.0, Some(100.0))]),
+            default,
+            "Intel 12th-14th gen desktop must land on exactly the historical value"
+        );
+
+        // The two broken families.
+        assert_eq!(
+            trigger_for(vec![cpu_with_crit("pkg", "coretemp", 50.0, Some(105.0))]),
+            110.0,
+            "Arrow Lake desktop must be lifted clear of its own ceiling"
+        );
+        assert_eq!(
+            trigger_for(vec![cpu_with_crit("pkg", "coretemp", 50.0, Some(110.0))]),
+            115.0,
+            "Core Ultra mobile must be lifted clear of its own ceiling"
+        );
+
+        // Raise-only: a low ceiling must never pull the trigger down, or a machine
+        // nobody reported a problem on would silently start tripping earlier.
+        assert_eq!(
+            trigger_for(vec![cpu_with_crit("pkg", "coretemp", 50.0, Some(70.0))]),
+            default,
+            "a ceiling below the global floor must not lower the trigger"
+        );
+
+        // Capped: hardware lies, and an absurd crit that sailed past the cap would
+        // put the trigger above the CPU's own THERMTRIP and disable the emergency.
+        assert_eq!(
+            trigger_for(vec![cpu_with_crit("pkg", "coretemp", 50.0, Some(4000.0))]),
+            constants::THERMAL_TRIGGER_MAX_C,
+            "an implausible ceiling must be capped, never trusted"
+        );
+
+        // Provenance: a Super-I/O CPUTIN publishes a crit too, and it is a
+        // board-defined alarm point, not the CPU's design ceiling.
+        assert_eq!(
+            trigger_for(vec![cpu_with_crit("cputin", "nct6799", 50.0, Some(120.0))]),
+            default,
+            "a motherboard proxy's crit must not raise the CPU's trip point"
+        );
+
+        // Several sensors: the authoritative one decides, the proxy is ignored.
+        assert_eq!(
+            trigger_for(vec![
+                cpu_with_crit("pkg", "coretemp", 50.0, Some(105.0)),
+                cpu_with_crit("cputin", "nct6799", 50.0, Some(4000.0)),
+            ]),
+            110.0,
+            "a bogus proxy alongside a real ceiling must not win"
+        );
+
+        // A non-finite ceiling must be IGNORED, not clamped. `f64::min` returns
+        // the non-NaN operand, so without the explicit finite check a NaN would
+        // emerge from the clamp as the cap — the highest trigger available, on a
+        // safety path, from a garbage reading.
+        assert_eq!(
+            trigger_for(vec![cpu_with_crit("pkg", "coretemp", 50.0, Some(f64::NAN))]),
+            default,
+            "a NaN ceiling must fall back, never clamp to the cap"
+        );
+        assert_eq!(
+            trigger_for(vec![cpu_with_crit(
+                "pkg",
+                "coretemp",
+                50.0,
+                Some(f64::INFINITY)
+            )]),
+            default,
+            "an infinite ceiling must fall back, never clamp to the cap"
+        );
+
+        // A non-CPU sensor's crit is irrelevant however hot its chip runs.
+        let mut gpu = cpu_with_crit("gpu", "amdgpu", 50.0, Some(110.0));
+        gpu.kind = SensorKind::GpuTemp;
+        assert_eq!(
+            trigger_for(vec![gpu]),
+            default,
+            "a non-CpuTemp sensor must not move the CPU trip point"
+        );
+    }
+
+    /// [SAFETY] DEC-308 — the CALL SITE, not the helper.
+    ///
+    /// `CLAUDE.md § Hard-won lessons`: extracting a rule into a testable function
+    /// does not test the call site, and this project has paid for that five times.
+    /// The unit test above proves `effective_trigger_c` computes the right number;
+    /// this proves the engine actually evaluates against it.
+    ///
+    /// Driven as a PAIR against one temperature. 107 °C is above the historical
+    /// 105 and below an Arrow Lake part's derived 110, so it is exactly the band
+    /// where the two answers differ — and the only difference between the two arms
+    /// is whether the kernel reported a ceiling.
+    #[tokio::test(start_paused = true)]
+    async fn the_engine_evaluates_against_the_derived_trigger_not_the_constant() {
+        async fn thermal_state_at_107(crit_c: Option<f64>) -> Option<String> {
+            let cache = Arc::new(StateCache::new());
+            cache.update_sensors(vec![cpu_with_crit("pkg", "coretemp", 107.0, crit_c)]);
+            run_engine_ticks_until(cache.clone(), None, 2, || {
+                cache.read_with(|s| s.thermal_override_state.is_some())
+            })
+            .await;
+            cache.read_with(|s| s.thermal_override_state.clone())
+        }
+
+        assert_eq!(
+            thermal_state_at_107(None).await,
+            Some("emergency".to_string()),
+            "with no reported ceiling the trigger is the 105 constant, and 107 °C \
+             must latch — this is the control arm, and if it fails the other \
+             assertion proves nothing"
+        );
+        assert_eq!(
+            thermal_state_at_107(Some(105.0)).await,
+            Some("normal".to_string()),
+            "an Arrow Lake part reporting a 105 °C ceiling gets a 110 °C trigger, \
+             so 107 °C is a healthy loaded CPU and must NOT latch a permanent \
+             emergency it could never release from"
+        );
+    }
+
+    /// [SAFETY] DEC-292's invariant, extended by DEC-308: what
+    /// `/diagnostics/hardware` REPORTS must equal what the rule ACTS on.
+    ///
+    /// That used to be free — both read one constant. Now the trip point is
+    /// per-machine, so the handler reads a value the engine publishes, and the
+    /// two can drift. Asserted against the rule's own accessor, never a literal.
+    #[tokio::test(start_paused = true)]
+    async fn the_reported_trip_point_is_the_one_the_engine_acted_on() {
+        let cache = Arc::new(StateCache::new());
+        cache.update_sensors(vec![cpu_with_crit("pkg", "coretemp", 40.0, Some(110.0))]);
+        run_engine_ticks_until(cache.clone(), None, 2, || {
+            cache.read_with(|s| s.thermal_emergency_trigger_c.is_some())
+        })
+        .await;
+
+        let reported = cache
+            .read_with(|s| s.thermal_emergency_trigger_c)
+            .expect("the engine must publish the trip point it acted on");
+        assert_eq!(
+            reported,
+            constants::THERMAL_TRIGGER_MAX_C,
+            "a 110 °C ceiling derives a 115 °C trigger, and that is what must be \
+             reported — reporting the constant while acting on the derived value \
+             is exactly the drift DEC-292 removed"
+        );
+        assert_ne!(
+            reported,
+            constants::THERMAL_EMERGENCY_TRIGGER_C,
+            "precondition: the derived value must actually differ from the \
+             constant here, or this test would pass against a hardcoded report"
         );
     }
 

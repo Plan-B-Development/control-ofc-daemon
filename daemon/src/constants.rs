@@ -184,24 +184,62 @@ pub const SENSOR_READ_FAIL_REDISCOVER_STREAK: u32 = 5;
 /// value while *acting* on another, with the assert still guarding the old one.
 /// Everything that needs this number now reads it from here.
 ///
-/// **This single global value cannot be correct for every CPU, and that is now
-/// measured rather than suspected (`D1-h`, confirmed from Intel datasheets).**
-/// Design ceilings differ by family: AMD Zen 4/5 desktop **95 °C**, Intel 12th-14th
-/// gen desktop **100 °C**, Intel Core Ultra 200S (Arrow Lake) desktop **105 °C**,
-/// Intel Core Ultra **mobile 110 °C**. A part is *designed* to sit at its ceiling
-/// under sustained load, so any single trigger either fires during normal
-/// operation on the families at or below it, or sits far above the design ceiling
-/// of the families beneath it.
+/// **This is the FLOOR and the fallback, not the only value the daemon uses**
+/// (DEC-308). Where the kernel publishes the CPU's own design ceiling, the engine
+/// derives a higher trigger per tick — see
+/// [`crate::profile_engine::effective_trigger_c`]. This constant is what a
+/// machine gets when it publishes nothing usable, and the derivation is
+/// raise-only, so no machine ever trips below this value.
 ///
-/// **105 is retained for now, knowingly.** Arrow Lake desktop sits exactly on it,
-/// so such a machine can latch the emergency while healthy and never release
+/// **A single global value cannot be correct for every CPU.** Design ceilings
+/// differ by family: AMD Zen 4/5 desktop ~95 °C, Intel 12th-14th gen desktop
+/// 100 °C, Intel Core Ultra 200S (Arrow Lake) desktop ~105 °C, Intel Core Ultra
+/// mobile ~110 °C. A part is *designed* to sit at its ceiling under sustained
+/// load, so 105 fires during normal operation on the families at or above it: an
+/// Arrow Lake desktop can latch the emergency while healthy and never release
 /// (release needs <=[`THERMAL_EMERGENCY_RELEASE_C`], which a part holding Tjmax
-/// never reaches). Raising it was attempted and **withdrawn**: 110 removes that
-/// case and lands precisely on Core Ultra mobile's ceiling, moving the identical
-/// permanent-100% fault onto laptops. The fix is a vendor/family-aware trigger,
-/// scheduled as its own change — see `DECISIONS_OPEN_ITEMS.md` row `D1-q` and
-/// DEC-305 § "The trigger is not a single number".
+/// never reaches), and a Core Ultra laptop sits 5 °C above the trigger at its
+/// own ceiling.
+///
+/// **⚠ Those family figures are third-party, and the attempt to source them
+/// primarily FAILED — 2026-09-01.** An earlier revision of this comment called
+/// them "confirmed from Intel datasheets" via `D1-h`; that was an overclaim and
+/// is retracted. Intel's own EDC datasheet pages for the Core Ultra 200S
+/// (document 832586) render their specification tables via JavaScript and return
+/// only a table of contents to a fetch; the Edge overview PDF is an image-only
+/// scan; and ARK returns 403 to automated requests. Every figure that could
+/// actually be read traces to secondary reporting. They are recorded here as
+/// *motivation*, and deliberately **not** encoded as a table — DEC-308 reads the
+/// ceiling from the running silicon instead, precisely so that no unverified
+/// number becomes a safety threshold. TjMax is also user-adjustable on unlocked
+/// parts, which a static table could not track either.
 pub const THERMAL_EMERGENCY_TRIGGER_C: f64 = 105.0;
+
+/// Headroom added to a CPU's own reported design ceiling to get its emergency
+/// trigger (DEC-308).
+///
+/// [SAFETY] The trigger cannot be the ceiling itself: a part is *designed* to sit
+/// at Tjmax under sustained load and throttles itself there, so a trigger at the
+/// ceiling would fire on every healthy loaded machine — the exact false positive
+/// this derivation exists to remove. Five degrees past the point the CPU is
+/// already throttling means cooling has failed, not that the machine is busy.
+///
+/// Chosen at 5 because it leaves mainstream Intel 12th-14th gen desktop
+/// (ceiling ~100) at exactly the historical 105, so the overwhelmingly common
+/// case sees no change at all, while the two families that are genuinely broken
+/// at 105 are lifted clear of their ceilings.
+pub const THERMAL_TRIGGER_MARGIN_C: f64 = 5.0;
+
+/// Hard ceiling on the derived emergency trigger (DEC-308).
+///
+/// [SAFETY] A `tempN_crit` is hardware-reported, and hardware lies. Without a cap
+/// a chip reporting an absurd crit would push the trigger past the point the CPU
+/// self-protects at (Intel documents THERMTRIP at approximately 130 °C), which
+/// would silently disable the emergency altogether — strictly worse than the
+/// single global value this replaces. 115 is the hottest design ceiling known to
+/// this project (Core Ultra mobile, ~110) plus [`THERMAL_TRIGGER_MARGIN_C`], so
+/// the derived trigger is always within `[105, 115]`.
+pub const THERMAL_TRIGGER_MAX_C: f64 = 115.0;
 
 /// CPU temperature (°C) at which a latched thermal emergency releases into its
 /// recovery floor. Deliberately far below the trigger: the gap is the hysteresis
@@ -221,6 +259,10 @@ pub const CALIBRATION_MAX_TEMP_C: f64 = 85.0;
 const _: () = assert!(CALIBRATION_MAX_TEMP_C < THERMAL_EMERGENCY_TRIGGER_C);
 const _: () = assert!(THERMAL_EMERGENCY_RELEASE_C < THERMAL_EMERGENCY_TRIGGER_C);
 const _: () = assert!(NO_SENSOR_SAFE_PCT > 0);
+// DEC-308: the derived trigger is clamped into [TRIGGER, TRIGGER_MAX], so the
+// window must be non-empty and must never dip under the calibration abort.
+const _: () = assert!(THERMAL_TRIGGER_MAX_C >= THERMAL_EMERGENCY_TRIGGER_C);
+const _: () = assert!(THERMAL_TRIGGER_MARGIN_C > 0.0);
 const _: () = assert!(DEADBAND_MAX_HOLD_CYCLES > 0);
 // The renew interval must leave room for ~3 attempts inside the TTL, and the
 // TTL must be non-trivial — a too-tight window would drop legitimate overrides.

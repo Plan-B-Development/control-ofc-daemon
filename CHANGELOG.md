@@ -25,6 +25,36 @@
   path, and only the name was ever read. (DEC-307, register row `D1-j`.)
 
 ### Changed
+- **[SAFETY] The thermal emergency trip point is now per-machine, derived from the
+  CPU's own reported design ceiling.** A single global 105 °C cannot be right for
+  every part, because a CPU is *designed* to sit at its Tjmax under sustained
+  load: an Intel Core Ultra 200S desktop (ceiling ~105 °C) could latch the
+  emergency while perfectly healthy and then never release, since release needs a
+  reading at or under 80 °C that a part holding Tjmax never produces. A Core Ultra
+  laptop (~110 °C) sat above the trigger at its own ceiling.
+
+  Where the kernel publishes `tempN_crit` — which `coretemp` documents as the
+  maximum junction temperature, read from a model-specific register — the daemon
+  now uses `min(ceiling + 5 °C, 115 °C)`. The derivation is **raise-only** (no
+  machine trips below 105 °C, so nobody regresses), **capped** (a lying chip
+  cannot push the trip point past the CPU's own THERMTRIP and silently disable
+  the emergency), and gated on authoritative CPU chips only — a Super-I/O
+  `CPUTIN` publishes a `crit` too, and it is a board alarm point, not the CPU's
+  ceiling. Recomputed each tick, since sensors come and go.
+
+  The 5 °C margin is chosen so mainstream Intel 12th-14th gen desktop (~100 °C)
+  lands on exactly the historical 105 — the common case is unchanged.
+
+  **In practice this is Intel-only, and that is the honest description.** Measured
+  on real hardware: `k10temp` on Zen publishes no `crit` at all, only
+  `temp1_input` and `temp1_label`. AMD therefore keeps the 105 °C floor — which
+  is the right outcome rather than a gap, since with a ~95 °C ceiling AMD was
+  never the broken case.
+
+  `/diagnostics/hardware` now reports the trip point the engine actually acted on
+  rather than the constant, published in the same write as `thermal_state` so the
+  two cannot disagree. **A client must render that field, not assume 105.**
+  (DEC-308, register row `D1-q`.)
 - **An expiring manual override is now swept during a thermal hold, not after
   it.** The forced path used to short-circuit before the override sweep, so an
   override that lapsed mid-emergency kept its deadman auto-restore deferred and

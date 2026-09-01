@@ -381,10 +381,16 @@ impl StateCache {
     /// the outage. Two separate call sites could drift, leaving the heartbeat
     /// claiming health while the safety state went stale: the exact failure this
     /// surface exists to catch.
-    pub fn record_engine_tick(&self, thermal_state: &str) {
+    /// `trigger_c` is the trip point the rule ACTED on this tick, published in
+    /// the same write as the state it produced (DEC-308). Same write on purpose:
+    /// DEC-292's invariant is that what `/diagnostics/hardware` reports equals
+    /// what the rule acts on, and since DEC-308 that value is per-machine rather
+    /// than a constant the handler could read for itself.
+    pub fn record_engine_tick(&self, thermal_state: &str, trigger_c: f64) {
         let now = Instant::now();
         let mut state = self.inner.write();
         state.thermal_override_state = Some(thermal_state.to_string());
+        state.thermal_emergency_trigger_c = Some(trigger_c);
         state.subsystem_timestamps.engine_started = Some(now);
     }
 
@@ -976,7 +982,7 @@ mod tests {
         // read guard and returns a derived value, with no full DaemonState
         // clone. It must observe exactly what snapshot() would.
         let cache = StateCache::new();
-        cache.record_engine_tick("emergency");
+        cache.record_engine_tick("emergency", crate::constants::THERMAL_EMERGENCY_TRIGGER_C);
         cache.update_sensors(vec![]);
 
         let via_read_with = cache.read_with(|s| s.thermal_override_state.clone());
@@ -994,26 +1000,26 @@ mod tests {
         let cache = StateCache::new();
         assert_eq!(cache.snapshot().thermal_override_state, None);
 
-        cache.record_engine_tick("normal");
+        cache.record_engine_tick("normal", crate::constants::THERMAL_EMERGENCY_TRIGGER_C);
         assert_eq!(
             cache.snapshot().thermal_override_state.as_deref(),
             Some("normal")
         );
 
         // Redundant write — value stays correct.
-        cache.record_engine_tick("normal");
+        cache.record_engine_tick("normal", crate::constants::THERMAL_EMERGENCY_TRIGGER_C);
         assert_eq!(
             cache.snapshot().thermal_override_state.as_deref(),
             Some("normal")
         );
 
         // Genuine change must be applied, not skipped.
-        cache.record_engine_tick("emergency");
+        cache.record_engine_tick("emergency", crate::constants::THERMAL_EMERGENCY_TRIGGER_C);
         assert_eq!(
             cache.snapshot().thermal_override_state.as_deref(),
             Some("emergency")
         );
-        cache.record_engine_tick("recovery");
+        cache.record_engine_tick("recovery", crate::constants::THERMAL_EMERGENCY_TRIGGER_C);
         assert_eq!(
             cache.snapshot().thermal_override_state.as_deref(),
             Some("recovery")
@@ -1035,14 +1041,14 @@ mod tests {
             "a cache that has seen no tick must not look alive"
         );
 
-        cache.record_engine_tick("normal");
+        cache.record_engine_tick("normal", crate::constants::THERMAL_EMERGENCY_TRIGGER_C);
         let first = cache
             .snapshot()
             .subsystem_timestamps
             .engine_started
             .expect("tick must stamp the heartbeat");
 
-        cache.record_engine_tick("emergency");
+        cache.record_engine_tick("emergency", crate::constants::THERMAL_EMERGENCY_TRIGGER_C);
         let snap = cache.snapshot();
         assert!(
             snap.subsystem_timestamps.engine_started.unwrap() >= first,

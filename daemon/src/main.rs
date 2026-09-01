@@ -1450,8 +1450,14 @@ async fn async_main() {
 
     // ── Thermal safety rule ─────────────────────────────────────────
     let safety_rule = Arc::new(Mutex::new(ThermalSafetyRule::new()));
+    // DEC-308: this is the FLOOR, not necessarily the trip point this machine
+    // will use. The engine derives a higher one per tick where the CPU reports
+    // its own design ceiling, and publishes what it acted on — a startup line
+    // cannot know it yet, because no sensor has been read. Worded so it does not
+    // become a fifth copy of a threshold that varies.
     log::info!(
-        "Thermal safety rule active: hottest CpuTemp emergency at {}°C",
+        "Thermal safety rule active: hottest CpuTemp emergency at {}°C or above \
+         (raised per-machine where the CPU reports its own ceiling)",
         control_ofc_daemon::constants::THERMAL_EMERGENCY_TRIGGER_C
     );
 

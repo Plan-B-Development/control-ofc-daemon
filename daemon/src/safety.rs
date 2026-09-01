@@ -137,6 +137,24 @@ impl ThermalSafetyRule {
         self.trigger_temp_c
     }
 
+    /// Set the trip point for this tick (DEC-308).
+    ///
+    /// [SAFETY] The engine derives this from the CPU's own reported design
+    /// ceiling — see `profile_engine::effective_trigger_c`, which owns every
+    /// guarantee about the value (raise-only, capped, authoritative chips only).
+    /// This setter deliberately holds no policy of its own: duplicating the
+    /// clamp here would be a second definition of the rule, which is what DEC-292
+    /// exists to prevent.
+    ///
+    /// Safe to call while latched, and called unconditionally every tick. Moving
+    /// the trip point cannot release an active emergency or extend one: `active`
+    /// is cleared solely by a reading at or below `release_temp_c`, which this
+    /// does not touch. So a sensor appearing or vanishing mid-emergency changes
+    /// what it would take to *re-enter*, never what it takes to leave.
+    pub fn set_trigger_temp_c(&mut self, trigger_c: f64) {
+        self.trigger_temp_c = trigger_c;
+    }
+
     /// The output this rule is already holding, read **without** a temperature.
     ///
     /// [SAFETY] DEC-269. For the case where the CPU reading is *stale* rather

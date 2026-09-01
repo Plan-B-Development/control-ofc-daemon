@@ -49,7 +49,10 @@ fn test_app_state_inner(engine_ticked: bool, runtime_cfg: std::path::PathBuf) ->
     let cache = Arc::new(StateCache::new());
 
     if engine_ticked {
-        cache.record_engine_tick("normal");
+        cache.record_engine_tick(
+            "normal",
+            control_ofc_daemon::constants::THERMAL_EMERGENCY_TRIGGER_C,
+        );
     }
 
     // Populate with test data
@@ -257,16 +260,25 @@ async fn status_endpoint_reflects_thermal_override_state() {
     let cache = state.cache.clone();
     let (path, shutdown, _dir) = start_test_server(state).await;
 
-    cache.record_engine_tick("emergency");
+    cache.record_engine_tick(
+        "emergency",
+        control_ofc_daemon::constants::THERMAL_EMERGENCY_TRIGGER_C,
+    );
     let (status, json) = uds_get(&path, "/status").await;
     assert_eq!(status, 200);
     assert_eq!(json["thermal_state"], "emergency");
 
-    cache.record_engine_tick("recovery");
+    cache.record_engine_tick(
+        "recovery",
+        control_ofc_daemon::constants::THERMAL_EMERGENCY_TRIGGER_C,
+    );
     let (_, json) = uds_get(&path, "/status").await;
     assert_eq!(json["thermal_state"], "recovery");
 
-    cache.record_engine_tick("normal");
+    cache.record_engine_tick(
+        "normal",
+        control_ofc_daemon::constants::THERMAL_EMERGENCY_TRIGGER_C,
+    );
     let (_, json) = uds_get(&path, "/status").await;
     assert_eq!(json["thermal_state"], "normal");
 
@@ -480,12 +492,59 @@ async fn superio_endpoint_matches_combined_endpoint_superio() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// [SAFETY] DEC-308 — `/diagnostics/hardware` must report the trip point the
+/// ENGINE acted on, not the compile-time constant.
+///
+/// DEC-292's invariant used to be free: the handler and the rule both read one
+/// constant, so they could not disagree. DEC-308 made the trip point per-machine,
+/// and the sibling assertion in `hardware_diagnostics_endpoint_returns_report`
+/// silently stopped proving anything — it compares the response against a FRESH
+/// `ThermalSafetyRule` while the fixture seeds the cache with that same constant,
+/// so both sides are 105 and a handler that read the constant directly would pass.
+///
+/// This is the test that fails for that. It seeds a trip point that is
+/// deliberately NOT the constant, which is the only way to tell "reports what the
+/// engine acted on" from "reports the constant". Raised by `ofc:security-reviewer`
+/// during the DEC-308 review, as a P2 on the tripwire itself.
+#[tokio::test]
+async fn hardware_diagnostics_reports_the_derived_trip_point_not_the_constant() {
+    let derived = control_ofc_daemon::constants::THERMAL_TRIGGER_MAX_C;
+    assert_ne!(
+        derived,
+        control_ofc_daemon::constants::THERMAL_EMERGENCY_TRIGGER_C,
+        "precondition: the seeded trip point must differ from the constant, or \
+         this test cannot distinguish the two sources"
+    );
+
+    let state = test_app_state();
+    state.cache.record_engine_tick("normal", derived);
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/diagnostics/hardware").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        json["thermal_safety"]["emergency_threshold_c"], derived,
+        "the endpoint must report the trip point the engine acted on; reporting \
+         the constant while the engine acts on a derived value is exactly the \
+         drift DEC-292 exists to catch, and it is reachable again since DEC-308"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
 #[tokio::test]
 async fn hardware_diagnostics_endpoint_returns_report() {
     // Exercises the spawn_blocking offload path: the handler performs blocking
-    // sysfs/procfs reads on the blocking pool and serializes the report. The
-    // thermal thresholds are hardcoded constants, so they're machine-independent
-    // and safe to assert regardless of the host's actual hardware.
+    // sysfs/procfs reads on the blocking pool and serializes the report.
+    //
+    // The RELEASE threshold is still a hardcoded constant and so is
+    // machine-independent. The EMERGENCY threshold is not, as of DEC-308 — it is
+    // derived per machine and published by the engine — so this fixture is
+    // machine-independent only because it seeds the cache with the constant
+    // itself. The assertions below therefore pin the VALUE here; what pins the
+    // handler-to-cache LINK is
+    // `hardware_diagnostics_reports_the_derived_trip_point_not_the_constant`.
     let state = test_app_state();
     let (path, shutdown, _dir) = start_test_server(state).await;
 
@@ -503,6 +562,12 @@ async fn hardware_diagnostics_endpoint_returns_report() {
     // acting on the new one, and this test would have gone green against the
     // stale value it had been given.
     let acting = control_ofc_daemon::safety::ThermalSafetyRule::new();
+    // NOTE what this does and does not prove since DEC-308. `acting` is a FRESH
+    // rule, so `trigger_temp_c()` is the default-constructor value — and this
+    // fixture seeds the cache with that same constant, so both sides are the
+    // constant and a handler that ignored the cache entirely would still pass.
+    // That is the very drift DEC-292 named, so the link is pinned separately by
+    // the test below rather than pretended to here.
     assert_eq!(
         json["thermal_safety"]["emergency_threshold_c"],
         acting.trigger_temp_c(),
@@ -520,13 +585,27 @@ async fn hardware_diagnostics_endpoint_returns_report() {
     //
     // This tripwire did its job during the D1 batch: a trial raise to 110 could
     // not land silently, and having to edit this line out loud is what surfaced
-    // that 110 is exactly Core Ultra mobile's Tjmax. The raise was withdrawn and
-    // the value is unchanged; the fix is a vendor/family-aware trigger, tracked
-    // as `D1-q`. Keep this assertion literal — deriving it from the constant
-    // would make it agree with any future change automatically, which is the one
-    // thing it exists not to do.
+    // that 110 is exactly Core Ultra mobile's Tjmax. The raise was withdrawn.
+    //
+    // DEC-308 then closed `D1-q` by a different route — the trip point is derived
+    // per machine from the CPU's own reported ceiling — so what this line pins is
+    // now the **floor and fallback**, which is what this fixture exercises (it
+    // seeds the cache directly, with no CPU sensor and therefore no ceiling to
+    // derive from). Still worth pinning literally, and now more so: a machine that
+    // reports nothing usable is the common case, and the derivation is raise-only,
+    // so this value is the guaranteed lower bound on every machine.
+    //
+    // Keep these literal — deriving them from the constants would make them agree
+    // with any future change automatically, which is the one thing they exist not
+    // to do.
     assert_eq!(json["thermal_safety"]["emergency_threshold_c"], 105.0);
     assert_eq!(json["thermal_safety"]["release_threshold_c"], 80.0);
+    // DEC-308's two new safety thresholds get the same treatment, for the same
+    // reason: the margin decides whether a healthy part at its ceiling trips, and
+    // the cap is the only thing stopping a lying chip from pushing the trigger
+    // past the CPU's own THERMTRIP and disabling the emergency outright.
+    assert_eq!(control_ofc_daemon::constants::THERMAL_TRIGGER_MARGIN_C, 5.0);
+    assert_eq!(control_ofc_daemon::constants::THERMAL_TRIGGER_MAX_C, 115.0);
     assert!(json["kernel_modules"].is_array());
 
     let _ = shutdown.send(());
@@ -1428,14 +1507,18 @@ async fn gpu_verify_refused_when_hot() {
 #[tokio::test]
 async fn verify_refused_while_thermal_safety_is_forcing() {
     // DEC-297 (295-a). `verify_thermal_guard` tested TEMPERATURE only, at 85C.
-    // The emergency latches at 105C and releases at <=80C, so the band
+    // The emergency latches at 105C or higher (per-machine since DEC-308) and
+    // releases at <=80C, so the band
     // 80 < T <= 85 passed it while the engine was still forcing every fan — and
     // a verify then drives its target to a test duty against that force.
     //
     // The fixture sits at a NORMAL temperature on purpose: it proves the guard
     // keys on the forced STATE, and could not fail if it keyed on temperature.
     let state = test_app_state_with_hwmon();
-    state.cache.record_engine_tick("emergency");
+    state.cache.record_engine_tick(
+        "emergency",
+        control_ofc_daemon::constants::THERMAL_EMERGENCY_TRIGGER_C,
+    );
     let (path, shutdown, _dir) = start_test_server(state).await;
 
     let (status, json) = uds_post(&path, "/hwmon/h1/verify", &serde_json::json!({})).await;
@@ -1465,7 +1548,10 @@ async fn verify_refused_while_thermal_safety_is_forcing() {
 async fn gpu_verify_refused_while_thermal_safety_is_forcing() {
     // DEC-297 (295-a), the GPU arm of the same gate.
     let state = test_app_state();
-    state.cache.record_engine_tick("recovery");
+    state.cache.record_engine_tick(
+        "recovery",
+        control_ofc_daemon::constants::THERMAL_EMERGENCY_TRIGGER_C,
+    );
     let (path, shutdown, _dir) = start_test_server(state).await;
 
     let (status, json) = uds_post(

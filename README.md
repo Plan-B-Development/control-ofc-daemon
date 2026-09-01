@@ -200,9 +200,12 @@ Full build / install / CLI / environment reference lives in
 - **HTTP over Unix domain socket** at `/run/control-ofc/control-ofc.sock`, exposing
   snapshot reads (`/poll`) — the GUI's 1 Hz poll path (the unused `/events` SSE
   stream was removed at v2.5.0, DEC-198).
-- **Thermal safety** is daemon-enforced: 105°C CPU trigger → all OpenFan and
-  motherboard (hwmon) fans to 100%, 25°C hysteresis, 40% fallback when no CPU
-  sensor reports for 5 cycles. GPU fans are excluded — AMD PMFW firmware owns
+- **Thermal safety** is daemon-enforced: at the CPU trip point → all OpenFan and
+  motherboard (hwmon) fans to 100%, hysteresis down to 80°C, 40% floor when no CPU
+  sensor reports for 5 cycles. The trip point is **per-machine** — at least 105°C,
+  raised to match the CPU's own reported design ceiling where the kernel publishes
+  it (DEC-308) — and every duty is a **floor** over the active profile's output
+  rather than a replacement for it (DEC-307), so the ladder can only raise a fan. GPU fans are excluded — AMD PMFW firmware owns
   GPU thermal protection independently of OS fan control (DEC-130).
 - **Headless profile engine** (`profile_engine/`) evaluates the active profile's
   fan curves autonomously on a 1 Hz loop and is the **sole writer** of every
