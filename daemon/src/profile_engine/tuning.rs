@@ -65,7 +65,7 @@ pub(crate) fn apply_tuning_with_floor(
     //    `validate()` by design (see `profile::load_profile`). A negative pair
     //    (`step_up_pct + step_down_pct < 0`) inverts the window, and the panic
     //    killed the engine task mid-tick — taking the sole PWM writer AND the
-    //    105°C thermal leg with it, silently, behind a still-200 `/status`.
+    //    thermal leg with it, silently, behind a still-200 `/status`.
     //    A negative cap is meaningless, so it reads as 0 ("no movement in that
     //    direction"), which freezes the output for that control instead of
     //    aborting fan control for the whole machine. `f64::max` returns the
@@ -99,7 +99,7 @@ pub(crate) fn apply_tuning_with_floor(
     //    stop_pct`, step 3 caps a from-stopped fan below `stop_pct`, step 4 then
     //    snaps it to 0, and the old `output > 0.0` guard could never fire — the
     //    fan stayed off forever despite the curve demanding it on (until the
-    //    105°C thermal force). Judging on `demand` rescues that case: the
+    //    thermal force). Judging on `demand` rescues that case: the
     //    kick raises the zeroed `output` back to `start_pct`. A demand the
     //    stop-snap would itself keep off (`demand < stop_pct`) correctly does
     //    NOT start. For a HARD floor step 4 is skipped, so `demand_wants_on`

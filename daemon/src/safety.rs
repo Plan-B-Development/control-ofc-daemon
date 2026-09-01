@@ -1,10 +1,34 @@
 //! CPU Tctl emergency thermal safety rule.
 //!
-//! Single latched rule: if CPU Tctl reaches 105°C, force all OpenFan channels
-//! and writable hwmon headers to 100%. Hold until Tctl drops to 80°C, then
-//! hold a 60% recovery floor for two cycles (the release cycle that drops out
-//! of emergency, plus one more recovery-floor cycle) before returning control
-//! to the active profile.
+//! Single latched rule: at [`crate::constants::THERMAL_EMERGENCY_TRIGGER_C`],
+//! force all OpenFan channels and writable hwmon headers to 100%. Hold until
+//! Tctl drops to [`crate::constants::THERMAL_EMERGENCY_RELEASE_C`], then hold
+//! 60% for two cycles (the release cycle that drops out of emergency, plus one
+//! more) before returning control to the active profile. The thresholds are
+//! deliberately not restated here — DEC-292 reduced them to one definition each
+//! precisely because a doc that spells a threshold out drifts from it.
+//!
+//! **The 60% step is a REPLACEMENT, not a floor — this doc used to say "floor"
+//! and that was wrong (`D1-j`).** Every value this rule returns reaches the
+//! engine as `decision.forced_pct`, and the engine's forced branch calls
+//! `force_all(pct)` and then `continue`s, skipping profile evaluation entirely.
+//! So on release the fans are driven **to** 60%, not held **at or above** it: a
+//! curve asking for 100% at that temperature is overridden downward for two
+//! ticks, immediately after an excursion, while the CPU is still hot. Same
+//! shape for the no-CPU-sensor duty.
+//!
+//! That is a real defect and it is **not fixed here** — correcting it means the
+//! engine must evaluate the profile during a forced tick and write
+//! `max(computed, forced)`, which cannot simply clamp the computed commands:
+//! `force_all` reaches every writable header and every OpenFan channel
+//! regardless of whether any control commands it, so clamping commands alone
+//! would shrink the emergency's reach to controlled fans only — the v2.38.0 P1
+//! shape. The correct form is a `force_all_with_floor(pct, &commands)` on
+//! `SafetyWriteBackend`, which is a trait change across three backends and
+//! interacts with the shared `BoundedWrite` invariant (DEC-289/298/299). It is
+//! tracked as `D1-j` in `DECISIONS_OPEN_ITEMS.md` and deferred to its own
+//! change, deliberately, rather than bolted onto a diff that already moves the
+//! trip point.
 //!
 //! GPU fans are deliberately excluded from this rule (DEC-130): there is no
 //! GPU emergency threshold. AMD PMFW firmware owns GPU thermal protection
@@ -118,7 +142,7 @@ impl ThermalSafetyRule {
     /// [SAFETY] DEC-269. For the case where the CPU reading is *stale* rather
     /// than *absent*: the poll loop has stopped updating, but the last thing it
     /// told us still stands as evidence. A latched emergency means we saw at
-    /// least 105 C and have never since seen 80 C or below, and that remains
+    /// least the trigger and have never since seen the release point or below, and that remains
     /// true while we are blind — so the safe response to losing sight is to keep
     /// forcing what we were already forcing, not to fall back to a lower floor.
     ///
@@ -147,6 +171,16 @@ impl Default for ThermalSafetyRule {
 mod tests {
     use super::*;
 
+    /// The configured trip point, read rather than restated.
+    ///
+    /// These tests used to hardcode `105.0`. When a trip-point move was trialled
+    /// (D1 batch) **27 tests went red at once**, none of which was testing the
+    /// number — they were testing the ladder, and had merely spelled the trigger
+    /// out. That is DEC-292's defect (a threshold written out in many places) in
+    /// its test-suite form, so it gets DEC-292's fix: derive from the constant,
+    /// and express "just above"/"just below" as offsets from it.
+    const TRIGGER: f64 = crate::constants::THERMAL_EMERGENCY_TRIGGER_C;
+
     #[test]
     fn normal_temp_no_override() {
         let mut rule = ThermalSafetyRule::new();
@@ -155,16 +189,16 @@ mod tests {
     }
 
     #[test]
-    fn trigger_at_105() {
+    fn trigger_at_the_configured_trip_point() {
         let mut rule = ThermalSafetyRule::new();
-        assert_eq!(rule.evaluate(105.0), Some(100));
+        assert_eq!(rule.evaluate(TRIGGER), Some(100));
         assert!(rule.is_active());
     }
 
     #[test]
     fn holds_at_100_while_above_release() {
         let mut rule = ThermalSafetyRule::new();
-        rule.evaluate(105.0); // trigger
+        rule.evaluate(TRIGGER); // trigger
         assert_eq!(rule.evaluate(90.0), Some(100)); // still hot
         assert!(rule.is_active());
     }
@@ -172,7 +206,7 @@ mod tests {
     #[test]
     fn releases_at_80_with_recovery() {
         let mut rule = ThermalSafetyRule::new();
-        rule.evaluate(105.0); // trigger
+        rule.evaluate(TRIGGER); // trigger
         assert_eq!(rule.evaluate(80.0), Some(60)); // release + recovery
         assert!(!rule.is_active());
     }
@@ -180,7 +214,7 @@ mod tests {
     #[test]
     fn recovery_lasts_one_cycle() {
         let mut rule = ThermalSafetyRule::new();
-        rule.evaluate(105.0); // trigger
+        rule.evaluate(TRIGGER); // trigger
         rule.evaluate(80.0); // release → recovery
         assert_eq!(rule.evaluate(70.0), Some(60)); // one-cycle recovery floor
         assert_eq!(rule.evaluate(70.0), None); // back to normal
@@ -192,7 +226,7 @@ mod tests {
         // for TWO cycles — the release cycle plus one recovery-floor cycle —
         // before control returns to the active profile.
         let mut rule = ThermalSafetyRule::new();
-        rule.evaluate(105.0); // trigger → emergency
+        rule.evaluate(TRIGGER); // trigger → emergency
         assert_eq!(rule.evaluate(80.0), Some(60)); // cycle 1: release at 60%
         assert_eq!(rule.evaluate(70.0), Some(60)); // cycle 2: recovery floor at 60%
         assert_eq!(rule.evaluate(70.0), None); // cycle 3: back to profile control
@@ -205,7 +239,7 @@ mod tests {
         let mut rule = ThermalSafetyRule::new();
         assert_eq!(rule.held_output_pct(), None, "nothing forced at rest");
 
-        rule.evaluate(106.0);
+        rule.evaluate(TRIGGER + 1.0);
         assert_eq!(rule.held_output_pct(), Some(100), "latched");
         assert_eq!(rule.held_output_pct(), Some(100), "and it is idempotent");
         assert!(rule.is_active(), "reading it must not clear the latch");
@@ -227,48 +261,48 @@ mod tests {
     #[test]
     fn retrigger_after_recovery() {
         let mut rule = ThermalSafetyRule::new();
-        rule.evaluate(105.0); // trigger
+        rule.evaluate(TRIGGER); // trigger
         rule.evaluate(80.0); // release
         rule.evaluate(70.0); // recovery
         rule.evaluate(70.0); // normal
 
         // Heat up again
-        assert_eq!(rule.evaluate(106.0), Some(100));
+        assert_eq!(rule.evaluate(TRIGGER + 1.0), Some(100));
         assert!(rule.is_active());
     }
 
     #[test]
     fn does_not_trigger_at_104() {
         let mut rule = ThermalSafetyRule::new();
-        assert_eq!(rule.evaluate(104.9), None);
+        assert_eq!(rule.evaluate(TRIGGER - 0.1), None);
         assert!(!rule.is_active());
     }
 
     #[test]
     fn does_not_release_at_81() {
         let mut rule = ThermalSafetyRule::new();
-        rule.evaluate(105.0); // trigger
+        rule.evaluate(TRIGGER); // trigger
         assert_eq!(rule.evaluate(81.0), Some(100)); // still above 80
         assert!(rule.is_active());
     }
 
     #[test]
     fn oscillation_at_trigger_boundary_stays_active() {
-        // Once triggered, temp oscillating near the trigger boundary (104.9–105.1)
-        // must NOT release — the 25°C hysteresis gap (trigger=105, release=80)
+        // Once triggered, temp oscillating near the trigger boundary
+        // must NOT release — the hysteresis gap between trigger and release
         // keeps the override locked until temp actually drops to 80°C.
         let mut rule = ThermalSafetyRule::new();
 
         // Cross the trigger threshold
-        assert_eq!(rule.evaluate(105.0), Some(100));
+        assert_eq!(rule.evaluate(TRIGGER), Some(100));
         assert!(rule.is_active());
 
         // Oscillate just below trigger — still far above release (80°C)
-        assert_eq!(rule.evaluate(104.9), Some(100));
+        assert_eq!(rule.evaluate(TRIGGER - 0.1), Some(100));
         assert!(rule.is_active());
-        assert_eq!(rule.evaluate(105.1), Some(100));
+        assert_eq!(rule.evaluate(TRIGGER + 0.1), Some(100));
         assert!(rule.is_active());
-        assert_eq!(rule.evaluate(104.9), Some(100));
+        assert_eq!(rule.evaluate(TRIGGER - 0.1), Some(100));
         assert!(rule.is_active());
 
         // Only releases when temp actually drops to the release threshold

@@ -22,12 +22,12 @@
 //! ## Identify (per fan)
 //! Stops a single fan for physical identification, auto-restoring after a short
 //! deadman TTL. Floor-exempt by necessity (you must be able to stop a pump to
-//! find it); bounded by the deadman and the 105°C thermal force. Restore is
+//! find it); bounded by the deadman and the thermal force. Restore is
 //! simply removal — the engine recomputes the fan's curve value next tick, so
 //! no prior-PWM is remembered.
 //!
 //! Safety ordering enforced by the engine tick:
-//! `105°C force  >  identify-stop (floor-exempt)  >  override (floor-clamped)  >  curve`.
+//! `thermal force  >  identify-stop (floor-exempt)  >  override (floor-clamped)  >  curve`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -431,7 +431,7 @@ mod tests {
     #[test]
     fn continuously_renewed_override_never_expires() {
         // No absolute max-duration cap (D4-c): a live renewing client holds
-        // indefinitely; the 105°C force is the safety net, not a hard cap.
+        // indefinitely; the thermal force is the safety net, not a hard cap.
         let clock = ManualClock::new();
         let mut t = OverrideTable::with_clock(clock.clone());
         let g = t.take_override("ctrl-a", 100, ttl());

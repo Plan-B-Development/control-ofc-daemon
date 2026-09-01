@@ -45,7 +45,7 @@ const WRITE_JOIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(1)
 ///
 /// Before this existed the engine awaited every backend join unconditionally. A
 /// sysfs write blocked in a driver therefore froze the *whole* loop: the tick
-/// never completed, so the 105 °C `force_all` never ran again — and because the
+/// never completed, so the thermal `force_all` never ran again — and because the
 /// task was still **alive**, DEC-266's death supervision never fired either. The
 /// daemon sat there holding the fans at whatever duty they happened to have.
 ///
@@ -192,7 +192,7 @@ impl<T: Send + 'static> BoundedWrite<T> {
     /// **DEC-298 changed this.** It used to drop `f` unread whenever it harvested
     /// a pending handle, even when that handle completed immediately — so a tick
     /// that cleared a slow write issued nothing of its own. Concretely: an
-    /// ordinary `apply` is pending at tick N, the CPU crosses 105 °C at N+1,
+    /// ordinary `apply` is pending at tick N, the CPU crosses the trip point at N+1,
     /// `force_all` harvests the apply's result and returns having written
     /// nothing, and the first forced write is issued at N+2. Against a device
     /// consistently slower than `budget`, forced writes alternated every other
@@ -350,7 +350,7 @@ pub(crate) struct OpenFanBackend {
     writes: BoundedWrite<Vec<(u8, Result<(), String>)>>,
     /// Edge-trigger for the "write still in flight" safety log (DEC-289), so a
     /// legitimately slow emergency write reports its transition once instead of
-    /// once per tick for the whole 105->80 hold.
+    /// once per tick for the whole emergency-to-release hold.
     stall_logged: bool,
 }
 
@@ -613,7 +613,7 @@ impl SafetyWriteBackend for OpenFanBackend {
         // this one device.
         //
         // Edge-triggered: a legitimately slow force_all spans several ticks over
-        // a degraded link, and the 105->80 hold can last minutes, so a per-tick
+        // a degraded link, and an emergency-to-release hold can last minutes, so a per-tick
         // line would bury the transition it exists to report. Every other safety
         // log in this file is throttled the same way.
         if stalled {
@@ -627,7 +627,7 @@ impl SafetyWriteBackend for OpenFanBackend {
             }
         } else if self.stall_logged {
             // DEC-298: the falling edge. Without it the journal asserted a
-            // condition that had cleared minutes earlier, and a 105->80 hold can
+            // condition that had cleared minutes earlier, and an emergency-to-release hold can
             // last minutes.
             self.stall_logged = false;
             log::warn!("THERMAL SAFETY: OpenFan force_all writes are landing again");
@@ -1074,7 +1074,7 @@ pub(crate) struct HwmonBackend {
     writes: BoundedWrite<Vec<(String, Result<(), String>)>>,
     /// Edge-trigger for the "write still in flight" safety log (DEC-289), so a
     /// legitimately slow emergency write reports its transition once instead of
-    /// once per tick for the whole 105->80 hold.
+    /// once per tick for the whole emergency-to-release hold.
     stall_logged: bool,
 }
 
@@ -1301,7 +1301,7 @@ impl SafetyWriteBackend for HwmonBackend {
                 // `Vec::new()` at the end of this closure) rather than through
                 // `note_outcomes`' per-member streak throttle — so a single
                 // read-only header emitted one THERMAL SAFETY ... FAILED line
-                // per second for the whole 105->80C hold, burying real failures
+                // per second for the whole emergency-to-release hold, burying real failures
                 // at the moment they matter most. Not a loss of reach: the rule
                 // is scoped to writable headers (`safety.rs`), so a read-only
                 // one was never going to be driven.
@@ -1462,7 +1462,7 @@ mod tests {
 
     /// The whole point: a write wedged in the kernel must not hold the caller.
     /// Before DEC-289 this join was unconditional, so the engine loop froze — and
-    /// with it the 105 °C `force_all`, on every backend, not just the stuck one.
+    /// with it the thermal `force_all`, on every backend, not just the stuck one.
     #[tokio::test]
     async fn a_wedged_write_releases_the_caller_instead_of_freezing_it() {
         let fifo = make_fifo("release");
@@ -1542,7 +1542,7 @@ mod tests {
     /// Before this, `run` took the pending handle and **dropped `f` unread** even
     /// when that handle completed immediately. So a tick that cleared a slow
     /// `apply` issued nothing of its own — and if that tick was the one where the
-    /// CPU crossed 105 °C, the first forced write was not issued until the tick
+    /// CPU crossed the trip point, the first forced write was not issued until the tick
     /// after. `ran == 2` is the discriminator: before the fix it was 1.
     #[tokio::test]
     async fn a_harvested_write_still_issues_this_ticks_own_write() {
@@ -1788,7 +1788,7 @@ mod tests {
     ///
     /// `GpuBackend::apply` used to `spawn_blocking(...).await` per fan with no
     /// bound. A PMFW write wedged in the driver therefore meant `apply` never
-    /// returned, the engine loop never reached `tick.tick()`, and the 105 °C
+    /// returned, the engine loop never reached `tick.tick()`, and the thermal
     /// `force_all` never ran again — while the task stayed ALIVE, so DEC-266's
     /// death supervision never fired either.
     ///
@@ -2662,10 +2662,10 @@ mod tests {
     /// DEC-295: the `force_all` twin of `hwmon_apply_skips_read_only_header`.
     ///
     /// `apply` has had the DEC-102 read-only backstop for a long time;
-    /// `force_all` did not, so during a 105C hold every read-only header
+    /// `force_all` did not, so during an emergency hold every read-only header
     /// attempted a write that could only EACCES — and this path logs INLINE,
     /// bypassing `note_outcomes`' streak throttle, so it emitted one
-    /// `THERMAL SAFETY ... FAILED` line per second for the whole 105->80C hold.
+    /// `THERMAL SAFETY ... FAILED` line per second for the whole emergency-to-release hold.
     ///
     /// The writable-sibling half is the load-bearing one. This is the thermal
     /// path, and a filter that over-filtered would remove the emergency's REACH
@@ -2918,7 +2918,7 @@ mod tests {
             "expected one forced SetPwm per channel; got {w:?}"
         );
         // Count alone can't catch a force_all that ignores its pct argument and
-        // sends e.g. 40% during a 105°C emergency. Pin the VALUE: 100% → raw 255
+        // sends e.g. 40% during a thermal emergency. Pin the VALUE: 100% → raw 255
         // → frame ">02{ch:02X}FF\n" for every channel.
         for frame in &set_pwm {
             assert!(

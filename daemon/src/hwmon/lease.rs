@@ -31,7 +31,7 @@ pub enum HwmonWriter {
     Engine,
     /// A hardware-verify handler's controlled test/restore writes.
     Verify,
-    /// The thermal-safety force (105 °C emergency / no-CPU-sensor fallback).
+    /// The thermal-safety force (thermal emergency / no-CPU-sensor fallback).
     ThermalSafety,
 }
 

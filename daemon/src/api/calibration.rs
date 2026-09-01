@@ -59,7 +59,7 @@ pub enum CalibrationError {
     /// The thermal ladder is forcing a duty, so calibration must not write
     /// (DEC-295). Deliberately NOT `ThermalAbort`: that means "too hot to
     /// calibrate", and this fires on a machine that may be perfectly cool —
-    /// the emergency latches at 105C and releases only at <=80C, and
+    /// the emergency latches at its trigger and releases only well below it, and
     /// `no_sensor_fallback` forces indefinitely on a machine with no CPU
     /// sensor at all. Carries the state so the message can name it.
     #[error("thermal safety is forcing fan output ({state}); calibration cannot run")]
@@ -236,7 +236,7 @@ pub async fn calibrate_openfan_channel(
 
             // DEC-295: the check above is a pure temperature test at
             // CALIBRATION_MAX_TEMP_C (85C), but the thermal emergency LATCHES at
-            // 105C and releases only at <=80C. The band 80 < T <= 85 therefore
+            // its trigger and releases only at <=80C. The band 80 < T <= 85 therefore
             // passes it while the engine is still forcing 100% every tick — and
             // this sweep starts at 0%, so without this guard it would fight the
             // emergency at 1 Hz for the whole sweep. Abort rather than skip: a

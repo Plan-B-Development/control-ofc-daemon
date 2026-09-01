@@ -117,8 +117,8 @@ pub const DEADBAND_MAX_HOLD_CYCLES: u32 = 30;
 /// Time-to-live for a daemon-owned manual override before it reverts to
 /// autonomous curve control. Judged on the daemon's monotonic clock — never a
 /// client timestamp — so a frozen/crashed/slept GUI cannot strand fans. The
-/// GUI renews well inside this window (see `OVERRIDE_RENEW_SECS`); the 105°C
-/// thermal force backstops regardless. K8s-leader-election-aligned (15 s
+/// GUI renews well inside this window (see `OVERRIDE_RENEW_SECS`); the thermal
+///  force backstops regardless. K8s-leader-election-aligned (15 s
 /// lease, renewed well within it). No absolute max-duration cap: a live
 /// renewing GUI proves the user is present, so deliberate long sessions are
 /// not force-reverted.
@@ -180,9 +180,27 @@ pub const SENSOR_READ_FAIL_REDISCOVER_STREAK: u32 = 5;
 /// written out four times — here in a compile-time assert, in
 /// `ThermalSafetyRule::new`, in the `/diagnostics/hardware` response, and in that
 /// rule's own doc comment. The dangerous copy was the API response: it was a bare
-/// literal, so moving the trip point would have left the daemon *reporting* 105
-/// while *acting* on something else, with the assert still guarding the old value.
+/// literal, so moving the trip point would have left the daemon *reporting* one
+/// value while *acting* on another, with the assert still guarding the old one.
 /// Everything that needs this number now reads it from here.
+///
+/// **This single global value cannot be correct for every CPU, and that is now
+/// measured rather than suspected (`D1-h`, confirmed from Intel datasheets).**
+/// Design ceilings differ by family: AMD Zen 4/5 desktop **95 °C**, Intel 12th-14th
+/// gen desktop **100 °C**, Intel Core Ultra 200S (Arrow Lake) desktop **105 °C**,
+/// Intel Core Ultra **mobile 110 °C**. A part is *designed* to sit at its ceiling
+/// under sustained load, so any single trigger either fires during normal
+/// operation on the families at or below it, or sits far above the design ceiling
+/// of the families beneath it.
+///
+/// **105 is retained for now, knowingly.** Arrow Lake desktop sits exactly on it,
+/// so such a machine can latch the emergency while healthy and never release
+/// (release needs <=[`THERMAL_EMERGENCY_RELEASE_C`], which a part holding Tjmax
+/// never reaches). Raising it was attempted and **withdrawn**: 110 removes that
+/// case and lands precisely on Core Ultra mobile's ceiling, moving the identical
+/// permanent-100% fault onto laptops. The fix is a vendor/family-aware trigger,
+/// scheduled as its own change — see `DECISIONS_OPEN_ITEMS.md` row `D1-q` and
+/// DEC-305 § "The trigger is not a single number".
 pub const THERMAL_EMERGENCY_TRIGGER_C: f64 = 105.0;
 
 /// CPU temperature (°C) at which a latched thermal emergency releases into its

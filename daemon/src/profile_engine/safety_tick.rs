@@ -1,4 +1,4 @@
-//! Thermal-safety tick: the 105/80/60C ladder + no-sensor fallback +
+//! Thermal-safety tick: the trigger/release/recovery ladder + no-sensor fallback +
 //! DEC-190 dropout handling. Pure decision returning SafetyDecision (C3).
 
 use super::*;
@@ -19,7 +19,7 @@ pub(crate) struct SafetyDecision {
 ///
 /// Owns the no-sensor counter transitions (threshold-edge logging included)
 /// and the thermal-state classification, separated from controller I/O so
-/// the 105/80/60 ladder and the 5-cycle fallback are unit-testable (DEC-135).
+/// the trigger/release/recovery ladder and the 5-cycle fallback are unit-testable (DEC-135).
 pub(crate) fn evaluate_safety_tick(
     reading: super::CpuReading,
     no_cpu_sensor_cycles: &mut u32,
@@ -103,7 +103,7 @@ pub(crate) fn evaluate_safety_tick(
     // fans dropped from a curve output of ~85% to 40%, on a CPU last measured at
     // 104 C. That is a reduction in cooling caused by going blind, which is the
     // exact thing this ADR exists to forbid, one rung out. Worse, it is a
-    // plausible route TO 105 C — at which point the emergency cannot fire,
+    // plausible route TO the trigger — at which point the emergency cannot fire,
     // because we are blind.
     //
     // So: while the last known temperature was at or above the release

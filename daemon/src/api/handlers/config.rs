@@ -778,7 +778,7 @@ pub async fn update_poll_interval_handler(
         //
         // [SAFETY] Ceiling of 2000 ms, deliberately tighter than what
         // `daemon.toml` accepts. This interval drives the sensor poll loop, and
-        // the 105 C emergency rule's staleness budget is derived from it
+        // the thermal emergency rule's staleness budget is derived from it
         // (5x, DEC-267) — so raising it directly widens how old a temperature
         // that rule will still act on, and `StalenessConfig` moves with it.
         //

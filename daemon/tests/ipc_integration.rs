@@ -209,7 +209,7 @@ async fn status_endpoint_returns_health() {
 
 #[tokio::test]
 async fn status_is_crit_when_engine_has_never_ticked() {
-    // DEC-249. The profile engine is the sole PWM writer and runs the 105°C
+    // DEC-249. The profile engine is the sole PWM writer and runs the thermal-emergency
     // rule, but nothing supervises its task — a panic inside a tick used to end
     // fan control silently while /status kept answering 200 with every
     // subsystem "ok". Engine liveness is now a subsystem of its own, so a
@@ -517,6 +517,14 @@ async fn hardware_diagnostics_endpoint_returns_report() {
     // And a deliberate tripwire on the values themselves, so the trip point
     // cannot be moved silently — a safety threshold change should have to edit a
     // test that says so out loud.
+    //
+    // This tripwire did its job during the D1 batch: a trial raise to 110 could
+    // not land silently, and having to edit this line out loud is what surfaced
+    // that 110 is exactly Core Ultra mobile's Tjmax. The raise was withdrawn and
+    // the value is unchanged; the fix is a vendor/family-aware trigger, tracked
+    // as `D1-q`. Keep this assertion literal — deriving it from the constant
+    // would make it agree with any future change automatically, which is the one
+    // thing it exists not to do.
     assert_eq!(json["thermal_safety"]["emergency_threshold_c"], 105.0);
     assert_eq!(json["thermal_safety"]["release_threshold_c"], 80.0);
     assert!(json["kernel_modules"].is_array());
@@ -1375,7 +1383,7 @@ fn make_hot(state: &Arc<AppState>) {
 #[tokio::test]
 async fn hwmon_verify_refused_when_hot() {
     // Phase 6 (DEC-201): a fan verify must not run while the system is hot — it
-    // pauses the engine's write phase (incl. the 105 °C thermal force_all) for its
+    // pauses the engine's write phase (incl. the thermal force_all) for its
     // window. A sensor over the 85 °C limit → 409 thermal_abort, before the
     // controller/header is even consulted (a global safety gate).
     let state = test_app_state();

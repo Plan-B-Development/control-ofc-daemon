@@ -85,7 +85,7 @@ daemon/                     Rust crate (control-ofc-daemon)
       mod.rs                  Loop body / coordinator: orchestrates safety_tick + curve_eval + tuning + backends
       curve_eval.rs           Deadband + trigger latch + Mix/Sync composites (topological order)
       tuning.rs               offset→floor→step-rate→stop-snap→start-kick→clamp + floor policy
-      safety_tick.rs          105/80/60 °C thermal ladder + no-sensor fallback (DEC-190)
+      safety_tick.rs          thermal ladder (trigger/release/recovery) + no-sensor fallback (DEC-190)
       backends.rs             WriteBackend impls (OpenFan/GPU/hwmon gating)
     safety.rs               ThermalSafetyRule (CPU emergency override)
     polling.rs              hwmon + OpenFan polling loops
@@ -203,7 +203,7 @@ Every sensor/fan/header includes:
 - **Thermal safety** (`safety.rs`): hottest CpuTemp sensor triggers at 105°C → force all OpenFan channels and writable hwmon headers to 100%. Hold until 80°C (hysteresis), then 60% for two cycles (the release cycle + a one-cycle recovery floor). Forces 40% if no CpuTemp sensor is found *or* none is still updating (DEC-267: a reading older than 5 poll intervals counts as absent; a *stale* reading during a latched emergency holds the emergency output instead — DEC-269) for 5 consecutive cycles. GPU fans are excluded by design (DEC-130) — PMFW firmware owns GPU thermal protection; the exclusion is structural (`GpuBackend` does not implement `SafetyWriteBackend`).
 - **AIO / coolant** (`hwmon/aio.rs`, DEC-156): coolant temperatures are classified as the `CoolantTemp` sensor kind and AIO PWM headers are flagged `is_aio` (dynamic `aio_hwmon` capability). Detection only — there is **deliberately no coolant thermal-override rule**; the CPU-only `ThermalSafetyRule` is the sole emergency backstop.
 - **OpenFan stop timeout**: 0% PWM allowed for max 8s, then rejected
-- **hwmon PWM**: no daemon-enforced per-header floors (`min_pwm_percent: 0` for all). The role-aware pump/CPU floor is GUI-baked and **daemon-enforced** (validate-time reject + eval-time clamp, DEC-162); the 105 °C thermal force is the absolute backstop.
+- **hwmon PWM**: no daemon-enforced per-header floors (`min_pwm_percent: 0` for all). The role-aware pump/CPU floor is GUI-baked and **daemon-enforced** (validate-time reject + eval-time clamp, DEC-162); the thermal force is the absolute backstop.
 - **Pump-stop guard** (`profile.rs`, DEC-167): a control with a pump/CPU member may not be set to stop — a non-zero `stop_pct` is rejected at profile-validate time (`PUMP_STOP_FORBIDDEN` → `400 validation_error`), and the eval-time stop-snap is skipped for pump/CPU members on any un-validated profile. Distinct from the DEC-162 *floor* above: this forbids *stopping*, not merely clamps the minimum.
 - **PWM enable mode** (`pwmN_enable=1`) set on first write per lease, reset on release
 - **ExecStopPost**: restores `pwm_enable=2` (auto) and resets GPU fan curves on any service stop

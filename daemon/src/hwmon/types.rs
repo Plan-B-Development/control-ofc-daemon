@@ -15,7 +15,7 @@ use std::time::SystemTime;
 ///
 /// Alarm flags (`alarm`, `max_alarm`, `crit_alarm`, `fault`) are sampled
 /// at discovery time only — real-time tracking would require per-poll
-/// sysfs reads. The daemon's hardcoded 105 °C thermal-safety override
+/// sysfs reads. The daemon's hardcoded thermal-safety override
 /// (`safety.rs`) is independent of these and remains authoritative for
 /// emergency fan response.
 #[derive(Debug, Clone, Default, PartialEq)]

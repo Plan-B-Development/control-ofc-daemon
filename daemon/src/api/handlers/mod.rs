@@ -249,7 +249,7 @@ pub struct AppState {
     /// enumerated late — or failed its identity probe once — left the daemon with
     /// no OpenFan backend for the whole process lifetime, and no way to recover
     /// short of a restart. That is not only lost fan control: the profile engine's
-    /// 105 C `force_all` is guarded by `if let Some(be) = openfan_be`, so the
+    /// thermal `force_all` is guarded by `if let Some(be) = openfan_be`, so the
     /// thermal emergency lost its reach to every OpenFan-attached fan too.
     /// `POST /fans/openfan/rescan` is what fills it. Read it through
     /// [`AppState::openfan`] rather than locking by hand.
@@ -409,7 +409,7 @@ pub(crate) fn begin_verify_pause(
 /// Refuse to START a hardware fan verify when it would fight thermal safety.
 ///
 /// **Corrected in DEC-297 (AUD-l).** This comment used to say a verify "pauses
-/// the engine's write phase for its window, which also suppresses the 105 °C
+/// the engine's write phase for its window, which also suppresses the thermal
 /// thermal `force_all`". **It does not, and never did.** `force_all` runs at
 /// `profile_engine/mod.rs:970/973` and `continue`s well BEFORE the
 /// `verify_active()` gate at `:1120`, so an emergency outranks a verify and is
@@ -474,7 +474,7 @@ pub(crate) fn verify_thermal_guard(
 /// `atomic_io::write_atomic` does `write` + `fsync` + `rename` + a directory
 /// `fsync`. That is unbounded wall-clock time on whichever tokio worker thread
 /// polls the handler — the same runtime the 1 Hz profile engine, and therefore
-/// the 105 °C decision, is scheduled on.
+/// the thermal-safety decision, is scheduled on.
 ///
 /// Severity, stated honestly: the runtime is multi-threaded with one worker per
 /// core (`#[tokio::main]` with no arguments), so a single write cannot starve

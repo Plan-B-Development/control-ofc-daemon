@@ -265,7 +265,7 @@ pub async fn gpu_verify_handler(
     // Single-flight + pause the engine's write phase for the verify's lifetime
     // so the engine's GPU backend does not overwrite our controlled test speed.
     // GPU writes need no lease (DEC-045); the pause is the only coordination.
-    // NOT a suppression of the 105 °C `force_all` — that runs before the engine's
+    // NOT a suppression of the thermal `force_all` — that runs before the engine's
     // `verify_active()` gate and always outranks a verify (corrected in DEC-297).
     let Some(verify_guard) =
         super::begin_verify_pause(&state.cache, constants::VERIFY_PAUSE_DEADMAN)

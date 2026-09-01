@@ -270,7 +270,7 @@ pub struct SubsystemTimestamps {
     /// from the poll loops; this one tracks whether the engine task is still
     /// running at all. Nothing supervises that task — it is spawned once and
     /// only awaited during shutdown — so a panic inside a tick used to end fan
-    /// control and the 105°C thermal leg silently, while `/status` kept
+    /// control and the thermal leg silently, while `/status` kept
     /// answering 200 with a frozen `thermal_state`. Stamped by
     /// [`StateCache::record_engine_tick`] in the same write as that thermal
     /// state, so the two can never drift apart.
@@ -291,7 +291,7 @@ pub struct SubsystemTimestamps {
     /// by `serial.timeout_ms` (up to 1 s via the API), so a degraded-but-open
     /// link makes a legitimate tick take 5-10 s — and the old single stamp then
     /// read "not ticking — fan control and thermal safety are stalled" while the
-    /// engine was in the middle of driving the 105 °C emergency. Exactly
+    /// engine was in the middle of driving the thermal emergency. Exactly
     /// backwards, in the one state where the surface most needs to be right.
     pub engine_completed: Option<Instant>,
 }

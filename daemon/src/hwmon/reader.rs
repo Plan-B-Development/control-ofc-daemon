@@ -11,8 +11,19 @@ use crate::hwmon::util::sanitize_f64;
 /// a hardware/driver fault rather than a temperature (DEC-288).
 const PLAUSIBLE_MIN_C: f64 = -50.0;
 /// Upper bound of a plausible sensor reading. No CPU survives to this
-/// temperature — hardware `THERMTRIP` fires around 125°C — so anything above it
-/// is a fault, not a measurement (DEC-288).
+/// temperature — hardware thermal protection fires well below it on every
+/// platform — so anything above it is a fault, not a measurement (DEC-288).
+///
+/// **Do not restate a THERMTRIP number here (D1-l).** This comment used to say
+/// "hardware `THERMTRIP` fires around 125°C", and that figure cannot be sourced:
+/// the public Zen 4 (55901) and Zen 5 (57238) PPRs contain **no** numeric
+/// THERMTRIP value — AMD defers it to a non-public thermal datasheet — and the
+/// figure Intel *does* publish is **higher**, ~130°C ("the processor will stop
+/// all executions when the junction temperature exceeds approximately 130 C",
+/// 655258 Rev 011 / 743844 Rev 015). The constant below is 250°C, far above
+/// either, so nothing downstream was ever wrong — this was a wrong *reason*
+/// attached to a right value, which is the shape that survives review for years
+/// and then gets cited as evidence. It was, once.
 ///
 /// Deliberately WIDER than `discovery::THRESHOLD_MAX_C` (200°C) and not to be
 /// "unified" with it: that constant bounds a declared *threshold* attribute
@@ -20,11 +31,12 @@ const PLAUSIBLE_MIN_C: f64 = -50.0;
 /// questions and their values are independent.
 ///
 /// **This bound cannot catch every fault, and still does not.** Garbage that
-/// lands inside [105, 250]°C — e.g. a saturated 8-bit thermistor reading 127°C —
-/// is indistinguishable from a real over-temperature *here* and would still
-/// latch the emergency. Widening the check is not the answer: 105-125°C are
-/// legitimate readings, so no reader-level bound can separate a real
-/// over-temperature from a stuck one.
+/// lands between [`crate::constants::THERMAL_EMERGENCY_TRIGGER_C`] and this
+/// bound — e.g. a saturated 8-bit thermistor reading 127°C — is
+/// indistinguishable from a real over-temperature *here* and would still latch
+/// the emergency. Widening the check is not the answer: temperatures at and
+/// above the trigger are legitimate readings on real hardware, so no
+/// reader-level bound can separate a real over-temperature from a stuck one.
 ///
 /// DEC-294 removed the one instance of this that is kernel-documented and
 /// reachable — an ASUS NCT6776F `CPUTIN`, which is frequently unconnected and
@@ -65,7 +77,8 @@ pub fn read_temp(descriptor: &SensorDescriptor) -> Result<SensorReading, HwmonEr
     // valid-looking 250.0°C, and every consumer downstream believed it:
     // `hottest_cpu_reading` max-reduces across CpuTemp sensors, so one broken
     // sensor outranked every healthy one, and `ThermalSafetyRule` latches at
-    // >=105°C but only releases at <=80°C — which 250 never reaches. The result
+    // `THERMAL_EMERGENCY_TRIGGER_C` but only releases at
+    // `THERMAL_EMERGENCY_RELEASE_C` — which 250 never reaches. The result
     // was a permanent, unrecoverable thermal emergency: every fan forced to 100%
     // until reboot, from a reading this very code had already identified as
     // garbage. It was also unquarantinable, because DEC-193 evicts a sensor that

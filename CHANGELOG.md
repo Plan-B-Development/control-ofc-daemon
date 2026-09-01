@@ -1,5 +1,57 @@
 # Changelog
 
+## [2.25.0] — 2026-09-01
+
+### Changed
+- **A `CPUTIN` pin on any Nuvoton `nct67xx` chip is no longer treated as a CPU
+  temperature on ASUS boards** — previously only `nct6776` was (DEC-294). The
+  kernel's remedy is scoped to the board, not the chip, so every sibling fell
+  through and was promoted to a CPU sensor. lm-sensors#283 is the case: an
+  `nct6775` reporting `CPUTIN` at 123.5 °C beside a `coretemp` package
+  temperature of 42.0 °C — fresh, in range, 81.5 °C wrong, and enough on its own
+  to pin every fan at 100% until reboot. **The vendor gate is unchanged**: the
+  same chip on a non-ASUS board keeps its CPU classification.
+
+### Added
+- **A CPU temperature that is absurd next to the motherboard is now quarantined
+  instead of trusted.** A `CpuTemp` reading is rejected only when it is *both*
+  more than 15 °C below the hottest motherboard sensor *and* below 10 °C — either
+  condition alone would misfire on an idle CPU under a hot VRM, or on a genuinely
+  cold machine. It fails open when no motherboard sensor is present. This closes a
+  silent failure: with a single CPU sensor reading 0 °C, nothing out-ranked it, the
+  absent-sensor floor never engaged because a sensor *was* present, and every fan
+  curve ran at 0 °C with nothing logged. Rejections take the existing quarantine
+  path, so they appear in `unavailable_sensors[]` and recover on their own.
+
+### Fixed
+- **`safety.rs` described the 60% recovery step as a "floor". It is not** — it is a
+  replacement, and it can drive fans *down* from 100% immediately after an
+  excursion. The false claim is corrected; the behaviour is tracked as `D1-j` and
+  is deliberately **not** fixed here, because the correct form needs a
+  `SafetyWriteBackend` trait change and interacts with the shared `BoundedWrite`
+  invariant (DEC-289/298/299).
+- **A `PLAUSIBLE_MAX_C` comment justified itself with "hardware THERMTRIP fires
+  around 125 °C", a figure that cannot be sourced.** AMD publishes no THERMTRIP
+  value in either public PPR; Intel publishes ~130 °C. The constant (250 °C) is
+  unchanged and was never wrong — the *reason* was.
+- **Two operator-visible log lines restated the thermal trip point instead of
+  reading it** — the startup "thermal safety rule active" line and the poll-interval
+  clamp warning — so either would have misreported the threshold the moment it
+  changed. Both now read the constant. Roughly thirty comments and documents that
+  spelled the number into the *name* of the rule ("the 105 °C emergency") are now
+  number-free, and the daemon's own tests derive the trigger from the constant
+  rather than restating it.
+
+### Note
+- **A raise of the thermal trigger to 110 °C was implemented and withdrawn before
+  release (DEC-305).** Intel Core Ultra 200S desktop has a Tjmax of exactly 105 °C,
+  so a healthy chip can latch the emergency and never release — but 110 °C is
+  exactly Core Ultra *mobile* Tjmax, so the raise would have moved the same fault
+  onto laptops. With confirmed design ceilings of 95 / 100 / 105 / 110 °C across
+  AMD and Intel families, no single global trigger is correct. The threshold is
+  **unchanged at 105 °C** and a vendor/family-aware trigger is scheduled as its own
+  change.
+
 ## [2.24.3] — 2026-08-31
 
 No behaviour change — a test correction and three documentation corrections.

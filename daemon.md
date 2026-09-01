@@ -91,7 +91,7 @@ daemon/src/
     mod.rs             — loop body / coordinator: orchestrates safety_tick + curve_eval + tuning + backends
     curve_eval.rs      — deadband + trigger latch + Mix/Sync composites (topological order)
     tuning.rs          — offset→floor→step-rate→stop-snap→start-kick→clamp + floor policy
-    safety_tick.rs     — 105/80/60 °C thermal ladder + no-sensor fallback (DEC-190)
+    safety_tick.rs     — thermal ladder (trigger/release/recovery) + no-sensor fallback (DEC-190)
     backends.rs        — WriteBackend per fan backend (gating/coalescing)
     skipped.rs         — debounced tracking of controls that cannot be resolved (273-i)
   control_override.rs  — manual-override + fan-identify state (expiring, fencing-guarded, deadman; DEC-163/166)
@@ -423,7 +423,7 @@ user hold any fan — including a pump-class header — stopped by re-issuing `s
 deadman window. **Accepted, bounded risk** (2026-07-21 audit: accept + document): identification
 requires stopping any fan by design (DEC-166); the deadman auto-restore limits an abandoned stop
 to one TTL; and a thermal emergency outranks the identify overlay entirely — the engine's
-`force_all` path (105 °C emergency, and the no-sensor 40 % fallback) drives every OpenFan +
+`force_all` path (thermal emergency, and the no-sensor 40 % fallback) drives every OpenFan +
 writable hwmon header directly, spinning a stalled pump back up regardless of standing stops.
 
 ### Write endpoints — GPU
@@ -456,7 +456,7 @@ writable hwmon header directly, spinning a stalled pump back up regardless of st
 | POST | `/profile/deactivate` | Clear active profile (DEC-097); also clears all active control-overrides, not identify-stops (DEC-218, ≥ 2.12.0); idempotent |
 | POST | `/control/{control_id}/override` (+`/override/renew`, `DELETE`) | Expiring manual override — floor-clamped, deadman, monotonic fencing (DEC-163); cleared on profile activation/deactivation (DEC-189/DEC-218) |
 | POST | `/config/profile-search-dirs` | Edit the profile search path: `{"add": [...]}` and/or `{"remove": [...]}`, at least one required. Removals apply before additions, so `add`+`remove` is one atomic "move" (DEC-285, `remove` is ≥ 2.23.0 and gated by `control.profile_search_dir_remove`). `/etc/control-ofc/profiles` and the last remaining entry cannot be removed. Applies live; persists to `runtime.toml`; 503 `persistence_failed` on write error |
-| POST | `/config/poll-interval` | Set the sensor/fan poll interval, 250-2000 ms (DEC-243; persists to `runtime.toml`, restart to apply). **[SAFETY]** the ceiling bounds how stale a temperature the 105 C rule can act on |
+| POST | `/config/poll-interval` | Set the sensor/fan poll interval, 250-2000 ms (DEC-243; persists to `runtime.toml`, restart to apply). **[SAFETY]** the ceiling bounds how stale a temperature the thermal-emergency rule can act on |
 | POST | `/config/serial-port` | Set the OpenFan serial device (`null` = auto-detect). Validated against the transport's own allowlist and capped at 256 chars; a configured port that fails to open **or fails to answer the `ReadAllRpm` handshake** falls back to auto-detection, so neither a bad value nor a wrong-but-openable device can remove OpenFan control. DEC-243 / DEC-250; restart to apply |
 | POST | `/config/serial-timeout` | Set the serial read timeout, 50-1000 ms (DEC-243; restart to apply). **[SAFETY]** bounds emergency `force_all` latency |
 | POST | `/config/allow-port-probe` | Opt into the active Super-I/O probe (DEC-243). **Also needs the `CAP_SYS_RAWIO` drop-in** — the flag alone does not enable it |

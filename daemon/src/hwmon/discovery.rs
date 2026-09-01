@@ -152,10 +152,35 @@ fn warn_once_about_cpu_classification(descriptors: &[SensorDescriptor], board_ve
 }
 
 /// Chips whose `CPUTIN` pin is documented as frequently unconnected on ASUS
-/// boards. A set rather than a literal so a second chip can be added without
-/// touching the predicate. Mirrors `_ASUS_CPUTIN_BOGUS_CHIPS` in the GUI's
+/// boards. A set rather than a literal so a chip can be added without touching
+/// the predicate. Mirrors `_ASUS_CPUTIN_BOGUS_CHIPS` in the GUI's
 /// `knowledge/sensor_knowledge.py`; the two must stay in step.
-const ASUS_CPUTIN_BOGUS_CHIPS: &[&str] = &["nct6776"];
+///
+/// **Widened from `nct6776` alone to the whole Nuvoton family (`AUD-x`).**
+/// DEC-294 added `nct6776` because that is the chip the kernel's `nct6775`
+/// documentation names. But the remedy the kernel describes is scoped to the
+/// **board**, not the chip — "The CPU temperature on ASUS boards is reported
+/// from PECI 0 or TSI 0" — while the gate here was scoped to one chip, so every
+/// sibling fell through to `classify_chip`'s `_ =>` arm, where
+/// `lower.contains("cpu")` matches "cputin" and promotes it to `CpuTemp`.
+///
+/// The failure that widening prevents is not hypothetical and is not the
+/// NCT6776F case DEC-294 already fixed: lm-sensors#283 reports an `nct6775`
+/// whose `CPUTIN` reads **123.5°C** beside a `coretemp` `Package id 0` of
+/// **42.0°C** and that same chip's `PECI Agent 0` at **39.0°C**. That reading is
+/// fresh, in range, and 81.5°C wrong. `hottest_cpu_reading` max-reduces, so it
+/// outranks every healthy sensor; `ThermalSafetyRule` latches on it and cannot
+/// release, because release needs a *fresh* reading at or below
+/// [`crate::constants::THERMAL_EMERGENCY_RELEASE_C`] and a pinned sensor never
+/// produces one. The result is every fan at 100% until reboot.
+///
+/// **Still vendor-gated** — see [`is_known_bogus_cpu_sensor`]. Widening the chip
+/// set does not widen the board set: the same chip on a non-ASUS board wires
+/// CPUTIN normally and keeps its `CpuTemp` classification.
+const ASUS_CPUTIN_BOGUS_CHIPS: &[&str] = &[
+    "nct6775", "nct6776", "nct6779", "nct6791", "nct6792", "nct6793", "nct6795", "nct6796",
+    "nct6797", "nct6798", "nct6799",
+];
 
 /// True for a sensor the kernel documents as reporting a bogus temperature on
 /// this board, which must therefore never be treated as a CPU temperature
@@ -194,7 +219,7 @@ pub(crate) fn classify_chip(chip_name: &str, label: &str, board_vendor: &str) ->
     // the NCT6776F, CPUTIN is not connected and reports unreasonable
     // temperatures, canonically a near-constant ~115C on an idle machine.
     // Classified CpuTemp it max-reduces over every healthy CPU sensor in
-    // `profile_engine::hottest_cpu_reading` and latches the 105C emergency,
+    // `profile_engine::hottest_cpu_reading` and latches the thermal emergency,
     // which releases only at <=80C — a permanent, unrecoverable 100% fan state
     // on a cold CPU. The GUI has flagged this exact triple as bogus for
     // display since long before the daemon could act on it.
@@ -1269,8 +1294,16 @@ mod tests {
                 SensorKind::CpuTemp,
             ),
             ("nct6776", "CPUTIN", "", SensorKind::CpuTemp),
-            // CHIP gate: only nct6776 is documented; its siblings are unaffected.
-            ("nct6775", "CPUTIN", asus, SensorKind::CpuTemp),
+            // CHIP gate, widened by `AUD-x`: the whole Nuvoton nct67xx family
+            // is now covered, because the kernel's remedy is board-scoped and
+            // every sibling previously fell through to the `_ =>` arm, where
+            // `contains("cpu")` promoted CPUTIN. lm-sensors#283 is the nct6775
+            // instance: CPUTIN 123.5 C beside coretemp 42.0 C.
+            ("nct6775", "CPUTIN", asus, SensorKind::MbTemp),
+            ("nct6799", "CPUTIN", asus, SensorKind::MbTemp),
+            // ...but the gate is still a gate: nct6687 is a different family and
+            // is NOT in the set, so it keeps its CpuTemp classification. If this
+            // case ever flips, the set has been widened past its evidence.
             ("nct6687", "CPUTIN", asus, SensorKind::CpuTemp),
             // LABEL gate: the board's other Nuvoton pins are untouched.
             ("nct6776", "SYSTIN", asus, SensorKind::MbTemp),

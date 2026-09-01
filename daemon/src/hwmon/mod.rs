@@ -19,6 +19,7 @@ pub mod nouveau_detect;
 pub mod nvidia;
 pub mod nvml;
 pub mod nvml_sys;
+pub mod plausibility;
 pub mod pwm_control;
 pub mod pwm_discovery;
 pub mod reader;
@@ -151,7 +152,8 @@ mod tests {
     /// This is the test that pins the actual defect. `read_temp` used to CLAMP an
     /// implausible reading to 250.0°C; `hottest_cpu_reading` max-reduces across
     /// CpuTemp sensors, so that one broken sensor outranked every healthy one, and
-    /// `ThermalSafetyRule` latches at >=105°C while releasing only at <=80°C —
+    /// `ThermalSafetyRule` latches at the trip point while releasing only well
+    /// below it —
     /// which 250 never reaches. The result was every fan forced to 100% until
     /// reboot. Unit-testing `read_temp` alone would NOT have caught that, because
     /// the damage is done by what the call site does with the value.
@@ -161,7 +163,7 @@ mod tests {
         let hwmon0 = tmp.path().join("hwmon0");
         fs::create_dir_all(&hwmon0).unwrap();
         fs::write(hwmon0.join("name"), "k10temp\n").unwrap();
-        // Healthy CPU sensor, comfortably below the 105°C trip point.
+        // Healthy CPU sensor, comfortably below the trip point.
         fs::write(hwmon0.join("temp1_input"), "45000\n").unwrap();
         fs::write(hwmon0.join("temp1_label"), "Tctl\n").unwrap();
         // Broken one: i32::MAX millidegrees, the canonical misprobed-chip value.
@@ -272,8 +274,9 @@ mod tests {
     /// failures — never gets a chance. The kernel documents this exact pin as
     /// frequently unconnected on ASUS NCT6776F boards, reporting a near-constant
     /// unreasonable value. Classified `CpuTemp` it max-reduces over every
-    /// healthy CPU sensor and latches the 105°C emergency, which releases only
-    /// at <=80°C: every fan at 100% on a cold machine, until reboot.
+    /// healthy CPU sensor and latches the emergency, which releases only at
+    /// `THERMAL_EMERGENCY_RELEASE_C`: every fan at 100% on a cold machine, until
+    /// reboot.
     ///
     /// **The non-ASUS half is not decoration.** It proves the fixture is
     /// genuinely capable of latching the ladder, so the ASUS half asserts a real

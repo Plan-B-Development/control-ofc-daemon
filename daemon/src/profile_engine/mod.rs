@@ -202,7 +202,7 @@ impl ProfileEngineState {
     /// control's *curve* resolves, and the full [`Self::deactivate`] also clears
     /// the skip tracker — correct for a profile switch, where the next profile's
     /// controls are genuinely different, and wrong here. The cost of conflating
-    /// them was that a 105 °C event published an empty `skipped_controls[]` for
+    /// them was that a thermal emergency published an empty `skipped_controls[]` for
     /// its entire duration and for a further 3-tick debounce after recovery, so
     /// the one surface that says "nothing is commanding these fans" went silent
     /// exactly while an operator was most likely to be reading it.
@@ -547,7 +547,7 @@ pub fn evaluate_profile_with_overrides(
 
     // Fan-identify (DEC-166): force identified fans to 0 AFTER curve/override
     // resolution and FLOOR-EXEMPT — you must be able to stop a pump to find it.
-    // Subordinate only to the 105°C thermal force, which short-circuits the
+    // Subordinate only to the thermal force, which short-circuits the
     // whole tick before this function is reached. Restore is the entry's
     // removal: the member resumes its curve command next tick (no prior PWM
     // remembered), and its per-member state stayed current (the control kept
@@ -684,7 +684,7 @@ impl Drop for TickCompletion<'_> {
 /// nothing. DEC-190 chose `NO_SENSOR_SAFE_PCT` for the *vanished* case
 /// deliberately, and routing a stale reading into that same branch silently
 /// extended a decision made about one state to a materially different one —
-/// dropping a latched 105 C emergency from 100% to 40% on a CPU last seen at
+/// dropping a latched thermal emergency from 100% to 40% on a CPU last seen at
 /// 95 C, and flapping between the two as readings crossed the budget.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum CpuReading {
@@ -803,7 +803,7 @@ pub async fn profile_engine_loop(
     // DEC-265: a shared slot, not a value. It can be filled after boot by
     // `POST /fans/openfan/rescan`, and the engine must pick that up — otherwise
     // the route adopts a controller that the sole PWM writer never sees, and the
-    // 105 C `force_all` still has no OpenFan leg.
+    // the thermal `force_all` still has no OpenFan leg.
     fan_controller: Arc<
         parking_lot::RwLock<Option<Arc<Mutex<crate::serial::controller::FanController>>>>,
     >,
@@ -938,7 +938,7 @@ pub async fn profile_engine_loop(
         // exit from this body. Without the pair a *slow* tick was indistinguishable
         // from a *stopped* engine, and the surface reported the worse of the two —
         // "fan control and thermal safety are stalled" while `force_all` was
-        // actively driving the 105°C emergency below.
+        // actively driving the thermal emergency below.
         let mut tick_done = TickCompletion::new(&cache);
         // DEC-289: publish the backends' write-stall state HERE, before any
         // branch. Every exit from this body — the emergency `continue`, the
@@ -1004,7 +1004,7 @@ pub async fn profile_engine_loop(
             // the skip tracker, which is right for a profile switch and wrong
             // here: an emergency says nothing about whether a control's curve
             // resolves, and inheriting that clear meant this surface published an
-            // empty list for the entire 105 °C → 80 °C hold plus a 3-tick
+            // empty list for the entire emergency-to-release hold plus a 3-tick
             // debounce blackout after recovery.
             engine_state.deactivate_tuning_only();
             // Publish before the `continue`, so the list survives the event
@@ -1189,6 +1189,11 @@ pub async fn profile_engine_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The configured trip point, read rather than restated — see the identical
+    /// constant in `safety.rs`'s test module for why. A temperature meant as
+    /// "hot enough to latch" is written `TRIGGER + 1.0`, never as a literal.
+    const TRIGGER: f64 = crate::constants::THERMAL_EMERGENCY_TRIGGER_C;
     use crate::health::cache::{CPU_TEMP_STALE_CEILING_MS, MAX_SUPERVISABLE_POLL_INTERVAL_MS};
     use crate::health::state::{CachedSensorReading, DeviceLabel};
     use crate::hwmon::types::SensorKind;
@@ -1416,7 +1421,7 @@ mod tests {
     /// control because a DIFFERENT child dropped out discards the surviving
     /// child's live demand: measured, a fresh 95 C CPU reading sat in the
     /// snapshot while the control issued no command at all and the fan stayed at
-    /// its old duty, backstopped only by the 105 C emergency.
+    /// its old duty, backstopped only by the thermal emergency.
     ///
     /// The CPU here is FRESH. No staleness of the CPU is needed to reach it.
     #[test]
@@ -1715,7 +1720,7 @@ mod tests {
     /// `the_skipped_list_is_published_exactly_once_per_tick`.
     #[tokio::test]
     async fn a_thermal_emergency_tick_drops_a_stale_cached_skip() {
-        let cache = make_cache_with_sensor("cpu", 110.0); // over the 105 °C line
+        let cache = make_cache_with_sensor("cpu", TRIGGER + 1.0); // over the trip point
         cache.update_skipped_controls(vec![SkippedControl {
             control_id: "stale".into(),
             control_name: "Stale".into(),
@@ -1915,7 +1920,7 @@ mod tests {
     ///
     /// The forced path called the full `deactivate()`, which also clears the skip
     /// tracker, and then `continue`d before the publish — so `TickCompletion::drop`
-    /// published its empty default for the ENTIRE 105 °C → 80 °C hold, plus a
+    /// published its empty default for the ENTIRE emergency-to-release hold, plus a
     /// fresh 3-tick debounce blackout on recovery. The one surface that says
     /// "nothing is commanding these fans" went silent exactly while an operator
     /// was most likely to be reading it, and the GUI chip blinked off.
@@ -1954,12 +1959,12 @@ mod tests {
             move || {
                 if p.load(Ordering::SeqCst) == 0 {
                     if observed.read_with(|s| !s.skipped_controls.is_empty()) {
-                        // Listed. Now push the CPU past the 105 °C threshold.
+                        // Listed. Now push the CPU past the trip point.
                         observed.update_sensors(vec![CachedSensorReading {
                             id: "cpu".into(),
                             kind: SensorKind::CpuTemp,
                             label: "Tctl".into(),
-                            value_c: 110.0,
+                            value_c: TRIGGER + 1.0,
                             source: DeviceLabel::Hwmon,
                             updated_at: Instant::now(),
                             rate_c_per_s: None,
@@ -2080,7 +2085,7 @@ mod tests {
                         id: "cpu".into(),
                         kind: SensorKind::CpuTemp,
                         label: "Tctl".into(),
-                        value_c: 110.0,
+                        value_c: TRIGGER + 1.0,
                         source: DeviceLabel::Hwmon,
                         updated_at: Instant::now(),
                         rate_c_per_s: None,
@@ -2595,7 +2600,7 @@ mod tests {
     //
     // The failure DEC-267 guards is silent in every channel the daemon has: the
     // engine keeps ticking (heartbeat green), the sensor is present (no-sensor
-    // fallback never engages), and the temperature never rises (105 C never
+    // fallback never engages), and the temperature never rises (the trigger is never
     // trips). Only the age distinguishes it.
     //
     // DEC-269 then split "stale" from "absent", because collapsing them let a
@@ -2681,7 +2686,7 @@ mod tests {
     #[test]
     fn a_stale_cpu_reading_is_stale_not_absent_and_not_fresh() {
         // The DEC-269 distinction. Reporting Fresh would let a frozen number
-        // drive the 105 C ladder forever (the DEC-267 bug); reporting Absent
+        // drive the thermal ladder forever (the DEC-267 bug); reporting Absent
         // would drop a latched emergency to 40% (the DEC-269 bug).
         let now = Instant::now();
         let sensors = sensor_map(vec![cpu_reading(
@@ -2758,10 +2763,14 @@ mod tests {
 
     // ── DEC-269: losing sight must never LOWER an already-forced output ──
 
-    /// Latch a real 105 C emergency the way the runtime does.
+    /// Latch a real thermal emergency the way the runtime does.
     fn latched_emergency() -> crate::safety::ThermalSafetyRule {
         let mut safety = crate::safety::ThermalSafetyRule::new();
-        assert_eq!(safety.evaluate(106.0), Some(100), "precondition: latched");
+        assert_eq!(
+            safety.evaluate(TRIGGER + 1.0),
+            Some(100),
+            "precondition: latched"
+        );
         assert!(safety.is_active());
         safety
     }
@@ -2822,7 +2831,7 @@ mod tests {
         // Same invariant one rung down: mid-recovery the rule is holding 60%,
         // and a stale tick used to let fans fall to the curve for that tick.
         let mut safety = crate::safety::ThermalSafetyRule::new();
-        safety.evaluate(106.0);
+        safety.evaluate(TRIGGER + 1.0);
         assert_eq!(safety.evaluate(70.0), Some(60), "precondition: in recovery");
         let mut cycles = 0u32;
 
@@ -2861,7 +2870,7 @@ mod tests {
                 "recovery",
                 {
                     let mut s = crate::safety::ThermalSafetyRule::new();
-                    s.evaluate(106.0);
+                    s.evaluate(TRIGGER + 1.0);
                     s.evaluate(70.0);
                     s
                 },
@@ -2888,7 +2897,7 @@ mod tests {
         // (which means 40%) while actually holding the 60% recovery floor, so
         // `thermal_state` meant two different duties.
         let mut safety = crate::safety::ThermalSafetyRule::new();
-        safety.evaluate(106.0);
+        safety.evaluate(TRIGGER + 1.0);
         assert_eq!(safety.evaluate(70.0), Some(60), "precondition: in recovery");
         let mut cycles = 0u32;
 
@@ -2921,7 +2930,7 @@ mod tests {
         // DEC-269 round 2, the sharper half. With nothing latched, a wedged poll
         // leg at 104 C used to force every fan from a curve output of ~85% down
         // to 40% — a REDUCTION in cooling caused by going blind, and a plausible
-        // route to the 105 C the emergency can no longer detect. The invariant
+        // route to the temperature the emergency can no longer detect. The invariant
         // was implemented only for output the rule was already forcing; this is
         // it applied where it always should have been.
         let mut safety = crate::safety::ThermalSafetyRule::new();
@@ -2973,7 +2982,7 @@ mod tests {
         let mut safety = crate::safety::ThermalSafetyRule::new();
         let mut cycles = 0u32;
 
-        let d = evaluate_safety_tick(CpuReading::Fresh(106.0), &mut cycles, &mut safety);
+        let d = evaluate_safety_tick(CpuReading::Fresh(TRIGGER + 1.0), &mut cycles, &mut safety);
         assert_eq!((d.forced_pct, d.thermal_state), (Some(100), "emergency"));
 
         for _ in 0..8 {
@@ -3074,7 +3083,7 @@ mod tests {
         assert_eq!(cache.cpu_temp_stale_after(), Duration::from_secs(5));
 
         // DEC-269: capped at the ceiling across the whole supervisable range, so
-        // a slow-but-legal cadence cannot hand the 105 C rule a long trust window.
+        // a slow-but-legal cadence cannot hand the thermal-emergency rule a long trust window.
         cache.set_hwmon_poll_interval_ms(MAX_SUPERVISABLE_POLL_INTERVAL_MS);
         assert_eq!(
             cache.cpu_temp_stale_after(),
@@ -3088,7 +3097,7 @@ mod tests {
         // DEC-270. The ceiling alone fails the opposite way from the trust window
         // it was written to prevent: clamp the budget below the cadence and every
         // reading is stale the moment it lands, so `hottest_cpu_reading` never
-        // returns `Fresh`, the 105 C ladder never runs, and fans sit at
+        // returns `Fresh`, the thermal ladder never runs, and fans sit at
         // NO_SENSOR_SAFE_PCT on healthy hardware while `/status` shows a ticking
         // engine. Neither direction is acceptable, so the budget floors at the
         // cadence and `apply_runtime_overlay` keeps the cadence supervisable.
@@ -3361,7 +3370,7 @@ mod tests {
                 id: "cpu_tccd1".into(),
                 kind: SensorKind::CpuTemp,
                 label: "Tccd1".into(),
-                value_c: 106.0, // This one triggers safety
+                value_c: TRIGGER + 1.0, // This one triggers safety
                 source: DeviceLabel::Hwmon,
                 updated_at: Instant::now(),
                 rate_c_per_s: None,
@@ -3380,9 +3389,9 @@ mod tests {
             .map(|s| s.value_c)
             .reduce(f64::max);
 
-        assert_eq!(hottest, Some(106.0));
+        assert_eq!(hottest, Some(TRIGGER + 1.0));
         // The hottest sensor (106C) should trigger the safety rule
-        let override_pct = rule.evaluate(106.0);
+        let override_pct = rule.evaluate(TRIGGER + 1.0);
         assert_eq!(override_pct, Some(100));
     }
 
@@ -3969,7 +3978,7 @@ mod tests {
         // a hand-edited or corrupt on-disk profile reaches the engine unchecked.
         // A negative pair inverted the step-rate window and `f64::clamp`
         // panicked on tick 2 — killing the engine task, and with it the sole PWM
-        // writer and the 105°C thermal leg, while `/status` kept answering 200.
+        // writer and the thermal leg, while `/status` kept answering 200.
         let mut profile = make_profile("curve", "flat", 30.0);
         profile.controls[0].step_up_pct = -50.0;
         profile.controls[0].step_down_pct = -50.0;
@@ -4033,7 +4042,7 @@ mod tests {
         // demands it on, even when step_up_pct < stop_pct. Pre-fix, step-rate
         // capped the from-zero output below stop_pct, the stop-snap zeroed it,
         // and the start-kick (gated on output > 0) could never fire — the fan
-        // stayed off forever (until the 105°C thermal force).
+        // stayed off forever (until the thermal force).
         let mut profile = make_profile("curve", "flat", 10.0);
         profile.controls[0].stop_pct = 20.0;
         profile.controls[0].start_pct = 35.0;
@@ -4916,7 +4925,7 @@ mod tests {
         // [SAFETY] DEC-265. `POST /fans/openfan/rescan` installs a controller into
         // the shared slot; if the engine did not re-read that slot, the route would
         // report success while the SOLE PWM WRITER still had no OpenFan backend —
-        // and the 105 C `force_all` is guarded by `if let Some(be) = openfan_be`,
+        // and the thermal `force_all` is guarded by `if let Some(be) = openfan_be`,
         // so the thermal emergency would still have no path to those fans.
         //
         // Starts with an EMPTY slot, exactly as a boot with no controller found.
@@ -5066,7 +5075,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn safety_override_forces_all_channels_to_100() {
         // CPU temp at 106°C triggers thermal safety → all 10 channels forced to 100%
-        let cache = make_cache_with_sensor("cpu", 106.0);
+        let cache = make_cache_with_sensor("cpu", TRIGGER + 1.0);
         // Profile doesn't matter — safety override takes precedence
         let profile_arc = Arc::new(Mutex::new(None::<DaemonProfile>));
         let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
@@ -5563,7 +5572,7 @@ mod tests {
         );
     }
 
-    /// DEC-130: the 105 °C thermal force drives OpenFan + writable hwmon to
+    /// DEC-130: the thermal force drives OpenFan + writable hwmon to
     /// 100 %, but GPU fans are EXCLUDED — AMD PMFW firmware owns GPU thermal
     /// protection and `GpuBackend` deliberately does not implement
     /// `SafetyWriteBackend`. This pins the exclusion behaviourally: with a GPU
@@ -5574,8 +5583,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (gpu, curve_path) = make_fake_gpu(&dir);
 
-        // 110 °C ≥ the 105 °C force threshold → sustained thermal emergency.
-        let cache = make_cache_with_sensor("cpu", 110.0);
+        // TRIGGER + 1 ≥ the force threshold → sustained thermal emergency.
+        let cache = make_cache_with_sensor("cpu", TRIGGER + 1.0);
 
         // A profile that controls the GPU, so absent the DEC-130 exclusion the
         // engine would have a GPU member it could force.
@@ -5736,7 +5745,7 @@ mod tests {
             });
         }
 
-        let cache = make_cache_with_sensor("cpu", 106.0); // >=105 -> force
+        let cache = make_cache_with_sensor("cpu", TRIGGER + 1.0); // >= trigger -> force
         let profile_arc = Arc::new(Mutex::new(None::<DaemonProfile>));
         let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
 
@@ -5802,7 +5811,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn loop_thermal_force_drives_hwmon() {
-        let cache = make_cache_with_sensor("cpu", 106.0); // ≥105 °C → force
+        let cache = make_cache_with_sensor("cpu", TRIGGER + 1.0); // ≥ trigger → force
         let profile_arc = Arc::new(Mutex::new(None::<DaemonProfile>));
         let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
 
@@ -5854,7 +5863,7 @@ mod tests {
         // maps None→"normal", so it cannot distinguish "engine wrote normal" from
         // "engine never wrote"; assert the cache field directly. No controllers
         // are needed — the cache write precedes any backend use.
-        let cache = make_cache_with_sensor("cpu", 106.0); // ≥105 °C → emergency + force 100
+        let cache = make_cache_with_sensor("cpu", TRIGGER + 1.0); // ≥ trigger → emergency + force 100
         let profile_arc = Arc::new(Mutex::new(None::<DaemonProfile>));
         let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
 
@@ -5950,8 +5959,11 @@ mod tests {
 
         // t1 @1.0s: normal evaluation at 79°C.
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-        // t2 @2.0s: thermal emergency.
-        cache.update_sensors(vec![cpu_reading(106.0)]);
+        // t2 @2.0s: thermal emergency (temperature derived from the trip point,
+        // never restated — a bare literal here silently stopped latching when the
+        // trigger moved, and the test then failed on its CONSEQUENCE rather than
+        // on its premise, which is a much harder failure to read).
+        cache.update_sensors(vec![cpu_reading(TRIGGER + 1.0)]);
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
         // t3 @3.0s: release + recovery floor.
         cache.update_sensors(vec![cpu_reading(60.0)]);
@@ -5979,7 +5991,7 @@ mod tests {
         );
     }
 
-    /// DEC-135: the extracted safety step must walk the full 105/80/60
+    /// DEC-135: the extracted safety step must walk the full trigger/release/recovery
     /// ladder — trigger, hold, release-with-recovery, one extra recovery
     /// cycle, then normal.
     #[test]
@@ -5987,7 +5999,7 @@ mod tests {
         let mut rule = crate::safety::ThermalSafetyRule::new();
         let mut cycles = 0u32;
 
-        let d = evaluate_safety_tick(CpuReading::Fresh(106.0), &mut cycles, &mut rule);
+        let d = evaluate_safety_tick(CpuReading::Fresh(TRIGGER + 1.0), &mut cycles, &mut rule);
         assert_eq!(
             d,
             SafetyDecision {
@@ -6132,7 +6144,7 @@ mod tests {
         let mut cycles = 0u32;
 
         // Latch the emergency with a real over-limit reading.
-        let d = evaluate_safety_tick(CpuReading::Fresh(106.0), &mut cycles, &mut rule);
+        let d = evaluate_safety_tick(CpuReading::Fresh(TRIGGER + 1.0), &mut cycles, &mut rule);
         assert_eq!(d.thermal_state, "emergency");
         assert_eq!(d.forced_pct, Some(100));
 
@@ -6180,7 +6192,7 @@ mod tests {
         // threshold boundary.
         let mut rule = crate::safety::ThermalSafetyRule::new();
         let mut cycles = 0u32;
-        evaluate_safety_tick(CpuReading::Fresh(106.0), &mut cycles, &mut rule); // latch emergency
+        evaluate_safety_tick(CpuReading::Fresh(TRIGGER + 1.0), &mut cycles, &mut rule); // latch emergency
 
         for cycle in 1..=(constants::NO_SENSOR_CYCLE_THRESHOLD + 2) {
             let d = evaluate_safety_tick(CpuReading::Absent, &mut cycles, &mut rule);
@@ -6202,7 +6214,7 @@ mod tests {
         // (>= the 80°C release temp) snaps back to forced-100% that tick.
         let mut rule = crate::safety::ThermalSafetyRule::new();
         let mut cycles = 0u32;
-        evaluate_safety_tick(CpuReading::Fresh(106.0), &mut cycles, &mut rule); // latch 100%
+        evaluate_safety_tick(CpuReading::Fresh(TRIGGER + 1.0), &mut cycles, &mut rule); // latch 100%
         for _ in 0..3 {
             evaluate_safety_tick(CpuReading::Absent, &mut cycles, &mut rule); // dropout → 40%
         }
@@ -6572,7 +6584,7 @@ mod tests {
     async fn safety_force_supersedes_active_override() {
         // 106°C forces every channel to 100% even with an override pinning 30% —
         // the safety tick short-circuits before the override overlay is applied.
-        let cache = make_cache_with_sensor("cpu", 106.0);
+        let cache = make_cache_with_sensor("cpu", TRIGGER + 1.0);
         let profile_arc = Arc::new(Mutex::new(Some(make_profile("curve", "graph", 50.0))));
         let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
 

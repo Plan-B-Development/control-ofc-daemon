@@ -88,7 +88,7 @@ enum StopReason {
     IpcDead,
     /// The profile engine — the sole PWM writer — ended (DEC-266).
     EngineDead,
-    /// The hwmon poll loop — the sole writer of the sensor map the 105 C rule
+    /// The hwmon poll loop — the sole writer of the sensor map the thermal-emergency rule
     /// reads — ended (DEC-267).
     HwmonDead,
 }
@@ -171,7 +171,7 @@ async fn wait_for_stop(
             _ = &mut engine_dead_rx => {
                 log::error!(
                     "SAFETY: the profile engine task exited unexpectedly — it is the sole \
-                     PWM writer, so fan control and the 105 \u{b0}C thermal emergency are \
+                     PWM writer, so fan control and the thermal emergency are \
                      both gone. Restoring fans to firmware control and exiting so systemd \
                      restarts the daemon."
                 );
@@ -180,11 +180,11 @@ async fn wait_for_stop(
                 break;
             }
             // DEC-267. Same reasoning one level upstream: this task is the
-            // only writer of the sensor map the 105 C rule reads.
+            // only writer of the sensor map the thermal-emergency rule reads.
             _ = &mut hwmon_dead_rx => {
                 log::error!(
                     "SAFETY: the hwmon poll task exited unexpectedly — the sensor feed the \
-                     105 \u{b0}C rule reads is frozen, so the daemon is running on \
+                     thermal-emergency rule reads is frozen, so the daemon is running on \
                      readings that can no longer change. Restoring fans to firmware \
                      control and exiting so systemd restarts the daemon."
                 );
@@ -540,7 +540,7 @@ fn apply_runtime_overlay(config: &mut DaemonConfig, runtime: &RuntimeConfig, adm
     // the clamp belongs here rather than at the six read sites.
     //
     // `daemon.toml` bounds this only as `>= 100`; the 250–2000 ms clamp lives on
-    // the API route. Past `MAX_SUPERVISABLE_POLL_INTERVAL_MS` the 105 °C rule's
+    // the API route. Past `MAX_SUPERVISABLE_POLL_INTERVAL_MS` the thermal-emergency rule's
     // staleness budget stops tracking the cadence (it is capped at
     // `CPU_TEMP_STALE_CEILING_MS`), so the 5x headroom erodes towards 1x and a
     // single missed poll starts reading as stale; past the 30 s ceiling it
@@ -551,7 +551,7 @@ fn apply_runtime_overlay(config: &mut DaemonConfig, runtime: &RuntimeConfig, adm
     if config.polling.poll_interval_ms > MAX_SUPERVISABLE_POLL_INTERVAL_MS {
         log::warn!(
             "[polling] poll_interval_ms = {} is slower than the {} ms the \
-             thermal-safety rule can supervise; clamping. Past that the 105 C \
+             thermal-safety rule can supervise; clamping. Past that the \
              ladder's staleness budget stops tracking the poll cadence, so \
              ordinary readings begin to look stale and the ladder stops firing.",
             config.polling.poll_interval_ms,
@@ -1450,7 +1450,10 @@ async fn async_main() {
 
     // ── Thermal safety rule ─────────────────────────────────────────
     let safety_rule = Arc::new(Mutex::new(ThermalSafetyRule::new()));
-    log::info!("Thermal safety rule active: hottest CpuTemp emergency at 105°C");
+    log::info!(
+        "Thermal safety rule active: hottest CpuTemp emergency at {}°C",
+        control_ofc_daemon::constants::THERMAL_EMERGENCY_TRIGGER_C
+    );
 
     // ── Profile loading (CLI > env > persisted state > none) ────────
     let initial_profile = resolve_initial_profile(&profile_search_dirs);
@@ -1611,7 +1614,7 @@ async fn async_main() {
     // DEC-146 P3-9: keep the JoinHandles for the poll/engine tasks so
     // shutdown can await them before restoring hardware to automatic.
     // DEC-267: supervised, for the same reason the engine is (DEC-266). This
-    // loop is the ONLY writer of the sensor map the 105 °C rule reads, so its
+    // loop is the ONLY writer of the sensor map the thermal-emergency rule reads, so its
     // death used to blind that rule silently.
     //
     // DEC-269 corrects what this comment used to claim. Stale readings do NOT
@@ -1699,7 +1702,7 @@ async fn async_main() {
     // API intent (manual override, fan identify); the GUI never writes PWM.
     //
     // DEC-266: the engine is SUPERVISED. Its task dying is not a contained
-    // failure — it is the loss of the only PWM writer, and with it the 105 °C
+    // failure — it is the loss of the only PWM writer, and with it the thermal
     // emergency, while the process stays up and `/status` keeps answering. The
     // panic hook cannot cover this (the engine runs on a tokio worker thread, so
     // its panic is "contained" by construction), and `Restart=on-failure` cannot
@@ -1767,7 +1770,7 @@ async fn async_main() {
     // policies), the daemon still terminates cleanly on SIGINT.
     // DEC-266/267: set when the loop breaks because a task the daemon cannot
     // function without ended — the profile engine (sole PWM writer) or the hwmon
-    // poll loop (sole writer of the sensor map the 105 C rule reads). Drives a
+    // poll loop (sole writer of the sensor map the thermal-emergency rule reads). Drives a
     // non-zero exit AFTER the ordered restore has run, so systemd restarts us.
     let stop = {
         use tokio::signal::unix::SignalKind;
@@ -1942,7 +1945,7 @@ mod tests {
     }
 
     /// [SAFETY] DEC-267. Same one rung upstream: the poll loop is the sole writer
-    /// of the sensor map the 105 C rule reads.
+    /// of the sensor map the thermal-emergency rule reads.
     #[tokio::test]
     async fn hwmon_death_stops_the_loop_and_demands_a_restart() {
         let ((_ipc_tx, ipc_rx), (_engine_tx, engine_rx), (hw_tx, hw_rx)) = stop_channels();
@@ -2123,7 +2126,7 @@ mod tests {
         // The case that matters: a panic inside the engine's own tick body. It
         // unwinds past any send placed after the `.await`, so the signal has to
         // ride on Drop. Without it the task dies silently and the daemon keeps
-        // running with no PWM writer and no 105 °C emergency.
+        // running with no PWM writer and no thermal emergency.
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let fired = rt.block_on(async {
             let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -2178,7 +2181,7 @@ mod tests {
     fn overlay_clamps_a_poll_cadence_the_safety_rule_cannot_supervise() {
         // DEC-270. `daemon.toml` bounds poll_interval_ms only as >= 100, so a
         // hand-edited `poll_interval_ms = 3600000` used to reach the engine
-        // intact. The 105 C rule's staleness budget is capped at 30 s, so every
+        // intact. The thermal-emergency rule's staleness budget is capped at 30 s, so every
         // reading arrived already older than its budget: `hottest_cpu_reading`
         // never returned `Fresh`, the emergency ladder never ran, and the fans
         // sat at NO_SENSOR_SAFE_PCT — with `/status` reporting a healthy engine.
@@ -2389,7 +2392,7 @@ mod tests {
     fn a_dead_configured_port_cannot_suppress_detection() {
         // REGRESSION: the pre-fix `configured.or_else(detect)` returned exactly
         // one candidate here, so an unprivileged user who persisted a dead path
-        // durably removed OpenFan control — and with it the 105 C emergency's
+        // durably removed OpenFan control — and with it the thermal emergency's
         // only path to those fans. Detection must still be reachable.
         let detect_called = std::cell::Cell::new(false);
         let c = control_ofc_daemon::serial::adoption::serial_port_candidates(
@@ -2455,7 +2458,7 @@ mod tests {
         // configured-but-wrong port was therefore adopted as the fan controller
         // and the loop stopped there — discarding the correctly detected port
         // sitting next in the candidate list. Writes to an indifferent device
-        // return Ok, so nothing surfaced: the 105 C emergency's `force_all`
+        // return Ok, so nothing surfaced: the thermal emergency's `force_all`
         // reported success while driving nothing.
         let chosen = control_ofc_daemon::serial::adoption::first_openfan_port(
             &ports(&["/dev/ttyACM9", "/dev/ttyACM0"]),

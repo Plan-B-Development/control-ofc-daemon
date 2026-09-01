@@ -21,7 +21,7 @@ const DEFAULT_HWMON_POLL_INTERVAL_MS: u64 = 1000;
 ///
 /// Five intervals is the same multiplier `health::staleness` uses for its `Crit`
 /// boundary — a reading the health rollup would already call critically stale is
-/// not one to run the 105 °C ladder on. Deliberately not tighter: at 2x (the
+/// not one to run the thermal ladder on. Deliberately not tighter: at 2x (the
 /// `Warn` boundary) an ordinary scheduling hiccup would drop the sensor.
 ///
 /// DEC-269: the two are **not** identical, and the earlier claim that they
@@ -37,7 +37,7 @@ const CPU_TEMP_STALE_INTERVALS: u32 = 5;
 ///
 /// [SAFETY] `polling.poll_interval_ms` is validated only as `>= 100`; the
 /// 250–2000 ms clamp lives on the API route, not on the config file. So an admin
-/// typo of `poll_interval_ms = 3600000` would otherwise hand the 105 °C rule a
+/// typo of `poll_interval_ms = 3600000` would otherwise hand the thermal-emergency rule a
 /// five-hour staleness budget — silently disabling the protection with no
 /// signal anywhere. Defence in depth under the DEC-253 trusted-local posture.
 ///
@@ -45,7 +45,7 @@ const CPU_TEMP_STALE_INTERVALS: u32 = 5;
 /// the ceiling *regardless* of the interval. That is no longer true, and taken
 /// literally it was not safe either. Once the cadence passes this ceiling the
 /// budget is *shorter than one poll period*, so every reading is stale on
-/// arrival, `hottest_cpu_reading` never returns `Fresh`, and the 105 °C ladder —
+/// arrival, `hottest_cpu_reading` never returns `Fresh`, and the thermal ladder —
 /// which runs only on a fresh reading — is disabled entirely. The floor in
 /// [`StateCache::cpu_temp_stale_after`] now makes that impossible at any
 /// cadence, and `apply_runtime_overlay` keeps the cadence low enough that this
@@ -61,7 +61,7 @@ pub(crate) const CPU_TEMP_STALE_CEILING_MS: u64 = 30_000;
 /// the 5x headroom this design promises erodes towards 1x — by a ~15 s cadence a
 /// single missed poll already reads as stale, and at the 30 s ceiling there is no
 /// margin left at all. Past 30 s it inverts outright: the budget is shorter than
-/// one poll period, every reading is stale on arrival, the 105 °C ladder is
+/// one poll period, every reading is stale on arrival, the thermal ladder is
 /// silently disabled and fans pin at NO_SENSOR_SAFE_PCT. Rather than pick a
 /// failure direction, refuse the cadence:
 /// `apply_runtime_overlay` clamps to this and logs a warning, so the daemon still
@@ -75,7 +75,7 @@ pub const MAX_SUPERVISABLE_POLL_INTERVAL_MS: u64 =
 // `CPU_TEMP_STALE_INTERVALS` far enough drives it below the API's own 250 ms
 // floor, and past `CEILING` it reaches 0 — which would clamp the interval to
 // zero and panic `tokio::time::interval` in the hwmon poll loop, killing the only
-// writer of the sensor map the 105 °C rule reads.
+// writer of the sensor map the thermal-emergency rule reads.
 //
 // Asserting `MAX * INTERVALS <= CEILING` instead would be vacuous: `MAX` is
 // *derived* by that division, so it holds for every input.
@@ -102,7 +102,7 @@ pub struct StateCache {
     /// The hwmon poll loop's configured interval, in ms (DEC-267).
     ///
     /// [SAFETY] Published here so the profile engine can tell a *stale* CPU
-    /// reading from a current one. The engine's 105 °C rule reads
+    /// reading from a current one. The engine's thermal-emergency rule reads
     /// `sensors_snapshot()`, which has no freshness filter of its own — so if
     /// the poll loop dies the last temperature is returned forever, the rule
     /// never crosses its threshold, and the no-sensor fallback never engages
@@ -185,7 +185,7 @@ impl StateCache {
     /// [SAFETY] This is what converts "the poll loop died" into "no CPU sensor",
     /// which is a state the daemon already handles correctly and has tested
     /// (DEC-132's 5-cycle fallback, DEC-190's latched-emergency dropout). Without
-    /// it a dead poll loop freezes the last reading, the 105 °C ladder is
+    /// it a dead poll loop freezes the last reading, the thermal ladder is
     /// evaluated forever against a temperature that can no longer rise, and
     /// `/status` reports a healthy engine throughout — because the engine *is*
     /// ticking, on stale data.
@@ -204,7 +204,7 @@ impl StateCache {
             // stops a mistyped interval buying an unbounded trust window, but
             // applied alone it fails the *other* way: with the cadence slower
             // than the ceiling, every reading is older than its budget the
-            // moment it lands, so the 105 °C ladder — which only runs on a
+            // moment it lands, so the thermal ladder — which only runs on a
             // `Fresh` reading — is permanently disabled and fans sit at
             // NO_SENSOR_SAFE_PCT on healthy hardware, with `/status` reporting a
             // ticking engine throughout. `apply_runtime_overlay` clamps the
@@ -294,7 +294,7 @@ impl StateCache {
         let mut state = self.inner.write();
         let covered: std::collections::HashSet<u8> = fans.iter().map(|f| f.channel).collect();
         // F6: count only channels a poll has actually MEASURED. `force_all` writes
-        // `0..NUM_CHANNELS` unconditionally, so one 105 °C emergency mints an entry
+        // `0..NUM_CHANNELS` unconditionally, so one thermal emergency mints an entry
         // for every channel the firmware does not report; those can never be
         // covered by a later frame, so counting them would latch the short-frame
         // warning on for the process lifetime and never emit the recovery line.
@@ -601,7 +601,7 @@ impl StateCache {
             // present as fresh *telemetry*: the fan reported `age_ms` near zero
             // beside an `rpm` frozen at whatever the last real poll saw, and
             // `stall_detected` was then computed from that frozen value. Widest
-            // exactly where it matters — a 105 °C `force_all` writes every
+            // exactly where it matters — a thermal `force_all` writes every
             // channel, and a ~10-byte `SetPwm` completes on a degraded link far
             // more readily than an ~80-byte `ReadAllRpm`, so "poll dead, writes
             // still acking" showed every fan FRESH while nothing was measuring.
@@ -1611,7 +1611,7 @@ mod tests {
     }
 
     /// F6. A channel that only ever got WRITTEN — `force_all` walks
-    /// `0..NUM_CHANNELS` unconditionally, so a 105 °C emergency mints one for every
+    /// `0..NUM_CHANNELS` unconditionally, so a thermal emergency mints one for every
     /// channel the firmware does not report — must not count as uncovered.
     ///
     /// It can never be covered by a later frame, so counting it would latch the

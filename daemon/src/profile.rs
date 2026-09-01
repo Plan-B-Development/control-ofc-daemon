@@ -334,7 +334,7 @@ pub fn load_profile(path: &Path) -> Result<DaemonProfile, String> {
 /// value on disk reached the engine unchecked. One was enough: a negative
 /// `step_up_pct` / `step_down_pct` pair inverted the step-rate window and
 /// panicked the engine task mid-tick, killing the sole PWM writer *and* the
-/// 105°C thermal leg while `/status` kept answering 200. `apply_tuning` no
+/// thermal leg while `/status` kept answering 200. `apply_tuning` no
 /// longer panics on that input either — this is the other half, so nothing the
 /// API would reject **on numeric grounds** can reach the engine from disk.
 ///
@@ -700,7 +700,7 @@ impl ValidationReport {
 ///   store, validate, and import. What it actually does differs by curve shape
 ///   (DEC-272): a curve naming the missing sensor **alone** is skipped and its
 ///   fans hold their last commanded duty — never 0%, never lower — while a
-///   **Mix** runs on the inputs it does have. The 105 °C thermal force backstops
+///   **Mix** runs on the inputs it does have. The thermal force backstops
 ///   either way.
 ///
 /// `known_sensor_ids` is the set of sensor entity ids currently discovered on
@@ -2233,7 +2233,7 @@ mod tests {
         // The exact input that killed the engine. `validate()` bounds these
         // 0..=100, but the boot paths skip it, so this profile used to load
         // cleanly and then panic `apply_tuning` on the engine's second tick —
-        // taking the sole PWM writer and the 105°C thermal leg with it.
+        // taking the sole PWM writer and the thermal leg with it.
         let mut ctrl = curve_control("c1", "cv");
         ctrl.step_up_pct = -50.0;
         ctrl.step_down_pct = -50.0;

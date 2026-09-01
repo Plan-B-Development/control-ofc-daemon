@@ -293,7 +293,7 @@ pub async fn hwmon_poll_loop(
                     // per-call timeout: an NVIDIA driver fault could stall this tick until
                     // it returns. The existing backstops bound the blast radius (the
                     // shutdown-drain timeout still fires; and since DEC-267 the engine
-                    // age-filters CPU readings, so a stall no longer leaves the 105 °C
+                    // age-filters CPU readings, so a stall no longer leaves the thermal
                     // rule evaluating a frozen temperature forever).
                     //
                     // DEC-269 recorded that a stall here leaves the task ALIVE, so
@@ -343,7 +343,7 @@ pub async fn hwmon_poll_loop(
         // constant. It is already derived from the poll interval, already clamped
         // and floored, and is by definition the instant the safety ladder stops
         // trusting a reading — so a read still running past it cannot produce a
-        // value the 105 °C rule would act on. There is nothing left to wait for.
+        // value the thermal-emergency rule would act on. There is nothing left to wait for.
         let result: Result<_, tokio::task::JoinError> =
             match tokio::time::timeout(cache.cpu_temp_stale_after(), &mut handle).await {
                 Ok(joined) => joined,
@@ -416,7 +416,31 @@ pub async fn hwmon_poll_loop(
                     discovered_once = true;
                 }
 
-                let SensorReadOutcome { readings, failures } = outcome;
+                let SensorReadOutcome {
+                    mut readings,
+                    mut failures,
+                } = outcome;
+
+                // 294-c: a CPU reading that is individually plausible but absurd
+                // beside the board is reclassified as a read FAILURE here, before
+                // the tracker runs, so it takes the DEC-193 path — quarantined,
+                // logged once, surfaced as `unavailable_sensors[]`, and recovered
+                // by itself when the channel reads sanely again.
+                //
+                // Doing it HERE and not in `read_temp` is forced by the shape of
+                // the test: `read_temp` sees one descriptor and cannot compare a
+                // CPU channel against the board. Doing it as a *failure* and not
+                // as a silent ladder-side filter is deliberate — a rejected
+                // sensor the user cannot see is the bogus-low fault wearing a
+                // different hat.
+                let implausible =
+                    crate::hwmon::plausibility::implausibly_low_cpu_readings(&readings);
+                if !implausible.is_empty() {
+                    let rejected: std::collections::HashSet<String> =
+                        implausible.iter().map(|f| f.id.clone()).collect();
+                    readings.retain(|r| !rejected.contains(&r.id));
+                    failures.extend(implausible);
+                }
 
                 // DEC-193: advance the failure tracker against the active
                 // descriptor set. It quarantines a still-present-but-unreadable
@@ -473,7 +497,7 @@ pub async fn hwmon_poll_loop(
                 // so a transient sysfs failure returns Ok with that chip's sensors
                 // missing. Evicting on that evidence took a live CPU sensor to
                 // `CpuReading::Absent`, and `Absent` is deliberately excluded from
-                // DEC-269's stale-hold (`safety_tick.rs`) — so a latched 105 °C
+                // DEC-269's stale-hold (`safety_tick.rs`) — so a latched thermal
                 // emergency fell from a forced 100% to NO_SENSOR_SAFE_PCT (40%) and
                 // back on rediscovery: the 100/40/100 flap DEC-269 removed.
                 //
@@ -794,7 +818,7 @@ fn poll_attempt_failed<T>(
 /// the same write guard it checks (DEC-266), so two racing rescans cannot each
 /// start a loop, and neither can replace a controller the engine is already
 /// writing through. Until *some* controller is
-/// adopted there is no OpenFan backend at all, which also costs the 105 C
+/// adopted there is no OpenFan backend at all, which also costs the thermal
 /// thermal emergency its OpenFan leg.
 ///
 /// (This block was lost once in `419025d`, which moved the reconnect helper out
@@ -1100,6 +1124,19 @@ mod tests {
         )
         .unwrap();
         fs::write(dir.join("temp1_label"), "Tctl\n").unwrap();
+    }
+
+    /// Write a fake Super-I/O board sensor (MbTemp) into the tempdir sysfs root.
+    fn write_board_temp(root: &std::path::Path, temp_c: f64) {
+        let dir = root.join("hwmon7");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("name"), "nct6776\n").unwrap();
+        fs::write(
+            dir.join("temp1_input"),
+            format!("{}\n", (temp_c * 1000.0) as i64),
+        )
+        .unwrap();
+        fs::write(dir.join("temp1_label"), "SYSTIN\n").unwrap();
     }
 
     /// Write a fake nvme device (non-CPU) into the tempdir sysfs root.
@@ -1698,7 +1735,7 @@ mod tests {
     /// single transient sysfs failure on the CPU chip evicted a live Tctl. That
     /// matters far beyond a missing row on `/status`: the reading becomes
     /// `CpuReading::Absent` rather than `Stale`, and `safety_tick` deliberately
-    /// excludes `Absent` from DEC-269's stale-hold — so a latched 105 °C emergency
+    /// excludes `Absent` from DEC-269's stale-hold — so a latched thermal emergency
     /// drops from a forced 100% to `NO_SENSOR_SAFE_PCT` (40%) and back on
     /// rediscovery. That is the 100/40/100 flap DEC-269 was written to remove,
     /// reachable from one failed read.
@@ -1914,7 +1951,7 @@ mod tests {
         assert!(
             sensor_by_label(&h.cache, "Tccd1").is_none(),
             "a frozen hot CPU sibling must be evicted within the quarantine bound, \
-             not left in the reduce the 105 C rule runs over"
+             not left in the reduce the thermal-emergency rule runs over"
         );
         assert!(
             sensor_by_label(&h.cache, "Tctl").is_some(),
@@ -1988,6 +2025,110 @@ mod tests {
     /// it no longer spams the journal. We prove the loop is no longer
     /// re-discovering by adding a fresh chip *after* quarantine and asserting it
     /// is NOT picked up — a still-re-discovering loop would surface it.
+    /// 294-c, at the CALL SITE. The predicate has its own unit tests in
+    /// `hwmon::plausibility`; this drives the real `hwmon_poll_loop` against a
+    /// real sysfs fixture, so deleting the call in the loop reds it.
+    ///
+    /// That distinction is the point. `CLAUDE.md § Hard-won lessons` records
+    /// "extracting a rule into a testable function does NOT test the call site"
+    /// as having recurred five times in this project; a green predicate with a
+    /// deleted call site is exactly that failure.
+    ///
+    /// The fixture is the documented Zen 3 fault (launchpad#1918065): a k10temp
+    /// pinned at 0 C beside a board reading 45 C. Both READ fine — nothing
+    /// upstream can tell them apart, which is why the rejection has to happen
+    /// where both readings are visible at once.
+    #[tokio::test(start_paused = true)]
+    async fn poll_loop_quarantines_an_implausibly_low_cpu_sensor() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_k10temp(tmp.path(), 0.0);
+        write_board_temp(tmp.path(), 45.0);
+        let h = spawn_poll_loop(tmp.path().to_path_buf());
+
+        let ticks = crate::constants::SENSOR_READ_FAIL_REDISCOVER_STREAK + 4;
+        for _ in 0..ticks {
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+        }
+
+        let snap = h.cache.snapshot();
+        assert!(
+            snap.unavailable_sensors
+                .iter()
+                .any(|s| s.id.contains("k10temp")),
+            "a CPU sensor pinned at 0 C beside a 45 C board must be quarantined; \
+             unavailable={:?}",
+            snap.unavailable_sensors
+        );
+        assert!(
+            !snap.sensors.values().any(|s| s.chip_name == "k10temp"),
+            "an implausible reading must never be served as a live CPU temperature — \
+             serving it resets no_cpu_sensor_cycles and silently suppresses the \
+             DEC-190 absent-sensor floor, which is the whole fault 294-c exists to fix"
+        );
+        assert!(
+            snap.sensors.values().any(|s| s.chip_name == "nct6776"),
+            "the board sensor it was judged against must stay in service — a filter \
+             that quarantined the witness too would pass the assertion above for the \
+             wrong reason"
+        );
+    }
+
+    /// The other half of `294-c`, and the half that matters for safety: a
+    /// quarantined CPU sensor must come BACK when it reads sanely again.
+    ///
+    /// A filter that could strand a CPU sensor out of service permanently would
+    /// be a worse fault than the one it fixes — the machine would run with no CPU
+    /// temperature and sit on DEC-190's 40% floor forever. Recovery works by
+    /// construction (a quarantined sensor keeps its descriptor, so it is still
+    /// read every tick, and a plausible reading simply never enters `failures`),
+    /// but "by construction" is a claim, and this asserts it.
+    ///
+    /// Asserts the PRESENCE of the quarantine first, so the recovery assertion
+    /// cannot pass vacuously against a sensor that was never quarantined —
+    /// `CLAUDE.md § Hard-won lessons`.
+    #[tokio::test(start_paused = true)]
+    async fn a_quarantined_cpu_sensor_recovers_when_it_reads_sanely_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_k10temp(tmp.path(), 0.0);
+        write_board_temp(tmp.path(), 45.0);
+        let h = spawn_poll_loop(tmp.path().to_path_buf());
+
+        let ticks = crate::constants::SENSOR_READ_FAIL_REDISCOVER_STREAK + 4;
+        for _ in 0..ticks {
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+        }
+        assert!(
+            h.cache
+                .snapshot()
+                .unavailable_sensors
+                .iter()
+                .any(|s| s.id.contains("k10temp")),
+            "precondition: the implausible sensor must actually be quarantined first"
+        );
+
+        // The channel starts reading a real temperature.
+        write_k10temp(tmp.path(), 42.0);
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+        }
+
+        let snap = h.cache.snapshot();
+        assert!(
+            !snap
+                .unavailable_sensors
+                .iter()
+                .any(|s| s.id.contains("k10temp")),
+            "a sensor that reads sanely again must leave the quarantine; \
+             unavailable={:?}",
+            snap.unavailable_sensors
+        );
+        assert!(
+            snap.sensors.values().any(|s| s.chip_name == "k10temp"),
+            "and must be served as a live CPU reading again, or the thermal ladder \
+             stays blind for the life of the process"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn poll_loop_quarantines_present_but_unreadable_sensor() {
         let tmp = tempfile::tempdir().unwrap();

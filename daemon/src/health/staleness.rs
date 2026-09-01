@@ -114,7 +114,7 @@ const POLL_REASONS: SubsystemReasons = SubsystemReasons {
 
 /// Wording for the profile engine (DEC-249). A stalled engine is not stale
 /// *data* — it means nothing is driving the fans and nothing is evaluating the
-/// 105°C rule, so the reasons say so in the operator's terms.
+/// thermal-emergency rule, so the reasons say so in the operator's terms.
 const ENGINE_REASONS: SubsystemReasons = SubsystemReasons {
     fresh: "evaluating on schedule",
     stale: "tick overdue",
@@ -140,7 +140,7 @@ const WEDGED_TICK_MULTIPLE: u32 = 30;
 /// *stopped* engine, and reported the worse of the two. `force_all` walks ten
 /// OpenFan channels at up to 1 s each, so a degraded link makes a legitimate
 /// tick take 5-10 s — and the surface then read "not ticking — fan control and
-/// thermal safety are stalled" **while the engine was driving the 105 °C
+/// thermal safety are stalled" **while the engine was driving the thermal
 /// emergency**. Exactly inverted, in the one state where a user most needs to
 /// trust it. Widening the threshold would have fixed the false alarm by blinding
 /// the surface to a real death for just as long; the pair of stamps distinguishes
@@ -412,7 +412,7 @@ fn poll_subsystem_health(
 /// Manual or External override is showing.
 ///
 /// **`Warn`, never `Crit`.** The fans are not stopped and there is no thermal
-/// hazard: the 105 °C rule is a separate path that bypasses controls entirely
+/// hazard: the thermal-emergency rule is a separate path that bypasses controls entirely
 /// (`force_all`), so it still reaches every OpenFan channel and writable hwmon
 /// header regardless of what is listed here. `Crit` is reserved for a subsystem
 /// that has actually failed, and escalating this one would drown that
@@ -488,7 +488,7 @@ pub fn compute_health(
                 "openfan",
                 ts.openfan,
                 // F6: only channels a poll has actually MEASURED. `force_all`
-                // writes `0..NUM_CHANNELS` unconditionally, so one 105 °C
+                // writes `0..NUM_CHANNELS` unconditionally, so one thermal
                 // emergency mints an entry for every channel the firmware does
                 // not report — and those can never be covered by a later poll, so
                 // counting them would latch openfan at Crit for the process
@@ -552,7 +552,7 @@ pub fn compute_health(
             config.hwmon_interval_ms,
             &POLL_REASONS,
         ),
-        // DEC-249: the profile engine is the sole PWM writer and runs the 105°C
+        // DEC-249: the profile engine is the sole PWM writer and runs the thermal-emergency
         // rule, so its liveness belongs in the same rollup as the poll loops. It
         // feeds `overall`, which is the point: a dead engine must not present as
         // a healthy daemon.
@@ -904,7 +904,7 @@ mod tests {
     }
 
     /// Warn, not Crit. The fans are not stopped and there is no thermal hazard:
-    /// the 105 °C rule bypasses controls entirely (`force_all`), so it still
+    /// the thermal-emergency rule bypasses controls entirely (`force_all`), so it still
     /// reaches every OpenFan channel and writable hwmon header. Escalating this
     /// to Crit would drown the distinction that a subsystem has actually failed.
     #[test]
@@ -966,7 +966,7 @@ mod tests {
         // The failure this surface exists to catch: the poll loops keep running
         // and reporting fresh data after the engine task dies, so every other
         // signal stays green while nothing drives the fans or evaluates the
-        // 105°C rule.
+        // thermal-emergency rule.
         let now = Instant::now();
         let mut state = base_state();
         state.subsystem_timestamps.openfan = Some(now);
@@ -995,7 +995,7 @@ mod tests {
         // walks ten OpenFan channels at up to 1 s each, so a degraded-but-open
         // link makes a legitimate tick take 5-10 s. With one timestamp the
         // surface reported "not ticking — fan control and thermal safety are
-        // stalled" **while the engine was driving the 105 °C emergency**: the
+        // stalled" **while the engine was driving the thermal emergency**: the
         // exact inverse of the truth, in the state where it matters most.
         let now = Instant::now();
         let mut state = base_state();
@@ -1285,7 +1285,7 @@ mod tests {
         assert_eq!(named(&dead, "hwmon").status, HealthStatus::Crit);
     }
 
-    /// F6. `force_all` writes `0..NUM_CHANNELS` unconditionally, so one 105 °C
+    /// F6. `force_all` writes `0..NUM_CHANNELS` unconditionally, so one thermal
     /// emergency mints an `OpenFanState` for every channel the firmware does not
     /// report — with `rpm_polled: false`, because nothing ever measured it.
     ///

@@ -224,7 +224,7 @@ To change fan behaviour you have two levers:
 
 ### Manual override (temporary, per-control)
 
-A manual override pins all fans in one of the active profile's logical *controls* to a fixed PWM. It is daemon-owned, expiring, and fencing-guarded (DEC-163): the override **reverts to autonomous curve control** if you stop renewing it (a deadman on the daemon's clock), and a superseded token cannot re-pin. The PWM is still clamped by the daemon's hard pump/CPU floor (≥30 %) and the GPU 0 % floor; the 105 °C thermal force always wins.
+A manual override pins all fans in one of the active profile's logical *controls* to a fixed PWM. It is daemon-owned, expiring, and fencing-guarded (DEC-163): the override **reverts to autonomous curve control** if you stop renewing it (a deadman on the daemon's clock), and a superseded token cannot re-pin. The PWM is still clamped by the daemon's hard pump/CPU floor (≥30 %) and the GPU 0 % floor; the thermal force always wins.
 
 ```bash
 SOCK="/run/control-ofc/control-ofc.sock"
