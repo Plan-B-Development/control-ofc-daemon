@@ -163,12 +163,16 @@ pub async fn fan_identify_handler(
     match body.action.as_str() {
         "stop" => {
             // The fan must exist. (Restore stays lenient below — you must always
-            // be able to clear a stop.)
-            let known = {
+            // be able to clear a hold.)
+            //
+            // The baseline duty is read from the same snapshot, so "does this fan
+            // exist?" and "what is it running at?" cannot disagree.
+            let (known, last_commanded) = {
                 let snap = state.cache.snapshot();
-                build_fan_entries(&snap, Instant::now())
-                    .iter()
-                    .any(|f| f.id == fan_id)
+                let entry = build_fan_entries(&snap, Instant::now())
+                    .into_iter()
+                    .find(|f| f.id == fan_id);
+                (entry.is_some(), entry.and_then(|f| f.last_commanded_pwm))
             };
             if !known {
                 return error_response(
@@ -176,8 +180,39 @@ pub async fn fan_identify_handler(
                     &ErrorEnvelope::validation(format!("unknown fan '{fan_id}'")),
                 );
             }
+
+            // [SAFETY] DEC-311. The CLIENT asks to identify a fan; the DAEMON
+            // decides what that means from the header's role. A pump is
+            // perturbed, never stopped — and because the decision is made here
+            // rather than in the request, a GUI predating this daemon (which can
+            // only ever send `action: "stop"`) gets the safe behaviour without
+            // knowing the feature exists. This supersedes DEC-166's floor-exempt
+            // "you must be able to stop a pump to find it".
+            // The UNION predicate, not the resolved role. A user assignment can
+            // add pump protection but must never strip protection the header's
+            // own label or chip already earned — otherwise
+            // `POST /config/header-role {"role":"chassis_fan"}` on an `AIO_PUMP`
+            // header would hand identify permission to stop a real pump, while
+            // the floor path (which already unions) went on treating it as one.
+            let role = if state.header_is_pump_protected(&fan_id) {
+                crate::hwmon::roles::HeaderRole::Pump
+            } else {
+                state.resolved_header_role(&fan_id)
+            };
+            let (target_pct, mode) =
+                crate::control_override::identify_target_for_role(role, last_commanded);
+
             let ttl = resolve_ttl(body.ttl_secs);
-            state.override_table.lock().identify_stop(&fan_id, ttl);
+            state
+                .override_table
+                .lock()
+                .identify_hold(&fan_id, target_pct, mode, ttl);
+            log::info!(
+                "Fan identify: {fan_id} held at {target_pct}% ({}) for {}s (role: {})",
+                mode.as_str(),
+                ttl.as_secs(),
+                role.as_str()
+            );
             json_ok(
                 StatusCode::OK,
                 IdentifyResponse {
@@ -185,6 +220,9 @@ pub async fn fan_identify_handler(
                     fan_id,
                     action: "stop".into(),
                     expires_in_secs: Some(ttl.as_secs()),
+                    mode: Some(mode.as_str().into()),
+                    identify_pwm_percent: Some(target_pct),
+                    baseline_pwm_percent: last_commanded,
                 },
             )
         }
@@ -197,6 +235,9 @@ pub async fn fan_identify_handler(
                     fan_id,
                     action: "restore".into(),
                     expires_in_secs: None,
+                    mode: None,
+                    identify_pwm_percent: None,
+                    baseline_pwm_percent: None,
                 },
             )
         }

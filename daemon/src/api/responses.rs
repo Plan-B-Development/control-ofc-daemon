@@ -140,6 +140,11 @@ pub struct OverrideStatusEntry {
 pub struct IdentifyStatusEntry {
     pub fan_id: String,
     pub expires_in_secs: u64,
+    /// `"stop"` or `"pump_perturb"` (DEC-311) — so a GUI that polls into an
+    /// identify it did not initiate still describes it truthfully.
+    pub mode: String,
+    /// The duty the fan is being held at for the identify.
+    pub identify_pwm_percent: u8,
 }
 
 /// Per-subsystem health status.
@@ -299,14 +304,39 @@ pub struct PwmHeaderEntry {
     /// Aquacomputer) — daemon-authoritative AIO hint for the GUI (AIO Phase 1).
     /// Pre-1.18.0 daemons omit this; consumers default it to `false`.
     pub is_aio: bool,
+    /// What this channel drives (AIO-MB Phase 1, daemon >= 2.28.0), with the
+    /// user's `POST /config/header-role` assignment already applied.
+    ///
+    /// Per-channel, unlike the chip-level `is_aio`: a pump on a motherboard
+    /// `AIO_PUMP` header is `role: "pump", is_aio: false`. Clients **must**
+    /// render an unrecognised token rather than dropping the header (the 273-i
+    /// rule). Pre-2.28.0 daemons omit this; consumers default to `"unknown"`.
+    pub role: crate::hwmon::roles::HeaderRole,
+    /// How `role` was established: `"none"`, `"label"`, `"chip_mapping"` or
+    /// `"user_assigned"`. Lets a client show *why* a header is a pump, and
+    /// distinguish a confident classification from a guess it should ask about.
+    pub role_source: crate::hwmon::roles::RoleSource,
 }
 
-impl From<&crate::hwmon::pwm_discovery::PwmHeaderDescriptor> for PwmHeaderEntry {
+impl PwmHeaderEntry {
     /// Single source of truth for the descriptor → wire-entry mapping
     /// (DEC-146 P3-12). Previously duplicated field-for-field in the
     /// headers and rescan handlers, which drifts when fields are added —
     /// this contract recently grew `pwm_mode` and `is_writable`.
-    fn from(h: &crate::hwmon::pwm_discovery::PwmHeaderDescriptor) -> Self {
+    ///
+    /// `assigned` is the user's `POST /config/header-role` override for this
+    /// header, or `None`. It is a **required argument rather than an overlay a
+    /// caller applies afterwards**, deliberately: the descriptor carries only
+    /// the inference (discovery cannot see `runtime.toml`), so a call site that
+    /// forgot the overlay would silently report a user-assigned pump as
+    /// `unknown` — and the GUI would then offer to stop it. Taking it here
+    /// makes that a compile error instead of a safety bug.
+    pub fn from_descriptor(
+        h: &crate::hwmon::pwm_discovery::PwmHeaderDescriptor,
+        assigned: Option<crate::hwmon::roles::HeaderRole>,
+    ) -> Self {
+        let (role, role_source) =
+            crate::hwmon::roles::resolve_role(assigned, (h.role, h.role_source));
         PwmHeaderEntry {
             id: h.id.clone(),
             label: h.label.clone(),
@@ -320,6 +350,8 @@ impl From<&crate::hwmon::pwm_discovery::PwmHeaderDescriptor> for PwmHeaderEntry 
             is_writable: h.is_writable,
             pwm_mode: h.pwm_mode,
             is_aio: h.is_aio,
+            role,
+            role_source,
         }
     }
 }
@@ -603,6 +635,17 @@ pub struct ControlCapability {
     /// been pruned when it had not.
     #[serde(default)]
     pub profile_search_dir_remove: bool,
+    /// Daemon classifies PWM headers by role, protects `role: "pump"` headers
+    /// from being stopped by identify or under-driven by verify, and accepts
+    /// `POST /config/header-role`. True since 2.28.0 (DEC-311, AIO-MB Phase 1).
+    ///
+    /// Load-bearing for truthfulness, not just for hiding a button. A GUI that
+    /// tells the user "the pump will briefly change speed" is **lying against a
+    /// pre-2.28.0 daemon**, which drives the pump to 0 instead. So the wizard
+    /// keys its copy on this flag and keeps the old "the fan will stop" wording
+    /// when it is false — the honest description of what that daemon does.
+    #[serde(default)]
+    pub header_roles: bool,
 }
 
 /// Per-device-group capability info.
@@ -1327,6 +1370,12 @@ pub struct OverrideReleaseResponse {
 
 /// Response to `POST /fans/{fan_id}/identify` (DEC-166). `expires_in_secs` is
 /// present only for `action: "stop"` (the deadman); `"restore"` omits it.
+///
+/// DEC-311 (AIO-MB Phase 1) added `mode` + the two duty fields. A client asks
+/// for `"stop"` as before; the **daemon** decides whether that means a stop or
+/// a pump-safe perturbation, from the header's role, and reports back which it
+/// did. Keeping the decision server-side is what makes an older GUI safe by
+/// construction — it cannot ask for a pump stop even by accident.
 #[derive(Debug, Clone, Serialize)]
 pub struct IdentifyResponse {
     pub api_version: u32,
@@ -1334,6 +1383,18 @@ pub struct IdentifyResponse {
     pub action: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_in_secs: Option<u64>,
+    /// `"stop"` (driven to 0) or `"pump_perturb"` (shifted to a distinguishable
+    /// duty that never goes below the pump floor). Omitted for `"restore"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// The duty the fan is held at for the identify. `0` for `"stop"`; always
+    /// `>= HARD_PUMP_CPU_FLOOR_PCT` for `"pump_perturb"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identify_pwm_percent: Option<u8>,
+    /// The duty it was running at when the identify was taken, so the GUI can
+    /// say "60% → 85%". `None` when nothing had been commanded yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_pwm_percent: Option<u8>,
 }
 
 /// Standard error envelope for all error responses.
@@ -2083,6 +2144,7 @@ mod tests {
                 min_supported_gui: String::new(),
                 openfan_rescan: false,
                 profile_search_dir_remove: false,
+                header_roles: false,
             },
         };
         let json = serde_json::to_value(&resp).unwrap();

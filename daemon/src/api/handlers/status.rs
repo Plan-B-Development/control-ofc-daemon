@@ -315,6 +315,9 @@ pub async fn capabilities_handler(
             min_supported_gui: "2.0.0".into(),
             openfan_rescan: true,
             profile_search_dir_remove: true,
+            // DEC-311 (AIO-MB Phase 1): role classification, pump-safe identify,
+            // role-aware verify, and POST /config/header-role.
+            header_roles: true,
         },
     })
 }

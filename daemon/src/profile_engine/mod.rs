@@ -18,8 +18,8 @@ use crate::health::cache::StateCache;
 use crate::health::state::CachedSensorReading;
 use crate::hwmon::types::SensorKind;
 use crate::profile::{
-    evaluate_curve, member_is_gpu, member_needs_hard_floor, ControlMember, DaemonProfile,
-    LogicalControl, HARD_PUMP_CPU_FLOOR_PCT,
+    assigned_role_is_pump, evaluate_curve, member_is_gpu, member_needs_hard_floor, ControlMember,
+    DaemonProfile, LogicalControl, HARD_PUMP_CPU_FLOOR_PCT,
 };
 
 mod curve_eval;
@@ -133,11 +133,31 @@ pub struct ProfileEngineState {
     /// is entangled with step-rate limiting (DEC-151), and which an override
     /// deliberately does not advance at all.
     tick_outputs: HashMap<String, f64>,
+    /// DEC-311: the user's persisted header-role assignments, refreshed onto the
+    /// state once per tick by the engine loop. Member id → assigned role.
+    ///
+    /// [SAFETY] Lives here rather than as an extra `evaluate_profile*` argument
+    /// **deliberately**: the 3-arg [`evaluate_profile`] used by the DEC-126
+    /// parity oracle builds its state with [`ProfileEngineState::new()`], which
+    /// leaves this empty — so `parity_vectors.json` is unperturbed *by
+    /// construction* rather than by an argument someone has to remember to pass
+    /// as empty. An `Arc` so the per-tick read in the evaluator is a refcount
+    /// bump, not a map clone.
+    assigned_roles: Arc<HashMap<String, crate::hwmon::roles::HeaderRole>>,
 }
 
 impl ProfileEngineState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Install this tick's header-role assignments (DEC-311). Called by the
+    /// engine loop from the shared `AppState` map before evaluating.
+    pub fn set_assigned_roles(
+        &mut self,
+        roles: Arc<HashMap<String, crate::hwmon::roles::HeaderRole>>,
+    ) {
+        self.assigned_roles = roles;
     }
 
     /// Feed this tick's skipped set into the debounce tracker and return the
@@ -387,10 +407,11 @@ pub fn evaluate_profile(
 /// fixed PWM — curve + tuning skipped, only the per-member hard safety floor
 /// applied — and its cross-tick state is left untouched (the engine resets it
 /// when the override clears, via [`ProfileEngineState::reset_control`]). Any fan
-/// in `overrides.identify_stop` is forced to 0 after all other resolution,
-/// floor-exempt. With an empty snapshot this is byte-identical to the
-/// pre-override evaluator, so the 3-arg `evaluate_profile` (used by the parity
-/// oracle) is unperturbed.
+/// in `overrides.identify` is pinned to that entry's duty after all other
+/// resolution — `0` for an ordinary fan (floor-exempt), or a floored
+/// perturbation for a pump (DEC-311). With an empty snapshot this is
+/// byte-identical to the pre-override evaluator, so the 3-arg
+/// `evaluate_profile` (used by the parity oracle) is unperturbed.
 pub fn evaluate_profile_with_overrides(
     profile: &DaemonProfile,
     sensors: &HashMap<String, CachedSensorReading>,
@@ -398,6 +419,10 @@ pub fn evaluate_profile_with_overrides(
     overrides: &OverrideSnapshot,
 ) -> Vec<PwmCommand> {
     engine_state.sync_profile_id(&profile.id);
+    // DEC-311: this tick's user role assignments. Cloned out of the state (an
+    // `Arc` bump) so the borrow checker lets the rest of the function keep
+    // mutating `engine_state`; empty for every parity-oracle call.
+    let assigned_roles = Arc::clone(&engine_state.assigned_roles);
     // EFF-3: (re)build the cached topological order + curve index for this
     // activation (no-op on the steady-state path), then evaluate against the
     // cache instead of rebuilding both every tick.
@@ -441,7 +466,7 @@ pub fn evaluate_profile_with_overrides(
             tick_outputs.insert(control.id.clone(), f64::from(override_pwm));
             for member in &control.members {
                 let gpu_fan_zero_rpm = member.source == "amd_gpu" && member.fan_zero_rpm;
-                let floor = member_effective_floor(control, member);
+                let floor = member_effective_floor(control, member, &assigned_roles);
                 let member_pwm = f64::from(override_pwm).max(floor).round().clamp(0.0, 100.0) as u8;
                 commands.push(PwmCommand {
                     member_id: member.member_id.clone(),
@@ -552,11 +577,12 @@ pub fn evaluate_profile_with_overrides(
             // matches the GUI's per-member flooring (the DEC-096 consistency
             // guarantee); otherwise reuse the control-wide value so the common
             // path stays byte-identical and the parity oracle is unperturbed.
-            let effective_floor = member_effective_floor(control, member);
+            let effective_floor = member_effective_floor(control, member, &assigned_roles);
             // DEC-252: same eval-time superset the floor uses. A pump the author
             // renamed must not lose its stop-snap exemption either — that is the
             // half that keeps a non-zero `stop_pct` from zeroing it outright.
-            let floor_is_hard = member_needs_hard_floor(member);
+            let floor_is_hard =
+                member_needs_hard_floor(member) || assigned_role_is_pump(member, &assigned_roles);
             let member_pwm = if effective_floor != control.minimum_pct || floor_is_hard {
                 // EFF-4: this per-member step-rate key allocates each tick for
                 // pump/CPU/GPU members. Left as-is deliberately — the key scheme
@@ -588,17 +614,25 @@ pub fn evaluate_profile_with_overrides(
         }
     }
 
-    // Fan-identify (DEC-166): force identified fans to 0 AFTER curve/override
-    // resolution and FLOOR-EXEMPT — you must be able to stop a pump to find it.
-    // Subordinate only to the thermal force, which short-circuits the
-    // whole tick before this function is reached. Restore is the entry's
-    // removal: the member resumes its curve command next tick (no prior PWM
-    // remembered), and its per-member state stayed current (the control kept
-    // evaluating; only the final command was zeroed), so no reset is needed.
-    if !overrides.identify_stop.is_empty() {
+    // Fan-identify (DEC-166, amended by DEC-311): pin identified fans to their
+    // hold duty AFTER curve/override resolution. Subordinate only to the thermal
+    // force, which short-circuits the whole tick before this function is
+    // reached. Restore is the entry's removal: the member resumes its curve
+    // command next tick (no prior PWM remembered), and its per-member state
+    // stayed current (the control kept evaluating; only the final command was
+    // rewritten), so no reset is needed.
+    //
+    // [SAFETY] The duty is chosen by `identify_target_for_role` at request time,
+    // NOT here — an ordinary fan gets 0 (floor-exempt, unchanged since DEC-166),
+    // a pump gets a perturbation already clamped at or above
+    // `HARD_PUMP_CPU_FLOOR_PCT`. This pass deliberately applies the stored value
+    // verbatim and does not re-clamp: re-clamping here would silently repair a
+    // bad target instead of failing, and the single-place-to-get-it-wrong
+    // property is what the identify tests rely on.
+    if !overrides.identify.is_empty() {
         for cmd in &mut commands {
-            if overrides.identify_stop.contains(&cmd.member_id) {
-                cmd.pwm_percent = 0;
+            if let Some(&target) = overrides.identify.get(&cmd.member_id) {
+                cmd.pwm_percent = target;
             }
         }
     }
@@ -924,6 +958,10 @@ pub async fn profile_engine_loop(
     gpu_infos: Vec<crate::hwmon::gpu_detect::AmdGpuInfo>,
     safety: Arc<Mutex<crate::safety::ThermalSafetyRule>>,
     override_table: Arc<Mutex<crate::control_override::OverrideTable>>,
+    // DEC-311: the same handle `AppState` holds, so an assignment made through
+    // `POST /config/header-role` reaches the sole PWM writer on its next tick
+    // without a restart. A safety floor that waited for a reboot would be a trap.
+    header_roles: Arc<parking_lot::RwLock<Arc<HashMap<String, crate::hwmon::roles::HeaderRole>>>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     // Interval (not `sleep`) so the period is measured tick-to-tick and the
@@ -1096,6 +1134,13 @@ pub async fn profile_engine_loop(
             }
             table.snapshot()
         };
+
+        // DEC-311: refresh the user's header-role assignments for this tick.
+        // Read here, once, as an `Arc` clone under a momentarily-held read guard
+        // — never with the guard alive across the evaluation, and never across
+        // an `.await`. `POST /config/header-role` swaps the whole `Arc`, so a
+        // tick either sees the old map or the new one, never a torn one.
+        engine_state.set_assigned_roles(Arc::clone(&header_roles.read()));
 
         // Get active profile — scope guard strictly to avoid !Send across .await
         //
@@ -2469,6 +2514,7 @@ mod tests {
             Vec::new(),
             Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new())),
             Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
             rx,
         ));
         // The interval fires immediately, then once a second. `saturating_sub`
@@ -4255,6 +4301,7 @@ mod tests {
             Vec::new(),
             safety,
             overrides,
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
             rx,
         ));
 
@@ -5110,6 +5157,7 @@ mod tests {
             vec![],
             safety,
             Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
             shutdown_rx,
         ));
 
@@ -5200,6 +5248,7 @@ mod tests {
             vec![], // no GPU
             safety,
             Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
             shutdown_rx,
         ));
 
@@ -5249,6 +5298,7 @@ mod tests {
             vec![],
             safety,
             Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
             shutdown_rx,
         ));
 
@@ -5313,6 +5363,7 @@ mod tests {
             vec![],
             safety,
             Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
             shutdown_rx,
         ));
 
@@ -5362,6 +5413,7 @@ mod tests {
             vec![],
             safety,
             Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
             shutdown_rx,
         ));
 
@@ -5403,6 +5455,7 @@ mod tests {
             vec![],
             safety,
             Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
             shutdown_rx,
         ));
 
@@ -5574,6 +5627,7 @@ mod tests {
             vec![],
             safety,
             Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
             shutdown_rx,
         ));
 
@@ -5630,6 +5684,7 @@ mod tests {
             vec![],
             safety,
             Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
             shutdown_rx,
         ));
 
@@ -5674,6 +5729,7 @@ mod tests {
             vec![],
             safety,
             Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
             shutdown_rx,
         ));
 
@@ -5721,6 +5777,7 @@ mod tests {
             vec![],
             safety,
             Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
             shutdown_rx,
         ));
 
@@ -5813,6 +5870,7 @@ mod tests {
             vec![gpu],
             safety,
             Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
             shutdown_rx,
         ));
 
@@ -5853,6 +5911,7 @@ mod tests {
             vec![gpu],
             safety,
             Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
             shutdown_rx,
         ));
 
@@ -5914,6 +5973,7 @@ mod tests {
             vec![gpu],
             safety,
             Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
             shutdown_rx,
         ));
 
@@ -5971,6 +6031,8 @@ mod tests {
             is_writable: true,
             pwm_mode: None,
             is_aio: false,
+            role: crate::hwmon::roles::HeaderRole::Unknown,
+            role_source: crate::hwmon::roles::RoleSource::None,
         }
     }
 
@@ -6078,6 +6140,7 @@ mod tests {
             vec![],
             safety,
             Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
             shutdown_rx,
         ));
 
@@ -6139,6 +6202,7 @@ mod tests {
             vec![], // no GPU
             safety,
             Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
             shutdown_rx,
         ));
 
@@ -6183,6 +6247,7 @@ mod tests {
             vec![], // no GPU
             safety,
             Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
             shutdown_rx,
         ));
 
@@ -6263,6 +6328,7 @@ mod tests {
             vec![],
             safety,
             Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
             shutdown_rx,
         ));
 
@@ -6360,6 +6426,7 @@ mod tests {
             vec![],
             safety,
             Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
             shutdown_rx,
         ));
 
@@ -6470,6 +6537,7 @@ mod tests {
             vec![],
             safety,
             Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
             shutdown_rx,
         ));
 
@@ -7008,6 +7076,7 @@ mod tests {
             vec![],
             safety,
             Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
             shutdown_rx,
         ));
 
@@ -7053,6 +7122,7 @@ mod tests {
             vec![],
             Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new())),
             Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
             shutdown_rx,
         ));
 
@@ -7100,6 +7170,7 @@ mod tests {
             vec![],
             safety,
             Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
             shutdown_rx,
         ));
 
@@ -7121,16 +7192,16 @@ mod tests {
         controls.insert(control_id.to_string(), pwm);
         OverrideSnapshot {
             controls,
-            identify_stop: HashSet::new(),
+            identify: HashMap::new(),
         }
     }
 
     fn identify_snapshot(fan_id: &str) -> OverrideSnapshot {
-        let mut identify_stop = HashSet::new();
-        identify_stop.insert(fan_id.to_string());
+        let mut identify = HashMap::new();
+        identify.insert(fan_id.to_string(), 0u8);
         OverrideSnapshot {
             controls: HashMap::new(),
-            identify_stop,
+            identify,
         }
     }
 
@@ -7272,9 +7343,17 @@ mod tests {
     }
 
     #[test]
-    fn identify_stop_forces_fan_to_zero_floor_exempt() {
-        // identify-stop zeroes a pump fan despite its 30% floor — you must be
-        // able to stop a pump to physically find it (DEC-166).
+    fn identify_applies_its_target_verbatim_and_is_floor_exempt_at_zero() {
+        // An identify hold of 0 zeroes the member despite its 30% floor. This
+        // is the DEC-166 floor exemption, and it survives DEC-311 — for
+        // ORDINARY fans, which is what a bare `Pump` *label* with no user
+        // assignment still is as far as this pass is concerned.
+        //
+        // The pump protection deliberately does NOT live here: the engine
+        // applies whatever target the handler stored, and it is
+        // `identify_target_for_role` that refuses to produce a 0 for a pump.
+        // Keeping the clamp in one place is why this pass stays this simple —
+        // see `pump_identify_never_targets_zero` in `control_override`.
         let mut profile = make_profile("curve", "graph", 50.0);
         profile.controls[0].members = vec![ControlMember {
             source: "hwmon".into(),
@@ -7291,6 +7370,215 @@ mod tests {
             &identify_snapshot("hwmon:nct6775:pwm1"),
         );
         assert_eq!(cmds[0].pwm_percent, 0);
+    }
+
+    /// [SAFETY] DEC-311. A pump-role identify pins the fan to its perturbation
+    /// duty, NOT to 0 — and the duty survives the floor pass rather than being
+    /// re-clamped or overwritten by the curve.
+    #[test]
+    fn identify_pins_a_pump_to_its_perturbation_duty() {
+        let mut profile = make_profile("curve", "graph", 50.0);
+        profile.controls[0].members = vec![ControlMember {
+            source: "hwmon".into(),
+            member_id: "hwmon:nct6775:pwm1:AIO_PUMP".into(),
+            member_label: "AIO_PUMP".into(),
+            fan_zero_rpm: false,
+        }];
+        let sensors = make_cache_with_sensor("cpu", 55.0).sensors_snapshot();
+        let mut state = ProfileEngineState::new();
+
+        // What the handler would have computed for a pump idling at 50%.
+        let (target, mode) = crate::control_override::identify_target_for_role(
+            crate::hwmon::roles::HeaderRole::Pump,
+            Some(50),
+        );
+        assert_eq!(mode, crate::control_override::IdentifyMode::PumpPerturb);
+        assert_eq!(target, 75, "50% + 25 points of headroom");
+
+        let mut identify = HashMap::new();
+        identify.insert("hwmon:nct6775:pwm1:AIO_PUMP".to_string(), target);
+        let cmds = evaluate_profile_with_overrides(
+            &profile,
+            &sensors,
+            &mut state,
+            &OverrideSnapshot {
+                controls: HashMap::new(),
+                identify,
+            },
+        );
+        assert_eq!(cmds[0].pwm_percent, 75);
+        assert!(
+            cmds[0].pwm_percent >= HARD_PUMP_CPU_FLOOR_PCT as u8,
+            "a pump identify must never drop below the pump floor"
+        );
+    }
+
+    /// [SAFETY] DEC-311. Releasing the identify returns the member to its curve
+    /// value — the "restore the previous PWM" requirement, satisfied structurally
+    /// by removing the entry rather than by replaying a remembered duty.
+    #[test]
+    fn releasing_a_pump_identify_returns_it_to_the_curve() {
+        let mut profile = make_profile("curve", "graph", 50.0);
+        profile.controls[0].members = vec![ControlMember {
+            source: "hwmon".into(),
+            member_id: "hwmon:nct6775:pwm1:AIO_PUMP".into(),
+            member_label: "AIO_PUMP".into(),
+            fan_zero_rpm: false,
+        }];
+        let sensors = make_cache_with_sensor("cpu", 55.0).sensors_snapshot();
+        let mut state = ProfileEngineState::new();
+
+        let curve_value = evaluate_profile_with_overrides(
+            &profile,
+            &sensors,
+            &mut state,
+            &OverrideSnapshot::default(),
+        )[0]
+        .pwm_percent;
+
+        let mut identify = HashMap::new();
+        identify.insert("hwmon:nct6775:pwm1:AIO_PUMP".to_string(), 85u8);
+        let held = evaluate_profile_with_overrides(
+            &profile,
+            &sensors,
+            &mut state,
+            &OverrideSnapshot {
+                controls: HashMap::new(),
+                identify,
+            },
+        );
+        assert_eq!(held[0].pwm_percent, 85);
+
+        // Entry removed → next tick is the curve again.
+        let restored = evaluate_profile_with_overrides(
+            &profile,
+            &sensors,
+            &mut state,
+            &OverrideSnapshot::default(),
+        );
+        assert_eq!(
+            restored[0].pwm_percent, curve_value,
+            "removing the hold must restore the curve-commanded duty"
+        );
+    }
+
+    /// [SAFETY] DEC-311. The user's header-role assignment is a union term on
+    /// the hard floor: a member whose label earns it NOTHING still gets the 30%
+    /// pump floor once the user says it is a pump. This is the case that matters
+    /// on a board with no `pwmN_label` files, where the label is a synthetic
+    /// `pwm3` and carries no hint at all.
+    #[test]
+    fn an_assigned_pump_role_earns_the_hard_floor() {
+        let mut profile = make_profile("curve", "graph", 5.0);
+        profile.controls[0].minimum_pct = 0.0;
+        profile.controls[0].members = vec![ControlMember {
+            source: "hwmon".into(),
+            member_id: "hwmon:it8696:it87.2624:pwm3:pwm3".into(),
+            member_label: "pwm3".into(),
+            fan_zero_rpm: false,
+        }];
+        let sensors = make_cache_with_sensor("cpu", 20.0).sensors_snapshot();
+
+        // Unassigned: the synthetic label earns nothing, so the curve stands.
+        let mut bare = ProfileEngineState::new();
+        let unassigned = evaluate_profile_with_overrides(
+            &profile,
+            &sensors,
+            &mut bare,
+            &OverrideSnapshot::default(),
+        );
+        assert!(
+            unassigned[0].pwm_percent < HARD_PUMP_CPU_FLOOR_PCT as u8,
+            "a synthetic pwmN label must NOT be floored on its own — if it is, \
+             the classifier has started guessing and this test proves nothing"
+        );
+
+        // Assigned pump: floored, without touching the profile.
+        let mut roles = HashMap::new();
+        roles.insert(
+            "hwmon:it8696:it87.2624:pwm3:pwm3".to_string(),
+            crate::hwmon::roles::HeaderRole::Pump,
+        );
+        let mut state = ProfileEngineState::new();
+        state.set_assigned_roles(Arc::new(roles));
+        let assigned = evaluate_profile_with_overrides(
+            &profile,
+            &sensors,
+            &mut state,
+            &OverrideSnapshot::default(),
+        );
+        assert_eq!(
+            assigned[0].pwm_percent, HARD_PUMP_CPU_FLOOR_PCT as u8,
+            "a user-assigned pump must be held at the hard floor"
+        );
+    }
+
+    /// [SAFETY] DEC-311 + DEC-167. An assigned pump must also inherit the
+    /// stop-snap exemption, or a non-zero `stop_pct` would zero it outright —
+    /// the floor alone is not enough.
+    #[test]
+    fn an_assigned_pump_role_cannot_be_stop_snapped() {
+        let mut profile = make_profile("curve", "graph", 5.0);
+        profile.controls[0].minimum_pct = 0.0;
+        profile.controls[0].stop_pct = 40.0;
+        profile.controls[0].members = vec![ControlMember {
+            source: "hwmon".into(),
+            member_id: "hwmon:it8696:it87.2624:pwm3:pwm3".into(),
+            member_label: "pwm3".into(),
+            fan_zero_rpm: false,
+        }];
+        let sensors = make_cache_with_sensor("cpu", 20.0).sensors_snapshot();
+
+        let mut roles = HashMap::new();
+        roles.insert(
+            "hwmon:it8696:it87.2624:pwm3:pwm3".to_string(),
+            crate::hwmon::roles::HeaderRole::Pump,
+        );
+        let mut state = ProfileEngineState::new();
+        state.set_assigned_roles(Arc::new(roles));
+        let cmds = evaluate_profile_with_overrides(
+            &profile,
+            &sensors,
+            &mut state,
+            &OverrideSnapshot::default(),
+        );
+        assert_eq!(
+            cmds[0].pwm_percent, HARD_PUMP_CPU_FLOOR_PCT as u8,
+            "stop_pct must never zero a member the user has declared a pump"
+        );
+    }
+
+    /// A non-pump assignment must not be able to STRIP a floor the labels
+    /// already earned. The union only ever adds.
+    #[test]
+    fn assigning_chassis_cannot_strip_a_label_earned_floor() {
+        let mut profile = make_profile("curve", "graph", 5.0);
+        profile.controls[0].minimum_pct = 0.0;
+        profile.controls[0].members = vec![ControlMember {
+            source: "hwmon".into(),
+            member_id: "hwmon:nct6798:isa:pwm3:AIO_PUMP".into(),
+            member_label: "AIO_PUMP".into(),
+            fan_zero_rpm: false,
+        }];
+        let sensors = make_cache_with_sensor("cpu", 20.0).sensors_snapshot();
+
+        let mut roles = HashMap::new();
+        roles.insert(
+            "hwmon:nct6798:isa:pwm3:AIO_PUMP".to_string(),
+            crate::hwmon::roles::HeaderRole::ChassisFan,
+        );
+        let mut state = ProfileEngineState::new();
+        state.set_assigned_roles(Arc::new(roles));
+        let cmds = evaluate_profile_with_overrides(
+            &profile,
+            &sensors,
+            &mut state,
+            &OverrideSnapshot::default(),
+        );
+        assert_eq!(
+            cmds[0].pwm_percent, HARD_PUMP_CPU_FLOOR_PCT as u8,
+            "an assignment must not remove a floor the label independently earned"
+        );
     }
 
     #[test]
@@ -7353,6 +7641,7 @@ mod tests {
             vec![],
             safety,
             overrides,
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
             shutdown_rx,
         ));
 

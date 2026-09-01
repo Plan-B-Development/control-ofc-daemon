@@ -81,9 +81,10 @@ fn build_hwmon_inventory(state: &AppState) -> (StatusCode, Json<serde_json::Valu
     let pwm_controls: Vec<PwmHeaderEntry> = match &state.hwmon_controller {
         Some(controller) => {
             let ctrl = controller.lock();
+            let assigned = state.header_roles();
             ctrl.headers()
                 .into_iter()
-                .map(PwmHeaderEntry::from)
+                .map(|h| PwmHeaderEntry::from_descriptor(h, assigned.get(&h.id).copied()))
                 .collect()
         }
         None => Vec::new(),

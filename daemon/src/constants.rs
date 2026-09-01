@@ -128,6 +128,32 @@ pub const OVERRIDE_TTL_SECS: u64 = 15;
 /// attempts land before expiry, robust against transient Qt event-loop stalls.
 pub const OVERRIDE_RENEW_SECS: u64 = 5;
 
+/// How far a pump-role header is shifted from its baseline duty during a
+/// pump-safe identify (DEC-311, AIO-MB Phase 1), in percentage points.
+///
+/// Large enough that the RPM change is audible and clearly visible in the
+/// reading, small enough to stay well inside the pump's operating range. The
+/// perturbation prefers to move **upward** so it never walks a pump toward its
+/// stall floor; the downward direction is used only when there is no headroom,
+/// and is clamped at `HARD_PUMP_CPU_FLOOR_PCT`.
+pub const IDENTIFY_PUMP_DELTA_PCT: u8 = 25;
+
+/// Baseline assumed for a pump-safe identify when nothing has been commanded
+/// yet (`last_commanded_pwm` absent). A typical pump idle duty; the computed
+/// target is clamped to the pump floor regardless, so this only affects which
+/// *direction* the perturbation takes.
+///
+/// Reached less often than it looks. For hwmon, `polling.rs` fills
+/// `last_commanded_pwm` from the sysfs read-back, so it is usually present even
+/// for a header no profile drives. This is the genuine gap: a header whose PWM
+/// read failed, or the first poll cycle after boot.
+///
+/// It deliberately does **not** claim to cover "a fan the active profile does
+/// not drive". For that fan the identify overlay rewrites nothing at all —
+/// there is no command to rewrite — so no baseline of any value would help. That
+/// is register row `AIO1-b`, out of scope for DEC-311.
+pub const IDENTIFY_PUMP_BASELINE_FALLBACK_PCT: u8 = 60;
+
 // ── Profile engine — no-sensor safety ────────────────────────────────
 
 /// If no CPU temperature sensor is found for this many consecutive

@@ -21,6 +21,7 @@
 
 use crate::atomic_io::{create_dir_private, write_atomic};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Filename used inside the state directory.
@@ -134,11 +135,28 @@ pub struct RuntimeHardware {
     pub preferred_cpu_sensor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_mb_sensor: Option<String>,
+    /// User-assigned PWM header roles (DEC-311), stable header id → role token
+    /// (`"pump"`, `"cpu_fan"`, `"radiator_fan"`, `"chassis_fan"`, `"unknown"`).
+    ///
+    /// A `BTreeMap` rather than a `HashMap` so `runtime.toml` serialises in a
+    /// stable order — this file is operator-editable and lands in diffs and
+    /// support bundles, and a map that reshuffles on every unrelated write is
+    /// noise no one can read past.
+    ///
+    /// Stored as a `String`, not a `HeaderRole`, deliberately: a hand-edited or
+    /// future-version token must not make the whole `[hardware]` section
+    /// unparseable (`deny_unknown_fields` is already strict about *keys*). An
+    /// unrecognised value is dropped with a warning at load — see
+    /// `header_roles_parsed`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub header_roles: std::collections::BTreeMap<String, String>,
 }
 
 impl RuntimeHardware {
     fn is_empty(&self) -> bool {
-        self.preferred_cpu_sensor.is_none() && self.preferred_mb_sensor.is_none()
+        self.preferred_cpu_sensor.is_none()
+            && self.preferred_mb_sensor.is_none()
+            && self.header_roles.is_empty()
     }
 }
 
@@ -316,6 +334,60 @@ impl RuntimeConfig {
     pub fn set_preferred_mb_sensor(&mut self, id: Option<String>) {
         let mut hw = self.hardware.take().unwrap_or_default();
         hw.preferred_mb_sensor = id;
+        self.hardware = if hw.is_empty() { None } else { Some(hw) };
+    }
+
+    /// The persisted header-role assignments, parsed into [`HeaderRole`]s
+    /// (DEC-311).
+    ///
+    /// An unrecognised token is **dropped with a warning**, not defaulted to
+    /// `Unknown` and not fatal. Both alternatives are worse: defaulting would
+    /// silently downgrade a `"pump"` that a future version spells differently
+    /// (losing a floor while reporting success), and failing the load would let
+    /// one bad line take out every other runtime setting — including the sensor
+    /// selections — on a file operators are invited to edit.
+    ///
+    /// Dropping is the honest middle: the assignment is gone, the log says so,
+    /// and the header falls back to its inferred role, which is the same state
+    /// it was in before anyone assigned anything.
+    pub fn header_roles_parsed(&self) -> HashMap<String, crate::hwmon::roles::HeaderRole> {
+        let Some(hw) = self.hardware.as_ref() else {
+            return HashMap::new();
+        };
+        hw.header_roles
+            .iter()
+            .filter_map(
+                |(id, token)| match crate::hwmon::roles::HeaderRole::from_token(token) {
+                    Some(role) => Some((id.clone(), role)),
+                    None => {
+                        log::warn!(
+                            "Ignoring unrecognised header role '{token}' for '{id}' in \
+                             runtime configuration — the header keeps its detected role"
+                        );
+                        None
+                    }
+                },
+            )
+            .collect()
+    }
+
+    /// Set (or clear, with `None`) one header's role assignment. Drops the whole
+    /// `[hardware]` section when nothing is left in it.
+    pub fn set_header_role(
+        &mut self,
+        header_id: &str,
+        role: Option<crate::hwmon::roles::HeaderRole>,
+    ) {
+        let mut hw = self.hardware.take().unwrap_or_default();
+        match role {
+            Some(r) => {
+                hw.header_roles
+                    .insert(header_id.to_string(), r.as_str().into());
+            }
+            None => {
+                hw.header_roles.remove(header_id);
+            }
+        }
         self.hardware = if hw.is_empty() { None } else { Some(hw) };
     }
 
@@ -581,6 +653,92 @@ mod tests {
         cfg.set_preferred_cpu_sensor(Some("cpu".into()));
         cfg.set_preferred_cpu_sensor(None);
         assert!(cfg.hardware.is_none());
+    }
+
+    /// [SAFETY] DEC-311. A `pump` assignment is a safety floor, so it has to
+    /// survive a daemon restart — losing it silently would drop the header back
+    /// to a 20% chassis floor with nothing to say so.
+    #[test]
+    fn header_roles_survive_a_save_load_round_trip() {
+        use crate::hwmon::roles::HeaderRole;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("runtime.toml");
+
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_header_role("hwmon:it8696:it87.2624:pwm5:pwm5", Some(HeaderRole::Pump));
+        cfg.set_header_role("hwmon:it8696:it87.2624:pwm1:pwm1", Some(HeaderRole::CpuFan));
+        cfg.save_to(&path).unwrap();
+
+        let loaded = RuntimeConfig::load_from(&path);
+        let roles = loaded.header_roles_parsed();
+        assert_eq!(
+            roles.get("hwmon:it8696:it87.2624:pwm5:pwm5"),
+            Some(&HeaderRole::Pump)
+        );
+        assert_eq!(
+            roles.get("hwmon:it8696:it87.2624:pwm1:pwm1"),
+            Some(&HeaderRole::CpuFan)
+        );
+    }
+
+    #[test]
+    fn clearing_the_last_header_role_drops_the_hardware_section() {
+        use crate::hwmon::roles::HeaderRole;
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_header_role("hwmon:x:pwm1:PUMP", Some(HeaderRole::Pump));
+        assert!(cfg.hardware.is_some());
+        cfg.set_header_role("hwmon:x:pwm1:PUMP", None);
+        assert!(
+            cfg.hardware.is_none(),
+            "an empty [hardware] section must not be left behind"
+        );
+    }
+
+    #[test]
+    fn header_roles_coexist_with_the_preferred_sensors() {
+        use crate::hwmon::roles::HeaderRole;
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_preferred_cpu_sensor(Some("cpu".into()));
+        cfg.set_header_role("hwmon:x:pwm1:PUMP", Some(HeaderRole::Pump));
+        cfg.set_header_role("hwmon:x:pwm1:PUMP", None);
+        assert_eq!(cfg.preferred_cpu_sensor(), Some("cpu"));
+        cfg.set_preferred_cpu_sensor(None);
+        assert!(cfg.hardware.is_none());
+    }
+
+    /// An unrecognised token — a hand-edit, or a downgrade from a version with
+    /// more roles — drops that ONE assignment with a warning. It must not
+    /// default to `unknown` (silently losing a pump's floor while reporting
+    /// success) and must not fail the load (taking every other runtime setting
+    /// with it, on a file operators are invited to edit).
+    #[test]
+    fn an_unrecognised_role_token_is_dropped_not_defaulted_and_not_fatal() {
+        use crate::hwmon::roles::HeaderRole;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("runtime.toml");
+        std::fs::write(
+            &path,
+            "[hardware]\n\
+             preferred_cpu_sensor = \"cpu\"\n\n\
+             [hardware.header_roles]\n\
+             \"hwmon:x:pwm1:PUMP\" = \"pump\"\n\
+             \"hwmon:x:pwm2:A\" = \"impeller\"\n",
+        )
+        .unwrap();
+
+        let loaded = RuntimeConfig::load_from(&path);
+        let roles = loaded.header_roles_parsed();
+        assert_eq!(roles.get("hwmon:x:pwm1:PUMP"), Some(&HeaderRole::Pump));
+        assert_eq!(
+            roles.get("hwmon:x:pwm2:A"),
+            None,
+            "an unknown token must be dropped, never defaulted to Unknown"
+        );
+        assert_eq!(
+            loaded.preferred_cpu_sensor(),
+            Some("cpu"),
+            "one bad role must not take the rest of the runtime config with it"
+        );
     }
 
     #[test]

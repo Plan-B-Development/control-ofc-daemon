@@ -338,6 +338,144 @@ pub async fn update_startup_delay_handler(
     )
 }
 
+/// POST /config/header-role — assign or clear one PWM header's role (DEC-311).
+///
+/// Body: `{"header_id": "hwmon:…", "role": "pump"}` to set, or `{"role": null}`
+/// to clear and fall back to the detected role.
+///
+/// [SAFETY] This is the mechanism that makes AIO-MB Phase 1 work on real
+/// hardware. On a board whose Super-I/O publishes no `pwmN_label` — measured on
+/// the validation target, `it8696`: five channels, zero label files — inference
+/// has nothing to work from and *every* header reads `unknown`. The user's
+/// assignment is then the only evidence that a header drives a pump, and it is
+/// what earns that header the 30% floor, the stop-snap exemption, pump-safe
+/// identify, and the role-aware verify duty.
+///
+/// Persist-first, exactly like the sibling setters: if the write fails we return
+/// 503 and the in-memory map is untouched, so the daemon never acts on an
+/// assignment it could not durably record. **Unlike** the DEC-243 admin keys,
+/// this one also takes effect immediately (no restart) — a safety floor that
+/// waited for a reboot would be a trap.
+pub async fn update_header_role_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let header_id = match body.get("header_id") {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => s.clone(),
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation("missing or empty 'header_id' (a stable header id)"),
+            );
+        }
+    };
+
+    // `role` is required as a key; a string assigns, null clears.
+    let new_role: Option<crate::hwmon::roles::HeaderRole> = match body.get("role") {
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation("missing 'role' (a role token, or null to clear)"),
+            );
+        }
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(token)) => {
+            // An unrecognised token is rejected rather than defaulted. A typo
+            // that silently became `unknown` would drop a pump's protection
+            // while the response said "updated".
+            match crate::hwmon::roles::HeaderRole::from_token(token) {
+                Some(role) => Some(role),
+                None => {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        &ErrorEnvelope::validation(format!(
+                            "unknown role '{token}' — expected one of: unknown, cpu_fan, \
+                             pump, radiator_fan, chassis_fan"
+                        )),
+                    );
+                }
+            }
+        }
+        Some(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation("'role' must be a string or null"),
+            );
+        }
+    };
+
+    // Validate a set id against the discovered headers. Deliberately NOT applied
+    // to a clear: you must always be able to remove an assignment for a header
+    // that has since disappeared, or a stale entry would be unreachable.
+    if new_role.is_some() {
+        let known = state
+            .hwmon_controller
+            .as_ref()
+            .is_some_and(|c| c.lock().headers().into_iter().any(|h| h.id == header_id));
+        if !known {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(format!("unknown hwmon header id: {header_id}")),
+            );
+        }
+    }
+
+    let mut runtime = match runtime_for_update(&state) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    runtime.set_header_role(&header_id, new_role);
+
+    let runtime_owned = runtime.clone();
+    let rc_path = state.runtime_config_path.clone();
+    if let Err(e) = super::persist_off_runtime(move || runtime_owned.save_to(&rc_path)).await {
+        log::error!(
+            "Failed to persist header role for '{header_id}' to {}: {e}",
+            state.runtime_config_path.display()
+        );
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::persistence_failed("failed to persist runtime configuration"),
+        );
+    }
+
+    // Commit in memory only after the write succeeded. Rebuilt from the freshly
+    // persisted config rather than patched, so the map the engine reads and the
+    // file on disk cannot drift apart.
+    *state.header_roles.write() = Arc::new(runtime.header_roles_parsed());
+
+    // [SAFETY] DEC-311: a live identify hold stores an ABSOLUTE duty chosen from
+    // the role at take time, so assigning `pump` to a header already held at 0
+    // would otherwise leave a real pump stopped until its deadman fired (up to
+    // `OVERRIDE_TTL_SECS`). Releasing the hold restores curve control on the
+    // engine's next tick, which is the correct answer to "this is a pump" —
+    // the user can re-issue identify and get the perturbation.
+    //
+    // Ordered after the `header_roles` write guard is released, so this takes
+    // `override_table` on its own and adds no lock-ordering cycle.
+    if new_role.is_some_and(|r| r.is_pump()) {
+        state.override_table.lock().identify_restore(&header_id);
+    }
+
+    log::info!(
+        "Header role for '{header_id}' set to {} (effective immediately)",
+        new_role
+            .map(|r| r.as_str())
+            .unwrap_or("<cleared, detected role applies>")
+    );
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "api_version": API_VERSION,
+            "updated": true,
+            "header_id": header_id,
+            "role": new_role.map(|r| r.as_str()),
+            "effective_role": state.resolved_header_role(&header_id).as_str(),
+        })),
+    )
+}
+
 /// Which preferred-sensor slot a request targets (Phase 5).
 enum PreferredSensorRole {
     Cpu,

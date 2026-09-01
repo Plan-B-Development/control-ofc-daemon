@@ -617,6 +617,44 @@ pub(crate) fn member_needs_hard_floor(member: &ControlMember) -> bool {
     })
 }
 
+/// Whether the **user** has explicitly assigned this member's header the pump
+/// role (DEC-311, AIO-MB Phase 1).
+///
+/// [SAFETY] A third union term beside [`member_needs_hard_floor`]'s two, and
+/// strictly additive — it can only ever *add* the hard floor, never remove one
+/// the labels already earned. That is why it is a separate predicate rather
+/// than a fourth branch inside `member_needs_hard_floor`: that function is what
+/// the DEC-162 `role_classification.json` oracle pins, and it must keep
+/// answering the label-only question so the oracle stays a valid check on both
+/// repos' classifiers.
+///
+/// This is the term that makes AIO-MB Phase 1 useful at all. On a board whose
+/// Super-I/O publishes no `pwmN_label` (measured: `it8696` exposes five channels
+/// and zero label files), every label-derived signal is blank and the user's
+/// assignment is the *only* evidence that a header drives a pump.
+///
+/// Only `HeaderRole::Pump` qualifies. `CpuFan` already carries the floor via the
+/// `"cpu"` label hint wherever a label exists, and assigning `ChassisFan` must
+/// not be able to strip a floor that a `PUMP` label independently established.
+///
+/// The identify and verify paths take the same union, via
+/// `AppState::header_is_pump_protected`. They did not at first, and the
+/// asymmetry was a real hole: the daemon held a label-derived pump at its 30%
+/// floor on every tick while identify — reading the fully-substituted role —
+/// would drive that same pump to 0 on request. If you are tempted to simplify
+/// either side back to "the assignment wins", that is the bug.
+pub(crate) fn assigned_role_is_pump(
+    member: &ControlMember,
+    assigned: &std::collections::HashMap<String, crate::hwmon::roles::HeaderRole>,
+) -> bool {
+    if member.source != "hwmon" {
+        return false;
+    }
+    assigned
+        .get(&member.member_id)
+        .is_some_and(|role| role.is_pump())
+}
+
 /// Severity of a [`FieldViolation`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]

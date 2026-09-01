@@ -20,16 +20,26 @@
 //! one field because the fence reduces to a per-resource counter.
 //!
 //! ## Identify (per fan)
-//! Stops a single fan for physical identification, auto-restoring after a short
-//! deadman TTL. Floor-exempt by necessity (you must be able to stop a pump to
-//! find it); bounded by the deadman and the thermal force. Restore is
-//! simply removal — the engine recomputes the fan's curve value next tick, so
-//! no prior-PWM is remembered.
+//! Holds a single fan at a distinguishable duty for physical identification,
+//! auto-restoring after a short deadman TTL. Bounded by the deadman and the
+//! thermal force. Restore is simply removal — the engine recomputes the fan's
+//! curve value next tick, so no prior-PWM is remembered, and a request that
+//! fails part-way through leaves nothing to unwind.
+//!
+//! **The hold duty is role-dependent (DEC-311).** An ordinary fan is held at 0
+//! and remains floor-exempt: stopping it is both safe and the clearest possible
+//! signal. A `role: Pump` header is instead **perturbed** — moved to a duty at
+//! least [`crate::profile::HARD_PUMP_CPU_FLOOR_PCT`] away from its baseline and
+//! never below that floor. This supersedes DEC-166's "floor-exempt by necessity
+//! (you must be able to stop a pump to find it)": losing coolant flow to find a
+//! header is not a trade the daemon should make on the user's behalf, and an
+//! audible RPM *change* identifies a pump just as well as a stop.
 //!
 //! Safety ordering enforced by the engine tick:
-//! `thermal force  >  identify-stop (floor-exempt)  >  override (floor-clamped)  >  curve`.
+//! `thermal force  >  identify (floor-exempt for fans, floored for pumps)
+//!   >  override (floor-clamped)  >  curve`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -64,10 +74,77 @@ struct ControlOverride {
     expires_at: Instant,
 }
 
-/// A live identify-stop on one fan.
+/// How a fan is being held for identification (DEC-311).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentifyMode {
+    /// Driven to 0 — the ordinary-fan behaviour, unchanged since DEC-166.
+    Stop,
+    /// Shifted to a distinguishable duty that never goes below the pump floor.
+    PumpPerturb,
+}
+
+impl IdentifyMode {
+    /// Wire token for `IdentifyResponse.mode` / `IdentifyStatusEntry.mode`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IdentifyMode::Stop => "stop",
+            IdentifyMode::PumpPerturb => "pump_perturb",
+        }
+    }
+}
+
+/// Choose the identify hold duty for a fan, from its role and current duty
+/// (DEC-311, AIO-MB Phase 1).
+///
+/// [SAFETY] **The only production path that computes an identify target.** Both
+/// the clamp and the role decision live here so there is exactly one place that
+/// can get this wrong, and one place to test.
+///
+/// - Non-pump roles → [`IdentifyMode::Stop`] at `0`. Unchanged since DEC-166:
+///   stopping an ordinary fan is safe and is the clearest possible signal.
+/// - `role: Pump` → [`IdentifyMode::PumpPerturb`]. Shifted by
+///   [`IDENTIFY_PUMP_DELTA_PCT`], **upward wherever there is headroom** so the
+///   pump never moves toward its stall floor, and clamped into
+///   `[HARD_PUMP_CPU_FLOOR_PCT, 100]` on **both** branches.
+///
+/// Clamping the upward branch matters and is not defensive noise: a baseline of
+/// 0 (nothing commanded yet) computes `0 + 25 = 25`, which is *below* the 30%
+/// pump floor. Without the clamp the pump-safe path would itself under-drive a
+/// pump — the precise failure `AIO1-a` records on the verify path.
+pub fn identify_target_for_role(
+    role: crate::hwmon::roles::HeaderRole,
+    last_commanded_pct: Option<u8>,
+) -> (u8, IdentifyMode) {
+    if !role.is_pump() {
+        return (0, IdentifyMode::Stop);
+    }
+    let floor = crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8;
+    let baseline =
+        last_commanded_pct.unwrap_or(crate::constants::IDENTIFY_PUMP_BASELINE_FALLBACK_PCT);
+    let delta = crate::constants::IDENTIFY_PUMP_DELTA_PCT;
+    let raised = baseline.saturating_add(delta);
+    let target = if raised <= 100 {
+        raised
+    } else {
+        baseline.saturating_sub(delta)
+    };
+    (target.clamp(floor, 100), IdentifyMode::PumpPerturb)
+}
+
+/// A live identify hold on one fan.
 #[derive(Debug, Clone)]
 struct IdentifyEntry {
     expires_at: Instant,
+    /// The duty the engine pins this fan to while the hold is live. `0` for
+    /// [`IdentifyMode::Stop`]; `>= HARD_PUMP_CPU_FLOOR_PCT` for a perturbation.
+    ///
+    /// Stored as an absolute value computed **once, when the identify was
+    /// taken**, rather than recomputed per tick against the live curve output.
+    /// A per-tick recomputation would chase a moving baseline: as the curve
+    /// ramped, the "perturbed" duty would drift along with it and the
+    /// difference the user is listening for would shrink to nothing.
+    target_pct: u8,
+    mode: IdentifyMode,
 }
 
 /// Grant returned to the caller on a successful override take/renew.
@@ -84,8 +161,14 @@ pub struct OverrideSnapshot {
     /// control_id → pinned PWM. Curve + tuning are skipped for these controls;
     /// only the per-member hard safety floor is applied at eval.
     pub controls: HashMap<String, u8>,
-    /// Fan member_ids forced to 0 (identify-stop). Floor-exempt at eval.
-    pub identify_stop: HashSet<String>,
+    /// Fan member_id → the duty its identify hold pins it to (DEC-311).
+    ///
+    /// Was a `HashSet` of ids forced to 0. It carries the duty now because the
+    /// duty is role-dependent: 0 for an ordinary fan, a floored perturbation
+    /// for a pump. Applied at eval **after** all other resolution and, for a
+    /// stop, floor-exempt — the pump case does not need the exemption because
+    /// its target is already at or above the floor by construction.
+    pub identify: HashMap<String, u8>,
 }
 
 /// One active override row for the `/status` poll surface.
@@ -101,6 +184,8 @@ pub struct OverrideStatusRow {
 pub struct IdentifyStatusRow {
     pub fan_id: String,
     pub expires_in_secs: u64,
+    pub mode: IdentifyMode,
+    pub identify_pwm_percent: u8,
 }
 
 /// IDs cleared by a `sweep`, so the engine can reset their cross-tick state.
@@ -109,8 +194,8 @@ pub struct SweepCleared {
     /// Controls whose override lapsed — their hysteresis must be reset so the
     /// resumed curve re-anchors instead of step-rate-clamping from the pin.
     pub controls: Vec<String>,
-    /// Fans whose identify-stop lapsed (no state reset needed — the control
-    /// kept evaluating; only the final command was zeroed).
+    /// Fans whose identify hold lapsed (no state reset needed — the control
+    /// kept evaluating; only the final command was rewritten).
     pub fans: Vec<String>,
 }
 
@@ -233,19 +318,34 @@ impl OverrideTable {
         self.controls.clear();
     }
 
-    /// Stop a fan for identification, auto-restoring after `ttl` (deadman). A
-    /// repeat call refreshes the deadman.
-    pub fn identify_stop(&mut self, fan_id: &str, ttl: Duration) {
+    /// Hold a fan at `target_pct` for identification, auto-restoring after
+    /// `ttl` (deadman). A repeat call refreshes the deadman and re-pins the
+    /// target.
+    ///
+    /// [SAFETY] The caller is responsible for choosing a `target_pct` that is
+    /// legal for the fan's role — see `identify_target_for_role`, which is the
+    /// only production path that computes one. This function does not clamp,
+    /// because it cannot see the role; the clamp lives with the role lookup so
+    /// there is exactly one place that decides.
+    pub fn identify_hold(
+        &mut self,
+        fan_id: &str,
+        target_pct: u8,
+        mode: IdentifyMode,
+        ttl: Duration,
+    ) {
         let now = self.clock.now();
         self.identify.insert(
             fan_id.to_string(),
             IdentifyEntry {
                 expires_at: now + ttl,
+                target_pct,
+                mode,
             },
         );
     }
 
-    /// Restore a fan immediately (remove the identify-stop). Idempotent.
+    /// Restore a fan immediately (remove the identify hold). Idempotent.
     pub fn identify_restore(&mut self, fan_id: &str) {
         self.identify.remove(fan_id);
     }
@@ -284,11 +384,11 @@ impl OverrideTable {
                 .filter(|(_, ov)| now < ov.expires_at)
                 .map(|(id, ov)| (id.clone(), ov.pwm_percent))
                 .collect(),
-            identify_stop: self
+            identify: self
                 .identify
                 .iter()
                 .filter(|(_, e)| now < e.expires_at)
-                .map(|(id, _)| id.clone())
+                .map(|(id, e)| (id.clone(), e.target_pct))
                 .collect(),
         }
     }
@@ -316,6 +416,8 @@ impl OverrideTable {
             .map(|(id, e)| IdentifyStatusRow {
                 fan_id: id.clone(),
                 expires_in_secs: e.expires_at.saturating_duration_since(now).as_secs(),
+                mode: e.mode,
+                identify_pwm_percent: e.target_pct,
             })
             .collect();
         identify.sort_by(|a, b| a.fan_id.cmp(&b.fan_id));
@@ -396,19 +498,19 @@ mod tests {
         let clock = ManualClock::new();
         let mut t = OverrideTable::with_clock(clock.clone());
         let g = t.take_override("ctrl-a", 70, ttl());
-        t.identify_stop("fan-1", ttl());
+        t.identify_hold("fan-1", 0, IdentifyMode::Stop, ttl());
 
         // One tick before the deadline: both still live.
         clock.advance(ttl() - Duration::from_nanos(1));
         assert_eq!(t.snapshot().controls.get("ctrl-a"), Some(&70));
-        assert!(t.snapshot().identify_stop.contains("fan-1"));
+        assert!(t.snapshot().identify.contains_key("fan-1"));
 
         // Land EXACTLY on `expires_at` (now == expires_at, so `now < expires_at`
         // is false): the entry is already expired everywhere it is read.
         clock.advance(Duration::from_nanos(1));
         let snap = t.snapshot();
         assert!(
-            snap.controls.is_empty() && snap.identify_stop.is_empty(),
+            snap.controls.is_empty() && snap.identify.is_empty(),
             "snapshot must exclude an entry at exactly its deadline"
         );
         // renew/release at the exact deadline see no live override → NotActive
@@ -501,25 +603,143 @@ mod tests {
         );
     }
 
+    /// [SAFETY] DEC-311, the headline invariant. No input — none — makes a pump
+    /// identify target 0, or anything below the pump floor.
+    ///
+    /// Exhaustive over every possible baseline rather than a sample, because
+    /// this is the assertion the whole feature rests on and the input space is
+    /// 102 values wide. A sampled version of this test would have passed with
+    /// the un-clamped upward branch (`0 + 25 = 25`) that the first draft had.
+    #[test]
+    fn pump_identify_never_targets_zero_or_below_the_floor() {
+        let floor = crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8;
+        for baseline in (0..=100u8).map(Some).chain(std::iter::once(None)) {
+            let (target, mode) =
+                identify_target_for_role(crate::hwmon::roles::HeaderRole::Pump, baseline);
+            assert_eq!(mode, IdentifyMode::PumpPerturb, "baseline {baseline:?}");
+            assert_ne!(target, 0, "baseline {baseline:?} produced a pump STOP");
+            assert!(
+                target >= floor,
+                "baseline {baseline:?} produced {target}%, below the {floor}% pump floor"
+            );
+            assert!(target <= 100, "baseline {baseline:?} produced {target}%");
+        }
+    }
+
+    /// The perturbation must actually be perceptible — a "safe" identify that
+    /// moved the pump by 0 points would satisfy every safety assertion above
+    /// and identify nothing at all.
+    #[test]
+    fn pump_identify_actually_moves_the_pump() {
+        for baseline in 0..=100u8 {
+            let (target, _) =
+                identify_target_for_role(crate::hwmon::roles::HeaderRole::Pump, Some(baseline));
+            // Below the floor the pump is not really running there; the clamp
+            // to the floor is itself the change, and is checked above.
+            if baseline >= crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8 {
+                assert_ne!(
+                    target, baseline,
+                    "baseline {baseline}% produced an identify that changes nothing"
+                );
+            }
+        }
+    }
+
+    /// Direction: up while there is headroom, down only when there is not.
+    /// Upward first is the point — it never walks the pump toward its stall
+    /// floor.
+    #[test]
+    fn pump_identify_prefers_the_upward_direction() {
+        let delta = crate::constants::IDENTIFY_PUMP_DELTA_PCT;
+        for baseline in 30..=(100 - delta) {
+            let (target, _) =
+                identify_target_for_role(crate::hwmon::roles::HeaderRole::Pump, Some(baseline));
+            assert_eq!(
+                target,
+                baseline + delta,
+                "with headroom, {baseline}% must perturb UPWARD"
+            );
+        }
+        // No headroom → downward, clamped at the floor.
+        for baseline in (100 - delta + 1)..=100 {
+            let (target, _) =
+                identify_target_for_role(crate::hwmon::roles::HeaderRole::Pump, Some(baseline));
+            assert!(
+                target < baseline,
+                "without headroom, {baseline}% must perturb DOWNWARD"
+            );
+        }
+    }
+
+    /// Every non-pump role keeps the ordinary DEC-166 stop. This is the
+    /// "existing fan behaviour remains intact" acceptance criterion.
+    #[test]
+    fn every_non_pump_role_still_stops_at_zero() {
+        use crate::hwmon::roles::HeaderRole;
+        for role in [
+            HeaderRole::Unknown,
+            HeaderRole::CpuFan,
+            HeaderRole::RadiatorFan,
+            HeaderRole::ChassisFan,
+        ] {
+            for baseline in [None, Some(0), Some(50), Some(100)] {
+                assert_eq!(
+                    identify_target_for_role(role, baseline),
+                    (0, IdentifyMode::Stop),
+                    "{role:?} at {baseline:?} must still stop"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn identify_hold_records_its_target_and_mode_on_the_status_row() {
+        let mut t = OverrideTable::new();
+        t.identify_hold("hwmon:x:pwm1:PUMP", 85, IdentifyMode::PumpPerturb, ttl());
+        t.identify_hold("openfan:ch00", 0, IdentifyMode::Stop, ttl());
+        let (_, rows) = t.status_rows();
+        let pump = rows
+            .iter()
+            .find(|r| r.fan_id == "hwmon:x:pwm1:PUMP")
+            .unwrap();
+        assert_eq!(pump.mode, IdentifyMode::PumpPerturb);
+        assert_eq!(pump.identify_pwm_percent, 85);
+        let fan = rows.iter().find(|r| r.fan_id == "openfan:ch00").unwrap();
+        assert_eq!(fan.mode, IdentifyMode::Stop);
+        assert_eq!(fan.identify_pwm_percent, 0);
+        // …and the engine-facing snapshot carries the duty, not just the id.
+        assert_eq!(t.snapshot().identify.get("hwmon:x:pwm1:PUMP"), Some(&85));
+    }
+
     #[test]
     fn identify_stop_auto_restores_after_deadman() {
         let clock = ManualClock::new();
         let mut t = OverrideTable::with_clock(clock.clone());
-        t.identify_stop("openfan:ch00", Duration::from_secs(10));
-        assert!(t.snapshot().identify_stop.contains("openfan:ch00"));
+        t.identify_hold(
+            "openfan:ch00",
+            0,
+            IdentifyMode::Stop,
+            Duration::from_secs(10),
+        );
+        assert!(t.snapshot().identify.contains_key("openfan:ch00"));
 
         clock.advance(Duration::from_secs(11));
         let cleared = t.sweep();
         assert_eq!(cleared.fans, vec!["openfan:ch00".to_string()]);
-        assert!(t.snapshot().identify_stop.is_empty());
+        assert!(t.snapshot().identify.is_empty());
     }
 
     #[test]
     fn identify_restore_removes_immediately() {
         let mut t = OverrideTable::new();
-        t.identify_stop("hwmon:nct6775:pwm1", Duration::from_secs(10));
+        t.identify_hold(
+            "hwmon:nct6775:pwm1",
+            0,
+            IdentifyMode::Stop,
+            Duration::from_secs(10),
+        );
         t.identify_restore("hwmon:nct6775:pwm1");
-        assert!(t.snapshot().identify_stop.is_empty());
+        assert!(t.snapshot().identify.is_empty());
     }
 
     #[test]
@@ -528,7 +748,7 @@ mod tests {
         let mut t = OverrideTable::with_clock(clock.clone());
         t.take_override("ctrl-b", 60, Duration::from_secs(15));
         t.take_override("ctrl-a", 50, Duration::from_secs(15));
-        t.identify_stop("fan-z", Duration::from_secs(10));
+        t.identify_hold("fan-z", 0, IdentifyMode::Stop, Duration::from_secs(10));
         clock.advance(Duration::from_secs(4));
 
         let (ovr, ident) = t.status_rows();
@@ -544,7 +764,7 @@ mod tests {
         let clock = ManualClock::new();
         let mut t = OverrideTable::with_clock(clock.clone());
         t.take_override("ctrl-a", 50, Duration::from_secs(10));
-        t.identify_stop("fan-z", Duration::from_secs(10));
+        t.identify_hold("fan-z", 0, IdentifyMode::Stop, Duration::from_secs(10));
 
         // One nanosecond before the deadline: both still reported.
         clock.advance(Duration::from_secs(10) - Duration::from_nanos(1));
@@ -597,7 +817,7 @@ mod tests {
         let mut t = OverrideTable::new();
         let g1 = t.take_override("cpu", 80, ttl());
         t.take_override("gpu", 40, ttl());
-        t.identify_stop("openfan:ch00", ttl());
+        t.identify_hold("openfan:ch00", 0, IdentifyMode::Stop, ttl());
 
         t.clear_all_overrides();
 
@@ -607,7 +827,7 @@ mod tests {
             "every control-override must be cleared on activation"
         );
         assert!(
-            snap.identify_stop.contains("openfan:ch00"),
+            snap.identify.contains_key("openfan:ch00"),
             "identify-stops survive a profile activation (per-fan, not per-profile)"
         );
 

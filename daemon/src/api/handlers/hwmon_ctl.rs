@@ -29,11 +29,14 @@ pub async fn hwmon_headers_handler(
 
     let ctrl = controller.lock();
 
-    // DEC-146 P3-12: single mapping source — From<&PwmHeaderDescriptor>.
+    // DEC-146 P3-12: single mapping source — `PwmHeaderEntry::from_descriptor`.
+    // DEC-311: the user's role assignment is overlaid here; the descriptor
+    // carries only what discovery could infer.
+    let assigned = state.header_roles();
     let headers = ctrl
         .headers()
         .into_iter()
-        .map(PwmHeaderEntry::from)
+        .map(|h| PwmHeaderEntry::from_descriptor(h, assigned.get(&h.id).copied()))
         .collect();
 
     json_ok(
@@ -108,8 +111,13 @@ pub async fn hwmon_rescan_handler(
     let hwmon_root = std::path::Path::new(HWMON_SYSFS_ROOT);
     match discover_pwm_headers(hwmon_root) {
         Ok(headers) => {
-            // DEC-146 P3-12: single mapping source — From<&PwmHeaderDescriptor>.
-            let entries: Vec<PwmHeaderEntry> = headers.iter().map(PwmHeaderEntry::from).collect();
+            // DEC-146 P3-12: single mapping source — `from_descriptor` (DEC-311
+            // overlays the user's role assignment).
+            let assigned = state.header_roles();
+            let entries: Vec<PwmHeaderEntry> = headers
+                .iter()
+                .map(|h| PwmHeaderEntry::from_descriptor(h, assigned.get(&h.id).copied()))
+                .collect();
             log::info!("Hwmon rescan: found {} PWM header(s)", entries.len());
             let count = entries.len();
             json_ok(
@@ -160,6 +168,49 @@ impl Drop for VerifyLeaseGuard {
             .lock()
             .lease_manager_mut()
             .release_lease(&self.lease_id);
+    }
+}
+
+/// The duty `POST /hwmon/{id}/verify` drives the header to for its settle window.
+///
+/// Pure and separately testable **because the two constraints on it pull against
+/// each other**, and the first attempt at this satisfied one while breaking the
+/// other:
+///
+/// 1. **Never under-drive a pump** (`AIO1-a` / DEC-311). The old rule was a flat
+///    `if current > 50 { 20 } else { 80 }`, and 20 % is below the daemon's own
+///    30 % pump floor — so verifying a motherboard AIO pump, which normally idles
+///    above 50 %, under-drove it for ~6 s. Verify was the one write path that
+///    never consulted `member_effective_floor`.
+/// 2. **Move far enough to be measurable.** `classify_verify_result` requires a
+///    **>20 % RPM change** (`init_rpm / 5`) before it will call a header
+///    `effective`. A duty that respects the floor but barely moves therefore
+///    reports a perfectly good pump as `no_rpm_effect` — "PWM writes may be
+///    accepted but have no hardware effect". The fix for (1) originally read
+///    `if current <= 75 { 80 }`, which at 75 % is a **5-point** delta: safe, and
+///    a false alarm on every pump between roughly 60 % and 80 %.
+///
+/// So a pump takes whichever direction yields the **larger** delta, preferring
+/// upward on a tie (upward never walks a pump toward its stall floor). The
+/// result is always `>= HARD_PUMP_CPU_FLOOR_PCT` and always at least 35 points
+/// from `current_pct` — see `pump_verify_duty_is_always_floored_and_measurable`,
+/// which asserts both over every possible input rather than sampling.
+///
+/// A non-pump header keeps the original 20/80 pair, byte-identical.
+fn verify_test_duty(is_pump: bool, current_pct: u8) -> u8 {
+    if !is_pump {
+        return if current_pct > 50 { 20 } else { 80 };
+    }
+    const DELTA: u8 = 40;
+    let floor = crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8;
+    let up = current_pct.saturating_add(DELTA).min(100).max(floor);
+    let down = current_pct.saturating_sub(DELTA).max(floor);
+    let up_delta = up.abs_diff(current_pct);
+    let down_delta = down.abs_diff(current_pct);
+    if up_delta >= down_delta {
+        up
+    } else {
+        down
     }
 }
 
@@ -274,6 +325,11 @@ pub async fn hwmon_verify_handler(
     // a fixed duty and nothing left to drive it.
     let bg_shutdown = state.openfan_runtime.shutdown.clone();
     let bg_header_id = header_id.clone();
+    // DEC-311: resolved BEFORE the blocking task so the role lookup never runs
+    // under `spawn_blocking` with the controller lock in play. The UNION
+    // predicate, not the resolved role — a user assignment must not be able to
+    // strip protection the header's own label already earned.
+    let bg_is_pump = state.header_is_pump_protected(&header_id);
     let bg_lease_id = verify_lease_id.clone();
     let join = tokio::task::spawn_blocking(move || {
         // Moved, not borrowed: dropped only when this task finishes, so the
@@ -308,7 +364,7 @@ pub async fn hwmon_verify_handler(
 
         // Test PWM: a significant delta from current, in whichever direction has room.
         let current_pct = initial.pwm_percent.unwrap_or(50);
-        let test_pct: u8 = if current_pct > 50 { 20 } else { 80 };
+        let test_pct: u8 = verify_test_duty(bg_is_pump, current_pct);
 
         // Write test value via controller (sets pwm_enable=1 + PWM).
         // Route errors through the shared HwmonControlError mapper: if the daemon's
@@ -528,18 +584,265 @@ mod tests {
         }
     }
 
+    /// [SAFETY] `AIO1-a` / DEC-311, over EVERY possible input.
+    ///
+    /// Two properties, and the first draft of this rule satisfied one while
+    /// breaking the other — which is why both are asserted here and why the
+    /// assertion is exhaustive rather than sampled:
+    ///   1. a pump is never driven below `HARD_PUMP_CPU_FLOOR_PCT`;
+    ///   2. the duty moves far enough for `classify_verify_result` to see it
+    ///      (>20% RPM change), or a healthy pump reports `no_rpm_effect`.
+    #[test]
+    fn pump_verify_duty_is_always_floored_and_measurable() {
+        let floor = crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8;
+        for current in 0..=100u8 {
+            let t = verify_test_duty(true, current);
+            assert!(
+                t >= floor,
+                "pump at {current}% tested at {t}%, below the {floor}% floor"
+            );
+            assert!(t <= 100, "pump at {current}% tested at {t}%");
+            assert!(
+                t.abs_diff(current) >= 30,
+                "pump at {current}% tested at {t}% — a {}-point move is too small \
+                 for classify_verify_result's >20% RPM threshold, so a healthy \
+                 pump would report `no_rpm_effect`",
+                t.abs_diff(current)
+            );
+        }
+    }
+
+    /// The non-pump path must be byte-identical to the pre-DEC-311 rule, or this
+    /// change silently altered verify for every fan on every machine.
+    #[test]
+    fn ordinary_verify_duty_is_unchanged() {
+        for current in 0..=100u8 {
+            let expected = if current > 50 { 20 } else { 80 };
+            assert_eq!(
+                verify_test_duty(false, current),
+                expected,
+                "ordinary header at {current}% must keep the original duty"
+            );
+        }
+    }
+
+    /// [SAFETY] The CALL SITE, not just the helper (`CLAUDE.md`: extracting a
+    /// rule into a testable function does not test the call site).
+    ///
+    /// Two things break independently and neither shows up in the table tests
+    /// above: the handler could stop consulting the role at all, and
+    /// `header_is_pump_protected` is keyed by *header* id while identify and
+    /// verify address a *fan* id — if those key spaces diverge the lookup
+    /// silently misses and every pump falls back to the unprotected path,
+    /// reporting success the whole way.
+    ///
+    /// **The baseline must be above 50%** or this test proves nothing: the
+    /// ordinary path picks 80% for anything at-or-below 50%, so a header whose
+    /// `pwm_path` does not exist (`current_pct` defaults to 50) passes with the
+    /// role check deleted. The first version of this test did exactly that and
+    /// its own bypass-the-fix validity check caught it.
+    #[tokio::test]
+    async fn verify_never_under_drives_a_pump_labelled_header() {
+        let (state, writes, _shutdown_tx, _tmp) =
+            verify_test_state_at_duty(230, crate::hwmon::roles::HeaderRole::Pump); // ~90%
+
+        let _ = hwmon_verify_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("hwmon:test:dev:pwm1".to_string()),
+        )
+        .await;
+
+        let floor = crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8;
+        let duties = pwm_duties(&writes);
+        assert!(!duties.is_empty(), "the verify wrote no PWM value at all");
+        for d in &duties {
+            assert!(
+                *d >= floor,
+                "verify drove a pump-labelled header to {d}%, below the {floor}% \
+                 floor (all duties: {duties:?})"
+            );
+        }
+    }
+
+    /// The other half: an ordinary header at the same 90% baseline must still
+    /// take the original downward 20% test. Without this, clamping everything to
+    /// the floor would pass the test above and change verify for every fan.
+    #[tokio::test]
+    async fn verify_leaves_an_ordinary_header_on_the_original_duty() {
+        let (state, writes, _shutdown_tx, _tmp) =
+            verify_test_state_at_duty(230, crate::hwmon::roles::HeaderRole::ChassisFan);
+        let _ = hwmon_verify_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("hwmon:test:dev:pwm1".to_string()),
+        )
+        .await;
+        let duties = pwm_duties(&writes);
+        assert!(
+            duties.contains(&20),
+            "an ordinary header at 90% must still test at 20%: {duties:?}"
+        );
+    }
+
+    /// [SAFETY] DEC-311: assigning `pump` to a header that is ALREADY held at 0
+    /// by a live identify must release that hold.
+    ///
+    /// The identify target is an absolute duty chosen from the role at take
+    /// time, so without this the exact sequence a user performs during setup —
+    /// start identify on an unlabelled header, hear the pump stop, assign
+    /// `pump` — would leave a real pump at 0 until the deadman fired (up to
+    /// `OVERRIDE_TTL_SECS`). The union predicate does NOT close this: on a
+    /// label-less header, which is the whole AIO-MB target case, the assignment
+    /// is the only evidence and it arrives after the hold was taken.
+    ///
+    /// Tests the WIRING — that `update_header_role_handler` actually calls
+    /// `identify_restore` — not just that `identify_restore` works.
+    #[tokio::test]
+    async fn assigning_pump_releases_a_live_identify_hold() {
+        let (state, _writes, _shutdown_tx, _tmp) =
+            verify_test_state_at_duty(230, crate::hwmon::roles::HeaderRole::Unknown);
+        let id = "hwmon:test:dev:pwm1";
+
+        // A hold taken while the header looked like an ordinary fan: pinned to 0.
+        state.override_table.lock().identify_hold(
+            id,
+            0,
+            crate::control_override::IdentifyMode::Stop,
+            std::time::Duration::from_secs(15),
+        );
+        assert_eq!(
+            state.override_table.lock().snapshot().identify.get(id),
+            Some(&0),
+            "precondition: the header must actually be held at 0"
+        );
+
+        let (status, body) = crate::api::handlers::update_header_role_handler(
+            axum::extract::State(state.clone()),
+            axum::response::Json(serde_json::json!({ "header_id": id, "role": "pump" })),
+        )
+        .await;
+        assert_eq!(status, 200, "{body:?}");
+
+        assert!(
+            !state
+                .override_table
+                .lock()
+                .snapshot()
+                .identify
+                .contains_key(id),
+            "assigning `pump` must release a hold that is pinning it to 0"
+        );
+    }
+
+    /// The converse: a NON-pump assignment must not disturb a live hold, or
+    /// every role edit would silently cancel an identify in progress.
+    #[tokio::test]
+    async fn assigning_a_non_pump_role_leaves_a_live_hold_alone() {
+        let (state, _writes, _shutdown_tx, _tmp) =
+            verify_test_state_at_duty(230, crate::hwmon::roles::HeaderRole::Unknown);
+        let id = "hwmon:test:dev:pwm1";
+        state.override_table.lock().identify_hold(
+            id,
+            0,
+            crate::control_override::IdentifyMode::Stop,
+            std::time::Duration::from_secs(15),
+        );
+
+        let (status, _) = crate::api::handlers::update_header_role_handler(
+            axum::extract::State(state.clone()),
+            axum::response::Json(serde_json::json!({ "header_id": id, "role": "chassis_fan" })),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            state.override_table.lock().snapshot().identify.get(id),
+            Some(&0),
+            "a non-pump assignment must not cancel an identify in progress"
+        );
+    }
+
+    /// Every PWM percentage this verify commanded.
+    fn pwm_duties(writes: &WriteLog) -> Vec<u8> {
+        writes
+            .lock()
+            .iter()
+            .filter(|(path, _)| path.ends_with("/pwm1"))
+            .filter_map(|(_, v)| v.trim().parse::<u8>().ok())
+            .map(crate::pwm::raw_to_percent)
+            .collect()
+    }
+
     fn verify_test_state() -> (Arc<AppState>, WriteLog, tokio::sync::watch::Sender<bool>) {
+        let (state, writes, tx, _tmp) =
+            build_verify_state(None, crate::hwmon::roles::HeaderRole::Unknown);
+        // `_tmp` is dropped here on purpose: this variant's callers never read a
+        // duty back, and its paths were always non-existent.
+        (state, writes, tx)
+    }
+
+    /// Verify harness with a REAL `pwm1` file holding `raw` (0..=255), so
+    /// `initial.pwm_percent` is a genuine value rather than the 50% default, and
+    /// with the header's inferred role set.
+    ///
+    /// The real file is the load-bearing part: at the 50% default the ordinary
+    /// and pump branches both choose 80%, so a test built on the old harness
+    /// passed with the role check deleted.
+    fn verify_test_state_at_duty(
+        raw: u8,
+        role: crate::hwmon::roles::HeaderRole,
+    ) -> (
+        Arc<AppState>,
+        WriteLog,
+        tokio::sync::watch::Sender<bool>,
+        tempfile::TempDir,
+    ) {
+        let (state, writes, tx, tmp) = build_verify_state(Some(raw), role);
+        (state, writes, tx, tmp.expect("a duty was requested"))
+    }
+
+    fn build_verify_state(
+        initial_raw: Option<u8>,
+        role: crate::hwmon::roles::HeaderRole,
+    ) -> (
+        Arc<AppState>,
+        WriteLog,
+        tokio::sync::watch::Sender<bool>,
+        Option<tempfile::TempDir>,
+    ) {
+        let (pwm_path, enable_path, tmp) = match initial_raw {
+            Some(raw) => {
+                let dir = tempfile::tempdir().unwrap();
+                let p = dir.path().join("pwm1");
+                let e = dir.path().join("pwm1_enable");
+                std::fs::write(&p, format!("{raw}\n")).unwrap();
+                std::fs::write(&e, "1\n").unwrap();
+                (
+                    p.display().to_string(),
+                    Some(e.display().to_string()),
+                    Some(dir),
+                )
+            }
+            // Paths need not exist: the state reads are best-effort `.ok()` and a
+            // missing file simply yields `None`.
+            None => (
+                "/nonexistent/pwm1".to_string(),
+                Some("/nonexistent/pwm1_enable".to_string()),
+                None,
+            ),
+        };
         let header = crate::hwmon::pwm_discovery::PwmHeaderDescriptor {
             id: "hwmon:test:dev:pwm1".into(),
-            label: "SYS_FAN".into(),
+            label: if role.is_pump() {
+                "AIO_PUMP"
+            } else {
+                "SYS_FAN"
+            }
+            .into(),
             chip_name: "test".into(),
             device_id: "dev".into(),
             pwm_index: 1,
             supports_enable: true,
-            // Paths need not exist: the state reads are best-effort `.ok()` and a
-            // missing file simply yields `None`, which is all this test needs.
-            pwm_path: "/nonexistent/pwm1".into(),
-            enable_path: Some("/nonexistent/pwm1_enable".into()),
+            pwm_path,
+            enable_path,
             rpm_available: false,
             rpm_path: None,
             min_pwm_percent: 0,
@@ -547,6 +850,12 @@ mod tests {
             is_writable: true,
             pwm_mode: None,
             is_aio: false,
+            role,
+            role_source: if role.is_pump() {
+                crate::hwmon::roles::RoleSource::Label
+            } else {
+                crate::hwmon::roles::RoleSource::None
+            },
         };
         let cache = Arc::new(crate::health::cache::StateCache::new());
         let writes: WriteLog = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -581,8 +890,14 @@ mod tests {
             nvidia_gpus: Vec::new(),
             profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
             config_path: String::new(),
-            runtime_config_path: std::path::PathBuf::new(),
+            runtime_config_path: tmp
+                .as_ref()
+                .map(|d| d.path().join("runtime.toml"))
+                .unwrap_or_default(),
             sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
+                std::collections::HashMap::new(),
+            ))),
             override_table: Arc::new(parking_lot::Mutex::new(
                 crate::control_override::OverrideTable::new(),
             )),
@@ -591,7 +906,7 @@ mod tests {
             readiness_rollup: readiness_rollup.clone(),
             assessment: Arc::new(crate::api::handlers::AssessmentCache::new(readiness_rollup)),
         });
-        (state, writes, shutdown_tx)
+        (state, writes, shutdown_tx, tmp)
     }
 
     /// DEC-290 regression. The verify used to run inline with an `.await` between

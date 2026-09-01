@@ -179,6 +179,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/config/preferred-mb-sensor",
             post(handlers::update_preferred_mb_sensor_handler),
         )
+        // DEC-311 (AIO-MB Phase 1): assign a PWM header's role via
+        // {"header_id": "<id>", "role": "pump"} or clear via {"role": null}.
+        // NOT advisory, unlike the two above — a `pump` assignment earns the
+        // header the 30% hard floor and pump-safe identify, and takes effect
+        // immediately rather than at next start.
+        .route(
+            "/config/header-role",
+            post(handlers::update_header_role_handler),
+        )
         // DEC-243: admin keys made runtime-mutable via the runtime.toml overlay
         // (ADR-002) rather than a privileged helper. All are start-only, so each
         // response says so and GET /config reports restart_pending per key. The

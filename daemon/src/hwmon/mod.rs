@@ -24,6 +24,7 @@ pub mod pwm_control;
 pub mod pwm_discovery;
 pub mod reader;
 pub mod readiness;
+pub mod roles;
 pub mod superio;
 pub mod superio_probe;
 pub mod types;

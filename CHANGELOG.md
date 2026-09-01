@@ -1,5 +1,65 @@
 # Changelog
 
+## [2.28.0] — 2026-09-01
+
+Pairs with `control-ofc-gui` ≥ v2.23.0. **Additive only** — new fields, one new endpoint,
+one new capability flag; nothing removed or reshaped. One *behaviour* narrows deliberately:
+a fan header classified as a pump is no longer stopped during identification.
+
+AIO-MB Phase 1 (DEC-311): motherboard-connected AIO pumps become first-class, without a
+vendor-specific backend.
+
+### Added
+- **Per-channel PWM header roles.** `GET /hwmon/headers` and `GET /inventory/hwmon` gain
+  `role` (`unknown` | `cpu_fan` | `pump` | `radiator_fan` | `chassis_fan`) and `role_source`
+  (`none` | `label` | `chip_mapping` | `user_assigned`). This is orthogonal to the existing
+  chip-level `is_aio`, whose meaning is unchanged: a pump on a motherboard `AIO_PUMP` header
+  is `role: "pump", is_aio: false`, which is exactly the case `is_aio` could never express.
+  Clients must render an unrecognised token rather than dropping the header.
+- **`POST /config/header-role`** — assign or clear a header's role
+  (`{"header_id": "...", "role": "pump"}`; `"role": null` clears). Persisted in `runtime.toml`
+  under `[hardware.header_roles]` and effective **immediately**, not at next start. This is
+  the mechanism that makes the feature work on real hardware: many boards' Super-I/O chips
+  publish no `pwmN_label`/`fanN_label` files at all (measured: `it8696` exposes five channels
+  and zero label files), so there is no label evidence to infer from and the user's assignment
+  is the only signal that a header drives a pump.
+- **Capability `control.header_roles`.** Gate any pump-specific UI wording on it — an older
+  daemon stops pumps, so "the pump will only change speed" is untrue against one.
+
+### Changed
+- **Fan identify no longer stops a pump.** The request is unchanged (`action: "stop"`); the
+  daemon decides what it means from the header's role and reports it in the new `mode` field:
+  `"stop"` (forces 0, floor-exempt — every non-pump role, unchanged) or `"pump_perturb"`
+  (shifts the duty ~25 points clear of the baseline, **upward wherever there is headroom**,
+  clamped into `[30, 100]` — never 0, never below the pump floor). `identify_pwm_percent` and
+  `baseline_pwm_percent` accompany it, and `mode` + `identify_pwm_percent` also appear on each
+  `/status` + `/poll` `fan_identify[]` entry.
+
+  This supersedes DEC-166's "floor-exempt — even a pump". That rule assumed finding a pump
+  *requires* stopping it; an audible RPM change identifies it just as well, and losing coolant
+  flow to locate a header is not a trade to make on a user's behalf. Because the daemon owns
+  the decision, a GUI built against an older daemon gets the safe behaviour for free.
+- **A user-assigned `pump` role earns the 30 % hard floor and the stop-snap exemption**, as a
+  union term — it can add a floor, never remove one. Roles the daemon *infers* change no floor
+  at all: every inferable pump was already inside the existing floor set, which is why both
+  parity oracles (`role_classification.json`, `parity_vectors.json`) pass unchanged with their
+  fixtures untouched.
+
+### Fixed
+- **`POST /hwmon/{id}/verify` no longer drives a pump below the daemon's own pump floor.** Its
+  downward test duty was a flat 20 % — under the 30 % floor the same daemon enforces on every
+  eval tick — so verifying a pump that idles above 50 % (the normal case for a motherboard AIO)
+  under-drove it for the ~6 s settle window. Verify was the one write path that never consulted
+  `member_effective_floor`. A pump header now prefers the upward 80 % test and clamps the
+  downward fallback at the floor; ordinary headers keep the 20/80 pair exactly as before.
+  (Register row `AIO1-a`.)
+
+### Known limit
+- Identify remains a structural no-op for a fan that no control in the **active profile**
+  commands — it rewrites the engine's command vector, and an uncommanded fan produces no
+  command to rewrite — while still returning `200` with a deadman TTL. Pre-existing, unchanged
+  here, and deliberately out of scope; recorded as register row `AIO1-b` for Phase 2.
+
 ## [2.27.0] — 2026-09-01
 
 Pairs with `control-ofc-gui` ≥ v2.23.0; **no wire, schema or API break** — no field was

@@ -131,13 +131,25 @@ pub(crate) fn apply_tuning_with_floor(
 /// declares a lower `minimum_pct`; every other member uses the control-wide
 /// floor. Shared by the curve path and the override path so the safety floor
 /// is computed in exactly one place.
-pub(crate) fn member_effective_floor(control: &LogicalControl, member: &ControlMember) -> f64 {
+pub(crate) fn member_effective_floor(
+    control: &LogicalControl,
+    member: &ControlMember,
+    assigned_roles: &std::collections::HashMap<String, crate::hwmon::roles::HeaderRole>,
+) -> f64 {
     if member_is_gpu(member) {
         0.0
-    } else if member_needs_hard_floor(member) {
+    } else if member_needs_hard_floor(member)
+        || crate::profile::assigned_role_is_pump(member, assigned_roles)
+    {
         // DEC-252: the eval-time superset — the author's label OR the daemon's
         // own discovered one. `validate`'s rejection deliberately stays on the
         // narrower `member_is_pump_or_cpu`; see `member_needs_hard_floor`.
+        //
+        // DEC-311 adds a third union term: the user's explicit header-role
+        // assignment. Same discipline — it can add a floor, never remove one —
+        // and `validate`'s rejection line does not move for the same reason it
+        // did not move for DEC-252 (a daemon that rejected more than the paired
+        // GUI stamps would block profile saving on a split upgrade).
         control.minimum_pct.max(HARD_PUMP_CPU_FLOOR_PCT)
     } else {
         control.minimum_pct

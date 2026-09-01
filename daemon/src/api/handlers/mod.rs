@@ -27,6 +27,7 @@ pub use profile::*;
 pub use status::*;
 
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
@@ -331,6 +332,23 @@ pub struct AppState {
     /// Mutated by the `/control/*/override` + `/fans/*/identify` handlers and
     /// swept + applied by the profile engine tick (both hold this same `Arc`).
     pub override_table: Arc<Mutex<crate::control_override::OverrideTable>>,
+    /// DEC-311: user-assigned PWM header roles, keyed by the header's stable id
+    /// (which for hwmon is also its fan id and its profile `member_id` — one key
+    /// space, so a lookup works from any of the three).
+    ///
+    /// Loaded from `runtime.toml` at boot, replaced wholesale by
+    /// `POST /config/header-role`, and read every tick by the profile engine
+    /// (which holds this same `Arc`). Behind an `RwLock` because the read side
+    /// is the 1 Hz engine plus every `/hwmon/headers` request while the write
+    /// side is a rare operator action.
+    ///
+    /// [SAFETY] Stored as `Arc<HashMap>` *inside* the lock, not `HashMap`, so
+    /// the engine's per-tick read is a clone of the `Arc` under a momentarily
+    /// held read guard rather than a map clone — and, more importantly, so no
+    /// guard is ever held across the evaluation. The engine must never hold a
+    /// lock an API handler can block on while it is computing PWM.
+    pub header_roles:
+        Arc<parking_lot::RwLock<Arc<HashMap<String, crate::hwmon::roles::HeaderRole>>>>,
     /// DEC-203: whether the opt-in active Super-I/O `/dev/port` probe is enabled
     /// (`[detection] allow_port_probe`). Off by default; the probe also needs the
     /// `CAP_SYS_RAWIO` drop-in to actually function.
@@ -369,6 +387,90 @@ impl AppState {
     /// runtime, and a handler that held it open would block a rescan.
     pub fn openfan(&self) -> Option<Arc<Mutex<FanController>>> {
         self.fan_controller.read().clone()
+    }
+
+    /// The current header-role assignment map (DEC-311).
+    ///
+    /// Clones the inner `Arc` out from under the read lock — cheap, and it means
+    /// no caller can hold the lock while doing real work.
+    pub fn header_roles(&self) -> Arc<HashMap<String, crate::hwmon::roles::HeaderRole>> {
+        Arc::clone(&self.header_roles.read())
+    }
+
+    /// The role in force for one header id: the user's assignment if any,
+    /// otherwise the role discovery inferred.
+    ///
+    /// [SAFETY] The single lookup every consumer uses — the headers/inventory
+    /// responses, pump-safe identify, and the role-aware verify duty. Going
+    /// through one function is what stops a new caller reading the descriptor's
+    /// inferred `role` directly and silently ignoring the user's assignment.
+    ///
+    /// This is the **display** role: a user assignment fully replaces the
+    /// inference, which is the honest thing to report back. For the *safety*
+    /// question — may this header be stopped or under-driven? — use
+    /// [`AppState::header_is_pump_protected`], which unions instead.
+    pub fn resolved_header_role(&self, header_id: &str) -> crate::hwmon::roles::HeaderRole {
+        let (assigned, inferred) = self.header_role_parts(header_id);
+        crate::hwmon::roles::resolve_role(assigned, inferred).0
+    }
+
+    /// The user's assignment for a header (if any) and the role discovery
+    /// inferred for it. Split out so the display and safety questions read the
+    /// same two facts and cannot drift apart.
+    ///
+    /// Takes the `header_roles` read lock and releases it *before* acquiring the
+    /// controller lock — deliberately, and load-bearing: `hwmon_headers_handler`
+    /// and the inventory handler take those two in the opposite order, so
+    /// holding both here would complete an ABBA cycle with the 1 Hz engine in
+    /// the middle of it.
+    fn header_role_parts(
+        &self,
+        header_id: &str,
+    ) -> (
+        Option<crate::hwmon::roles::HeaderRole>,
+        (
+            crate::hwmon::roles::HeaderRole,
+            crate::hwmon::roles::RoleSource,
+        ),
+    ) {
+        let assigned = self.header_roles().get(header_id).copied();
+        let inferred = self
+            .hwmon_controller
+            .as_ref()
+            .and_then(|c| {
+                c.lock()
+                    .headers()
+                    .into_iter()
+                    .find(|h| h.id == header_id)
+                    .map(|h| (h.role, h.role_source))
+            })
+            .unwrap_or_default();
+        (assigned, inferred)
+    }
+
+    /// [SAFETY] Whether this header must never be stopped or driven below the
+    /// pump floor — the predicate behind pump-safe identify (DEC-311) and the
+    /// role-aware verify duty (`AIO1-a`).
+    ///
+    /// A **union**, exactly like [`crate::profile_engine::tuning`]'s floor: the
+    /// header is protected if the role in force is `Pump` **or** if the daemon's
+    /// own discovery evidence (a `PUMP`-ish label, or a known liquid-cooler
+    /// chip) says pump. A user assignment can therefore ADD protection — which
+    /// is the entire point on a board that publishes no labels — but it cannot
+    /// REMOVE protection the hardware's own evidence established.
+    ///
+    /// Without the second term the daemon held two contradictory beliefs about
+    /// the same header: `member_effective_floor` unions with
+    /// `member_needs_hard_floor` and so kept a label-derived pump at its 30%
+    /// floor, while identify consulted the fully-substituted role and would
+    /// happily drive that same pump to 0. `POST /config/header-role
+    /// {"role": "chassis_fan"}` on an `AIO_PUMP` header was all it took.
+    pub fn header_is_pump_protected(&self, header_id: &str) -> bool {
+        let (assigned, inferred) = self.header_role_parts(header_id);
+        inferred.0.is_pump()
+            || crate::hwmon::roles::resolve_role(assigned, inferred)
+                .0
+                .is_pump()
     }
 }
 
@@ -543,6 +645,10 @@ pub(crate) fn build_status_response(
         .map(|r| IdentifyStatusEntry {
             fan_id: r.fan_id,
             expires_in_secs: r.expires_in_secs,
+            // DEC-311: a GUI polling into an identify it did not initiate still
+            // needs to describe it truthfully — "stopped" vs "held at 85%".
+            mode: r.mode.as_str().into(),
+            identify_pwm_percent: r.identify_pwm_percent,
         })
         .collect();
 

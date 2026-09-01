@@ -114,6 +114,9 @@ fn test_app_state_inner(engine_ticked: bool, runtime_cfg: std::path::PathBuf) ->
         config_path: String::new(),
         runtime_config_path: runtime_cfg,
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
+            std::collections::HashMap::new(),
+        ))),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
@@ -858,6 +861,9 @@ async fn fans_endpoint_tags_intel_gpu_source_by_id_prefix() {
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
+            std::collections::HashMap::new(),
+        ))),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
@@ -1024,6 +1030,9 @@ fn test_app_state_with_nvidia_gpu(
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
+            std::collections::HashMap::new(),
+        ))),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
@@ -1259,6 +1268,8 @@ fn make_test_header(id: &str, label: &str, min_pwm: u8) -> PwmHeaderDescriptor {
         is_writable: true,
         pwm_mode: None,
         is_aio: false,
+        role: control_ofc_daemon::hwmon::roles::HeaderRole::Unknown,
+        role_source: control_ofc_daemon::hwmon::roles::RoleSource::None,
     }
 }
 
@@ -1298,6 +1309,9 @@ fn test_app_state_with_hwmon() -> Arc<AppState> {
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
+            std::collections::HashMap::new(),
+        ))),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
@@ -1628,6 +1642,9 @@ fn test_app_state_with_unsupported_gpu(pci_bdf: &str) -> Arc<AppState> {
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
+            std::collections::HashMap::new(),
+        ))),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
@@ -1713,6 +1730,9 @@ fn test_app_state_with_read_only_gpu(pci_bdf: &str, pci_device_id: u16) -> Arc<A
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
+            std::collections::HashMap::new(),
+        ))),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
@@ -1788,6 +1808,9 @@ fn test_app_state_with_amd_gpu(
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
+            std::collections::HashMap::new(),
+        ))),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
@@ -2263,6 +2286,9 @@ async fn deactivate_profile_resets_hwmon_coalescing() {
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
+            std::collections::HashMap::new(),
+        ))),
         override_table: Arc::new(Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
@@ -2389,6 +2415,9 @@ fn test_app_state_with_writable_pmfw_gpu(pci_bdf: &str) -> (Arc<AppState>, tempf
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
+            std::collections::HashMap::new(),
+        ))),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
@@ -2571,6 +2600,9 @@ async fn hwmon_discovery_excludes_amdgpu_end_to_end_via_ipc() {
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
+            std::collections::HashMap::new(),
+        ))),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
@@ -2644,6 +2676,9 @@ fn test_app_state_with_profile_dirs(dirs: Vec<std::path::PathBuf>) -> Arc<AppSta
         config_path: String::new(),
         runtime_config_path: std::path::PathBuf::new(),
         sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
+            std::collections::HashMap::new(),
+        ))),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
@@ -4005,6 +4040,142 @@ async fn profile_search_dirs_refuses_to_remove_the_profile_store() {
             .as_deref(),
         Some(store)
     );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+// ── DEC-311 / AIO-MB Phase 1: header roles + pump-safe identify ──────────
+
+#[tokio::test]
+async fn capabilities_advertise_header_roles() {
+    // Load-bearing for TRUTHFULNESS, not just for hiding a button: a GUI that
+    // says "the pump will briefly change speed" is lying against a pre-2.28.0
+    // daemon, which drives the pump to 0 instead.
+    let state = test_app_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/capabilities").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        json["control"]["header_roles"], true,
+        "this daemon classifies header roles and protects pumps: {json}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn header_role_assignment_round_trips_and_validates() {
+    let (state, _tmp) = config_test_state("");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    // An unrecognised role token is REJECTED, never silently defaulted — a typo
+    // that became `unknown` would drop a pump's protection while the response
+    // said "updated".
+    let (status, json) = uds_post(
+        &path,
+        "/config/header-role",
+        &serde_json::json!({ "header_id": "hwmon:x:pwm1:PUMP", "role": "impeller" }),
+    )
+    .await;
+    assert_eq!(status, 400, "unknown role token must be rejected: {json}");
+    assert_eq!(json["error"]["code"], "validation_error");
+
+    // A missing `role` key is a 400 (distinct from an explicit null, which clears).
+    let (status, _) = uds_post(
+        &path,
+        "/config/header-role",
+        &serde_json::json!({ "header_id": "hwmon:x:pwm1:PUMP" }),
+    )
+    .await;
+    assert_eq!(status, 400);
+
+    // A missing/empty header_id is a 400.
+    let (status, _) = uds_post(
+        &path,
+        "/config/header-role",
+        &serde_json::json!({ "role": "pump" }),
+    )
+    .await;
+    assert_eq!(status, 400);
+
+    // Assigning to a header this daemon has never discovered is a 400 rather
+    // than a silently-stored assignment that can never take effect.
+    let (status, json) = uds_post(
+        &path,
+        "/config/header-role",
+        &serde_json::json!({ "header_id": "hwmon:nope:pwm9:X", "role": "pump" }),
+    )
+    .await;
+    assert_eq!(status, 400, "unknown header id must be rejected: {json}");
+
+    // Clearing is always allowed, even for an id that no longer exists — a
+    // stale assignment must never become unreachable.
+    let (status, json) = uds_post(
+        &path,
+        "/config/header-role",
+        &serde_json::json!({ "header_id": "hwmon:nope:pwm9:X", "role": null }),
+    )
+    .await;
+    assert_eq!(status, 200, "a clear must always be possible: {json}");
+    assert_eq!(json["updated"], true);
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn hwmon_headers_carry_role_and_role_source() {
+    // The GUI joins fan → header by id to learn a fan is a pump, so the field
+    // has to be on this response (and on /inventory/hwmon, which shares the
+    // same entry type — one struct, so one assertion covers the shape).
+    let state = test_app_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/hwmon/headers").await;
+    assert_eq!(status, 200);
+    // The test state has no hwmon controller, so the list is empty; assert the
+    // envelope rather than inventing hardware. The per-field shape is pinned by
+    // the roles unit tests and the serde round-trip test.
+    assert!(json["headers"].is_array(), "{json}");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn identify_reports_the_mode_it_actually_used() {
+    // DEC-311: the client asks for "stop"; the DAEMON decides what that means
+    // and says which it did. An unclassified fan still stops — the
+    // "existing ordinary fan behaviour remains intact" acceptance criterion.
+    let state = test_app_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_post(
+        &path,
+        "/fans/openfan:ch00/identify",
+        &serde_json::json!({ "action": "stop" }),
+    )
+    .await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(
+        json["mode"], "stop",
+        "an unclassified fan still stops: {json}"
+    );
+    assert_eq!(json["identify_pwm_percent"], 0);
+
+    // Restore omits the mode/duty fields entirely (nothing is being held).
+    let (status, json) = uds_post(
+        &path,
+        "/fans/openfan:ch00/identify",
+        &serde_json::json!({ "action": "restore" }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(json.get("mode").is_none(), "restore holds nothing: {json}");
+    assert!(json.get("identify_pwm_percent").is_none());
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);

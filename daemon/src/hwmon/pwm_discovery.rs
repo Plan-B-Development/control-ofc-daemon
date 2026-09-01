@@ -49,6 +49,18 @@ pub struct PwmHeaderDescriptor {
     /// and floor pumps without re-deriving hardware knowledge. Writability
     /// still rides `is_writable`. See `aio.rs`.
     pub is_aio: bool,
+    /// What this channel drives, **inferred** from its label and chip
+    /// (AIO-MB Phase 1). Per-channel, and orthogonal to the chip-level
+    /// `is_aio` — a pump on a motherboard `AIO_PUMP` header is
+    /// `role: Pump, is_aio: false`, which is the whole point of the field.
+    ///
+    /// Discovery has no access to the user's `runtime.toml` assignments, so
+    /// this is the inference **only**. Consumers must overlay the assignment
+    /// with `roles::resolve_role` — see `AppState::resolved_header_role`.
+    pub role: crate::hwmon::roles::HeaderRole,
+    /// How `role` was established. `RoleSource::None` whenever the role is
+    /// `Unknown`.
+    pub role_source: crate::hwmon::roles::RoleSource,
 }
 
 /// Discover all controllable PWM outputs under a given hwmon root.
@@ -150,6 +162,11 @@ fn discover_device_pwm(hwmon_dir: &Path) -> Result<Vec<PwmHeaderDescriptor>, Hwm
 
         let id = build_stable_id(&chip_name, &device_id, pwm_index, &label);
 
+        // Per-channel role (AIO-MB Phase 1). Inference only — the user's
+        // assignment lives in `runtime.toml` and is overlaid by the API layer.
+        let (role, role_source) =
+            crate::hwmon::roles::classify_header_role(&chip_name, pwm_index, &label);
+
         // Check if pwmN is writable (probe file permissions)
         let is_writable = std::fs::metadata(&pwm_path)
             .map(|m| !m.permissions().readonly())
@@ -189,6 +206,8 @@ fn discover_device_pwm(hwmon_dir: &Path) -> Result<Vec<PwmHeaderDescriptor>, Hwm
             is_writable,
             pwm_mode,
             is_aio,
+            role,
+            role_source,
         });
     }
 

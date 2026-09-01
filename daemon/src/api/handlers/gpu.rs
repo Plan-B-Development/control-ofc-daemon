@@ -795,6 +795,9 @@ mod tests {
             config_path: String::new(),
             runtime_config_path: std::path::PathBuf::new(),
             sensor_rescan_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
+                std::collections::HashMap::new(),
+            ))),
             override_table: Arc::new(parking_lot::Mutex::new(
                 crate::control_override::OverrideTable::new(),
             )),

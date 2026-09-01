@@ -191,7 +191,8 @@ As of 2.0.0 the profile engine is the **sole writer** (DEC-159 / DEC-165) — th
 | `POST /control/{control_id}/override` | Pin a control's fans to a fixed PWM — expiring, floor-clamped, deadman auto-reverts to the curve. Body `{"pwm_percent": 0..100, "ttl_secs"?}` |
 | `POST /control/{control_id}/override/renew` | Extend the override deadman (fresh TTL). Body `{"override_token": N}` |
 | `DELETE /control/{control_id}/override` | Release the override, reverting to curve control immediately. Body `{"override_token": N}` |
-| `POST /fans/{fan_id}/identify` | Stop or restore one fan for physical identification (floor-exempt, deadman auto-restore). Body `{"action": "stop"\|"restore", "ttl_secs"?}` |
+| `POST /fans/{fan_id}/identify` | Hold or restore one fan for physical identification (deadman auto-restore). An ordinary fan is stopped; a `role: pump` header is perturbed instead, never stopped (DEC-311). Body `{"action": "stop"\|"restore", "ttl_secs"?}` |
+| `POST /config/header-role` | Assign or clear one PWM header's role (DEC-311). Body `{"header_id": "<id>", "role": "pump"\|"cpu_fan"\|"radiator_fan"\|"chassis_fan"\|"unknown"\|null}` |
 
 **Diagnostics / maintenance:**
 
@@ -253,7 +254,20 @@ Active overrides also appear in `GET /status` (`overrides[]` of `{control_id, pw
 
 ### Identifying a fan (temporary stop/restore)
 
-To find which physical fan is which, the fan-identify API stops a single fan briefly so you can spot the one that went quiet. It is floor-exempt (it can stop even a pump) and auto-restores on a deadman, so a crashed client can never leave a fan stopped (DEC-166):
+To find which physical fan is which, the fan-identify API changes a single fan briefly so you can spot the one that responded. It auto-restores on a deadman, so a crashed client can never leave a fan held (DEC-166).
+
+**A pump is never stopped (DEC-311).** You always send `action: "stop"`; the daemon decides what that means from the header's role. An ordinary fan is driven to 0 (floor-exempt). A header whose role resolves to `pump` is *perturbed* instead — shifted about 25 points clear of its current duty, upward wherever there is headroom, and never below the 30 % pump floor. The response's `mode` field says which happened (`"stop"` or `"pump_perturb"`), along with `identify_pwm_percent` and `baseline_pwm_percent`.
+
+If your pump is on a header the daemon cannot classify — common on boards whose Super-I/O publishes no fan labels, where every header reads `role: "unknown"` — tell it explicitly first:
+
+```bash
+curl -s --unix-socket /run/control-ofc/control-ofc.sock \
+  -X POST -H 'Content-Type: application/json' \
+  -d '{"header_id":"hwmon:it8696:it87.2624:pwm5:pwm5","role":"pump"}' \
+  http://localhost/config/header-role
+```
+
+That assignment persists in `runtime.toml`, takes effect immediately, and also earns the header the 30 % pump floor and the stop-snap exemption.
 
 ```bash
 SOCK="/run/control-ofc/control-ofc.sock"

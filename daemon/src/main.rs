@@ -1565,6 +1565,13 @@ async fn async_main() {
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
+        // DEC-311: user-assigned header roles, restored from runtime.toml at
+        // boot. A `pump` assignment is a safety floor, so it must survive a
+        // restart — an unrecognised token is dropped with a warning rather than
+        // failing the load (see `header_roles_parsed`).
+        header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
+            runtime_cfg.header_roles_parsed(),
+        ))),
         allow_port_probe: config.detection.allow_port_probe,
         running_config: config.clone(),
         // DEC-206/207: seeded by the assessment task below once the poll cache is
@@ -1576,8 +1583,9 @@ async fn async_main() {
         )),
     });
 
-    // Silence "assigned but not read" — runtime_cfg is consumed by the
-    // overlay/migration above; the variable itself is no longer needed.
+    // runtime_cfg is consumed by the overlay/migration above and by the
+    // DEC-311 header-role restore in `AppState`; the variable itself is no
+    // longer needed.
     drop(runtime_cfg);
 
     // Populate panic hook targets now that hardware is discovered.
@@ -1724,6 +1732,7 @@ async fn async_main() {
         let engine_hwmon = app_state.hwmon_controller.clone();
         let engine_gpus = app_state.amd_gpus.clone();
         let engine_overrides = app_state.override_table.clone();
+        let engine_roles = app_state.header_roles.clone();
         let engine_shutdown = poll_shutdown_rx;
 
         spawn_supervised(async move {
@@ -1735,6 +1744,7 @@ async fn async_main() {
                 engine_gpus,
                 engine_safety,
                 engine_overrides,
+                engine_roles,
                 engine_shutdown,
             )
             .await;
@@ -2899,6 +2909,8 @@ mod tests {
             is_writable: true,
             pwm_mode: None,
             is_aio: false,
+            role: control_ofc_daemon::hwmon::roles::HeaderRole::Unknown,
+            role_source: control_ofc_daemon::hwmon::roles::RoleSource::None,
         }
     }
 

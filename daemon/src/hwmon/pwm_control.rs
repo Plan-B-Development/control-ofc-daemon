@@ -533,6 +533,8 @@ mod tests {
             is_writable: true,
             pwm_mode: None,
             is_aio: false,
+            role: crate::hwmon::roles::HeaderRole::Unknown,
+            role_source: crate::hwmon::roles::RoleSource::None,
         }
     }
 
