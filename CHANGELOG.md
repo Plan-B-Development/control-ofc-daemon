@@ -1,5 +1,20 @@
 # Changelog
 
+## [2.28.1] — 2026-09-02
+
+Pairs with `control-ofc-gui` ≥ v2.23.0 (unchanged floor). **Documentation only — no code
+change.** The daemon binary is byte-for-byte 2.28.0; this release exists so the corrected
+`USER_GUIDE.md` reaches the copy installed at `/usr/share/doc/control-ofc-daemon/`.
+
+### Changed
+- **The support table no longer says a hwmon AIO pump runs at a constant speed.** That was
+  the GUI's rule (DEC-157) and the GUI has retracted it (DEC-312): whether a pump should
+  hold a fixed speed is a property of the cooler, not a fact about pumps, and vendors
+  contradict each other about their own hardware. The row now reads "fixed speed or a
+  temperature curve, always floored at 30%", and notes that a motherboard-connected pump
+  is configured the same way once its header carries the `pump` role — assigned by GUI
+  v2.51.0, or by `POST /config/header-role` for any other client.
+
 ## [2.28.0] — 2026-09-01
 
 Pairs with `control-ofc-gui` ≥ v2.23.0. **Additive only** — new fields, one new endpoint,
