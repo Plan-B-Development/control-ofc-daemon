@@ -8,27 +8,27 @@
 //! deliberately not restated here — DEC-292 reduced them to one definition each
 //! precisely because a doc that spells a threshold out drifts from it.
 //!
-//! **The 60% step is a REPLACEMENT, not a floor — this doc used to say "floor"
-//! and that was wrong (`D1-j`).** Every value this rule returns reaches the
-//! engine as `decision.forced_pct`, and the engine's forced branch calls
-//! `force_all(pct)` and then `continue`s, skipping profile evaluation entirely.
-//! So on release the fans are driven **to** 60%, not held **at or above** it: a
-//! curve asking for 100% at that temperature is overridden downward for two
-//! ticks, immediately after an excursion, while the CPU is still hot. Same
-//! shape for the no-CPU-sensor duty.
+//! **Every value this rule returns is a FLOOR, and since DEC-307 the engine
+//! implements it as one.** Each reaches the engine as `decision.forced_pct`,
+//! and the forced branch calls `force_all_with_floor(pct, &commands)`: every
+//! OpenFan channel and writable hwmon header is written — including the ones no
+//! control commands, which is what preserves the emergency's reach — and a
+//! commanded output gets `max(commanded, pct)`.
 //!
-//! That is a real defect and it is **not fixed here** — correcting it means the
-//! engine must evaluate the profile during a forced tick and write
-//! `max(computed, forced)`, which cannot simply clamp the computed commands:
-//! `force_all` reaches every writable header and every OpenFan channel
-//! regardless of whether any control commands it, so clamping commands alone
-//! would shrink the emergency's reach to controlled fans only — the v2.38.0 P1
-//! shape. The correct form is a `force_all_with_floor(pct, &commands)` on
-//! `SafetyWriteBackend`, which is a trait change across three backends and
-//! interacts with the shared `BoundedWrite` invariant (DEC-289/298/299). It is
-//! tracked as `D1-j` in `DECISIONS_OPEN_ITEMS.md` and deferred to its own
-//! change, deliberately, rather than bolted onto a diff that already moves the
-//! trip point.
+//! It was not always so, and the history is the point (`D1-j`). Until DEC-307
+//! the branch called `force_all(pct)` and `continue`d, skipping profile
+//! evaluation entirely, so the returned value **replaced** the profile's output
+//! instead of flooring it. For the 100% emergency that is invisible, because
+//! 100 is the maximum. For the other two rungs it was not: on release the fans
+//! were driven **to** 60%, so a curve asking for more at that temperature was
+//! overridden *downward* for two ticks immediately after an excursion while the
+//! CPU was still hot; and the no-CPU-sensor duty did the same to a control
+//! driven by a still-healthy GPU or coolant sensor. This doc called the 60%
+//! step a "floor" throughout, which is how the gap survived — name and
+//! behaviour disagreed on a safety path, and only the name was ever read.
+//!
+//! The fix is monotone by construction: no output is ever driven lower than the
+//! old `force_all(pct)` would have driven it.
 //!
 //! GPU fans are deliberately excluded from this rule (DEC-130): there is no
 //! GPU emergency threshold. AMD PMFW firmware owns GPU thermal protection

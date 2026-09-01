@@ -25,7 +25,7 @@ pub trait SerialTransport {
 /// succeeds on any readable tty — a modem, an Arduino, a 3D printer — so
 /// accepting a port because it opened lets the wrong device be adopted as the
 /// fan controller. Every subsequent write then "succeeds" against a device that
-/// simply ignores it, **including the thermal emergency `force_all`**: no error is
+/// simply ignores it, **including the thermal emergency `force_all_with_floor`**: no error is
 /// ever returned, so no `THERMAL SAFETY ... FAILED` is logged, `/status` reports
 /// OpenFan healthy, and not one OpenFan-attached fan is actually being driven.
 ///
@@ -53,7 +53,7 @@ const MAX_DEBUG_LINES: usize = 50;
 ///
 /// A desynchronised link is usually one frame behind, but the worst *legitimate*
 /// backlog is larger than that: a board slower than `serial.timeout_ms` can make
-/// all ten writes of a `force_all` tick time out while their acks still arrive, so
+/// all ten writes of a `force_all_with_floor` tick time out while their acks still arrive, so
 /// two such ticks queue ~20 frames. Draining shrinks the backlog by up to this many
 /// per exchange, so even that case resynchronises within two exchanges — it costs
 /// one spurious `Protocol` error, not a stuck link.
@@ -81,13 +81,13 @@ const MAX_STALE_FRAMES: usize = 16;
 ///
 /// Correlation also restores the meaning of a write acknowledgement. `set_pwm`
 /// discards the response and treats `Ok` as "the controller took it", and the
-/// a thermal `force_all` writes through that same path — so an emergency write used
+/// a thermal `force_all_with_floor` writes through that same path — so an emergency write used
 /// to be confirmed by whatever frame happened to be next in the buffer. It is now
 /// confirmed only by an ack **for that channel**; a write the controller never
 /// acknowledges times out and is reported instead of being silently swallowed.
 ///
 /// The per-channel half of that is load-bearing, not decoration: matching on the
-/// opcode alone would leave `force_all`'s ten back-to-back `SetPwm` writes — all
+/// opcode alone would leave `force_all_with_floor`'s ten back-to-back `SetPwm` writes — all
 /// opcode `0x02` — able to absorb a one-frame offset undetected, each confirmed by
 /// its predecessor's ack. See `Command::matches_reply`.
 ///
@@ -444,7 +444,7 @@ mod tests {
     fn send_command_correlates_a_set_pwm_ack() {
         // The mirror direction, and the safety-relevant one: `set_pwm` discards the
         // response and treats Ok as "the controller took it", and the thermal-emergency
-        // `force_all` writes through that path. A poll reply must not be able to
+        // `force_all_with_floor` writes through that path. A poll reply must not be able to
         // stand in as the acknowledgement for a write.
         let ch = Channel::new(3).unwrap();
         let mut transport = MockTransport::new(vec![
@@ -504,7 +504,7 @@ mod tests {
     fn send_command_rejects_another_channels_ack_for_the_same_opcode() {
         // Both DEC-301 reviewers found this independently. Every per-channel write
         // carries opcode 0x02, so opcode-only correlation lets a one-frame offset
-        // ride an entire `force_all` burst: each write confirmed by its
+        // ride an entire `force_all_with_floor` burst: each write confirmed by its
         // predecessor's ack, and the tenth never acknowledged at all. That is the
         // thermal emergency path, so the channel check is the load-bearing half.
         let ch = Channel::new(3).unwrap();

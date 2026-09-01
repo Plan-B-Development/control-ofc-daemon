@@ -196,9 +196,13 @@ impl ProfileEngineState {
     /// (277-i).
     ///
     /// This is the half the thermal-force path actually wants, and separating it
-    /// is the whole of 277-i. `force_all` puts the fans at a known duty, so P3-2's
-    /// reasoning holds: a resumed curve must not step-rate-clamp from a
-    /// pre-emergency anchor. But a thermal emergency says nothing about whether a
+    /// is the whole of 277-i. `force_all_with_floor` puts the fans at or above a
+    /// known duty, so P3-2's reasoning holds: a resumed curve must not
+    /// step-rate-clamp from a pre-emergency anchor. (DEC-307 narrowed "at" to
+    /// "at or above" — the forced duty is now a floor over the profile's own
+    /// output — which leaves the reasoning intact, because the fans are still
+    /// strictly above the curve's own `last_output`.) But a thermal emergency
+    /// says nothing about whether a
     /// control's *curve* resolves, and the full [`Self::deactivate`] also clears
     /// the skip tracker — correct for a profile switch, where the next profile's
     /// controls are genuinely different, and wrong here. The cost of conflating
@@ -208,10 +212,10 @@ impl ProfileEngineState {
     /// exactly while an operator was most likely to be reading it.
     ///
     /// Note what this does NOT do: it does not touch `skipped_this_tick` or
-    /// `skipped_tracker` at all, so the list simply *freezes* for the duration of
-    /// a forced tick. That is the intended reading — a forced tick evaluates no
-    /// curves, so it learns nothing new about resolvability, and the last thing
-    /// it did learn stays true until it evaluates again.
+    /// `skipped_tracker` at all. It is now reached only through
+    /// [`Self::deactivate`] (profile switch / no profile), which clears those
+    /// itself — the thermal-force path stopped calling this in DEC-307 and uses
+    /// [`Self::reset_for_forced_tick`] instead.
     fn deactivate_tuning_only(&mut self) {
         self.last_output.clear();
         self.last_curve_output.clear();
@@ -219,10 +223,13 @@ impl ProfileEngineState {
         self.trigger_latch.clear();
         self.deadband_hold_cycles.clear();
         self.active_profile_id = None;
-        // 277-k: this tick's outputs are facts about an evaluation that is being
-        // abandoned, so they go with the tuning state. A forced tick publishes no
-        // per-control output — `force_all` drives the fans directly and bypasses
-        // every control, so there is no control-wide output to report.
+        // 277-k: this tick's outputs are facts about an evaluation whose result
+        // was only a floor input, so they go with the tuning state. A forced tick
+        // publishes no per-control output — since DEC-307 not because the force
+        // bypasses every control (it no longer does), but because no single
+        // control-wide number is true during one: a control's OpenFan and hwmon
+        // members sit at `max(commanded, forced)` while its GPU members sit at
+        // whatever they last held, GPU being excluded from the force (DEC-130).
         self.tick_outputs.clear();
         // EFF-3: drop the cached eval plan so a re-anchor (epoch bump, thermal
         // force, or no-profile) rebuilds it against whatever activates next.
@@ -230,6 +237,42 @@ impl ProfileEngineState {
         // clears active_profile_id, so the next evaluate rebuilds anyway — but
         // kept so a deactivated state is internally consistent, not half-cleared.)
         self.static_cache = None;
+    }
+
+    /// Cross-tick state a *forced* tick must drop — and nothing more (DEC-307).
+    ///
+    /// [SAFETY] This is the narrow half of [`Self::deactivate_tuning_only`], and
+    /// the difference is load-bearing. P3-2 wants exactly one thing from the
+    /// thermal-force path: a resumed curve must not step-rate-clamp down from a
+    /// pre-emergency anchor. That anchor is `last_output`, and `tuning.rs`'s
+    /// `if let Some(last)` gives the intended unclamped step when it is absent —
+    /// so clearing `last_output` is the whole of P3-2's requirement.
+    ///
+    /// Clearing the *rest* of the tuning state was harmless while a forced tick
+    /// evaluated no curves. DEC-307 made forced ticks evaluate, and the ladder's
+    /// lower rungs can hold for a long time (the 40% no-CPU-sensor rung holds for
+    /// as long as the sensor is missing), so a wider reset would be re-read by
+    /// the *next* forced tick as a cold start, every tick, for the whole hold:
+    ///
+    /// - a cleared `trigger_latch` makes `evaluate_trigger`'s `_` arm test
+    ///   `current_temp >= load_temp`, so a control latched into its LOAD state
+    ///   between the two trip points falls back to `idle_pct` — a **reduction in
+    ///   the floor's input**, which is the exact defect class DEC-307 exists to
+    ///   remove;
+    /// - cleared `last_curve_output` / `last_transition_temp` disable the DEC-096
+    ///   deadband, so the floor input tracks sensor noise at 1 Hz.
+    ///
+    /// `active_profile_id` and `static_cache` are likewise left alone: dropping
+    /// them rebuilt the cached eval plan on every tick of a hold, for nothing.
+    fn reset_for_forced_tick(&mut self) {
+        self.last_output.clear();
+        // 277-k: a forced tick publishes no per-control output — since DEC-307
+        // not because the force bypasses every control (it no longer does), but
+        // because no single control-wide number is true during one: a control's
+        // OpenFan and hwmon members sit at `max(commanded, forced)` while its GPU
+        // members sit at whatever they last held, GPU being excluded from the
+        // force (DEC-130).
+        self.tick_outputs.clear();
     }
 
     /// Reset state to a profile-less state (call when active profile is
@@ -803,7 +846,7 @@ pub async fn profile_engine_loop(
     // DEC-265: a shared slot, not a value. It can be filled after boot by
     // `POST /fans/openfan/rescan`, and the engine must pick that up — otherwise
     // the route adopts a controller that the sole PWM writer never sees, and the
-    // the thermal `force_all` still has no OpenFan leg.
+    // the thermal `force_all_with_floor` still has no OpenFan leg.
     fan_controller: Arc<
         parking_lot::RwLock<Option<Arc<Mutex<crate::serial::controller::FanController>>>>,
     >,
@@ -937,7 +980,7 @@ pub async fn profile_engine_loop(
         // DEC-259: pairs the start stamp above with a completion stamp on every
         // exit from this body. Without the pair a *slow* tick was indistinguishable
         // from a *stopped* engine, and the surface reported the worse of the two —
-        // "fan control and thermal safety are stalled" while `force_all` was
+        // "fan control and thermal safety are stalled" while `force_all_with_floor` was
         // actively driving the thermal emergency below.
         let mut tick_done = TickCompletion::new(&cache);
         // DEC-289: publish the backends' write-stall state HERE, before any
@@ -965,69 +1008,6 @@ pub async fn profile_engine_loop(
                 || gpu_be.writes_stalled(),
         );
 
-        if let Some(forced_pct) = decision.forced_pct {
-            // Forced safety override — all OpenFan channels and writable
-            // hwmon headers. GPU fans are deliberately excluded (DEC-130):
-            // AMD PMFW firmware owns GPU thermal protection (junction-temp
-            // throttle, firmware fan ramp) independently of OS fan control,
-            // and forcing PMFW curve commits from a CPU emergency would add
-            // SMU churn without improving GPU safety. There is no GPU
-            // emergency threshold; the exclusion is structural — GpuBackend
-            // does not implement SafetyWriteBackend.
-            if let Some(be) = openfan_be.as_mut() {
-                be.force_all(forced_pct).await;
-            }
-            if let Some(be) = hwmon_be.as_mut() {
-                be.force_all(forced_pct).await;
-            }
-
-            // DEC-269: name the three cases distinctly. "stale" is the one an
-            // operator most needs to tell apart — the sensor is still listed,
-            // so a log saying "no CPU temp sensor" would contradict the UI.
-            let reason = match hottest_cpu_c {
-                CpuReading::Fresh(temp) => format!("CPU temp {temp:.1}°C"),
-                CpuReading::Stale(temp) => {
-                    format!("CPU temp {temp:.1}°C, STALE — the sensor has stopped updating")
-                }
-                CpuReading::Absent => "no CPU temp sensor".to_string(),
-            };
-            log::warn!(
-                "Thermal safety override: forcing all OpenFan+hwmon fans to \
-                 {forced_pct}% ({reason})"
-            );
-            // P3-2: drop cross-cycle tuning state so post-override
-            // evaluation starts fresh instead of step-rate-clamping from a
-            // pre-emergency anchor — the fans are physically at
-            // `forced_pct`, not at the stale `last_output`.
-            //
-            // 277-i: the TUNING half only. The full `deactivate()` also clears
-            // the skip tracker, which is right for a profile switch and wrong
-            // here: an emergency says nothing about whether a control's curve
-            // resolves, and inheriting that clear meant this surface published an
-            // empty list for the entire emergency-to-release hold plus a 3-tick
-            // debounce blackout after recovery.
-            engine_state.deactivate_tuning_only();
-            // Publish before the `continue`, so the list survives the event
-            // rather than being dropped by `TickCompletion::drop`'s empty
-            // default. It FREEZES for the duration — a forced tick evaluates no
-            // curves, so it learns nothing new to report.
-            //
-            // Read a listed control correctly during an event: it means "this
-            // control's curve is unresolvable", NOT "this fan is stopped".
-            // `force_all` reaches OpenFan channels and writable hwmon headers but
-            // excludes GPU fans by design (DEC-130), so a GPU-bound control with
-            // an unresolvable curve genuinely is uncommanded throughout — which
-            // is precisely the case that must not go silent. The thermal banner
-            // already explains the override for everything else.
-            tick_done.set_skipped(engine_state.skipped_snapshot());
-            // 277-k: outputs are NOT published here, and the asymmetry is
-            // deliberate. `force_all` drives the fans directly and bypasses every
-            // control, so there is no control-wide output to report — an empty
-            // list is the honest answer, and `deactivate_tuning_only` has already
-            // cleared them. A card falls back to "—" for the event, which is true.
-            continue;
-        }
-
         // Sweep expired override/identify entries on the daemon's own monotonic
         // clock (never a client timestamp) and reset the cross-tick state of any
         // control whose override just lapsed, so it re-anchors to its curve
@@ -1042,7 +1022,27 @@ pub async fn profile_engine_loop(
         };
 
         // Get active profile — scope guard strictly to avoid !Send across .await
-        let commands = {
+        //
+        // [SAFETY] D1-j / DEC-307: this evaluation moved ABOVE the safety branch
+        // below. A forced tick now uses these commands as the baseline it floors,
+        // so it has to have them. Two ordering constraints this must not break,
+        // both of which the previous shape got right by construction and this one
+        // has to get right on purpose:
+        //
+        //   1. `None` here means "no profile loaded", and it must NOT `continue`
+        //      at this point. The emergency has to reach the fans on a daemon
+        //      with no profile — that is the whole no-sensor/no-profile case. The
+        //      `continue` therefore lives *after* the safety branch, and the
+        //      forced path passes an empty command slice, which floors every
+        //      output to `forced_pct` exactly as the pre-D1-j `force_all` did.
+        //   2. Evaluating costs a curve pass on the emergency path that the old
+        //      short-circuit skipped. It is bounded by the profile's control
+        //      count and runs before any I/O; `deactivate_tuning_only()` below
+        //      still clears the cached eval plan each forced tick, so the plan is
+        //      rebuilt per tick during a hold. Measured cheap against the 1 Hz
+        //      budget, and the alternative is a safety rung that cannot see what
+        //      it is supposed to be flooring.
+        let profile_commands: Option<Vec<PwmCommand>> = {
             let profile_guard = profile.lock();
 
             // DEC-188: re-anchor on an activation epoch bump. Read under the
@@ -1058,18 +1058,20 @@ pub async fn profile_engine_loop(
                 engine_state.deactivate();
             }
 
-            let Some(ref active_profile) = *profile_guard else {
-                // No profile loaded — drop any leftover tuning state so a
-                // later activation doesn't pick up stale cross-cycle outputs.
-                engine_state.deactivate();
-                continue;
-            };
-            evaluate_profile_with_overrides(
-                active_profile,
-                &sensors,
-                &mut engine_state,
-                &override_snapshot,
-            )
+            match *profile_guard {
+                Some(ref active_profile) => Some(evaluate_profile_with_overrides(
+                    active_profile,
+                    &sensors,
+                    &mut engine_state,
+                    &override_snapshot,
+                )),
+                None => {
+                    // No profile loaded — drop any leftover tuning state so a
+                    // later activation doesn't pick up stale cross-cycle outputs.
+                    engine_state.deactivate();
+                    None
+                }
+            }
         };
 
         // 273-i: fold this tick's skipped set into the debounce tracker, log the
@@ -1077,6 +1079,18 @@ pub async fn profile_engine_loop(
         // check below so a control that went unresolvable is still reported on
         // the tick the daemon is asked to stop — the operator stopping the
         // daemon to investigate is exactly who needs the line.
+        //
+        // [SAFETY] DEC-307 moved this ABOVE the safety branch so a FORCED tick
+        // commits too. It used to sit below, which was right while a forced tick
+        // evaluated nothing — but this change makes forced ticks evaluate, and
+        // leaving them uncommitted had two costs its review found: a control that
+        // went unresolvable during a hold was never reported until the hold
+        // ended, and a profile activated mid-hold cleared the tracker (via the
+        // epoch-bump `deactivate()`, which this change also newly exposed to
+        // forced ticks) with nothing able to repopulate it — reopening exactly
+        // the silence 277-i existed to remove, through a path 277-i never saw.
+        // Committing on every evaluating tick makes the debounce uniform, which
+        // is what the `since` stamps were always supposed to mean.
         for event in engine_state.commit_skips(std::time::Instant::now()) {
             match event {
                 SkipEvent::Skipped { id, name, reason } => log::warn!(
@@ -1090,6 +1104,103 @@ pub async fn profile_engine_loop(
             }
         }
         tick_done.set_skipped(engine_state.skipped_snapshot());
+
+        if let Some(forced_pct) = decision.forced_pct {
+            // Forced safety override — all OpenFan channels and writable
+            // hwmon headers. GPU fans are deliberately excluded (DEC-130):
+            // AMD PMFW firmware owns GPU thermal protection (junction-temp
+            // throttle, firmware fan ramp) independently of OS fan control,
+            // and forcing PMFW curve commits from a CPU emergency would add
+            // SMU churn without improving GPU safety. There is no GPU
+            // emergency threshold; the exclusion is structural — GpuBackend
+            // does not implement SafetyWriteBackend.
+            //
+            // [SAFETY] D1-j / DEC-307: `forced_pct` is a FLOOR over the profile's
+            // own commands, not a replacement for them. Every OpenFan channel and
+            // writable hwmon header is still written — including the ones no
+            // control commands, which is what preserves the emergency's reach —
+            // but a commanded output gets `max(commanded, forced_pct)`. Passing
+            // an empty slice (no profile) reproduces the old behaviour exactly.
+            let baseline = profile_commands.as_deref().unwrap_or(&[]);
+            if let Some(be) = openfan_be.as_mut() {
+                be.force_all_with_floor(forced_pct, baseline).await;
+            }
+            if let Some(be) = hwmon_be.as_mut() {
+                be.force_all_with_floor(forced_pct, baseline).await;
+            }
+
+            // DEC-269: name the three cases distinctly. "stale" is the one an
+            // operator most needs to tell apart — the sensor is still listed,
+            // so a log saying "no CPU temp sensor" would contradict the UI.
+            let reason = match hottest_cpu_c {
+                CpuReading::Fresh(temp) => format!("CPU temp {temp:.1}°C"),
+                CpuReading::Stale(temp) => {
+                    format!("CPU temp {temp:.1}°C, STALE — the sensor has stopped updating")
+                }
+                CpuReading::Absent => "no CPU temp sensor".to_string(),
+            };
+            log::warn!(
+                "Thermal safety override: holding all OpenFan+hwmon fans at \
+                 {forced_pct}% or above ({reason})"
+            );
+            // P3-2: drop the step-rate anchor so post-override evaluation
+            // starts fresh instead of step-rate-clamping from a pre-emergency
+            // anchor — the fans are physically at or above `forced_pct`, not at
+            // the stale `last_output`. Narrowed to exactly that in DEC-307's
+            // review: see `reset_for_forced_tick`, which explains why a forced
+            // tick must NOT drop the deadband or trigger-latch state it now
+            // re-reads on its own next tick.
+            //
+            // D1-j narrowed the wording, not the reasoning: the fans now sit at
+            // `max(commanded, forced_pct)` rather than exactly `forced_pct`, and
+            // that is still strictly above the curve's own `last_output`, so
+            // re-anchoring on release remains the right call. Keeping the reset
+            // also means each forced tick evaluates unclamped, which is what a
+            // floor input should be — a step-rate limiter has no business slowing
+            // a control down on the way INTO an emergency.
+            //
+            // 277-i: the narrow reset, never the full `deactivate()`. That one
+            // also clears the skip tracker, which is right for a profile switch
+            // and wrong here: an emergency says nothing about whether a control's
+            // curve resolves, and inheriting that clear meant this surface
+            // published an empty list for the entire emergency-to-release hold
+            // plus a 3-tick debounce blackout after recovery. DEC-307's review
+            // narrowed it further still — see `reset_for_forced_tick`, which
+            // keeps the deadband and trigger-latch state a forced tick now
+            // re-reads on its own next tick.
+            engine_state.reset_for_forced_tick();
+            // The skip list is committed and published ABOVE this branch, so it
+            // is LIVE during a forced tick rather than frozen — see the note
+            // there. Read a listed control correctly during an event: it means "this
+            // control's curve is unresolvable", NOT "this fan is stopped".
+            // The forced write reaches OpenFan channels and writable hwmon
+            // headers but excludes GPU fans by design (DEC-130), so a GPU-bound
+            // control with an unresolvable curve genuinely is uncommanded
+            // throughout — which is precisely the case that must not go silent.
+            // The thermal banner already explains the override for everything
+            // else.
+            // 277-k: outputs are NOT published here, and the asymmetry survives
+            // D1-j for a NEW reason — the old one ("the force bypasses every
+            // control, so there is no control-wide output") is no longer true.
+            // The reason now is that no single control-wide number is true during
+            // a forced tick: a control's OpenFan and hwmon members sit at
+            // `max(commanded, forced_pct)` while its GPU members sit at whatever
+            // they last held, because GPU is excluded from the force (DEC-130).
+            // Publishing the curve value alone would understate the first set;
+            // publishing the floored value would overstate the second. An empty
+            // list — a card showing "—" — remains the only honest answer, and
+            // `reset_for_forced_tick` has already cleared them.
+            continue;
+        }
+
+        // No profile loaded: nothing to apply, so end the tick here. Deliberately
+        // AFTER the safety branch (D1-j) — a daemon with no profile must still
+        // get the thermal force, and this `continue` used to sit above it only
+        // because the force did not need the commands.
+        let Some(commands) = profile_commands else {
+            continue;
+        };
+
         // 277-k: published beside the skip list, through the same single
         // `TickCompletion::drop` point. Both answer the Controls page's two
         // questions — "is anything commanding this?" and "at what duty?" — and
@@ -1102,7 +1213,7 @@ pub async fn profile_engine_loop(
         // `restore_hardware()` on the way out. Defense-in-depth: in normal
         // timing the write is fast, `.await`-joined, and drained before the
         // restore anyway (`shutdown_sequence` awaits this task first). A thermal
-        // emergency is handled earlier this tick (force_all + `continue`) and is
+        // emergency is handled earlier this tick (force_all_with_floor + `continue`) and is
         // never suppressed here. The only window this cannot close — a single
         // sysfs/serial write that hangs past `SHUTDOWN_TASK_TIMEOUT`, which
         // `spawn_blocking` cannot cancel — is backstopped by `ExecStopPost`.
@@ -1122,7 +1233,7 @@ pub async fn profile_engine_loop(
         // adopt a "verify" lease, GPU re-checks per fan, OpenFan re-checks per
         // channel — to close the race where a verify/calibration begins *after*
         // this gate is read but before the awaited writes land (P2-1 / DEC-191).
-        // Thermal safety force_all runs earlier this tick and `continue`s before
+        // Thermal safety force_all_with_floor runs earlier this tick and `continue`s before
         // here, so a verify never suppresses an emergency. Deadman-bounded
         // (DEC-165).
         if !cache.verify_active() {
@@ -1921,7 +2032,9 @@ mod tests {
     /// The forced path called the full `deactivate()`, which also clears the skip
     /// tracker, and then `continue`d before the publish — so `TickCompletion::drop`
     /// published its empty default for the ENTIRE emergency-to-release hold, plus a
-    /// fresh 3-tick debounce blackout on recovery. The one surface that says
+    /// fresh 3-tick debounce blackout on recovery. DEC-307 went further and made
+    /// the list *live* rather than merely surviving: forced ticks now evaluate and
+    /// commit, so a control that goes unresolvable mid-hold is reported at once. The one surface that says
     /// "nothing is commanding these fans" went silent exactly while an operator
     /// was most likely to be reading it, and the GUI chip blinked off.
     ///
@@ -1996,11 +2109,122 @@ mod tests {
         assert_eq!(
             skipped.len(),
             1,
-            "the skipped list must survive the emergency — a forced tick \
-             evaluates no curves, so it learns nothing new about resolvability \
-             and must not discard what it already knew"
+            "the skipped list must survive the emergency — since DEC-307 a \
+             forced tick evaluates curves AND commits what it learned, so this \
+             list must be live during a hold, never discarded or frozen"
         );
         assert_eq!(skipped[0].control_id, "ctl");
+    }
+
+    /// [SAFETY-adjacent] DEC-307 review, finding 2 — activating a profile during
+    /// a thermal hold must not silence `skipped_controls[]` for the rest of it.
+    ///
+    /// DEC-307 moved the epoch-bump check above the safety branch, which newly
+    /// exposed the FULL `deactivate()` (it clears the skip tracker, unlike
+    /// `reset_for_forced_tick`) to forced ticks. On its own that reopened exactly
+    /// the silence 277-i was written to remove, through a path 277-i never saw: a
+    /// `POST /profile/activate` mid-emergency wiped the tracker, and nothing on
+    /// the forced path could repopulate it, so the list stayed empty for the rest
+    /// of the hold plus a debounce blackout after it.
+    ///
+    /// The fix is that forced ticks now `commit_skips` like any other evaluating
+    /// tick. This test drives the whole sequence — list a skip, enter the
+    /// emergency, bump the epoch mid-hold — and requires the list to come BACK
+    /// while still forced.
+    #[tokio::test(start_paused = true)]
+    async fn a_profile_activation_mid_emergency_does_not_silence_the_skipped_list() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        let profile = DaemonProfile {
+            id: "mix".into(),
+            name: "Mix".into(),
+            version: 7,
+            description: "".into(),
+            controls: vec![openfan_control("ctl", "mx", "openfan:ch00")],
+            curves: vec![mix_curve("mx", "max", &["deleted"])],
+        };
+        let cache = make_cache_with_sensor("cpu", 40.0);
+
+        let observed = cache.clone();
+        let phase = Arc::new(AtomicU8::new(0));
+        let p = phase.clone();
+        run_engine_ticks_until(
+            cache.clone(),
+            Some(profile),
+            SKIP_DEBOUNCE_TICKS + 2,
+            move || {
+                match p.load(Ordering::SeqCst) {
+                    0 => {
+                        // Wait for the skip to be listed, then push past the trip point.
+                        if observed.read_with(|s| !s.skipped_controls.is_empty()) {
+                            observed.update_sensors(vec![CachedSensorReading {
+                                id: "cpu".into(),
+                                kind: SensorKind::CpuTemp,
+                                label: "Tctl".into(),
+                                value_c: TRIGGER + 1.0,
+                                source: DeviceLabel::Hwmon,
+                                updated_at: Instant::now(),
+                                rate_c_per_s: None,
+                                session_min_c: None,
+                                session_max_c: None,
+                                chip_name: "k10temp".into(),
+                                temp_type: None,
+                                thresholds: None,
+                            }]);
+                            p.store(1, Ordering::SeqCst);
+                        }
+                        false
+                    }
+                    1 => {
+                        // Once genuinely forced, activate a profile mid-hold. This
+                        // is the `deactivate()` that clears the tracker.
+                        if observed
+                            .read_with(|s| s.thermal_override_state.as_deref() == Some("emergency"))
+                        {
+                            observed.bump_profile_activation_epoch();
+                            p.store(2, Ordering::SeqCst);
+                        }
+                        false
+                    }
+                    2 => {
+                        // Wait for the bump to be CONSUMED — the list must actually
+                        // go empty first. Without this the next phase can observe
+                        // the stale pre-bump list and pass having tested nothing,
+                        // which is how the first cut of this test passed with the
+                        // fix reverted.
+                        if observed.read_with(|s| s.skipped_controls.is_empty()) {
+                            p.store(3, Ordering::SeqCst);
+                        }
+                        false
+                    }
+                    // Done only when the list has come BACK while still forced.
+                    _ => observed.read_with(|s| {
+                        !s.skipped_controls.is_empty()
+                            && s.thermal_override_state.as_deref() == Some("emergency")
+                    }),
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            phase.load(Ordering::SeqCst),
+            3,
+            "precondition: the activation must have been made AND consumed (the \
+             list observed empty), or this test asserts nothing about recovery"
+        );
+        assert_eq!(
+            cache.read_with(|s| s.thermal_override_state.clone()),
+            Some("emergency".to_string()),
+            "precondition: the engine must still be in the forced path"
+        );
+        assert_eq!(
+            cache.read_with(|s| s.skipped_controls.len()),
+            1,
+            "the skipped list must be repopulated by forced ticks after a mid-hold \
+             profile activation cleared it — otherwise the one surface that says \
+             'nothing is commanding these fans' is silent for the rest of the hold"
+        );
     }
 
     /// 277-k — the call site, on the same terms as the skipped-list test above.
@@ -2044,9 +2268,11 @@ mod tests {
 
     /// 277-k — a forced tick publishes NO output, and that is the honest answer.
     ///
-    /// `force_all` drives the fans directly and bypasses every control, so there
-    /// is no control-wide output to report. Publishing the pre-emergency value
-    /// would have a card confidently display a duty nothing is applying.
+    /// No single control-wide number is true during a forced tick: OpenFan and
+    /// hwmon members sit at `max(commanded, forced)` while GPU members sit at
+    /// whatever they last held (DEC-130/DEC-307). Publishing either figure — or
+    /// the pre-emergency value — would have a card confidently display a duty
+    /// nothing is applying.
     ///
     /// **Driven as a TRANSITION, and that is the whole point of the test.** The
     /// first version seeded the cache hot at 110 °C, so no normal evaluation ever
@@ -2117,9 +2343,11 @@ mod tests {
         );
         assert!(
             cache.read_with(|s| s.control_outputs.is_empty()),
-            "a forced tick evaluates no control, so it has no control-wide output \
-             to report — republishing the pre-emergency duty would be a card lying \
-             about what the fans are doing"
+            "a forced tick has no single control-wide output that is TRUE — its \
+             OpenFan/hwmon members sit at max(commanded, forced) and its GPU \
+             members at whatever they last held (DEC-130/DEC-307) — so it must \
+             report none; republishing either figure would be a card lying about \
+             what the fans are doing"
         );
     }
 
@@ -4925,7 +5153,7 @@ mod tests {
         // [SAFETY] DEC-265. `POST /fans/openfan/rescan` installs a controller into
         // the shared slot; if the engine did not re-read that slot, the route would
         // report success while the SOLE PWM WRITER still had no OpenFan backend —
-        // and the thermal `force_all` is guarded by `if let Some(be) = openfan_be`,
+        // and the thermal `force_all_with_floor` is guarded by `if let Some(be) = openfan_be`,
         // so the thermal emergency would still have no path to those fans.
         //
         // Starts with an EMPTY slot, exactly as a boot with no controller found.
@@ -5671,7 +5899,7 @@ mod tests {
     }
 
     /// P1-1: the thermal force must drive WRITABLE HWMON headers to 100 % through
-    /// the loop (the `force_all` branch, hwmon leg). OpenFan-force + GPU-exclusion
+    /// the loop (the `force_all_with_floor` branch, hwmon leg). OpenFan-force + GPU-exclusion
     /// are already covered (`safety_override_forces_all_channels_to_100` /
     /// `loop_thermal_force_excludes_gpu`); the hwmon leg had no loop-level test —
     /// every other thermal loop test passes `hwmon_controller = None`.
@@ -5904,10 +6132,12 @@ mod tests {
     /// Timeline (1 tick/s, paused time):
     ///   t1: 79°C → curve 98.4% → writes 98%   (anchor now 98.4)
     ///   t2: 106°C → EMERGENCY, all 10 ch → 100%, state cleared
-    ///   t3: 60°C → release + recovery floor → all ch → 60%
-    ///   t4: recovery floor (one extra cycle) → 60% (coalesced, no writes)
-    ///   t5: normal eval at 60°C → curve 68%.
-    ///       Fixed: fresh state → writes 68% (raw 0xAD).
+    ///   t3: 60°C → release + recovery floor. Since D1-j the floor is a floor:
+    ///       ch0 (controlled) → max(curve 68%, 60%) = 68% (raw 0xAD);
+    ///       ch1-9 (uncommanded) → the bare 60% (raw 0x99).
+    ///   t4: recovery floor (one extra cycle) → coalesced, no writes
+    ///   t5: normal eval at 60°C → curve 68%, coalesced (ch0 is already there).
+    ///       Fixed: fresh state → ch0 shows 68% (raw 0xAD).
     ///       Bug: stale anchor 98.4 with step_down 2%/cycle → 96% (raw 0xF5).
     #[tokio::test(start_paused = true)]
     async fn forced_override_resets_engine_tuning_state() {
@@ -5936,7 +6166,10 @@ mod tests {
         let profile_arc = Arc::new(Mutex::new(Some(profile)));
         let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
 
-        // 1 (t1) + 10 (t2) + 10 (t3) + 0 (t4 coalesced) + 1 (t5) = 22 writes.
+        // 1 (t1) + 10 (t2) + 10 (t3) + 0 (t4 coalesced) + 0 (t5 coalesced) = 21
+        // writes. t5 coalesces because D1-j lets ch0 reach its curve value at t3
+        // (the floor no longer drags it down to 60%), so the normal tick has
+        // nothing new to say.
         let (transport, written) = LoopTestTransport::new(30);
         let fan_ctrl = crate::serial::controller::FanController::new(
             Box::new(transport),
@@ -5979,15 +6212,233 @@ mod tests {
 
         let cmds = written.lock();
         let set_pwm_cmds: Vec<_> = cmds.iter().filter(|c| c.starts_with(">02")).collect();
-        let last = set_pwm_cmds.last().expect("expected SetPwm commands");
-        let hex_value = &last[last.len() - 3..last.len() - 1];
+        // Channel 0 is the profile's controlled member. Read ITS writes rather
+        // than the last write on the link: this assertion used to be
+        // `set_pwm_cmds.last()`, which was a positional proxy that only held
+        // while the recovery rung dragged ch0 down to 60% and left the fresh
+        // anchor to show up on the following normal tick. D1-j removed that drag,
+        // so ch0 reaches its curve value one tick earlier and the final write on
+        // the link is now some other channel's floor. The property under test is
+        // unchanged; where it lands is not.
+        let ch0: Vec<&str> = set_pwm_cmds
+            .iter()
+            .filter(|c| c.starts_with(">0200"))
+            .map(|c| &c[c.len() - 3..c.len() - 1])
+            .collect();
         let expected = format!("{:02X}", crate::pwm::percent_to_raw(68));
         let stale = format!("{:02X}", crate::pwm::percent_to_raw(96));
-        assert_eq!(
-            hex_value, expected,
+        assert!(
+            ch0.contains(&expected.as_str()),
             "post-override evaluation must start from a fresh anchor \
-             (expected 68% = 0x{expected}, stale-anchor bug yields 96% = 0x{stale}); \
+             (expected 68% = 0x{expected} on ch0); ch0 writes: {ch0:?}; \
              commands: {set_pwm_cmds:?}"
+        );
+        assert!(
+            !ch0.contains(&stale.as_str()),
+            "a stale anchor step-rate-clamps the descent to 96% = 0x{stale}; \
+             ch0 writes: {ch0:?}; commands: {set_pwm_cmds:?}"
+        );
+    }
+
+    /// [SAFETY] D1-j / DEC-307: the recovery rung is a FLOOR, and must never
+    /// lower a control below what its curve is asking for.
+    ///
+    /// This is the defect in its most direct form. The 60% recovery step fires
+    /// on the tick a CPU crosses back down through the release point — still
+    /// hot, seconds after a 105 °C excursion — and before DEC-307 it *replaced*
+    /// the profile's output rather than flooring it. At 70 °C this curve asks
+    /// for 84%; the old code drove the fan to 60% instead, a 24-point reduction
+    /// in cooling caused by the safety ladder itself.
+    ///
+    ///   t1: trigger+1 °C → emergency, every channel → 100%
+    ///   t2: 70 °C → release + recovery.
+    ///       ch0 (controlled, curve = 84%) → max(84, 60) = 84%
+    ///       ch1-9 (uncommanded)           → the bare 60%
+    ///
+    /// The second half is the one that must not regress: an uncommanded channel
+    /// still gets the floor. Flooring the command list alone would shrink the
+    /// emergency's reach to controlled fans only — the v2.38.0 P1 shape, which
+    /// removed the emergency's reach to OpenFan fans entirely.
+    #[tokio::test(start_paused = true)]
+    async fn the_recovery_rung_floors_a_curve_it_used_to_replace() {
+        let cache = make_cache_with_sensor("cpu", TRIGGER + 1.0);
+        // step_up/step_down are 100%/cycle in this fixture, so nothing rate-limits
+        // the descent and the value observed at t2 is the curve's own.
+        let profile_arc = Arc::new(Mutex::new(Some(make_profile("curve", "graph", 50.0))));
+        let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
+
+        let (transport, written) = LoopTestTransport::new(30);
+        let fan_ctrl = crate::serial::controller::FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            std::time::Duration::from_millis(500),
+        );
+        let fan_ctrl = Some(Arc::new(Mutex::new(fan_ctrl)));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(profile_engine_loop(
+            cache.clone(),
+            profile_arc,
+            Arc::new(parking_lot::RwLock::new(fan_ctrl)),
+            None,
+            vec![],
+            safety,
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            shutdown_rx,
+        ));
+
+        // t1 @1.0s: emergency latches, all ten channels forced to 100%.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        // t2 @2.0s: fall to the release point → recovery rung.
+        cache.update_sensors(vec![cpu_reading("cpu", 70.0, Instant::now())]);
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let _ = handle.await;
+
+        let cmds = written.lock();
+        let hex = |pct: u8| format!("{:02X}", crate::pwm::percent_to_raw(pct));
+        let values_for = |ch: u8| -> Vec<String> {
+            let prefix = format!(">02{ch:02}");
+            cmds.iter()
+                .filter(|c| c.starts_with(&prefix))
+                .map(|c| c[c.len() - 3..c.len() - 1].to_string())
+                .collect()
+        };
+
+        assert_eq!(
+            values_for(0),
+            vec![hex(100), hex(84)],
+            "the controlled channel must hold its own curve value (84%) through \
+             the recovery rung, not be replaced by the 60% floor; commands: {:?}",
+            cmds.iter()
+                .filter(|c| c.starts_with(">02"))
+                .collect::<Vec<_>>()
+        );
+        for ch in 1..crate::serial::protocol::NUM_CHANNELS {
+            assert_eq!(
+                values_for(ch),
+                vec![hex(100), hex(60)],
+                "uncommanded channel {ch} must still receive the bare floor — \
+                 that is the reach the emergency depends on"
+            );
+        }
+    }
+
+    /// [SAFETY] DEC-307 review, finding 1: a sustained forced hold must not keep
+    /// resetting the state its own next tick evaluates against.
+    ///
+    /// DEC-307 made forced ticks evaluate the profile, so that they can floor its
+    /// output instead of replacing it. The forced path had always followed that
+    /// with `deactivate_tuning_only()`, which was free while nothing evaluated —
+    /// and became a per-tick cold start once something did. The 40% no-CPU-sensor
+    /// rung holds for as long as the sensor is missing, so the consequence is
+    /// unbounded: a Trigger control latched into its LOAD state has its latch
+    /// wiped every tick, re-reads `current_temp >= load_temp` on the next one,
+    /// and falls back to `idle_pct` — a **reduction in the floor's input**, which
+    /// is the exact defect class DEC-307 exists to remove, reintroduced by
+    /// DEC-307's own fix one layer up.
+    ///
+    /// Here: `gpu` latches LOAD at 65 °C, then settles to 55 °C — above
+    /// `idle_temp` (50), below `load_temp` (60), so the latch is what holds it at
+    /// `load_pct`. With no CpuTemp sensor at all, the ladder forces 40% from the
+    /// fifth tick on. The controlled channel must sit at `max(80, 40) = 80` for
+    /// the whole hold; with the latch being wiped it decays to `max(30, 40) = 40`.
+    #[tokio::test(start_paused = true)]
+    async fn a_sustained_forced_hold_does_not_reset_the_state_it_evaluates() {
+        let cache = Arc::new(StateCache::new());
+        // GpuTemp only — no CpuTemp anywhere, which is what arms the 40% rung.
+        cache.update_sensors(vec![reading_aged(
+            "gpu",
+            SensorKind::GpuTemp,
+            65.0,
+            std::time::Duration::ZERO,
+        )]);
+
+        let profile = DaemonProfile {
+            id: "trig".into(),
+            name: "Trig".into(),
+            version: 7,
+            description: "".into(),
+            controls: vec![openfan_control("ctl", "tc", "openfan:ch00")],
+            curves: vec![CurveConfig {
+                id: "tc".into(),
+                name: "Trigger".into(),
+                curve_type: "trigger".into(),
+                sensor_id: "gpu".into(),
+                trigger_idle_temp_c: Some(50.0),
+                trigger_load_temp_c: Some(60.0),
+                trigger_idle_pct: Some(30.0),
+                trigger_load_pct: Some(80.0),
+                ..Default::default()
+            }],
+        };
+        let profile_arc = Arc::new(Mutex::new(Some(profile)));
+        let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
+
+        let (transport, written) = LoopTestTransport::new(60);
+        let fan_ctrl = crate::serial::controller::FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            std::time::Duration::from_millis(500),
+        );
+        let fan_ctrl = Some(Arc::new(Mutex::new(fan_ctrl)));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(profile_engine_loop(
+            cache.clone(),
+            profile_arc,
+            Arc::new(parking_lot::RwLock::new(fan_ctrl)),
+            None,
+            vec![],
+            safety,
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            shutdown_rx,
+        ));
+
+        // t1: 65 °C latches the control into its LOAD state at 80%.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        // Settle between the two trip points. Only the latch keeps this at LOAD.
+        cache.update_sensors(vec![reading_aged(
+            "gpu",
+            SensorKind::GpuTemp,
+            55.0,
+            std::time::Duration::ZERO,
+        )]);
+        // Run well past NO_SENSOR_CYCLE_THRESHOLD (5) so several FORCED ticks
+        // follow one another — one forced tick cannot show this, because the
+        // damage is what the *next* tick reads.
+        tokio::time::sleep(std::time::Duration::from_millis(8000)).await;
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let _ = handle.await;
+
+        let cmds = written.lock();
+        let hex = |pct: u8| format!("{:02X}", crate::pwm::percent_to_raw(pct));
+        let ch0: Vec<String> = cmds
+            .iter()
+            .filter(|c| c.starts_with(">0200"))
+            .map(|c| c[c.len() - 3..c.len() - 1].to_string())
+            .collect();
+        assert_eq!(
+            cache.read_with(|s| s.thermal_override_state.clone()),
+            Some("no_sensor_fallback".to_string()),
+            "precondition: the 40% no-sensor rung must actually be forcing, or \
+             this test asserts nothing about a sustained hold"
+        );
+        assert!(
+            !ch0.contains(&hex(40)),
+            "the controlled channel must never drop to the bare 40% floor — that \
+             is the trigger latch being wiped and the control falling back to \
+             idle_pct; ch0 writes: {ch0:?}"
+        );
+        assert_eq!(
+            ch0.last().map(String::as_str),
+            Some(hex(80).as_str()),
+            "the controlled channel must hold max(load_pct 80, floor 40) = 80 for \
+             the whole hold; ch0 writes: {ch0:?}"
         );
     }
 

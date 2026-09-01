@@ -18,7 +18,7 @@ use std::time::Duration;
 /// (DEC-243), any local user could persist a well-formed but dead path and, from
 /// the next restart, leave `fan_controller` as `None` — which does not merely
 /// disable fan control, because the profile engine's thermal-emergency
-/// `force_all` is guarded by `if let Some(be) = openfan_be`. The thermal-emergency rule
+/// `force_all_with_floor` is guarded by `if let Some(be) = openfan_be`. The thermal-emergency rule
 /// would lose its only path to every OpenFan-attached fan, with no failsafe.
 ///
 /// Pure so the rule is unit-testable without a serial device: `detect` is
@@ -94,7 +94,7 @@ pub fn same_port_set(a: &[String], b: &[String]) -> bool {
 /// loop stopped there, discarding the correctly detected port that was sitting
 /// next in the candidate list. Because writes to an indifferent device return
 /// `Ok`, nothing surfaced: no failure was logged, `/status` showed OpenFan
-/// healthy, and the thermal emergency's `force_all` reported success while driving
+/// healthy, and the thermal emergency's `force_all_with_floor` reported success while driving
 /// nothing. `serial.port` is settable by any local user over the 0666 socket
 /// (DEC-243) and persists in `runtime.toml`, so this was durable across reboots.
 ///

@@ -293,7 +293,7 @@ impl StateCache {
         let now = Instant::now();
         let mut state = self.inner.write();
         let covered: std::collections::HashSet<u8> = fans.iter().map(|f| f.channel).collect();
-        // F6: count only channels a poll has actually MEASURED. `force_all` writes
+        // F6: count only channels a poll has actually MEASURED. `force_all_with_floor` writes
         // `0..NUM_CHANNELS` unconditionally, so one thermal emergency mints an entry
         // for every channel the firmware does not report; those can never be
         // covered by a later frame, so counting them would latch the short-frame
@@ -601,7 +601,7 @@ impl StateCache {
             // present as fresh *telemetry*: the fan reported `age_ms` near zero
             // beside an `rpm` frozen at whatever the last real poll saw, and
             // `stall_detected` was then computed from that frozen value. Widest
-            // exactly where it matters — a thermal `force_all` writes every
+            // exactly where it matters — a thermal `force_all_with_floor` writes every
             // channel, and a ~10-byte `SetPwm` completes on a degraded link far
             // more readily than an ~80-byte `ReadAllRpm`, so "poll dead, writes
             // still acking" showed every fan FRESH while nothing was measuring.
@@ -1610,7 +1610,7 @@ mod tests {
         assert_eq!(cache2.update_openfan_fans(vec![make_openfan(0, 900)]), 0);
     }
 
-    /// F6. A channel that only ever got WRITTEN — `force_all` walks
+    /// F6. A channel that only ever got WRITTEN — `force_all_with_floor` walks
     /// `0..NUM_CHANNELS` unconditionally, so a thermal emergency mints one for every
     /// channel the firmware does not report — must not count as uncovered.
     ///

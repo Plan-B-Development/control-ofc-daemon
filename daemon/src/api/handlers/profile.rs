@@ -254,7 +254,7 @@ pub async fn deactivate_profile_handler(
             }
             // Audit P3-3: pair the release with a coalescing reset, exactly as
             // the thermal force-take does (`profile_engine/backends.rs`
-            // force_all). This clears the engine's stale `manual_mode_set` so a
+            // force_all_with_floor). This clears the engine's stale `manual_mode_set` so a
             // later re-activation re-asserts `pwm_enable=1` from a clean slate
             // after the deactivated gap — defense-in-depth alongside the
             // per-write pwm_enable watchdog in `HwmonPwmController::set_pwm`,

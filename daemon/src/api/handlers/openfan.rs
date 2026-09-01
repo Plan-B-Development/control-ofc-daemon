@@ -209,7 +209,7 @@ pub async fn calibrate_openfan_handler(
 /// nothing could subsequently write. A device that enumerated a second too late,
 /// or that failed its DEC-250 identity handshake once, therefore left the daemon
 /// with no OpenFan backend for the entire process lifetime — and the profile
-/// engine's thermal `force_all` is guarded by `if let Some(be) = openfan_be`, so
+/// engine's thermal `force_all_with_floor` is guarded by `if let Some(be) = openfan_be`, so
 /// the thermal emergency silently lost its reach to every OpenFan-attached fan
 /// too. A failed boot connect only logs a warning, so `Restart=on-failure` never
 /// fired and nothing recovered it.

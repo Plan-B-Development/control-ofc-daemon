@@ -249,7 +249,7 @@ pub struct AppState {
     /// enumerated late — or failed its identity probe once — left the daemon with
     /// no OpenFan backend for the whole process lifetime, and no way to recover
     /// short of a restart. That is not only lost fan control: the profile engine's
-    /// thermal `force_all` is guarded by `if let Some(be) = openfan_be`, so the
+    /// thermal `force_all_with_floor` is guarded by `if let Some(be) = openfan_be`, so the
     /// thermal emergency lost its reach to every OpenFan-attached fan too.
     /// `POST /fans/openfan/rescan` is what fills it. Read it through
     /// [`AppState::openfan`] rather than locking by hand.
@@ -410,7 +410,7 @@ pub(crate) fn begin_verify_pause(
 ///
 /// **Corrected in DEC-297 (AUD-l).** This comment used to say a verify "pauses
 /// the engine's write phase for its window, which also suppresses the thermal
-/// thermal `force_all`". **It does not, and never did.** `force_all` runs at
+/// thermal `force_all_with_floor`". **It does not, and never did.** `force_all_with_floor` runs at
 /// `profile_engine/mod.rs:970/973` and `continue`s well BEFORE the
 /// `verify_active()` gate at `:1120`, so an emergency outranks a verify and is
 /// unaffected by the pause — which `profile_engine/mod.rs:1072-1074` has always

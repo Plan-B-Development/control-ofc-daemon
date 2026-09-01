@@ -239,7 +239,7 @@ pub async fn gpu_verify_handler(
     Path(gpu_id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     // Phase 6 (DEC-201): refuse to start a verify while the system is hot — the
-    // verify pauses the engine (incl. the thermal force_all) for its window.
+    // verify pauses the engine (incl. the thermal force_all_with_floor) for its window.
     if let Some(resp) = super::verify_thermal_guard(&state.cache) {
         return resp;
     }
@@ -265,7 +265,7 @@ pub async fn gpu_verify_handler(
     // Single-flight + pause the engine's write phase for the verify's lifetime
     // so the engine's GPU backend does not overwrite our controlled test speed.
     // GPU writes need no lease (DEC-045); the pause is the only coordination.
-    // NOT a suppression of the thermal `force_all` — that runs before the engine's
+    // NOT a suppression of the thermal `force_all_with_floor` — that runs before the engine's
     // `verify_active()` gate and always outranks a verify (corrected in DEC-297).
     let Some(verify_guard) =
         super::begin_verify_pause(&state.cache, constants::VERIFY_PAUSE_DEADMAN)

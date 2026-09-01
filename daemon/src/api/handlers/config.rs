@@ -889,7 +889,7 @@ pub async fn update_serial_timeout_handler(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let ms = match body.get("timeout_ms").and_then(|v| v.as_u64()) {
         // [SAFETY] Ceiling of 1000 ms, tighter than the admin file allows. An
-        // emergency `force_all` awaits the OpenFan backend before the hwmon one,
+        // emergency `force_all_with_floor` awaits the OpenFan backend before the hwmon one,
         // costing up to `channels x timeout` on a wedged serial link — at 5000 ms
         // that is ~40 s for 8 channels, during which no further safety
         // evaluation runs. Same reasoning as the poll ceiling: the API is

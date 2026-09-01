@@ -125,7 +125,7 @@ const ENGINE_REASONS: SubsystemReasons = SubsystemReasons {
 /// How long a single tick may legitimately take before it counts as wedged
 /// rather than slow (DEC-259), as a multiple of the nominal 1 Hz period.
 ///
-/// Derived, not guessed. The worst legitimate tick is a thermal `force_all` over
+/// Derived, not guessed. The worst legitimate tick is a thermal `force_all_with_floor` over
 /// a degraded-but-open serial link: `NUM_CHANNELS` (10) writes, each bounded by
 /// `serial.timeout_ms`, which the API caps at 1000 ms — so ~10 s for OpenFan
 /// alone, plus the hwmon leg. 30× leaves room for that and for a slow sysfs
@@ -137,7 +137,7 @@ const WEDGED_TICK_MULTIPLE: u32 = 30;
 /// Engine liveness, which is a different question from data freshness.
 ///
 /// [SAFETY] DEC-259. A single timestamp could not tell a *slow* tick from a
-/// *stopped* engine, and reported the worse of the two. `force_all` walks ten
+/// *stopped* engine, and reported the worse of the two. `force_all_with_floor` walks ten
 /// OpenFan channels at up to 1 s each, so a degraded link makes a legitimate
 /// tick take 5-10 s — and the surface then read "not ticking — fan control and
 /// thermal safety are stalled" **while the engine was driving the thermal
@@ -196,9 +196,9 @@ fn engine_health(
         //
         // "fans are holding their last duty" was removed from the Warn text: the
         // 30x threshold above is derived (DEC-259) from a *legitimate* thermal
-        // `force_all` over a degraded serial link taking ~10s, which crosses this
+        // `force_all_with_floor` over a degraded serial link taking ~10s, which crosses this
         // 2x line within three seconds. The old wording therefore said fans were
-        // holding while `force_all` was actively driving them to 100% — the exact
+        // holding while `force_all_with_floor` was actively driving them to 100% — the exact
         // surface-contradicts-reality failure DEC-259 exists to remove.
         if stalled_ms > interval_ms * u64::from(WEDGED_TICK_MULTIPLE) {
             return entry(
@@ -412,9 +412,11 @@ fn poll_subsystem_health(
 /// Manual or External override is showing.
 ///
 /// **`Warn`, never `Crit`.** The fans are not stopped and there is no thermal
-/// hazard: the thermal-emergency rule is a separate path that bypasses controls entirely
-/// (`force_all`), so it still reaches every OpenFan channel and writable hwmon
-/// header regardless of what is listed here. `Crit` is reserved for a subsystem
+/// hazard: the thermal-emergency rule is a separate path that reaches every
+/// OpenFan channel and writable hwmon header regardless of what is listed here
+/// (`force_all_with_floor` writes them all, commanded or not — that reach is
+/// what DEC-307 preserved when it made the forced duty a floor over the
+/// profile's output rather than a replacement for it). `Crit` is reserved for a subsystem
 /// that has actually failed, and escalating this one would drown that
 /// distinction on a machine with one mis-authored profile.
 ///
@@ -487,7 +489,7 @@ pub fn compute_health(
             OpenFanPresence::Present => poll_subsystem_health(
                 "openfan",
                 ts.openfan,
-                // F6: only channels a poll has actually MEASURED. `force_all`
+                // F6: only channels a poll has actually MEASURED. `force_all_with_floor`
                 // writes `0..NUM_CHANNELS` unconditionally, so one thermal
                 // emergency mints an entry for every channel the firmware does
                 // not report — and those can never be covered by a later poll, so
@@ -904,8 +906,8 @@ mod tests {
     }
 
     /// Warn, not Crit. The fans are not stopped and there is no thermal hazard:
-    /// the thermal-emergency rule bypasses controls entirely (`force_all`), so it still
-    /// reaches every OpenFan channel and writable hwmon header. Escalating this
+    /// the thermal-emergency rule reaches every OpenFan channel and writable
+    /// hwmon header whether or not a control commands it (`force_all_with_floor`). Escalating this
     /// to Crit would drown the distinction that a subsystem has actually failed.
     #[test]
     fn a_skipped_control_does_not_report_as_a_failed_subsystem() {
@@ -991,7 +993,7 @@ mod tests {
 
     #[test]
     fn a_slow_tick_is_reported_as_busy_not_stalled() {
-        // [SAFETY] DEC-259, and the reason the stamps were split. `force_all`
+        // [SAFETY] DEC-259, and the reason the stamps were split. `force_all_with_floor`
         // walks ten OpenFan channels at up to 1 s each, so a degraded-but-open
         // link makes a legitimate tick take 5-10 s. With one timestamp the
         // surface reported "not ticking — fan control and thermal safety are
@@ -1285,7 +1287,7 @@ mod tests {
         assert_eq!(named(&dead, "hwmon").status, HealthStatus::Crit);
     }
 
-    /// F6. `force_all` writes `0..NUM_CHANNELS` unconditionally, so one thermal
+    /// F6. `force_all_with_floor` writes `0..NUM_CHANNELS` unconditionally, so one thermal
     /// emergency mints an `OpenFanState` for every channel the firmware does not
     /// report — with `rpm_polled: false`, because nothing ever measured it.
     ///

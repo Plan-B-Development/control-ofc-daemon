@@ -2458,7 +2458,7 @@ mod tests {
         // configured-but-wrong port was therefore adopted as the fan controller
         // and the loop stopped there — discarding the correctly detected port
         // sitting next in the candidate list. Writes to an indifferent device
-        // return Ok, so nothing surfaced: the thermal emergency's `force_all`
+        // return Ok, so nothing surfaced: the thermal emergency's `force_all_with_floor`
         // reported success while driving nothing.
         let chosen = control_ofc_daemon::serial::adoption::first_openfan_port(
             &ports(&["/dev/ttyACM9", "/dev/ttyACM0"]),

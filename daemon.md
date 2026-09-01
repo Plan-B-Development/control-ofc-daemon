@@ -129,6 +129,15 @@ inside the band cannot pin the pre-settle fan speed indefinitely.
 ## Safety Model
 
 1. **ThermalSafetyRule** (`safety.rs`): Emergency CPU override
+   - **Every duty below is a FLOOR over the active profile's output, not a
+     replacement for it (DEC-307).** The engine calls
+     `force_all_with_floor(pct, &commands)`: each OpenFan channel and writable
+     hwmon header gets `max(commanded, pct)`, and one no control commands still
+     gets the bare `pct` — that second half is what preserves the emergency's
+     reach. The ladder can therefore only ever raise a fan. Until DEC-307 these
+     were replacements, so the 60% and 40% rungs could drive a fan *below* what
+     its curve was asking for; the 100% emergency was never affected, because
+     100 is the maximum
    - Triggers at hottest CpuTemp >= 105C, forces all OpenFan channels and
      writable hwmon headers to 100%
    - GPU fans are deliberately excluded (DEC-130) — there is no GPU emergency
@@ -423,8 +432,11 @@ user hold any fan — including a pump-class header — stopped by re-issuing `s
 deadman window. **Accepted, bounded risk** (2026-07-21 audit: accept + document): identification
 requires stopping any fan by design (DEC-166); the deadman auto-restore limits an abandoned stop
 to one TTL; and a thermal emergency outranks the identify overlay entirely — the engine's
-`force_all` path (thermal emergency, and the no-sensor 40 % fallback) drives every OpenFan +
-writable hwmon header directly, spinning a stalled pump back up regardless of standing stops.
+`force_all_with_floor` path (thermal emergency, and the no-sensor 40 % fallback) drives every OpenFan +
+writable hwmon header to **at least** the forced duty, spinning a stalled pump back up regardless of
+standing stops. Since DEC-307 that duty is a floor over the profile's own output rather than a
+replacement for it, so a control already asking for more keeps its higher duty; an output no control
+commands still gets the forced duty, which is what keeps the reach above true.
 
 ### Write endpoints — GPU
 
@@ -458,7 +470,7 @@ writable hwmon header directly, spinning a stalled pump back up regardless of st
 | POST | `/config/profile-search-dirs` | Edit the profile search path: `{"add": [...]}` and/or `{"remove": [...]}`, at least one required. Removals apply before additions, so `add`+`remove` is one atomic "move" (DEC-285, `remove` is ≥ 2.23.0 and gated by `control.profile_search_dir_remove`). `/etc/control-ofc/profiles` and the last remaining entry cannot be removed. Applies live; persists to `runtime.toml`; 503 `persistence_failed` on write error |
 | POST | `/config/poll-interval` | Set the sensor/fan poll interval, 250-2000 ms (DEC-243; persists to `runtime.toml`, restart to apply). **[SAFETY]** the ceiling bounds how stale a temperature the thermal-emergency rule can act on |
 | POST | `/config/serial-port` | Set the OpenFan serial device (`null` = auto-detect). Validated against the transport's own allowlist and capped at 256 chars; a configured port that fails to open **or fails to answer the `ReadAllRpm` handshake** falls back to auto-detection, so neither a bad value nor a wrong-but-openable device can remove OpenFan control. DEC-243 / DEC-250; restart to apply |
-| POST | `/config/serial-timeout` | Set the serial read timeout, 50-1000 ms (DEC-243; restart to apply). **[SAFETY]** bounds emergency `force_all` latency |
+| POST | `/config/serial-timeout` | Set the serial read timeout, 50-1000 ms (DEC-243; restart to apply). **[SAFETY]** bounds emergency `force_all_with_floor` latency |
 | POST | `/config/allow-port-probe` | Opt into the active Super-I/O probe (DEC-243). **Also needs the `CAP_SYS_RAWIO` drop-in** — the flag alone does not enable it |
 | POST | `/config/nvidia-telemetry` | Opt into read-only NVML telemetry (DEC-243). **Also needs the `/dev/nvidia*` drop-in** |
 | POST | `/config/startup-delay` | Set startup delay seconds, 0-30 (persists to `runtime.toml`, takes effect on restart; 503 `persistence_failed` on write error). Since 2.23.0 the reply also carries the shared DEC-243 setter shape (`key`/`value`) alongside the original `delay_secs`, so one client parser covers every `POST /config/*` |

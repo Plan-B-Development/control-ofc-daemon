@@ -65,7 +65,7 @@ impl Command {
     /// **The opcode alone is not enough, and assuming it was is the defect both
     /// DEC-301 reviewers found independently.** Every per-channel write carries
     /// opcode `0x02`, so a one-frame offset *within* a tick's `ch0..ch9` burst —
-    /// which is exactly the shape of `force_all` during a thermal emergency — matches on opcode and
+    /// which is exactly the shape of `force_all_with_floor` during a thermal emergency — matches on opcode and
     /// slips straight through: each write confirmed by its predecessor's ack, and
     /// the last write never acknowledged at all.
     ///

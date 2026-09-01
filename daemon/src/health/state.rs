@@ -287,7 +287,7 @@ pub struct SubsystemTimestamps {
     /// running, rather than that it took an exit nobody instrumented.
     ///
     /// The pair exists because a single timestamp reported a *slow* tick as a
-    /// *dead* engine. `force_all` walks all ten OpenFan channels, each bounded
+    /// *dead* engine. `force_all_with_floor` walks all ten OpenFan channels, each bounded
     /// by `serial.timeout_ms` (up to 1 s via the API), so a degraded-but-open
     /// link makes a legitimate tick take 5-10 s — and the old single stamp then
     /// read "not ticking — fan control and thermal safety are stalled" while the

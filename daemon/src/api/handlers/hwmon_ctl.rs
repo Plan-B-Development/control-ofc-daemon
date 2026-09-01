@@ -179,8 +179,8 @@ pub async fn hwmon_verify_handler(
 ) -> (StatusCode, Json<serde_json::Value>) {
     // DEC-201/DEC-297: refuse to start a verify while the system is hot, OR while
     // the ladder is forcing — a verify drives the header AWAY from its commanded
-    // duty. NOT because it suppresses the thermal `force_all`, which is what this
-    // comment used to claim: `force_all` runs before the engine's
+    // duty. NOT because it suppresses the thermal `force_all_with_floor`, which is what this
+    // comment used to claim: `force_all_with_floor` runs before the engine's
     // `verify_active()` gate and always outranks a verify.
     if let Some(resp) = super::verify_thermal_guard(&state.cache) {
         return resp;

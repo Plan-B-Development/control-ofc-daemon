@@ -45,7 +45,7 @@ const WRITE_JOIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(1)
 ///
 /// Before this existed the engine awaited every backend join unconditionally. A
 /// sysfs write blocked in a driver therefore froze the *whole* loop: the tick
-/// never completed, so the thermal `force_all` never ran again — and because the
+/// never completed, so the thermal `force_all_with_floor` never ran again — and because the
 /// task was still **alive**, DEC-266's death supervision never fired either. The
 /// daemon sat there holding the fans at whatever duty they happened to have.
 ///
@@ -193,11 +193,11 @@ impl<T: Send + 'static> BoundedWrite<T> {
     /// a pending handle, even when that handle completed immediately — so a tick
     /// that cleared a slow write issued nothing of its own. Concretely: an
     /// ordinary `apply` is pending at tick N, the CPU crosses the trip point at N+1,
-    /// `force_all` harvests the apply's result and returns having written
+    /// `force_all_with_floor` harvests the apply's result and returns having written
     /// nothing, and the first forced write is issued at N+2. Against a device
     /// consistently slower than `budget`, forced writes alternated every other
     /// tick. A delay, not a loss of reach — a wedged write holds the controller
-    /// mutex, so a separately spawned `force_all` would have blocked on
+    /// mutex, so a separately spawned `force_all_with_floor` would have blocked on
     /// `ctrl.lock()` and reached no header either — but a delay on the emergency
     /// path is worth removing.
     ///
@@ -312,14 +312,32 @@ pub(crate) trait WriteBackend {
 }
 
 /// Backends that participate in forced safety writes (thermal emergency /
-/// no-sensor fallback). `force_all` drives every output to `pct`
-/// unconditionally — no GUI deferral, no coalescing shortcuts beyond the
+/// no-sensor fallback). No GUI deferral, no coalescing shortcuts beyond the
 /// controller's own exact-match skip.
 pub(crate) trait SafetyWriteBackend: WriteBackend {
+    /// Drive every output to **at least** `pct`, using `commands` as the
+    /// per-output baseline.
+    ///
+    /// [SAFETY] D1-j / DEC-307. This was `force_all(pct)`, which drove every
+    /// output *to* `pct` — a **replacement** of the profile's own duty, not a
+    /// floor over it. For the 100% emergency the two coincide, because 100 is
+    /// the maximum. For the other two rungs of the ladder they do not, and the
+    /// replacement could *reduce* cooling: the 60% recovery step fired while a
+    /// CPU was coming down through the release point, overriding a curve asking
+    /// for far more than 60%, and the 40% no-sensor fallback did the same to a
+    /// control driven by a still-healthy GPU or coolant sensor.
+    ///
+    /// Each output now gets `max(commanded, pct)`; an output no control
+    /// commands still gets `pct`. That is what keeps the emergency's **reach**
+    /// intact — clamping the command list alone would shrink the force to
+    /// controlled fans only, which is the v2.38.0 P1 shape. The result is
+    /// monotone against the old behaviour: no output is ever driven lower than
+    /// `force_all(pct)` would have driven it.
+    ///
     /// Async since DEC-146 P3-8: implementations run their blocking
     /// serial/sysfs writes on the blocking pool instead of pinning a tokio
     /// worker for up to `channels × serial-timeout` during an emergency.
-    async fn force_all(&mut self, pct: u8);
+    async fn force_all_with_floor(&mut self, pct: u8, commands: &[PwmCommand]);
 }
 
 // ─── OpenFan (serial) ────────────────────────────────────────────────────
@@ -342,9 +360,9 @@ pub(crate) struct OpenFanBackend {
     cache: Arc<StateCache>,
     /// Bounded join for this backend's blocking writes (DEC-289).
     ///
-    /// Shared by `apply` and `force_all` deliberately. They never run in the same
+    /// Shared by `apply` and `force_all_with_floor` deliberately. They never run in the same
     /// tick — the emergency path `continue`s before the apply phase — but they do
-    /// run in *consecutive* ticks, and a `force_all` still wedged when the
+    /// run in *consecutive* ticks, and a `force_all_with_floor` still wedged when the
     /// emergency clears must not let `apply` strand a second blocking thread
     /// against the same stuck device.
     writes: BoundedWrite<Vec<(u8, Result<(), String>)>>,
@@ -563,7 +581,11 @@ impl WriteBackend for OpenFanBackend {
 }
 
 impl SafetyWriteBackend for OpenFanBackend {
-    /// Force every OpenFan channel to `pct`.
+    /// Drive every OpenFan channel to at least `pct` (D1-j).
+    ///
+    /// Every channel is written, including ones no control commands — that is
+    /// the reach the emergency depends on. A commanded channel gets
+    /// `max(commanded, pct)`.
     ///
     /// DEC-099: drop the lock between channels so GUI requests can
     /// interleave during a long emergency scan; if the GUI overrides a
@@ -572,8 +594,22 @@ impl SafetyWriteBackend for OpenFanBackend {
     /// DEC-146 P3-8: runs on the blocking pool — worst case is
     /// `NUM_CHANNELS × serial-timeout` (10 × 500 ms default), far too long
     /// to pin a tokio worker during a thermal emergency.
-    async fn force_all(&mut self, pct: u8) {
+    async fn force_all_with_floor(&mut self, pct: u8, commands: &[PwmCommand]) {
         let ctrl = self.ctrl.clone();
+        // D1-j: this tick's profile duty per channel, so `pct` acts as a floor
+        // over it rather than replacing it. Parsed silently — `apply` owns the
+        // malformed-`member_id` warning, and a forced tick `continue`s before
+        // `apply`, so warning here too would repeat it at 1 Hz for the whole
+        // hold. A channel missing from this map is simply uncommanded and gets
+        // the bare floor, which is the pre-D1-j behaviour for every channel.
+        let floors: HashMap<u8, u8> = commands
+            .iter()
+            .filter(|c| c.source == "openfan")
+            .filter_map(|c| {
+                let ch = c.member_id.strip_prefix("openfan:ch")?.parse::<u8>().ok()?;
+                Some((ch, c.pwm_percent))
+            })
+            .collect();
         // Returns the same outcome type as `apply` so both share one
         // `BoundedWrite` (DEC-289); the emergency path logs inline, so the vec is
         // always empty and nothing consumes it.
@@ -581,8 +617,11 @@ impl SafetyWriteBackend for OpenFanBackend {
             .writes
             .run(WRITE_JOIN_BUDGET, move || {
                 for ch in 0..NUM_CHANNELS {
+                    let duty = floors
+                        .get(&ch)
+                        .map_or(pct, |commanded| (*commanded).max(pct));
                     let mut guard = ctrl.lock();
-                    if let Err(e) = guard.set_pwm(ch, pct) {
+                    if let Err(e) = guard.set_pwm(ch, duty) {
                         log::error!("THERMAL SAFETY: OpenFan ch{ch} write FAILED: {e}");
                     }
                 }
@@ -594,7 +633,7 @@ impl SafetyWriteBackend for OpenFanBackend {
         // slower than the budget completes a write every tick and must not be
         // reported as stalled.
         let stalled = join.in_flight && join.harvested.is_none() && join.issued.is_none();
-        // A harvested `apply` result arrives here when force_all re-awaits a
+        // A harvested `apply` result arrives here when force_all_with_floor re-awaits a
         // pending ordinary write. Route it through the normal accounting rather
         // than dropping it, or a failing channel's streak is neither advanced nor
         // reset for that tick (DEC-289). Since DEC-298 this call can also have
@@ -604,7 +643,9 @@ impl SafetyWriteBackend for OpenFanBackend {
                 Ok(outcomes) => self.note_outcomes(&outcomes),
                 // Concurrency review D3: never swallow a panicked safety write —
                 // the next 1 Hz tick retries, but the operator must see this.
-                Err(e) => log::error!("THERMAL SAFETY: OpenFan force_all task panicked: {e}"),
+                Err(e) => {
+                    log::error!("THERMAL SAFETY: OpenFan force_all_with_floor task panicked: {e}")
+                }
             }
         }
         // DEC-289: still in flight. The write was NOT abandoned — the handle is
@@ -612,7 +653,7 @@ impl SafetyWriteBackend for OpenFanBackend {
         // ladder and the other backends keep running instead of freezing behind
         // this one device.
         //
-        // Edge-triggered: a legitimately slow force_all spans several ticks over
+        // Edge-triggered: a legitimately slow force_all_with_floor spans several ticks over
         // a degraded link, and an emergency-to-release hold can last minutes, so a per-tick
         // line would bury the transition it exists to report. Every other safety
         // log in this file is throttled the same way.
@@ -620,7 +661,7 @@ impl SafetyWriteBackend for OpenFanBackend {
             if !self.stall_logged {
                 self.stall_logged = true;
                 log::error!(
-                    "THERMAL SAFETY: OpenFan force_all still in flight after \
+                    "THERMAL SAFETY: OpenFan force_all_with_floor still in flight after \
                      {}s — the emergency write has not reached the controller yet",
                     WRITE_JOIN_BUDGET.as_secs()
                 );
@@ -630,7 +671,7 @@ impl SafetyWriteBackend for OpenFanBackend {
             // condition that had cleared minutes earlier, and an emergency-to-release hold can
             // last minutes.
             self.stall_logged = false;
-            log::warn!("THERMAL SAFETY: OpenFan force_all writes are landing again");
+            log::warn!("THERMAL SAFETY: OpenFan force_all_with_floor writes are landing again");
         }
     }
 }
@@ -1068,7 +1109,7 @@ pub(crate) struct HwmonBackend {
     /// in isolation (mirrors [`OpenFanBackend`]'s `channel_failures`, audit P3-5).
     member_failures: HashMap<String, u32>,
     /// Bounded join for this backend's blocking writes (DEC-289). Shared by
-    /// `apply` and `force_all` for the reason documented on
+    /// `apply` and `force_all_with_floor` for the reason documented on
     /// [`OpenFanBackend::writes`]: a wedged emergency write must not let the next
     /// tick's ordinary write strand a second blocking thread on the same header.
     writes: BoundedWrite<Vec<(String, Result<(), String>)>>,
@@ -1147,7 +1188,7 @@ impl WriteBackend for HwmonBackend {
     /// and is the steady-state holder (DEC-165 — the GUI no longer takes the
     /// lease). DEC-146 P3-8: the body runs on the blocking pool (matching the
     /// hwmon poll loop). DEC-154: the lease-acquire → per-header write → renew
-    /// sequence locks the controller mutex PER COMMAND (like `force_all` and
+    /// sequence locks the controller mutex PER COMMAND (like `force_all_with_floor` and
     /// `OpenFanBackend`), not once for the whole batch, so concurrent API
     /// requests are not starved for the duration of a multi-header tick. A
     /// thermal force-take mid-scan fails the remaining writes with InvalidLease;
@@ -1275,7 +1316,12 @@ impl WriteBackend for HwmonBackend {
 }
 
 impl SafetyWriteBackend for HwmonBackend {
-    /// Force every hwmon header to `pct` (auto-lease for safety writes).
+    /// Drive every writable hwmon header to at least `pct` (D1-j),
+    /// auto-leasing for safety writes.
+    ///
+    /// Every writable header is written, including ones no control commands —
+    /// that is the reach the emergency depends on. A commanded header gets
+    /// `max(commanded, pct)`.
     ///
     /// Force-takes the lease as thermal-safety, then re-locks the controller per
     /// header so concurrent GUI activity can proceed between writes (DEC-099).
@@ -1287,8 +1333,18 @@ impl SafetyWriteBackend for HwmonBackend {
     /// un-forced. (The lease system is hwmon-only; the OpenFan path has none.)
     /// DEC-146 P3-8: runs on the blocking pool; the re-lock-per-header structure
     /// (DEC-099) is preserved inside the closure.
-    async fn force_all(&mut self, pct: u8) {
+    async fn force_all_with_floor(&mut self, pct: u8, commands: &[PwmCommand]) {
         let ctrl = self.ctrl.clone();
+        // D1-j: this tick's profile duty per header, so `pct` acts as a floor
+        // over it rather than replacing it. A header missing from this map is
+        // uncommanded and gets the bare floor — the pre-D1-j behaviour for every
+        // header. Read-only headers never reach the write below (DEC-295), so a
+        // command naming one is irrelevant here either way.
+        let floors: HashMap<String, u8> = commands
+            .iter()
+            .filter(|c| c.source == "hwmon")
+            .map(|c| (c.member_id.clone(), c.pwm_percent))
+            .collect();
         // Same outcome type as `apply` so both share one `BoundedWrite`
         // (DEC-289); this path logs inline, so the vec is always empty.
         let join = self.writes.run(WRITE_JOIN_BUDGET, move || {
@@ -1325,8 +1381,13 @@ impl SafetyWriteBackend for HwmonBackend {
                 (hdr_ids, lease_id)
             };
             for hdr_id in &hdr_ids {
+                // D1-j: floor, not replacement. Resolved once per header so the
+                // lease-retry below writes the identical duty.
+                let duty = floors
+                    .get(hdr_id)
+                    .map_or(pct, |commanded| (*commanded).max(pct));
                 let mut guard = ctrl.lock();
-                match guard.set_pwm(hdr_id, pct, &lease_id) {
+                match guard.set_pwm(hdr_id, duty, &lease_id) {
                     Ok(_) => {}
                     Err(HwmonControlError::Lease(_)) => {
                         // A concurrent GUI verify force-took the lease in the
@@ -1343,7 +1404,7 @@ impl SafetyWriteBackend for HwmonBackend {
                             .force_take_lease(HwmonWriter::ThermalSafety)
                             .lease_id;
                         guard.on_lease_released();
-                        if let Err(e) = guard.set_pwm(hdr_id, pct, &lease_id) {
+                        if let Err(e) = guard.set_pwm(hdr_id, duty, &lease_id) {
                             log::error!(
                                 "THERMAL SAFETY: hwmon {hdr_id} write FAILED after lease re-take: {e}"
                             );
@@ -1368,26 +1429,28 @@ impl SafetyWriteBackend for HwmonBackend {
             match joined {
                 Ok(outcomes) => self.note_outcomes(&outcomes),
                 // Concurrency review D3: never swallow a panicked safety write.
-                Err(e) => log::error!("THERMAL SAFETY: hwmon force_all task panicked: {e}"),
+                Err(e) => {
+                    log::error!("THERMAL SAFETY: hwmon force_all_with_floor task panicked: {e}")
+                }
             }
         }
         // DEC-289: still in flight — held and re-awaited next tick, never
         // re-issued. The loop is released so the ladder and the other backends
         // keep running instead of freezing behind this header.
-        // Edge-triggered for the reason given on `OpenFanBackend::force_all`.
+        // Edge-triggered for the reason given on `OpenFanBackend::force_all_with_floor`.
         if stalled {
             if !self.stall_logged {
                 self.stall_logged = true;
                 log::error!(
-                    "THERMAL SAFETY: hwmon force_all still in flight after {}s — \
+                    "THERMAL SAFETY: hwmon force_all_with_floor still in flight after {}s — \
                      the emergency write has not reached the header yet",
                     WRITE_JOIN_BUDGET.as_secs()
                 );
             }
         } else if self.stall_logged {
-            // DEC-298: the falling edge — see `OpenFanBackend::force_all`.
+            // DEC-298: the falling edge — see `OpenFanBackend::force_all_with_floor`.
             self.stall_logged = false;
-            log::warn!("THERMAL SAFETY: hwmon force_all writes are landing again");
+            log::warn!("THERMAL SAFETY: hwmon force_all_with_floor writes are landing again");
         }
     }
 }
@@ -1462,7 +1525,7 @@ mod tests {
 
     /// The whole point: a write wedged in the kernel must not hold the caller.
     /// Before DEC-289 this join was unconditional, so the engine loop froze — and
-    /// with it the thermal `force_all`, on every backend, not just the stuck one.
+    /// with it the thermal `force_all_with_floor`, on every backend, not just the stuck one.
     #[tokio::test]
     async fn a_wedged_write_releases_the_caller_instead_of_freezing_it() {
         let fifo = make_fifo("release");
@@ -1789,7 +1852,7 @@ mod tests {
     /// `GpuBackend::apply` used to `spawn_blocking(...).await` per fan with no
     /// bound. A PMFW write wedged in the driver therefore meant `apply` never
     /// returned, the engine loop never reached `tick.tick()`, and the thermal
-    /// `force_all` never ran again — while the task stayed ALIVE, so DEC-266's
+    /// `force_all_with_floor` never ran again — while the task stayed ALIVE, so DEC-266's
     /// death supervision never fired either.
     ///
     /// The wedge is a FIFO `fan_curve` with no reader: `set_static_speed` opens
@@ -2190,13 +2253,13 @@ mod tests {
         }
     }
 
-    /// DEC-289: `apply` and `force_all` deliberately SHARE one `BoundedWrite` per
+    /// DEC-289: `apply` and `force_all_with_floor` deliberately SHARE one `BoundedWrite` per
     /// backend. They never run in the same tick, but they do run in consecutive
-    /// ticks, and a `force_all` still wedged when an emergency clears must not let
+    /// ticks, and a `force_all_with_floor` still wedged when an emergency clears must not let
     /// the next `apply` start a SECOND uncancellable blocking task on the same
     /// device — that is the DEC-272 thread-leak trap.
     ///
-    /// Without this test, a plausible "cleanup" giving `force_all` its own field
+    /// Without this test, a plausible "cleanup" giving `force_all_with_floor` its own field
     /// would reintroduce that trap and every other test would stay green.
     #[tokio::test]
     async fn force_all_and_apply_share_one_bounded_write_so_a_wedge_starts_one_task() {
@@ -2216,13 +2279,16 @@ mod tests {
         );
         let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl)));
 
-        // Tick 1: an emergency force_all wedges.
-        be.force_all(100).await;
+        // Tick 1: an emergency force_all_with_floor wedges.
+        be.force_all_with_floor(100, &[]).await;
         // DEC-298: `writes_stalled` rather than the old `writes_outstanding` —
         // a STRONGER assertion for this test's intent. "Outstanding" is merely
         // "something is in flight"; "stalled" additionally requires that nothing
         // completed, which is what "wedged" means here.
-        assert!(be.writes_stalled(), "the force_all should be wedged");
+        assert!(
+            be.writes_stalled(),
+            "the force_all_with_floor should be wedged"
+        );
 
         // Tick 2: the emergency clears and ordinary control resumes.
         be.apply(&[cmd("hwmon:t:d:pwm1", "hwmon", 40)]).await;
@@ -2231,7 +2297,7 @@ mod tests {
             entered.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "a second blocking task was started against a device already wedged — \
-             apply and force_all are no longer sharing one BoundedWrite, which is \
+             apply and force_all_with_floor are no longer sharing one BoundedWrite, which is \
              the DEC-272 thread-leak trap"
         );
         let _reader = std::fs::File::open(&fifo).unwrap();
@@ -2440,7 +2506,7 @@ mod tests {
         // 1. Engine controls the header → first pwm_enable=1 write.
         be.apply(&[cmd("hwmon:it8696:pwm1", "hwmon", 40)]).await;
         // 2. Thermal safety force-takes the lease and forces 100%.
-        be.force_all(100).await;
+        be.force_all_with_floor(100, &[]).await;
 
         let enable_writes = writes
             .lock()
@@ -2598,13 +2664,13 @@ mod tests {
             .lease_manager_mut()
             .force_take_lease(HwmonWriter::Engine);
 
-        be.force_all(100).await;
+        be.force_all_with_floor(100, &[]).await;
 
         let lease = be.ctrl.lock().lease_manager().active_lease().cloned();
         assert_eq!(lease.map(|l| l.owner), Some(HwmonWriter::ThermalSafety));
         let w = writes.lock();
         // Pin the forced VALUE (100% → raw "255"), not just write-presence: a
-        // force_all that ignored its pct and wrote 40% would else pass. Assert
+        // force_all_with_floor that ignored its pct and wrote 40% would else pass. Assert
         // both headers' pwm data write (the pwm{i} path excludes pwm{i}_enable).
         for i in 1..=2 {
             let pwm_path = format!("/sys/class/hwmon/hwmon0/pwm{i}");
@@ -2642,7 +2708,7 @@ mod tests {
                 let _ = self.tx.send(());
                 // Still holding the controller lock: park the preemptor long
                 // enough that the next unlock hands off to it (fairness), not
-                // to force_all's own re-lock for the second header.
+                // to force_all_with_floor's own re-lock for the second header.
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
             Ok(())
@@ -2659,17 +2725,74 @@ mod tests {
         h
     }
 
-    /// DEC-295: the `force_all` twin of `hwmon_apply_skips_read_only_header`.
+    /// [SAFETY] D1-j / DEC-307: the hwmon twin of
+    /// `the_recovery_rung_floors_a_curve_it_used_to_replace`.
+    ///
+    /// A commanded header keeps its own higher duty; an uncommanded one still
+    /// gets the bare floor. The second half is what preserves the emergency's
+    /// reach — flooring only the command list would leave every header no
+    /// control happens to drive untouched during a thermal event, which is the
+    /// v2.38.0 P1 shape.
+    #[tokio::test]
+    async fn hwmon_force_with_floor_raises_a_low_command_and_keeps_a_high_one() {
+        let commanded = header_with_paths(1);
+        let uncommanded = header_with_paths(2);
+        let (mut be, writes) = hwmon_backend(vec![commanded, uncommanded]);
+
+        be.force_all_with_floor(
+            60,
+            &[
+                PwmCommand {
+                    member_id: "hwmon:it8696:pwm1".into(),
+                    source: "hwmon".into(),
+                    pwm_percent: 84,
+                    gpu_fan_zero_rpm: false,
+                },
+                // A command BELOW the floor must not lower the header; the floor
+                // wins. This is the direction the pre-D1-j code got right and the
+                // one a naive "always take the command" fix would break.
+                PwmCommand {
+                    member_id: "hwmon:it8696:pwm3".into(),
+                    source: "hwmon".into(),
+                    pwm_percent: 10,
+                    gpu_fan_zero_rpm: false,
+                },
+            ],
+        )
+        .await;
+
+        let w = writes.lock();
+        let vals = |path: &str| -> Vec<String> {
+            w.iter()
+                .filter(|(p, _)| p == path)
+                .map(|(_, v)| v.trim().to_string())
+                .collect()
+        };
+        assert!(
+            vals("/sys/class/hwmon/hwmon0/pwm1")
+                .contains(&crate::pwm::percent_to_raw(84).to_string()),
+            "a commanded header above the floor must keep its own duty (84%); got {:?}",
+            vals("/sys/class/hwmon/hwmon0/pwm1")
+        );
+        assert!(
+            vals("/sys/class/hwmon/hwmon0/pwm2")
+                .contains(&crate::pwm::percent_to_raw(60).to_string()),
+            "an uncommanded header must still get the bare floor (60%); got {:?}",
+            vals("/sys/class/hwmon/hwmon0/pwm2")
+        );
+    }
+
+    /// DEC-295: the `force_all_with_floor` twin of `hwmon_apply_skips_read_only_header`.
     ///
     /// `apply` has had the DEC-102 read-only backstop for a long time;
-    /// `force_all` did not, so during an emergency hold every read-only header
+    /// `force_all_with_floor` did not, so during an emergency hold every read-only header
     /// attempted a write that could only EACCES — and this path logs INLINE,
     /// bypassing `note_outcomes`' streak throttle, so it emitted one
     /// `THERMAL SAFETY ... FAILED` line per second for the whole emergency-to-release hold.
     ///
     /// The writable-sibling half is the load-bearing one. This is the thermal
     /// path, and a filter that over-filtered would remove the emergency's REACH
-    /// — the v2.38.0 P1 failure mode, which took OpenFan fans out of `force_all`
+    /// — the v2.38.0 P1 failure mode, which took OpenFan fans out of `force_all_with_floor`
     /// and was caught only by a review pass that no longer runs unconditionally.
     #[tokio::test]
     async fn hwmon_force_all_skips_read_only_headers_but_still_forces_writable_ones() {
@@ -2678,7 +2801,7 @@ mod tests {
         let rw = header_with_paths(2);
         let (mut be, writes) = hwmon_backend(vec![ro, rw]);
 
-        be.force_all(100).await;
+        be.force_all_with_floor(100, &[]).await;
 
         let w = writes.lock();
         assert!(
@@ -2701,9 +2824,9 @@ mod tests {
 
     #[tokio::test]
     async fn hwmon_force_all_completes_every_header_despite_midscan_verify_preempt() {
-        // Regression for the force_all partial-write bug. DEC-099 drops the
+        // Regression for the force_all_with_floor partial-write bug. DEC-099 drops the
         // controller lock between headers, so a GUI verify can force-take the
-        // lease mid-scan and invalidate force_all's. The retry-on-lease-error
+        // lease mid-scan and invalidate force_all_with_floor's. The retry-on-lease-error
         // fix re-takes thermal-safety and still forces EVERY header; without it
         // the header after the preemption is silently left un-forced during a
         // thermal emergency.
@@ -2721,17 +2844,18 @@ mod tests {
         let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl)));
 
         // Exactly one mid-scan preemption: a GUI verify force-takes the lease
-        // once force_all is past the first header.
+        // once force_all_with_floor is past the first header.
         let ctrl_for_preempt = be.ctrl.clone();
         let preemptor = std::thread::spawn(move || {
-            rx.recv().expect("force_all must write at least one header");
+            rx.recv()
+                .expect("force_all_with_floor must write at least one header");
             ctrl_for_preempt
                 .lock()
                 .lease_manager_mut()
                 .force_take_lease(HwmonWriter::Verify);
         });
 
-        be.force_all(100).await;
+        be.force_all_with_floor(100, &[]).await;
         preemptor.join().unwrap();
 
         // Every header must have been forced to 100% despite the mid-scan
@@ -2756,13 +2880,13 @@ mod tests {
         }
         drop(w);
 
-        // force_all reclaimed the lease from the verify preemptor — proof the
+        // force_all_with_floor reclaimed the lease from the verify preemptor — proof the
         // re-take (not just a lucky race) carried the scan to completion.
         let lease = be.ctrl.lock().lease_manager().active_lease().cloned();
         assert_eq!(
             lease.map(|l| l.owner),
             Some(HwmonWriter::ThermalSafety),
-            "force_all must re-take thermal-safety after a mid-scan verify preempt"
+            "force_all_with_floor must re-take thermal-safety after a mid-scan verify preempt"
         );
     }
 
@@ -2908,7 +3032,7 @@ mod tests {
     async fn openfan_force_all_writes_every_channel() {
         let (mut be, written, _cache) = openfan_backend();
 
-        be.force_all(100).await;
+        be.force_all_with_floor(100, &[]).await;
 
         let w = written.lock();
         let set_pwm: Vec<_> = w.iter().filter(|c| c.starts_with(">02")).collect();
@@ -2917,7 +3041,7 @@ mod tests {
             NUM_CHANNELS as usize,
             "expected one forced SetPwm per channel; got {w:?}"
         );
-        // Count alone can't catch a force_all that ignores its pct argument and
+        // Count alone can't catch a force_all_with_floor that ignores its pct argument and
         // sends e.g. 40% during a thermal emergency. Pin the VALUE: 100% → raw 255
         // → frame ">02{ch:02X}FF\n" for every channel.
         for frame in &set_pwm {
@@ -3097,7 +3221,7 @@ mod tests {
     #[tokio::test]
     async fn hwmon_apply_reuses_thermal_safety_lease_no_post_emergency_stall() {
         // P2-1 regression guard: Option B excludes ONLY the verify lease. A
-        // non-verify foreign lease (e.g. "thermal-safety" left by force_all after
+        // non-verify foreign lease (e.g. "thermal-safety" left by force_all_with_floor after
         // an emergency) must still be reused so the engine resumes hwmon control
         // immediately instead of being locked out for the lease's 60 s TTL.
         let (mut be, writes) = hwmon_backend(vec![make_header("hwmon:it8696:pwm1")]);

@@ -1383,7 +1383,7 @@ fn make_hot(state: &Arc<AppState>) {
 #[tokio::test]
 async fn hwmon_verify_refused_when_hot() {
     // Phase 6 (DEC-201): a fan verify must not run while the system is hot — it
-    // pauses the engine's write phase (incl. the thermal force_all) for its
+    // pauses the engine's write phase (incl. the thermal force) for its
     // window. A sensor over the 85 °C limit → 409 thermal_abort, before the
     // controller/header is even consulted (a global safety gate).
     let state = test_app_state();
@@ -1405,8 +1405,8 @@ async fn hwmon_verify_refused_when_hot() {
 async fn gpu_verify_refused_when_hot() {
     // The GPU verify drives the fan away from its commanded duty, so it must
     // refuse to start while hot (DEC-201). NOT because it suppresses the thermal
-    // force_all — it does not, and DEC-297 corrected that claim wherever it
-    // appeared; `force_all` runs before the `verify_active()` gate.
+    // the thermal force — it does not, and DEC-297 corrected that claim wherever
+    // it appeared; `force_all_with_floor` runs before the `verify_active()` gate.
     let state = test_app_state();
     make_hot(&state);
     let (path, shutdown, _dir) = start_test_server(state).await;

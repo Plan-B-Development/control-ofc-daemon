@@ -1,5 +1,43 @@
 # Changelog
 
+## [2.26.0] — 2026-09-01
+
+### Fixed
+- **[SAFETY] The thermal ladder's lower rungs could REDUCE cooling.** Two of the
+  three forced duties were applied as a *replacement* for the active profile's
+  output rather than as a floor over it, so the safety path could command fans
+  **down**. The 60% recovery step is the reachable case: it fires on the tick a
+  CPU crosses back down through the release point — still hot, seconds after a
+  105 °C excursion — and drove every OpenFan channel and writable hwmon header
+  to exactly 60%, overriding a curve asking for far more. Measured on the
+  project's own test fixture: a curve asking for **84%** at 70 °C was driven to
+  **60%**. The 40% no-CPU-sensor fallback did the same to a control driven by a
+  still-healthy GPU or coolant sensor. The 105 °C emergency itself was never
+  affected — 100% is the maximum, so replacement and floor coincide there.
+
+  Each output now receives `max(commanded, forced)`. An output no control
+  commands still receives the forced duty unchanged, which is what preserves the
+  emergency's **reach** — the property whose loss was the v2.38.0 P1. The change
+  is monotone by construction: no fan is ever driven lower than before.
+
+  The module doc had called the 60% step a "recovery floor" since it was written,
+  which is how this survived — the name and the behaviour disagreed on a safety
+  path, and only the name was ever read. (DEC-307, register row `D1-j`.)
+
+### Changed
+- **An expiring manual override is now swept during a thermal hold, not after
+  it.** The forced path used to short-circuit before the override sweep, so an
+  override that lapsed mid-emergency kept its deadman auto-restore deferred and
+  stayed listed on `/status` until the ladder released — which on a long
+  105 °C→80 °C descent is minutes. A consequence of evaluating the profile on
+  forced ticks (above), not a separate fix. (DEC-307.)
+- **`skipped_controls[]` is live during a thermal event rather than frozen.**
+  Forced ticks now evaluate curves, so they also commit what they learned: a
+  control that becomes unresolvable during a hold is reported at once instead of
+  at the end of it. This also closes a silence the same change would otherwise
+  have introduced — activating a profile mid-hold cleared the list, and nothing
+  on the forced path could refill it. (DEC-307.)
+
 ## [2.25.0] — 2026-09-01
 
 ### Changed
