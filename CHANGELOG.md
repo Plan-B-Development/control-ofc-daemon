@@ -2,6 +2,13 @@
 
 ## [2.26.0] — 2026-09-01
 
+Pairs with `control-ofc-gui` ≥ v2.23.0; **no wire, schema or API break** — no field
+was added, removed or reshaped. `thermal_safety.emergency_threshold_c` on
+`/diagnostics/hardware` keeps its type and its meaning ("the emergency trip point")
+and only stops being the same number on every machine, so a client that renders it —
+which is what every released GUI does — needs no change. A client that hardcoded 105
+would now be wrong, and never had licence to.
+
 ### Fixed
 - **[SAFETY] The thermal ladder's lower rungs could REDUCE cooling.** Two of the
   three forced duties were applied as a *replacement* for the active profile's
