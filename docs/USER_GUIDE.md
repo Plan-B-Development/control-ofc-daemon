@@ -28,7 +28,7 @@ The daemon provides a local API that a GUI (or scripts) can use to monitor tempe
 | AMD GPU fans (pre-RDNA3) | Yes | Yes (daemon-driven via pwm1) |
 | Intel Arc discrete GPU fans (`xe` / `i915`) | Yes (RPM) | No — firmware-managed, no kernel PWM interface (DEC-121) |
 | NVIDIA discrete GPU fans (`nouveau` / opt-in NVML) | Yes (RPM; firmware-measured duty via NVML) | No — read-only, no kernel/PMFW write path (DEC-204) |
-| AIO coolers (hwmon-attached) | Yes — coolant temp (`CoolantTemp` kind) + pump RPM (DEC-156) | Yes — hwmon pump PWM via the guided Configure-AIO flow, constant-speed pump (DEC-157) |
+| AIO coolers (hwmon-attached) | Yes — coolant temp (`CoolantTemp` kind) + pump RPM (DEC-156) | Yes — hwmon pump PWM via the guided Configure-AIO flow; fixed speed or a temperature curve, always floored at 30% (DEC-157, DEC-312). A motherboard-connected pump is configured the same way once its header carries the `pump` role (GUI ≥ v2.51.0 assigns it; `POST /config/header-role` otherwise) |
 
 ## Installation
 
