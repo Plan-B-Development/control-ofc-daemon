@@ -171,6 +171,24 @@ pub const HWMON_FAIL_SUMMARY_INTERVAL: u32 = 300;
 /// every tick.
 pub const SENSOR_READ_FAIL_REDISCOVER_STREAK: u32 = 5;
 
+/// Poll intervals a cached hwmon FAN entry may go unrefreshed before it is
+/// evicted (OFS-m).
+///
+/// `update_hwmon_fans` only ever inserts, and `read_hwmon_fan_states` drops any
+/// header with neither a readable RPM nor a readable PWM — so a header whose chip
+/// unbinds mid-session left a cached entry whose `updated_at` stopped advancing
+/// while `/fans` kept publishing it with an `age_ms` climbing without bound.
+///
+/// Deliberately judged on the entry's AGE rather than on a poll-failure streak.
+/// The poll loop is not the only writer of this map: `HwmonPwmController::set_pwm`
+/// reads the header's own RPM and inserts a fresh entry on every engine write. A
+/// streak counted on poll failures alone would therefore evict genuinely-current
+/// entries out from under an active profile and re-insert them on the next write,
+/// flapping the fan in and out of `/fans` at 1 Hz. Age answers the question the
+/// defect actually asks — "has anything refreshed this?" — and is unanimous
+/// across both writers.
+pub const HWMON_FAN_STALE_INTERVALS: u32 = 5;
+
 // ── Thermal emergency ────────────────────────────────────────────────
 
 /// CPU temperature (°C) at which the thermal emergency latches, forcing every

@@ -1,5 +1,38 @@
 # Changelog
 
+## [2.27.0] — 2026-09-01
+
+Pairs with `control-ofc-gui` ≥ v2.23.0; **no wire, schema or API break** — no field was
+added, removed or reshaped. `rpm` was already optional and a fan's absence already meant
+"not currently readable"; what changed is that the daemon now only populates them when it
+actually measured something.
+
+### Fixed
+- **Fan telemetry is now only reported when it was actually measured.** Three
+  places published values that looked like readings and were not:
+  - **A GPU fan's `age_ms` was reset by a *command*.** `set_gpu_fan_commanded_pct`
+    refreshed the timestamp that `/fans` publishes as the reading's age, so a
+    commanded GPU fan reported an age near zero beside an `rpm`/`duty_pct` frozen
+    at whatever the last real poll saw. This is byte-for-byte the defect DEC-302
+    removed from the OpenFan path one function above it, and was the surviving
+    instance of it. (`OFS-k`.)
+  - **A never-polled OpenFan channel reported `rpm: 0` as though measured.** The
+    zero was the struct's initial value; `rpm_polled` already recorded the
+    difference and was already consulted for `stall_detected`. Such a channel now
+    omits `rpm` — which is what that optional field is for — instead of being
+    indistinguishable on the wire from a genuinely stalled fan. A channel that was
+    polled and genuinely read zero is unaffected. (`OFS-l`.)
+  - **A hwmon fan header that stopped reading was published forever.** The cache
+    only ever inserted, so a header whose chip unbound mid-session kept an entry
+    whose `age_ms` climbed without bound. Entries nothing has refreshed for five
+    poll intervals are now evicted. A fan under active control cannot be evicted —
+    every engine write refreshes its entry, which is why this keys on the entry's
+    age rather than on a poll-failure streak. (`OFS-m`.)
+
+  No wire shape changed: `rpm` was already optional, and fan absence already meant
+  "not currently readable". Nothing on the control or safety path reads this map —
+  the engine takes headers from `HwmonPwmController` — so fan control is unaffected.
+
 ## [2.26.0] — 2026-09-01
 
 Pairs with `control-ofc-gui` ≥ v2.23.0; **no wire, schema or API break** — no field

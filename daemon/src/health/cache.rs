@@ -663,7 +663,16 @@ impl StateCache {
                 updated_at: now,
             });
         fan.last_commanded_pct = Some(pct);
-        fan.updated_at = now;
+        // OFS-k: deliberately does NOT touch `updated_at` — byte-for-byte the same
+        // rule DEC-302 (OFS-i) established for `set_openfan_commanded_pwm` one
+        // function above, and this was the surviving instance of it. That field is
+        // when this GPU's fan telemetry was last READ, and `build_fan_entries`
+        // publishes it as the reading's `age_ms`. Refreshing it here made a
+        // *command* present as fresh *telemetry*: the fan reported an `age_ms`
+        // near zero beside an `rpm`/`duty_pct` frozen at whatever the last real
+        // poll saw. The insert arm below still stamps it, which is correct — a
+        // GPU seen for the first time by a write has no prior reading, and its
+        // `rpm: None` says so honestly.
         state.snapshot_at = now;
     }
 
@@ -814,6 +823,57 @@ impl StateCache {
     /// list, and evicting on that evidence took a live CPU sensor to
     /// `CpuReading::Absent` — see the guard at the `polling.rs` call site
     /// ([SAFETY] DEC-272 round 2).
+    /// Evict hwmon fan entries that nothing has refreshed within `max_age`
+    /// (OFS-m).
+    ///
+    /// The sibling of [`Self::retain_sensors`] for the fan map, and it keys on age
+    /// rather than on a live-id set for a reason specific to this map: the poll
+    /// loop's PWM header set is built once at startup (`polling.rs`, `Arc::new`)
+    /// and never re-enumerated — `/hwmon/rescan` refreshes sensor descriptors, not
+    /// this — so "the currently-discovered header set" never shrinks and retaining
+    /// against it would evict nothing, ever. Age is the only signal that actually
+    /// distinguishes a header still being read from one that has gone silent.
+    ///
+    /// Both writers refresh `updated_at`: the poll loop on a successful read, and
+    /// `HwmonPwmController::set_pwm` on every engine write (it reads the header's
+    /// own RPM). So an entry is evicted only when *neither* has touched it —
+    /// which is exactly the frozen-forever state this exists to remove, and is why
+    /// an actively-commanded fan cannot be evicted from under a running profile.
+    ///
+    /// Nothing on the control or safety path consumes this map — the engine reads
+    /// headers from `HwmonPwmController`, not from here — so eviction cannot
+    /// affect fan control. It changes `/fans` and `/poll` only.
+    pub fn retain_fresh_hwmon_fans(&self, max_age: std::time::Duration) {
+        let now = Instant::now();
+        // Fast path, mirroring `retain_sensors`: the steady-state tick evicts
+        // nothing and must not take the write lock to discover that.
+        //
+        // `retain_sensors` documents that its read-then-write gap is safe only
+        // because it has a single writer, and warns that a second one would
+        // require a re-check under the write lock. **This map genuinely has two
+        // writers** — the poll loop and `HwmonPwmController::set_pwm` — so that
+        // warning applies here, and is satisfied rather than inherited: the
+        // predicate below is re-evaluated against each entry's own `updated_at`
+        // while holding the write lock, not against an id set captured during the
+        // read. An entry inserted in the gap is therefore judged on its real age
+        // and survives. `now` is sampled before the read, so a slow acquisition
+        // makes ages look *smaller* — the conservative direction, since the worst
+        // outcome is deferring an eviction by one tick.
+        if self
+            .inner
+            .read()
+            .hwmon_fans
+            .values()
+            .all(|f| now.saturating_duration_since(f.updated_at) <= max_age)
+        {
+            return;
+        }
+        let mut state = self.inner.write();
+        state
+            .hwmon_fans
+            .retain(|_, f| now.saturating_duration_since(f.updated_at) <= max_age);
+    }
+
     pub fn retain_sensors(&self, live: &HashSet<String>) {
         // Fast path mirrors `update_unavailable_sensors`: the steady-state tick
         // evicts nothing and must not take the write lock to discover that.
@@ -1171,6 +1231,116 @@ mod tests {
         let snap = cache.snapshot();
         assert_eq!(snap.hwmon_fans.len(), 1);
         assert_eq!(snap.hwmon_fans["it8696:fan1"].rpm, Some(800));
+    }
+
+    /// OFS-k: a COMMAND must not make stale telemetry look fresh.
+    ///
+    /// The GPU twin of DEC-302's `set_openfan_commanded_pwm` fix, and the instance
+    /// that survived it. `build_fan_entries` publishes `updated_at` as the
+    /// reading's `age_ms`, so refreshing it on a write reported an age near zero
+    /// beside an `rpm` frozen at whatever the last real poll saw.
+    #[test]
+    fn a_gpu_command_does_not_refresh_the_telemetry_timestamp() {
+        let cache = StateCache::new();
+        cache.update_gpu_fans(vec![AmdGpuFanState {
+            id: "amd_gpu:0000:2d:00.0".into(),
+            rpm: Some(1200),
+            last_commanded_pct: None,
+            duty_pct: Some(40),
+            updated_at: Instant::now() - std::time::Duration::from_secs(30),
+        }]);
+        let before = cache.gpu_fans_snapshot()["amd_gpu:0000:2d:00.0"].updated_at;
+
+        cache.set_gpu_fan_commanded_pct("amd_gpu:0000:2d:00.0", 75);
+
+        let snap = cache.gpu_fans_snapshot();
+        let after = &snap["amd_gpu:0000:2d:00.0"];
+        assert_eq!(
+            after.updated_at, before,
+            "a command must leave the READING's timestamp alone — the rpm beside \
+             it is still 30s old, and age_ms is computed from this field"
+        );
+        assert_eq!(
+            after.last_commanded_pct,
+            Some(75),
+            "precondition: the command itself must still have been recorded, or \
+             this test would pass against a no-op"
+        );
+    }
+
+    /// OFS-k, the other half: a GPU seen for the first time BY a write has no
+    /// prior reading, so stamping `updated_at` on insert is correct. `rpm: None`
+    /// is what says "nothing measured this".
+    #[test]
+    fn a_first_ever_gpu_command_still_stamps_the_new_entry() {
+        let cache = StateCache::new();
+        cache.set_gpu_fan_commanded_pct("amd_gpu:0000:2d:00.0", 60);
+        let snap = cache.gpu_fans_snapshot();
+        let fan = &snap["amd_gpu:0000:2d:00.0"];
+        assert!(fan.rpm.is_none(), "nothing has measured this fan");
+        assert!(
+            Instant::now().saturating_duration_since(fan.updated_at)
+                < std::time::Duration::from_secs(5),
+            "a newly-created entry is not stale — there is no older reading to \
+             misrepresent"
+        );
+    }
+
+    /// OFS-m: an entry nothing refreshes is evicted, and one something DOES
+    /// refresh survives.
+    ///
+    /// The second half is the load-bearing one. `HwmonPwmController::set_pwm`
+    /// refreshes this map on every engine write, so an eviction rule that keyed on
+    /// poll failures alone would drop a fan that is being actively commanded and
+    /// re-insert it on the next write — flapping it in and out of `/fans` at 1 Hz
+    /// under a running profile.
+    #[test]
+    fn a_frozen_hwmon_fan_is_evicted_and_a_refreshed_one_is_not() {
+        let cache = StateCache::new();
+        let stale = std::time::Duration::from_secs(60);
+        cache.update_hwmon_fans(vec![
+            HwmonFanState {
+                id: "it8696:pwm1".into(),
+                rpm: Some(800),
+                last_commanded_pwm: Some(40),
+                updated_at: Instant::now() - stale,
+            },
+            HwmonFanState {
+                id: "it8696:pwm2".into(),
+                rpm: Some(900),
+                last_commanded_pwm: Some(50),
+                updated_at: Instant::now(),
+            },
+        ]);
+
+        cache.retain_fresh_hwmon_fans(std::time::Duration::from_secs(5));
+
+        let fans = cache.snapshot().hwmon_fans;
+        assert!(
+            !fans.contains_key("it8696:pwm1"),
+            "a header nothing has refreshed for 60s must not keep being published \
+             with an age_ms that climbs forever"
+        );
+        assert!(
+            fans.contains_key("it8696:pwm2"),
+            "a header something IS refreshing must survive — this is the write-path \
+             case a poll-failure streak would have flapped"
+        );
+    }
+
+    /// OFS-m: the steady-state tick evicts nothing and must not take the write
+    /// lock to discover that — the same fast-path contract as `retain_sensors`.
+    #[test]
+    fn retain_fresh_hwmon_fans_is_a_no_op_when_everything_is_fresh() {
+        let cache = StateCache::new();
+        cache.update_hwmon_fans(vec![HwmonFanState {
+            id: "it8696:pwm1".into(),
+            rpm: Some(800),
+            last_commanded_pwm: Some(40),
+            updated_at: Instant::now(),
+        }]);
+        cache.retain_fresh_hwmon_fans(std::time::Duration::from_secs(5));
+        assert_eq!(cache.snapshot().hwmon_fans.len(), 1);
     }
 
     #[test]

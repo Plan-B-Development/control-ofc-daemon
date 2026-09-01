@@ -525,6 +525,14 @@ pub async fn hwmon_poll_loop(
                 } else {
                     log::debug!("hwmon poll: {count} sensors updated");
                 }
+                // OFS-m: drop fan entries nothing has refreshed. Deliberately
+                // OUTSIDE the `is_empty` guard above — a tick where *every*
+                // header went unreadable produces an empty batch, and that is
+                // precisely the case that used to leave the whole map frozen and
+                // ageing forever.
+                cache.retain_fresh_hwmon_fans(
+                    interval.saturating_mul(crate::constants::HWMON_FAN_STALE_INTERVALS),
+                );
 
                 // Update GPU fan state in cache
                 if !gpu_fan_states.is_empty() {

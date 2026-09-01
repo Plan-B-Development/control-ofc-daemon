@@ -152,7 +152,16 @@ pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntr
         fans.push(FanEntry {
             id: format!("openfan:ch{ch:02}"),
             source: "openfan".into(),
-            rpm: Some(fan.rpm),
+            // OFS-l: a channel the daemon has only ever WRITTEN has `rpm == 0`
+            // because that is the struct's initial value, not because anything
+            // measured it. `rpm_polled` exists for exactly this distinction and
+            // was already consulted for `stall` three lines up; publishing
+            // `Some(0)` regardless made an unmeasured channel indistinguishable
+            // from a genuinely stalled one. `rpm` is optional on the wire
+            // (`skip_serializing_if`), and every other source already emits
+            // `None` when it has no reading, so absence is the established shape
+            // rather than a new one.
+            rpm: fan.rpm_polled.then_some(fan.rpm),
             last_commanded_pwm: fan.last_commanded_pwm,
             duty_pct: None,
             age_ms,
@@ -636,6 +645,63 @@ mod tests {
         let state = DaemonState::default();
         let entries = build_fan_entries(&state, Instant::now());
         assert!(entries.is_empty());
+    }
+
+    /// OFS-l: a channel the daemon has only ever WRITTEN must not publish a
+    /// fabricated `rpm: 0`.
+    ///
+    /// `OpenFanState.rpm` starts at 0 because that is the struct's initial value,
+    /// not because anything measured it. `rpm_polled` records the difference and
+    /// was already consulted for `stall_detected` — publishing `Some(0)` anyway
+    /// made an unmeasured channel indistinguishable on the wire from a genuinely
+    /// stalled one.
+    #[test]
+    fn a_never_polled_openfan_channel_publishes_no_rpm() {
+        let mut state = DaemonState::default();
+        state.openfan_fans.insert(
+            3,
+            crate::health::state::OpenFanState {
+                channel: 3,
+                rpm: 0,
+                last_commanded_pwm: Some(70),
+                updated_at: Instant::now(),
+                rpm_polled: false,
+            },
+        );
+        state.openfan_fans.insert(
+            4,
+            crate::health::state::OpenFanState {
+                channel: 4,
+                rpm: 0,
+                last_commanded_pwm: Some(70),
+                updated_at: Instant::now(),
+                rpm_polled: true,
+            },
+        );
+
+        let entries = build_fan_entries(&state, Instant::now());
+        let ch3 = entries.iter().find(|e| e.id == "openfan:ch03").unwrap();
+        let ch4 = entries.iter().find(|e| e.id == "openfan:ch04").unwrap();
+
+        assert_eq!(
+            ch3.rpm, None,
+            "a channel nothing has polled must report no rpm, not a measured-looking zero"
+        );
+        assert_eq!(
+            ch4.rpm,
+            Some(0),
+            "a channel that WAS polled and genuinely read 0 must still report it — \
+             the fix must not suppress a real stalled-fan reading"
+        );
+        assert_eq!(
+            ch4.stall_detected,
+            Some(true),
+            "precondition: the polled zero is the stall signal, and it must survive"
+        );
+        assert_eq!(
+            ch3.stall_detected, None,
+            "precondition: an unpolled channel already reported no stall verdict"
+        );
     }
 
     #[test]

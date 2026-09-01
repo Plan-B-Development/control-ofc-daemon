@@ -542,10 +542,16 @@ pub fn compute_health(
         // publishes `unavailable_sensors[]`. Adding a second opinion here bought
         // three false positives and no new signal.
         //
-        // The genuinely unmanaged surface is `hwmon_fans`, which freezes when
-        // headers stop reading and is never pruned — recorded as its own register
-        // row rather than fixed by chaining it in here, because an un-pruned map
-        // would latch Crit forever for a removed header.
+        // `hwmon_fans` used to be the genuinely unmanaged surface: it froze when
+        // headers stopped reading and was never pruned, so chaining it in here
+        // would have latched Crit forever for a removed header. **DEC-309 pruned
+        // it** — `retain_fresh_hwmon_fans` evicts entries nothing has refreshed
+        // for `HWMON_FAN_STALE_INTERVALS` poll intervals — which removes that
+        // objection. Chaining it into this reduction is now *possible* and is
+        // still deliberately NOT done: it would be a second opinion on the same
+        // question this comment already rejects for openfan, and a frozen entry
+        // now evicts rather than lingering, so there is nothing left for it to
+        // report. Tracked as `309-b` if that judgement is ever revisited.
         poll_subsystem_health(
             "hwmon",
             ts.hwmon,
