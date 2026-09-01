@@ -279,6 +279,21 @@ pub struct AppState {
     pub active_profile: Arc<Mutex<Option<crate::profile::DaemonProfile>>>,
     /// Prevents concurrent calibration sweeps from corrupting each other.
     pub calibrating: AtomicBool,
+    /// The current or most recent PWM/RPM characterisation run (AIO-MB Phase 3),
+    /// and the flag `DELETE /diagnostics/characterization` sets to ask it to stop.
+    ///
+    /// The run itself is a **detached** `tokio::spawn`, unlike every other
+    /// hardware diagnostic here: the sweep is minutes long and the client polls
+    /// `GET /diagnostics/characterization` rather than holding a request open.
+    /// It claims the same single verify slot as verify and calibrate, so at most
+    /// one of the three can be in flight; concurrency is bounded by that slot,
+    /// not by this field.
+    ///
+    /// [SAFETY] Because the task is detached it is NOT in
+    /// `main::shutdown_sequence`'s `task_handles`. What makes that safe is the
+    /// shutdown check inside `characterization::RestoreOnDrop` — see its docs.
+    pub characterization: crate::api::characterization::RunSlot,
+    pub characterization_cancel: Arc<AtomicBool>,
     /// Prevents concurrent `POST /fans/openfan/rescan` probes (DEC-265).
     /// Two racing probes would open the same tty, and the loser would install
     /// a controller over the winner's — orphaning a poll loop on a transport

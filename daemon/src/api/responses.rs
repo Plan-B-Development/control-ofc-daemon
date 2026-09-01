@@ -646,6 +646,19 @@ pub struct ControlCapability {
     /// when it is false — the honest description of what that daemon does.
     #[serde(default)]
     pub header_roles: bool,
+    /// Daemon exposes `POST /hwmon/{id}/characterize` plus the
+    /// `GET`/`DELETE /diagnostics/characterization` pair — the deeper PWM/RPM
+    /// response sweep that sits alongside the quick verify. True since 2.29.0
+    /// (AIO-MB Phase 3).
+    ///
+    /// A client MUST gate on this rather than probing: an older daemon 404s the
+    /// POST — the same *status* this route returns for an unknown header id. The
+    /// two differ only in `error.code` (`not_found` from the route fallback vs
+    /// `validation_error` from the handler's own branch), and coupling feature
+    /// detection to which error code came back is exactly what this flag exists
+    /// to replace.
+    #[serde(default)]
+    pub pwm_characterization: bool,
 }
 
 /// Per-device-group capability info.
@@ -2145,6 +2158,7 @@ mod tests {
                 openfan_rescan: false,
                 profile_search_dir_remove: false,
                 header_roles: false,
+                pwm_characterization: true,
             },
         };
         let json = serde_json::to_value(&resp).unwrap();

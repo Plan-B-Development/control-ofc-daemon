@@ -318,6 +318,8 @@ pub async fn capabilities_handler(
             // DEC-311 (AIO-MB Phase 1): role classification, pump-safe identify,
             // role-aware verify, and POST /config/header-role.
             header_roles: true,
+            // AIO-MB Phase 3: PWM/RPM response characterisation.
+            pwm_characterization: true,
         },
     })
 }

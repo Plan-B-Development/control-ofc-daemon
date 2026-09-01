@@ -77,6 +77,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/hwmon/{header_id}/verify",
             post(handlers::hwmon_verify_handler),
         )
+        // AIO-MB Phase 3: the deeper PWM/RPM sweep that sits ALONGSIDE the quick
+        // verify above (never in place of it). Returns 202 and runs detached;
+        // the client polls the /diagnostics/characterization pair below.
+        .route(
+            "/hwmon/{header_id}/characterize",
+            post(handlers::hwmon_characterize_handler),
+        )
+        .route(
+            "/diagnostics/characterization",
+            get(handlers::characterization_status_handler)
+                .delete(handlers::characterization_cancel_handler),
+        )
         // Hwmon rescan
         .route("/hwmon/rescan", post(handlers::hwmon_rescan_handler))
         // DEC-265: adopt an OpenFanController that appeared after boot,

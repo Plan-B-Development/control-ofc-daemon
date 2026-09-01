@@ -298,6 +298,66 @@ pub const THERMAL_EMERGENCY_RELEASE_C: f64 = 80.0;
 /// more headroom.
 pub const CALIBRATION_MAX_TEMP_C: f64 = 85.0;
 
+// ── PWM/RPM characterisation (AIO-MB Phase 3) ────────────────────────
+
+/// Default sweep points for `POST /hwmon/{id}/characterize`, from
+/// `AIO-Phase3.md`. Clamped per-header before use — a pump-protected header
+/// never sees a point below [`crate::profile::HARD_PUMP_CPU_FLOOR_PCT`].
+pub const CHARACTERIZATION_DEFAULT_POINTS: [u8; 8] = [30, 40, 50, 60, 70, 80, 90, 100];
+
+/// [SAFETY] The floor under every characterisation point on a NON-pump header.
+///
+/// **0% is unreachable through the characterisation endpoint for any header**,
+/// and that is the invariant the whole diagnostic is built on: one flat clamp
+/// `[max(CHARACTERIZATION_MIN_PCT, header floor) .. 100]`, never a
+/// role-conditional branch. `AIO-Phase3.md` forbids only *automatically*
+/// including 0%, so a lower non-pump floor was available and was declined —
+/// a flat rule is testable in one assertion, where a role-conditional one is
+/// only as correct as `header_is_pump_protected` is on every board.
+///
+/// The cost (no chassis-fan stall/start-point discovery) is accepted and
+/// recorded as `AIO3-c` in `DECISIONS_OPEN_ITEMS.md`. Do not "fix" it by
+/// branching here; the reserved route is a per-device policy table.
+pub const CHARACTERIZATION_MIN_PCT: u8 = 20;
+
+/// Cap on caller-supplied sweep points. Mirrors the calibrate sweep's
+/// `steps 2..=20`, so the worst-case run (20 x 15 s) stays the same order as
+/// calibration's ~325 s and inside its accepted engine-pause precedent.
+pub const CHARACTERIZATION_MAX_POINTS: usize = 20;
+
+/// Settle window per point, and its clamp. Default matches
+/// [`VERIFY_WAIT_SECONDS`] — raised to 6 s for exactly this reason (DEC-101):
+/// slow-spinning pumps need >3 s or they report a false `no_response`.
+///
+/// The maximum is load-bearing for DEC-296: the pause deadman is renewed once
+/// per point, so the renewal interval is `settle + I/O`. At 15 s that leaves
+/// ample margin inside [`VERIFY_PAUSE_DEADMAN`] (30 s); raising it past ~28 s
+/// would let a healthy sweep time its own pause out.
+pub const CHARACTERIZATION_DEFAULT_SETTLE_S: u64 = VERIFY_WAIT_SECONDS as u64;
+pub const CHARACTERIZATION_SETTLE_MIN_S: u64 = 2;
+pub const CHARACTERIZATION_SETTLE_MAX_S: u64 = 15;
+
+/// Sub-sampling interval used to measure `first_change_ms` within a settle
+/// window. Deliberately no early exit: the sweep always holds the full settle,
+/// so a run can only ever be shorter than its budgeted pause, never longer.
+pub const CHARACTERIZATION_SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Readback tolerance in percentage points. A duty is stored as a 0-255 raw
+/// value, so a round-trip through `percent -> raw -> percent` can legitimately
+/// land one point away; 2 absorbs that without hiding a real clamp.
+pub const CHARACTERIZATION_READBACK_TOLERANCE_PCT: u8 = 2;
+
+/// Absolute RPM noise floor for "did this reading move?". Below this, tach
+/// jitter on a healthy fan would read as a response.
+pub const CHARACTERIZATION_RPM_NOISE_FLOOR: u16 = 50;
+
+/// Minimum absolute RPM spread across the whole sweep before it is called
+/// `responsive`. Paired with a >20% relative test (the same rule
+/// `classify_verify_result` uses) so a slow pump is not a false negative:
+/// 20% of a 900 RPM idle is 180, but 20% of a 300 RPM idle is only 60, which
+/// tach noise alone can cover.
+pub const CHARACTERIZATION_RESPONSIVE_MIN_DELTA_RPM: u16 = 150;
+
 // Compile-time invariant checks — these fail the build if someone changes a
 // constant to an unsafe value.
 const _: () = assert!(CALIBRATION_MAX_TEMP_C < THERMAL_EMERGENCY_TRIGGER_C);
@@ -308,6 +368,22 @@ const _: () = assert!(NO_SENSOR_SAFE_PCT > 0);
 const _: () = assert!(THERMAL_TRIGGER_MAX_C >= THERMAL_EMERGENCY_TRIGGER_C);
 const _: () = assert!(THERMAL_TRIGGER_MARGIN_C > 0.0);
 const _: () = assert!(DEADBAND_MAX_HOLD_CYCLES > 0);
+// AIO-MB Phase 3: 0% must be unreachable through characterisation, the settle
+// clamp must be a non-empty range, and the whole per-point window (settle plus
+// slack) must fit inside the pause deadman that is renewed once per point.
+const _: () = assert!(CHARACTERIZATION_MIN_PCT > 0);
+const _: () = assert!(CHARACTERIZATION_SETTLE_MIN_S <= CHARACTERIZATION_SETTLE_MAX_S);
+const _: () = assert!(CHARACTERIZATION_DEFAULT_SETTLE_S >= CHARACTERIZATION_SETTLE_MIN_S);
+const _: () = assert!(CHARACTERIZATION_DEFAULT_SETTLE_S <= CHARACTERIZATION_SETTLE_MAX_S);
+const _: () = assert!(CHARACTERIZATION_SETTLE_MAX_S * 2 <= VERIFY_PAUSE_DEADMAN.as_secs());
+const _: () = assert!(CHARACTERIZATION_MAX_POINTS > 0);
+// [SAFETY] The hwmon lease is renewed once per point, so the renewal interval is
+// one settle window. It must sit well inside BOTH deadlines the sweep depends on:
+// the engine-pause deadman above, and the hwmon lease TTL — which is 60 s and is
+// NOT refreshed by a write. Before the renewal was added, a legal 20 x 15 s sweep
+// blew the lease at t~60 s and then could not even restore the header.
+const _: () =
+    assert!(CHARACTERIZATION_SETTLE_MAX_S * 2 <= crate::hwmon::lease::DEFAULT_LEASE_TTL.as_secs());
 // The renew interval must leave room for ~3 attempts inside the TTL, and the
 // TTL must be non-trivial — a too-tight window would drop legitimate overrides.
 const _: () = assert!(OVERRIDE_RENEW_SECS > 0);

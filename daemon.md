@@ -468,6 +468,9 @@ commands still gets the forced duty, which is what keeps the reach above true.
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST | `/hwmon/{header_id}/verify` | Test PWM write effectiveness (~6s; daemon uses its own internal lease, detects BIOS/EC interference) |
+| POST | `/hwmon/{header_id}/characterize` | Start a PWM/RPM response sweep (AIO-MB Phase 3, DEC-313). Returns `202` and runs detached; alongside the quick verify, never replacing it. Points clamped to `[max(20, header floor)..100]` — **0% is unreachable** — and swept ascending |
+| GET | `/diagnostics/characterization` | Current or most recent characterisation run, including points measured so far (live progress) |
+| DELETE | `/diagnostics/characterization` | Ask a running sweep to stop; the header is restored either way |
 | POST | `/hwmon/rescan` | Re-enumerate hwmon devices and return fresh header list |
 | POST | `/fans/openfan/rescan` | Look for an OpenFanController and adopt it without a restart (DEC-265) |
 

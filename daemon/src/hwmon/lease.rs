@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Default token TTL (60 seconds).
-const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(60);
+pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(60);
 
 // Monotonic clock seam, injectable so expiry tests can advance time
 // deterministically instead of sleeping (audit P2-F). Promoted to the shared

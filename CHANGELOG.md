@@ -1,5 +1,62 @@
 # Changelog
 
+## [2.29.0] — 2026-09-02
+
+Pairs with `control-ofc-gui` >= v2.23.0 (unchanged floor). **Additive only** — three new
+endpoints and one capability flag; every existing route, response shape and safety rule is
+untouched. A client that does not know the flag behaves exactly as it did against v2.28.1.
+
+AIO-MB Phase 3: a deeper PWM/RPM response diagnostic, **alongside** the quick verify.
+
+### Added
+- **`POST /hwmon/{header_id}/characterize`** — walks a motherboard PWM header across a
+  series of duties (30-100% by default) and reports what it measured at each. Returns
+  `202` immediately and runs the sweep daemon-side; the client polls. Gated on the new
+  `control.pwm_characterization` capability.
+- **`GET /diagnostics/characterization`** — the current or most recent run, including
+  points measured so far, so a client can show progress while the sweep is still going.
+  `404` when no run has ever been started.
+- **`DELETE /diagnostics/characterization`** — asks a running sweep to stop. Cooperative:
+  the current point finishes settling, then the header is restored.
+- **Command acceptance, PWM readback and physical RPM response are three separate
+  verdicts**, never one pass/fail. A pump whose firmware overrides PWM during its startup
+  or self-bleeding period reports a *correct* readback with RPM pinned high; collapsing
+  the axes would call that a write failure, which is the wrong conclusion. The summary
+  reports it as `possible_device_override` instead, and derives monotonicity, a candidate
+  dead zone, a candidate PWM clamp and whether another controller interfered.
+
+### Safety
+- **0% is unreachable through the new endpoint, for every header and every input.** Points
+  are clamped into `[max(20, header floor) .. 100]`, where a pump-protected header's floor
+  is the existing hard 30%. One flat rule rather than a role-conditional branch — the
+  invariant is then provable in a single assertion instead of being only as correct as
+  role resolution is on every board. The pump term reads the **union** predicate
+  `header_is_pump_protected`, never the wire `role` (DEC-312), so a user who relabels a
+  `PUMP` header `chassis_fan` does not strip its floor.
+- **Points are swept ascending**, so a sweep that aborts part-way leaves the header high
+  rather than low.
+- **The pre-sweep duty is restored on every exit path** — completion, cancellation, a
+  failed write, a reclaim, a thermal abort, and the runtime dropping the detached task at
+  shutdown. Two skips, both deliberate: while the thermal ladder is forcing (DEC-295,
+  restoring would lower the header back under the forced duty) and while the daemon is
+  shutting down (DEC-290/277-c, firmware already owns the header).
+- **The run claims the existing single verify/calibrate slot**, so a characterisation, a
+  verify and a calibration can never drive hardware at the same time, and the engine's
+  write phase is paused for its lifetime. The pause deadman is renewed once per point
+  (DEC-296) so it measures liveness rather than total duration.
+- **The thermal ladder still outranks the diagnostic, unchanged.** The forced-safety
+  branch runs and `continue`s before the engine's `verify_active()` gate, exactly as
+  before; a sweep is *refused* while the system is hot (`409 thermal_abort`) or while the
+  ladder is forcing (`409 validation_error`, retryable), and aborts if either becomes true
+  mid-run.
+- A header reclaimed by BIOS/EC mid-sweep (`pwm_enable != 1`) aborts the run and is
+  reported, rather than continuing to measure a header something else is driving.
+
+### Changed
+- `hwmon_verify_handler`'s inner sysfs-read closure is now the shared
+  `read_header_state()`, used by both the verify and the sweep. No behaviour change —
+  extracted so the two cannot drift apart (DEC-276's lesson).
+
 ## [2.28.1] — 2026-09-02
 
 Pairs with `control-ofc-gui` ≥ v2.23.0 (unchanged floor). **Documentation only — no code

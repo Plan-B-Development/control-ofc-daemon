@@ -785,6 +785,8 @@ mod tests {
             history: Arc::new(crate::health::history::HistoryRing::new(250)),
             active_profile: Arc::new(parking_lot::Mutex::new(None)),
             calibrating: std::sync::atomic::AtomicBool::new(false),
+            characterization: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
             last_openfan_rescan: Arc::new(parking_lot::Mutex::new(None)),
             adopted_poll_handles: Arc::new(parking_lot::Mutex::new(Vec::new())),

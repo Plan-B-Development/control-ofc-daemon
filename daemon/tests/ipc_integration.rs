@@ -104,6 +104,8 @@ fn test_app_state_inner(engine_ticked: bool, runtime_cfg: std::path::PathBuf) ->
         history: Arc::new(HistoryRing::new(250)),
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
+        characterization: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_handles: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -851,6 +853,8 @@ async fn fans_endpoint_tags_intel_gpu_source_by_id_prefix() {
         history: Arc::new(HistoryRing::new(250)),
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
+        characterization: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_handles: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -1020,6 +1024,8 @@ fn test_app_state_with_nvidia_gpu(
         history: Arc::new(HistoryRing::new(250)),
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
+        characterization: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_handles: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -1232,6 +1238,33 @@ async fn uds_post(
     (status, json)
 }
 
+/// DELETE with no body — used by `DELETE /diagnostics/characterization`
+/// (AIO-MB Phase 3), which carries its arguments in the path alone.
+async fn uds_delete(socket_path: &str, path: &str) -> (u16, serde_json::Value) {
+    let stream = UnixStream::connect(socket_path).await.unwrap();
+    let io = TokioIo::new(stream);
+
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(path)
+        .header("host", "localhost")
+        .body(http_body_util::Empty::<bytes::Bytes>::new())
+        .unwrap();
+
+    let resp = sender.send_request(req).await.unwrap();
+    let status = resp.status().as_u16();
+    let resp_body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value =
+        serde_json::from_slice(&resp_body).unwrap_or(serde_json::Value::Null);
+
+    (status, json)
+}
+
 // ── Hwmon integration tests ──────────────────────────────────────────
 
 /// Mock sysfs writer for hwmon integration tests.
@@ -1299,6 +1332,8 @@ fn test_app_state_with_hwmon() -> Arc<AppState> {
         history: Arc::new(HistoryRing::new(250)),
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
+        characterization: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_handles: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -1632,6 +1667,8 @@ fn test_app_state_with_unsupported_gpu(pci_bdf: &str) -> Arc<AppState> {
         history: Arc::new(HistoryRing::new(250)),
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
+        characterization: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_handles: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -1720,6 +1757,8 @@ fn test_app_state_with_read_only_gpu(pci_bdf: &str, pci_device_id: u16) -> Arc<A
         history: Arc::new(HistoryRing::new(250)),
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
+        characterization: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_handles: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -1798,6 +1837,8 @@ fn test_app_state_with_amd_gpu(
         history: Arc::new(HistoryRing::new(250)),
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
+        characterization: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_handles: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -2276,6 +2317,8 @@ async fn deactivate_profile_resets_hwmon_coalescing() {
             curves: Vec::new(),
         }))),
         calibrating: std::sync::atomic::AtomicBool::new(false),
+        characterization: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_handles: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -2405,6 +2448,8 @@ fn test_app_state_with_writable_pmfw_gpu(pci_bdf: &str) -> (Arc<AppState>, tempf
         history: Arc::new(HistoryRing::new(250)),
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
+        characterization: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_handles: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -2590,6 +2635,8 @@ async fn hwmon_discovery_excludes_amdgpu_end_to_end_via_ipc() {
         history: Arc::new(HistoryRing::new(250)),
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
+        characterization: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_handles: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -2666,6 +2713,8 @@ fn test_app_state_with_profile_dirs(dirs: Vec<std::path::PathBuf>) -> Arc<AppSta
         history: Arc::new(HistoryRing::new(250)),
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
         calibrating: std::sync::atomic::AtomicBool::new(false),
+        characterization: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_handles: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -5058,4 +5107,378 @@ async fn capabilities_advertise_the_openfan_rescan_route() {
     let (code, body) = uds_get(&sock_str, "/capabilities").await;
     assert_eq!(code, 200);
     assert_eq!(body["control"]["openfan_rescan"], true);
+}
+
+// ── PWM/RPM characterisation (AIO-MB Phase 3) ────────────────────────
+
+/// Poll `GET /diagnostics/characterization` until the run leaves `running`.
+/// Bounded so a wedged sweep fails the test instead of hanging CI (the
+/// tokio-test trap recorded in CLAUDE.md: an unbounded wait turns a red test
+/// into a hung job).
+async fn await_characterization(path: &str) -> serde_json::Value {
+    for _ in 0..100 {
+        let (status, json) = uds_get(path, "/diagnostics/characterization").await;
+        assert_eq!(status, 200, "status endpoint should serve a started run");
+        if json["state"] != "running" {
+            return json;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("characterisation run never reached a terminal state");
+}
+
+/// Build the hwmon fixture with a deliberately short hwmon lease TTL.
+///
+/// The real TTL is 60 s, which no test can wait out. Shortening it is what makes
+/// the lease-renewal call site testable at all.
+fn test_app_state_with_short_lease(ttl: std::time::Duration) -> Arc<AppState> {
+    let state = test_app_state_with_hwmon();
+    if let Some(ctrl) = state.hwmon_controller.as_ref() {
+        *ctrl.lock().lease_manager_mut() = LeaseManager::with_ttl(ttl);
+    }
+    state
+}
+
+/// [SAFETY] **The call-site test for the lease renewal.**
+///
+/// `run_sweep`'s unit test proves it calls `keepalive` once per point. It does
+/// NOT prove the *handler's* keepalive renews the hwmon lease — that is the
+/// "extracting a rule into a testable function does not test the call site"
+/// trap, which this project has hit five times. This drives the real handler
+/// through a sweep several times longer than the lease TTL.
+///
+/// The assertion that matters is `restore_failed == false`: an expired lease
+/// fails the sweep's writes *and the restore with them*, which is what actually
+/// strands the header at a duty nothing will correct.
+#[tokio::test]
+async fn characterize_renews_the_hwmon_lease_across_a_long_sweep() {
+    let state = test_app_state_with_short_lease(std::time::Duration::from_secs(3));
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    // 3 points x 2 s = ~6 s, twice the lease TTL, with renewals ~2 s apart.
+    let (status, json) = uds_post(
+        &path,
+        "/hwmon/h1/characterize",
+        &serde_json::json!({"points_pct": [40, 60, 80], "settle_seconds": 2}),
+    )
+    .await;
+    assert_eq!(status, 202, "{json}");
+
+    let done = await_characterization(&path).await;
+    assert_eq!(
+        done["state"], "complete",
+        "the sweep outlived the lease TTL and must have renewed it: {done}"
+    );
+    assert_eq!(
+        done["restore_failed"], false,
+        "an unrenewed lease fails the RESTORE too, stranding the header: {done}"
+    );
+    assert_eq!(done["points"].as_array().unwrap().len(), 3);
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn characterize_refused_when_hot() {
+    let state = test_app_state_with_hwmon();
+    make_hot(&state);
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_post(&path, "/hwmon/h1/characterize", &serde_json::json!({})).await;
+
+    assert_eq!(status, 409, "{json}");
+    assert_eq!(json["error"]["code"], "thermal_abort");
+    assert_eq!(json["error"]["retryable"], true);
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn characterize_refused_while_thermal_safety_is_forcing() {
+    // The 80-85 °C band, and the `no_sensor_fallback` case: cool enough to pass
+    // the temperature test while the ladder is still forcing every fan. The
+    // fixture is at a normal temperature on purpose, so this cannot pass by
+    // keying on temperature.
+    let state = test_app_state_with_hwmon();
+    state.cache.record_engine_tick(
+        "emergency",
+        control_ofc_daemon::constants::THERMAL_EMERGENCY_TRIGGER_C,
+    );
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_post(&path, "/hwmon/h1/characterize", &serde_json::json!({})).await;
+
+    assert_eq!(status, 409, "{json}");
+    assert_eq!(json["error"]["code"], "validation_error");
+    assert_eq!(json["error"]["retryable"], true);
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn characterize_unknown_header_is_404_and_no_controller_is_503() {
+    let state = test_app_state_with_hwmon();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+    let (status, json) = uds_post(
+        &path,
+        "/hwmon/nope:missing/characterize",
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, 404, "{json}");
+    assert_eq!(json["error"]["code"], "validation_error");
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+
+    let (path2, shutdown2, _dir2) = start_test_server(test_app_state()).await;
+    let (status2, json2) = uds_post(&path2, "/hwmon/h1/characterize", &serde_json::json!({})).await;
+    assert_eq!(status2, 503, "{json2}");
+    assert_eq!(json2["error"]["code"], "hardware_unavailable");
+    let _ = shutdown2.send(());
+    let _ = std::fs::remove_file(&path2);
+}
+
+/// [SAFETY] **The call-site test.** `resolve_points` having correct arithmetic
+/// is not evidence the handler calls it, still less that it passes the pump
+/// floor — this project has shipped that exact gap five times (CLAUDE.md:
+/// "extracting a rule into a testable function does NOT test the call site").
+///
+/// Assigns `pump` to a header the hardware labels `CHA_FAN1`, asks for points
+/// the daemon must refuse, and reads the clamped list back off the 202.
+#[tokio::test]
+async fn characterize_clamps_a_user_assigned_pump_to_the_hard_floor() {
+    let state = test_app_state_with_hwmon();
+    {
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "h1".to_string(),
+            control_ofc_daemon::hwmon::roles::HeaderRole::Pump,
+        );
+        *state.header_roles.write() = Arc::new(map);
+    }
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_post(
+        &path,
+        "/hwmon/h1/characterize",
+        &serde_json::json!({"points_pct": [0, 5, 10, 25, 100], "settle_seconds": 2}),
+    )
+    .await;
+
+    assert_eq!(status, 202, "{json}");
+    let pts: Vec<u64> = json["requested_points_pct"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap())
+        .collect();
+    assert!(
+        pts.iter().all(|p| *p >= 30),
+        "a pump-assigned header must never be swept below the 30% floor: {pts:?}"
+    );
+    assert!(!pts.contains(&0), "0% must be unreachable: {pts:?}");
+    assert!(
+        pts.windows(2).all(|w| w[0] < w[1]),
+        "points must be ascending so an abort leaves the header high: {pts:?}"
+    );
+    assert_eq!(json["state"], "running");
+    assert_eq!(json["settle_seconds"], 2);
+
+    await_characterization(&path).await;
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// [SAFETY] The second half of the call-site test: the terminal snapshot must
+/// carry a `summary`, which only `characterization::summarise` produces. A
+/// handler that derived verdicts inline — or forgot to summarise at all — would
+/// pass every pure unit test in the module and fail here.
+#[tokio::test]
+async fn characterize_publishes_a_summary_derived_by_summarise() {
+    let state = test_app_state_with_hwmon();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, _) = uds_post(
+        &path,
+        "/hwmon/h1/characterize",
+        &serde_json::json!({"points_pct": [40, 80], "settle_seconds": 2}),
+    )
+    .await;
+    assert_eq!(status, 202);
+
+    let done = await_characterization(&path).await;
+    assert_eq!(done["header_id"], "h1");
+    assert!(
+        done["summary"].is_object(),
+        "a finished run must carry the derived summary: {done}"
+    );
+    // The three axes must be present and separate — collapsing them into one
+    // pass/fail is the defect `AIO-Phase3.md` names explicitly.
+    for axis in ["command_acceptance", "pwm_readback", "rpm_response"] {
+        assert!(
+            done["summary"][axis].is_string(),
+            "summary is missing the {axis} axis: {done}"
+        );
+    }
+    assert!(done["summary"]["possible_device_override"].is_boolean());
+    assert!(done["summary"]["interference_detected"].is_boolean());
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A characterisation claims the same single-flight slot as verify and
+/// calibrate, so the three cannot drive hardware at once.
+#[tokio::test]
+async fn characterize_is_single_flight_against_itself_and_verify() {
+    let state = test_app_state_with_hwmon();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (first, _) = uds_post(
+        &path,
+        "/hwmon/h1/characterize",
+        &serde_json::json!({"points_pct": [50], "settle_seconds": 2}),
+    )
+    .await;
+    assert_eq!(first, 202);
+
+    let (again, j2) = uds_post(
+        &path,
+        "/hwmon/h2/characterize",
+        &serde_json::json!({"points_pct": [50], "settle_seconds": 2}),
+    )
+    .await;
+    assert_eq!(again, 409, "a second sweep must be refused: {j2}");
+
+    let (verify, j3) = uds_post(&path, "/hwmon/h2/verify", &serde_json::json!({})).await;
+    assert_eq!(verify, 409, "a verify must be refused mid-sweep: {j3}");
+
+    await_characterization(&path).await;
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// [SAFETY] Regression test for the run-slot fence.
+///
+/// The terminal state used to be written AFTER the single-flight guards were
+/// released, and neither the per-point publish nor that write compared
+/// `run_id`. A finishing sweep could therefore overwrite a run that had already
+/// started in the gap — reporting a live sweep as finished, with another run's
+/// data, and leaving the one actually driving the header uncancellable.
+///
+/// Asserts the invariant that closes it: a second run is refused until the first
+/// has fully published, and once accepted it carries its OWN id and only its own
+/// points.
+#[tokio::test]
+async fn a_second_run_never_inherits_the_first_runs_points() {
+    let state = test_app_state_with_hwmon();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (s1, j1) = uds_post(
+        &path,
+        "/hwmon/h1/characterize",
+        &serde_json::json!({"points_pct": [40, 60], "settle_seconds": 2}),
+    )
+    .await;
+    assert_eq!(s1, 202, "{j1}");
+    let first_id = j1["run_id"].as_str().unwrap().to_string();
+
+    let first = await_characterization(&path).await;
+    assert_eq!(first["run_id"], first_id);
+    assert_eq!(first["points"].as_array().unwrap().len(), 2);
+
+    let (s2, j2) = uds_post(
+        &path,
+        "/hwmon/h2/characterize",
+        &serde_json::json!({"points_pct": [80], "settle_seconds": 2}),
+    )
+    .await;
+    assert_eq!(
+        s2, 202,
+        "the slot must be free once the first run published: {j2}"
+    );
+    let second_id = j2["run_id"].as_str().unwrap().to_string();
+    assert_ne!(second_id, first_id, "each run gets its own id");
+
+    let second = await_characterization(&path).await;
+    assert_eq!(
+        second["run_id"], second_id,
+        "the slot must hold the NEW run"
+    );
+    assert_eq!(second["header_id"], "h2");
+    assert_eq!(
+        second["points"].as_array().unwrap().len(),
+        1,
+        "the first run's points must not leak into the second: {second}"
+    );
+    assert_eq!(second["requested_points_pct"], serde_json::json!([80]));
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn characterize_status_is_404_before_any_run_and_cancel_is_409() {
+    let state = test_app_state_with_hwmon();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/diagnostics/characterization").await;
+    assert_eq!(status, 404, "{json}");
+
+    let (cancel, cj) = uds_delete(&path, "/diagnostics/characterization").await;
+    assert_eq!(cancel, 409, "nothing to cancel: {cj}");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn characterize_cancel_stops_the_run_and_reports_cancelled() {
+    let state = test_app_state_with_hwmon();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, _) = uds_post(
+        &path,
+        "/hwmon/h1/characterize",
+        &serde_json::json!({"points_pct": [30, 50, 70, 90], "settle_seconds": 2}),
+    )
+    .await;
+    assert_eq!(status, 202);
+
+    let (cancel, cj) = uds_delete(&path, "/diagnostics/characterization").await;
+    assert_eq!(cancel, 202, "{cj}");
+
+    let done = await_characterization(&path).await;
+    assert_eq!(
+        done["state"], "cancelled",
+        "a cancelled sweep must say so rather than reporting a partial pass: {done}"
+    );
+    assert!(
+        done["points"].as_array().unwrap().len() < 4,
+        "cancellation must actually stop the sweep early: {done}"
+    );
+    assert!(
+        done["summary"].is_object(),
+        "a cancelled run still summarises what it measured"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn capabilities_advertises_pwm_characterization() {
+    let state = test_app_state_with_hwmon();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+    let (status, json) = uds_get(&path, "/capabilities").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        json["control"]["pwm_characterization"], true,
+        "clients gate the whole feature on this flag rather than probing"
+    );
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
 }

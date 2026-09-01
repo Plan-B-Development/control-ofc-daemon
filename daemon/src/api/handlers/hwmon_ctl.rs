@@ -2,6 +2,7 @@
 //!
 //! Named `hwmon_ctl` to avoid confusion with the top-level `crate::hwmon` module.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -171,6 +172,41 @@ impl Drop for VerifyLeaseGuard {
     }
 }
 
+/// Read one header's live sysfs state: `pwm_enable`, the raw PWM byte, that byte
+/// as a percentage, and the tach.
+///
+/// Lifted out of `hwmon_verify_handler`'s inner closure (AIO-MB Phase 3) so the
+/// verify and the characterisation sweep read hardware through **one**
+/// implementation. Duplicating a three-file read triple is the DEC-276 mistake:
+/// the second copy drifts, and nothing catches it because both copies have
+/// tests. Every field is `Option` because any of the three files may be absent
+/// (no `pwm_enable` on a read-only header) or transiently unreadable.
+pub(crate) fn read_header_state(
+    pwm: &str,
+    en: &Option<String>,
+    rpm: &Option<String>,
+) -> HwmonVerifyState {
+    let pwm_raw = std::fs::read_to_string(pwm)
+        .ok()
+        .and_then(|s| s.trim().parse::<u8>().ok());
+    let pwm_enable = en.as_ref().and_then(|p| {
+        std::fs::read_to_string(p)
+            .ok()
+            .and_then(|s| s.trim().parse::<u8>().ok())
+    });
+    let rpm_val = rpm.as_ref().and_then(|p| {
+        std::fs::read_to_string(p)
+            .ok()
+            .and_then(|s| s.trim().parse::<u16>().ok())
+    });
+    HwmonVerifyState {
+        pwm_enable,
+        pwm_raw,
+        pwm_percent: pwm_raw.map(crate::pwm::raw_to_percent),
+        rpm: rpm_val,
+    }
+}
+
 /// The duty `POST /hwmon/{id}/verify` drives the header to for its settle window.
 ///
 /// Pure and separately testable **because the two constraints on it pull against
@@ -337,30 +373,7 @@ pub async fn hwmon_verify_handler(
         let verify_guard = verify_guard;
         let _verify_lease = verify_lease;
 
-        let read_state =
-            |pwm: &str, en: &Option<String>, rpm: &Option<String>| -> HwmonVerifyState {
-                let pwm_raw = std::fs::read_to_string(pwm)
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u8>().ok());
-                let pwm_enable = en.as_ref().and_then(|p| {
-                    std::fs::read_to_string(p)
-                        .ok()
-                        .and_then(|s| s.trim().parse::<u8>().ok())
-                });
-                let rpm_val = rpm.as_ref().and_then(|p| {
-                    std::fs::read_to_string(p)
-                        .ok()
-                        .and_then(|s| s.trim().parse::<u16>().ok())
-                });
-                HwmonVerifyState {
-                    pwm_enable,
-                    pwm_raw,
-                    pwm_percent: pwm_raw.map(crate::pwm::raw_to_percent),
-                    rpm: rpm_val,
-                }
-            };
-
-        let initial = read_state(&pwm_path, &enable_path, &rpm_path);
+        let initial = read_header_state(&pwm_path, &enable_path, &rpm_path);
 
         // Test PWM: a significant delta from current, in whichever direction has room.
         let current_pct = initial.pwm_percent.unwrap_or(50);
@@ -381,7 +394,7 @@ pub async fn hwmon_verify_handler(
         // restructure exists to remove.
         std::thread::sleep(std::time::Duration::from_secs(VERIFY_WAIT_SECONDS as u64));
 
-        let final_state = read_state(&pwm_path, &enable_path, &rpm_path);
+        let final_state = read_header_state(&pwm_path, &enable_path, &rpm_path);
 
         // DEC-296: prove we are still alive before restoring, and keep the slot.
         // The settle and the reads above are blocking sysfs work with no lock
@@ -562,6 +575,282 @@ fn classify_verify_result(
             "PWM values held but RPM sensor unavailable or too low to verify".into(),
         ),
     }
+}
+
+// ── PWM/RPM characterisation (AIO-MB Phase 3) ────────────────────────
+
+/// POST /hwmon/{header_id}/characterize — start a PWM/RPM response sweep.
+///
+/// Returns **202 immediately** with the run snapshot; the sweep itself runs as a
+/// detached task and the client polls `GET /diagnostics/characterization`. That
+/// shape is the one requirement `AIO-Phase3.md` states outright — "show live or
+/// progressive results" — and it is also what makes a Cancel button possible.
+///
+/// Deliberately NOT the DEC-290 `spawn_blocking` shape used by the two verifies,
+/// and for the reason already recorded at `calibration.rs:143-156`: a sweep is
+/// minutes long, and making it uncancellable would pin a blocking thread and
+/// hold the single verify slot for that whole time after the client had gone.
+/// The restore is protected by a drop guard instead, which restores the hardware
+/// without extending the work's lifetime.
+///
+/// [SAFETY] The task is detached, so it is not in `main::shutdown_sequence`'s
+/// `task_handles`. `characterization::RestoreOnDrop` carries the shutdown check
+/// that makes that safe — read its docs before changing anything here.
+pub async fn hwmon_characterize_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(header_id): axum::extract::Path<String>,
+    Json(body): Json<crate::api::characterization::CharacterizationRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use crate::api::characterization as ch;
+
+    // Same two refusals as a verify, for the same reason: a sweep drives the
+    // header away from its commanded duty, which must not happen while the
+    // system is hot or while the ladder is forcing (DEC-297).
+    if let Some(resp) = super::verify_thermal_guard(&state.cache) {
+        return resp;
+    }
+    let Some(controller) = state.hwmon_controller.as_ref() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::hardware_unavailable("no hwmon PWM headers available"),
+        );
+    };
+
+    let (pwm_path, enable_path, rpm_path) = {
+        let ctrl = controller.lock();
+        match ctrl.header(&header_id) {
+            Some(h) => (
+                h.pwm_path.clone(),
+                h.enable_path.clone(),
+                h.rpm_path.clone(),
+            ),
+            None => {
+                return error_response(
+                    StatusCode::NOT_FOUND,
+                    &ErrorEnvelope::validation(format!("unknown header: {header_id}")),
+                )
+            }
+        }
+    };
+
+    // Claim the SAME single-flight slot verify and calibrate use, so at most one
+    // of the three ever drives hardware, and the engine's write phase is paused
+    // for the sweep's lifetime. Renewed once per point inside the sweep so the
+    // deadman measures liveness, not total duration (DEC-296).
+    let Some(verify_guard) =
+        super::begin_verify_pause(&state.cache, crate::constants::VERIFY_PAUSE_DEADMAN)
+    else {
+        return error_response(
+            StatusCode::CONFLICT,
+            &ErrorEnvelope::validation("a hardware verify or calibration is already in progress"),
+        );
+    };
+
+    // [SAFETY] The UNION predicate, never the wire `role` (DEC-312): a user who
+    // assigns `chassis_fan` to a header the hardware labels PUMP must still get
+    // the pump floor. Resolved here, before the task, so the role lookup never
+    // races the controller lock inside the sweep.
+    let floor = if state.header_is_pump_protected(&header_id) {
+        crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8
+    } else {
+        0
+    };
+    let points = ch::resolve_points(body.points_pct.as_deref(), floor);
+    let settle = ch::resolve_settle(body.settle_seconds);
+    if points.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorEnvelope::validation("no usable sweep points after clamping"),
+        );
+    }
+
+    let verify_lease_id = {
+        let mut ctrl = controller.lock();
+        ctrl.lease_manager_mut()
+            .force_take_lease(HwmonWriter::Verify)
+            .lease_id
+    };
+    let verify_lease = VerifyLeaseGuard {
+        controller: controller.clone(),
+        lease_id: verify_lease_id.clone(),
+    };
+    let lease_for_renew = verify_lease_id.clone();
+
+    let run = ch::CharacterizationRun {
+        run_id: ch::next_run_id(),
+        header_id: header_id.clone(),
+        state: ch::STATE_RUNNING.to_string(),
+        requested_points_pct: points.clone(),
+        settle_seconds: settle.as_secs(),
+        points: vec![],
+        summary: None,
+        original_pct: read_header_state(&pwm_path, &enable_path, &rpm_path).pwm_percent,
+        restore_failed: false,
+        detail: None,
+    };
+    // The cancel flag is cleared and the run installed under ONE lock, and the
+    // cancel handler takes the same lock across its check-and-set. Without that
+    // pairing a DELETE aimed at a finishing run could set the flag after this
+    // reset and abort the run that replaced it, reporting the new run's snapshot
+    // as though the user had cancelled it.
+    {
+        let mut slot_guard = state.characterization.lock();
+        state.characterization_cancel.store(false, Ordering::SeqCst);
+        *slot_guard = Some(run.clone());
+    }
+
+    let slot = state.characterization.clone();
+    let my_run_id = run.run_id.clone();
+    let cancel = state.characterization_cancel.clone();
+    let cache = state.cache.clone();
+    let ctrl_arc = controller.clone();
+    let shutdown_rx = state.openfan_runtime.shutdown.clone();
+    let hid = header_id.clone();
+
+    tokio::spawn(async move {
+        let restore_failed = std::sync::atomic::AtomicBool::new(false);
+
+        // Guard drop order is load-bearing and is asserted by
+        // `characterization::tests::the_restore_write_lands_while_the_lease_is_still_valid`.
+        // `run_sweep`
+        // declares its own `RestoreOnDrop` internally, so that guard drops when
+        // the sweep future completes — i.e. BEFORE `lease` and `pause` below,
+        // which is the only order in which the restore write can still succeed.
+        {
+            let pause = verify_guard;
+            let _lease = verify_lease;
+
+            // [SAFETY] Renews BOTH the engine pause and the hwmon lease, once per
+            // point. Renewing only the pause was a defect: `force_take_lease`
+            // stamps a 60 s TTL (`hwmon::lease::DEFAULT_LEASE_TTL`), nothing else
+            // renews a Verify lease, and `set_pwm` merely *validates* it without
+            // refreshing. A documented-legal 20 x 15 s sweep therefore wrote fine
+            // until t~60 s and then failed every write — **including the drop
+            // guard's restore**, stranding the header at a mid-sweep duty with no
+            // writer left to correct it. The renewal is what makes both deadlines
+            // measure liveness rather than total duration.
+            let keepalive = || {
+                let lease_ok = ctrl_arc
+                    .lock()
+                    .lease_manager_mut()
+                    .renew_lease(&lease_for_renew)
+                    .is_ok();
+                let pause_ok = pause.renew(crate::constants::VERIFY_PAUSE_DEADMAN);
+                lease_ok && pause_ok
+            };
+            let shutting_down = || *shutdown_rx.borrow();
+            let write_fn = |pct: u8| -> Result<(), String> {
+                let mut c = ctrl_arc.lock();
+                c.set_pwm(&hid, pct, &verify_lease_id)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            };
+            // KNOWN LIMITATION, recorded as `AIO3-d`: these are blocking
+            // `std::fs` reads issued from the async runtime — ~12 per point
+            // during the settle sub-sampling — where the verify does the same
+            // reads inside `spawn_blocking`. On a wedged chip (the DEC-278
+            // hazard) this parks a tokio worker with no bound. Calibrate is NOT
+            // a precedent for this specific point: its sweep reads RPM from the
+            // cache, not from sysfs. Left as-is deliberately — wrapping each read
+            // is a change to a hardware path that this diff did not scope — but
+            // the note is here because an unremarked gap is an invisible one.
+            let read_fn = || read_header_state(&pwm_path, &enable_path, &rpm_path);
+            // Fenced on `run_id`: a run whose deadman elapsed can be superseded
+            // (`try_begin_verify` deliberately permits the steal), and without the
+            // fence the loser would append its points into the winner's list and
+            // then mark it terminal — reporting a live sweep as finished, with
+            // another run's data, and making the one actually driving the header
+            // uncancellable.
+            let publish = |pt: ch::CharPoint| {
+                if let Some(r) = slot.lock().as_mut() {
+                    if r.run_id == my_run_id && r.state == ch::STATE_RUNNING {
+                        r.points.push(pt);
+                    }
+                }
+            };
+
+            let outcome = ch::run_sweep(
+                &cache,
+                &hid,
+                &points,
+                settle,
+                write_fn,
+                read_fn,
+                &cancel,
+                shutting_down,
+                keepalive,
+                &restore_failed,
+                publish,
+            )
+            .await;
+
+            // Terminal publish, INSIDE the guarded scope and fenced on `run_id`.
+            // Inside, because the single-flight slot is released the moment this
+            // block ends — a terminal write placed after it could legally land on
+            // a run that had already started in the gap. `run_sweep`'s own
+            // `RestoreOnDrop` has already dropped by here (it lives in that
+            // future), so `restore_failed` is final.
+            //
+            // `summarise` is the ONLY place the derived verdicts come from —
+            // deriving any of them here instead would be the "extracted rule the
+            // call site never uses" defect this project has hit five times.
+            if let Some(r) = slot.lock().as_mut() {
+                if r.run_id == my_run_id {
+                    r.points = outcome.points;
+                    r.summary = Some(ch::summarise(&r.points));
+                    r.state = outcome.state.to_string();
+                    r.detail = outcome.detail;
+                    r.restore_failed = restore_failed.load(Ordering::SeqCst);
+                }
+            }
+        };
+    });
+
+    json_ok(StatusCode::ACCEPTED, run)
+}
+
+/// GET /diagnostics/characterization — the current or most recent run.
+pub async fn characterization_status_handler(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match state.characterization.lock().clone() {
+        Some(run) => json_ok(StatusCode::OK, run),
+        None => error_response(
+            StatusCode::NOT_FOUND,
+            &ErrorEnvelope::validation("no characterisation run has been started"),
+        ),
+    }
+}
+
+/// DELETE /diagnostics/characterization — ask the running sweep to stop.
+///
+/// Cooperative: the sweep checks the flag between points, so the current point
+/// finishes its settle first. That is deliberate — tearing down mid-write would
+/// leave the header at an unmeasured duty, and the restore is what the caller
+/// actually wants. It always runs.
+pub async fn characterization_cancel_handler(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // ONE lock across the check and the set. Two acquisitions left a window in
+    // which the running run could finish and a new one be installed between them,
+    // so the late `store(true)` aborted the *successor* after its first point and
+    // returned its snapshot as though the user had cancelled it.
+    let snapshot = {
+        let guard = state.characterization.lock();
+        match guard.as_ref() {
+            Some(run) if run.is_running() => {
+                state.characterization_cancel.store(true, Ordering::SeqCst);
+                run.clone()
+            }
+            _ => {
+                return error_response(
+                    StatusCode::CONFLICT,
+                    &ErrorEnvelope::validation("no characterisation run is in progress"),
+                )
+            }
+        }
+    };
+    json_ok(StatusCode::ACCEPTED, snapshot)
 }
 
 #[cfg(test)]
@@ -882,6 +1171,8 @@ mod tests {
             history: Arc::new(crate::health::history::HistoryRing::new(250)),
             active_profile: Arc::new(parking_lot::Mutex::new(None)),
             calibrating: std::sync::atomic::AtomicBool::new(false),
+            characterization: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
             last_openfan_rescan: Arc::new(parking_lot::Mutex::new(None)),
             adopted_poll_handles: Arc::new(parking_lot::Mutex::new(Vec::new())),

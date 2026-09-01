@@ -1552,6 +1552,8 @@ async fn async_main() {
         history: history.clone(),
         active_profile: active_profile.clone(),
         calibrating: std::sync::atomic::AtomicBool::new(false),
+        characterization: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_handles: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
