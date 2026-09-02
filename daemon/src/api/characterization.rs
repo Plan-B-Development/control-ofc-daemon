@@ -18,14 +18,19 @@
 //!   header's floor is [`crate::profile::HARD_PUMP_CPU_FLOOR_PCT`].
 //! - Points are swept **ascending**, so an abort part-way leaves the header
 //!   *high* rather than low.
-//! - The pre-sweep duty is restored by [`RestoreOnDrop`] on every exit path —
-//!   completion, cancellation, a failed write, a reclaim, a thermal abort, and
-//!   the runtime dropping the task at shutdown.
+//! - The pre-sweep duty is restored by [`RestoreOnDrop`] on every exit path on
+//!   which nothing else owns the header — completion, cancellation, a failed
+//!   write, a reclaim, and a thermal abort below the forcing threshold. (The
+//!   same narrowing DEC-295 applied to DEC-134's identical claim for calibrate.)
 //! - The restore is skipped while the thermal ladder is forcing (DEC-295) and
 //!   while the daemon is shutting down (DEC-290) — in both cases something with
 //!   more authority owns the header.
+//! - **A skipped restore is reported, not silently reported as a success.**
+//!   [`RestoreOutcome`] records which of the five exits the guard actually took,
+//!   and `restore_failed` is derived from it, so "the header is back where it
+//!   was" is answerable from the wire on every path.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -121,11 +126,28 @@ pub struct CharacterizationRun {
     pub points: Vec<CharPoint>,
     /// `None` while running.
     pub summary: Option<CharSummary>,
-    /// The duty the header held before the sweep, and whether putting it back
-    /// succeeded. A `true` here means the header is parked at the last swept
-    /// point and the caller may want to write its intent explicitly.
+    /// The duty the header held before the sweep. `None` means it could not be
+    /// read, in which case there is nothing to put back.
     pub original_pct: Option<u8>,
+    /// **The header was NOT put back.** True on every exit that leaves it parked
+    /// at the last swept point — a failed restore write *and* the two deliberate
+    /// skips *and* an unreadable pre-sweep duty. Derived from
+    /// [`RestoreOutcome::header_left_moved`], so it cannot drift from the reason
+    /// below.
+    ///
+    /// Before v2.30.0 this was `false` on the three non-write exits, which said
+    /// "restored" about a header that had not been (`AUD2-c`).
     pub restore_failed: bool,
+    /// *Why*, as a stable token: `pending` while the run is still going, then one
+    /// of `restored` | `write_failed` | `skipped_shutting_down` |
+    /// `skipped_thermal_force` | `no_original_duty`. The client owns the wording
+    /// and must render an unrecognised token rather than dropping it (273-i).
+    ///
+    /// This exists because `restore_failed: true` alone would invite exactly the
+    /// wrong action on `skipped_thermal_force`: the header is high because
+    /// thermal safety put it there, and a client "writing its intent explicitly"
+    /// is the one thing it must not do until the ladder releases.
+    pub restore_outcome: String,
     /// Why the run ended, when it did not simply complete.
     pub detail: Option<String>,
 }
@@ -141,6 +163,88 @@ pub const STATE_COMPLETE: &str = "complete";
 pub const STATE_CANCELLED: &str = "cancelled";
 pub const STATE_ABORTED: &str = "aborted";
 pub const STATE_FAILED: &str = "failed";
+
+// ── Restore reporting ────────────────────────────────────────────────
+
+/// Which exit [`RestoreOnDrop`] took — the single source of truth for both
+/// `restore_failed` and `restore_outcome` on the wire.
+///
+/// [SAFETY-adjacent] Two of these five are *deliberate* skips, not faults, and
+/// conflating them with a success is what `AUD2-c` recorded: the guard returned
+/// early under a thermal force or a shutdown and the run still published
+/// `restore_failed: false`, i.e. "the header is back where it was" about a
+/// header parked at the last swept duty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RestoreOutcome {
+    /// The sweep has not finished, so the guard has not run yet.
+    Pending = 0,
+    /// The pre-sweep duty was written back successfully.
+    Restored = 1,
+    /// The restore write was attempted and failed.
+    WriteFailed = 2,
+    /// Skipped: the daemon is shutting down and `restore_hardware()` owns the
+    /// header (DEC-290 / 277-c).
+    SkippedShuttingDown = 3,
+    /// Skipped: the thermal ladder is forcing and outranks a diagnostic
+    /// (DEC-295).
+    SkippedThermalForce = 4,
+    /// The pre-sweep duty could not be read *and* the sweep moved the header, so
+    /// there was nothing to put it back to.
+    NoOriginalDuty = 5,
+}
+
+impl RestoreOutcome {
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Restored => "restored",
+            Self::WriteFailed => "write_failed",
+            Self::SkippedShuttingDown => "skipped_shutting_down",
+            Self::SkippedThermalForce => "skipped_thermal_force",
+            Self::NoOriginalDuty => "no_original_duty",
+        }
+    }
+
+    /// Is the header parked somewhere other than where the sweep found it?
+    ///
+    /// `Pending` is false because nothing has been swept back yet *and* the
+    /// terminal publish only reads this after the guard has dropped, so it is
+    /// unreachable there. `Restored` is the only other false.
+    pub fn header_left_moved(self) -> bool {
+        !matches!(self, Self::Pending | Self::Restored)
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Restored,
+            2 => Self::WriteFailed,
+            3 => Self::SkippedShuttingDown,
+            4 => Self::SkippedThermalForce,
+            5 => Self::NoOriginalDuty,
+            _ => Self::Pending,
+        }
+    }
+}
+
+/// A write-once cell the drop guard stamps and the terminal publish reads.
+///
+/// An atomic rather than a mutex on purpose: the guard runs inside `Drop`, where
+/// a poisoned or contended lock has nowhere to report a failure to.
+#[derive(Debug, Default)]
+pub struct RestoreReport(AtomicU8);
+
+impl RestoreReport {
+    pub fn new() -> Self {
+        Self(AtomicU8::new(RestoreOutcome::Pending as u8))
+    }
+    pub fn set(&self, outcome: RestoreOutcome) {
+        self.0.store(outcome as u8, Ordering::SeqCst);
+    }
+    pub fn get(&self) -> RestoreOutcome {
+        RestoreOutcome::from_u8(self.0.load(Ordering::SeqCst))
+    }
+}
 
 // ── Input resolution (pure) ──────────────────────────────────────────
 
@@ -362,38 +466,82 @@ struct RestoreOnDrop<'a, W: Fn(u8) -> Result<(), String>, S: Fn() -> bool> {
     write_fn: &'a W,
     cache: &'a StateCache,
     shutting_down: &'a S,
-    restore_failed: &'a AtomicBool,
+    /// Set by the sweep loop before its first write. Distinguishes "there was no
+    /// pre-sweep duty to restore and we never moved the header" (nothing to
+    /// report) from "we moved it and cannot put it back" ([`RestoreOutcome::NoOriginalDuty`]).
+    wrote_any: &'a AtomicBool,
+    report: &'a RestoreReport,
 }
 
 impl<W: Fn(u8) -> Result<(), String>, S: Fn() -> bool> Drop for RestoreOnDrop<'_, W, S> {
+    /// **Rewritten for `AUD2-c`:** every exit now stamps `self.report`. It
+    /// previously recorded only the failed-write exit and left the other four at
+    /// the caller's `false`, so three of them published "restored" about a header
+    /// that was still at the last swept duty. The branch *order* and the two skip
+    /// rules are unchanged — this is a reporting fix, not a behaviour change, and
+    /// no write was added or removed on any path.
     fn drop(&mut self) {
-        let Some(restore) = self.original_pct else {
-            return;
+        // A run that never wrote left the header exactly where it found it, so
+        // none of the three non-restoring exits is a finding for it. Reporting
+        // one would trade `AUD2-c`'s false "restored" for a false alarm — and the
+        // ladder-aborts-at-point-0 case, which writes nothing, is the common one.
+        let moved = self.wrote_any.load(Ordering::SeqCst);
+        let left_behind = |o: RestoreOutcome| {
+            if moved {
+                o
+            } else {
+                RestoreOutcome::Restored
+            }
         };
+
+        // The two authority skips are checked BEFORE `original_pct`, deliberately
+        // and unlike the original order. Both can coincide with an unreadable
+        // pre-sweep duty, and when they do it is the *authority* the client needs
+        // to hear about: `no_original_duty` invites "re-activate your profile",
+        // which under a thermal force is the one thing it must not do. No write
+        // moves as a result — all three of these exits only ever `return`.
         if (self.shutting_down)() {
             log::info!(
                 "characterize: skipping restore of {} — the daemon is shutting down \
                  and the hardware restore owns the header",
                 self.header_id
             );
+            self.report
+                .set(left_behind(RestoreOutcome::SkippedShuttingDown));
             return;
         }
         if let Some(state) = thermal_force_state(self.cache) {
             log::warn!(
                 "characterize: {} left at the thermal-safety forced duty instead of \
-                 restoring {restore}% — thermal safety is active ({state}) and \
-                 outranks a diagnostic.",
+                 restoring its pre-sweep duty — thermal safety is active ({state}) \
+                 and outranks a diagnostic.",
                 self.header_id
             );
+            self.report
+                .set(left_behind(RestoreOutcome::SkippedThermalForce));
             return;
         }
-        if let Err(e) = (self.write_fn)(restore) {
-            log::warn!(
-                "characterize: restore of {} to {restore}% failed; it is left at the \
-                 last swept duty: {e}",
-                self.header_id
-            );
-            self.restore_failed.store(true, Ordering::SeqCst);
+        let Some(restore) = self.original_pct else {
+            if moved {
+                log::warn!(
+                    "characterize: {} was swept but its pre-sweep duty could not be \
+                     read, so it is left at the last swept duty",
+                    self.header_id
+                );
+            }
+            self.report.set(left_behind(RestoreOutcome::NoOriginalDuty));
+            return;
+        };
+        match (self.write_fn)(restore) {
+            Ok(()) => self.report.set(RestoreOutcome::Restored),
+            Err(e) => {
+                log::warn!(
+                    "characterize: restore of {} to {restore}% failed; it is left at the \
+                     last swept duty: {e}",
+                    self.header_id
+                );
+                self.report.set(RestoreOutcome::WriteFailed);
+            }
         }
     }
 }
@@ -426,7 +574,7 @@ pub async fn run_sweep<W, R, P, S, K>(
     cancel: &AtomicBool,
     shutting_down: S,
     keepalive: K,
-    restore_failed: &AtomicBool,
+    report: &RestoreReport,
     mut publish: P,
 ) -> SweepOutcome
 where
@@ -438,6 +586,8 @@ where
 {
     let original_pct = read_fn().pwm_percent;
     let mut measured: Vec<CharPoint> = Vec::with_capacity(points.len());
+    // Declared BEFORE the guard so it outlives it — the guard reads it in `drop`.
+    let wrote_any = AtomicBool::new(false);
 
     // Declared LAST so it drops FIRST — while the caller's lease guard is still
     // held. Reversed, the restore write fails `InvalidLease` and the header is
@@ -448,7 +598,8 @@ where
         write_fn: &write_fn,
         cache,
         shutting_down: &shutting_down,
-        restore_failed,
+        wrote_any: &wrote_any,
+        report,
     };
 
     for (idx, &pct) in points.iter().enumerate() {
@@ -505,6 +656,11 @@ where
         let before = read_fn();
         let rpm_before = before.rpm;
 
+        // Stamped BEFORE the call, deliberately: `set_pwm` writes sysfs and then
+        // reads back, so an `Err` can still have moved the header. Over-reporting
+        // "the header moved" is the safe direction; under-reporting it is the
+        // `AUD2-c` defect.
+        wrote_any.store(true, Ordering::SeqCst);
         let command_accepted = match write_fn(pct) {
             Ok(()) => true,
             Err(e) => {
@@ -920,7 +1076,7 @@ mod tests {
     struct Rig {
         writes: Arc<Mutex<Vec<u8>>>,
         keepalives: Arc<Mutex<usize>>,
-        restore_failed: AtomicBool,
+        report: RestoreReport,
         cancel: AtomicBool,
     }
 
@@ -929,12 +1085,18 @@ mod tests {
             Self {
                 writes: Arc::new(Mutex::new(Vec::new())),
                 keepalives: Arc::new(Mutex::new(0)),
-                restore_failed: AtomicBool::new(false),
+                report: RestoreReport::new(),
                 cancel: AtomicBool::new(false),
             }
         }
         fn written(&self) -> Vec<u8> {
             self.writes.lock().unwrap().clone()
+        }
+        /// What the run would publish. Asserting the pair together is the point:
+        /// `AUD2-c` was a boolean that disagreed with the reason beside it.
+        fn restore(&self) -> (bool, &'static str) {
+            let outcome = self.report.get();
+            (outcome.header_left_moved(), outcome.token())
         }
     }
 
@@ -981,7 +1143,7 @@ mod tests {
                 *ka.lock().unwrap() += 1;
                 true
             },
-            &rig.restore_failed,
+            &rig.report,
             |_| {},
         )
         .await
@@ -1010,7 +1172,7 @@ mod tests {
             vec![30, 50, 100, 42],
             "the sweep must end by writing the pre-sweep duty back"
         );
-        assert!(!rig.restore_failed.load(Ordering::SeqCst));
+        assert_eq!(rig.restore(), (false, "restored"));
         // One liveness renewal per point (DEC-296), not one for the whole run.
         assert_eq!(*rig.keepalives.lock().unwrap(), 3);
     }
@@ -1137,6 +1299,178 @@ mod tests {
             "must not write at all — including the restore, which would lower \
              the header back under the ladder's forced duty"
         );
+        // `AUD2-c`, the no-false-alarm direction: this sweep never wrote, so it
+        // left the header exactly where it found it and must NOT claim otherwise.
+        // The skip-is-reported direction needs a sweep that actually moved the
+        // header first — `a_thermal_force_after_a_write_reports_the_skip` below.
+        assert_eq!(rig.restore(), (false, "restored"));
+    }
+
+    /// `AUD2-c`: the ladder starts forcing AFTER the sweep has moved the header,
+    /// which is the interleaving where the skip actually strands something. The
+    /// old code published `restore_failed: false` here — "the header is back
+    /// where it was" about a header parked at 50%.
+    #[tokio::test(start_paused = true)]
+    async fn a_thermal_force_after_a_write_reports_the_skip() {
+        let cache = cache_at(45.0, Some("normal"));
+        let cancel = AtomicBool::new(false);
+        let report = RestoreReport::new();
+        let writes: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let writes_w = writes.clone();
+        let hot: &StateCache = &cache;
+
+        let out = run_sweep(
+            &cache,
+            "hwmon:test:pwm1",
+            &[30, 50],
+            Duration::from_secs(6),
+            move |p: u8| {
+                writes_w.lock().unwrap().push(p);
+                // The ladder starts forcing once the header has been moved.
+                hot.record_engine_tick("emergency", constants::THERMAL_EMERGENCY_TRIGGER_C);
+                Ok(())
+            },
+            move || sample(Some(42), Some(1), Some(900)),
+            &cancel,
+            || false,
+            || true,
+            &report,
+            |_| {},
+        )
+        .await;
+
+        assert_eq!(out.state, STATE_ABORTED);
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![30],
+            "precondition: the header WAS moved, and no restore write followed it"
+        );
+        assert_eq!(rig_free_restore(&report), (true, "skipped_thermal_force"));
+    }
+
+    /// The same for the shutdown skip, and distinct from the drop-the-future test
+    /// above: here the sweep's own loop check returns `aborted`, the future
+    /// completes, and the terminal publish therefore RUNS — which is what makes
+    /// the mis-report reachable by a client at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_after_a_write_reports_the_skip() {
+        let cache = cache_at(45.0, Some("normal"));
+        let cancel = AtomicBool::new(false);
+        let report = RestoreReport::new();
+        let going_down = Arc::new(AtomicBool::new(false));
+        let flip = going_down.clone();
+        let writes: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let writes_w = writes.clone();
+
+        let out = run_sweep(
+            &cache,
+            "hwmon:test:pwm1",
+            &[30, 50],
+            Duration::from_secs(6),
+            move |p: u8| {
+                writes_w.lock().unwrap().push(p);
+                flip.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            move || sample(Some(42), Some(1), Some(900)),
+            &cancel,
+            move || going_down.load(Ordering::SeqCst),
+            || true,
+            &report,
+            |_| {},
+        )
+        .await;
+
+        assert_eq!(out.state, STATE_ABORTED);
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![30],
+            "precondition: the header WAS moved, and no restore write followed it"
+        );
+        assert_eq!(rig_free_restore(&report), (true, "skipped_shutting_down"));
+    }
+
+    /// The third silent exit: the pre-sweep duty could not be read, so there is
+    /// nothing to put the header back to — after the sweep has already moved it.
+    #[tokio::test(start_paused = true)]
+    async fn an_unreadable_pre_sweep_duty_is_reported_once_the_header_has_moved() {
+        let cache = cache_at(45.0, Some("normal"));
+        let cancel = AtomicBool::new(false);
+        let report = RestoreReport::new();
+        let writes: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let writes_w = writes.clone();
+
+        let out = run_sweep(
+            &cache,
+            "hwmon:test:pwm1",
+            &[30, 50],
+            Duration::from_secs(6),
+            move |p: u8| {
+                writes_w.lock().unwrap().push(p);
+                Ok(())
+            },
+            // `pwm_percent: None` — the chip publishes a pwm file it will not read.
+            || sample(None, Some(1), Some(900)),
+            &cancel,
+            || false,
+            || true,
+            &report,
+            |_| {},
+        )
+        .await;
+
+        assert_eq!(out.state, STATE_COMPLETE);
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![30, 50],
+            "precondition: the sweep really did move the header, and no restore \
+             write could follow it"
+        );
+        assert_eq!(rig_free_restore(&report), (true, "no_original_duty"));
+    }
+
+    /// …and the same unreadable duty must NOT be reported when the sweep never
+    /// moved the header. Without this the fix above would trade one false
+    /// statement for another — a run that touched nothing claiming the header
+    /// was left somewhere else.
+    #[tokio::test(start_paused = true)]
+    async fn an_unreadable_pre_sweep_duty_is_silent_when_nothing_was_written() {
+        let cache = cache_at(45.0, Some("normal"));
+        let cancel = AtomicBool::new(true); // aborts before the first write
+        let report = RestoreReport::new();
+        let writes: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let writes_w = writes.clone();
+
+        let out = run_sweep(
+            &cache,
+            "hwmon:test:pwm1",
+            &[30, 50],
+            Duration::from_secs(6),
+            move |p: u8| {
+                writes_w.lock().unwrap().push(p);
+                Ok(())
+            },
+            || sample(None, Some(1), Some(900)),
+            &cancel,
+            || false,
+            || true,
+            &report,
+            |_| {},
+        )
+        .await;
+
+        assert_eq!(out.state, STATE_CANCELLED);
+        assert!(
+            writes.lock().unwrap().is_empty(),
+            "precondition: the header was never moved"
+        );
+        assert_eq!(rig_free_restore(&report), (false, "restored"));
+    }
+
+    /// `Rig::restore` for the tests that drive `run_sweep` directly.
+    fn rig_free_restore(report: &RestoreReport) -> (bool, &'static str) {
+        let outcome = report.get();
+        (outcome.header_left_moved(), outcome.token())
     }
 
     /// [SAFETY] DEC-290 / 277-c, the path the loop check CANNOT cover: the
@@ -1152,7 +1486,7 @@ mod tests {
     async fn dropping_the_task_during_shutdown_does_not_write_a_restore() {
         let cache = cache_at(45.0, Some("normal"));
         let cancel = AtomicBool::new(false);
-        let failed = AtomicBool::new(false);
+        let failed = RestoreReport::new();
         let writes: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let writes_w = writes.clone();
         let last = Arc::new(Mutex::new(42u8));
@@ -1208,7 +1542,7 @@ mod tests {
         )
         .await;
         assert_eq!(out.state, STATE_COMPLETE);
-        assert!(rig.restore_failed.load(Ordering::SeqCst));
+        assert_eq!(rig.restore(), (true, "write_failed"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1281,7 +1615,7 @@ mod tests {
 
         let cache = cache_at(45.0, Some("normal"));
         let cancel = AtomicBool::new(false);
-        let failed = AtomicBool::new(false);
+        let failed = RestoreReport::new();
         // A documented-legal worst case: the full 20 points at the maximum
         // settle — 300 s, five times the lease TTL.
         let points: Vec<u8> = (0..constants::CHARACTERIZATION_MAX_POINTS)
@@ -1307,8 +1641,9 @@ mod tests {
             "a legal 300 s sweep must not die of an unrenewed lease: {:?}",
             out.detail
         );
-        assert!(
-            !failed.load(Ordering::SeqCst),
+        assert_eq!(
+            failed.get(),
+            RestoreOutcome::Restored,
             "the restore must still be able to write after 5x the lease TTL"
         );
         assert_eq!(
@@ -1325,7 +1660,7 @@ mod tests {
     async fn a_shutdown_part_way_through_stops_writing_immediately() {
         let cache = cache_at(45.0, Some("normal"));
         let cancel = AtomicBool::new(false);
-        let failed = AtomicBool::new(false);
+        let failed = RestoreReport::new();
         let writes: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let writes_w = writes.clone();
         let last = Arc::new(Mutex::new(50u8));
@@ -1370,7 +1705,7 @@ mod tests {
         let pub2 = published.clone();
         let cache = cache_at(45.0, Some("normal"));
         let cancel = AtomicBool::new(false);
-        let failed = AtomicBool::new(false);
+        let failed = RestoreReport::new();
         let last = Arc::new(Mutex::new(50u8));
         let last_w = last.clone();
         let out = run_sweep(

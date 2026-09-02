@@ -1,5 +1,41 @@
 # Changelog
 
+## [2.30.0] — 2026-09-02
+
+Pairs with `control-ofc-gui` >= v2.23.0 (unchanged floor). **Additive only** — one new
+field on an existing response, and one field whose value is corrected. No route, no
+capability flag and no safety rule changes; a client that ignores the new field sees the
+same behaviour it saw against v2.29.0, minus the false value.
+
+### Fixed
+- **A characterisation run reported `restore_failed: false` on three exits where it had
+  deliberately NOT restored the header** — the daemon was shutting down (DEC-290), the
+  thermal ladder was forcing (DEC-295), or the pre-sweep duty could not be read at all.
+  The field's own contract says `false` means the header is back where the sweep found
+  it, so each of those published a header parked at the last swept duty as a success,
+  and nothing re-runs a skipped restore once the force clears. The verify path has
+  reported its shutdown skip since DEC-290; characterisation was the outlier.
+  (Audit row `AUD2-c`, DEC-315)
+
+### Added
+- **`restore_outcome` on `GET /diagnostics/characterization`** — a stable token saying
+  *why*: `pending` | `restored` | `write_failed` | `skipped_shutting_down` |
+  `skipped_thermal_force` | `no_original_duty`. `restore_failed` is now derived from it,
+  so the two cannot disagree. The reason is load-bearing rather than decorative: on
+  `skipped_thermal_force` the header is being held high on purpose, and the advice the
+  old single "restore failed" message warranted — re-assert your intent — is the one
+  action a client must not take until the ladder releases.
+
+### Changed
+- **A sweep that aborted before writing anything now reports `restored`.** It left the
+  header exactly where it found it, and raising a finding there would trade the old
+  false success for a false alarm. The two authority skips are also checked *before*
+  the unreadable-duty case, so where both apply the client hears about the authority.
+- Narrowed the documented claim that the pre-sweep duty is "restored on every exit path"
+  to "every exit path on which nothing else owns the header", matching the narrowing
+  DEC-295 already applied to DEC-134's identical claim for calibration. Corrected in
+  `daemon.md`, `docs/USER_GUIDE.md` and the module's own header.
+
 ## [2.29.0] — 2026-09-02
 
 Pairs with `control-ofc-gui` >= v2.23.0 (unchanged floor). **Additive only** — three new

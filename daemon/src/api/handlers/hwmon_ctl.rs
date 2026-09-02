@@ -686,6 +686,7 @@ pub async fn hwmon_characterize_handler(
         summary: None,
         original_pct: read_header_state(&pwm_path, &enable_path, &rpm_path).pwm_percent,
         restore_failed: false,
+        restore_outcome: ch::RestoreOutcome::Pending.token().to_string(),
         detail: None,
     };
     // The cancel flag is cleared and the run installed under ONE lock, and the
@@ -708,7 +709,7 @@ pub async fn hwmon_characterize_handler(
     let hid = header_id.clone();
 
     tokio::spawn(async move {
-        let restore_failed = std::sync::atomic::AtomicBool::new(false);
+        let report = ch::RestoreReport::new();
 
         // Guard drop order is load-bearing and is asserted by
         // `characterization::tests::the_restore_write_lands_while_the_lease_is_still_valid`.
@@ -779,7 +780,7 @@ pub async fn hwmon_characterize_handler(
                 &cancel,
                 shutting_down,
                 keepalive,
-                &restore_failed,
+                &report,
                 publish,
             )
             .await;
@@ -789,7 +790,8 @@ pub async fn hwmon_characterize_handler(
             // block ends — a terminal write placed after it could legally land on
             // a run that had already started in the gap. `run_sweep`'s own
             // `RestoreOnDrop` has already dropped by here (it lives in that
-            // future), so `restore_failed` is final.
+            // future), so the restore report is final — which is why
+            // `RestoreOutcome::Pending` is unreachable below.
             //
             // `summarise` is the ONLY place the derived verdicts come from —
             // deriving any of them here instead would be the "extracted rule the
@@ -800,7 +802,12 @@ pub async fn hwmon_characterize_handler(
                     r.summary = Some(ch::summarise(&r.points));
                     r.state = outcome.state.to_string();
                     r.detail = outcome.detail;
-                    r.restore_failed = restore_failed.load(Ordering::SeqCst);
+                    // ONE source of truth for both fields (`AUD2-c`): the boolean
+                    // is derived from the reason, so a future exit path cannot
+                    // report "restored" while naming a skip.
+                    let restore = report.get();
+                    r.restore_failed = restore.header_left_moved();
+                    r.restore_outcome = restore.token().to_string();
                 }
             }
         };

@@ -5147,9 +5147,17 @@ fn test_app_state_with_short_lease(ttl: std::time::Duration) -> Arc<AppState> {
 /// trap, which this project has hit five times. This drives the real handler
 /// through a sweep several times longer than the lease TTL.
 ///
-/// The assertion that matters is `restore_failed == false`: an expired lease
-/// fails the sweep's writes *and the restore with them*, which is what actually
-/// strands the header at a duty nothing will correct.
+/// The assertion that matters is `state == "complete"`: an expired lease fails
+/// every point write, so a sweep that walked all three points and finished is a
+/// sweep whose lease was renewed under it.
+///
+/// **What this does NOT prove, stated because the comment here used to claim it
+/// did (`AUD2-c2`):** that the *restore* write survives the TTL. This fixture's
+/// `pwm_path` is a real `/sys` path that does not exist under test, so
+/// `original_pct` is `None` and the guard has nothing to write back — which the
+/// `restore_outcome` below now says out loud, and which `restore_failed: false`
+/// previously concealed. Covered instead by the unit test
+/// `characterization::tests::the_restore_write_lands_while_the_lease_is_still_valid`.
 #[tokio::test]
 async fn characterize_renews_the_hwmon_lease_across_a_long_sweep() {
     let state = test_app_state_with_short_lease(std::time::Duration::from_secs(3));
@@ -5169,9 +5177,17 @@ async fn characterize_renews_the_hwmon_lease_across_a_long_sweep() {
         done["state"], "complete",
         "the sweep outlived the lease TTL and must have renewed it: {done}"
     );
+    // `AUD2-c`: the fixture cannot read a pre-sweep duty, so there is nothing to
+    // restore — and the run must SAY so rather than publishing the `false` that
+    // used to read as "the header is back where it was".
     assert_eq!(
-        done["restore_failed"], false,
-        "an unrenewed lease fails the RESTORE too, stranding the header: {done}"
+        done["restore_outcome"], "no_original_duty",
+        "an unreadable pre-sweep duty must be reported, not silently passed off \
+         as a successful restore: {done}"
+    );
+    assert_eq!(
+        done["restore_failed"], true,
+        "…and the boolean is derived from that reason, so it must agree: {done}"
     );
     assert_eq!(done["points"].as_array().unwrap().len(), 3);
 
@@ -5190,6 +5206,53 @@ async fn characterize_refused_when_hot() {
     assert_eq!(status, 409, "{json}");
     assert_eq!(json["error"]["code"], "thermal_abort");
     assert_eq!(json["error"]["retryable"], true);
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `AUD2-c` at the CALL SITE: the skip branches live in `RestoreOnDrop`, but the
+/// two wire fields are derived in the handler's terminal publish. A unit test of
+/// the guard proves the reason is *recorded*; only this proves it is *published*.
+///
+/// The ladder starts forcing AFTER the 202, which is the only way to reach the
+/// mid-sweep skip — a ladder already forcing refuses the POST outright
+/// (`characterize_refused_while_thermal_safety_is_forcing`, below).
+#[tokio::test]
+async fn characterize_reports_a_thermally_skipped_restore_rather_than_a_success() {
+    let state = test_app_state_with_hwmon();
+    let cache = state.cache.clone();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    // 3 x 2 s: the sweep is still inside its first settle when the ladder starts.
+    let (status, json) = uds_post(
+        &path,
+        "/hwmon/h1/characterize",
+        &serde_json::json!({"points_pct": [40, 60, 80], "settle_seconds": 2}),
+    )
+    .await;
+    assert_eq!(status, 202, "{json}");
+    assert_eq!(
+        json["restore_outcome"], "pending",
+        "a live run has no outcome yet"
+    );
+
+    cache.record_engine_tick(
+        "emergency",
+        control_ofc_daemon::constants::THERMAL_EMERGENCY_TRIGGER_C,
+    );
+
+    let done = await_characterization(&path).await;
+    assert_eq!(done["state"], "aborted", "{done}");
+    assert_eq!(
+        done["restore_outcome"], "skipped_thermal_force",
+        "the restore was skipped because the ladder outranks a diagnostic: {done}"
+    );
+    assert_eq!(
+        done["restore_failed"], true,
+        "…and the boolean must agree with it — the header is NOT back where the \
+         sweep found it: {done}"
+    );
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
