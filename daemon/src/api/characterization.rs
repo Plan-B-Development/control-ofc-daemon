@@ -56,7 +56,7 @@ pub struct CharacterizationRequest {
 
 /// One measured point. The three axes stay separate on the wire — see the
 /// module docs for why collapsing them is a defect, not a simplification.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CharPoint {
     /// The duty this point asked for, **after** clamping.
     pub requested_pct: u8,
@@ -85,7 +85,7 @@ pub struct CharPoint {
 
 /// Derived diagnostics over a whole sweep. Produced by [`summarise`], which is
 /// pure — the handler must call it rather than deriving any of this inline.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CharSummary {
     /// `pass` | `partial` | `fail`
     pub command_acceptance: String,
@@ -113,7 +113,7 @@ pub struct CharSummary {
 }
 
 /// A characterisation run, and the body of `GET /diagnostics/characterization`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CharacterizationRun {
     pub run_id: String,
     pub header_id: String,

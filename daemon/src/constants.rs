@@ -393,3 +393,59 @@ const _: () = assert!(GPU_COALESCE_DELTA_PCT > 0);
 // window; a too-short wait re-introduces the false `no_rpm_effect` verdicts
 // DEC-101/DEC-120 fixed.
 const _: () = assert!(VERIFY_WAIT_SECONDS >= 4);
+
+// ── AIO-MB Phase 5: validation sessions ─────────────────────────────────────
+
+/// Sampling cadence for a recording validation session.
+///
+/// Matched to the poll loop deliberately: the recorder reads the state cache the
+/// poll fills, so a faster tick would resample identical bytes and a slower one
+/// would alias the 1 Hz telemetry it is copying. §4 is explicit — do not add an
+/// aggressive second polling loop for data already being sampled elsewhere.
+pub const VALIDATION_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Hard sample cap per session — 7200 at 1 Hz, so two hours.
+///
+/// **Cap-and-stop, never a ring buffer.** A ring evicts the OLDEST samples, and
+/// those are the startup/self-bleeding evidence §9 exists to capture. On reaching
+/// this the session finalises itself with `sample_limit_reached`, which is
+/// bounded and never silently deletes the interesting end of the recording.
+pub const VALIDATION_MAX_SAMPLES: usize = 7200;
+
+/// Completed sessions retained on disk. ~1 MB each at the sample cap.
+pub const VALIDATION_MAX_RETAINED_SESSIONS: usize = 5;
+
+/// Cap on timeline events, so a pathological reclaim loop cannot grow the file
+/// without bound between samples.
+pub const VALIDATION_MAX_EVENTS: usize = 4096;
+
+/// Cap on externally measured observations attached to one session (§14).
+pub const VALIDATION_MAX_EXTERNAL_MEASUREMENTS: usize = 512;
+
+/// User/test metadata bounds (§11) — keys and value length.
+pub const VALIDATION_MAX_METADATA_KEYS: usize = 16;
+pub const VALIDATION_MAX_METADATA_VALUE_BYTES: usize = 512;
+
+/// How many members one session may sweep. Each adds a full characterisation
+/// (~3 min), so an unbounded list is a multi-hour run that drives every fan.
+pub const VALIDATION_MAX_SWEEP_MEMBERS: usize = 8;
+
+/// Minimum readback swing, in percent, before the summariser will judge whether
+/// RPM followed PWM. Below this the duty did not meaningfully move and the
+/// question is unanswerable — reported `not_tested`, never `pass` (§7).
+pub const VALIDATION_DIVERGENCE_MIN_PWM_SWING_PCT: u8 = 15;
+
+/// RPM swing, below which RPM is treated as having failed to follow a PWM change
+/// that exceeded the swing threshold above (§10's "fails to follow the expected
+/// direction"). Deliberately generous — this produces an `observed`, never a
+/// `fail`, and a false positive here would misreport working hardware.
+pub const VALIDATION_DIVERGENCE_MAX_RPM_SWING: u16 = 100;
+
+// A cap of zero would make every session finalise before its first sample, and a
+// retention of zero would delete each session as it was written.
+const _: () = assert!(VALIDATION_MAX_SAMPLES > 0);
+const _: () = assert!(VALIDATION_MAX_RETAINED_SESSIONS > 0);
+const _: () = assert!(VALIDATION_MAX_SWEEP_MEMBERS > 0);
+// The divergence rule needs a real swing to test against; a zero threshold would
+// classify a perfectly steady header as having "moved".
+const _: () = assert!(VALIDATION_DIVERGENCE_MIN_PWM_SWING_PCT > 0);

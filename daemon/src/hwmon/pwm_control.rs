@@ -245,6 +245,21 @@ impl HwmonPwmController {
         &self.enable_revert_counts
     }
 
+    /// The duty this controller last COMMANDED for a header, as a percent
+    /// (AIO-MB Phase 5). `None` if it has never written to it.
+    ///
+    /// This is the authoritative command value, and the reason a validation
+    /// sample reads it here rather than from the state cache: the cache's
+    /// `last_commanded_pwm` is overwritten at 1 Hz by the poll's sysfs readback
+    /// (AIO5-a), so for an uncontrolled header it reports the readback and for a
+    /// controlled one it reports whichever producer wrote last. This field has
+    /// exactly one producer.
+    pub fn last_commanded_pct(&self, header_id: &str) -> Option<u8> {
+        self.write_state
+            .get(header_id)
+            .and_then(|ws| ws.last_commanded_pct)
+    }
+
     /// Set PWM on a header. Requires a valid lease.
     ///
     /// Includes a pwm_enable watchdog: on every call where manual_mode_set is
@@ -381,6 +396,9 @@ impl HwmonPwmController {
                 id: header_id.to_string(),
                 rpm,
                 last_commanded_pwm: Some(effective_pct),
+                // See the write path below — `None` so the poll's readback
+                // survives this refresh.
+                pwm_readback_pct: None,
                 updated_at: now,
                 alarm: None,
                 pwm_enable_mode: None,
@@ -451,6 +469,10 @@ impl HwmonPwmController {
             id: header_id.to_string(),
             rpm,
             last_commanded_pwm: Some(effective_pct),
+            // `None`, not `Some(effective_pct)`: this is the COMMAND, and the
+            // readback is whatever sysfs says it became. The cache merge carries
+            // the poll's answer forward across this refresh (AIO-MB Phase 5).
+            pwm_readback_pct: None,
             updated_at: now,
             alarm: None,
             pwm_enable_mode: None,

@@ -56,6 +56,16 @@ pub struct StatusResponse {
     /// whatever they render for "no value", which is what they already did.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub control_outputs: Vec<ControlOutputEntry>,
+    /// The current or most recent validation session, in miniature (AIO-MB
+    /// Phase 5). Rides the poll so a client's live panel needs no second
+    /// request — the DEC-316 static-vs-dynamic split, applied again: the
+    /// session's *topology* is static and fetched once from
+    /// `GET /validation/session`, while its progress is state and belongs here.
+    ///
+    /// Omitted when no session has ever run, so the common-case wire shape is
+    /// unchanged and an older daemon's omission reads as "none".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation_session: Option<ValidationSessionSummary>,
     /// Active profile id + display name, mirrored onto the `/status` + `/poll`
     /// surface so an external activation (CLI `--profile`, another client,
     /// systemd) is reflected within one 1 Hz poll instead of the GUI's slow
@@ -298,6 +308,38 @@ pub struct FanEntry {
     /// exposes no alarm attribute — which is not the same as "no alarm".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fan_alarm: Option<bool>,
+    /// The **hardware readback** of `pwmN`, as a percent (AIO-MB Phase 5).
+    ///
+    /// Distinct from `last_commanded_pwm`, which for an hwmon header carries
+    /// whichever of the poll's readback and the engine's command wrote last
+    /// (AIO5-a). AIO-MB Phase 5 §3 needs the two as separate columns and §10
+    /// classifies a device-side override from `command low + readback low + RPM
+    /// high`, neither of which is expressible while they share a field.
+    ///
+    /// hwmon only — an OpenFan channel and a GPU fan have no equivalent
+    /// attribute, and both emit `None` rather than echoing the command back as
+    /// though it were a reading. Absent means "the daemon did not say", never 0%.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pwm_readback_pct: Option<u8>,
+}
+
+/// A validation session's progress, for the poll surface (AIO-MB Phase 5).
+///
+/// Deliberately tiny: ids and counts, no samples. The full session — metadata,
+/// telemetry, events, evidence and findings — is `GET /validation/session`, and
+/// putting any of it here would put a megabyte on a 1 Hz poll.
+#[derive(Debug, Clone, Serialize)]
+pub struct ValidationSessionSummary {
+    pub session_id: String,
+    pub kind: String,
+    /// `idle` | `recording` | `completed` | `cancelled` | `interrupted` | `error`.
+    /// A client must render an unrecognised token rather than dropping the row.
+    pub state: String,
+    pub elapsed_ms: u64,
+    pub sample_count: usize,
+    pub event_count: usize,
+    pub sample_limit_reached: bool,
+    pub cooling_device_id: String,
 }
 
 /// A single PWM header in the API response.
@@ -852,6 +894,15 @@ pub struct ControlCapability {
     /// believing a defaulted zero.
     #[serde(default)]
     pub cooling_devices: bool,
+    /// Daemon exposes the validation-session surface: `POST`/`GET`/`DELETE
+    /// /validation/session`, its `stop`/`event`/`measurement` sub-routes, and
+    /// `GET /validation/sessions[/{id}]`. True since 2.32.0 (AIO-MB Phase 5).
+    ///
+    /// Gate on this rather than probing, for the same reason as
+    /// `pwm_characterization` above: an older daemon 404s these routes from the
+    /// fallback, which a client cannot tell from a genuine "no such session".
+    #[serde(default)]
+    pub validation_sessions: bool,
 }
 
 /// Per-device-group capability info.
@@ -1958,6 +2009,7 @@ mod tests {
             unavailable_sensors: Vec::new(),
             skipped_controls: Vec::new(),
             control_outputs: Vec::new(),
+            validation_session: None,
             active_profile_id: None,
             active_profile_name: None,
             readiness: None,
@@ -2001,6 +2053,7 @@ mod tests {
             unavailable_sensors: Vec::new(),
             skipped_controls: Vec::new(),
             control_outputs: Vec::new(),
+            validation_session: None,
             active_profile_id: None,
             active_profile_name: None,
             readiness: Some(ReadinessRollup {
@@ -2040,6 +2093,7 @@ mod tests {
             unavailable_sensors: Vec::new(),
             skipped_controls: Vec::new(),
             control_outputs: Vec::new(),
+            validation_session: None,
             active_profile_id: None,
             active_profile_name: None,
             readiness: None,
@@ -2072,6 +2126,7 @@ mod tests {
                 skipped_for_ms: 9000,
             }],
             control_outputs: Vec::new(),
+            validation_session: None,
             active_profile_id: None,
             active_profile_name: None,
             readiness: None,
@@ -2104,6 +2159,7 @@ mod tests {
             }],
             skipped_controls: Vec::new(),
             control_outputs: Vec::new(),
+            validation_session: None,
             active_profile_id: None,
             active_profile_name: None,
             readiness: None,
@@ -2353,6 +2409,7 @@ mod tests {
                 header_roles: false,
                 pwm_characterization: true,
                 cooling_devices: false,
+                validation_sessions: false,
             },
         };
         let json = serde_json::to_value(&resp).unwrap();
@@ -2496,6 +2553,7 @@ mod tests {
             source: "openfan".into(),
             rpm: Some(1200),
             last_commanded_pwm: None,
+            pwm_readback_pct: None,
             duty_pct: None,
             age_ms: 50,
             stall_detected: None,
@@ -2514,6 +2572,7 @@ mod tests {
             source: "nvidia_gpu".into(),
             rpm: None,
             last_commanded_pwm: None,
+            pwm_readback_pct: None,
             duty_pct: Some(47),
             age_ms: 10,
             stall_detected: None,

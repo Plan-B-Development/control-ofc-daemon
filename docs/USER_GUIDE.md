@@ -194,6 +194,8 @@ As of 2.0.0 the profile engine is the **sole writer** (DEC-159 / DEC-165) — th
 | `POST /fans/{fan_id}/identify` | Hold or restore one fan for physical identification (deadman auto-restore). An ordinary fan is stopped; a `role: pump` header is perturbed instead, never stopped (DEC-311). Body `{"action": "stop"\|"restore", "ttl_secs"?}` |
 | `POST /config/header-role` | Assign or clear one PWM header's role (DEC-311). Body `{"header_id": "<id>", "role": "pump"\|"cpu_fan"\|"radiator_fan"\|"chassis_fan"\|"unknown"\|null}` |
 | `GET /inventory/cooling-devices` | The configured cooling-device topology — a pump, its radiator fans and an advisory sensor as one named assembly — plus every device policy this daemon ships (DEC-316) |
+| `GET /validation/session` | The current or most recent validation session — what a cooler did while it was recording, plus the evidence summary (DEC-317). `404` when none has ever run |
+| `GET /validation/sessions` | The last five retained sessions, newest first (DEC-317) |
 | `POST /config/cooling-device` | Create or replace one cooling device by id (DEC-316). Body `{"id": "<id>", "name"?, "kind"?, "pump_member"?, "radiator_members"?, "device_policy_id"?, ...}`. Safety limits are **not** settable — a policy is chosen by id and `minimum_safe_pwm` & siblings are rejected |
 | `DELETE /config/cooling-device/{id}` | Remove one cooling device (DEC-316) |
 

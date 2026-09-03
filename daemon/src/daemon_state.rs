@@ -73,6 +73,14 @@ pub fn profiles_dir() -> PathBuf {
     PathBuf::from(state_dir()).join("profiles")
 }
 
+/// Directory where validation sessions are stored: `{state_dir}/validation`
+/// (AIO-MB Phase 5). A sibling of `profiles/` with the same ownership and mode —
+/// created lazily by the store on first write, not at startup, so a daemon that
+/// never runs a session leaves no directory behind.
+pub fn validation_dir() -> PathBuf {
+    PathBuf::from(state_dir()).join("validation")
+}
+
 /// Load persisted state from a specific directory (testable without global OnceLock).
 pub fn load_state_from(dir: &Path) -> DaemonState {
     let path = dir.join(STATE_FILE);

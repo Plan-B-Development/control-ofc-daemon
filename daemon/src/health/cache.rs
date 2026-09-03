@@ -156,6 +156,18 @@ pub struct StateCache {
     /// that one. Each consumer compares against its own last-seen value instead —
     /// the same shape as `profile_activation_epoch`.
     openfan_write_generation: AtomicU64,
+    /// Monotonic count of observed system resumes (AIO-MB Phase 5).
+    ///
+    /// A third consumer of the resume signal, and it needs its own counter for
+    /// the reason spelled out above: `take_resume_flag` is a swap that hwmon
+    /// already owns, so a second caller would steal the event from it. Reusing
+    /// `openfan_write_generation` would be wrong for a different reason — that
+    /// one is *also* bumped on serial reconnect, so it answers "may the device
+    /// have been reset?", not "did the system resume?".
+    ///
+    /// The validation recorder compares this against its own last-seen value to
+    /// emit a `resume` event marker, and never mutates it.
+    resume_generation: AtomicU64,
 }
 
 impl StateCache {
@@ -168,6 +180,7 @@ impl StateCache {
             hwmon_poll_interval_ms: AtomicU64::new(DEFAULT_HWMON_POLL_INTERVAL_MS),
             gpu_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             openfan_write_generation: AtomicU64::new(0),
+            resume_generation: AtomicU64::new(0),
         }
     }
 
@@ -331,13 +344,24 @@ impl StateCache {
             // header under an active profile: exactly the header whose fan
             // alarm matters most. Mirrors `update_openfan_fans`, which carries
             // `last_commanded_pwm` forward for the same reason.
-            if fan.alarm.is_none() || fan.pwm_enable_mode.is_none() {
+            //
+            // `pwm_readback_pct` joined this list in AIO-MB Phase 5 for exactly
+            // the same reason: the poll is its only producer, so without the
+            // merge a controlled header — the one a validation session cares
+            // about — would report no readback at all.
+            if fan.alarm.is_none()
+                || fan.pwm_enable_mode.is_none()
+                || fan.pwm_readback_pct.is_none()
+            {
                 if let Some(existing) = state.hwmon_fans.get(&fan.id) {
                     if fan.alarm.is_none() {
                         fan.alarm = existing.alarm;
                     }
                     if fan.pwm_enable_mode.is_none() {
                         fan.pwm_enable_mode = existing.pwm_enable_mode;
+                    }
+                    if fan.pwm_readback_pct.is_none() {
+                        fan.pwm_readback_pct = existing.pwm_readback_pct;
                     }
                 }
             }
@@ -939,11 +963,18 @@ impl StateCache {
         self.openfan_write_generation.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// Read the resume counter (AIO-MB Phase 5). Non-consuming, unlike
+    /// `take_resume_flag` — any number of observers may watch it.
+    pub fn resume_generation(&self) -> u64 {
+        self.resume_generation.load(Ordering::SeqCst)
+    }
+
     pub fn set_resume_detected(&self) {
         // A resume invalidates OpenFan's coalescing cache for the same reason it
         // clears hwmon's manual-mode flags: the device may have been reset
         // underneath us (DEC-256).
         self.invalidate_openfan_writes();
+        self.resume_generation.fetch_add(1, Ordering::SeqCst);
         self.resume_detected.store(true, Ordering::Relaxed);
     }
 }
@@ -1245,6 +1276,7 @@ mod tests {
             id: "it8696:fan1".into(),
             rpm: Some(800),
             last_commanded_pwm: None,
+            pwm_readback_pct: None,
             updated_at: Instant::now(),
             alarm: None,
             pwm_enable_mode: None,
@@ -1325,6 +1357,7 @@ mod tests {
                 id: "it8696:pwm1".into(),
                 rpm: Some(800),
                 last_commanded_pwm: Some(40),
+                pwm_readback_pct: None,
                 updated_at: Instant::now() - stale,
                 alarm: None,
                 pwm_enable_mode: None,
@@ -1333,6 +1366,7 @@ mod tests {
                 id: "it8696:pwm2".into(),
                 rpm: Some(900),
                 last_commanded_pwm: Some(50),
+                pwm_readback_pct: None,
                 updated_at: Instant::now(),
                 alarm: None,
                 pwm_enable_mode: None,
@@ -1374,6 +1408,7 @@ mod tests {
             id: "hwmon:it8696:isa-0a40:pwm5:PUMP".into(),
             rpm: Some(1200),
             last_commanded_pwm: Some(40),
+            pwm_readback_pct: None,
             alarm: Some(true),
             pwm_enable_mode: Some(1),
             updated_at: now,
@@ -1384,6 +1419,7 @@ mod tests {
             id: "hwmon:it8696:isa-0a40:pwm5:PUMP".into(),
             rpm: Some(1350),
             last_commanded_pwm: Some(45),
+            pwm_readback_pct: None,
             alarm: None,
             pwm_enable_mode: None,
             updated_at: now,
@@ -1402,6 +1438,76 @@ mod tests {
         assert_eq!(fan.last_commanded_pwm, Some(45));
     }
 
+    /// AIO-MB Phase 5: the same merge, for the readback.
+    ///
+    /// Its own test rather than a third assertion on the one above, because the
+    /// two fields fail differently: alarm and enable-mode are absent from the
+    /// write path because it cannot cheaply re-read them, while
+    /// `pwm_readback_pct` is absent because the write path has no readback to
+    /// report — it knows what it COMMANDED. Losing the merge would make the
+    /// readback permanently absent for exactly the headers under active control,
+    /// which are the only ones a validation session records.
+    #[test]
+    fn an_engine_write_does_not_erase_the_polls_pwm_readback() {
+        let cache = StateCache::new();
+        let now = Instant::now();
+        // The poll: readback and command happen to agree here, as they do
+        // whenever writes are landing.
+        cache.update_hwmon_fans(vec![HwmonFanState {
+            id: "hwmon:it8696:isa-0a40:pwm5:PUMP".into(),
+            rpm: Some(1200),
+            last_commanded_pwm: Some(40),
+            pwm_readback_pct: Some(40),
+            alarm: None,
+            pwm_enable_mode: None,
+            updated_at: now,
+        }]);
+
+        // The engine commands 45%. It has no readback to publish, so it sends
+        // `None` — which must NOT erase the poll's answer.
+        cache.update_hwmon_fans(vec![HwmonFanState {
+            id: "hwmon:it8696:isa-0a40:pwm5:PUMP".into(),
+            rpm: Some(1350),
+            last_commanded_pwm: Some(45),
+            pwm_readback_pct: None,
+            alarm: None,
+            pwm_enable_mode: None,
+            updated_at: now,
+        }]);
+
+        let fans = cache.snapshot().hwmon_fans;
+        let fan = &fans["hwmon:it8696:isa-0a40:pwm5:PUMP"];
+        assert_eq!(
+            fan.pwm_readback_pct,
+            Some(40),
+            "the poll's readback must survive an engine write"
+        );
+        // The engine's own fields still win — a merge, not a skip.
+        assert_eq!(fan.last_commanded_pwm, Some(45));
+        assert_eq!(fan.rpm, Some(1350));
+    }
+
+    /// And the other direction: a later poll reporting a genuinely CHANGED
+    /// readback must be able to move it. A merge that carried the old value
+    /// forward unconditionally would freeze the readback at its first sample.
+    #[test]
+    fn a_later_poll_updates_the_pwm_readback() {
+        let cache = StateCache::new();
+        let now = Instant::now();
+        for pct in [40u8, 55] {
+            cache.update_hwmon_fans(vec![HwmonFanState {
+                id: "h1".into(),
+                rpm: Some(1000),
+                last_commanded_pwm: Some(pct),
+                pwm_readback_pct: Some(pct),
+                alarm: None,
+                pwm_enable_mode: None,
+                updated_at: now,
+            }]);
+        }
+        assert_eq!(cache.snapshot().hwmon_fans["h1"].pwm_readback_pct, Some(55));
+    }
+
     /// The other direction: a later poll that genuinely reads a CLEARED alarm
     /// must be able to clear it. A merge that carried `Some(true)` forward
     /// unconditionally would latch a fan fault on for the process lifetime.
@@ -1413,6 +1519,7 @@ mod tests {
             id: "h".into(),
             rpm: Some(0),
             last_commanded_pwm: Some(40),
+            pwm_readback_pct: None,
             alarm: Some(true),
             pwm_enable_mode: Some(1),
             updated_at: now,
@@ -1421,6 +1528,7 @@ mod tests {
             id: "h".into(),
             rpm: Some(900),
             last_commanded_pwm: Some(40),
+            pwm_readback_pct: None,
             alarm: Some(false),
             pwm_enable_mode: Some(2),
             updated_at: now,
@@ -1437,6 +1545,7 @@ mod tests {
             id: "it8696:pwm1".into(),
             rpm: Some(800),
             last_commanded_pwm: Some(40),
+            pwm_readback_pct: None,
             updated_at: Instant::now(),
             alarm: None,
             pwm_enable_mode: None,

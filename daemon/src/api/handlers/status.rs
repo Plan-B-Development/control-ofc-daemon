@@ -324,6 +324,10 @@ pub async fn capabilities_handler(
             // topology endpoints only — the additive header fields that shipped
             // with them are optional on the wire and need no flag.
             cooling_devices: true,
+            // AIO-MB Phase 5, daemon >= 2.32.0. Gates the validation-session
+            // routes. The additive `pwm_readback_pct` field that shipped with
+            // them is optional on the wire and needs no flag.
+            validation_sessions: true,
         },
     })
 }

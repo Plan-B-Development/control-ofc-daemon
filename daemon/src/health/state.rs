@@ -74,7 +74,29 @@ pub struct HwmonFanState {
     /// RPM reading if available.
     pub rpm: Option<u16>,
     /// Last PWM value commanded by the daemon (if controlled).
+    ///
+    /// **This field has two producers and they mean different things** — the
+    /// poll writes the sysfs readback here, while `HwmonPwmController::set_pwm`
+    /// writes the value it commanded. They agree only while writes are landing.
+    /// The divergence is recorded as `AIO5-a`; nothing depends on resolving it,
+    /// because anything needing the true readback reads `pwm_readback_pct` and
+    /// anything needing the true command reads the controller's own
+    /// `last_commanded_pct`. Do not "tidy" this by pointing the poll at the new
+    /// field only — that would change what `last_commanded_pwm` reports for an
+    /// uncontrolled header, which is a wire-visible behaviour change.
     pub last_commanded_pwm: Option<u8>,
+    /// The **hardware readback** of `pwmN`, as a percent (AIO-MB Phase 5).
+    ///
+    /// Unambiguous, unlike `last_commanded_pwm` above: only the poll ever writes
+    /// it, and it is always what sysfs reported. `None` means "the daemon did
+    /// not say" — never 0% — which is why it is carried forward across a write
+    /// refresh rather than being reset to `None` by it.
+    ///
+    /// AIO-MB Phase 5 §3 requires "pump requested PWM" and "pump PWM readback"
+    /// as separate columns, and §10 classifies a device-side override from
+    /// `command low + readback low + RPM high`. Neither is expressible while the
+    /// two axes share one field.
+    pub pwm_readback_pct: Option<u8>,
     /// The **live** value of `pwmN_enable` (AIO-MB Phase 4).
     ///
     /// Sampled on the poll, not at discovery: the daemon writes

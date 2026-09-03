@@ -786,6 +786,7 @@ mod tests {
             active_profile: Arc::new(parking_lot::Mutex::new(None)),
             calibrating: std::sync::atomic::AtomicBool::new(false),
             characterization: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            validation: std::sync::Arc::new(Default::default()),
             characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
             last_openfan_rescan: Arc::new(parking_lot::Mutex::new(None)),

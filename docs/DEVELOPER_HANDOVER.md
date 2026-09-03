@@ -171,6 +171,8 @@ The profile engine is the **sole writer** as of 2.0.0 (DEC-159/DEC-165); the GUI
 | `POST /fans/{fan_id}/identify` | Per-fan identify hold/restore — 0 for an ordinary fan (floor-exempt), a floored perturbation for a `role: pump` header (DEC-311); deadman auto-restore (DEC-166) |
 | `POST /config/header-role` | Assign/clear a PWM header's role; a `pump` assignment earns the 30% floor (DEC-311) |
 | `GET /inventory/cooling-devices` | Cooling-device topology + the shipped device policies (DEC-316). Metadata — the profile engine never reads a device |
+| `GET /validation/session` | The current or most recent validation session in full (DEC-317). The engine is an observer that may orchestrate the existing verify/characterize handlers; it never writes a duty itself |
+| `GET /validation/sessions`, `/validation/sessions/{id}` | Retained session index (last 5) and one session in full (DEC-317) |
 | `POST /config/cooling-device` | Create/replace a cooling device. Confers **no** pump protection: that is still `/config/header-role` (DEC-316) |
 | `DELETE /config/cooling-device/{id}` | Remove a cooling device (DEC-316) |
 | `POST /fans/openfan/{ch}/calibrate` | Run a PWM-to-RPM calibration sweep |
@@ -198,7 +200,8 @@ Every sensor/fan/header includes:
 ## Measured vs commanded
 
 - `rpm` — measured from hardware (OpenFanController serial reads, hwmon `fanN_input`, or NVML per driver R565+)
-- `last_commanded_pwm` — daemon-tracked (firmware does not report PWM state)
+- `last_commanded_pwm` — daemon-tracked (OpenFan firmware does not report PWM state). **For an hwmon header this field has two producers** (register row `AIO5-a`): the poll writes the sysfs readback, the engine writes the commanded value. Read `pwm_readback_pct` for the readback where the distinction matters
+- `pwm_readback_pct` — the hardware readback of `pwmN` (hwmon only, DEC-317); one producer, always the poll
 - `duty_pct` — firmware-**reported** current fan duty % (NVIDIA via NVML, DEC-204); a *measured* value, present only where the source exposes a duty readback
 - These are always separate fields, never ambiguous
 

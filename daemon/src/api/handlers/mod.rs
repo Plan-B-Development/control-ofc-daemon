@@ -14,6 +14,7 @@ mod openfan;
 mod path_confine;
 mod profile;
 mod status;
+pub mod validation;
 
 pub use assessment::*;
 pub use config::*;
@@ -169,6 +170,7 @@ pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntr
             stall_detected: stall,
             fan_alarm: None,
             pwm_enable_mode: None,
+            pwm_readback_pct: None,
         });
     }
 
@@ -189,6 +191,7 @@ pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntr
             stall_detected: stall,
             fan_alarm: fan.alarm,
             pwm_enable_mode: fan.pwm_enable_mode,
+            pwm_readback_pct: fan.pwm_readback_pct,
         });
     }
 
@@ -214,6 +217,7 @@ pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntr
             stall_detected: None,
             fan_alarm: None,
             pwm_enable_mode: None,
+            pwm_readback_pct: None,
         });
     }
 
@@ -299,6 +303,15 @@ pub struct AppState {
     /// `main::shutdown_sequence`'s `task_handles`. What makes that safe is the
     /// shutdown check inside `characterization::RestoreOnDrop` — see its docs.
     pub characterization: crate::api::characterization::RunSlot,
+    /// The validation-session engine (AIO-MB Phase 5).
+    ///
+    /// Holds at most one session and derives its event timeline by diffing the
+    /// state cache. It is a **pure observer**: it performs no sysfs I/O, plants
+    /// no hooks in the engine or the write path, and contains no code that
+    /// commands a duty. Where a session runs a diagnostic it calls the existing
+    /// verify/characterize handler, which already owns the lease, the pump floor
+    /// and the thermal refusal — so this adds no second PWM ownership path (§2).
+    pub validation: Arc<crate::validation::recorder::ValidationEngine>,
     pub characterization_cancel: Arc<AtomicBool>,
     /// Prevents concurrent `POST /fans/openfan/rescan` probes (DEC-265).
     /// Two racing probes would open the same tty, and the loser would install
@@ -730,6 +743,24 @@ pub(crate) fn build_status_response(
         unavailable_sensors,
         skipped_controls,
         control_outputs,
+        // `live_summary`, NOT `snapshot`: this runs on `/status` AND `/poll`, the
+        // GUI's 1 Hz path. `snapshot` clones every sample and event to produce
+        // eight scalars — order 10^5 allocations for a full two-hour session,
+        // growing as it records — while holding the very lock the recorder tick
+        // needs. The summary is fixed-size and lives behind its own mutex.
+        validation_session: state
+            .validation
+            .live_summary()
+            .map(|s| ValidationSessionSummary {
+                session_id: s.session_id,
+                kind: s.kind,
+                state: s.state,
+                elapsed_ms: s.elapsed_ms,
+                sample_count: s.sample_count,
+                event_count: s.event_count,
+                sample_limit_reached: s.sample_limit_reached,
+                cooling_device_id: s.cooling_device_id,
+            }),
         active_profile_id,
         active_profile_name,
         readiness,
@@ -897,6 +928,7 @@ mod tests {
                 id: "hwmon:z_fan".into(),
                 rpm: Some(1000),
                 last_commanded_pwm: None,
+                pwm_readback_pct: None,
                 updated_at: now,
                 alarm: None,
                 pwm_enable_mode: None,
@@ -908,6 +940,7 @@ mod tests {
                 id: "hwmon:a_fan".into(),
                 rpm: Some(500),
                 last_commanded_pwm: None,
+                pwm_readback_pct: None,
                 updated_at: now,
                 alarm: None,
                 pwm_enable_mode: None,
@@ -968,6 +1001,7 @@ mod tests {
                 id: "hwmon:fan1".into(),
                 rpm: Some(0),
                 last_commanded_pwm: Some(constants::STALL_PWM_THRESHOLD),
+                pwm_readback_pct: None,
                 updated_at: now,
                 alarm: None,
                 pwm_enable_mode: None,

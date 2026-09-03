@@ -286,6 +286,24 @@ pub async fn hwmon_verify_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(header_id): axum::extract::Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // [SAFETY] Refuse once the daemon is going down (AIO-MB Phase 5, DEC-317).
+    //
+    // This used to be structurally unnecessary: the only caller was an HTTP
+    // request, and `shutdown_sequence` stops the IPC server *before* it drains
+    // tasks and restores hardware, so no request could arrive this late. The
+    // validation orchestrator calls this handler as a FUNCTION from a detached
+    // task, which breaks that invariant — and a diagnostic that starts after
+    // `restore_hwmon_to_auto` writes its duty, re-asserts `pwm_enable=1` through
+    // `set_pwm`'s reclaim watchdog, and then deliberately skips its own restore
+    // (DEC-290), leaving the header latched in manual with no daemon left to
+    // drive it. Guarding at entry closes that for every caller, present and
+    // future, rather than relying on each one to remember.
+    if *state.openfan_runtime.shutdown.borrow() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::hardware_unavailable("the daemon is shutting down"),
+        );
+    }
     // DEC-201/DEC-297: refuse to start a verify while the system is hot, OR while
     // the ladder is forcing — a verify drives the header AWAY from its commanded
     // duty. NOT because it suppresses the thermal `force_all_with_floor`, which is what this
@@ -623,6 +641,24 @@ pub async fn hwmon_characterize_handler(
     axum::extract::Path(header_id): axum::extract::Path<String>,
     Json(body): Json<crate::api::characterization::CharacterizationRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // [SAFETY] Refuse once the daemon is going down (AIO-MB Phase 5, DEC-317).
+    //
+    // This used to be structurally unnecessary: the only caller was an HTTP
+    // request, and `shutdown_sequence` stops the IPC server *before* it drains
+    // tasks and restores hardware, so no request could arrive this late. The
+    // validation orchestrator calls this handler as a FUNCTION from a detached
+    // task, which breaks that invariant — and a diagnostic that starts after
+    // `restore_hwmon_to_auto` writes its duty, re-asserts `pwm_enable=1` through
+    // `set_pwm`'s reclaim watchdog, and then deliberately skips its own restore
+    // (DEC-290), leaving the header latched in manual with no daemon left to
+    // drive it. Guarding at entry closes that for every caller, present and
+    // future, rather than relying on each one to remember.
+    if *state.openfan_runtime.shutdown.borrow() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::hardware_unavailable("the daemon is shutting down"),
+        );
+    }
     use crate::api::characterization as ch;
 
     // Same two refusals as a verify, for the same reason: a sweep drives the
@@ -1202,6 +1238,7 @@ mod tests {
             active_profile: Arc::new(parking_lot::Mutex::new(None)),
             calibrating: std::sync::atomic::AtomicBool::new(false),
             characterization: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            validation: std::sync::Arc::new(Default::default()),
             characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
             last_openfan_rescan: Arc::new(parking_lot::Mutex::new(None)),

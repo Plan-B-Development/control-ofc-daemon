@@ -633,7 +633,12 @@ fn read_hwmon_fan_states(
                 Some(HwmonFanState {
                     id: h.id.clone(),
                     rpm,
+                    // Both fields get the same sysfs reading here, deliberately.
+                    // `last_commanded_pwm` keeps the meaning it has always had on
+                    // the wire (AIO5-a); `pwm_readback_pct` is the unambiguous
+                    // one, and is the only field a validation sample reads.
                     last_commanded_pwm: pwm_pct,
+                    pwm_readback_pct: pwm_pct,
                     alarm,
                     pwm_enable_mode,
                     updated_at: now,

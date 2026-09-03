@@ -85,7 +85,10 @@ daemon/src/
       status.rs        — read endpoints (status, sensors, fans, poll, capabilities, history)
       openfan.rs       — OpenFan serial write endpoints + calibration handler
       gpu.rs           — AMD GPU fan set/reset endpoints
-      hwmon_ctl.rs     — hwmon header list, rescan, PWM-verify endpoints
+      hwmon_ctl.rs     — hwmon header list, rescan, PWM-verify + characterize endpoints
+      validation.rs    — validation-session endpoints + the diagnostic orchestrator
+                         (DEC-317). Calls the verify/characterize handlers above as
+                         functions — it owns no lease, no floor and no PWM write
       profile.rs       — profile activation + CRUD endpoints
       control.rs       — manual-override + fan-identify endpoints (DEC-163/166)
       config.rs        — runtime config endpoints (search dirs, startup delay)
@@ -96,6 +99,14 @@ daemon/src/
     responses.rs       — response structs (Serialize)
     calibration.rs     — OpenFan calibration sweep
     diagnostics.rs     — hardware-diagnostics scanning logic behind /diagnostics/hardware
+    characterization.rs — PWM/RPM response sweep (DEC-313), reused by validation
+
+  validation/            — AIO-MB Phase 5 (DEC-317). Split by who may have side effects.
+    mod.rs             — subsystem re-exports + the safety posture, stated once
+    session.rs         — pure data model + stable wire tokens (no side effects)
+    summary.rs         — pure derivation of the evidence summary (no side effects)
+    store.rs           — {state_dir}/validation/*.json; the boot interrupted-sweep
+    recorder.rs        — the 1 Hz engine. Reads live state; NEVER writes hardware
 
   pwm.rs               — shared percent_to_raw / raw_to_percent conversion
   clock.rs             — injectable monotonic clock (lease/override/identify TTLs; deterministic in tests)
@@ -385,9 +396,9 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/status` | Subsystem health + freshness; `thermal_state`; `unavailable_sensors[]` (present-but-unreadable sensors, DEC-193); `skipped_controls[]` (controls the engine cannot resolve, so is not commanding — 273-i); `active_profile_id`/`active_profile_name` (active profile, DEC-194); `readiness` (compact cached hardware-readiness rollup for the GUI Dashboard chip — `{overall, critical, warning, info, top_summary, top_code}`, DEC-206) |
+| GET | `/status` | Subsystem health + freshness; `thermal_state`; `unavailable_sensors[]` (present-but-unreadable sensors, DEC-193); `skipped_controls[]` (controls the engine cannot resolve, so is not commanding — 273-i); `active_profile_id`/`active_profile_name` (active profile, DEC-194); `readiness` (compact cached hardware-readiness rollup for the GUI Dashboard chip — `{overall, critical, warning, info, top_summary, top_code}`, DEC-206); `validation_session` (the live session in miniature, DEC-317) |
 | GET | `/sensors` | All temperature readings (each entry optionally carries a curated hwmon `thresholds` object — DEC-117; each also carries `control_eligible: bool` — DEC-193) |
-| GET | `/fans` | Fan RPM + last commanded PWM (+ `stall_detected`) |
+| GET | `/fans` | Fan RPM + last commanded PWM (+ `stall_detected`, `fan_alarm`, `pwm_enable_mode`, and `pwm_readback_pct` — the hardware readback, distinct from the command, DEC-317) |
 | GET | `/poll` | Batch: status (incl. `unavailable_sensors[]`, `skipped_controls[]`, `active_profile_*`, `readiness` rollup) + sensors (incl. `control_eligible`) + fans |
 | GET | `/sensors/history` | Per-entity time-series (ring buffer) |
 | GET | `/capabilities` | Device list, feature flags, limits, `amd_gpu.kernel_warnings` (kernel-version regression catalogue, DEC-098) |
@@ -398,6 +409,8 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 | GET | `/diagnostics/hardware` | Hardware readiness report (hwmon chips, GPU, thermal safety, kernel modules, ACPI conflicts, board info) |
 | GET | `/inventory/hwmon` | Read-only structured inventory: temp sensors (each with a fine `classification`/`confidence`/`rationale` + an advisory `default_cpu`), controllable PWM headers, and monitor-only fan tachometers (`fanN_input` with no matching `pwmN`) |
 | GET | `/inventory/cooling-devices` | Configured cooling-device topology + every device policy the daemon ships (DEC-316). Metadata — the profile engine never reads a device |
+| GET | `/validation/session` | The current or most recent validation session in full — metadata, samples, event timeline, referenced diagnostics, findings (DEC-317). `404` when none has ever run |
+| GET | `/validation/sessions`, `/validation/sessions/{id}` | The retained session index (last 5, newest first) and one session in full (DEC-317) |
 | GET | `/inventory/readiness` | Structured hardware-readiness list (`items[]` with code/severity/component/action + blocks-flags; `overall` rollup). Read-only diagnose-and-guide |
 | GET | `/inventory/superio` | Passive Super-I/O chip detection report — DMI/hwmon/`/proc/modules`/kmsg/ACPI evidence → per-chip presence + allowlisted driver recommendations; `port_probe_available` flags the opt-in active probe. Read-only, never touches an I/O port (DEC-202) |
 | GET | `/inventory/hardware-readiness` | Combined readiness + Super-I/O snapshot from ONE shared passive scan (DEC-207): the readiness `rollup`/`overall`/`items`, the `superio` report, `scanned_age_ms`, and a monotonic `generation`. The GUI's merged "Cooling Hardware Readiness" page fetches this in a single request; `?refresh=true` forces a fresh (coalesced) scan. Read-only, 404-gated |
@@ -497,6 +510,23 @@ commands still gets the forced duty, which is what keeps the reach above true.
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST | `/inventory/superio/probe` | Opt-in active Super-I/O `/dev/port` probe (DEC-203) — a deliberate one-shot that identifies an UNBOUND chip so the user can be told which driver to load. Refuses unless `[detection] allow_port_probe` + `CAP_SYS_RAWIO`; skips ports claimed by a driver/ACPI; single-flight + 10 s cooldown. Returns the `/inventory/superio` shape enriched with probe hits |
+
+### Write endpoints — validation sessions (DEC-317, AIO-MB Phase 5)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/validation/session` | Start recording against a configured cooling device. Optionally **orchestrates** `pwm_verify` / `pwm_characterization` against named `sweep_members` (default: the pump member). `409` if one is already recording |
+| POST | `/validation/session/stop` | Finalise and compute the evidence summary |
+| DELETE | `/validation/session` | End without finalising |
+| POST | `/validation/session/event` | Place a user marker on the timeline |
+| POST | `/validation/session/measurement` | Attach an external measurement — **untrusted; no control path reads one** |
+
+**A session is an observer that may orchestrate, and never a second writer.** The recorder
+performs no sysfs I/O and plants no hooks in the engine or the write path. Where a session
+runs a diagnostic it invokes the **existing** verify/characterize handler, which already owns
+the hwmon lease, the pump floor clamp, the thermal refusal and restore-on-drop. There is no
+code in `validation/` or `api/handlers/validation.rs` that commands a duty, and tests assert
+that absence rather than leaving it to review.
 
 ### Write endpoints — profile / control / config
 

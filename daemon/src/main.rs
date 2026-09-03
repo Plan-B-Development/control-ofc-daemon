@@ -1278,6 +1278,24 @@ async fn async_main() {
 
     // Init state directory from config (must happen before any state load/save)
     daemon_state::init_state_dir(&config.state.state_dir);
+
+    // AIO-MB Phase 5 (§15): any validation session still marked `recording` in a
+    // file belongs to a process that died — a crash, a SIGKILL, or an ordinary
+    // restart that beat the finaliser. Mark it `interrupted` and record where the
+    // evidence actually stopped. **Nothing is fabricated for the gap**; the
+    // record simply ends at the last sample that was really taken.
+    {
+        let repaired = control_ofc_daemon::validation::store::sweep_interrupted(
+            &control_ofc_daemon::daemon_state::validation_dir(),
+            "daemon_restart",
+        );
+        if !repaired.is_empty() {
+            log::info!(
+                "Marked {} interrupted validation session(s) from a previous run",
+                repaired.len()
+            );
+        }
+    }
     log::info!("State directory: {}", config.state.state_dir);
 
     // Load runtime.toml from state_dir and merge. Keys present in runtime.toml
@@ -1553,6 +1571,7 @@ async fn async_main() {
         active_profile: active_profile.clone(),
         calibrating: std::sync::atomic::AtomicBool::new(false),
         characterization: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        validation: std::sync::Arc::new(Default::default()),
         characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
@@ -1759,6 +1778,60 @@ async fn async_main() {
         })
     };
 
+    // ── Spawn the validation recorder (AIO-MB Phase 5) ──────────────
+    //
+    // Always alive, idle until a session records. A PURE OBSERVER: it reads the
+    // state cache the poll already fills and performs no sysfs I/O, so it cannot
+    // perturb a control decision and a fault in it cannot take down the sensor
+    // feed (§15).
+    //
+    // A plain `tokio::spawn`, NOT `spawn_supervised`: a dead recorder loses
+    // evidence, which is not a reason to kill a daemon that is still controlling
+    // fans correctly. It IS joined at shutdown (see `task_handles` below) — the
+    // 277-c lesson about an orphaned handle that stops but is never awaited.
+    //
+    // Deliberately different from the Phase 3 sweep, which is a bare detached
+    // spawn: that task is short-lived and self-bounding, this one is not.
+    let validation_handle = {
+        let engine = app_state.validation.clone();
+        let ctx = control_ofc_daemon::validation::recorder::RecorderContext {
+            cache: cache.clone(),
+            hwmon_controller: app_state.hwmon_controller.clone(),
+            override_table: app_state.override_table.clone(),
+            characterization: app_state.characterization.clone(),
+        };
+        let mut shutdown = poll_shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(control_ofc_daemon::constants::VALIDATION_SAMPLE_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.changed() => break,
+                    _ = interval.tick() => {
+                        if *shutdown.borrow() {
+                            break;
+                        }
+                        engine.tick(&ctx);
+                    }
+                }
+            }
+            // Flush whatever was captured. The session stays `recording` on
+            // disk on purpose: the next boot's sweep is what turns it into
+            // `interrupted`, which is the honest representation of a restart
+            // (§15) and is unavailable to us here — we cannot know whether the
+            // daemon is coming back.
+            if let Some(s) = engine.snapshot() {
+                if s.is_recording() {
+                    if let Err(e) = control_ofc_daemon::validation::store::save(&s) {
+                        log::warn!("Could not flush validation session at shutdown: {e}");
+                    }
+                }
+            }
+        })
+    };
+
     // ── Spawn IPC server ────────────────────────────────────────────
     // Listener was bound in preflight_check, so we know IPC is healthy
     // before any subsystem started. If the server task exits unexpectedly
@@ -1846,6 +1919,7 @@ async fn async_main() {
         ("hwmon-poll", Some(hwmon_poll_handle)),
         ("openfan-poll", openfan_poll_handle),
         ("profile-engine", Some(engine_handle)),
+        ("validation-recorder", Some(validation_handle)),
     ]
     .into_iter()
     .filter_map(|(name, handle)| handle.map(|h| (name, h)))

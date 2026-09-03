@@ -1,5 +1,62 @@
 # Changelog
 
+## [2.32.0] — 2026-09-03
+
+Pairs with `control-ofc-gui` >= v2.23.0 (unchanged floor). **Additive only** — six new
+routes behind a new capability flag, one optional new field on two existing responses, and
+a new `{state_dir}/validation/` directory. **No floor, threshold or safety rule changes**:
+a validation session commands no hardware of its own, and both parity oracles are
+byte-identical. A client that ignores everything new sees byte-identical behaviour.
+
+### Added
+- **Validation sessions: record what a cooler actually did, and produce evidence about
+  it** (AIO-MB Phase 5, DEC-317). `POST`/`GET`/`DELETE /validation/session`, plus
+  `/validation/session/stop`, `/validation/session/event`,
+  `/validation/session/measurement`, `GET /validation/sessions` and
+  `GET /validation/sessions/{id}` — all gated on the new `control.validation_sessions`
+  capability. A session samples PWM, RPM, temperature, ownership and thermal state at
+  1 Hz against a configured cooling device, derives a timeline of lifecycle events, and
+  finalises into a typed summary with explicit result states.
+
+  **The engine is an observer that may orchestrate.** It performs no sysfs I/O, plants no
+  hooks in the profile engine or the write path, and contains no code that commands a
+  duty. Where a session is asked to run a diagnostic it invokes the **existing** PWM
+  verify or Phase 3 characterisation, which already own the hwmon lease, the pump floor
+  clamp, the thermal refusal and restore-on-drop. It therefore acquires no second PWM
+  ownership path, and cannot lower a floor or stop a pump.
+
+- **Result semantics are explicit, and absence is never success.** Findings carry stable
+  tokens — `pass`, `fail`, `observed`, `not_observed`, `not_tested`, `unknown`,
+  `unavailable`, `interrupted`. A capability the hardware does not expose is
+  `unavailable` and never `fail`; a diagnostic nobody ran is `not_tested` and never
+  `pass`. A possible device-side override is preserved as `observed` evidence rather than
+  reported as a failed write, so motherboard PWM control is not misclassified as broken.
+
+- **`FanEntry.pwm_readback_pct`** on `/fans` and `/poll` — the hardware readback of
+  `pwmN` as a percent, for hwmon headers. Optional; absent means "the daemon did not say",
+  never 0%. `last_commanded_pwm` is unchanged.
+
+- **Sessions survive a restart as `interrupted`, not as a silent gap.** Each session is
+  persisted under `{state_dir}/validation/`, last five retained. At startup any session
+  still marked `recording` is rewritten as `interrupted` with the timestamp of its last
+  real sample. **No telemetry is fabricated for the gap.**
+
+- **A hard sample cap of 7200 (two hours at 1 Hz), then the session finalises itself.**
+  Deliberately cap-and-stop rather than a ring buffer: a ring evicts the *oldest* samples,
+  which are the startup and self-bleeding evidence a session exists to capture.
+
+### Changed
+- `StateCache` gained a non-consuming `resume_generation` counter. The existing
+  `take_resume_flag` is a swap with one owner, so a second observer would steal the event
+  from it; `openfan_write_generation` could not be reused because it also fires on serial
+  reconnect and so answers a different question.
+
+### Notes
+- `HwmonFanState.last_commanded_pwm` has two producers meaning different things — the
+  poll writes the sysfs readback, the write path writes the commanded value. Recorded as
+  register row `AIO5-a`; unchanged here by design, because pointing the poll at the new
+  field instead would alter what an uncontrolled header reports on the wire.
+
 ## [2.31.0] — 2026-09-03
 
 Pairs with `control-ofc-gui` >= v2.23.0 (unchanged floor). **Additive only** — three new

@@ -89,6 +89,36 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(handlers::characterization_status_handler)
                 .delete(handlers::characterization_cancel_handler),
         )
+        // AIO-MB Phase 5: validation sessions. A session RECORDS what an
+        // already-configured cooler did, and may ORCHESTRATE the two diagnostics
+        // above — it never writes a duty itself, so it adds no second PWM
+        // ownership path (§2). Capability-gated on `control.validation_sessions`.
+        .route(
+            "/validation/session",
+            post(handlers::validation::start_session_handler)
+                .get(handlers::validation::get_session_handler)
+                .delete(handlers::validation::cancel_session_handler),
+        )
+        .route(
+            "/validation/session/stop",
+            post(handlers::validation::stop_session_handler),
+        )
+        .route(
+            "/validation/session/event",
+            post(handlers::validation::post_event_handler),
+        )
+        .route(
+            "/validation/session/measurement",
+            post(handlers::validation::post_measurement_handler),
+        )
+        .route(
+            "/validation/sessions",
+            get(handlers::validation::list_sessions_handler),
+        )
+        .route(
+            "/validation/sessions/{session_id}",
+            get(handlers::validation::get_session_by_id_handler),
+        )
         // Hwmon rescan
         .route("/hwmon/rescan", post(handlers::hwmon_rescan_handler))
         // DEC-265: adopt an OpenFanController that appeared after boot,
