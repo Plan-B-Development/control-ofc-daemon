@@ -119,6 +119,7 @@ fn test_app_state_inner(engine_ticked: bool, runtime_cfg: std::path::PathBuf) ->
         header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
             std::collections::HashMap::new(),
         ))),
+        cooling_devices: Arc::new(parking_lot::RwLock::new(Arc::new(Vec::new()))),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
@@ -868,6 +869,7 @@ async fn fans_endpoint_tags_intel_gpu_source_by_id_prefix() {
         header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
             std::collections::HashMap::new(),
         ))),
+        cooling_devices: Arc::new(parking_lot::RwLock::new(Arc::new(Vec::new()))),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
@@ -1039,6 +1041,7 @@ fn test_app_state_with_nvidia_gpu(
         header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
             std::collections::HashMap::new(),
         ))),
+        cooling_devices: Arc::new(parking_lot::RwLock::new(Arc::new(Vec::new()))),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
@@ -1303,6 +1306,7 @@ fn make_test_header(id: &str, label: &str, min_pwm: u8) -> PwmHeaderDescriptor {
         is_aio: false,
         role: control_ofc_daemon::hwmon::roles::HeaderRole::Unknown,
         role_source: control_ofc_daemon::hwmon::roles::RoleSource::None,
+        ..Default::default()
     }
 }
 
@@ -1347,6 +1351,7 @@ fn test_app_state_with_hwmon() -> Arc<AppState> {
         header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
             std::collections::HashMap::new(),
         ))),
+        cooling_devices: Arc::new(parking_lot::RwLock::new(Arc::new(Vec::new()))),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
@@ -1682,6 +1687,7 @@ fn test_app_state_with_unsupported_gpu(pci_bdf: &str) -> Arc<AppState> {
         header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
             std::collections::HashMap::new(),
         ))),
+        cooling_devices: Arc::new(parking_lot::RwLock::new(Arc::new(Vec::new()))),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
@@ -1772,6 +1778,7 @@ fn test_app_state_with_read_only_gpu(pci_bdf: &str, pci_device_id: u16) -> Arc<A
         header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
             std::collections::HashMap::new(),
         ))),
+        cooling_devices: Arc::new(parking_lot::RwLock::new(Arc::new(Vec::new()))),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
@@ -1852,6 +1859,7 @@ fn test_app_state_with_amd_gpu(
         header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
             std::collections::HashMap::new(),
         ))),
+        cooling_devices: Arc::new(parking_lot::RwLock::new(Arc::new(Vec::new()))),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
@@ -2332,6 +2340,7 @@ async fn deactivate_profile_resets_hwmon_coalescing() {
         header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
             std::collections::HashMap::new(),
         ))),
+        cooling_devices: Arc::new(parking_lot::RwLock::new(Arc::new(Vec::new()))),
         override_table: Arc::new(Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
@@ -2463,6 +2472,7 @@ fn test_app_state_with_writable_pmfw_gpu(pci_bdf: &str) -> (Arc<AppState>, tempf
         header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
             std::collections::HashMap::new(),
         ))),
+        cooling_devices: Arc::new(parking_lot::RwLock::new(Arc::new(Vec::new()))),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
@@ -2650,6 +2660,7 @@ async fn hwmon_discovery_excludes_amdgpu_end_to_end_via_ipc() {
         header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
             std::collections::HashMap::new(),
         ))),
+        cooling_devices: Arc::new(parking_lot::RwLock::new(Arc::new(Vec::new()))),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
@@ -2728,6 +2739,7 @@ fn test_app_state_with_profile_dirs(dirs: Vec<std::path::PathBuf>) -> Arc<AppSta
         header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
             std::collections::HashMap::new(),
         ))),
+        cooling_devices: Arc::new(parking_lot::RwLock::new(Arc::new(Vec::new()))),
         override_table: Arc::new(parking_lot::Mutex::new(
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
@@ -5542,6 +5554,194 @@ async fn capabilities_advertises_pwm_characterization() {
         json["control"]["pwm_characterization"], true,
         "clients gate the whole feature on this flag rather than probing"
     );
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+// ── AIO-MB Phase 4 (DEC-316): cooling-device topology + capability audit ─────
+
+#[tokio::test]
+async fn capabilities_advertise_cooling_devices() {
+    // Gates the three topology endpoints. A client must branch on this rather
+    // than probing: an older daemon 404s the POST, which is the same status the
+    // route returns for an unknown device id on DELETE.
+    let state = test_app_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/capabilities").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        json["control"]["cooling_devices"], true,
+        "this daemon exposes cooling-device topology: {json}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn cooling_device_round_trips_through_the_api() {
+    let (state, _tmp) = config_test_state("");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    // Nothing configured yet — an empty list, not an error, and the shipped
+    // policies are advertised so a client need not hardcode them.
+    let (status, json) = uds_get(&path, "/inventory/cooling-devices").await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json["cooling_devices"].as_array().unwrap().len(), 0);
+    let policies = json["available_policies"].as_array().unwrap();
+    assert!(
+        policies.iter().any(|p| p["id"] == "generic_pump"),
+        "the generic pump policy must be advertised: {json}"
+    );
+
+    // The brief's topology requirement: one pump, several radiator fans, and
+    // no coolant sensor — which is the normal motherboard-AIO case.
+    let (status, json) = uds_post(
+        &path,
+        "/config/cooling-device",
+        &serde_json::json!({
+            "id": "aio-1",
+            "name": "AIO Cooling System",
+            "kind": "aio_liquid",
+            "pump_member": "hwmon:it8696:isa-0a40:pwm5:PUMP",
+            "radiator_members": [
+                "hwmon:it8696:isa-0a40:pwm1:CPU_FAN",
+                "hwmon:it8696:isa-0a40:pwm2:CPU_OPT"
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json["updated"], true);
+
+    let (status, json) = uds_get(&path, "/inventory/cooling-devices").await;
+    assert_eq!(status, 200);
+    let dev = &json["cooling_devices"][0];
+    assert_eq!(dev["id"], "aio-1");
+    assert_eq!(dev["kind"], "aio_liquid");
+    assert_eq!(dev["radiator_members"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        dev["coolant_telemetry"], "unavailable",
+        "a missing coolant sensor is a supported configuration, not an error"
+    );
+    assert_eq!(
+        dev["device_policy"]["id"], "generic_pump",
+        "a device naming no policy resolves to the conservative default"
+    );
+    assert_eq!(dev["device_policy"]["supports_stop"], false);
+
+    // Same id replaces rather than duplicating.
+    let (status, _) = uds_post(
+        &path,
+        "/config/cooling-device",
+        &serde_json::json!({ "id": "aio-1", "name": "Renamed" }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (_, json) = uds_get(&path, "/inventory/cooling-devices").await;
+    assert_eq!(json["cooling_devices"].as_array().unwrap().len(), 1);
+    assert_eq!(json["cooling_devices"][0]["name"], "Renamed");
+
+    // Delete, then a second delete is a 404 rather than a silent success.
+    let (status, _) = uds_delete(&path, "/config/cooling-device/aio-1").await;
+    assert_eq!(status, 200);
+    let (status, json) = uds_delete(&path, "/config/cooling-device/aio-1").await;
+    assert_eq!(status, 404, "{json}");
+    assert_eq!(json["error"]["code"], "not_found");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// **The brief's trust-model requirement**: "a normal user profile must not be
+/// able to submit `minimum_safe_pwm = 1` and bypass pump protections."
+///
+/// Two independent defences, and this asserts both. `DevicePolicy` derives no
+/// `Deserialize`, so the number is unconstructible from a payload — that is the
+/// compile-time half, pinned by a unit test. This is the runtime half: the
+/// endpoint rejects the key by name rather than ignoring it, because a caller
+/// that believes it tightened a pump floor when it did not is the more
+/// dangerous outcome.
+#[tokio::test]
+async fn a_cooling_device_payload_cannot_set_a_safety_number() {
+    let (state, _tmp) = config_test_state("");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    for key in [
+        "minimum_safe_pwm",
+        "minimum_safe_pwm_pct",
+        "supports_stop",
+        "startup_override_seconds",
+        "effective_min_pwm_pct",
+        "stop_permitted",
+        "device_policy",
+    ] {
+        let mut body = serde_json::json!({ "id": "aio-1" });
+        body[key] = serde_json::json!(1);
+        let (status, json) = uds_post(&path, "/config/cooling-device", &body).await;
+        assert_eq!(status, 400, "'{key}' must be rejected, got: {json}");
+        assert_eq!(json["error"]["code"], "validation_error");
+    }
+
+    // A policy id this daemon does not ship is rejected too — a client must not
+    // be able to name a relaxed policy into existence.
+    let (status, json) = uds_post(
+        &path,
+        "/config/cooling-device",
+        &serde_json::json!({ "id": "aio-1", "device_policy_id": "nl-lc1-validated-20pct" }),
+    )
+    .await;
+    assert_eq!(status, 400, "{json}");
+
+    // Nothing was stored by any of the rejected calls.
+    let (_, json) = uds_get(&path, "/inventory/cooling-devices").await;
+    assert_eq!(
+        json["cooling_devices"].as_array().unwrap().len(),
+        0,
+        "a rejected payload must store nothing: {json}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn cooling_device_rejects_malformed_topology() {
+    let (state, _tmp) = config_test_state("");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    for (body, why) in [
+        (serde_json::json!({}), "missing id"),
+        (serde_json::json!({ "id": "" }), "empty id"),
+        (serde_json::json!({ "id": "has/slash" }), "path-unsafe id"),
+        (serde_json::json!({ "id": ".." }), "dot-dot id"),
+        (
+            serde_json::json!({ "id": "a", "kind": "thermosiphon" }),
+            "unknown kind",
+        ),
+        (
+            serde_json::json!({ "id": "a", "radiator_members": [""] }),
+            "empty member id",
+        ),
+        (
+            serde_json::json!({ "id": "a", "radiator_members": "not-an-array" }),
+            "member list of the wrong shape",
+        ),
+        (
+            serde_json::json!({
+                "id": "a",
+                "pump_member": "hwmon:x:pwm1:PUMP",
+                "radiator_members": ["hwmon:x:pwm1:PUMP"]
+            }),
+            "one header claimed twice",
+        ),
+    ] {
+        let (status, json) = uds_post(&path, "/config/cooling-device", &body).await;
+        assert_eq!(status, 400, "{why} must be rejected, got: {json}");
+        assert_eq!(json["error"]["code"], "validation_error", "{why}");
+    }
+
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
 }

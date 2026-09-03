@@ -65,6 +65,23 @@ pub struct RuntimeConfig {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detection: Option<RuntimeDetection>,
+
+    /// Cooling-device topology (AIO-MB Phase 4, DEC-316).
+    ///
+    /// **Top-level, deliberately** — not a key under `[hardware]` beside
+    /// `header_roles`, even though that is the obvious precedent. `RuntimeHardware`
+    /// carries `deny_unknown_fields`, so an older daemon meeting this key there
+    /// would fail to parse the whole section, and `load_from` does not even
+    /// quarantine at boot — it warns and falls back to `Default`. A downgrade
+    /// would therefore drop the user's pump role assignment, and with it a 30%
+    /// floor, leaving no artifact behind. Up here, this struct's own lack of
+    /// `deny_unknown_fields` (see the doc comment above) means an older daemon
+    /// ignores the array and `[hardware]` still parses: a downgrade costs the
+    /// topology, which is metadata, and never a safety input.
+    ///
+    /// Declared last so the array-of-tables serialises after the plain tables.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cooling_devices: Vec<crate::hwmon::cooling_device::CoolingDeviceConfig>,
 }
 
 /// Runtime overrides for `[serial]` (DEC-243). Both take effect at next start.
@@ -369,6 +386,39 @@ impl RuntimeConfig {
                 },
             )
             .collect()
+    }
+
+    /// Every configured cooling device, with unusable entries dropped.
+    ///
+    /// Sanitised on **read** rather than on load, matching `header_roles_parsed`:
+    /// a hand-edited file keeps its good devices, one bad device costs only
+    /// itself, and nothing rewrites the user's file behind their back.
+    pub fn cooling_devices(&self) -> Vec<crate::hwmon::cooling_device::CoolingDeviceConfig> {
+        crate::hwmon::cooling_device::sanitize(self.cooling_devices.clone())
+    }
+
+    /// Create or replace a cooling device, keyed by id. Returns false when the
+    /// table is already full and this would be a new device.
+    pub fn set_cooling_device(
+        &mut self,
+        dev: crate::hwmon::cooling_device::CoolingDeviceConfig,
+    ) -> bool {
+        if let Some(slot) = self.cooling_devices.iter_mut().find(|d| d.id == dev.id) {
+            *slot = dev;
+            return true;
+        }
+        if self.cooling_devices.len() >= crate::hwmon::cooling_device::MAX_COOLING_DEVICES {
+            return false;
+        }
+        self.cooling_devices.push(dev);
+        true
+    }
+
+    /// Remove a cooling device by id. Returns whether anything was removed.
+    pub fn remove_cooling_device(&mut self, id: &str) -> bool {
+        let before = self.cooling_devices.len();
+        self.cooling_devices.retain(|d| d.id != id);
+        before != self.cooling_devices.len()
     }
 
     /// Set (or clear, with `None`) one header's role assignment. Drops the whole
@@ -936,5 +986,192 @@ mod tests {
         assert_eq!(cfg.polling.map(|p| p.poll_interval_ms), Some(750));
         assert!(path.exists(), "a file we understood must be left alone");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    // ── AIO-MB Phase 4 (DEC-316): cooling-device topology ────────────────────
+
+    use crate::hwmon::cooling_device::CoolingDeviceConfig;
+
+    fn aio_device() -> CoolingDeviceConfig {
+        CoolingDeviceConfig {
+            id: "aio-1".into(),
+            name: "AIO Cooling System".into(),
+            kind: "aio_liquid".into(),
+            pump_member: Some("hwmon:it8696:isa-0a40:pwm5:PUMP".into()),
+            radiator_members: vec![
+                "hwmon:it8696:isa-0a40:pwm1:CPU_FAN".into(),
+                "hwmon:it8696:isa-0a40:pwm2:CPU_OPT".into(),
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// The brief's topology requirement, end to end through the file format:
+    /// a pump plus several radiator fans survives a save/load round trip.
+    #[test]
+    fn cooling_devices_round_trip_through_runtime_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.toml");
+
+        let mut cfg = RuntimeConfig::default();
+        assert!(cfg.set_cooling_device(aio_device()));
+        cfg.set_header_role(
+            "hwmon:it8696:isa-0a40:pwm5:PUMP",
+            Some(crate::hwmon::roles::HeaderRole::Pump),
+        );
+        cfg.save_to(&path).unwrap();
+
+        let back = RuntimeConfig::load_from(&path);
+        let devices = back.cooling_devices();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].id, "aio-1");
+        assert_eq!(
+            devices[0].pump_member.as_deref(),
+            Some("hwmon:it8696:isa-0a40:pwm5:PUMP")
+        );
+        assert_eq!(devices[0].radiator_members.len(), 2);
+        assert_eq!(devices[0].coolant_telemetry(), "unavailable");
+        // The role assignment is untouched by the new section.
+        assert_eq!(back.header_roles_parsed().len(), 1);
+
+        // It really is a TOP-LEVEL array, not a key under [hardware]. If this
+        // ever moves, the downgrade test below stops meaning anything.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("[[cooling_devices]]"),
+            "expected a top-level array of tables, got:\n{text}"
+        );
+        // `[hardware]` serialises as `[hardware.header_roles]` when the
+        // preferred-sensor keys are unset, so match the prefix rather than the
+        // bare header — the exact-string trap from `CLAUDE.md`.
+        let hardware_at = text.find("[hardware").expect("hardware section");
+        let devices_at = text.find("[[cooling_devices]]").unwrap();
+        assert!(
+            devices_at > hardware_at,
+            "the array must serialise after the plain tables:\n{text}"
+        );
+    }
+
+    /// **The reason this lives at the top level (Decision 4).**
+    ///
+    /// An older daemon has no `cooling_devices` field. Its `[hardware]` section
+    /// carries `deny_unknown_fields`, so had the array been stored there the
+    /// whole section would fail to parse — and `load_from` does not quarantine
+    /// at boot, it warns and falls back to `Default`, silently dropping the
+    /// user's pump role and its 30% floor with no artifact left behind.
+    ///
+    /// `PriorRuntimeConfig` models that daemon exactly: same shape, minus the
+    /// field. The assertion is that it still reads `header_roles`.
+    #[test]
+    fn an_older_daemon_ignores_cooling_devices_and_keeps_header_roles() {
+        #[derive(Debug, Deserialize)]
+        struct PriorHardware {
+            #[serde(default)]
+            header_roles: std::collections::BTreeMap<String, String>,
+        }
+        #[derive(Debug, Deserialize)]
+        struct PriorRuntimeConfig {
+            #[serde(default)]
+            hardware: Option<PriorHardware>,
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.toml");
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_header_role(
+            "hwmon:it8696:isa-0a40:pwm5:PUMP",
+            Some(crate::hwmon::roles::HeaderRole::Pump),
+        );
+        assert!(cfg.set_cooling_device(aio_device()));
+        cfg.save_to(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let prior: PriorRuntimeConfig =
+            toml::from_str(&text).expect("an older daemon must still parse this file");
+        let roles = prior
+            .hardware
+            .expect("[hardware] must survive")
+            .header_roles;
+        assert_eq!(
+            roles
+                .get("hwmon:it8696:isa-0a40:pwm5:PUMP")
+                .map(String::as_str),
+            Some("pump"),
+            "the pump role — and therefore its 30% floor — must survive a downgrade"
+        );
+    }
+
+    /// The presence half of the test above: a `[hardware]` section that really
+    /// does reject unknown keys, proving the hazard is real and the placement
+    /// is what avoids it rather than the assertion passing vacuously.
+    #[test]
+    fn the_hardware_section_would_have_rejected_an_unknown_key() {
+        let with_unknown = "[hardware]\nheader_roles = {}\ncooling_devices = []\n";
+        let parsed: Result<RuntimeConfig, _> = toml::from_str(with_unknown);
+        assert!(
+            parsed.is_err(),
+            "[hardware] must still reject unknown keys — if this passes,              deny_unknown_fields was removed and the downgrade argument is void"
+        );
+    }
+
+    #[test]
+    fn set_cooling_device_upserts_and_remove_reports_absence() {
+        let mut cfg = RuntimeConfig::default();
+        assert!(cfg.set_cooling_device(aio_device()));
+        let renamed = CoolingDeviceConfig {
+            name: "Renamed".into(),
+            ..aio_device()
+        };
+        assert!(cfg.set_cooling_device(renamed));
+        assert_eq!(cfg.cooling_devices.len(), 1, "same id must replace");
+        assert_eq!(cfg.cooling_devices()[0].name, "Renamed");
+
+        assert!(cfg.remove_cooling_device("aio-1"));
+        assert!(
+            !cfg.remove_cooling_device("aio-1"),
+            "second remove is a no-op"
+        );
+        assert!(cfg.cooling_devices().is_empty());
+    }
+
+    #[test]
+    fn set_cooling_device_refuses_to_exceed_the_cap() {
+        let mut cfg = RuntimeConfig::default();
+        for i in 0..crate::hwmon::cooling_device::MAX_COOLING_DEVICES {
+            assert!(cfg.set_cooling_device(CoolingDeviceConfig {
+                id: format!("dev-{i}"),
+                ..Default::default()
+            }));
+        }
+        assert!(
+            !cfg.set_cooling_device(CoolingDeviceConfig {
+                id: "one-too-many".into(),
+                ..Default::default()
+            }),
+            "a new device beyond the cap must be refused"
+        );
+        // ...but replacing an existing one still works at the cap.
+        assert!(cfg.set_cooling_device(CoolingDeviceConfig {
+            id: "dev-0".into(),
+            name: "still editable".into(),
+            ..Default::default()
+        }));
+    }
+
+    /// A hand-edited file with one bad device keeps the good ones and never
+    /// aborts the load.
+    #[test]
+    fn a_bad_hand_edited_device_costs_only_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.toml");
+        std::fs::write(
+            &path,
+            "[[cooling_devices]]\nid = \"good\"\n\n[[cooling_devices]]\nid = \"has/slash\"\n",
+        )
+        .unwrap();
+        let cfg = RuntimeConfig::load_from(&path);
+        let devices = cfg.cooling_devices();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].id, "good");
     }
 }

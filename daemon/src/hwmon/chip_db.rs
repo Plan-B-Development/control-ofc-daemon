@@ -93,7 +93,7 @@ const KNOWN_MODULES: &[(&str, bool)] = &[
 /// w83627hf), SMSC (smsc47m1, smsc47b397, dme1737, sch5627, sch5636) and
 /// National (pc87360, pc87427). Each mapping is verified against that driver's
 /// docs.kernel.org "Supported chips" / "Prefix" listing (2026-07-07).
-fn expected_driver_for_chip(chip_name: &str) -> &'static str {
+pub(crate) fn expected_driver_for_chip(chip_name: &str) -> &'static str {
     let lower = chip_name.to_lowercase();
 
     // ── Nuvoton ──

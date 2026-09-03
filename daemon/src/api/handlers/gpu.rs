@@ -800,6 +800,7 @@ mod tests {
             header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
                 std::collections::HashMap::new(),
             ))),
+            cooling_devices: Arc::new(parking_lot::RwLock::new(Arc::new(Vec::new()))),
             override_table: Arc::new(parking_lot::Mutex::new(
                 crate::control_override::OverrideTable::new(),
             )),

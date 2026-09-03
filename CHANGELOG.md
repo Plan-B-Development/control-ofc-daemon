@@ -1,5 +1,53 @@
 # Changelog
 
+## [2.31.0] — 2026-09-03
+
+Pairs with `control-ofc-gui` >= v2.23.0 (unchanged floor). **Additive only** — three new
+routes behind a new capability flag, optional new fields on two existing responses, and a
+new top-level `runtime.toml` section. **No floor, threshold or safety rule changes**: the
+device-policy table ships generic entries only, whose pump floor *is* the constant the
+engine already enforced, so a client that ignores everything new sees byte-identical
+behaviour.
+
+### Added
+- **A cooler is now one device, not three coincidentally related channels** (AIO-MB
+  Phase 4, DEC-316). `GET /inventory/cooling-devices`, `POST /config/cooling-device` and
+  `DELETE /config/cooling-device/{id}`, gated on the new `control.cooling_devices`
+  capability, describe a pump header, its radiator fans, auxiliary members and an advisory
+  temperature source as one named assembly. Persisted as a top-level `[[cooling_devices]]`
+  array in `runtime.toml`.
+
+  **Topology is metadata and the profile engine never reads it.** Naming a header as a
+  device's `pump_member` confers no pump protection — the 30% floor and pump-safe identify
+  still come from `POST /config/header-role`, which is a separate call.
+- **A trusted device-capability policy model.** A device selects a policy *by id*; the
+  numbers live compiled into the daemon. The Rust `DevicePolicy` type derives no
+  `Deserialize`, so no inbound payload can construct one, and the endpoint additionally
+  rejects `minimum_safe_pwm` and its siblings by name rather than ignoring them. An
+  absolute 20% backstop clamps every resolution regardless of table contents.
+
+  Only generic policies ship in this release, so **no floor moves**.
+- **Headers report the floor the daemon will actually enforce.** `effective_min_pwm_pct`,
+  `stop_permitted` and `cooling_device_id` join `/hwmon/headers` and `/inventory/hwmon`,
+  so a client can display the enforced number instead of re-deriving it from labels and
+  chip names. All optional: absent means "this daemon did not say", never zero.
+- **A read-only header capability audit.** `pwm_freq_hz`, `rpm_min_threshold`,
+  `rpm_max_threshold` and `tach_pulses_per_rev` on `/hwmon/headers`, plus
+  `supported_pwm_enable_modes` from a cited driver table (`it87` → `[0,1,2]`, `nct6775` →
+  `[0,1,2,3,4,5]`; empty means **unknown**, not "none"). Pure reads — no new write path.
+- **`fan_alarm` and `pwm_enable_mode` on `/poll`** — the driver's own `fanN_alarm` bit and
+  the live `pwmN_enable` mode for an hwmon header. Both sampled at 1 Hz rather than frozen
+  into the header snapshot: an alarm captured at discovery would read "clear" while a fan is
+  failing, and the daemon writes `pwmN_enable` itself when it takes a header over, so a
+  captured mode would report the pre-takeover value for the process lifetime. Absent means
+  not known, never "no alarm".
+
+### Changed
+- The pump-protection union now has exactly one definition, `roles::is_pump_protected`;
+  `AppState::header_is_pump_protected` is the lookup wrapper around it. Forced rather than
+  chosen — three header-mapping call sites hold the controller lock the wrapper re-takes,
+  so a second copy of the predicate was the alternative to a deadlock.
+
 ## [2.30.0] — 2026-09-02
 
 Pairs with `control-ofc-gui` >= v2.23.0 (unchanged floor). **Additive only** — one new

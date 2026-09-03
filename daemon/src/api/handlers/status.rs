@@ -320,6 +320,10 @@ pub async fn capabilities_handler(
             header_roles: true,
             // AIO-MB Phase 3: PWM/RPM response characterisation.
             pwm_characterization: true,
+            // AIO-MB Phase 4 (DEC-316), daemon >= 2.31.0. Gates the three
+            // topology endpoints only — the additive header fields that shipped
+            // with them are optional on the wire and need no flag.
+            cooling_devices: true,
         },
     })
 }

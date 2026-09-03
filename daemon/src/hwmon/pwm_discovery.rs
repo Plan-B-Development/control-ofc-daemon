@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use crate::error::HwmonError;
 
 /// Descriptor for a controllable PWM fan header.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PwmHeaderDescriptor {
     /// Stable identifier (e.g. `hwmon:it8696:it87.2624:pwm3:PUMP`).
     pub id: String,
@@ -61,6 +61,18 @@ pub struct PwmHeaderDescriptor {
     /// How `role` was established. `RoleSource::None` whenever the role is
     /// `Unknown`.
     pub role_source: crate::hwmon::roles::RoleSource,
+    /// Read-only driver capability audit (AIO-MB Phase 4, DEC-316). Static
+    /// facts sampled once here; every field is `Option` and stays `None` when
+    /// the driver does not expose the attribute. See
+    /// [`crate::hwmon::header_caps`].
+    pub caps: crate::hwmon::header_caps::HeaderCaps,
+    /// Path to `fanN_alarm` when the driver exposes one.
+    ///
+    /// The alarm is *state*, not a capability, so only its path is captured
+    /// here — the value is sampled on the 1 Hz poll and published on `/poll`.
+    /// Freezing it into this snapshot would let it read "clear" while a fan is
+    /// failing, because clients refetch headers only occasionally.
+    pub alarm_path: Option<String>,
 }
 
 /// Discover all controllable PWM outputs under a given hwmon root.
@@ -172,6 +184,11 @@ fn discover_device_pwm(hwmon_dir: &Path) -> Result<Vec<PwmHeaderDescriptor>, Hwm
             .map(|m| !m.permissions().readonly())
             .unwrap_or(false);
 
+        // Read-only capability audit + the alarm path (AIO-MB Phase 4). Pure
+        // reads; this adds no write path to discovery.
+        let caps = crate::hwmon::header_caps::read_header_caps(hwmon_dir, pwm_index);
+        let alarm_path = crate::hwmon::header_caps::alarm_path(hwmon_dir, pwm_index);
+
         // Read pwmN_mode if present (0=DC, 1=PWM)
         let mode_path = hwmon_dir.join(format!("pwm{pwm_index}_mode"));
         let pwm_mode = if mode_path.exists() {
@@ -208,6 +225,8 @@ fn discover_device_pwm(hwmon_dir: &Path) -> Result<Vec<PwmHeaderDescriptor>, Hwm
             is_aio,
             role,
             role_source,
+            caps,
+            alarm_path,
         });
     }
 

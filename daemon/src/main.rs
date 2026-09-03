@@ -1574,6 +1574,12 @@ async fn async_main() {
         header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
             runtime_cfg.header_roles_parsed(),
         ))),
+        // AIO-MB Phase 4: topology from the top-level `[[cooling_devices]]`
+        // array. Sanitised on read, so one bad hand-edited device costs only
+        // itself. Effective immediately, like `header_roles`.
+        cooling_devices: Arc::new(parking_lot::RwLock::new(Arc::new(
+            runtime_cfg.cooling_devices(),
+        ))),
         allow_port_probe: config.detection.allow_port_probe,
         running_config: config.clone(),
         // DEC-206/207: seeded by the assessment task below once the poll cache is
@@ -2913,6 +2919,7 @@ mod tests {
             is_aio: false,
             role: control_ofc_daemon::hwmon::roles::HeaderRole::Unknown,
             role_source: control_ofc_daemon::hwmon::roles::RoleSource::None,
+            ..Default::default()
         }
     }
 

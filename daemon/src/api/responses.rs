@@ -280,6 +280,24 @@ pub struct FanEntry {
     /// True when RPM is 0 but last_commanded_pwm is above the safety floor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stall_detected: Option<bool>,
+    /// The **live** `pwmN_enable` mode for an hwmon header (AIO-MB Phase 4).
+    ///
+    /// On the poll rather than on `/hwmon/headers` because the daemon writes
+    /// this attribute itself when it takes a header over: a discovery-time
+    /// snapshot would report the pre-takeover mode for the process lifetime,
+    /// while the field's whole diagnostic value is answering "is something else
+    /// controlling this header *now*?". A different attribute from
+    /// `PwmHeaderEntry::pwm_mode` (`pwmN_mode`, DC vs PWM).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pwm_enable_mode: Option<u8>,
+    /// The driver's own `fanN_alarm` bit for this header (AIO-MB Phase 4).
+    ///
+    /// Rides the 1 Hz poll rather than `/hwmon/headers` because it is *state*:
+    /// clients refetch headers only occasionally, so an alarm carried there
+    /// would read "clear" while a fan is failing. Absent when the driver
+    /// exposes no alarm attribute — which is not the same as "no alarm".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fan_alarm: Option<bool>,
 }
 
 /// A single PWM header in the API response.
@@ -316,6 +334,43 @@ pub struct PwmHeaderEntry {
     /// `"user_assigned"`. Lets a client show *why* a header is a pump, and
     /// distinguish a confident classification from a guess it should ask about.
     pub role_source: crate::hwmon::roles::RoleSource,
+
+    // ── AIO-MB Phase 4 (DEC-316) ──────────────────────────────────────────
+    // Every field below is OPTIONAL on the wire and absent when this daemon or
+    // this driver cannot answer. That is load-bearing for `effective_min_pwm_pct`
+    // in particular: a non-optional integer would parse as 0 against a pre-2.31
+    // daemon, i.e. a client would believe a 0% floor on a pump. Absent means
+    // "fall back to your own reconstruction", never "zero".
+    /// The duty floor the daemon will actually enforce for this header, in
+    /// percent — the resolved device policy clamped by the absolute pump
+    /// backstop. Lets a client display the enforced number instead of
+    /// re-deriving it from labels and chip names.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_min_pwm_pct: Option<u8>,
+    /// Whether this header may be driven to 0 at all. False wherever
+    /// `header_is_pump_protected` holds, whatever a policy claims.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_permitted: Option<bool>,
+    /// The cooling device that claims this header, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooling_device_id: Option<String>,
+    /// PWM base frequency in Hz, from `pwmN_freq`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pwm_freq_hz: Option<u32>,
+    /// The `pwmN_enable` values this chip's driver accepts. Empty means
+    /// **unknown** — nothing in sysfs reports this, so it comes from driver
+    /// knowledge and a client must not render an empty list as "no modes".
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub supported_pwm_enable_modes: Vec<u8>,
+    /// Low RPM alarm threshold from `fanN_min`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpm_min_threshold: Option<u16>,
+    /// High RPM threshold from `fanN_max`. Absent on most Super-I/O chips.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpm_max_threshold: Option<u16>,
+    /// Tachometer pulses per revolution from `fanN_pulses`. Absent on `it87`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tach_pulses_per_rev: Option<u8>,
 }
 
 impl PwmHeaderEntry {
@@ -331,12 +386,33 @@ impl PwmHeaderEntry {
     /// forgot the overlay would silently report a user-assigned pump as
     /// `unknown` — and the GUI would then offer to stop it. Taking it here
     /// makes that a compile error instead of a safety bug.
+    ///
+    /// `pump_protected` and `device` are required for exactly the same reason
+    /// (AIO-MB Phase 4). `pump_protected` must be the daemon's own union
+    /// predicate `AppState::header_is_pump_protected` — **never** `role ==
+    /// Pump`, which DEC-312 records as a bug: a user may assign `chassis_fan`
+    /// to a header the hardware labels `PUMP`, and the display role then reads
+    /// `chassis_fan` while the daemon still refuses to stop it. Deriving the
+    /// published floor from the display role would advertise a stoppable
+    /// header the daemon will not stop.
     pub fn from_descriptor(
         h: &crate::hwmon::pwm_discovery::PwmHeaderDescriptor,
         assigned: Option<crate::hwmon::roles::HeaderRole>,
+        pump_protected: bool,
+        device: Option<&crate::hwmon::cooling_device::CoolingDeviceConfig>,
     ) -> Self {
         let (role, role_source) =
             crate::hwmon::roles::resolve_role(assigned, (h.role, h.role_source));
+        // The policy a header resolves under. With no device the default
+        // depends on whether the header is pump-protected: defaulting every
+        // header to the pump policy would advertise a 30% floor on ordinary
+        // chassis fans that the engine does not enforce.
+        let policy = match device {
+            Some(d) => d.resolved_policy(),
+            None if pump_protected => &crate::hwmon::device_policy::GENERIC_PUMP,
+            None => &crate::hwmon::device_policy::GENERIC_FAN,
+        };
+        let floor = crate::hwmon::device_policy::resolve_policy_floor(policy, pump_protected);
         PwmHeaderEntry {
             id: h.id.clone(),
             label: h.label.clone(),
@@ -352,6 +428,20 @@ impl PwmHeaderEntry {
             is_aio: h.is_aio,
             role,
             role_source,
+            effective_min_pwm_pct: Some(floor.round() as u8),
+            stop_permitted: Some(crate::hwmon::device_policy::stop_permitted(
+                policy,
+                pump_protected,
+            )),
+            cooling_device_id: device.map(|d| d.id.clone()),
+            pwm_freq_hz: h.caps.pwm_freq_hz,
+            supported_pwm_enable_modes: crate::hwmon::header_caps::supported_pwm_enable_modes(
+                &h.chip_name,
+            )
+            .to_vec(),
+            rpm_min_threshold: h.caps.rpm_min_threshold,
+            rpm_max_threshold: h.caps.rpm_max_threshold,
+            tach_pulses_per_rev: h.caps.tach_pulses_per_rev,
         }
     }
 }
@@ -361,6 +451,98 @@ impl PwmHeaderEntry {
 pub struct PwmHeadersResponse {
     pub api_version: u32,
     pub headers: Vec<PwmHeaderEntry>,
+}
+
+/// The resolved device policy a cooling device operates under (AIO-MB Phase 4).
+///
+/// Published so a client can *show* the policy, never so it can set one: the
+/// values come from `hwmon::device_policy`'s compiled-in table, selected by id.
+/// `DevicePolicy` derives no `Deserialize`, so nothing inbound can construct one.
+#[derive(Debug, Clone, Serialize)]
+pub struct DevicePolicySummary {
+    pub id: &'static str,
+    pub display_name: &'static str,
+    /// The policy's own declared floor. The floor a given *header* actually
+    /// gets is `PwmHeaderEntry::effective_min_pwm_pct`, which additionally
+    /// applies the absolute pump backstop.
+    pub minimum_safe_pwm_pct: u8,
+    pub supports_stop: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_override_seconds: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_rpm_min: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_rpm_max: Option<u16>,
+    pub internal_control_possible: bool,
+}
+
+impl DevicePolicySummary {
+    pub fn from_policy(p: &'static crate::hwmon::device_policy::DevicePolicy) -> Self {
+        DevicePolicySummary {
+            id: p.id,
+            display_name: p.display_name,
+            minimum_safe_pwm_pct: p.minimum_safe_pwm.round() as u8,
+            supports_stop: p.supports_stop,
+            startup_override_seconds: p.startup_override_seconds,
+            expected_rpm_min: p.expected_rpm_min,
+            expected_rpm_max: p.expected_rpm_max,
+            internal_control_possible: p.internal_control_possible,
+        }
+    }
+}
+
+/// One cooling device on `GET /inventory/cooling-devices` (AIO-MB Phase 4).
+#[derive(Debug, Clone, Serialize)]
+pub struct CoolingDeviceEntry {
+    pub id: String,
+    pub name: String,
+    /// `unknown` | `aio_liquid` | `air_cooler` | `custom_loop`. Presentation
+    /// only — no daemon branch reads it.
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pump_member: Option<String>,
+    pub radiator_members: Vec<String>,
+    pub auxiliary_members: Vec<String>,
+    /// Advisory. A curve keeps its own `sensor_id`; nothing in the control path
+    /// reads this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferred_sensor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_sensor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coolant_sensor: Option<String>,
+    /// `available` | `unavailable`. Unavailable is the normal case for a
+    /// motherboard-connected AIO and is **not** an error or a readiness item.
+    pub coolant_telemetry: &'static str,
+    pub device_policy: DevicePolicySummary,
+}
+
+impl CoolingDeviceEntry {
+    pub fn from_config(d: &crate::hwmon::cooling_device::CoolingDeviceConfig) -> Self {
+        CoolingDeviceEntry {
+            id: d.id.clone(),
+            name: d.name.clone(),
+            kind: d.resolved_kind().as_str(),
+            pump_member: d.pump_member.clone(),
+            radiator_members: d.radiator_members.clone(),
+            auxiliary_members: d.auxiliary_members.clone(),
+            preferred_sensor: d.preferred_sensor.clone(),
+            fallback_sensor: d.fallback_sensor.clone(),
+            coolant_sensor: d.coolant_sensor.clone(),
+            coolant_telemetry: d.coolant_telemetry(),
+            device_policy: DevicePolicySummary::from_policy(d.resolved_policy()),
+        }
+    }
+}
+
+/// Response for `GET /inventory/cooling-devices`.
+#[derive(Debug, Clone, Serialize)]
+pub struct CoolingDevicesResponse {
+    pub api_version: u32,
+    pub cooling_devices: Vec<CoolingDeviceEntry>,
+    /// Every policy this daemon ships, so a client can offer the real choices
+    /// rather than hardcoding a list that drifts from the binary.
+    pub available_policies: Vec<DevicePolicySummary>,
 }
 
 /// A monitor-only fan tachometer in the hwmon inventory (Phase 1) — an
@@ -659,6 +841,17 @@ pub struct ControlCapability {
     /// to replace.
     #[serde(default)]
     pub pwm_characterization: bool,
+    /// Daemon exposes the cooling-device topology surface:
+    /// `GET /inventory/cooling-devices`, `POST /config/cooling-device` and
+    /// `DELETE /config/cooling-device/{id}`. True since 2.31.0 (AIO-MB Phase 4).
+    ///
+    /// This gates the **endpoints** only. The additive header fields that came
+    /// with them (`effective_min_pwm_pct`, `stop_permitted`, the capability
+    /// audit) need no flag: each is optional on the wire, so absence already
+    /// means "this daemon did not say" and a client falls back rather than
+    /// believing a defaulted zero.
+    #[serde(default)]
+    pub cooling_devices: bool,
 }
 
 /// Per-device-group capability info.
@@ -2159,6 +2352,7 @@ mod tests {
                 profile_search_dir_remove: false,
                 header_roles: false,
                 pwm_characterization: true,
+                cooling_devices: false,
             },
         };
         let json = serde_json::to_value(&resp).unwrap();
@@ -2305,6 +2499,8 @@ mod tests {
             duty_pct: None,
             age_ms: 50,
             stall_detected: None,
+            fan_alarm: None,
+            pwm_enable_mode: None,
         };
         let json = serde_json::to_value(&entry).unwrap();
         assert_eq!(json["rpm"], 1200);
@@ -2321,6 +2517,8 @@ mod tests {
             duty_pct: Some(47),
             age_ms: 10,
             stall_detected: None,
+            fan_alarm: None,
+            pwm_enable_mode: None,
         };
         let json = serde_json::to_value(&nvidia).unwrap();
         assert_eq!(json["duty_pct"], 47);

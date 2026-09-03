@@ -597,12 +597,45 @@ fn read_hwmon_fan_states(
                 }
             };
 
+            // AIO-MB Phase 4: the driver's own fault bit, sampled here rather
+            // than frozen into discovery, because it is state — a header
+            // refetched only occasionally would report "clear" while a fan is
+            // failing. Absent attribute or unreadable => None ("not known"),
+            // never Some(false).
+            let alarm = h
+                .alarm_path
+                .as_ref()
+                .and_then(|p| match std::fs::read_to_string(p) {
+                    Ok(s) => s.trim().parse::<u8>().ok().map(|v| v != 0),
+                    Err(e) => {
+                        log::debug!(
+                            "hwmon header '{}': failed to read alarm from {}: {e}",
+                            h.id,
+                            p
+                        );
+                        None
+                    }
+                });
+
+            // The LIVE pwmN_enable mode (DEC-316). Read here rather than at
+            // discovery because the daemon itself writes this attribute when it
+            // takes a header over, so a discovery-time snapshot would report
+            // the pre-takeover mode forever — and this field's whole diagnostic
+            // value is answering "is something else controlling this header?".
+            let pwm_enable_mode = h.enable_path.as_ref().and_then(|p| {
+                std::fs::read_to_string(p)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u8>().ok())
+            });
+
             // Only report if we got at least one meaningful reading
             if rpm.is_some() || pwm_pct.is_some() {
                 Some(HwmonFanState {
                     id: h.id.clone(),
                     rpm,
                     last_commanded_pwm: pwm_pct,
+                    alarm,
+                    pwm_enable_mode,
                     updated_at: now,
                 })
             } else {

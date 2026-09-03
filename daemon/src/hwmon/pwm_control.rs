@@ -382,6 +382,8 @@ impl HwmonPwmController {
                 rpm,
                 last_commanded_pwm: Some(effective_pct),
                 updated_at: now,
+                alarm: None,
+                pwm_enable_mode: None,
             }]);
             return Ok(HwmonSetPwmResult {
                 header_id: header_id.to_string(),
@@ -450,6 +452,8 @@ impl HwmonPwmController {
             rpm,
             last_commanded_pwm: Some(effective_pct),
             updated_at: now,
+            alarm: None,
+            pwm_enable_mode: None,
         }]);
 
         Ok(HwmonSetPwmResult {
@@ -535,6 +539,7 @@ mod tests {
             is_aio: false,
             role: crate::hwmon::roles::HeaderRole::Unknown,
             role_source: crate::hwmon::roles::RoleSource::None,
+            ..Default::default()
         }
     }
 

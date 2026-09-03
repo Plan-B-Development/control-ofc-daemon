@@ -1147,6 +1147,302 @@ pub async fn update_nvidia_telemetry_handler(
     (status, resp)
 }
 
+// ── AIO-MB Phase 4 (DEC-316): cooling-device topology ─────────────────────────
+
+/// Keys a client might send believing they set a safety number.
+///
+/// A cooling device selects a policy **by id**; the numbers live compiled into
+/// `hwmon::device_policy`, whose `DevicePolicy` derives no `Deserialize` so they
+/// are unconstructible from a payload. That already makes these keys inert — but
+/// silently ignoring them would let a caller believe it had tightened a pump
+/// floor when it had not, which is the more dangerous failure. So they are
+/// rejected explicitly, by name.
+const REJECTED_POLICY_KEYS: &[&str] = &[
+    "minimum_safe_pwm",
+    "minimum_safe_pwm_pct",
+    "supports_stop",
+    "startup_override_seconds",
+    "expected_rpm_min",
+    "expected_rpm_max",
+    "internal_control_possible",
+    "device_policy",
+    "effective_min_pwm_pct",
+    "stop_permitted",
+];
+
+/// Pull an optional string field, treating `null` and absent alike.
+fn opt_string_field(body: &serde_json::Value, field: &str) -> Result<Option<String>, String> {
+    match body.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) if s.is_empty() => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(format!("'{field}' must be a string or null")),
+    }
+}
+
+/// Pull an optional array-of-non-empty-strings field.
+fn member_list_field(body: &serde_json::Value, field: &str) -> Result<Vec<String>, String> {
+    match body.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .map(|v| match v {
+                serde_json::Value::String(s) if !s.is_empty() => Ok(s.clone()),
+                _ => Err(format!("'{field}' entries must be non-empty strings")),
+            })
+            .collect(),
+        Some(_) => Err(format!("'{field}' must be an array of strings")),
+    }
+}
+
+/// POST /config/cooling-device — create or replace one cooling device by id.
+///
+/// Persist-first, then commit in memory by rebuilding from the freshly persisted
+/// config, exactly as `update_header_role_handler` does, so the map handlers read
+/// and the file on disk cannot drift.
+///
+/// **No follow-on safety action, deliberately.** `update_header_role_handler`
+/// releases a live identify hold when a header becomes a pump, because that call
+/// changes `header_is_pump_protected`. This one cannot: the pump-protection union
+/// is role + label + liquid-cooler channel, and reads no cooling device. Naming a
+/// header as a device's `pump_member` is a *description*, not a protection
+/// grant — a client that wants the floor assigns the role, and the GUI's
+/// Configure-AIO flow already posts `/config/header-role` before it posts here.
+pub async fn set_cooling_device_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !body.is_object() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorEnvelope::validation("body must be a JSON object"),
+        );
+    }
+    for key in REJECTED_POLICY_KEYS {
+        if body.get(key).is_some() {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(format!(
+                    "'{key}' is not settable — safety limits are daemon-owned. Select a \
+                     policy with 'device_policy_id' instead; the values it names are \
+                     compiled into the daemon."
+                )),
+            );
+        }
+    }
+
+    let id = match body.get("id") {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => s.clone(),
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation("missing or empty 'id'"),
+            );
+        }
+    };
+
+    let field = |f: &str| opt_string_field(&body, f);
+    let (name, kind, pump_member, preferred_sensor, fallback_sensor, coolant_sensor, policy_id) = {
+        let vals = [
+            field("name"),
+            field("kind"),
+            field("pump_member"),
+            field("preferred_sensor"),
+            field("fallback_sensor"),
+            field("coolant_sensor"),
+            field("device_policy_id"),
+        ];
+        let mut out = Vec::with_capacity(vals.len());
+        for v in vals {
+            match v {
+                Ok(x) => out.push(x),
+                Err(e) => {
+                    return error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(e));
+                }
+            }
+        }
+        (
+            out[0].clone(),
+            out[1].clone(),
+            out[2].clone(),
+            out[3].clone(),
+            out[4].clone(),
+            out[5].clone(),
+            out[6].clone(),
+        )
+    };
+
+    let radiator_members = match member_list_field(&body, "radiator_members") {
+        Ok(v) => v,
+        Err(e) => {
+            return error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(e));
+        }
+    };
+    let auxiliary_members = match member_list_field(&body, "auxiliary_members") {
+        Ok(v) => v,
+        Err(e) => {
+            return error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(e));
+        }
+    };
+
+    // An unrecognised kind is rejected rather than defaulted, matching the role
+    // setter: a typo that silently became `unknown` would report success having
+    // stored something the caller did not ask for.
+    if let Some(k) = kind.as_deref() {
+        if crate::hwmon::cooling_device::CoolingDeviceKind::from_token(k).is_none() {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(format!(
+                    "unknown kind '{k}' — expected one of: unknown, aio_liquid, \
+                     air_cooler, custom_loop"
+                )),
+            );
+        }
+    }
+    // Likewise an unrecognised policy id: on the *load* path an unknown id
+    // degrades to the conservative default with a warning (a file written by a
+    // newer daemon must still boot), but a live caller gets told.
+    if let Some(pid) = policy_id.as_deref() {
+        if !crate::hwmon::device_policy::POLICIES
+            .iter()
+            .any(|p| p.id == pid)
+        {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(format!(
+                    "unknown device_policy_id '{pid}' — this daemon ships: {}",
+                    crate::hwmon::device_policy::POLICIES
+                        .iter()
+                        .map(|p| p.id)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+            );
+        }
+    }
+
+    let dev = crate::hwmon::cooling_device::CoolingDeviceConfig {
+        id: id.clone(),
+        name: name.unwrap_or_default(),
+        kind: kind.unwrap_or_default(),
+        pump_member,
+        radiator_members,
+        auxiliary_members,
+        preferred_sensor,
+        fallback_sensor,
+        coolant_sensor,
+        device_policy_id: policy_id.unwrap_or_default(),
+    };
+
+    if let Err(reason) = crate::hwmon::cooling_device::validate_device(&dev) {
+        return error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(reason));
+    }
+
+    // Members must exist, so a typo is caught at author time rather than
+    // producing a device that silently describes nothing. Checked against live
+    // discovery, like the role setter's id check.
+    let known: std::collections::HashSet<String> = state
+        .hwmon_controller
+        .as_ref()
+        .map(|c| {
+            c.lock()
+                .headers()
+                .into_iter()
+                .map(|h| h.id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    if !known.is_empty() {
+        for m in dev.all_members() {
+            if !known.contains(m) {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    &ErrorEnvelope::validation(format!("unknown hwmon header id: {m}")),
+                );
+            }
+        }
+    }
+
+    let mut runtime = match runtime_for_update(&state) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if !runtime.set_cooling_device(dev) {
+        return error_response(
+            StatusCode::CONFLICT,
+            &ErrorEnvelope::already_exists(format!(
+                "cooling device limit reached ({})",
+                crate::hwmon::cooling_device::MAX_COOLING_DEVICES
+            )),
+        );
+    }
+
+    let runtime_owned = runtime.clone();
+    let rc_path = state.runtime_config_path.clone();
+    if let Err(e) = super::persist_off_runtime(move || runtime_owned.save_to(&rc_path)).await {
+        log::error!(
+            "Failed to persist cooling device '{id}' to {}: {e}",
+            state.runtime_config_path.display()
+        );
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::persistence_failed("failed to persist runtime configuration"),
+        );
+    }
+    *state.cooling_devices.write() = Arc::new(runtime.cooling_devices());
+
+    log::info!("Cooling device '{id}' saved (effective immediately)");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "api_version": API_VERSION,
+            "updated": true,
+            "id": id,
+        })),
+    )
+}
+
+/// DELETE /config/cooling-device/{id} — remove one cooling device.
+pub async fn delete_cooling_device_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let mut runtime = match runtime_for_update(&state) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if !runtime.remove_cooling_device(&id) {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            &ErrorEnvelope::not_found(&format!("no cooling device with id: {id}")),
+        );
+    }
+
+    let runtime_owned = runtime.clone();
+    let rc_path = state.runtime_config_path.clone();
+    if let Err(e) = super::persist_off_runtime(move || runtime_owned.save_to(&rc_path)).await {
+        log::error!(
+            "Failed to persist cooling device removal '{id}' to {}: {e}",
+            state.runtime_config_path.display()
+        );
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::persistence_failed("failed to persist runtime configuration"),
+        );
+    }
+    *state.cooling_devices.write() = Arc::new(runtime.cooling_devices());
+
+    log::info!("Cooling device '{id}' removed");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "api_version": API_VERSION,
+            "updated": true,
+            "id": id,
+        })),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

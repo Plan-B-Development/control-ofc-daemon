@@ -320,7 +320,27 @@ impl StateCache {
     pub fn update_hwmon_fans(&self, fans: Vec<HwmonFanState>) {
         let now = Instant::now();
         let mut state = self.inner.write();
-        for fan in fans {
+        for mut fan in fans {
+            // Merge, do not replace, the fields only the POLL samples (DEC-316).
+            //
+            // `HwmonPwmController::set_pwm` constructs a whole `HwmonFanState`
+            // on every engine tick — including its coalesce fast path, which
+            // skips sysfs but still refreshes the cache — and has no cheap way
+            // to re-read these. A bare `insert` therefore erased the poll's
+            // answer at ~1 Hz, making both fields permanently absent for any
+            // header under an active profile: exactly the header whose fan
+            // alarm matters most. Mirrors `update_openfan_fans`, which carries
+            // `last_commanded_pwm` forward for the same reason.
+            if fan.alarm.is_none() || fan.pwm_enable_mode.is_none() {
+                if let Some(existing) = state.hwmon_fans.get(&fan.id) {
+                    if fan.alarm.is_none() {
+                        fan.alarm = existing.alarm;
+                    }
+                    if fan.pwm_enable_mode.is_none() {
+                        fan.pwm_enable_mode = existing.pwm_enable_mode;
+                    }
+                }
+            }
             state.hwmon_fans.insert(fan.id.clone(), fan);
         }
         state.snapshot_at = now;
@@ -1226,6 +1246,8 @@ mod tests {
             rpm: Some(800),
             last_commanded_pwm: None,
             updated_at: Instant::now(),
+            alarm: None,
+            pwm_enable_mode: None,
         }]);
 
         let snap = cache.snapshot();
@@ -1304,12 +1326,16 @@ mod tests {
                 rpm: Some(800),
                 last_commanded_pwm: Some(40),
                 updated_at: Instant::now() - stale,
+                alarm: None,
+                pwm_enable_mode: None,
             },
             HwmonFanState {
                 id: "it8696:pwm2".into(),
                 rpm: Some(900),
                 last_commanded_pwm: Some(50),
                 updated_at: Instant::now(),
+                alarm: None,
+                pwm_enable_mode: None,
             },
         ]);
 
@@ -1330,6 +1356,80 @@ mod tests {
 
     /// OFS-m: the steady-state tick evicts nothing and must not take the write
     /// lock to discover that — the same fast-path contract as `retain_sensors`.
+    /// DEC-316 regression. The poll is the only sampler of `alarm` and
+    /// `pwm_enable_mode`; `set_pwm` rebuilds the whole `HwmonFanState` on every
+    /// engine tick with both `None`, including on its coalesce fast path. With
+    /// a wholesale `insert` that erased the poll's answer at ~1 Hz, so
+    /// `fan_alarm` was absent for exactly the headers under active control —
+    /// the ones whose failing fan matters most. It made the field decoration.
+    ///
+    /// Asserts the MERGE, not merely that a value survives one write: the
+    /// second update also carries a genuinely newer `rpm`, so a fix that simply
+    /// dropped the later entry would fail here too.
+    #[test]
+    fn an_engine_write_does_not_erase_the_polls_alarm_or_enable_mode() {
+        let cache = StateCache::new();
+        let now = Instant::now();
+        cache.update_hwmon_fans(vec![HwmonFanState {
+            id: "hwmon:it8696:isa-0a40:pwm5:PUMP".into(),
+            rpm: Some(1200),
+            last_commanded_pwm: Some(40),
+            alarm: Some(true),
+            pwm_enable_mode: Some(1),
+            updated_at: now,
+        }]);
+
+        // What `HwmonPwmController::set_pwm` publishes on every tick.
+        cache.update_hwmon_fans(vec![HwmonFanState {
+            id: "hwmon:it8696:isa-0a40:pwm5:PUMP".into(),
+            rpm: Some(1350),
+            last_commanded_pwm: Some(45),
+            alarm: None,
+            pwm_enable_mode: None,
+            updated_at: now,
+        }]);
+
+        let fans = cache.snapshot().hwmon_fans;
+        let fan = &fans["hwmon:it8696:isa-0a40:pwm5:PUMP"];
+        assert_eq!(
+            fan.alarm,
+            Some(true),
+            "the poll's alarm must survive an engine write"
+        );
+        assert_eq!(fan.pwm_enable_mode, Some(1), "so must the live enable mode");
+        // The engine's own fields still win — this is a merge, not a skip.
+        assert_eq!(fan.rpm, Some(1350));
+        assert_eq!(fan.last_commanded_pwm, Some(45));
+    }
+
+    /// The other direction: a later poll that genuinely reads a CLEARED alarm
+    /// must be able to clear it. A merge that carried `Some(true)` forward
+    /// unconditionally would latch a fan fault on for the process lifetime.
+    #[test]
+    fn a_later_poll_can_still_clear_an_alarm() {
+        let cache = StateCache::new();
+        let now = Instant::now();
+        cache.update_hwmon_fans(vec![HwmonFanState {
+            id: "h".into(),
+            rpm: Some(0),
+            last_commanded_pwm: Some(40),
+            alarm: Some(true),
+            pwm_enable_mode: Some(1),
+            updated_at: now,
+        }]);
+        cache.update_hwmon_fans(vec![HwmonFanState {
+            id: "h".into(),
+            rpm: Some(900),
+            last_commanded_pwm: Some(40),
+            alarm: Some(false),
+            pwm_enable_mode: Some(2),
+            updated_at: now,
+        }]);
+        let fans = cache.snapshot().hwmon_fans;
+        assert_eq!(fans["h"].alarm, Some(false));
+        assert_eq!(fans["h"].pwm_enable_mode, Some(2));
+    }
+
     #[test]
     fn retain_fresh_hwmon_fans_is_a_no_op_when_everything_is_fresh() {
         let cache = StateCache::new();
@@ -1338,6 +1438,8 @@ mod tests {
             rpm: Some(800),
             last_commanded_pwm: Some(40),
             updated_at: Instant::now(),
+            alarm: None,
+            pwm_enable_mode: None,
         }]);
         cache.retain_fresh_hwmon_fans(std::time::Duration::from_secs(5));
         assert_eq!(cache.snapshot().hwmon_fans.len(), 1);

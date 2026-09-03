@@ -8,9 +8,12 @@
 pub mod aio;
 pub mod chip_db;
 pub mod classify;
+pub mod cooling_device;
+pub mod device_policy;
 pub mod discovery;
 pub mod gpu_detect;
 pub mod gpu_fan;
+pub mod header_caps;
 pub mod intel_gpu_detect;
 pub mod inventory;
 pub mod kernel_warnings;

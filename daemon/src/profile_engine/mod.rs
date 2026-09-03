@@ -6033,6 +6033,7 @@ mod tests {
             is_aio: false,
             role: crate::hwmon::roles::HeaderRole::Unknown,
             role_source: crate::hwmon::roles::RoleSource::None,
+            ..Default::default()
         }
     }
 

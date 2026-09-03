@@ -243,6 +243,26 @@ pub fn resolve_role(
     }
 }
 
+/// The pump-protection union, computed from parts the caller already holds.
+///
+/// `inferred.0.is_pump() || resolve_role(assigned, inferred).0.is_pump()` — an
+/// inferred pump OR a resolved one. It is a **union**, so a user assignment can
+/// only ever *add* protection: assigning `chassis_fan` to a header the hardware
+/// labels `PUMP` changes the display role and changes nothing about whether the
+/// daemon will stop it (DEC-312).
+///
+/// This is the single definition of the predicate.
+/// [`crate::api::handlers::AppState::header_is_pump_protected`] is the lookup
+/// wrapper around it, for callers holding only a header id. Callers already
+/// inside a loop over descriptors must use **this** function rather than the
+/// wrapper: the wrapper takes the header-roles lock and then the controller
+/// lock, so calling it while holding the controller lock would deadlock on a
+/// non-reentrant `parking_lot::Mutex`. Two copies of the rule would be worse
+/// still — a floor that disagreed with itself between two endpoints.
+pub fn is_pump_protected(assigned: Option<HeaderRole>, inferred: (HeaderRole, RoleSource)) -> bool {
+    inferred.0.is_pump() || resolve_role(assigned, inferred).0.is_pump()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

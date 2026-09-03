@@ -167,6 +167,8 @@ pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntr
             duty_pct: None,
             age_ms,
             stall_detected: stall,
+            fan_alarm: None,
+            pwm_enable_mode: None,
         });
     }
 
@@ -185,6 +187,8 @@ pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntr
             duty_pct: None,
             age_ms,
             stall_detected: stall,
+            fan_alarm: fan.alarm,
+            pwm_enable_mode: fan.pwm_enable_mode,
         });
     }
 
@@ -208,6 +212,8 @@ pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntr
             duty_pct: fan.duty_pct,
             age_ms,
             stall_detected: None,
+            fan_alarm: None,
+            pwm_enable_mode: None,
         });
     }
 
@@ -364,6 +370,19 @@ pub struct AppState {
     /// lock an API handler can block on while it is computing PWM.
     pub header_roles:
         Arc<parking_lot::RwLock<Arc<HashMap<String, crate::hwmon::roles::HeaderRole>>>>,
+    /// Cooling-device topology (AIO-MB Phase 4, DEC-316).
+    ///
+    /// Cached here for the same reason as `header_roles`: `/hwmon/headers` is
+    /// polled, and re-reading + parsing `runtime.toml` per request would put
+    /// blocking file I/O on an async handler for data that changes only on an
+    /// operator action.
+    ///
+    /// Unlike `header_roles`, this is **never read by the profile engine**.
+    /// Topology is metadata; no evaluation, no floor and no write consults it.
+    /// The only safety-adjacent thing a device carries is a `device_policy_id`,
+    /// and that is a selector for a compiled-in policy, never a number.
+    pub cooling_devices:
+        Arc<parking_lot::RwLock<Arc<Vec<crate::hwmon::cooling_device::CoolingDeviceConfig>>>>,
     /// DEC-203: whether the opt-in active Super-I/O `/dev/port` probe is enabled
     /// (`[detection] allow_port_probe`). Off by default; the probe also needs the
     /// `CAP_SYS_RAWIO` drop-in to actually function.
@@ -410,6 +429,16 @@ impl AppState {
     /// no caller can hold the lock while doing real work.
     pub fn header_roles(&self) -> Arc<HashMap<String, crate::hwmon::roles::HeaderRole>> {
         Arc::clone(&self.header_roles.read())
+    }
+
+    /// Snapshot of the configured cooling devices (AIO-MB Phase 4).
+    ///
+    /// Clones the `Arc` under a momentarily held read guard, so no guard is
+    /// held while a caller iterates — the same discipline as `header_roles`.
+    /// Takes no other lock, so it composes with the controller lock in either
+    /// order.
+    pub fn cooling_devices(&self) -> Arc<Vec<crate::hwmon::cooling_device::CoolingDeviceConfig>> {
+        Arc::clone(&self.cooling_devices.read())
     }
 
     /// The role in force for one header id: the user's assignment if any,
@@ -482,10 +511,10 @@ impl AppState {
     /// {"role": "chassis_fan"}` on an `AIO_PUMP` header was all it took.
     pub fn header_is_pump_protected(&self, header_id: &str) -> bool {
         let (assigned, inferred) = self.header_role_parts(header_id);
-        inferred.0.is_pump()
-            || crate::hwmon::roles::resolve_role(assigned, inferred)
-                .0
-                .is_pump()
+        // One definition of the union, in `roles`. This wrapper only adds the
+        // lookup — see `roles::is_pump_protected` for why a caller already
+        // holding the controller lock must call that directly instead.
+        crate::hwmon::roles::is_pump_protected(assigned, inferred)
     }
 }
 
@@ -869,6 +898,8 @@ mod tests {
                 rpm: Some(1000),
                 last_commanded_pwm: None,
                 updated_at: now,
+                alarm: None,
+                pwm_enable_mode: None,
             },
         );
         state.hwmon_fans.insert(
@@ -878,6 +909,8 @@ mod tests {
                 rpm: Some(500),
                 last_commanded_pwm: None,
                 updated_at: now,
+                alarm: None,
+                pwm_enable_mode: None,
             },
         );
 
@@ -936,6 +969,8 @@ mod tests {
                 rpm: Some(0),
                 last_commanded_pwm: Some(constants::STALL_PWM_THRESHOLD),
                 updated_at: now,
+                alarm: None,
+                pwm_enable_mode: None,
             },
         );
 

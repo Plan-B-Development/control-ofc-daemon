@@ -82,9 +82,21 @@ fn build_hwmon_inventory(state: &AppState) -> (StatusCode, Json<serde_json::Valu
         Some(controller) => {
             let ctrl = controller.lock();
             let assigned = state.header_roles();
+            // Snapshot before the loop: the controller lock is held here, and
+            // `header_is_pump_protected` would re-take it (see
+            // `roles::is_pump_protected`).
+            let devices = state.cooling_devices();
             ctrl.headers()
                 .into_iter()
-                .map(|h| PwmHeaderEntry::from_descriptor(h, assigned.get(&h.id).copied()))
+                .map(|h| {
+                    let assign = assigned.get(&h.id).copied();
+                    PwmHeaderEntry::from_descriptor(
+                        h,
+                        assign,
+                        crate::hwmon::roles::is_pump_protected(assign, (h.role, h.role_source)),
+                        devices.iter().find(|d| d.claims(&h.id)),
+                    )
+                })
                 .collect()
         }
         None => Vec::new(),
@@ -726,6 +738,36 @@ fn probed_to_superio_chip(p: &superio_probe::ProbedChip) -> superio::SuperIoChip
         recommendation,
         caveats,
     }
+}
+
+/// GET /inventory/cooling-devices — the configured cooling-device topology
+/// (AIO-MB Phase 4, DEC-316).
+///
+/// On `/inventory/*` rather than `/config` deliberately: `GET /config` exposes
+/// only the nine scalar admin keys and has never carried per-device state — the
+/// `[hardware]` section (preferred sensors, `header_roles`) is likewise absent
+/// from it and surfaces on `/inventory/hwmon` and `/hwmon/headers` instead.
+///
+/// Also publishes every policy this daemon ships, so a client offers the real
+/// choices rather than hardcoding a list that drifts from the binary.
+pub async fn cooling_devices_handler(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let devices = state.cooling_devices();
+    json_ok(
+        StatusCode::OK,
+        CoolingDevicesResponse {
+            api_version: API_VERSION,
+            cooling_devices: devices
+                .iter()
+                .map(CoolingDeviceEntry::from_config)
+                .collect(),
+            available_policies: crate::hwmon::device_policy::POLICIES
+                .iter()
+                .map(|p| DevicePolicySummary::from_policy(p))
+                .collect(),
+        },
+    )
 }
 
 #[cfg(test)]

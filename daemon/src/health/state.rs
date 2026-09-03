@@ -75,6 +75,21 @@ pub struct HwmonFanState {
     pub rpm: Option<u16>,
     /// Last PWM value commanded by the daemon (if controlled).
     pub last_commanded_pwm: Option<u8>,
+    /// The **live** value of `pwmN_enable` (AIO-MB Phase 4).
+    ///
+    /// Sampled on the poll, not at discovery: the daemon writes
+    /// `PWM_ENABLE_MANUAL` to this very attribute when it takes a header over,
+    /// and the BIOS-reclaim watchdog shows it changing underneath at runtime,
+    /// so a discovery-time snapshot reports the pre-takeover mode for the whole
+    /// process lifetime. `None` means not known — see `alarm`.
+    pub pwm_enable_mode: Option<u8>,
+    /// The driver's `fanN_alarm` bit, when it exposes one (AIO-MB Phase 4).
+    ///
+    /// `None` means "not known right now", never "no alarm" — it is `None` both
+    /// when the driver has no alarm attribute and briefly after a PWM write
+    /// refreshes this entry without re-reading it. The next 1 Hz poll restores
+    /// the real value.
+    pub alarm: Option<bool>,
     /// When this reading was taken.
     pub updated_at: Instant,
 }

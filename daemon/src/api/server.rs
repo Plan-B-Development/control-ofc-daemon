@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use axum::extract::connect_info::Connected;
 use axum::extract::DefaultBodyLimit;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::serve::IncomingStream;
 use axum::Router;
 use tokio::net::UnixListener;
@@ -106,6 +106,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // sensors, controllable PWM headers, and monitor-only fan tachometers
         // (fanN_input with no matching pwmN). Additive; never writes hardware.
         .route("/inventory/hwmon", get(handlers::hwmon_inventory_handler))
+        // AIO-MB Phase 4: read side of the topology. On /inventory/* rather
+        // than /config because GET /config has never carried per-device state.
+        .route(
+            "/inventory/cooling-devices",
+            get(handlers::cooling_devices_handler),
+        )
         // Structured hardware-readiness list (Phase 3): actionable diagnose-and-
         // guide items (severity + recommended action + blocks-flags). Read-only.
         .route(
@@ -199,6 +205,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/config/header-role",
             post(handlers::update_header_role_handler),
+        )
+        // AIO-MB Phase 4 (DEC-316): cooling-device topology. Metadata — no
+        // engine path reads a device — so unlike the role setter above this
+        // grants no floor and needs no follow-on safety action.
+        .route(
+            "/config/cooling-device",
+            post(handlers::set_cooling_device_handler),
+        )
+        .route(
+            "/config/cooling-device/{id}",
+            delete(handlers::delete_cooling_device_handler),
         )
         // DEC-243: admin keys made runtime-mutable via the runtime.toml overlay
         // (ADR-002) rather than a privileged helper. All are start-only, so each

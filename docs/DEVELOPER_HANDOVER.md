@@ -170,6 +170,9 @@ The profile engine is the **sole writer** as of 2.0.0 (DEC-159/DEC-165); the GUI
 | `POST /control/{control_id}/override` (+ `/override/renew`, `DELETE`) | Expiring manual override — floor-clamped, deadman, monotonic fencing (DEC-163) |
 | `POST /fans/{fan_id}/identify` | Per-fan identify hold/restore — 0 for an ordinary fan (floor-exempt), a floored perturbation for a `role: pump` header (DEC-311); deadman auto-restore (DEC-166) |
 | `POST /config/header-role` | Assign/clear a PWM header's role; a `pump` assignment earns the 30% floor (DEC-311) |
+| `GET /inventory/cooling-devices` | Cooling-device topology + the shipped device policies (DEC-316). Metadata — the profile engine never reads a device |
+| `POST /config/cooling-device` | Create/replace a cooling device. Confers **no** pump protection: that is still `/config/header-role` (DEC-316) |
+| `DELETE /config/cooling-device/{id}` | Remove a cooling device (DEC-316) |
 | `POST /fans/openfan/{ch}/calibrate` | Run a PWM-to-RPM calibration sweep |
 | `POST /hwmon/{header_id}/verify` | Behavioural test of PWM write effectiveness (~6 s; daemon's own internal lease); returns `restore_failed: bool` per DEC-100 |
 | `POST /gpu/{gpu_id}/fan/verify` | Test GPU fan-control effectiveness (~6 s, no lease) |

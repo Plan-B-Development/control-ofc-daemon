@@ -38,6 +38,21 @@ daemon/src/
     pwm_control.rs     — HwmonPwmController + SysfsWriter trait
     lease.rs           — LeaseManager (exclusive write access)
     aio.rs             — liquid-cooler (AIO/custom-loop) recognition: coolant-sensor + is_aio flag + aio_hwmon cap (DEC-156)
+    roles.rs           — per-channel header role inference + resolution, and THE
+                          pump-protection union `is_pump_protected` (DEC-311/312/316).
+                          `AppState::header_is_pump_protected` is the lookup wrapper
+                          around it; callers holding the controller lock must use the
+                          function directly or they deadlock
+    cooling_device.rs  — cooling-device topology: a pump + radiator fans + an advisory
+                          sensor as one named assembly (DEC-316). Metadata only — the
+                          profile engine never reads one, and a `pump_member` confers
+                          no floor
+    device_policy.rs   — trusted, compiled-in device capability policy (DEC-316).
+                          Derives NO `Deserialize`, so no inbound payload can set a
+                          safety number. Generic entries only in 2.31.0, so no floor moves
+    header_caps.rs     — read-only header capability audit (DEC-316): pwmN_freq,
+                          pwmN_enable, fanN_min/max, fanN_pulses + a cited
+                          supported-mode table. Pure reads; adds no write path
     gpu_detect.rs      — AMD GPU detection via sysfs/DRM
     intel_gpu_detect.rs— Intel discrete GPU (Arc) detection, read-only (DEC-121)
     nouveau_detect.rs  — NVIDIA discrete GPU detection via the open nouveau driver, read-only (DEC-204)
@@ -382,6 +397,7 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 | GET | `/profile/active` | Current active profile or `{"active": false}` |
 | GET | `/diagnostics/hardware` | Hardware readiness report (hwmon chips, GPU, thermal safety, kernel modules, ACPI conflicts, board info) |
 | GET | `/inventory/hwmon` | Read-only structured inventory: temp sensors (each with a fine `classification`/`confidence`/`rationale` + an advisory `default_cpu`), controllable PWM headers, and monitor-only fan tachometers (`fanN_input` with no matching `pwmN`) |
+| GET | `/inventory/cooling-devices` | Configured cooling-device topology + every device policy the daemon ships (DEC-316). Metadata — the profile engine never reads a device |
 | GET | `/inventory/readiness` | Structured hardware-readiness list (`items[]` with code/severity/component/action + blocks-flags; `overall` rollup). Read-only diagnose-and-guide |
 | GET | `/inventory/superio` | Passive Super-I/O chip detection report — DMI/hwmon/`/proc/modules`/kmsg/ACPI evidence → per-chip presence + allowlisted driver recommendations; `port_probe_available` flags the opt-in active probe. Read-only, never touches an I/O port (DEC-202) |
 | GET | `/inventory/hardware-readiness` | Combined readiness + Super-I/O snapshot from ONE shared passive scan (DEC-207): the readiness `rollup`/`overall`/`items`, the `superio` report, `scanned_age_ms`, and a monotonic `generation`. The GUI's merged "Cooling Hardware Readiness" page fetches this in a single request; `?refresh=true` forces a fresh (coalesced) scan. Read-only, 404-gated |
@@ -439,6 +455,8 @@ subsystem — DEC-102 / DEC-130).
 | POST | `/fans/openfan/{channel}/calibrate` | PWM→RPM sweep (long-running, thermal-aborting; pauses the engine write phase for the sweep so an active profile cannot corrupt the readback — DEC-191) |
 | POST | `/fans/{fan_id}/identify` | Per-fan identify hold/restore — 0 for an ordinary fan (floor-exempt), a floored perturbation for a `role: pump` header (DEC-311); deadman auto-restore (DEC-166) |
 | POST | `/config/header-role` | Assign or clear one PWM header's role (DEC-311). `{"header_id","role"}`; `role: null` clears |
+| POST | `/config/cooling-device` | Create or replace one cooling device by id (DEC-316). Safety numbers are **not** settable — a policy is chosen with `device_policy_id` and `minimum_safe_pwm` & siblings are rejected by name |
+| DELETE | `/config/cooling-device/{id}` | Remove one cooling device (DEC-316). `404` when no device has that id |
 
 The identify `stop` on the world-writable socket (0666, DEC-049) lets any local
 user hold any fan at its identify duty by re-issuing `stop` inside the

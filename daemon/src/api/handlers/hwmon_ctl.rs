@@ -34,10 +34,23 @@ pub async fn hwmon_headers_handler(
     // DEC-311: the user's role assignment is overlaid here; the descriptor
     // carries only what discovery could infer.
     let assigned = state.header_roles();
+    // AIO-MB Phase 4: snapshot the topology once. `state.header_is_pump_protected`
+    // must NOT be called in this loop — it re-takes the controller lock this
+    // scope already holds, which would deadlock; the pure union takes the parts
+    // we have.
+    let devices = state.cooling_devices();
     let headers = ctrl
         .headers()
         .into_iter()
-        .map(|h| PwmHeaderEntry::from_descriptor(h, assigned.get(&h.id).copied()))
+        .map(|h| {
+            let assign = assigned.get(&h.id).copied();
+            PwmHeaderEntry::from_descriptor(
+                h,
+                assign,
+                crate::hwmon::roles::is_pump_protected(assign, (h.role, h.role_source)),
+                devices.iter().find(|d| d.claims(&h.id)),
+            )
+        })
         .collect();
 
     json_ok(
@@ -115,9 +128,18 @@ pub async fn hwmon_rescan_handler(
             // DEC-146 P3-12: single mapping source — `from_descriptor` (DEC-311
             // overlays the user's role assignment).
             let assigned = state.header_roles();
+            let devices = state.cooling_devices();
             let entries: Vec<PwmHeaderEntry> = headers
                 .iter()
-                .map(|h| PwmHeaderEntry::from_descriptor(h, assigned.get(&h.id).copied()))
+                .map(|h| {
+                    let assign = assigned.get(&h.id).copied();
+                    PwmHeaderEntry::from_descriptor(
+                        h,
+                        assign,
+                        crate::hwmon::roles::is_pump_protected(assign, (h.role, h.role_source)),
+                        devices.iter().find(|d| d.claims(&h.id)),
+                    )
+                })
                 .collect();
             log::info!("Hwmon rescan: found {} PWM header(s)", entries.len());
             let count = entries.len();
@@ -1152,6 +1174,7 @@ mod tests {
             } else {
                 crate::hwmon::roles::RoleSource::None
             },
+            ..Default::default()
         };
         let cache = Arc::new(crate::health::cache::StateCache::new());
         let writes: WriteLog = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -1196,6 +1219,7 @@ mod tests {
             header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(
                 std::collections::HashMap::new(),
             ))),
+            cooling_devices: Arc::new(parking_lot::RwLock::new(Arc::new(Vec::new()))),
             override_table: Arc::new(parking_lot::Mutex::new(
                 crate::control_override::OverrideTable::new(),
             )),
