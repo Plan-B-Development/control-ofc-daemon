@@ -1295,6 +1295,15 @@ async fn async_main() {
                 repaired.len()
             );
         }
+        // Reconcile retention at boot too, not only when a session stops
+        // (`prune_default`'s other caller). A session written by a daemon that
+        // predates the DEC-320 byte budget is over the store's read cap, so it
+        // is invisible to every normal path and retention can never reach it —
+        // and stopping a *new* session was the only thing that would have
+        // reclaimed it. A user who simply upgrades and never runs another
+        // validation would have kept the orphaned file for ever, which is the
+        // half of `AUD3-i` that the store-side fix alone does not close.
+        control_ofc_daemon::validation::store::prune_default();
     }
     log::info!("State directory: {}", config.state.state_dir);
 

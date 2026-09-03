@@ -412,8 +412,82 @@ pub const VALIDATION_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration:
 /// bounded and never silently deletes the interesting end of the recording.
 pub const VALIDATION_MAX_SAMPLES: usize = 7200;
 
-/// Completed sessions retained on disk. ~1 MB each at the sample cap.
+/// Completed sessions retained on disk.
+///
+/// **Size, corrected 2026-09-04 (`AUD3-i`).** This said "~1 MB each at the sample
+/// cap" and was wrong by up to two orders of magnitude: a session document is
+/// 3.6 MiB at one member, 5.7 MiB at two and 7.8 MiB at three, because a sample
+/// carries one entry per cooling-device member. Retention is bounded in *files*;
+/// [`VALIDATION_MAX_SAMPLE_BYTES`] is what bounds each file.
 pub const VALIDATION_MAX_RETAINED_SESSIONS: usize = 5;
+
+/// Byte budget for the `samples` array of one persisted session.
+///
+/// **The sample cap alone does not bound the file, and assuming it did was
+/// `AUD3-i`.** A sample serialises one `MemberSample` per cooling-device member,
+/// so [`VALIDATION_MAX_SAMPLES`] bounds the row count while the byte count scales
+/// with the topology. Measured against the real serialised shapes at 7200
+/// samples: **3.6 MiB at one member, 5.7 MiB at two, 7.8 MiB at three, 137 MiB at
+/// the 65-member maximum** a device can claim (`1 + 2 * MAX_MEMBERS_PER_LIST`).
+/// Everything from two members up exceeded the 4 MiB read cap the store used, so
+/// the daemon wrote sessions it could then never read, list, serve or prune.
+///
+/// `session::max_samples_for` divides this budget by the measured worst-case cost
+/// of one sample, so the document stays inside [`VALIDATION_MAX_SESSION_BYTES`]
+/// whatever the topology. **Sized so that every realistic AIO — a pump plus up to
+/// four radiator fans, which covers a 360 mm cooler with margin — still records
+/// the full two hours**, which is what
+/// `the_derived_cap_is_the_full_two_hours_for_every_realistic_aio` pins.
+///
+/// The budget is a *reservation*, not the realised size: the probe is a genuine
+/// upper bound (widest integers, longest tokens, a 128-byte sensor id), so it
+/// runs ~40% above a typical sample and the file that results is correspondingly
+/// smaller. That pessimism is deliberate — an estimate that was not a bound is
+/// exactly what `AUD3-i` was — and it is why the budget must be sized above the
+/// realised figures rather than at them. At 12 MiB a four-member cooler lost
+/// samples to the pessimism alone. Only exotic many-member devices shorten now,
+/// and those previously produced an unreadable file instead.
+pub const VALIDATION_MAX_SAMPLE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Read cap for one session document, replacing `atomic_io::MAX_CONFIG_BYTES` at
+/// the validation store's read sites.
+///
+/// A session is evidence the daemon itself produced, not operator-edited config,
+/// and the daemon already holds it whole in memory while recording — so the 4 MiB
+/// config cap was protecting against a cost it had already paid. The cap still
+/// exists (a corrupt or hostile file in the directory must not be buffered whole)
+/// but is sized from the write-side budget rather than chosen independently, and
+/// the assertion below is what keeps the two from drifting apart again. The slack
+/// over [`VALIDATION_MAX_SAMPLE_BYTES`] covers the non-sample content: events,
+/// external measurements, metadata and the summary.
+pub const VALIDATION_MAX_SESSION_BYTES: u64 = 24 * 1024 * 1024;
+
+/// Reservation for everything in a session document that is NOT a sample:
+/// events, external measurements, user metadata, the member snapshot and the
+/// summary.
+///
+/// **This exists because the sample budget alone is not a bound on the file, and
+/// believing it was is how `AUD3-i` nearly recurred inside its own fix.** The
+/// `const` assertion below is only meaningful if the ancillary content is itself
+/// bounded, which is what `VALIDATION_MAX_TEXT_FIELD_BYTES` and
+/// `VALIDATION_MAX_METADATA_KEY_BYTES` are for. Worst case with those in force:
+/// 4096 events x ~760 B = ~3.0 MiB, 512 measurements x ~810 B = ~0.4 MiB,
+/// 16 metadata pairs = ~10 KB, 65 members = ~16 KB — ~3.4 MiB against this 4 MiB.
+pub const VALIDATION_MAX_ANCILLARY_BYTES: usize = 4 * 1024 * 1024;
+
+/// Bound on each free-text field a client may attach to a session (an event
+/// `detail`, a measurement `kind`/`unit`/`note`/`member_id`, a metadata value).
+///
+/// Unbounded, these turned the delete path added for `AUD3-i` into a way to
+/// destroy an operator's evidence: a session grown past the read cap by ~10 KB
+/// measurement notes became `TooLarge` and was then pruned. Bounding at ingest
+/// is what makes "too large to read" mean "written by a daemon older than this
+/// one" and therefore safe to reclaim.
+pub const VALIDATION_MAX_TEXT_FIELD_BYTES: usize = 512;
+
+/// Bound on a user-metadata KEY. The value was already bounded by
+/// [`VALIDATION_MAX_METADATA_VALUE_BYTES`]; the key was not.
+pub const VALIDATION_MAX_METADATA_KEY_BYTES: usize = 128;
 
 /// Cap on timeline events, so a pathological reclaim loop cannot grow the file
 /// without bound between samples.
@@ -444,6 +518,20 @@ pub const VALIDATION_DIVERGENCE_MAX_RPM_SWING: u16 = 100;
 // A cap of zero would make every session finalise before its first sample, and a
 // retention of zero would delete each session as it was written.
 const _: () = assert!(VALIDATION_MAX_SAMPLES > 0);
+// The read cap must exceed the write budget, or the store would again produce
+// documents it cannot read back. This is the invariant `AUD3-i` violated, made
+// unbreakable at compile time rather than restated in prose.
+// The read cap must exceed the write budget PLUS the ancillary reservation, or
+// a session with a full complement of events and measurements would again be
+// unreadable. The earlier form of this assertion compared against the sample
+// budget alone, which bounded only part of the document — caught in review.
+const _: () = assert!(
+    VALIDATION_MAX_SESSION_BYTES as usize
+        > VALIDATION_MAX_SAMPLE_BYTES + VALIDATION_MAX_ANCILLARY_BYTES
+);
+// A budget below one sample would make `max_samples_for` clamp every session to
+// its floor of 1, silently reducing every recording to a single tick.
+const _: () = assert!(VALIDATION_MAX_SAMPLE_BYTES > 64 * 1024);
 const _: () = assert!(VALIDATION_MAX_RETAINED_SESSIONS > 0);
 const _: () = assert!(VALIDATION_MAX_SWEEP_MEMBERS > 0);
 // The divergence rule needs a real swing to test against; a zero threshold would

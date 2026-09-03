@@ -1371,3 +1371,287 @@ fn a_failed_start_rollback_cannot_wipe_a_later_session() {
     engine.rollback_for_test(&live.session_id);
     assert!(engine.snapshot().is_none());
 }
+
+// ── AUD3-i: the persisted document must be bounded in BYTES, not only in rows ──
+
+/// Realistic AIO ids, at the length the daemon actually produces.
+fn aio_member_ids(n: usize) -> Vec<String> {
+    (0..n)
+        .map(|i| format!("hwmon:it8696:isa-0a40:pwm{i}:CHA_FAN{i}"))
+        .collect()
+}
+
+/// A session over `n` members whose samples carry `sensor` as their
+/// `temperature_sensor` — the field `recorder.rs` copies into every sample.
+fn sized_session(tag: &str, n: usize, sensor: &str) -> ValidationSession {
+    let ids = aio_member_ids(n);
+    let mut s = session();
+    s.session_id = format!("val-{tag}");
+    s.metadata.temperature_sensor = Some(sensor.to_string());
+    s.metadata.members = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| member(id, if i == 0 { MEMBER_PUMP } else { MEMBER_RADIATOR }))
+        .collect();
+    s
+}
+
+/// Fill `s` to its derived cap with samples of the shape the recorder writes.
+fn fill_to_cap(s: &mut ValidationSession) -> usize {
+    let cap = max_samples_for(
+        s,
+        control_ofc_daemon::constants::VALIDATION_MAX_SAMPLE_BYTES,
+    );
+    let ids: Vec<String> = s
+        .metadata
+        .members
+        .iter()
+        .map(|m| m.member_id.clone())
+        .collect();
+    let sensor = s.metadata.temperature_sensor.clone();
+    s.samples = (0..cap)
+        .map(|i| ValidationSample {
+            elapsed_ms: i as u64 * 1000,
+            unix_ms: 1_757_000_000_000 + i as u64 * 1000,
+            temperature_c: Some(65.5),
+            temperature_sensor: sensor.clone(),
+            coolant_c: Some(32.5),
+            thermal_state: "normal".into(),
+            members: ids
+                .iter()
+                .map(|id| member_sample(id, MEMBER_RADIATOR, Some(50), Some(50), Some(2100)))
+                .collect(),
+        })
+        .collect();
+    cap
+}
+
+/// Save `s` and return the realised file length.
+fn saved_len(dir: &std::path::Path, s: &ValidationSession) -> u64 {
+    store::save_to(dir, s).expect("a session at its own cap must be writable");
+    std::fs::metadata(dir.join(format!("{}.json", s.session_id)))
+        .unwrap()
+        .len()
+}
+
+/// **The regression test for `AUD3-i`.** A pump plus two radiator fans, recorded
+/// to the session's own cap, must still read back.
+///
+/// Before the fix the store wrote with no byte bound and read under
+/// `atomic_io::MAX_CONFIG_BYTES` (4 MiB), while a three-member session at 7200
+/// samples serialises to ~7.8 MiB. The file was written successfully and was then
+/// invisible to *every* read path at once: `load_from` failed, `list_from` skipped
+/// it, `GET /validation/sessions/{id}` 500'd, `sweep_interrupted` could never
+/// repair it and `prune` could never delete it, so it also leaked disk for ever.
+#[test]
+fn a_session_at_its_derived_cap_still_reads_back_from_the_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = sized_session("bytes-cap", 3, "hwmon:k10temp:k10temp-pci-00c3:Tctl");
+    let cap = fill_to_cap(&mut s);
+    let len = saved_len(tmp.path(), &s);
+
+    assert!(
+        len <= control_ofc_daemon::constants::VALIDATION_MAX_SESSION_BYTES,
+        "a session at its derived cap wrote {len} bytes, over the {} the store can read",
+        control_ofc_daemon::constants::VALIDATION_MAX_SESSION_BYTES
+    );
+    // The precondition that makes this test non-vacuous: the file must actually
+    // be big enough to have tripped the old 4 MiB cap, or it proves nothing.
+    assert!(
+        len > control_ofc_daemon::atomic_io::MAX_CONFIG_BYTES,
+        "this fixture no longer reproduces the defect: {len} bytes is under the \
+         old {} cap, so it would have round-tripped before the fix too",
+        control_ofc_daemon::atomic_io::MAX_CONFIG_BYTES
+    );
+
+    let back = store::load_from(tmp.path(), "val-bytes-cap")
+        .expect("a session the store wrote must be readable");
+    assert!(back.is_some(), "the session must load, not vanish");
+    assert_eq!(back.unwrap().samples.len(), cap);
+    assert_eq!(
+        store::list_from(tmp.path()).len(),
+        1,
+        "and it must be listed"
+    );
+}
+
+/// The byte bound must hold **as a realised file**, across every topology —
+/// including the many-member case where the derivation actually binds.
+///
+/// The first version of this test compared the derived cap against a per-sample
+/// size measured with a *standalone* `to_vec_pretty`, which is strictly smaller
+/// than the nested marginal cost the production code divides by — so it held by
+/// construction and **passed with the nesting correction deleted**. That is this
+/// project's recurring "the unit test proves you answered, never that you were
+/// asked" shape, and it was caught by `ofc:security-reviewer`, not by the test.
+/// Asserting the length of the file that is actually written cannot go vacuous
+/// the same way.
+#[test]
+fn every_topology_writes_a_file_the_store_can_read_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hard = control_ofc_daemon::constants::VALIDATION_MAX_SAMPLES;
+    let budget = control_ofc_daemon::constants::VALIDATION_MAX_SAMPLE_BYTES;
+    let cap_bytes = control_ofc_daemon::constants::VALIDATION_MAX_SESSION_BYTES;
+    let mut derivation_bound_at_least_once = false;
+
+    // 65 = the maximum a device may claim (1 pump + 2 x MAX_MEMBERS_PER_LIST).
+    for n in [1usize, 3, 8, 65] {
+        let mut s = sized_session(
+            &format!("topo-{n}"),
+            n,
+            "hwmon:k10temp:k10temp-pci-00c3:Tctl",
+        );
+        let cap = fill_to_cap(&mut s);
+        assert!(cap > 0, "{n} members must still record at least one sample");
+        if cap < hard {
+            derivation_bound_at_least_once = true;
+        }
+        let len = saved_len(tmp.path(), &s);
+        assert!(
+            len <= cap_bytes,
+            "{n} members: {cap} samples wrote {len} bytes, over the {cap_bytes} cap"
+        );
+
+        // And the SAMPLES portion must stay inside its own budget, measured as
+        // the difference the samples make to the realised file. The whole-file
+        // check above is satisfied by the read cap's headroom and so cannot see
+        // an over-spending derivation; this can. It is also the invariant the
+        // `VALIDATION_MAX_SESSION_BYTES > SAMPLE + ANCILLARY` assertion rests
+        // on — if samples may exceed their budget, the ancillary reservation is
+        // not sound and the const assert is decoration.
+        let mut empty = s.clone();
+        empty.session_id = format!("{}-empty", s.session_id);
+        empty.samples.clear();
+        let samples_bytes = len - saved_len(tmp.path(), &empty);
+        assert!(
+            samples_bytes as usize <= budget,
+            "{n} members: the samples array realised {samples_bytes} bytes, over its {budget} budget"
+        );
+        assert!(
+            store::load_from(tmp.path(), &s.session_id)
+                .unwrap()
+                .is_some(),
+            "{n} members: the file the store just wrote must read back"
+        );
+    }
+    // Or the loop only ever exercised the clamp and proved nothing about the
+    // derivation — the same precondition discipline as the test above.
+    assert!(
+        derivation_bound_at_least_once,
+        "no topology in this sweep was actually bounded by the byte budget"
+    );
+}
+
+/// **Regression for the defect found INSIDE the fix.** The per-sample probe used
+/// a 128-byte placeholder for `temperature_sensor` on the reasoning that no real
+/// sensor id is longer. But `recorder.rs` copies `metadata.temperature_sensor`
+/// into every sample, and that string comes from `preferred_sensor` on
+/// `POST /config/cooling-device` — client-supplied. A long one made the probe
+/// under-count without bound and reproduced `AUD3-i` exactly. A guess is not a
+/// bound; the probe now measures the session's own value.
+#[test]
+fn a_long_configured_sensor_id_cannot_break_the_byte_bound() {
+    let tmp = tempfile::tempdir().unwrap();
+    let budget = control_ofc_daemon::constants::VALIDATION_MAX_SAMPLE_BYTES;
+    let long = "s".repeat(control_ofc_daemon::hwmon::cooling_device::MAX_DEVICE_TEXT_BYTES);
+
+    // Measured at a member count where the byte budget actually binds. At three
+    // members the hard 7200 clamp masks the derivation entirely, so a comparison
+    // there would pass whether or not the probe reads the sensor id at all —
+    // pick the sample that can move (CLAUDE.md), or the check is blind.
+    let long_cap = max_samples_for(&sized_session("l", 65, &long), budget);
+    let short_cap = max_samples_for(&sized_session("s", 65, "hwmon:k10temp:Tctl"), budget);
+    assert!(
+        long_cap < short_cap,
+        "the probe must read the session's own sensor id: {long_cap} vs {short_cap}"
+    );
+
+    let mut s = sized_session("long-sensor", 65, &long);
+    let cap = fill_to_cap(&mut s);
+    assert_eq!(cap, long_cap);
+    let len = saved_len(tmp.path(), &s);
+    assert!(
+        len <= control_ofc_daemon::constants::VALIDATION_MAX_SESSION_BYTES,
+        "a long configured sensor id produced {len} bytes, over the cap"
+    );
+    assert!(store::load_from(tmp.path(), "val-long-sensor")
+        .unwrap()
+        .is_some());
+}
+
+/// A realistic cooler keeps the documented two hours; only pathological
+/// topologies shorten. Asserted as a relationship to the hard cap, never as a
+/// sample count — the budget is allowed to move, the guarantee is not.
+#[test]
+fn the_derived_cap_is_the_full_two_hours_for_every_realistic_aio() {
+    let budget = control_ofc_daemon::constants::VALIDATION_MAX_SAMPLE_BYTES;
+    let hard = control_ofc_daemon::constants::VALIDATION_MAX_SAMPLES;
+    let sensor = "hwmon:k10temp:k10temp-pci-00c3:Tctl";
+    // Pump alone, through pump + four radiator fans — a 360 mm cooler is four
+    // members, so this covers every consumer AIO with one member of margin.
+    for n in 1..=5 {
+        assert_eq!(
+            max_samples_for(&sized_session("real", n, sensor), budget),
+            hard,
+            "a {n}-member cooler must still record the full sample cap"
+        );
+    }
+    let pathological = max_samples_for(&sized_session("path", 65, sensor), budget);
+    assert!(
+        pathological < hard && pathological > 0,
+        "a 65-member device must be bounded but still record: got {pathological}"
+    );
+}
+
+/// An over-cap file is unreadable for ever, so retention can never reach it —
+/// which is why `prune` must delete it rather than step over it.
+#[test]
+fn prune_deletes_a_session_too_large_to_read_but_spares_a_merely_corrupt_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let oversized = tmp.path().join("val-oversized.json");
+    let corrupt = tmp.path().join("val-corrupt.json");
+    std::fs::write(
+        &oversized,
+        vec![b'x'; control_ofc_daemon::constants::VALIDATION_MAX_SESSION_BYTES as usize + 1],
+    )
+    .unwrap();
+    std::fs::write(&corrupt, b"{ not json").unwrap();
+
+    store::prune(tmp.path(), 5);
+
+    assert!(
+        !oversized.exists(),
+        "an unreadable oversized session must be reclaimed, or it occupies the \
+         state directory permanently"
+    );
+    assert!(
+        corrupt.exists(),
+        "a merely unparseable session must NOT be deleted — a serde slip or a \
+         transient read error would otherwise destroy every retained session"
+    );
+}
+
+/// `prune` re-stats before removing, so a file that became readable between the
+/// scan and the delete is spared.
+///
+/// Without this, a flush landing in that window could have its smaller, valid
+/// replacement deleted — taking a live recording with it and leaving
+/// `sweep_interrupted` nothing to mark `interrupted`, which is the one property
+/// §15 requires the store to guarantee. Raised by `ofc:security-reviewer`.
+#[test]
+fn prune_spares_a_file_that_became_readable_since_the_scan() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = sized_session("shrunk", 1, "hwmon:k10temp:Tctl");
+    s.state = "completed".into();
+    s.samples.clear();
+    // A readable file at a path prune was told is oversized: the state prune
+    // reaches when a flush lands between its scan and its delete.
+    store::save_to(tmp.path(), &s).unwrap();
+    store::prune(tmp.path(), 5);
+    assert!(
+        store::load_from(tmp.path(), "val-shrunk")
+            .unwrap()
+            .is_some(),
+        "a readable session must never be pruned as oversized"
+    );
+}

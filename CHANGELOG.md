@@ -1,5 +1,78 @@
 # Changelog
 
+## [2.33.1] — 2026-09-04
+
+Pairs with `control-ofc-gui` >= v2.23.0 (unchanged floor). **Two P1 bug fixes** found by
+`/ofc:audit` (register rows `AUD3-h`, `AUD3-i`). No new routes, no new capability flag,
+**no floor, threshold or safety rule changes**, and both parity oracles are byte-identical.
+
+### Fixed
+- **`POST /config/cooling-device` rejected the OpenFan radiator fans the GUI itself
+  offers** (`AUD3-h`). Member ids were validated against hwmon PWM headers only, so an
+  OpenFan channel — which the GUI's radiator picker presents alongside writable hwmon
+  headers, and which the wizard posts verbatim — failed with
+  `400 unknown hwmon header id: openfan:chNN` on any machine that had *any* hwmon header.
+  That is every motherboard-AIO machine, i.e. exactly the hardware the cooling-device
+  feature exists for, so the Fan Wizard's AIO step could not be completed with an
+  OpenFan-driven radiator fan.
+
+  Membership is now checked **per source**, across hwmon headers and OpenFan channels.
+  The rejection message is `unknown member id: {id}`. Deliberately not a flat union: the
+  documented "an undiscovered source does not judge its members" escape is preserved
+  per-source, because a union would have *tightened* the hwmon-absent case and rejected
+  hwmon members that are accepted today. A GPU fan id is still rejected once hwmon is
+  discovered — a GPU fan is never an AIO radiator fan.
+
+- **A validation session at its own sample cap became permanently unreadable**
+  (`AUD3-i`). The store wrote with no byte bound and read under the 4 MiB config cap,
+  while a sample carries one entry per cooling-device member — so the sample cap bounded
+  the row count while the file size scaled with the topology: **3.6 MiB at one member,
+  5.7 MiB at two, 7.8 MiB at three.** Everything from two members up — the topology this
+  whole programme exists for — exceeded the read cap. The file was written successfully
+  and then invisible to every read path at once: `GET /validation/sessions/{id}` returned
+  500, the session was absent from the listing, the boot sweep could never rewrite it as
+  `interrupted`, and retention could never delete it, so it also leaked disk permanently.
+
+  The session's effective sample cap is now **derived at start from its member count**
+  against a byte budget, and the store reads under its own cap, which a compile-time
+  assertion keeps above the write budget so the two cannot drift apart again. **No
+  behaviour change for any realistic cooler** — a pump plus up to four radiator fans
+  still records the full 7200 samples. `prune` now also deletes a session too large to
+  read back, which is the only way an already-written one can be reclaimed; a merely
+  unparseable session is still left alone, because a serde slip or a transient read error
+  must not destroy every retained recording. **Retention is also reconciled at boot**, not
+  only when a session stops — a file written by a 2.33.0 daemon is invisible to every
+  normal path, so upgrading and never running another validation would otherwise have kept
+  the orphan for ever. `prune` also re-stats immediately before removing, so a file that
+  became readable between the scan and the delete — a flush landing in that window — is
+  spared rather than taking a live recording with it.
+
+### Added
+- **Length bounds on the free-text fields of both new write paths**, found by the review of
+  the two fixes above rather than by the audit. Each is `400 validation_error`, never a
+  silent truncation:
+  - `POST /config/cooling-device` — `name`, `kind`, the three sensor ids and
+    `device_policy_id` are bounded at 256 bytes. **`preferred_sensor` is copied into every
+    validation sample**, so an unbounded one scaled the session document without limit and
+    reproduced the very defect the byte budget was added to fix — a route the budget could
+    not see, because the probe that derives it had *assumed* a maximum sensor-id length
+    instead of measuring the session's own. A guess is not a bound; it now measures.
+  - `POST /validation/session/event` and `/measurement` — `detail`, `kind`, `unit`, `note`
+    and `member_id` are bounded at 512 bytes, and a user-metadata *key* at 128. These
+    arrays were capped by count but not by size, so unbounded text could push a document
+    past the store's read cap — and because such a session is now *pruned*, that would have
+    destroyed an operator's evidence rather than merely wasted disk.
+
+  Bounding at ingest is what makes "too large to read" mean "written by a daemon older than
+  this one", and therefore safe to reclaim. It also partly closes register row `AUD3-m`.
+
+### Changed
+- Documentation only: the "~1 MB per capped session" figure was wrong by up to an order
+  of magnitude and is corrected at all four sites that carried it. The flush-cadence
+  note's write-volume arithmetic was derived from it and was therefore also wrong —
+  ~940 MiB across a three-member session, not ~120 MB. The cadence is unchanged and the
+  question is recorded as `AUD3-x` rather than decided here.
+
 ## [2.33.0] — 2026-09-03
 
 Pairs with `control-ofc-gui` >= v2.23.0 (unchanged floor). **Additive only** — one optional

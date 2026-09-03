@@ -70,6 +70,28 @@ pub struct MeasurementRequest {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+/// Reject a client-supplied free-text field longer than
+/// [`constants::VALIDATION_MAX_TEXT_FIELD_BYTES`].
+///
+/// These fields are stored verbatim and are read by nothing — but the events and
+/// measurements arrays are bounded only by COUNT, so unbounded text made the
+/// session document unbounded too. Since DEC-320 an over-cap session is pruned,
+/// which turned that from wasted disk into destroyed evidence. Bounding here is
+/// what lets `SessionReadError::TooLarge` mean "written by an older daemon" and
+/// therefore be safe to reclaim.
+fn too_long(field: &str, value: Option<&String>) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let over = value.is_some_and(|v| v.len() > constants::VALIDATION_MAX_TEXT_FIELD_BYTES);
+    over.then(|| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorEnvelope::validation(format!(
+                "{field} exceeds {} bytes",
+                constants::VALIDATION_MAX_TEXT_FIELD_BYTES
+            )),
+        )
+    })
+}
+
 fn recorder_context(state: &Arc<AppState>) -> RecorderContext {
     RecorderContext {
         cache: state.cache.clone(),
@@ -277,6 +299,21 @@ pub async fn start_session_handler(
             constants::VALIDATION_MAX_METADATA_VALUE_BYTES
         )));
     }
+    // The KEY was unbounded while the value was not, so one 4 MiB key under the
+    // body limit could still push the document past the store's read cap — and
+    // since DEC-320 an over-cap session is *pruned*, so that would have been a
+    // way to destroy an operator's evidence rather than merely to waste disk.
+    if let Some((k, _)) = body
+        .metadata
+        .iter()
+        .find(|(k, _)| k.len() > constants::VALIDATION_MAX_METADATA_KEY_BYTES)
+    {
+        return start_error_response(StartError::TooMany(format!(
+            "metadata key '{}...' exceeds {} bytes",
+            k.chars().take(16).collect::<String>(),
+            constants::VALIDATION_MAX_METADATA_KEY_BYTES
+        )));
+    }
 
     let kind = match body.kind.as_deref() {
         Some(KIND_LIFECYCLE) => KIND_LIFECYCLE,
@@ -393,6 +430,14 @@ pub async fn post_event_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<EventRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    for (field, value) in [
+        ("detail", body.detail.as_ref()),
+        ("member_id", body.member_id.as_ref()),
+    ] {
+        if let Some(resp) = too_long(field, value) {
+            return resp;
+        }
+    }
     if state
         .validation
         .push_event(EV_USER_MARKER, body.detail, body.member_id)
@@ -420,6 +465,16 @@ pub async fn post_measurement_handler(
             &ErrorEnvelope::validation("measurement value must be finite"),
         );
     }
+    for (field, value) in [
+        ("kind", Some(&body.kind)),
+        ("unit", body.unit.as_ref()),
+        ("note", body.note.as_ref()),
+        ("member_id", body.member_id.as_ref()),
+    ] {
+        if let Some(resp) = too_long(field, value) {
+            return resp;
+        }
+    }
     let m = ExternalMeasurement {
         unix_ms: unix_ms(),
         kind: body.kind,
@@ -443,8 +498,11 @@ pub async fn list_sessions_handler(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     // Read the store off the runtime: `list_from` fully parses every retained
-    // session (up to five, ~1 MB each) to sort them, and doing that inline
-    // blocks a tokio worker for as long as it takes.
+    // session to sort them, and doing that inline blocks a tokio worker for as
+    // long as it takes. Up to five sessions, each bounded by
+    // `VALIDATION_MAX_SAMPLE_BYTES` — 3.6 MiB at one member, 7.8 MiB at three.
+    // This said "~1 MB each" until 2026-09-04 (`AUD3-i`), which understated the
+    // cost of doing it inline rather than overstating it.
     let mut sessions = super::persist_off_runtime(|| Ok::<_, String>(store::list()))
         .await
         .unwrap_or_default();

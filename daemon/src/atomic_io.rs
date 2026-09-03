@@ -156,18 +156,29 @@ pub const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
 /// `daemon_state`, `runtime_config`). Sysfs/proc reads stay uncapped — the
 /// kernel bounds them.
 pub fn read_to_string_capped(path: &Path) -> std::io::Result<String> {
+    read_to_string_with_cap(path, MAX_CONFIG_BYTES)
+}
+
+/// [`read_to_string_capped`] with a caller-chosen cap.
+///
+/// The validation session store reads through this rather than the config cap:
+/// its documents are daemon-produced evidence whose size scales with the cooling
+/// topology, and holding them to a *config* file's budget is what made a normal
+/// multi-member session unreadable (`AUD3-i`). The cap is still enforced — an
+/// unbounded read of a corrupt file is the thing this helper exists to prevent —
+/// it is simply the store's own, tied to the store's write budget.
+pub fn read_to_string_with_cap(path: &Path, cap: u64) -> std::io::Result<String> {
     use std::io::Read;
     let mut buf = Vec::new();
+    // `saturating_add`: a `u64::MAX` cap would wrap `take` to 0 and return an
+    // empty string — a cap helper that fails OPEN. No caller passes that today.
     File::open(path)?
-        .take(MAX_CONFIG_BYTES + 1)
+        .take(cap.saturating_add(1))
         .read_to_end(&mut buf)?;
-    if buf.len() as u64 > MAX_CONFIG_BYTES {
+    if buf.len() as u64 > cap {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!(
-                "file exceeds {MAX_CONFIG_BYTES}-byte cap: {}",
-                path.display()
-            ),
+            format!("file exceeds {cap}-byte cap: {}", path.display()),
         ));
     }
     String::from_utf8(buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
@@ -176,6 +187,20 @@ pub fn read_to_string_capped(path: &Path) -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_with_cap_does_not_wrap_at_the_maximum_cap() {
+        // `cap + 1` panics in debug and wraps to `take(0)` in release, so an
+        // extreme cap would have returned `Ok("")` — a cap helper failing OPEN.
+        // No caller passes this today; the helper is public, so it is bounded.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("max.json");
+        std::fs::write(&p, b"{\"hello\": 1}").unwrap();
+        assert_eq!(
+            read_to_string_with_cap(&p, u64::MAX).unwrap(),
+            "{\"hello\": 1}"
+        );
+    }
 
     #[test]
     fn read_capped_reads_a_normal_file() {

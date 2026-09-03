@@ -1340,8 +1340,10 @@ pub async fn set_cooling_device_handler(
 
     // Members must exist, so a typo is caught at author time rather than
     // producing a device that silently describes nothing. Checked against live
-    // discovery, like the role setter's id check.
-    let known: std::collections::HashSet<String> = state
+    // discovery, like the role setter's id check — but across BOTH fan sources a
+    // cooling device may name, not hwmon alone (`AUD3-h`). See
+    // `cooling_device::unknown_member` for why the per-source skip is preserved.
+    let hwmon_ids: std::collections::HashSet<String> = state
         .hwmon_controller
         .as_ref()
         .map(|c| {
@@ -1352,15 +1354,20 @@ pub async fn set_cooling_device_handler(
                 .collect()
         })
         .unwrap_or_default();
-    if !known.is_empty() {
-        for m in dev.all_members() {
-            if !known.contains(m) {
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    &ErrorEnvelope::validation(format!("unknown hwmon header id: {m}")),
-                );
-            }
-        }
+    let openfan_ids: std::collections::HashSet<String> = state
+        .cache
+        .snapshot()
+        .openfan_fans
+        .keys()
+        .map(|ch| format!("openfan:ch{ch:02}"))
+        .collect();
+    if let Some(m) =
+        crate::hwmon::cooling_device::unknown_member(&dev.all_members(), &hwmon_ids, &openfan_ids)
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorEnvelope::validation(format!("unknown member id: {m}")),
+        );
     }
 
     let mut runtime = match runtime_for_update(&state) {

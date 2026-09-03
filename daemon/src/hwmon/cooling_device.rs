@@ -51,6 +51,13 @@ pub const MAX_MEMBERS_PER_LIST: usize = 32;
 /// Maximum length of a device id, in bytes.
 pub const MAX_DEVICE_ID_BYTES: usize = 64;
 
+/// Bound on each free-text field of a cooling device (`name`, `kind`, the three
+/// sensor ids, `device_policy_id`).
+///
+/// Generous enough for any real sensor id — this project's longest are ~40 bytes
+/// — and small enough that 16 devices cannot make `runtime.toml` unreadable.
+pub const MAX_DEVICE_TEXT_BYTES: usize = 256;
+
 /// What kind of cooling assembly a device describes.
 ///
 /// Presentation only — no branch in the daemon reads this to decide anything
@@ -178,6 +185,42 @@ impl CoolingDeviceConfig {
     }
 }
 
+/// The first member id naming a source the daemon HAS discovered but does not
+/// contain, or `None` when every member is acceptable.
+///
+/// **Per-source, and that is the whole point (`AUD3-h`).** This check used to run
+/// against hwmon PWM headers alone, so an OpenFan radiator fan — which the GUI's
+/// own radiator picker offers, and which `all_members` carries verbatim — was
+/// rejected as an "unknown hwmon header id" on every machine that had any hwmon
+/// header at all. That is every motherboard-AIO machine, i.e. exactly the
+/// hardware the cooling-device feature exists for.
+///
+/// The escape for an undiscovered source is preserved rather than widened: if a
+/// source has produced no ids at all (no hwmon controller, a driver not yet
+/// loaded, no OpenFan attached) its members are not judged, matching the
+/// documented behaviour that a cooling device is metadata and an unresolvable
+/// member is surfaced by the client as missing rather than blocking the write.
+/// Making the set a flat union instead would have silently *tightened* the
+/// hwmon-absent case, rejecting hwmon members that are accepted today.
+///
+/// A GPU fan id is judged against the hwmon set and therefore rejected once
+/// hwmon is discovered, which is correct: a GPU fan is never an AIO radiator fan,
+/// and the GUI's picker already excludes every vendor's.
+pub fn unknown_member<'a>(
+    members: &[&'a str],
+    hwmon_ids: &std::collections::HashSet<String>,
+    openfan_ids: &std::collections::HashSet<String>,
+) -> Option<&'a str> {
+    members.iter().copied().find(|m| {
+        let known = if m.starts_with("openfan:") {
+            openfan_ids
+        } else {
+            hwmon_ids
+        };
+        !known.is_empty() && !known.contains(*m)
+    })
+}
+
 /// Reject a device that cannot be stored safely or would make later resolution
 /// ambiguous. Returns a stable reason token suitable for a `validation_error`.
 ///
@@ -202,6 +245,25 @@ pub fn validate_device(dev: &CoolingDeviceConfig) -> Result<(), String> {
     // `.` and `..` would be ambiguous if an id is ever used as a path segment.
     if dev.id == "." || dev.id == ".." {
         return Err("device id must not be '.' or '..'".into());
+    }
+    // Bound the free-text fields. `preferred_sensor` in particular is copied into
+    // EVERY validation sample (`recorder.rs` clones `metadata.temperature_sensor`
+    // per tick), so an unbounded one scaled a session document without bound and
+    // reproduced `AUD3-i` through a route the byte budget could not see. The rest
+    // are bounded for the same reason `runtime.toml` must stay readable: it is
+    // read back under a 4 MiB cap and degrades to defaults on failure, taking
+    // every user-assigned pump role with it.
+    for (field, value) in [
+        ("name", Some(&dev.name)),
+        ("kind", Some(&dev.kind)),
+        ("preferred_sensor", dev.preferred_sensor.as_ref()),
+        ("fallback_sensor", dev.fallback_sensor.as_ref()),
+        ("coolant_sensor", dev.coolant_sensor.as_ref()),
+        ("device_policy_id", Some(&dev.device_policy_id)),
+    ] {
+        if value.is_some_and(|v| v.len() > MAX_DEVICE_TEXT_BYTES) {
+            return Err(format!("{field} exceeds {MAX_DEVICE_TEXT_BYTES} bytes"));
+        }
     }
     if dev.radiator_members.len() > MAX_MEMBERS_PER_LIST
         || dev.auxiliary_members.len() > MAX_MEMBERS_PER_LIST
@@ -261,6 +323,75 @@ pub fn sanitize(devices: Vec<CoolingDeviceConfig>) -> Vec<CoolingDeviceConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ids(v: &[&str]) -> std::collections::HashSet<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `AUD3-h`: the defect itself. An OpenFan radiator fan is a member the GUI's
+    /// own picker offers, and it was rejected on every machine with any hwmon
+    /// header — i.e. every motherboard-AIO machine.
+    #[test]
+    fn an_openfan_member_is_accepted_when_hwmon_is_also_discovered() {
+        let hwmon = ids(&["hwmon:it8696:isa-0a40:pwm5:PUMP"]);
+        let openfan = ids(&["openfan:ch00", "openfan:ch01"]);
+        assert_eq!(
+            unknown_member(
+                &["hwmon:it8696:isa-0a40:pwm5:PUMP", "openfan:ch00"],
+                &hwmon,
+                &openfan
+            ),
+            None
+        );
+    }
+
+    /// The fix must not be a blanket "accept anything": a typo in either source
+    /// is still caught, which is the whole reason the check exists.
+    #[test]
+    fn an_unknown_id_is_still_rejected_in_either_source() {
+        let hwmon = ids(&["hwmon:a"]);
+        let openfan = ids(&["openfan:ch00"]);
+        assert_eq!(
+            unknown_member(&["openfan:ch07"], &hwmon, &openfan),
+            Some("openfan:ch07")
+        );
+        assert_eq!(
+            unknown_member(&["hwmon:b"], &hwmon, &openfan),
+            Some("hwmon:b")
+        );
+    }
+
+    /// The documented escape, preserved PER SOURCE. A flat union would have
+    /// tightened this case instead: with no hwmon controller, hwmon members are
+    /// accepted today and must stay accepted.
+    #[test]
+    fn an_undiscovered_source_does_not_judge_its_members() {
+        let none = ids(&[]);
+        let openfan = ids(&["openfan:ch00"]);
+        // No hwmon discovered: hwmon members pass, OpenFan members still checked.
+        assert_eq!(unknown_member(&["hwmon:anything"], &none, &openfan), None);
+        assert_eq!(
+            unknown_member(&["openfan:ch09"], &none, &openfan),
+            Some("openfan:ch09")
+        );
+        // No OpenFan attached: its members pass, hwmon members still checked.
+        let hwmon = ids(&["hwmon:a"]);
+        assert_eq!(unknown_member(&["openfan:ch09"], &hwmon, &none), None);
+        assert_eq!(unknown_member(&["hwmon:z"], &hwmon, &none), Some("hwmon:z"));
+    }
+
+    /// A GPU fan is never an AIO radiator fan, and the GUI's picker excludes
+    /// every vendor's. Judged against the hwmon set, so it is rejected once
+    /// hwmon is discovered rather than admitted by the OpenFan widening.
+    #[test]
+    fn a_gpu_fan_is_not_an_acceptable_cooling_device_member() {
+        let hwmon = ids(&["hwmon:a"]);
+        let openfan = ids(&["openfan:ch00"]);
+        assert_eq!(
+            unknown_member(&["amd_gpu:0000:03:00.0:fan0"], &hwmon, &openfan),
+            Some("amd_gpu:0000:03:00.0:fan0")
+        );
+    }
 
     fn aio() -> CoolingDeviceConfig {
         CoolingDeviceConfig {

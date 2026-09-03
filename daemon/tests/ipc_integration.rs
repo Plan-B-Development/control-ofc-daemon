@@ -5756,3 +5756,234 @@ async fn cooling_device_rejects_malformed_topology() {
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
 }
+
+// ── AUD3-h: a cooling device may name an OpenFan fan, not hwmon headers alone ──
+
+/// A state that has discovered BOTH sources, plus a writable runtime config.
+///
+/// Both halves are load-bearing. `config_test_state` has no hwmon controller, so
+/// the member check short-circuits on its documented "nothing discovered" escape
+/// and never runs — which is precisely why the existing Phase 4 tests pass while
+/// naming header ids the daemon has never seen, and why they could not have
+/// caught `AUD3-h`.
+fn cooling_device_test_state() -> (Arc<AppState>, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut state = test_app_state_with_hwmon();
+    {
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.runtime_config_path = tmp.path().join("runtime.toml");
+    }
+    state.cache.update_openfan_fans(vec![OpenFanState {
+        channel: 0,
+        rpm: 1200,
+        last_commanded_pwm: Some(128),
+        updated_at: Instant::now(),
+        rpm_polled: true,
+    }]);
+    (state, tmp)
+}
+
+/// **The regression test for `AUD3-h`, at the call site.**
+///
+/// The GUI's radiator picker offers OpenFan outputs alongside writable hwmon
+/// headers (`build_radiator_candidates`), and the wizard posts the selection
+/// verbatim. The handler validated every member against hwmon PWM headers only,
+/// so on any machine with hwmon headers — i.e. every motherboard-AIO machine,
+/// the hardware this feature exists for — Apply failed with
+/// `400 unknown hwmon header id: openfan:ch00`, naming an id the GUI itself chose.
+#[tokio::test]
+async fn a_cooling_device_accepts_an_openfan_radiator_member() {
+    let (state, _tmp) = cooling_device_test_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    // The precondition that makes this test non-vacuous: hwmon IS discovered, so
+    // the member check genuinely runs. Without this a blanket skip would pass.
+    let (status, json) = uds_post(
+        &path,
+        "/config/cooling-device",
+        &serde_json::json!({ "id": "probe", "pump_member": "definitely-not-a-header" }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "hwmon must be discovered for this test to prove anything: {json}"
+    );
+
+    // The actual case: a pump on a motherboard header, radiators split across an
+    // hwmon header and an OpenFan channel.
+    let (status, json) = uds_post(
+        &path,
+        "/config/cooling-device",
+        &serde_json::json!({
+            "id": "aio-1",
+            "name": "AIO Cooling System",
+            "kind": "aio_liquid",
+            "pump_member": "h2",
+            "radiator_members": ["h1", "openfan:ch00"]
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "an OpenFan radiator fan is a member the GUI offers and must be accepted: {json}"
+    );
+    assert_eq!(json["updated"], true);
+
+    let (status, json) = uds_get(&path, "/inventory/cooling-devices").await;
+    assert_eq!(status, 200);
+    let members = json["cooling_devices"][0]["radiator_members"]
+        .as_array()
+        .unwrap();
+    assert!(
+        members.iter().any(|m| m == "openfan:ch00"),
+        "the OpenFan member must survive the round trip: {json}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The widening must not become a blanket accept: an OpenFan channel that is not
+/// attached is still rejected, so a typo is still caught at author time.
+#[tokio::test]
+async fn a_cooling_device_still_rejects_an_undiscovered_openfan_channel() {
+    let (state, _tmp) = cooling_device_test_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_post(
+        &path,
+        "/config/cooling-device",
+        &serde_json::json!({
+            "id": "aio-1",
+            "pump_member": "h2",
+            "radiator_members": ["openfan:ch07"]
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "channel 7 is not attached: {json}");
+    assert_eq!(json["error"]["code"], "validation_error");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+// ── DEC-320: free-text fields on the validation routes are bounded at ingest ──
+
+/// Redirect the process-wide state directory into a temp dir.
+///
+/// A validation session persists on start, and without this it tries to create
+/// `/var/lib/control-ofc/validation` and fails with `503 persistence_failed`.
+/// `init_state_dir` is a `OnceLock`, so the first caller in this binary wins;
+/// nothing else here reads the state dir (only `validation/store.rs` does, from
+/// a handler path), so redirecting it is safe and is what the Phase 5 test
+/// binary already does.
+fn ipc_temp_state_dir() {
+    use std::sync::OnceLock;
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let d = tempfile::tempdir().unwrap();
+        control_ofc_daemon::daemon_state::init_state_dir(d.path().to_str().unwrap());
+        d
+    });
+}
+
+/// The bounds exist because `prune` now DELETES a session too large to read.
+/// Unbounded event/measurement text could push a document past the store's read
+/// cap, at which point the new reclaim path would destroy an operator's evidence
+/// rather than merely leak disk. Raised by `ofc:security-reviewer`.
+///
+/// Driven through the real routes, not through `too_long` directly: these are the
+/// only two call sites, and a helper proven in isolation says nothing about
+/// whether the handlers actually call it.
+#[tokio::test]
+async fn validation_ingest_rejects_over_long_free_text() {
+    ipc_temp_state_dir();
+    let (state, _tmp) = cooling_device_test_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_post(
+        &path,
+        "/config/cooling-device",
+        &serde_json::json!({"id": "aio-1", "pump_member": "h2", "radiator_members": ["h1"]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{json}");
+
+    let (status, json) = uds_post(
+        &path,
+        "/validation/session",
+        &serde_json::json!({"cooling_device_id": "aio-1"}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a session must start for this test to mean anything: {json}"
+    );
+
+    let long = "x".repeat(control_ofc_daemon::constants::VALIDATION_MAX_TEXT_FIELD_BYTES + 1);
+
+    // A note within the bound is accepted — so the rejection below is the bound
+    // firing, not the route being broken.
+    let (status, json) = uds_post(
+        &path,
+        "/validation/session/measurement",
+        &serde_json::json!({"kind": "rpm", "value": 1200.0, "note": "ok"}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a normal measurement must still be accepted: {json}"
+    );
+
+    for body in [
+        serde_json::json!({"kind": "rpm", "value": 1200.0, "note": long.clone()}),
+        serde_json::json!({"kind": long.clone(), "value": 1200.0}),
+    ] {
+        let (status, json) = uds_post(&path, "/validation/session/measurement", &body).await;
+        assert_eq!(
+            status, 400,
+            "an over-long measurement field must be rejected: {json}"
+        );
+        assert_eq!(json["error"]["code"], "validation_error");
+    }
+
+    let (status, json) = uds_post(
+        &path,
+        "/validation/session/event",
+        &serde_json::json!({"detail": long.clone()}),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "an over-long event detail must be rejected: {json}"
+    );
+
+    let _ = uds_delete(&path, "/validation/session").await;
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A cooling device's sensor ids are copied into every validation sample, so an
+/// unbounded one scaled the session document without bound — the route by which
+/// `AUD3-i` was still reproducible inside its own fix.
+#[tokio::test]
+async fn a_cooling_device_rejects_an_over_long_sensor_id() {
+    let (state, _tmp) = cooling_device_test_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let long = "s".repeat(control_ofc_daemon::hwmon::cooling_device::MAX_DEVICE_TEXT_BYTES + 1);
+    let (status, json) = uds_post(
+        &path,
+        "/config/cooling-device",
+        &serde_json::json!({"id": "aio-1", "pump_member": "h2", "preferred_sensor": long}),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "an over-long preferred_sensor must be rejected: {json}"
+    );
+    assert_eq!(json["error"]["code"], "validation_error");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}

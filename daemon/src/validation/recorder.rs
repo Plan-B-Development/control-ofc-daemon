@@ -75,17 +75,25 @@ pub enum StartError {
     Persistence(String),
 }
 
-/// Flush to disk every this many ticks. A full rewrite of a capped session is
-/// ~1 MB, so flushing every tick would write a megabyte a second for two hours;
-/// flushing only at the end would lose the whole recording to a crash. On an
-/// interruption the file simply ends at the last flush — samples are lost, never
-/// invented (§15).
+/// Flush to disk every this many ticks. Flushing every tick would rewrite the
+/// whole document once a second; flushing only at the end would lose the whole
+/// recording to a crash. On an interruption the file simply ends at the last
+/// flush — samples are lost, never invented (§15).
 ///
-/// Each flush rewrites the whole document, so the total bytes written over a
-/// session are quadratic in its length: ~240 writes averaging ~0.5 MB, or
-/// ~120 MB spread across two hours (~17 KB/s). Bounded and unremarkable at this
-/// cadence — but it is why the interval is 30 s and not 1 s, and why lengthening
-/// a session's cap without revisiting this would not be free.
+/// **Volume, corrected 2026-09-04 (`AUD3-i`).** This said a capped session is
+/// "~1 MB" and derived "~240 writes averaging ~0.5 MB, or ~120 MB spread across
+/// two hours (~17 KB/s)". The input was wrong by up to an order of magnitude, so
+/// the conclusion was too: a capped session is 3.6 MiB at one member and 7.8 MiB
+/// at three, which makes the real figure **~240 writes averaging ~3.9 MiB, or
+/// ~940 MiB across two hours (~133 KB/s)** for a three-member cooler, and ~1.4 GB
+/// at the `VALIDATION_MAX_SAMPLE_BYTES` ceiling. Each flush rewrites the whole
+/// document, so the total is quadratic in session length.
+///
+/// That is still bounded and it is still why the interval is 30 s and not 1 s —
+/// but "bounded and unremarkable" was a judgement made against 120 MB, and it has
+/// not been re-made against 1 GB. Recorded as `AUD3-x` rather than changed here:
+/// altering the cadence trades crash-loss against write volume and is a design
+/// decision, not a correction.
 const FLUSH_EVERY_TICKS: u32 = 30;
 
 /// How long a tick will wait for the hwmon controller before giving up on the
@@ -134,6 +142,14 @@ pub struct ValidationEngine {
     /// could rename its stale `recording` copy over a `completed` one, which the
     /// next boot sweep would then "repair" to `interrupted` despite a clean stop.
     save_lock: Mutex<()>,
+    /// The session's effective sample cap, derived at start from its topology.
+    ///
+    /// `VALIDATION_MAX_SAMPLES` bounds the sample COUNT; this bounds the
+    /// persisted document's SIZE, which is not the same thing once a sample
+    /// carries one entry per cooling-device member (`AUD3-i`). Cached for the
+    /// same reason `member_ids` is: it is fixed for the session's life and
+    /// deriving it costs a serialisation, which has no business running per tick.
+    max_samples: Mutex<usize>,
 }
 
 impl Default for ValidationEngine {
@@ -150,6 +166,7 @@ impl ValidationEngine {
             live: Mutex::new(None),
             member_ids: Mutex::new(Vec::new()),
             save_lock: Mutex::new(()),
+            max_samples: Mutex::new(constants::VALIDATION_MAX_SAMPLES),
         }
     }
 
@@ -236,12 +253,19 @@ impl ValidationEngine {
         *self.watch.lock() = seed_watch(ctx);
         // Fixed for this session's life, and cached so `tick` can take the hwmon
         // controller lock BEFORE the session lock instead of underneath it.
-        *self.member_ids.lock() = session
+        let ids: Vec<String> = session
             .metadata
             .members
             .iter()
             .map(|m| m.member_id.clone())
             .collect();
+        // Derived before the first tick from the session ITSELF, not from a
+        // summary of it: the byte cost scales with the member ids AND with the
+        // sensor id every sample carries, and the latter is client-supplied.
+        // See `session::max_samples_for`.
+        *self.max_samples.lock() =
+            super::session::max_samples_for(&session, constants::VALIDATION_MAX_SAMPLE_BYTES);
+        *self.member_ids.lock() = ids;
         let started = session.clone();
         self.refresh_live(&session);
         *slot = Some(session);
@@ -667,7 +691,10 @@ impl ValidationEngine {
         }
 
         // ── Cap and flush ───────────────────────────────────────────────────
-        let at_cap = session.samples.len() >= constants::VALIDATION_MAX_SAMPLES;
+        // The topology-derived cap, never the raw sample count: a three-member
+        // cooler at 7200 samples wrote a 7.8 MiB document the store could not
+        // read back (`AUD3-i`). For a realistic AIO this is still 7200.
+        let at_cap = session.samples.len() >= *self.max_samples.lock();
         let should_flush = {
             let mut w = self.watch.lock();
             if w.ticks_since_flush >= FLUSH_EVERY_TICKS {

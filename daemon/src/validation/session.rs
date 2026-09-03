@@ -235,6 +235,94 @@ pub struct ValidationSample {
     pub members: Vec<MemberSample>,
 }
 
+/// Worst-case serialised bytes for one sample of `session`.
+///
+/// Built to be a genuine upper bound rather than a typical case: every optional
+/// field is present, every integer sits at its widest decimal width, and the
+/// longest role and ownership tokens are used.
+///
+/// **Every variable-length field is taken from the session itself, never
+/// assumed.** An earlier version used a 128-byte placeholder for
+/// `temperature_sensor` on the reasoning that no real sensor id is longer — but
+/// `recorder.rs` copies `metadata.temperature_sensor` into *every* sample, and
+/// that string is `preferred_sensor`/`fallback_sensor` from
+/// `POST /config/cooling-device`, which is client-supplied. A long one made the
+/// probe under-count without bound and reproduced `AUD3-i` exactly, inside its
+/// own fix. Caught by `ofc:security-reviewer`. A guess is not a bound.
+fn probe_sample_bytes(session: &ValidationSession) -> usize {
+    let member_ids: Vec<String> = session
+        .metadata
+        .members
+        .iter()
+        .map(|m| m.member_id.clone())
+        .collect();
+    let probe = ValidationSample {
+        elapsed_ms: u64::MAX,
+        unix_ms: u64::MAX,
+        temperature_c: Some(-100.5),
+        // The session's own value, which is what every sample will carry.
+        temperature_sensor: session.metadata.temperature_sensor.clone(),
+        coolant_c: Some(-100.5),
+        // The longest of the four thermal states, so the probe over-estimates.
+        thermal_state: "no_sensor_fallback".to_string(),
+        members: member_ids
+            .iter()
+            .map(|id| MemberSample {
+                member_id: id.clone(),
+                role: MEMBER_AUXILIARY.to_string(),
+                requested_pct: Some(u8::MAX),
+                readback_pct: Some(u8::MAX),
+                rpm: Some(u16::MAX),
+                pwm_enable_mode: Some(u8::MAX),
+                alarm: Some(false),
+                enable_revert_count: u64::MAX,
+                ownership: OWNERSHIP_EXTERNAL.to_string(),
+            })
+            .collect(),
+    };
+    // Measured as the MARGINAL cost of one sample inside a `samples` field, not
+    // as a standalone value. Two reasons, both of which would otherwise
+    // under-count and so reintroduce the very defect this bounds:
+    //   * `store::save_to` uses `to_vec_pretty`, and pretty-printing is ~45% of
+    //     the cost, so a compact estimate is not the thing being bounded;
+    //   * a sample nested under `samples` sits two levels deep, so every one of
+    //     its ~40 lines carries four more spaces than it would standalone.
+    // Taking the difference between a one-element and an empty `samples` field
+    // captures the indentation, the separator and the brackets exactly, with no
+    // fudge factor to drift.
+    #[derive(serde::Serialize)]
+    struct SamplesField<'a> {
+        samples: &'a [ValidationSample],
+    }
+    let empty = serde_json::to_vec_pretty(&SamplesField { samples: &[] })
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let one = serde_json::to_vec_pretty(&SamplesField {
+        samples: std::slice::from_ref(&probe),
+    })
+    .map(|v| v.len())
+    // A serialisation failure must shrink the cap, never remove it.
+    .unwrap_or(usize::MAX / 2);
+    one.saturating_sub(empty)
+}
+
+/// How many samples `session` may hold within `budget_bytes`.
+///
+/// **This is what bounds the persisted document (`AUD3-i`).**
+/// [`crate::constants::VALIDATION_MAX_SAMPLES`] bounds the sample *count*, which
+/// is not the same thing: a sample carries one entry per cooling-device member,
+/// so the byte count scales with the topology and a three-member cooler reached
+/// 7.8 MiB against a 4 MiB read cap. Dividing a byte budget by the measured
+/// worst-case sample cost bounds the file directly, whatever the topology.
+///
+/// Never returns 0 — a pathological topology records one sample rather than
+/// finalising before its first tick — and never exceeds the hard sample cap, so
+/// the documented two-hour ceiling still holds for every realistic device.
+pub fn max_samples_for(session: &ValidationSession, budget_bytes: usize) -> usize {
+    let per = probe_sample_bytes(session).max(1);
+    (budget_bytes / per).clamp(1, crate::constants::VALIDATION_MAX_SAMPLES)
+}
+
 /// A point on the session timeline (§5). Phase 6 places these as chart markers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ValidationEvent {

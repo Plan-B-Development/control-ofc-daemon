@@ -57,11 +57,55 @@ pub fn load_from(dir: &Path, session_id: &str) -> Result<Option<ValidationSessio
     if !path.exists() {
         return Ok(None);
     }
-    let text = atomic_io::read_to_string_capped(&path)
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    read_session(&path).map(Some).map_err(|e| e.to_string())
+}
+
+/// Why a session file on disk could not be turned into a [`ValidationSession`].
+///
+/// The distinction is load-bearing, and having only one bucket was half of
+/// `AUD3-i`: an over-cap file is unreadable *by construction* and will be for
+/// ever, so stepping over it leaks a file retention can never reclaim, whereas an
+/// unparseable one may be a transient error or a serde slip and must not be
+/// destroyed on a guess.
+#[derive(Debug)]
+enum SessionReadError {
+    /// Larger than [`constants::VALIDATION_MAX_SESSION_BYTES`]. Only a daemon
+    /// predating the write-side byte budget could have produced this. It is
+    /// deleted by [`prune`], because nothing will ever read it again.
+    TooLarge(u64),
+    /// Within the cap but unreadable or unparseable. Logged and skipped, never
+    /// deleted.
+    Unreadable(String),
+}
+
+impl std::fmt::Display for SessionReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLarge(n) => write!(
+                f,
+                "session file is {n} bytes, over the {}-byte cap",
+                constants::VALIDATION_MAX_SESSION_BYTES
+            ),
+            Self::Unreadable(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Read and parse one session file, classifying failure.
+///
+/// The length is taken from the file's metadata *before* reading, so "too large"
+/// is decided by a stat rather than inferred from the read helper's error text.
+fn read_session(path: &Path) -> Result<ValidationSession, SessionReadError> {
+    let len = std::fs::metadata(path)
+        .map_err(|e| SessionReadError::Unreadable(format!("stat {}: {e}", path.display())))?
+        .len();
+    if len > constants::VALIDATION_MAX_SESSION_BYTES {
+        return Err(SessionReadError::TooLarge(len));
+    }
+    let text = atomic_io::read_to_string_with_cap(path, constants::VALIDATION_MAX_SESSION_BYTES)
+        .map_err(|e| SessionReadError::Unreadable(format!("read {}: {e}", path.display())))?;
     serde_json::from_str(&text)
-        .map(Some)
-        .map_err(|e| format!("parse {}: {e}", path.display()))
+        .map_err(|e| SessionReadError::Unreadable(format!("parse {}: {e}", path.display())))
 }
 
 /// Every session on disk, newest first.
@@ -69,26 +113,42 @@ pub fn load_from(dir: &Path, session_id: &str) -> Result<Option<ValidationSessio
 /// A file that will not parse is logged and skipped rather than failing the
 /// listing — one corrupt session must not hide the other four.
 ///
-/// **This fully parses every retained session** (up to five, ~1 MB each at the
-/// sample cap), so it is not free. Every async caller runs it through
+/// **This fully parses every retained session** (up to five, each bounded by
+/// `VALIDATION_MAX_SAMPLE_BYTES` — 3.6 MiB at one member, 5.7 MiB at two; the
+/// "~1 MB" this said until 2026-09-04 was wrong by up to an order of magnitude,
+/// which is `AUD3-i`), so it is not free. Every async caller runs it through
 /// `persist_off_runtime` rather than inline, for the same reason the profile
 /// store's writes go off-runtime: blocking a tokio worker for tens of
 /// milliseconds starves whatever else that thread was going to poll.
 pub fn list_from(dir: &Path) -> Vec<ValidationSession> {
+    scan(dir).0
+}
+
+/// Every readable session (newest first) plus the paths of any that are over the
+/// store's cap.
+///
+/// [`list_from`] wants only the first half; [`prune`] needs the second, because a
+/// file it cannot read is a file it can otherwise never reclaim.
+fn scan(dir: &Path) -> (Vec<ValidationSession>, Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let mut out = Vec::new();
+    let mut oversized = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        match atomic_io::read_to_string_capped(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|t| serde_json::from_str::<ValidationSession>(&t).map_err(|e| e.to_string()))
-        {
+        match read_session(&path) {
             Ok(s) => out.push(s),
+            Err(e @ SessionReadError::TooLarge(_)) => {
+                log::warn!(
+                    "Validation session {} cannot be read back: {e}. It will be pruned.",
+                    path.display()
+                );
+                oversized.push(path);
+            }
             Err(e) => log::warn!(
                 "Skipping unreadable validation session {}: {e}",
                 path.display()
@@ -96,7 +156,7 @@ pub fn list_from(dir: &Path) -> Vec<ValidationSession> {
         }
     }
     out.sort_by_key(|s| std::cmp::Reverse(s.started_unix_ms));
-    out
+    (out, oversized)
 }
 
 /// Delete the oldest sessions beyond the retention limit.
@@ -104,7 +164,35 @@ pub fn list_from(dir: &Path) -> Vec<ValidationSession> {
 /// A session still `recording` is never pruned, however old — it is the live one,
 /// and deleting it would lose the very record the sweep depends on.
 pub fn prune(dir: &Path, keep: usize) {
-    let sessions = list_from(dir);
+    let (sessions, oversized) = scan(dir);
+    // An over-cap file is unreadable for ever, so retention can never reach it
+    // through the normal path — it is not listed, not served, and not counted.
+    // Deleting it here is the only thing that stops it occupying the state
+    // directory permanently. Unparseable-but-within-cap files are deliberately
+    // left alone: see `SessionReadError`.
+    for path in oversized {
+        // Re-stat immediately before removing. `scan` measured this file some
+        // moments ago, and a flush landing in between can legitimately have
+        // replaced it with a smaller, readable one — deleting *that* would take
+        // a live recording with it and leave `sweep_interrupted` nothing to mark
+        // `interrupted`, which is the one property this store exists to
+        // guarantee (§15). Raised by `ofc:security-reviewer`.
+        match std::fs::metadata(&path) {
+            Ok(m) if m.len() <= constants::VALIDATION_MAX_SESSION_BYTES => {
+                log::info!(
+                    "Not pruning {}: it is readable again since the scan",
+                    path.display()
+                );
+                continue;
+            }
+            Err(_) => continue,
+            Ok(_) => {}
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => log::warn!("Pruned unreadable oversized session {}", path.display()),
+            Err(e) => log::warn!("Could not prune {}: {e}", path.display()),
+        }
+    }
     let mut kept = 0usize;
     for s in sessions {
         if s.state == STATE_RECORDING {
