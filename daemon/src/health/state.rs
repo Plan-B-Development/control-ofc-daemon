@@ -97,6 +97,23 @@ pub struct HwmonFanState {
     /// `command low + readback low + RPM high`. Neither is expressible while the
     /// two axes share one field.
     pub pwm_readback_pct: Option<u8>,
+    /// The duty the daemon last **COMMANDED** for this header, as a percent
+    /// (AIO-MB Phase 6).
+    ///
+    /// The other half of the pair `pwm_readback_pct` opened, and unambiguous in
+    /// the same way: only `HwmonPwmController::set_pwm` ever writes it, and it
+    /// is always a value the daemon chose. `None` means "the daemon has never
+    /// commanded this header" — never 0% — which is why the poll leaves it alone
+    /// and the cache carries it forward across a poll refresh.
+    ///
+    /// Mirrors the controller's own `last_commanded_pct`, published through the
+    /// cache rather than read from the controller so that `/poll` never has to
+    /// take the hwmon lock: the engine holds that lock across a sysfs write, and
+    /// a blocked write would otherwise stall the 1 Hz poll (the DEC-278 shape).
+    ///
+    /// Deliberately NOT a replacement for `last_commanded_pwm`, which keeps its
+    /// established two-producer wire meaning (AIO5-a).
+    pub pwm_commanded_pct: Option<u8>,
     /// The **live** value of `pwmN_enable` (AIO-MB Phase 4).
     ///
     /// Sampled on the poll, not at discovery: the daemon writes

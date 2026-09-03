@@ -171,6 +171,7 @@ pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntr
             fan_alarm: None,
             pwm_enable_mode: None,
             pwm_readback_pct: None,
+            pwm_commanded_pct: None,
         });
     }
 
@@ -192,6 +193,7 @@ pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntr
             fan_alarm: fan.alarm,
             pwm_enable_mode: fan.pwm_enable_mode,
             pwm_readback_pct: fan.pwm_readback_pct,
+            pwm_commanded_pct: fan.pwm_commanded_pct,
         });
     }
 
@@ -218,6 +220,7 @@ pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntr
             fan_alarm: None,
             pwm_enable_mode: None,
             pwm_readback_pct: None,
+            pwm_commanded_pct: None,
         });
     }
 
@@ -929,6 +932,7 @@ mod tests {
                 rpm: Some(1000),
                 last_commanded_pwm: None,
                 pwm_readback_pct: None,
+                pwm_commanded_pct: None,
                 updated_at: now,
                 alarm: None,
                 pwm_enable_mode: None,
@@ -941,6 +945,7 @@ mod tests {
                 rpm: Some(500),
                 last_commanded_pwm: None,
                 pwm_readback_pct: None,
+                pwm_commanded_pct: None,
                 updated_at: now,
                 alarm: None,
                 pwm_enable_mode: None,
@@ -989,6 +994,81 @@ mod tests {
         }
     }
 
+    /// AIO-MB Phase 6: the command and the readback must reach the wire as two
+    /// independent numbers, and an hwmon header is the only source that has both.
+    ///
+    /// Asserts the disagreeing case on purpose. Equal values would pass with the
+    /// two fields wired to the same cache member, which is the bug this split
+    /// exists to prevent — and is what `last_commanded_pwm` still does (AIO5-a).
+    #[test]
+    fn hwmon_fan_entry_publishes_command_and_readback_separately() {
+        let mut state = DaemonState::default();
+        let now = Instant::now();
+        state.hwmon_fans.insert(
+            "hwmon:it8696:isa-0a40:pwm5:PUMP".into(),
+            crate::health::state::HwmonFanState {
+                id: "hwmon:it8696:isa-0a40:pwm5:PUMP".into(),
+                rpm: Some(1284),
+                last_commanded_pwm: Some(30),
+                pwm_readback_pct: Some(30),
+                pwm_commanded_pct: Some(45),
+                updated_at: now,
+                alarm: None,
+                pwm_enable_mode: Some(1),
+            },
+        );
+
+        let entries = build_fan_entries(&state, now);
+        let e = &entries[0];
+        assert_eq!(e.pwm_commanded_pct, Some(45), "the daemon commanded 45%");
+        assert_eq!(e.pwm_readback_pct, Some(30), "the hardware reports 30%");
+        assert_ne!(
+            e.pwm_commanded_pct, e.pwm_readback_pct,
+            "the two axes must not be wired to the same source"
+        );
+    }
+
+    /// Absent, never 0%, and never an echo of the command: an OpenFan channel
+    /// and a GPU fan have no hwmon command/readback split to report, and
+    /// synthesising one would make a fabricated number indistinguishable from a
+    /// measured one.
+    #[test]
+    fn non_hwmon_fan_entries_omit_the_pwm_command_split() {
+        let mut state = DaemonState::default();
+        let now = Instant::now();
+        state.openfan_fans.insert(
+            3,
+            crate::health::state::OpenFanState {
+                channel: 3,
+                rpm: 900,
+                last_commanded_pwm: Some(50),
+                updated_at: now,
+                rpm_polled: true,
+            },
+        );
+        state.gpu_fans.insert(
+            "amd_gpu:0000:03:00.0".into(),
+            crate::health::state::AmdGpuFanState {
+                id: "amd_gpu:0000:03:00.0".into(),
+                rpm: Some(1500),
+                last_commanded_pct: Some(60),
+                duty_pct: None,
+                updated_at: now,
+            },
+        );
+
+        for e in build_fan_entries(&state, now) {
+            assert_eq!(
+                e.pwm_commanded_pct, None,
+                "{} must not synthesise a commanded-PWM readback split",
+                e.id
+            );
+            assert_eq!(e.pwm_readback_pct, None, "{}", e.id);
+            // Their own single-producer command field is untouched.
+            assert!(e.last_commanded_pwm.is_some(), "{}", e.id);
+        }
+    }
+
     #[test]
     fn stall_detection_uses_constant_threshold() {
         let mut state = DaemonState::default();
@@ -1002,6 +1082,7 @@ mod tests {
                 rpm: Some(0),
                 last_commanded_pwm: Some(constants::STALL_PWM_THRESHOLD),
                 pwm_readback_pct: None,
+                pwm_commanded_pct: None,
                 updated_at: now,
                 alarm: None,
                 pwm_enable_mode: None,

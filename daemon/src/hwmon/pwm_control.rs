@@ -399,6 +399,7 @@ impl HwmonPwmController {
                 // See the write path below — `None` so the poll's readback
                 // survives this refresh.
                 pwm_readback_pct: None,
+                pwm_commanded_pct: Some(effective_pct),
                 updated_at: now,
                 alarm: None,
                 pwm_enable_mode: None,
@@ -473,6 +474,7 @@ impl HwmonPwmController {
             // readback is whatever sysfs says it became. The cache merge carries
             // the poll's answer forward across this refresh (AIO-MB Phase 5).
             pwm_readback_pct: None,
+            pwm_commanded_pct: Some(effective_pct),
             updated_at: now,
             alarm: None,
             pwm_enable_mode: None,

@@ -639,6 +639,7 @@ fn read_hwmon_fan_states(
                     // one, and is the only field a validation sample reads.
                     last_commanded_pwm: pwm_pct,
                     pwm_readback_pct: pwm_pct,
+                    pwm_commanded_pct: None,
                     alarm,
                     pwm_enable_mode,
                     updated_at: now,

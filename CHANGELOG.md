@@ -1,5 +1,40 @@
 # Changelog
 
+## [2.33.0] — 2026-09-03
+
+Pairs with `control-ofc-gui` >= v2.23.0 (unchanged floor). **Additive only** — one optional
+new field on two existing responses. No new routes, no new capability flag, **no floor,
+threshold or safety rule changes**, and both parity oracles are byte-identical. A client
+that ignores the new field sees byte-identical behaviour.
+
+### Added
+- **`FanEntry.pwm_commanded_pct`** on `/fans` and `/poll` — the duty the daemon last
+  **commanded** for an hwmon header, as a percent (AIO-MB Phase 6, DEC-318). The command
+  half of the pair whose readback half is `pwm_readback_pct` (DEC-317), and the field a
+  client should read when it needs the value the daemon actually chose.
+
+  **Single-producer, which is the whole point.** Only the hwmon write path sets it. That
+  makes it unambiguous in a way `last_commanded_pwm` is not: for an hwmon header, that
+  older field carries whichever of the poll's sysfs readback and the engine's command
+  wrote last (register row `AIO5-a`), so for an *uncontrolled* header it reports a
+  readback despite its name. `last_commanded_pwm` is deliberately **unchanged** — its wire
+  meaning is long-established and repairing it in place would alter what an uncontrolled
+  header reports.
+
+  Phase 6 §6 requires requested PWM and hardware readback as separate numbers on the GUI's
+  Hardware page, because collapsing them makes a write failure, a BIOS/EC reclaim and a
+  device-side override indistinguishable from one another. Only an hwmon header has both
+  axes; an OpenFan channel and a GPU fan emit `None` rather than echoing their command
+  back as though it were a reading. Absent means "the daemon has never commanded this
+  header" — never 0%.
+
+  Published through the state cache rather than read from `HwmonPwmController` on demand,
+  so `/poll` never takes the hwmon lock: the engine holds that lock across a sysfs write,
+  and a blocked write would otherwise stall the 1 Hz poll. The cache carries the field
+  forward across a poll refresh for the same reason it carries `pwm_readback_pct` forward
+  across a write — each producer sends `None` for the other's field, and without the merge
+  the poll would blank the command within a second of every engine write.
+
 ## [2.32.0] — 2026-09-03
 
 Pairs with `control-ofc-gui` >= v2.23.0 (unchanged floor). **Additive only** — six new

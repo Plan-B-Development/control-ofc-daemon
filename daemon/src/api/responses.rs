@@ -321,6 +321,27 @@ pub struct FanEntry {
     /// though it were a reading. Absent means "the daemon did not say", never 0%.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pwm_readback_pct: Option<u8>,
+    /// The duty the daemon last **COMMANDED** for this hwmon header, as a
+    /// percent (AIO-MB Phase 6).
+    ///
+    /// The command half of the pair whose readback half is `pwm_readback_pct`.
+    /// Single-producer: only the hwmon write path sets it, so unlike
+    /// `last_commanded_pwm` — which for an hwmon header carries whichever of the
+    /// poll's readback and the engine's command wrote last (AIO5-a) — it is
+    /// always a value the daemon actually chose.
+    ///
+    /// AIO-MB Phase 6 §6 requires requested PWM and hardware readback as
+    /// separate numbers on the Hardware page ("do not collapse requested PWM and
+    /// hardware readback into one number"), which diagnoses a write failure, a
+    /// BIOS/EC reclaim and a device-side override apart from one another. Absent
+    /// means "the daemon has never commanded this header" — never 0%.
+    ///
+    /// hwmon only. An OpenFan channel and a GPU fan already report an
+    /// unambiguous single-producer command in `last_commanded_pwm` (their
+    /// firmware reports no duty back), so they emit `None` here rather than
+    /// duplicating it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pwm_commanded_pct: Option<u8>,
 }
 
 /// A validation session's progress, for the poll surface (AIO-MB Phase 5).
@@ -2554,6 +2575,7 @@ mod tests {
             rpm: Some(1200),
             last_commanded_pwm: None,
             pwm_readback_pct: None,
+            pwm_commanded_pct: None,
             duty_pct: None,
             age_ms: 50,
             stall_detected: None,
@@ -2573,6 +2595,7 @@ mod tests {
             rpm: None,
             last_commanded_pwm: None,
             pwm_readback_pct: None,
+            pwm_commanded_pct: None,
             duty_pct: Some(47),
             age_ms: 10,
             stall_detected: None,

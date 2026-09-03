@@ -349,9 +349,19 @@ impl StateCache {
             // the same reason: the poll is its only producer, so without the
             // merge a controlled header — the one a validation session cares
             // about — would report no readback at all.
+            //
+            // `pwm_commanded_pct` (AIO-MB Phase 6) is the same rule pointing the
+            // OTHER way, and is why this block is a merge rather than a list of
+            // poll-only fields. Its only producer is the write path, so it is
+            // the POLL that must not erase it: without the carry-forward every
+            // 1 Hz poll would blank the command for a controlled header — again,
+            // exactly the header whose requested-vs-readback split the Hardware
+            // page exists to show. Each producer writes `None` for the other's
+            // field, so one "if none, keep what is there" rule serves both.
             if fan.alarm.is_none()
                 || fan.pwm_enable_mode.is_none()
                 || fan.pwm_readback_pct.is_none()
+                || fan.pwm_commanded_pct.is_none()
             {
                 if let Some(existing) = state.hwmon_fans.get(&fan.id) {
                     if fan.alarm.is_none() {
@@ -362,6 +372,9 @@ impl StateCache {
                     }
                     if fan.pwm_readback_pct.is_none() {
                         fan.pwm_readback_pct = existing.pwm_readback_pct;
+                    }
+                    if fan.pwm_commanded_pct.is_none() {
+                        fan.pwm_commanded_pct = existing.pwm_commanded_pct;
                     }
                 }
             }
@@ -1277,6 +1290,7 @@ mod tests {
             rpm: Some(800),
             last_commanded_pwm: None,
             pwm_readback_pct: None,
+            pwm_commanded_pct: None,
             updated_at: Instant::now(),
             alarm: None,
             pwm_enable_mode: None,
@@ -1358,6 +1372,7 @@ mod tests {
                 rpm: Some(800),
                 last_commanded_pwm: Some(40),
                 pwm_readback_pct: None,
+                pwm_commanded_pct: None,
                 updated_at: Instant::now() - stale,
                 alarm: None,
                 pwm_enable_mode: None,
@@ -1367,6 +1382,7 @@ mod tests {
                 rpm: Some(900),
                 last_commanded_pwm: Some(50),
                 pwm_readback_pct: None,
+                pwm_commanded_pct: None,
                 updated_at: Instant::now(),
                 alarm: None,
                 pwm_enable_mode: None,
@@ -1409,6 +1425,7 @@ mod tests {
             rpm: Some(1200),
             last_commanded_pwm: Some(40),
             pwm_readback_pct: None,
+            pwm_commanded_pct: None,
             alarm: Some(true),
             pwm_enable_mode: Some(1),
             updated_at: now,
@@ -1420,6 +1437,7 @@ mod tests {
             rpm: Some(1350),
             last_commanded_pwm: Some(45),
             pwm_readback_pct: None,
+            pwm_commanded_pct: None,
             alarm: None,
             pwm_enable_mode: None,
             updated_at: now,
@@ -1458,6 +1476,7 @@ mod tests {
             rpm: Some(1200),
             last_commanded_pwm: Some(40),
             pwm_readback_pct: Some(40),
+            pwm_commanded_pct: None,
             alarm: None,
             pwm_enable_mode: None,
             updated_at: now,
@@ -1470,6 +1489,7 @@ mod tests {
             rpm: Some(1350),
             last_commanded_pwm: Some(45),
             pwm_readback_pct: None,
+            pwm_commanded_pct: None,
             alarm: None,
             pwm_enable_mode: None,
             updated_at: now,
@@ -1500,12 +1520,91 @@ mod tests {
                 rpm: Some(1000),
                 last_commanded_pwm: Some(pct),
                 pwm_readback_pct: Some(pct),
+                pwm_commanded_pct: None,
                 alarm: None,
                 pwm_enable_mode: None,
                 updated_at: now,
             }]);
         }
         assert_eq!(cache.snapshot().hwmon_fans["h1"].pwm_readback_pct, Some(55));
+    }
+
+    /// AIO-MB Phase 6: the mirror image, and the one that actually bites.
+    ///
+    /// `pwm_commanded_pct` has exactly one producer — the write path — so it is
+    /// the POLL that threatens it, and the poll runs at 1 Hz forever. Without
+    /// the carry-forward the command would be blanked within a second of every
+    /// engine write, leaving the Hardware page unable to show requested and
+    /// readback as separate numbers for precisely the headers under control.
+    #[test]
+    fn a_poll_does_not_erase_the_engines_pwm_command() {
+        let cache = StateCache::new();
+        let now = Instant::now();
+        // The engine commands 45%. It has no readback to publish.
+        cache.update_hwmon_fans(vec![HwmonFanState {
+            id: "hwmon:it8696:isa-0a40:pwm5:PUMP".into(),
+            rpm: Some(1350),
+            last_commanded_pwm: Some(45),
+            pwm_readback_pct: None,
+            pwm_commanded_pct: Some(45),
+            alarm: None,
+            pwm_enable_mode: None,
+            updated_at: now,
+        }]);
+
+        // The poll then reports a readback that DISAGREES — the device-override
+        // and BIOS-reclaim signature the split exists to make visible. The poll
+        // knows nothing about the command, so it sends `None`.
+        cache.update_hwmon_fans(vec![HwmonFanState {
+            id: "hwmon:it8696:isa-0a40:pwm5:PUMP".into(),
+            rpm: Some(1350),
+            last_commanded_pwm: Some(30),
+            pwm_readback_pct: Some(30),
+            pwm_commanded_pct: None,
+            alarm: None,
+            pwm_enable_mode: None,
+            updated_at: now,
+        }]);
+
+        let fans = cache.snapshot().hwmon_fans;
+        let fan = &fans["hwmon:it8696:isa-0a40:pwm5:PUMP"];
+        assert_eq!(
+            fan.pwm_commanded_pct,
+            Some(45),
+            "the engine's command must survive a poll refresh"
+        );
+        assert_eq!(
+            fan.pwm_readback_pct,
+            Some(30),
+            "and the poll's disagreeing readback must still land"
+        );
+        // The two axes are now genuinely independent, which is the whole point.
+        assert_ne!(fan.pwm_commanded_pct, fan.pwm_readback_pct);
+    }
+
+    /// And the other direction, so the carry-forward cannot freeze the command
+    /// at its first value — the same trap `a_later_poll_updates_the_pwm_readback`
+    /// guards for the readback.
+    #[test]
+    fn a_later_write_updates_the_pwm_command() {
+        let cache = StateCache::new();
+        let now = Instant::now();
+        for pct in [40u8, 65] {
+            cache.update_hwmon_fans(vec![HwmonFanState {
+                id: "h1".into(),
+                rpm: Some(1000),
+                last_commanded_pwm: Some(pct),
+                pwm_readback_pct: None,
+                pwm_commanded_pct: Some(pct),
+                alarm: None,
+                pwm_enable_mode: None,
+                updated_at: now,
+            }]);
+        }
+        assert_eq!(
+            cache.snapshot().hwmon_fans["h1"].pwm_commanded_pct,
+            Some(65)
+        );
     }
 
     /// The other direction: a later poll that genuinely reads a CLEARED alarm
@@ -1520,6 +1619,7 @@ mod tests {
             rpm: Some(0),
             last_commanded_pwm: Some(40),
             pwm_readback_pct: None,
+            pwm_commanded_pct: None,
             alarm: Some(true),
             pwm_enable_mode: Some(1),
             updated_at: now,
@@ -1529,6 +1629,7 @@ mod tests {
             rpm: Some(900),
             last_commanded_pwm: Some(40),
             pwm_readback_pct: None,
+            pwm_commanded_pct: None,
             alarm: Some(false),
             pwm_enable_mode: Some(2),
             updated_at: now,
@@ -1546,6 +1647,7 @@ mod tests {
             rpm: Some(800),
             last_commanded_pwm: Some(40),
             pwm_readback_pct: None,
+            pwm_commanded_pct: None,
             updated_at: Instant::now(),
             alarm: None,
             pwm_enable_mode: None,

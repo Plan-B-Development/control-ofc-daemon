@@ -202,6 +202,7 @@ Every sensor/fan/header includes:
 - `rpm` — measured from hardware (OpenFanController serial reads, hwmon `fanN_input`, or NVML per driver R565+)
 - `last_commanded_pwm` — daemon-tracked (OpenFan firmware does not report PWM state). **For an hwmon header this field has two producers** (register row `AIO5-a`): the poll writes the sysfs readback, the engine writes the commanded value. Read `pwm_readback_pct` for the readback where the distinction matters
 - `pwm_readback_pct` — the hardware readback of `pwmN` (hwmon only, DEC-317); one producer, always the poll
+- `pwm_commanded_pct` — the duty the daemon last **commanded** (hwmon only, DEC-318); one producer, always the write path. With `pwm_readback_pct` these are the two clean axes; read them, not `last_commanded_pwm`, whenever command and readback must be told apart
 - `duty_pct` — firmware-**reported** current fan duty % (NVIDIA via NVML, DEC-204); a *measured* value, present only where the source exposes a duty readback
 - These are always separate fields, never ambiguous
 

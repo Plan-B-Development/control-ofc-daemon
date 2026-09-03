@@ -398,7 +398,7 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 |--------|------|---------|
 | GET | `/status` | Subsystem health + freshness; `thermal_state`; `unavailable_sensors[]` (present-but-unreadable sensors, DEC-193); `skipped_controls[]` (controls the engine cannot resolve, so is not commanding — 273-i); `active_profile_id`/`active_profile_name` (active profile, DEC-194); `readiness` (compact cached hardware-readiness rollup for the GUI Dashboard chip — `{overall, critical, warning, info, top_summary, top_code}`, DEC-206); `validation_session` (the live session in miniature, DEC-317) |
 | GET | `/sensors` | All temperature readings (each entry optionally carries a curated hwmon `thresholds` object — DEC-117; each also carries `control_eligible: bool` — DEC-193) |
-| GET | `/fans` | Fan RPM + last commanded PWM (+ `stall_detected`, `fan_alarm`, `pwm_enable_mode`, and `pwm_readback_pct` — the hardware readback, distinct from the command, DEC-317) |
+| GET | `/fans` | Fan RPM + last commanded PWM (+ `stall_detected`, `fan_alarm`, `pwm_enable_mode`, `pwm_readback_pct` — the hardware readback, DEC-317 — and `pwm_commanded_pct` — the single-producer command, DEC-318; the two are the separate axes `last_commanded_pwm` conflates for an hwmon header) |
 | GET | `/poll` | Batch: status (incl. `unavailable_sensors[]`, `skipped_controls[]`, `active_profile_*`, `readiness` rollup) + sensors (incl. `control_eligible`) + fans |
 | GET | `/sensors/history` | Per-entity time-series (ring buffer) |
 | GET | `/capabilities` | Device list, feature flags, limits, `amd_gpu.kernel_warnings` (kernel-version regression catalogue, DEC-098) |
