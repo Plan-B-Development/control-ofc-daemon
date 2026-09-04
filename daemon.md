@@ -449,6 +449,46 @@ token (`curve_not_found` | `sensor_unavailable` | `mix_unresolvable` |
 empty, so an older client sees the wire shape it always did and a newer client
 reads `skipped_controls = []` from an older daemon. See Safety Model item 3.
 
+**`stop_permitted` reports what identify does, not what the device policy says
+(`AIO7-d`, fixed in 2.35.0).** `PwmHeaderEntry::from_descriptor` resolves one
+policy for **every member** of a cooling device, so a radiator fan in an AIO
+inherited `GENERIC_PUMP`'s `supports_stop: false` and was published unstoppable —
+while identify branches on `header_is_pump_protected`, in which device membership
+is not a term, and stopped it. The published value is now exactly
+`!header_is_pump_protected`, pinned by
+`stop_permitted_matches_identify_for_every_shipped_policy` (the sibling of the
+floor honesty test, one field over). Do **not** reconcile the two by adding
+membership to `header_is_pump_protected`: that would hand a 30% floor and
+stop-refusal to every radiator and auxiliary fan in a device, which is a cooling
+change rather than a reporting one. The floor field still resolves through the
+device policy and over-claims for the same members — tracked as `AIO4-a` /
+`AUD3-r`, deliberately unchanged here, so neither field may be derived from the
+other.
+
+**A diagnostic never restores a pump to a stop (`AUD3-l`, fixed in 2.35.0).**
+`resolve_points` and `verify_test_duty` floor the duty written on the way *in*;
+until 2.35.0 nothing floored the way *out*. Both restores wrote the captured
+pre-sweep duty straight into `set_pwm`, which applies no floor, so a pump header
+reading 0 was restored to 0 with `pwm_enable=1` asserted — a firmware-controlled
+0 converted into a stopped pump with no writer. Both sites now clamp to
+`max(HARD_PUMP_CPU_FLOOR_PCT, captured)` for pump-protected headers only; an
+ordinary fan is still restored exactly as captured, 0 included.
+Two boundaries stated rather than left implicit: a **CPU-labelled** header is
+outside the clamp (`header_is_pump_protected` is `Pump` only, while the engine
+floors CPU members at the same 30%) — `322-b`; and neither diagnostic restores
+the captured `pwm_enable`, so a header taken from firmware control stays in
+manual whatever duty it lands on — `322-c`. Both are pre-existing and recorded
+rather than changed here. A consequence for clients: `restore_outcome:
+"restored"` now means *restored, floor-clamped* on a pump, so the duty on the
+hardware may exceed the original reported beside it.
+
+**A third parity oracle, `header_role_classification.json` (`AUD3-c`).** The GUI
+hand-mirrors `classify_header_role`'s label branches — it must, because a daemon
+< 2.31.0 publishes no `stop_permitted` and the reconstruction is then the only
+answer. The copies agreed; what was missing was the *gate*. 29 cases of
+`(chip_name, pwm_index, label) -> (role, pump_protected)`, asserted on both sides
+and compared byte-for-byte by `parity.yml`, which now covers three fixtures.
+
 **A runtime config that failed to load (`AUD3-m`, daemon >= 2.34.0).**
 `RuntimeConfig::load_from` degrades to `Self::default()` when `runtime.toml`
 cannot be read or parsed, so a corrupt file can never stop the daemon booting.

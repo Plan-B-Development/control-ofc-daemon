@@ -6081,6 +6081,87 @@ async fn cooling_device_round_trips_through_the_api() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// [SAFETY] `AIO7-d`, the CALL-SITE test — the helper's own honesty test lives in
+/// `device_policy::tests` and would not have caught a bad call site.
+///
+/// Reproduces the divergence as measured on an X870E AORUS MASTER: a
+/// `radiator_members` entry of a cooling device whose policy resolves to
+/// `GENERIC_PUMP` was published `stop_permitted: false` — inheriting the
+/// *device's* policy — while identify branches on `header_is_pump_protected`,
+/// which has no membership term, and would stop it. The GUI reads
+/// `not stop_permitted` as that predicate (`services/pump_protection.py`), so the
+/// wire was telling every client a fan was protected that the daemon would stop.
+#[tokio::test]
+async fn a_radiator_member_is_not_published_as_unstoppable() {
+    let (state, tmp) = config_test_state_with_hwmon();
+    let state_ref = state.clone();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    // h1 is the pump (role assigned); h2 is a radiator fan with no role at all.
+    let (status, json) = uds_post(
+        &path,
+        "/config/header-role",
+        &serde_json::json!({"header_id": "h1", "role": "pump"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{json}");
+    let (status, json) = uds_post(
+        &path,
+        "/config/cooling-device",
+        &serde_json::json!({
+            "id": "aio-1",
+            "name": "AIO",
+            "kind": "aio_liquid",
+            "pump_member": "h1",
+            "radiator_members": ["h2"]
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{json}");
+
+    let (status, json) = uds_get(&path, "/hwmon/headers").await;
+    assert_eq!(status, 200, "{json}");
+    let headers = json["headers"].as_array().expect("headers array");
+    let find = |id: &str| {
+        headers
+            .iter()
+            .find(|h| h["id"] == id)
+            .unwrap_or_else(|| panic!("header {id} missing from {json}"))
+    };
+
+    // The pump: protected by its assigned role, so unstoppable — unchanged.
+    assert_eq!(
+        find("h1")["stop_permitted"],
+        serde_json::json!(false),
+        "the pump must still publish as unstoppable"
+    );
+    // The radiator fan: NOT pump-protected, so the wire must say so rather than
+    // inheriting the device's pump policy.
+    assert_eq!(
+        find("h2")["stop_permitted"],
+        serde_json::json!(true),
+        "a radiator member with no pump role is published as unstoppable while \
+         identify would stop it — the wire must report what the daemon does"
+    );
+
+    // And the published field must agree with the predicate identify obeys, for
+    // BOTH members. This is the relationship, not a literal: it is what stays
+    // true if the roles or the policy change.
+    for id in ["h1", "h2"] {
+        let published_stoppable = find(id)["stop_permitted"].as_bool().unwrap();
+        let protected = state_ref.header_is_pump_protected(id);
+        assert_eq!(
+            published_stoppable, !protected,
+            "{id}: wire says stoppable={published_stoppable} but identify's \
+             predicate header_is_pump_protected={protected}"
+        );
+    }
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+    drop(tmp);
+}
+
 /// **The brief's trust-model requirement**: "a normal user profile must not be
 /// able to submit `minimum_safe_pwm = 1` and bypass pump protections."
 ///

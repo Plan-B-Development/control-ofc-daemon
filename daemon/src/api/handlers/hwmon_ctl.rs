@@ -229,6 +229,45 @@ pub(crate) fn read_header_state(
     }
 }
 
+/// [SAFETY] The duty a diagnostic may restore a header to (`AUD3-l`).
+///
+/// A diagnostic captures the pre-test duty and puts it back on the way out. For
+/// a pump-protected header that captured value is **not** unconditionally safe
+/// to write: `set_pwm` always asserts `pwm_enable=1`, so restoring a captured 0
+/// converts "0 under firmware control" into "0 under manual control with no
+/// writer" — a stopped pump, held until the engine's next tick if the header is
+/// a controlled member and indefinitely if no profile is active.
+///
+/// Clamped for pump-protected headers only. An ordinary chassis fan restored to
+/// its own captured 0 is being put back exactly where it was found, and raising
+/// it would be a real behaviour change rather than a safety fix.
+///
+/// **A CPU-labelled header is outside this clamp, and that is a decision rather
+/// than a consequence of the predicate (`322-b`).** The constant is named
+/// `HARD_PUMP_CPU_FLOOR_PCT` and the *engine* applies it to CPU members too
+/// (`profile::CPU_PUMP_LABEL_HINTS` = cpu / pump / aio), but
+/// `header_is_pump_protected` resolves through `HeaderRole::is_pump()`, which is
+/// `Pump` only. So a `CPU_FAN` header sitting at 0 under BIOS fan-stop is
+/// restored to 0 in manual mode, exactly as a chassis fan is.
+///
+/// It is left that way here because widening the predicate would change what the
+/// machine does — raising a fan the BIOS deliberately stopped — and that is a
+/// design decision this change did not have. The narrower reading of the real
+/// hazard is that the *mode*, not the duty, is what makes a restored 0 dangerous
+/// for any header (`322-c`), and neither diagnostic restores `pwm_enable`.
+/// Raised by `ofc:security-reviewer`; recorded rather than silently inherited.
+///
+/// This is the counterpart of [`verify_test_duty`], which has always floored the
+/// duty written on the way IN. `api/characterization.rs` applies the same clamp
+/// to its own restore through `RestoreOnDrop::restore_floor`.
+fn restore_duty(is_pump: bool, captured_pct: u8) -> u8 {
+    if is_pump {
+        captured_pct.max(crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8)
+    } else {
+        captured_pct
+    }
+}
+
 /// The duty `POST /hwmon/{id}/verify` drives the header to for its settle window.
 ///
 /// Pure and separately testable **because the two constraints on it pull against
@@ -476,13 +515,35 @@ pub async fn hwmon_verify_handler(
             return Ok((initial, final_state, test_pct, true));
         }
 
+        // [SAFETY] `AUD3-l`: clamp the RESTORE to the pump floor, not just the
+        // test duty. `verify_test_duty` has always floored the duty we write on
+        // the way in; the way out wrote the captured original straight into
+        // `set_pwm`, which applies no floor of its own (pinned by
+        // `set_pwm_accepts_low_values_no_floor`). So a pump header that read 0
+        // got `pwm_enable=1` plus a floored test duty, then a 0% restore —
+        // latched in MANUAL at 0 with no writer, until the engine's next tick if
+        // it is a controlled member and indefinitely if no profile is active.
+        // The mode is the part that makes it dangerous: 0 under firmware control
+        // is the firmware's business, 0 under `pwm_enable=1` is a stopped pump.
+        //
+        // **This clamps the duty; it does NOT restore the mode** — neither
+        // diagnostic writes the captured `pwm_enable` back, so a header taken
+        // from firmware control stays in manual for the daemon's lifetime
+        // whatever duty it lands on. Pre-existing, wider than this change, and
+        // recorded as `322-c` rather than fixed here (`CLAUDE.md § Review blast
+        // radius`). Named because the argument above is a mode argument, and it
+        // would be dishonest to borrow it and imply the mode were handled.
+        //
+        // Newly reachable rather than merely old: Phase 5's orchestrator aims
+        // both diagnostics at `device.pump_member` by default.
+        let restore_pct = restore_duty(bg_is_pump, current_pct);
         let restore_failed = {
             let mut ctrl = bg_controller.lock();
-            match ctrl.set_pwm(&bg_header_id, current_pct, &bg_lease_id) {
+            match ctrl.set_pwm(&bg_header_id, restore_pct, &bg_lease_id) {
                 Ok(_) => false,
                 Err(e) => {
                     log::warn!(
-                        "verify: restore PWM to {current_pct}% on {bg_header_id} \
+                        "verify: restore PWM to {restore_pct}% on {bg_header_id} \
                          failed (header left at test value {test_pct}%): {e}"
                     );
                     true
@@ -832,6 +893,12 @@ pub async fn hwmon_characterize_handler(
                 &cache,
                 &hid,
                 &points,
+                // [SAFETY] `AUD3-l`: the same header floor `resolve_points` used for
+                // the sweep, reused for the RESTORE — 30% for a pump-protected
+                // header, 0 for everything else. Before this the restore wrote the
+                // captured pre-sweep duty straight through, so a pump reading 0
+                // was restored to 0 with `pwm_enable=1` and left stopped.
+                floor,
                 settle,
                 write_fn,
                 read_fn,
@@ -977,6 +1044,51 @@ mod tests {
                 expected,
                 "ordinary header at {current}% must keep the original duty"
             );
+        }
+    }
+    /// [SAFETY] `AUD3-l`: a diagnostic must not restore a pump to a stop.
+    ///
+    /// `verify_test_duty` has always floored the duty written on the way IN, and
+    /// is exhaustively tested over all 101 inputs. Nothing asserted the way OUT,
+    /// and the way out wrote the captured duty straight into `set_pwm`, which
+    /// applies no floor of its own. Exhaustive here too, for the same reason:
+    /// the interesting inputs are the low ones and there are only 101 of them.
+    #[test]
+    fn a_pump_is_never_restored_below_its_floor() {
+        let floor = crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8;
+        for captured in 0u8..=100 {
+            assert!(
+                restore_duty(true, captured) >= floor,
+                "a pump captured at {captured}% would be restored to {}%, below \
+                 the {floor}% floor — with pwm_enable=1 asserted, that is a \
+                 stopped pump no writer will revise",
+                restore_duty(true, captured)
+            );
+            // Above the floor the captured value is returned untouched: this is a
+            // restore, not a re-clamp, and raising a pump that was legitimately
+            // at 55% would be its own defect.
+            if captured >= floor {
+                assert_eq!(restore_duty(true, captured), captured);
+            }
+        }
+    }
+
+    /// The other half of the same rule: an ordinary fan is put back EXACTLY where
+    /// it was found, 0 included. Clamping it up would be a real behaviour change
+    /// rather than a safety fix, and this is what stops the floor spreading.
+    ///
+    /// **Read what this does and does not pin.** `is_pump` here is
+    /// `header_is_pump_protected`, i.e. `HeaderRole::is_pump()`, which is `Pump`
+    /// only — so this case also covers **CPU-labelled** headers, which the engine
+    /// *does* floor at the same 30%. That exclusion is deliberate and argued at
+    /// `restore_duty`'s own doc; it is recorded as `322-b` precisely so this
+    /// assertion is not mistaken for evidence that the question was considered
+    /// and settled. If `322-b` is ever decided the other way, this test is the
+    /// one that must change, and it should be changed knowingly.
+    #[test]
+    fn a_non_pump_header_is_restored_exactly_as_captured() {
+        for captured in 0u8..=100 {
+            assert_eq!(restore_duty(false, captured), captured);
         }
     }
 

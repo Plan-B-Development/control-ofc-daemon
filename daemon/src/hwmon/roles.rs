@@ -267,6 +267,64 @@ pub fn is_pump_protected(assigned: Option<HeaderRole>, inferred: (HeaderRole, Ro
 mod tests {
     use super::*;
 
+    /// [SAFETY] `AUD3-c` / DEC-322: the cross-stack oracle for the classifier
+    /// that decides whether a client may offer to STOP a header.
+    ///
+    /// The GUI hand-mirrors `classify_header_role`'s label branches in
+    /// `services/pump_protection.py` — it has to, because a daemon older than
+    /// 2.31.0 publishes no `stop_permitted` and the reconstruction is the only
+    /// answer available. Until this fixture there was no gate holding the two
+    /// copies together, unlike the two previous times this project faced exactly
+    /// this problem (DEC-126's `parity_vectors.json`, DEC-162's
+    /// `role_classification.json`). The direction of harm is the unsafe one: if
+    /// this side learns a new pump-classifying label and the GUI's copy does not,
+    /// the GUI concludes "not protected" and the wizard offers to stop a pump.
+    ///
+    /// The GUI half is `tests/test_header_role_parity.py`, against a
+    /// byte-identical copy; `parity.yml` in both repos fails if they diverge.
+    ///
+    /// `is_aio` is asserted here too rather than merely consumed, so the field
+    /// the GUI depends on cannot drift from `aio::is_liquid_cooler_chip`.
+    #[test]
+    fn header_role_classification_matches_the_cross_stack_oracle() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/header_role_classification.json"
+        );
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read header role fixture: {e}"));
+        let vectors: serde_json::Value =
+            serde_json::from_str(&text).expect("parse header role fixture");
+        let cases = vectors["cases"].as_array().expect("cases array");
+        assert!(!cases.is_empty(), "an empty oracle asserts nothing");
+
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let chip = case["chip_name"].as_str().unwrap();
+            let idx = case["pwm_index"].as_u64().unwrap() as u8;
+            let label = case["label"].as_str().unwrap();
+
+            let inferred = classify_header_role(chip, idx, label);
+            assert_eq!(
+                inferred.0.as_str(),
+                case["role"].as_str().unwrap(),
+                "role[{name}]"
+            );
+            assert_eq!(
+                is_pump_protected(None, inferred),
+                case["pump_protected"].as_bool().unwrap(),
+                "pump_protected[{name}] — this is the value that decides whether \
+                 a client may offer to stop the header"
+            );
+            assert_eq!(
+                crate::hwmon::aio::is_liquid_cooler_chip(chip),
+                case["is_aio"].as_bool().unwrap(),
+                "is_aio[{name}] — the GUI cannot see chip_name and consumes this \
+                 field instead, so it must not drift from the chip list"
+            );
+        }
+    }
+
     /// The `it8696` case measured on the AIO-MB validation target: five
     /// channels, no label files at all, so discovery synthesises `pwmN`.
     #[test]

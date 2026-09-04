@@ -51,7 +51,10 @@
 //! rather than through `member_effective_floor`, so a future phase that adds a
 //! relaxing entry must wire **all five** or a policy floor would be honoured by
 //! the profile engine and silently ignored by identify, verify and
-//! characterize. `reported_floor_matches_enforced_floor_for_every_shipped_policy`
+//! characterize — **plus, since DEC-322, the two diagnostic RESTORE writes
+//! (`hwmon_ctl::restore_duty` and `characterization::RestoreOnDrop::restore_floor`),
+//! so a future relaxing policy must wire SIX sites and not five** (`AUD3-l`).
+//! `reported_floor_matches_enforced_floor_for_every_shipped_policy`
 //! below is what keeps the reported number honest until that happens: it fails
 //! the moment a shipped policy would report a floor the engine does not enforce.
 
@@ -180,12 +183,48 @@ pub fn resolve_policy_floor(policy: &DevicePolicy, pump_protected: bool) -> f64 
     declared.max(ABSOLUTE_PUMP_FLOOR_PCT)
 }
 
-/// Whether a header may be driven to 0 under a policy.
+/// Whether the daemon will let this header be driven to 0.
 ///
-/// A pump-protected header is never stoppable, whatever the policy claims —
-/// the union predicate outranks the table in the restrictive direction only.
-pub fn stop_permitted(policy: &DevicePolicy, pump_protected: bool) -> bool {
-    !pump_protected && policy.supports_stop
+/// **The device policy is deliberately NOT a term (`AIO7-d`).** This value is a
+/// prediction about one specific behaviour — what `POST /fans/{id}/identify`
+/// will do — and that behaviour branches on `AppState::header_is_pump_protected`
+/// alone: the union of the user's assigned role and discovery's inferred one,
+/// with cooling-device membership not a term at all. So the published field is
+/// exactly `!pump_protected`, and `stop_permitted_matches_identify` pins it.
+///
+/// It used to read `!pump_protected && policy.supports_stop`, which took the
+/// policy from the *device* — and `PwmHeaderEntry::from_descriptor` resolves one
+/// policy for **every member** of a device. A radiator fan in an AIO therefore
+/// inherited `GENERIC_PUMP`'s `supports_stop: false` and was published as
+/// unstoppable while identify stopped it. Measured on an X870E AORUS MASTER:
+/// `pwm1`, a `radiator_members` entry with `role: unknown`, no pump label and
+/// not a liquid-cooler channel 1, reported `stop_permitted: false` with its
+/// identify predicate `false`.
+///
+/// Both directions were wrong and the second is the one that matters: a
+/// `pump_member` named **without** a pump role — reachable by `curl`, and
+/// something DEC-316's own "naming a `pump_member` confers no floor" note
+/// already contemplates — was promised `stop_permitted: false` while identify
+/// drove it to 0. A pump stopped while every client was told it would not be.
+///
+/// **Do not "fix" the divergence from the other end** by making device
+/// membership a term in `header_is_pump_protected`: that would hand a 30% floor
+/// and stop-refusal to every radiator and auxiliary fan in a device, which is a
+/// real cooling and behaviour change rather than a reporting correction.
+///
+/// `DevicePolicy::supports_stop` is still published, as part of the policy
+/// descriptor — what a *class of device* declares stays visible; it is simply no
+/// longer conflated with a per-header prediction.
+///
+/// **The sibling field was deliberately NOT changed, and the asymmetry is real.**
+/// [`resolve_policy_floor`] still resolves `effective_min_pwm_pct` through the
+/// device policy, so a non-pump member of an AIO still publishes a 30% floor that
+/// nothing enforces for it. That over-reports, which is the safe direction, and
+/// moving it is a cooling decision rather than a reporting one — tracked as
+/// `AIO4-a` / `AUD3-r`, with the now-visible inconsistency recorded as `322-a`.
+/// **Neither field may be derived from the other.**
+pub fn stop_permitted(pump_protected: bool) -> bool {
+    !pump_protected
 }
 
 #[cfg(test)]
@@ -318,13 +357,51 @@ mod tests {
         assert_eq!(resolve(DEFAULT_POLICY_ID).id, "generic_pump");
     }
 
-    /// A pump-protected header is never stoppable, even under a policy that
-    /// claims otherwise — the union predicate outranks the table restrictively.
+    /// A pump-protected header is never stoppable, whatever any policy claims.
+    ///
+    /// The third assertion is the one that changed (`AIO7-d`). It used to read
+    /// `assert!(!stop_permitted(&GENERIC_PUMP, false))` — i.e. it *encoded the
+    /// defect*: a header that is not pump-protected was expected to publish
+    /// "unstoppable" purely because the device it belongs to has a pump policy,
+    /// while identify stopped it. A test can pin a bug as firmly as it pins a
+    /// fix, and this one did for a whole release.
     #[test]
-    fn pump_protection_outranks_a_permissive_policy() {
-        assert!(!stop_permitted(&GENERIC_FAN, true));
-        assert!(stop_permitted(&GENERIC_FAN, false));
-        assert!(!stop_permitted(&GENERIC_PUMP, false));
+    fn pump_protection_is_what_decides_stoppability() {
+        assert!(
+            !stop_permitted(true),
+            "a protected header is never stoppable"
+        );
+        assert!(stop_permitted(false), "an unprotected header is stoppable");
+    }
+
+    /// [SAFETY] The published `stop_permitted` must equal what identify actually
+    /// does, for **every shipped policy** — the `AIO7-d` honesty test, and the
+    /// sibling of `reported_floor_matches_enforced_floor_for_every_shipped_policy`
+    /// one field over.
+    ///
+    /// Identify branches on `AppState::header_is_pump_protected` alone, so any
+    /// policy term reintroduced here would make the wire disagree with the
+    /// behaviour it describes. Iterating `POLICIES` is what makes this catch a
+    /// *future* policy rather than only today's two: adding one with
+    /// `supports_stop: false` used to silently mark every member of every device
+    /// using it as unstoppable.
+    #[test]
+    fn stop_permitted_matches_identify_for_every_shipped_policy() {
+        for p in POLICIES {
+            for pump_protected in [true, false] {
+                assert_eq!(
+                    stop_permitted(pump_protected),
+                    !pump_protected,
+                    "policy {} publishes a stoppability that identify does not \
+                     obey: identify refuses a stop iff header_is_pump_protected \
+                     ({pump_protected}), and cooling-device membership is not a \
+                     term in that predicate. Do NOT reconcile this by adding \
+                     membership to header_is_pump_protected — that floors every \
+                     radiator fan in the device.",
+                    p.id
+                );
+            }
+        }
     }
 
     /// The compile-time property, asserted against the source.

@@ -1,5 +1,65 @@
 # Changelog
 
+## [2.35.0] — 2026-09-04
+
+Pairs with `control-ofc-gui` >= v2.23.0 (unchanged floor). **Three P2 fixes from the
+`/ofc:audit` register (`AUD3-l`, `AIO7-d`, `AUD3-c`), which are one failure story: the
+daemon could drive or describe a pump wrongly.** No new routes and no new capability flag.
+One published field changes its value for some headers — see below — and a third
+cross-repo parity oracle is added. Both existing oracles are byte-identical.
+
+### Fixed
+- **A diagnostic could restore a pump to a stop** (`AUD3-l`). `resolve_points` and
+  `verify_test_duty` have always floored the duty a diagnostic writes on the way *in*, and
+  `characterization.rs`'s own module doc claimed on that basis that "0% is unreachable
+  through this module". It was not: both the verify restore and `RestoreOnDrop` wrote the
+  **captured pre-sweep duty** straight into `set_pwm`, which applies no floor of its own.
+  A pump-protected header whose duty read 0 was therefore swept correctly and then restored
+  to 0 — with `pwm_enable=1` asserted by the write, which is what turns a firmware-controlled
+  0 into a stopped pump nothing will revise: until the engine's next tick if the header is a
+  controlled member, and indefinitely if no profile is active. Both restores now clamp to
+  `max(HARD_PUMP_CPU_FLOOR_PCT, captured)` for pump-protected headers **only** — an ordinary
+  fan is still put back exactly where it was found, 0 included, because raising it would be
+  a behaviour change rather than a safety fix. Newly reachable rather than merely old:
+  Phase 5's orchestrator aims both diagnostics at `device.pump_member` by default.
+  **Honest limit:** whether a pump header can read 0 under BIOS automatic control was not
+  reproduced on the development machine (its auto-mode headers read 63/255), so the trigger
+  remains unverified against hardware; the unguarded code path was not in doubt.
+- **`stop_permitted` was published from the cooling device's policy, not from the predicate
+  the daemon obeys** (`AIO7-d`). `PwmHeaderEntry::from_descriptor` resolves one policy for
+  **every member** of a device, so a radiator fan in an AIO inherited `GENERIC_PUMP`'s
+  `supports_stop: false` and was advertised unstoppable — while `POST /fans/{id}/identify`
+  branches on `header_is_pump_protected`, in which cooling-device membership is not a term,
+  and stopped it. Live-reproduced on an X870E AORUS MASTER. The published value is now
+  exactly `!header_is_pump_protected`, which is what
+  `docs/08_API_Integration_Contract.md` has always said it was. **The dangerous direction
+  was the second one:** a header named as a `pump_member` *without* a pump role was promised
+  `stop_permitted: false` while identify drove it to 0 — a pump stopped while every client
+  was told it would not be. Deliberately **not** fixed from the other end: making membership
+  a term in `header_is_pump_protected` would hand a 30% floor and stop-refusal to every
+  radiator and auxiliary fan in a device, which is a real cooling change. `supports_stop`
+  is still published as part of the policy descriptor; it is simply no longer conflated with
+  a per-header prediction.
+
+### Added
+- **A third cross-repo parity oracle, `header_role_classification.json`** (`AUD3-c`). The GUI
+  hand-mirrors this daemon's `classify_header_role` label branches, because a daemon older
+  than 2.31.0 publishes no `stop_permitted` and the reconstruction is then the only answer
+  available. The two copies were **in agreement** — this closes the absence of a *gate*, not
+  a drift. The direction of harm is the unsafe one: if this daemon learns a new
+  pump-classifying label and the GUI's copy does not, the GUI concludes "not protected" and
+  the wizard offers to stop a real pump. 29 cases of
+  `(chip_name, pwm_index, label) -> (role, pump_protected)`, asserted on both sides and
+  gated by `parity.yml`, which now compares three fixtures instead of two.
+
+### Compatibility
+`stop_permitted` changes value for one population: **radiator and auxiliary members of a
+cooling device that are not themselves pump-protected**, which now correctly report `true`.
+No client needs updating — the GUI already reads the field as `not stop_permitted` meaning
+"pump protected", which is the semantics this restores. There is no capability flag
+separating the old behaviour from the new, so a client that must distinguish them should
+branch on the daemon version.
+
 ## [2.34.0] — 2026-09-04
 
 Pairs with `control-ofc-gui` >= v2.23.0 (unchanged floor). **Three P2 fixes from the

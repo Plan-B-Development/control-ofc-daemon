@@ -315,6 +315,14 @@ pub const CHARACTERIZATION_DEFAULT_POINTS: [u8; 8] = [30, 40, 50, 60, 70, 80, 90
 /// a flat rule is testable in one assertion, where a role-conditional one is
 /// only as correct as `header_is_pump_protected` is on every board.
 ///
+/// **Scope, precisely (`AUD3-l`).** This governs *commanded sweep points*: none
+/// can be 0, for any header. The RESTORE is governed separately, by
+/// `RestoreOnDrop::restore_floor` and `hwmon_ctl::restore_duty` — a pump is
+/// never restored below its floor, while an ordinary fan is put back exactly
+/// where it was found, 0 included, because that is a restore rather than a
+/// command. Until DEC-322 the restore had no floor at all, and this sentence
+/// was read as covering it.
+///
 /// The cost (no chassis-fan stall/start-point discovery) is accepted and
 /// recorded as `AIO3-c` in `DECISIONS_OPEN_ITEMS.md`. Do not "fix" it by
 /// branching here; the reserved route is a per-device policy table.

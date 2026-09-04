@@ -137,10 +137,7 @@ fn build_metadata(
             member_kind: kind.to_string(),
             pump_protected,
             effective_min_pwm_pct: Some(floor.round() as u8),
-            stop_permitted: Some(crate::hwmon::device_policy::stop_permitted(
-                policy,
-                pump_protected,
-            )),
+            stop_permitted: Some(crate::hwmon::device_policy::stop_permitted(pump_protected)),
             writable: header.map(|h| h.is_writable).unwrap_or(false),
         });
     };

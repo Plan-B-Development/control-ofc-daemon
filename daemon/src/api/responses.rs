@@ -511,10 +511,7 @@ impl PwmHeaderEntry {
             role,
             role_source,
             effective_min_pwm_pct: Some(floor.round() as u8),
-            stop_permitted: Some(crate::hwmon::device_policy::stop_permitted(
-                policy,
-                pump_protected,
-            )),
+            stop_permitted: Some(crate::hwmon::device_policy::stop_permitted(pump_protected)),
             cooling_device_id: device.map(|d| d.id.clone()),
             pwm_freq_hz: h.caps.pwm_freq_hz,
             supported_pwm_enable_modes: crate::hwmon::header_caps::supported_pwm_enable_modes(

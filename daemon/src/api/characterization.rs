@@ -16,6 +16,25 @@
 //! - **0% is unreachable through this module.** [`resolve_points`] clamps every
 //!   input into `[max(CHARACTERIZATION_MIN_PCT, floor) .. 100]`; a pump-protected
 //!   header's floor is [`crate::profile::HARD_PUMP_CPU_FLOOR_PCT`].
+//!
+//!   **This claim was false for one duty until `AUD3-l`, and the exception was
+//!   the restore.** `resolve_points` governs the duties written on the way *in*;
+//!   the restore wrote the captured pre-sweep duty straight through, and the
+//!   write path applies no floor of its own. A pump header whose duty read 0 was
+//!   therefore swept correctly and then restored to 0 — with `pwm_enable=1`
+//!   asserted, which is what turns a firmware-controlled 0 into a stopped pump
+//!   that nothing will revise. `RestoreOnDrop::restore_floor` now clamps it.
+//!
+//!   **So state the claim precisely, because the loose version is what went
+//!   wrong:** no *commanded sweep point* is ever 0, for any header; and a
+//!   **pump-protected** header is never left below its floor by this module at
+//!   all, restore included. A non-pump header's restore may still write 0 — that
+//!   is putting the fan back exactly where it was found, which is deliberate and
+//!   is asserted by `a_non_pump_header_is_restored_exactly_as_captured`.
+//!   `HeaderRole::is_pump()` is `Pump` only, so a **CPU-labelled** header is
+//!   outside this clamp even though the engine floors CPU members at the same
+//!   30% (`profile::CPU_PUMP_LABEL_HINTS`). That gap is deliberate here and
+//!   recorded as `322-b`; it is not an oversight of the clamp's predicate.
 //! - Points are swept **ascending**, so an abort part-way leaves the header
 //!   *high* rather than low.
 //! - The pre-sweep duty is restored by [`RestoreOnDrop`] on every exit path on
@@ -471,6 +490,14 @@ struct RestoreOnDrop<'a, W: Fn(u8) -> Result<(), String>, S: Fn() -> bool> {
     /// report) from "we moved it and cannot put it back" ([`RestoreOutcome::NoOriginalDuty`]).
     wrote_any: &'a AtomicBool,
     report: &'a RestoreReport,
+    /// [SAFETY] `AUD3-l`. The lowest duty this header may be RESTORED to —
+    /// `HARD_PUMP_CPU_FLOOR_PCT` for a pump-protected header, 0 for everything
+    /// else. `resolve_points` has always floored the duties written on the way
+    /// IN; the way out wrote `original_pct` straight through, and the write path
+    /// applies no floor of its own. Restoring a captured 0 to a pump therefore
+    /// converted "0 under firmware control" into "0 under `pwm_enable=1` with no
+    /// writer" — a stopped pump. Same clamp as `hwmon_ctl::restore_duty`.
+    restore_floor: u8,
 }
 
 impl<W: Fn(u8) -> Result<(), String>, S: Fn() -> bool> Drop for RestoreOnDrop<'_, W, S> {
@@ -532,6 +559,8 @@ impl<W: Fn(u8) -> Result<(), String>, S: Fn() -> bool> Drop for RestoreOnDrop<'_
             self.report.set(left_behind(RestoreOutcome::NoOriginalDuty));
             return;
         };
+        // [SAFETY] `AUD3-l` — clamp on the way out, as the sweep does on the way in.
+        let restore = restore.max(self.restore_floor);
         match (self.write_fn)(restore) {
             Ok(()) => self.report.set(RestoreOutcome::Restored),
             Err(e) => {
@@ -568,6 +597,13 @@ pub async fn run_sweep<W, R, P, S, K>(
     cache: &StateCache,
     header_id: &str,
     points: &[u8],
+    // [SAFETY] `AUD3-l`: the lowest duty the RESTORE may write. Separate from
+    // the sweep floor already baked into `points` — for a non-pump header the
+    // sweep floor is `CHARACTERIZATION_MIN_PCT` while the correct restore floor
+    // is 0, because putting an ordinary fan back where it was found is not a
+    // safety event. Passed explicitly rather than derived from `points[0]` for
+    // exactly that reason.
+    restore_floor: u8,
     settle: Duration,
     write_fn: W,
     read_fn: R,
@@ -600,6 +636,7 @@ where
         shutting_down: &shutting_down,
         wrote_any: &wrote_any,
         report,
+        restore_floor,
     };
 
     for (idx, &pct) in points.iter().enumerate() {
@@ -1099,6 +1136,65 @@ mod tests {
             (outcome.header_left_moved(), outcome.token())
         }
     }
+    /// [SAFETY] `AUD3-l`: the sweep's RESTORE obeys the pump floor, not just its
+    /// points.
+    ///
+    /// `resolve_points` has always clamped the duties written on the way in, and
+    /// the module doc claimed on that basis that "0% is unreachable through this
+    /// module". It was not: the restore wrote `original_pct` straight through the
+    /// write path, which applies no floor. A pump header whose pre-sweep duty
+    /// read 0 was swept correctly and then put back to 0 — with `pwm_enable=1`
+    /// asserted by the write, which is what turns a firmware-controlled 0 into a
+    /// stopped pump nothing will revise.
+    ///
+    /// Asserts the REALISED write log, not a re-derivation of the clamp.
+    #[tokio::test]
+    async fn a_pump_sweep_never_restores_to_a_stop() {
+        let cache = StateCache::new();
+        let rig = Rig::new();
+        let writes = rig.writes.clone();
+        let floor = crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8;
+
+        let writes_w = writes.clone();
+        let _ = run_sweep(
+            &cache,
+            "hwmon:test:pwm1",
+            &[30, 50],
+            floor, // restore_floor: this header IS pump-protected
+            Duration::from_millis(1),
+            move |p: u8| {
+                writes_w.lock().unwrap().push(p);
+                Ok(())
+            },
+            // Pre-sweep duty reads 0 — the case the row could not verify against
+            // hardware, and the one the code path is unguarded for either way.
+            move || sample(Some(0), Some(1), Some(0)),
+            &rig.cancel,
+            || false,
+            || true,
+            &rig.report,
+            |_| {},
+        )
+        .await;
+
+        let log = writes.lock().unwrap().clone();
+        assert!(!log.is_empty(), "the sweep must have written something");
+        for (i, &w) in log.iter().enumerate() {
+            assert!(
+                w >= floor,
+                "write #{i} of {log:?} drove a pump-protected header to {w}%, \
+                 below the {floor}% floor; the LAST entry is the restore, which \
+                 is the one that used to be 0"
+            );
+        }
+        // Name the restore explicitly, so a future change that stops restoring
+        // at all cannot satisfy this test by writing nothing on the way out.
+        assert_eq!(
+            *log.last().unwrap(),
+            floor,
+            "the restore should be the captured 0 raised to the floor"
+        );
+    }
 
     /// Drive the sweep with fake hardware. `rpm_for` maps the last written duty
     /// to a tach reading; `fail_at` makes that one write fail.
@@ -1134,6 +1230,7 @@ mod tests {
             cache,
             "hwmon:test:pwm1",
             points,
+            0, // restore_floor: tests exercise the non-pump path
             settle,
             write_fn,
             read_fn,
@@ -1323,6 +1420,7 @@ mod tests {
             &cache,
             "hwmon:test:pwm1",
             &[30, 50],
+            0, // restore_floor: tests exercise the non-pump path
             Duration::from_secs(6),
             move |p: u8| {
                 writes_w.lock().unwrap().push(p);
@@ -1366,6 +1464,7 @@ mod tests {
             &cache,
             "hwmon:test:pwm1",
             &[30, 50],
+            0, // restore_floor: tests exercise the non-pump path
             Duration::from_secs(6),
             move |p: u8| {
                 writes_w.lock().unwrap().push(p);
@@ -1404,6 +1503,7 @@ mod tests {
             &cache,
             "hwmon:test:pwm1",
             &[30, 50],
+            0, // restore_floor: tests exercise the non-pump path
             Duration::from_secs(6),
             move |p: u8| {
                 writes_w.lock().unwrap().push(p);
@@ -1445,6 +1545,7 @@ mod tests {
             &cache,
             "hwmon:test:pwm1",
             &[30, 50],
+            0, // restore_floor: tests exercise the non-pump path
             Duration::from_secs(6),
             move |p: u8| {
                 writes_w.lock().unwrap().push(p);
@@ -1498,6 +1599,7 @@ mod tests {
                 &cache,
                 "hwmon:test:pwm1",
                 &[30, 60, 90],
+                0, // restore_floor: tests exercise the non-pump path
                 Duration::from_secs(6),
                 move |p: u8| {
                     writes_w.lock().unwrap().push(p);
@@ -1625,6 +1727,7 @@ mod tests {
             &cache,
             "hwmon:test:pwm1",
             &points,
+            0, // restore_floor: tests exercise the non-pump path
             Duration::from_secs(constants::CHARACTERIZATION_SETTLE_MAX_S),
             write_fn,
             read_fn,
@@ -1679,6 +1782,7 @@ mod tests {
             &cache,
             "hwmon:test:pwm1",
             &[30, 60, 90],
+            0, // restore_floor: tests exercise the non-pump path
             Duration::from_secs(2),
             write_fn,
             move || sample(Some(*last_r.lock().unwrap()), Some(1), Some(900)),
@@ -1712,6 +1816,7 @@ mod tests {
             &cache,
             "hwmon:test:pwm1",
             &[30, 60, 90],
+            0, // restore_floor: tests exercise the non-pump path
             Duration::from_secs(2),
             move |p| {
                 *last_w.lock().unwrap() = p;
