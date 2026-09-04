@@ -1856,7 +1856,26 @@ async fn async_main() {
                         if *shutdown.borrow() {
                             break;
                         }
-                        engine.tick(&ctx);
+                        // `AUD3-n`: off the async runtime. One tick in 30 flushes
+                        // the whole session document — `write` + `fsync` +
+                        // `rename` + a directory `fsync`, over up to ~5.7 MiB
+                        // (`AUD3-i`) — and every tick can wait on the hwmon
+                        // controller lock. Neither belongs on the worker threads
+                        // the 1 Hz profile engine, and therefore the
+                        // thermal-safety decision, is scheduled on.
+                        //
+                        // Awaited rather than detached: two ticks must never run
+                        // concurrently against one session, and `MissedTickBehavior
+                        // ::Skip` above is already the policy for a tick that ran
+                        // long.
+                        let (e, c) = (engine.clone(), ctx.clone());
+                        if tokio::task::spawn_blocking(move || e.tick(&c)).await.is_err() {
+                            // Panicked, or the runtime is going down. A dead
+                            // recorder loses evidence, which is not a reason to
+                            // stop a daemon that is still controlling fans — the
+                            // same judgement as the plain `spawn` above.
+                            log::warn!("Validation recorder tick failed");
+                        }
                     }
                 }
             }
@@ -1865,13 +1884,18 @@ async fn async_main() {
             // `interrupted`, which is the honest representation of a restart
             // (§15) and is unavailable to us here — we cannot know whether the
             // daemon is coming back.
-            if let Some(s) = engine.snapshot() {
-                if s.is_recording() {
-                    if let Err(e) = control_ofc_daemon::validation::store::save(&s) {
-                        log::warn!("Could not flush validation session at shutdown: {e}");
-                    }
-                }
-            }
+            //
+            // Deliberately still inline, unlike the tick above (`AUD3-n`): this
+            // is the shutdown path, the engine loop is already stopping, and
+            // handing the last write to a pool whose runtime is being torn down
+            // trades a certain flush for a possible one.
+            //
+            // But through `flush_recording`, NOT `store::save` — this shares the
+            // engine's `save_lock` and stale-write guard, so an in-flight
+            // `POST /validation/session/stop` racing this shutdown cannot have
+            // its `completed` document overwritten by this `recording` snapshot
+            // and be "repaired" to `interrupted` on the next boot.
+            engine.flush_recording();
         })
     };
 

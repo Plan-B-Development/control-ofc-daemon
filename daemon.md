@@ -610,8 +610,8 @@ commands still gets the forced duty, which is what keeps the reach above true.
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST | `/validation/session` | Start recording against a configured cooling device. Optionally **orchestrates** `pwm_verify` / `pwm_characterization` against named `sweep_members` (default: the pump member). `409` if one is already recording |
-| POST | `/validation/session/stop` | Finalise and compute the evidence summary |
-| DELETE | `/validation/session` | End without finalising |
+| POST | `/validation/session/stop` | Finalise and compute the evidence summary. **Also ends the diagnostic the session started** — see below. `404` only when no session has ever been started; `500 internal_error` if the finaliser itself broke, in which case the session is **still recording** |
+| DELETE | `/validation/session` | End without finalising. Same three outcomes as `stop` |
 | POST | `/validation/session/event` | Place a user marker on the timeline |
 | POST | `/validation/session/measurement` | Attach an external measurement — **untrusted; no control path reads one** |
 
@@ -621,6 +621,18 @@ runs a diagnostic it invokes the **existing** verify/characterize handler, which
 the hwmon lease, the pump floor clamp, the thermal refusal and restore-on-drop. There is no
 code in `validation/` or `api/handlers/validation.rs` that commands a duty, and tests assert
 that absence rather than leaving it to review.
+
+**Ending a session ends the diagnostic it started** (`AUD3-j`, daemon 2.35.1). A
+characterisation sweep runs detached and renews the engine's write-pause once per point, so
+until 2.35.1 stop/cancel finalised the record while the sweep kept driving the header — and
+kept curve control suspended — for up to `CHARACTERIZATION_MAX_POINTS ×
+CHARACTERIZATION_SETTLE_MAX_S` afterwards. The orchestrator now asks the sweep to stop,
+**fenced on the `run_id` it was handed at 202**, so a run started by anyone else is never
+aborted. The cancel is cooperative, as `DELETE /diagnostics/characterization` has always
+been: the current point finishes its settle and the header is restored, which is what the
+caller actually wants. `GET /diagnostics/characterization` therefore reports `cancelled` for
+that run. Thermal safety never depended on this — the forced-duty branch runs *above* the
+`verify_active` gate, so a paused engine still floors every output.
 
 ### Write endpoints — profile / control / config
 

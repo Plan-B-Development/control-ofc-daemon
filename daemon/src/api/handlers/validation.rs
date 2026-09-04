@@ -239,6 +239,74 @@ async fn prune_sessions_off_runtime() {
     .await;
 }
 
+/// Which finaliser the request asked for.
+enum Finalise {
+    Stop,
+    Cancel,
+}
+
+/// Finalise a session off the async worker threads (`AUD3-n`).
+///
+/// `stop`/`cancel` summarise the session and then persist it, and that write is
+/// the expensive half of this request: `atomic_io::write_atomic` does `write` +
+/// `fsync` + `rename` + a directory `fsync` over a document `AUD3-i` measures at
+/// up to ~5.7 MiB. Running it inline blocked a tokio worker — the same runtime
+/// the 1 Hz profile engine, and therefore the thermal-safety decision, is
+/// scheduled on — while `prune_sessions_off_runtime()` on the very next line was
+/// already careful to go off-runtime for a strictly cheaper read.
+///
+/// The whole engine call is wrapped rather than just the write. That keeps the
+/// engine synchronous, which is its stated design and what lets it own its own
+/// `save_lock` and stale-write guard, and it takes the slot-lock acquisition off
+/// the runtime too — which matters because that same lock is what a wedged sysfs
+/// write can hold up (`AUD3-k`).
+///
+/// **`Ok(None)` and `Err` are different facts and must not collapse.** `Ok(None)`
+/// means no session has ever been started — a 404. `Err` means the finaliser
+/// panicked, or the runtime is shutting down, and the session is *still
+/// installed and still recording*: answering 404 there would tell a client the
+/// session does not exist while the recorder keeps sampling it and the next
+/// `POST` refuses with `AlreadyRecording`. It is a 500.
+async fn finalise_off_runtime(
+    state: &Arc<AppState>,
+    which: Finalise,
+) -> Result<Option<crate::validation::session::ValidationSession>, String> {
+    let engine = state.validation.clone();
+    match tokio::task::spawn_blocking(move || match which {
+        Finalise::Stop => engine.stop(),
+        Finalise::Cancel => engine.cancel(),
+    })
+    .await
+    {
+        Ok(session) => Ok(session),
+        // A panicking finaliser must not take an API worker down. The session
+        // stays installed and `recording`, which the next boot sweep represents
+        // honestly as `interrupted` (§15) — never a fabricated "completed".
+        Err(e) => Err(format!("validation finalise task failed: {e}")),
+    }
+}
+
+/// Render a finalise result. Shared so `stop` and `cancel` cannot drift on the
+/// three-way distinction above.
+fn finalise_response(
+    result: Result<Option<crate::validation::session::ValidationSession>, String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match result {
+        Ok(Some(s)) => json_ok(StatusCode::OK, s),
+        Ok(None) => error_response(
+            StatusCode::NOT_FOUND,
+            &ErrorEnvelope::not_found("no validation session has been started"),
+        ),
+        Err(e) => {
+            log::warn!("{e}");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorEnvelope::internal(e),
+            )
+        }
+    }
+}
+
 /// `POST /validation/session`
 pub async fn start_session_handler(
     State(state): State<Arc<AppState>>,
@@ -337,7 +405,25 @@ pub async fn start_session_handler(
     };
 
     let ctx = recorder_context(&state);
-    match state.validation.start(session, &ctx) {
+    // `AUD3-n`: off the async runtime. `start` writes the session document —
+    // `write` + `fsync` + `rename` + a directory `fsync`, over a document
+    // `AUD3-i` measures at up to ~5.7 MiB — and blocks on the slot lock to do
+    // it, all on the worker thread the 1 Hz profile engine shares. Wrapping the
+    // whole call rather than only the write keeps `start`'s admit-only-if-
+    // persisted rollback where it belongs, inside the engine.
+    let started = {
+        let engine = state.validation.clone();
+        match tokio::task::spawn_blocking(move || engine.start(session, &ctx)).await {
+            Ok(result) => result,
+            // The blocking task panicked or the runtime is shutting down.
+            // Reported as a persistence failure rather than unwrapped: a
+            // panicking start must not take an API worker down with it.
+            Err(e) => Err(StartError::Persistence(format!(
+                "validation start task failed: {e}"
+            ))),
+        }
+    };
+    match started {
         Ok(started) => {
             log::info!(
                 "Validation session {} started for device '{}' ({} diagnostic(s), {} sweep member(s))",
@@ -394,32 +480,22 @@ pub async fn get_session_handler(
 pub async fn stop_session_handler(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.validation.stop() {
-        Some(s) => {
-            prune_sessions_off_runtime().await;
-            json_ok(StatusCode::OK, s)
-        }
-        None => error_response(
-            StatusCode::NOT_FOUND,
-            &ErrorEnvelope::not_found("no validation session has been started"),
-        ),
+    let result = finalise_off_runtime(&state, Finalise::Stop).await;
+    if matches!(result, Ok(Some(_))) {
+        prune_sessions_off_runtime().await;
     }
+    finalise_response(result)
 }
 
 /// `DELETE /validation/session`
 pub async fn cancel_session_handler(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.validation.cancel() {
-        Some(s) => {
-            prune_sessions_off_runtime().await;
-            json_ok(StatusCode::OK, s)
-        }
-        None => error_response(
-            StatusCode::NOT_FOUND,
-            &ErrorEnvelope::not_found("no validation session has been started"),
-        ),
+    let result = finalise_off_runtime(&state, Finalise::Cancel).await;
+    if matches!(result, Ok(Some(_))) {
+        prune_sessions_off_runtime().await;
     }
+    finalise_response(result)
 }
 
 /// `POST /validation/session/event` — a user marker (§5).
@@ -737,6 +813,51 @@ async fn run_verify(state: &Arc<AppState>, session_id: &str, member: &str) {
     );
 }
 
+/// Ask the characterisation sweep to stop, **fenced on the run this session
+/// started** (`AUD3-j`).
+///
+/// The fence is the whole safety property, and it is why this is not a bare
+/// `characterization_cancel.store(true)`. The sweep runs detached and the slot is
+/// process-global: a run whose deadman elapsed can legally be superseded, and a
+/// session ending a fraction late would otherwise abort *someone else's* sweep
+/// after its first point and strand that header mid-restore. Comparing the
+/// `run_id` we were handed at 202 is what makes "cancel my diagnostic" mean only
+/// that.
+///
+/// Check and set under ONE lock, for the reason `characterization_cancel_handler`
+/// states: two acquisitions leave a window in which the run can finish and a new
+/// one be installed between them, and the late store then aborts the successor.
+///
+/// Takes the slot and the flag rather than `AppState` so the rule is unit-testable
+/// on its own: the four cases that matter — ours still running, ours already
+/// finished, someone else's, and none at all — need no daemon around them.
+fn cancel_run_fenced(
+    slot: &parking_lot::Mutex<Option<crate::api::characterization::CharacterizationRun>>,
+    cancel: &std::sync::atomic::AtomicBool,
+    run_id: Option<&str>,
+) {
+    use std::sync::atomic::Ordering;
+    let Some(run_id) = run_id else {
+        return;
+    };
+    // The STORE stays under the guard — one lock across check-and-set is the
+    // whole point — but the log does not: a `log::info!` can block on a full
+    // stderr pipe, and this mutex is on the sweep's per-point publish path.
+    let cancelled = {
+        let guard = slot.lock();
+        let mine = guard
+            .as_ref()
+            .is_some_and(|r| r.is_running() && r.run_id == run_id);
+        if mine {
+            cancel.store(true, Ordering::SeqCst);
+        }
+        mine
+    };
+    if cancelled {
+        log::info!("Validation session ended; cancelling its characterisation run {run_id}");
+    }
+}
+
 async fn run_characterization(state: &Arc<AppState>, session_id: &str, member: &str) {
     let started = unix_ms();
     // The existing handler returns 202 and sweeps detached; the run lands in the
@@ -810,6 +931,20 @@ async fn run_characterization(state: &Arc<AppState>, session_id: &str, member: &
         // Stop if THIS session is no longer the live one — see the fence note
         // on `attach_evidence_for`.
         if state.validation.recording_session_id().as_deref() != Some(session_id) {
+            // ...and take the sweep down with us (`AUD3-j`). Returning alone left
+            // the detached sweep in `hwmon_characterize_handler` still driving the
+            // header AND still renewing the engine's write-pause once per point,
+            // so ending a session suspended curve control for up to
+            // `CHARACTERIZATION_MAX_POINTS × CHARACTERIZATION_SETTLE_MAX_S` after
+            // the user had ended it. Thermal safety still outranked that — the
+            // forced-duty branch runs above the `verify_active` gate — so it was
+            // lost control intent, never lost cooling; it was still a diagnostic
+            // that outlived the thing that asked for it.
+            cancel_run_fenced(
+                &state.characterization,
+                &state.characterization_cancel,
+                run_id.as_deref(),
+            );
             return;
         }
     }
@@ -835,4 +970,181 @@ async fn run_characterization(state: &Arc<AppState>, session_id: &str, member: &
             verify: None,
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::characterization as ch;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// The smallest `ValidationSession` the response mapper can be handed. Built
+    /// literally because `SessionMetadata` has no `Default` — every field of it is
+    /// load-bearing evidence, so making one defaultable would let a real session
+    /// be constructed with an empty device.
+    fn finalised_session() -> ValidationSession {
+        ValidationSession {
+            session_id: "val-fin".into(),
+            kind: KIND_VALIDATION.into(),
+            state: STATE_COMPLETED.into(),
+            started_unix_ms: 1,
+            completed_unix_ms: Some(2),
+            metadata: SessionMetadata {
+                cooling_device_id: "dev-1".into(),
+                device_name: "Test AIO".into(),
+                device_kind: "aio_liquid".into(),
+                pump_member: None,
+                radiator_members: vec![],
+                auxiliary_members: vec![],
+                temperature_sensor: None,
+                coolant_sensor: None,
+                coolant_telemetry: "unavailable".into(),
+                device_policy: DevicePolicySnapshot {
+                    id: "generic_pump".into(),
+                    display_name: "Generic pump".into(),
+                    minimum_safe_pwm_pct: 30.0,
+                    supports_stop: false,
+                    startup_override_seconds: None,
+                    expected_rpm_min: None,
+                    expected_rpm_max: None,
+                    internal_control_possible: true,
+                },
+                members: vec![],
+                active_profile_id: None,
+                active_profile_name: None,
+                daemon_version: "0.0.0-test".into(),
+                user_metadata: Default::default(),
+            },
+            requested_diagnostics: vec![],
+            sweep_members: vec![],
+            samples: vec![],
+            events: vec![],
+            evidence: vec![],
+            external_measurements: vec![],
+            findings: vec![],
+            sample_limit_reached: false,
+            interrupted_reason: None,
+            truncated_at_unix_ms: None,
+        }
+    }
+
+    fn run(id: &str, state: &str) -> ch::CharacterizationRun {
+        ch::CharacterizationRun {
+            run_id: id.into(),
+            header_id: "hwmon:it87:isa-0a30:pwm2:PUMP".into(),
+            state: state.into(),
+            requested_points_pct: vec![30, 60, 100],
+            settle_seconds: 5,
+            points: vec![],
+            summary: None,
+            original_pct: Some(40),
+            restore_failed: false,
+            restore_outcome: ch::RestoreOutcome::Pending.token().to_string(),
+            detail: None,
+        }
+    }
+
+    /// A broken finaliser and an absent session are different facts, and the
+    /// wire must not collapse them (review finding on DEC-323).
+    ///
+    /// Folding a `JoinError` into `None` answered `404 "no validation session has
+    /// been started"` while the session was still installed and still recording —
+    /// so a client would conclude the session did not exist, stop offering to stop
+    /// it, and then be refused `AlreadyRecording` on its next `POST`.
+    #[test]
+    fn a_broken_finaliser_is_a_500_and_an_absent_session_is_a_404() {
+        let (code, _) = finalise_response(Ok(None));
+        assert_eq!(
+            code,
+            StatusCode::NOT_FOUND,
+            "no session ever started is a 404"
+        );
+
+        let (code, body) = finalise_response(Err("validation finalise task failed: panic".into()));
+        assert_eq!(
+            code,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a finaliser that broke must not be reported as an absent session"
+        );
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|c| c.as_str()),
+            Some("internal_error")
+        );
+
+        // And the ordinary case still answers 200, so a mapping that returned
+        // one status for everything cannot satisfy the two assertions above.
+        let (code, _) = finalise_response(Ok(Some(finalised_session())));
+        assert_eq!(code, StatusCode::OK);
+    }
+
+    /// `AUD3-j`: ending a session must end the sweep that session started.
+    ///
+    /// Without this the detached sweep kept driving the header AND kept renewing
+    /// the engine's write-pause once per point, so curve control stayed suspended
+    /// for up to `CHARACTERIZATION_MAX_POINTS × CHARACTERIZATION_SETTLE_MAX_S`
+    /// after the user ended the session.
+    #[test]
+    fn ending_a_session_cancels_the_run_that_session_started() {
+        let slot = parking_lot::Mutex::new(Some(run("char-7", ch::STATE_RUNNING)));
+        let cancel = AtomicBool::new(false);
+        cancel_run_fenced(&slot, &cancel, Some("char-7"));
+        assert!(
+            cancel.load(Ordering::SeqCst),
+            "our own running sweep must be asked to stop"
+        );
+    }
+
+    /// The fence, and the reason it is not a bare `store(true)`.
+    ///
+    /// The slot is process-global and a run whose deadman elapsed can legally be
+    /// superseded. A session ending a fraction late would otherwise abort a
+    /// stranger's sweep after its first point, strand that header mid-restore, and
+    /// report the abort as though the user had asked for it.
+    #[test]
+    fn a_successor_run_is_never_cancelled_by_the_session_that_preceded_it() {
+        let slot = parking_lot::Mutex::new(Some(run("char-8", ch::STATE_RUNNING)));
+        let cancel = AtomicBool::new(false);
+        cancel_run_fenced(&slot, &cancel, Some("char-7"));
+        assert!(
+            !cancel.load(Ordering::SeqCst),
+            "a run this session did not start must never be cancelled"
+        );
+    }
+
+    /// A finished run must not leave the flag armed: the next sweep clears it
+    /// under the slot lock at install, but arming it for a terminal run is a
+    /// pointless race to lose.
+    #[test]
+    fn a_run_that_has_already_finished_is_not_cancelled() {
+        for state in [
+            ch::STATE_COMPLETE,
+            ch::STATE_CANCELLED,
+            ch::STATE_ABORTED,
+            ch::STATE_FAILED,
+        ] {
+            let slot = parking_lot::Mutex::new(Some(run("char-9", state)));
+            let cancel = AtomicBool::new(false);
+            cancel_run_fenced(&slot, &cancel, Some("char-9"));
+            assert!(
+                !cancel.load(Ordering::SeqCst),
+                "a '{state}' run needs no cancelling"
+            );
+        }
+    }
+
+    /// No run id means the 202 never carried one — there is nothing this session
+    /// can prove it owns, so it cancels nothing. An empty slot likewise.
+    #[test]
+    fn an_unidentified_run_cancels_nothing() {
+        let slot = parking_lot::Mutex::new(Some(run("char-10", ch::STATE_RUNNING)));
+        let cancel = AtomicBool::new(false);
+        cancel_run_fenced(&slot, &cancel, None);
+        assert!(!cancel.load(Ordering::SeqCst));
+
+        let empty = parking_lot::Mutex::new(None);
+        cancel_run_fenced(&empty, &cancel, Some("char-10"));
+        assert!(!cancel.load(Ordering::SeqCst));
+    }
 }

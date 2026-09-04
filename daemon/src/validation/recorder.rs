@@ -243,6 +243,21 @@ impl ValidationEngine {
         session: ValidationSession,
         ctx: &RecorderContext,
     ) -> Result<ValidationSession, StartError> {
+        // [LOCK ORDER] Seeded BEFORE the slot lock, for the reason `tick` states
+        // at length: `seed_watch` reaches for the hwmon controller, the engine
+        // holds that same mutex across `set_pwm`'s `std::fs::write`, and a wedged
+        // write is a recorded failure mode (DEC-278/DEC-289). Doing it *under*
+        // the slot guard — which is what this did until `AUD3-k` — put an
+        // unbounded, non-cancellable acquisition behind the lock `/status`,
+        // `/poll`, `recording_session_id()` and the recorder tick all take. That
+        // is precisely the starvation the ordering rule in `tick` exists to
+        // prevent, arrived at from the one entry point that ignored it.
+        //
+        // Computed into a local and installed only once the recording check has
+        // passed: seeding straight into `self.watch` here would clobber a live
+        // session's baselines on behalf of a start that is about to be rejected.
+        let seeded = seed_watch(ctx);
+
         let mut slot = self.slot.lock();
         if slot.as_ref().is_some_and(|s| s.is_recording()) {
             return Err(StartError::AlreadyRecording);
@@ -256,8 +271,10 @@ impl ValidationEngine {
             member_id: None,
         });
         // Seed baselines from the live values so the first tick reports change,
-        // not merely difference-from-default.
-        *self.watch.lock() = seed_watch(ctx);
+        // not merely difference-from-default. Installed under the slot guard,
+        // which is the order `tick` already uses (watch under slot, never the
+        // reverse); only the *controller* read moved out, above.
+        *self.watch.lock() = seeded;
         // Fixed for this session's life, and cached so `tick` can take the hwmon
         // controller lock BEFORE the session lock instead of underneath it.
         let ids: Vec<String> = session
@@ -411,6 +428,32 @@ impl ValidationEngine {
         }
         push_event_locked(session, kind, detail, member_id);
         self.refresh_live(session);
+        true
+    }
+
+    /// Flush a still-recording session through the **real** persistence path.
+    ///
+    /// The shutdown path's one write, and it goes through [`persist`] rather than
+    /// calling `store::save` directly so it shares the `save_lock` and the
+    /// stale-write guard with every other writer. It did not, and that was a live
+    /// race: a `POST /validation/session/stop` in flight when shutdown is
+    /// signalled can publish `completed` while this call is holding a `recording`
+    /// snapshot, and whichever `rename` lands second wins. Publishing the stale
+    /// copy resurrects a cleanly-stopped session as `recording`, and the next
+    /// boot sweep then "repairs" it to `interrupted` and discards its findings —
+    /// exactly the hazard [`save_lock`](Self::save_lock) exists to prevent.
+    ///
+    /// Returns whether anything was written.
+    ///
+    /// [`persist`]: Self::persist
+    pub fn flush_recording(&self) -> bool {
+        let Some(session) = self.snapshot() else {
+            return false;
+        };
+        if !session.is_recording() {
+            return false;
+        }
+        self.persist(&session);
         true
     }
 
@@ -762,10 +805,15 @@ fn seed_watch(ctx: &RecorderContext) -> Watch {
             enable_modes.insert(id.clone(), mode);
         }
     }
+    // `try_lock_for`, never `lock` — the same rule, and the same reason, as the
+    // read in `tick`. The cost of giving up is one spurious `control_reclaimed`
+    // event on the first tick if the watchdog counter was already non-zero; the
+    // cost of blocking is the caller's session lock, which is what `AUD3-k` was.
     let enable_reverts = ctx
         .hwmon_controller
         .as_ref()
-        .map(|c| c.lock().enable_revert_counts().clone())
+        .and_then(|c| c.try_lock_for(CONTROLLER_READ_TIMEOUT))
+        .map(|guard| guard.enable_revert_counts().clone())
         .unwrap_or_default();
     Watch {
         profile_epoch: ctx.cache.profile_activation_epoch(),

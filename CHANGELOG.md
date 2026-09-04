@@ -1,5 +1,78 @@
 # Changelog
 
+## [2.35.1] — 2026-09-04
+
+Pairs with `control-ofc-gui` >= v2.23.0 (unchanged floor). **Three P2 fixes from the
+`/ofc:audit` register (`AUD3-j`, `AUD3-k`, `AUD3-n`), which are one story: a validation
+session did not own the things it started.** No new routes, no new capability flag, no
+floor, threshold or safety-rule change, and both parity oracles are byte-identical. One
+observable behaviour changes for a client that watches a session-orchestrated
+characterisation — see below.
+
+### Fixed
+- **Ending a validation session did not end the diagnostic it started** (`AUD3-j`). A
+  characterisation sweep runs in a detached task and renews the profile engine's write-pause
+  once per point, so it keeps curve control suspended for as long as it runs. Stop and cancel
+  finalised the session record only: the orchestrator noticed the session had ended and simply
+  returned, discarding the evidence rather than stopping the sweep. For up to
+  `CHARACTERIZATION_MAX_POINTS × CHARACTERIZATION_SETTLE_MAX_S` — **20 × 15 s** — after the
+  user ended the session, the header was still being swept and **every backend's curve control
+  was still suspended**. The orchestrator now asks the sweep to stop, **fenced on the `run_id`
+  it was handed at 202**, so a run started by anyone else is never aborted — that fence is the
+  whole safety property, and an unfenced abort is a defect this daemon has already been fixed
+  for once. **Thermal safety never depended on this**, and it was checked rather than assumed:
+  the forced-duty branch runs *above* the `verify_active` gate, so a paused engine still floors
+  every output. This was lost control intent, not lost cooling.
+  **Two consequences for a client:** `GET /diagnostics/characterization` now reports such a run
+  as `cancelled` rather than `complete` — which is not a hardware failure and must not be
+  worded as one — and the cancel is cooperative, as `DELETE /diagnostics/characterization`
+  has always been, so the current point finishes its settle (≤ 15 s) and the header is restored
+  before the run goes terminal. A progress view should expect the run to stay `running` briefly
+  after the session has already returned its summary. There is no capability flag separating
+  this from the older behaviour; branch on the daemon version if you must distinguish them.
+- **Starting a session could park a worker behind a wedged sysfs write** (`AUD3-k`).
+  `ValidationEngine::start` held the session slot across an unbounded blocking acquisition of
+  the hwmon controller lock — the exact ordering the recorder's own `[LOCK ORDER]` contract
+  states must never happen, reached from the one entry point that ignored it. The engine holds
+  that same mutex across a PWM write, and a wedged write is a recorded failure mode, so a
+  `POST /validation/session` arriving during one blocked indefinitely **while holding the
+  slot** — which then blocked the recorder, `GET /validation/session` and the orchestrator's
+  own liveness check behind it. Not a deadlock; precisely the starvation the module was built
+  to prevent. The baseline read now uses the same short timeout the sampling tick does, and is
+  taken *before* the slot rather than under it. A baseline it cannot read costs one spurious
+  event on the first sample, never a refused session — the same trade the tick has always made.
+- **The session's expensive writes ran on the async runtime** (`AUD3-n`). Persisting a session
+  serialises a document of up to ~5.7 MiB and performs `write` + `fsync` + `rename` + a
+  directory `fsync`. That ran inline on the worker threads the 1 Hz profile engine — and
+  therefore the thermal-safety decision — is scheduled on: every 30 sampling ticks, and on the
+  start, stop and cancel request paths. `stop` did it on the request path **and then** ran a
+  strictly cheaper listing off-runtime, so the cheap half was already careful and the expensive
+  half was not. All four sites now go through the blocking pool. The shutdown flush stays
+  inline on purpose: handing the last write to a pool whose runtime is being torn down would
+  trade a certain flush for a possible one.
+
+- **A broken finaliser was reported as an absent session.** Found in review of the above. When
+  the off-runtime finalise task fails — a panic in the summariser, or the runtime shutting down
+  — `POST /validation/session/stop` and `DELETE /validation/session` answered
+  `404 not_found "no validation session has been started"` while the session was **still
+  installed and still recording**. A client would conclude the session did not exist, stop
+  offering to stop it, and then be refused `409`-equivalent `AlreadyRecording` on its next
+  start. The two facts are now distinct: no session is still a `404`, a finaliser that broke is
+  a `500 internal_error`.
+- **The shutdown flush could resurrect a cleanly-stopped session.** Also found in review. The
+  recorder's last write called the store directly instead of going through the engine, so it
+  shared neither the write-ordering lock nor the stale-write guard every other writer uses. A
+  `stop` in flight when the daemon is signalled to shut down could therefore have its
+  `completed` document overwritten by the flush's older `recording` snapshot — and the next
+  boot's sweep would then mark a cleanly-stopped session `interrupted` and discard its
+  findings. Pre-existing rather than introduced here; fixed because this release re-reasoned
+  about that exact line.
+
+### Internal
+- `daemon.md` and `docs/08_API_Integration_Contract.md` record the session-ends-the-diagnostic
+  behaviour and its two client-visible consequences. Full rationale, the two shape choices, the
+  review outcome and the alternatives rejected: **DEC-323**.
+
 ## [2.35.0] — 2026-09-04
 
 Pairs with `control-ofc-gui` >= v2.23.0 (unchanged floor). **Three P2 fixes from the

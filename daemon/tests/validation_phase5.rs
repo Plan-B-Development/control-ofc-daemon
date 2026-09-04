@@ -834,6 +834,102 @@ fn the_orchestrator_delegates_rather_than_reimplementing_safety() {
     }
 }
 
+/// `AUD3-j`, at the call site. The fence's four cases have their own unit tests
+/// in `api::handlers::validation::tests`; this asserts that the path which
+/// abandons a run actually *uses* them.
+///
+/// `CLAUDE.md` records "extracting a rule into a testable function does NOT test
+/// the call site" as having recurred six times, and this is exactly that shape:
+/// a correct `cancel_run_fenced` reached from nowhere would leave the sweep
+/// running, every unit test still green. The assertion is positional rather than
+/// a mere `contains` — between the session fence and the `return` it guards,
+/// the cancel must appear — because a cancel that had drifted out of that block
+/// would satisfy a whole-file search and stop nothing.
+#[test]
+fn abandoning_a_run_cancels_it_rather_than_leaving_it_sweeping() {
+    let body = strip_comments(include_str!("../src/api/handlers/validation.rs"));
+
+    // `Some(session_id)` exactly: the sibling fence in `spawn_orchestration`
+    // writes `Some(session_id.as_str())` and has no run in flight to cancel.
+    let marker = "recording_session_id().as_deref() != Some(session_id)";
+    let at = body
+        .find(marker)
+        .expect("the orchestrator's session fence must still be there");
+    let after = &body[at..];
+    let ret = after
+        .find("return;")
+        .expect("the session fence must still abandon the run");
+    assert!(
+        after[..ret].contains("cancel_run_fenced("),
+        "the orchestrator returns without cancelling the sweep it started — the \
+         header keeps being driven and the engine write-pause keeps being renewed \
+         for up to CHARACTERIZATION_MAX_POINTS x CHARACTERIZATION_SETTLE_MAX_S \
+         after the session ended (`AUD3-j`)"
+    );
+}
+
+/// `AUD3-n`. The session document is written with `write` + `fsync` + `rename` +
+/// a directory `fsync`, over up to ~5.7 MiB (`AUD3-i`). None of that belongs on
+/// the worker threads the 1 Hz profile engine — and therefore the thermal-safety
+/// decision — is scheduled on.
+///
+/// **This is a wiring guard, and deliberately not a runtime measurement.** The
+/// property "this call did not block a tokio worker" is only observable as a
+/// latency difference, and discriminating a ~10 ms inline write from a scheduled
+/// one needs a timing threshold — which `CLAUDE.md` forbids ("no flaky timing")
+/// and which CI would decide by load rather than by correctness. What can be
+/// asserted honestly is that each call site still goes through the wrapper, which
+/// is the thing a regression would undo.
+#[test]
+fn the_session_lifecycle_writes_stay_off_the_async_runtime() {
+    let body = strip_comments(include_str!("../src/api/handlers/validation.rs"));
+
+    // The finalisers: no direct engine call left in either handler...
+    for direct in ["state.validation.stop()", "state.validation.cancel()"] {
+        assert!(
+            !body.contains(direct),
+            "`{direct}` finalises AND persists inline on the request path — hand \
+             it to `finalise_off_runtime` (`AUD3-n`)"
+        );
+    }
+    // ...and the wrapper they share is what carries the hop.
+    let at = body
+        .find("async fn finalise_off_runtime")
+        .expect("the off-runtime finaliser must still exist");
+    let wrapper = &body[at..];
+    let end = wrapper.find("\n}\n").unwrap_or(wrapper.len());
+    assert!(
+        wrapper[..end].contains("spawn_blocking"),
+        "`finalise_off_runtime` no longer goes off the runtime"
+    );
+
+    // The start path wraps the whole engine call, so `start`'s
+    // admit-only-if-persisted rollback stays inside the engine.
+    let at = body
+        .find("pub async fn start_session_handler")
+        .expect("the start handler must still exist");
+    let handler = &body[at..];
+    let call = handler
+        .find("engine.start(session, &ctx)")
+        .expect("the start handler must still start a session");
+    assert!(
+        handler[..call].contains("spawn_blocking"),
+        "`start` writes the session document inline on the request path (`AUD3-n`)"
+    );
+
+    // And the 1 Hz recorder tick, whose 30th flush rewrites the whole document.
+    let main_body = strip_comments(include_str!("../src/main.rs"));
+    let tick = main_body
+        .lines()
+        .find(|l| l.contains(".tick(&c)") || l.contains("engine.tick(&ctx)"))
+        .expect("the recorder task must still tick the engine");
+    assert!(
+        tick.contains("spawn_blocking"),
+        "the recorder tick flushes the session document on a tokio worker \
+         (`AUD3-n`): {tick}"
+    );
+}
+
 /// A source-scanning guard matches its own explanation unless comments are
 /// stripped first — the `polling.rs` precedent. Attribute-position matching does
 /// not help here because the tokens are ordinary identifiers, so strip instead.
@@ -1213,6 +1309,16 @@ fn evidence_from_a_cancelled_session_cannot_land_on_its_successor() {
 /// to the lock before the ticker ever took it. `tick` completing is deterministic:
 /// under the correct order it gives up on the controller after a short timeout,
 /// and under the bad order it cannot return until the wedge releases.
+///
+/// **The wedge is now established BEFORE `start`, which is `AUD3-k`.** Until
+/// 2026-09-04 this test started the session first, so `tick` was the only entry
+/// point ever exercised against a wedged controller — and `start` was meanwhile
+/// performing the exact inversion the comment above forbids, holding the session
+/// slot across a bare blocking `c.lock()` inside `seed_watch`. A `POST
+/// /validation/session` arriving during a DEC-278/289 wedge therefore parked a
+/// tokio worker indefinitely *while holding the slot*, blocking the recorder,
+/// `GET /validation/session` and `recording_session_id()` behind it. Both entry
+/// points are asserted here now, in the order a real session meets them.
 #[test]
 fn a_wedged_controller_stalls_neither_the_recorder_nor_the_poll() {
     use std::sync::mpsc;
@@ -1235,11 +1341,10 @@ fn a_wedged_controller_stalls_neither_the_recorder_nor_the_poll() {
     ));
     ctx.hwmon_controller = Some(controller.clone());
 
-    engine.start(unique_session("lockorder"), &ctx).unwrap();
-
-    // Wedge the controller from another thread. The self-releasing deadline is
-    // deliberate: a failed assertion below skips this test's own cleanup, and an
-    // unbounded held lock would turn a red test into a hung CI job (DEC-272).
+    // Wedge the controller from another thread, BEFORE the session starts. The
+    // self-releasing deadline is deliberate: a failed assertion below skips this
+    // test's own cleanup, and an unbounded held lock would turn a red test into a
+    // hung CI job (DEC-272).
     let (release_tx, release_rx) = mpsc::channel::<()>();
     let held = controller.clone();
     let wedge = std::thread::spawn(move || {
@@ -1255,6 +1360,28 @@ fn a_wedged_controller_stalls_neither_the_recorder_nor_the_poll() {
         waited += 1;
         assert!(waited < 400, "the wedging thread never took the lock");
     }
+
+    // THE FIRST assertion (`AUD3-k`): `start` returns while the controller is
+    // wedged. On another thread with a bounded wait, for the same reason `tick`
+    // is below — a `join` on the bad ordering hangs the job instead of failing it.
+    let (start_tx, start_rx) = mpsc::channel::<bool>();
+    {
+        let engine = engine.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let ok = engine.start(unique_session("lockorder"), &ctx).is_ok();
+            let _ = start_tx.send(ok);
+        });
+    }
+    let admitted = start_rx.recv_timeout(Duration::from_secs(3)).expect(
+        "start() did not return while the controller was wedged — it is \
+                 holding the session lock across an unbounded controller acquisition",
+    );
+    assert!(
+        admitted,
+        "the session must still be admitted: a missed watchdog baseline costs one \
+         spurious first-tick event, and is never a reason to refuse a recording"
+    );
 
     // Tick on another thread, reporting completion through a channel so we can
     // bound the wait instead of blocking forever on `join`.
@@ -1302,6 +1429,57 @@ fn a_wedged_controller_stalls_neither_the_recorder_nor_the_poll() {
     );
 }
 
+/// **The rejected start must not disturb the live session's baselines** —
+/// the hazard `AUD3-k`'s fix introduces, and the reason the seed is computed
+/// into a local rather than written straight into `self.watch`.
+///
+/// Moving `seed_watch` above the slot guard also moves it above the
+/// `AlreadyRecording` check, so a second `POST /validation/session` now reads the
+/// live values on its way to being refused. If it *installed* them, it would
+/// silently re-baseline the recording session and the next tick would report no
+/// change — a thermal failsafe entered between the two calls would vanish from
+/// the timeline of the session that was running when it happened.
+///
+/// Asserted through the event the baseline produces, because `Watch` is private:
+/// an intact baseline says "normal", sees "emergency", and emits. A clobbered one
+/// says "emergency", sees "emergency", and says nothing.
+#[test]
+fn a_refused_start_does_not_reseed_the_recording_session() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let ctx = test_context();
+
+    // Baseline: normal, at session start.
+    ctx.cache.record_engine_tick("normal", 105.0);
+    engine.start(unique_session("reseed-a"), &ctx).unwrap();
+
+    // The ladder trips while the session is recording, and BEFORE the next tick
+    // observes it — the window a re-seed would erase.
+    ctx.cache.record_engine_tick("emergency", 105.0);
+
+    // A second start arrives in that window and is refused.
+    let err = engine.start(unique_session("reseed-b"), &ctx).unwrap_err();
+    assert_eq!(
+        err,
+        control_ofc_daemon::validation::recorder::StartError::AlreadyRecording
+    );
+
+    // The refused start must have left A's baselines alone.
+    assert!(engine.tick(&ctx), "A is still recording");
+    let s = engine.snapshot().unwrap();
+    assert!(
+        s.events.iter().any(|e| e.kind == EV_THERMAL_ENTERED),
+        "the failsafe A was recording through must still reach A's timeline; a \
+         refused start re-seeded its baselines"
+    );
+    assert_eq!(
+        s.session_id, "val-reseed-a",
+        "and the refused start must not have installed itself"
+    );
+
+    engine.stop();
+}
+
 /// **The save race.** A periodic flush must never republish a stale `recording`
 /// copy over a session that has already finalised.
 ///
@@ -1343,6 +1521,72 @@ fn a_late_flush_cannot_resurrect_a_finalised_session() {
     assert!(
         !repaired.contains(&done.session_id),
         "a cleanly-stopped session must not be repaired to `interrupted`"
+    );
+}
+
+/// **The shutdown flush shares the stale-write guard.** Found in review of DEC-323.
+///
+/// The recorder task's last write used to call `store::save` directly, bypassing
+/// `persist`'s `save_lock` and its supersession check. That is a live race, and
+/// DEC-323 made it likelier by moving the concurrent writer onto the blocking
+/// pool: a `POST /validation/session/stop` in flight when shutdown is signalled
+/// publishes `completed`, while the flush holds a `recording` snapshot taken
+/// before it — and whichever `rename` lands second wins. The stale copy
+/// resurrects a cleanly-stopped session as `recording`, and the next boot sweep
+/// "repairs" it to `interrupted` and discards its findings.
+///
+/// Two halves, because the rule and its call site are different claims: the
+/// engine method must obey the guard, and `main.rs` must actually use it.
+#[test]
+fn the_shutdown_flush_cannot_resurrect_a_finalised_session() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let ctx = test_context();
+    engine
+        .start(unique_session("shutdown-flush"), &ctx)
+        .unwrap();
+    engine.tick(&ctx);
+
+    // While recording, it writes.
+    assert!(
+        engine.flush_recording(),
+        "a recording session must be flushed at shutdown"
+    );
+    let dir = temp_state_dir().join("validation");
+    let back = store::load_from(&dir, "val-shutdown-flush")
+        .unwrap()
+        .unwrap();
+    assert_eq!(back.state, STATE_RECORDING);
+
+    // Once finalised it writes nothing — and, critically, cannot publish a
+    // `recording` copy over the `completed` one.
+    let done = engine.stop().unwrap();
+    assert_eq!(done.state, STATE_COMPLETED);
+    assert!(
+        !engine.flush_recording(),
+        "a finalised session must not be re-flushed as `recording`"
+    );
+    let back = store::load_from(&dir, "val-shutdown-flush")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        back.state, STATE_COMPLETED,
+        "the shutdown flush must not resurrect a finalised session"
+    );
+    assert!(!back.findings.is_empty(), "and its findings must survive");
+
+    // The call site: `main.rs` must reach the disk through the engine, so the
+    // guard applies. A direct `store::save` there would satisfy every assertion
+    // above and still carry the race.
+    let main_body = strip_comments(include_str!("../src/main.rs"));
+    assert!(
+        main_body.contains("engine.flush_recording()"),
+        "the recorder task's shutdown flush must go through the engine"
+    );
+    assert!(
+        !main_body.contains("store::save"),
+        "main.rs must not write a session document directly — that bypasses \
+         `persist`'s save_lock and stale-write guard"
     );
 }
 
