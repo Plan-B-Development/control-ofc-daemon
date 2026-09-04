@@ -1320,11 +1320,22 @@ fn make_test_header(id: &str, label: &str, min_pwm: u8) -> PwmHeaderDescriptor {
 }
 
 fn test_app_state_with_hwmon() -> Arc<AppState> {
-    let cache = Arc::new(StateCache::new());
-    let headers = vec![
+    test_app_state_with_headers(vec![
         make_test_header("h1", "CHA_FAN1", 20),
         make_test_header("h2", "CPU_FAN", 30),
-    ];
+    ])
+}
+
+/// Same fixture, with the header descriptors supplied by the caller.
+///
+/// Exists so a test can point the sysfs paths somewhere it controls.
+/// `make_test_header` hardcodes `/sys/class/hwmon/hwmon0/pwm1`, and although
+/// every *write* goes to `HwmonMockWriter`, `read_header_state` reads those
+/// paths for real — so on a host where `hwmon0` happens to be a live PWM chip
+/// publishing `pwm_enable != 1`, a sweep can take `run_sweep`'s reclaim branch
+/// and abort for a reason that has nothing to do with what the test asserts.
+fn test_app_state_with_headers(headers: Vec<PwmHeaderDescriptor>) -> Arc<AppState> {
+    let cache = Arc::new(StateCache::new());
     let lease_mgr = LeaseManager::new();
     let ctrl =
         HwmonPwmController::new(headers, lease_mgr, Box::new(HwmonMockWriter), cache.clone());
@@ -5863,17 +5874,18 @@ async fn characterize_is_single_flight_against_itself_and_verify() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// [SAFETY] Regression test for the run-slot fence.
+/// The single-flight slot, from the ordinary direction: a second run is refused
+/// until the first has fully published, and once accepted it carries its OWN id
+/// and only its own points.
 ///
-/// The terminal state used to be written AFTER the single-flight guards were
-/// released, and neither the per-point publish nor that write compared
-/// `run_id`. A finishing sweep could therefore overwrite a run that had already
-/// started in the gap — reporting a live sweep as finished, with another run's
-/// data, and leaving the one actually driving the header uncancellable.
-///
-/// Asserts the invariant that closes it: a second run is refused until the first
-/// has fully published, and once accepted it carries its OWN id and only its own
-/// points.
+/// **This test does NOT exercise the `run_id` fence, and used to claim it did**
+/// (register row `AUD2-i`). It awaits a terminal state before POSTing the
+/// second run, so the two never coexist — delete `r.run_id == my_run_id` from
+/// both fences in `hwmon_ctl.rs` and it passes unchanged, because run 1's task
+/// has already finished when run 2 installs itself. The defect the fence closes
+/// requires a supersession while run 1 is still finishing, which only the
+/// DEC-296 expired-deadman steal permits. That case is covered by
+/// [`a_superseded_run_cannot_publish_over_the_run_that_replaced_it`].
 #[tokio::test]
 async fn a_second_run_never_inherits_the_first_runs_points() {
     let state = test_app_state_with_hwmon();
@@ -5920,6 +5932,249 @@ async fn a_second_run_never_inherits_the_first_runs_points() {
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
+}
+
+/// [SAFETY] **The call-site test for the `run_id` fence** (register row `AUD2-i`).
+///
+/// Two characterisation runs can only ever coexist through one door: the DEC-296
+/// steal, where a claim whose deadman elapsed is taken from under a holder that
+/// is still alive. The fence at `hwmon_ctl.rs`'s per-point `publish` and its
+/// terminal write is what stops the loser writing its points, its state and its
+/// `detail` over the winner — reporting a live sweep as finished, with another
+/// header's data, and leaving the run actually driving hardware uncancellable.
+///
+/// **The damage is transient, so the assertion has to be an invariant held
+/// across the whole window rather than a check of the final state.** Run B's own
+/// terminal write repairs `state` and `points` afterwards, so a snapshot taken
+/// at the end passes with both fences deleted; what never repairs is what the
+/// slot said *while B was still running*. Hence the polling loop below, which
+/// asserts on every observation.
+///
+/// **Three preconditions, and each exists because without it the test loses
+/// coverage silently rather than failing** (all three were raised by
+/// `ofc:concurrency-reviewer` against the first draft):
+///
+///  1. **A must have landed its first write before the steal.** `run_sweep`
+///     calls `keepalive()` at the *top* of each point, ahead of the write. If
+///     A's task has not been polled when the steal lands, A's very first
+///     keepalive fails, it aborts at index 0 with `measured` empty, and
+///     **`publish` is never called at all** — the per-point fence would then be
+///     untested and deletable with this test green. Waiting for
+///     `last_commanded_pct("h1") == Some(40)` proves A cleared its keepalive
+///     *and* its write, so a point-0 publish must follow.
+///  2. **B's claim must be a steal, not a free take.** If A had already
+///     terminated (any of `run_sweep`'s early exits), B would claim an unheld
+///     slot, the runs would never coexist, and every assertion below would pass
+///     vacuously. `assert_ne!(a_id, b_id)` does not discriminate that, so A is
+///     asserted still `running` immediately before each attempt.
+///  3. **The loop must still be polling when A tries to publish.** It exits on
+///     B's first terminal snapshot, so coverage would otherwise rest on the
+///     unasserted 2 s-vs-4 s settle asymmetry — change B's settle, or let A slip
+///     under load, and the window is missed with `saw_b_running` still true.
+///     The loop therefore keeps polling until A's whole sweep is provably over.
+///
+/// No `sleep`-based *assertion*: every wait is a bounded poll with a deadline,
+/// and the sweep is driven by `tokio::time`, so nothing here can hang CI
+/// (CLAUDE.md tokio traps 1-3).
+#[tokio::test]
+async fn a_superseded_run_cannot_publish_over_the_run_that_replaced_it() {
+    // Sysfs paths under a directory that does not exist, rather than
+    // `make_test_header`'s real `/sys/class/hwmon/hwmon0/pwm1`: reads are meant
+    // to fail here (that is what the fixture has always relied on), and pointing
+    // them at the host would make a fence assertion depend on what `hwmon0`
+    // happens to be on the machine running the test.
+    let headers = ["h1", "h2"]
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            let mut h = make_test_header(id, "CHA_FAN1", 20);
+            let base = format!("/nonexistent/control-ofc-test/hwmon{i}");
+            h.pwm_path = format!("{base}/pwm1");
+            h.enable_path = Some(format!("{base}/pwm1_enable"));
+            h.rpm_path = Some(format!("{base}/fan1_input"));
+            h
+        })
+        .collect();
+    let state = test_app_state_with_headers(headers);
+    let cache = state.cache.clone();
+    let controller = state
+        .hwmon_controller
+        .clone()
+        .expect("the hwmon fixture always installs a controller");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    // Run A: the loser. Two points, so it reaches a second keepalive and learns
+    // it was superseded; the minimum settle, so it is parked and harmless.
+    let (s1, j1) = uds_post(
+        &path,
+        "/hwmon/h1/characterize",
+        &serde_json::json!({"points_pct": [40, 60], "settle_seconds": 2}),
+    )
+    .await;
+    assert_eq!(s1, 202, "{j1}");
+    let a_id = j1["run_id"].as_str().unwrap().to_string();
+    let a_started = tokio::time::Instant::now();
+
+    // Precondition 1: A is inside its settle, past keepalive and past its write.
+    let mut a_wrote = false;
+    for _ in 0..100 {
+        if controller.lock().last_commanded_pct("h1") == Some(40) {
+            a_wrote = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        a_wrote,
+        "run A never landed its first point — without that it aborts before \
+         calling `publish` at all, and the per-point fence goes untested"
+    );
+
+    // Run B: the winner. A longer settle so it is still RUNNING when A wakes up
+    // and tries to publish over it — which is the only window in which the
+    // per-point fence is observable at all.
+    let mut b: Option<(String, serde_json::Value)> = None;
+    for _ in 0..40 {
+        // Precondition 2: the slot B is about to take is one A still holds.
+        let (_, live) = uds_get(&path, "/diagnostics/characterization").await;
+        assert_eq!(live["run_id"], a_id, "A must still own the slot: {live}");
+        assert_eq!(
+            live["state"], "running",
+            "A must still be running, or B takes a free slot and the two runs \
+             never coexist: {live}"
+        );
+
+        cache.expire_verify_claim_for_test();
+        let (code, json) = uds_post(
+            &path,
+            "/hwmon/h2/characterize",
+            &serde_json::json!({"points_pct": [80], "settle_seconds": 4}),
+        )
+        .await;
+        if code == 202 {
+            b = Some((json["run_id"].as_str().unwrap().to_string(), json));
+            break;
+        }
+        assert_eq!(
+            code, 409,
+            "the only legitimate refusal is single-flight: {json}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let (b_id, b_json) = b.expect(
+        "run B never stole the expired claim — the DEC-296 steal is the only way \
+         two runs coexist, and without it this test proves nothing",
+    );
+    assert_ne!(a_id, b_id, "each run gets its own id: {b_json}");
+
+    // A's whole sweep: 2 points x 2 s of settle, plus margin. The loop must not
+    // stop before this has elapsed, or it can miss A's publish attempts.
+    let a_sweep_over = a_started + std::time::Duration::from_secs(6);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut saw_b_running = false;
+    let mut b_terminal: Option<serde_json::Value> = None;
+    while tokio::time::Instant::now() < deadline {
+        let (status, snap) = uds_get(&path, "/diagnostics/characterization").await;
+        assert_eq!(status, 200, "the slot must stay served: {snap}");
+
+        assert_eq!(
+            snap["run_id"], b_id,
+            "A must never install itself over B: {snap}"
+        );
+        assert_eq!(
+            snap["header_id"], "h2",
+            "A's header must never appear: {snap}"
+        );
+        for point in snap["points"].as_array().unwrap() {
+            assert_eq!(
+                point["requested_pct"], 80,
+                "A's points must never land in B's list: {snap}"
+            );
+        }
+        // The exact discriminator for the terminal fence: with it removed, A's
+        // outcome lands here verbatim. Matched on A's own text rather than on
+        // `detail.is_null()`, so an abort from any other cause is not mistaken
+        // for a fence failure.
+        let detail = snap["detail"].as_str().unwrap_or("");
+        assert!(
+            !detail.contains("superseded"),
+            "A's abort reason must never be attributed to B: {snap}"
+        );
+
+        if snap["state"] == "running" {
+            saw_b_running = true;
+        } else if tokio::time::Instant::now() >= a_sweep_over {
+            // Precondition 3: B finished AND A's sweep is provably over, so the
+            // loop above observed every window in which A could have published.
+            b_terminal = Some(snap);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    assert!(saw_b_running, "B must have been observed mid-sweep");
+    let done = b_terminal.expect("B never reached a terminal state within the deadline");
+    assert_eq!(done["requested_points_pct"], serde_json::json!([80]));
+    assert_eq!(done["run_id"], b_id, "{done}");
+
+    // And a late write from A is still refused after everything has settled.
+    let (recheck, after) = uds_get(&path, "/diagnostics/characterization").await;
+    assert_eq!(recheck, 200);
+    assert_eq!(
+        after["run_id"], b_id,
+        "a late write from A must still be refused: {after}"
+    );
+    assert!(
+        !after["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("superseded"),
+        "a late write from A must still be refused: {after}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// [SAFETY] `expire_verify_claim_for_test` must stay test-only, and this is what
+/// makes that a rule rather than a request.
+///
+/// It is an ungated `pub fn` compiled into the production binary, and calling it
+/// does two things: it un-pauses the profile engine's write phase while a
+/// diagnostic is still driving a header, and it makes the single-flight slot
+/// stealable — which the `run_id` fence makes safe for characterisation only,
+/// since the hwmon verify, the GPU verify and calibrate share that slot with no
+/// run id to fence on. Nothing under `daemon/src/` may call it.
+///
+/// Matched in **call position** (`.expire_verify_claim_for_test(`), not as a bare
+/// substring: the definition and its own doc comment name it, and a substring
+/// scan would match those and be permanently red. Same trap as the `polling.rs`
+/// self-scanning guard recorded in `CLAUDE.md`.
+#[test]
+fn the_verify_deadman_test_seam_has_no_production_caller() {
+    let mut offenders = Vec::new();
+    let mut stack = vec![std::path::PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src"
+    ))];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("daemon/src must be readable") {
+            let path = entry.expect("readable dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let body = std::fs::read_to_string(&path).expect("readable source file");
+                if body.contains(".expire_verify_claim_for_test(") {
+                    offenders.push(path);
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "`expire_verify_claim_for_test` is a test-only seam and must have no \
+         production caller, but it is called from: {offenders:?}"
+    );
 }
 
 #[tokio::test]

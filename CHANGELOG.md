@@ -1,5 +1,31 @@
 # Changelog
 
+## [Unreleased]
+
+**Tests only, plus one `#[doc(hidden)]` test seam — no behaviour change.** Batch D of the
+`/ofc:audit` register triage (DEC-324); the daemon's share is `AUD2-i`.
+
+### Added
+- **The characterisation `run_id` fence has a regression test that can actually fail**
+  (`AUD2-i`). The fence stops a superseded sweep publishing its points, its state and its
+  `detail` over the run that replaced it. The test named for it awaited a terminal state
+  before starting the second run, so the two never coexisted and both fences could be deleted
+  with it green; its docstring now says so and points at the new test. The new one supersedes
+  a live run through the DEC-296 expired-deadman steal — the only door through which two runs
+  can coexist — and asserts an invariant across *both* sweeps, because the damage repairs
+  itself: run B's own terminal write restores `state` and `points`, so an end-state snapshot
+  passes with both fences removed. Verified by removing each fence independently and requiring
+  the test to go red.
+- `StateCache::expire_verify_claim_for_test()` — `#[doc(hidden)]`, called only by that test,
+  following the existing `persist_for_test` / `rollback_for_test` precedent. It stamps a live
+  claim's deadman as elapsed so the steal branch is reachable without waiting out the real 30 s
+  window. No production read path changes and `VERIFY_PAUSE_DEADMAN` remains a literal constant
+  at all three of its call sites. Recorded as register row `324-a`.
+- `the_verify_deadman_test_seam_has_no_production_caller` — a source scan asserting nothing
+  under `daemon/src/` calls that seam, matched in *call position* rather than as a substring
+  so it does not match the definition or its own doc comment. It replaces a comment that
+  merely asked for the same thing, and is itself verified by planting a caller.
+
 ## [2.35.1] — 2026-09-04
 
 Pairs with `control-ofc-gui` >= v2.23.0 (unchanged floor). **Three P2 fixes from the

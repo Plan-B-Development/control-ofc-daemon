@@ -543,6 +543,53 @@ impl StateCache {
         true
     }
 
+    /// Test-only: stamp the live claim's deadman as already elapsed, so the
+    /// next [`try_begin_verify`](Self::try_begin_verify) takes the DEC-296
+    /// steal branch instead of returning `None`.
+    ///
+    /// The steal is the only way two characterisation runs can ever coexist,
+    /// and coexistence is the only thing that exercises the `run_id` fence in
+    /// `hwmon_ctl.rs` — the fence that stops a superseded run publishing its
+    /// points and its terminal state over the run that replaced it. The real
+    /// window is [`VERIFY_PAUSE_DEADMAN`](crate::constants::VERIFY_PAUSE_DEADMAN)
+    /// (30 s), which no test can wait out, and integration tests live in a
+    /// separate crate so `#[cfg(test)]` is invisible to them. Register row
+    /// `AUD2-i`.
+    ///
+    /// Deliberately narrower than making the window itself configurable: no
+    /// production read path changes, and the constant stays a constant at all
+    /// three of its call sites.
+    ///
+    /// **What a stray call would actually do — stated precisely, because an
+    /// earlier version of this comment understated it in both directions and a
+    /// wrong safety argument is the only thing guarding an ungated `pub fn`.**
+    /// It has two effects, not one. (1) [`verify_active`](Self::verify_active)
+    /// goes false immediately, which **un-pauses the profile engine's write
+    /// phase with no competitor involved at all** — the engine would then
+    /// overwrite a live diagnostic's test duty and falsify its verdict.
+    /// (2) The slot becomes stealable. The `run_id` fence makes that safe *only
+    /// for characterisation*: `hwmon_verify_handler`, the GPU verify and
+    /// calibrate share this same slot and have no run id to fence on, so a steal
+    /// there force-takes their lease and can strand a header at a test duty.
+    ///
+    /// Neither reduces the thermal emergency's reach: `force_all_with_floor`
+    /// runs at `profile_engine/mod.rs:1247` and `continue`s well before the
+    /// `verify_active()` gate at `:1360`, so the pause never gated the ladder
+    /// (DEC-297), and un-pausing early only returns the engine to writing
+    /// sooner. It sets no state a subsequent claim does not overwrite, and the
+    /// `verify_in_progress` guard makes a call with no live claim a no-op.
+    ///
+    /// It is called only from `daemon/tests/ipc_integration.rs`, which
+    /// `the_verify_deadman_test_seam_has_no_production_caller` enforces rather
+    /// than merely asks for.
+    #[doc(hidden)]
+    pub fn expire_verify_claim_for_test(&self) {
+        let mut state = self.inner.write();
+        if state.verify_in_progress {
+            state.verify_active_until = Some(Instant::now());
+        }
+    }
+
     /// True while a hardware verify is in progress — held for the verify's
     /// entire lifetime by the handler's RAII guard, and bounded by the deadman
     /// backstop so a leaked guard cannot pause the engine indefinitely.
