@@ -11,6 +11,11 @@
 //!   cannot expose an empty file (which is the classic ext4/btrfs failure
 //!   mode for `write + rename` without fsync). The parent directory is also
 //!   fsynced after rename so the rename itself is durable.
+//! - **Two writers racing on the same destination** (AUD3-b) — each call gets
+//!   its own uniquely named scratch file, so neither can truncate the other's
+//!   partial content and rename a hybrid document into place. Which writer wins
+//!   the destination is still a race (that is `AIO1-d`, serialised by the
+//!   `/config/*` write lock), but the winner's document is always whole.
 //!
 //! `std::fs::write` alone does NOT provide either guarantee — it returns as
 //! soon as the kernel has buffered the write, before any data hits the disk.
@@ -23,9 +28,11 @@
 //! "tmp + fsync + rename + dir fsync" pattern documented by Dan Luu and the
 //! `atomic-write-file` crate.
 
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Atomically write `bytes` to `path` with crash safety guarantees.
 ///
@@ -38,16 +45,47 @@ use std::path::{Path, PathBuf};
 /// call sites in `daemon_state.rs` and `runtime_config.rs`). The parent
 /// directory must exist — callers create it explicitly so they can report
 /// dir-creation failures distinctly from write failures.
+///
+/// **Concurrency (AUD3-b).** The temp file is uniquely named per call, so two
+/// concurrent writers to the same destination never share a scratch file. Each
+/// still races to `rename(2)`, so the *last* writer wins the destination — a
+/// lost update, which is `AIO1-d`'s problem and is serialised by the
+/// `/config/*` write lock — but neither can any longer truncate the other's
+/// half-written scratch file and publish a hybrid document.
+///
+/// A caller therefore no longer needs a private lock *for corruption*. It may
+/// still need one for **ordering** — `validation::recorder::save_lock` is kept
+/// for exactly that (a stale `recording` flush must not rename over a
+/// `completed` document), so do not read this note as licence to remove it.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = tmp_path_for(path);
+    match write_via_tmp(&tmp, path, bytes) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Best-effort cleanup on EVERY failure, not just a failed rename.
+            // A unique temp name is what makes this necessary: the old fixed
+            // `{path}.tmp` was self-limiting because the next write truncated
+            // whatever a failed one left behind, so at most one stale file
+            // existed per destination. Unique names remove that ceiling, and a
+            // leak per failed write would be a new defect introduced by the fix.
+            // A crash between create and rename can still leak one file — that
+            // is the residual case, and it is bounded by hard-kill frequency.
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
 
+/// Steps 1-4 of the write. Split out of [`write_atomic`] so a failure at *any*
+/// step unwinds through one cleanup path rather than four early returns.
+fn write_via_tmp(tmp: &Path, path: &Path, bytes: &[u8]) -> Result<(), String> {
     // 1. Write the temp file and fsync its data + metadata before
     //    dropping the descriptor. sync_all() is fsync(2), not fdatasync —
     //    it covers both data and metadata, which is what we want before
     //    the file becomes durable under another name.
     {
         let mut f =
-            File::create(&tmp).map_err(|e| format!("create tmp file '{}': {e}", tmp.display()))?;
+            File::create(tmp).map_err(|e| format!("create tmp file '{}': {e}", tmp.display()))?;
         f.write_all(bytes)
             .map_err(|e| format!("write tmp file '{}': {e}", tmp.display()))?;
         f.sync_all()
@@ -59,20 +97,14 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+        std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(0o600))
             .map_err(|e| format!("set permissions on '{}': {e}", tmp.display()))?;
     }
 
-    // 3. POSIX-atomic rename. On failure, best-effort clean up the temp
-    //    file so a future save isn't blocked by a stale `.tmp` sibling.
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!(
-            "rename '{}' to '{}': {e}",
-            tmp.display(),
-            path.display()
-        ));
-    }
+    // 3. POSIX-atomic rename. The temp file ceases to exist under its own name
+    //    on success, so the caller's cleanup only ever fires on failure.
+    std::fs::rename(tmp, path)
+        .map_err(|e| format!("rename '{}' to '{}': {e}", tmp.display(), path.display()))?;
 
     // 4. fsync the parent directory so the rename itself is durable. The
     //    file content is already on disk; if we skip this and the box loses
@@ -125,13 +157,39 @@ pub fn create_dir_private(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// A unique, hidden scratch path beside `path` (AUD3-b).
+///
+/// **This used to be a fixed `{path}.tmp`, and that was the defect.**
+/// [`write_atomic`] opens it with `File::create`, which *truncates* — so two
+/// writers to the same destination shared one scratch file and could each
+/// overwrite the other's partial content, then rename the hybrid into place.
+/// `validation::recorder` documented that hazard and guarded it with a private
+/// save lock; the other four call sites (`runtime_config`, `daemon_state`,
+/// `profile_store`, `validation::store`) did not, and could not reasonably be
+/// expected to — a helper that creates a hazard every caller must independently
+/// know about is the broken abstraction of DEC-276. Uniqueness belongs here, so
+/// that all five call sites are fixed at once and a sixth cannot reintroduce it.
+///
+/// Shape: `.{filename}.tmp.{pid}.{counter}`. The **pid** separates two processes
+/// writing the same path (a daemon and a test binary, or an old and a new daemon
+/// mid-restart); the **counter** separates two threads or tasks inside one
+/// process. `Relaxed` is sufficient and is not a shortcut: `fetch_add` is a
+/// read-modify-write, so every caller observes a distinct value in the atomic's
+/// modification order regardless of ordering — ordering would only matter if the
+/// counter published *other* memory, and it does not.
+///
+/// The leading dot mirrors the GUI's twin helper (`paths.py::atomic_write`, which
+/// uses `mkstemp(prefix=".")`) and keeps a leaked scratch file out of a plain
+/// directory listing. Both directory readers in this crate filter on a `.json`
+/// extension, so neither the old name nor this one can be mistaken for content.
 fn tmp_path_for(path: &Path) -> PathBuf {
-    // Append `.tmp` literally so `daemon_state.json` → `daemon_state.json.tmp`
-    // and `runtime.toml` → `runtime.toml.tmp`, matching the prior call
-    // sites' behaviour.
-    let mut s = path.as_os_str().to_owned();
-    s.push(".tmp");
-    s.into()
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let mut name = OsString::from(".");
+    name.push(path.file_name().unwrap_or_default());
+    name.push(format!(".tmp.{}.{n}", std::process::id()));
+    path.with_file_name(name)
 }
 
 #[cfg(unix)]
@@ -231,6 +289,17 @@ mod tests {
         assert_eq!(content, b"hello");
     }
 
+    /// Every entry in `dir`, including dotfiles — the scratch files are hidden,
+    /// so a listing that skips them would assert nothing (AUD3-b).
+    fn entries(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
     #[test]
     fn does_not_leave_tmp_file_after_successful_write() {
         let tmp = tempfile::tempdir().unwrap();
@@ -238,11 +307,11 @@ mod tests {
 
         write_atomic(&path, b"data").unwrap();
 
-        let tmp_sibling = tmp.path().join("file.txt.tmp");
-        assert!(
-            !tmp_sibling.exists(),
-            "tmp sibling should be removed by rename"
-        );
+        // Assert the realised directory contents rather than the absence of one
+        // computed name: the scratch name is now unique, so a test that rebuilt
+        // it here would be re-deriving production's naming rule and would share
+        // its blind spot (DEC-320's lesson).
+        assert_eq!(entries(tmp.path()), vec!["file.txt".to_string()]);
     }
 
     #[test]
@@ -343,27 +412,122 @@ mod tests {
         let err = write_atomic(&dst_dir, b"y").unwrap_err();
         assert!(err.contains("rename"), "expected rename error, got: {err}");
 
-        let tmp_sibling = {
-            let mut s = dst_dir.as_os_str().to_owned();
-            s.push(".tmp");
-            PathBuf::from(s)
-        };
-        assert!(
-            !tmp_sibling.exists(),
-            "tmp sibling should be cleaned up on rename failure"
+        // Only the destination directory remains — no scratch sibling. Checked
+        // by listing rather than by rebuilding the (now unique) scratch name.
+        assert_eq!(entries(tmp.path()), vec!["dst".to_string()]);
+    }
+
+    #[test]
+    fn a_failed_write_leaves_no_scratch_file() {
+        // The cleanup used to fire only on a failed *rename*. With a fixed
+        // scratch name that was survivable — the next write truncated whatever
+        // was left. With unique names it would leak one file per failed write,
+        // so cleanup has to cover every failure step. Step 2 (set_permissions)
+        // is the one reachable from a test: make the parent read-only after the
+        // scratch file exists and... it is not, portably. Use the step-3 path,
+        // which shares the single cleanup arm, and additionally assert the
+        // *count* stays flat across repeated failures — that is what a per-call
+        // leak would break and a single-shot assertion would not.
+        let tmp = tempfile::tempdir().unwrap();
+        let dst_dir = tmp.path().join("dst");
+        std::fs::create_dir(&dst_dir).unwrap();
+        std::fs::write(dst_dir.join("blocker"), "x").unwrap();
+
+        for _ in 0..5 {
+            write_atomic(&dst_dir, b"y").unwrap_err();
+        }
+
+        assert_eq!(
+            entries(tmp.path()),
+            vec!["dst".to_string()],
+            "each failed write must clean up its own scratch file"
         );
     }
 
     #[test]
-    fn tmp_path_is_sibling_of_destination() {
-        let p = tmp_path_for(Path::new("/var/lib/control-ofc/daemon_state.json"));
-        assert_eq!(
-            p,
-            PathBuf::from("/var/lib/control-ofc/daemon_state.json.tmp")
-        );
+    fn tmp_path_is_a_hidden_sibling_of_destination() {
+        // The rename must stay within one filesystem, so the scratch file has to
+        // be a sibling. Asserted as a relationship, not as a literal name — the
+        // name now carries a pid and a counter.
+        for dst in [
+            "/var/lib/control-ofc/daemon_state.json",
+            "/var/lib/control-ofc/runtime.toml",
+        ] {
+            let dst = Path::new(dst);
+            let p = tmp_path_for(dst);
+            assert_eq!(p.parent(), dst.parent(), "scratch file must be a sibling");
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            let stem = dst.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(
+                name.starts_with(&format!(".{stem}.tmp.")),
+                "scratch name should be a hidden, traceable derivative of the \
+                 destination, got: {name}"
+            );
+            // Neither directory reader in this crate may mistake it for content:
+            // both filter on a `.json` extension.
+            assert_ne!(p.extension().and_then(|e| e.to_str()), Some("json"));
+        }
+    }
 
-        let p = tmp_path_for(Path::new("/var/lib/control-ofc/runtime.toml"));
-        assert_eq!(p, PathBuf::from("/var/lib/control-ofc/runtime.toml.tmp"));
+    #[test]
+    fn tmp_paths_are_unique_per_call() {
+        // The defect (AUD3-b): a fixed name meant two concurrent writers shared
+        // one scratch file, and `File::create` truncates — so one could publish
+        // a document half-overwritten by the other. Uniqueness is the fix, and
+        // it is asserted here directly because the corruption it prevents is
+        // only reachable through a race.
+        let dst = Path::new("/var/lib/control-ofc/runtime.toml");
+        let a = tmp_path_for(dst);
+        let b = tmp_path_for(dst);
+        assert_ne!(a, b, "two calls must not share a scratch path");
+    }
+
+    #[test]
+    fn concurrent_writers_never_publish_a_hybrid_document() {
+        // The call-site test for the property above: many threads writing
+        // distinct, distinguishable payloads to ONE destination. Whoever wins
+        // the rename is a race (that is `AIO1-d`), but the published bytes must
+        // always be exactly one writer's whole payload — never a mixture, never
+        // short. Asserts the realised artefact on disk, not a re-derivation of
+        // the naming rule.
+        //
+        // Payloads differ in length as well as content, because the original
+        // defect's signature is a long document with a shorter one written over
+        // its head — which a same-length check would miss.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("runtime.toml");
+        const WRITERS: usize = 8;
+        let payloads: Vec<Vec<u8>> = (0..WRITERS)
+            .map(|i| vec![b'a' + i as u8; 1024 * (i + 1)])
+            .collect();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS));
+        std::thread::scope(|scope| {
+            for payload in &payloads {
+                let barrier = barrier.clone();
+                let path = &path;
+                scope.spawn(move || {
+                    barrier.wait();
+                    // A loser's rename can fail if its scratch file is gone; the
+                    // point of the test is the published bytes, not the verdict.
+                    let _ = write_atomic(path, payload);
+                });
+            }
+        });
+
+        let published = std::fs::read(&path).unwrap();
+        assert!(
+            payloads.contains(&published),
+            "published document is not any single writer's payload: {} bytes \
+             starting {:?}",
+            published.len(),
+            &published[..published.len().min(8)]
+        );
+        assert_eq!(
+            entries(tmp.path()),
+            vec!["runtime.toml".to_string()],
+            "no scratch file may survive a concurrent write"
+        );
     }
 
     #[test]

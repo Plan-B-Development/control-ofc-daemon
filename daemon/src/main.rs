@@ -298,7 +298,9 @@ use control_ofc_daemon::hwmon::pwm_control::{HwmonPwmController, RealSysfsWriter
 use control_ofc_daemon::hwmon::pwm_discovery::discover_pwm_headers;
 use control_ofc_daemon::hwmon::HWMON_SYSFS_ROOT;
 use control_ofc_daemon::profile::{self, DaemonProfile};
-use control_ofc_daemon::runtime_config::{RuntimeConfig, RUNTIME_CONFIG_FILE};
+use control_ofc_daemon::runtime_config::{
+    LoadPhase, RuntimeConfig, RuntimeConfigDegraded, RUNTIME_CONFIG_FILE,
+};
 use control_ofc_daemon::safety::ThermalSafetyRule;
 use control_ofc_daemon::serial::controller::FanController;
 use control_ofc_daemon::serial::real_transport::{auto_detect_port, RealSerialTransport};
@@ -582,10 +584,22 @@ fn apply_config_reload(
     config_path: &str,
     runtime_config_path: &Path,
     profile_search_dirs: &parking_lot::RwLock<Vec<std::path::PathBuf>>,
+    degraded: &parking_lot::RwLock<Option<RuntimeConfigDegraded>>,
 ) -> Result<Vec<std::path::PathBuf>, String> {
     let mut new_config =
         DaemonConfig::load(config_path).map_err(|e| format!("config reload failed: {e}"))?;
-    let new_runtime = RuntimeConfig::load_from(runtime_config_path);
+    // `AUD3-m`: a reload that cannot parse `runtime.toml` re-applies DEFAULTS to
+    // the running config, exactly as the boot load does. Narrower in effect —
+    // only `profile_search_dirs` is committed below, so header roles keep
+    // whatever boot established — but it is the same silent degradation on the
+    // same surface, so it is reported rather than left in the journal. Latest
+    // wins; a successful reload does not clear an earlier startup degradation,
+    // because the keys that one dropped are consumed once at boot.
+    let (new_runtime, problem) =
+        RuntimeConfig::load_from_reporting(runtime_config_path, LoadPhase::Reload);
+    if problem.is_some() {
+        *degraded.write() = problem;
+    }
     apply_runtime_overlay(&mut new_config, &new_runtime, config_path);
     let new_dirs = with_store_dir(
         new_config
@@ -1311,7 +1325,23 @@ async fn async_main() {
     // shadow the admin-owned daemon.toml (NetworkManager-intern pattern — ADR-002).
     let runtime_config_path =
         std::path::PathBuf::from(&config.state.state_dir).join(RUNTIME_CONFIG_FILE);
-    let runtime_cfg = RuntimeConfig::load_from(&runtime_config_path);
+    // [SAFETY] `AUD3-m`: capture *why* a load fell back to defaults, not just
+    // the defaults. This is the load that seeds `header_roles`, so a silent
+    // failure here removes every user-assigned pump role's 30% floor — and until
+    // this was reported on `/status`, a single `warn!` was the only trace.
+    let (runtime_cfg, runtime_cfg_degraded) =
+        RuntimeConfig::load_from_reporting(&runtime_config_path, LoadPhase::Startup);
+    if let Some(ref d) = runtime_cfg_degraded {
+        log::error!(
+            "Runtime config at {} is {} ({}) — the daemon is running on DEFAULTS. \
+             User-assigned header roles are NOT in effect, so any pump 30% floor \
+             set via POST /config/header-role is not applied. Reported on /status \
+             as runtime_config_degraded.",
+            d.path,
+            d.reason,
+            d.detail
+        );
+    }
     apply_runtime_overlay(&mut config, &runtime_cfg, &config_path);
 
     // Pre-flight: verify we can bind the IPC socket and write to state_dir
@@ -1614,6 +1644,10 @@ async fn async_main() {
         // warm. The rollup Arc is shared with the AssessmentCache (its store keeps
         // this poll mirror in lockstep with the full snapshot).
         readiness_rollup: readiness_rollup.clone(),
+        config_write: Default::default(),
+        // `AUD3-m`: seeded from the boot load above, and updated by the SIGHUP
+        // reload path. Never cleared — see the field's doc.
+        runtime_config_degraded: Arc::new(parking_lot::RwLock::new(runtime_cfg_degraded)),
         assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
             readiness_rollup,
         )),
@@ -1910,6 +1944,7 @@ async fn async_main() {
                     &config_path,
                     &runtime_config_path,
                     &app_state.profile_search_dirs,
+                    &app_state.runtime_config_degraded,
                 ) {
                     log::error!("{e}");
                 }
@@ -3611,8 +3646,12 @@ search_dirs = ["/custom/profiles", "/other/profiles"]
 
         let search_dirs = parking_lot::RwLock::new(vec![PathBuf::from("/old/path")]);
 
-        let result =
-            apply_config_reload(config_path.to_str().unwrap(), &runtime_path, &search_dirs);
+        let result = apply_config_reload(
+            config_path.to_str().unwrap(),
+            &runtime_path,
+            &search_dirs,
+            &parking_lot::RwLock::new(None),
+        );
         assert!(result.is_ok());
 
         let dirs = search_dirs.read().clone();
@@ -3625,6 +3664,79 @@ search_dirs = ["/custom/profiles", "/other/profiles"]
                 PathBuf::from("/custom/profiles"),
                 PathBuf::from("/other/profiles"),
             ]
+        );
+    }
+
+    #[test]
+    fn a_reload_that_cannot_parse_runtime_toml_records_the_degradation() {
+        // `AUD3-m`, at the CALL SITE rather than on the helper. `load_from_reporting`
+        // is unit-tested in `runtime_config`, but a helper that returns a value
+        // nothing stores is a rule with no consumer — `CLAUDE.md`'s #1 recurring
+        // lesson. This drives the real `apply_config_reload` and asserts the
+        // shared cell the `/status` builder reads.
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("daemon.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let runtime_path = tmp.path().join("runtime.toml");
+        std::fs::write(
+            &runtime_path,
+            "[polling]\npoll_interval_ms = 900\n[garbage\n",
+        )
+        .unwrap();
+
+        let search_dirs = parking_lot::RwLock::new(vec![]);
+        let degraded = parking_lot::RwLock::new(None);
+
+        // The reload still SUCCEEDS — degrading to defaults rather than refusing
+        // is deliberate, and this asserts the fix did not quietly change that.
+        apply_config_reload(
+            config_path.to_str().unwrap(),
+            &runtime_path,
+            &search_dirs,
+            &degraded,
+        )
+        .expect("a corrupt runtime.toml must not fail the reload");
+
+        let d = degraded
+            .read()
+            .clone()
+            .expect("the degradation is recorded");
+        assert_eq!(d.reason, "malformed");
+        assert_eq!(d.phase, "reload");
+    }
+
+    #[test]
+    fn a_clean_reload_does_not_clear_an_earlier_startup_degradation() {
+        // Sticky, deliberately. A successful reload repairs nothing that a failed
+        // STARTUP load cost: nearly every runtime-mutable key is consumed once at
+        // boot, so the daemon is still running on defaults for those. Clearing
+        // here would claim a recovery that did not happen.
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("daemon.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let runtime_path = tmp.path().join("runtime.toml");
+        RuntimeConfig::default().save_to(&runtime_path).unwrap();
+
+        let search_dirs = parking_lot::RwLock::new(vec![]);
+        let degraded = parking_lot::RwLock::new(Some(RuntimeConfigDegraded {
+            reason: "malformed".into(),
+            path: runtime_path.display().to_string(),
+            detail: "expected `]`".into(),
+            phase: "startup".into(),
+        }));
+
+        apply_config_reload(
+            config_path.to_str().unwrap(),
+            &runtime_path,
+            &search_dirs,
+            &degraded,
+        )
+        .unwrap();
+
+        assert_eq!(
+            degraded.read().as_ref().map(|d| d.phase.clone()),
+            Some("startup".to_string()),
+            "a clean reload must not erase what the startup load lost"
         );
     }
 
@@ -3652,8 +3764,12 @@ search_dirs = ["/etc/control-ofc/profiles"]
 
         let search_dirs = parking_lot::RwLock::new(vec![]);
 
-        let result =
-            apply_config_reload(config_path.to_str().unwrap(), &runtime_path, &search_dirs);
+        let result = apply_config_reload(
+            config_path.to_str().unwrap(),
+            &runtime_path,
+            &search_dirs,
+            &parking_lot::RwLock::new(None),
+        );
         assert!(result.is_ok());
 
         let dirs = search_dirs.read().clone();
@@ -3678,8 +3794,12 @@ search_dirs = ["/etc/control-ofc/profiles"]
         let runtime_path = tmp.path().join("runtime.toml");
         let search_dirs = parking_lot::RwLock::new(vec![PathBuf::from("/should/stay")]);
 
-        let result =
-            apply_config_reload(config_path.to_str().unwrap(), &runtime_path, &search_dirs);
+        let result = apply_config_reload(
+            config_path.to_str().unwrap(),
+            &runtime_path,
+            &search_dirs,
+            &parking_lot::RwLock::new(None),
+        );
         assert!(result.is_err());
 
         // Original dirs should be untouched

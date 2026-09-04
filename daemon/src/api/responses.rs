@@ -56,6 +56,25 @@ pub struct StatusResponse {
     /// whatever they render for "no value", which is what they already did.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub control_outputs: Vec<ControlOutputEntry>,
+    /// Set when this daemon's `runtime.toml` could not be read or parsed and it
+    /// fell back to **defaults** (`AUD3-m`, daemon >= 2.34.0).
+    ///
+    /// [SAFETY] `RuntimeConfig::default()` carries no `header_roles`, so a
+    /// `phase: "startup"` degradation means every user-assigned pump role is
+    /// gone — no 30% floor, no stop exemption, no pump-safe identify — on
+    /// exactly the boards (no `pwmN_label` files) where a user assignment is the
+    /// only evidence a header drives a pump. Until this field there was no
+    /// endpoint on which that was visible; it was one `warn!` in the journal.
+    ///
+    /// Omitted when the config loaded cleanly, so the common-case wire shape is
+    /// unchanged (additive) and an older daemon's omission reads the same as
+    /// "fine" — which is the safe direction, since it is exactly the (absent)
+    /// warning such a daemon shows today. A **missing** `runtime.toml` is not a
+    /// degradation: that is first boot, and defaults are the right answer.
+    ///
+    /// Sticky for the daemon's lifetime — see `AppState::runtime_config_degraded`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_config_degraded: Option<crate::runtime_config::RuntimeConfigDegraded>,
     /// The current or most recent validation session, in miniature (AIO-MB
     /// Phase 5). Rides the poll so a client's live panel needs no second
     /// request — the DEC-316 static-vs-dynamic split, applied again: the
@@ -2030,6 +2049,7 @@ mod tests {
             unavailable_sensors: Vec::new(),
             skipped_controls: Vec::new(),
             control_outputs: Vec::new(),
+            runtime_config_degraded: None,
             validation_session: None,
             active_profile_id: None,
             active_profile_name: None,
@@ -2074,6 +2094,7 @@ mod tests {
             unavailable_sensors: Vec::new(),
             skipped_controls: Vec::new(),
             control_outputs: Vec::new(),
+            runtime_config_degraded: None,
             validation_session: None,
             active_profile_id: None,
             active_profile_name: None,
@@ -2114,6 +2135,7 @@ mod tests {
             unavailable_sensors: Vec::new(),
             skipped_controls: Vec::new(),
             control_outputs: Vec::new(),
+            runtime_config_degraded: None,
             validation_session: None,
             active_profile_id: None,
             active_profile_name: None,
@@ -2147,6 +2169,7 @@ mod tests {
                 skipped_for_ms: 9000,
             }],
             control_outputs: Vec::new(),
+            runtime_config_degraded: None,
             validation_session: None,
             active_profile_id: None,
             active_profile_name: None,
@@ -2180,6 +2203,7 @@ mod tests {
             }],
             skipped_controls: Vec::new(),
             control_outputs: Vec::new(),
+            runtime_config_degraded: None,
             validation_session: None,
             active_profile_id: None,
             active_profile_name: None,

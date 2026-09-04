@@ -1263,6 +1263,8 @@ mod tests {
             allow_port_probe: false,
             running_config: Default::default(),
             readiness_rollup: readiness_rollup.clone(),
+            config_write: Default::default(),
+            runtime_config_degraded: Default::default(),
             assessment: Arc::new(crate::api::handlers::AssessmentCache::new(readiness_rollup)),
         });
         (state, writes, shutdown_tx, tmp)

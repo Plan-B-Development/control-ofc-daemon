@@ -220,6 +220,22 @@ pub async fn update_profile_search_dirs_handler(
     // peer-uid confinement of activation (a change to the pre-existing activation
     // path), deferred as out of Wave-2 scope.
 
+    // Persist first. On failure, leave in-memory state alone and return 503
+    // so the caller sees a durable, actionable error rather than a silent
+    // drift between in-memory and on-disk state.
+    let (_config_guard, mut runtime) = match runtime_for_update(&state).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    // [AIO1-d] The merge base is read INSIDE the guard, and that ordering is the
+    // whole fix for this route. This is the only one of the twelve whose
+    // persisted value is derived from shared mutable state rather than from the
+    // request body: `add`/`remove` are a delta applied to the *current* list. Read
+    // before the lock, two concurrent callers both merge onto the same stale base
+    // and the second silently discards the first's directory — the exact lost
+    // update the lock exists to remove, surviving inside it. Pinned by
+    // `concurrent_search_dir_edits_are_not_lost`.
     let current: Vec<String> = {
         let dirs = state.profile_search_dirs.read();
         dirs.iter().map(|p| p.display().to_string()).collect()
@@ -233,14 +249,6 @@ pub async fn update_profile_search_dirs_handler(
         Err(msg) => {
             return error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(msg));
         }
-    };
-
-    // Persist first. On failure, leave in-memory state alone and return 503
-    // so the caller sees a durable, actionable error rather than a silent
-    // drift between in-memory and on-disk state.
-    let mut runtime = match runtime_for_update(&state) {
-        Ok(r) => r,
-        Err(resp) => return resp,
     };
     runtime.set_profile_search_dirs(merged.clone());
     // DEC-252/255: fsync off the async worker threads the engine shares.
@@ -299,7 +307,7 @@ pub async fn update_startup_delay_handler(
         }
     };
 
-    let mut runtime = match runtime_for_update(&state) {
+    let (_config_guard, mut runtime) = match runtime_for_update(&state).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -420,7 +428,7 @@ pub async fn update_header_role_handler(
         }
     }
 
-    let mut runtime = match runtime_for_update(&state) {
+    let (_config_guard, mut runtime) = match runtime_for_update(&state).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -463,6 +471,27 @@ pub async fn update_header_role_handler(
             .map(|r| r.as_str())
             .unwrap_or("<cleared, detected role applies>")
     );
+
+    // [AIO1-d] Release the config lock BEFORE building the response. Everything
+    // it guards — the load, the persist and both in-memory commits — is done.
+    //
+    // This is not tidiness. `resolved_header_role` below reaches
+    // `AppState::header_role_parts`, which takes `hwmon_controller` — the one
+    // lock the profile engine holds across a blocking sysfs write (DEC-278/289).
+    // Reading it while still holding `config_write` would park EVERY `/config/*`
+    // write route behind a wedged header instead of just this request, and would
+    // stack a third lock onto a pair that `header_role_parts` already documents
+    // as ABBA-sensitive. On the `role: null` clear path this is the only
+    // `hwmon_controller` acquisition in the handler, so the pre-lock validation
+    // above does not cover it.
+    //
+    // The cost of dropping early is that a concurrent setter could change the
+    // resolution between here and the read, so `effective_role` reports the live
+    // answer rather than a snapshot of ours. That is a *report*, never a safety
+    // decision, and the live answer is the more useful one. The alternative —
+    // recomputing the resolution locally from `new_role` — was rejected: it would
+    // duplicate a safety-adjacent rule that DEC-312 deliberately keeps in one place.
+    drop(_config_guard);
 
     (
         StatusCode::OK,
@@ -526,7 +555,7 @@ async fn set_preferred_sensor(
     }
 
     // Persist-first, matching the sibling config handlers.
-    let mut runtime = match runtime_for_update(state) {
+    let (_config_guard, mut runtime) = match runtime_for_update(state).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -850,16 +879,45 @@ pub async fn get_config_handler(
     )
 }
 
-/// Load runtime.toml for a setter, converting an unreadable existing file into a
-/// 503 rather than letting the write erase it (DEC-252).
+/// Take the `/config/*` write lock, then load runtime.toml for a setter —
+/// converting an unreadable existing file into a 503 rather than letting the
+/// write erase it (DEC-252).
 ///
-/// Every `POST /config/*` is load → mutate one key → save. Without this the
-/// fallback-to-defaults inside `load_from` turns a failed read into a permanent
-/// overwrite of every other setting.
-fn runtime_for_update(
+/// Every `POST`/`DELETE /config/*` is load → mutate one key → save → commit.
+/// Without the DEC-252 half, the fallback-to-defaults inside `load_from` turns a
+/// failed read into a permanent overwrite of every other setting.
+///
+/// # The returned guard is load-bearing (`AIO1-d`)
+///
+/// The lock is acquired **here**, before the load, and the caller must hold the
+/// returned guard until it has finished persisting *and* committing. That is
+/// what makes the read-modify-write atomic against a second setter: without it,
+/// two handlers load the same base, and the later `save_to` wins the file while
+/// the later in-memory commit wins the cache — with **both** answering
+/// `updated: true`. Losing a `header_roles` edit that way drops a pump's 30%
+/// floor at the next restart, and since DEC-316 the GUI opens that window during
+/// one ordinary Configure-AIO action (`/config/header-role` then
+/// `/config/cooling-device`, back to back).
+///
+/// Binding it as `_config_guard` — a named binding, **never** a bare `_` — is
+/// what keeps it alive to the end of the handler. A bare `_` drops it
+/// immediately and silently restores the race. Two route tests in
+/// `daemon/tests/ipc_integration.rs` are what catch that, and both were verified
+/// to fail under exactly that mutation:
+/// `concurrent_config_setters_do_not_lose_an_edit` and
+/// `a_cooling_device_write_never_drops_a_concurrent_header_role`.
+///
+/// Handing the guard back from the same call that does the load is deliberate:
+/// it means a new setter cannot acquire the config without acquiring the lock,
+/// so the rule does not depend on the next author reading this comment
+/// (`CLAUDE.md` — a rule that lives inside one consumer is a rule the others
+/// cannot follow).
+async fn runtime_for_update(
     state: &AppState,
-) -> Result<RuntimeConfig, (StatusCode, Json<serde_json::Value>)> {
-    RuntimeConfig::load_for_update(&state.runtime_config_path).map_err(|e| {
+) -> Result<(tokio::sync::MutexGuard<'_, ()>, RuntimeConfig), (StatusCode, Json<serde_json::Value>)>
+{
+    let guard = state.config_write.lock().await;
+    let cfg = RuntimeConfig::load_for_update(&state.runtime_config_path).map_err(|e| {
         log::error!("{e}");
         error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -867,7 +925,8 @@ fn runtime_for_update(
                 "existing runtime configuration could not be read; refusing to overwrite it",
             ),
         )
-    })
+    })?;
+    Ok((guard, cfg))
 }
 
 /// Shared persist-and-report tail for the DEC-243 setters.
@@ -947,7 +1006,7 @@ pub async fn update_poll_interval_handler(
             );
         }
     };
-    let mut runtime = match runtime_for_update(&state) {
+    let (_config_guard, mut runtime) = match runtime_for_update(&state).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -1012,7 +1071,7 @@ pub async fn update_serial_port_handler(
             );
         }
     };
-    let mut runtime = match runtime_for_update(&state) {
+    let (_config_guard, mut runtime) = match runtime_for_update(&state).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -1046,7 +1105,7 @@ pub async fn update_serial_timeout_handler(
             );
         }
     };
-    let mut runtime = match runtime_for_update(&state) {
+    let (_config_guard, mut runtime) = match runtime_for_update(&state).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -1083,7 +1142,7 @@ pub async fn update_allow_port_probe_handler(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let mut runtime = match runtime_for_update(&state) {
+    let (_config_guard, mut runtime) = match runtime_for_update(&state).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -1121,7 +1180,7 @@ pub async fn update_nvidia_telemetry_handler(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let mut runtime = match runtime_for_update(&state) {
+    let (_config_guard, mut runtime) = match runtime_for_update(&state).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -1370,7 +1429,7 @@ pub async fn set_cooling_device_handler(
         );
     }
 
-    let mut runtime = match runtime_for_update(&state) {
+    let (_config_guard, mut runtime) = match runtime_for_update(&state).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -1414,7 +1473,7 @@ pub async fn delete_cooling_device_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let mut runtime = match runtime_for_update(&state) {
+    let (_config_guard, mut runtime) = match runtime_for_update(&state).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };

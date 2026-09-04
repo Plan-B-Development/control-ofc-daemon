@@ -1,5 +1,72 @@
 # Changelog
 
+## [2.34.0] — 2026-09-04
+
+Pairs with `control-ofc-gui` >= v2.23.0 (unchanged floor). **Three P2 fixes from the
+`/ofc:audit` register (`AUD3-b`, `AIO1-d`, `AUD3-m`), which are one failure story told
+three ways: a user-assigned pump role could vanish from `runtime.toml`, and nothing
+reported it.** One additive `/status` + `/poll` field, no new routes, no new capability
+flag, **no floor, threshold or safety-rule change**, and both parity oracles are
+byte-identical. A client that ignores the new field sees byte-identical behaviour.
+
+Why the three ship together: `RuntimeConfig::default()` carries **no `header_roles`**, and
+on the boards this programme exists for (an it8696 publishing no `pwmN_label` files) a
+user's `pump` assignment is the only evidence a header drives a pump. So any path that
+loses or corrupts that file removes the header's 30% floor, its stop exemption and its
+pump-safe identify — and until now every one of those paths was silent.
+
+### Fixed
+- **Two concurrent writes to the same file could publish a hybrid document** (`AUD3-b`).
+  `atomic_io::write_atomic` derived its scratch file as a **fixed** `{path}.tmp` and
+  opened it with `File::create`, which truncates — so two writers shared one scratch file
+  and each could overwrite the other's partial content before renaming the result into
+  place. `validation::recorder` documented that hazard and carried a private save lock;
+  the other four call sites (`runtime_config`, `daemon_state`, `profile_store`,
+  `validation::store`) did not. The scratch name is now unique per call
+  (`.{name}.tmp.{pid}.{counter}`) and hidden, so **all five call sites are fixed at once
+  and a sixth cannot reintroduce it** — the hazard no longer lives in a rule each caller
+  must independently know. Cleanup now also runs on *every* failure rather than only a
+  failed rename, because unique names would otherwise turn a bounded leak into a
+  per-failure one. The GUI's twin helper (`paths.py::atomic_write`) has always done this
+  correctly with `mkstemp`; the two had diverged on precisely the safety-relevant axis.
+- **Two concurrent `/config/*` setters lost one edit, and both reported success**
+  (`AIO1-d`). Every setter is load the whole file → change one key → write the whole file
+  back → commit in memory, and nothing ordered two of them: the later `save_to` won the
+  file, the later commit won the cache, and **both requests answered `updated: true`**.
+  All twelve `/config/*` write routes (eleven acquisition sites — the two preferred-sensor
+  routes share a helper) now serialise on one `tokio::sync::Mutex` taken by
+  `runtime_for_update` itself, so a new setter cannot acquire the config without acquiring
+  the lock. **The consequence was asymmetric, which is why this is P2 rather than
+  cosmetic:** losing a poll-interval edit is annoying, but a `/config/cooling-device`
+  write landing from a stale base **dropped the `/config/header-role` edit that preceded
+  it** — and since v2.31.0 the GUI's Configure-AIO flow posts those two back to back in
+  one user action, so the window was opened by ordinary use rather than by two operators
+  racing. Measured: with the lock removed, three of six concurrent edits vanished and the
+  pump role was dropped entirely, every request still returning `200 updated: true`.
+  Two subtleties the review caught, neither of which the lock alone covers:
+  `/config/profile-search-dirs` derives its value from the *current* list rather than from
+  the request body, so its merge base is now read **inside** the guard — read outside, the
+  lost update survived the lock; and `POST /config/header-role` releases the guard before
+  building its response, because that response resolves the header's effective role through
+  `hwmon_controller` — the one lock the engine holds across a blocking sysfs write — and
+  holding both would have stalled every config route behind a wedged header rather than the
+  one request that touched it.
+
+### Added
+- **`runtime_config_degraded` on `GET /status` and `GET /poll`** (`AUD3-m`) — additive,
+  `api_version` unchanged, **omitted when the config loaded cleanly**. Reports that
+  `runtime.toml` could not be read or parsed and the daemon fell back to defaults:
+  `{reason: "unreadable" | "malformed", path, detail, phase: "startup" | "reload"}`.
+  `RuntimeConfig::load_from` has always degraded silently — deliberately, so a corrupt
+  file cannot stop the daemon booting — but the defaults it returns carry no
+  `header_roles`, so a failed load removes every user-assigned pump role's 30% floor with
+  **one `warn!` in the journal as the entire notification**. No endpoint reported it;
+  this was checked by grep before the field was added. A *missing* `runtime.toml` is not
+  a degradation and is not reported: that is first boot, and defaults are the correct
+  answer there. The field is **sticky for the daemon's lifetime** — a later successful
+  `POST /config/*` repairs the file, but nearly every runtime-mutable key is consumed once
+  at startup, so clearing it would claim a recovery that did not happen.
+
 ## [2.33.1] — 2026-09-04
 
 Pairs with `control-ofc-gui` >= v2.23.0 (unchanged floor). **Two P1 bug fixes** found by

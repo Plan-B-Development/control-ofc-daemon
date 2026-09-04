@@ -192,6 +192,51 @@ fn quarantine_path(path: &Path) -> std::path::PathBuf {
     path.with_file_name(name)
 }
 
+/// When a runtime-config load was attempted. Reported on `/status` so a client
+/// can tell which settings the degradation actually cost (`AUD3-m`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadPhase {
+    /// The boot-time load in `main`. Its overlay seeds **every** runtime-mutable
+    /// key, including `header_roles` and `cooling_devices`.
+    Startup,
+    /// A `SIGHUP` reload. Narrower: it re-applies the overlay but only commits
+    /// `profile_search_dirs`, so header roles keep whatever boot established.
+    Reload,
+}
+
+impl LoadPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LoadPhase::Startup => "startup",
+            LoadPhase::Reload => "reload",
+        }
+    }
+}
+
+/// A runtime-config load that fell back to defaults, surfaced on `/status`
+/// (`AUD3-m`).
+///
+/// [SAFETY] The reason this is on the wire at all: [`RuntimeConfig::load_from`]
+/// degrades **silently** to `Self::default()`, and the default carries **no
+/// `header_roles`**. On the boards the AIO-MB programme exists for — an it8696
+/// publishing no `pwmN_label` files — a user's `pump` assignment is the only
+/// evidence a header drives a pump, so a failed load removes its 30% floor, its
+/// stop exemption and its pump-safe identify. Before this field, one `warn!` in
+/// the journal was the entire notification: no client could tell.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RuntimeConfigDegraded {
+    /// `"unreadable"` (I/O error, or over the 4 MiB read cap) or `"malformed"`
+    /// (the bytes were read but are not valid TOML for this daemon version).
+    pub reason: String,
+    /// The file that could not be loaded.
+    pub path: String,
+    /// The underlying I/O or TOML error, verbatim.
+    pub detail: String,
+    /// `"startup"` or `"reload"` — see [`LoadPhase`], which documents what each
+    /// one costs. A `startup` degradation is the one that drops header roles.
+    pub phase: String,
+}
+
 impl RuntimeConfig {
     /// Load runtime.toml from a specific file path.
     ///
@@ -199,30 +244,63 @@ impl RuntimeConfig {
     /// malformed file logs a warning and also returns defaults — runtime
     /// config is regenerated on the next successful write, so a one-off
     /// corruption should not prevent the daemon from starting.
+    ///
+    /// **This discards the fact that it degraded.** That is correct for the
+    /// callers that re-read the file only to *compare* it (`GET /config`'s
+    /// `restart_pending`, the inventory readers), and wrong for the two that
+    /// establish what the daemon is *running on* — they call
+    /// [`Self::load_from_reporting`] instead (`AUD3-m`).
     pub fn load_from(path: &Path) -> Self {
-        match crate::atomic_io::read_to_string_capped(path) {
+        Self::load_from_reporting(path, LoadPhase::Startup).0
+    }
+
+    /// [`Self::load_from`], but also returning *why* it fell back to defaults.
+    ///
+    /// Identical behaviour and identical logging — the daemon still boots on a
+    /// corrupt file, which is deliberate (`load_from`'s doc explains why). The
+    /// only difference is that the degradation is now reportable, so `/status`
+    /// can say the daemon is running on defaults instead of leaving it in the
+    /// journal where no client can see it.
+    ///
+    /// A **missing** file is not a degradation: that is the first-boot case and
+    /// defaults are the correct answer, not a fallback.
+    pub fn load_from_reporting(
+        path: &Path,
+        phase: LoadPhase,
+    ) -> (Self, Option<RuntimeConfigDegraded>) {
+        let (reason, detail) = match crate::atomic_io::read_to_string_capped(path) {
             Ok(content) => match toml::from_str::<RuntimeConfig>(&content) {
                 Ok(cfg) => {
                     log::info!("Loaded runtime config from {}", path.display());
-                    cfg
+                    return (cfg, None);
                 }
                 Err(e) => {
                     log::warn!(
                         "Malformed runtime config at {}: {e} — ignoring, will regenerate",
                         path.display()
                     );
-                    Self::default()
+                    ("malformed", e.to_string())
                 }
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Self::default(), None),
             Err(e) => {
                 log::warn!(
                     "Failed to read runtime config at {}: {e} — using defaults",
                     path.display()
                 );
-                Self::default()
+                ("unreadable", e.to_string())
             }
-        }
+        };
+
+        (
+            Self::default(),
+            Some(RuntimeConfigDegraded {
+                reason: reason.to_string(),
+                path: path.display().to_string(),
+                detail,
+                phase: phase.as_str().to_string(),
+            }),
+        )
     }
 
     /// Load runtime.toml for a **read-modify-write** setter, quarantining a
@@ -505,6 +583,83 @@ impl RuntimeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_runtime_config_is_not_a_degradation() {
+        // First boot. Defaults are the CORRECT answer here, not a fallback, so
+        // reporting it would put a permanent scary banner on every fresh
+        // install — and a warning that is always on is a warning nobody reads
+        // when it matters. This is the case that separates `AUD3-m` from noise.
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, degraded) = RuntimeConfig::load_from_reporting(
+            &dir.path().join("runtime.toml"),
+            LoadPhase::Startup,
+        );
+        // `RuntimeConfig` derives no `PartialEq` and is not worth one for a
+        // test, so assert the properties that matter rather than the whole value.
+        assert!(cfg.header_roles_parsed().is_empty());
+        assert!(cfg.poll_interval_ms().is_none());
+        assert!(
+            degraded.is_none(),
+            "a missing file is first boot, not damage"
+        );
+    }
+
+    #[test]
+    fn a_malformed_runtime_config_reports_that_roles_were_dropped() {
+        // [SAFETY] The whole point of `AUD3-m`. The daemon still boots on a
+        // corrupt file — deliberate, see `load_from` — but the defaults it boots
+        // on carry NO header roles, so a user-assigned pump loses its 30% floor.
+        // Assert both halves: the silent-degradation behaviour is unchanged, and
+        // the degradation is now reportable.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.toml");
+        std::fs::write(&path, "[hardware.header_roles]\nh1 = \"pump\"\n[garbage\n").unwrap();
+
+        let (cfg, degraded) = RuntimeConfig::load_from_reporting(&path, LoadPhase::Startup);
+        assert!(
+            cfg.header_roles_parsed().is_empty(),
+            "the fallback carries no roles — this is the loss being reported"
+        );
+        let d = degraded.expect("a malformed file must be reported");
+        assert_eq!(d.reason, "malformed");
+        assert_eq!(d.phase, "startup");
+        assert!(d.path.ends_with("runtime.toml"));
+        assert!(!d.detail.is_empty(), "the TOML error is carried verbatim");
+    }
+
+    #[test]
+    fn an_oversized_runtime_config_reports_as_unreadable() {
+        // The other limb: `read_to_string_capped` refuses anything over the
+        // 4 MiB cap, which is how a `runtime.toml` written by a newer daemon (or
+        // by a buggy client before the DEC-320 ingest bounds) presents. It is a
+        // different `reason` from `malformed` because the remedy differs.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.toml");
+        std::fs::write(
+            &path,
+            vec![b'a'; (crate::atomic_io::MAX_CONFIG_BYTES + 1) as usize],
+        )
+        .unwrap();
+
+        let (_cfg, degraded) = RuntimeConfig::load_from_reporting(&path, LoadPhase::Reload);
+        let d = degraded.expect("an unreadable file must be reported");
+        assert_eq!(d.reason, "unreadable");
+        assert_eq!(d.phase, "reload", "the phase is the caller's, not inferred");
+    }
+
+    #[test]
+    fn a_healthy_runtime_config_reports_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.toml");
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_poll_interval_ms(Some(750));
+        cfg.save_to(&path).unwrap();
+
+        let (loaded, degraded) = RuntimeConfig::load_from_reporting(&path, LoadPhase::Startup);
+        assert_eq!(loaded.poll_interval_ms(), Some(750));
+        assert!(degraded.is_none());
+    }
 
     #[test]
     fn default_is_empty() {

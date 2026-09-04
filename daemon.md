@@ -396,10 +396,10 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/status` | Subsystem health + freshness; `thermal_state`; `unavailable_sensors[]` (present-but-unreadable sensors, DEC-193); `skipped_controls[]` (controls the engine cannot resolve, so is not commanding — 273-i); `active_profile_id`/`active_profile_name` (active profile, DEC-194); `readiness` (compact cached hardware-readiness rollup for the GUI Dashboard chip — `{overall, critical, warning, info, top_summary, top_code}`, DEC-206); `validation_session` (the live session in miniature, DEC-317) |
+| GET | `/status` | Subsystem health + freshness; `thermal_state`; `unavailable_sensors[]` (present-but-unreadable sensors, DEC-193); `skipped_controls[]` (controls the engine cannot resolve, so is not commanding — 273-i); `runtime_config_degraded` (set when `runtime.toml` failed to load and the daemon is running on defaults — `AUD3-m`); `active_profile_id`/`active_profile_name` (active profile, DEC-194); `readiness` (compact cached hardware-readiness rollup for the GUI Dashboard chip — `{overall, critical, warning, info, top_summary, top_code}`, DEC-206); `validation_session` (the live session in miniature, DEC-317) |
 | GET | `/sensors` | All temperature readings (each entry optionally carries a curated hwmon `thresholds` object — DEC-117; each also carries `control_eligible: bool` — DEC-193) |
 | GET | `/fans` | Fan RPM + last commanded PWM (+ `stall_detected`, `fan_alarm`, `pwm_enable_mode`, `pwm_readback_pct` — the hardware readback, DEC-317 — and `pwm_commanded_pct` — the single-producer command, DEC-318; the two are the separate axes `last_commanded_pwm` conflates for an hwmon header) |
-| GET | `/poll` | Batch: status (incl. `unavailable_sensors[]`, `skipped_controls[]`, `active_profile_*`, `readiness` rollup) + sensors (incl. `control_eligible`) + fans |
+| GET | `/poll` | Batch: status (incl. `unavailable_sensors[]`, `skipped_controls[]`, `runtime_config_degraded`, `active_profile_*`, `readiness` rollup) + sensors (incl. `control_eligible`) + fans |
 | GET | `/sensors/history` | Per-entity time-series (ring buffer) |
 | GET | `/capabilities` | Device list, feature flags, limits, `amd_gpu.kernel_warnings` (kernel-version regression catalogue, DEC-098) |
 | GET | `/config` | Effective merged configuration (DEC-243): per key its on-disk `value`, the `running_value` this process started with, `source` (`runtime`/`admin`/`default`), `mutable`, `requires_restart`, `restart_pending`, and `requires_privilege` where a drop-in is also needed. `/capabilities` carries no configuration at all — this is the only read side |
@@ -448,6 +448,60 @@ token (`curve_not_found` | `sensor_unavailable` | `mix_unresolvable` |
 `sync_unresolvable`); the client owns the wording. Additive and omitted when
 empty, so an older client sees the wire shape it always did and a newer client
 reads `skipped_controls = []` from an older daemon. See Safety Model item 3.
+
+**A runtime config that failed to load (`AUD3-m`, daemon >= 2.34.0).**
+`RuntimeConfig::load_from` degrades to `Self::default()` when `runtime.toml`
+cannot be read or parsed, so a corrupt file can never stop the daemon booting.
+That fallback is deliberate and unchanged — but the defaults it returns carry
+**no `header_roles`**, and on a board whose Super-I/O publishes no `pwmN_label`
+files a user's `pump` assignment is the only evidence a header drives a pump.
+A failed load therefore removes that header's 30% floor, its stop exemption and
+its pump-safe identify, and until this field the entire notification was one
+`warn!` in the journal: no endpoint reported it. `/status` + `/poll` now carry
+`runtime_config_degraded = {reason, path, detail, phase}` — `reason` is
+`unreadable` (I/O error, or over the 4 MiB read cap) or `malformed` (read, but
+not valid TOML for this daemon version); `phase` is `startup` or `reload` and
+says what the degradation cost, since a startup load seeds every key while a
+SIGHUP reload commits only `profile_search_dirs`. Additive and **omitted when
+the config loaded cleanly**, so an older daemon's omission reads exactly as
+"fine" — which is the same (absent) warning such a daemon shows today. A
+*missing* file is not a degradation: that is first boot. The field is sticky for
+the process lifetime, because nearly every runtime-mutable key is consumed once
+at startup and a later successful write does not retroactively apply them.
+
+**Atomic writes are concurrency-safe as of 2.34.0 (`AUD3-b`).**
+`atomic_io::write_atomic` derives a **unique, hidden** scratch path per call
+(`.{name}.tmp.{pid}.{counter}`). It used to be a fixed `{path}.tmp` opened with
+`File::create`, which truncates — so two concurrent writers to one destination
+shared a scratch file and could publish a document half-overwritten by the
+other. Which writer wins the destination is still a race (that is the
+`/config/*` lock's job, below); the winner's document is now always whole. All
+five call sites — `runtime_config`, `daemon_state`, `profile_store`,
+`validation::store`, `validation::recorder` — are covered without any of them
+knowing, which is the point: the previous shape required every caller to carry
+its own save lock and only one did.
+
+**`/config/*` setters are serialised as of 2.34.0 (`AIO1-d`).** Every setter is
+load the whole file → change one key → write it back → commit in memory, and
+nothing ordered two of them: the later write won the file, the later commit won
+the cache, and **both requests answered `updated: true`**. All twelve write
+routes — through eleven acquisition sites, since the two preferred-sensor routes
+share a helper — now take one `tokio::sync::Mutex` inside `runtime_for_update`,
+held to the end of the handler, so a new setter cannot load the config without
+serialising. The lock is
+taken **first** and covers only leaf locks (`header_roles`, `cooling_devices`,
+`profile_search_dirs`, `override_table`). It must never be held across
+`hwmon_controller`, which the engine holds across a blocking sysfs write — that
+holds by construction for the setters that validate against live headers (they
+validate before acquiring), and by an explicit `drop` in
+`update_header_role_handler`, whose *response* reads `resolved_header_role` and
+would otherwise park every config route behind a wedged header. One further
+subtlety: `/config/profile-search-dirs` derives its value from the current list
+rather than from the request body, so its merge base is read **inside** the
+guard; read outside, the lost update survives the lock. The consequence being prevented is
+asymmetric: a `/config/cooling-device` write landing from a stale base dropped
+the `/config/header-role` edit before it, i.e. a pump's 30% floor, and since
+2.31.0 the GUI posts those two back to back in a single Configure-AIO action.
 
 **Read-only hwmon discovery + readiness (DEC-200, additive, GUI-facing):** `GET
 /inventory/hwmon` returns a structured, read-only snapshot — temperature sensors

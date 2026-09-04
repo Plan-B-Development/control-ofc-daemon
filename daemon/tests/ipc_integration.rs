@@ -127,6 +127,8 @@ fn test_app_state_inner(engine_ticked: bool, runtime_cfg: std::path::PathBuf) ->
         allow_port_probe: false,
         running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
+        config_write: Default::default(),
+        runtime_config_degraded: Default::default(),
         assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
             readiness_rollup,
         )),
@@ -878,6 +880,8 @@ async fn fans_endpoint_tags_intel_gpu_source_by_id_prefix() {
         allow_port_probe: false,
         running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
+        config_write: Default::default(),
+        runtime_config_degraded: Default::default(),
         assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
             readiness_rollup,
         )),
@@ -1051,6 +1055,8 @@ fn test_app_state_with_nvidia_gpu(
         allow_port_probe: false,
         running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
+        config_write: Default::default(),
+        runtime_config_degraded: Default::default(),
         assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
             readiness_rollup,
         )),
@@ -1362,6 +1368,8 @@ fn test_app_state_with_hwmon() -> Arc<AppState> {
         allow_port_probe: false,
         running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
+        config_write: Default::default(),
+        runtime_config_degraded: Default::default(),
         assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
             readiness_rollup,
         )),
@@ -1699,6 +1707,8 @@ fn test_app_state_with_unsupported_gpu(pci_bdf: &str) -> Arc<AppState> {
         allow_port_probe: false,
         running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
+        config_write: Default::default(),
+        runtime_config_degraded: Default::default(),
         assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
             readiness_rollup,
         )),
@@ -1791,6 +1801,8 @@ fn test_app_state_with_read_only_gpu(pci_bdf: &str, pci_device_id: u16) -> Arc<A
         allow_port_probe: false,
         running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
+        config_write: Default::default(),
+        runtime_config_degraded: Default::default(),
         assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
             readiness_rollup,
         )),
@@ -1873,6 +1885,8 @@ fn test_app_state_with_amd_gpu(
         allow_port_probe: false,
         running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
+        config_write: Default::default(),
+        runtime_config_degraded: Default::default(),
         assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
             readiness_rollup,
         )),
@@ -2004,6 +2018,400 @@ async fn a_failed_legacy_reset_hands_the_fan_back() {
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
+}
+
+/// `config_test_state` with real hwmon headers (`h1`, `h2`), so the setters that
+/// validate a header id — `POST /config/header-role` — can be driven end to end.
+fn config_test_state_with_hwmon() -> (Arc<AppState>, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let admin = tmp.path().join("daemon.toml");
+    std::fs::write(&admin, "").unwrap();
+
+    let mut state = test_app_state_with_hwmon();
+    let inner = Arc::get_mut(&mut state).unwrap();
+    inner.config_path = admin.to_str().unwrap().to_string();
+    inner.runtime_config_path = tmp.path().join("runtime.toml");
+    (state, tmp)
+}
+
+#[tokio::test]
+async fn concurrent_config_setters_do_not_lose_an_edit() {
+    // `AIO1-d`. Every `POST /config/*` is load the WHOLE file -> change one key
+    // -> write the WHOLE file back. Unserialised, two setters that load the same
+    // base each write their own key over the other's, the later `save_to` wins
+    // the file, and BOTH answer `updated: true` — so the caller is told an edit
+    // landed that no longer exists.
+    //
+    // Six distinct keys, fired concurrently, none of which needs hardware. With
+    // the `config_write` lock each request loads the previous winner's file, so
+    // all six survive. Without it, the persist (`write` + `fsync` + `rename` +
+    // directory `fsync`, off-runtime) is the interleaving window.
+    let (state, tmp) = config_test_state("");
+    let rc = state.runtime_config_path.clone();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let requests: Vec<(&str, serde_json::Value)> = vec![
+        (
+            "/config/poll-interval",
+            serde_json::json!({"poll_interval_ms": 1234}),
+        ),
+        (
+            "/config/serial-port",
+            serde_json::json!({"port": "/dev/ttyACM7"}),
+        ),
+        (
+            "/config/serial-timeout",
+            serde_json::json!({"timeout_ms": 421}),
+        ),
+        (
+            "/config/startup-delay",
+            serde_json::json!({"delay_secs": 17}),
+        ),
+        (
+            "/config/allow-port-probe",
+            serde_json::json!({"enabled": true}),
+        ),
+        (
+            "/config/nvidia-telemetry",
+            serde_json::json!({"enabled": true}),
+        ),
+    ];
+
+    let mut tasks = Vec::new();
+    for (route, body) in requests {
+        let path = path.clone();
+        tasks.push(tokio::spawn(async move {
+            let (status, json) = uds_post(&path, route, &body).await;
+            (route, status, json)
+        }));
+    }
+    for t in tasks {
+        let (route, status, json) = t.await.unwrap();
+        assert_eq!(status, 200, "{route}: {json}");
+        assert_eq!(json["updated"], true, "{route}: {json}");
+    }
+
+    // Assert the realised artefact — the bytes on disk — rather than each
+    // response, because every response said `updated: true` in the defect too.
+    let written = std::fs::read_to_string(&rc).unwrap();
+    for expected in [
+        "poll_interval_ms = 1234",
+        "/dev/ttyACM7",
+        "timeout_ms = 421",
+        "delay_secs = 17",
+        "allow_port_probe = true",
+        "enable_nvidia_telemetry = true",
+    ] {
+        assert!(
+            written.contains(expected),
+            "a concurrent setter lost the edit `{expected}`; every request \
+             reported success. File was:\n{written}"
+        );
+    }
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+    drop(tmp);
+}
+
+#[tokio::test]
+async fn a_cooling_device_write_never_drops_a_concurrent_header_role() {
+    // `AIO1-d`, the [SAFETY] case, and the reason this is a lock rather than a
+    // note. `header_roles` is the only `/config/*` key that is a safety input:
+    // on a board whose Super-I/O publishes no `pwmN_label` files, a user's
+    // `pump` assignment is the ONLY evidence a header drives a pump, so losing
+    // that edit removes its 30% floor and its identify protection at the next
+    // daemon restart.
+    //
+    // These two routes are the realistic pair rather than an invented one: since
+    // DEC-316 the GUI's Configure-AIO flow posts `/config/header-role` and then
+    // `/config/cooling-device` in ONE user action, so the interleaving window is
+    // opened by ordinary use. The asymmetry matters too — the cooling-device
+    // write is metadata the engine never reads, but landing it from a stale base
+    // drops the role edit that preceded it.
+    let (state, tmp) = config_test_state_with_hwmon();
+    let rc = state.runtime_config_path.clone();
+    let roles = state.header_roles.clone();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (p1, p2) = (path.clone(), path.clone());
+    let role = tokio::spawn(async move {
+        uds_post(
+            &p1,
+            "/config/header-role",
+            &serde_json::json!({"header_id": "h1", "role": "pump"}),
+        )
+        .await
+    });
+    let device = tokio::spawn(async move {
+        uds_post(
+            &p2,
+            "/config/cooling-device",
+            &serde_json::json!({
+                "id": "aio-1",
+                "name": "AIO",
+                "kind": "aio_liquid",
+                "pump_member": "h1",
+                "radiator_members": ["h2"]
+            }),
+        )
+        .await
+    });
+    let (role_status, role_json) = role.await.unwrap();
+    let (dev_status, dev_json) = device.await.unwrap();
+    assert_eq!(role_status, 200, "{role_json}");
+    assert_eq!(dev_status, 200, "{dev_json}");
+
+    let written = std::fs::read_to_string(&rc).unwrap();
+    assert!(
+        written.contains("[hardware.header_roles]") && written.contains(r#"h1 = "pump""#),
+        "the pump role was lost from runtime.toml by a concurrent \
+         cooling-device write — at the next restart h1 has no 30% floor. \
+         File was:\n{written}"
+    );
+    assert!(
+        written.contains("aio-1"),
+        "the cooling device was lost instead. File was:\n{written}"
+    );
+    // The in-memory commit the engine actually reads must agree with the file.
+    assert!(
+        roles.read().contains_key("h1"),
+        "runtime.toml and the engine's live role map disagree"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+    drop(tmp);
+}
+
+#[tokio::test]
+async fn concurrent_search_dir_edits_are_not_lost() {
+    // `AIO1-d`, the limb the first cut of the fix MISSED — found by
+    // `ofc:concurrency-reviewer` and confirmed against the code.
+    //
+    // `concurrent_config_setters_do_not_lose_an_edit` fires six *different*
+    // routes, so it can only catch a lost update across keys. This route is the
+    // one of the twelve whose persisted value is derived from **shared mutable
+    // state** rather than from the request body: `add`/`remove` are a delta
+    // merged onto the current list. While that merge base was read *before* the
+    // lock, two concurrent callers both merged onto the same stale list and the
+    // second silently discarded the first's directory — the lost update
+    // surviving inside the very lock added to remove it.
+    let (state, tmp) = config_test_state("");
+    let rc = state.runtime_config_path.clone();
+    // `profile_search_dirs` is a bare `RwLock` on `AppState`, so hold the `Arc`
+    // rather than cloning the lock out of it.
+    let state_ref = state.clone();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (_ka, a) = addable_dir();
+    let (_kb, b) = addable_dir();
+
+    let (p1, p2) = (path.clone(), path.clone());
+    let (a1, b1) = (a.clone(), b.clone());
+    let ta = tokio::spawn(async move {
+        uds_post(
+            &p1,
+            "/config/profile-search-dirs",
+            &serde_json::json!({"add": [a1]}),
+        )
+        .await
+    });
+    let tb = tokio::spawn(async move {
+        uds_post(
+            &p2,
+            "/config/profile-search-dirs",
+            &serde_json::json!({"add": [b1]}),
+        )
+        .await
+    });
+    let (sa, ja) = ta.await.unwrap();
+    let (sb, jb) = tb.await.unwrap();
+    assert_eq!(sa, 200, "{ja}");
+    assert_eq!(sb, 200, "{jb}");
+
+    // Both requests reported success, so assert the realised artefact — the file
+    // on disk, and the in-memory list the profile loader actually reads.
+    let written = std::fs::read_to_string(&rc).unwrap();
+    for (label, dir) in [("first", &a), ("second", &b)] {
+        assert!(
+            written.contains(dir.as_str()),
+            "the {label} concurrent search-dir add was lost from runtime.toml \
+             while its request reported success. File was:\n{written}"
+        );
+    }
+    let live: Vec<String> = state_ref
+        .profile_search_dirs
+        .read()
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    for dir in [&a, &b] {
+        assert!(
+            live.iter().any(|d| d == dir),
+            "runtime.toml and the in-memory search-dir list disagree: {live:?}"
+        );
+    }
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+    drop(tmp);
+}
+
+// Holding the guard across the barrier's `await` is the POINT of this test — it is
+// standing in for a sysfs write wedged in the kernel, which is precisely what
+// `await_holding_lock` exists to warn about in production. Suppressed here rather
+// than restructured onto a helper thread, because moving the wedge off this thread
+// would also move the thing being simulated.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wedged_hwmon_header_does_not_stall_unrelated_config_writes() {
+    // `AIO1-d`, the second limb the review caught. `POST /config/header-role`
+    // builds its response with `resolved_header_role`, which takes
+    // `hwmon_controller` — the one lock the profile engine holds across a
+    // BLOCKING sysfs write (DEC-278/289). While the config guard was still alive
+    // at that point, a single wedged header parked ALL TWELVE `/config/*` write
+    // routes instead of the one request that touched it. On the `role: null`
+    // clear path this is the handler's only `hwmon_controller` acquisition, so
+    // the pre-lock validation above does not cover it.
+    //
+    // **The discriminator is `config_write`, not latency.** Fixed and broken both
+    // leave the clear request blocked on the wedge for ever; they differ in
+    // whether it is still holding the config lock while it blocks. The first cut
+    // of this test raced two requests and asserted the unrelated one completed —
+    // and it **passed with the fix deleted**, because nothing ordered the two, so
+    // the unrelated request simply won the lock first. It asserted nothing.
+    //
+    // `multi_thread` is required: the wedge is a blocking `parking_lot` lock, and
+    // on the default current-thread runtime it stops the runtime itself.
+    let (state, tmp) = config_test_state_with_hwmon();
+    let ctrl = state
+        .hwmon_controller
+        .clone()
+        .expect("harness has a controller");
+    let state_ref = state.clone();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    // Give h1 a role first, so CLEARING it is an observable state change we can
+    // use as a barrier. Done before the wedge — this request must complete.
+    let (status, json) = uds_post(
+        &path,
+        "/config/header-role",
+        &serde_json::json!({"header_id": "h1", "role": "pump"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{json}");
+    assert!(state_ref.header_roles().contains_key("h1"));
+
+    // Wedge the header the way a stuck sysfs write does: hold the controller lock.
+    let wedge = ctrl.lock();
+
+    let p1 = path.clone();
+    let blocked = tokio::spawn(async move {
+        uds_post(
+            &p1,
+            "/config/header-role",
+            &serde_json::json!({"header_id": "h1", "role": null}),
+        )
+        .await
+    });
+
+    // Barrier: wait until the clear has PERSISTED AND COMMITTED. Past that point
+    // the handler's only remaining work is the response — i.e. it is at (or in)
+    // `resolved_header_role`, blocked on the wedge. Spinning on observable state
+    // rather than sleeping for a guessed duration.
+    let mut committed = false;
+    for _ in 0..600 {
+        if !state_ref.header_roles().contains_key("h1") {
+            committed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        committed,
+        "the clear never reached its in-memory commit; the barrier this test \
+         depends on did not hold, so the assertion below would be vacuous"
+    );
+
+    // THE ASSERTION. The request is blocked on a wedged header. It must not still
+    // be holding the lock that every other `/config/*` route needs.
+    let free = state_ref.config_write.try_lock();
+    let held = free.is_err();
+    drop(free);
+    drop(wedge);
+    let _ = blocked.await;
+
+    assert!(
+        !held,
+        "a request blocked on ONE wedged hwmon header is still holding \
+         `config_write`, so all twelve /config/* write routes are stalled behind \
+         it — the guard must be dropped before the response reads \
+         `resolved_header_role`"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+    drop(tmp);
+}
+
+#[tokio::test]
+async fn status_reports_a_runtime_config_that_failed_to_load() {
+    // `AUD3-m`. `RuntimeConfig::load_from` degrades SILENTLY to defaults, and
+    // the default carries no `header_roles` — so a boot that cannot parse
+    // `runtime.toml` removes every user-assigned pump role's 30% floor, its stop
+    // exemption and its pump-safe identify, with one `warn!` in the journal as
+    // the entire notification. Nothing on any endpoint said so.
+    let (mut state, tmp) = config_test_state("");
+    Arc::get_mut(&mut state).unwrap().runtime_config_degraded = Arc::new(parking_lot::RwLock::new(
+        Some(control_ofc_daemon::runtime_config::RuntimeConfigDegraded {
+            reason: "malformed".into(),
+            path: "/var/lib/control-ofc/runtime.toml".into(),
+            detail: "expected `]`".into(),
+            phase: "startup".into(),
+        }),
+    ));
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    // Must ride BOTH surfaces: the GUI is poll-only at 1 Hz (DEC-165), so a
+    // field that appeared on `/status` alone would never be seen.
+    for route in ["/status", "/poll"] {
+        let (status, json) = uds_get(&path, route).await;
+        assert_eq!(status, 200, "{route}: {json}");
+        let d = if route == "/poll" {
+            &json["status"]["runtime_config_degraded"]
+        } else {
+            &json["runtime_config_degraded"]
+        };
+        assert_eq!(d["reason"], "malformed", "{route}: {json}");
+        assert_eq!(d["phase"], "startup", "{route}: {json}");
+        assert_eq!(d["detail"], "expected `]`", "{route}: {json}");
+        assert!(d["path"].is_string(), "{route}: {json}");
+    }
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+    drop(tmp);
+}
+
+#[tokio::test]
+async fn status_omits_runtime_config_degraded_when_the_config_is_healthy() {
+    // The field is additive and absent-means-fine, so an older daemon's omission
+    // reads exactly as today's behaviour (no warning) rather than as a warning
+    // that cannot be dismissed. Asserted as absence of the KEY, not a null.
+    let (state, tmp) = config_test_state("");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/status").await;
+    assert_eq!(status, 200);
+    assert!(
+        json.get("runtime_config_degraded").is_none(),
+        "a healthy daemon must not carry the key at all: {json}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+    drop(tmp);
 }
 
 #[tokio::test]
@@ -2355,6 +2763,8 @@ async fn deactivate_profile_resets_hwmon_coalescing() {
         allow_port_probe: false,
         running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
+        config_write: Default::default(),
+        runtime_config_degraded: Default::default(),
         assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
             readiness_rollup,
         )),
@@ -2488,6 +2898,8 @@ fn test_app_state_with_writable_pmfw_gpu(pci_bdf: &str) -> (Arc<AppState>, tempf
         allow_port_probe: false,
         running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
+        config_write: Default::default(),
+        runtime_config_degraded: Default::default(),
         assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
             readiness_rollup,
         )),
@@ -2677,6 +3089,8 @@ async fn hwmon_discovery_excludes_amdgpu_end_to_end_via_ipc() {
         allow_port_probe: false,
         running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
+        config_write: Default::default(),
+        runtime_config_degraded: Default::default(),
         assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
             readiness_rollup,
         )),
@@ -2757,6 +3171,8 @@ fn test_app_state_with_profile_dirs(dirs: Vec<std::path::PathBuf>) -> Arc<AppSta
         allow_port_probe: false,
         running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
+        config_write: Default::default(),
+        runtime_config_degraded: Default::default(),
         assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
             readiness_rollup,
         )),

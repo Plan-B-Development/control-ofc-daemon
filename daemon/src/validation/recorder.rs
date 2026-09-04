@@ -132,15 +132,22 @@ pub struct ValidationEngine {
     /// acquire the hwmon controller lock **before** the session lock rather than
     /// while holding it. See the lock-order note on `tick`.
     member_ids: Mutex<Vec<String>>,
-    /// Serialises persistence.
+    /// Serialises persistence — for **ordering**, not for corruption.
     ///
     /// The periodic flush and the finaliser both clone under the slot lock,
-    /// release it, and then write — so without this they can reach
-    /// `atomic_io::write_atomic` concurrently. That helper uses a **fixed**
-    /// `{path}.tmp` name opened with `File::create`, so two writers truncate each
-    /// other and can publish a hybrid document; and a flush that started first
-    /// could rename its stale `recording` copy over a `completed` one, which the
-    /// next boot sweep would then "repair" to `interrupted` despite a clean stop.
+    /// release it, and then write, so without this they reach
+    /// `atomic_io::write_atomic` concurrently. A flush that started first could
+    /// then rename its stale `recording` copy over a `completed` one, which the
+    /// next boot sweep would "repair" to `interrupted` despite a clean stop.
+    /// That hazard is real and is why this lock stays.
+    ///
+    /// **The other half of this comment is RETRACTED (AUD3-b).** It used to say
+    /// the helper opens a **fixed** `{path}.tmp` with `File::create`, so two
+    /// writers truncate each other and can publish a hybrid document. That was
+    /// true, and it was true of the four call sites that had *no* such lock —
+    /// which is why the hazard was moved into `atomic_io::tmp_path_for`, where
+    /// every caller gets a uniquely named scratch file and none has to know.
+    /// Do not re-derive a private save lock elsewhere for that reason.
     save_lock: Mutex<()>,
     /// The session's effective sample cap, derived at start from its topology.
     ///

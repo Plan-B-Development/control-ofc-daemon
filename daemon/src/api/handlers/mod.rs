@@ -361,6 +361,64 @@ pub struct AppState {
     /// Path to the daemon-owned runtime.toml (read/write by handlers).
     /// Lives at `{state_dir}/runtime.toml`. See ADR-002.
     pub runtime_config_path: std::path::PathBuf,
+    /// Serialises the whole load → mutate → persist → commit sequence of every
+    /// `POST`/`DELETE /config/*` setter (`AIO1-d`) — **twelve write routes, served
+    /// by eleven acquisition sites** (the two preferred-sensor routes share
+    /// `set_preferred_sensor`).
+    ///
+    /// Each setter reads all of `runtime.toml`, changes one key, and writes the
+    /// whole file back. Unserialised, two of them from the same base lose one
+    /// edit: the later `save_to` wins the file and the later in-memory commit
+    /// wins the cache, and **both requests answer `updated: true`**.
+    ///
+    /// [SAFETY] The consequence is asymmetric, which is why this is a lock and
+    /// not a doc note. Losing a poll-interval edit is annoying; losing a
+    /// `header_roles` edit drops a **pump's 30% floor** and its identify
+    /// protection at the next daemon restart. Since DEC-316 the GUI's
+    /// Configure-AIO flow posts `/config/header-role` and then
+    /// `/config/cooling-device` in one user action, so the interleaving window
+    /// is opened by ordinary use rather than by two operators racing.
+    ///
+    /// This is a `tokio::sync::Mutex` rather than a `parking_lot` one precisely
+    /// because it is held across the `.await` on `persist_off_runtime`.
+    ///
+    /// **Lock order.** Acquired FIRST, before any other lock a setter takes, and
+    /// held until the setter has persisted and committed. Inside it a setter
+    /// takes only leaf locks — `profile_search_dirs`, `header_roles`,
+    /// `cooling_devices`, `override_table` — none of which ever reaches back for
+    /// this one, so no cycle exists.
+    ///
+    /// **It must never be held across `hwmon_controller`**, which is the one lock
+    /// the profile engine holds across a blocking sysfs write (the DEC-278/289
+    /// wedge): holding both would park every `/config/*` write route behind a
+    /// wedged header rather than the one request that touched it, and
+    /// `AppState::header_role_parts` already documents that pair as ABBA-sensitive.
+    /// Setters that validate against live headers do so *before* acquiring this.
+    /// `update_header_role_handler` additionally **drops the guard before building
+    /// its response**, because `resolved_header_role` reaches `hwmon_controller`
+    /// and, on the `role: null` clear path, is the handler's only acquisition of
+    /// it — so the pre-lock validation does not cover it. An earlier revision of
+    /// this comment claimed the invariant held by construction; it did not, and
+    /// the drop is what makes it true.
+    pub config_write: tokio::sync::Mutex<()>,
+    /// Set when a `runtime.toml` load fell back to defaults, mirrored onto
+    /// `/status` + `/poll` so a client can see it (`AUD3-m`).
+    ///
+    /// [SAFETY] `RuntimeConfig::load_from` degrades silently and the default it
+    /// returns carries **no `header_roles`**, so a failed boot load removes
+    /// every user-assigned pump role — its 30% floor, its stop exemption and its
+    /// pump-safe identify — with one `warn!` in the journal as the only trace.
+    /// Nothing on any endpoint reported it.
+    ///
+    /// **Sticky for the process lifetime, deliberately.** A later successful
+    /// `POST /config/*` repairs the *file*, and `header_roles` /
+    /// `cooling_devices` are re-committed live by their setters — but nearly
+    /// every other runtime-mutable key is consumed once at boot, so the daemon
+    /// genuinely is still running on defaults for those. Clearing this on the
+    /// next successful write would therefore claim a recovery that did not
+    /// happen. Latest-wins: a reload degradation overwrites a startup one.
+    pub runtime_config_degraded:
+        Arc<parking_lot::RwLock<Option<crate::runtime_config::RuntimeConfigDegraded>>>,
     /// Set by `POST /hwmon/rescan` to ask the sensor polling loop to refresh
     /// its cached descriptor set (labels, types, DEC-117 threshold snapshot)
     /// on its next tick. Swap-checked (and cleared) by the loop (DEC-133).
@@ -677,6 +735,17 @@ pub(crate) fn build_status_response(
     control_outputs: Vec<ControlOutputEntry>,
     health: crate::health::staleness::HealthSummary,
 ) -> StatusResponse {
+    // `AUD3-m`. Hoisted out of the struct literal deliberately: a temporary in a
+    // field initialiser lives until the end of the whole statement, so reading it
+    // inline would hold this guard across `state.validation.live_summary()` (which
+    // takes the recorder's `live` mutex) and across the `override_table` lock
+    // below. No cycle exists today — nothing takes those and then reaches for this
+    // — but a guard held across two unrelated acquisitions on the 1 Hz poll path is
+    // exactly the latent ordering hazard this file warns about elsewhere. Cloning
+    // into a local makes it a genuine leaf read, which is what the field's doc
+    // claims it is.
+    let degraded = state.runtime_config_degraded.read().clone();
+
     let subsystems = health
         .subsystems
         .into_iter()
@@ -751,6 +820,7 @@ pub(crate) fn build_status_response(
         // eight scalars — order 10^5 allocations for a full two-hour session,
         // growing as it records — while holding the very lock the recorder tick
         // needs. The summary is fixed-size and lives behind its own mutex.
+        runtime_config_degraded: degraded,
         validation_session: state
             .validation
             .live_summary()
