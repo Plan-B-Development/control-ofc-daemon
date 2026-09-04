@@ -1,5 +1,34 @@
 # Changelog
 
+## [Unreleased]
+
+Documentation only — no code, route, capability or behaviour change. From the GUI repo's
+`/ofc:docs-correctness` pass (`UDOC-*`); the GUI half shipped as GUI v2.57.7.
+
+### Fixed
+- **The thermal trip point was described 5 °C low in three places here** (`UDOC-j`):
+  `README.md`, `docs/USER_GUIDE.md` and `man/control-ofc-daemon.1.scd` all said the
+  per-machine emergency limit is "raised to **match** the CPU's own reported design
+  ceiling". `profile_engine::effective_trigger_c` computes
+  `min(ceiling + 5 °C, 115 °C)`. The margin is not incidental: a limit set *at* the
+  ceiling fires on a healthy part and then latches, because release needs a reading at
+  or below 80 °C that a part holding its ceiling never produces — so the docs described
+  the exact failure DEC-308 exists to prevent. **No code was wrong**; `daemon.md` and
+  `constants.rs` already stated it correctly. `README.md` and `man/` were survivors of
+  the DEC-308 sweep too, and are now named in the curator's update-target map.
+- **`docs/USER_GUIDE.md`'s operator-facing API table listed two superseded readiness
+  routes and omitted the live one** (`UDOC-n`). It named `GET /inventory/readiness`
+  (DEC-200) and `GET /inventory/superio` (DEC-202); DEC-207 merged both into
+  `GET /inventory/hardware-readiness`, which is the only readiness route any shipped GUI
+  calls and did not appear in the document at all. All three are now listed with their
+  status.
+
+### Changed
+- **The README "Latest release" line is one sentence again** (`UDOC-a`) — it had grown to
+  19,566 characters, the release notes of every recent version in a single paragraph at
+  the top of the landing page and in `/usr/share/doc/`. Per-version detail lives in this
+  file.
+
 ## [2.35.3] — 2026-09-04
 
 Pairs with `control-ofc-gui` >= v2.23.0 (unchanged floor). Batch G of the

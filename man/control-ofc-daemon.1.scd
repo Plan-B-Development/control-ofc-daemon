@@ -17,8 +17,8 @@ It serves an HTTP API over a Unix domain socket for client applications
 autonomously.
 
 The daemon owns thermal safety: the emergency limit (at least 105°C, raised
-per-machine to match the CPU's own reported design ceiling) drives all fans to
-100% PWM, holds
+per-machine to min(CPU-reported design ceiling + 5°C, 115°C) where the kernel
+publishes the ceiling) drives all fans to 100% PWM, holds
 until temperature falls below 80°C, then applies a 60% PWM recovery floor
 for one cycle before returning to active control. Forces 40% if no CPU
 sensor is reachable for 5 consecutive poll cycles.
