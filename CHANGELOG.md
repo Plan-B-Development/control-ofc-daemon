@@ -2,7 +2,10 @@
 
 ## [Unreleased]
 
-**Tests only, plus one `#[doc(hidden)]` test seam — no behaviour change.** Batch D of the
+## [2.35.2] — 2026-09-04
+
+Pairs with `control-ofc-gui` >= v2.23.0 (unchanged floor). **Tests only, plus one
+`#[doc(hidden)]` test seam — no behaviour change.** Batch D of the
 `/ofc:audit` register triage (DEC-324); the daemon's share is `AUD2-i`.
 
 ### Added
