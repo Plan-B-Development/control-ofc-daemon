@@ -1,11 +1,12 @@
 # Changelog
 
-## [Unreleased]
+## [2.35.3] — 2026-09-04
 
-Batch G of the `/ofc:audit` register triage (DEC-326 and DEC-327). **Fixes a
-false "BIOS reclaimed the header" verdict that fired whenever a fan header sat
-at 100% on an ITE Super-I/O**, and **stops the unbound-chip advice recommending
-a driver build the user is already running**. No wire-format change and no route
+Pairs with `control-ofc-gui` >= v2.23.0 (unchanged floor). Batch G of the
+`/ofc:audit` register triage (DEC-326 and DEC-327). **Fixes a false "BIOS
+reclaimed the header" verdict that fired whenever a fan header sat at 100% on an
+ITE Super-I/O**, and **stops the unbound-chip advice recommending a driver build
+the user is already running**. No wire-format change and no route
 change — some published fields stop reporting cases that were never true, and
 no field, code or capability moves. Touches no floor, no threshold, no ladder
 rung and no capability flag.
