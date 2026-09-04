@@ -1899,3 +1899,316 @@ fn prune_spares_a_file_that_became_readable_since_the_scan() {
         "a readable session must never be pruned as oversized"
     );
 }
+
+// ── [HOST-a / DEC-326] the driver's full-speed alias ─────────────────
+//
+// `it87.c:3612` reports `pwm_enable == 0` ("full speed") whenever the duty
+// register holds 0xff — on every header of a chip without `FEAT_FANCTL_ONOFF`,
+// and on `pwm4+` of every ITE chip. A member curve reaching 100% under load is
+// exactly what a validation session exists to observe, so before this the
+// session recorded `control_reclaimed` and published the
+// `bios_ec_control_reclaim` finding on a machine where nothing reclaimed
+// anything.
+
+fn fan_at(
+    id: &str,
+    commanded: Option<u8>,
+    readback: Option<u8>,
+    enable: Option<u8>,
+) -> control_ofc_daemon::health::state::HwmonFanState {
+    control_ofc_daemon::health::state::HwmonFanState {
+        id: id.into(),
+        rpm: Some(1436),
+        last_commanded_pwm: readback,
+        pwm_readback_pct: readback,
+        pwm_commanded_pct: commanded,
+        alarm: Some(false),
+        pwm_enable_mode: enable,
+        updated_at: std::time::Instant::now(),
+    }
+}
+
+/// The CALL-SITE test. `pwm::is_full_speed_alias` has its own unit coverage;
+/// this drives the real `tick` and asserts on the events it actually recorded,
+/// because "extracting a rule into a testable function does NOT test the call
+/// site" is this project's most-repeated lesson.
+#[test]
+fn a_member_reaching_full_speed_is_not_recorded_as_a_bios_reclaim() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let pump = "hwmon:it87:pwm2:PUMP";
+    let (ctx, ctrl) = context_with_controller(&[pump]);
+
+    // Tick 1 — the daemon holds the header in manual mode at 60%.
+    ctrl.command(pump, 60);
+    ctx.cache
+        .update_hwmon_fans(vec![fan_at(pump, Some(60), Some(60), Some(1))]);
+    engine.start(unique_session("alias"), &ctx).unwrap();
+    engine.tick(&ctx);
+
+    // Tick 2 — the curve reaches 100%. The write fully succeeded; the driver
+    // now synthesises mode 0 from the duty register.
+    ctrl.command(pump, 100);
+    ctx.cache
+        .update_hwmon_fans(vec![fan_at(pump, Some(100), Some(100), Some(0))]);
+    engine.tick(&ctx);
+
+    let s = engine.snapshot().unwrap();
+    assert!(
+        !s.events.iter().any(|e| e.kind == EV_CONTROL_RECLAIMED),
+        "the header accepted our own 100% write; recording a reclaim would be \
+         a false BIOS accusation. events: {:?}",
+        s.events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+    );
+    // The sample must agree with the event stream, not contradict it.
+    assert_eq!(
+        s.samples.last().unwrap().members[0].ownership,
+        OWNERSHIP_DAEMON,
+        "a suppressed reclaim and an `external` ownership stamp cannot both be right"
+    );
+
+    let done = engine.stop().unwrap();
+    let findings = summary::summarise(&done);
+    assert_ne!(
+        find(&findings, F_BIOS_RECLAIM).state,
+        RESULT_OBSERVED,
+        "no reclaim was observed, so the session must not report one"
+    );
+}
+
+/// The opposite branch — without it a predicate stuck at "always alias" would
+/// pass the test above, and the daemon would stop reporting real reclaims.
+#[test]
+fn a_member_genuinely_losing_manual_mode_is_still_recorded_as_a_reclaim() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let pump = "hwmon:it87:pwm2:PUMP";
+    let (ctx, ctrl) = context_with_controller(&[pump]);
+
+    ctrl.command(pump, 60);
+    ctx.cache
+        .update_hwmon_fans(vec![fan_at(pump, Some(60), Some(60), Some(1))]);
+    engine.start(unique_session("realreclaim"), &ctx).unwrap();
+    engine.tick(&ctx);
+
+    // Mode 2 (automatic) at full duty: a real reclaim, not the alias.
+    ctrl.command(pump, 100);
+    ctx.cache
+        .update_hwmon_fans(vec![fan_at(pump, Some(100), Some(100), Some(2))]);
+    engine.tick(&ctx);
+
+    let s = engine.snapshot().unwrap();
+    assert!(
+        s.events.iter().any(|e| e.kind == EV_CONTROL_RECLAIMED),
+        "mode 2 is a genuine loss of control and must still be recorded"
+    );
+}
+
+/// [DEC-326 remediation, `concurrency-reviewer` finding 2] The exemption reads
+/// the CONTROLLER's `last_commanded_pct`, not the cache's `pwm_commanded_pct` —
+/// the cache field is carried forward indefinitely and is never cleared when the
+/// daemon stops driving a header, so a stale "we commanded 100" would suppress a
+/// REAL reclaim on a header we no longer own.
+#[test]
+fn a_stale_cached_command_cannot_suppress_a_reclaim_on_a_header_we_lost() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let pump = "hwmon:it87:pwm2:PUMP";
+    let (ctx, ctrl) = context_with_controller(&[pump]);
+
+    ctrl.command(pump, 100);
+    ctx.cache
+        .update_hwmon_fans(vec![fan_at(pump, Some(100), Some(100), Some(1))]);
+    engine.start(unique_session("stale"), &ctx).unwrap();
+    engine.tick(&ctx);
+
+    // The daemon releases the header. The CACHE still says we commanded 100%
+    // (nothing ever clears it), but the controller has forgotten — which is the
+    // difference this test exists to pin.
+    ctrl.ctrl.lock().on_lease_released();
+    assert_eq!(
+        ctx.cache.snapshot().hwmon_fans[pump].pwm_commanded_pct,
+        Some(100),
+        "precondition: the cache must still carry the stale command, or this \
+         test proves nothing"
+    );
+
+    // Firmware now takes it to full speed.
+    ctx.cache
+        .update_hwmon_fans(vec![fan_at(pump, Some(100), Some(100), Some(0))]);
+    engine.tick(&ctx);
+
+    let s = engine.snapshot().unwrap();
+    assert!(
+        s.events.iter().any(|e| e.kind == EV_CONTROL_RECLAIMED),
+        "the daemon no longer owns this header, so mode 0 is a real reclaim and \
+         must be recorded. events: {:?}",
+        s.events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+    );
+}
+
+/// A context whose controller genuinely reports `last_commanded_pct`, which the
+/// full-speed-alias predicate reads. `test_context()` leaves `hwmon_controller`
+/// as `None`, and the predicate then (correctly) refuses to exempt anything —
+/// with no controller the daemon is driving nothing, so there is no duty of ours
+/// to recognise. Exercising the exemption therefore needs a real one.
+///
+/// The writer is a stub: nothing here asserts on sysfs, only on what the
+/// controller remembers having commanded.
+struct NullWriter;
+impl control_ofc_daemon::hwmon::pwm_control::SysfsWriter for NullWriter {
+    fn write_file(
+        &mut self,
+        _p: &str,
+        _v: &str,
+    ) -> Result<(), control_ofc_daemon::error::HwmonError> {
+        Ok(())
+    }
+    fn read_file(&self, _p: &str) -> Result<String, control_ofc_daemon::error::HwmonError> {
+        Ok("1\n".to_string())
+    }
+}
+
+fn header(id: &str) -> control_ofc_daemon::hwmon::pwm_discovery::PwmHeaderDescriptor {
+    control_ofc_daemon::hwmon::pwm_discovery::PwmHeaderDescriptor {
+        id: id.to_string(),
+        label: "TEST".into(),
+        chip_name: "it8696".into(),
+        pwm_index: 1,
+        supports_enable: true,
+        pwm_path: "/dev/null".into(),
+        enable_path: Some("/dev/null".into()),
+        max_pwm_percent: 100,
+        is_writable: true,
+        ..Default::default()
+    }
+}
+
+/// Build a context and drive `ctrl.set_pwm` so `last_commanded_pct` is real.
+fn context_with_controller(ids: &[&str]) -> (RecorderContext, ControllerHandle) {
+    let mut ctx = test_context();
+    let mut lease_mgr = control_ofc_daemon::hwmon::lease::LeaseManager::new();
+    let lease = lease_mgr
+        .take_lease(control_ofc_daemon::hwmon::lease::HwmonWriter::Engine)
+        .unwrap();
+    let ctrl = control_ofc_daemon::hwmon::pwm_control::HwmonPwmController::new(
+        ids.iter().map(|i| header(i)).collect(),
+        lease_mgr,
+        Box::new(NullWriter),
+        ctx.cache.clone(),
+    );
+    let ctrl = std::sync::Arc::new(parking_lot::Mutex::new(ctrl));
+    ctx.hwmon_controller = Some(ctrl.clone());
+    (
+        ctx,
+        ControllerHandle {
+            ctrl,
+            lease_id: lease.lease_id,
+        },
+    )
+}
+
+struct ControllerHandle {
+    ctrl: std::sync::Arc<
+        parking_lot::Mutex<control_ofc_daemon::hwmon::pwm_control::HwmonPwmController>,
+    >,
+    lease_id: String,
+}
+
+impl ControllerHandle {
+    /// Command a duty for real, so the controller remembers it.
+    fn command(&self, id: &str, pct: u8) {
+        self.ctrl.lock().set_pwm(id, pct, &self.lease_id).unwrap();
+    }
+}
+
+/// [DEC-326 remediation, `concurrency-reviewer` finding 1] The two tests above
+/// both STOP at the aliased tick, so neither can see this: suppressing the
+/// reclaim is not enough if the watermark still advances, because the descent
+/// back below 100% then pushes a phantom `EV_CONTROL_RESTORED`.
+#[test]
+fn descending_from_full_speed_pushes_no_phantom_restore() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let pump = "hwmon:it87:pwm2:PUMP";
+    let (ctx, ctrl) = context_with_controller(&[pump]);
+
+    ctrl.command(pump, 60);
+    ctx.cache
+        .update_hwmon_fans(vec![fan_at(pump, Some(60), Some(60), Some(1))]);
+    engine.start(unique_session("descend"), &ctx).unwrap();
+    engine.tick(&ctx);
+
+    // Up to full speed — the driver aliases the mode to 0.
+    ctrl.command(pump, 100);
+    ctx.cache
+        .update_hwmon_fans(vec![fan_at(pump, Some(100), Some(100), Some(0))]);
+    engine.tick(&ctx);
+
+    // ...and back down. The mode reads 1 again because the duty left 0xff.
+    ctrl.command(pump, 40);
+    ctx.cache
+        .update_hwmon_fans(vec![fan_at(pump, Some(40), Some(40), Some(1))]);
+    engine.tick(&ctx);
+
+    let s = engine.snapshot().unwrap();
+    let kinds: Vec<&str> = s.events.iter().map(|e| e.kind.as_str()).collect();
+    assert!(
+        !kinds.contains(&EV_CONTROL_RESTORED),
+        "nothing was ever reclaimed, so nothing may be 'restored'. events: {kinds:?}"
+    );
+    assert!(!kinds.contains(&EV_CONTROL_RECLAIMED));
+}
+
+/// The consequence the phantom restore actually has, asserted on the published
+/// finding rather than on the event: `summary::control_restoration` counts
+/// reclaims and restores GLOBALLY, so one member riding 100%→40% could satisfy
+/// a DIFFERENT member's genuine, never-restored reclaim and turn FAIL into PASS.
+#[test]
+fn one_members_full_speed_ride_cannot_mask_anothers_real_reclaim() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let a = "hwmon:it87:pwm2:PUMP"; // takes a genuine reclaim, never restored
+    let b = "hwmon:it87:pwm3:RAD1"; // merely rides up to 100% and back
+    let (ctx, ctrl) = context_with_controller(&[a, b]);
+
+    ctrl.command(a, 60);
+    ctrl.command(b, 60);
+    ctx.cache.update_hwmon_fans(vec![
+        fan_at(a, Some(60), Some(60), Some(1)),
+        fan_at(b, Some(60), Some(60), Some(1)),
+    ]);
+    engine.start(unique_session("mask"), &ctx).unwrap();
+    engine.tick(&ctx);
+
+    // A is genuinely reclaimed to automatic; B goes to full speed.
+    ctrl.command(b, 100);
+    ctx.cache.update_hwmon_fans(vec![
+        fan_at(a, Some(60), Some(60), Some(2)),
+        fan_at(b, Some(100), Some(100), Some(0)),
+    ]);
+    engine.tick(&ctx);
+
+    // A stays reclaimed; B comes back down.
+    ctrl.command(b, 40);
+    ctx.cache.update_hwmon_fans(vec![
+        fan_at(a, Some(60), Some(60), Some(2)),
+        fan_at(b, Some(40), Some(40), Some(1)),
+    ]);
+    engine.tick(&ctx);
+
+    let done = engine.stop().unwrap();
+    // Precondition: the window this test claims to exercise really happened.
+    assert!(
+        done.events
+            .iter()
+            .any(|e| e.kind == EV_CONTROL_RECLAIMED && e.member_id.as_deref() == Some(a)),
+        "A's genuine reclaim must be recorded, or this test asserts nothing"
+    );
+    let findings = summary::summarise(&done);
+    assert_eq!(
+        find(&findings, F_CONTROL_RESTORATION).state,
+        RESULT_FAIL,
+        "control was never restored to A; B's ride to 100% must not pay for it"
+    );
+}

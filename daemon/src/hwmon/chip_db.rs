@@ -557,11 +557,23 @@ pub fn read_board_info_from(dmi_dir: &Path) -> BoardInfo {
 //
 // Some Gigabyte boards expose two ITE Super-IO chips on a single PCB. The
 // upstream frankcrawford/it87 driver scans both 0x2E and 0x4E SuperIO base
-// addresses, but a stale SuperIO state (e.g. left in config-mode by a prior
-// `sensors-detect` run) or a missing `mmio=on` modparam on PR-#77-era code
-// can cause the secondary chip's DEVID read to return 0xFFFF and the driver
-// silently gives up on the second chip. Result: only N of M expected PWM
-// headers reach hwmon.
+// addresses. When the secondary chip does not enumerate, only N of M expected
+// PWM headers reach hwmon — and there are **two distinct failure modes** that
+// produce that same visible symptom. They have different causes, different
+// evidence and different remedies, so do not conflate them (DEC-326 / `HOST-b`):
+//
+//   MODE 1 — secondary DEVID reads 0xFFFF. A stale SuperIO state, canonically
+//   left in config-mode by a prior `sensors-detect` run (or, on PR-#77-era
+//   code, a missing `mmio=on`). Recoverable: reboot without running
+//   `sensors-detect`. This mode is real and this comment's original account of
+//   it stands.
+//
+//   MODE 2 — secondary DEVID reads 0x8883. **Not recoverable locally, as at
+//   2026-09-04.** See the X870 STEALTH ICE / X870E AORUS MASTER note at the
+//   foot of `GIGABYTE_DUAL_CHIP_BOARDS` for the measurements. The critical
+//   difference is that `mmio=on` is NOT a remedy here, because `mmio` already
+//   defaults to `true` (`it87.c:314`, `static bool mmio = true;`) — advice to
+//   "enable" it names a state that is already in effect.
 //
 // We expose the expected chip-list to the GUI so it can render a dual-chip
 // warning when `expected_chips - chips_detected` is non-empty. The list is
@@ -726,13 +738,49 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "B850 AI TOP",
         chips: &["it8696", "it87952"],
     },
-    // X870 AORUS STEALTH ICE: NOT enrolled above (yet). The earlier reason —
-    // "secondary chip is an undriveable IT8883" — was wrong: per
-    // frankcrawford/it87 #81/#70 the real pair is IT8696E + IT87952E, and
-    // 0x8883 is only what the secondary reports when stuck in config mode
-    // (clean read 0x8695), recovered with mmio=on. Enrolling it like the
-    // other it8696+it87952 boards is a reasonable follow-up; kept out here to
-    // avoid a behaviour change in the 2026-07 doc-correctness pass.
+    // X870 AORUS STEALTH ICE: NOT enrolled above, and the reason has now been
+    // measured rather than inferred (DEC-326 / `HOST-b`).
+    //
+    // This comment previously retracted an earlier "undriveable IT8883" reading
+    // as *"was wrong"*, and asserted that 0x8883 is merely a stuck-in-config-mode
+    // IT87952E "recovered with mmio=on", citing #81/#70. **That retraction was
+    // itself wrong on both of its load-bearing halves, and is hereby withdrawn.**
+    //
+    // MEASURED, on an X870E AORUS MASTER running the DKMS build at upstream HEAD
+    // (it87-349.c567739), 2026-09-04:
+    //   * `mmio` is `true` BY DEFAULT (`it87.c:314`). This host passes the module
+    //     no parameters at all — `/sys/module/it87/parameters/` does not even
+    //     exist — so "recovered with mmio=on" named a state already in effect and
+    //     could never have been an outstanding remedy.
+    //   * The kernel log reads `Found IT8696E chip at 0xa40 [MMIO at
+    //     0x00000000fe100000]` and then, under `dyndbg=+p`, `Unsupported chip
+    //     (DEVID=0x8883)`. One `it87` hwmon device enumerates, not two.
+    //   * The string `8883` appears **nowhere** in the driver — no case, no
+    //     constant, no comment (grep over the whole file: 0 hits). Meanwhile
+    //     `IT87952E_DEVID 0x8695` IS defined (`:280`) and IS handled in the
+    //     probe switch (`:5393`). So the IT87952E is **unreachable, not
+    //     unsupported** — a distinction the old comment inverted.
+    //   * #81 does not record a resolution. Its owner ran
+    //     `force_id=0x8696,0x8883 ignore_resource_conflict=true mmio=on` and
+    //     still reports one chip, five fans, with "the last three fans and a
+    //     water pump" non-functional. Citing it as evidence that the theory
+    //     WORKS reads the issue backwards.
+    //
+    // INFERRED, and labelled as such: 0x8883 is most likely an IT8883 eSPI→LPC
+    // bridge with the IT87952E sitting behind it (per #64's "espi to lpc bridge
+    // chips"), i.e. the driver is answering the bridge rather than the chip.
+    // Nothing here confirms that; it is the least-bad reading of the evidence.
+    //
+    // Consequence for this table: enrolling STEALTH ICE would make the GUI
+    // promise headers that no Linux driver can currently reach, so it stays out
+    // — now for a measured reason rather than to avoid churn. **Do not
+    // re-retract this without a fresh measurement**; that is exactly how the
+    // previous version got here.
+    //
+    // This does NOT generalise to the family. `X870E AORUS ELITE` above is an
+    // owner-confirmed working it8696+it87952 pairing (#89, both chips, control
+    // working), so the correct unit of judgement is the board pairing, never
+    // "X870E" or "dual ITE".
 ];
 
 /// Look up the chip names a known Gigabyte dual-chip board is expected to

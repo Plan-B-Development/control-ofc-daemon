@@ -610,9 +610,28 @@ fn classify_verify_result(
     final_state: &HwmonVerifyState,
     test_pct: u8,
 ) -> (String, String) {
-    // Check if pwm_enable was reclaimed
+    // Check if pwm_enable was reclaimed.
+    //
+    // [HOST-a / DEC-326] Exempt the driver's full-speed alias. `verify_test_duty`
+    // returns exactly 100 for a pump header already running at >=60%, which is an
+    // ordinary state — so without this the verify reports a BIOS reclaim that did
+    // not happen, on the one endpoint built to answer "does this header accept
+    // writes?".
     if let Some(final_enable) = final_state.pwm_enable {
-        if final_enable != 1 {
+        // The exemption additionally requires that the daemon HELD manual mode
+        // to begin with (`initial.pwm_enable == Some(1)`) — the verdict's own
+        // message says "changed from 1", and without that term a header the
+        // firmware already pins at full speed presents identically to the alias
+        // (enable 0, duty 100%, zero `pwm_raw` delta) and would verify as a pass
+        // on the one endpoint built to answer "does this header accept writes?".
+        if final_enable != 1
+            && !(initial.pwm_enable == Some(1)
+                && crate::pwm::is_full_speed_alias(
+                    test_pct,
+                    final_state.pwm_percent,
+                    final_state.pwm_enable,
+                ))
+        {
             return (
                 "pwm_enable_reverted".into(),
                 format!(
@@ -1595,6 +1614,107 @@ mod tests {
         assert!(
             details.contains("Re-run with no profile active"),
             "details: {details:?}"
+        );
+    }
+
+    // ── [HOST-a / DEC-326] the driver's full-speed alias ─────────────
+
+    #[test]
+    fn verify_does_not_report_a_reclaim_for_its_own_full_speed_write() {
+        let initial = HwmonVerifyState {
+            pwm_enable: Some(1),
+            pwm_raw: Some(153),
+            pwm_percent: Some(60),
+            rpm: Some(1000),
+        };
+        // The test wrote 100%; the driver now reports mode 0 because the duty
+        // register holds 0xff. Nothing reclaimed anything.
+        let final_state = HwmonVerifyState {
+            pwm_enable: Some(0),
+            pwm_raw: Some(255),
+            pwm_percent: Some(100),
+            rpm: Some(1436),
+        };
+        let (result, _details) = classify_verify_result(&initial, &final_state, 100);
+        assert_ne!(
+            result, "pwm_enable_reverted",
+            "the header accepted the write; reporting a BIOS reclaim would be a lie"
+        );
+    }
+
+    #[test]
+    fn verify_still_reports_a_reclaim_when_the_mode_is_genuinely_lost() {
+        // Opposite branch, and the reachability argument in one test: this is
+        // the same 100% test duty, but mode 2 (automatic) is a real reclaim.
+        let initial = HwmonVerifyState {
+            pwm_enable: Some(1),
+            pwm_raw: Some(153),
+            pwm_percent: Some(60),
+            rpm: Some(1000),
+        };
+        let final_state = HwmonVerifyState {
+            pwm_enable: Some(2),
+            pwm_raw: Some(255),
+            pwm_percent: Some(100),
+            rpm: Some(1436),
+        };
+        let (result, _) = classify_verify_result(&initial, &final_state, 100);
+        assert_eq!(result, "pwm_enable_reverted");
+    }
+
+    #[test]
+    fn a_header_the_firmware_already_pins_at_full_speed_does_not_verify_as_a_pass() {
+        // [DEC-326 remediation, `concurrency-reviewer` finding 4] The exemption
+        // requires evidence the daemon HELD manual mode. Without that term, a
+        // header the firmware owns at full speed is indistinguishable from the
+        // alias — enable 0, duty 100%, zero `pwm_raw` delta — and the endpoint
+        // built to answer "does this header accept writes?" answers yes.
+        let initial = HwmonVerifyState {
+            pwm_enable: Some(0), // firmware already owns it: never was 1
+            pwm_raw: Some(255),
+            pwm_percent: Some(100),
+            rpm: Some(1436),
+        };
+        let final_state = HwmonVerifyState {
+            pwm_enable: Some(0),
+            pwm_raw: Some(255),
+            pwm_percent: Some(100),
+            rpm: Some(1436),
+        };
+        let (result, _) = classify_verify_result(&initial, &final_state, 100);
+        assert_eq!(
+            result, "pwm_enable_reverted",
+            "the daemon never held manual mode here, so this is not our duty \
+             read back — it is a header we do not control"
+        );
+    }
+
+    #[test]
+    fn a_pump_at_an_ordinary_idle_duty_is_verified_at_exactly_full_speed() {
+        // Why the alias case above is not hypothetical. The window is DERIVED
+        // from the real function rather than asserted as a literal, so it stays
+        // true if DELTA or the pump floor ever move — the failure this pins is
+        // "no pump duty reaches 100" (exposure gone, test now vacuous), not a
+        // particular arithmetic result.
+        let window: Vec<u8> = (0..=100u8)
+            .filter(|&c| verify_test_duty(true, c) == 100)
+            .collect();
+        assert!(
+            !window.is_empty(),
+            "if no pump duty verifies at 100%, the alias case above is unreachable \
+             and must be re-justified rather than silently kept"
+        );
+        // Measured today: 60..=65 — an ordinary idle duty for an AIO pump, which
+        // is what makes the false `pwm_enable_reverted` verdict reachable in
+        // normal use rather than only under a contrived duty.
+        assert!(
+            window.iter().all(|&c| (30..=99).contains(&c)),
+            "the window must sit inside ordinary running duties, got {window:?}"
+        );
+        // ...and no non-pump header reaches it, which bounds the exposure.
+        assert!(
+            (0..=100u8).all(|c| verify_test_duty(false, c) != 100),
+            "an ordinary fan is never verified at full speed"
         );
     }
 

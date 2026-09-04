@@ -578,6 +578,15 @@ impl ValidationEngine {
         for m in &session.metadata.members {
             let fan = snap.hwmon_fans.get(&m.member_id);
             let enable = fan.and_then(|f| f.pwm_enable_mode);
+            // [HOST-a / DEC-326] The same exemption the reclaim decision below
+            // uses. Without it a sample records `ownership: external` for every
+            // tick a member sits at 100% while the session records no reclaim —
+            // an artefact that contradicts itself.
+            let alias = crate::pwm::is_full_speed_alias(
+                commanded.get(&m.member_id).copied().unwrap_or(0),
+                fan.and_then(|f| f.pwm_readback_pct),
+                enable,
+            );
             members.push(MemberSample {
                 member_id: m.member_id.clone(),
                 role: m.member_kind.clone(),
@@ -589,6 +598,7 @@ impl ValidationEngine {
                 enable_revert_count: reverts.get(&m.member_id).copied().unwrap_or(0),
                 ownership: match enable {
                     Some(1) => OWNERSHIP_DAEMON.to_string(),
+                    Some(_) if alias => OWNERSHIP_DAEMON.to_string(),
                     Some(_) => OWNERSHIP_EXTERNAL.to_string(),
                     None => OWNERSHIP_UNKNOWN.to_string(),
                 },
@@ -689,20 +699,57 @@ impl ValidationEngine {
                 .map(|m| m.member_id.clone())
                 .collect();
             for id in &member_ids {
-                let now_mode = snap.hwmon_fans.get(id).and_then(|f| f.pwm_enable_mode);
+                let fan = snap.hwmon_fans.get(id);
+                let now_mode = fan.and_then(|f| f.pwm_enable_mode);
                 let was_mode = w.enable_modes.get(id).copied();
+                // [HOST-a / DEC-326] The full-speed alias is our own duty read
+                // back, not a second writer. Both halves come from the SAME poll
+                // snapshot, so they describe one instant. A member curve reaching
+                // 100% under load is what a validation session exists to observe;
+                // without this it was recorded as `control_reclaimed` and surfaced
+                // as the `bios_ec_control_reclaim` finding on the session report.
+                // "What we asked for" comes from the CONTROLLER (`commanded`,
+                // read from `last_commanded_pct` at the top of this tick), not
+                // from the cache's `pwm_commanded_pct`. The cache field is
+                // carried forward indefinitely by `update_hwmon_fans` and is
+                // never cleared when the daemon stops driving a header, so a
+                // stale "we commanded 100" would suppress a REAL reclaim on a
+                // header we no longer own. The controller's copy is cleared by
+                // `on_lease_released`, which is exactly the ownership signal
+                // this predicate needs. `None` (nothing commanded, or the
+                // controller lock was busy) means no duty of ours to recognise,
+                // so the event stands — the conservative direction.
+                let full_speed_alias = crate::pwm::is_full_speed_alias(
+                    commanded.get(id).copied().unwrap_or(0),
+                    fan.and_then(|f| f.pwm_readback_pct),
+                    now_mode,
+                );
                 if let Some(mode) = now_mode {
-                    if was_mode == Some(1) && mode != 1 {
-                        push_event_locked(
-                            session,
-                            EV_CONTROL_RECLAIMED,
-                            Some(format!("pwm_enable {mode}")),
-                            Some(id.clone()),
-                        );
-                    } else if was_mode.is_some_and(|w| w != 1) && mode == 1 {
-                        push_event_locked(session, EV_CONTROL_RESTORED, None, Some(id.clone()));
+                    if full_speed_alias {
+                        // [HOST-a / DEC-326] Suppressing the reclaim is not
+                        // enough: the WATERMARK must not move either. If it
+                        // advanced to 0 here, the next tick below 100% would see
+                        // `was_mode = Some(0)` and `mode == 1` and push a
+                        // phantom `EV_CONTROL_RESTORED` — and
+                        // `summary::control_restoration` counts reclaims and
+                        // restores GLOBALLY rather than per member, so one
+                        // member riding 100%→40% could satisfy the restore of a
+                        // DIFFERENT member's genuine, never-restored reclaim and
+                        // turn a FAIL into a PASS. Leaving the last non-aliased
+                        // mode in place makes both halves consistent.
+                    } else {
+                        if was_mode == Some(1) && mode != 1 {
+                            push_event_locked(
+                                session,
+                                EV_CONTROL_RECLAIMED,
+                                Some(format!("pwm_enable {mode}")),
+                                Some(id.clone()),
+                            );
+                        } else if was_mode.is_some_and(|w| w != 1) && mode == 1 {
+                            push_event_locked(session, EV_CONTROL_RESTORED, None, Some(id.clone()));
+                        }
+                        w.enable_modes.insert(id.clone(), mode);
                     }
-                    w.enable_modes.insert(id.clone(), mode);
                 }
                 let now_rev = reverts.get(id).copied().unwrap_or(0);
                 let was_rev = w.enable_reverts.get(id).copied().unwrap_or(0);

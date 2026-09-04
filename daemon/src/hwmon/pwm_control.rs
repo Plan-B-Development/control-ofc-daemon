@@ -309,21 +309,49 @@ impl HwmonPwmController {
         // ── pwm_enable watchdog ─────────────────────────────────────
         // When we believe manual mode is already set, read back pwm_enable
         // to detect BIOS/EC reclaim (Gigabyte SmartFan, MSI Smart Fan, etc.).
+        //
+        // [HOST-a / DEC-326] `enable != 1` is NOT sufficient on its own. Some
+        // drivers synthesise `enable == 0` ("fan at full speed") from the duty
+        // register rather than reporting the mode we set, so a wholly
+        // successful write of 100% reads back as a reclaim. Confirm it against
+        // the duty before believing it — see `pwm::is_full_speed_alias` for the
+        // kernel condition and why this carries no chip table.
+        //
+        // The duty read is deliberately inside the `!= 1` arm: the common path
+        // (mode still 1) costs exactly what it did before, and the extra read
+        // happens only where we were about to declare a reclaim anyway.
         let enable_reclaimed = if supports_enable {
-            let mode_set = self
-                .write_state
-                .get(header_id)
-                .is_some_and(|ws| ws.manual_mode_set);
+            // The watchdog runs BEFORE this call's write, so the duty register
+            // still holds the PREVIOUS command — compare against that, never
+            // against `effective_pct`. Reading `effective_pct` here would
+            // declare a false reclaim on the first descending tick after a
+            // 100% one, which is the very defect this guard exists to remove.
+            let (mode_set, last_pct) =
+                self.write_state.get(header_id).map_or((false, None), |ws| {
+                    (ws.manual_mode_set, ws.last_commanded_pct)
+                });
             if mode_set {
-                enable_path
-                    .as_ref()
-                    .and_then(|ep| {
-                        self.writer
-                            .read_file(ep)
+                let enable_read = enable_path.as_ref().and_then(|ep| {
+                    self.writer
+                        .read_file(ep)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u8>().ok())
+                });
+                match (enable_read, last_pct) {
+                    (Some(1) | None, _) => false,
+                    (Some(mode), Some(last)) => {
+                        let duty_pct = self
+                            .writer
+                            .read_file(&pwm_path)
                             .ok()
                             .and_then(|s| s.trim().parse::<u8>().ok())
-                    })
-                    .is_some_and(|v| v != 1)
+                            .map(raw_to_percent);
+                        !crate::pwm::is_full_speed_alias(last, duty_pct, Some(mode))
+                    }
+                    // Manual mode set but nothing commanded yet: no duty of ours
+                    // to confirm against, so the mode reading stands on its own.
+                    (Some(_), None) => true,
+                }
             } else {
                 false
             }
@@ -1226,6 +1254,107 @@ mod tests {
         assert_eq!(w.len(), 4);
         assert_eq!(w[0].1, "1"); // first enable
         assert_eq!(w[2].1, "1"); // watchdog re-wrote enable
+    }
+
+    // ── [HOST-a / DEC-326] the driver's full-speed alias ─────────────
+    //
+    // `it87.c:3612` synthesises `pwm_enable == 0` ("full speed") from the duty
+    // register whenever it holds 0xff, on any header of a chip without
+    // `FEAT_FANCTL_ONOFF` and on `pwm4+` of every ITE chip. A wholly successful
+    // 100% write therefore reads back looking exactly like a BIOS reclaim.
+
+    /// Seed both the enable AND the duty file, which the alias check reads.
+    fn setup_controller_with_enable_and_duty(
+        headers: Vec<PwmHeaderDescriptor>,
+        enable_value: &str,
+        duty_raw: &str,
+    ) -> (HwmonPwmController, WriteLog, Arc<StateCache>) {
+        let cache = Arc::new(StateCache::new());
+        let (writer, writes) = MockSysfsWriter::new();
+        let writer = writer
+            .with_file("/sys/class/hwmon/hwmon0/fan1_input", "1200\n")
+            .with_file("/sys/class/hwmon/hwmon0/pwm1_enable", enable_value)
+            .with_file("/sys/class/hwmon/hwmon0/pwm1", duty_raw);
+        let lease_mgr = LeaseManager::new();
+        let ctrl = HwmonPwmController::new(headers, lease_mgr, Box::new(writer), cache.clone());
+        (ctrl, writes, cache)
+    }
+
+    #[test]
+    fn watchdog_ignores_the_full_speed_alias_at_100_percent() {
+        // enable reads 0 and the duty register holds 255 — the exact live
+        // signature measured on this host's it8696 at 100%.
+        let (mut ctrl, _writes, _cache) = setup_controller_with_enable_and_duty(
+            vec![make_header("h1", "CHA_FAN1", 0)],
+            "0",
+            "255\n",
+        );
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
+
+        ctrl.set_pwm("h1", 100, &lease.lease_id).unwrap();
+        ctrl.set_pwm("h1", 100, &lease.lease_id).unwrap();
+
+        assert_eq!(
+            ctrl.enable_revert_counts().get("h1"),
+            None,
+            "our own 100% duty read back through the driver is not a BIOS reclaim"
+        );
+    }
+
+    #[test]
+    fn watchdog_still_detects_a_reclaim_when_the_duty_is_not_ours() {
+        // The opposite branch. Same enable=0, but the duty register does NOT
+        // hold what we commanded — so the mode reading means what it says.
+        // Without this case a predicate stuck at "always alias" would pass the
+        // test above.
+        let (mut ctrl, _writes, _cache) = setup_controller_with_enable_and_duty(
+            vec![make_header("h1", "CHA_FAN1", 0)],
+            "0",
+            "128\n",
+        );
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
+
+        ctrl.set_pwm("h1", 100, &lease.lease_id).unwrap();
+        ctrl.set_pwm("h1", 100, &lease.lease_id).unwrap();
+
+        assert_eq!(
+            ctrl.enable_revert_counts().get("h1"),
+            Some(&1),
+            "enable=0 at a duty we did not command is a real loss of control"
+        );
+    }
+
+    #[test]
+    fn watchdog_compares_against_the_last_command_not_the_pending_one() {
+        // The watchdog runs BEFORE this call's write, so the duty register still
+        // holds the PREVIOUS command. Reading the pending duty instead would
+        // declare a false reclaim on the first descending tick after a 100% one —
+        // the same defect one tick over.
+        let (mut ctrl, _writes, _cache) = setup_controller_with_enable_and_duty(
+            vec![make_header("h1", "CHA_FAN1", 0)],
+            "0",
+            "255\n",
+        );
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
+
+        ctrl.set_pwm("h1", 100, &lease.lease_id).unwrap();
+        // Descending: we ask for 40 while the register still shows our own 255.
+        ctrl.set_pwm("h1", 40, &lease.lease_id).unwrap();
+
+        assert_eq!(
+            ctrl.enable_revert_counts().get("h1"),
+            None,
+            "the duty on the wire is still the 100% WE wrote, not a reclaim"
+        );
     }
 
     #[test]

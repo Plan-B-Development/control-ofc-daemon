@@ -315,10 +315,14 @@ fn rpm_moved(before: u16, after: u16) -> bool {
 }
 
 /// Classify one point's PWM readback. `reverted` outranks everything: if
-/// `pwm_enable` is not 1, the value read back is not ours to interpret.
+/// `pwm_enable` is not 1, the value read back is not ours to interpret —
+/// **unless** it is the driver's full-speed alias, which is our own write
+/// reflected back (`pwm::is_full_speed_alias`, DEC-326 / `HOST-a`). Without
+/// that exemption every sweep's 100% point scores `reverted` on an ITE chip
+/// and the run aborts one point from the end.
 fn readback_verdict(requested_pct: u8, readback_pct: Option<u8>, pwm_enable: Option<u8>) -> String {
     if let Some(en) = pwm_enable {
-        if en != 1 {
+        if en != 1 && !crate::pwm::is_full_speed_alias(requested_pct, readback_pct, pwm_enable) {
             return "reverted".into();
         }
     }
@@ -360,9 +364,13 @@ pub fn summarise(points: &[CharPoint]) -> CharSummary {
     }
     .to_string();
 
-    let interference_detected = points
-        .iter()
-        .any(|p| matches!(p.pwm_enable, Some(en) if en != 1));
+    // Same exemption as `readback_verdict`: a full-speed alias is our own duty
+    // read back through a driver that reports mode from the duty register, not
+    // a second writer (DEC-326 / `HOST-a`).
+    let interference_detected = points.iter().any(|p| {
+        matches!(p.pwm_enable, Some(en) if en != 1)
+            && !crate::pwm::is_full_speed_alias(p.requested_pct, p.readback_pct, p.pwm_enable)
+    });
 
     let pwm_readback = if points.iter().any(|p| p.readback_verdict == "reverted") {
         "reverted"
@@ -780,7 +788,11 @@ where
             readback_verdict: readback_verdict(pct, after.pwm_percent, after.pwm_enable),
             rpm_verdict: rpm_verdict(rpm_before, after.rpm),
         };
-        let reclaimed = matches!(after.pwm_enable, Some(en) if en != 1);
+        // The abort predicate gets the same exemption (DEC-326 / `HOST-a`).
+        // This is the limb that actually ends the run: without it, a sweep whose
+        // last point is 100% aborts on a header that accepted every write.
+        let reclaimed = matches!(after.pwm_enable, Some(en) if en != 1)
+            && !crate::pwm::is_full_speed_alias(pct, after.pwm_percent, after.pwm_enable);
         measured.push(point.clone());
         publish(point);
 
@@ -1347,6 +1359,98 @@ mod tests {
         assert_eq!(summarise(&out.points).pwm_readback, "reverted");
         assert!(summarise(&out.points).interference_detected);
         assert_eq!(rig.written(), vec![30, 42]);
+    }
+
+    // ── [HOST-a / DEC-326] the driver's full-speed alias ─────────────
+
+    #[test]
+    fn the_full_speed_alias_is_not_scored_as_reverted() {
+        // enable=0 at the 100% point, duty reading back what we asked for.
+        assert_eq!(readback_verdict(100, Some(100), Some(0)), "match");
+        // ...and the opposite branch: a real reclaim to automatic still wins.
+        assert_eq!(readback_verdict(100, Some(100), Some(2)), "reverted");
+        // ...as does enable=0 at any duty that is not the one we commanded.
+        assert_eq!(readback_verdict(60, Some(60), Some(0)), "reverted");
+    }
+
+    #[test]
+    fn the_full_speed_alias_is_not_counted_as_interference() {
+        let alias = summarise(&[
+            point(30, Some(30), Some(1), Some(600)),
+            point(100, Some(100), Some(0), Some(1436)),
+        ]);
+        assert!(
+            !alias.interference_detected,
+            "our own duty read back is not a second writer"
+        );
+        assert_eq!(alias.pwm_readback, "pass");
+
+        // Opposite branch — an actual reclaim is still reported as one.
+        let real = summarise(&[
+            point(30, Some(30), Some(1), Some(600)),
+            point(100, Some(100), Some(2), Some(1436)),
+        ]);
+        assert!(real.interference_detected);
+        assert_eq!(real.pwm_readback, "reverted");
+    }
+
+    /// The limb that actually ends the run. `sweep`'s fixed `enable` cannot
+    /// express the driver behaviour, so this rig makes the mode a FUNCTION of
+    /// the duty — which is precisely what `it87.c:3612` does.
+    async fn sweep_with_it87_enable(
+        rig: &Rig,
+        cache: &StateCache,
+        points: &[u8],
+        initial_pct: u8,
+    ) -> SweepOutcome {
+        let writes = rig.writes.clone();
+        let last = Arc::new(Mutex::new(initial_pct));
+        let last_w = last.clone();
+        let write_fn = move |pct: u8| -> Result<(), String> {
+            writes.lock().unwrap().push(pct);
+            *last_w.lock().unwrap() = pct;
+            Ok(())
+        };
+        let read_fn = move || {
+            let p = *last.lock().unwrap();
+            // The kernel's rule, verbatim: full scale reports mode 0.
+            sample(Some(p), Some(if p == 100 { 0 } else { 1 }), Some(1000))
+        };
+        let ka = rig.keepalives.clone();
+        run_sweep(
+            cache,
+            "hwmon:test:pwm1",
+            points,
+            0,
+            Duration::from_secs(6),
+            write_fn,
+            read_fn,
+            &rig.cancel,
+            move || false,
+            move || {
+                *ka.lock().unwrap() += 1;
+                true
+            },
+            &rig.report,
+            |_| {},
+        )
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_sweep_reaching_100_percent_completes_on_an_it87_header() {
+        let rig = Rig::new();
+        let cache = cache_at(45.0, Some("normal"));
+        let out = sweep_with_it87_enable(&rig, &cache, &[30, 50, 100], 42).await;
+
+        assert_eq!(
+            out.state, STATE_COMPLETE,
+            "every write landed; the run must not abort at its own last point"
+        );
+        assert_eq!(out.points.len(), 3, "all three points measured");
+        let s = summarise(&out.points);
+        assert!(!s.interference_detected);
+        assert_eq!(s.pwm_readback, "pass");
     }
 
     #[tokio::test(start_paused = true)]

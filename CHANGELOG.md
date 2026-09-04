@@ -2,6 +2,76 @@
 
 ## [Unreleased]
 
+Batch G of the `/ofc:audit` register triage (DEC-326). **Fixes a false "BIOS
+reclaimed the header" verdict that fired whenever a fan header sat at 100% on an
+ITE Super-I/O.** No wire-format change and no route change — four published
+fields stop reporting a case that was never true. Touches no floor, no
+threshold, no ladder rung and no capability flag.
+
+### Fixed
+- **A fan at 100% is no longer misreported as a BIOS reclaim** (`HOST-a`). The
+  `it87` driver reports the PWM mode it *computes* rather than the one it was set
+  to: at full duty it answers `pwm_enable = 0` ("full speed"), which every
+  `enable != 1` check read as firmware taking the header. A wholly successful
+  100% write therefore looked identical to a reclaim. Four things were wrong as a
+  result, and all four are fixed:
+  - the write path logged `pwm_enable ... reclaimed by BIOS` every tick at 100%
+    and inflated the revert count on `/diagnostics/hardware`;
+  - **`POST /fans/characterize` aborted its own sweep at the 100% point** and
+    reported `interference_detected: true` — a false positive in the one
+    diagnostic built to answer "does this header accept writes?";
+  - **`POST /hwmon/{id}/verify` returned `pwm_enable_reverted`** for a pump
+    header, reachable for any pump idling at 60–65% because the verify duty is
+    exactly 100 there;
+  - **a validation session recorded `control_reclaimed`** and published the
+    `bios_ec_control_reclaim` finding whenever a member curve reached 100% under
+    load — which is what a validation session exists to observe.
+
+  The discriminator carries no chip table: `pwm_enable == 0` is only ignored when
+  the duty register still holds the 100% the daemon itself commanded. A reclaim
+  to *automatic* reports mode 2 and is unaffected, and detection resumes on the
+  first observation below 100%. **Cooling behaviour is unchanged in every case** —
+  the only suppressed state is one in which the fan is already at maximum.
+
+  Wider than it first appears: the kernel condition is
+  `(!has_fanctl_onoff || nr >= 3) && duty == 0xff`, so `pwm4` and above are
+  affected on *every* ITE chip, not only on chips lacking the feature bit.
+
+- **A validation session can no longer report "control restored" for a restore
+  that never happened.** Found reviewing the fix above: suppressing the false
+  reclaim was not enough, because the recorder still advanced its watermark, so
+  a member coming back down from 100% pushed a phantom `control_restored`
+  event. Since the `control_restoration` finding counts reclaims and restores
+  across the whole session rather than per member, one member's ordinary ride
+  to 100% could have paid for a *different* member's genuine, never-restored
+  reclaim — turning a FAIL into a PASS on the report.
+- **A header the daemon no longer owns is reported as reclaimed again.** The
+  recorder was reading a cached "last commanded" value that is carried forward
+  indefinitely and never cleared when the daemon stops driving a header, so a
+  stale command could have masked a real reclaim. It now reads the controller's
+  own value, which is cleared when the lease is released.
+- **`POST /hwmon/{id}/verify` no longer passes a header the firmware already
+  pins at full speed.** Such a header is indistinguishable from the case above
+  unless the daemon also held manual mode to begin with, which is now required.
+
+### Changed
+- **The unbound-chip hint no longer recommends `mmio=on`** (`HOST-b`/`HOST-c`).
+  It is already the driver default, so the advice named a state that was always
+  in effect. The hint now also names the `0x8883` case as a terminal state with
+  no local fix, rather than sending the user round a loop.
+- **`README.md`'s dual-ITE row reports the outcome per board rather than per
+  family.** X870E AORUS ELITE is owner-confirmed working (it87 #89); on X870E
+  AORUS MASTER the secondary is unreachable with no local fix (measured
+  2026-09-04). The previous text promised the working outcome to both.
+- **`chip_db.rs`'s account of device-ID `0x8883` is corrected and its previous
+  retraction withdrawn** (`HOST-b`). The comment claimed `0x8883` was a secondary
+  stuck in config mode "recovered with `mmio=on`", citing it87 #81. Measured here:
+  `mmio` already defaults to true, `0x8883` appears nowhere in the driver while
+  the IT87952E *is* supported (so the chip is unreachable, not unsupported), and
+  #81 is open — its reporter applied that advice and still lost three fans and a
+  pump. The separate `0xFFFF`/`sensors-detect` failure is kept as the real,
+  recoverable mode it always was.
+
 ## [2.35.2] — 2026-09-04
 
 Pairs with `control-ofc-gui` >= v2.23.0 (unchanged floor). **Tests only, plus one

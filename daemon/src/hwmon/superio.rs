@@ -482,7 +482,9 @@ fn build_recommendation(
         // notes are ITE-specific, so only add them for the it87 driver.
         let ite_tail = if module == "it87" {
             " For newer Gigabyte ITE boards the in-tree it87 often cannot drive the chip — install \
-             the it87-dkms-git build (with `mmio=on`). Do not pass force_id."
+             the it87-dkms-git build. (Do not add `mmio=on`: it is already the driver default, \
+             DEC-326.) Do not pass force_id. If the chip still does not bind and its DEVID reads \
+             0x8883, it is behind a bridge the driver cannot reach and there is no local fix."
         } else {
             ""
         };
