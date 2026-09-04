@@ -29,6 +29,7 @@
 use crate::hwmon::chip_db;
 use crate::hwmon::classify::Confidence;
 use std::collections::BTreeMap;
+use std::path::Path;
 
 /// Whether Super-I/O detection is supported on the build target. Detection
 /// relies on x86 Super-I/O / ISA semantics; on any other architecture the
@@ -172,6 +173,14 @@ pub trait SuperIoEvidence {
     fn kmsg_chips(&self) -> Vec<String>;
     /// Driver names with an ACPI I/O-port conflict.
     fn acpi_conflict_drivers(&self) -> Vec<String>;
+    /// Is the currently-loaded `module` an out-of-tree build? (`HOST-d`.)
+    ///
+    /// On the trait rather than read inline, because `detect_superio` is
+    /// documented deterministic and side-effect free and every other input
+    /// already arrives this way. The production implementation reads
+    /// `/sys/module/<name>/taint`; see [`module_is_out_of_tree`] for why the
+    /// module's *path* cannot be used.
+    fn module_out_of_tree(&self, module: &str) -> bool;
 }
 
 // ── Module allowlist ────────────────────────────────────────────────
@@ -350,6 +359,7 @@ pub fn detect_superio(ev: &dyn SuperIoEvidence) -> SuperIoReport {
             &ev_acc,
             &loaded,
             &acpi_conflict_drivers,
+            &|m| ev.module_out_of_tree(m),
         ));
     }
 
@@ -381,6 +391,10 @@ fn build_chip(
     ev: &EvidenceAcc,
     loaded: &[String],
     acpi_conflict_drivers: &[String],
+    // `HOST-d`: "is the loaded build out-of-tree?", taken from the evidence
+    // trait rather than read here, so `build_chip` stays a pure function of its
+    // inputs and the recommendation path is testable without a real `/sys`.
+    out_of_tree: &dyn Fn(&str) -> bool,
 ) -> SuperIoChip {
     let expected_module = chip_db::expected_driver(chip_name).to_string();
     let vendor = vendor_for_module(&expected_module);
@@ -431,7 +445,13 @@ fn build_chip(
             chip_name,
             &expected_module,
             ev,
-            module_loaded,
+            if !module_loaded {
+                DriverState::NotLoaded
+            } else if out_of_tree(&expected_module) {
+                DriverState::LoadedOutOfTree
+            } else {
+                DriverState::LoadedInTree
+            },
             loaded,
             acpi_conflict_drivers,
             &mut caveats,
@@ -452,6 +472,119 @@ fn build_chip(
     }
 }
 
+/// Production root for per-module kernel metadata.
+///
+/// `/sys` is mounted read-only-but-readable in the daemon's namespace, so this
+/// is reachable. **`/lib/modules` is NOT** — see [`module_is_out_of_tree_at`].
+const SYS_MODULE_ROOT: &str = "/sys/module";
+
+/// Is the currently-loaded `module` an **out-of-tree** build rather than the
+/// in-tree one? (`HOST-d`, DEC-327.)
+///
+/// Reads `/sys/module/<name>/taint` and looks for the `O` flag, which the kernel
+/// sets on any module built outside the tree. Measured on the dev host:
+/// `it87` (DKMS build) reads `OE`, while in-tree `kvm` and `nvme` read empty.
+///
+/// # Why not the module's path, which is the obvious answer
+///
+/// `HOST-d` proposed `/lib/modules/*/updates/dkms/<mod>.ko*`. **The daemon
+/// cannot read that.** `ProtectKernelModules=true` in the unit file mounts an
+/// inaccessible directory over `/usr/lib/modules` — verified in the running
+/// daemon's own mount namespace, not inferred from documentation:
+///
+/// ```text
+/// /systemd/inaccessible/dir  /usr/lib/modules  ro,nosuid,nodev,noexec
+/// ```
+///
+/// (`/lib` symlinks to `/usr/lib`, so both spellings hit the same mount.)
+/// `dkms status` is likewise out of reach. The taint flag is the only signal
+/// that survives the sandbox, and it is arguably the better one anyway: it
+/// describes what is **loaded**, not what happens to be installed on disk.
+///
+/// # What it does and does not tell you
+///
+/// `O` means "built out-of-tree" — **not** "installed by DKMS" specifically. A
+/// hand-compiled module reads `O` too. For the one decision this drives that is
+/// correct rather than approximate: the advice being suppressed is *"install the
+/// DKMS build"*, and somebody already running any out-of-tree build is in
+/// exactly the same position as somebody running the DKMS one.
+///
+/// Returns `false` when the file is missing or unreadable, which is the
+/// conservative direction — the caller then keeps the install recommendation
+/// rather than suppressing it on a failed read.
+pub fn module_is_out_of_tree(module: &str) -> bool {
+    module_is_out_of_tree_at(Path::new(SYS_MODULE_ROOT), module)
+}
+
+/// Internal: the same check against an injectable root (test seam), matching
+/// the `amdgpu_module_loaded` / `amdgpu_module_loaded_at` pair in `gpu_detect`.
+pub fn module_is_out_of_tree_at(module_root: &Path, module: &str) -> bool {
+    std::fs::read_to_string(module_root.join(module).join("taint"))
+        .map(|t| t.contains('O'))
+        .unwrap_or(false)
+}
+
+/// How the expected driver stands for a present-but-unbound chip.
+///
+/// Replaces the pair `(module_loaded: bool, out_of_tree: bool)`. Two booleans
+/// that must agree is the shape `CLAUDE.md § Hard-won lessons` records as
+/// "two arguments to the same call, derived from different sources, will
+/// eventually disagree" (DEC-325) — here `(false, true)`, "not loaded but
+/// out-of-tree", is nonsense that the type system can simply forbid. It also
+/// keeps `build_recommendation` inside clippy's argument budget, which is what
+/// surfaced the coupling in the first place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriverState {
+    /// The expected module is not loaded at all.
+    NotLoaded,
+    /// Loaded, and it is the in-tree build.
+    LoadedInTree,
+    /// Loaded, and it is an out-of-tree build (`HOST-d`, DEC-327).
+    LoadedOutOfTree,
+}
+
+impl DriverState {
+    fn loaded(self) -> bool {
+        !matches!(self, Self::NotLoaded)
+    }
+}
+
+/// The ITE-specific tail of the "loaded but did not bind" hint.
+///
+/// Extracted so the branch is testable on its own — the surrounding
+/// [`build_recommendation`] already branches on the driver state, and layering a
+/// second special case inside it is what this project's rewrite-vs-patch rule
+/// calls a broken abstraction.
+fn ite_unbound_tail(out_of_tree: bool) -> &'static str {
+    if out_of_tree {
+        // `HOST-d`: the whole point. Telling somebody to install a build they
+        // are demonstrably already running is what made this hint a loop.
+        //
+        // But the taint flag proves the build is OUT-OF-TREE, not that it is
+        // CURRENT — so this must not send a user on a stale build to a dead end
+        // while the GUI beside it correctly tells them to update. "Reinstalling
+        // the same build" and "updating to a current one" are different actions
+        // and only the first is futile.
+        " You are already running an out-of-tree `it87` build, so reinstalling \
+         the same build will not change anything — the plain 'install \
+         it87-dkms-git' advice is for somebody still on the in-tree driver. If \
+         yours is old, updating is still worth doing: `it87-dkms-git` is a \
+         `-git` package, so reinstalling it rebuilds the current upstream \
+         snapshot, and several secondary-chip fixes landed in 2026-03 and later. \
+         Do not pass force_id, and do not add `mmio=on` (it is already the \
+         driver default). If the chip still does not bind on a current build and \
+         its DEVID reads 0x8883, the secondary is most likely behind an \
+         eSPI-to-LPC bridge the driver cannot reach — there is no local fix for \
+         that case, and it needs driver work upstream."
+    } else {
+        " For newer Gigabyte ITE boards the in-tree it87 often cannot drive the \
+         chip — install the it87-dkms-git build. (Do not add `mmio=on`: it is \
+         already the driver default, DEC-326.) Do not pass force_id. If the chip \
+         still does not bind and its DEVID reads 0x8883, it is behind a bridge \
+         the driver cannot reach and there is no local fix."
+    }
+}
+
 /// Build a load recommendation for a present-but-unbound chip whose module is
 /// allowlisted. Returns `None` (with a caveat) if the module is not on the
 /// allowlist — the safety gate that stops the daemon ever recommending an
@@ -460,7 +593,7 @@ fn build_recommendation(
     chip_name: &str,
     module: &str,
     ev: &EvidenceAcc,
-    module_loaded: bool,
+    driver: DriverState,
     loaded: &[String],
     acpi_conflict_drivers: &[String],
     caveats: &mut Vec<String>,
@@ -475,16 +608,13 @@ fn build_recommendation(
 
     let in_mainline = chip_db::chip_driver_in_mainline(chip_name);
 
-    let load_hint = if module_loaded {
+    let load_hint = if driver.loaded() {
         // The driver is already loaded but the chip produced no hwmon device —
         // telling the user to "load it" would be wrong. Point at the real
         // causes of a failed bind instead. The it87-dkms / mmio / force_id
         // notes are ITE-specific, so only add them for the it87 driver.
         let ite_tail = if module == "it87" {
-            " For newer Gigabyte ITE boards the in-tree it87 often cannot drive the chip — install \
-             the it87-dkms-git build. (Do not add `mmio=on`: it is already the driver default, \
-             DEC-326.) Do not pass force_id. If the chip still does not bind and its DEVID reads \
-             0x8883, it is behind a bridge the driver cannot reach and there is no local fix."
+            ite_unbound_tail(driver == DriverState::LoadedOutOfTree)
         } else {
             ""
         };
@@ -508,7 +638,7 @@ fn build_recommendation(
         )
     };
 
-    let reason = if module_loaded {
+    let reason = if driver.loaded() {
         format!(
             "The `{module}` driver is loaded but no hwmon device appeared for this chip — it did \
              not bind."
@@ -547,7 +677,7 @@ fn build_recommendation(
         ));
     }
     if let Some(other) = chip_db::conflicting_loaded_module(module, loaded) {
-        if module_loaded {
+        if driver.loaded() {
             // Both drivers are loaded right now — the collision is ACTIVE, not
             // a future risk of loading.
             risk_notes.push(format!(
@@ -593,6 +723,10 @@ impl SysfsSuperIoEvidence {
 }
 
 impl SuperIoEvidence for SysfsSuperIoEvidence {
+    fn module_out_of_tree(&self, module: &str) -> bool {
+        module_is_out_of_tree(module)
+    }
+
     fn board(&self) -> (String, String) {
         let b = chip_db::read_board_info();
         (b.vendor, b.name)
@@ -637,9 +771,14 @@ mod tests {
         loaded: Vec<String>,
         kmsg: Vec<String>,
         acpi: Vec<String>,
+        /// Modules the fake reports as out-of-tree builds (`HOST-d`).
+        out_of_tree: Vec<String>,
     }
 
     impl SuperIoEvidence for FakeEvidence {
+        fn module_out_of_tree(&self, module: &str) -> bool {
+            self.out_of_tree.iter().any(|m| m == module)
+        }
         fn board(&self) -> (String, String) {
             self.board.clone()
         }
@@ -839,6 +978,185 @@ mod tests {
         assert!(chip.caveats.iter().any(|c| c.contains("Unrecognized")));
     }
 
+    // ── [HOST-d / DEC-327] out-of-tree detection ────────────────────
+
+    /// The DETECTOR, against a fake `/sys/module` tree — never real hardware
+    /// (`CLAUDE.md § Testing policy`).
+    #[test]
+    fn out_of_tree_is_read_from_the_module_taint_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Shapes measured on the dev host 2026-09-04.
+        for (module, taint) in [("it87", "OE\n"), ("kvm", "\n"), ("nvme", "")] {
+            std::fs::create_dir_all(root.join(module)).unwrap();
+            std::fs::write(root.join(module).join("taint"), taint).unwrap();
+        }
+        assert!(
+            module_is_out_of_tree_at(root, "it87"),
+            "`OE` carries the out-of-tree flag"
+        );
+        assert!(
+            !module_is_out_of_tree_at(root, "kvm"),
+            "in-tree: empty taint"
+        );
+        assert!(
+            !module_is_out_of_tree_at(root, "nvme"),
+            "in-tree: empty taint"
+        );
+        // A module with no taint file, and one absent entirely, must both be
+        // FALSE — the conservative direction, which keeps the install advice
+        // rather than suppressing it on a failed read.
+        std::fs::create_dir_all(root.join("notaint")).unwrap();
+        assert!(!module_is_out_of_tree_at(root, "notaint"));
+        assert!(!module_is_out_of_tree_at(root, "absent"));
+    }
+
+    /// The rule itself, asserted as a RELATIONSHIP between the two branches
+    /// rather than against a literal string — a substring check on "install"
+    /// would pass against a sentence saying installing does not help.
+    #[test]
+    fn the_unbound_tail_stops_recommending_a_build_already_loaded() {
+        let already = ite_unbound_tail(true);
+        let not_yet = ite_unbound_tail(false);
+
+        assert!(
+            already.contains("reinstalling the same build will not change anything"),
+            "the out-of-tree branch must say REINSTALLING is futile"
+        );
+        // [security-reviewer finding 1] ...but the taint flag proves the build
+        // is out-of-tree, NOT that it is current. A user on a stale out-of-tree
+        // build must still be told updating is worth doing — otherwise this
+        // sends them to a dead end while the GUI beside it says the opposite.
+        assert!(
+            already.contains("updating is still worth doing"),
+            "an out-of-tree build may still be STALE; the branch must not \
+             present a dead end. got: {already}"
+        );
+        // The terminal "no local fix" must stay gated on the DEVID condition
+        // rather than applying to every out-of-tree build.
+        assert!(
+            already.contains("no local fix for that case"),
+            "the terminal state must be scoped to the 0x8883 case"
+        );
+        // And it must not cite a CLOSED upstream issue as the live thread —
+        // it87 #64 is recorded closed 2025-12 (docs/19:705). Same defect as
+        // HOST-c, which cited #81 as a resolution where it records a failure.
+        assert!(
+            !already.contains("#64"),
+            "do not point users at a closed issue as the tracking thread"
+        );
+        assert!(
+            not_yet.contains("install the it87-dkms-git build"),
+            "the in-tree branch must still offer the install that DOES help"
+        );
+        // The opposite branch, or a predicate stuck on one answer passes above.
+        assert_ne!(already, not_yet, "the branches must actually differ");
+        // `HOST-d` is explicit that this half stays, on BOTH branches. It is
+        // correct, well-tested, and independently reconfirmed by DEC-326.
+        assert!(already.contains("force_id") && not_yet.contains("force_id"));
+    }
+
+    /// The CALL-SITE test. The detector and the tail each have their own
+    /// coverage above; this drives `detect_superio` and asserts the rendered
+    /// recommendation changes — because "extracting a rule into a testable
+    /// function does NOT test the call site" is this project's most-repeated
+    /// lesson, and the whole defect was a call site rendering the wrong string.
+    #[test]
+    fn an_unbound_chip_on_an_out_of_tree_build_is_not_told_to_install_it() {
+        let board = (
+            "Gigabyte Technology Co., Ltd.".to_string(),
+            "X870E AORUS MASTER".to_string(),
+        );
+        // Loaded, but nothing bound — the exact state this host is in.
+        let mk = |oot: Vec<String>| FakeEvidence {
+            board: board.clone(),
+            loaded: vec!["it87".to_string()],
+            kmsg: vec!["it8696".to_string()],
+            out_of_tree: oot,
+            ..Default::default()
+        };
+
+        let dkms = detect_superio(&mk(vec!["it87".to_string()]));
+        let in_tree = detect_superio(&mk(vec![]));
+
+        let hint = |r: &SuperIoReport| {
+            r.chips
+                .iter()
+                .find_map(|c| c.recommendation.as_ref().map(|x| x.load_hint.clone()))
+                .expect("an unbound allowlisted chip must produce a recommendation")
+        };
+        let (dkms_hint, in_tree_hint) = (hint(&dkms), hint(&in_tree));
+
+        assert!(
+            !dkms_hint.contains("install the it87-dkms-git build"),
+            "the user is already running an out-of-tree build; telling them to \
+             install one is the loop HOST-d exists to break. got: {dkms_hint}"
+        );
+        assert!(
+            in_tree_hint.contains("install the it87-dkms-git build"),
+            "somebody still on the in-tree driver must still be told to install \
+             it. got: {in_tree_hint}"
+        );
+        // Asserted as a relationship against the extracted rule, not a literal.
+        assert!(dkms_hint.ends_with(ite_unbound_tail(true)));
+        assert!(in_tree_hint.ends_with(ite_unbound_tail(false)));
+    }
+
+    /// `DriverState` exists so "not loaded but out-of-tree" cannot be
+    /// represented. That is a type-level guarantee, but its *behavioural*
+    /// consequence is testable: an unloaded module's advice must be identical
+    /// whether or not the taint probe would say out-of-tree, because the flag
+    /// must never reach that branch.
+    #[test]
+    fn the_out_of_tree_flag_cannot_leak_into_the_not_loaded_branch() {
+        let mk = |oot: Vec<String>| FakeEvidence {
+            board: (
+                "Gigabyte Technology Co., Ltd.".to_string(),
+                "X870E AORUS MASTER".to_string(),
+            ),
+            loaded: vec![], // <- the module is NOT loaded
+            kmsg: vec!["it8696".to_string()],
+            out_of_tree: oot,
+            ..Default::default()
+        };
+        let claims_oot = detect_superio(&mk(vec!["it87".to_string()]));
+        let clean = detect_superio(&mk(vec![]));
+        assert_eq!(
+            format!("{:?}", claims_oot.chips),
+            format!("{:?}", clean.chips),
+            "an unloaded module has no build to be out-of-tree; the flag must \
+             not change its advice"
+        );
+        // Precondition: the case really is the not-loaded one, or this asserts
+        // nothing — a recommendation must exist and must offer the install.
+        let hint = clean
+            .chips
+            .iter()
+            .find_map(|c| c.recommendation.as_ref().map(|r| r.load_hint.clone()))
+            .expect("an unbound allowlisted chip must produce a recommendation");
+        assert!(hint.contains("Enable it at boot") || hint.contains("DKMS"));
+    }
+
+    /// The detection must not leak to other families: only the ITE tail branches
+    /// on it, so a Nuvoton chip's advice is byte-identical either way.
+    #[test]
+    fn out_of_tree_detection_does_not_alter_non_ite_advice() {
+        let mk = |oot: Vec<String>| FakeEvidence {
+            board: ("MSI".to_string(), "MAG B650".to_string()),
+            loaded: vec!["nct6687".to_string()],
+            kmsg: vec!["nct6687".to_string()],
+            out_of_tree: oot,
+            ..Default::default()
+        };
+        let a = detect_superio(&mk(vec!["nct6687".to_string()]));
+        let b = detect_superio(&mk(vec![]));
+        assert_eq!(
+            format!("{:?}", a.chips),
+            format!("{:?}", b.chips),
+            "only the ITE tail may branch on the out-of-tree flag"
+        );
+    }
+
     #[test]
     fn recommendations_never_suggest_forbidden_parameters() {
         // Sweep unbound-chip scenarios across every recommendation-producing
@@ -859,6 +1177,28 @@ mod tests {
                     "Gigabyte Technology Co., Ltd.".into(),
                     "X870E AORUS MASTER".into(),
                 ),
+                ..Default::default()
+            },
+            // [security-reviewer finding 5] Every fixture above leaves `loaded`
+            // empty, so `module_loaded` is false and the ITE tail is `""` — this
+            // sweep has never reached either branch of `ite_unbound_tail`, and
+            // a future edit adding `force_id=0x8696` there would ship green.
+            // These two put both branches under the guard.
+            FakeEvidence {
+                board: (
+                    "Gigabyte Technology Co., Ltd.".into(),
+                    "X870E AORUS MASTER".into(),
+                ),
+                loaded: vec!["it87".into()],
+                ..Default::default()
+            },
+            FakeEvidence {
+                board: (
+                    "Gigabyte Technology Co., Ltd.".into(),
+                    "X870E AORUS MASTER".into(),
+                ),
+                loaded: vec!["it87".into()],
+                out_of_tree: vec!["it87".into()],
                 ..Default::default()
             },
         ];

@@ -2,11 +2,13 @@
 
 ## [Unreleased]
 
-Batch G of the `/ofc:audit` register triage (DEC-326). **Fixes a false "BIOS
-reclaimed the header" verdict that fired whenever a fan header sat at 100% on an
-ITE Super-I/O.** No wire-format change and no route change — four published
-fields stop reporting a case that was never true. Touches no floor, no
-threshold, no ladder rung and no capability flag.
+Batch G of the `/ofc:audit` register triage (DEC-326 and DEC-327). **Fixes a
+false "BIOS reclaimed the header" verdict that fired whenever a fan header sat
+at 100% on an ITE Super-I/O**, and **stops the unbound-chip advice recommending
+a driver build the user is already running**. No wire-format change and no route
+change — some published fields stop reporting cases that were never true, and
+no field, code or capability moves. Touches no floor, no threshold, no ladder
+rung and no capability flag.
 
 ### Fixed
 - **A fan at 100% is no longer misreported as a BIOS reclaim** (`HOST-a`). The
@@ -53,6 +55,20 @@ threshold, no ladder rung and no capability flag.
 - **`POST /hwmon/{id}/verify` no longer passes a header the firmware already
   pins at full speed.** Such a header is indistinguishable from the case above
   unless the daemon also held manual mode to begin with, which is now required.
+
+- **The unbound-chip hint no longer tells you to install a driver build you
+  are already running** (`HOST-d`). If the loaded `it87` is an out-of-tree
+  build, the advice to install `it87-dkms-git` is a no-op — and it was the
+  advice being given, so a user in that state had nothing left to try and no
+  way to know it. The hint now says so and names the terminal state instead.
+  Detected from the module's taint flag (`/sys/module/<name>/taint`), because
+  the daemon's own sandbox makes `/lib/modules` unreadable —
+  `ProtectKernelModules=true` mounts an inaccessible directory over it.
+- **The "Super-I/O driver not loaded" readiness card no longer says the driver
+  is not loaded when it is.** The same card covers two different states, and it
+  described both as the first; on a machine whose driver loaded but failed to
+  bind, it contradicted the recommendation shown beside it. Its `code` is
+  unchanged, so nothing in the GUI needs to move.
 
 ### Changed
 - **The unbound-chip hint no longer recommends `mmio=on`** (`HOST-b`/`HOST-c`).

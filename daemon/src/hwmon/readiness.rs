@@ -482,24 +482,58 @@ pub fn superio_readiness_items(
         .map(|c| format!("{} → {}", c.chip_name, c.expected_module))
         .collect();
     if !unbound.is_empty() {
+        // [HOST-d / DEC-327] This item fires for BOTH "no driver loaded" and
+        // "driver loaded but it did not bind", and it used to describe only the
+        // first — so on a machine whose driver is loaded it asserted the
+        // opposite of the truth, directly beside a per-chip recommendation that
+        // (since this change) correctly says the driver is already there.
+        //
+        // The `code` is deliberately NOT renamed: the GUI keys off it, so a
+        // rename is a contract change. Only the human-readable half moves.
+        let any_loaded = report
+            .chips
+            .iter()
+            .any(|c| c.recommendation.is_some() && c.module_loaded);
+        let (title, tail) = if any_loaded {
+            (
+                "Motherboard Super-I/O chip detected but its driver did not bind",
+                "The driver is loaded; it did not attach to the chip. See the per-chip \
+                 recommendation for what that means on this board — on some it is an ACPI \
+                 resource conflict, and on others no available driver can reach the chip.",
+            )
+        } else {
+            (
+                "Motherboard Super-I/O chip detected without its driver loaded",
+                "Loading the driver is what makes the motherboard fan headers and sensors \
+                 appear.",
+            )
+        };
         items.push(
             ReadinessItem::new(
                 "superio_driver_unloaded",
                 ReadinessSeverity::Warning,
                 "hwmon",
-                "Motherboard Super-I/O chip detected without its driver loaded",
+                title,
                 format!(
                     "{} Super-I/O chip(s) were detected but no matching kernel driver is bound: \
-                     {}. Loading the driver is what makes the motherboard fan headers and sensors \
-                     appear.",
+                     {}. {tail}",
                     unbound.len(),
                     unbound.join(", ")
                 ),
             )
-            .action(
+            .action(if any_loaded {
+                // [security-reviewer finding 4] The loaded branch deliberately
+                // offers no copy-paste command, so promising one here would be
+                // the same defect this change fixes, one field over — an
+                // incomplete correction of exactly the kind `CLAUDE.md`
+                // records as its own defect class.
+                "Open Diagnostics ▸ Super-I/O and read the per-chip recommendation — it says \
+                 whether anything can be done on this board, and on some there is nothing to \
+                 configure."
+            } else {
                 "Open Diagnostics ▸ Super-I/O for the exact module and copy-paste command; a \
-                 reboot or module reload may be needed.",
-            )
+                 reboot or module reload may be needed."
+            })
             .reboot(),
         );
     }
@@ -785,6 +819,83 @@ mod tests {
         assert!(unloaded.detail.contains("it8688 → it87"));
         assert!(unloaded.reboot_may_be_required);
         assert_eq!(unloaded.severity, ReadinessSeverity::Warning);
+    }
+
+    /// [HOST-d / DEC-327] The item fires for two different states and must not
+    /// describe both as the first. Asserted as a RELATIONSHIP between the two
+    /// renderings, not against a literal, and with both branches present — one
+    /// branch alone passes with the condition stuck on either answer.
+    #[test]
+    fn the_unbound_item_says_did_not_bind_when_the_driver_is_actually_loaded() {
+        use crate::hwmon::superio::{
+            Evidence, SuperIoChip, SuperIoRecommendation, SuperIoReport, SuperIoVendor,
+        };
+        let report = |module_loaded: bool| SuperIoReport {
+            arch_supported: true,
+            chips: vec![SuperIoChip {
+                chip_name: "it8696".into(),
+                vendor: SuperIoVendor::Ite,
+                evidence: vec![Evidence::DmiBoardTable],
+                confidence: crate::hwmon::classify::Confidence::Medium,
+                bound_driver: None,
+                expected_module: "it87".into(),
+                module_loaded,
+                hwmon_present: false,
+                recommendation: Some(SuperIoRecommendation {
+                    module: "it87".into(),
+                    in_mainline: false,
+                    load_hint: "irrelevant here".into(),
+                    reason: "board lists it8696".into(),
+                    risk_notes: vec![],
+                }),
+                caveats: vec![],
+            }],
+            acpi_conflict_drivers: vec![],
+            notes: vec![],
+        };
+        let item = |loaded: bool| {
+            superio_readiness_items(&report(loaded))
+                .into_iter()
+                .find(|i| i.code == "superio_driver_unloaded")
+                .expect("an unbound chip with a recommendation must emit the item")
+        };
+        let loaded = item(true);
+        let not_loaded = item(false);
+
+        // The state this host is actually in.
+        assert!(
+            loaded.summary.contains("did not bind"),
+            "a loaded driver that failed to attach must not be described as \
+             unloaded. got: {}",
+            loaded.summary
+        );
+        assert!(
+            !loaded.detail.contains("Loading the driver is what makes"),
+            "...and must not be told that loading it is the remedy"
+        );
+        // The opposite branch, unchanged — deleting it would be a regression.
+        assert!(not_loaded.summary.contains("without its driver loaded"));
+        assert!(not_loaded
+            .detail
+            .contains("Loading the driver is what makes"));
+        // The two must genuinely differ, or the condition is stuck.
+        assert_ne!(loaded.summary, not_loaded.summary);
+        // [security-reviewer finding 4] The action must not promise a
+        // copy-paste command on the branch that deliberately offers none.
+        assert!(
+            !loaded.recommended_action.contains("copy-paste command"),
+            "the loaded branch offers no command; promising one is the same \
+             defect one field over. got: {}",
+            loaded.recommended_action
+        );
+        assert!(
+            not_loaded.recommended_action.contains("copy-paste command"),
+            "...but the not-loaded branch genuinely has one and must keep it"
+        );
+        assert_ne!(loaded.recommended_action, not_loaded.recommended_action);
+        // The GUI keys off `code`: renaming it is a contract change, so pin it.
+        assert_eq!(loaded.code, not_loaded.code);
+        assert_eq!(loaded.severity, not_loaded.severity);
     }
 
     #[test]
