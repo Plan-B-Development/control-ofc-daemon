@@ -1,6 +1,6 @@
 # Changelog
 
-## [2.38.0] — 2026-09-05
+## [2.38.0] — 2026-09-06
 
 **Packaging + one probe behaviour change.** No API shape change; `api_version`
 unchanged. `GIGABYTE_DUAL_CHIP_BOARDS` gains a board, so `expected_chips` on
