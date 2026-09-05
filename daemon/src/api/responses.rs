@@ -1941,6 +1941,336 @@ mod tests {
         assert_eq!(ok.override_token, 7);
     }
 
+    /// Every key the GUI-consumed structs put on the wire, pinned.
+    ///
+    /// The GUI's `tests/fixtures/wire_fields.json` declares the same lists and
+    /// `tests/test_wire_field_coverage.py` asserts each has a model slot there.
+    /// Neither copy can drift alone: adding a field here reds this test, and
+    /// updating the fixture to match then reds the Python one until the GUI
+    /// models it. That is the pairing the 2026-09-05 wire sweep found missing —
+    /// 41 divergences, none of which anything compared (register row `WIRE-aj`).
+    ///
+    /// Every `Option` is `Some` and every `Vec` non-empty on purpose: these
+    /// structs are dense with `skip_serializing_if`, so a `None` would drop the
+    /// key and the assertion would silently stop covering it.
+    ///
+    /// Scope is deliberately partial — the ten structs behind `/sensors`,
+    /// `/fans`, `/poll`, `/hwmon/headers`, `/inventory/hwmon` and
+    /// `/inventory/cooling-devices`, i.e. where drift has actually happened.
+    /// Adding a struct is an arm here plus a fixture entry; it is not automatic.
+    #[test]
+    fn wire_field_surface_is_pinned() {
+        fn keys(v: &serde_json::Value) -> Vec<String> {
+            let mut k: Vec<String> = v
+                .as_object()
+                .expect("expected a JSON object")
+                .keys()
+                .cloned()
+                .collect();
+            k.sort();
+            k
+        }
+        fn expect(v: &serde_json::Value, name: &str, want: &[&str]) {
+            let mut w: Vec<String> = want.iter().map(|s| s.to_string()).collect();
+            w.sort();
+            assert_eq!(
+                keys(v),
+                w,
+                "{name}: serialised key set has drifted from the pinned list. \
+                 Update this arm AND the GUI's tests/fixtures/wire_fields.json \
+                 AND docs/08."
+            );
+        }
+
+        let thresholds = SensorThresholdsResponse {
+            max_c: Some(90.0),
+            min_c: Some(0.0),
+            crit_c: Some(95.0),
+            crit_hyst_c: Some(3.0),
+            emergency_c: Some(100.0),
+            emergency_hyst_c: Some(2.0),
+            lcrit_c: Some(-5.0),
+            offset_c: Some(0.0),
+            alarm: Some(false),
+            max_alarm: Some(false),
+            crit_alarm: Some(false),
+            fault: Some(false),
+        };
+        let sensor = SensorEntry {
+            id: "hwmon:k10temp:pci0:Tctl".into(),
+            kind: "cpu_temp".into(),
+            label: "Tctl".into(),
+            value_c: 48.0,
+            source: "hwmon".into(),
+            age_ms: 120,
+            rate_c_per_s: Some(0.25),
+            session_min_c: Some(31.0),
+            session_max_c: Some(91.5),
+            chip_name: "k10temp".into(),
+            temp_type: Some(5),
+            thresholds: Some(thresholds),
+            control_eligible: true,
+        };
+        expect(
+            &serde_json::to_value(&sensor).unwrap(),
+            "SensorEntry",
+            &[
+                "id",
+                "kind",
+                "label",
+                "value_c",
+                "source",
+                "age_ms",
+                "rate_c_per_s",
+                "session_min_c",
+                "session_max_c",
+                "chip_name",
+                "temp_type",
+                "thresholds",
+                "control_eligible",
+            ],
+        );
+
+        let fan = FanEntry {
+            id: "hwmon:it8696:pci0:pwm1".into(),
+            source: "hwmon".into(),
+            rpm: Some(900),
+            last_commanded_pwm: Some(40),
+            duty_pct: Some(41),
+            age_ms: 100,
+            stall_detected: Some(false),
+            pwm_enable_mode: Some(1),
+            fan_alarm: Some(false),
+            pwm_readback_pct: Some(40),
+            pwm_commanded_pct: Some(40),
+        };
+        expect(
+            &serde_json::to_value(&fan).unwrap(),
+            "FanEntry",
+            &[
+                "id",
+                "source",
+                "rpm",
+                "last_commanded_pwm",
+                "duty_pct",
+                "age_ms",
+                "stall_detected",
+                "pwm_enable_mode",
+                "fan_alarm",
+                "pwm_readback_pct",
+                "pwm_commanded_pct",
+            ],
+        );
+
+        let header = PwmHeaderEntry {
+            id: "hwmon:it8696:pci0:pwm3:AIO_PUMP".into(),
+            label: "AIO_PUMP".into(),
+            chip_name: "it8696".into(),
+            device_id: "pci0".into(),
+            pwm_index: 3,
+            supports_enable: true,
+            rpm_available: true,
+            min_pwm_percent: 0,
+            max_pwm_percent: 100,
+            is_writable: true,
+            pwm_mode: Some(1),
+            is_aio: false,
+            role: crate::hwmon::roles::HeaderRole::Pump,
+            role_source: crate::hwmon::roles::RoleSource::Label,
+            effective_min_pwm_pct: Some(30),
+            stop_permitted: Some(false),
+            cooling_device_id: Some("dev-1".into()),
+            pwm_freq_hz: Some(25000),
+            supported_pwm_enable_modes: vec![0, 1, 2],
+            rpm_min_threshold: Some(300),
+            rpm_max_threshold: Some(3000),
+            tach_pulses_per_rev: Some(2),
+        };
+        let header_keys = [
+            "id",
+            "label",
+            "chip_name",
+            "device_id",
+            "pwm_index",
+            "supports_enable",
+            "rpm_available",
+            "min_pwm_percent",
+            "max_pwm_percent",
+            "is_writable",
+            "pwm_mode",
+            "is_aio",
+            "role",
+            "role_source",
+            "effective_min_pwm_pct",
+            "stop_permitted",
+            "cooling_device_id",
+            "pwm_freq_hz",
+            "supported_pwm_enable_modes",
+            "rpm_min_threshold",
+            "rpm_max_threshold",
+            "tach_pulses_per_rev",
+        ];
+        expect(
+            &serde_json::to_value(&header).unwrap(),
+            "PwmHeaderEntry",
+            &header_keys,
+        );
+
+        // `temp_sensors[]` flattens the whole SensorEntry alongside the
+        // refinement — the exact shape whose six dropped keys were `WIRE-h`.
+        let inv_sensor = InventoryTempSensor {
+            sensor: sensor.clone(),
+            classification: "cpu_tctl".into(),
+            confidence: "high".into(),
+            rationale: "k10temp Tctl".into(),
+        };
+        expect(
+            &serde_json::to_value(&inv_sensor).unwrap(),
+            "InventoryTempSensor",
+            &[
+                "id",
+                "kind",
+                "label",
+                "value_c",
+                "source",
+                "age_ms",
+                "rate_c_per_s",
+                "session_min_c",
+                "session_max_c",
+                "chip_name",
+                "temp_type",
+                "thresholds",
+                "control_eligible",
+                "classification",
+                "confidence",
+                "rationale",
+            ],
+        );
+
+        let fan_input = FanInputEntry {
+            id: "hwmon:it8696:pci0:fan5".into(),
+            source: "hwmon".into(),
+            chip_name: "it8696".into(),
+            label: "SYS_FAN5".into(),
+            fan_index: 5,
+        };
+        expect(
+            &serde_json::to_value(&fan_input).unwrap(),
+            "FanInputEntry",
+            &["id", "source", "chip_name", "label", "fan_index"],
+        );
+
+        let default_cpu = DefaultCpuEntry {
+            sensor_id: "hwmon:k10temp:pci0:Tctl".into(),
+            confidence: "high".into(),
+            rationale: "k10temp Tctl".into(),
+            source: "auto".into(),
+        };
+        expect(
+            &serde_json::to_value(&default_cpu).unwrap(),
+            "DefaultCpuEntry",
+            &["sensor_id", "confidence", "rationale", "source"],
+        );
+
+        let inventory = HwmonInventoryResponse {
+            api_version: API_VERSION,
+            temp_sensors: vec![inv_sensor],
+            pwm_controls: vec![header.clone()],
+            monitor_only_fans: vec![fan_input],
+            default_cpu: Some(default_cpu),
+            preferences: Some(InventoryPreferences {
+                cpu_sensor_id: Some("hwmon:k10temp:pci0:Tctl".into()),
+                mb_sensor_id: Some("hwmon:it8696:pci0:temp2".into()),
+            }),
+        };
+        expect(
+            &serde_json::to_value(&inventory).unwrap(),
+            "HwmonInventoryResponse",
+            &[
+                "api_version",
+                "temp_sensors",
+                "pwm_controls",
+                "monitor_only_fans",
+                "default_cpu",
+                "preferences",
+            ],
+        );
+        // `pwm_controls[]` is this same PwmHeaderEntry — one wire struct behind
+        // two GUI names, which is how half of `WIRE-h` stayed invisible.
+        expect(
+            &serde_json::to_value(&inventory).unwrap()["pwm_controls"][0],
+            "HwmonInventoryResponse.pwm_controls[]",
+            &header_keys,
+        );
+
+        let policy = DevicePolicySummary {
+            id: "aio_generic",
+            display_name: "Generic AIO",
+            minimum_safe_pwm_pct: 30,
+            supports_stop: false,
+            startup_override_seconds: Some(10),
+            expected_rpm_min: Some(1200),
+            expected_rpm_max: Some(3000),
+            internal_control_possible: false,
+        };
+        expect(
+            &serde_json::to_value(&policy).unwrap(),
+            "DevicePolicySummary",
+            &[
+                "id",
+                "display_name",
+                "minimum_safe_pwm_pct",
+                "supports_stop",
+                "startup_override_seconds",
+                "expected_rpm_min",
+                "expected_rpm_max",
+                "internal_control_possible",
+            ],
+        );
+
+        let device = CoolingDeviceEntry {
+            id: "dev-1".into(),
+            name: "Kraken X63".into(),
+            kind: "aio_liquid",
+            pump_member: Some("hwmon:it8696:pci0:pwm3:AIO_PUMP".into()),
+            radiator_members: vec!["hwmon:it8696:pci0:pwm1:CHA_FAN1".into()],
+            auxiliary_members: vec!["hwmon:it8696:pci0:pwm2:CHA_FAN2".into()],
+            preferred_sensor: Some("hwmon:k10temp:pci0:Tctl".into()),
+            fallback_sensor: Some("hwmon:it8696:pci0:temp2".into()),
+            coolant_sensor: Some("hwmon:z53:usb-3-2:temp1".into()),
+            coolant_telemetry: "available",
+            device_policy: policy.clone(),
+        };
+        expect(
+            &serde_json::to_value(&device).unwrap(),
+            "CoolingDeviceEntry",
+            &[
+                "id",
+                "name",
+                "kind",
+                "pump_member",
+                "radiator_members",
+                "auxiliary_members",
+                "preferred_sensor",
+                "fallback_sensor",
+                "coolant_sensor",
+                "coolant_telemetry",
+                "device_policy",
+            ],
+        );
+
+        let devices = CoolingDevicesResponse {
+            api_version: API_VERSION,
+            cooling_devices: vec![device],
+            available_policies: vec![policy],
+        };
+        expect(
+            &serde_json::to_value(&devices).unwrap(),
+            "CoolingDevicesResponse",
+            &["api_version", "cooling_devices", "available_policies"],
+        );
+    }
+
     #[test]
     fn hwmon_inventory_response_schema() {
         // Phase 2: temp_sensors flatten the standard SensorEntry fields with the
