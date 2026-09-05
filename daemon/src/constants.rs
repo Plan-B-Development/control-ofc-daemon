@@ -545,3 +545,18 @@ const _: () = assert!(VALIDATION_MAX_SWEEP_MEMBERS > 0);
 // The divergence rule needs a real swing to test against; a zero threshold would
 // classify a perfectly steady header as having "moved".
 const _: () = assert!(VALIDATION_DIVERGENCE_MIN_PWM_SWING_PCT > 0);
+
+/// Minimum `control-ofc-gui` version this daemon supports, published verbatim as
+/// `control.min_supported_gui` on `GET /capabilities` (`WIRE-ac`).
+///
+/// A constant rather than a literal in the handler because it is *quoted* in two
+/// other places that drift: each release's "Pairs with `control-ofc-gui` >= …"
+/// line and `docs/08`. Those said `2.23.0` for roughly thirty releases while the
+/// handler said `2.0.0`, which is the drift this constant exists to stop — the
+/// wire is the single source and the prose cites it.
+///
+/// It is the floor the daemon places on the **GUI**, the opposite direction from
+/// `control.autonomous_control`, which is the floor the GUI places on the daemon
+/// (DEC-257). Raising it is a real compatibility claim: move the release-note
+/// line in the same change, and only for a genuine GUI-side requirement.
+pub const MIN_SUPPORTED_GUI: &str = "2.23.0";

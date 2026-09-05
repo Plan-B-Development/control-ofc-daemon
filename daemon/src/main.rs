@@ -592,13 +592,33 @@ fn apply_config_reload(
     // the running config, exactly as the boot load does. Narrower in effect —
     // only `profile_search_dirs` is committed below, so header roles keep
     // whatever boot established — but it is the same silent degradation on the
-    // same surface, so it is reported rather than left in the journal. Latest
-    // wins; a successful reload does not clear an earlier startup degradation,
-    // because the keys that one dropped are consumed once at boot.
+    // same surface, so it is reported rather than left in the journal.
+    //
+    // [SAFETY] `WIRE-ao`: **most-severe wins, not latest-wins.** This used to
+    // overwrite the slot unconditionally, and the two phases do not cost the
+    // same. A `startup` degradation drops every `header_roles` assignment — on a
+    // board with no `pwmN_label` files that is the only evidence a header drives
+    // a pump, so its 30% floor, stop exemption and pump-safe identify are all
+    // gone. A `reload` degradation drops nothing: boot's roles are still in
+    // force. Letting the cheaper record overwrite the expensive one made
+    // `phase` under-report, so a client reading `reload` would reassure the user
+    // while a hand-assigned pump was unprotected — reachable by editing a broken
+    // `runtime.toml` and sending SIGHUP. GUI v2.58.0 works around it by never
+    // reassuring on `reload`; this fixes it at source.
+    //
+    // A startup record therefore stands. Latest-wins is kept *within* the reload
+    // phase, so a second failed reload still refreshes `detail` with the current
+    // error rather than serving a stale one.
     let (new_runtime, problem) =
         RuntimeConfig::load_from_reporting(runtime_config_path, LoadPhase::Reload);
-    if problem.is_some() {
-        *degraded.write() = problem;
+    if let Some(problem) = problem {
+        let mut slot = degraded.write();
+        let startup_record_stands = slot
+            .as_ref()
+            .is_some_and(|existing| existing.phase == LoadPhase::Startup.as_str());
+        if !startup_record_stands {
+            *slot = Some(problem);
+        }
     }
     apply_runtime_overlay(&mut new_config, &new_runtime, config_path);
     let new_dirs = with_store_dir(
@@ -3761,6 +3781,99 @@ search_dirs = ["/custom/profiles", "/other/profiles"]
             degraded.read().as_ref().map(|d| d.phase.clone()),
             Some("startup".to_string()),
             "a clean reload must not erase what the startup load lost"
+        );
+    }
+
+    #[test]
+    fn a_failed_reload_does_not_overwrite_a_startup_degradation() {
+        // [SAFETY] `WIRE-ao`. The sibling above proves a *clean* reload leaves the
+        // startup record alone; this is the case that was actually broken — the
+        // write was unconditional, so a FAILED reload replaced it. The two are not
+        // equally severe: a startup failure drops every `header_roles` assignment
+        // (no 30% floor, no stop exemption, no pump-safe identify), a reload
+        // failure drops nothing because boot's roles are still in force. Letting
+        // `reload` win made `/status` under-report, and a client reading `reload`
+        // would reassure a user whose hand-assigned pump was unprotected.
+        //
+        // Asserted on `phase` AND `detail`: `phase` alone would pass if the
+        // startup record were replaced by a *different* startup record, and the
+        // detail is what identifies which one survived.
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("daemon.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let runtime_path = tmp.path().join("runtime.toml");
+        std::fs::write(&runtime_path, "[garbage\n").unwrap();
+
+        let search_dirs = parking_lot::RwLock::new(vec![]);
+        let degraded = parking_lot::RwLock::new(Some(RuntimeConfigDegraded {
+            reason: "malformed".into(),
+            path: runtime_path.display().to_string(),
+            detail: "THE STARTUP ERROR".into(),
+            phase: "startup".into(),
+        }));
+
+        apply_config_reload(
+            config_path.to_str().unwrap(),
+            &runtime_path,
+            &search_dirs,
+            &degraded,
+        )
+        .expect("a corrupt runtime.toml must still not fail the reload");
+
+        let d = degraded.read().clone().expect("a record still stands");
+        assert_eq!(
+            d.phase, "startup",
+            "the more severe record must survive a failed reload"
+        );
+        assert_eq!(
+            d.detail, "THE STARTUP ERROR",
+            "it must be the ORIGINAL startup record, not a fresh one wearing its phase"
+        );
+    }
+
+    #[test]
+    fn a_second_failed_reload_refreshes_the_reload_record() {
+        // `WIRE-ao` kept latest-wins *within* the reload phase, and this pins that
+        // half — without it the fix would be indistinguishable from "never
+        // overwrite", which would serve a stale error while a different one was
+        // live. The two writes carry different TOML errors so the assertion cannot
+        // pass on a stale record.
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("daemon.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let runtime_path = tmp.path().join("runtime.toml");
+        let search_dirs = parking_lot::RwLock::new(vec![]);
+        let degraded = parking_lot::RwLock::new(None);
+
+        std::fs::write(&runtime_path, "[garbage\n").unwrap();
+        apply_config_reload(
+            config_path.to_str().unwrap(),
+            &runtime_path,
+            &search_dirs,
+            &degraded,
+        )
+        .unwrap();
+        let first = degraded.read().clone().expect("first failure recorded");
+        assert_eq!(first.phase, "reload");
+
+        // A *different* malformed file. The table name is echoed into the TOML
+        // error's source snippet, so the two details are distinguishable by
+        // content rather than by chance — an unknown-key file would parse
+        // cleanly and this test would then assert nothing.
+        std::fs::write(&runtime_path, "[the_second_failure\n").unwrap();
+        apply_config_reload(
+            config_path.to_str().unwrap(),
+            &runtime_path,
+            &search_dirs,
+            &degraded,
+        )
+        .unwrap();
+        let second = degraded.read().clone().expect("second failure recorded");
+        assert_eq!(second.phase, "reload");
+        assert!(
+            second.detail.contains("the_second_failure"),
+            "a later reload failure must refresh the detail, not serve the stale one; got {}",
+            second.detail
         );
     }
 

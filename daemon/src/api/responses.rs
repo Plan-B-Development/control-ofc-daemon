@@ -105,6 +105,31 @@ pub struct StatusResponse {
     /// hides the chip (additive — API_VERSION unchanged).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub readiness: Option<crate::hwmon::readiness::ReadinessRollup>,
+    /// True while a hardware verify, PWM characterisation, OpenFan calibration
+    /// or validation sweep owns the engine's **write pause** (`WIRE-n`, daemon
+    /// >= 2.36.0).
+    ///
+    /// The engine keeps *evaluating* during such a session — it computes every
+    /// control's duty and publishes it in `control_outputs[]` — and simply does
+    /// not write it. Without this field a client cannot tell the two apart, so
+    /// its Controls cards report a duty that nothing is applying, which is the
+    /// exact failure the `control_outputs` absence rule already prevents for a
+    /// thermal force. Narrow but reachable: the dialogs are modal, yet a
+    /// validation session keeps recording after its dialog closes.
+    ///
+    /// **Not a safety signal, and must not be read as one.** The thermal
+    /// emergency's `force_all_with_floor` runs well before the `verify_active()`
+    /// gate (DEC-297), so a paused write phase never gates the ladder — a client
+    /// that suppressed a thermal banner on this field would be hiding a live
+    /// emergency. Mark or blank the *commanded duty*, nothing else.
+    ///
+    /// Always serialised, including when false, so a client can distinguish
+    /// "this daemon says no session is running" from "this daemon does not
+    /// report sessions" — the field is not optional-with-a-safe-default the way
+    /// the `skip_serializing_if` arrays above are, because its safe default
+    /// (`false`, "writes are landing") is also its common value. An older daemon
+    /// omits it and a client reads `false`, which is what it renders today.
+    pub verify_active: bool,
 }
 
 /// One present-but-unreadable sensor on the `/status` + `/poll` surface
@@ -884,8 +909,18 @@ pub struct ControlCapability {
     /// control rather than silently leaving fans uncontrolled. The
     /// safety-critical version gate.
     pub autonomous_control: bool,
-    /// Minimum GUI version this daemon supports for daemon-owned control, or
-    /// empty when no floor is enforced yet (set at the 2.0.0 cutover).
+    /// Minimum GUI version this daemon supports, or empty when no floor is
+    /// enforced. **This handler is the single source of that number**
+    /// (`WIRE-ac`) — before daemon 2.36.0 it said `2.0.0` while every release
+    /// note since 2.23.0 declared a `>= 2.23.0` pairing floor, so the contract
+    /// had two answers and a client reading either one could be right.
+    ///
+    /// The floor is the GUI's, not the daemon's: it says which GUI versions this
+    /// daemon is willing to be driven by, the opposite direction from
+    /// `autonomous_control` (DEC-257). Raise it only for a genuine GUI-side
+    /// requirement, and move the release-note line in the same change — the
+    /// whole point of naming this the single source is that the prose now
+    /// *quotes* it rather than asserting a second number.
     pub min_supported_gui: String,
     /// Daemon exposes `POST /fans/openfan/rescan` — adopting an OpenFanController
     /// that appeared after boot, without a restart (DEC-265). An older daemon
@@ -948,6 +983,50 @@ pub struct ControlCapability {
     /// fallback, which a client cannot tell from a genuine "no such session".
     #[serde(default)]
     pub validation_sessions: bool,
+    // ── `WIRE-k`: five features that predate their own flags ──────────────
+    //
+    // Each of the five below shipped before this block had a key for it, so a
+    // client had two ways to detect them and both were wrong. It could compare
+    // the daemon *version string* — which says when a feature first appeared,
+    // not whether this build has it — or it could call the route and treat a
+    // `404 not_found` as "unsupported". The comments on `pwm_characterization`
+    // and `validation_sessions` above already state why probing is not a
+    // contract: the route fallback's 404 is indistinguishable from a handler's
+    // own 404 for an unknown id, so a probe cannot tell "no such feature" from
+    // "no such header". Those two were given flags; these five never were.
+    //
+    // They are all `true` on any daemon new enough to serialise them, which is
+    // the point — the flag's job is to let a client stop guessing, not to be
+    // switchable. An older daemon omits them, they default `false`, and a client
+    // falls back to exactly the probe-then-recover it does today.
+    /// Daemon exposes `POST /gpu/{id}/fan/verify`. True since 1.11.0 (DEC-120).
+    #[serde(default)]
+    pub gpu_fan_verify: bool,
+    /// Daemon exposes `GET /inventory/hardware-readiness`, the combined report
+    /// that superseded `/inventory/readiness` and `/inventory/superio`. True
+    /// since 2.11.0 (DEC-207).
+    #[serde(default)]
+    pub hardware_readiness: bool,
+    /// Daemon exposes `POST /inventory/superio/probe`, the opt-in *active* port
+    /// probe. True since 2.7.0 (DEC-203).
+    ///
+    /// Advertises the ROUTE, not that a probe will do anything: the probe is
+    /// separately gated by daemon configuration and by `CAP_SYS_RAWIO`, and a
+    /// disabled probe returns a normal report rather than an error. A client
+    /// gates the *button* on this and still reads the report to learn whether
+    /// the probe ran.
+    #[serde(default)]
+    pub superio_port_probe: bool,
+    /// Daemon exposes `GET /inventory/hwmon` — the classified sensor inventory a
+    /// client needs to offer preferred CPU/motherboard sensor selection. True
+    /// since 2.6.0 (DEC-200).
+    #[serde(default)]
+    pub preferred_sensors: bool,
+    /// Daemon exposes `GET /config` — its own effective merged configuration,
+    /// so a client can read a knob back instead of keeping a local guess. True
+    /// since 2.16.0 (DEC-243).
+    #[serde(default)]
+    pub daemon_config_report: bool,
 }
 
 /// Per-device-group capability info.
@@ -1282,6 +1361,35 @@ pub struct HardwareDiagnosticsResponse {
     /// the wire and the GUI's `_filter_fields` parser tolerates it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expected_chips: Vec<String>,
+    /// What the board's **firmware** declares it has, read from the Gigabyte SIV
+    /// descriptor `it87` exports (`X87-d`, daemon >= 2.36.0).
+    ///
+    /// `expected_chips` above is a curated DMI lookup — an inference that is
+    /// only ever as good as the table. This is a measurement from the board
+    /// itself, so a client can state the deficit as a fact rather than deriving
+    /// one from a hard-coded list.
+    ///
+    /// Compare `fan_count` against `hwmon.total_headers`, not against
+    /// `writable_headers`: a BIOS-owned read-only header is discovered, and
+    /// counting it as missing reports a phantom deficit on a working board.
+    ///
+    /// **`total_headers` is `pwmN`-capable headers only.** Monitor-only
+    /// tachometers (a `fanN_input` with no matching `pwmN`) are a disjoint set
+    /// and are not on this response at all — they live on `GET /inventory/hwmon`
+    /// as `monitor_only_fans`. A client reading only this endpoint must therefore
+    /// describe the difference as "headers with no controllable PWM", never as
+    /// "unreachable headers": on a board with tach-only headers on a *detected*
+    /// chip the latter overstates the deficit by exactly those headers.
+    ///
+    /// Absent on every non-Gigabyte board, when `it87` is not loaded, and when
+    /// the descriptor does not decode — which is why it is an `Option` and never
+    /// a defaulted zero. A zero `fan_count` would read as "this board has no fan
+    /// headers", a far stronger claim than "the firmware did not say".
+    ///
+    /// It counts headers; it does not name chips. The DMI table remains the
+    /// source for *which* chip should be carrying them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board_firmware_counts: Option<crate::hwmon::gigabyte_siv::GigabyteSiv>,
     /// Best-effort kernel-level chip detection — chip names parsed out of
     /// `/dev/kmsg` `it87:` log lines (DEC-101). Populated when the daemon
     /// can read the kernel ring buffer (Arch default: `dmesg_restrict=0`).
@@ -2404,6 +2512,7 @@ mod tests {
             active_profile_id: None,
             active_profile_name: None,
             readiness: None,
+            verify_active: false,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["api_version"], 1);
@@ -2456,6 +2565,7 @@ mod tests {
                 top_summary: Some("No motherboard PWM fan controls detected".into()),
                 top_code: Some("no_pwm_controls".into()),
             }),
+            verify_active: false,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["readiness"]["overall"], "warning");
@@ -2490,6 +2600,7 @@ mod tests {
             active_profile_id: None,
             active_profile_name: None,
             readiness: None,
+            verify_active: false,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert!(
@@ -2524,6 +2635,7 @@ mod tests {
             active_profile_id: None,
             active_profile_name: None,
             readiness: None,
+            verify_active: false,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["skipped_controls"][0]["control_id"], "ctl-front");
@@ -2558,6 +2670,7 @@ mod tests {
             active_profile_id: None,
             active_profile_name: None,
             readiness: None,
+            verify_active: false,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(
@@ -2799,6 +2912,11 @@ mod tests {
                 fan_identify: false,
                 autonomous_control: false,
                 min_supported_gui: String::new(),
+                gpu_fan_verify: false,
+                hardware_readiness: false,
+                superio_port_probe: false,
+                preferred_sensors: false,
+                daemon_config_report: false,
                 openfan_rescan: false,
                 profile_search_dir_remove: false,
                 header_roles: false,

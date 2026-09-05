@@ -3655,7 +3655,131 @@ async fn capabilities_advertises_profile_storage() {
     // DEC-165 (2.0.0 flip): the daemon is the sole authoritative writer and
     // advertises the version floor that powers the GUI's safety gate.
     assert_eq!(body["control"]["autonomous_control"], true);
-    assert_eq!(body["control"]["min_supported_gui"], "2.0.0");
+    // `WIRE-ac`: anchored to the constant, not to the number. This assertion was
+    // a literal `"2.0.0"` and is exactly why moving the floor is a change and not
+    // a typo fix — see `capabilities_publish_the_gui_pairing_floor_from_one_source`
+    // for the contract, and `CLAUDE.md`'s rule that a threshold spelled into a
+    // test drifts every time the threshold moves.
+    assert_eq!(
+        body["control"]["min_supported_gui"],
+        control_ofc_daemon::constants::MIN_SUPPORTED_GUI
+    );
+}
+
+#[tokio::test]
+async fn hardware_diagnostics_report_the_boards_firmware_declared_counts() {
+    // `X87-d`, asserted at the CALL SITE. The decode is unit-tested in
+    // `hwmon::gigabyte_siv`; a helper nothing reads is a rule with no consumer,
+    // which is `CLAUDE.md`'s most-repeated failure here.
+    //
+    // Written as a RELATIONSHIP against the reader rather than against this
+    // host's descriptor, so it means the same thing on a Gigabyte board (where
+    // the file exists) and on every other machine (where it does not). A test
+    // asserting `fan_count == 8` would pass only on the board the row was opened
+    // from and would be skipped-by-accident everywhere else.
+    let state = test_app_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/diagnostics/hardware").await;
+    assert_eq!(status, 200);
+
+    let expected = control_ofc_daemon::hwmon::gigabyte_siv::read_siv(std::path::Path::new(
+        control_ofc_daemon::hwmon::gigabyte_siv::GIGABYTE_SIV_PATH,
+    ));
+    match expected {
+        Some(siv) => {
+            let got = &json["board_firmware_counts"];
+            assert!(
+                got.is_object(),
+                "this host publishes a SIV, so the field must be present: {json}"
+            );
+            assert_eq!(got["fan_count"], siv.fan_count);
+            assert_eq!(got["temp_count"], siv.temp_count);
+            assert_eq!(got["volt_count"], siv.volt_count);
+            assert_eq!(got["platform"], siv.platform);
+        }
+        None => {
+            // ABSENT, not zero. A defaulted `fan_count: 0` would read as "this
+            // board has no fan headers" — a far stronger and wrong claim than
+            // "the firmware did not say", and the reason the field is an Option.
+            assert!(
+                json.get("board_firmware_counts").is_none(),
+                "no SIV on this host: the key must be omitted, never defaulted: {json}"
+            );
+        }
+    }
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn status_and_poll_report_whether_the_engine_is_writing() {
+    // `WIRE-n`. The engine keeps EVALUATING during a verify / characterisation /
+    // calibration / validation sweep — it publishes every control's duty in
+    // `control_outputs[]` — and simply does not write it. Without this field a
+    // client renders a duty nothing is applying.
+    //
+    // Both surfaces are asserted because they build the field independently:
+    // `/status` and `/poll` each read it inside their own `read_with` closure,
+    // and a fix applied to one is not a fix applied to the other.
+    //
+    // Every assertion is a RELATIONSHIP against `cache.verify_active()`, never a
+    // literal `true`/`false`. A literal passes on a handler that hardcodes the
+    // field, which is the failure this field exists to prevent one layer down;
+    // the relationship only passes if the wire really is derived from the slot.
+    let state = test_app_state_with_hwmon();
+    let cache = state.cache.clone();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    // Idle: nothing holds the slot, so both surfaces must say the engine writes.
+    assert!(!cache.verify_active(), "precondition: slot starts free");
+    let (_, status_json) = uds_get(&path, "/status").await;
+    let (_, poll_json) = uds_get(&path, "/poll").await;
+    assert_eq!(status_json["verify_active"], cache.verify_active());
+    assert_eq!(poll_json["status"]["verify_active"], cache.verify_active());
+    assert_eq!(
+        status_json["verify_active"], false,
+        "the idle branch must actually be observed, or this test asserts nothing"
+    );
+
+    // Held: claim the slot the way a verify handler does.
+    assert!(cache
+        .try_begin_verify(std::time::Duration::from_secs(30))
+        .is_some());
+    assert!(cache.verify_active(), "precondition: the slot is now held");
+    let (_, status_json) = uds_get(&path, "/status").await;
+    let (_, poll_json) = uds_get(&path, "/poll").await;
+    assert_eq!(
+        status_json["verify_active"],
+        cache.verify_active(),
+        "/status must report the live slot: {status_json}"
+    );
+    assert_eq!(
+        poll_json["status"]["verify_active"],
+        cache.verify_active(),
+        "/poll must report the live slot: {poll_json}"
+    );
+    assert_eq!(
+        status_json["verify_active"], true,
+        "the held branch must actually be observed, or the field could be a constant false"
+    );
+
+    // The DEADMAN is part of the predicate, not an afterthought (DEC-296): a
+    // leaked guard leaves `verify_in_progress` set forever while the engine
+    // resumes writing, and a client told "still verifying" past that point would
+    // blank its cards against a daemon that was commanding. The test seam expires
+    // the claim in place, so no sleep is needed and nothing is timing-dependent.
+    cache.expire_verify_claim_for_test();
+    assert!(!cache.verify_active(), "precondition: the deadman elapsed");
+    let (_, status_json) = uds_get(&path, "/status").await;
+    assert_eq!(
+        status_json["verify_active"], false,
+        "an elapsed deadman means the engine is writing again: {status_json}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
 }
 
 #[tokio::test]
@@ -4559,6 +4683,79 @@ async fn capabilities_advertise_header_roles() {
     assert_eq!(
         json["control"]["header_roles"], true,
         "this daemon classifies header roles and protects pumps: {json}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn capabilities_advertise_the_five_previously_flagless_features() {
+    // `WIRE-k`. These five routes shipped before this block had keys for them, so
+    // a client detected them by comparing the daemon's VERSION STRING or by
+    // reading a 404 off the route. The comments on `pwm_characterization` and
+    // `validation_sessions` already record why a probe is not a contract: the
+    // route fallback's 404 is indistinguishable from a handler's own 404 for an
+    // unknown id.
+    //
+    // Asserted against the ROUTES rather than as five bare `true`s: a flag that
+    // claims a feature the daemon does not serve is worse than no flag, and five
+    // literals would pass on a handler that hardcoded them with the routes gone.
+    let state = test_app_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, caps) = uds_get(&path, "/capabilities").await;
+    assert_eq!(status, 200);
+    for flag in [
+        "gpu_fan_verify",
+        "hardware_readiness",
+        "superio_port_probe",
+        "preferred_sensors",
+        "daemon_config_report",
+    ] {
+        assert_eq!(
+            caps["control"][flag], true,
+            "control.{flag} must be advertised: {caps}"
+        );
+    }
+
+    // Each advertised GET must actually route. A 404 `not_found` from the
+    // fallback is the exact failure the flags exist to make undetectable-by-probe,
+    // so it is the thing this asserts against — any other status (including a
+    // 503 for absent hardware) means the route is served.
+    for route in [
+        "/inventory/hardware-readiness",
+        "/inventory/hwmon",
+        "/config",
+    ] {
+        let (status, body) = uds_get(&path, route).await;
+        assert_ne!(status, 404, "{route} is advertised but not routed: {body}");
+    }
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn capabilities_publish_the_gui_pairing_floor_from_one_source() {
+    // `WIRE-ac`. Three numbers claimed to be this contract: the handler said
+    // `2.0.0`, ~30 release notes said `>= 2.23.0`, and the 2.16.0 entry said
+    // `>= 2.38.0`. Asserted as a RELATIONSHIP against the constant, not as the
+    // literal "2.23.0" — a literal here would have to be edited in lockstep with
+    // the constant, which is the drift this row is about, one level up.
+    let state = test_app_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, caps) = uds_get(&path, "/capabilities").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        caps["control"]["min_supported_gui"],
+        control_ofc_daemon::constants::MIN_SUPPORTED_GUI,
+        "the handler must publish the constant verbatim: {caps}"
+    );
+    assert_ne!(
+        caps["control"]["min_supported_gui"], "",
+        "an empty floor means 'no floor enforced' and is not what this daemon means"
     );
 
     let _ = shutdown.send(());

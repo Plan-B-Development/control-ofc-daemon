@@ -67,6 +67,7 @@ daemon/                     Rust crate (control-ofc-daemon)
                             Matches running kernel against published amdgpu
                             regressions; surfaced via
                             /capabilities.amd_gpu.kernel_warnings.
+      gigabyte_siv.rs       Gigabyte SIV descriptor decode — the board's own firmware-declared fan/temp/voltage counts, read from /sys/class/gigabyte/id/gigabyte_siv (X87-d). Read-only sysfs; no port I/O
       inventory.rs          Structured hwmon inventory (temps, fans, PWM metadata; DEC-200)
       classify.rs           CPU/mobo sensor + PWM classification (DEC-200)
       readiness.rs          Hardware-readiness item computation (DEC-200)

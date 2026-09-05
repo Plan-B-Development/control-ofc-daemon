@@ -11,6 +11,7 @@ pub mod classify;
 pub mod cooling_device;
 pub mod device_policy;
 pub mod discovery;
+pub mod gigabyte_siv;
 pub mod gpu_detect;
 pub mod gpu_fan;
 pub mod header_caps;

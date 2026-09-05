@@ -411,6 +411,32 @@ pub struct DaemonState {
     pub control_outputs: Vec<ControlOutput>,
 }
 
+impl DaemonState {
+    /// Whether a hardware verify / characterisation / calibration / validation
+    /// sweep currently owns the write pause, evaluated against *now*.
+    ///
+    /// The single definition of that predicate (`WIRE-n`). It lives on the state
+    /// rather than on the cache because it has two readers that cannot share a
+    /// lock guard: [`crate::health::cache::Cache::verify_active`] takes its own
+    /// read, while `/status` and `/poll` are already inside
+    /// `Cache::read_with` and would re-enter it. Two hand-written copies of
+    /// `verify_in_progress && now < verify_active_until` would be two rules that
+    /// can drift, and the wire field exists precisely to tell a client what the
+    /// engine is doing — a divergence there is a lie, not a cosmetic bug.
+    ///
+    /// The deadman is part of the predicate, not an afterthought: a leaked guard
+    /// leaves `verify_in_progress` set forever, and the engine resumes writing
+    /// when `verify_active_until` elapses (DEC-296). A client told "still
+    /// verifying" past that point would blank its cards while the engine was
+    /// commanding again.
+    pub fn verify_active_at(&self, now: Instant) -> bool {
+        self.verify_in_progress
+            && self
+                .verify_active_until
+                .is_some_and(|deadline| now < deadline)
+    }
+}
+
 impl Default for DaemonState {
     fn default() -> Self {
         Self {

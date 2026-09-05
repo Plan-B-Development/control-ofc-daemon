@@ -260,6 +260,16 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
     let expected_chips = diagnostics::expected_chips_for_board(&board.vendor, &board.name);
     let kernel_detected_chips = diagnostics::read_kernel_detected_chips();
 
+    // `X87-d`: the board's own firmware-declared counts, where `it87` exports
+    // them. Read unconditionally rather than gated on the DMI vendor — the file
+    // exists only on boards whose driver published it, so its presence IS the
+    // detection, and gating on a vendor string would reintroduce the DMI
+    // dependency this field exists to stop relying on. Read-only sysfs: one
+    // small file, no port I/O, unaffected by the port-probe gate.
+    let board_firmware_counts = crate::hwmon::gigabyte_siv::read_siv(std::path::Path::new(
+        crate::hwmon::gigabyte_siv::GIGABYTE_SIV_PATH,
+    ));
+
     // DEC-105 / DEC-106: known-bad simultaneous-load detection. The
     // flagship case is (nct6687, nct6775) — both must never be loaded at
     // the same time on a SINGLE-chip board with NCT6797D because they
@@ -295,6 +305,7 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
             acpi_conflicts,
             board,
             expected_chips,
+            board_firmware_counts,
             kernel_detected_chips,
             module_collisions,
             cpu_vendor,

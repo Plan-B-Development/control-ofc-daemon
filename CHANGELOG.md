@@ -1,5 +1,88 @@
 # Changelog
 
+## [2.36.0] — 2026-09-05
+
+Wave 3 of the 2026-09-05 wire-surface sweep — the daemon-side half. **Additive only:**
+five new capability flags, two new optional response fields, one corrected record, and
+`api_version` unchanged. Pairs with `control-ofc-gui` >= v2.23.0, which this release makes
+the daemon itself state rather than something the release notes assert.
+
+### Added
+- **Five capability flags for features that shipped before they had one** (`WIRE-k`).
+  `GET /capabilities` gains `control.gpu_fan_verify`, `control.hardware_readiness`,
+  `control.superio_port_probe`, `control.preferred_sensors` and
+  `control.daemon_config_report`, all `true`. Each route existed for between one and five
+  minor versions with no key, so a client had to compare the daemon's **version string** or
+  call the route and read a `404` as "unsupported" — and that `404` is indistinguishable
+  from a handler's own `404` for an unknown id, which is precisely why
+  `pwm_characterization` and `validation_sessions` were given flags when they landed. These
+  five simply never were.
+
+  **An absent flag is not a denial.** The keys exist only from this release while the
+  features behind them shipped from 1.11.0 onward, so a client that collapsed "absent" into
+  `false` would stand five working features down on every daemon in between. `docs/08`
+  states the tri-state rule.
+
+- **`/status` and `/poll` say whether the engine is writing** (`WIRE-n`). New
+  `verify_active` boolean, `true` while a hardware verify, PWM characterisation, OpenFan
+  calibration or validation sweep holds the engine's write pause. The engine keeps
+  *evaluating* during such a session and keeps publishing every control's duty in
+  `control_outputs[]`; it simply does not apply it, and until now nothing on the wire said
+  so — a client rendered a duty nothing was writing. Narrow but reachable: the dialogs are
+  modal, yet a validation session keeps recording after its dialog closes.
+
+  **Not a safety signal.** The thermal emergency's `force_all_with_floor` runs well before
+  the `verify_active()` gate (DEC-297), so a paused write phase never gated the ladder;
+  a client that suppressed a thermal banner on this field would hide a live emergency. It
+  qualifies the commanded duty and nothing else.
+
+- **`/diagnostics/hardware` reports the board's firmware-declared header counts** (`X87-d`).
+  New optional `board_firmware_counts` — `{platform, special, fan_count, temp_count,
+  volt_count}` — decoded from the Gigabyte SIV descriptor `it87` exports at
+  `/sys/class/gigabyte/id/gigabyte_siv`. `expected_chips` beside it is a curated DMI lookup
+  and therefore an inference, only ever as good as the table; this is a measurement from the
+  board, so a client can state the deficit as a fact. The DMI table stays as the fallback and
+  stays authoritative for *which* chip should carry them. Compare against
+  `hwmon.total_headers`, which is `pwmN`-capable headers only — monitor-only tachometers are
+  a disjoint set on `GET /inventory/hwmon`, so the difference is "headers with no
+  controllable PWM", not "unreachable headers".
+
+  Read-only sysfs — no port I/O, no `CAP_SYS_RAWIO`, unaffected by the Super-I/O port-probe
+  gate. Absent on every non-Gigabyte board, when `it87` is not loaded and when the
+  descriptor does not decode; never a zeroed object, because a `fan_count` of 0 would claim
+  the board has no fan headers.
+
+### Changed
+- **`control.min_supported_gui` is now `2.23.0`, and is the single source of the pairing
+  floor** (`WIRE-ac`). It said `2.0.0` — the DEC-165 cutover — while the release notes said
+  something else, and there turned out to be **four** numbers claiming to be one contract,
+  not the three the register recorded: `2.0.0` in the handler *and* in this file's eight
+  most recent entries, `>= v2.23.0` in roughly thirty entries before those, and `>= v2.38.0`
+  in the 2.16.0 entry (a forward reference to the GUI that consumes `GET /config`, not a
+  floor at all). The handler now publishes the number from one constant and the prose quotes
+  it.
+
+  Nothing acts on the field today — the reference GUI's compatibility banner quotes its own
+  constant — so the practical effect is a truthful contract rather than a behaviour change.
+  The banner it feeds is non-blocking by design (`docs/08`): the daemon is the sole PWM
+  writer and controls fans correctly whatever the GUI's age.
+
+### Fixed
+- **A failed config reload no longer overwrites a startup degradation** (`WIRE-ao`).
+  `runtime_config_degraded` recorded latest-wins, so a `SIGHUP` reload that could not parse
+  `runtime.toml` replaced an earlier *startup* record. The two are not equally severe: a
+  startup failure drops every `header_roles` assignment — and on a board with no `pwmN_label`
+  files that assignment is the only evidence a header drives a pump, so its 30% floor, its
+  stop exemption and its pump-safe identify go with it — while a reload failure drops
+  nothing, because startup's roles are still in force. The record could therefore read
+  `reload` while a hand-assigned pump was already unprotected.
+
+  Now most-severe-wins: a `startup` record stands. Latest-wins is kept *within* the reload
+  phase, so a second failed reload still refreshes `detail` rather than serving a stale one.
+  Pre-existing since 2.34.0 and already worked around client-side (GUI v2.58.0 never
+  reassures on `reload`), which is why it was a P2; the client-side rule stays in `docs/08`
+  regardless, since a client cannot tell which daemon it is talking to from this field.
+
 ## [2.35.5] — 2026-09-05
 
 **Test-only.** No runtime, API or cooling behaviour changes: every line added lands inside

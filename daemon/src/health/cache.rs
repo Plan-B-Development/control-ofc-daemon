@@ -594,11 +594,11 @@ impl StateCache {
     /// entire lifetime by the handler's RAII guard, and bounded by the deadman
     /// backstop so a leaked guard cannot pause the engine indefinitely.
     pub fn verify_active(&self) -> bool {
-        let state = self.inner.read();
-        state.verify_in_progress
-            && state
-                .verify_active_until
-                .is_some_and(|deadline| Instant::now() < deadline)
+        // `WIRE-n`: delegate rather than restate. `/status` and `/poll` publish
+        // this same predicate from inside `read_with`, where they cannot call
+        // this method without re-entering the read lock, so the rule lives on
+        // `DaemonState` and both readers evaluate the one copy.
+        self.inner.read().verify_active_at(Instant::now())
     }
 
     /// Relinquish a GPU fan to firmware-auto: the profile engine stops writing

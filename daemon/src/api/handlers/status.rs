@@ -47,15 +47,21 @@ pub async fn status_handler(State(state): State<Arc<AppState>>) -> Json<StatusRe
     // EFF-1: read the state once under a shared guard instead of cloning the
     // whole `DaemonState`. Only pure reads happen inside; the override_table
     // lock in `build_status_response` stays outside the guard.
-    let (health, thermal_state, unavailable, skipped, outputs) = state.cache.read_with(|snap| {
-        (
-            compute_health(snap, &state.staleness_config, now, openfan),
-            thermal_state_of(snap),
-            build_unavailable_entries(snap, now),
-            build_skipped_entries(snap, now),
-            build_control_output_entries(snap),
-        )
-    });
+    let (health, thermal_state, unavailable, skipped, outputs, verify_active) =
+        state.cache.read_with(|snap| {
+            (
+                compute_health(snap, &state.staleness_config, now, openfan),
+                thermal_state_of(snap),
+                build_unavailable_entries(snap, now),
+                build_skipped_entries(snap, now),
+                build_control_output_entries(snap),
+                // `WIRE-n`: read from the snapshot, NOT via
+                // `state.cache.verify_active()` — that method takes its own
+                // `inner.read()`, and calling it here would re-enter the guard
+                // this closure already holds.
+                snap.verify_active_at(now),
+            )
+        });
     Json(build_status_response(
         &state,
         thermal_state,
@@ -63,6 +69,7 @@ pub async fn status_handler(State(state): State<Arc<AppState>>) -> Json<StatusRe
         skipped,
         outputs,
         health,
+        verify_active,
     ))
 }
 
@@ -94,7 +101,7 @@ pub async fn poll_handler(State(state): State<Arc<AppState>>) -> Json<PollRespon
     // the entire state. The `override_table` lock lives in
     // `build_status_response`, kept outside this guard to preserve lock order.
     let openfan = openfan_presence(&state);
-    let (health, thermal_state, unavailable, skipped, outputs, sensors, fans) =
+    let (health, thermal_state, unavailable, skipped, outputs, sensors, fans, verify_active) =
         state.cache.read_with(|snap| {
             (
                 compute_health(snap, &state.staleness_config, now, openfan),
@@ -104,12 +111,22 @@ pub async fn poll_handler(State(state): State<Arc<AppState>>) -> Json<PollRespon
                 build_control_output_entries(snap),
                 build_sensor_entries(snap, now),
                 build_fan_entries(snap, now),
+                // `WIRE-n` — see the note in `status_handler`.
+                snap.verify_active_at(now),
             )
         });
 
     Json(PollResponse {
         api_version: API_VERSION,
-        status: build_status_response(&state, thermal_state, unavailable, skipped, outputs, health),
+        status: build_status_response(
+            &state,
+            thermal_state,
+            unavailable,
+            skipped,
+            outputs,
+            health,
+            verify_active,
+        ),
         sensors,
         fans,
     })
@@ -312,7 +329,12 @@ pub async fn capabilities_handler(
             manual_override: true,
             fan_identify: true,
             autonomous_control: true,
-            min_supported_gui: "2.0.0".into(),
+            // `WIRE-ac`: the single source of the pairing floor. `2.0.0` was the
+            // DEC-165 cutover and stood here unchanged while ~30 release notes
+            // declared `>= 2.23.0`; three numbers claimed to be one contract.
+            // 2.23.0 is the published floor, so the wire now states it and the
+            // prose quotes the wire.
+            min_supported_gui: crate::constants::MIN_SUPPORTED_GUI.into(),
             openfan_rescan: true,
             profile_search_dir_remove: true,
             // DEC-311 (AIO-MB Phase 1): role classification, pump-safe identify,
@@ -328,6 +350,15 @@ pub async fn capabilities_handler(
             // routes. The additive `pwm_readback_pct` field that shipped with
             // them is optional on the wire and needs no flag.
             validation_sessions: true,
+            // `WIRE-k`: five features that shipped before this block had keys
+            // for them, so clients gated on a version string or on a probe's
+            // 404. All true here — the flag exists so a client can stop
+            // guessing, not so it can be turned off.
+            gpu_fan_verify: true,
+            hardware_readiness: true,
+            superio_port_probe: true,
+            preferred_sensors: true,
+            daemon_config_report: true,
         },
     })
 }

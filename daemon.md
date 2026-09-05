@@ -67,6 +67,10 @@ daemon/src/
     superio.rs         — passive Super-I/O chip detection (DMI + hwmon + /proc/modules + kmsg + ACPI evidence, DEC-202)
     superio_probe.rs   — opt-in active /dev/port Super-I/O probe, off by default (DEC-203)
     chip_db.rs         — Super-I/O chip → expected-driver knowledge base (DEC-202)
+    gigabyte_siv.rs    — Gigabyte SIV decode: the board's firmware-declared fan/temp/volt
+                         counts, published as `board_firmware_counts` on
+                         `/diagnostics/hardware` (`X87-d`). A measurement, where
+                         `chip_db`'s board table is an inference. Read-only sysfs
     util.rs            — shared sysfs path helpers
 
   health/
@@ -396,17 +400,17 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/status` | Subsystem health + freshness; `thermal_state`; `unavailable_sensors[]` (present-but-unreadable sensors, DEC-193); `skipped_controls[]` (controls the engine cannot resolve, so is not commanding — 273-i); `runtime_config_degraded` (set when `runtime.toml` failed to load and the daemon is running on defaults — `AUD3-m`); `active_profile_id`/`active_profile_name` (active profile, DEC-194); `readiness` (compact cached hardware-readiness rollup for the GUI Dashboard chip — `{overall, critical, warning, info, top_summary, top_code}`, DEC-206); `validation_session` (the live session in miniature, DEC-317) |
+| GET | `/status` | Subsystem health + freshness; `thermal_state`; `unavailable_sensors[]` (present-but-unreadable sensors, DEC-193); `skipped_controls[]` (controls the engine cannot resolve, so is not commanding — 273-i); `runtime_config_degraded` (set when `runtime.toml` failed to load and the daemon is running on defaults — `AUD3-m`); `active_profile_id`/`active_profile_name` (active profile, DEC-194); `readiness` (compact cached hardware-readiness rollup for the GUI Dashboard chip — `{overall, critical, warning, info, top_summary, top_code}`, DEC-206); `validation_session` (the live session in miniature, DEC-317); `verify_active` (a verify / characterisation / calibration / validation sweep owns the engine's WRITE PAUSE — the engine keeps evaluating and keeps publishing `control_outputs[]`, it simply does not apply them, `WIRE-n`. **Not a safety signal:** the thermal force runs before this gate, DEC-297) |
 | GET | `/sensors` | All temperature readings (each entry optionally carries a curated hwmon `thresholds` object — DEC-117; each also carries `control_eligible: bool` — DEC-193) |
 | GET | `/fans` | Fan RPM + last commanded PWM (+ `stall_detected`, `fan_alarm`, `pwm_enable_mode`, `pwm_readback_pct` — the hardware readback, DEC-317 — and `pwm_commanded_pct` — the single-producer command, DEC-318; the two are the separate axes `last_commanded_pwm` conflates for an hwmon header) |
-| GET | `/poll` | Batch: status (incl. `unavailable_sensors[]`, `skipped_controls[]`, `runtime_config_degraded`, `active_profile_*`, `readiness` rollup) + sensors (incl. `control_eligible`) + fans |
+| GET | `/poll` | Batch: status (incl. `unavailable_sensors[]`, `skipped_controls[]`, `runtime_config_degraded`, `active_profile_*`, `readiness` rollup, `verify_active` — the engine is evaluating but NOT writing, `WIRE-n`) + sensors (incl. `control_eligible`) + fans |
 | GET | `/sensors/history` | Per-entity time-series (ring buffer) |
-| GET | `/capabilities` | Device list, feature flags, limits, `amd_gpu.kernel_warnings` (kernel-version regression catalogue, DEC-098) |
+| GET | `/capabilities` | Device list, feature flags, limits, `amd_gpu.kernel_warnings` (kernel-version regression catalogue, DEC-098). `control.min_supported_gui` is the **single source** of the GUI pairing floor (`WIRE-ac`, `constants::MIN_SUPPORTED_GUI`); `WIRE-k` added flags for five older features (`gpu_fan_verify`, `hardware_readiness`, `superio_port_probe`, `preferred_sensors`, `daemon_config_report`) — an absent flag means "this daemon predates the key", never "unsupported" |
 | GET | `/config` | Effective merged configuration (DEC-243): per key its on-disk `value`, the `running_value` this process started with, `source` (`runtime`/`admin`/`default`), `mutable`, `requires_restart`, `restart_pending`, and `requires_privilege` where a drop-in is also needed. `/capabilities` carries no configuration at all — this is the only read side |
 | GET | `/hwmon/headers` | Controllable motherboard PWM outputs |
 | GET | `/profiles`, `/profiles/{id}` | Daemon-stored profiles (store of record — DEC-160) |
 | GET | `/profile/active` | Current active profile or `{"active": false}` |
-| GET | `/diagnostics/hardware` | Hardware readiness report (hwmon chips, GPU, thermal safety, kernel modules, ACPI conflicts, board info) |
+| GET | `/diagnostics/hardware` | Hardware readiness report (hwmon chips, GPU, thermal safety, kernel modules, ACPI conflicts, board info, and `board_firmware_counts` — the board's own firmware-declared fan/temp/volt counts where `it87` publishes the Gigabyte SIV, `X87-d`; a measurement beside `expected_chips`' DMI-table inference; compare against `hwmon.total_headers`, which is `pwmN`-capable headers only — monitor-only tachometers are disjoint and live on `/inventory/hwmon`) |
 | GET | `/inventory/hwmon` | Read-only structured inventory: temp sensors (each with a fine `classification`/`confidence`/`rationale` + an advisory `default_cpu`), controllable PWM headers, and monitor-only fan tachometers (`fanN_input` with no matching `pwmN`) |
 | GET | `/inventory/cooling-devices` | Configured cooling-device topology + every device policy the daemon ships (DEC-316). Metadata — the profile engine never reads a device |
 | GET | `/validation/session` | The current or most recent validation session in full — metadata, samples, event timeline, referenced diagnostics, findings (DEC-317). `404` when none has ever run |
