@@ -1,0 +1,173 @@
+#!/bin/sh
+# control-ofc-superio-guard — refuse a Nuvoton/Winbond Super-I/O probe on a
+# board whose Super-I/O is ITE.
+#
+# WHY THIS EXISTS (measured 2026-09-05, X870E AORUS MASTER, DEC-332)
+# ------------------------------------------------------------------
+# nct6775 and w83627ehf share one `superio_enter()`:
+#
+#     outb(0x87, ioreg); outb(0x87, ioreg);      /* UNCONDITIONAL */
+#
+# and only then read the device ID, on both 0x2E and 0x4E. On a Gigabyte board
+# whose secondary Super-I/O sits behind an ITE eSPI-to-LPC bridge, that write
+# puts the BRIDGE into configuration mode. The bridge then answers 0x8883 in
+# place of the chip behind it, so it87 cannot find the secondary at all.
+#
+# Measured cost on this board: 3 of 8 fan headers and 3 of 9 temperatures
+# disappear. The probe FAILS ("could not insert 'nct6775': No such device") and
+# does the damage anyway -- the write happens before the -ENODEV.
+#
+# The latch survives a warm reboot AND a soft power-off. Only a FULL POWER CUT
+# clears it. See the Hardware Troubleshooting guide for the recovery procedure.
+#
+# WHY SUPPRESSION IS FREE HERE
+# ----------------------------
+# Every board matched below has an ITE Super-I/O. nct6775 and w83627ehf drive
+# Nuvoton and Winbond silicon, so on these boards they can only ever fail --
+# there is no functionality to lose, only a destructive probe to avoid. On every
+# OTHER board the real modprobe runs untouched, because nct6775 is genuinely
+# required on most Nuvoton boards and blanket removal would break them.
+#
+# WHY `install` AND NOT `blacklist`
+# ---------------------------------
+# systemd-modules-load issues an explicit `modprobe <name>`, which IGNORES
+# blacklist and HONOURS install. blacklist would silently do nothing here.
+#
+# To override, create a file with the SAME NAME in /etc/modprobe.d/:
+#     /etc/modprobe.d/control-ofc-superio.conf
+# A same-named file in a higher-priority directory masks this one entirely, which
+# is the ONLY override modprobe.d(5) guarantees. A DIFFERENTLY-named file in
+# /etc/modprobe.d does NOT reliably win: all config files across all directories
+# are parsed in lexicographic order by basename, and for a duplicated `install`
+# the FIRST one parsed takes effect. Measured with kmod 34.2 -- `10-a.conf` beat
+# `90-b.conf` in both orderings -- so an override named e.g. `zz-nct6775.conf`
+# would sort after this file and be silently ignored.
+#
+# FAIL-OPEN BY DESIGN
+# -------------------
+# Anything unexpected -- unreadable DMI, missing modprobe, no arguments -- falls
+# through to loading the module. A guard that breaks must not cost a user their
+# fan control on hardware this was never about.
+
+set -u
+
+# Never inherit PATH from the caller: this runs as root, early, from modprobe.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+# Pin the locale too: the board match case-folds with `tr`, and a locale where
+# that fold does not map ASCII identically would make the match MISS -- which
+# fails open, i.e. it loads the module on an affected board. That is the
+# destructive direction, so it is worth one line to remove.
+LC_ALL=C
+export LC_ALL
+
+# Two test seams, neither of which can widen what this script is able to do:
+#   CONTROL_OFC_DMI_DIR   -- where to read DMI from (default: the real sysfs)
+#   CONTROL_OFC_GUARD_DRY_RUN -- print the decision instead of exec'ing modprobe
+# Setting either requires already being able to control this root process's
+# environment, and the worst either can produce is the fail-open behaviour that
+# is already the default. They exist so the decision table is actually tested.
+DMI_DIR="${CONTROL_OFC_DMI_DIR:-/sys/class/dmi/id}"
+DRY_RUN="${CONTROL_OFC_GUARD_DRY_RUN:-}"
+
+MODULE="${1-}"
+
+# No module named: nothing to decide. Fail open by doing nothing rather than
+# exec'ing modprobe with no arguments.
+[ -n "$MODULE" ] || exit 0
+
+# `--ignore-install` is what stops this rule re-entering itself.
+load_it() {
+    if [ -n "$DRY_RUN" ]; then
+        printf 'LOAD %s\n' "$MODULE"
+        exit 0
+    fi
+    exec modprobe --ignore-install "$@"
+    # Only reached if exec ITSELF failed (no modprobe on PATH). That is not
+    # "fail open" -- the module does not get loaded -- so say so rather than
+    # exiting 0 in silence and leaving a Nuvoton board mysteriously without
+    # sensors. Still exit 0: a non-zero exit here would fail the boot-time
+    # modprobe for a condition the user cannot act on mid-boot.
+    if command -v logger >/dev/null 2>&1; then
+        logger -t control-ofc-superio-guard -p daemon.err \
+            "could not exec modprobe to load $MODULE; the module has NOT been loaded"
+    fi
+    exit 0
+}
+
+board_name=$(cat "$DMI_DIR/board_name" 2>/dev/null) || board_name=''
+board_vendor=$(cat "$DMI_DIR/board_vendor" 2>/dev/null) || board_vendor=''
+
+# Unreadable DMI (container, exotic firmware) -> we cannot judge -> load.
+[ -n "$board_name" ] || load_it "$@"
+
+upper() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
+board_uc=$(upper "$board_name")
+vendor_uc=$(upper "$board_vendor")
+
+# Vendor gate first: every entry below is a Gigabyte board, and the names are
+# matched as substrings, so this stops a coincidental match on another vendor.
+case "$vendor_uc" in
+    *GIGABYTE*) ;;
+    *) load_it "$@" ;;
+esac
+
+# ── BEGIN GENERATED BOARD LIST ──
+# Parity-pinned against `GIGABYTE_DUAL_CHIP_BOARDS` in daemon/src/hwmon/chip_db.rs
+# by `superio_guard_board_list_matches_chip_db` -- edit the Rust table, then this,
+# and the test will tell you if they diverge. Matched case-insensitively as
+# SUBSTRINGS, exactly as chip_db.rs matches them.
+DUAL_CHIP_ITE_BOARDS='X870E AORUS MASTER
+X870E AORUS PRO
+X870E AORUS ELITE
+X870 AORUS ELITE WIFI7
+X870 AORUS ELITE WIFI7 ICE
+X670E AORUS MASTER
+X670E AORUS PRO X
+X670 AORUS ELITE AX
+Z690 AORUS PRO
+Z790 AORUS ELITE AX
+Z790 AORUS MASTER
+Z790 AORUS XTREME
+X570 AORUS MASTER
+X570 AORUS PRO
+X570 AORUS PRO WIFI
+X570 AORUS ULTRA
+TRX40 AORUS XTREME
+X470 AORUS ULTRA GAMING
+X470 AORUS GAMING 7 WIFI
+X470 AORUS GAMING 5 WIFI
+B450 AORUS PRO
+X399 DESIGNARE EX-CF
+B450 AORUS PRO-CF
+B550 VISION D
+B850 AI TOP
+X870 AORUS STEALTH ICE'
+# ── END GENERATED BOARD LIST ──
+
+matched=''
+# Field-split the list on newlines only, so board names keep their spaces.
+IFS='
+'
+for entry in $DUAL_CHIP_ITE_BOARDS; do
+    [ -n "$entry" ] || continue
+    case "$board_uc" in
+        *"$entry"*) matched="$entry"; break ;;
+    esac
+done
+unset IFS
+
+[ -n "$matched" ] || load_it "$@"
+
+# Suppressed. Say so in the journal: an absence from `lsmod` cannot distinguish
+# "we suppressed it" from "it failed to load", and those need different advice.
+if [ -n "$DRY_RUN" ]; then
+    printf 'SUPPRESS %s (%s)\n' "$MODULE" "$matched"
+    exit 0
+fi
+if command -v logger >/dev/null 2>&1; then
+    logger -t control-ofc-superio-guard -p daemon.notice \
+        "not loading $MODULE: $board_name has an ITE Super-I/O ($matched). A Nuvoton/Winbond probe writes a config-mode unlock to 0x2E/0x4E, which can latch an ITE eSPI-to-LPC bridge and hide the secondary chip's fan headers until a full power cut. Nothing is lost: this module cannot drive ITE silicon."
+fi
+exit 0

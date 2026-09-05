@@ -568,12 +568,22 @@ pub fn read_board_info_from(dmi_dir: &Path) -> BoardInfo {
 //   `sensors-detect`. This mode is real and this comment's original account of
 //   it stands.
 //
-//   MODE 2 — secondary DEVID reads 0x8883. **Not recoverable locally, as at
-//   2026-09-04.** See the X870 STEALTH ICE / X870E AORUS MASTER note at the
-//   foot of `GIGABYTE_DUAL_CHIP_BOARDS` for the measurements. The critical
-//   difference is that `mmio=on` is NOT a remedy here, because `mmio` already
-//   defaults to `true` (`it87.c:314`, `static bool mmio = true;`) — advice to
-//   "enable" it names a state that is already in effect.
+//   MODE 2 — secondary DEVID reads 0x8883. An ITE eSPI→LPC bridge has been
+//   latched into configuration mode and answers in place of the chip behind it.
+//   **Recoverable, and the cause is measured (DEC-332, 2026-09-05.)** Some
+//   driver wrote a config-mode unlock to 0x4E: `nct6775` and `w83627ehf` both
+//   do so unconditionally in `superio_enter()` before reading the DEVID, and
+//   loading `nct6775` on an X870E AORUS MASTER reproduced the latch inside a
+//   single boot, against an `it87`-reload control that did not. Remedy: keep
+//   those modules off the board (the package ships a modprobe guard that does
+//   this automatically), then clear the latch with a FULL POWER CUT — it
+//   survives a warm reboot and a soft power-off, so a reboot alone is a false
+//   negative. Note `mmio=on` is NOT the remedy for either mode, because `mmio`
+//   already defaults to `true` (`it87.c:314`, `static bool mmio = true;`) —
+//   advice to "enable" it names a state that is already in effect.
+//
+//   This entry said "Not recoverable locally" until 2026-09-05. It asked to be
+//   re-retracted only against a fresh measurement; that is what happened.
 //
 // We expose the expected chip-list to the GUI so it can render a dual-chip
 // warning when `expected_chips - chips_detected` is non-empty. The list is
@@ -738,8 +748,32 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "B850 AI TOP",
         chips: &["it8696", "it87952"],
     },
-    // X870 AORUS STEALTH ICE: NOT enrolled above, and the reason has now been
-    // measured rather than inferred (DEC-326 / `HOST-b`).
+    // DEC-332: enrolled after the 0x8883 latch was measured recoverable. Its
+    // secondary is an IT87952E behind an ITE eSPI→LPC bridge, evidenced by
+    // it87 #81, whose reporter got the second chip working and drove `pwmN` on
+    // it. See the long note below the table.
+    DualChipEntry {
+        board_name: "X870 AORUS STEALTH ICE",
+        chips: &["it8696", "it87952"],
+    },
+    // X870 AORUS STEALTH ICE: now ENROLLED above (DEC-332), after two rounds of
+    // getting this wrong in opposite directions.
+    //
+    // It was held out on the grounds that "no Linux driver can currently reach"
+    // its secondary. That premise is now measured false twice over: the `0x8883`
+    // reading is a latched bridge and clears on a power cut (see MODE 2 at the
+    // head of this file), and #81's own thread records its reporter getting the
+    // second chip working and driving `pwmN` on it. Holding it out while
+    // `X870E AORUS ELITE` was enrolled on #89 owner-report evidence applied two
+    // different evidence tiers to the same class of report — the inconsistency
+    // that `X87-f` was opened for.
+    //
+    // Enrolling it has a second effect worth naming: the modprobe guard's board
+    // list is parity-tested against this table, so an enrolled board is also a
+    // protected board.
+    //
+    // The measurements below stand and are why the enrolment is safe; only the
+    // CONCLUSION drawn from them changed.
     //
     // This comment previously retracted an earlier "undriveable IT8883" reading
     // as *"was wrong"*, and asserted that 0x8883 is merely a stuck-in-config-mode
@@ -766,16 +800,18 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
     //     water pump" non-functional. Citing it as evidence that the theory
     //     WORKS reads the issue backwards.
     //
-    // INFERRED, and labelled as such: 0x8883 is most likely an IT8883 eSPI→LPC
-    // bridge with the IT87952E sitting behind it (per #64's "espi to lpc bridge
-    // chips"), i.e. the driver is answering the bridge rather than the chip.
-    // Nothing here confirms that; it is the least-bad reading of the evidence.
+    // The bridge reading is no longer inference. On 2026-09-05 the same host
+    // recovered the secondary as `it87952-isa-0a60` — 3 fans, 3 PWMs, 3
+    // thermistor temps — after a full power cut with `nct6775`/`w83627ehf`
+    // suppressed, and lost it again inside one boot when `nct6775` was loaded
+    // (DEC-332). So 0x8883 is an ITE eSPI→LPC bridge in config mode with the
+    // IT87952E behind it, and the driver is answering the bridge.
     //
-    // Consequence for this table: enrolling STEALTH ICE would make the GUI
-    // promise headers that no Linux driver can currently reach, so it stays out
-    // — now for a measured reason rather than to avoid churn. **Do not
-    // re-retract this without a fresh measurement**; that is exactly how the
-    // previous version got here.
+    // Consequence for this table: the secondary IS reachable, so enrolling
+    // STEALTH ICE promises headers a user can actually get, and gives them the
+    // dual-chip warning that explains the deficit in the meantime. **Do not
+    // re-retract this without a fresh measurement**; that rule is what got the
+    // entry corrected both times.
     //
     // This does NOT generalise to the family. `X870E AORUS ELITE` above is an
     // owner-confirmed working it8696+it87952 pairing (#89, both chips, control
@@ -1362,15 +1398,22 @@ mod tests {
     }
 
     #[test]
-    fn expected_chips_x870_aorus_stealth_ice_not_in_table() {
-        // X870 AORUS STEALTH ICE is an IT8696E + IT87952E board (NOT an
-        // undriveable "IT8883" — corrected 2026-07 per frankcrawford/it87
-        // #81/#70; 0x8883 is only a stuck-config-mode symptom, clean read
-        // 0x8695). It is deliberately left out of the table for now, so
-        // `expected_chips` stays empty; enrolling it is a tracked follow-up.
+    fn expected_chips_x870_aorus_stealth_ice_is_enrolled() {
+        // Renamed from `..._not_in_table` (DEC-332). The board was held out
+        // because its secondary was believed unreachable; the 0x8883 reading is
+        // a latched ITE bridge that clears on a power cut, and it87 #81's
+        // reporter drove `pwmN` on the second chip. Holding it out while
+        // X870E AORUS ELITE was enrolled on the same tier of evidence was the
+        // inconsistency `X87-f` recorded.
         let chips =
             expected_chips_for_board("Gigabyte Technology Co., Ltd.", "X870 AORUS STEALTH ICE");
-        assert!(chips.is_empty());
+        assert_eq!(
+            chips,
+            vec!["it8696".to_string(), "it87952".to_string()],
+            "STEALTH ICE owners must get the dual-chip warning that explains \
+             their missing headers, and enrolment is also what puts the board \
+             behind the modprobe guard"
+        );
     }
 
     #[test]

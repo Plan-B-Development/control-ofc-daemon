@@ -573,15 +573,23 @@ fn ite_unbound_tail(out_of_tree: bool) -> &'static str {
          snapshot, and several secondary-chip fixes landed in 2026-03 and later. \
          Do not pass force_id, and do not add `mmio=on` (it is already the \
          driver default). If the chip still does not bind on a current build and \
-         its DEVID reads 0x8883, the secondary is most likely behind an \
-         eSPI-to-LPC bridge the driver cannot reach — there is no local fix for \
-         that case, and it needs driver work upstream."
+         its DEVID reads 0x8883, an ITE eSPI-to-LPC bridge has been latched into \
+         configuration mode and is answering in place of the chip behind it. \
+         That IS recoverable: it is caused by a driver writing a config-mode \
+         unlock to 0x2E/0x4E, almost always nct6775 or w83627ehf, and this \
+         package now ships a guard that stops them loading on affected boards. \
+         The catch is that clearing the latch needs the machine fully powered \
+         down at the wall — a reboot does not clear it. Full steps in the \
+         Hardware Troubleshooting guide."
     } else {
         " For newer Gigabyte ITE boards the in-tree it87 often cannot drive the \
          chip — install the it87-dkms-git build. (Do not add `mmio=on`: it is \
          already the driver default, DEC-326.) Do not pass force_id. If the chip \
-         still does not bind and its DEVID reads 0x8883, it is behind a bridge \
-         the driver cannot reach and there is no local fix."
+         still does not bind and its DEVID reads 0x8883, an ITE eSPI-to-LPC \
+         bridge is latched in configuration mode and masking it — recoverable by \
+         keeping nct6775/w83627ehf off the board and then powering fully down at \
+         the wall, since a reboot does not clear it. Full steps in the Hardware \
+         Troubleshooting guide."
     }
 }
 
@@ -1032,11 +1040,25 @@ mod tests {
             "an out-of-tree build may still be STALE; the branch must not \
              present a dead end. got: {already}"
         );
-        // The terminal "no local fix" must stay gated on the DEVID condition
-        // rather than applying to every out-of-tree build.
+        // The 0x8883 advice must stay gated on the DEVID condition rather than
+        // applying to every out-of-tree build — but it is no longer terminal.
+        // DEC-332 measured the recovery, so a hint that still said "no local
+        // fix" would be telling a user to give up on a chip they can get back.
         assert!(
-            already.contains("no local fix for that case"),
-            "the terminal state must be scoped to the 0x8883 case"
+            already.contains("0x8883"),
+            "the bridge advice must stay scoped to the DEVID that identifies it"
+        );
+        assert!(
+            !already.contains("no local fix"),
+            "retracted by DEC-332: the latch IS clearable (suppress the \
+             Nuvoton/Winbond probe, then a full power cut). Telling a user \
+             otherwise costs them 3 of 8 fan headers permanently."
+        );
+        assert!(
+            already.contains("powered down at the wall"),
+            "a reboot does NOT clear the latch — the hint has to say so, \
+             because trying a reboot and failing is exactly what makes users \
+             conclude the chip is dead. got: {already}"
         );
         // And it must not cite a CLOSED upstream issue as the live thread —
         // it87 #64 is recorded closed 2025-12 (docs/19:705). Same defect as

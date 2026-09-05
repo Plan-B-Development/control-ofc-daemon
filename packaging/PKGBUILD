@@ -1,6 +1,6 @@
 # Maintainer: Plan-B-Development <https://github.com/Plan-B-Development>
 pkgname=control-ofc-daemon
-pkgver=2.37.0
+pkgver=2.38.0
 pkgrel=1
 pkgdesc="Hardware fan control daemon for Linux (OpenFan, hwmon, GPU)"
 arch=('x86_64')
@@ -108,6 +108,20 @@ package() {
     # for rationale. Covered by backup=() so pacman preserves user edits.
     install -Dm644 packaging/modules-load.d/control-ofc.conf \
         "$pkgdir/etc/modules-load.d/control-ofc.conf"
+
+    # Super-I/O probe guard (DEC-332). The modules-load.d file above asks for
+    # nct6775 and w83627ehf; on a Gigabyte board with an ITE Super-I/O their
+    # probe writes a config-mode unlock that can latch an eSPI-to-LPC bridge and
+    # hide the secondary chip's fan headers until a full power cut. The guard
+    # suppresses them on exactly those boards and is a no-op everywhere else.
+    #
+    # /usr/lib/modprobe.d, not /etc: this is vendor policy, and a user who wants
+    # it gone drops an overriding file in /etc/modprobe.d (which wins) or edits
+    # nothing we will overwrite on upgrade. Not in backup=() for the same reason.
+    install -Dm755 packaging/control-ofc-superio-guard \
+        "$pkgdir/usr/lib/control-ofc/control-ofc-superio-guard"
+    install -Dm644 packaging/modprobe.d-control-ofc-superio.conf \
+        "$pkgdir/usr/lib/modprobe.d/control-ofc-superio.conf"
 
     # Man page (rendered in build())
     install -Dm644 control-ofc-daemon.1 \

@@ -15,8 +15,13 @@
 //!   `request_muxed_region`, so we ONLY probe a base the caller has confirmed is
 //!   unclaimed (no bound driver, no ACPI/ioport reservation). On such a base
 //!   nothing else owns the chip, bounding the blast radius.
-//! - **Clean enter/exit every time**, byte-for-byte per the kernel drivers
-//!   (verified against `it87.c` and `nct6775-platform.c`, 2026-07). We read only
+//! - **Read before write, then clean enter/exit.** The DEVID read happens with
+//!   **no unlock at all**; a vendor unlock is written only when that read
+//!   returns `0xffff`, exactly as `it87_find` does. This ordering is the whole
+//!   safety property — see [`probe_base`]. Until 2026-09-05 this bullet claimed
+//!   the sequences were "byte-for-byte per the kernel drivers (verified against
+//!   `it87.c`)". The unlock **bytes** did match; the **decision whether to
+//!   unlock** did not, and only the decision protects the hardware. We read only
 //!   the fixed DEVID registers and **never** write a configuration value,
 //!   `force_id`, or the hardware-monitor block. A vendor whose unlock did not
 //!   take stays locked and ignores our writes.
@@ -33,6 +38,61 @@ use crate::hwmon::superio::SuperIoVendor;
 /// The two canonical Super-I/O configuration base ports. The index port is the
 /// base, the data port is `base + 1`. No other ports are ever touched.
 pub const SIO_BASES: [u16; 2] = [0x2e, 0x4e];
+
+/// Did nothing answer at this base? `0xffff` is the usual undecoded-read value
+/// and `0x0000` the other one chipsets produce; [`is_valid_family_devid`] has
+/// always treated both as "no chip", and this must agree with it or the two
+/// predicates disagree about what an empty base looks like. **This is the only
+/// condition that licenses an unlock write** — see [`probe_base`].
+fn no_response(devid: u16) -> bool {
+    !is_valid_family_devid(devid)
+}
+
+/// What a DEVID that has actually been read means, wherever it was read from.
+/// Shared by the no-enter read and the post-unlock reads so the two cannot
+/// drift — they did, once, and it put a destructive write back on the ITE leg.
+enum DevidVerdict {
+    /// The eSPI→LPC bridge. Report it; never write to this base again.
+    Bridge,
+    /// A nameable ITE chip.
+    IteChip,
+    /// Nothing is listening. The one case where an unlock is licensed.
+    NoResponse,
+    /// Something answered that we cannot name. Do not write — a base that
+    /// already responds is exactly where an unlock is unnecessary and risky.
+    UnknownResponder,
+}
+
+fn classify_devid(devid: u16) -> DevidVerdict {
+    if devid == IT8883_BRIDGE_DEVID {
+        DevidVerdict::Bridge
+    } else if is_ite_devid(devid) {
+        DevidVerdict::IteChip
+    } else if no_response(devid) {
+        DevidVerdict::NoResponse
+    } else {
+        DevidVerdict::UnknownResponder
+    }
+}
+
+/// Build the bridge report. `chip_name: None` deliberately: an ITE-family
+/// response that is emphatically not a chip. The raw DEVID is the diagnostic
+/// value — it is what tells an operator the bridge is latched.
+fn bridge_report(base: u16, devid: u16) -> ProbedChip {
+    log::warn!(
+        "Super-I/O base {base:#06x} answered DEVID {devid:#06x}: an ITE eSPI→LPC \
+         bridge is in configuration mode and is masking the Super-I/O behind it. \
+         Not probing this base further — the config-mode unlock write is what \
+         causes this. Recovery needs a full power cut (a reboot does not clear \
+         it); see the Hardware Troubleshooting guide."
+    );
+    ProbedChip {
+        base,
+        vendor: SuperIoVendor::Ite,
+        devid,
+        chip_name: None,
+    }
+}
 
 /// Read/write access to individual x86 I/O ports, injected so the probe logic is
 /// exercised against a fake — no real hardware, no `CAP_SYS_RAWIO` — in tests.
@@ -115,11 +175,25 @@ fn ite_exit(r: &dyn SuperIoPortReader, base: u16) -> io::Result<()> {
     Ok(())
 }
 
+/// The IT8883 eSPI→LPC bridge's signature.
+///
+/// It is **not** a sensor chip and never becomes one. It answers in place of the
+/// Super-I/O behind it while it is in configuration mode, and what puts it there
+/// is precisely an unlock write to its base — the write this module performed
+/// before reading until 2026-09-05.
+///
+/// That cost is **measured, not theoretical**: on an X870E AORUS MASTER, loading
+/// a driver that unlocks 0x4E hid the secondary IT87952E (3 fan headers, 3
+/// thermistor temps) until a full power cut. Naming it `it8883` reported
+/// hardware that does not exist, on the one code path able to create the state
+/// it was reporting.
+pub(crate) const IT8883_BRIDGE_DEVID: u16 = 0x8883;
+
 /// ITE DEVIDs are `0x86xx`–`0x88xx` (the chip number after "IT", e.g. IT8688E =
-/// 0x8688). `0x88xx` covers the config-mode `0x8883` reported by the STEALTH ICE
-/// secondary before recovery.
+/// 0x8688). The bridge signature is explicitly **excluded** — it is a bus
+/// bridge, not a chip we can name. See [`IT8883_BRIDGE_DEVID`].
 fn is_ite_devid(devid: u16) -> bool {
-    matches!(devid >> 8, 0x86..=0x88)
+    devid != IT8883_BRIDGE_DEVID && matches!(devid >> 8, 0x86..=0x88)
 }
 
 // ── Nuvoton / Winbond 0x87,0x87 family (nct6775-platform.c) ──────────
@@ -181,13 +255,54 @@ impl Drop for SioExitGuard<'_> {
     }
 }
 
-/// Probe one already-confirmed-unclaimed base. Tries ITE first (short-circuits
-/// on a match so the wrong vendor's exit never runs on an identified chip), then
-/// the Nuvoton/Winbond family. Returns `Ok(None)` when nothing plausible
-/// responds. Each vendor attempt arms a [`SioExitGuard`] right after its unlock,
-/// so the matching exit runs on every path out of the block — including an early
-/// `?` return when the DEVID read itself errors (DEC-203 config-mode-leak fix).
+/// Probe one already-confirmed-unclaimed base.
+///
+/// **Reads before it writes.** `it87_find` performs its DEVID read via
+/// `superio_enter(sioaddr, /*noentry=*/true)` — no unlock — and unlocks only if
+/// that returns `0xffff`, because `it8790`/`it8792`/`it87952` carry
+/// `FEAT_NOCONF` ("chip conf mode enabled on startup"). This function used to
+/// unlock first and read second, which is the exact write that latches an
+/// IT8883 eSPI→LPC bridge into configuration mode and hides the Super-I/O
+/// behind it. See [`IT8883_BRIDGE_DEVID`] for the measurement.
+///
+/// Order of operations:
+///   1. **no-enter read** — a `FEAT_NOCONF` chip answers here and we never write
+///      to its base at all, which is also why a healthy board now reports its
+///      true DEVID instead of a bridge signature we created ourselves;
+///   2. **the bridge** — reported without writing. Unlocking is what creates
+///      that state, so probing it again could only deepen the damage;
+///   3. **anything else that answers unlocked** — unrecognised, so we bail
+///      without writing, exactly as `it87_find` does rather than forcing a
+///      second opinion out of a chip that already gave one;
+///   4. **`0xffff` only** — nothing answered, so fall through to the vendor
+///      unlock sequences unchanged: ITE first (short-circuiting on a match so
+///      the wrong vendor's exit never runs on an identified chip), then the
+///      Nuvoton/Winbond family. Each attempt arms a [`SioExitGuard`] right after
+///      its unlock, so the matching exit runs on every path out of the block —
+///      including an early `?` return when the DEVID read itself errors
+///      (DEC-203 config-mode-leak fix).
 fn probe_base(r: &dyn SuperIoPortReader, base: u16) -> io::Result<Option<ProbedChip>> {
+    // ── 1-3: the no-enter read, before any write reaches this base ──
+    let unlocked_devid = sio_devid(r, base)?;
+    match classify_devid(unlocked_devid) {
+        DevidVerdict::Bridge => return Ok(Some(bridge_report(base, unlocked_devid))),
+        DevidVerdict::IteChip => {
+            // A FEAT_NOCONF chip, already in config mode at power-on. Identified
+            // without a single UNLOCK byte reaching the port — `sio_inb` still
+            // writes the register index (0x20/0x21) to select it, which is a
+            // read protocol, not an unlock. The tests assert on that distinction.
+            return Ok(Some(ProbedChip {
+                base,
+                vendor: SuperIoVendor::Ite,
+                devid: unlocked_devid,
+                chip_name: Some(format!("it{unlocked_devid:04x}")),
+            }));
+        }
+        DevidVerdict::UnknownResponder => return Ok(None),
+        DevidVerdict::NoResponse => { /* fall through: an unlock is licensed */ }
+    }
+
+    // ── 4: nothing answered without an unlock — vendor sequences, unchanged ──
     // ── ITE ──
     {
         ite_enter(r, base)?;
@@ -197,13 +312,29 @@ fn probe_base(r: &dyn SuperIoPortReader, base: u16) -> io::Result<Option<ProbedC
             vendor: SuperIoVendor::Ite,
         };
         let devid = sio_devid(r, base)?;
-        if is_ite_devid(devid) {
-            return Ok(Some(ProbedChip {
-                base,
-                vendor: SuperIoVendor::Ite,
-                devid,
-                chip_name: Some(format!("it{devid:04x}")),
-            }));
+        match classify_devid(devid) {
+            // THE regression this arm exists to prevent. Our own ITE unlock can
+            // be what latches the bridge, so 0x8883 here is the EXPECTED reading
+            // on an affected board — not an edge case. Before this arm existed,
+            // `is_ite_devid` matched 0x8883 and returned; once it stopped
+            // matching, the value fell through to `nuvoton_enter` and wrote
+            // `0x87,0x87` — the exact sequence measured to cause the latch — and
+            // the hit was then reported as Nuvoton, recommending the very module
+            // the packaged guard exists to block.
+            DevidVerdict::Bridge => return Ok(Some(bridge_report(base, devid))),
+            DevidVerdict::IteChip => {
+                return Ok(Some(ProbedChip {
+                    base,
+                    vendor: SuperIoVendor::Ite,
+                    devid,
+                    chip_name: Some(format!("it{devid:04x}")),
+                }));
+            }
+            // Something answered the ITE unlock that is not ITE and not a
+            // bridge. A locked Nuvoton chip reads as no-response here, so this
+            // is not the Nuvoton case — do not write a second unlock at it.
+            DevidVerdict::UnknownResponder => return Ok(None),
+            DevidVerdict::NoResponse => { /* fall through to the Nuvoton leg */ }
         }
     }
 
@@ -321,6 +452,11 @@ mod tests {
         /// If false, the chip is "locked" and every data read returns 0xff
         /// (models a chip whose unlock sequence did not match).
         unlocked_by: Option<Vec<u8>>, // the exact enter bytes that unlock it
+        /// Models silicon that is already in configuration mode at power-on and
+        /// answers with no unlock written: `FEAT_NOCONF` chips
+        /// (it8790/it8792/it87952), and the IT8883 bridge once something has
+        /// latched it. Data reads succeed immediately.
+        answers_without_unlock: bool,
         selected: RefCell<u8>,
         entered: RefCell<Vec<u8>>,
         /// Fault injection: succeed this many reads, then error on every read
@@ -347,6 +483,26 @@ mod tests {
         fn nuvoton(devid: u16) -> Self {
             Self::new(devid, vec![0x87, 0x87])
         }
+        /// A chip already in config mode at startup — it answers its DEVID with
+        /// no unlock written at all.
+        fn noconf(devid: u16) -> Self {
+            let mut f = Self::new(devid, vec![0x87, 0x01, 0x55, 0xaa]);
+            f.answers_without_unlock = true;
+            f
+        }
+        /// The IT8883 eSPI→LPC bridge, latched into config mode by somebody
+        /// else's unlock write. Answers for the same reason a NOCONF chip does.
+        fn bridge() -> Self {
+            Self::noconf(IT8883_BRIDGE_DEVID)
+        }
+        /// A base that reads as empty until an unlock is written, and answers
+        /// the BRIDGE signature afterwards — i.e. our own `ite_enter` is what
+        /// latched it. This is the real shape of an affected board whose bridge
+        /// was not already latched, and the case a post-unlock bridge check
+        /// must catch.
+        fn bridge_latched_by_our_own_unlock() -> Self {
+            Self::new(IT8883_BRIDGE_DEVID, vec![0x87, 0x01, 0x55, 0xaa])
+        }
         fn empty() -> Self {
             // No chip: never unlocks, data reads are 0xff.
             Self {
@@ -354,6 +510,7 @@ mod tests {
                 devid_hi: 0xff,
                 devid_lo: 0xff,
                 unlocked_by: None,
+                answers_without_unlock: false,
                 selected: RefCell::new(0),
                 entered: RefCell::new(Vec::new()),
                 fail_read_after: Cell::new(None),
@@ -365,12 +522,16 @@ mod tests {
                 devid_hi: (devid >> 8) as u8,
                 devid_lo: (devid & 0xff) as u8,
                 unlocked_by: Some(unlock),
+                answers_without_unlock: false,
                 selected: RefCell::new(0),
                 entered: RefCell::new(Vec::new()),
                 fail_read_after: Cell::new(None),
             }
         }
         fn is_unlocked(&self) -> bool {
+            if self.answers_without_unlock {
+                return true;
+            }
             match &self.unlocked_by {
                 None => false,
                 // The chip is unlocked once its exact enter sequence has been
@@ -512,7 +673,13 @@ mod tests {
         // ite_enter, the SioExitGuard must still fire ite_exit. The pre-fix code
         // returned via `?` without exiting, stranding the chip in unlock/config
         // mode where nothing owns it.
-        let p = FakePort::ite(0x8688).failing_after(0);
+        //
+        // `failing_after(2)`, not 0: since the read-before-write fix the FIRST
+        // two reads are the no-enter DEVID probe, which happens before any
+        // unlock and therefore has no config mode to leak. Letting the fault
+        // land there would assert nothing about the guard — it would just
+        // observe an error path that writes no unlock at all.
+        let p = FakePort::ite(0x8688).failing_after(2);
         let err = probe_base(&p, 0x2e).unwrap_err();
         assert_eq!(
             err.kind(),
@@ -537,11 +704,12 @@ mod tests {
         // read a locked 0xffff), then the Nuvoton DEVID read (the 3rd read)
         // errors — the guard must fire nuvoton_exit on the way out.
         //
-        // `failing_after(2)` assumes the ITE leg performs exactly two port reads
-        // (sio_devid = hi @ 0x20 + lo @ 0x21). If sio_devid's read count ever
-        // changes, bump this — otherwise the fault would land on the ITE leg and
-        // silently stop exercising the Nuvoton guard.
-        let p = FakePort::nuvoton(0xd428).failing_after(2);
+        // `failing_after(4)` counts two `sio_devid` calls ahead of the Nuvoton
+        // leg, each two port reads (hi @ 0x20 + lo @ 0x21): the no-enter probe
+        // added by the read-before-write fix, then the ITE leg. If that count
+        // ever changes, bump this — otherwise the fault lands on an earlier leg
+        // and silently stops exercising the Nuvoton guard.
+        let p = FakePort::nuvoton(0xd428).failing_after(4);
         let err = probe_base(&p, 0x2e).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Other);
         let writes = p.writes.borrow();
@@ -616,9 +784,140 @@ mod tests {
     fn is_ite_devid_ranges() {
         assert!(is_ite_devid(0x8688));
         assert!(is_ite_devid(0x8628));
-        assert!(is_ite_devid(0x8883));
+        assert!(is_ite_devid(0x8695)); // IT87952E, the chip a latched bridge hides
+        assert!(
+            !is_ite_devid(IT8883_BRIDGE_DEVID),
+            "0x8883 is an eSPI→LPC bridge, not a chip. This assertion was \
+             inverted until 2026-09-05, which is how the probe came to report a \
+             chip named `it8883` that has never existed."
+        );
         assert!(!is_ite_devid(0xffff));
         assert!(!is_ite_devid(0xd592)); // Nuvoton
         assert!(!is_ite_devid(0x0000));
+    }
+
+    /// The unlock byte shared by BOTH vendor sequences (ITE `0x87,0x01,0x55,..`
+    /// and Nuvoton `0x87,0x87`). Its absence from the write log is the precise
+    /// safety property: `sio_inb` legitimately writes register indices 0x20/0x21
+    /// to the base, so "wrote nothing at all" would be the wrong assertion.
+    const UNLOCK_BYTE: u8 = 0x87;
+
+    fn wrote_an_unlock(p: &FakePort) -> bool {
+        p.writes.borrow().iter().any(|(_, v)| *v == UNLOCK_BYTE)
+    }
+
+    #[test]
+    fn noconf_chip_is_identified_without_writing_any_unlock() {
+        // it8790/it8792/it87952 carry FEAT_NOCONF — already in config mode at
+        // power-on. `it87_find` reads them with `noentry=true` and never writes;
+        // so must we, because that write is what latches a bridge.
+        let p = FakePort::noconf(0x8695);
+        let hits = probe_ports(&p, &[0x4e]);
+
+        assert_eq!(hits.len(), 1, "a NOCONF chip must still be found");
+        assert_eq!(hits[0].chip_name.as_deref(), Some("it8695"));
+        assert!(
+            !wrote_an_unlock(&p),
+            "the probe must identify a NOCONF chip with NO unlock written. \
+             Writes were: {:?}",
+            p.writes.borrow()
+        );
+    }
+
+    #[test]
+    fn latched_bridge_is_reported_as_a_bridge_and_never_unlocked() {
+        let p = FakePort::bridge();
+        let hits = probe_ports(&p, &[0x4e]);
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].devid, IT8883_BRIDGE_DEVID);
+        assert_eq!(
+            hits[0].chip_name, None,
+            "0x8883 must NOT be named as a chip — it is a bus bridge"
+        );
+        assert!(
+            !wrote_an_unlock(&p),
+            "unlocking is what latches the bridge in the first place, so the \
+             one base already showing that signature is the last place to \
+             write one. Writes were: {:?}",
+            p.writes.borrow()
+        );
+    }
+
+    #[test]
+    fn bridge_appearing_after_our_own_unlock_never_reaches_the_nuvoton_leg() {
+        // Regression for the P1 found in review of DEC-332's first draft.
+        // Dropping 0x8883 from `is_ite_devid` stopped the post-unlock ITE read
+        // short-circuiting, so the value fell through to `nuvoton_enter` and
+        // wrote `0x87,0x87` — the sequence measured to cause the latch — on a
+        // path the pre-fix code never wrote it. It was then reported as a
+        // Nuvoton chip, recommending `modprobe nct6775`: the exact module the
+        // packaged guard exists to block, on the exact board it protects.
+        let p = FakePort::bridge_latched_by_our_own_unlock();
+        let hits = probe_ports(&p, &[0x4e]);
+
+        assert_eq!(hits.len(), 1, "the bridge must still be reported");
+        assert_eq!(hits[0].devid, IT8883_BRIDGE_DEVID);
+        assert_eq!(
+            hits[0].vendor,
+            SuperIoVendor::Ite,
+            "an ITE bridge must never be reported as Nuvoton — that is what \
+             produces a `modprobe nct6775` recommendation on a board where \
+             loading it is destructive"
+        );
+        assert_eq!(hits[0].chip_name, None);
+
+        // The load-bearing assertion: exactly ONE unlock reached this base (the
+        // ITE one), never the Nuvoton follow-up. Counting is what discriminates
+        // here — asserting "no 0x87 at all" would fail on the legitimate ITE
+        // unlock and prove nothing about the second one.
+        let unlock_writes = p
+            .writes
+            .borrow()
+            .iter()
+            .filter(|(port, v)| *port == 0x4e && *v == 0x87)
+            .count();
+        assert_eq!(
+            unlock_writes,
+            1,
+            "expected only the ITE unlock's leading 0x87; a second means the \
+             Nuvoton leg ran after the bridge answered. Writes: {:?}",
+            p.writes.borrow()
+        );
+    }
+
+    #[test]
+    fn a_base_reading_zero_is_treated_as_empty_not_as_a_responder() {
+        // `is_valid_family_devid` has always counted 0x0000 as "no chip". The
+        // unlock gate must agree, or a chipset that reads 0x00 on an undecoded
+        // port would make the probe skip a genuine locked chip and report
+        // nothing — a false negative on the one board the probe exists for.
+        assert!(matches!(classify_devid(0x0000), DevidVerdict::NoResponse));
+        assert!(matches!(classify_devid(0xffff), DevidVerdict::NoResponse));
+        assert!(matches!(
+            classify_devid(IT8883_BRIDGE_DEVID),
+            DevidVerdict::Bridge
+        ));
+        assert!(matches!(classify_devid(0x8628), DevidVerdict::IteChip));
+        assert!(matches!(
+            classify_devid(0xd428),
+            DevidVerdict::UnknownResponder
+        ));
+    }
+
+    #[test]
+    fn locked_chip_still_gets_its_unlock() {
+        // The complement, without which the two tests above pass against a
+        // probe that simply never writes anything and finds nothing.
+        let p = FakePort::ite(0x8628);
+        let hits = probe_ports(&p, &[0x2e]);
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].chip_name.as_deref(), Some("it8628"));
+        assert!(
+            wrote_an_unlock(&p),
+            "a LOCKED chip returns 0xffff to the no-enter read, which is the \
+             one case that still licenses the unlock sequence"
+        );
     }
 }

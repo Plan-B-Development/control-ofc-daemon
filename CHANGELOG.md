@@ -1,5 +1,61 @@
 # Changelog
 
+## [2.38.0] — 2026-09-05
+
+**Packaging + one probe behaviour change.** No API shape change; `api_version`
+unchanged. `GIGABYTE_DUAL_CHIP_BOARDS` gains a board, so `expected_chips` on
+`GET /diagnostics/hardware` is non-empty for one more DMI match.
+
+### Added
+- **A Super-I/O probe guard** (`X87-a`, DEC-332). On Gigabyte boards with an ITE
+  Super-I/O, loading `nct6775` or `w83627ehf` can hide the board's *second*
+  Super-I/O chip — and every fan header on it — until the machine is physically
+  disconnected from mains power. Both drivers write a config-mode unlock to
+  0x2E/0x4E **before** reading the device ID, and that write latches an ITE
+  eSPI→LPC bridge into configuration mode, where it answers `0x8883` in place of
+  the chip behind it. Measured on an X870E AORUS MASTER: 3 of 8 fan headers and
+  3 of 9 temperatures lost. The module *fails to load* ("No such device") and
+  does the damage anyway.
+
+  The package now ships `/usr/lib/modprobe.d/control-ofc-superio.conf` and a
+  guard that declines those two modules on boards known to carry an ITE
+  Super-I/O — where they could never have bound in the first place — and runs
+  the real `modprobe` everywhere else. `nct6775` is genuinely required on most
+  Nuvoton boards and is untouched there. Fail-open: unreadable DMI or any
+  unexpected condition loads the module. To override, create a **same-named**
+  file at `/etc/modprobe.d/control-ofc-superio.conf` — same-name masking is the
+  only override `modprobe.d(5)` guarantees. A differently-named file does *not*
+  reliably win: config files are parsed in lexicographic order by basename and
+  the first `install` for a module takes effect (measured, kmod 34.2).
+
+### Changed
+- **The opt-in Super-I/O port probe reads before it writes** (`X87-g`, DEC-332).
+  `probe_base` used to unlock config mode and *then* read the DEVID — the exact
+  write proven above to latch a bridge. It now mirrors `it87_find`: a no-enter
+  DEVID read first, an unlock only when that returns `0xffff`. A chip already in
+  config mode (`FEAT_NOCONF`: it8790/it8792/it87952) is now identified without a
+  single unlock byte reaching its port.
+- **`0x8883` is no longer reported as a chip.** `is_ite_devid` accepted it, so
+  the probe invented a device named `it8883` — on the one code path capable of
+  creating the state it was reporting. It is now reported as the bridge it is.
+- **X870 AORUS STEALTH ICE is enrolled as a dual-chip board** (`X87-f`,
+  DEC-332). It had been held out on the premise that nothing local could reach
+  its secondary, which the measurement disproves; it87 #81's own thread records
+  its reporter driving `pwmN` on the second chip. Owners now get the dual-chip
+  warning, and the board is covered by the guard.
+
+### Fixed
+- **Guidance that told users to give up is corrected** (`X87-b`, DEC-332). The
+  dual-chip hint, `chip_db.rs`'s failure-mode notes and `README.md` all stated
+  that a secondary reading `0x8883` was unreachable with "no local fix". It is
+  recoverable — suppress the two modules, then power down **at the wall**, since
+  the latch survives both a reboot and a soft power-off. All three now say so
+  and point at the step-by-step recovery.
+- **A false claim shipped in `/etc/modules-load.d/control-ofc.conf`.** Its
+  comment read "Loading a module for a chip that is not present is harmless
+  (modprobe exits silently)". Both halves are false on these boards, and the
+  file is user-visible on every install.
+
 ## [2.37.0] — 2026-09-05
 
 **Additive only:** one new optional response field on `GET /diagnostics/hardware`,

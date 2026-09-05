@@ -679,18 +679,39 @@ fn probed_to_superio_chip(p: &superio_probe::ProbedChip) -> superio::SuperIoChip
             "nct6775".to_string(),
             true,
         ),
+        // The one probe result that diagnoses a real, fixable fault. Without
+        // this arm it falls into the generic branch below and reaches the user
+        // as an unnamed "Super-I/O (DEVID 0x8883)" with no recommendation and a
+        // caveat reading "Unrecognized Super-I/O chip" -- so the single code
+        // path able to PROVE the latch would tell them nothing they can act on,
+        // and the explanation would exist only in a log line no GUI reads.
+        (None, _) if p.devid == superio_probe::IT8883_BRIDGE_DEVID => (
+            "ITE eSPI-to-LPC bridge (not a sensor chip)".to_string(),
+            "unknown".to_string(),
+            false,
+        ),
         (None, _) => (
             format!("Super-I/O (DEVID 0x{:04x})", p.devid),
             "unknown".to_string(),
             false,
         ),
     };
+    let is_bridge = p.chip_name.is_none() && p.devid == superio_probe::IT8883_BRIDGE_DEVID;
 
-    let reason = format!(
-        "An active port probe found this chip at base 0x{:04x} (DEVID 0x{:04x}) with no driver \
-         bound.",
-        p.base, p.devid
-    );
+    let reason = if is_bridge {
+        format!(
+            "An active port probe found an ITE eSPI-to-LPC bridge at base 0x{:04x} answering \
+             DEVID 0x{:04x}. This is not a chip: the bridge is in configuration mode and is \
+             masking the Super-I/O behind it, which is why that chip's fan headers are missing.",
+            p.base, p.devid
+        )
+    } else {
+        format!(
+            "An active port probe found this chip at base 0x{:04x} (DEVID 0x{:04x}) with no \
+             driver bound.",
+            p.base, p.devid
+        )
+    };
     let recommendation = if expected_module == "unknown" {
         None
     } else {
@@ -717,7 +738,15 @@ fn probed_to_superio_chip(p: &superio_probe::ProbedChip) -> superio::SuperIoChip
             risk_notes: Vec::new(),
         })
     };
-    let caveats = if expected_module == "unknown" {
+    let caveats = if is_bridge {
+        vec![
+            "This is recoverable, but not by a reboot. The bridge is latched by a config-mode \
+             unlock written by the nct6775 or w83627ehf modules; keep them off this board, then \
+             power the machine down fully at the wall — the latch survives both a reboot and a \
+             normal shut-down. See the Hardware Troubleshooting guide for the full procedure."
+                .to_string(),
+        ]
+    } else if expected_module == "unknown" {
         vec![format!(
             "Unrecognized Super-I/O chip (vendor {}, DEVID 0x{:04x}).",
             p.vendor, p.devid

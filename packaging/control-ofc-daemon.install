@@ -47,6 +47,25 @@ post_upgrade() {
         echo "   updated example in case the required directives changed:"
         echo "   /usr/share/doc/control-ofc-daemon/nvidia-telemetry.conf.example"
     fi
+    # Only speak up on a board that is actually affected, and only when the
+    # symptom is present -- a Super-I/O chip the DMI table expects is missing.
+    # The guard shipped by this version PREVENTS the latch on the next boot; it
+    # does NOT clear one already set, and nothing short of removing mains power
+    # does. Without this the user restarts the daemon as told, sees no change,
+    # and has no pointer to the recovery except a journal line they may not read.
+    if [[ -r /sys/class/dmi/id/board_vendor ]] &&
+       grep -qi gigabyte /sys/class/dmi/id/board_vendor 2>/dev/null &&
+       [[ $(ls -d /sys/class/hwmon/hwmon*/ 2>/dev/null |
+            xargs -r -I{} cat {}name 2>/dev/null |
+            grep -c '^it8') -eq 1 ]]; then
+        echo ":: This version adds a guard that stops nct6775/w83627ehf hiding a second"
+        echo "   Super-I/O chip on Gigabyte ITE boards. Only one ITE chip is visible here."
+        echo "   If fan headers are missing, check: sudo dmesg | grep it87"
+        echo "   A line reading 'Unsupported chip (DEVID=0x8883)' means a bridge is latched."
+        echo "   The guard prevents it recurring but CANNOT clear it — that needs a full"
+        echo "   power cut (PSU switch or unplug); a reboot will not work. Full steps:"
+        echo "   https://github.com/Plan-B-Development/control-ofc-gui/blob/main/manual/hardware-troubleshooting.md"
+    fi
 }
 
 pre_remove() {
