@@ -1,5 +1,41 @@
 # Changelog
 
+## [2.37.0] — 2026-09-05
+
+**Additive only:** one new optional response field on `GET /diagnostics/hardware`,
+`api_version` unchanged. Pairs with `control-ofc-gui` >= v2.61.0, which renders it;
+older clients ignore the field and older daemons omit it.
+
+### Added
+- **Board voltage rails are discovered and published** (`WIRE-ag`). Super-I/O chips
+  expose their ADC block as `inN_input` in sysfs and the daemon read none of it —
+  ten rails sit there on a typical board and nothing looked. `GET
+  /diagnostics/hardware` now carries `voltages[]`, each entry `{id, chip_name,
+  channel, label, value_v, identified}`.
+
+  **`identified` is the load-bearing field.** Only channels the driver labels are
+  identified rails; on the reference board that is 3 of 10. The rest are raw ADC
+  pins, and because boards feed rails through resistor dividers the driver knows
+  nothing about, an unnamed channel's reading is a real voltage at the pin and is
+  *not* the rail voltage. Clients must render the two cases differently.
+
+  Read-only sysfs on the hwmon tree this endpoint already walks: no port I/O, no
+  new capability, and unaffected by the Super-I/O port-probe gate. Nothing in the
+  daemon reads a rail — no control path, no floor, no threshold. A failed scan
+  degrades to an empty list rather than failing the report, and the field is
+  omitted entirely when empty.
+
+  Deliberately not published: `inN_alarm` (measured untrustworthy — two channels
+  on the reference board assert the bit while reading inside their own min/max
+  window), `inN_min`/`inN_max` (driver defaults, not board limits), and GPU core
+  voltages — `amdgpu` `vddgfx`/`vddnb` and Intel `i915`/`xe` `in0_input` — which
+  are not board rails.
+
+  Voltages are **not** on `/status` or `/poll`, and are **not** sensors: a rail
+  moves by millivolts, and `sensors[]` is temperature-shaped (`value_c`,
+  `temp_type`, `thresholds`) and feeds curve binding and the thermal-safety path.
+  A rail can never be offered as a fan-curve source. See DEC-331.
+
 ## [2.36.0] — 2026-09-05
 
 Wave 3 of the 2026-09-05 wire-surface sweep — the daemon-side half. **Additive only:**

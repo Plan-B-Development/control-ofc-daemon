@@ -287,6 +287,29 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
         .collect();
     let module_collisions = diagnostics::detect_module_collisions(&chip_bindings);
 
+    // `WIRE-ag`: board voltage rails. Read-only sysfs on the same hwmon tree
+    // this handler already walks — no port I/O, unaffected by the port-probe
+    // gate, and on the `spawn_blocking` side like every other read here. A
+    // failed scan degrades to an empty list: a rail display is the least
+    // important thing on this response and must never fail the whole report.
+    let voltages: Vec<VoltageEntry> = crate::hwmon::voltages::discover_voltages(
+        std::path::Path::new(crate::hwmon::HWMON_SYSFS_ROOT),
+    )
+    .unwrap_or_else(|e| {
+        log::warn!("Voltage rail discovery failed: {e}");
+        Vec::new()
+    })
+    .into_iter()
+    .map(|v| VoltageEntry {
+        id: v.id,
+        chip_name: v.chip_name,
+        channel: v.channel,
+        label: v.label,
+        value_v: v.value_v,
+        identified: v.identified,
+    })
+    .collect();
+
     json_ok(
         StatusCode::OK,
         HardwareDiagnosticsResponse {
@@ -311,6 +334,7 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
             cpu_vendor,
             amd_pci_devices,
             amdgpu_module_loaded,
+            voltages,
         },
     )
 }

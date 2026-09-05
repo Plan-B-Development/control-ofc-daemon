@@ -71,6 +71,12 @@ daemon/src/
                          counts, published as `board_firmware_counts` on
                          `/diagnostics/hardware` (`X87-d`). A measurement, where
                          `chip_db`'s board table is an inference. Read-only sysfs
+    voltages.rs        — board voltage rails from hwmon `inN_input`, published as
+                         `voltages` on `/diagnostics/hardware` (`WIRE-ag`, DEC-331).
+                         Display-only: nothing in the daemon reads a rail. Each entry
+                         carries `identified` — true only where the driver labelled the
+                         channel; an unlabelled channel is a raw ADC pin whose reading
+                         is NOT the rail voltage. Read-only sysfs, no port I/O
     util.rs            — shared sysfs path helpers
 
   health/

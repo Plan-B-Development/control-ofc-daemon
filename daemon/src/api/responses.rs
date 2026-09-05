@@ -1432,6 +1432,55 @@ pub struct HardwareDiagnosticsResponse {
     /// older clients that don't send the field.
     #[serde(default)]
     pub amdgpu_module_loaded: bool,
+    /// Board voltage rails discovered from hwmon `inN_input` (`WIRE-ag`,
+    /// daemon >= 2.37.0). Display-only: nothing in the daemon reads a rail, no
+    /// control path consumes one, and they are deliberately **not** on
+    /// `/status` or `/poll` — a rail moves by millivolts, so a 1 Hz copy would
+    /// buy nothing for the payload it costs.
+    ///
+    /// **These are not temperature sensors and are not on `sensors[]`.** That
+    /// array is temperature-shaped to the field name (`value_c`, `temp_type`,
+    /// `thresholds.*_c`) and feeds curve binding and the thermal-safety path;
+    /// a voltage in it would be a lie in a field those consumers trust. A rail
+    /// can never be offered as a fan-curve source.
+    ///
+    /// Empty (and omitted) when no chip exposes an ADC channel, and on every
+    /// older daemon — clients default it to an empty list.
+    ///
+    /// Read `identified` before rendering a value as a named rail: see
+    /// [`VoltageEntry::identified`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub voltages: Vec<VoltageEntry>,
+}
+
+/// One board voltage rail — an hwmon `inN_input` channel (`WIRE-ag`).
+#[derive(Debug, Clone, Serialize)]
+pub struct VoltageEntry {
+    /// Stable id `hwmon:<chip>:<device_id>:in<N>`. The label is deliberately
+    /// **not** embedded: a rail's label appears or changes when the user
+    /// installs an `/etc/sensors.d` file, and an id that moved with it would
+    /// break any client that had stored one.
+    pub id: String,
+    /// Hwmon chip name (e.g. `it8696`).
+    pub chip_name: String,
+    /// Channel index `N` from `inN_input`.
+    pub channel: u8,
+    /// `inN_label` where the driver publishes one, else `in{N}`.
+    pub label: String,
+    /// Volts **at the chip's input pin**, after whatever scaling the driver
+    /// applies. This is the rail voltage only when `identified` is true — see
+    /// that field.
+    pub value_v: f64,
+    /// True when the driver published an `inN_label` for this channel.
+    ///
+    /// **A client must render the two cases differently.** Boards routinely
+    /// feed a rail through an external resistor divider the driver knows
+    /// nothing about, so on an *unidentified* channel `value_v` is a genuine
+    /// measurement of the pin and is **not** evidence of what any named rail is
+    /// doing. Measured on the reference board (`it8696`): 10 channels, 3
+    /// labelled. Presenting a divided 1.2 V reading with the same authority as
+    /// a direct 3.3 V one is the specific failure this flag exists to prevent.
+    pub identified: bool,
 }
 
 /// Hwmon chip diagnostics.
@@ -2062,10 +2111,13 @@ mod tests {
     /// structs are dense with `skip_serializing_if`, so a `None` would drop the
     /// key and the assertion would silently stop covering it.
     ///
-    /// Scope is deliberately partial — the ten structs behind `/sensors`,
-    /// `/fans`, `/poll`, `/hwmon/headers`, `/inventory/hwmon` and
-    /// `/inventory/cooling-devices`, i.e. where drift has actually happened.
-    /// Adding a struct is an arm here plus a fixture entry; it is not automatic.
+    /// Scope is deliberately partial — the structs behind `/sensors`, `/fans`,
+    /// `/poll`, `/hwmon/headers`, `/inventory/hwmon`, `/inventory/cooling-devices`,
+    /// `/capabilities` (`Limits`) and `/diagnostics/hardware` (`VoltageEntry`),
+    /// i.e. where drift has actually happened or where a struct is new enough
+    /// that it has not had the chance yet. Adding a struct is an arm here plus a
+    /// fixture entry; it is not automatic. **Keep this list current** — it is
+    /// what the next person reads to decide whether a struct belongs.
     #[test]
     fn wire_field_surface_is_pinned() {
         fn keys(v: &serde_json::Value) -> Vec<String> {
@@ -2392,6 +2444,97 @@ mod tests {
             "CoolingDevicesResponse",
             &["api_version", "cooling_devices", "available_policies"],
         );
+
+        // `WIRE-ag`. Pinned from the first release that publishes it, so the
+        // GUI cannot silently fail to model a rail — the WIRE-h failure mode.
+        let rail = VoltageEntry {
+            id: "hwmon:it8696:pci0:in7".into(),
+            chip_name: "it8696".into(),
+            channel: 7,
+            label: "3VSB".into(),
+            value_v: 3.288,
+            identified: true,
+        };
+        expect(
+            &serde_json::to_value(&rail).unwrap(),
+            "VoltageEntry",
+            &[
+                "id",
+                "chip_name",
+                "channel",
+                "label",
+                "value_v",
+                "identified",
+            ],
+        );
+    }
+
+    /// `WIRE-ag`: the rail list is additive — omitted entirely when no chip
+    /// exposes an ADC channel, so an older client sees the response it always
+    /// saw and a client on a board without rails is not handed an empty array
+    /// to distinguish from "this daemon does not publish them".
+    #[test]
+    fn voltages_are_omitted_from_the_wire_when_empty() {
+        // Asserted against the REALISED response, not against a re-derivation of
+        // `skip_serializing_if` — a test that rebuilds production's own model
+        // shares production's blind spot by construction (`CLAUDE.md`, DEC-320).
+        fn response(voltages: Vec<VoltageEntry>) -> serde_json::Value {
+            serde_json::to_value(HardwareDiagnosticsResponse {
+                api_version: API_VERSION,
+                hwmon: HwmonDiagnostics {
+                    chips_detected: Vec::new(),
+                    total_headers: 0,
+                    writable_headers: 0,
+                    enable_revert_counts: HashMap::new(),
+                },
+                gpu: None,
+                intel_gpu: None,
+                nvidia_gpu: None,
+                thermal_safety: ThermalSafetyInfo {
+                    state: "normal".into(),
+                    cpu_sensor_found: true,
+                    emergency_threshold_c: 105.0,
+                    release_threshold_c: 80.0,
+                },
+                kernel_modules: Vec::new(),
+                acpi_conflicts: Vec::new(),
+                board: BoardInfo {
+                    vendor: "Gigabyte".into(),
+                    name: "X870E AORUS MASTER".into(),
+                    bios_version: "F14c".into(),
+                },
+                expected_chips: Vec::new(),
+                board_firmware_counts: None,
+                kernel_detected_chips: Vec::new(),
+                module_collisions: Vec::new(),
+                cpu_vendor: String::new(),
+                amd_pci_devices: Vec::new(),
+                amdgpu_module_loaded: false,
+                voltages,
+            })
+            .unwrap()
+        }
+
+        assert!(
+            response(Vec::new()).get("voltages").is_none(),
+            "an empty rail list must be omitted, not published as [] — an older \
+             client must see the response it always saw"
+        );
+
+        let populated = response(vec![VoltageEntry {
+            id: "hwmon:it8696:pci0:in0".into(),
+            chip_name: "it8696".into(),
+            channel: 0,
+            label: "in0".into(),
+            value_v: 1.236,
+            identified: false,
+        }]);
+        let rails = populated["voltages"].as_array().expect("voltages array");
+        assert_eq!(rails.len(), 1);
+        // An unidentified rail still carries a real measurement and says so.
+        assert_eq!(rails[0]["identified"], false);
+        assert_eq!(rails[0]["label"], "in0");
+        assert!((rails[0]["value_v"].as_f64().unwrap() - 1.236).abs() < 1e-9);
     }
 
     #[test]
