@@ -2259,6 +2259,17 @@ mod tests {
             ],
         );
 
+        let limits = Limits {
+            pwm_percent_min: 0,
+            pwm_percent_max: 100,
+            openfan_stop_timeout_s: 8,
+        };
+        expect(
+            &serde_json::to_value(&limits).unwrap(),
+            "Limits",
+            &["pwm_percent_min", "pwm_percent_max", "openfan_stop_timeout_s"],
+        );
+
         let devices = CoolingDevicesResponse {
             api_version: API_VERSION,
             cooling_devices: vec![device],
