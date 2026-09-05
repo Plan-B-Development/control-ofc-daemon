@@ -1,5 +1,26 @@
 # Changelog
 
+## [2.35.5] — 2026-09-05
+
+**Test-only.** No runtime, API or cooling behaviour changes: every line added lands inside
+`#[cfg(test)]` in `daemon/src/api/responses.rs`. This is the daemon half of the GUI's Wave 2
+wire-surface sweep (`DEC-329`), released so the pin travels with the package rather than
+sitting on `main`. Pairs with `control-ofc-gui` >= v2.0.0 (unchanged floor).
+
+### Added
+- **The serialised wire-field surface is pinned on the daemon side** (`WIRE-aj`). For ten
+  response structs the daemon now serialises a representative value and asserts the exact
+  key set it puts on the wire, against the same declared surface the GUI asserts its models
+  against (`tests/fixtures/wire_fields.json` in the GUI repo). Previously each side tested
+  only itself, so a field the daemon added or renamed could reach a release with nothing
+  comparing the two — which is the systemic reason the v2.58.0 GUI fix went a whole release
+  unnoticed. A key added to a response without a corresponding GUI model field now fails
+  here, at `cargo test`, instead of silently becoming a field the GUI never reads.
+- **The `Limits` block is pinned with the rest of the surface** (`WIRE-d`). Its keys were
+  outside the first pass; the GUI now reads the OpenFan spin-down ceiling from this block
+  rather than hardcoding 8 seconds, so its shape is load-bearing and is asserted with the
+  others.
+
 ## [2.35.4] — 2026-09-05
 
 A reporting correction plus the previously-unreleased documentation batch. **No cooling
