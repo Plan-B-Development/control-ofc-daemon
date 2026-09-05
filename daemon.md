@@ -460,10 +460,21 @@ is not a term, and stopped it. The published value is now exactly
 floor honesty test, one field over). Do **not** reconcile the two by adding
 membership to `header_is_pump_protected`: that would hand a 30% floor and
 stop-refusal to every radiator and auxiliary fan in a device, which is a cooling
-change rather than a reporting one. The floor field still resolves through the
-device policy and over-claims for the same members — tracked as `AIO4-a` /
-`AUD3-r`, deliberately unchanged here, so neither field may be derived from the
-other.
+change rather than a reporting one.
+
+**The floor field has since been brought into line the same way (`WIRE-b`, fixed
+in 2.35.4).** `resolve_policy_floor` resolved `effective_min_pwm_pct` through the
+device policy for every member too, so that same radiator fan published a 30%
+floor no enforcement site applied — directly beside `stop_permitted: true`. It
+now returns `0` for any header that is not pump-protected, exactly what an
+ordinary chassis header already reported, and
+`reported_floor_matches_enforced_floor_for_every_shipped_policy` asserts over
+**both** values of `pump_protected` rather than only `true` — testing one branch
+is why the invariant stayed green over the defect it exists to catch. Both fields
+are now functions of `pump_protected` alone, but **that correlation is a property
+of the shipped policy table, not a contract**: a future relaxing policy moves the
+floor down toward the absolute backstop without changing `stop_permitted` at all,
+so still do not derive one from the other.
 
 **A diagnostic never restores a pump to a stop (`AUD3-l`, fixed in 2.35.0).**
 `resolve_points` and `verify_test_duty` floor the duty written on the way *in*;

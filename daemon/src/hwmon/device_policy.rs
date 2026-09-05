@@ -57,6 +57,18 @@
 //! `reported_floor_matches_enforced_floor_for_every_shipped_policy`
 //! below is what keeps the reported number honest until that happens: it fails
 //! the moment a shipped policy would report a floor the engine does not enforce.
+//! It asserts over **both** values of `pump_protected`. It once tested only
+//! `true` — which is precisely why it stayed green while a non-pump member of a
+//! cooling device published an unenforced 30% (`WIRE-b`): the over-claim lived
+//! in the branch the test never called.
+//!
+//! Be precise about what that loop now proves, because it is easy to over-credit:
+//! the `false` branch is **policy-independent by construction** (it returns
+//! before reading `policy`), so iterating the table there adds no per-policy
+//! coverage — it is a regression guard against reintroducing a policy-derived
+//! floor, and nothing more. What pins the value actually *published* is the
+//! call-site test `a_cooling_device_member_carries_a_floor_only_when_it_is_pump_protected`
+//! in `api::responses`. Do not delete that on the belief this invariant covers it.
 
 /// The lowest duty any pump may be driven to, whatever a policy claims.
 ///
@@ -173,7 +185,26 @@ pub fn resolve(id: &str) -> &'static DevicePolicy {
 /// reconstruction this value replaces.
 pub fn resolve_policy_floor(policy: &DevicePolicy, pump_protected: bool) -> f64 {
     if !pump_protected {
-        return policy.minimum_safe_pwm.max(0.0);
+        // Nothing applies a DEVICE-POLICY floor to a header that is not
+        // pump-protected: every site that could keys on
+        // `AppState::header_is_pump_protected`, a union in which cooling-device
+        // membership is not a term. Publishing the policy's own number here
+        // advertises a floor no such site honours.
+        //
+        // The profile-role floor reached through
+        // `profile_engine::tuning::member_effective_floor` is a *different*
+        // floor — GUI-owned `minimum_pct`, DEC-095 — and is deliberately not
+        // what this field reports. Do not read the sentence above as "no floor
+        // of any kind applies here".
+        //
+        // `PwmHeaderEntry::from_descriptor` already avoids exactly this for a
+        // header with NO device, by resolving it under `GENERIC_FAN` rather than
+        // the pump policy — its comment gives this same reason. A radiator or
+        // auxiliary member of an AIO reached this branch carrying its *device's*
+        // `generic_pump` policy and so published 30 beside `stop_permitted:
+        // true` (`WIRE-b`). It now reports 0, exactly as an ordinary chassis
+        // header already did.
+        return 0.0;
     }
     let declared = if policy.supports_stop {
         GENERIC_PUMP.minimum_safe_pwm
@@ -216,13 +247,18 @@ pub fn resolve_policy_floor(policy: &DevicePolicy, pump_protected: bool) -> f64 
 /// descriptor — what a *class of device* declares stays visible; it is simply no
 /// longer conflated with a per-header prediction.
 ///
-/// **The sibling field was deliberately NOT changed, and the asymmetry is real.**
-/// [`resolve_policy_floor`] still resolves `effective_min_pwm_pct` through the
-/// device policy, so a non-pump member of an AIO still publishes a 30% floor that
-/// nothing enforces for it. That over-reports, which is the safe direction, and
-/// moving it is a cooling decision rather than a reporting one — tracked as
-/// `AIO4-a` / `AUD3-r`, with the now-visible inconsistency recorded as `322-a`.
-/// **Neither field may be derived from the other.**
+/// **The sibling field has since been brought into line (`WIRE-b`).** Until then
+/// [`resolve_policy_floor`] resolved `effective_min_pwm_pct` through the device
+/// policy for *every* member, so a non-pump member of an AIO published a 30%
+/// floor nothing enforced for it, directly beside this field's `true`. Both are
+/// now functions of `pump_protected` alone.
+///
+/// **That correlation is a property of the shipped table, not a contract, so do
+/// not derive one from the other.** A future relaxing policy moves the floor
+/// (down to [`ABSOLUTE_PUMP_FLOOR_PCT`]) without changing this value at all, and
+/// the fix above deliberately did not make membership a term here — that would
+/// hand a 30% floor and stop-refusal to every radiator and auxiliary fan in a
+/// device, which is a real cooling change rather than a reporting correction.
 pub fn stop_permitted(pump_protected: bool) -> bool {
     !pump_protected
 }
@@ -287,7 +323,47 @@ mod tests {
                 p.id,
                 crate::profile::HARD_PUMP_CPU_FLOOR_PCT
             );
+
+            // The other half of the predicate, and the half this test was
+            // missing (`WIRE-b`). A header that is not pump-protected has no
+            // enforced floor at all, so ANY non-zero report for it is a floor no
+            // site honours — the exact failure the assertion above exists to
+            // prevent, one branch over. Testing only `true` is what let
+            // `generic_pump` publish 30 for a radiator fan.
+            let unprotected = resolve_policy_floor(p, false);
+            assert_eq!(
+                unprotected, 0.0,
+                "policy {} reports a floor of {unprotected} for a header that is not \
+                 pump-protected, but no enforcement site applies one there",
+                p.id
+            );
         }
+    }
+
+    /// **`WIRE-b`.** The shape measured on an X870E AORUS MASTER: a radiator fan
+    /// in an AIO cooling device resolves that *device's* policy — `generic_pump`
+    /// by default ([`DEFAULT_POLICY_ID`]) — while `header_is_pump_protected`,
+    /// which every enforcement site keys on, is false for it because membership
+    /// is not a term in that union. It therefore published a 30% floor nothing
+    /// applied, next to `stop_permitted: true`.
+    ///
+    /// **This is the regression-validity target for the fix:** bypass only the
+    /// `!pump_protected` early return in [`resolve_policy_floor`] and this must
+    /// go red. Both branches are asserted, or a predicate stuck at one value
+    /// would pass.
+    #[test]
+    fn a_non_pump_member_of_a_pump_policy_device_reports_no_floor() {
+        assert_eq!(
+            resolve_policy_floor(&GENERIC_PUMP, false),
+            0.0,
+            "a radiator fan inheriting its device's pump policy must not be published \
+             a floor the engine does not enforce for it"
+        );
+        assert_eq!(
+            resolve_policy_floor(&GENERIC_PUMP, true),
+            crate::profile::HARD_PUMP_CPU_FLOOR_PCT,
+            "the pump member of that same device must keep the enforced floor"
+        );
     }
 
     /// The mechanism genuinely works — a tighter policy lowers the floor toward

@@ -427,6 +427,14 @@ pub struct PwmHeaderEntry {
     /// percent — the resolved device policy clamped by the absolute pump
     /// backstop. Lets a client display the enforced number instead of
     /// re-deriving it from labels and chip names.
+    ///
+    /// **`0` for any header that is not pump-protected, whatever its device's
+    /// policy declares (`WIRE-b`).** No enforcement site applies a policy floor
+    /// to such a header — every one keys on `header_is_pump_protected`, in which
+    /// cooling-device membership is not a term — so reporting the policy's own
+    /// number would advertise a floor nothing honours. That is what a radiator
+    /// fan in an AIO published until this was fixed: `30`, beside
+    /// `stop_permitted: true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_min_pwm_pct: Option<u8>,
     /// Whether this header may be driven to 0 at all. False wherever
@@ -2664,6 +2672,67 @@ mod tests {
         assert!(
             json.get("port").is_none(),
             "port must be omitted when nothing was adopted"
+        );
+    }
+
+    /// **`WIRE-b` — the CALL SITE, not the helper.** `resolve_policy_floor` has
+    /// its own unit tests; testing it alone would prove only that the rule was
+    /// extracted, never that `/hwmon/headers` applies it. This asserts what the
+    /// entry actually carries for the shape measured on an X870E AORUS MASTER: a
+    /// radiator fan belonging to an AIO cooling device, which resolves that
+    /// *device's* policy (`generic_pump` by default) while
+    /// `header_is_pump_protected` is false for it, because membership is not a
+    /// term in that union.
+    ///
+    /// The assertion is a RELATIONSHIP, not a literal: a header the daemon will
+    /// stop on request is exactly a header that must carry no floor. Both
+    /// branches are present, or a predicate stuck at one value would pass.
+    #[test]
+    fn a_cooling_device_member_carries_a_floor_only_when_it_is_pump_protected() {
+        let device = crate::hwmon::cooling_device::CoolingDeviceConfig {
+            id: "aio0".into(),
+            pump_member: Some("hwmon:it8696:it87.2624:pwm2:PUMP".into()),
+            radiator_members: vec!["hwmon:it8696:it87.2624:pwm1".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            device.resolved_policy().id,
+            "generic_pump",
+            "precondition: a device with no explicit policy must resolve the pump \
+             policy, or this test is not exercising the shape it exists for"
+        );
+
+        let radiator = crate::hwmon::pwm_discovery::PwmHeaderDescriptor {
+            id: "hwmon:it8696:it87.2624:pwm1".into(),
+            label: "pwm1".into(),
+            ..Default::default()
+        };
+        let entry = PwmHeaderEntry::from_descriptor(&radiator, None, false, Some(&device));
+        assert_eq!(
+            entry.stop_permitted,
+            Some(true),
+            "precondition: the radiator fan must be stoppable, or the pairing below \
+             is not the case this test was written for"
+        );
+        assert_eq!(
+            entry.effective_min_pwm_pct,
+            Some(0),
+            "a header the daemon will drive to 0 on request must not also advertise \
+             a safety floor: no enforcement site applies one to it"
+        );
+
+        // The opposite branch — the pump member of the very same device.
+        let pump = crate::hwmon::pwm_discovery::PwmHeaderDescriptor {
+            id: "hwmon:it8696:it87.2624:pwm2:PUMP".into(),
+            label: "PUMP".into(),
+            ..Default::default()
+        };
+        let entry = PwmHeaderEntry::from_descriptor(&pump, None, true, Some(&device));
+        assert_eq!(entry.stop_permitted, Some(false));
+        assert_eq!(
+            entry.effective_min_pwm_pct,
+            Some(crate::profile::HARD_PUMP_CPU_FLOOR_PCT.round() as u8),
+            "the pump member of the same device must keep the enforced floor"
         );
     }
 }

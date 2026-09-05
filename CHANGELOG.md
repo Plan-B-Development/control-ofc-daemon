@@ -1,11 +1,39 @@
 # Changelog
 
-## [Unreleased]
+## [2.35.4] — 2026-09-05
 
-Documentation only — no code, route, capability or behaviour change. From the GUI repo's
-`/ofc:docs-correctness` pass (`UDOC-*`); the GUI half shipped as GUI v2.57.7.
+A reporting correction plus the previously-unreleased documentation batch. **No cooling
+behaviour changes** — `resolve_policy_floor` is the reporting path and no enforcement site
+calls it. Pairs with `control-ofc-gui` >= v2.0.0 (unchanged floor).
 
 ### Fixed
+- **`effective_min_pwm_pct` no longer advertises a floor nothing enforces** (`WIRE-b`).
+  `PwmHeaderEntry::from_descriptor` resolves one policy for *every member* of a cooling
+  device, so a radiator or auxiliary fan inherited its device's `generic_pump` policy and
+  published `30` — beside `stop_permitted: true`, since identify branches on
+  `header_is_pump_protected`, a union in which membership is not a term. Nothing held that
+  floor: every site that could apply a *device-policy* floor keys on the same union. (The
+  profile-role floor reached through `member_effective_floor` is a different floor, DEC-095,
+  and is not what this field reports.) `resolve_policy_floor` now
+  returns `0` for any header that is not pump-protected, which is exactly what an ordinary
+  chassis header already reported.
+
+  This is the sibling of `AIO7-d` (fixed in 2.35.0) one field over, and the same reasoning
+  was **already written into `from_descriptor`** for the no-device case: its comment says
+  defaulting to the pump policy "would advertise a 30% floor on ordinary chassis fans that
+  the engine does not enforce". The `Some(device)` branch reproduced precisely that.
+
+  **The honesty invariant that exists to catch this was structurally blind to it:**
+  `reported_floor_matches_enforced_floor_for_every_shipped_policy` only ever called
+  `resolve_policy_floor(p, true)`, and the over-claim lived in the `false` branch. It now
+  asserts over both, and a new call-site test pins what `/hwmon/headers` actually publishes
+  for a cooling-device member rather than only what the helper returns.
+
+  Deliberately **not** fixed from the other end: making membership a term in
+  `header_is_pump_protected` would hand a 30% floor and stop-refusal to every radiator and
+  auxiliary fan in a device, which is a real cooling change rather than a reporting one.
+
+### Fixed (documentation)
 - **The thermal trip point was described 5 °C low in three places here** (`UDOC-j`):
   `README.md`, `docs/USER_GUIDE.md` and `man/control-ofc-daemon.1.scd` all said the
   per-machine emergency limit is "raised to **match** the CPU's own reported design
