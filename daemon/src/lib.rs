@@ -14,6 +14,7 @@ pub mod profile;
 pub mod profile_engine;
 pub mod profile_store;
 pub mod pwm;
+pub mod pwm_baselines;
 pub mod runtime_config;
 pub mod safety;
 pub mod serial;

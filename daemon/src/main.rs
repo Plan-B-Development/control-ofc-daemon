@@ -1534,6 +1534,23 @@ async fn async_main() {
         pruned
     };
 
+    // DEC-334 §6: the learned-response store, pruned by the same stable-header-id
+    // rule for the same reason — a record that survives is one whose hardware did.
+    let pwm_baselines_at_boot = {
+        let dir = control_ofc_daemon::daemon_state::state_dir_path();
+        let mut loaded = control_ofc_daemon::pwm_baselines::load_from(&dir);
+        let live: Vec<String> = hwmon_headers_for_poll
+            .iter()
+            .map(|h| h.id.clone())
+            .collect();
+        if loaded.prune_to_live(&live) > 0 {
+            if let Err(e) = control_ofc_daemon::pwm_baselines::save_to(&dir, &loaded) {
+                log::warn!("could not rewrite the pruned PWM baseline store: {e}");
+            }
+        }
+        loaded
+    };
+
     let staleness_config = StalenessConfig {
         openfan_interval_ms: config.polling.poll_interval_ms,
         hwmon_interval_ms: config.polling.poll_interval_ms,
@@ -1669,6 +1686,7 @@ async fn async_main() {
         // label, so a board or driver change invalidates a stale record by
         // construction rather than by anyone remembering to check.
         control_paths: Arc::new(parking_lot::RwLock::new(Arc::new(control_paths_at_boot))),
+        pwm_baselines: Arc::new(parking_lot::RwLock::new(Arc::new(pwm_baselines_at_boot))),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_handles: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),

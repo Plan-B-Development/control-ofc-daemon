@@ -110,6 +110,11 @@ daemon/src/
     responses.rs       — response structs (Serialize)
     calibration.rs     — OpenFan calibration sweep
     diagnostics.rs     — hardware-diagnostics scanning logic behind /diagnostics/hardware
+    stats.rs           — pure statistics over retained tach samples (DEC-334): mean,
+                         median, sigma, CV, dropouts, robust (median/MAD) outliers,
+                         rolling-median settling, plateaus, effective range, hysteresis.
+                         No I/O, no locks, no clock — and written to be reused by
+                         Batch 3's steady-state detector, which is its temperature twin
     characterization.rs — PWM/RPM response sweep (DEC-313), reused by validation.
                          Owns RestoreOnDrop, which the discovery sweep reuses verbatim
     discovery.rs       — PWM-to-tach control-path sweep (DEC-333). Perturbs one header
@@ -130,6 +135,10 @@ daemon/src/
   atomic_io.rs         — crash-safe atomic file write (tmp+fsync+rename)
   profile.rs           — profile JSON loading + curve evaluation
   profile_store.rs     — daemon-owned profile storage (store of record, DEC-160)
+  pwm_baselines.rs     — {state_dir}/pwm_baselines.json: learned per-duty RPM bands
+                         (DEC-334 §6). Widened by each completed run, never replaced;
+                         pruned at boot by the same stable-header-id rule. NOTHING in
+                         the control path reads it — it is diagnostic evidence only
   control_paths.rs     — {state_dir}/control_paths.json: discovered PWM-to-tach
                          relationships, keyed by stable header id and pruned at boot to
                          whatever discovery can still see (DEC-333)
@@ -624,7 +633,7 @@ commands still gets the forced duty, which is what keeps the reach above true.
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST | `/hwmon/{header_id}/verify` | Test PWM write effectiveness (~6s; daemon uses its own internal lease, detects BIOS/EC interference) |
-| POST | `/hwmon/{header_id}/characterize` | Start a PWM/RPM response sweep (AIO-MB Phase 3, DEC-313). Returns `202` and runs detached; alongside the quick verify, never replacing it. Points clamped to `[max(20, header floor)..100]` — **0% is unreachable** — and swept ascending |
+| POST | `/hwmon/{header_id}/characterize` | Start a PWM/RPM response sweep (AIO-MB Phase 3, DEC-313). Returns `202` and runs detached; alongside the quick verify, never replacing it. Points clamped to `[max(20, header floor)..100]` — **0% is unreachable** — and swept ascending. Since 2.40.0 (DEC-334) `bidirectional` walks them down from the top and back up, ending high, and `stability_seconds` adds a dwell at up to 3 daemon-chosen duties; both gated on `control.pwm_behaviour_characterization` |
 | GET | `/diagnostics/characterization` | Current or most recent characterisation run, including points measured so far (live progress) |
 | DELETE | `/diagnostics/characterization` | Ask a running sweep to stop; the header is restored either way, except where something with more authority owns it (a thermal force, or shutdown) — reported as `restore_outcome`, never as a silent success |
 | POST | `/hwmon/rescan` | Re-enumerate hwmon devices and return fresh header list |

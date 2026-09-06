@@ -104,6 +104,25 @@ pub struct DevicePolicy {
     /// Whether the device runs its own internal control loop that may override
     /// host PWM (the `possible_device_override` signature from Phase 3).
     pub internal_control_possible: bool,
+    /// AIO Phase 8 Batch 2 `§7`. Multiplier from **reported** tach RPM to
+    /// estimated physical RPM, for devices whose tach is known to be scaled
+    /// (a 2-pulse pump reported as double speed, say).
+    ///
+    /// `None` means "unknown", never "1.0" — the difference is the whole point.
+    /// With `None` the daemon publishes no `estimated_physical_rpm` at all,
+    /// rather than a relabelled copy of the reported figure.
+    ///
+    /// **No shipped entry sets this**, so every machine reports the RPM
+    /// provenance as UNVERIFIED today. That is deliberate: `§7` forbids
+    /// inferring a correction from an approximate RPM range, so a factor may
+    /// only ever arrive as validated per-device knowledge compiled in here —
+    /// and because [`DevicePolicy`] derives no `Deserialize`, "untrusted input
+    /// cannot silently define a tach correction" is enforced by the compiler
+    /// rather than by a reviewer noticing.
+    pub rpm_correction_factor: Option<f64>,
+    /// Where [`Self::rpm_correction_factor`] came from, for the `§8.6` details
+    /// row. Meaningless without a factor.
+    pub correction_source: Option<&'static str>,
 }
 
 /// The conservative default for any pump whose exact hardware is unknown.
@@ -120,6 +139,8 @@ pub static GENERIC_PUMP: DevicePolicy = DevicePolicy {
     expected_rpm_min: None,
     expected_rpm_max: None,
     internal_control_possible: false,
+    rpm_correction_factor: None,
+    correction_source: None,
 };
 
 /// The default for an ordinary fan: no policy floor of its own.
@@ -136,10 +157,18 @@ pub static GENERIC_FAN: DevicePolicy = DevicePolicy {
     expected_rpm_min: None,
     expected_rpm_max: None,
     internal_control_possible: false,
+    rpm_correction_factor: None,
+    correction_source: None,
 };
 
 /// Every policy the daemon ships. Generic only in this phase, by decision.
 pub static POLICIES: &[&DevicePolicy] = &[&GENERIC_PUMP, &GENERIC_FAN];
+
+/// Every compiled-in policy, for invariants that must hold across the whole
+/// shipped table rather than across the entries a test happened to name.
+pub fn all_policies() -> impl Iterator<Item = &'static DevicePolicy> {
+    POLICIES.iter().copied()
+}
 
 /// The id assumed for a cooling device that names none, and the fail-safe
 /// landing spot for an id this daemon does not recognise.

@@ -97,12 +97,21 @@ pub const DIAG_VERIFY: &str = "pwm_verify";
 /// `api::discovery`, exactly as the characterisation run is — a session
 /// orchestrates diagnostics, it never reimplements one (§6).
 pub const DIAG_CONTROL_PATH: &str = "control_path_discovery";
+/// The AIO Phase 8 Batch 2 behaviour sweep (DEC-334): the same route and the
+/// same run slot as [`DIAG_CHARACTERIZATION`], with the bidirectional walk and
+/// the stability dwell enabled.
+///
+/// A **separate token** rather than a flag on the existing one so a session can
+/// ask for the basic sweep, the behaviour sweep, or neither, without a second
+/// request field the older daemon would ignore. Requesting both runs only the
+/// behaviour sweep — see `ordered_diagnostics`.
+pub const DIAG_BEHAVIOUR: &str = "pwm_behaviour_characterization";
 
 /// Is this a diagnostic the session knows how to run?
 pub fn is_known_diagnostic(token: &str) -> bool {
     matches!(
         token,
-        DIAG_CHARACTERIZATION | DIAG_VERIFY | DIAG_CONTROL_PATH
+        DIAG_CHARACTERIZATION | DIAG_VERIFY | DIAG_CONTROL_PATH | DIAG_BEHAVIOUR
     )
 }
 
@@ -442,6 +451,18 @@ pub const F_PUMP_RPM: &str = "pump_rpm_telemetry";
 pub const F_RADIATOR_RPM: &str = "radiator_rpm_telemetry";
 pub const F_PWM_RESPONSE: &str = "pwm_response_characterization";
 pub const F_RESPONSE_LATENCY: &str = "response_latency";
+/// AIO Phase 8 Batch 2 §2. Observational: `§2` lists six legitimate explanations
+/// for hysteresis and forbids treating it as a fault.
+pub const F_HYSTERESIS: &str = "pwm_hysteresis";
+/// §4. Observational: `§4` forbids inferring cavitation or electrical failure
+/// from tach variability alone.
+pub const F_RPM_STABILITY: &str = "rpm_stability";
+/// §3. The band over which PWM actually moves reported RPM.
+pub const F_EFFECTIVE_RANGE: &str = "effective_control_range";
+/// §6. Whether this run agreed with what previous runs learned. Never a fault:
+/// `§6` requires cautious wording and forbids labelling unexpected RPM as
+/// hardware failure.
+pub const F_LEARNED_RANGE: &str = "learned_response_range";
 pub const F_STARTUP_BEHAVIOUR: &str = "startup_lifecycle_behaviour";
 pub const F_PWM_RPM_DIVERGENCE: &str = "pwm_rpm_divergence";
 pub const F_DEVICE_OVERRIDE: &str = "possible_device_override";

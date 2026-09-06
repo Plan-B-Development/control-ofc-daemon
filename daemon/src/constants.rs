@@ -366,6 +366,120 @@ pub const CHARACTERIZATION_RPM_NOISE_FLOOR: u16 = 50;
 /// tach noise alone can cover.
 pub const CHARACTERIZATION_RESPONSIVE_MIN_DELTA_RPM: u16 = 150;
 
+// ── PWM behaviour characterisation (AIO Phase 8 Batch 2, DEC-334) ────
+
+/// Unique duties a **bidirectional** plan may hold.
+///
+/// [`CHARACTERIZATION_MAX_POINTS`] is a cap on **walked steps**, not on unique
+/// duties, and DEC-334 deliberately left it where it was: the worst-case run,
+/// the engine write-pause it budgets, and the session poll deadline derived from
+/// it all stay exactly as tested. A bidirectional walk is `2n - 1` steps (the
+/// turn-around duty is walked once, not twice — see `resolve_sweep_plan`), so
+/// the unique-duty budget is the largest `n` with `2n - 1 <= MAX_POINTS`.
+pub const CHARACTERIZATION_MAX_UNIQUE_BIDIRECTIONAL: usize =
+    CHARACTERIZATION_MAX_POINTS.div_ceil(2);
+
+/// [SAFETY] The renewal cadence **inside** the stability dwell loop.
+///
+/// **This constant exists because the settle-window assert could not be reused,
+/// and copying it would have been silently wrong (DEC-333).** The existing
+/// invariant is `CHARACTERIZATION_SETTLE_MAX_S * 2 <= VERIFY_PAUSE_DEADMAN`,
+/// which reads "one renewal per settle window, 2x margin" — and it holds at
+/// `15 * 2 == 30`, i.e. with **zero** headroom. A dwell renewing only once per
+/// point would therefore overrun the pause deadman at *any* dwell length, and at
+/// [`STABILITY_MAX_S`] it would also outlive the 60 s hwmon lease TTL, which is
+/// the failure recorded a few lines below: a sweep that blew its lease could not
+/// even restore the header.
+///
+/// So the dwell renews on its own cadence and the assert below is derived from
+/// **this** value, not from the settle window. Changing the dwell length cannot
+/// break the deadman; changing this can, and the build says so.
+pub const STABILITY_RENEW_INTERVAL_S: u64 = 5;
+
+/// Dwell length when stability sampling is requested, and its clamp. Off by
+/// default: `stability_seconds` absent or `0` means no dwell at all, and the
+/// statistics are then derived from the samples the settle window already takes.
+pub const STABILITY_DEFAULT_S: u64 = 20;
+pub const STABILITY_MIN_S: u64 = 5;
+pub const STABILITY_MAX_S: u64 = 60;
+
+/// How many walked steps may carry a dwell. The daemon picks them (lowest, mid,
+/// highest of the plan) rather than the client, so the run's cost is bounded by
+/// the daemon regardless of what is asked for.
+pub const STABILITY_MAX_POINTS: usize = 3;
+
+/// Retained samples below which stability statistics are `insufficient_data`.
+///
+/// A bare settle window yields `settle_s * 2` samples (500 ms cadence), so the
+/// 2 s minimum settle gives 4 and the 6 s default gives 12. Set at 8 so the
+/// default settle qualifies and the shortest one honestly does not — `AIO-Phase8
+/// Batch 2 §4` requires `INSUFFICIENT_DATA` to be a real outcome rather than a
+/// value invented from three readings.
+pub const STABILITY_MIN_SAMPLES: usize = 8;
+
+/// Coefficient-of-variation thresholds for the `§4` stability classification:
+/// `stable` at or below the first, `variable` at or below the second,
+/// `unstable` above it.
+pub const STABILITY_STABLE_MAX_CV_PCT: f64 = 3.0;
+pub const STABILITY_VARIABLE_MAX_CV_PCT: f64 = 10.0;
+
+/// Outlier threshold, as an Iglewicz-Hoaglin **modified z-score** (median and
+/// median-absolute-deviation based). Outliers are **counted and reported**,
+/// never silently dropped from the raw record (`§9`: do not overwrite raw
+/// evidence with derived values).
+///
+/// **This is deliberately NOT a multiple of the standard deviation, and the
+/// first draft that was got it wrong in a way no test would have shown.** With
+/// a population σ the largest possible z-score in a window of `n` samples is
+/// `(n-1)/√n`: at the 12 readings a default 6 s settle produces that ceiling is
+/// **3.18**, and at 10 readings it is **2.85** — so a `3σ` rule is arithmetically
+/// incapable of flagging anything at the sample counts this feature actually
+/// collects, and the field would have always read 0 and looked like evidence of
+/// a clean tach. A single extreme reading also inflates σ enough to hide itself
+/// (masking), which is the same defect from the other direction. The median and
+/// MAD move by almost nothing when one reading is wild, so this bound is
+/// reachable — `an_outlier_is_detectable_at_the_sample_count_a_default_settle_produces`
+/// pins exactly that, because a bound you cannot reach is not a bound (DEC-320).
+pub const STABILITY_OUTLIER_MODIFIED_Z: f64 = 3.5;
+
+/// `§5` settling criterion: reported RPM must stay within this band of the
+/// rolling median for [`SETTLING_HOLD_SAMPLES`] consecutive samples.
+pub const SETTLING_BAND_PCT: f64 = 5.0;
+pub const SETTLING_HOLD_SAMPLES: usize = 4;
+
+/// `§2` hysteresis: the rising/falling gap at a shared duty, as a percentage of
+/// the sweep's observed RPM span, below which the difference is reported as
+/// noise rather than hysteresis.
+pub const HYSTERESIS_MIN_PCT: f64 = 5.0;
+
+/// `§3` plateau detection. A plateau needs at least this many consecutive
+/// duties whose RPM all sit within [`PLATEAU_BAND_PCT`] of the run's span —
+/// "use tolerance bands and multiple observations rather than declaring a
+/// plateau from a single equal reading".
+pub const PLATEAU_MIN_POINTS: usize = 3;
+pub const PLATEAU_BAND_PCT: f64 = 3.0;
+
+/// `§6` learned-range tolerance: how far an observation may sit outside a
+/// learned min/max band before it is reported as `outside_learned_range`.
+/// Deliberately wide — this feeds cautious wording, never a fault verdict.
+pub const LEARNED_RANGE_TOLERANCE_PCT: f64 = 25.0;
+
+/// Learned-response store (`{state_dir}/pwm_baselines.json`), mirroring the
+/// control-path store's bounds exactly. Ingest-bounded per string so that "too
+/// large to read" can only mean "written by a newer version" (DEC-320).
+pub const PWM_BASELINES_MAX_ENTRIES: usize = 64;
+pub const PWM_BASELINE_MAX_TEXT_BYTES: usize = VALIDATION_MAX_TEXT_FIELD_BYTES;
+pub const PWM_BASELINE_MAX_POINTS: usize = CHARACTERIZATION_MAX_POINTS;
+/// Derived, not guessed: 4 text fields plus one `{duty, min, max}` triple per
+/// retained point, each generously padded for JSON punctuation and key names.
+pub const PWM_BASELINE_RECORD_MAX_BYTES: usize = {
+    let text_fields = 4;
+    let per_point = 64;
+    text_fields * (PWM_BASELINE_MAX_TEXT_BYTES + 128) + PWM_BASELINE_MAX_POINTS * per_point + 512
+};
+pub const PWM_BASELINES_MAX_BYTES: u64 =
+    (PWM_BASELINES_MAX_ENTRIES * PWM_BASELINE_RECORD_MAX_BYTES + 8192) as u64;
+
 // Compile-time invariant checks — these fail the build if someone changes a
 // constant to an unsafe value.
 const _: () = assert!(CALIBRATION_MAX_TEMP_C < THERMAL_EMERGENCY_TRIGGER_C);
@@ -385,6 +499,38 @@ const _: () = assert!(CHARACTERIZATION_DEFAULT_SETTLE_S >= CHARACTERIZATION_SETT
 const _: () = assert!(CHARACTERIZATION_DEFAULT_SETTLE_S <= CHARACTERIZATION_SETTLE_MAX_S);
 const _: () = assert!(CHARACTERIZATION_SETTLE_MAX_S * 2 <= VERIFY_PAUSE_DEADMAN.as_secs());
 const _: () = assert!(CHARACTERIZATION_MAX_POINTS > 0);
+
+// ── AIO Phase 8 Batch 2 (DEC-334) ────────────────────────────────────
+// [SAFETY] The dwell's deadman/lease invariant, RE-DERIVED from the dwell's own
+// renewal cadence rather than copied from the settle window's. Copying it would
+// have kept the arithmetic and changed its meaning — the settle assert holds at
+// exactly 30 == 30, so a dwell renewing once per point breaks the pause deadman
+// at any dwell length, and at STABILITY_MAX_S it outlives the lease TTL too.
+const _: () = assert!(STABILITY_RENEW_INTERVAL_S > 0);
+const _: () = assert!(STABILITY_RENEW_INTERVAL_S * 2 <= VERIFY_PAUSE_DEADMAN.as_secs());
+const _: () =
+    assert!(STABILITY_RENEW_INTERVAL_S * 2 <= crate::hwmon::lease::DEFAULT_LEASE_TTL.as_secs());
+// The renewal must be able to fire at least twice inside the longest dwell, or
+// the cadence is decorative and the dwell is really renewing once per point.
+const _: () = assert!(STABILITY_MAX_S >= STABILITY_RENEW_INTERVAL_S * 2);
+const _: () = assert!(STABILITY_MIN_S <= STABILITY_DEFAULT_S);
+const _: () = assert!(STABILITY_DEFAULT_S <= STABILITY_MAX_S);
+const _: () = assert!(STABILITY_MAX_POINTS > 0);
+const _: () = assert!(STABILITY_MAX_POINTS <= CHARACTERIZATION_MAX_POINTS);
+// A bare settle window must be able to clear the sample threshold at the DEFAULT
+// settle, or every point reports insufficient_data and the feature never fires.
+const _: () = assert!(CHARACTERIZATION_DEFAULT_SETTLE_S * 2 >= STABILITY_MIN_SAMPLES as u64);
+const _: () = assert!(STABILITY_MIN_SAMPLES > 2);
+// A bidirectional walk is 2n-1 steps and must fit the TOTAL step cap (Q4).
+const _: () = assert!(CHARACTERIZATION_MAX_UNIQUE_BIDIRECTIONAL > 1);
+const _: () =
+    assert!(2 * CHARACTERIZATION_MAX_UNIQUE_BIDIRECTIONAL - 1 <= CHARACTERIZATION_MAX_POINTS);
+const _: () = assert!(PWM_BASELINES_MAX_ENTRIES > 0);
+const _: () = assert!(PWM_BASELINE_MAX_TEXT_BYTES > 0);
+const _: () = assert!(PWM_BASELINE_MAX_POINTS > 0);
+const _: () = assert!(
+    PWM_BASELINES_MAX_BYTES > (PWM_BASELINES_MAX_ENTRIES * PWM_BASELINE_RECORD_MAX_BYTES) as u64
+);
 // [SAFETY] The hwmon lease is renewed once per point, so the renewal interval is
 // one settle window. It must sit well inside BOTH deadlines the sweep depends on:
 // the engine-pause deadman above, and the hwmon lease TTL — which is 60 s and is

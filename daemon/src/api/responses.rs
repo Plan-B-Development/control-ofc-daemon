@@ -888,7 +888,7 @@ pub struct CapabilitiesResponse {
 /// Control-execution capability flags. The daemon advertises which control
 /// responsibilities it can own. Each flag defaults to the pre-migration
 /// behaviour when read by a client that doesn't understand it (AIP-180).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct ControlCapability {
     /// Daemon can store, validate, list, and delete GUI-authored profiles via
     /// the `/profiles` CRUD API. True since 1.19.0 (DEC-160).
@@ -963,6 +963,19 @@ pub struct ControlCapability {
     /// to replace.
     #[serde(default)]
     pub pwm_characterization: bool,
+    /// Daemon understands the AIO Phase 8 Batch 2 behaviour-characterisation
+    /// inputs (`bidirectional`, `stability_seconds`) on
+    /// `POST /hwmon/{id}/characterize`, publishes the `§2`-`§7` derivations on
+    /// the run, and accepts the `pwm_behaviour_characterization` session
+    /// diagnostic. True since 2.40.0 (DEC-334).
+    ///
+    /// **Separate from `pwm_characterization`, which keeps its old meaning.** An
+    /// older daemon ignores the two new request fields rather than rejecting
+    /// them, so a client that did not gate would silently get a plain ascending
+    /// sweep and render empty hysteresis and stability panels as though the
+    /// hardware had produced them.
+    #[serde(default)]
+    pub pwm_behaviour_characterization: bool,
     /// Daemon exposes the cooling-device topology surface:
     /// `GET /inventory/cooling-devices`, `POST /config/cooling-device` and
     /// `DELETE /config/cooling-device/{id}`. True since 2.31.0 (AIO-MB Phase 4).
@@ -3079,6 +3092,7 @@ mod tests {
                 diagnostic_preflight: true,
                 cooling_devices: false,
                 validation_sessions: false,
+                ..Default::default()
             },
         };
         let json = serde_json::to_value(&resp).unwrap();

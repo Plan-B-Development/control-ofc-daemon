@@ -1,5 +1,62 @@
 # Changelog
 
+## [2.40.0] — 2026-09-06
+
+**AIO Phase 8 Batch 2 (DEC-334): PWM behaviour characterisation.** Pairs with
+`control-ofc-gui` >= v2.63.0. Additive — no existing route is removed, no
+existing field changes meaning, and `api_version` is unchanged. Gated on a new
+`control.pwm_behaviour_characterization` capability, separate from
+`pwm_characterization`, which keeps its old meaning.
+
+### Added
+- `POST /hwmon/{id}/characterize` accepts two optional inputs: `bidirectional`
+  and `stability_seconds`. Both are advisory — the daemon clamps the dwell and
+  chooses which duties carry one, so the run's cost is bounded server-side.
+- **Bidirectional walk.** The clamped duty list is walked **down from the top and
+  back up**, so the run ends at its highest duty. Each step reports the leg that
+  produced it (`ramp` | `falling` | `rising`); `ramp` is the first step of either
+  mode, whose approach direction is unknown because it is entered from the
+  captured pre-sweep duty. The walked step count stays inside the existing
+  `CHARACTERIZATION_MAX_POINTS` cap, so the worst-case engine write-pause does
+  not move.
+- **`api/stats.rs`**, a pure statistics module: mean, median, standard
+  deviation, coefficient of variation, tach dropouts, robust outlier counting,
+  rolling-median settling detection, plateau detection, effective control range
+  and hysteresis. Written to be reusable by Batch 3's steady-state detector.
+- **Per-step RPM statistics** over the samples the settle window already took,
+  plus an optional longer dwell at up to three daemon-chosen duties.
+- **Learned response bands**, persisted at `{state_dir}/pwm_baselines.json` and
+  pruned at boot by the same stable-header-id rule as the control-path store. A
+  band *widens* as runs accumulate; nothing in the control path reads it.
+- **`{value, provenance}` on `estimated_physical_rpm`**, plus a per-run
+  `provenance` legend. `DevicePolicy` gained `rpm_correction_factor` and
+  `correction_source`; **no shipped entry sets them**, and because that type
+  derives no `Deserialize`, untrusted input cannot define a correction.
+- **`pwm_behaviour_characterization`** as a validation-session diagnostic.
+  Requesting it alongside `pwm_characterization` runs only the behaviour sweep —
+  it is a strict superset, and both feed the same findings.
+- Four observational findings: `pwm_hysteresis`, `rpm_stability`,
+  `effective_control_range`, `learned_response_range`. None can report `fail`.
+
+### Fixed
+- **`response_latency` no longer implies millisecond precision it does not have.**
+  It reported "first RPM change 500–3000 ms" from readings taken every 500 ms.
+  The figures are now quantised and the measurement resolution published beside
+  them.
+
+### Safety
+- **The stability dwell renews the engine pause and the hwmon lease from inside
+  its own loop**, on its own cadence, with a compile-time bound derived from that
+  cadence rather than copied from the settle window's. The settle bound holds at
+  exactly `15 x 2 == 30` — no headroom — so a hold longer than a settle would
+  have overrun the pause deadman at any dwell length, and at the maximum dwell
+  would also have outlived the 60 s lease.
+- **The walk descends first and ends high.** An interrupted run leaves the header
+  at or near its maximum duty, which is what keeps the four exits that do not
+  restore it benign.
+- No walked duty is ever below `max(20, header floor)`, in either direction, and
+  0% remains unreachable through this endpoint for any header and any input.
+
 ## [2.39.0] — 2026-09-06
 
 **AIO Phase 8 Batch 1 (DEC-333): a shared diagnostic preflight, PWM-to-tach

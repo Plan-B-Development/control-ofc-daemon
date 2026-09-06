@@ -32,6 +32,15 @@ pub fn summarise(session: &ValidationSession) -> Vec<ValidationFinding> {
     out.extend(rpm_telemetry(session));
     out.push(pwm_response(session, interrupted));
     out.push(response_latency(session, interrupted));
+    // DEC-334 (AIO Phase 8 Batch 2). All four are OBSERVATIONAL by construction:
+    // §2 forbids treating hysteresis as a fault, §3 forbids reinterpreting a
+    // plateau as pump failure, §4 forbids inferring cavitation or an electrical
+    // fault from tach variability, and §6 forbids labelling unexpected RPM as
+    // hardware failure. None of them can produce RESULT_FAIL.
+    out.push(hysteresis_finding(session, interrupted));
+    out.push(stability_finding(session, interrupted));
+    out.push(effective_range_finding(session, interrupted));
+    out.push(learned_range_finding(session, interrupted));
     out.push(startup_behaviour(session));
     out.extend(divergence(session));
     out.push(device_override(session, interrupted));
@@ -70,11 +79,24 @@ fn absent_state(interrupted: bool) -> &'static str {
     }
 }
 
+/// Every characterisation run in this session, **of either kind**.
+///
+/// [DEC-334, Q15] The behaviour sweep is a strict superset of the basic one: same
+/// route, same run type, same `evidence[].characterization` payload, and
+/// `ordered_diagnostics` runs it *instead of* the basic sweep when both are
+/// requested. So every finding derived from a characterisation must see it — and
+/// this one-line filter is the whole of that promise.
+///
+/// Filtering on `DIAG_CHARACTERIZATION` alone would have silently emptied
+/// `pwm_response_characterization`, `response_latency` and
+/// `possible_device_override` for any session that asked for the richer sweep,
+/// with every one of them reporting `not_tested` about a diagnostic that had just
+/// run. Pinned by `a_behaviour_run_feeds_every_basic_characterisation_finding`.
 fn characterizations(session: &ValidationSession) -> impl Iterator<Item = &EvidenceRef> {
     session
         .evidence
         .iter()
-        .filter(|e| e.kind == DIAG_CHARACTERIZATION)
+        .filter(|e| e.kind == DIAG_CHARACTERIZATION || e.kind == DIAG_BEHAVIOUR)
 }
 
 fn verifies(session: &ValidationSession) -> impl Iterator<Item = &EvidenceRef> {
@@ -101,7 +123,7 @@ fn pwm_header_control(session: &ValidationSession, interrupted: bool) -> Validat
                     format!("command acceptance: {}", sum.command_acceptance),
                 );
                 f.member_id = Some(ev.member_id.clone());
-                f.evidence_kind = Some(DIAG_CHARACTERIZATION.to_string());
+                f.evidence_kind = Some(ev.kind.clone());
                 return f;
             }
         }
@@ -136,7 +158,7 @@ fn pwm_readback(session: &ValidationSession, interrupted: bool) -> ValidationFin
                     format!("readback: {}", sum.pwm_readback),
                 );
                 f.member_id = Some(ev.member_id.clone());
-                f.evidence_kind = Some(DIAG_CHARACTERIZATION.to_string());
+                f.evidence_kind = Some(ev.kind.clone());
                 return f;
             }
         }
@@ -222,7 +244,7 @@ fn pwm_response(session: &ValidationSession, interrupted: bool) -> ValidationFin
                     format!("rpm response: {}", sum.rpm_response),
                 );
                 f.member_id = Some(ev.member_id.clone());
-                f.evidence_kind = Some(DIAG_CHARACTERIZATION.to_string());
+                f.evidence_kind = Some(ev.kind.clone());
                 return f;
             }
         }
@@ -275,6 +297,183 @@ fn control_path(session: &ValidationSession, interrupted: bool) -> ValidationFin
     finding(F_CONTROL_PATH, absent_state(interrupted))
 }
 
+/// §2. How far apart were the rising and falling curves?
+///
+/// `not_observed` when the walk was unidirectional — that is "we did not look",
+/// which is a different statement from "there is none", and the Overview is
+/// explicit that lack of evidence must not become a PASS.
+fn hysteresis_finding(session: &ValidationSession, interrupted: bool) -> ValidationFinding {
+    use crate::api::stats;
+    for ev in characterizations(session) {
+        let Some(sum) = ev
+            .characterization
+            .as_ref()
+            .and_then(|r| r.summary.as_ref())
+        else {
+            continue;
+        };
+        let (state, detail) = match sum.hysteresis_verdict.as_str() {
+            stats::HYSTERESIS_NOT_TESTED => (
+                RESULT_NOT_TESTED,
+                "the sweep walked one direction only".to_string(),
+            ),
+            stats::HYSTERESIS_INSUFFICIENT => (
+                RESULT_UNKNOWN,
+                "no duty carried readings in both directions".to_string(),
+            ),
+            stats::HYSTERESIS_NONE => (
+                RESULT_NOT_OBSERVED,
+                match sum.hysteresis_pct {
+                    Some(p) => format!("rising and falling agree to within {p:.1}% of span"),
+                    None => "rising and falling agree".to_string(),
+                },
+            ),
+            // Present, and reported as an observation about the DEVICE, never a
+            // verdict on it: §2 names an internal controller, a firmware clamp,
+            // temperature dependence, noise and tach scaling as explanations.
+            _ => (
+                RESULT_OBSERVED,
+                match (sum.hysteresis_pct, sum.hysteresis_worst_duty_pct) {
+                    (Some(p), Some(d)) => {
+                        format!("rising and falling differ by up to {p:.1}% of span, worst at {d}%")
+                    }
+                    (Some(p), None) => {
+                        format!("rising and falling differ by up to {p:.1}% of span")
+                    }
+                    _ => "rising and falling differ".to_string(),
+                },
+            ),
+        };
+        let mut f = with_detail(finding(F_HYSTERESIS, state), detail);
+        f.member_id = Some(ev.member_id.clone());
+        f.evidence_kind = ev.characterization.as_ref().map(|_| ev.kind.clone());
+        return f;
+    }
+    finding(F_HYSTERESIS, absent_state(interrupted))
+}
+
+/// §4. How steady was the tach at a held duty?
+fn stability_finding(session: &ValidationSession, interrupted: bool) -> ValidationFinding {
+    use crate::api::stats;
+    for ev in characterizations(session) {
+        let Some(sum) = ev
+            .characterization
+            .as_ref()
+            .and_then(|r| r.summary.as_ref())
+        else {
+            continue;
+        };
+        if sum.stability_verdict.is_empty() {
+            continue;
+        }
+        let state = match sum.stability_verdict.as_str() {
+            stats::STABILITY_UNAVAILABLE => RESULT_UNAVAILABLE,
+            stats::STABILITY_INSUFFICIENT => RESULT_UNKNOWN,
+            // `variable` and `unstable` are OBSERVED, never FAIL. §4: "Do not
+            // claim cavitation, electrical failure or bubbles purely from tach
+            // variability."
+            _ => RESULT_OBSERVED,
+        };
+        let mut detail = format!("worst per-point stability: {}", sum.stability_verdict);
+        if let Some(cv) = sum.worst_cv_pct {
+            detail.push_str(&format!(" (worst CV {cv:.1}%)"));
+        }
+        if sum.total_dropouts > 0 {
+            detail.push_str(&format!(", {} tach dropout(s)", sum.total_dropouts));
+        }
+        let mut f = with_detail(finding(F_RPM_STABILITY, state), detail);
+        f.member_id = Some(ev.member_id.clone());
+        f.evidence_kind = Some(ev.kind.clone());
+        return f;
+    }
+    finding(F_RPM_STABILITY, absent_state(interrupted))
+}
+
+/// §3. Over what band does PWM actually move reported RPM?
+fn effective_range_finding(session: &ValidationSession, interrupted: bool) -> ValidationFinding {
+    for ev in characterizations(session) {
+        let Some(sum) = ev
+            .characterization
+            .as_ref()
+            .and_then(|r| r.summary.as_ref())
+        else {
+            continue;
+        };
+        let detail = match (sum.min_responsive_pct, sum.max_responsive_pct) {
+            (Some(lo), Some(hi)) => {
+                let mut d = format!("effective control range {lo}-{hi}%");
+                if let Some(p) = sum.low_plateau_to_pct {
+                    d.push_str(&format!(", low plateau to {p}%"));
+                }
+                if let Some(p) = sum.saturation_from_pct {
+                    d.push_str(&format!(", saturating from {p}%"));
+                }
+                d
+            }
+            // A sweep that plateaued end to end has no responsive band. That is
+            // an observation about the device — §3: "Do not reinterpret a
+            // plateau as pump failure."
+            _ => "no duty change produced a meaningful RPM change".to_string(),
+        };
+        let state = if sum.min_responsive_pct.is_some() {
+            RESULT_OBSERVED
+        } else {
+            RESULT_NOT_OBSERVED
+        };
+        let mut f = with_detail(finding(F_EFFECTIVE_RANGE, state), detail);
+        f.member_id = Some(ev.member_id.clone());
+        f.evidence_kind = Some(ev.kind.clone());
+        return f;
+    }
+    finding(F_EFFECTIVE_RANGE, absent_state(interrupted))
+}
+
+/// §6. Did this run agree with what previous runs learned?
+fn learned_range_finding(session: &ValidationSession, interrupted: bool) -> ValidationFinding {
+    for ev in characterizations(session) {
+        let Some(sum) = ev
+            .characterization
+            .as_ref()
+            .and_then(|r| r.summary.as_ref())
+        else {
+            continue;
+        };
+        let (state, detail) = match sum.outside_learned_range {
+            // Three states, and this is the one that matters: no model yet is
+            // NOT a pass. §6 compares against a previously learned response, and
+            // a first run has nothing to compare with.
+            None => (
+                RESULT_NOT_TESTED,
+                "no learned response range for this header yet".to_string(),
+            ),
+            Some(false) => (
+                RESULT_NOT_OBSERVED,
+                "every reading fell inside the learned response range".to_string(),
+            ),
+            Some(true) => {
+                let mut d = "reported RPM outside the learned response range".to_string();
+                if let Some(note) = &sum.learned_range_note {
+                    d.push_str(&format!(" — {note}"));
+                }
+                if !sum.interpretation_states.is_empty() {
+                    d.push_str(&format!(
+                        "; possible explanations: {}",
+                        sum.interpretation_states.join(", ")
+                    ));
+                }
+                // OBSERVED, never FAIL. §8.5 requires cautious wording here and
+                // forbids a generic red "hardware failed" for this condition.
+                (RESULT_OBSERVED, d)
+            }
+        };
+        let mut f = with_detail(finding(F_LEARNED_RANGE, state), detail);
+        f.member_id = Some(ev.member_id.clone());
+        f.evidence_kind = Some(ev.kind.clone());
+        return f;
+    }
+    finding(F_LEARNED_RANGE, absent_state(interrupted))
+}
+
 /// How quickly did RPM begin to move after a duty change?
 fn response_latency(session: &ValidationSession, interrupted: bool) -> ValidationFinding {
     for ev in characterizations(session) {
@@ -289,15 +488,41 @@ fn response_latency(session: &ValidationSession, interrupted: bool) -> Validatio
             }
             let min = latencies.iter().copied().min().unwrap_or(0);
             let max = latencies.iter().copied().max().unwrap_or(0);
-            let mut f = with_detail(
-                finding(F_RESPONSE_LATENCY, RESULT_OBSERVED),
+            // [DEC-334, §5] "Do not publish unrealistic millisecond precision
+            // when the driver updates tach once per second or slower."
+            //
+            // This line used to read "first RPM change 500–3000 ms", which is
+            // millisecond wording over a figure that can only ever be a multiple
+            // of the sub-sample interval — the sweep detects a change by polling,
+            // so the timing's true resolution is that cadence and nothing finer.
+            // Report in the resolution that exists, and name it, exactly as
+            // discovery's `measurement_resolution_ms` already does.
+            let resolution_ms = run
+                .summary
+                .as_ref()
+                .and_then(|s| s.measurement_resolution_ms)
+                .unwrap_or_else(|| {
+                    crate::constants::CHARACTERIZATION_SAMPLE_INTERVAL.as_millis() as u64
+                })
+                .max(1);
+            let quantise = |ms: u64| (ms / resolution_ms) * resolution_ms;
+            let detail = if min == max {
                 format!(
-                    "first RPM change {min}–{max} ms across {} points",
+                    "first RPM change ~{} ms across {} points (resolution {resolution_ms} ms)",
+                    quantise(min),
                     latencies.len()
-                ),
-            );
+                )
+            } else {
+                format!(
+                    "first RPM change ~{}–{} ms across {} points (resolution {resolution_ms} ms)",
+                    quantise(min),
+                    quantise(max),
+                    latencies.len()
+                )
+            };
+            let mut f = with_detail(finding(F_RESPONSE_LATENCY, RESULT_OBSERVED), detail);
             f.member_id = Some(ev.member_id.clone());
-            f.evidence_kind = Some(DIAG_CHARACTERIZATION.to_string());
+            f.evidence_kind = Some(ev.kind.clone());
             return f;
         }
     }
@@ -424,7 +649,7 @@ fn device_override(session: &ValidationSession, interrupted: bool) -> Validation
                     },
                 );
                 f.member_id = Some(ev.member_id.clone());
-                f.evidence_kind = Some(DIAG_CHARACTERIZATION.to_string());
+                f.evidence_kind = Some(ev.kind.clone());
                 return f;
             }
         }
@@ -453,7 +678,7 @@ fn bios_reclaim(session: &ValidationSession) -> ValidationFinding {
                         finding(F_BIOS_RECLAIM, RESULT_OBSERVED),
                         "interference detected during characterisation",
                     );
-                    f.evidence_kind = Some(DIAG_CHARACTERIZATION.to_string());
+                    f.evidence_kind = Some(ev.kind.clone());
                     return f;
                 }
             }

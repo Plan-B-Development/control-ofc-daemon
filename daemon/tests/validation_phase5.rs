@@ -297,6 +297,7 @@ fn a_possible_device_override_is_observed_evidence_and_never_a_failure() {
                 first_change_ms: None,
                 readback_verdict: "pass".into(),
                 rpm_verdict: "no_effect".into(),
+                ..Default::default()
             }],
             summary: Some(CharSummary {
                 command_acceptance: "pass".into(),
@@ -313,11 +314,13 @@ fn a_possible_device_override_is_observed_evidence_and_never_a_failure() {
                 // the physical response is not what was asked for.
                 possible_device_override: true,
                 interference_detected: false,
+                ..Default::default()
             }),
             original_pct: Some(50),
             restore_failed: false,
             restore_outcome: "restored".into(),
             detail: None,
+            ..Default::default()
         }),
         verify: None,
         control_path: None,
@@ -368,11 +371,13 @@ fn characterisation_evidence_is_carried_verbatim_not_recomputed() {
             clamp_pct: Some(60),
             possible_device_override: false,
             interference_detected: false,
+            ..Default::default()
         }),
         original_pct: Some(50),
         restore_failed: false,
         restore_outcome: "restored".into(),
         detail: None,
+        ..Default::default()
     };
     s.evidence.push(EvidenceRef {
         kind: DIAG_CHARACTERIZATION.into(),

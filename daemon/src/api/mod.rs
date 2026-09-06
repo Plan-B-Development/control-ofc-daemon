@@ -11,3 +11,4 @@ pub mod handlers;
 pub mod preflight;
 pub mod responses;
 pub mod server;
+pub mod stats;

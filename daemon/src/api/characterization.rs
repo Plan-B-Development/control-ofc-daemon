@@ -35,8 +35,20 @@
 //!   outside this clamp even though the engine floors CPU members at the same
 //!   30% (`profile::CPU_PUMP_LABEL_HINTS`). That gap is deliberate here and
 //!   recorded as `322-b`; it is not an oversight of the clamp's predicate.
-//! - Points are swept **ascending**, so an abort part-way leaves the header
-//!   *high* rather than low.
+//! - **Unidirectional** sweeps are ascending, so an abort part-way leaves the
+//!   header *high* rather than low. That is DEC-313 decision 5 and it is
+//!   unchanged.
+//! - **Bidirectional** sweeps (DEC-334) descend from the top and then climb
+//!   back, so the run *ends* at the highest duty and the early part of a long
+//!   run sits near maximum. The order was chosen for exactly this reason: the
+//!   spec's illustrative rising-then-falling order would have ended every
+//!   completed run at the LOWEST duty, and `RestoreOnDrop` has four exits that
+//!   leave the header where the sweep put it — the two deliberate skips, an
+//!   unreadable pre-sweep duty, and a shutdown whose `restore_hwmon_to_auto`
+//!   found no `pwmN_enable` to hand back (`main.rs`, `NothingToRestore` /
+//!   `WritesTimedOut` / `Unresolvable`). Ending high keeps all four benign.
+//! - The invariant that holds in **both** modes, and the one to reason from:
+//!   **no walked duty is ever below `max(CHARACTERIZATION_MIN_PCT, floor)`.**
 //! - The pre-sweep duty is restored by [`RestoreOnDrop`] on every exit path on
 //!   which nothing else owns the header — completion, cancellation, a failed
 //!   write, a reclaim, and a thermal abort below the forcing threshold. (The
@@ -49,6 +61,7 @@
 //!   and `restore_failed` is derived from it, so "the header is back where it
 //!   was" is answerable from the wire on every path.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -71,11 +84,145 @@ pub struct CharacterizationRequest {
     /// Seconds to hold each duty before reading back. Clamped into
     /// `[CHARACTERIZATION_SETTLE_MIN_S, CHARACTERIZATION_SETTLE_MAX_S]`.
     pub settle_seconds: Option<u64>,
+    /// DEC-334. Walk the duties down from the top and back up, so `§2`
+    /// hysteresis can be measured. Absent is `false`, i.e. the pre-2.40.0
+    /// ascending sweep, so an older client's payload means exactly what it
+    /// always did.
+    pub bidirectional: Option<bool>,
+    /// DEC-334. Extra hold, in seconds, at up to
+    /// [`constants::STABILITY_MAX_POINTS`] daemon-chosen duties, for `§4`
+    /// statistics. Absent or `0` means no dwell. Clamped into
+    /// `[STABILITY_MIN_S, STABILITY_MAX_S]`.
+    ///
+    /// **Which** duties get it is deliberately not a client input: the run's
+    /// cost has to be bounded by the daemon, not by the caller.
+    pub stability_seconds: Option<u64>,
+}
+
+/// `§4` statistics over the tach samples retained during one step's hold.
+///
+/// `None` on a [`CharPoint`] means the step retained nothing at all — a failed
+/// write, or an abort before the hold opened.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct PointStability {
+    /// Every retained reading, dropouts included.
+    pub samples: u32,
+    pub usable: u32,
+    /// An unreadable reading, or a `0` recorded while the window proved the fan
+    /// was turning. A steadily stopped fan reports no dropouts.
+    pub dropouts: u32,
+    /// Counted, never removed from the figures below.
+    pub outliers: u32,
+    pub mean_rpm: Option<f64>,
+    pub median_rpm: Option<u16>,
+    pub min_rpm: Option<u16>,
+    pub max_rpm: Option<u16>,
+    pub stddev_rpm: Option<f64>,
+    /// `None` when the mean is zero; a stopped fan has no relative spread.
+    pub cv_pct: Option<f64>,
+    /// `stable` | `variable` | `unstable` | `insufficient_data` | `unavailable`.
+    /// An opaque token: render an unrecognised one, never drop it (273-i).
+    pub verdict: String,
+    /// The cadence these readings were actually taken at. Published so no client
+    /// has to assume one — `§5` forbids implying resolution the data lacks.
+    pub sample_interval_ms: u64,
+    /// How much of the hold was dwell rather than settle. `0` for a step the
+    /// daemon did not select.
+    pub dwell_ms: u64,
+}
+
+/// `§7`: a value the daemon derived from a *trusted* correction factor, carried
+/// with its provenance so a client can never mistake it for an observation.
+///
+/// This is the wire's first `{value, provenance}` envelope, and it exists only
+/// where the provenance genuinely varies. `rpm_after` is invariantly OBSERVED
+/// and stays a bare field.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EstimatedRpm {
+    pub value: u16,
+    /// `DERIVED` — the figure is computed, never measured.
+    pub provenance: String,
+    pub correction_factor: f64,
+    /// Where the factor came from. Only ever compiled-in device metadata:
+    /// `DevicePolicy` derives no `Deserialize`, so untrusted input cannot define
+    /// one (`§7`: "never auto-infer a correction from approximate RPM range").
+    pub correction_source: String,
+}
+
+/// Project one window's [`crate::api::stats::RpmStats`] onto the wire.
+fn point_stability(samples: &[crate::api::stats::RpmSample], dwell: Duration) -> PointStability {
+    let st = crate::api::stats::rpm_stats(samples);
+    PointStability {
+        samples: st.samples,
+        usable: st.usable,
+        dropouts: st.dropouts,
+        outliers: st.outliers,
+        mean_rpm: st.mean,
+        median_rpm: st.median,
+        min_rpm: st.min,
+        max_rpm: st.max,
+        stddev_rpm: st.stddev,
+        cv_pct: st.cv_pct,
+        verdict: st.verdict.to_string(),
+        sample_interval_ms: constants::CHARACTERIZATION_SAMPLE_INTERVAL.as_millis() as u64,
+        dwell_ms: dwell.as_millis() as u64,
+    }
+}
+
+/// One duty's learned RPM band, from a previous characterisation of this header
+/// (`§6`). Supplied by the caller from the persisted store; `summarise` never
+/// reads it from disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LearnedPoint {
+    pub duty_pct: u8,
+    pub rpm_min: u16,
+    pub rpm_max: u16,
+}
+
+/// A trusted tach correction, from compiled-in device metadata only.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RpmCorrection {
+    pub factor: f64,
+    pub source: &'static str,
+}
+
+/// `§7`: apply a trusted correction, or report nothing.
+///
+/// Returns `None` when there is no correction — **never a copy of the reported
+/// value stamped `DERIVED`**. A client showing "estimated physical RPM" that is
+/// really just the reported figure relabelled is exactly the silent promotion
+/// the Overview's provenance rule forbids.
+pub fn estimate_physical_rpm(
+    reported: Option<u16>,
+    correction: Option<RpmCorrection>,
+) -> Option<EstimatedRpm> {
+    let (rpm, c) = (reported?, correction?);
+    if !c.factor.is_finite() || c.factor <= 0.0 {
+        return None;
+    }
+    let scaled = (f64::from(rpm) * c.factor).round();
+    Some(EstimatedRpm {
+        value: scaled.clamp(0.0, f64::from(u16::MAX)) as u16,
+        provenance: "DERIVED".into(),
+        correction_factor: c.factor,
+        correction_source: c.source.to_string(),
+    })
+}
+
+/// A contiguous span of duties over which reported RPM did not meaningfully
+/// change. **Not a fault** — `§3` is explicit that a plateau must not be
+/// reinterpreted as pump failure.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlateauSpan {
+    pub from_pct: u8,
+    pub to_pct: u8,
+    pub rpm_min: u16,
+    pub rpm_max: u16,
 }
 
 /// One measured point. The three axes stay separate on the wire — see the
 /// module docs for why collapsing them is a defect, not a simplification.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct CharPoint {
     /// The duty this point asked for, **after** clamping.
     pub requested_pct: u8,
@@ -100,11 +247,29 @@ pub struct CharPoint {
     pub readback_verdict: String,
     /// `changed` | `unchanged` | `unavailable`
     pub rpm_verdict: String,
+    /// DEC-334. Which leg of the walk this step belongs to: `ramp` | `falling` |
+    /// `rising`. `ramp` is the first step in either mode — the only one whose
+    /// approach direction is unknown, because it is entered from the captured
+    /// pre-sweep duty. A hysteresis comparison must exclude it.
+    pub direction: String,
+    /// DEC-334. 0-based position in the walked plan. A bidirectional walk visits
+    /// some duties twice, so `requested_pct` alone does not order the points.
+    pub step_index: u16,
+    /// DEC-334, `§5`. When reported RPM entered its settled band, measured from
+    /// the write. `None` means it never settled within the hold — **not** that it
+    /// settled instantly, the same distinction `first_change_ms` carries.
+    pub settled_ms: Option<u64>,
+    /// DEC-334, `§4`. `None` when the step retained no samples at all.
+    pub stability: Option<PointStability>,
+    /// DEC-334, `§7`. Present only where trusted device metadata supplies a
+    /// correction factor. **`rpm_after` is always the raw reported value and is
+    /// never overwritten by this** (`§9`).
+    pub estimated_physical_rpm: Option<EstimatedRpm>,
 }
 
 /// Derived diagnostics over a whole sweep. Produced by [`summarise`], which is
 /// pure — the handler must call it rather than deriving any of this inline.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct CharSummary {
     /// `pass` | `partial` | `fail`
     pub command_acceptance: String,
@@ -129,10 +294,59 @@ pub struct CharSummary {
     pub possible_device_override: bool,
     /// Some point saw `pwm_enable != 1` — another controller has the header.
     pub interference_detected: bool,
+
+    // ── DEC-334 (AIO Phase 8 Batch 2) ────────────────────────────────
+    /// `§2`. Largest rising/falling gap as a percentage of the observed RPM
+    /// span. `None` when nothing could be compared.
+    pub hysteresis_pct: Option<f64>,
+    /// `none` | `present` | `insufficient_data` | `not_tested`. **Never a fault
+    /// verdict** — `§2` lists six legitimate explanations, starting with an
+    /// internal device controller.
+    pub hysteresis_verdict: String,
+    pub hysteresis_worst_duty_pct: Option<u8>,
+    pub hysteresis_worst_delta_rpm: Option<u16>,
+    /// How many duties carried readings in **both** directions. The turn-around
+    /// duty and the `ramp` step do not, and are excluded rather than paired with
+    /// a neighbour.
+    pub hysteresis_compared_points: u32,
+
+    /// `§3`. Where PWM changes actually move reported RPM.
+    pub min_responsive_pct: Option<u8>,
+    pub max_responsive_pct: Option<u8>,
+    pub low_plateau_to_pct: Option<u8>,
+    pub saturation_from_pct: Option<u8>,
+    pub plateaus: Vec<PlateauSpan>,
+
+    /// `§4`. The **worst** per-point classification across the sweep, not an
+    /// average: one unstable duty is the finding, and averaging would bury it.
+    pub stability_verdict: String,
+    pub worst_cv_pct: Option<f64>,
+    pub total_dropouts: u32,
+    pub total_outliers: u32,
+
+    /// `§5`. The cadence the timings were actually measured at. A client must
+    /// render the timings against **this**, never assume milliseconds.
+    pub measurement_resolution_ms: Option<u64>,
+    /// Median across points, in the resolution above. `None` when no point
+    /// produced one.
+    pub typical_response_ms: Option<u64>,
+    pub typical_settling_ms: Option<u64>,
+
+    /// `§6`. `Some(true)` when a reading sat outside the learned band, `Some(false)`
+    /// when a band existed and every reading fell inside it, `None` when nothing
+    /// has been learned for this header yet. **Three states on purpose:** "no
+    /// model" must not read as "passed".
+    pub outside_learned_range: Option<bool>,
+    pub learned_range_note: Option<String>,
+    /// `§6` interpretation states, e.g. `DEVICE_OVERRIDE_POSSIBLE`,
+    /// `PWM_CLAMP_POSSIBLE`, `TACH_MAPPING_OR_SCALING_POSSIBLE`. **Possibilities,
+    /// never conclusions** — `§6` forbids stating that an internal override
+    /// definitely occurred without trusted metadata.
+    pub interpretation_states: Vec<String>,
 }
 
 /// A characterisation run, and the body of `GET /diagnostics/characterization`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct CharacterizationRun {
     pub run_id: String,
     pub header_id: String,
@@ -169,6 +383,19 @@ pub struct CharacterizationRun {
     pub restore_outcome: String,
     /// Why the run ended, when it did not simply complete.
     pub detail: Option<String>,
+
+    // ── DEC-334 (AIO Phase 8 Batch 2) ────────────────────────────────
+    /// Whether this run walked both directions.
+    pub bidirectional: bool,
+    /// The clamped dwell actually used; `0` when none was requested.
+    pub stability_seconds: u64,
+    /// Wall clock, for `§6`'s learned-range provenance and the Hardware page's
+    /// "last characterised" row. `ControlPathRun` has carried this since Batch 1.
+    pub completed_unix_ms: Option<u64>,
+    /// `§9` provenance legend for this result: field name → classification
+    /// token. A **sidecar**, so the export needs no per-field wrapping and the
+    /// fields whose provenance never varies stay bare on the wire.
+    pub provenance: BTreeMap<String, String>,
 }
 
 impl CharacterizationRun {
@@ -293,6 +520,177 @@ pub fn resolve_points(requested: Option<&[u8]>, floor: u8) -> Vec<u8> {
     out
 }
 
+/// Which leg of a walk a step belongs to (DEC-334).
+///
+/// `Ramp` is **always the first step of the walk, in both modes**, and it is not
+/// a cosmetic label. Every other step is entered from its neighbour, so its
+/// approach direction is known; the first is entered from the captured pre-sweep
+/// duty, which may be above or below it. Calling that `Falling` (or `Rising`)
+/// would feed a wrong-direction reading into the hysteresis comparison — a flag
+/// describing a value must be derived from that value, not from the leg it
+/// happens to sit in (DEC-325).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Ramp,
+    Falling,
+    Rising,
+}
+
+impl Direction {
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Ramp => "ramp",
+            Self::Falling => "falling",
+            Self::Rising => "rising",
+        }
+    }
+}
+
+/// One step of a resolved walk: the duty, which leg it belongs to, and whether
+/// it carries a stability dwell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SweepStep {
+    pub pct: u8,
+    pub direction: Direction,
+    /// Extra hold beyond the settle window, for `§4` statistics. The **daemon**
+    /// chooses which steps carry one; the client only asks for a duration.
+    pub dwell: Option<Duration>,
+}
+
+/// Thin an ascending list to at most `max` entries, keeping the first and last.
+///
+/// Truncation would have been wrong: it drops the top of the range, and the
+/// range is the thing being characterised.
+fn thin_to(points: &[u8], max: usize) -> Vec<u8> {
+    if points.len() <= max || max < 2 {
+        return points.to_vec();
+    }
+    let n = points.len();
+    let mut out: Vec<u8> = (0..max).map(|i| points[i * (n - 1) / (max - 1)]).collect();
+    out.dedup();
+    out
+}
+
+/// Turn a clamped ascending duty list into the walk the sweep will actually
+/// perform.
+///
+/// [`resolve_points`] is untouched and still owns the clamp/dedup/sort — so its
+/// exhaustive "never yields zero or below the floor for any input" proof still
+/// covers every duty here, in both modes.
+///
+/// Bidirectional walks descend from the top (`Ramp`, then `Falling`) and climb
+/// back (`Rising`), **skipping the turn-around duty on the way up** because the
+/// header is already sitting on it and it cannot be approached from below
+/// without breaching the floor. That makes the walk `2n - 1` steps, which is why
+/// the unique-duty budget is [`constants::CHARACTERIZATION_MAX_UNIQUE_BIDIRECTIONAL`]
+/// rather than the step cap itself.
+pub fn resolve_sweep_plan(
+    points: &[u8],
+    bidirectional: bool,
+    dwell: Option<Duration>,
+) -> Vec<SweepStep> {
+    if points.is_empty() {
+        return Vec::new();
+    }
+    let base: Vec<u8> = if bidirectional {
+        thin_to(points, constants::CHARACTERIZATION_MAX_UNIQUE_BIDIRECTIONAL)
+    } else {
+        points.to_vec()
+    };
+
+    let mut steps: Vec<SweepStep> = Vec::new();
+    let push = |pct: u8, direction: Direction, steps: &mut Vec<SweepStep>| {
+        steps.push(SweepStep {
+            pct,
+            direction,
+            dwell: None,
+        });
+    };
+    if bidirectional {
+        for (i, &pct) in base.iter().rev().enumerate() {
+            push(
+                pct,
+                if i == 0 {
+                    Direction::Ramp
+                } else {
+                    Direction::Falling
+                },
+                &mut steps,
+            );
+        }
+        for &pct in base.iter().skip(1) {
+            push(pct, Direction::Rising, &mut steps);
+        }
+    } else {
+        for (i, &pct) in base.iter().enumerate() {
+            push(
+                pct,
+                if i == 0 {
+                    Direction::Ramp
+                } else {
+                    Direction::Rising
+                },
+                &mut steps,
+            );
+        }
+    }
+    // Belt and braces: the arithmetic above cannot exceed the cap, and the
+    // compile-time assert says so, but a walk is the thing that costs engine
+    // write-pause and it is bounded here as well as by construction.
+    steps.truncate(constants::CHARACTERIZATION_MAX_POINTS);
+    assign_dwells(&mut steps, dwell);
+    steps
+}
+
+/// Choose which steps carry a stability dwell — lowest, middle and highest of
+/// the **final** leg, capped at [`constants::STABILITY_MAX_POINTS`].
+///
+/// Daemon-chosen rather than client-chosen so the run's cost is bounded here
+/// regardless of what is requested. The final leg is preferred because those
+/// readings are taken after the device has been through the whole walk.
+fn assign_dwells(steps: &mut [SweepStep], dwell: Option<Duration>) {
+    let Some(d) = dwell else {
+        return;
+    };
+    if steps.is_empty() {
+        return;
+    }
+    let last_dir = steps[steps.len() - 1].direction;
+    let mut leg: Vec<usize> = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.direction == last_dir)
+        .map(|(i, _)| i)
+        .collect();
+    if leg.len() < 2 {
+        leg = (0..steps.len()).collect();
+    }
+    let n = leg.len();
+    let k = constants::STABILITY_MAX_POINTS.min(n);
+    let mut picks: Vec<usize> = if k <= 1 {
+        vec![leg[n - 1]]
+    } else {
+        (0..k).map(|i| leg[i * (n - 1) / (k - 1)]).collect()
+    };
+    picks.sort_unstable();
+    picks.dedup();
+    for i in picks {
+        steps[i].dwell = Some(d);
+    }
+}
+
+/// Clamp the optional stability dwell. Absent **or zero** means no dwell at all:
+/// the statistics are then derived from the samples the settle window already
+/// takes, which is the always-on half of `§4`.
+pub fn resolve_stability_dwell(requested: Option<u64>) -> Option<Duration> {
+    match requested {
+        None | Some(0) => None,
+        Some(secs) => Some(Duration::from_secs(
+            secs.clamp(constants::STABILITY_MIN_S, constants::STABILITY_MAX_S),
+        )),
+    }
+}
+
 /// Clamp the per-point settle window. See
 /// [`constants::CHARACTERIZATION_SETTLE_MAX_S`] for why the ceiling is
 /// load-bearing rather than cosmetic.
@@ -353,7 +751,7 @@ fn rpm_verdict(before: Option<u16>, after: Option<u16>) -> String {
 
 /// Derive the whole-sweep diagnostics. Pure, total, and the only place these
 /// rules live — the handler calls this rather than deriving anything inline.
-pub fn summarise(points: &[CharPoint]) -> CharSummary {
+pub fn summarise(points: &[CharPoint], learned: &[LearnedPoint]) -> CharSummary {
     let accepted = points.iter().filter(|p| p.command_accepted).count();
     let command_acceptance = if points.is_empty() || accepted == 0 {
         "fail"
@@ -457,6 +855,139 @@ pub fn summarise(points: &[CharPoint]) -> CharSummary {
         _ => None,
     };
 
+    // ── DEC-334 derivations ──────────────────────────────────────────
+    use crate::api::stats;
+
+    // Derived from the POINTS, not from a request flag: a flag describing a
+    // value must come from that value (DEC-325). A run that aborted before the
+    // falling leg produced no falling readings and is honestly unidirectional.
+    let bidirectional = points.iter().any(|p| p.direction == "falling");
+
+    let series = |dir: &str| -> Vec<stats::DutyRpm> {
+        stats::fold_direction(
+            points
+                .iter()
+                .filter(|p| p.direction == dir)
+                .filter_map(|p| {
+                    p.rpm_after.map(|rpm| stats::DutyRpm {
+                        duty_pct: p.requested_pct,
+                        rpm,
+                    })
+                }),
+        )
+    };
+    let rising = series("rising");
+    let falling = series("falling");
+
+    let hyst = stats::hysteresis(&rising, &falling, bidirectional);
+
+    // Shape analysis runs over every usable reading regardless of leg — the
+    // effective range is a property of the header, not of one direction.
+    let all_points = stats::fold_direction(points.iter().filter_map(|p| {
+        p.rpm_after.map(|rpm| stats::DutyRpm {
+            duty_pct: p.requested_pct,
+            rpm,
+        })
+    }));
+    let range = stats::effective_range(&all_points);
+    let plateaus: Vec<PlateauSpan> = stats::plateaus(&all_points)
+        .into_iter()
+        .map(|pl| PlateauSpan {
+            from_pct: pl.from_pct,
+            to_pct: pl.to_pct,
+            rpm_min: pl.rpm_min,
+            rpm_max: pl.rpm_max,
+        })
+        .collect();
+
+    // `§4`: the WORST per-point classification, never an average — one unstable
+    // duty is the finding, and averaging would bury it.
+    let rank = |v: &str| match v {
+        stats::STABILITY_UNSTABLE => 4,
+        stats::STABILITY_VARIABLE => 3,
+        stats::STABILITY_INSUFFICIENT => 2,
+        stats::STABILITY_STABLE => 1,
+        _ => 0,
+    };
+    let stability_verdict = points
+        .iter()
+        .filter_map(|p| p.stability.as_ref())
+        .map(|st| st.verdict.as_str())
+        .max_by_key(|v| rank(v))
+        .unwrap_or(stats::STABILITY_UNAVAILABLE)
+        .to_string();
+    let worst_cv_pct = points
+        .iter()
+        .filter_map(|p| p.stability.as_ref())
+        .filter_map(|st| st.cv_pct)
+        .fold(None::<f64>, |acc, cv| {
+            Some(acc.map_or(cv, |a: f64| a.max(cv)))
+        });
+    let total_dropouts: u32 = points
+        .iter()
+        .filter_map(|p| p.stability.as_ref())
+        .map(|st| st.dropouts)
+        .sum();
+    let total_outliers: u32 = points
+        .iter()
+        .filter_map(|p| p.stability.as_ref())
+        .map(|st| st.outliers)
+        .sum();
+
+    // `§5`: publish the cadence the timings were measured at, so no client has
+    // to assume milliseconds. Taken from the samples actually retained rather
+    // than restated as a constant.
+    let measurement_resolution_ms = points
+        .iter()
+        .filter_map(|p| p.stability.as_ref())
+        .map(|st| st.sample_interval_ms)
+        .max();
+    let median_u64 = |mut v: Vec<u64>| -> Option<u64> {
+        if v.is_empty() {
+            return None;
+        }
+        v.sort_unstable();
+        Some(v[v.len() / 2])
+    };
+    let typical_response_ms = median_u64(points.iter().filter_map(|p| p.first_change_ms).collect());
+    let typical_settling_ms = median_u64(points.iter().filter_map(|p| p.settled_ms).collect());
+
+    // `§6`: compare against the learned band, three-state.
+    let (outside_learned_range, learned_range_note, above, below) =
+        compare_to_learned(points, learned);
+
+    // `§6` interpretation states. Every one is a POSSIBILITY: the section is
+    // explicit that an internal override must never be stated as fact without
+    // trusted metadata, and that unexpected RPM is not pump failure.
+    let mut interpretation_states: Vec<String> = Vec::new();
+    let readback_ok = pwm_readback == "pass";
+    if readback_ok && rpm_response == "no_response" {
+        interpretation_states.push("DEVICE_OVERRIDE_POSSIBLE".into());
+    }
+    if pwm_readback == "clamped" {
+        interpretation_states.push("PWM_CLAMP_POSSIBLE".into());
+    }
+    if outside_learned_range == Some(true) && readback_ok {
+        if above > below && above * 2 >= points.len() {
+            // Consistently faster than learned across most of the sweep: the
+            // device driving itself is a better explanation than a fault.
+            interpretation_states.push("DEVICE_THERMAL_CONTROL_POSSIBLE".into());
+        }
+        if above > 0 && above <= 2 && points.len() > 3 {
+            interpretation_states.push("STARTUP_OVERRIDE_POSSIBLE".into());
+        }
+        if let Some(ratio) = suspicious_tach_ratio(points, learned) {
+            let _ = ratio;
+            interpretation_states.push("TACH_MAPPING_OR_SCALING_POSSIBLE".into());
+        }
+        if !interpretation_states
+            .iter()
+            .any(|s| s == "DEVICE_OVERRIDE_POSSIBLE")
+        {
+            interpretation_states.push("DEVICE_OVERRIDE_POSSIBLE".into());
+        }
+    }
+
     CharSummary {
         possible_device_override: pwm_readback == "pass" && rpm_response == "no_response",
         command_acceptance,
@@ -470,6 +1001,119 @@ pub fn summarise(points: &[CharPoint]) -> CharSummary {
         dead_zone_upper_pct,
         clamp_pct,
         interference_detected,
+
+        hysteresis_pct: hyst.magnitude_pct,
+        hysteresis_verdict: hyst.verdict.to_string(),
+        hysteresis_worst_duty_pct: hyst.worst_duty_pct,
+        hysteresis_worst_delta_rpm: hyst.worst_delta_rpm,
+        hysteresis_compared_points: hyst.compared_points,
+
+        min_responsive_pct: range.min_responsive_pct,
+        max_responsive_pct: range.max_responsive_pct,
+        low_plateau_to_pct: range.low_plateau_to_pct,
+        saturation_from_pct: range.saturation_from_pct,
+        plateaus,
+
+        stability_verdict,
+        worst_cv_pct,
+        total_dropouts,
+        total_outliers,
+
+        measurement_resolution_ms,
+        typical_response_ms,
+        typical_settling_ms,
+
+        outside_learned_range,
+        learned_range_note,
+        interpretation_states,
+    }
+}
+
+/// `§6`: measure each reading against its learned band.
+///
+/// Returns `(outside, note, above_count, below_count)`. `outside` is **three
+/// state**: `None` means nothing has been learned for this header yet, and must
+/// not read as "passed" — the Overview's rule that lack of evidence never
+/// becomes a PASS, applied to its own absence.
+fn compare_to_learned(
+    points: &[CharPoint],
+    learned: &[LearnedPoint],
+) -> (Option<bool>, Option<String>, usize, usize) {
+    if learned.is_empty() {
+        return (None, None, 0, 0);
+    }
+    let tol = constants::LEARNED_RANGE_TOLERANCE_PCT / 100.0;
+    let mut above = 0usize;
+    let mut below = 0usize;
+    let mut compared = 0usize;
+    let mut worst: Option<(u8, u16, u16, u16)> = None;
+    for p in points {
+        let (Some(rpm), Some(band)) = (
+            p.rpm_after,
+            learned.iter().find(|l| l.duty_pct == p.requested_pct),
+        ) else {
+            continue;
+        };
+        compared += 1;
+        let hi = f64::from(band.rpm_max) * (1.0 + tol);
+        let lo = f64::from(band.rpm_min) * (1.0 - tol);
+        let v = f64::from(rpm);
+        if v > hi {
+            above += 1;
+        } else if v < lo {
+            below += 1;
+        } else {
+            continue;
+        }
+        let gap = if v > hi {
+            rpm.saturating_sub(band.rpm_max)
+        } else {
+            band.rpm_min.saturating_sub(rpm)
+        };
+        if worst.is_none_or(|(_, _, _, g)| gap > g) {
+            worst = Some((p.requested_pct, band.rpm_min, band.rpm_max, gap));
+        }
+    }
+    if compared == 0 {
+        return (None, None, 0, 0);
+    }
+    let note =
+        worst.map(|(duty, lo, hi, _)| format!("at {duty}% the learned response is {lo}-{hi} RPM"));
+    (Some(above + below > 0), note, above, below)
+}
+
+/// `§7`-adjacent: does the deviation look like a tach *scaling* difference
+/// rather than a speed difference?
+///
+/// A scaled tach is off by a near-constant multiple across the whole sweep — 2x
+/// and 0.5x being the common pulse-per-revolution mismatches. A device running
+/// its own control is not. Reported only as a possibility, and never used to
+/// infer a correction: `§7` forbids auto-inferring one from an approximate range.
+fn suspicious_tach_ratio(points: &[CharPoint], learned: &[LearnedPoint]) -> Option<f64> {
+    let mut ratios: Vec<f64> = Vec::new();
+    for p in points {
+        let (Some(rpm), Some(band)) = (
+            p.rpm_after,
+            learned.iter().find(|l| l.duty_pct == p.requested_pct),
+        ) else {
+            continue;
+        };
+        let mid = (f64::from(band.rpm_min) + f64::from(band.rpm_max)) / 2.0;
+        if mid > 0.0 {
+            ratios.push(f64::from(rpm) / mid);
+        }
+    }
+    if ratios.len() < 3 {
+        return None;
+    }
+    let mean = ratios.iter().sum::<f64>() / ratios.len() as f64;
+    // Consistent to within 10%, and near a 2x or 0.5x mismatch.
+    let consistent = ratios.iter().all(|r| (r - mean).abs() <= mean * 0.10);
+    let near = |target: f64| (mean - target).abs() <= 0.15;
+    if consistent && (near(2.0) || near(0.5) || near(3.0) || near(1.0 / 3.0)) {
+        Some(mean)
+    } else {
+        None
     }
 }
 
@@ -612,7 +1256,7 @@ pub struct SweepOutcome {
 pub async fn run_sweep<W, R, P, S, K>(
     cache: &StateCache,
     header_id: &str,
-    points: &[u8],
+    plan: &[SweepStep],
     // [SAFETY] `AUD3-l`: the lowest duty the RESTORE may write. Separate from
     // the sweep floor already baked into `points` — for a non-pump header the
     // sweep floor is `CHARACTERIZATION_MIN_PCT` while the correct restore floor
@@ -621,6 +1265,8 @@ pub async fn run_sweep<W, R, P, S, K>(
     // exactly that reason.
     restore_floor: u8,
     settle: Duration,
+    // `§7`. `None` on every shipped machine — no `DevicePolicy` entry sets one.
+    correction: Option<RpmCorrection>,
     write_fn: W,
     read_fn: R,
     cancel: &AtomicBool,
@@ -637,7 +1283,7 @@ where
     K: Fn() -> bool,
 {
     let original_pct = read_fn().pwm_percent;
-    let mut measured: Vec<CharPoint> = Vec::with_capacity(points.len());
+    let mut measured: Vec<CharPoint> = Vec::with_capacity(plan.len());
     // Declared BEFORE the guard so it outlives it — the guard reads it in `drop`.
     let wrote_any = AtomicBool::new(false);
 
@@ -655,7 +1301,8 @@ where
         restore_floor,
     };
 
-    for (idx, &pct) in points.iter().enumerate() {
+    for (idx, step) in plan.iter().enumerate() {
+        let pct = step.pct;
         // [SAFETY] Stop writing the moment the daemon starts going down. The
         // drop guard's shutdown skip covers the RESTORE, but not this loop: the
         // task is detached, so it keeps running through `shutdown_sequence` and
@@ -675,7 +1322,7 @@ where
         if cancel.load(Ordering::SeqCst) {
             return SweepOutcome {
                 state: STATE_CANCELLED,
-                detail: Some(format!("cancelled after {idx} of {} points", points.len())),
+                detail: Some(format!("cancelled after {idx} of {} steps", plan.len())),
                 points: measured,
             };
         }
@@ -729,6 +1376,9 @@ where
                     first_change_ms: None,
                     readback_verdict: "unavailable".into(),
                     rpm_verdict: "unavailable".into(),
+                    direction: step.direction.token().into(),
+                    step_index: idx as u16,
+                    ..Default::default()
                 });
                 let last = measured.last().expect("just pushed").clone();
                 publish(last);
@@ -740,19 +1390,38 @@ where
             }
         };
 
-        // Hold the full settle, sub-sampling for the first movement. No early
-        // exit: a deterministic window keeps the pause budget an upper bound.
-        // `tokio::time::Instant`, NOT `std::time::Instant`: the latter does not
-        // advance under `#[tokio::test(start_paused)]`, so this loop's exit
-        // condition would never be reached and the test would hang rather than
-        // fail (CLAUDE.md, tokio-test trap 1). Identical behaviour in production.
+        // Hold the settle, then any stability dwell, sub-sampling throughout.
+        // No early exit: a deterministic window keeps the pause budget an upper
+        // bound. `tokio::time::Instant`, NOT `std::time::Instant`: the latter
+        // does not advance under `#[tokio::test(start_paused)]`, so this loop's
+        // exit condition would never be reached and the test would hang rather
+        // than fail (CLAUDE.md, tokio-test trap 1). Identical in production.
+        //
+        // [SAFETY] DEC-334. The lease and the engine-pause deadman are renewed
+        // **inside this loop** on their own cadence, not once per step. That is
+        // not a refinement, it is what makes a dwell legal at all: the per-step
+        // renewal that served the bare settle is bounded by
+        // `CHARACTERIZATION_SETTLE_MAX_S * 2 <= VERIFY_PAUSE_DEADMAN`, which
+        // holds at exactly 30 == 30 — zero headroom — so a hold longer than a
+        // settle overruns the deadman at ANY dwell length, and at
+        // `STABILITY_MAX_S` it also outlives the 60 s lease TTL. `constants.rs`
+        // records what that costs: a sweep that blew its lease could not even
+        // restore the header. The assert that guards this is derived from
+        // `STABILITY_RENEW_INTERVAL_S`, deliberately NOT copied from the settle
+        // one — copying it would have kept the arithmetic and changed its
+        // meaning (DEC-333).
+        let dwell = step.dwell.unwrap_or(Duration::ZERO);
+        let hold = settle + dwell;
+        let renew_every = Duration::from_secs(constants::STABILITY_RENEW_INTERVAL_S);
         let started = tokio::time::Instant::now();
         let mut first_change_ms: Option<u64> = None;
-        while started.elapsed() < settle {
-            let remaining = settle.saturating_sub(started.elapsed());
+        let mut samples: Vec<crate::api::stats::RpmSample> = Vec::new();
+        let mut last_renew = tokio::time::Instant::now();
+        while started.elapsed() < hold {
+            let remaining = hold.saturating_sub(started.elapsed());
             tokio::time::sleep(remaining.min(constants::CHARACTERIZATION_SAMPLE_INTERVAL)).await;
-            // Same rule mid-settle: the sub-sample cadence is what bounds how
-            // long a shutdown waits for this task to stop touching hardware.
+            // Same rule mid-hold: the sub-sample cadence is what bounds how long
+            // a shutdown waits for this task to stop touching hardware.
             if shutting_down() {
                 measured.push(CharPoint {
                     requested_pct: pct,
@@ -766,6 +1435,9 @@ where
                     first_change_ms,
                     readback_verdict: "unavailable".into(),
                     rpm_verdict: "unavailable".into(),
+                    direction: step.direction.token().into(),
+                    step_index: idx as u16,
+                    ..Default::default()
                 });
                 return SweepOutcome {
                     state: STATE_ABORTED,
@@ -773,10 +1445,86 @@ where
                     points: measured,
                 };
             }
+            if last_renew.elapsed() >= renew_every {
+                // [SAFETY] The thermal abort has to be re-evaluated INSIDE the
+                // hold, not only at the top of the step. A step used to be at
+                // most one settle (15 s); with a dwell it is up to 75 s, so
+                // checking only at entry stretched the worst-case latency on the
+                // `CALIBRATION_MAX_TEMP_C` (85 °C) abort five-fold — and that
+                // threshold exists precisely because a sweep is *voluntary* and
+                // should give up with more headroom than the emergency ladder.
+                //
+                // The >=105 °C ladder was never the exposure: it force-takes the
+                // hwmon lease, so `keepalive()` below fails within one renewal
+                // interval. The 85-105 °C band had nothing backstopping it.
+                //
+                // Evaluated on the renewal cadence rather than per sample: that
+                // bounds the latency at ~5.5 s, which is *better* than the 15 s
+                // this path allowed before the dwell existed, without paying for
+                // a cache snapshot twice a second.
+                if let Err(e) = check_thermal_safety(cache) {
+                    return SweepOutcome {
+                        state: STATE_ABORTED,
+                        detail: Some(e.to_string()),
+                        points: measured,
+                    };
+                }
+                if let Some(state) = thermal_force_state(cache) {
+                    return SweepOutcome {
+                        state: STATE_ABORTED,
+                        detail: Some(format!(
+                            "thermal safety is forcing fan output ({state}); \
+                             characterisation cannot continue"
+                        )),
+                        points: measured,
+                    };
+                }
+                if !keepalive() {
+                    return SweepOutcome {
+                        state: STATE_ABORTED,
+                        detail: Some(
+                            "superseded by a later diagnostic; this run's lease is gone".into(),
+                        ),
+                        points: measured,
+                    };
+                }
+                last_renew = tokio::time::Instant::now();
+            }
+            // A dwell can be an order of magnitude longer than a settle, so it
+            // honours a cancel rather than making the user wait it out. The
+            // SETTLE keeps its documented semantics exactly — "the window
+            // currently being held finishes" — because shortening that would
+            // change behaviour older clients already depend on.
+            //
+            // **Gated on `step.dwell`, and the first draft was not.** With no
+            // dwell `hold == settle`, and the final iteration sleeps exactly the
+            // remainder — so `elapsed() >= settle` is true on the last tick of
+            // EVERY plain settle. A cancel pressed at any point during that
+            // window therefore returned here before `read_fn()`, discarding a
+            // point that had completed its full settle and reporting it as
+            // "cancelled during the stability hold" on a run that requested no
+            // hold. Pinned by `a_cancel_during_a_plain_settle_still_records_the_point`.
+            if step.dwell.is_some() && started.elapsed() >= settle && cancel.load(Ordering::SeqCst)
+            {
+                return SweepOutcome {
+                    state: STATE_CANCELLED,
+                    detail: Some(format!(
+                        "cancelled during the stability hold at {pct}%, after {idx} of {} steps",
+                        plan.len()
+                    )),
+                    points: measured,
+                };
+            }
+            let at_ms = started.elapsed().as_millis() as u64;
+            let sampled = read_fn().rpm;
+            samples.push(crate::api::stats::RpmSample {
+                at_ms,
+                rpm: sampled,
+            });
             if first_change_ms.is_none() {
-                if let (Some(b), Some(now)) = (rpm_before, read_fn().rpm) {
+                if let (Some(b), Some(now)) = (rpm_before, sampled) {
                     if rpm_moved(b, now) {
-                        first_change_ms = Some(started.elapsed().as_millis() as u64);
+                        first_change_ms = Some(at_ms);
                     }
                 }
             }
@@ -795,6 +1543,11 @@ where
             first_change_ms,
             readback_verdict: readback_verdict(pct, after.pwm_percent, after.pwm_enable),
             rpm_verdict: rpm_verdict(rpm_before, after.rpm),
+            direction: step.direction.token().into(),
+            step_index: idx as u16,
+            settled_ms: crate::api::stats::settling_ms(&samples),
+            stability: Some(point_stability(&samples, dwell)),
+            estimated_physical_rpm: estimate_physical_rpm(after.rpm, correction),
         };
         // The abort predicate gets the same exemption (DEC-326 / `HOST-a`).
         // This is the limb that actually ends the run: without it, a sweep whose
@@ -826,6 +1579,88 @@ where
     }
 }
 
+/// `§9` provenance legend for a characterisation result.
+///
+/// A **sidecar**, not per-field envelopes: the Overview requires that every
+/// result preserve the COMMANDED / OBSERVED / DERIVED / DEVICE_METADATA /
+/// UNVERIFIED distinction, but for almost every field here the classification is
+/// fixed by definition and wrapping each one would restate a constant on the wire
+/// once per point. Only `estimated_physical_rpm` genuinely varies, and that one
+/// carries a real envelope.
+///
+/// Fields absent from this map are unclassified and a client must render them as
+/// such rather than assuming OBSERVED — silently promoting a derived value into a
+/// hardware observation is the one thing the Overview forbids outright.
+pub fn provenance_legend() -> BTreeMap<String, String> {
+    let mut m = BTreeMap::new();
+    let mut put = |k: &str, v: &str| {
+        m.insert(k.to_string(), v.to_string());
+    };
+    // What Control-OFC asked for.
+    put("requested_pct", "COMMANDED");
+    put("requested_points_pct", "COMMANDED");
+    put("settle_seconds", "COMMANDED");
+    put("stability_seconds", "COMMANDED");
+    put("bidirectional", "COMMANDED");
+    put("original_pct", "OBSERVED");
+    // What hwmon actually reported.
+    put("readback_pct", "OBSERVED");
+    put("readback_raw", "OBSERVED");
+    put("pwm_enable", "OBSERVED");
+    put("rpm_before", "OBSERVED");
+    put("rpm_after", "OBSERVED");
+    put("settle_ms", "OBSERVED");
+    put("sample_interval_ms", "OBSERVED");
+    put("samples", "OBSERVED");
+    put("usable", "OBSERVED");
+    put("min_rpm", "OBSERVED");
+    put("max_rpm", "OBSERVED");
+    put("median_rpm", "OBSERVED");
+    // What Control-OFC inferred from those observations.
+    for k in [
+        "first_change_ms",
+        "settled_ms",
+        "mean_rpm",
+        "stddev_rpm",
+        "cv_pct",
+        "dropouts",
+        "outliers",
+        "verdict",
+        "readback_verdict",
+        "rpm_verdict",
+        "command_acceptance",
+        "pwm_readback",
+        "rpm_response",
+        "monotonic",
+        "dead_zone_upper_pct",
+        "clamp_pct",
+        "possible_device_override",
+        "interference_detected",
+        "hysteresis_pct",
+        "hysteresis_verdict",
+        "min_responsive_pct",
+        "max_responsive_pct",
+        "low_plateau_to_pct",
+        "saturation_from_pct",
+        "plateaus",
+        "stability_verdict",
+        "worst_cv_pct",
+        "measurement_resolution_ms",
+        "typical_response_ms",
+        "typical_settling_ms",
+        "outside_learned_range",
+        "interpretation_states",
+        "estimated_physical_rpm",
+        "direction",
+    ] {
+        put(k, "DERIVED");
+    }
+    // Supplied by a trusted, compiled-in device definition.
+    put("correction_factor", "DEVICE_METADATA");
+    put("correction_source", "DEVICE_METADATA");
+    m
+}
+
 /// A monotonically increasing run id. Opaque to clients; only used so a polling
 /// GUI can tell "my run" from "a later one".
 pub fn next_run_id() -> String {
@@ -840,11 +1675,86 @@ pub type RunSlot = Arc<parking_lot::Mutex<Option<CharacterizationRun>>>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `summarise` with no learned band — the pre-DEC-334 behaviour, which is
+    /// what every test written before §6 existed is asserting about.
+    fn sum(points: &[CharPoint]) -> CharSummary {
+        summarise(points, &[])
+    }
+
+    /// A unidirectional plan over `points`, i.e. exactly the walk these tests
+    /// have always driven.
+    fn plan_of(points: &[u8]) -> Vec<SweepStep> {
+        resolve_sweep_plan(points, false, None)
+    }
+
+    /// `run_sweep` in its pre-DEC-334 shape: a unidirectional walk and no tach
+    /// correction. Every test written before §1/§7 existed is asserting about
+    /// exactly that walk, so routing them through one shim keeps their meaning
+    /// identical instead of restating the new arguments 11 times.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_sweep_uni<W, R, P, S, K>(
+        cache: &StateCache,
+        header_id: &str,
+        points: &[u8],
+        restore_floor: u8,
+        settle: Duration,
+        write_fn: W,
+        read_fn: R,
+        cancel: &AtomicBool,
+        shutting_down: S,
+        keepalive: K,
+        report: &RestoreReport,
+        publish: P,
+    ) -> SweepOutcome
+    where
+        W: Fn(u8) -> Result<(), String>,
+        R: Fn() -> HwmonVerifyState,
+        P: FnMut(CharPoint),
+        S: Fn() -> bool,
+        K: Fn() -> bool,
+    {
+        run_sweep(
+            cache,
+            header_id,
+            &plan_of(points),
+            restore_floor,
+            settle,
+            None,
+            write_fn,
+            read_fn,
+            cancel,
+            shutting_down,
+            keepalive,
+            report,
+            publish,
+        )
+        .await
+    }
     use crate::health::state::{CachedSensorReading, DeviceLabel};
     use crate::hwmon::types::SensorKind;
     use std::sync::Mutex;
 
     const PUMP_FLOOR: u8 = crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8;
+
+    /// One hot CPU reading, for tests that heat the cache mid-run rather than
+    /// starting from a hot one.
+    fn hot_cpu(temp_c: f64) -> CachedSensorReading {
+        CachedSensorReading {
+            id: "cpu".into(),
+            kind: SensorKind::CpuTemp,
+            label: "Tctl".into(),
+            value_c: temp_c,
+            source: DeviceLabel::Hwmon,
+            updated_at: std::time::Instant::now(),
+            rate_c_per_s: None,
+            session_min_c: None,
+            session_max_c: None,
+            chip_name: "k10temp".into(),
+            temp_type: None,
+            thresholds: None,
+        }
+    }
 
     fn cache_at(temp_c: f64, thermal_state: Option<&str>) -> StateCache {
         let cache = StateCache::new();
@@ -890,6 +1800,7 @@ mod tests {
             first_change_ms: None,
             readback_verdict: readback_verdict(pct, readback, enable),
             rpm_verdict: rpm_verdict(Some(0), rpm),
+            ..Default::default()
         }
     }
 
@@ -981,7 +1892,7 @@ mod tests {
             .iter()
             .map(|p| point(*p, Some(*p), Some(1), Some(2800)))
             .collect();
-        let s = summarise(&pts);
+        let s = sum(&pts);
         assert_eq!(s.command_acceptance, "pass");
         assert_eq!(s.pwm_readback, "pass");
         assert_eq!(s.rpm_response, "no_response");
@@ -998,7 +1909,7 @@ mod tests {
             point(70, Some(70), Some(1), Some(2140)),
             point(100, Some(100), Some(1), Some(3380)),
         ];
-        let s = summarise(&pts);
+        let s = sum(&pts);
         assert_eq!(s.command_acceptance, "pass");
         assert_eq!(s.pwm_readback, "pass");
         assert_eq!(s.rpm_response, "responsive");
@@ -1022,7 +1933,7 @@ mod tests {
             point(70, Some(70), Some(1), Some(1200)),
             point(100, Some(100), Some(1), Some(3000)),
         ];
-        let s = summarise(&pts);
+        let s = sum(&pts);
         assert_eq!(s.monotonic, Some(false));
         assert_eq!(s.command_acceptance, "pass", "writes all succeeded");
         assert_eq!(
@@ -1039,7 +1950,7 @@ mod tests {
             point(30, Some(30), Some(1), Some(900)),
             point(50, Some(88), Some(2), Some(2500)),
         ];
-        let s = summarise(&pts);
+        let s = sum(&pts);
         assert_eq!(s.pwm_readback, "reverted");
         assert!(s.interference_detected);
         assert!(
@@ -1056,7 +1967,7 @@ mod tests {
             point(90, Some(75), Some(1), Some(2200)),
             point(100, Some(75), Some(1), Some(2200)),
         ];
-        let s = summarise(&pts);
+        let s = sum(&pts);
         assert_eq!(s.pwm_readback, "clamped");
         assert_eq!(s.clamp_pct, Some(75));
     }
@@ -1070,7 +1981,7 @@ mod tests {
             point(70, Some(70), Some(1), Some(1900)),
             point(100, Some(100), Some(1), Some(3000)),
         ];
-        let s = summarise(&pts).dead_zone_upper_pct;
+        let s = sum(&pts).dead_zone_upper_pct;
         assert_eq!(s, Some(50));
     }
 
@@ -1082,7 +1993,7 @@ mod tests {
             .iter()
             .map(|p| point(*p, Some(*p), Some(1), Some(2000)))
             .collect();
-        let s = summarise(&pts);
+        let s = sum(&pts);
         assert_eq!(s.rpm_response, "no_response");
         assert_eq!(s.dead_zone_upper_pct, None);
     }
@@ -1095,12 +2006,12 @@ mod tests {
             point(30, Some(30), Some(1), Some(300)),
             point(100, Some(100), Some(1), Some(360)),
         ];
-        assert_eq!(summarise(&quiet).rpm_response, "no_response");
+        assert_eq!(sum(&quiet).rpm_response, "no_response");
         let real = vec![
             point(30, Some(30), Some(1), Some(300)),
             point(100, Some(100), Some(1), Some(700)),
         ];
-        assert_eq!(summarise(&real).rpm_response, "responsive");
+        assert_eq!(sum(&real).rpm_response, "responsive");
     }
 
     #[test]
@@ -1109,7 +2020,7 @@ mod tests {
             point(30, Some(30), Some(1), None),
             point(100, Some(100), Some(1), None),
         ];
-        let s = summarise(&pts);
+        let s = sum(&pts);
         assert_eq!(s.rpm_response, "unavailable");
         assert_eq!(s.monotonic, None);
         assert!(
@@ -1124,8 +2035,8 @@ mod tests {
         let mut bad = point(50, None, Some(1), None);
         bad.command_accepted = false;
         pts.push(bad);
-        assert_eq!(summarise(&pts).command_acceptance, "partial");
-        assert_eq!(summarise(&[]).command_acceptance, "fail");
+        assert_eq!(sum(&pts).command_acceptance, "partial");
+        assert_eq!(sum(&[]).command_acceptance, "fail");
     }
 
     // ── the sweep ────────────────────────────────────────────────────
@@ -1176,7 +2087,7 @@ mod tests {
         let floor = crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8;
 
         let writes_w = writes.clone();
-        let _ = run_sweep(
+        let _ = run_sweep_uni(
             &cache,
             "hwmon:test:pwm1",
             &[30, 50],
@@ -1246,7 +2157,7 @@ mod tests {
             sample(Some(p), enable, rpm_for(p))
         };
         let ka = rig.keepalives.clone();
-        run_sweep(
+        run_sweep_uni(
             cache,
             "hwmon:test:pwm1",
             points,
@@ -1290,8 +2201,32 @@ mod tests {
             "the sweep must end by writing the pre-sweep duty back"
         );
         assert_eq!(rig.restore(), (false, "restored"));
-        // One liveness renewal per point (DEC-296), not one for the whole run.
-        assert_eq!(*rig.keepalives.lock().unwrap(), 3);
+        // Liveness renewal, asserted as two RELATIONSHIPS rather than a count.
+        // It was `== 3` ("one per point, not one for the whole run", DEC-296)
+        // and that literal silently encoded the per-step cadence — which DEC-334
+        // had to change, because a hold longer than a settle overruns the pause
+        // deadman at any dwell length.
+        let ka = *rig.keepalives.lock().unwrap();
+        let steps = out.points.len();
+        assert!(
+            ka >= steps,
+            "DEC-296: at least one liveness renewal per step; got {ka} for {steps}"
+        );
+        // DEC-334: renewal also fires INSIDE a step's hold on its own cadence.
+        // This 6 s settle exceeds STABILITY_RENEW_INTERVAL_S, so a correct
+        // implementation renews more than once per step; deleting the in-hold
+        // renewal makes this fail while the line above still passes.
+        assert!(
+            Duration::from_secs(6) > Duration::from_secs(constants::STABILITY_RENEW_INTERVAL_S),
+            "precondition: the settle must exceed the renewal cadence, or this \
+             assertion proves nothing"
+        );
+        assert!(
+            ka > steps,
+            "a 6 s hold at a {} s renewal cadence must renew more than once per \
+             step; got {ka} for {steps}",
+            constants::STABILITY_RENEW_INTERVAL_S
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1335,7 +2270,7 @@ mod tests {
         assert_eq!(out.state, STATE_FAILED);
         assert_eq!(out.points.len(), 2);
         assert!(!out.points[1].command_accepted);
-        assert_eq!(summarise(&out.points).command_acceptance, "partial");
+        assert_eq!(sum(&out.points).command_acceptance, "partial");
         assert_eq!(
             rig.written(),
             vec![30, 42],
@@ -1364,8 +2299,8 @@ mod tests {
         assert_eq!(out.state, STATE_ABORTED);
         assert_eq!(out.points.len(), 1, "stops at the first reclaimed point");
         assert!(out.detail.unwrap().contains("reclaimed"));
-        assert_eq!(summarise(&out.points).pwm_readback, "reverted");
-        assert!(summarise(&out.points).interference_detected);
+        assert_eq!(sum(&out.points).pwm_readback, "reverted");
+        assert!(sum(&out.points).interference_detected);
         assert_eq!(rig.written(), vec![30, 42]);
     }
 
@@ -1383,7 +2318,7 @@ mod tests {
 
     #[test]
     fn the_full_speed_alias_is_not_counted_as_interference() {
-        let alias = summarise(&[
+        let alias = sum(&[
             point(30, Some(30), Some(1), Some(600)),
             point(100, Some(100), Some(0), Some(1436)),
         ]);
@@ -1394,7 +2329,7 @@ mod tests {
         assert_eq!(alias.pwm_readback, "pass");
 
         // Opposite branch — an actual reclaim is still reported as one.
-        let real = summarise(&[
+        let real = sum(&[
             point(30, Some(30), Some(1), Some(600)),
             point(100, Some(100), Some(2), Some(1436)),
         ]);
@@ -1425,7 +2360,7 @@ mod tests {
             sample(Some(p), Some(if p == 100 { 0 } else { 1 }), Some(1000))
         };
         let ka = rig.keepalives.clone();
-        run_sweep(
+        run_sweep_uni(
             cache,
             "hwmon:test:pwm1",
             points,
@@ -1456,7 +2391,7 @@ mod tests {
             "every write landed; the run must not abort at its own last point"
         );
         assert_eq!(out.points.len(), 3, "all three points measured");
-        let s = summarise(&out.points);
+        let s = sum(&out.points);
         assert!(!s.interference_detected);
         assert_eq!(s.pwm_readback, "pass");
     }
@@ -1528,7 +2463,7 @@ mod tests {
         let writes_w = writes.clone();
         let hot: &StateCache = &cache;
 
-        let out = run_sweep(
+        let out = run_sweep_uni(
             &cache,
             "hwmon:test:pwm1",
             &[30, 50],
@@ -1572,7 +2507,7 @@ mod tests {
         let writes: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let writes_w = writes.clone();
 
-        let out = run_sweep(
+        let out = run_sweep_uni(
             &cache,
             "hwmon:test:pwm1",
             &[30, 50],
@@ -1611,7 +2546,7 @@ mod tests {
         let writes: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let writes_w = writes.clone();
 
-        let out = run_sweep(
+        let out = run_sweep_uni(
             &cache,
             "hwmon:test:pwm1",
             &[30, 50],
@@ -1653,7 +2588,7 @@ mod tests {
         let writes: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let writes_w = writes.clone();
 
-        let out = run_sweep(
+        let out = run_sweep_uni(
             &cache,
             "hwmon:test:pwm1",
             &[30, 50],
@@ -1707,7 +2642,7 @@ mod tests {
         let last_r = last.clone();
 
         {
-            let fut = run_sweep(
+            let fut = run_sweep_uni(
                 &cache,
                 "hwmon:test:pwm1",
                 &[30, 60, 90],
@@ -1835,7 +2770,7 @@ mod tests {
         let points: Vec<u8> = (0..constants::CHARACTERIZATION_MAX_POINTS)
             .map(|i| 30 + i as u8)
             .collect();
-        let out = run_sweep(
+        let out = run_sweep_uni(
             &cache,
             "hwmon:test:pwm1",
             &points,
@@ -1890,7 +2825,7 @@ mod tests {
             Ok(())
         };
         let last_r = last.clone();
-        let out = run_sweep(
+        let out = run_sweep_uni(
             &cache,
             "hwmon:test:pwm1",
             &[30, 60, 90],
@@ -1924,7 +2859,7 @@ mod tests {
         let failed = RestoreReport::new();
         let last = Arc::new(Mutex::new(50u8));
         let last_w = last.clone();
-        let out = run_sweep(
+        let out = run_sweep_uni(
             &cache,
             "hwmon:test:pwm1",
             &[30, 60, 90],
@@ -1951,5 +2886,790 @@ mod tests {
             vec![30, 60, 90],
             "the progressive view and the final result must not diverge"
         );
+    }
+
+    // ── AIO Phase 8 Batch 2 (DEC-334) ────────────────────────────
+    mod behaviour {
+        use super::*;
+
+        /// A point with an explicit walk direction, for the §2/§6 derivations.
+        fn point_dir(
+            pct: u8,
+            readback: Option<u8>,
+            enable: Option<u8>,
+            rpm: Option<u16>,
+            direction: &str,
+        ) -> CharPoint {
+            CharPoint {
+                direction: direction.to_string(),
+                ..point(pct, readback, enable, rpm)
+            }
+        }
+
+        /// Drive a **bidirectional** walk with fake hardware.
+        async fn sweep_bidi(
+            rig: &Rig,
+            cache: &StateCache,
+            points: &[u8],
+            initial_pct: u8,
+            rpm_for: impl Fn(u8) -> Option<u16> + Send + 'static,
+        ) -> SweepOutcome {
+            let plan = resolve_sweep_plan(points, true, None);
+            let writes = rig.writes.clone();
+            let last = Arc::new(Mutex::new(initial_pct));
+            let last_w = last.clone();
+            run_sweep(
+                cache,
+                "hwmon:test:pwm1",
+                &plan,
+                0,
+                Duration::from_millis(1),
+                None,
+                move |pct: u8| {
+                    writes.lock().unwrap().push(pct);
+                    *last_w.lock().unwrap() = pct;
+                    Ok(())
+                },
+                move || {
+                    let p = *last.lock().unwrap();
+                    sample(Some(p), Some(1), rpm_for(p))
+                },
+                &rig.cancel,
+                || false,
+                || true,
+                &rig.report,
+                |_| {},
+            )
+            .await
+        }
+
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+
+        fn duties(plan: &[SweepStep]) -> Vec<u8> {
+            plan.iter().map(|s| s.pct).collect()
+        }
+        fn dirs(plan: &[SweepStep]) -> Vec<&'static str> {
+            plan.iter().map(|s| s.direction.token()).collect()
+        }
+
+        // ── §1 plan resolution ───────────────────────────────────────────
+
+        #[test]
+        fn a_unidirectional_plan_is_the_ascending_list_it_always_was() {
+            let plan = resolve_sweep_plan(&[30, 50, 100], false, None);
+            assert_eq!(duties(&plan), vec![30, 50, 100]);
+            // DEC-313 decision 5 is unchanged for this mode.
+            assert!(duties(&plan).windows(2).all(|w| w[0] < w[1]));
+        }
+
+        /// [SAFETY] Q1. The walk descends from the top and climbs back, so the run
+        /// ENDS at the highest duty. `RestoreOnDrop` has four exits that leave the
+        /// header where the sweep put it, and ending high keeps all four benign.
+        #[test]
+        fn a_bidirectional_walk_ends_at_the_highest_duty() {
+            let plan = resolve_sweep_plan(&[30, 40, 50], true, None);
+            assert_eq!(duties(&plan), vec![50, 40, 30, 40, 50]);
+            assert_eq!(
+                *duties(&plan).last().expect("non-empty"),
+                *duties(&plan).iter().max().expect("non-empty"),
+                "the walk must end at its maximum, or an aborted restore leaves the \
+             header low"
+            );
+        }
+
+        /// The first step is entered from the captured pre-sweep duty, so its
+        /// approach direction is unknown. Labelling it `falling` would put a
+        /// wrong-direction reading into the hysteresis comparison (DEC-325).
+        #[test]
+        fn the_first_step_of_either_walk_is_a_ramp() {
+            assert_eq!(
+                dirs(&resolve_sweep_plan(&[30, 40, 50], true, None))[0],
+                "ramp"
+            );
+            assert_eq!(
+                dirs(&resolve_sweep_plan(&[30, 40, 50], false, None))[0],
+                "ramp"
+            );
+        }
+
+        #[test]
+        fn the_two_legs_are_labelled_by_the_direction_they_are_walked() {
+            let plan = resolve_sweep_plan(&[30, 40, 50], true, None);
+            assert_eq!(
+                dirs(&plan),
+                vec!["ramp", "falling", "falling", "rising", "rising"]
+            );
+        }
+
+        /// The turn-around duty is walked once, not twice: the header is already
+        /// sitting on it and it cannot be approached from below without breaching
+        /// the floor.
+        #[test]
+        fn the_turnaround_duty_is_not_repeated() {
+            let plan = resolve_sweep_plan(&[30, 40, 50, 60], true, None);
+            assert_eq!(plan.iter().filter(|s| s.pct == 30).count(), 1);
+            assert_eq!(plan.len(), 2 * 4 - 1);
+        }
+
+        /// [SAFETY] §10: "rising and falling sweeps respect safe minimum" and "pump
+        /// sweeps never include 0%". Exhaustive over every floor and every u8 the
+        /// caller could ask for, in BOTH directions.
+        #[test]
+        fn no_walked_duty_is_ever_zero_or_below_the_floor_in_either_direction() {
+            for floor in [0u8, 20, 30, 100] {
+                for bidi in [false, true] {
+                    for raw in 0u8..=255 {
+                        let points = resolve_points(Some(&[raw, raw / 2, 100]), floor);
+                        let plan = resolve_sweep_plan(&points, bidi, None);
+                        let effective = floor.max(constants::CHARACTERIZATION_MIN_PCT);
+                        for step in &plan {
+                            assert!(
+                                step.pct >= effective && step.pct > 0 && step.pct <= 100,
+                                "floor {floor} bidi {bidi} raw {raw}: walked {}",
+                                step.pct
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Q4: the cap is on WALKED STEPS, so the worst case and the engine
+        /// write-pause it budgets do not move when a walk doubles back.
+        #[test]
+        fn a_bidirectional_walk_never_exceeds_the_total_step_cap() {
+            // 17 duties: enough that a bidirectional walk must thin them, but inside
+            // `resolve_points`' own pre-existing cap so this test measures the
+            // thinning rather than that truncation.
+            let many: Vec<u8> = (20..=100).step_by(5).collect();
+            let points = resolve_points(Some(&many), 0);
+            assert_eq!(
+                points.len(),
+                many.len(),
+                "precondition: resolve_points must not have truncated, or this test \
+             measures the wrong cap"
+            );
+            let plan = resolve_sweep_plan(&points, true, None);
+            assert!(
+                plan.len() <= constants::CHARACTERIZATION_MAX_POINTS,
+                "walked {} steps, cap is {}",
+                plan.len(),
+                constants::CHARACTERIZATION_MAX_POINTS
+            );
+            assert!(
+                plan.len() > constants::CHARACTERIZATION_MAX_UNIQUE_BIDIRECTIONAL,
+                "precondition: the walk must actually double back"
+            );
+            // Thinning keeps the RANGE — truncating to the first N would have
+            // dropped the top of the sweep, which is the part being characterised.
+            assert_eq!(duties(&plan)[0], 100, "the walk starts at the maximum");
+            assert_eq!(*duties(&plan).last().expect("non-empty"), 100);
+            assert!(duties(&plan).contains(&20), "and still reaches the minimum");
+        }
+
+        #[test]
+        fn a_dwell_is_requested_by_duration_and_placed_by_the_daemon() {
+            let plan =
+                resolve_sweep_plan(&[30, 40, 50, 60, 70], true, Some(Duration::from_secs(20)));
+            let dwelled: Vec<u8> = plan
+                .iter()
+                .filter(|s| s.dwell.is_some())
+                .map(|s| s.pct)
+                .collect();
+            assert!(
+                dwelled.len() <= constants::STABILITY_MAX_POINTS,
+                "the daemon bounds how many steps dwell, got {dwelled:?}"
+            );
+            assert!(!dwelled.is_empty());
+        }
+
+        #[test]
+        fn no_dwell_is_assigned_when_none_is_requested() {
+            let plan = resolve_sweep_plan(&[30, 40, 50], true, None);
+            assert!(plan.iter().all(|s| s.dwell.is_none()));
+            assert_eq!(resolve_stability_dwell(None), None);
+            assert_eq!(
+                resolve_stability_dwell(Some(0)),
+                None,
+                "0 means off, not 0 s"
+            );
+        }
+
+        #[test]
+        fn a_requested_dwell_is_clamped_both_ways() {
+            assert_eq!(
+                resolve_stability_dwell(Some(u64::MAX)),
+                Some(Duration::from_secs(constants::STABILITY_MAX_S))
+            );
+            assert_eq!(
+                resolve_stability_dwell(Some(1)),
+                Some(Duration::from_secs(constants::STABILITY_MIN_S))
+            );
+        }
+
+        // ── [SAFETY] the dwell's deadman/lease cadence ───────────────────
+
+        /// **The highest-value test in DEC-334.** A dwell renewing once per step
+        /// overruns the engine-pause deadman at *any* dwell length — the settle
+        /// invariant holds at exactly `15 * 2 == 30`, with zero headroom — and at
+        /// `STABILITY_MAX_S` it also outlives the 60 s hwmon lease, which
+        /// `constants.rs` records as having once left a header un-restorable.
+        ///
+        /// So assert the REALISED gap between renewals, not a re-derivation of the
+        /// rule's arithmetic (DEC-320), and assert a precondition that the dwell was
+        /// genuinely long enough to break it — otherwise a short dwell would pass
+        /// this while proving nothing (DEC-314).
+        #[tokio::test(start_paused = true)]
+        async fn the_longest_dwell_never_lets_a_renewal_gap_reach_the_deadman() {
+            let cache = StateCache::new();
+            let cancel = AtomicBool::new(false);
+            let report = RestoreReport::new();
+            let stamps: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::new()));
+            let start = tokio::time::Instant::now();
+
+            let dwell = Duration::from_secs(constants::STABILITY_MAX_S);
+            let deadman = constants::VERIFY_PAUSE_DEADMAN;
+            let lease = crate::hwmon::lease::DEFAULT_LEASE_TTL;
+            // Precondition: without it, a dwell shorter than the deadman would pass
+            // this test with the in-hold renewal deleted.
+            assert!(
+                dwell > deadman,
+                "precondition: the longest dwell ({dwell:?}) must exceed the pause \
+             deadman ({deadman:?}), or this test cannot detect the defect"
+            );
+
+            let plan = vec![SweepStep {
+                pct: 50,
+                direction: Direction::Ramp,
+                dwell: Some(dwell),
+            }];
+            let stamps_k = stamps.clone();
+            let _ = run_sweep(
+                &cache,
+                "hwmon:test:pwm1",
+                &plan,
+                0,
+                Duration::from_secs(constants::CHARACTERIZATION_SETTLE_MIN_S),
+                None,
+                |_p: u8| Ok(()),
+                || sample(Some(50), Some(1), Some(1200)),
+                &cancel,
+                || false,
+                move || {
+                    stamps_k.lock().unwrap().push(start.elapsed());
+                    true
+                },
+                &report,
+                |_| {},
+            )
+            .await;
+
+            let mut marks = stamps.lock().unwrap().clone();
+            assert!(marks.len() > 2, "expected repeated renewal, got {marks:?}");
+            // The window closes at the end of the hold, so the final gap is measured
+            // to the run's end rather than to another renewal.
+            marks.push(Duration::from_secs(constants::CHARACTERIZATION_SETTLE_MIN_S) + dwell);
+            let worst = marks
+                .windows(2)
+                .map(|w| w[1].saturating_sub(w[0]))
+                .max()
+                .expect("at least one gap");
+            assert!(
+                worst < deadman,
+                "a renewal gap of {worst:?} reaches the {deadman:?} pause deadman"
+            );
+            assert!(
+                worst < lease,
+                "a renewal gap of {worst:?} reaches the {lease:?} hwmon lease TTL"
+            );
+        }
+
+        // ── §1 restore across a two-direction sequence ───────────────────
+
+        /// §1: "Restore original state after the full sequence or any interruption."
+        #[tokio::test(start_paused = true)]
+        async fn a_completed_two_direction_sweep_restores_the_original_duty_last() {
+            let rig = Rig::new();
+            let cache = StateCache::new();
+            let out = sweep_bidi(&rig, &cache, &[30, 50, 100], 42, |p| {
+                Some(500 + u16::from(p) * 20)
+            })
+            .await;
+            assert_eq!(out.state, STATE_COMPLETE);
+            let w = rig.written();
+            assert_eq!(
+                w,
+                vec![100, 50, 30, 50, 100, 42],
+                "down from the top, back up, then the pre-sweep duty"
+            );
+            assert_eq!(rig.restore(), (false, "restored"));
+        }
+
+        /// §10: "cancellation between sweep directions restores state."
+        #[tokio::test(start_paused = true)]
+        async fn cancelling_between_the_two_legs_still_restores() {
+            let rig = Rig::new();
+            let cache = StateCache::new();
+            let cancel_after = Arc::new(Mutex::new(0usize));
+            let seen = cancel_after.clone();
+            let flag = &rig.cancel;
+            let writes = rig.writes.clone();
+            let last = Arc::new(Mutex::new(42u8));
+            let last_w = last.clone();
+            let plan = resolve_sweep_plan(&[30, 50, 100], true, None);
+            let turn = plan
+                .iter()
+                .position(|s| s.direction == Direction::Rising)
+                .expect("a bidirectional plan has a rising leg");
+            let report = RestoreReport::new();
+            let out = run_sweep(
+                &cache,
+                "hwmon:test:pwm1",
+                &plan,
+                0,
+                Duration::from_millis(1),
+                None,
+                move |p: u8| {
+                    writes.lock().unwrap().push(p);
+                    *last_w.lock().unwrap() = p;
+                    let mut n = seen.lock().unwrap();
+                    *n += 1;
+                    Ok(())
+                },
+                move || {
+                    let p = *last.lock().unwrap();
+                    sample(Some(p), Some(1), Some(500 + u16::from(p) * 20))
+                },
+                flag,
+                || false,
+                || true,
+                &report,
+                {
+                    let flag2 = &rig.cancel;
+                    let counter = cancel_after.clone();
+                    move |_pt: CharPoint| {
+                        // Trip the cancel exactly at the turn-around, i.e. between
+                        // the falling and rising legs.
+                        if *counter.lock().unwrap() == turn {
+                            flag2.store(true, Ordering::SeqCst);
+                        }
+                    }
+                },
+            )
+            .await;
+            assert_eq!(out.state, STATE_CANCELLED);
+            assert!(
+                out.points.len() < plan.len(),
+                "precondition: the cancel must land mid-walk, not after it"
+            );
+            let w = rig.written();
+            assert_eq!(
+                *w.last().expect("wrote something"),
+                42,
+                "a cancel between the legs still restores the pre-sweep duty: {w:?}"
+            );
+        }
+
+        /// [SAFETY] The pump floor holds on the way DOWN too — which is the leg that
+        /// did not exist before DEC-334.
+        #[tokio::test(start_paused = true)]
+        async fn a_bidirectional_pump_sweep_never_writes_below_its_floor() {
+            let rig = Rig::new();
+            let cache = StateCache::new();
+            let floor = crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8;
+            let points = resolve_points(Some(&[0, 5, 10, 50, 100]), floor);
+            let plan = resolve_sweep_plan(&points, true, None);
+            let writes = rig.writes.clone();
+            let report = RestoreReport::new();
+            let _ = run_sweep(
+                &cache,
+                "hwmon:test:pwm1",
+                &plan,
+                floor,
+                Duration::from_millis(1),
+                None,
+                move |p: u8| {
+                    writes.lock().unwrap().push(p);
+                    Ok(())
+                },
+                || sample(Some(0), Some(1), Some(900)),
+                &rig.cancel,
+                || false,
+                || true,
+                &report,
+                |_| {},
+            )
+            .await;
+            // Asserts the REALISED write log, not a re-derivation of the clamp.
+            for w in rig.written() {
+                assert!(
+                    w >= floor,
+                    "wrote {w}% to a pump-protected header: {:?}",
+                    rig.written()
+                );
+            }
+        }
+
+        // ── review remediation: the two P2s the concurrency pass found ───
+
+        /// [C1] **A cancel during a plain settle must not discard the point.**
+        ///
+        /// With no dwell `hold == settle`, and the last loop iteration sleeps exactly
+        /// the remainder — so `elapsed() >= settle` is true on the final tick of
+        /// EVERY settle. The first draft of the mid-hold cancel check was not gated
+        /// on `step.dwell`, so it returned there before `read_fn()`, dropping a
+        /// point that had completed its full window and labelling the run
+        /// "cancelled during the stability hold" on a run with no hold at all.
+        ///
+        /// Deleting `step.dwell.is_some() &&` from the guard makes this fail.
+        #[tokio::test(start_paused = true)]
+        async fn a_cancel_during_a_plain_settle_still_records_the_point() {
+            let cache = StateCache::new();
+            let cancel = AtomicBool::new(false);
+            let report = RestoreReport::new();
+            let plan = plan_of(&[50, 80]);
+            assert!(
+                plan.iter().all(|s| s.dwell.is_none()),
+                "precondition: this test only means something on a plan with NO dwell"
+            );
+            let reads = Arc::new(Mutex::new(0usize));
+            let reads_r = reads.clone();
+            let flag = &cancel;
+            let out = run_sweep(
+                &cache,
+                "hwmon:test:pwm1",
+                &plan,
+                0,
+                Duration::from_secs(constants::CHARACTERIZATION_DEFAULT_SETTLE_S),
+                None,
+                |_p: u8| Ok(()),
+                move || {
+                    let mut n = reads_r.lock().unwrap();
+                    *n += 1;
+                    // Mid-settle, not before it and not between steps.
+                    if *n == 3 {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                    sample(Some(50), Some(1), Some(1200))
+                },
+                &cancel,
+                || false,
+                || true,
+                &report,
+                |_| {},
+            )
+            .await;
+            assert_eq!(out.state, STATE_CANCELLED);
+            assert_eq!(
+                out.points.len(),
+                1,
+                "the step whose settle completed must still be recorded; got {:?}",
+                out.points
+            );
+            assert!(
+                !out.detail
+                    .clone()
+                    .unwrap_or_default()
+                    .contains("stability hold"),
+                "a run with no dwell must not report a stability hold: {:?}",
+                out.detail
+            );
+        }
+
+        /// [C2] **[SAFETY] The thermal abort is re-evaluated INSIDE the hold.**
+        ///
+        /// A step used to be at most one settle; with a dwell it is up to 75 s, so
+        /// checking only at the top of the step stretched the worst-case latency on
+        /// the 85 °C voluntary-operation abort five-fold. The >=105 °C ladder was
+        /// never the exposure — it force-takes the lease, so `keepalive()` catches
+        /// it — but nothing backstopped the band between the two.
+        ///
+        /// Sets the sensor hot only AFTER the sweep has entered the hold, so the
+        /// pre-existing entry check cannot be what catches it.
+        #[tokio::test(start_paused = true)]
+        async fn a_sensor_that_goes_hot_during_a_dwell_aborts_before_the_hold_ends() {
+            let cache = StateCache::new();
+            let cancel = AtomicBool::new(false);
+            let report = RestoreReport::new();
+            let dwell = Duration::from_secs(constants::STABILITY_MAX_S);
+            let settle = Duration::from_secs(constants::CHARACTERIZATION_SETTLE_MIN_S);
+            let plan = vec![SweepStep {
+                pct: 50,
+                direction: Direction::Ramp,
+                dwell: Some(dwell),
+            }];
+            let reads = Arc::new(Mutex::new(0usize));
+            let reads_r = reads.clone();
+            let cache_w = &cache;
+            let out = run_sweep(
+                &cache,
+                "hwmon:test:pwm1",
+                &plan,
+                0,
+                settle,
+                None,
+                |_p: u8| Ok(()),
+                move || {
+                    let mut n = reads_r.lock().unwrap();
+                    *n += 1;
+                    if *n == 2 {
+                        // Well inside the hold, and above CALIBRATION_MAX_TEMP_C.
+                        cache_w
+                            .update_sensors(vec![hot_cpu(constants::CALIBRATION_MAX_TEMP_C + 5.0)]);
+                    }
+                    sample(Some(50), Some(1), Some(1200))
+                },
+                &cancel,
+                || false,
+                || true,
+                &report,
+                |_| {},
+            )
+            .await;
+            assert_eq!(out.state, STATE_ABORTED, "detail: {:?}", out.detail);
+            // The REALISED bound, not a re-derivation: the abort must land inside a
+            // renewal interval plus a sample, not at the end of the 60 s dwell.
+            let observed = *reads.lock().unwrap() as u64;
+            let worst_ticks = (constants::STABILITY_RENEW_INTERVAL_S * 1000
+                / constants::CHARACTERIZATION_SAMPLE_INTERVAL.as_millis() as u64)
+                + 2;
+            assert!(
+                observed <= worst_ticks,
+                "aborted after {observed} samples; a renewal-cadence check bounds it at \
+             {worst_ticks}, and the whole dwell would be {}",
+                dwell.as_millis() as u64
+                    / constants::CHARACTERIZATION_SAMPLE_INTERVAL.as_millis() as u64
+            );
+        }
+
+        // ── §7 correction ────────────────────────────────────────────────
+
+        /// §7: "keep raw reported RPM in all exports". The correction is additive
+        /// evidence, never a replacement.
+        #[test]
+        fn a_correction_never_overwrites_the_reported_rpm() {
+            let est = estimate_physical_rpm(
+                Some(1500),
+                Some(RpmCorrection {
+                    // A 3-pulse tach reported as 1.5x actual: exact in binary, so the
+                    // test asserts the correction rather than a rounding mode.
+                    factor: 2.0 / 3.0,
+                    source: "test cooler",
+                }),
+            )
+            .expect("a factor produces an estimate");
+            assert_eq!(est.value, 1000);
+            assert_eq!(est.provenance, "DERIVED");
+            assert_eq!(est.correction_source, "test cooler");
+        }
+
+        /// §7: with no trusted metadata there is NO estimate — not a relabelled copy
+        /// of the reported figure. Promoting an observation into a derived value is
+        /// exactly what the Overview's provenance rule forbids.
+        #[test]
+        fn no_correction_means_no_estimated_value_at_all() {
+            assert!(estimate_physical_rpm(Some(1500), None).is_none());
+            assert!(estimate_physical_rpm(
+                None,
+                Some(RpmCorrection {
+                    factor: 2.0,
+                    source: "x"
+                })
+            )
+            .is_none());
+        }
+
+        #[test]
+        fn a_nonsense_correction_factor_is_refused_rather_than_applied() {
+            for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+                assert!(
+                    estimate_physical_rpm(
+                        Some(1500),
+                        Some(RpmCorrection {
+                            factor: bad,
+                            source: "x"
+                        })
+                    )
+                    .is_none(),
+                    "factor {bad} must not produce an estimate"
+                );
+            }
+        }
+
+        /// §10: "untrusted profile/user input cannot ... silently define tach
+        /// correction." Enforced by the TYPE, not by a runtime check: `DevicePolicy`
+        /// derives no `Deserialize`, so there is no path from a payload to a factor.
+        #[test]
+        fn no_shipped_device_policy_defines_a_tach_correction() {
+            for policy in crate::hwmon::device_policy::all_policies() {
+                assert!(
+                    policy.rpm_correction_factor.is_none(),
+                    "{} ships a correction factor; §7 requires validated per-device \
+                 evidence before one is added, and the GUI must show it as \
+                 DEVICE_METADATA rather than an observation",
+                    policy.id
+                );
+            }
+        }
+
+        // ── §5 / §6 summary derivations ──────────────────────────────────
+
+        /// §5: "Do not publish unrealistic millisecond precision." The summary must
+        /// name the resolution its timings were measured at.
+        #[tokio::test(start_paused = true)]
+        async fn the_summary_publishes_the_resolution_its_timings_were_measured_at() {
+            let rig = Rig::new();
+            let cache = StateCache::new();
+            let out = sweep_bidi(&rig, &cache, &[30, 100], 42, |p| {
+                Some(500 + u16::from(p) * 20)
+            })
+            .await;
+            let s = summarise(&out.points, &[]);
+            assert_eq!(
+                s.measurement_resolution_ms,
+                Some(constants::CHARACTERIZATION_SAMPLE_INTERVAL.as_millis() as u64),
+                "the timings can only be multiples of the sub-sample cadence"
+            );
+        }
+
+        /// The flag is derived from the POINTS, not from the request (DEC-325): a run
+        /// that aborted before its rising leg is honestly unidirectional.
+        #[test]
+        fn hysteresis_is_not_tested_when_the_walk_produced_one_direction() {
+            let uni = vec![
+                point_dir(30, Some(30), Some(1), Some(900), "ramp"),
+                point_dir(50, Some(50), Some(1), Some(1500), "rising"),
+            ];
+            assert_eq!(
+                summarise(&uni, &[]).hysteresis_verdict,
+                crate::api::stats::HYSTERESIS_NOT_TESTED
+            );
+        }
+
+        #[test]
+        fn hysteresis_is_measured_at_duties_walked_in_both_directions() {
+            let pts = vec![
+                point_dir(100, Some(100), Some(1), Some(3000), "ramp"),
+                point_dir(50, Some(50), Some(1), Some(2000), "falling"),
+                point_dir(30, Some(30), Some(1), Some(900), "falling"),
+                point_dir(50, Some(50), Some(1), Some(1200), "rising"),
+                point_dir(100, Some(100), Some(1), Some(3000), "rising"),
+            ];
+            let s = summarise(&pts, &[]);
+            assert_eq!(s.hysteresis_compared_points, 1, "only 50% has both legs");
+            assert_eq!(s.hysteresis_worst_duty_pct, Some(50));
+            assert_eq!(s.hysteresis_worst_delta_rpm, Some(800));
+            assert_eq!(s.hysteresis_verdict, crate::api::stats::HYSTERESIS_PRESENT);
+        }
+
+        /// §6: three states, and "no model yet" is the one that must not read as a
+        /// pass. The Overview: "Do not turn lack of evidence into PASS."
+        #[test]
+        fn an_unlearned_header_reports_no_comparison_rather_than_agreement() {
+            let pts = vec![point_dir(50, Some(50), Some(1), Some(2000), "rising")];
+            assert_eq!(summarise(&pts, &[]).outside_learned_range, None);
+        }
+
+        #[test]
+        fn a_reading_inside_the_learned_band_is_false_not_none() {
+            let pts = vec![point_dir(50, Some(50), Some(1), Some(2000), "rising")];
+            let learned = [LearnedPoint {
+                duty_pct: 50,
+                rpm_min: 1900,
+                rpm_max: 2100,
+            }];
+            assert_eq!(summarise(&pts, &learned).outside_learned_range, Some(false));
+        }
+
+        /// §6's worked example, and §8.5's rule that this must never render as a
+        /// hardware failure.
+        #[test]
+        fn a_reading_far_outside_the_learned_band_is_observed_with_possibilities() {
+            let pts = vec![point_dir(35, Some(35), Some(1), Some(3350), "rising")];
+            let learned = [LearnedPoint {
+                duty_pct: 35,
+                rpm_min: 900,
+                rpm_max: 1150,
+            }];
+            let s = summarise(&pts, &learned);
+            assert_eq!(s.outside_learned_range, Some(true));
+            assert!(
+                s.learned_range_note
+                    .as_deref()
+                    .is_some_and(|n| n.contains("900") && n.contains("1150")),
+                "the note must name the learned band: {:?}",
+                s.learned_range_note
+            );
+            assert!(
+                s.interpretation_states
+                    .iter()
+                    .all(|t| t.ends_with("_POSSIBLE")),
+                "§6 states are possibilities, never conclusions: {:?}",
+                s.interpretation_states
+            );
+        }
+
+        /// §10: "override detection requires command/readback success before
+        /// suggesting device override."
+        #[test]
+        fn a_failed_readback_does_not_suggest_a_device_override() {
+            let mut p = point_dir(35, Some(80), Some(1), Some(3350), "rising");
+            p.readback_verdict = "clamped".into();
+            let learned = [LearnedPoint {
+                duty_pct: 35,
+                rpm_min: 900,
+                rpm_max: 1150,
+            }];
+            let s = summarise(&[p], &learned);
+            assert!(
+                !s.interpretation_states
+                    .iter()
+                    .any(|t| t == "DEVICE_OVERRIDE_POSSIBLE"),
+                "readback did not succeed, so an internal override is not the \
+             indicated explanation: {:?}",
+                s.interpretation_states
+            );
+        }
+
+        // ── §9 provenance ────────────────────────────────────────────────
+
+        #[test]
+        fn the_provenance_legend_classifies_the_commanded_observed_and_derived_split() {
+            let m = provenance_legend();
+            assert_eq!(
+                m.get("requested_pct").map(String::as_str),
+                Some("COMMANDED")
+            );
+            assert_eq!(m.get("rpm_after").map(String::as_str), Some("OBSERVED"));
+            assert_eq!(
+                m.get("estimated_physical_rpm").map(String::as_str),
+                Some("DERIVED")
+            );
+            assert_eq!(
+                m.get("correction_source").map(String::as_str),
+                Some("DEVICE_METADATA")
+            );
+        }
+
+        /// A raw observation must never be classified as derived, or the legend
+        /// would license exactly the silent promotion the Overview forbids.
+        #[test]
+        fn no_raw_tach_or_readback_field_is_classified_as_derived() {
+            let m = provenance_legend();
+            for raw in [
+                "rpm_before",
+                "rpm_after",
+                "readback_pct",
+                "readback_raw",
+                "pwm_enable",
+            ] {
+                assert_eq!(
+                    m.get(raw).map(String::as_str),
+                    Some("OBSERVED"),
+                    "{raw} is a direct hwmon reading"
+                );
+            }
+        }
     }
 }

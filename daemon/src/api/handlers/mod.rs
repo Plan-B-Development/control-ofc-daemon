@@ -334,6 +334,9 @@ pub struct AppState {
     /// `cooling_devices`, so a reader clones the pointer and never holds the lock
     /// while it works.
     pub control_paths: Arc<parking_lot::RwLock<Arc<crate::control_paths::ControlPathStore>>>,
+    /// AIO Phase 8 Batch 2 `§6` learned response bands. **Diagnostic evidence
+    /// only — nothing in the control path reads this** (DEC-334).
+    pub pwm_baselines: Arc<parking_lot::RwLock<Arc<crate::pwm_baselines::PwmBaselineStore>>>,
     /// Prevents concurrent `POST /fans/openfan/rescan` probes (DEC-265).
     /// Two racing probes would open the same tty, and the loser would install
     /// a controller over the winner's — orphaning a poll loop on a transport

@@ -722,8 +722,9 @@ fn spawn_orchestration(
                 match diag {
                     DIAG_VERIFY => run_verify(&state, &session_id, member).await,
                     DIAG_CHARACTERIZATION => {
-                        run_characterization(&state, &session_id, member).await
+                        run_characterization(&state, &session_id, member, false).await
                     }
+                    DIAG_BEHAVIOUR => run_characterization(&state, &session_id, member, true).await,
                     DIAG_CONTROL_PATH => run_discovery(&state, &session_id, member).await,
                     _ => {}
                 }
@@ -738,7 +739,16 @@ fn ordered_diagnostics(requested: &[String]) -> Vec<&'static str> {
     if requested.iter().any(|d| d == DIAG_VERIFY) {
         out.push(DIAG_VERIFY);
     }
-    if requested.iter().any(|d| d == DIAG_CHARACTERIZATION) {
+    // DEC-334 (Q15): the behaviour sweep SUPERSEDES the basic one when both are
+    // asked for. They drive the same route and the same process-global run slot
+    // and differ only in request parameters, and the behaviour walk is a strict
+    // superset — so running both would sweep every member twice for data the
+    // second run already contains. `summarise` derives the basic findings from
+    // the behaviour run too, so nothing is lost by skipping it.
+    let behaviour = requested.iter().any(|d| d == DIAG_BEHAVIOUR);
+    if behaviour {
+        out.push(DIAG_BEHAVIOUR);
+    } else if requested.iter().any(|d| d == DIAG_CHARACTERIZATION) {
         out.push(DIAG_CHARACTERIZATION);
     }
     // AIO Phase 8 Batch 1. Ordered LAST deliberately: discovery perturbs around
@@ -894,14 +904,35 @@ fn cancel_run_fenced<R: CancellableRun>(
     }
 }
 
-async fn run_characterization(state: &Arc<AppState>, session_id: &str, member: &str) {
+async fn run_characterization(
+    state: &Arc<AppState>,
+    session_id: &str,
+    member: &str,
+    behaviour: bool,
+) {
+    // Evidence is attributed to the token that was actually requested, so a
+    // reader can tell a behaviour run from a basic one without inspecting the
+    // run's fields. `EvidenceRef.kind` already carries this distinction; both
+    // still land in `evidence[].characterization`, because it is the same run
+    // type from the same route.
+    let kind = if behaviour {
+        DIAG_BEHAVIOUR
+    } else {
+        DIAG_CHARACTERIZATION
+    };
     let started = unix_ms();
     // The existing handler returns 202 and sweeps detached; the run lands in the
     // process-global `RunSlot`, which is what we then watch.
     let (status, Json(body)) = super::hwmon_ctl::hwmon_characterize_handler(
         State(state.clone()),
         axum::extract::Path(member.to_string()),
-        Json(crate::api::characterization::CharacterizationRequest::default()),
+        Json(crate::api::characterization::CharacterizationRequest {
+            // DEC-334 Q3: the bidirectional walk is OFF for the basic token
+            // inside a session — selecting the behaviour token IS the opt-in.
+            bidirectional: Some(behaviour),
+            stability_seconds: behaviour.then_some(crate::constants::STABILITY_DEFAULT_S),
+            ..Default::default()
+        }),
     )
     .await;
 
@@ -914,7 +945,7 @@ async fn run_characterization(state: &Arc<AppState>, session_id: &str, member: &
         state.validation.attach_evidence_for(
             session_id,
             EvidenceRef {
-                kind: DIAG_CHARACTERIZATION.to_string(),
+                kind: kind.to_string(),
                 member_id: member.to_string(),
                 run_id: None,
                 started_unix_ms: started,
@@ -938,11 +969,22 @@ async fn run_characterization(state: &Arc<AppState>, session_id: &str, member: &
         .map(str::to_string);
 
     // Watch the slot until this run leaves `running`. Bounded by the sweep's own
-    // worst case: every point at the maximum settle, plus slack.
+    // worst case: every step at the maximum settle, plus every dwellable step at
+    // the maximum dwell, plus slack.
+    //
+    // [SAFETY-adjacent] DEC-334 RE-DERIVED this rather than leaving it standing.
+    // The old form was `MAX_POINTS * SETTLE_MAX_S * 2 + 60` = 660 s against a
+    // 300 s worst case — a 2.2x margin. A stability dwell adds up to
+    // `STABILITY_MAX_POINTS * STABILITY_MAX_S` to that worst case, which the old
+    // formula does not know about, so it would have silently eroded to ~1.4x and
+    // then started reporting healthy long runs as interrupted. Copying a bound
+    // between two call sites keeps its arithmetic and changes its meaning
+    // (DEC-333); this one is derived from what the sweep can actually take.
     let deadline = tokio::time::Instant::now()
         + std::time::Duration::from_secs(
-            constants::CHARACTERIZATION_MAX_POINTS as u64
+            (constants::CHARACTERIZATION_MAX_POINTS as u64
                 * constants::CHARACTERIZATION_SETTLE_MAX_S
+                + constants::STABILITY_MAX_POINTS as u64 * constants::STABILITY_MAX_S)
                 * 2
                 + 60,
         );
@@ -995,7 +1037,7 @@ async fn run_characterization(state: &Arc<AppState>, session_id: &str, member: &
     state.validation.attach_evidence_for(
         session_id,
         EvidenceRef {
-            kind: DIAG_CHARACTERIZATION.to_string(),
+            kind: kind.to_string(),
             member_id: member.to_string(),
             run_id,
             started_unix_ms: started,
@@ -1214,6 +1256,7 @@ mod tests {
             restore_failed: false,
             restore_outcome: ch::RestoreOutcome::Pending.token().to_string(),
             detail: None,
+            ..Default::default()
         }
     }
 
@@ -1320,5 +1363,137 @@ mod tests {
             parking_lot::Mutex::new(None);
         cancel_run_fenced(&empty, &cancel, Some("char-10"));
         assert!(!cancel.load(Ordering::SeqCst));
+    }
+
+    // ── AIO Phase 8 Batch 2 (DEC-334) ────────────────────────────────
+
+    #[test]
+    fn the_behaviour_token_is_recognised_and_ordered_with_the_other_diagnostics() {
+        assert!(is_known_diagnostic(DIAG_BEHAVIOUR));
+        let out = ordered_diagnostics(&[
+            DIAG_CONTROL_PATH.to_string(),
+            DIAG_BEHAVIOUR.to_string(),
+            DIAG_VERIFY.to_string(),
+        ]);
+        assert_eq!(out, vec![DIAG_VERIFY, DIAG_BEHAVIOUR, DIAG_CONTROL_PATH]);
+    }
+
+    /// [DEC-334 Q15] Both tokens drive the same route and the same
+    /// process-global run slot, and the behaviour walk is a strict superset — so
+    /// asking for both must sweep each member ONCE, not twice.
+    #[test]
+    fn requesting_both_characterisations_runs_only_the_behaviour_sweep() {
+        let out = ordered_diagnostics(&[
+            DIAG_CHARACTERIZATION.to_string(),
+            DIAG_BEHAVIOUR.to_string(),
+        ]);
+        assert_eq!(out, vec![DIAG_BEHAVIOUR]);
+        assert!(
+            !out.contains(&DIAG_CHARACTERIZATION),
+            "the basic sweep is superseded, not run alongside"
+        );
+    }
+
+    /// The other side of the same rule: the basic token still works alone, so an
+    /// older client that never learned the new one is unaffected.
+    #[test]
+    fn the_basic_token_still_runs_on_its_own() {
+        assert_eq!(
+            ordered_diagnostics(&[DIAG_CHARACTERIZATION.to_string()]),
+            vec![DIAG_CHARACTERIZATION]
+        );
+    }
+
+    /// [DEC-334 Q15] The load-bearing half of "behaviour supersedes": if the
+    /// findings only looked at `pwm_characterization` evidence, a session that
+    /// asked for the richer sweep would report `not_tested` for every basic
+    /// characterisation finding — about a diagnostic that had just run.
+    ///
+    /// Asserts a RELATIONSHIP: the same evidence under either kind must produce
+    /// the same basic findings. A literal expectation would pass against a
+    /// filter that happened to match only the token the test wrote.
+    #[test]
+    fn a_behaviour_run_feeds_every_basic_characterisation_finding() {
+        use crate::validation::session::{F_PWM_RESPONSE, F_RESPONSE_LATENCY, RESULT_NOT_TESTED};
+        let mut r = run("char-9", ch::STATE_COMPLETE);
+        r.points = vec![ch::CharPoint {
+            requested_pct: 60,
+            command_accepted: true,
+            readback_pct: Some(60),
+            pwm_enable: Some(1),
+            rpm_before: Some(900),
+            rpm_after: Some(1800),
+            first_change_ms: Some(1500),
+            readback_verdict: "match".into(),
+            rpm_verdict: "changed".into(),
+            direction: "rising".into(),
+            ..Default::default()
+        }];
+        r.summary = Some(ch::summarise(&r.points, &[]));
+
+        let findings_for = |kind: &str| {
+            let mut session = finalised_session();
+            session.evidence = vec![EvidenceRef {
+                kind: kind.to_string(),
+                member_id: "hwmon:it87:isa-0a30:pwm2:PUMP".into(),
+                run_id: Some("char-9".into()),
+                started_unix_ms: 1,
+                completed_unix_ms: Some(2),
+                outcome: crate::validation::session::RESULT_OBSERVED.to_string(),
+                detail: None,
+                characterization: Some(r.clone()),
+                verify: None,
+                control_path: None,
+            }];
+            crate::validation::summary::summarise(&session)
+        };
+
+        let basic = findings_for(DIAG_CHARACTERIZATION);
+        let behaviour = findings_for(DIAG_BEHAVIOUR);
+        let state_of = |fs: &[ValidationFinding], id: &str| {
+            fs.iter()
+                .find(|f| f.id == id)
+                .map(|f| f.state.clone())
+                .unwrap_or_else(|| panic!("no {id} finding"))
+        };
+
+        // [contract review] `evidence_kind` must name the token that ACTUALLY
+        // ran. Six findings hardcoded `pwm_characterization`, so a behaviour-only
+        // session exported six findings attributed to a diagnostic that never
+        // executed — in a batch whose entire subject is provenance honesty.
+        let kind_of = |fs: &[ValidationFinding], id: &str| {
+            fs.iter()
+                .find(|f| f.id == id)
+                .and_then(|f| f.evidence_kind.clone())
+                .unwrap_or_else(|| panic!("no {id} finding"))
+        };
+        for id in [F_PWM_RESPONSE, F_RESPONSE_LATENCY] {
+            assert_eq!(
+                kind_of(&basic, id),
+                DIAG_CHARACTERIZATION,
+                "{id} must name the basic token when the basic run produced it"
+            );
+            assert_eq!(
+                kind_of(&behaviour, id),
+                DIAG_BEHAVIOUR,
+                "{id} must name the BEHAVIOUR token when that is what ran"
+            );
+        }
+
+        for id in [F_PWM_RESPONSE, F_RESPONSE_LATENCY] {
+            // The precondition that makes the comparison mean something: the
+            // basic run must genuinely have produced a finding, or "they match"
+            // would be two `not_tested`s agreeing.
+            assert_ne!(
+                state_of(&basic, id),
+                RESULT_NOT_TESTED,
+                "precondition: the basic run must produce a real {id} finding"
+            );
+            assert_eq!(
+                state_of(&behaviour, id),
+                state_of(&basic, id),
+                "a behaviour run must feed {id} exactly as a basic run does"
+            );
+        }
     }
 }

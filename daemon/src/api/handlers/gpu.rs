@@ -791,6 +791,7 @@ mod tests {
             control_path: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             control_path_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
+            pwm_baselines: Default::default(),
             openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
             last_openfan_rescan: Arc::new(parking_lot::Mutex::new(None)),
             adopted_poll_handles: Arc::new(parking_lot::Mutex::new(Vec::new())),

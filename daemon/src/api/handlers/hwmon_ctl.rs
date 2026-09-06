@@ -806,6 +806,48 @@ pub async fn hwmon_characterize_handler(
             &ErrorEnvelope::validation("no usable sweep points after clamping"),
         );
     }
+    // DEC-334. `resolve_points` still owns the clamp, so its exhaustive
+    // "never 0, never below the floor" proof covers every duty in the plan.
+    let bidirectional = body.bidirectional.unwrap_or(false);
+    let dwell = ch::resolve_stability_dwell(body.stability_seconds);
+    let plan = ch::resolve_sweep_plan(&points, bidirectional, dwell);
+    if plan.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorEnvelope::validation("no usable sweep steps after clamping"),
+        );
+    }
+    // `§7`. Compiled-in device metadata only — `DevicePolicy` derives no
+    // `Deserialize`, so no inbound payload can reach this. `None` on every
+    // shipped machine, because no shipped entry sets a factor.
+    let correction = state
+        .cooling_devices()
+        .iter()
+        .find(|d| d.claims(&header_id))
+        .map(|d| d.resolved_policy())
+        .and_then(|pol| {
+            pol.rpm_correction_factor.map(|factor| ch::RpmCorrection {
+                factor,
+                source: pol.correction_source.unwrap_or(pol.display_name),
+            })
+        });
+    // `§6`. The learned band for THIS header, read once before the sweep so the
+    // summary can compare against it. Empty until a run has completed.
+    let learned: Vec<ch::LearnedPoint> = state
+        .pwm_baselines
+        .read()
+        .get(&header_id)
+        .map(|rec| {
+            rec.points
+                .iter()
+                .map(|b| ch::LearnedPoint {
+                    duty_pct: b.duty_pct,
+                    rpm_min: b.rpm_min,
+                    rpm_max: b.rpm_max,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     let verify_lease_id = {
         let mut ctrl = controller.lock();
@@ -823,7 +865,11 @@ pub async fn hwmon_characterize_handler(
         run_id: ch::next_run_id(),
         header_id: header_id.clone(),
         state: ch::STATE_RUNNING.to_string(),
-        requested_points_pct: points.clone(),
+        // DEC-334: the FULL walked sequence, including the falling leg's
+        // repeats — so `points.len()` against this stays a correct progress
+        // indicator for every existing client. A bidirectional walk visits more
+        // steps than the deduped duty list holds.
+        requested_points_pct: plan.iter().map(|s| s.pct).collect(),
         settle_seconds: settle.as_secs(),
         points: vec![],
         summary: None,
@@ -831,6 +877,10 @@ pub async fn hwmon_characterize_handler(
         restore_failed: false,
         restore_outcome: ch::RestoreOutcome::Pending.token().to_string(),
         detail: None,
+        bidirectional,
+        stability_seconds: dwell.map(|d| d.as_secs()).unwrap_or(0),
+        completed_unix_ms: None,
+        provenance: ch::provenance_legend(),
     };
     // The cancel flag is cleared and the run installed under ONE lock, and the
     // cancel handler takes the same lock across its check-and-set. Without that
@@ -844,6 +894,7 @@ pub async fn hwmon_characterize_handler(
     }
 
     let slot = state.characterization.clone();
+    let state_for_persist = Arc::clone(&state);
     let my_run_id = run.run_id.clone();
     let cancel = state.characterization_cancel.clone();
     let cache = state.cache.clone();
@@ -853,6 +904,10 @@ pub async fn hwmon_characterize_handler(
 
     tokio::spawn(async move {
         let report = ch::RestoreReport::new();
+        // Declared outside the guarded scope: the §6 learn-from-this-run step
+        // below must happen AFTER the restore, per the Overview's rule 15
+        // ("restore first; perform non-essential analysis/export second").
+        let mut terminal: Option<ch::CharacterizationRun> = None;
 
         // Guard drop order is load-bearing and is asserted by
         // `characterization::tests::the_restore_write_lands_while_the_lease_is_still_valid`.
@@ -864,8 +919,13 @@ pub async fn hwmon_characterize_handler(
             let pause = verify_guard;
             let _lease = verify_lease;
 
-            // [SAFETY] Renews BOTH the engine pause and the hwmon lease, once per
-            // point. Renewing only the pause was a defect: `force_take_lease`
+            // [SAFETY] Renews BOTH the engine pause and the hwmon lease. Called
+            // once per step, and additionally every
+            // `STABILITY_RENEW_INTERVAL_S` **inside** a step's hold, which is
+            // what makes a stability dwell legal (DEC-334): the per-step cadence
+            // alone is bounded by `SETTLE_MAX_S * 2 <= VERIFY_PAUSE_DEADMAN`,
+            // which holds at exactly 30 == 30. Renewing only the pause was a
+            // defect: `force_take_lease`
             // stamps a 60 s TTL (`hwmon::lease::DEFAULT_LEASE_TTL`), nothing else
             // renews a Verify lease, and `set_pwm` merely *validates* it without
             // refreshing. A documented-legal 20 x 15 s sweep therefore wrote fine
@@ -916,7 +976,7 @@ pub async fn hwmon_characterize_handler(
             let outcome = ch::run_sweep(
                 &cache,
                 &hid,
-                &points,
+                &plan,
                 // [SAFETY] `AUD3-l`: the same header floor `resolve_points` used for
                 // the sweep, reused for the RESTORE — 30% for a pump-protected
                 // header, 0 for everything else. Before this the restore wrote the
@@ -924,6 +984,7 @@ pub async fn hwmon_characterize_handler(
                 // was restored to 0 with `pwm_enable=1` and left stopped.
                 floor,
                 settle,
+                correction,
                 write_fn,
                 read_fn,
                 &cancel,
@@ -948,7 +1009,7 @@ pub async fn hwmon_characterize_handler(
             if let Some(r) = slot.lock().as_mut() {
                 if r.run_id == my_run_id {
                     r.points = outcome.points;
-                    r.summary = Some(ch::summarise(&r.points));
+                    r.summary = Some(ch::summarise(&r.points, &learned));
                     r.state = outcome.state.to_string();
                     r.detail = outcome.detail;
                     // ONE source of truth for both fields (`AUD2-c`): the boolean
@@ -957,12 +1018,115 @@ pub async fn hwmon_characterize_handler(
                     let restore = report.get();
                     r.restore_failed = restore.header_left_moved();
                     r.restore_outcome = restore.token().to_string();
+                    r.completed_unix_ms = Some(crate::control_paths::unix_ms());
+                    terminal = Some(r.clone());
                 }
             }
         };
+
+        // DEC-334 §6: learn from this run, but ONLY from one that completed.
+        // A partial sweep's band would be narrower than the truth, and a
+        // too-narrow learned band is what produces false OUTSIDE LEARNED RANGE
+        // reports later — the cry-wolf failure §6 explicitly warns against.
+        //
+        // Outside the guarded scope on purpose: this is persistence, not a
+        // hardware operation, and the Overview's rule 15 is "restore first,
+        // perform non-essential analysis/export second".
+        if let Some(run) = terminal {
+            if run.state == ch::STATE_COMPLETE {
+                if let Some(record) = baseline_record_for(&run) {
+                    persist_baseline(&state_for_persist, record).await;
+                }
+            }
+        }
     });
 
     json_ok(StatusCode::ACCEPTED, run)
+}
+
+/// Build a `§6` learned-response record from a completed run.
+///
+/// Returns `None` when the run produced no usable tach reading at all — an empty
+/// band is not knowledge, and storing one would make the next run's comparison
+/// silently vacuous.
+///
+/// The band starts as a **point** (min == max == the observed value) and widens
+/// as runs accumulate; see `PwmBaselineStore::merge` for why widening rather
+/// than replacement is the cautious direction.
+fn baseline_record_for(
+    run: &crate::api::characterization::CharacterizationRun,
+) -> Option<crate::pwm_baselines::PwmBaselineRecord> {
+    let mut points: Vec<crate::pwm_baselines::PwmBaselinePoint> = Vec::new();
+    for p in &run.points {
+        let Some(rpm) = p.rpm_after else { continue };
+        match points.iter_mut().find(|e| e.duty_pct == p.requested_pct) {
+            // A bidirectional walk measures most duties twice. Both readings are
+            // legitimate observations of this header at this duty, so the band
+            // spans them rather than one overwriting the other — which is also
+            // how the hysteresis this run just measured stops being reported as
+            // an anomaly by the NEXT run.
+            Some(existing) => {
+                existing.rpm_min = existing.rpm_min.min(rpm);
+                existing.rpm_max = existing.rpm_max.max(rpm);
+            }
+            None => points.push(crate::pwm_baselines::PwmBaselinePoint {
+                duty_pct: p.requested_pct,
+                rpm_min: rpm,
+                rpm_max: rpm,
+            }),
+        }
+    }
+    if points.is_empty() {
+        return None;
+    }
+    let summary = run.summary.as_ref();
+    Some(crate::pwm_baselines::PwmBaselineRecord {
+        header_id: run.header_id.clone(),
+        min_rpm: points.iter().map(|p| p.rpm_min).min(),
+        max_rpm: points.iter().map(|p| p.rpm_max).max(),
+        points,
+        worst_cv_pct: summary.and_then(|s| s.worst_cv_pct),
+        bidirectional: run.bidirectional,
+        run_id: run.run_id.clone(),
+        validated_unix_ms: run
+            .completed_unix_ms
+            .unwrap_or_else(crate::control_paths::unix_ms),
+        runs: 1,
+    })
+}
+
+/// Merge a record into the store and persist it off the runtime.
+///
+/// Persist-first, commit-second, and the commit **re-merges under the write
+/// lock** rather than committing a snapshot computed before the fsync — the same
+/// discipline as the control-path store, and for the same reason: the DEC-296
+/// deadman steal means two runs can be in flight, each holding a pre-fsync clone,
+/// and the later commit would otherwise drop the earlier record.
+async fn persist_baseline(state: &Arc<AppState>, record: crate::pwm_baselines::PwmBaselineRecord) {
+    let to_write = {
+        let guard = state.pwm_baselines.read();
+        let mut store = (**guard).clone();
+        store.merge(record.clone());
+        store
+    };
+    let result = super::persist_off_runtime(move || {
+        crate::pwm_baselines::save_to(&crate::daemon_state::state_dir_path(), &to_write)
+    })
+    .await;
+    match result {
+        Ok(()) => {
+            let mut guard = state.pwm_baselines.write();
+            let mut store = (**guard).clone();
+            store.merge(record);
+            *guard = Arc::new(store);
+        }
+        Err(e) => {
+            // The run itself succeeded and is reported; only the durable learned
+            // band is lost. Leaving the in-memory map untouched keeps it and the
+            // disk from ever disagreeing.
+            log::warn!("could not persist the PWM baseline store: {e}");
+        }
+    }
 }
 
 /// GET /diagnostics/characterization — the current or most recent run.
@@ -1379,6 +1543,7 @@ mod tests {
             control_path: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             control_path_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
+            pwm_baselines: Default::default(),
             openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
             last_openfan_rescan: Arc::new(parking_lot::Mutex::new(None)),
             adopted_poll_handles: Arc::new(parking_lot::Mutex::new(Vec::new())),
