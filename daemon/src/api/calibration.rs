@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::api::preflight::TemperatureFreshness;
 use crate::constants;
 use crate::health::cache::StateCache;
 
@@ -107,6 +108,147 @@ pub fn thermal_force_state(cache: &StateCache) -> Option<String> {
         Some(s) if s == "normal" => None,
         Some(s) => Some(s),
     }
+}
+
+/// [SAFETY] How fresh the temperature telemetry the thermal gates read actually
+/// is (DEC-336, register row `P8-p`).
+///
+/// The CpuTemp-then-fallback selection lives HERE, once, and is the only
+/// producer of a [`TemperatureFreshness`] from a cache in this daemon. It used
+/// to be inlined in `handlers::discovery::gather_preflight`, which made the
+/// preflight the sole reader of a rule the write path also needs; a second
+/// inlined copy at the write path would have been two gating shapes for one
+/// safety rule, which is the proximate cause `CLAUDE.md § Hard-won lessons`
+/// records for the v2.63.1 defect.
+///
+/// A machine with no CPU sensor at all falls back to every temperature it has,
+/// rather than reporting "no temperature sensors" while a dozen are readable.
+/// Every age is taken from ONE `Instant`, so two readings cannot be compared
+/// against two different "now"s.
+///
+/// # The budget is derived, not fixed
+///
+/// [`diagnostic_temp_max_age`] widens the flat
+/// [`constants::DIAGNOSTIC_TEMP_MAX_AGE`] to the cache's own trust window when
+/// the operator has configured a slow poll. **Never refuse on a reading the
+/// thermal ladder itself is still acting on** — see that function.
+pub fn cache_temperature_freshness(cache: &StateCache) -> TemperatureFreshness {
+    // Snapshot FIRST, then stamp `now`. Reversed, any time spent waiting on the
+    // read lock behind the 1 Hz `update_sensors` writer is silently subtracted
+    // from every age, and it subtracts in the fail-OPEN direction: a reading
+    // stamped after `now` saturates to age 0 and reads as fresh. Sub-millisecond
+    // in practice, and this is a gate rather than a report, so it is taken in
+    // the conservative order. (The reversed order was carried over verbatim from
+    // the copy that used to be inlined in `gather_preflight`.)
+    //
+    // `read_with`, not `snapshot()`: a full snapshot clones all five maps of
+    // `DaemonState` to read one, which `health::cache` documents against as
+    // EFF-1. This runs once per POST, once per preflight and once per discovery
+    // cycle, beside two existing full-snapshot callers.
+    let readings: Vec<(String, std::time::Instant)> = cache.read_with(|state| {
+        let cpu: Vec<_> = state
+            .sensors
+            .values()
+            .filter(|s| matches!(s.kind, crate::hwmon::types::SensorKind::CpuTemp))
+            .map(|s| (s.id.clone(), s.updated_at))
+            .collect();
+        if cpu.is_empty() {
+            state
+                .sensors
+                .values()
+                .map(|s| (s.id.clone(), s.updated_at))
+                .collect()
+        } else {
+            cpu
+        }
+    });
+    let now = std::time::Instant::now();
+    crate::api::preflight::temperature_freshness(&readings, diagnostic_temp_max_age(cache), now)
+}
+
+/// [SAFETY] How old a temperature reading may be before a diagnostic treats it
+/// as unusable (DEC-336).
+///
+/// `max(DIAGNOSTIC_TEMP_MAX_AGE, cache.cpu_temp_stale_after())`.
+///
+/// # Why this is not just the constant
+///
+/// The flat 10 s was chosen in DEC-333 as "ten poll intervals", on the stated
+/// assumption that the sensor poll runs at 1 s — and while this predicate was
+/// only ever *reported*, an over-strict budget cost a warning line. DEC-336
+/// made it **refuse**, and an over-strict budget now aborts a diagnostic.
+///
+/// `polling.poll_interval_ms` in `daemon.toml` has no upper bound in
+/// `DaemonConfig::validate`; the overlay clamps it down to
+/// `MAX_SUPERVISABLE_POLL_INTERVAL_MS` (6 s), which is a supported cadence, not
+/// a typo. At 6 s, ordinary reading ages reach 6 s and one missed poll passes
+/// 10 s — so a fixed budget would refuse discovery on a perfectly healthy
+/// machine, with nothing the operator could set to stop it. Worse, the daemon's
+/// own trust window at that cadence is 30 s, so the thermal ladder would still
+/// be acting on a reading this gate had declared unusable.
+///
+/// **That is the invariant, and it is a relationship rather than a number: a
+/// diagnostic must never refuse on a reading the ladder is still acting on.**
+/// `cpu_temp_stale_after` is the one place that window is defined, so this
+/// consumes it rather than restating it — and the flat constant is kept as a
+/// FLOOR so the default 1 s cadence (whose window is 5 s) behaves exactly as it
+/// did before.
+pub fn diagnostic_temp_max_age(cache: &StateCache) -> std::time::Duration {
+    constants::DIAGNOSTIC_TEMP_MAX_AGE.max(cache.cpu_temp_stale_after())
+}
+
+/// [SAFETY] The refusal the preflight publishes, performed (DEC-336, `P8-p`).
+///
+/// `Some(message)` when `diagnostic` blocks on a stale temperature source AND
+/// the cache holds no usable reading. `None` otherwise — including for the two
+/// diagnostics that only *warn*, so this cannot silently widen what verify and
+/// characterisation refuse.
+///
+/// # Why this exists
+///
+/// `GET /diagnostics/preflight` has published `verdict: "blocked"`,
+/// `blocking: ["temperature_source"]` for `control_path_discovery` since
+/// DEC-333, and **nothing performed it**: the POST gated on
+/// [`check_thermal_safety`] and [`thermal_force_state`], both of which compare
+/// `value_c` with no age term. A wedged poll loop therefore froze the cache at
+/// its last-known-good temperatures, the preflight said `blocked`, and the POST
+/// returned `202` and perturbed a header on a machine whose real temperature
+/// was unknown — leaving the refusal to whichever client happened to honour the
+/// verdict, which §6.1 forbids in exactly those words.
+///
+/// It is deliberately keyed on [`Diagnostic::blocks_on_stale_temperature`]
+/// rather than on a `matches!` of its own: that predicate is what the published
+/// report is derived from, so consuming it is what makes the wire verdict and
+/// the daemon's behaviour incapable of disagreeing.
+///
+/// [`Diagnostic::blocks_on_stale_temperature`]: crate::api::preflight::Diagnostic::blocks_on_stale_temperature
+pub fn stale_temperature_refusal(
+    cache: &StateCache,
+    diagnostic: crate::api::preflight::Diagnostic,
+) -> Option<String> {
+    if !diagnostic.blocks_on_stale_temperature() {
+        return None;
+    }
+    let freshness = cache_temperature_freshness(cache);
+    if freshness.is_usable() {
+        return None;
+    }
+    Some(match (freshness.total, freshness.newest_age_ms) {
+        (0, _) => "no temperature readings are available, so the thermal guards \
+                   cannot be evaluated"
+            .to_string(),
+        (_, Some(age)) => format!(
+            "every temperature reading is stale — freshest is {age} ms old, limit \
+             {} ms; the thermal guards cannot be evaluated",
+            // The budget actually applied, not the bare constant: on a slow poll
+            // cadence they differ, and a message naming a limit the daemon did
+            // not use sends the operator looking for the wrong fault.
+            diagnostic_temp_max_age(cache).as_millis()
+        ),
+        _ => "every temperature reading is stale, so the thermal guards cannot be \
+              evaluated"
+            .to_string(),
+    })
 }
 
 /// Restore the pre-calibration duty, unless thermal safety is forcing (DEC-295).

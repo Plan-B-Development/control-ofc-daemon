@@ -42,6 +42,16 @@
 //! temperature source becomes stale/unavailable" as both a preflight check and a
 //! runtime abort trigger, so it is expressed here once and consumed by both.
 //!
+//! **"Consumed by both" was aspirational until DEC-336 and is now true.** From
+//! DEC-333 until then this predicate had exactly one production caller — the
+//! preflight's own gatherer — so the daemon published `blocked` on a stale
+//! temperature source and then accepted the POST anyway (register row `P8-p`).
+//! The runtime half now lives in
+//! [`calibration::stale_temperature_refusal`](crate::api::calibration::stale_temperature_refusal),
+//! which keys on [`Diagnostic::blocks_on_stale_temperature`] rather than
+//! restating the rule, and is called by `POST
+//! /hwmon/{id}/discover-control-path` and by every cycle of the sweep it starts.
+//!
 //! **It does not change what the existing diagnostics do.** A stale temperature
 //! source *blocks* `control_path_discovery` (the new diagnostic, whose abort
 //! triggers this batch defines) and *warns* for verify and characterisation,
@@ -120,6 +130,14 @@ impl Diagnostic {
     /// — the Q3 constraint. Reporting it as a warning is the honest middle: the
     /// operator sees the risk, and the preflight does not promise a refusal the
     /// daemon will not perform.
+    ///
+    /// That last sentence was **false for the one diagnostic that blocks** from
+    /// DEC-333 to DEC-336 — nothing on the write path read this predicate. It
+    /// is now the single source both the report and the refusal are derived
+    /// from (see
+    /// [`calibration::stale_temperature_refusal`](crate::api::calibration::stale_temperature_refusal)),
+    /// which is what makes the two incapable of disagreeing. **Do not add a
+    /// `matches!` copy of this rule at a call site.**
     pub fn blocks_on_stale_temperature(self) -> bool {
         matches!(self, Self::ControlPathDiscovery)
     }

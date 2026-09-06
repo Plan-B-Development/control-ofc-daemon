@@ -12,10 +12,19 @@
 //!
 //! The POST handler's entry sequence is deliberately the **same sequence, in the
 //! same order**, as `hwmon_characterize_handler`: shutdown refusal → thermal
-//! guard → controller present → header known → claim the single-flight slot →
-//! resolve the pump floor → force-take the Verify lease → install the run →
-//! spawn. Every step of it is the existing shared function, so this is a fourth
-//! consumer of one implementation rather than a fourth copy of a sequence.
+//! guard → **staleness refusal** → controller present → header known → claim the
+//! single-flight slot → resolve the pump floor → force-take the Verify lease →
+//! install the run → spawn. Every step of it is the existing shared function, so
+//! this is a fourth consumer of one implementation rather than a fourth copy of
+//! a sequence.
+//!
+//! The one step that is **not** shared is the staleness refusal (DEC-336,
+//! `P8-p`), and that asymmetry is the point: `Diagnostic::blocks_on_stale_temperature`
+//! blocks for this diagnostic alone, because verify and characterisation have
+//! shipped without a staleness gate since 2.32.0 and silently widening what they
+//! refuse is not this change's to make. The guard is therefore keyed on that
+//! predicate rather than written out here, so this handler cannot end up
+//! refusing on a rule different from the one the preflight published.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -118,29 +127,11 @@ fn gather_preflight(
         0
     };
 
-    // [SAFETY] The new staleness predicate. Ages are taken from the same
-    // `Instant`, once, so two readings cannot be compared against two different
-    // "now"s.
-    let now = std::time::Instant::now();
-    let snap = state.cache.snapshot();
-    let readings: Vec<(String, std::time::Instant)> = snap
-        .sensors
-        .values()
-        .filter(|s| matches!(s.kind, crate::hwmon::types::SensorKind::CpuTemp))
-        .map(|s| (s.id.clone(), s.updated_at))
-        .collect();
-    // A machine with no CPU sensor at all falls back to every temperature it has,
-    // rather than reporting "no temperature sensors" while a dozen are readable.
-    let readings = if readings.is_empty() {
-        snap.sensors
-            .values()
-            .map(|s| (s.id.clone(), s.updated_at))
-            .collect()
-    } else {
-        readings
-    };
-    let temperature =
-        pf::temperature_freshness(&readings, crate::constants::DIAGNOSTIC_TEMP_MAX_AGE, now);
+    // [SAFETY] The staleness predicate, from the ONE producer of it
+    // (`calibration::cache_temperature_freshness`). This was inlined here until
+    // DEC-336; the write path needs the same rule, and a second inlined copy
+    // there would have been two gating shapes for one safety rule.
+    let temperature = crate::api::calibration::cache_temperature_freshness(&state.cache);
 
     let too_hot = match crate::api::calibration::check_thermal_safety(&state.cache) {
         Err(crate::api::calibration::CalibrationError::ThermalAbort {
@@ -251,6 +242,39 @@ pub async fn discover_control_path_handler(
     }
     if let Some(resp) = super::verify_thermal_guard(&state.cache) {
         return resp;
+    }
+    // [SAFETY] DEC-336 (`P8-p`): perform the refusal the preflight publishes.
+    // The two guards above compare `value_c` and have no view of how old it is,
+    // so a wedged poll loop presents its last-known-good temperatures forever
+    // and both of them pass. This is the third thermal gate and the only one
+    // that can see that, and it is keyed on the SAME predicate the published
+    // verdict is derived from, so the two cannot disagree.
+    //
+    // Placed before the controller lookup, with the other thermal guards, so it
+    // is reached on every request rather than only on requests that get as far
+    // as resolving hardware. `validation_error` + `retryable`, deliberately not
+    // `thermal_abort`: the machine may be perfectly cool and the honest
+    // statement is that the daemon cannot tell — the same shape, and the same
+    // client-side "soft refusal" taxonomy, as the forcing branch of
+    // `verify_thermal_guard`.
+    if let Some(reason) =
+        crate::api::calibration::stale_temperature_refusal(&state.cache, disc::DISCOVERY_DIAGNOSTIC)
+    {
+        return error_response(
+            StatusCode::CONFLICT,
+            &ErrorEnvelope {
+                error: crate::api::responses::ErrorBody {
+                    code: "validation_error".into(),
+                    message: format!(
+                        "control-path discovery cannot run: {reason}. Retry once \
+                         sensor polling recovers."
+                    ),
+                    retryable: true,
+                    source: "validation".into(),
+                    details: None,
+                },
+            },
+        );
     }
     let Some(controller) = state.hwmon_controller.as_ref() else {
         return error_response(

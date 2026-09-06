@@ -1,5 +1,36 @@
 # Changelog
 
+## [2.42.0] — 2026-09-07
+
+**Two audit findings from the 2026-09-06 cross-stack audit (DEC-336).** Pairs
+with `control-ofc-gui` >= v2.64.1. The GUI half is independent — neither change
+needs the other, and there is no new capability flag.
+
+### Fixed
+- **[SAFETY] Control-path discovery now performs the refusal it publishes.**
+  `GET /diagnostics/preflight` has reported `blocked` on a stale temperature
+  source since 2.39.0, and nothing on the write path acted on it: the two thermal
+  gates compare a temperature against a limit and have no view of how old that
+  reading is, so a sensor-polling loop wedged on an unresponsive chip presented
+  its last-known-good temperatures indefinitely and both gates kept passing. The
+  POST returned `202` and perturbed a fan header on a machine whose real
+  temperature was unknown, leaving the refusal to whichever client happened to
+  honour the verdict. `POST /hwmon/{id}/discover-control-path` now returns
+  `409 validation_error` (retryable) in that state, and a run already in flight
+  aborts and restores on the same per-cycle cadence as the other two thermal
+  gates. Verdict and refusal are derived from one predicate, so they cannot
+  disagree. **Deliberately discovery-only:** fan verify and PWM characterisation
+  have shipped without a staleness gate since 2.32.0 and still only *warn*.
+- **The v2.41.0 release note named the wrong configuration file for
+  `record_startup`, and following it removed pump protection.** It said
+  `runtime.toml`; the key belongs to `/etc/control-ofc/daemon.toml`. The
+  `[startup]` section of `runtime.toml` accepts `delay_secs` alone and rejects
+  unknown keys, so writing it there fails the parse and the **whole file** falls
+  back to defaults — taking every saved header-role assignment with it, and with
+  them the 30% pump floor, the stop exemption and pump-safe identify, on exactly
+  the boards with no usable labels. The note is corrected, `daemon.toml.example`
+  now documents the option where it is read, and a test pins both halves.
+
 ## [2.41.0] — 2026-09-06
 
 **AIO Phase 8 Batch 3a (DEC-335): lifecycle fingerprint, thermal observation and
@@ -25,8 +56,8 @@ capability-gated on the new `control.thermal_observation` flag.
   and the duty commanded and read back while it happened. A cooler that spins its
   fans up at power-on and then obeys the duty is reported as a device behaviour;
   it is explicitly never reported as failed PWM control.
-- **An opt-in startup recording**, `[startup] record_startup` in `runtime.toml`,
-  **off by default**. Records a bounded window at daemon start so the startup
+- **An opt-in startup recording**, `[startup] record_startup` in
+  `/etc/control-ofc/daemon.toml`, **off by default**. Records a bounded window at daemon start so the startup
   behaviour above can be captured without somebody being at the machine. It never
   blocks you: starting a session yourself takes over immediately and the partial
   recording is still saved, and these recordings are retained separately so they

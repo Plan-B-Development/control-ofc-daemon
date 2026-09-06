@@ -6980,3 +6980,151 @@ async fn a_cooling_device_rejects_an_over_long_sensor_id() {
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
 }
+
+// ── DEC-336 / `P8-p`: the POST performs the refusal the preflight publishes ──
+
+/// Re-stamp the state's CPU reading so it is `age` old, **by construction**.
+///
+/// Never by waiting: `std::time::Instant` does not advance under a paused-time
+/// test, so a sleeping staleness test would age by ~0 ms and assert nothing.
+fn age_the_cpu_reading(state: &Arc<AppState>, age: std::time::Duration) {
+    state.cache.update_sensors(vec![CachedSensorReading {
+        id: "hwmon:k10temp:0000:00:18.3:Tctl".into(),
+        kind: SensorKind::CpuTemp,
+        label: "Tctl".into(),
+        value_c: 55.0,
+        source: DeviceLabel::Hwmon,
+        updated_at: Instant::now() - age,
+        rate_c_per_s: None,
+        session_min_c: None,
+        session_max_c: None,
+        chip_name: "k10temp".into(),
+        temp_type: None,
+        thresholds: None,
+    }]);
+}
+
+/// [SAFETY] `POST /hwmon/{id}/discover-control-path` **refuses** when every
+/// temperature reading is stale — the refusal `GET /diagnostics/preflight` has
+/// published as `blocked` since DEC-333 and nothing performed until DEC-336
+/// (register row `P8-p`).
+///
+/// This is a **call-site** test, and deliberately so: `build_report`'s verdict
+/// was already pinned by `discovery_phase8::a_stale_temperature_source_blocks_discovery_and_warns_the_others`,
+/// and that test passed throughout the entire period the handler ignored the
+/// rule. What is asserted here is the realised HTTP status of the real route,
+/// through the real router, over the real socket.
+///
+/// The **fresh** half is what makes it discriminate. With the guard deleted both
+/// halves return the same `503` (this `AppState` has no hwmon controller, the
+/// next refusal down the entry sequence), so the test goes red rather than
+/// silently passing on an unrelated rejection.
+#[tokio::test]
+async fn discovery_post_refuses_a_stale_temperature_source() {
+    let state = test_app_state();
+
+    // Fresh: this request must get PAST the staleness guard. It is then refused
+    // for having no hwmon controller — a different code, from a later step.
+    //
+    // Stamped at zero age explicitly rather than relying on `test_app_state()`'s
+    // own `Instant::now()` still being inside the budget by the time the request
+    // lands. That would hold today by a wide margin, but it is a wall-clock
+    // assumption in the one test whose entire subject is that ages are stamped
+    // by construction — and if it ever missed, the PRECONDITION would go red and
+    // look like the guard misfiring.
+    age_the_cpu_reading(&state, std::time::Duration::ZERO);
+    let (path, shutdown, _dir) = start_test_server(state.clone()).await;
+    let (fresh_status, fresh_json) = uds_post(
+        &path,
+        "/hwmon/hwmon:nct6798:isa:pwm2:AIO_PUMP/discover-control-path",
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(
+        fresh_status, 503,
+        "precondition: a fresh cache must reach the controller check, not the \
+         staleness guard; body was {fresh_json}"
+    );
+    assert_eq!(fresh_json["error"]["code"], "hardware_unavailable");
+
+    // Stale: refused before anything is claimed or written.
+    age_the_cpu_reading(
+        &state,
+        control_ofc_daemon::constants::DIAGNOSTIC_TEMP_MAX_AGE + std::time::Duration::from_secs(5),
+    );
+    let (stale_status, stale_json) = uds_post(
+        &path,
+        "/hwmon/hwmon:nct6798:isa:pwm2:AIO_PUMP/discover-control-path",
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(stale_status, 409, "body was {stale_json}");
+    // `validation_error` + `retryable`, not `thermal_abort`: the machine may be
+    // perfectly cool and the honest statement is that the daemon cannot tell.
+    // This exact pair is also what the GUI's `_is_soft_safety_refusal` reads, so
+    // the message is shown as protection rather than as an error.
+    assert_eq!(stale_json["error"]["code"], "validation_error");
+    assert_eq!(stale_json["error"]["retryable"], true);
+    let msg = stale_json["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("stale"), "message was {msg:?}");
+    // The message is operator-visible and the GUI shows it VERBATIM as a soft
+    // safety refusal, so its rendered form is part of what this change ships.
+    // A run of spaces means a `\`-continued literal lost its continuation —
+    // which is exactly what happened on the first draft of this handler and was
+    // invisible to rustfmt, clippy and every other assertion here.
+    assert!(
+        !msg.contains("  "),
+        "message has collapsed whitespace: {msg:?}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The published verdict and the performed refusal agree on the SAME cache.
+///
+/// The defect `P8-p` records was not that either half was wrong on its own — it
+/// was that they disagreed, and only the report was ever asserted. This pins the
+/// agreement across both routes in one request pair, so a future change that
+/// moves one without the other fails here rather than in the field.
+#[tokio::test]
+async fn a_blocked_preflight_and_a_refused_post_agree_on_one_cache() {
+    let state = test_app_state();
+    age_the_cpu_reading(
+        &state,
+        control_ofc_daemon::constants::DIAGNOSTIC_TEMP_MAX_AGE + std::time::Duration::from_secs(5),
+    );
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (pf_status, pf_json) = uds_get(
+        &path,
+        "/diagnostics/preflight?header=hwmon:nct6798:isa:pwm2:AIO_PUMP\
+         &diagnostic=control_path_discovery",
+    )
+    .await;
+    assert_eq!(pf_status, 200);
+    assert_eq!(pf_json["verdict"], "blocked");
+    assert!(
+        pf_json["blocking"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b == "temperature_source"),
+        "blocking was {}",
+        pf_json["blocking"]
+    );
+
+    let (post_status, _) = uds_post(
+        &path,
+        "/hwmon/hwmon:nct6798:isa:pwm2:AIO_PUMP/discover-control-path",
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(
+        post_status, 409,
+        "the preflight said blocked and the POST did not refuse — this is `P8-p`"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}

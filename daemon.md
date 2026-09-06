@@ -764,7 +764,7 @@ per-member startup fingerprint and the steady-state result before `summarise()` 
 findings read what it writes. A startup override whose commanded duty was honoured is reported as
 a *device behaviour* — never as failed PWM control.
 
-**The opt-in startup auto-record** (`[startup] record_startup`, default `false`) is the only
+**The opt-in startup auto-record** (`[startup] record_startup` in `daemon.toml`, default `false`) is the only
 autonomous behaviour added. `ValidationEngine::start` pre-empts it for any operator-started
 session, finalising rather than discarding it, and `store::prune` retains auto-records in their
 own slot. Both properties are validity-checked in `validation_phase5.rs`. It is also the first

@@ -2553,3 +2553,108 @@ fn the_sample_cap_still_bounds_the_realised_document_with_the_power_fields() {
         "the document must load back"
     );
 }
+
+// ── DEC-336 / `P8-r`: `record_startup` is documented in the file that reads it ──
+
+/// [SAFETY] `[startup] record_startup` belongs to **`daemon.toml`** and is not a
+/// `runtime.toml` key — and following documentation that says otherwise removes
+/// a user's pump protection.
+///
+/// The v2.41.0 release note named `runtime.toml`. `RuntimeStartup` carries
+/// `delay_secs` alone under `#[serde(deny_unknown_fields)]`, so the key there
+/// fails the section parse, `load_from` degrades the **whole file** to defaults,
+/// and the defaults carry no `header_roles` — dropping the 30 % pump floor, the
+/// stop exemption and pump-safe identify on exactly the label-less boards this
+/// programme exists for.
+///
+/// Asserted as a **relationship between the two loaders on one input**, not as a
+/// pair of literals: the same TOML fragment is fed to both, and the test says
+/// which one must accept it. A doc fix alone would have left nothing pinning
+/// this, which is how the note shipped.
+#[test]
+fn record_startup_is_a_daemon_toml_key_and_poisons_runtime_toml() {
+    const FRAGMENT: &str = "[startup]\nrecord_startup = true\n";
+
+    // The file that reads it accepts it.
+    let cfg = control_ofc_daemon::config::DaemonConfig::from_toml(FRAGMENT)
+        .expect("record_startup must parse in daemon.toml");
+    assert!(cfg.startup.record_startup);
+
+    // The file the note named does not — and, crucially, does not merely ignore
+    // the key: it drops everything else in the file with it.
+    let dir = tempfile::tempdir().unwrap();
+    let rt = dir.path().join("runtime.toml");
+    std::fs::write(
+        &rt,
+        format!("{FRAGMENT}\n[hardware]\nheader_roles = {{ \"hwmon:x:y:pwm1:H\" = \"pump\" }}\n"),
+    )
+    .unwrap();
+    let (loaded, degraded) = control_ofc_daemon::runtime_config::RuntimeConfig::load_from_reporting(
+        &rt,
+        control_ofc_daemon::runtime_config::LoadPhase::Startup,
+    );
+    assert!(
+        degraded.is_some(),
+        "runtime.toml accepted record_startup — if this ever becomes true, the \
+         documentation in packaging/daemon.toml.example must be revisited"
+    );
+    // The [SAFETY] consequence, asserted rather than described: the pump role
+    // the same file carried is GONE.
+    assert!(
+        loaded
+            .hardware
+            .as_ref()
+            .map(|h| h.header_roles.is_empty())
+            .unwrap_or(true),
+        "header_roles survived the degradation, so the safety consequence this \
+         test exists to pin is no longer real"
+    );
+
+    // Precondition: that same file, WITHOUT the poisoning key, really does keep
+    // its header_roles. Without this the assertion above passes for a loader
+    // that never reads header_roles at all.
+    let ok = dir.path().join("ok.toml");
+    std::fs::write(
+        &ok,
+        "[hardware]\nheader_roles = { \"hwmon:x:y:pwm1:H\" = \"pump\" }\n",
+    )
+    .unwrap();
+    let (good, no_degrade) = control_ofc_daemon::runtime_config::RuntimeConfig::load_from_reporting(
+        &ok,
+        control_ofc_daemon::runtime_config::LoadPhase::Startup,
+    );
+    assert!(no_degrade.is_none());
+    assert_eq!(
+        good.hardware.as_ref().map(|h| h.header_roles.len()),
+        Some(1),
+        "the control file lost its header_roles too, so the test is blind"
+    );
+}
+
+/// The shipped example config documents the key, in the section that reads it.
+///
+/// `packaging/daemon.toml.example` is the file `daemon/README.md` sends users
+/// to, and `record_startup` being absent from it is half of why the release note
+/// sent people to the wrong file. Pinned so the line cannot be dropped silently.
+#[test]
+fn the_example_config_documents_record_startup_under_startup() {
+    const EXAMPLE: &str = include_str!("../../packaging/daemon.toml.example");
+    // Matched in TABLE-HEADER position, not as a substring: the file's own
+    // preamble lists "[startup]  delay_secs" in a comment, and a substring split
+    // lands there instead — the same trap `CLAUDE.md § Hard-won lessons` records
+    // for a source-scanning guard matching its own explanation.
+    let startup = EXAMPLE
+        .split("\n[startup]\n")
+        .nth(1)
+        .expect("the example config must have a [startup] section");
+    let section = startup.split("\n[").next().unwrap();
+    assert!(
+        section.contains("record_startup"),
+        "[startup] section does not mention record_startup:\n{section}"
+    );
+    // And the commented form must be the real key, so uncommenting it works.
+    assert!(
+        section.contains("# record_startup = false"),
+        "the documented default is not a directly uncommentable line:\n{section}"
+    );
+}

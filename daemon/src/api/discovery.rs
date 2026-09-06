@@ -54,11 +54,23 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::api::calibration::{check_thermal_safety, thermal_force_state};
+use crate::api::calibration::{
+    check_thermal_safety, stale_temperature_refusal, thermal_force_state,
+};
 use crate::api::characterization::{RestoreOnDrop, RestoreReport};
 use crate::api::responses::HwmonVerifyState;
 use crate::constants;
 use crate::health::cache::StateCache;
+
+/// The diagnostic this module IS, named once (DEC-336, `P8-p`).
+///
+/// The POST handler's entry guard and [`run_discovery`]'s per-cycle guard both
+/// key their staleness refusal on this, so neither can end up gated on a
+/// different diagnostic than the preflight the operator was shown. Consuming
+/// `Diagnostic::blocks_on_stale_temperature` rather than restating the rule is
+/// what keeps the published verdict and the enforced behaviour in step.
+pub const DISCOVERY_DIAGNOSTIC: crate::api::preflight::Diagnostic =
+    crate::api::preflight::Diagnostic::ControlPathDiscovery;
 
 // ── Vocabulary ───────────────────────────────────────────────────────
 
@@ -710,6 +722,27 @@ where
                      discovery cannot write"
                 )
             );
+        }
+        // [SAFETY] DEC-336 (`P8-p`): the third thermal gate, and the only one
+        // that can see a poll loop that has stopped. The two above compare
+        // `value_c` against a limit; neither has a view of how OLD that value
+        // is, so a reader wedged mid-run freezes the cache and both keep
+        // passing on last-known-good readings while this sweep goes on writing.
+        // Evaluated ONCE PER CYCLE, alongside its two siblings — **not** ahead
+        // of every `keepalive()`, which an earlier draft of this comment
+        // claimed. A cycle holds two observation windows and therefore two
+        // keepalives, so a poll that wedges just after this check leaves the
+        // header at the perturbed duty for up to two windows (~30 s at the
+        // documented 15 s maximum) before the run aborts and restores. That is
+        // the same cadence `check_thermal_safety` and `thermal_force_state`
+        // have always run at, so this matches its siblings rather than
+        // introducing a new gap — and tightening all three to per-window is
+        // register row `P8-u`, deliberately out of scope here. The comment is
+        // corrected rather than the code because a safety comment that
+        // overstates its own cadence is how the next reader concludes the gap
+        // is already covered.
+        if let Some(reason) = stale_temperature_refusal(cache, DISCOVERY_DIAGNOSTIC) {
+            bail!(STATE_ABORTED, reason);
         }
         // ── Baseline window ──
         // Written explicitly rather than assumed: cycle 2 arrives here straight

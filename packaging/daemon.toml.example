@@ -43,6 +43,19 @@
 # Seconds to wait before device detection at boot (0–30). The API
 # (POST /config/startup-delay) can override this at runtime.
 # delay_secs = 0
+#
+# Record a short lifecycle session automatically at daemon start, so a cooler's
+# power-on behaviour is captured without somebody sitting at the machine
+# (DEC-335). Writes no hardware, takes no lease, and never blocks you: starting
+# a session yourself takes the slot immediately and the partial recording is
+# still saved. Default: false.
+#
+# This key belongs HERE and is NOT settable in runtime.toml — that file's
+# [startup] section accepts delay_secs alone, under deny_unknown_fields, so an
+# unknown key there fails the parse and the WHOLE file falls back to defaults
+# (taking your saved header_roles pump assignments with it). There is no
+# POST /config/* route for this one.
+# record_startup = false
 
 [detection]
 # Opt-in active Super-I/O port probe (DEC-203). Default: false.

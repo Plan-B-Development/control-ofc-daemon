@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use control_ofc_daemon::api::calibration as cal;
 use control_ofc_daemon::api::characterization::{RestoreOutcome, RestoreReport};
 use control_ofc_daemon::api::discovery as disc;
 use control_ofc_daemon::api::preflight as pf;
@@ -62,6 +63,31 @@ fn cache_at(temp_c: f64, thermal_state: Option<&str>) -> StateCache {
     if let Some(s) = thermal_state {
         cache.record_engine_tick(s, constants::THERMAL_EMERGENCY_TRIGGER_C);
     }
+    cache
+}
+
+/// A cache whose one CPU reading is `age` old, stamped **by construction**.
+///
+/// Never by waiting: `std::time::Instant` does not advance under
+/// `#[tokio::test(start_paused)]`, so a sleeping staleness test would age by
+/// ~0 ms and pass while asserting nothing (tokio trap 1, and the reason this
+/// file's module doc names it).
+fn cache_aged(temp_c: f64, age: Duration) -> StateCache {
+    let cache = StateCache::new();
+    cache.update_sensors(vec![CachedSensorReading {
+        id: "cpu".into(),
+        kind: SensorKind::CpuTemp,
+        label: "Tctl".into(),
+        value_c: temp_c,
+        source: DeviceLabel::Hwmon,
+        updated_at: Instant::now() - age,
+        rate_c_per_s: None,
+        session_min_c: None,
+        session_max_c: None,
+        chip_name: "k10temp".into(),
+        temp_type: None,
+        thresholds: None,
+    }]);
     cache
 }
 
@@ -1670,4 +1696,196 @@ fn ingest_truncation_does_not_split_a_codepoint() {
     let kept = &store.get("h").unwrap().relationship;
     assert!(kept.len() <= constants::CONTROL_PATH_MAX_TEXT_BYTES);
     assert!(kept.chars().all(|c| c == 'é'));
+}
+
+// ── DEC-336 / `P8-p`: the published refusal is PERFORMED ─────────────
+
+/// [SAFETY] The refusal rule, asserted as the RELATIONSHIP it is derived from.
+///
+/// `blocks_on_stale_temperature()` is what `build_report` keys the `blocked`
+/// verdict on, so the enforcement must key on the same thing. Asserting
+/// `is_some()` for discovery and `is_none()` for the other two against literals
+/// would pass for an implementation that hardcoded `matches!(d,
+/// ControlPathDiscovery)` — the exact second copy that could later disagree with
+/// the published verdict. The right-hand side is therefore the predicate itself,
+/// evaluated per diagnostic, and BOTH branches are exercised (a rule stuck at
+/// `true` fails the verify/characterisation arms).
+#[test]
+fn stale_temperature_refusal_tracks_the_predicate_the_verdict_is_published_from() {
+    let stale = cache_aged(
+        40.0,
+        constants::DIAGNOSTIC_TEMP_MAX_AGE + Duration::from_secs(5),
+    );
+    let fresh = cache_aged(40.0, Duration::from_millis(0));
+
+    let mut blocked_any = false;
+    let mut warned_any = false;
+    for d in [
+        pf::Diagnostic::Verify,
+        pf::Diagnostic::Characterization,
+        pf::Diagnostic::ControlPathDiscovery,
+    ] {
+        let refused = cal::stale_temperature_refusal(&stale, d).is_some();
+        assert_eq!(
+            refused,
+            d.blocks_on_stale_temperature(),
+            "{} refuses on stale = {refused}, but blocks_on_stale_temperature() = {}",
+            d.token(),
+            d.blocks_on_stale_temperature()
+        );
+        blocked_any |= d.blocks_on_stale_temperature();
+        warned_any |= !d.blocks_on_stale_temperature();
+
+        // A fresh cache never refuses, for any diagnostic. Without this the
+        // predicate could be stuck at "always refuse" and still pass above.
+        assert!(
+            cal::stale_temperature_refusal(&fresh, d).is_none(),
+            "{} refused on a FRESH cache",
+            d.token()
+        );
+    }
+    // Precondition: both branches were actually observed, or the loop asserted
+    // nothing about the distinction it exists to prove.
+    assert!(blocked_any && warned_any);
+
+    // An empty cache is distinguishable from a stale one, and both refuse.
+    let empty = StateCache::new();
+    let msg = cal::stale_temperature_refusal(&empty, pf::Diagnostic::ControlPathDiscovery)
+        .expect("no readings at all must refuse");
+    assert!(
+        msg.contains("no temperature readings"),
+        "message was {msg:?}"
+    );
+}
+
+/// [SAFETY] The staleness the preflight publishes aborts the SWEEP, and the
+/// abort is asserted on the writes that were actually issued.
+///
+/// The realised artefact, not a re-derivation: `rig.written` is what the sweep
+/// really commanded. A test that only read `outcome.state` would pass for a run
+/// that perturbed the header and *then* reported `aborted`.
+#[tokio::test]
+async fn a_stale_temperature_source_aborts_the_sweep_before_it_writes() {
+    let cache = Arc::new(cache_aged(
+        40.0,
+        constants::DIAGNOSTIC_TEMP_MAX_AGE + Duration::from_secs(5),
+    ));
+    let rig = Rig::new(30);
+    let cancel = AtomicBool::new(false);
+    let report = RestoreReport::default();
+    let chans = channels(&[("pump", true)]);
+
+    let outcome = sweep(
+        &rig,
+        &cache,
+        &chans,
+        30,
+        70,
+        2,
+        0,
+        false,
+        |_, duty| Some(u16::from(duty) * 20),
+        None,
+        None,
+        &cancel,
+        &report,
+    )
+    .await;
+
+    assert_eq!(outcome.state, disc::STATE_ABORTED);
+    assert!(
+        outcome.detail.as_deref().unwrap_or("").contains("stale"),
+        "detail was {:?}",
+        outcome.detail
+    );
+    // Not "wrote nothing": `RestoreOnDrop` puts the header back on EVERY exit
+    // path, including this one, so the pre-run duty is legitimately re-commanded
+    // and asserting an empty list would fail for the right behaviour. The safety
+    // property is that the header was never moved OFF its pre-run duty.
+    let wrote = rig.written.lock().unwrap().clone();
+    assert!(
+        wrote.iter().all(|&d| d == 30),
+        "the sweep perturbed the header despite refusing: {wrote:?}"
+    );
+
+    // The discriminating control: the SAME sweep on a fresh cache does perturb.
+    // Without it, this test would pass against a sweep that never writes at all.
+    let fresh = Arc::new(cache_aged(40.0, Duration::from_millis(0)));
+    let rig2 = Rig::new(30);
+    let cancel2 = AtomicBool::new(false);
+    let report2 = RestoreReport::default();
+    let outcome2 = sweep(
+        &rig2,
+        &fresh,
+        &chans,
+        30,
+        70,
+        2,
+        0,
+        false,
+        |_, duty| Some(u16::from(duty) * 20),
+        None,
+        None,
+        &cancel2,
+        &report2,
+    )
+    .await;
+    assert_ne!(outcome2.state, disc::STATE_ABORTED);
+    assert!(
+        rig2.written.lock().unwrap().contains(&70),
+        "the fresh-cache control never reached the perturbed duty, so the assertion \
+         above proves nothing: {:?}",
+        rig2.written.lock().unwrap()
+    );
+}
+
+/// [SAFETY] **A diagnostic never refuses on a reading the thermal ladder is
+/// still acting on** (DEC-336, the concurrency review's finding 2).
+///
+/// Asserted as that RELATIONSHIP across the supported cadence range, not as a
+/// number: `diagnostic_temp_max_age` must be `>= cache.cpu_temp_stale_after()`
+/// at every poll interval the daemon accepts, and never below the flat constant
+/// at the default. A literal `10_000` would be satisfied by the fixed budget
+/// this test exists to reject.
+///
+/// The interesting cadence is the slow end. `DaemonConfig::validate` bounds
+/// `polling.poll_interval_ms` only from BELOW (>= 100 ms), and the runtime
+/// overlay clamps it down to `MAX_SUPERVISABLE_POLL_INTERVAL_MS` — so 6 s is a
+/// supported configuration, not a typo, and at 6 s the ladder trusts a reading
+/// for 30 s while a flat 10 s budget would have aborted a healthy run.
+#[test]
+fn the_diagnostic_budget_never_undercuts_the_ladders_own_trust_window() {
+    let mut saw_widened = false;
+    let mut saw_floor = false;
+    for interval_ms in [1000u64, 2000, 4000, 6000] {
+        let cache = cache_aged(40.0, Duration::from_millis(0));
+        cache.set_hwmon_poll_interval_ms(interval_ms);
+        let budget = cal::diagnostic_temp_max_age(&cache);
+        let ladder = cache.cpu_temp_stale_after();
+
+        assert!(
+            budget >= ladder,
+            "at {interval_ms} ms the diagnostic would refuse at {budget:?} while the \
+             ladder still acts on a reading up to {ladder:?} old"
+        );
+        assert!(
+            budget >= constants::DIAGNOSTIC_TEMP_MAX_AGE,
+            "at {interval_ms} ms the budget fell below the flat floor"
+        );
+        saw_widened |= budget > constants::DIAGNOSTIC_TEMP_MAX_AGE;
+        saw_floor |= budget == constants::DIAGNOSTIC_TEMP_MAX_AGE;
+    }
+    // Preconditions: both regimes were actually observed. Without these the loop
+    // passes for a budget that is always the constant (the defect) or always the
+    // ladder window (which would silently move the default cadence's behaviour).
+    assert!(saw_floor, "no cadence exercised the flat-floor regime");
+    assert!(saw_widened, "no cadence exercised the widened regime");
+
+    // And the default cadence is unchanged, which is what lets every other test
+    // in this file keep asserting against the flat constant.
+    let cache = cache_aged(40.0, Duration::from_millis(0));
+    assert_eq!(
+        cal::diagnostic_temp_max_age(&cache),
+        constants::DIAGNOSTIC_TEMP_MAX_AGE
+    );
 }
