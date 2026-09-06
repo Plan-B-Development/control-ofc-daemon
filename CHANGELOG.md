@@ -1,6 +1,6 @@
 # Changelog
 
-## [2.42.0] — 2026-09-07
+## [2.42.0] — 2026-09-06
 
 **Two audit findings from the 2026-09-06 cross-stack audit (DEC-336).** Pairs
 with `control-ofc-gui` >= v2.64.1. The GUI half is independent — neither change
