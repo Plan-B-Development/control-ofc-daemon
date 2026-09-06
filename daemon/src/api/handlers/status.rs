@@ -350,6 +350,11 @@ pub async fn capabilities_handler(
             // routes. The additive `pwm_readback_pct` field that shipped with
             // them is optional on the wire and needs no flag.
             validation_sessions: true,
+            // AIO Phase 8 Batch 1, daemon >= 2.39.0. Discovery and preflight are
+            // flagged separately because preflight is read-only and also covers
+            // the two pre-existing diagnostics.
+            control_path_discovery: true,
+            diagnostic_preflight: true,
             // `WIRE-k`: five features that shipped before this block had keys
             // for them, so clients gated on a version string or on a probe's
             // 404. All true here — the flag exists so a client can stop

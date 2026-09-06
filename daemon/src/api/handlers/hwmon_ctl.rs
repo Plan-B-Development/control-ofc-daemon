@@ -180,9 +180,14 @@ const VERIFY_WAIT_SECONDS: u8 = crate::constants::VERIFY_WAIT_SECONDS;
 /// sequence is ever made cancellable again, this reasoning fails with it — the
 /// coalescing state would then claim the pre-verify duty while the hardware sat
 /// at the test duty.
-struct VerifyLeaseGuard {
-    controller: std::sync::Arc<parking_lot::Mutex<crate::hwmon::pwm_control::HwmonPwmController>>,
-    lease_id: String,
+/// Also constructed by `handlers::discovery` (AIO Phase 8 Batch 1), which is why
+/// this and its fields are `pub(crate)`. The guard is unchanged; a fourth
+/// diagnostic simply releases its force-taken lease the same way the other three
+/// do, rather than growing a fourth copy of the release.
+pub(crate) struct VerifyLeaseGuard {
+    pub(crate) controller:
+        std::sync::Arc<parking_lot::Mutex<crate::hwmon::pwm_control::HwmonPwmController>>,
+    pub(crate) lease_id: String,
 }
 impl Drop for VerifyLeaseGuard {
     fn drop(&mut self) {
@@ -1371,6 +1376,9 @@ mod tests {
             characterization: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             validation: std::sync::Arc::new(Default::default()),
             characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            control_path: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            control_path_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
             openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
             last_openfan_rescan: Arc::new(parking_lot::Mutex::new(None)),
             adopted_poll_handles: Arc::new(parking_lot::Mutex::new(Vec::new())),

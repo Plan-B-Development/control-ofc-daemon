@@ -560,3 +560,188 @@ const _: () = assert!(VALIDATION_DIVERGENCE_MIN_PWM_SWING_PCT > 0);
 /// (DEC-257). Raising it is a real compatibility claim: move the release-note
 /// line in the same change, and only for a genuine GUI-side requirement.
 pub const MIN_SUPPORTED_GUI: &str = "2.23.0";
+
+// ── AIO Phase 8 Batch 1: control-path discovery + diagnostic preflight ──────
+
+/// Default perturbation size, in duty points, for `POST
+/// /hwmon/{id}/discover-control-path`.
+///
+/// 25 matches [`IDENTIFY_PUMP_DELTA_PCT`] deliberately: that value was chosen so
+/// a pump moves audibly and measurably without approaching either rail, and the
+/// discovery sweep wants exactly the same property. It is NOT the verify's 40,
+/// which is sized to clear `classify_verify_result`'s >20 % relative test on a
+/// single reading — discovery compares against a *measured* per-channel noise
+/// floor across two cycles instead, so it can be gentler.
+pub const DISCOVERY_DELTA_PCT: u8 = 25;
+
+/// Clamp on a caller-supplied perturbation size. The floor keeps the swing above
+/// tach noise on a slow pump; the ceiling keeps it well short of a rail so
+/// [`perturbation_target`](crate::api::discovery::perturbation_target) always has
+/// somewhere to go.
+pub const DISCOVERY_DELTA_MIN_PCT: u8 = 10;
+pub const DISCOVERY_DELTA_MAX_PCT: u8 = 40;
+
+/// [SAFETY] The floor under every duty control-path discovery commands, on ANY
+/// header — the same flat rule as [`CHARACTERIZATION_MIN_PCT`] and for the same
+/// reason: one clamp `[max(DISCOVERY_MIN_PCT, header floor) .. 100]`, never a
+/// role-conditional branch, so "0 % is unreachable through this endpoint" is a
+/// single assertion rather than a claim about how good `header_is_pump_protected`
+/// is on every board.
+///
+/// `AIO-Phase7-Batch1` §2 is explicit for pump-role and ambiguous-role channels:
+/// never command 0 %, never cross below the safe minimum, and choose the
+/// perturbation entirely within the safe range. This constant is the "never 0 %"
+/// half; the header floor supplied by the caller is the other.
+pub const DISCOVERY_MIN_PCT: u8 = 20;
+
+/// Perturbation cycles per run, and the clamp on a caller-supplied count.
+///
+/// Two by default because repeatability is a **confidence input** (§2), not a
+/// nicety: one cycle cannot distinguish a tach that responded from a tach that
+/// happened to drift during the window. Three is the ceiling so the worst-case
+/// run stays inside the pause budget asserted below.
+pub const DISCOVERY_DEFAULT_CYCLES: u8 = 2;
+pub const DISCOVERY_MAX_CYCLES: u8 = 3;
+
+/// Cap on the tach channels one run observes.
+///
+/// Load-bearing rather than cosmetic (DEC-320): every observation is copied into
+/// the run, from there into a validation session's `evidence[]`, and from there
+/// into every export. An unbounded channel set therefore scales the session
+/// document with the machine's hwmon topology, which is exactly the shape of
+/// defect `VALIDATION_MAX_SAMPLE_BYTES` exists to prevent. 32 is roughly four
+/// times the largest tach count seen on a consumer board.
+pub const DISCOVERY_MAX_TACH_CHANNELS: usize = 32;
+
+/// Sub-sampling cadence inside an observation window. Shared with the
+/// characterisation sweep so the two diagnostics read hardware at one rate, and
+/// so [`crate::api::discovery::measurement_resolution_ms`] can derive a driver's
+/// update cadence from samples the run already took rather than from a second,
+/// faster polling loop.
+pub const DISCOVERY_SAMPLE_INTERVAL: Duration = CHARACTERIZATION_SAMPLE_INTERVAL;
+
+/// A tach must move at least this fraction of its own baseline before the run
+/// will call it a response, expressed in percent.
+pub const DISCOVERY_RESPONSE_MIN_PCT: u8 = 10;
+
+/// …and it must move at least this multiple of the largest change seen on any
+/// NON-target channel in the same window. This is what separates "this header
+/// drives this tach" from "the whole machine sped up while we were looking".
+pub const DISCOVERY_TARGET_OVER_NOISE: u16 = 3;
+
+/// Absolute floor under a measured per-channel noise estimate, in RPM. A channel
+/// that reads perfectly steady during the baseline window would otherwise get a
+/// zero noise floor, making any single-RPM flicker a "response".
+pub const DISCOVERY_MIN_NOISE_FLOOR_RPM: u16 = 50;
+
+/// Maximum age of a temperature reading before a diagnostic treats its
+/// temperature source as stale.
+///
+/// [SAFETY] `AIO-Phase7-Batch1` §1 requires "required temperature source becomes
+/// stale/unavailable" as both a preflight check and a runtime abort trigger, and
+/// nothing in this daemon previously expressed it: `check_thermal_safety`
+/// iterates whatever the cache holds, with no view of how old it is, so a poll
+/// loop wedged on an unresponsive chip presents its last-known-good temperatures
+/// forever and every thermal gate passes on them.
+///
+/// 10 s is ten poll intervals ([`crate::constants::VALIDATION_SAMPLE_INTERVAL`]
+/// is 1 s and the sensor poll matches it), so a healthy machine never trips it
+/// and a genuinely wedged reader trips it inside one settle window.
+pub const DIAGNOSTIC_TEMP_MAX_AGE: Duration = Duration::from_secs(10);
+
+/// Retained control-path records. Keyed by header id, so this is a ceiling on
+/// distinct headers ever discovered rather than on runs.
+pub const CONTROL_PATHS_MAX_ENTRIES: usize = 64;
+
+/// Ingest bound on every client-influenced string stored in a control-path
+/// record. Matches [`VALIDATION_MAX_TEXT_FIELD_BYTES`].
+pub const CONTROL_PATH_MAX_TEXT_BYTES: usize = VALIDATION_MAX_TEXT_FIELD_BYTES;
+
+/// Tach references stored per record.
+///
+/// Deliberately far below [`DISCOVERY_MAX_TACH_CHANNELS`]: a run *observes* every
+/// channel, but a record only keeps the ones that **responded**, and a single PWM
+/// header driving more than eight tach-reporting devices is not a thing. This is
+/// the difference between a per-record ceiling of ~10 KB and one of ~35 KB, and
+/// it is a bound on stored data rather than on what the diagnostic may look at.
+pub const CONTROL_PATH_MAX_TACH_REFS: usize = 8;
+
+/// Worst-case serialised size of one record.
+///
+/// **Derived, not assumed** — this is the DEC-320 rule applied to its own
+/// successor. Five scalar text fields (`header_id`, `relationship`, `confidence`,
+/// `direction`, `run_id`) plus an id and a label for each stored tach reference,
+/// every one of them at the full ingest bound, plus slack for JSON syntax, keys
+/// and the numeric fields.
+///
+/// The first version of this constant assumed "about four text fields" and
+/// produced a 256 KiB file cap for a store whose real worst case was 2.2 MiB —
+/// i.e. a daemon that could write a document it would then refuse to read on the
+/// next boot. That was found by a test asserting the **realised** file length of
+/// a deliberately full store, not by re-deriving this arithmetic.
+pub const CONTROL_PATH_RECORD_MAX_BYTES: usize = {
+    // `header_id` is stored TWICE — once as the `BTreeMap` key and once as a
+    // field — so the field count is 6, not 5. Missing that was worth 512 bytes a
+    // record, and the realised-length test is what found it.
+    let text_fields = 6 + 2 * CONTROL_PATH_MAX_TACH_REFS;
+    // Per-field JSON overhead: the key name, quotes, colon, comma and the
+    // pretty-printer's indentation. Scales WITH the field count rather than
+    // being a flat allowance, so adding a field cannot silently eat the margin
+    // (DEC-303: provision above the slope, not above today's worst cell).
+    text_fields * (CONTROL_PATH_MAX_TEXT_BYTES + 128) + 512
+};
+
+/// Byte ceiling on `{state_dir}/control_paths.json`.
+///
+/// Read with a stat BEFORE the file is opened, exactly as
+/// `validation::store::read_session` does: an over-size document is discarded
+/// and deleted rather than parsed. Bounding the ingest (see
+/// [`CONTROL_PATH_MAX_TEXT_BYTES`]) is what makes that safe — it means "too
+/// large" can only be a document this daemon did not write, never a legitimate
+/// one it must now refuse to read.
+///
+/// **Derived from the per-record ceiling** so the two can never disagree. A
+/// hand-picked number here is how a legitimately full store becomes permanently
+/// unreadable.
+pub const CONTROL_PATHS_MAX_BYTES: u64 =
+    (CONTROL_PATHS_MAX_ENTRIES * CONTROL_PATH_RECORD_MAX_BYTES + 8192) as u64;
+
+// Compile-time invariants for the above.
+// [SAFETY] 0 % must be unreachable through discovery, for every header.
+const _: () = assert!(DISCOVERY_MIN_PCT > 0);
+// A perturbation must fit between the floor and the ceiling with room to spare,
+// or `perturbation_target` could be asked for a swing it cannot take in either
+// direction.
+const _: () = assert!(DISCOVERY_DELTA_MAX_PCT < 100 - DISCOVERY_MIN_PCT);
+const _: () = assert!(DISCOVERY_DELTA_MIN_PCT <= DISCOVERY_DELTA_PCT);
+const _: () = assert!(DISCOVERY_DELTA_PCT <= DISCOVERY_DELTA_MAX_PCT);
+const _: () = assert!(DISCOVERY_DEFAULT_CYCLES >= 2);
+const _: () = assert!(DISCOVERY_DEFAULT_CYCLES <= DISCOVERY_MAX_CYCLES);
+const _: () = assert!(DISCOVERY_MAX_TACH_CHANNELS > 0);
+const _: () = assert!(DISCOVERY_TARGET_OVER_NOISE > 1);
+// [SAFETY] The pause deadman is renewed before **every observation window**, so
+// the renewal interval is ONE window — `api::discovery::run_discovery` is what
+// makes that true, and this assertion is the tripwire on it.
+//
+// The distinction is not pedantic and it was wrong on the first attempt: a cycle
+// holds TWO windows, so renewing once per cycle makes the interval `2 × window`,
+// which at the maximum settle (15 s) equals the deadman (30 s) before any I/O
+// overhead. The pause then expires mid-run, the engine's write phase resumes,
+// and `try_begin_verify`'s steal branch lets a second diagnostic force-take this
+// run's lease so even its restore fails — the DEC-296 defect. If the renewal is
+// ever moved back to per-cycle, this assertion must become
+// `CHARACTERIZATION_SETTLE_MAX_S * 4 <= …`, which does not hold, which is the
+// point of writing it this way.
+const _: () = assert!(CHARACTERIZATION_SETTLE_MAX_S * 2 <= VERIFY_PAUSE_DEADMAN.as_secs());
+const _: () = assert!(CONTROL_PATHS_MAX_ENTRIES > 0);
+const _: () = assert!(CONTROL_PATH_MAX_TEXT_BYTES > 0);
+const _: () = assert!(CONTROL_PATH_MAX_TACH_REFS > 0);
+const _: () = assert!(CONTROL_PATH_MAX_TACH_REFS <= DISCOVERY_MAX_TACH_CHANNELS);
+// The store must be able to hold its own maximum: every entry at full text
+// length, with slack for JSON, still inside the byte ceiling. This holds by
+// construction now that the file cap is derived from the record cap — the
+// assertion stays as a tripwire for a future field added to the record without
+// updating `CONTROL_PATH_RECORD_MAX_BYTES`.
+const _: () = assert!(
+    CONTROL_PATHS_MAX_ENTRIES * CONTROL_PATH_RECORD_MAX_BYTES < CONTROL_PATHS_MAX_BYTES as usize
+);

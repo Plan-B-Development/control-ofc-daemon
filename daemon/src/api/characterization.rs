@@ -487,17 +487,25 @@ pub fn summarise(points: &[CharPoint]) -> CharSummary {
 /// written there would re-assert `pwm_enable=1` at a fixed duty with no writer
 /// left to revise it — the exact DEC-290 / 277-c hazard. Checking before the
 /// await instead of inside `drop` would not cover it.
-struct RestoreOnDrop<'a, W: Fn(u8) -> Result<(), String>, S: Fn() -> bool> {
-    header_id: &'a str,
-    original_pct: Option<u8>,
-    write_fn: &'a W,
-    cache: &'a StateCache,
-    shutting_down: &'a S,
+///
+/// **Second consumer, AIO Phase 8 Batch 1.** `api::discovery`'s control-path
+/// sweep constructs one of these too, which is why the struct and its fields are
+/// `pub(crate)` rather than private. Nothing about the guard changed for that —
+/// the two skip rules, their order, and the `restore_floor` clamp are the same
+/// code running for both diagnostics, which is the point. **The drop-order
+/// invariant travels with it**: whoever builds one must declare it LAST in its
+/// scope so it drops FIRST, while the caller's hwmon lease guard is still held.
+pub(crate) struct RestoreOnDrop<'a, W: Fn(u8) -> Result<(), String>, S: Fn() -> bool> {
+    pub(crate) header_id: &'a str,
+    pub(crate) original_pct: Option<u8>,
+    pub(crate) write_fn: &'a W,
+    pub(crate) cache: &'a StateCache,
+    pub(crate) shutting_down: &'a S,
     /// Set by the sweep loop before its first write. Distinguishes "there was no
     /// pre-sweep duty to restore and we never moved the header" (nothing to
     /// report) from "we moved it and cannot put it back" ([`RestoreOutcome::NoOriginalDuty`]).
-    wrote_any: &'a AtomicBool,
-    report: &'a RestoreReport,
+    pub(crate) wrote_any: &'a AtomicBool,
+    pub(crate) report: &'a RestoreReport,
     /// [SAFETY] `AUD3-l`. The lowest duty this header may be RESTORED to —
     /// `HARD_PUMP_CPU_FLOOR_PCT` for a pump-protected header, 0 for everything
     /// else. `resolve_points` has always floored the duties written on the way
@@ -505,7 +513,7 @@ struct RestoreOnDrop<'a, W: Fn(u8) -> Result<(), String>, S: Fn() -> bool> {
     /// applies no floor of its own. Restoring a captured 0 to a pump therefore
     /// converted "0 under firmware control" into "0 under `pwm_enable=1` with no
     /// writer" — a stopped pump. Same clamp as `hwmon_ctl::restore_duty`.
-    restore_floor: u8,
+    pub(crate) restore_floor: u8,
 }
 
 impl<W: Fn(u8) -> Result<(), String>, S: Fn() -> bool> Drop for RestoreOnDrop<'_, W, S> {

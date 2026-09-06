@@ -1507,6 +1507,33 @@ async fn async_main() {
         }
     };
 
+    // AIO Phase 8 Batch 1 (§6.3): load the persisted PWM to tach relationships
+    // and drop any whose header discovery can no longer see.
+    //
+    // The invalidation is structural, not a policy anyone has to remember: a
+    // record is keyed by the header's stable id, which embeds chip, device,
+    // `pwmN` and label. Change the board, the driver, or start publishing labels
+    // and the id changes with it, so a record that SURVIVES this prune is a
+    // record whose hardware did not change. §6.3's warning against persisting a
+    // mapping "as unquestioned truth" is satisfied here rather than by a
+    // freshness heuristic.
+    let control_paths_at_boot = {
+        let dir = control_ofc_daemon::daemon_state::state_dir_path();
+        let loaded = control_ofc_daemon::control_paths::load_from(&dir);
+        let live: Vec<String> = hwmon_headers_for_poll
+            .iter()
+            .map(|h| h.id.clone())
+            .collect();
+        let pruned =
+            control_ofc_daemon::api::handlers::discovery::prune_store_to_live(&loaded, &live);
+        if pruned != loaded {
+            if let Err(e) = control_ofc_daemon::control_paths::save_to(&dir, &pruned) {
+                log::warn!("could not rewrite the pruned control-path store: {e}");
+            }
+        }
+        pruned
+    };
+
     let staleness_config = StalenessConfig {
         openfan_interval_ms: config.polling.poll_interval_ms,
         hwmon_interval_ms: config.polling.poll_interval_ms,
@@ -1632,6 +1659,16 @@ async fn async_main() {
         characterization: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         validation: std::sync::Arc::new(Default::default()),
         characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        // AIO Phase 8 Batch 1: control-path discovery. Same slot-plus-cancel
+        // shape as characterisation above, and the same single verify slot, so
+        // this is a fourth claimant rather than a fourth concurrent writer.
+        control_path: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        control_path_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        // Persisted PWM to tach relationships, pruned at boot to whatever
+        // discovery can still see. The header id embeds chip, device, pwmN and
+        // label, so a board or driver change invalidates a stale record by
+        // construction rather than by anyone remembering to check.
+        control_paths: Arc::new(parking_lot::RwLock::new(Arc::new(control_paths_at_boot))),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_handles: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),

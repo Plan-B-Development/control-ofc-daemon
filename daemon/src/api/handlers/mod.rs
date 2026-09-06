@@ -6,6 +6,7 @@
 mod assessment;
 pub mod config;
 mod control;
+pub mod discovery;
 mod gpu;
 mod hw_diagnostics;
 mod hwmon_ctl;
@@ -316,6 +317,23 @@ pub struct AppState {
     /// and the thermal refusal — so this adds no second PWM ownership path (§2).
     pub validation: Arc<crate::validation::recorder::ValidationEngine>,
     pub characterization_cancel: Arc<AtomicBool>,
+    /// The current or most recent control-path discovery run (AIO Phase 8
+    /// Batch 1).
+    ///
+    /// Same shape, same lifetime and the same detached-task caveat as
+    /// `characterization` above — including that its safety comes from the
+    /// shutdown check inside the shared `RestoreOnDrop`. It claims the SAME
+    /// single verify slot, so discovery, verify, characterise and calibrate are
+    /// still mutually exclusive: this field adds a fourth claimant, not a fourth
+    /// concurrent writer.
+    pub control_path: crate::api::discovery::ControlPathSlot,
+    pub control_path_cancel: Arc<AtomicBool>,
+    /// Persisted PWM to tach relationships, keyed by header id (§6.3).
+    ///
+    /// An `Arc` swapped under a write lock, exactly like `header_roles` and
+    /// `cooling_devices`, so a reader clones the pointer and never holds the lock
+    /// while it works.
+    pub control_paths: Arc<parking_lot::RwLock<Arc<crate::control_paths::ControlPathStore>>>,
     /// Prevents concurrent `POST /fans/openfan/rescan` probes (DEC-265).
     /// Two racing probes would open the same tty, and the loser would install
     /// a controller over the winner's — orphaning a poll loop on a transport

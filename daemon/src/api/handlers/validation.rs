@@ -702,6 +702,7 @@ fn spawn_orchestration(
                             detail: Some("header is not writable".to_string()),
                             characterization: None,
                             verify: None,
+                            control_path: None,
                         },
                     );
                 }
@@ -723,6 +724,7 @@ fn spawn_orchestration(
                     DIAG_CHARACTERIZATION => {
                         run_characterization(&state, &session_id, member).await
                     }
+                    DIAG_CONTROL_PATH => run_discovery(&state, &session_id, member).await,
                     _ => {}
                 }
             }
@@ -738,6 +740,13 @@ fn ordered_diagnostics(requested: &[String]) -> Vec<&'static str> {
     }
     if requested.iter().any(|d| d == DIAG_CHARACTERIZATION) {
         out.push(DIAG_CHARACTERIZATION);
+    }
+    // AIO Phase 8 Batch 1. Ordered LAST deliberately: discovery perturbs around
+    // whatever duty it finds, so running it after the two diagnostics that
+    // restore their own pre-test duty means it measures the header's settled
+    // working point rather than another diagnostic's leftovers.
+    if requested.iter().any(|d| d == DIAG_CONTROL_PATH) {
+        out.push(DIAG_CONTROL_PATH);
     }
     out
 }
@@ -803,6 +812,7 @@ async fn run_verify(state: &Arc<AppState>, session_id: &str, member: &str) {
             detail: evidence.detail.clone(),
             characterization: None,
             verify: Some(evidence),
+            control_path: None,
         },
     );
     state.validation.push_event_for(
@@ -831,8 +841,34 @@ async fn run_verify(state: &Arc<AppState>, session_id: &str, member: &str) {
 /// Takes the slot and the flag rather than `AppState` so the rule is unit-testable
 /// on its own: the four cases that matter — ours still running, ours already
 /// finished, someone else's, and none at all — need no daemon around them.
-fn cancel_run_fenced(
-    slot: &parking_lot::Mutex<Option<crate::api::characterization::CharacterizationRun>>,
+/// A diagnostic run a session can cancel. Implemented by both detached sweeps so
+/// [`cancel_run_fenced`] stays ONE definition of the fencing rule rather than
+/// growing a near-identical copy per diagnostic (DEC-276).
+pub(crate) trait CancellableRun {
+    fn is_running(&self) -> bool;
+    fn run_id(&self) -> &str;
+}
+
+impl CancellableRun for crate::api::characterization::CharacterizationRun {
+    fn is_running(&self) -> bool {
+        self.is_running()
+    }
+    fn run_id(&self) -> &str {
+        &self.run_id
+    }
+}
+
+impl CancellableRun for crate::api::discovery::ControlPathRun {
+    fn is_running(&self) -> bool {
+        self.is_running()
+    }
+    fn run_id(&self) -> &str {
+        &self.run_id
+    }
+}
+
+fn cancel_run_fenced<R: CancellableRun>(
+    slot: &parking_lot::Mutex<Option<R>>,
     cancel: &std::sync::atomic::AtomicBool,
     run_id: Option<&str>,
 ) {
@@ -847,14 +883,14 @@ fn cancel_run_fenced(
         let guard = slot.lock();
         let mine = guard
             .as_ref()
-            .is_some_and(|r| r.is_running() && r.run_id == run_id);
+            .is_some_and(|r| CancellableRun::is_running(r) && r.run_id() == run_id);
         if mine {
             cancel.store(true, Ordering::SeqCst);
         }
         mine
     };
     if cancelled {
-        log::info!("Validation session ended; cancelling its characterisation run {run_id}");
+        log::info!("Validation session ended; cancelling its diagnostic run {run_id}");
     }
 }
 
@@ -890,6 +926,7 @@ async fn run_characterization(state: &Arc<AppState>, session_id: &str, member: &
                 detail,
                 characterization: None,
                 verify: None,
+                control_path: None,
             },
         );
         return;
@@ -968,7 +1005,143 @@ async fn run_characterization(state: &Arc<AppState>, session_id: &str, member: &
             // Verbatim (§6) — every verdict on it is Phase 3's, recomputed nowhere.
             characterization: final_run,
             verify: None,
+            control_path: None,
         },
+    );
+}
+
+/// Orchestrate one control-path discovery run (AIO Phase 8 Batch 1, §5).
+///
+/// Structurally identical to [`run_characterization`], and deliberately so: the
+/// existing handler is called as a function — lease, pump floor, thermal
+/// refusal, restore guard and all — and this only watches the slot and attaches
+/// the result. A session orchestrates diagnostics; it never reimplements one.
+async fn run_discovery(state: &Arc<AppState>, session_id: &str, member: &str) {
+    let started = unix_ms();
+    state.validation.push_event_for(
+        session_id,
+        EV_DISCOVERY_STARTED,
+        None,
+        Some(member.to_string()),
+    );
+    let (status, Json(body)) = super::discovery::discover_control_path_handler(
+        State(state.clone()),
+        axum::extract::Path(member.to_string()),
+        Json(crate::api::discovery::DiscoveryRequest::default()),
+    )
+    .await;
+
+    if status != StatusCode::ACCEPTED {
+        let detail = body
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .map(str::to_string);
+        state.validation.attach_evidence_for(
+            session_id,
+            EvidenceRef {
+                kind: DIAG_CONTROL_PATH.to_string(),
+                member_id: member.to_string(),
+                run_id: None,
+                started_unix_ms: started,
+                completed_unix_ms: Some(unix_ms()),
+                // Refused, not failed (§7): the slot was taken, the ladder was
+                // forcing, the header is read-only, or the daemon is going down.
+                outcome: RESULT_UNAVAILABLE.to_string(),
+                detail,
+                characterization: None,
+                verify: None,
+                control_path: None,
+            },
+        );
+        state.validation.push_event_for(
+            session_id,
+            EV_DISCOVERY_COMPLETED,
+            Some(RESULT_UNAVAILABLE.to_string()),
+            Some(member.to_string()),
+        );
+        return;
+    }
+
+    let run_id = body
+        .get("run_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    // Bounded by the sweep's own worst case: every cycle holding the maximum
+    // settle at BOTH the baseline and the perturbed duty, plus slack. A bare
+    // `sleep` would be the tokio trap this project has recorded — every wait
+    // here is a bounded poll against a deadline.
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(
+            constants::DISCOVERY_MAX_CYCLES as u64
+                * 2
+                * constants::CHARACTERIZATION_SETTLE_MAX_S
+                * 2
+                + 60,
+        );
+    let mut final_run = None;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let snap = state.control_path.lock().clone();
+        match snap {
+            Some(run) if Some(&run.run_id) == run_id.as_ref() => {
+                if !run.is_running() {
+                    final_run = Some(run);
+                    break;
+                }
+            }
+            // A different run took the slot — ours is gone, and attributing
+            // someone else's evidence to this session is the exact defect the
+            // `run_id` fence exists to prevent.
+            Some(_) => break,
+            None => break,
+        }
+        if state.validation.recording_session_id().as_deref() != Some(session_id) {
+            // ...and take the sweep down with us (`AUD3-j`): a detached run left
+            // alive would keep driving the header AND keep renewing the engine's
+            // write-pause after the user ended the session.
+            cancel_run_fenced(
+                &state.control_path,
+                &state.control_path_cancel,
+                run_id.as_deref(),
+            );
+            return;
+        }
+    }
+
+    let outcome = match &final_run {
+        Some(run) if run.state == crate::api::discovery::STATE_COMPLETE => RESULT_OBSERVED,
+        Some(_) => RESULT_INTERRUPTED,
+        None => RESULT_UNKNOWN,
+    };
+    let detail = final_run.as_ref().and_then(|r| r.detail.clone());
+    state.validation.attach_evidence_for(
+        session_id,
+        EvidenceRef {
+            kind: DIAG_CONTROL_PATH.to_string(),
+            member_id: member.to_string(),
+            run_id,
+            started_unix_ms: started,
+            completed_unix_ms: Some(unix_ms()),
+            outcome: outcome.to_string(),
+            detail,
+            characterization: None,
+            verify: None,
+            // Verbatim (§6) — the relationship, the confidence and the
+            // measurement resolution are the ones `discovery::summarise`
+            // computed, recomputed nowhere.
+            control_path: final_run,
+        },
+    );
+    state.validation.push_event_for(
+        session_id,
+        EV_DISCOVERY_COMPLETED,
+        Some(outcome.to_string()),
+        Some(member.to_string()),
     );
 }
 
@@ -1143,7 +1316,8 @@ mod tests {
         cancel_run_fenced(&slot, &cancel, None);
         assert!(!cancel.load(Ordering::SeqCst));
 
-        let empty = parking_lot::Mutex::new(None);
+        let empty: parking_lot::Mutex<Option<crate::api::characterization::CharacterizationRun>> =
+            parking_lot::Mutex::new(None);
         cancel_run_fenced(&empty, &cancel, Some("char-10"));
         assert!(!cancel.load(Ordering::SeqCst));
     }

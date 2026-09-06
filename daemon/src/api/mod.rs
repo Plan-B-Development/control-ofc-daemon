@@ -6,6 +6,8 @@
 pub mod calibration;
 pub mod characterization;
 pub mod diagnostics;
+pub mod discovery;
 pub mod handlers;
+pub mod preflight;
 pub mod responses;
 pub mod server;

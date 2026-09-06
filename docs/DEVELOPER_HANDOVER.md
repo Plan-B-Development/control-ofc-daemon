@@ -38,10 +38,15 @@ daemon/                     Rust crate (control-ofc-daemon)
         inventory.rs        /inventory/{hwmon,readiness,superio,hardware-readiness} reads + Super-I/O probe; shared assessment snapshot + coalesced scan (DEC-200/202/203/207)
         assessment.rs       Hardware-assessment cache + single-flight coordinator (DEC-207)
         path_confine.rs     SO_PEERCRED search-dir confinement predicate (DEC-205)
+        discovery.rs        /diagnostics/preflight + the control-path routes (DEC-333)
       responses.rs          JSON response/request types (v1 schema)
       server.rs             Unix socket server lifecycle
       calibration.rs        OpenFan calibration sweep
       diagnostics.rs        Hardware-diagnostics scanning logic behind /diagnostics/hardware
+      discovery.rs          PWM-to-tach control-path sweep (DEC-333)
+      preflight.rs          Shared diagnostic safety predicates + typed report (DEC-333).
+                            CONSUMES the existing guards rather than restating them,
+                            which is why verify/characterize/calibrate needed no edit
     health/
       state.rs              Canonical state model (DaemonState)
       cache.rs              RwLock in-memory cache
@@ -159,6 +164,8 @@ sudo systemctl enable --now control-ofc-daemon
 | `GET /inventory/readiness` | Readiness items (`blocks_monitoring`/`blocks_control`, `reboot_may_be_required`; DEC-200) |
 | `GET /inventory/superio` | Passive Super-I/O chip detection (DEC-202) |
 | `GET /inventory/hardware-readiness` | Combined readiness + Super-I/O snapshot from one shared scan (DEC-207) |
+| `GET /diagnostics/preflight` | Typed safety verdict for one header + one diagnostic, before anything is driven (DEC-333). Read-only: no lease, no slot, nothing reserved |
+| `GET /diagnostics/control-path` | Current/most recent control-path discovery run, plus every persisted relationship (DEC-333). Records are keyed by stable header id and pruned at boot to whatever discovery still sees |
 
 ### Write
 The profile engine is the **sole writer** as of 2.0.0 (DEC-159/DEC-165); the GUI sends intent + diagnostics calls. Bare PWM/lease endpoints were retired (note below).
@@ -178,6 +185,8 @@ The profile engine is the **sole writer** as of 2.0.0 (DEC-159/DEC-165); the GUI
 | `DELETE /config/cooling-device/{id}` | Remove a cooling device (DEC-316) |
 | `POST /fans/openfan/{ch}/calibrate` | Run a PWM-to-RPM calibration sweep |
 | `POST /hwmon/{header_id}/verify` | Behavioural test of PWM write effectiveness (~6 s; daemon's own internal lease); returns `restore_failed: bool` per DEC-100 |
+| `POST /hwmon/{header_id}/discover-control-path` | Establish which tach channel(s) this output drives, by measurement (DEC-333). Claims the **same** single-flight verify slot as verify/calibrate/characterize, so at most one of the four ever drives hardware. Perturbs away from the nearer rail; 0% unreachable for any header; a pump never crosses its floor |
+| `DELETE /diagnostics/control-path` | Cooperative cancel; same restore semantics and the same two deliberate skips as the characterisation sweep |
 | `POST /gpu/{gpu_id}/fan/verify` | Test GPU fan-control effectiveness (~6 s, no lease) |
 | `POST /gpu/{gpu_id}/fan/reset` | Reset GPU fan to automatic |
 | `POST /hwmon/rescan` | Re-enumerate hwmon devices |

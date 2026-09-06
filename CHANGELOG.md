@@ -1,5 +1,74 @@
 # Changelog
 
+## [2.39.0] — 2026-09-06
+
+**AIO Phase 8 Batch 1 (DEC-333): a shared diagnostic preflight, PWM-to-tach
+control-path discovery, and the evidence/provenance foundation.** Pairs with
+`control-ofc-gui` >= v2.62.0. Additive: no existing route or field changes
+meaning, and `api_version` is unchanged.
+
+### Added
+- **`POST /hwmon/{id}/discover-control-path`** plus **`GET`/`DELETE
+  /diagnostics/control-path`** — establishes which tach channel(s) a PWM output
+  actually drives, by measurement. Returns `202` and runs detached, like
+  characterisation, and claims the **same** single-flight verify slot, so at most
+  one of the four diagnostics ever drives hardware.
+
+  Deliberately **not** `pwmconfig`'s stop-the-fan model: the perturbation moves
+  away from the nearer rail so there is always headroom, every commanded duty is
+  clamped into `[max(20, header floor) .. 100]` — **0 % is unreachable for any
+  header** — and two cycles are run so repeatability is a real confidence input.
+  Reports `confirmed` / `probable` / `ambiguous` / `no_tach_response` /
+  `multiple_responses`, and represents a one-PWM-to-many-tach mapping rather than
+  assuming one-to-one.
+- **`GET /diagnostics/preflight`** — a read-only typed safety report for one
+  header and one diagnostic. Takes no lease and no slot, so calling it reserves
+  nothing. Consumes the *existing* predicates (`verify_thermal_guard`,
+  `header_is_pump_protected`, the verify slot), so there is one definition of
+  each rule rather than a second copy.
+- **`control_path_discovery`** as an orchestratable validation-session
+  diagnostic, attached to `evidence[]` verbatim, with a `control_path_mapping`
+  finding. A run that found nothing is `not_observed`, **never** `fail`.
+- **Two capability flags**: `control.control_path_discovery` and
+  `control.diagnostic_preflight`.
+- **`{state_dir}/control_paths.json`** — discovered relationships, keyed by the
+  header's stable id and pruned at boot to whatever discovery can still see, so a
+  board or driver change invalidates a stale record by construction.
+- **Monitor-only tach channels are observable.** `FanInputDescriptor` gains
+  `input_path` (not on the wire) so discovery can read a `fanN_input` that has no
+  `pwmN`. The 1 Hz poll is unchanged — these are read only for the duration of a
+  run, so poll cost stays flat.
+
+### Safety
+- **A temperature-staleness predicate**, new. `check_thermal_safety` iterates
+  whatever the state cache holds and has never had a view of how old those
+  readings are, so a poll loop wedged on an unresponsive chip presented its
+  last-known-good temperatures indefinitely and every thermal gate passed on
+  them. Now surfaced on the preflight for every diagnostic, and a **blocking**
+  condition for control-path discovery. It does **not** change what
+  `POST /hwmon/{id}/verify` or `.../characterize` do — those report it as a
+  warning, because a preflight that promised a refusal the daemon does not
+  perform would be lying about the daemon's own behaviour.
+- **A pump-tach-disappearance abort.** A pump-protected header whose tachometer
+  was readable at the start of a run and stops reporting mid-run aborts
+  immediately and restores. Conditional on the tach having been there to begin
+  with, so a pump with no tach at all does not abort every run on that board.
+- **Liveness is proved before every observation window, not once per cycle.** A
+  cycle holds two windows, so a per-cycle renewal makes the interval `2 × window`
+  — equal to `VERIFY_PAUSE_DEADMAN` at the maximum settle before any I/O
+  overhead. The pause would then expire mid-run, the engine's write phase would
+  resume while discovery was still perturbing, and a second diagnostic could
+  force-take the lease so that even the restore failed. Caught in review; never
+  shipped. Pinned by a test asserting `renewals == cycles × 2`, whose second limb
+  asserts the per-cycle interval does *not* fit, so it can tell the two apart.
+- Shutdown is re-checked immediately before each of the three PWM writes.
+  `observe` checks at the top of each sample iteration but returns after one more
+  read, so shutdown could land in that gap and a write could follow
+  `restore_hardware()` — the DEC-290 / 277-c hazard.
+- Restoration reuses `characterization::RestoreOnDrop` unchanged — the same two
+  deliberate skips (shutdown, thermal force), the same `AUD3-l` restore floor and
+  the same load-bearing drop order — rather than growing a second copy.
+
 ## [2.38.0] — 2026-09-06
 
 **Packaging + one probe behaviour change.** No API shape change; `api_version`

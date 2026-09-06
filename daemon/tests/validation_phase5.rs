@@ -320,6 +320,7 @@ fn a_possible_device_override_is_observed_evidence_and_never_a_failure() {
             detail: None,
         }),
         verify: None,
+        control_path: None,
     });
 
     let findings = summary::summarise(&s);
@@ -383,6 +384,7 @@ fn characterisation_evidence_is_carried_verbatim_not_recomputed() {
         detail: None,
         characterization: Some(run.clone()),
         verify: None,
+        control_path: None,
     });
 
     // The attached run is bit-for-bit the one Phase 3 produced.
@@ -412,6 +414,7 @@ fn a_refused_diagnostic_is_unavailable_not_fail() {
         detail: Some("thermal_abort".into()),
         characterization: None,
         verify: None,
+        control_path: None,
     });
     let findings = summary::summarise(&s);
     for id in [F_PWM_HEADER_CONTROL, F_PWM_RESPONSE, F_DEVICE_OVERRIDE] {
@@ -1255,6 +1258,7 @@ fn evidence_from_a_cancelled_session_cannot_land_on_its_successor() {
             detail: None,
             characterization: None,
             verify: None,
+            control_path: None,
         },
     );
     let event_accepted = engine.push_event_for(&a_id, EV_CHAR_COMPLETED, None, Some("pump".into()));
@@ -1290,6 +1294,7 @@ fn evidence_from_a_cancelled_session_cannot_land_on_its_successor() {
             detail: None,
             characterization: None,
             verify: None,
+            control_path: None,
         },
     ));
     assert_eq!(engine.snapshot().unwrap().evidence.len(), 1);

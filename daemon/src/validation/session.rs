@@ -82,6 +82,8 @@ pub const EV_CHAR_STARTED: &str = "characterization_started";
 pub const EV_CHAR_COMPLETED: &str = "characterization_completed";
 pub const EV_VERIFY_STARTED: &str = "verify_started";
 pub const EV_VERIFY_COMPLETED: &str = "verify_completed";
+pub const EV_DISCOVERY_STARTED: &str = "control_path_discovery_started";
+pub const EV_DISCOVERY_COMPLETED: &str = "control_path_discovery_completed";
 pub const EV_USER_MARKER: &str = "user_marker";
 pub const EV_SAMPLE_LIMIT: &str = "sample_limit_reached";
 
@@ -91,10 +93,17 @@ pub const EV_SAMPLE_LIMIT: &str = "sample_limit_reached";
 pub const DIAG_CHARACTERIZATION: &str = "pwm_characterization";
 /// The short write/readback verification.
 pub const DIAG_VERIFY: &str = "pwm_verify";
+/// The AIO Phase 8 Batch 1 PWM to tach control-path sweep. Reused verbatim from
+/// `api::discovery`, exactly as the characterisation run is — a session
+/// orchestrates diagnostics, it never reimplements one (§6).
+pub const DIAG_CONTROL_PATH: &str = "control_path_discovery";
 
 /// Is this a diagnostic the session knows how to run?
 pub fn is_known_diagnostic(token: &str) -> bool {
-    matches!(token, DIAG_CHARACTERIZATION | DIAG_VERIFY)
+    matches!(
+        token,
+        DIAG_CHARACTERIZATION | DIAG_VERIFY | DIAG_CONTROL_PATH
+    )
 }
 
 // ── Member roles within a session ───────────────────────────────────────────
@@ -363,6 +372,12 @@ pub struct EvidenceRef {
     pub characterization: Option<crate::api::characterization::CharacterizationRun>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify: Option<VerifyEvidence>,
+    /// The AIO Phase 8 Batch 1 discovery run, verbatim. Same rule as
+    /// `characterization` above: every verdict on it — relationship, confidence,
+    /// measurement resolution — is the one `api::discovery::summarise` computed,
+    /// recalculated nowhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_path: Option<crate::api::discovery::ControlPathRun>,
 }
 
 /// The result of a PWM write/readback verification, flattened for evidence.
@@ -434,6 +449,8 @@ pub const F_BIOS_RECLAIM: &str = "bios_ec_control_reclaim";
 pub const F_THERMAL_SAFETY: &str = "thermal_safety";
 pub const F_CONTROL_RESTORATION: &str = "control_restoration";
 pub const F_COOLANT_TELEMETRY: &str = "coolant_telemetry";
+/// AIO Phase 8 Batch 1: which tach channel(s) this header actually drives.
+pub const F_CONTROL_PATH: &str = "control_path_mapping";
 pub const F_DAEMON_RESTART_RECOVERY: &str = "daemon_restart_recovery";
 
 // ── The session itself ──────────────────────────────────────────────────────

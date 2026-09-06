@@ -983,6 +983,17 @@ pub struct ControlCapability {
     /// fallback, which a client cannot tell from a genuine "no such session".
     #[serde(default)]
     pub validation_sessions: bool,
+    /// AIO Phase 8 Batch 1, daemon >= 2.39.0. Gates
+    /// `POST /hwmon/{id}/discover-control-path` and the
+    /// `GET`/`DELETE /diagnostics/control-path` pair, plus the
+    /// `control_path_discovery` token on a validation session's `diagnostics[]`.
+    pub control_path_discovery: bool,
+    /// AIO Phase 8 Batch 1, daemon >= 2.39.0. Gates `GET /diagnostics/preflight`.
+    ///
+    /// A SEPARATE flag from `control_path_discovery`, deliberately: preflight is
+    /// read-only and applies to the pre-existing verify and characterise
+    /// diagnostics as well, so a client may want it without offering discovery.
+    pub diagnostic_preflight: bool,
     // ── `WIRE-k`: five features that predate their own flags ──────────────
     //
     // Each of the five below shipped before this block had a key for it, so a
@@ -3064,6 +3075,8 @@ mod tests {
                 profile_search_dir_remove: false,
                 header_roles: false,
                 pwm_characterization: true,
+                control_path_discovery: true,
+                diagnostic_preflight: true,
                 cooling_devices: false,
                 validation_sessions: false,
             },

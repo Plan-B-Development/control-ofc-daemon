@@ -89,6 +89,28 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(handlers::characterization_status_handler)
                 .delete(handlers::characterization_cancel_handler),
         )
+        // AIO Phase 8 Batch 1: read-only safety preflight. Takes no lease and no
+        // slot, so calling it reserves nothing — the POST below still runs its
+        // own guards. Capability-gated on `control.diagnostic_preflight`.
+        .route(
+            "/diagnostics/preflight",
+            get(handlers::discovery::preflight_handler),
+        )
+        // AIO Phase 8 Batch 1: PWM to tach control-path discovery. Establishes
+        // which output actually drives which tach by measurement rather than by
+        // sysfs numbering. Returns 202 and runs detached, like characterise; it
+        // claims the SAME single verify slot, so at most one of the four
+        // diagnostics ever drives hardware. Capability-gated on
+        // `control.control_path_discovery`.
+        .route(
+            "/hwmon/{header_id}/discover-control-path",
+            post(handlers::discovery::discover_control_path_handler),
+        )
+        .route(
+            "/diagnostics/control-path",
+            get(handlers::discovery::control_path_status_handler)
+                .delete(handlers::discovery::control_path_cancel_handler),
+        )
         // AIO-MB Phase 5: validation sessions. A session RECORDS what an
         // already-configured cooler did, and may ORCHESTRATE the two diagnostics
         // above — it never writes a duty itself, so it adds no second PWM

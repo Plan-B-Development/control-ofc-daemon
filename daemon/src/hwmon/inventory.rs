@@ -30,6 +30,17 @@ pub struct FanInputDescriptor {
     pub fan_index: u8,
     /// Human-readable label from `fanN_label`, else `fan{N}`.
     pub label: String,
+    /// Absolute path of the `fanN_input` file.
+    ///
+    /// Added for AIO Phase 8 Batch 1: control-path discovery observes
+    /// monitor-only tachs during its own measurement window, and without a path
+    /// it would have to re-resolve one from `chip_name` + `fan_index`, which is
+    /// how a second, drifting copy of the discovery rules gets created (DEC-276).
+    ///
+    /// **Not on the wire.** `FanInputEntry::from` does not carry it, deliberately
+    /// — a sysfs path is a daemon-internal handle, and the GUI has no business
+    /// receiving one when the architecture forbids it touching sysfs at all.
+    pub input_path: PathBuf,
 }
 
 /// Discover monitor-only fan tachometers under a given sysfs hwmon root.
@@ -130,6 +141,7 @@ fn discover_device_monitor_only_fans(
             chip_name: chip_name.clone(),
             fan_index,
             label,
+            input_path: hwmon_dir.join(format!("fan{fan_index}_input")),
         });
     }
 

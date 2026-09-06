@@ -38,6 +38,7 @@ pub fn summarise(session: &ValidationSession) -> Vec<ValidationFinding> {
     out.push(bios_reclaim(session));
     out.push(thermal_safety(session));
     out.push(control_restoration(session));
+    out.push(control_path(session, interrupted));
     out.push(coolant_telemetry(session));
     out.push(daemon_restart_recovery(session));
 
@@ -227,6 +228,51 @@ fn pwm_response(session: &ValidationSession, interrupted: bool) -> ValidationFin
         }
     }
     finding(F_PWM_RESPONSE, absent_state(interrupted))
+}
+
+/// Which tach channel(s) does this header actually drive (AIO Phase 8 Batch 1)?
+///
+/// [SAFETY-adjacent reporting rule] A run that found nothing is `not_observed`,
+/// **never** `fail`. §5 and the Overview both say it outright: "Do not label an
+/// unexpected RPM response as hardware failure unless evidence supports that
+/// conclusion." A header that drives no tach-reporting device, or whose device is
+/// running under its own internal control, is a legitimate configuration — and it
+/// is also exactly what a `possible_device_override` looks like from here.
+///
+/// `ambiguous` maps to `unknown` rather than to a verdict, for the same reason:
+/// the run's own answer was "not repeatable enough to rely on", and promoting
+/// that to either pass or fail would be the report inventing evidence.
+fn control_path(session: &ValidationSession, interrupted: bool) -> ValidationFinding {
+    for ev in session
+        .evidence
+        .iter()
+        .filter(|e| e.kind == DIAG_CONTROL_PATH)
+    {
+        if let Some(run) = &ev.control_path {
+            if let Some(sum) = &run.summary {
+                use crate::api::discovery as disc;
+                let state = match sum.relationship.as_str() {
+                    disc::REL_CONFIRMED | disc::REL_PROBABLE | disc::REL_MULTIPLE => {
+                        RESULT_OBSERVED
+                    }
+                    disc::REL_NO_RESPONSE => RESULT_NOT_OBSERVED,
+                    _ => RESULT_UNKNOWN,
+                };
+                let detail = match sum.candidates.first() {
+                    Some(best) => format!(
+                        "{} -> {} ({} confidence)",
+                        run.header_id, best.label, sum.confidence
+                    ),
+                    None => format!("{}: no tach channel responded", run.header_id),
+                };
+                let mut f = with_detail(finding(F_CONTROL_PATH, state), detail);
+                f.member_id = Some(ev.member_id.clone());
+                f.evidence_kind = Some(DIAG_CONTROL_PATH.to_string());
+                return f;
+            }
+        }
+    }
+    finding(F_CONTROL_PATH, absent_state(interrupted))
 }
 
 /// How quickly did RPM begin to move after a duty change?

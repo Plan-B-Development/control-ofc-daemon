@@ -106,10 +106,17 @@ daemon/src/
       inventory.rs     — /inventory/{hwmon,readiness,superio,hardware-readiness} reads + Super-I/O probe; shared assessment snapshot + coalesced scan (DEC-200/202/203/207)
       assessment.rs    — hardware-assessment cache + single-flight coordinator (DEC-207)
       path_confine.rs  — SO_PEERCRED search-dir confinement predicate (DEC-205)
+      discovery.rs     — /diagnostics/preflight + the control-path routes (DEC-333)
     responses.rs       — response structs (Serialize)
     calibration.rs     — OpenFan calibration sweep
     diagnostics.rs     — hardware-diagnostics scanning logic behind /diagnostics/hardware
-    characterization.rs — PWM/RPM response sweep (DEC-313), reused by validation
+    characterization.rs — PWM/RPM response sweep (DEC-313), reused by validation.
+                         Owns RestoreOnDrop, which the discovery sweep reuses verbatim
+    discovery.rs       — PWM-to-tach control-path sweep (DEC-333). Perturbs one header
+                         away from the nearer rail, watches every tach incl. monitor-only
+    preflight.rs       — the shared diagnostic safety predicates + typed report (DEC-333).
+                         CONSUMES the existing guards rather than restating them, which is
+                         why the three older diagnostics needed no edit
 
   validation/            — AIO-MB Phase 5 (DEC-317). Split by who may have side effects.
     mod.rs             — subsystem re-exports + the safety posture, stated once
@@ -123,6 +130,9 @@ daemon/src/
   atomic_io.rs         — crash-safe atomic file write (tmp+fsync+rename)
   profile.rs           — profile JSON loading + curve evaluation
   profile_store.rs     — daemon-owned profile storage (store of record, DEC-160)
+  control_paths.rs     — {state_dir}/control_paths.json: discovered PWM-to-tach
+                         relationships, keyed by stable header id and pruned at boot to
+                         whatever discovery can still see (DEC-333)
   profile_engine/      — headless 1Hz curve evaluation loop (DEC-135)
     mod.rs             — loop body / coordinator: orchestrates safety_tick + curve_eval + tuning + backends
     curve_eval.rs      — deadband + trigger latch + Mix/Sync composites (topological order)

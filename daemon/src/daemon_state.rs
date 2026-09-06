@@ -60,6 +60,16 @@ impl Default for DaemonState {
     }
 }
 
+/// The state directory itself: `{state_dir}`.
+///
+/// Public because AIO Phase 8 Batch 1 stores `control_paths.json` directly in it
+/// rather than in a subdirectory. Both of its callers previously derived it as
+/// `validation_dir().parent()`, which is two copies of a path rule that only
+/// happens to be right — exactly the duplication DEC-276 records.
+pub fn state_dir_path() -> PathBuf {
+    PathBuf::from(state_dir())
+}
+
 /// Get the state file path.
 pub fn state_file_path() -> PathBuf {
     PathBuf::from(state_dir()).join(STATE_FILE)
