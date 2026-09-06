@@ -93,11 +93,152 @@ fn too_long(field: &str, value: Option<&String>) -> Option<(StatusCode, Json<ser
 }
 
 fn recorder_context(state: &Arc<AppState>) -> RecorderContext {
+    let (hwmon_root, powercap_root) = RecorderContext::sysfs_roots();
     RecorderContext {
         cache: state.cache.clone(),
         hwmon_controller: state.hwmon_controller.clone(),
         override_table: state.override_table.clone(),
         characterization: state.characterization.clone(),
+        hwmon_root,
+        powercap_root,
+    }
+}
+
+/// Open the opt-in startup lifecycle recording (Batch 3a §1, DEC-335).
+///
+/// Called once at daemon start, and only when `[startup] record_startup = true`.
+/// Returns the session id when a recording was opened, `None` when there was
+/// nothing to record or the slot was already busy.
+///
+/// # What it deliberately does not do
+///
+/// It writes no hardware, claims no verify slot and takes no hwmon lease — it is
+/// the same passive recorder an operator would start by hand, with the same
+/// engine. It also never blocks one: `ValidationEngine::start` pre-empts this
+/// session the moment an operator starts their own.
+///
+/// A machine with no configured cooling device records nothing and logs once.
+/// There is no sensible fallback — a validation session is scoped to a device,
+/// and inventing one would produce a recording whose members mean nothing.
+/// `AUD3-n`: `start` persists the session document, so the engine call is
+/// handed to `spawn_blocking` exactly as the request path does. Building the
+/// session itself is cheap and stays here.
+pub async fn start_auto_startup_record(state: &Arc<AppState>) -> Option<String> {
+    let devices = state.cooling_devices.read().clone();
+    let Some(device) = devices.first() else {
+        log::info!(
+            "[startup] record_startup is enabled but no cooling device is configured; \
+             nothing to record"
+        );
+        return None;
+    };
+
+    let metadata = build_metadata(state, device, Default::default());
+    let started_unix_ms = unix_ms();
+    let session = ValidationSession {
+        session_id: next_session_id(),
+        kind: KIND_LIFECYCLE.to_string(),
+        state: STATE_RECORDING.to_string(),
+        started_unix_ms,
+        completed_unix_ms: None,
+        metadata,
+        // No active diagnostic. §1 is a passive observation of what the hardware
+        // does on its own at power-on; running a sweep would change the very
+        // behaviour being recorded.
+        requested_diagnostics: Vec::new(),
+        sweep_members: Vec::new(),
+        samples: Vec::new(),
+        // **The first and only emitter of `daemon_restart_observed`.** The token
+        // has existed since Phase 5 and nothing has ever pushed it, because a
+        // session cannot survive a restart — so both findings that consume it
+        // were structurally unreachable. A recording that begins *because* the
+        // daemon started is the one place the event is true by construction.
+        events: vec![ValidationEvent {
+            elapsed_ms: 0,
+            unix_ms: started_unix_ms,
+            kind: EV_DAEMON_RESTART.to_string(),
+            detail: Some("recording opened automatically at daemon start".to_string()),
+            member_id: None,
+        }],
+        evidence: Vec::new(),
+        external_measurements: Vec::new(),
+        findings: Vec::new(),
+        sample_limit_reached: false,
+        interrupted_reason: None,
+        truncated_at_unix_ms: None,
+        auto_started: true,
+        startup_fingerprints: Vec::new(),
+        steady_state: None,
+    };
+
+    let ctx = recorder_context(state);
+    let device_id = device.id.clone();
+    let engine = state.validation.clone();
+    let started = tokio::task::spawn_blocking(move || engine.start(session, &ctx))
+        .await
+        .ok()?;
+    match started {
+        Ok(s) => {
+            log::info!(
+                "Startup lifecycle recording {} opened for {} ({} s window)",
+                s.session_id,
+                device_id,
+                constants::STARTUP_RECORD_WINDOW_S
+            );
+            Some(s.session_id)
+        }
+        Err(e) => {
+            // Never fatal, and never retried. An operator who started a session
+            // in the first seconds after boot has already won, which is the
+            // intended outcome.
+            log::info!("Startup lifecycle recording not opened: {e:?}");
+            None
+        }
+    }
+}
+
+/// Close the startup auto-record, if it is still the session in the slot.
+///
+/// Fenced on the id: by the time the window elapses the recording may have been
+/// pre-empted by an operator and a *different* session may be running. Stopping
+/// unconditionally would then finalise the operator's session out from under
+/// them — the precise failure this whole feature is supposed to be incapable of.
+/// `AUD3-n` again: finalising persists, so this goes through the same
+/// `finalise_off_runtime` hop the two request handlers use rather than calling
+/// `stop()` inline. A source-scanning guard in `validation_phase5.rs` enforces
+/// it, and it caught this exact call site while Batch 3a was being written.
+pub async fn stop_auto_startup_record(state: &Arc<AppState>, session_id: &str) {
+    // A cheap early-out, NOT the guarantee. `stop_if` below is what actually
+    // fences; this only avoids a `spawn_blocking` hop in the common case where
+    // the recording is plainly gone.
+    if !state
+        .validation
+        .recording_session_id()
+        .is_some_and(|id| id == session_id)
+    {
+        log::debug!("Startup lifecycle recording {session_id} already ended; nothing to stop");
+        return;
+    }
+    // `stop_if`, not `stop`: the id comparison must happen under the SAME guard
+    // as the finalisation. Checking `recording_session_id()` and then calling
+    // the unfenced `stop()` leaves a `spawn_blocking` dispatch in the gap — long
+    // enough for an operator to pre-empt and have this finalise *their* session
+    // seconds after it started, which is the one outcome this feature must be
+    // incapable of. Found by `ofc:concurrency-reviewer`.
+    let engine = state.validation.clone();
+    let owned = session_id.to_string();
+    let finished = tokio::task::spawn_blocking(move || engine.stop_if(&owned)).await;
+    match finished {
+        Ok(Some(s)) => log::info!(
+            "Startup lifecycle recording {} closed after {} s ({} samples)",
+            s.session_id,
+            constants::STARTUP_RECORD_WINDOW_S,
+            s.samples.len()
+        ),
+        Ok(None) => {
+            log::debug!("Startup lifecycle recording {session_id} was already superseded")
+        }
+        Err(e) => log::warn!("Startup lifecycle recording {session_id} could not be closed: {e}"),
     }
 }
 
@@ -380,8 +521,15 @@ pub async fn start_session_handler(
         )));
     }
 
+    // An unrecognised kind still falls back to `validation` rather than being
+    // rejected. That is pre-existing behaviour and it is why every kind added
+    // after the first needs a capability flag: an older daemon accepts
+    // `thermal_observation` and silently records something else, and a client
+    // cannot tell from the response alone. `control.thermal_observation` is
+    // what closes that on the client side. Registered as `P8-k`.
     let kind = match body.kind.as_deref() {
         Some(KIND_LIFECYCLE) => KIND_LIFECYCLE,
+        Some(KIND_THERMAL) => KIND_THERMAL,
         _ => KIND_VALIDATION,
     };
     let metadata = build_metadata(&state, device, body.metadata);
@@ -402,6 +550,16 @@ pub async fn start_session_handler(
         sample_limit_reached: false,
         interrupted_reason: None,
         truncated_at_unix_ms: None,
+        // An operator asked for this one. `ValidationEngine::start` reads the
+        // flag to decide whether an in-flight session may be pre-empted, so a
+        // hand-started session must never carry it.
+        auto_started: false,
+        // Both are derived at finalisation from the recorded samples, never
+        // during recording: a fingerprint or a steady-state verdict computed
+        // from a partial run would have to be recomputed anyway, and publishing
+        // an interim one invites a client to render it as settled.
+        startup_fingerprints: Vec::new(),
+        steady_state: None,
     };
 
     let ctx = recorder_context(&state);
@@ -1240,6 +1398,9 @@ mod tests {
             sample_limit_reached: false,
             interrupted_reason: None,
             truncated_at_unix_ms: None,
+            auto_started: false,
+            startup_fingerprints: vec![],
+            steady_state: None,
         }
     }
 

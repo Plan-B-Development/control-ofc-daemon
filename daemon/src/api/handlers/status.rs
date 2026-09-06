@@ -356,6 +356,10 @@ pub async fn capabilities_handler(
             // the two pre-existing diagnostics.
             control_path_discovery: true,
             diagnostic_preflight: true,
+            // AIO Phase 8 Batch 3a, daemon >= 2.41.0. Required rather than
+            // optional: the session-kind fallback makes an older daemon
+            // indistinguishable from a supporting one without it.
+            thermal_observation: true,
             // `WIRE-k`: five features that shipped before this block had keys
             // for them, so clients gated on a version string or on a probe's
             // 404. All true here — the flag exists so a client can stop

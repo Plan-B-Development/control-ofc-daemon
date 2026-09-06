@@ -193,13 +193,28 @@ pub fn prune(dir: &Path, keep: usize) {
             Err(e) => log::warn!("Could not prune {}: {e}", path.display()),
         }
     }
+    // DEC-335: auto-records are retained in their OWN slot. Counting them
+    // against `keep` would let a machine that reboots repeatedly — precisely the
+    // machine on which someone enables `[startup] record_startup` — evict every
+    // session a human made, one boot at a time, with no action from the user and
+    // no warning. Two counters, one loop, so the ordering (newest first) is
+    // shared and cannot drift between them.
     let mut kept = 0usize;
+    let mut kept_auto = 0usize;
     for s in sessions {
         if s.state == STATE_RECORDING {
             continue;
         }
-        kept += 1;
-        if kept <= keep {
+        let (count, limit) = if s.auto_started {
+            (
+                &mut kept_auto,
+                constants::VALIDATION_MAX_RETAINED_AUTO_SESSIONS,
+            )
+        } else {
+            (&mut kept, keep)
+        };
+        *count += 1;
+        if *count <= limit {
             continue;
         }
         if let Some(path) = session_path(dir, &s.session_id) {

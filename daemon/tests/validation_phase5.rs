@@ -85,6 +85,9 @@ fn session() -> ValidationSession {
         sample_limit_reached: false,
         interrupted_reason: None,
         truncated_at_unix_ms: None,
+        auto_started: false,
+        startup_fingerprints: vec![],
+        steady_state: None,
     }
 }
 
@@ -115,6 +118,8 @@ fn sample_at(ms: u64, members: Vec<MemberSample>) -> ValidationSample {
         temperature_c: Some(45.0),
         temperature_sensor: Some("cpu:package".into()),
         coolant_c: None,
+        package_power_w: None,
+        gpu_power_w: None,
         thermal_state: "normal".into(),
         members,
     }
@@ -643,6 +648,13 @@ fn the_serialized_session_contains_only_cooling_relevant_keys() {
         "sample_limit_reached",
         "interrupted_reason",
         "truncated_at_unix_ms",
+        // DEC-335 (Batch 3a). All three are cooling-relevant and carry no host
+        // or user identity: `auto_started` is the recording's provenance (a
+        // daemon-opened startup capture versus an operator's), and the other two
+        // are derived fan and thermal behaviour.
+        "auto_started",
+        "startup_fingerprints",
+        "steady_state",
     ];
     for key in obj.keys() {
         assert!(
@@ -1025,7 +1037,22 @@ fn test_context() -> RecorderContext {
             control_ofc_daemon::control_override::OverrideTable::new(),
         )),
         characterization: Arc::new(parking_lot::Mutex::new(None)),
+        // DEC-335: EMPTY fixture roots, not the real `/sys`. Power discovery
+        // finds nothing here, which is the deterministic answer — pointing these
+        // at the host would make every recorder test depend on whether the
+        // machine running it happens to expose a RAPL zone, which the project's
+        // hardware-fixtures rule forbids. Raised by `ofc:concurrency-reviewer`.
+        hwmon_root: empty_sysfs_root().join("hwmon"),
+        powercap_root: empty_sysfs_root().join("powercap"),
     }
+}
+
+/// A shared empty directory standing in for `/sys`. One per test binary, like
+/// `temp_state_dir`, so parallel tests share it safely.
+fn empty_sysfs_root() -> &'static std::path::Path {
+    use std::sync::OnceLock;
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    DIR.get_or_init(|| tempfile::tempdir().unwrap()).path()
 }
 
 /// §4 "keep in-memory/session storage bounded" — and §9's reason it must be
@@ -1670,6 +1697,12 @@ fn fill_to_cap(s: &mut ValidationSession) -> usize {
             temperature_c: Some(65.5),
             temperature_sensor: sensor.clone(),
             coolant_c: Some(32.5),
+            // The cap probe assumes every optional field is PRESENT at its
+            // widest; a fixture that left these `None` would measure a smaller
+            // sample than production writes and the derived cap would be wrong
+            // in the unsafe direction (DEC-320).
+            package_power_w: Some(123.45678901234567),
+            gpu_power_w: Some(123.45678901234567),
             thermal_state: "normal".into(),
             members: ids
                 .iter()
@@ -2220,5 +2253,303 @@ fn one_members_full_speed_ride_cannot_mask_anothers_real_reclaim() {
         find(&findings, F_CONTROL_RESTORATION).state,
         RESULT_FAIL,
         "control was never restored to A; B's ride to 100% must not pay for it"
+    );
+}
+
+// ── AIO Phase 8 Batch 3a (DEC-335) ──────────────────────────────────────────
+//
+// These live here rather than in a file of their own because the validation
+// harness — `temp_state_dir`, `test_context`, `unique_session` — is defined
+// above, and a second copy of it in a sibling integration test would be free to
+// drift from the fixtures the rest of this file asserts against.
+
+/// **§3.6: the operator always wins.** This is the load-bearing property of the
+/// opt-in startup auto-record, and the reason it is acceptable for the daemon to
+/// open a session with nobody watching.
+///
+/// Without pre-emption, enabling `[startup] record_startup` would make
+/// `POST /validation/session` return `409 already_recording` for the first two
+/// minutes after every boot — a background diagnostic blocking a human.
+#[test]
+fn an_operator_session_pre_empts_the_startup_auto_record() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let ctx = test_context();
+
+    let mut auto = unique_session("preempt-auto");
+    auto.auto_started = true;
+    auto.kind = KIND_LIFECYCLE.into();
+    engine.start(auto, &ctx).unwrap();
+    engine.tick(&ctx);
+    assert!(
+        engine.is_recording(),
+        "precondition: the auto-record is live"
+    );
+
+    let mut operator = unique_session("preempt-operator");
+    operator.auto_started = false;
+    let started = engine
+        .start(operator, &ctx)
+        .expect("an operator must never be refused by a background recording");
+
+    assert_eq!(
+        engine.recording_session_id().as_deref(),
+        Some(started.session_id.as_str()),
+        "the operator's session must hold the slot"
+    );
+
+    // And the pre-empted recording was FINALISED, not discarded: up to two
+    // minutes of real evidence about this boot may already be in it.
+    // The engine writes through `store::save`, i.e. into `{state_dir}/validation`.
+    let saved = store::load_from(&temp_state_dir().join("validation"), "val-preempt-auto")
+        .expect("the session file must be readable")
+        .expect("the superseded auto-record must still be on disk");
+    assert_eq!(saved.state, STATE_COMPLETED);
+    assert_eq!(
+        saved.interrupted_reason.as_deref(),
+        Some("superseded by an operator-started session")
+    );
+    assert!(
+        saved.findings.iter().any(|f| f.id == F_STEADY_STATE),
+        "a finalised session carries its derived findings, however short"
+    );
+}
+
+/// The opposite branch, and it is what makes the test above mean anything: a
+/// `start` that always succeeded would satisfy it too. An operator's session is
+/// still single-flight against another operator's.
+#[test]
+fn an_operator_session_does_not_pre_empt_another_operator_session() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let ctx = test_context();
+
+    let first = unique_session("no-preempt-first");
+    engine.start(first, &ctx).unwrap();
+
+    let second = unique_session("no-preempt-second");
+    assert_eq!(
+        engine.start(second, &ctx).unwrap_err(),
+        control_ofc_daemon::validation::recorder::StartError::AlreadyRecording,
+        "only an auto-record may be pre-empted"
+    );
+}
+
+/// Auto-records are retained in their own slot, so a machine that reboots
+/// repeatedly cannot evict hand-made sessions one boot at a time.
+#[test]
+fn pruning_never_lets_auto_records_evict_operator_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let keep = control_ofc_daemon::constants::VALIDATION_MAX_RETAINED_SESSIONS;
+
+    // `keep` operator sessions, then twice as many auto-records, all newer.
+    for i in 0..keep {
+        let mut s = session();
+        s.session_id = format!("val-op-{i}");
+        s.state = STATE_COMPLETED.into();
+        s.started_unix_ms = 1_000 + i as u64;
+        store::save_to(dir.path(), &s).unwrap();
+    }
+    for i in 0..(keep * 2) {
+        let mut s = session();
+        s.session_id = format!("val-auto-{i}");
+        s.state = STATE_COMPLETED.into();
+        s.auto_started = true;
+        s.started_unix_ms = 100_000 + i as u64;
+        store::save_to(dir.path(), &s).unwrap();
+    }
+
+    store::prune(dir.path(), keep);
+
+    let left = store::list_from(dir.path());
+    let operators = left.iter().filter(|s| !s.auto_started).count();
+    let autos = left.iter().filter(|s| s.auto_started).count();
+    assert_eq!(
+        operators, keep,
+        "every operator session must survive a flood of auto-records"
+    );
+    assert_eq!(
+        autos,
+        control_ofc_daemon::constants::VALIDATION_MAX_RETAINED_AUTO_SESSIONS,
+        "auto-records are bounded to their own slot"
+    );
+}
+
+/// **§1: a high startup RPM is NOT a PWM control failure** when command and
+/// readback agree. The spec states this as a prohibition, so it is asserted as
+/// one: the interpretation must be the benign token, and the finding must not be
+/// a failure state.
+#[test]
+fn a_startup_override_with_a_honoured_duty_is_not_a_control_failure() {
+    let mut s = session();
+    let id = s.metadata.members[0].member_id.clone();
+    let kind = s.metadata.members[0].member_kind.clone();
+    s.metadata.members.truncate(1);
+
+    // 3400 RPM at a commanded 35% for 50 s, settling to ~1040 — §1's own worked
+    // example. Command and readback agree throughout, which is the whole point.
+    s.samples = (0..120u64)
+        .map(|i| {
+            let rpm = if i < 50 { 3400 } else { 1040 };
+            sample_at(
+                i * 1000,
+                vec![member_sample(&id, &kind, Some(35), Some(35), Some(rpm))],
+            )
+        })
+        .collect();
+
+    summary::derive_analysis(&mut s);
+    let f = s
+        .startup_fingerprints
+        .first()
+        .expect("a fingerprint must be derived");
+
+    assert!(f.override_observed);
+    assert_eq!(
+        f.interpretation, STARTUP_DEVICE_OVERRIDE,
+        "a honoured duty means the device ramped, not that control failed"
+    );
+    assert_eq!(f.peak_rpm, Some(3400));
+    assert_eq!(f.post_override_rpm, Some(1040));
+    assert_eq!(f.requested_pct_during, Some(35));
+    assert_eq!(f.readback_pct_during, Some(35));
+    assert_eq!(f.override_duration_ms, Some(50_000));
+
+    let findings = summary::summarise(&s);
+    let startup = find(&findings, F_STARTUP_BEHAVIOUR);
+    assert_eq!(startup.state, RESULT_OBSERVED);
+    assert_ne!(startup.state, RESULT_FAIL, "§1 forbids a failure verdict");
+    // The evidence that rules the fault out must reach the reader, not just the
+    // RPM that raises the question.
+    let detail = startup.detail.clone().unwrap_or_default();
+    assert!(detail.contains("35%"), "the duty must be stated: {detail}");
+    assert!(detail.contains(STARTUP_DEVICE_OVERRIDE), "got: {detail}");
+}
+
+/// The other branch of the same rule: when the readback does NOT match the
+/// command, the benign reading is not asserted. Still not a failure verdict —
+/// it says the evidence does not support the benign reading, which is a
+/// different claim from asserting a fault.
+#[test]
+fn a_startup_override_with_a_mismatched_readback_is_not_called_benign() {
+    let mut s = session();
+    let id = s.metadata.members[0].member_id.clone();
+    let kind = s.metadata.members[0].member_kind.clone();
+    s.metadata.members.truncate(1);
+    s.samples = (0..120u64)
+        .map(|i| {
+            let rpm = if i < 50 { 3400 } else { 1040 };
+            // Commanded 35, reading back 100 — the device is not honouring it.
+            sample_at(
+                i * 1000,
+                vec![member_sample(&id, &kind, Some(35), Some(100), Some(rpm))],
+            )
+        })
+        .collect();
+
+    summary::derive_analysis(&mut s);
+    let f = s.startup_fingerprints.first().unwrap();
+    assert_eq!(f.interpretation, STARTUP_COMMAND_MISMATCH);
+
+    let findings = summary::summarise(&s);
+    assert_ne!(
+        find(&findings, F_STARTUP_BEHAVIOUR).state,
+        RESULT_FAIL,
+        "even a mismatch is reported observationally, never as a fault"
+    );
+}
+
+/// A fan that simply runs at a steady speed has no startup override, and must
+/// not be given one. Without this, a fingerprint that always reported
+/// `override_observed` would pass both tests above.
+#[test]
+fn a_steady_fan_reports_no_startup_override() {
+    let mut s = session();
+    let id = s.metadata.members[0].member_id.clone();
+    let kind = s.metadata.members[0].member_kind.clone();
+    s.metadata.members.truncate(1);
+    s.samples = (0..60u64)
+        .map(|i| {
+            sample_at(
+                i * 1000,
+                vec![member_sample(&id, &kind, Some(40), Some(40), Some(1200))],
+            )
+        })
+        .collect();
+
+    summary::derive_analysis(&mut s);
+    let f = s.startup_fingerprints.first().unwrap();
+    assert!(!f.override_observed);
+    assert_eq!(f.interpretation, STARTUP_NONE_OBSERVED);
+    assert_eq!(f.peak_rpm, None, "there was no override to have a peak");
+}
+
+/// §3 as a finding: observational, and `not_established` is a statement about
+/// the observation rather than a verdict on the cooler.
+#[test]
+fn the_steady_state_finding_is_never_a_failure() {
+    // Rising throughout: never settles.
+    let mut rising = session();
+    rising.samples = (0..900u64)
+        .map(|i| {
+            let mut smp = sample_at(i * 1000, vec![]);
+            smp.temperature_c = Some(40.0 + (i as f64 / 60.0) * 0.5);
+            smp
+        })
+        .collect();
+    summary::derive_analysis(&mut rising);
+    let f = find(&summary::summarise(&rising), F_STEADY_STATE).clone();
+    assert_eq!(f.state, RESULT_NOT_OBSERVED);
+    assert_ne!(f.state, RESULT_FAIL);
+    // §3 requires the criterion be reported alongside the verdict.
+    assert!(
+        f.detail.unwrap_or_default().contains("criterion:"),
+        "the rule that produced the verdict must travel with it"
+    );
+
+    // No temperature at all is `not_tested`, never a pass and never a failure.
+    let mut blind = session();
+    blind.samples = (0..900u64)
+        .map(|i| {
+            let mut smp = sample_at(i * 1000, vec![]);
+            smp.temperature_c = None;
+            smp
+        })
+        .collect();
+    summary::derive_analysis(&mut blind);
+    assert!(blind.steady_state.is_none());
+    assert_eq!(
+        find(&summary::summarise(&blind), F_STEADY_STATE).state,
+        RESULT_NOT_TESTED
+    );
+}
+
+/// DEC-320: adding fields to a sample must move the derived cap, and the cap
+/// must still bound the REALISED file rather than a re-derivation of production's
+/// own arithmetic.
+#[test]
+fn the_sample_cap_still_bounds_the_realised_document_with_the_power_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session();
+    s.session_id = "val-cap-power".into();
+    s.state = STATE_COMPLETED.into();
+
+    let cap = fill_to_cap(&mut s);
+    store::save_to(dir.path(), &s).unwrap();
+
+    let path = dir.path().join("val-cap-power.json");
+    let realised = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        realised <= control_ofc_daemon::constants::VALIDATION_MAX_SESSION_BYTES,
+        "a session filled to its own derived cap must still be readable back: \
+         {realised} bytes over a {} byte read cap, at {cap} samples",
+        control_ofc_daemon::constants::VALIDATION_MAX_SESSION_BYTES
+    );
+    // And it really round-trips — the read cap is the thing that matters.
+    assert!(
+        store::load_from(dir.path(), "val-cap-power")
+            .expect("readable")
+            .is_some(),
+        "the document must load back"
     );
 }

@@ -1912,11 +1912,15 @@ async fn async_main() {
     // spawn: that task is short-lived and self-bounding, this one is not.
     let validation_handle = {
         let engine = app_state.validation.clone();
+        let (hwmon_root, powercap_root) =
+            control_ofc_daemon::validation::recorder::RecorderContext::sysfs_roots();
         let ctx = control_ofc_daemon::validation::recorder::RecorderContext {
             cache: cache.clone(),
             hwmon_controller: app_state.hwmon_controller.clone(),
             override_table: app_state.override_table.clone(),
             characterization: app_state.characterization.clone(),
+            hwmon_root,
+            powercap_root,
         };
         let mut shutdown = poll_shutdown_tx.subscribe();
         tokio::spawn(async move {
@@ -1973,6 +1977,46 @@ async fn async_main() {
             engine.flush_recording();
         })
     };
+
+    // ── Opt-in startup lifecycle recording (DEC-335 §1) ─────────────
+    //
+    // OFF unless `[startup] record_startup = true`. This is the only autonomous
+    // behaviour AIO Phase 8 Batch 3a adds, and the bar for the daemon acting on
+    // its own is deliberately high — so it is opt-in, bounded, and incapable of
+    // costing an operator anything:
+    //
+    //   * it writes no hardware, claims no verify slot and takes no hwmon lease;
+    //   * `ValidationEngine::start` PRE-EMPTS it the moment an operator starts a
+    //     session, so it can never turn `POST /validation/session` into a 409;
+    //   * `store::prune` retains auto-records in their own slot, so a machine
+    //     that reboots repeatedly cannot evict hand-made sessions;
+    //   * the stop is fenced on the session id, so a window that elapses after
+    //     an operator took over does not finalise *their* session.
+    //
+    // Detached rather than joined at shutdown: it holds no resource worth
+    // draining, and a shutdown inside the window leaves the recording marked
+    // `recording`, which the next boot's `sweep_interrupted` repairs to
+    // `interrupted` — the honest outcome, and the one §15 already specifies.
+    if config.startup.record_startup {
+        let state = app_state.clone();
+        tokio::spawn(async move {
+            let Some(session_id) =
+                control_ofc_daemon::api::handlers::validation::start_auto_startup_record(&state)
+                    .await
+            else {
+                return;
+            };
+            tokio::time::sleep(std::time::Duration::from_secs(
+                control_ofc_daemon::constants::STARTUP_RECORD_WINDOW_S,
+            ))
+            .await;
+            control_ofc_daemon::api::handlers::validation::stop_auto_startup_record(
+                &state,
+                &session_id,
+            )
+            .await;
+        });
+    }
 
     // ── Spawn IPC server ────────────────────────────────────────────
     // Listener was bound in preflight_check, so we know IPC is healthy

@@ -19,6 +19,8 @@
 //! a cautious classification; the interpretation lives in `validation::summary`,
 //! and even there it stays `observed` / `not_observed`, never `fail`.
 
+use serde::{Deserialize, Serialize};
+
 use crate::constants;
 
 // ── Stability classification tokens ──────────────────────────────────
@@ -534,6 +536,271 @@ pub fn fold_direction(points: impl IntoIterator<Item = DutyRpm>) -> Vec<DutyRpm>
     out
 }
 
+// ── Steady-state detection (Batch 3a §3, DEC-335) ────────────────────
+//
+// This is the temperature-domain twin the module header promised: "a
+// conservative rolling-window method based on temperature trend/slope and
+// variance". It stays pure for the same two reasons everything above it does.
+
+/// Wire token: a steady state was observed.
+pub const STEADY_STATE_DETECTED: &str = "detected";
+/// Wire token: enough data was seen, and it never settled.
+pub const STEADY_STATE_NOT_ESTABLISHED: &str = "not_established";
+/// Wire token: too little data to judge — distinct from `not_established`, which
+/// is a real negative finding. §3 asks for this explicitly rather than a forced
+/// conclusion.
+pub const STEADY_STATE_INSUFFICIENT: &str = "insufficient_data";
+
+/// Confidence tokens. Not a percentage: nothing here supports one.
+pub const CONFIDENCE_HIGH: &str = "high";
+pub const CONFIDENCE_MEDIUM: &str = "medium";
+pub const CONFIDENCE_LOW: &str = "low";
+
+/// One temperature reading from a thermal observation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TempSample {
+    pub at_ms: u64,
+    pub temp_c: f64,
+}
+
+/// The §3 outcome. Every magnitude is `Option` because "not known" and "zero"
+/// are different answers, the same rule the sample types above follow.
+///
+/// Serialisable and stored verbatim in the session document, rather than
+/// mirrored into a second wire type. `verdict` and `confidence` are therefore
+/// `String` and not `&'static str`: the pure constructors below only ever put a
+/// `STEADY_STATE_*` / `CONFIDENCE_*` constant in them, but the document has to
+/// deserialise, and a borrowed token cannot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SteadyState {
+    /// One of the three `STEADY_STATE_*` tokens.
+    pub verdict: String,
+    /// When the steady region began, as a sample `at_ms`.
+    pub start_ms: Option<u64>,
+    /// How long the observation ran before it settled.
+    pub warmup_ms: Option<u64>,
+    /// Temperature trend across the steady region.
+    pub slope_c_per_min: Option<f64>,
+    pub stddev_c: Option<f64>,
+    pub mean_c: Option<f64>,
+    /// Peak across the WHOLE observation, not just the steady region — a peak
+    /// that happened during warm-up is still the peak the user cares about.
+    pub peak_c: Option<f64>,
+    pub confidence: String,
+    /// The exact rule applied, rendered for the engineering detail block.
+    ///
+    /// **Built from the constants, never restated as literals.** §3 requires the
+    /// criterion be reported, and `CLAUDE.md` records what happens when a
+    /// threshold is spelled into prose: moving the constant falsifies every copy
+    /// at once, including the tests asserting on the text.
+    pub criterion: String,
+}
+
+/// The rule, rendered once so the verdict and its explanation cannot disagree.
+pub fn steady_state_criterion() -> String {
+    format!(
+        "|slope| <= {:.2} °C/min and σ <= {:.2} °C, held over {} consecutive {} s windows, after at least {} s of samples",
+        constants::STEADY_STATE_MAX_SLOPE_C_PER_MIN,
+        constants::STEADY_STATE_MAX_STDDEV_C,
+        constants::STEADY_STATE_HOLD_WINDOWS,
+        constants::STEADY_STATE_WINDOW_S,
+        constants::STEADY_STATE_MIN_OBSERVATION_S,
+    )
+}
+
+/// Least-squares slope of `samples` in °C per minute, and the population
+/// standard deviation of their temperatures.
+///
+/// `None` slope when fewer than two samples, or when every sample shares one
+/// timestamp — a vertical fit has no gradient and returning 0.0 would claim a
+/// flat trend that was never measured.
+fn slope_and_spread(samples: &[TempSample]) -> (Option<f64>, Option<f64>) {
+    if samples.is_empty() {
+        return (None, None);
+    }
+    let n = samples.len() as f64;
+    let mean_y = samples.iter().map(|s| s.temp_c).sum::<f64>() / n;
+    let variance = samples
+        .iter()
+        .map(|s| (s.temp_c - mean_y).powi(2))
+        .sum::<f64>()
+        / n;
+    let stddev = variance.sqrt();
+
+    if samples.len() < 2 {
+        return (None, Some(stddev));
+    }
+    // x in MINUTES so the slope is already in the reported unit and no
+    // conversion constant can drift between here and the criterion string.
+    let base = samples[0].at_ms as f64;
+    let xs: Vec<f64> = samples
+        .iter()
+        .map(|s| (s.at_ms as f64 - base) / 60_000.0)
+        .collect();
+    let mean_x = xs.iter().sum::<f64>() / n;
+    let sxx: f64 = xs.iter().map(|x| (x - mean_x).powi(2)).sum();
+    if sxx <= f64::EPSILON {
+        return (None, Some(stddev));
+    }
+    let sxy: f64 = xs
+        .iter()
+        .zip(samples.iter())
+        .map(|(x, s)| (x - mean_x) * (s.temp_c - mean_y))
+        .sum();
+    (Some(sxy / sxx), Some(stddev))
+}
+
+/// Whether one window satisfies the §3 criterion.
+fn window_qualifies(window: &[TempSample]) -> bool {
+    let (slope, stddev) = slope_and_spread(window);
+    match (slope, stddev) {
+        (Some(sl), Some(sd)) => {
+            sl.abs() <= constants::STEADY_STATE_MAX_SLOPE_C_PER_MIN
+                && sd <= constants::STEADY_STATE_MAX_STDDEV_C
+        }
+        // A window we cannot fit is not a window that passed. Lack of evidence
+        // never becomes a PASS (the Overview's status vocabulary).
+        _ => false,
+    }
+}
+
+/// Detect steady state over a whole observation (§3).
+///
+/// Conservative by construction, in three separate ways, because §3's explicit
+/// warning is against treating a short noisy plateau as equilibrium:
+///
+/// 1. Nothing is judged before [`constants::STEADY_STATE_MIN_OBSERVATION_S`] of
+///    elapsed samples — below that the answer is `insufficient_data`, not a
+///    guess.
+/// 2. The criterion must hold over [`constants::STEADY_STATE_HOLD_WINDOWS`]
+///    **consecutive, non-overlapping** windows, so a single quiet window cannot
+///    carry the verdict.
+/// 3. A window that cannot be fitted counts as a failure, never as a pass.
+pub fn steady_state(samples: &[TempSample]) -> SteadyState {
+    let criterion = steady_state_criterion();
+    let peak_c = samples
+        .iter()
+        .map(|s| s.temp_c)
+        .filter(|t| t.is_finite())
+        .fold(None::<f64>, |acc, t| Some(acc.map_or(t, |a: f64| a.max(t))));
+
+    let unresolved = |verdict: &'static str| SteadyState {
+        verdict: verdict.to_string(),
+        start_ms: None,
+        warmup_ms: None,
+        slope_c_per_min: None,
+        stddev_c: None,
+        mean_c: None,
+        peak_c,
+        confidence: CONFIDENCE_LOW.to_string(),
+        criterion: criterion.clone(),
+    };
+
+    let (Some(first), Some(last)) = (samples.first(), samples.last()) else {
+        return unresolved(STEADY_STATE_INSUFFICIENT);
+    };
+    let span_s = last.at_ms.saturating_sub(first.at_ms) / 1_000;
+    if span_s < constants::STEADY_STATE_MIN_OBSERVATION_S {
+        return unresolved(STEADY_STATE_INSUFFICIENT);
+    }
+
+    let window_ms = constants::STEADY_STATE_WINDOW_S * 1_000;
+    let hold = constants::STEADY_STATE_HOLD_WINDOWS;
+
+    // Walk the SAMPLES, closing a window when a sample crosses its boundary.
+    //
+    // **Bounded by sample count, deliberately, and the first draft was not.** It
+    // stepped a cursor forward by `window_ms` until it passed `last.at_ms`,
+    // which is bounded by the *span* rather than by the data — and `at_ms` here
+    // is `ValidationSample::elapsed_ms`, which `recorder::tick` computes as
+    // `unix_ms() - started_unix_ms`, i.e. a difference of two `SystemTime`
+    // reads. A clock step (timesyncd on a machine with a dead RTC, a VM, a first
+    // boot — precisely when the startup auto-record is running) makes that span
+    // ~1e12 ms, so the walk ran ~1e7 near-empty iterations, each allocating and
+    // scanning, **while the caller holds the session slot guard**. That is a
+    // hang, not a slow path. Iterating the samples cannot exceed
+    // `VALIDATION_MAX_SAMPLES` however far the clock jumps.
+    let mut run: usize = 0;
+    let mut run_start_ms: Option<u64> = None;
+    let mut settled_at: Option<u64> = None;
+    let mut window: Vec<TempSample> = Vec::new();
+    let mut window_index: u64 = 0;
+    let window_of = |at_ms: u64| at_ms.saturating_sub(first.at_ms) / window_ms;
+
+    for sample in samples {
+        let idx = window_of(sample.at_ms);
+        if idx != window_index {
+            // A window is only judged once it is COMPLETE — i.e. when a later
+            // sample proves we have left it. The trailing partial window is
+            // never judged, which is what the span-based guard did too.
+            if window_qualifies(&window) {
+                if run == 0 {
+                    run_start_ms = Some(first.at_ms + window_index * window_ms);
+                }
+                run += 1;
+                if run >= hold {
+                    settled_at = run_start_ms;
+                    break;
+                }
+            } else {
+                run = 0;
+                run_start_ms = None;
+            }
+            // Windows skipped entirely (a gap in the recording, or a clock
+            // step) hold no samples, so they cannot qualify and the run breaks.
+            // Counting them as "not present" rather than "passed" is the same
+            // rule `window_qualifies` applies to an unfittable window.
+            if idx > window_index + 1 {
+                run = 0;
+                run_start_ms = None;
+            }
+            window_index = idx;
+            window.clear();
+        }
+        window.push(*sample);
+    }
+
+    let Some(start_ms) = settled_at else {
+        return unresolved(STEADY_STATE_NOT_ESTABLISHED);
+    };
+
+    let steady: Vec<TempSample> = samples
+        .iter()
+        .copied()
+        .filter(|s| s.at_ms >= start_ms)
+        .collect();
+    let (slope, stddev) = slope_and_spread(&steady);
+    let mean = (!steady.is_empty())
+        .then(|| steady.iter().map(|s| s.temp_c).sum::<f64>() / steady.len() as f64);
+
+    // Confidence is about how much evidence there is and how far inside the
+    // band it sits — never a probability, which nothing here supports.
+    let held_ms = last.at_ms.saturating_sub(start_ms);
+    let required_ms = window_ms * hold as u64;
+    let deep_inside = slope
+        .is_some_and(|s| s.abs() <= constants::STEADY_STATE_MAX_SLOPE_C_PER_MIN / 2.0)
+        && stddev.is_some_and(|s| s <= constants::STEADY_STATE_MAX_STDDEV_C / 2.0);
+    let confidence = if held_ms >= required_ms * 2 && deep_inside {
+        CONFIDENCE_HIGH
+    } else if deep_inside || held_ms >= required_ms * 2 {
+        CONFIDENCE_MEDIUM
+    } else {
+        CONFIDENCE_LOW
+    };
+
+    SteadyState {
+        verdict: STEADY_STATE_DETECTED.to_string(),
+        start_ms: Some(start_ms),
+        warmup_ms: Some(start_ms.saturating_sub(first.at_ms)),
+        slope_c_per_min: slope,
+        stddev_c: stddev,
+        mean_c: mean,
+        peak_c,
+        confidence: confidence.to_string(),
+        criterion,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -954,5 +1221,216 @@ mod tests {
     fn folding_sorts_by_duty_and_keeps_the_last_reading_at_a_repeated_duty() {
         let out = fold_direction(vec![dr(60, 100), dr(30, 900), dr(60, 200)]);
         assert_eq!(out, vec![dr(30, 900), dr(60, 200)]);
+    }
+
+    // ── Steady-state detection (Batch 3a §3) ─────────────────────────
+
+    /// A 1 Hz trace of `secs` seconds, temperature from `f(second)`.
+    fn trace(f: impl Fn(u64) -> f64, secs: u64) -> Vec<TempSample> {
+        (0..=secs)
+            .map(|s| TempSample {
+                at_ms: s * 1_000,
+                temp_c: f(s),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn too_short_an_observation_is_insufficient_not_a_verdict() {
+        // §3: return STEADY_STATE_NOT_ESTABLISHED rather than forcing a
+        // conclusion — and `insufficient_data` is a THIRD answer, because "we
+        // could not tell" is not "it never settled".
+        let ss = steady_state(&trace(|_| 50.0, 100));
+        assert_eq!(ss.verdict, STEADY_STATE_INSUFFICIENT);
+        assert_eq!(ss.start_ms, None);
+        assert_eq!(ss.slope_c_per_min, None);
+    }
+
+    #[test]
+    fn an_empty_trace_is_insufficient_rather_than_a_panic() {
+        assert_eq!(steady_state(&[]).verdict, STEADY_STATE_INSUFFICIENT);
+    }
+
+    #[test]
+    fn a_still_rising_temperature_never_establishes() {
+        // 0.5 °C/min, five times the threshold: a loop still absorbing heat.
+        let ss = steady_state(&trace(|s| 40.0 + (s as f64 / 60.0) * 0.5, 900));
+        assert_eq!(ss.verdict, STEADY_STATE_NOT_ESTABLISHED);
+        assert_eq!(ss.start_ms, None);
+        // The peak is still reported: it is a fact about the observation, and
+        // it is what the user actually wants from a run that never settled.
+        assert!(ss.peak_c.is_some_and(|p| p > 47.0), "peak: {:?}", ss.peak_c);
+    }
+
+    #[test]
+    fn a_flat_trace_settles_and_reports_its_metrics() {
+        let ss = steady_state(&trace(|_| 52.0, 900));
+        assert_eq!(ss.verdict, STEADY_STATE_DETECTED);
+        assert_eq!(ss.start_ms, Some(0), "a trace flat from t=0 has no warm-up");
+        assert_eq!(ss.warmup_ms, Some(0));
+        assert!(ss.slope_c_per_min.is_some_and(|s| s.abs() < 1e-9));
+        assert!(ss.stddev_c.is_some_and(|s| s < 1e-9));
+        assert!(ss.mean_c.is_some_and(|m| (m - 52.0).abs() < 1e-9));
+        assert_eq!(ss.confidence, CONFIDENCE_HIGH);
+    }
+
+    #[test]
+    fn a_warm_up_is_excluded_from_the_steady_region() {
+        // Rises for 300 s, then flat. The steady region must start AFTER the
+        // ramp, and the reported mean must be the plateau's, not the whole
+        // trace's — averaging the warm-up in is the error this guards.
+        let ss = steady_state(&trace(
+            |s| {
+                if s < 300 {
+                    40.0 + s as f64 * 0.04
+                } else {
+                    52.0
+                }
+            },
+            900,
+        ));
+        assert_eq!(ss.verdict, STEADY_STATE_DETECTED);
+        let start = ss.start_ms.expect("must settle");
+        assert!(
+            start >= 300_000,
+            "steady region began at {start} ms, inside the ramp"
+        );
+        assert!(ss.warmup_ms.is_some_and(|w| w >= 300_000));
+        assert!(
+            ss.mean_c.is_some_and(|m| (m - 52.0).abs() < 0.5),
+            "mean {:?} should be the plateau's, not the whole trace's",
+            ss.mean_c
+        );
+    }
+
+    #[test]
+    fn one_quiet_window_is_not_equilibrium() {
+        // THE §3 warning, asserted directly: "do not treat short noisy plateaus
+        // as guaranteed equilibrium". Flat for one window, then climbing. With
+        // STEADY_STATE_HOLD_WINDOWS == 1 this would report `detected`.
+        let ss = steady_state(&trace(
+            |s| {
+                if s < constants::STEADY_STATE_WINDOW_S {
+                    45.0
+                } else {
+                    45.0 + (s - constants::STEADY_STATE_WINDOW_S) as f64 * 0.02
+                }
+            },
+            900,
+        ));
+        assert_eq!(
+            ss.verdict, STEADY_STATE_NOT_ESTABLISHED,
+            "a single qualifying window must not carry the verdict"
+        );
+    }
+
+    #[test]
+    fn a_noisy_plateau_with_no_trend_still_fails_on_spread() {
+        // Mean is dead flat, so the slope gate alone would pass it. The
+        // variance gate is what refuses it — both halves of §3's criterion are
+        // load-bearing, and this is the one that a slope-only implementation
+        // would silently drop.
+        let ss = steady_state(&trace(|s| if s % 2 == 0 { 48.0 } else { 54.0 }, 900));
+        assert!(
+            ss.slope_c_per_min.is_none() || ss.verdict == STEADY_STATE_NOT_ESTABLISHED,
+            "verdict {:?}",
+            ss.verdict
+        );
+        assert_eq!(ss.verdict, STEADY_STATE_NOT_ESTABLISHED);
+    }
+
+    #[test]
+    fn the_peak_spans_the_whole_observation_not_the_steady_region() {
+        // A spike during warm-up is still the peak. Reporting only the steady
+        // region's maximum would under-report the hottest moment, which is
+        // exactly the number a thermal observation exists to capture.
+        let ss = steady_state(&trace(
+            |s| match s {
+                100 => 91.0,
+                s if s < 300 => 40.0,
+                _ => 52.0,
+            },
+            900,
+        ));
+        assert_eq!(ss.peak_c, Some(91.0));
+        assert_eq!(ss.verdict, STEADY_STATE_DETECTED);
+        assert!(
+            ss.mean_c.is_some_and(|m| m < 60.0),
+            "the spike must not drag the steady-region mean: {:?}",
+            ss.mean_c
+        );
+    }
+
+    #[test]
+    fn the_criterion_is_rendered_from_the_constants() {
+        // CLAUDE.md: a threshold spelled into prose drifts the moment the
+        // constant moves. This asserts the rendered text against the constants
+        // themselves, so re-tuning either one keeps the reported rule honest
+        // and cannot leave the test asserting a stale number.
+        let text = steady_state_criterion();
+        assert!(
+            text.contains(&format!(
+                "{:.2}",
+                constants::STEADY_STATE_MAX_SLOPE_C_PER_MIN
+            )),
+            "criterion must name the slope threshold: {text}"
+        );
+        assert!(
+            text.contains(&format!("{:.2}", constants::STEADY_STATE_MAX_STDDEV_C)),
+            "criterion must name the spread threshold: {text}"
+        );
+        assert!(
+            text.contains(&constants::STEADY_STATE_WINDOW_S.to_string()),
+            "criterion must name the window: {text}"
+        );
+        // And every verdict carries it, including the ones that resolved nothing.
+        assert_eq!(steady_state(&[]).criterion, text);
+        assert_eq!(steady_state(&trace(|_| 50.0, 900)).criterion, text);
+    }
+
+    #[test]
+    fn a_clock_step_cannot_make_the_walk_unbounded() {
+        // `at_ms` is `elapsed_ms`, which the recorder derives from two
+        // `SystemTime` reads — so a clock step during a recording puts a
+        // ~1e12 ms gap in the series. The first draft walked the SPAN in
+        // 120 s steps, i.e. ~1e7 near-empty iterations while the caller held
+        // the session slot guard. This asserts the walk is bounded by the
+        // number of samples instead.
+        //
+        // Bounded by wall time rather than by an iteration counter because the
+        // property is "this returns"; the old code did not, and any threshold
+        // generous enough to be non-flaky still separates 40 samples from 1e7
+        // iterations by four orders of magnitude.
+        let mut samples = trace(|_| 50.0, 400);
+        samples.push(TempSample {
+            at_ms: 1_800_000_000_000,
+            temp_c: 50.0,
+        });
+
+        let started = std::time::Instant::now();
+        let ss = steady_state(&samples);
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "the walk must be bounded by sample count, not by span; took {elapsed:?}"
+        );
+        // And it still answers rather than degrading to a shrug: the 400 s of
+        // flat samples before the jump satisfy the criterion.
+        assert_eq!(ss.verdict, STEADY_STATE_DETECTED);
+    }
+
+    #[test]
+    fn a_window_that_cannot_be_fitted_is_not_a_pass() {
+        // Every sample at one timestamp: no gradient exists. Lack of evidence
+        // must not become a PASS (the Overview's status vocabulary).
+        let flat_in_time: Vec<TempSample> = (0..10)
+            .map(|_| TempSample {
+                at_ms: 0,
+                temp_c: 50.0,
+            })
+            .collect();
+        assert!(!window_qualifies(&flat_in_time));
+        assert!(!window_qualifies(&[]));
     }
 }

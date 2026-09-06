@@ -60,6 +60,15 @@ pub const KIND_VALIDATION: &str = "validation";
 /// findings and a different Phase 6 preset. Two engines would be the duplication
 /// §17 forbids.
 pub const KIND_LIFECYCLE: &str = "lifecycle";
+/// A thermal observation (Batch 3a §2) — again the same engine, and again only
+/// the findings and the client preset differ.
+///
+/// **Capability-gated on the wire, unlike the two above.** `handlers::validation`
+/// falls back to [`KIND_VALIDATION`] for a kind it does not recognise, so an
+/// older daemon would accept a thermal request and silently record something
+/// else under a name the client would then misreport. `control.thermal_observation`
+/// is what lets a client know the difference.
+pub const KIND_THERMAL: &str = "thermal_observation";
 
 // ── Event markers (§5) ──────────────────────────────────────────────────────
 //
@@ -248,10 +257,41 @@ pub struct ValidationSample {
     pub temperature_sensor: Option<String>,
     #[serde(default)]
     pub coolant_c: Option<f64>,
+    /// CPU package power in watts (Batch 3a §2).
+    ///
+    /// `None` means **not known**, never idle. Three separate causes produce it
+    /// and none of them is zero watts: the machine exposes no readable source
+    /// (measured: `k10temp` publishes no power attribute at all), this is the
+    /// first tick of a session whose source is a cumulative RAPL counter, or the
+    /// derived value failed the plausibility guard. See [`crate::hwmon::power`].
+    #[serde(default)]
+    pub package_power_w: Option<f64>,
+    /// GPU power in watts, where the GPU subsystem exposes it.
+    ///
+    /// Recorded because the GPU is a heat source inside the same case and a
+    /// thermal observation that ignores it cannot explain a coolant rise during
+    /// a mixed workload. It is **not** CPU package power and the two are never
+    /// summed here.
+    #[serde(default)]
+    pub gpu_power_w: Option<f64>,
     /// `normal` / `recovery` / `emergency` / `no_sensor_fallback`.
     pub thermal_state: String,
     pub members: Vec<MemberSample>,
 }
+
+/// The power value with the longest JSON rendering that a power field can hold.
+///
+/// `10 µJ / 900 000 µs` — 23 characters. Chosen by measurement over the
+/// achievable quotient space, not by inspection; see the note in
+/// [`probe_sample_bytes`] for why the obvious "largest value" guess is wrong.
+const WIDEST_POWER_SAMPLE: f64 = 10.0 / 900_000.0;
+
+// The probe value must be a reading a power field can actually hold — otherwise
+// the cap is padded rather than bounded, which is its own kind of wrong. Checked
+// at compile time rather than in a test: it is a property of two constants and
+// nothing at runtime can change it.
+const _: () = assert!(WIDEST_POWER_SAMPLE > 0.0);
+const _: () = assert!(WIDEST_POWER_SAMPLE <= crate::constants::POWER_MAX_PLAUSIBLE_W);
 
 /// Worst-case serialised bytes for one sample of `session`.
 ///
@@ -281,6 +321,27 @@ fn probe_sample_bytes(session: &ValidationSession) -> usize {
         // The session's own value, which is what every sample will carry.
         temperature_sensor: session.metadata.temperature_sensor.clone(),
         coolant_c: Some(-100.5),
+        // The widest value each power field can actually hold — MEASURED, not
+        // reasoned about (DEC-320).
+        //
+        // The first draft used `999.9999999999999` on the reasoning that the
+        // widest rendering must be a full-precision value just under
+        // `POWER_MAX_PLAUSIBLE_W`. That is 17 characters and it is **wrong**:
+        // the RAPL path computes `delta_uj as f64 / elapsed_us as f64`, an
+        // arbitrary quotient of two integers, and a small one such as
+        // `10 / 900_000` renders as `0.000011111111111111112` — **23**
+        // characters, six more per field per sample. Values below ~1e-5 switch
+        // to compact scientific notation, so this band is the true worst case
+        // and it is exactly where a near-idle or wrap-adjacent tick lands.
+        // Caught by `ofc:contract-reviewer`; it is the same "measure the real
+        // value rather than assuming its ceiling" rule that DEC-320 exists for,
+        // missed in its own fix a second time.
+        //
+        // `WIDEST_POWER_SAMPLE` is pinned by `the_probe_covers_every_achievable_
+        // power_rendering`, which sweeps the achievable quotient space and
+        // asserts nothing serialises longer.
+        package_power_w: Some(WIDEST_POWER_SAMPLE),
+        gpu_power_w: Some(WIDEST_POWER_SAMPLE),
         // The longest of the four thermal states, so the probe over-estimates.
         thermal_state: "no_sensor_fallback".to_string(),
         members: member_ids
@@ -472,6 +533,13 @@ pub const F_CONTROL_RESTORATION: &str = "control_restoration";
 pub const F_COOLANT_TELEMETRY: &str = "coolant_telemetry";
 /// AIO Phase 8 Batch 1: which tach channel(s) this header actually drives.
 pub const F_CONTROL_PATH: &str = "control_path_mapping";
+/// AIO Phase 8 Batch 3a §3: whether the observation reached thermal equilibrium.
+///
+/// Observational like every other finding here. "Not established" is a statement
+/// about the *observation*, never about the hardware — a run that was stopped
+/// early and a cooler that genuinely cannot stabilise produce the same token,
+/// and this finding does not claim to tell them apart.
+pub const F_STEADY_STATE: &str = "thermal_steady_state";
 pub const F_DAEMON_RESTART_RECOVERY: &str = "daemon_restart_recovery";
 
 // ── The session itself ──────────────────────────────────────────────────────
@@ -515,7 +583,81 @@ pub struct ValidationSession {
     /// **never fabricated** for the gap after it (§15).
     #[serde(default)]
     pub truncated_at_unix_ms: Option<u64>,
+    /// This session was opened by the daemon at startup, not by an operator
+    /// (Batch 3a §1, `[startup] record_startup`).
+    ///
+    /// Two behaviours hang off it, and both exist to keep a background recording
+    /// from costing an operator anything: `ValidationEngine::start` **pre-empts**
+    /// an auto-record rather than refusing the operator's session, and
+    /// `store::prune` retains auto-records in their own slot so a boot loop
+    /// cannot evict hand-made sessions.
+    #[serde(default)]
+    pub auto_started: bool,
+    /// Per-member startup behaviour (Batch 3a §1). Empty when nothing was
+    /// derivable — never a row of zeroes.
+    #[serde(default)]
+    pub startup_fingerprints: Vec<StartupFingerprint>,
+    /// Steady-state analysis of the control temperature (Batch 3a §3).
+    ///
+    /// `None` when the session recorded no temperature at all. A session that
+    /// recorded temperature but did not settle carries a result whose verdict is
+    /// `not_established` — which is a finding, not an absence.
+    #[serde(default)]
+    pub steady_state: Option<crate::api::stats::SteadyState>,
 }
+
+/// What one member's fans did in the moments after control was established
+/// (Batch 3a §1).
+///
+/// **Observational, always.** §1 is explicit: *"do not diagnose startup high RPM
+/// as failed PWM control when command/readback remain valid"*. A device that
+/// spins its fans to maximum for fifty seconds at power-on and then obeys the
+/// duty is a device behaving as designed, and the interpretation field says so
+/// rather than leaving a client to guess from a large number.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StartupFingerprint {
+    pub member_id: String,
+    pub role: String,
+    /// True when RPM began materially above where it settled.
+    pub override_observed: bool,
+    /// How long RPM stayed above the settled band.
+    #[serde(default)]
+    pub override_duration_ms: Option<u64>,
+    /// Highest RPM seen during the override.
+    #[serde(default)]
+    pub peak_rpm: Option<u16>,
+    /// The duty **commanded** while the override was in progress. Paired with
+    /// `readback_pct_during` because §1's whole point is that these two agreeing
+    /// is what rules out a control fault.
+    #[serde(default)]
+    pub requested_pct_during: Option<u8>,
+    #[serde(default)]
+    pub readback_pct_during: Option<u8>,
+    /// Where RPM settled once the override ended.
+    #[serde(default)]
+    pub post_override_rpm: Option<u16>,
+    /// Time from the peak to the first in-band reading.
+    #[serde(default)]
+    pub transition_ms: Option<u64>,
+    /// A stable token; the client owns the wording and must render an
+    /// unrecognised one rather than dropping it.
+    pub interpretation: String,
+}
+
+/// The override ended and the commanded duty was honoured throughout — a device
+/// startup behaviour, explicitly **not** a control fault (§1).
+pub const STARTUP_DEVICE_OVERRIDE: &str = "device_startup_override";
+/// RPM started high and never came down to a band consistent with the duty
+/// within the recording. Still observational: the recording may simply have been
+/// too short, which is why this does not say "stuck".
+pub const STARTUP_UNRESOLVED: &str = "override_did_not_resolve";
+/// No elevated startup period was seen at all.
+pub const STARTUP_NONE_OBSERVED: &str = "no_override_observed";
+/// The duty and its readback disagreed during the elevated period, so the
+/// elevated RPM cannot be attributed to a device override. **This still is not a
+/// failure verdict** — it says the evidence does not support the benign reading,
+/// which is a different claim from asserting a fault.
+pub const STARTUP_COMMAND_MISMATCH: &str = "command_readback_mismatch";
 
 impl ValidationSession {
     /// Is this session still sampling?
@@ -568,4 +710,91 @@ pub fn is_safe_session_id(id: &str) -> bool {
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins [`WIDEST_POWER_SAMPLE`] against the values a power field can
+    /// actually hold (DEC-320, `ofc:contract-reviewer`).
+    ///
+    /// The probe's whole job is to be an upper bound, and the first draft was
+    /// not one: it assumed the widest rendering was a full-precision value just
+    /// under `POWER_MAX_PLAUSIBLE_W` (17 chars) when a small quotient renders in
+    /// 23. This sweeps the achievable space — `delta_uj / elapsed_us` for both
+    /// integers — and asserts nothing serialises longer than the constant.
+    ///
+    /// Asserts the **realised serialisation**, not a re-derivation of the
+    /// reasoning that produced the constant: a test that re-argued "the biggest
+    /// number is the longest" would share the original blind spot exactly.
+    #[test]
+    fn the_probe_covers_every_achievable_power_rendering() {
+        let widest = serde_json::to_string(&Some(WIDEST_POWER_SAMPLE))
+            .unwrap()
+            .len();
+
+        let mut worst = (0usize, String::new(), 0u64, 0u64);
+        for elapsed_us in [
+            1u64,
+            3,
+            7,
+            97,
+            999,
+            1_000,
+            65_537,
+            500_000,
+            900_000,
+            1_000_000,
+            1_048_576,
+            60_000_000,
+            3_600_000_000,
+        ] {
+            for delta_uj in [
+                1u64,
+                2,
+                3,
+                7,
+                10,
+                97,
+                999,
+                1_000,
+                65_537,
+                999_983,
+                123_456_789,
+                999_999_999,
+                7_200_000_000,
+            ] {
+                let w = delta_uj as f64 / elapsed_us as f64;
+                if !(w.is_finite() && w <= crate::constants::POWER_MAX_PLAUSIBLE_W) {
+                    continue;
+                }
+                let len = serde_json::to_string(&Some(w)).unwrap().len();
+                if len > worst.0 {
+                    worst = (
+                        len,
+                        serde_json::to_string(&Some(w)).unwrap(),
+                        delta_uj,
+                        elapsed_us,
+                    );
+                }
+            }
+        }
+
+        assert!(
+            worst.0 > 0,
+            "precondition: the sweep must actually have produced a plausible value"
+        );
+        assert!(
+            worst.0 <= widest,
+            "the probe under-counts a power field by {} bytes: {} ({} uJ / {} us) renders in {} \
+             chars, the probe assumes {}",
+            worst.0 - widest,
+            worst.1,
+            worst.2,
+            worst.3,
+            worst.0,
+            widest
+        );
+    }
 }

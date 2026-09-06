@@ -42,6 +42,9 @@ pub fn summarise(session: &ValidationSession) -> Vec<ValidationFinding> {
     out.push(effective_range_finding(session, interrupted));
     out.push(learned_range_finding(session, interrupted));
     out.push(startup_behaviour(session));
+    // DEC-335 (Batch 3a §3). Observational like the four above: `not_established`
+    // is a statement about the observation, never about the cooler.
+    out.push(steady_state_finding(session));
     out.extend(divergence(session));
     out.push(device_override(session, interrupted));
     out.push(bios_reclaim(session));
@@ -537,6 +540,173 @@ fn response_latency(session: &ValidationSession, interrupted: bool) -> Validatio
     finding(F_RESPONSE_LATENCY, absent_state(interrupted))
 }
 
+/// Derive the Batch 3a §1 and §3 analyses onto the session.
+///
+/// Called once at finalisation, before [`summarise`], because both findings read
+/// what this writes. Kept separate from `summarise` for the same reason
+/// everything in `stats` is separate from the sweep: these are total functions
+/// over the recorded samples, and a caller that wants the numbers should not
+/// have to render a finding to get them.
+pub fn derive_analysis(session: &mut ValidationSession) {
+    session.startup_fingerprints = startup_fingerprints(session);
+    session.steady_state = steady_state_for(session);
+}
+
+/// The control temperature as a series [`crate::api::stats`] can analyse.
+///
+/// Keyed on `elapsed_ms` rather than `unix_ms`: the criterion is about rates,
+/// and a wall clock can step. Samples with no temperature are dropped rather
+/// than zero-filled — a missing reading is not 0 °C.
+pub fn steady_state_for(session: &ValidationSession) -> Option<crate::api::stats::SteadyState> {
+    let series: Vec<crate::api::stats::TempSample> = session
+        .samples
+        .iter()
+        .filter_map(|s| {
+            s.temperature_c.map(|t| crate::api::stats::TempSample {
+                at_ms: s.elapsed_ms,
+                temp_c: t,
+            })
+        })
+        .collect();
+    if series.is_empty() {
+        return None;
+    }
+    Some(crate::api::stats::steady_state(&series))
+}
+
+/// §3 as a finding. **Never `fail`.**
+///
+/// `not_established` maps to `not_observed`, not to a failure: a run stopped
+/// early and a loop that genuinely never settles are indistinguishable from the
+/// data, and the Overview's vocabulary forbids turning either into a verdict
+/// about the hardware.
+fn steady_state_finding(session: &ValidationSession) -> ValidationFinding {
+    use crate::api::stats::{
+        STEADY_STATE_DETECTED, STEADY_STATE_INSUFFICIENT, STEADY_STATE_NOT_ESTABLISHED,
+    };
+    let Some(ss) = &session.steady_state else {
+        return with_detail(
+            finding(F_STEADY_STATE, RESULT_NOT_TESTED),
+            "no control temperature was recorded".to_string(),
+        );
+    };
+    let state = match ss.verdict.as_str() {
+        STEADY_STATE_DETECTED => RESULT_OBSERVED,
+        STEADY_STATE_NOT_ESTABLISHED => RESULT_NOT_OBSERVED,
+        STEADY_STATE_INSUFFICIENT => RESULT_NOT_TESTED,
+        // An unknown token must not silently become a pass.
+        _ => RESULT_UNKNOWN,
+    };
+    // The criterion travels with the verdict, which §3 requires: a reader must
+    // be able to see what rule produced it without consulting the source.
+    let detail = match (ss.mean_c, ss.slope_c_per_min) {
+        (Some(mean), Some(slope)) if ss.verdict == STEADY_STATE_DETECTED => format!(
+            "mean {mean:.1} °C, trend {slope:+.2} °C/min ({}); criterion: {}",
+            ss.confidence, ss.criterion
+        ),
+        _ => format!("criterion: {}", ss.criterion),
+    };
+    with_detail(finding(F_STEADY_STATE, state), detail)
+}
+
+/// §1's per-member startup fingerprint.
+///
+/// Pure over the recorded samples. Returns an entry only for members whose tach
+/// gave enough readings to say anything — an empty vector is the honest result
+/// for a board with no usable tach, and is not a row of zeroes.
+pub fn startup_fingerprints(session: &ValidationSession) -> Vec<StartupFingerprint> {
+    session
+        .metadata
+        .members
+        .iter()
+        .filter_map(|m| fingerprint_for(session, &m.member_id, &m.member_kind))
+        .collect()
+}
+
+fn fingerprint_for(
+    session: &ValidationSession,
+    member_id: &str,
+    role: &str,
+) -> Option<StartupFingerprint> {
+    // (elapsed_ms, rpm, requested, readback) for every tick this member reported
+    // a tach reading. An unreadable tach is skipped, never treated as 0 RPM.
+    let series: Vec<(u64, u16, Option<u8>, Option<u8>)> = session
+        .samples
+        .iter()
+        .filter_map(|s| {
+            let m = s.members.iter().find(|m| m.member_id == member_id)?;
+            Some((s.elapsed_ms, m.rpm?, m.requested_pct, m.readback_pct))
+        })
+        .collect();
+    if series.len() < constants::STARTUP_MIN_SAMPLES {
+        return None;
+    }
+
+    // Where it ended up: the median of the final third, which is robust to a
+    // single late spike in a way a mean or a last-sample read is not.
+    let tail_start = series.len() * 2 / 3;
+    let mut tail: Vec<u16> = series[tail_start..].iter().map(|s| s.1).collect();
+    tail.sort_unstable();
+    let settled = tail[tail.len() / 2];
+
+    let base = StartupFingerprint {
+        member_id: member_id.to_string(),
+        role: role.to_string(),
+        override_observed: false,
+        override_duration_ms: None,
+        peak_rpm: None,
+        requested_pct_during: None,
+        readback_pct_during: None,
+        post_override_rpm: Some(settled),
+        transition_ms: None,
+        interpretation: STARTUP_NONE_OBSERVED.to_string(),
+    };
+
+    // A settled reading of zero gives no band to compare against — a ratio
+    // around zero admits nothing, so no override can be established either way.
+    if settled == 0 {
+        return Some(base);
+    }
+    let band_high = f64::from(settled) * constants::STARTUP_OVERRIDE_RATIO;
+    if f64::from(series[0].1) <= band_high {
+        return Some(base);
+    }
+
+    // The override runs until the first reading back inside the band.
+    let resolved_at = series.iter().position(|s| f64::from(s.1) <= band_high);
+    let end_idx = resolved_at.unwrap_or(series.len());
+    let during = &series[..end_idx];
+    let (peak_idx, peak) = during
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, s)| s.1)
+        .map(|(i, s)| (i, s.1))?;
+
+    let (requested, readback) = (during[peak_idx].2, during[peak_idx].3);
+    // The §1 rule: a high startup RPM is a device behaviour, not a control
+    // fault, *when the command was honoured*. A mismatch is only claimed on
+    // positive evidence of disagreement — an unreadable readback leaves the
+    // benign reading standing, because lack of evidence must not become a fault.
+    let interpretation = match (requested, readback) {
+        (Some(req), Some(rb)) if req.abs_diff(rb) > constants::STARTUP_DUTY_MATCH_TOLERANCE_PCT => {
+            STARTUP_COMMAND_MISMATCH
+        }
+        _ if resolved_at.is_none() => STARTUP_UNRESOLVED,
+        _ => STARTUP_DEVICE_OVERRIDE,
+    };
+
+    Some(StartupFingerprint {
+        override_observed: true,
+        override_duration_ms: resolved_at.map(|i| series[i].0),
+        peak_rpm: Some(peak),
+        requested_pct_during: requested,
+        readback_pct_during: readback,
+        transition_ms: resolved_at.map(|i| series[i].0.saturating_sub(during[peak_idx].0)),
+        interpretation: interpretation.to_string(),
+        ..base
+    })
+}
+
 /// Startup/lifecycle behaviour — §9 is explicit that a temporary high-RPM period
 /// must be representable **without** being treated as a failure, so this is
 /// always observational.
@@ -555,12 +725,54 @@ fn startup_behaviour(session: &ValidationSession) -> ValidationFinding {
         .filter(|e| LIFECYCLE.contains(&e.kind.as_str()))
         .map(|e| e.kind.as_str())
         .collect();
-    if seen.is_empty() {
+    // DEC-335 (§1): the fingerprint is evidence in its own right. Before it,
+    // this finding could only count events, so a device that overrode its fans
+    // for fifty seconds at power-on produced `not_observed` unless some
+    // unrelated lifecycle event happened to coincide.
+    let overrides: Vec<&StartupFingerprint> = session
+        .startup_fingerprints
+        .iter()
+        .filter(|f| f.override_observed)
+        .collect();
+
+    if seen.is_empty() && overrides.is_empty() {
         return finding(F_STARTUP_BEHAVIOUR, RESULT_NOT_OBSERVED);
     }
+
+    let mut parts: Vec<String> = Vec::new();
+    if !seen.is_empty() {
+        parts.push(format!("{} lifecycle event(s)", seen.len()));
+    }
+    for f in overrides {
+        // Phrased as a device behaviour, with the command evidence attached.
+        // §1 is explicit that a temporary high-RPM period must be
+        // representable without being treated as a control failure, so the
+        // duty and its readback are stated alongside the RPM rather than the
+        // RPM alone — the two agreeing is exactly what rules the fault out.
+        let duty = match (f.requested_pct_during, f.readback_pct_during) {
+            (Some(req), Some(rb)) => format!(", duty {req}% / readback {rb}%"),
+            (Some(req), None) => format!(", duty {req}%"),
+            _ => String::new(),
+        };
+        let duration = f
+            .override_duration_ms
+            .map(|ms| format!(" for ~{} s", ms / 1000))
+            .unwrap_or_else(|| " (unresolved within the recording)".to_string());
+        parts.push(format!(
+            "{}: startup override{}, peak {} RPM{} → settled {} RPM [{}]",
+            f.member_id,
+            duration,
+            f.peak_rpm.map_or_else(|| "?".into(), |r| r.to_string()),
+            duty,
+            f.post_override_rpm
+                .map_or_else(|| "?".into(), |r| r.to_string()),
+            f.interpretation,
+        ));
+    }
+
     with_detail(
         finding(F_STARTUP_BEHAVIOUR, RESULT_OBSERVED),
-        format!("{} lifecycle event(s)", seen.len()),
+        parts.join("; "),
     )
 }
 

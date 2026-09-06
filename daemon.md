@@ -726,3 +726,51 @@ Codes (note `validation_error` is returned with **two** HTTP statuses):
 The client-lease codes `lease_required` / `lease_already_held` were retired (DEC-165)
 and fully removed at DEC-170 — a verify-path internal-lease lapse now returns
 `503 hardware_unavailable`.
+
+
+## AIO Phase 8 Batch 3a — thermal observation and steady state (DEC-335, v2.41.0)
+
+Three additions, all of them **recorders or pure derivations**. Nothing here writes hardware,
+claims the verify slot, takes the hwmon lease, or can suppress a forced duty or lower a floor.
+
+**`hwmon/power.rs` (new).** CPU package power, read only inside a validation session and never
+on the 1 Hz poll. Two sources: a CPU chip's hwmon `powerN_input`/`powerN_average` (allow-listed
+chips only — a bare "any non-GPU chip" filter would report a PSU or VRM rail as CPU package
+power), else a powercap RAPL `package-*` zone's `energy_uj`. Subzones (`core`, `uncore`, `dram`)
+are excluded: they measure a *part* of the package.
+
+Three RAPL properties shape the module and are worth knowing before touching it:
+
+- it is a cumulative **energy** counter, so one reading is not a power and the first sample of a
+  session yields `None`;
+- it **wraps often** — `max_energy_range_uj` is 65 532.6 J on the reference host, i.e. every
+  ~5.5 min at 200 W, ~22 times in a two-hour observation. Wrap handling is a routine path, and
+  the arithmetic is a pure clock-free function so the wrap is testable at all;
+- a counter **reset** is indistinguishable from a wrap by inspection, so a plausibility ceiling
+  (`POWER_MAX_PLAUSIBLE_W`) discards the resulting spike. The residual blind spot is recorded as
+  `P8-l`.
+
+GPU power is read through `gpu_detect::read_gpu_power_w` from the path the GPU subsystem already
+resolved — **not** from the hwmon walk, which excludes `amdgpu` by design.
+
+**`api/stats.rs` gained the temperature-domain twin its own header promised.** `steady_state()`
+applies a least-squares slope over a rolling window plus a variance band, held over two
+consecutive non-overlapping windows, after a minimum observation. Conservative on purpose:
+`insufficient_data` and `not_established` are distinct answers, and neither is ever a fault.
+The criterion string is **built from the constants** and travels with every verdict.
+
+**`validation/summary.rs` derives two new things at finalisation.** `derive_analysis()` fills the
+per-member startup fingerprint and the steady-state result before `summarise()` runs, because two
+findings read what it writes. A startup override whose commanded duty was honoured is reported as
+a *device behaviour* — never as failed PWM control.
+
+**The opt-in startup auto-record** (`[startup] record_startup`, default `false`) is the only
+autonomous behaviour added. `ValidationEngine::start` pre-empts it for any operator-started
+session, finalising rather than discarding it, and `store::prune` retains auto-records in their
+own slot. Both properties are validity-checked in `validation_phase5.rs`. It is also the first
+and only emitter of `daemon_restart_observed`, a token that has existed since Phase 5 with no
+producer.
+
+New capability: `control.thermal_observation`. **Required, not a convenience** — an unrecognised
+session `kind` falls back to `"validation"` and returns 200, so without the flag a client cannot
+tell a supporting daemon from an older one.

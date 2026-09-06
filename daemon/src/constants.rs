@@ -548,6 +548,101 @@ const _: () = assert!(GPU_COALESCE_DELTA_PCT > 0);
 // DEC-101/DEC-120 fixed.
 const _: () = assert!(VERIFY_WAIT_SECONDS >= 4);
 
+// ── AIO Phase 8 Batch 3a: package power (DEC-335) ───────────────────────────
+
+/// Upper bound on a believable CPU package power, in watts.
+///
+/// This is a **counter-reset guard**, not a hardware limit, and it is the only
+/// defence against one. A powercap RAPL `energy_uj` counter that has been reset
+/// — by a driver reload, or across suspend — reads lower than the previous
+/// sample, which is byte-for-byte indistinguishable from a wrap. Completing the
+/// "wrap" across the reference host's 65.5 kJ range over a 1 s tick implies
+/// ~65 kW, so any threshold in this region separates the two cases cleanly.
+/// Deliberately generous: a 500 W HEDT package under an AVX load must read
+/// normally, and discarding a real sample would be the worse error.
+pub const POWER_MAX_PLAUSIBLE_W: f64 = 1_000.0;
+
+// ── AIO Phase 8 Batch 3a: startup fingerprint (DEC-335, §1) ─────────────────
+
+/// How far above its settled RPM a fan must start for the opening period to be
+/// called a startup override.
+///
+/// 1.25 is deliberately well clear of tach jitter: `STABILITY_STABLE_MAX_CV_PCT`
+/// puts ordinary variation in single-digit percent, and the behaviour this
+/// detects is a device running its fans at or near maximum — on the worked
+/// example in §1, 3400 RPM against a settled 1040, a ratio above 3.
+pub const STARTUP_OVERRIDE_RATIO: f64 = 1.25;
+
+/// Minimum usable RPM samples before a startup fingerprint is derived at all.
+pub const STARTUP_MIN_SAMPLES: usize = 10;
+
+/// How long the opt-in startup auto-record runs, in seconds.
+///
+/// Long enough to contain the behaviour §1 describes — its worked example is a
+/// ~50 s override — with headroom for a slower device, and short enough that an
+/// operator opening the GUI a couple of minutes after boot finds the slot free
+/// rather than being pre-empted out of it. It is a ceiling, not a target: the
+/// recording stops early the moment an operator starts their own session.
+pub const STARTUP_RECORD_WINDOW_S: u64 = 120;
+
+/// How many auto-records are retained, independently of the operator's
+/// [`VALIDATION_MAX_RETAINED_SESSIONS`].
+///
+/// One. The slot exists so that a machine which reboots repeatedly — the exact
+/// situation in which someone would enable this — cannot quietly evict every
+/// session a human made. Retaining more than the most recent boot would defeat
+/// the point of a bounded store for no extra evidence.
+pub const VALIDATION_MAX_RETAINED_AUTO_SESSIONS: usize = 1;
+
+/// How far the commanded duty and its readback may differ, in percentage
+/// points, while still counting as "the command was honoured" (§1).
+///
+/// Non-zero because a duty is stored as 0-255 and reported as a percentage, so
+/// the round trip is lossy by up to a point at some values. Wide enough to
+/// absorb that and nothing else: this tolerance is what decides between "the
+/// device ran its own startup ramp" and "the command was not honoured", and an
+/// over-wide band would silently convert the second into the first.
+pub const STARTUP_DUTY_MATCH_TOLERANCE_PCT: u8 = 5;
+
+// ── AIO Phase 8 Batch 3a: steady-state detection (DEC-335, §3) ──────────────
+//
+// Conservative on purpose. §3's explicit warning is against treating a short
+// noisy plateau as guaranteed equilibrium, so each of these errs toward
+// `not_established` rather than toward a comfortable verdict.
+
+/// Rolling window over which the trend and spread are computed.
+pub const STEADY_STATE_WINDOW_S: u64 = 120;
+
+/// Maximum |temperature trend| for a window to qualify, °C per minute.
+///
+/// 0.1 °C/min is 6 °C/hour — a coolant loop still absorbing heat moves faster
+/// than this, and instrument noise on a 1 °C-resolution sensor moves slower.
+pub const STEADY_STATE_MAX_SLOPE_C_PER_MIN: f64 = 0.1;
+
+/// Maximum standard deviation within a qualifying window, °C.
+pub const STEADY_STATE_MAX_STDDEV_C: f64 = 0.5;
+
+/// How many consecutive, non-overlapping qualifying windows are required.
+///
+/// Two, not one: a single quiet window is exactly the "short noisy plateau" §3
+/// says must not be read as equilibrium.
+pub const STEADY_STATE_HOLD_WINDOWS: usize = 2;
+
+/// No verdict at all below this much elapsed observation, in seconds.
+///
+/// Below it the answer is `insufficient_data` — a distinct token from
+/// `not_established`, because "we could not tell" and "it never settled" are
+/// different findings and the Overview's vocabulary requires both.
+pub const STEADY_STATE_MIN_OBSERVATION_S: u64 = 300;
+
+// The minimum observation must be at least as long as the hold requirement it
+// gates, or the two rules contradict each other: a run could satisfy the hold
+// while still being refused for insufficient data, and tuning either constant
+// alone would silently change which rule binds.
+const _: () = assert!(
+    STEADY_STATE_MIN_OBSERVATION_S >= STEADY_STATE_WINDOW_S * STEADY_STATE_HOLD_WINDOWS as u64
+);
+
 // ── AIO-MB Phase 5: validation sessions ─────────────────────────────────────
 
 /// Sampling cadence for a recording validation session.

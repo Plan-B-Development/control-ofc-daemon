@@ -3,7 +3,17 @@
 //! # A pure observer of state that already exists
 //!
 //! The recorder plants **no hooks** in the profile engine, the PWM write path, or
-//! any handler. It performs **zero sysfs I/O**. Once per second it reads the
+//! any handler.
+//!
+//! **It performed zero sysfs I/O until DEC-335, and that claim is now RETRACTED.**
+//! Batch 3a samples CPU package and GPU power, which are sysfs reads. The
+//! invariant that actually holds — and the one the safety argument below now
+//! rests on — is narrower and still structural: every read here is **read-only**,
+//! and none of it happens **under the session slot guard**. Power is sampled
+//! before the guard is taken, exactly as the controller read already was, so a
+//! blocking sysfs read still cannot stall a start or stop request.
+//!
+//! Once per second it reads the
 //! `StateCache` snapshot the poll loop already fills, plus four cheap handles
 //! ([`RecorderContext`]), and derives every §5 event marker by **diffing
 //! consecutive observations**.
@@ -26,9 +36,11 @@ use super::{store, summary};
 use crate::constants;
 use crate::control_override::OverrideTable;
 use crate::health::cache::StateCache;
+use crate::hwmon::power::PowerSampler;
 use crate::hwmon::pwm_control::HwmonPwmController;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// The handles the recorder reads. Deliberately not `AppState`: the engine needs
@@ -39,6 +51,20 @@ pub struct RecorderContext {
     pub hwmon_controller: Option<Arc<Mutex<HwmonPwmController>>>,
     pub override_table: Arc<Mutex<OverrideTable>>,
     pub characterization: crate::api::characterization::RunSlot,
+    /// Sysfs roots for power discovery (DEC-335). Fields rather than constants
+    /// so a test can point them at a fixture tree; see `SessionPower::discover`.
+    pub hwmon_root: PathBuf,
+    pub powercap_root: PathBuf,
+}
+
+impl RecorderContext {
+    /// The real sysfs roots. Every production caller uses this.
+    pub fn sysfs_roots() -> (PathBuf, PathBuf) {
+        (
+            PathBuf::from(crate::hwmon::HWMON_SYSFS_ROOT),
+            PathBuf::from(crate::hwmon::power::POWERCAP_ROOT),
+        )
+    }
 }
 
 /// Baselines the event derivation diffs against.
@@ -157,6 +183,80 @@ pub struct ValidationEngine {
     /// same reason `member_ids` is: it is fixed for the session's life and
     /// deriving it costs a serialisation, which has no business running per tick.
     max_samples: Mutex<usize>,
+    /// Power telemetry for the current session (Batch 3a §2).
+    ///
+    /// `None` means **not yet resolved**, and `start` sets it so deliberately:
+    /// discovery is a sysfs directory walk, and `start` is reached from an axum
+    /// handler on the async runtime while `tick` already runs off it
+    /// (`AUD3-n`). Resolving lazily on the first tick keeps the blocking read
+    /// where the other blocking reads already are, which is the distinction
+    /// `P8-b` is about.
+    ///
+    /// Rebuilding it per session also resets the RAPL baseline. Carrying one
+    /// over would charge the whole idle gap between two sessions to the second
+    /// session's first sample.
+    power: Mutex<Option<SessionPower>>,
+}
+
+/// Close `session` out in place: stamp the terminal state and derive everything
+/// that is computed once, at the end.
+///
+/// Extracted (DEC-335) because there are now **two** callers — `finish`, and
+/// `start`'s pre-emption of an auto-record — and a second hand-written copy of
+/// this sequence would be free to drift. The order matters and is the reason it
+/// is one function: `derive_analysis` writes the §1 fingerprint and the §3
+/// steady-state result, and two of the findings `summarise` produces read them.
+///
+/// Takes no lock and performs no I/O. The caller holds the slot guard and owns
+/// persistence, which is what lets `start` finalise a superseded session while
+/// installing its replacement under the same guard.
+fn finalise_in_place(session: &mut ValidationSession, state: &str, reason: Option<String>) {
+    let now = unix_ms();
+    session.events.push(ValidationEvent {
+        elapsed_ms: now.saturating_sub(session.started_unix_ms),
+        unix_ms: now,
+        kind: EV_SESSION_STOPPED.to_string(),
+        detail: reason.clone(),
+        member_id: None,
+    });
+    session.state = state.to_string();
+    session.completed_unix_ms = Some(now);
+    session.interrupted_reason = reason;
+    summary::derive_analysis(session);
+    // Nothing downstream recalculates backend meaning (§16).
+    session.findings = summary::summarise(session);
+}
+
+/// Per-session power sources, resolved together on the first tick.
+struct SessionPower {
+    /// CPU package power. Stateful — a RAPL wattage is a difference between
+    /// two ticks.
+    package: PowerSampler,
+    /// The primary GPU's hwmon directory, or `None` when there is no AMD GPU.
+    ///
+    /// A path rather than a sampler because GPU power is already a rate: there
+    /// is nothing to difference and so nothing to keep. Read through
+    /// `gpu_detect::read_gpu_power_w`, never through the hwmon walk.
+    gpu_hwmon: Option<PathBuf>,
+}
+
+impl SessionPower {
+    /// Resolve both sources from the roots the context names.
+    ///
+    /// The roots come from [`RecorderContext`] rather than from the constants
+    /// directly, so a test can point them at a `tempfile::tempdir()`. Without
+    /// that seam every `engine.tick()` test walks the host's real `/sys` — which
+    /// `hwmon/power.rs` was explicitly built to avoid, and which this project's
+    /// rule against hardware-dependent tests forbids. Found by
+    /// `ofc:concurrency-reviewer`.
+    fn discover(ctx: &RecorderContext) -> Self {
+        Self {
+            package: PowerSampler::discover(&ctx.hwmon_root, &ctx.powercap_root),
+            gpu_hwmon: crate::hwmon::gpu_detect::detect_amd_gpus(&ctx.hwmon_root)
+                .first()
+                .map(|g| g.hwmon_path.clone()),
+        }
+    }
 }
 
 impl Default for ValidationEngine {
@@ -174,6 +274,7 @@ impl ValidationEngine {
             member_ids: Mutex::new(Vec::new()),
             save_lock: Mutex::new(()),
             max_samples: Mutex::new(constants::VALIDATION_MAX_SAMPLES),
+            power: Mutex::new(None),
         }
     }
 
@@ -213,12 +314,27 @@ impl ValidationEngine {
     fn persist(&self, session: &ValidationSession) {
         let _guard = self.save_lock.lock();
         if !session.is_terminal() {
-            let superseded = self
+            // Drop the write unless the slot STILL HOLDS this exact session in a
+            // non-terminal state.
+            //
+            // The test used to be "the slot holds this id AND it is terminal",
+            // which was correct while `stop()` was the only finaliser: it leaves
+            // the finalised session installed, so a late flush could always see
+            // it. DEC-335's pre-emption removes the superseded session from the
+            // slot entirely, and the old test then passed a stale `recording`
+            // document straight through — republishing it over the `completed`
+            // one, so the next boot's `sweep_interrupted` would mark a cleanly
+            // superseded session `interrupted` and discard its findings.
+            //
+            // Every non-terminal writer only ever writes the session it believes
+            // is installed, so "not installed" and "installed but finalised" are
+            // both reasons to drop. Found by `ofc:concurrency-reviewer`.
+            let still_ours = self
                 .slot
                 .lock()
                 .as_ref()
-                .is_some_and(|cur| cur.session_id == session.session_id && cur.is_terminal());
-            if superseded {
+                .is_some_and(|cur| cur.session_id == session.session_id && !cur.is_terminal());
+            if !still_ours {
                 return;
             }
         }
@@ -259,8 +375,32 @@ impl ValidationEngine {
         let seeded = seed_watch(ctx);
 
         let mut slot = self.slot.lock();
-        if slot.as_ref().is_some_and(|s| s.is_recording()) {
-            return Err(StartError::AlreadyRecording);
+        // DEC-335 §3.6: an operator ALWAYS wins over the background startup
+        // recording. Without this, enabling `[startup] record_startup` would
+        // make `POST /validation/session` return 409 for the first two minutes
+        // after every boot — a background diagnostic blocking a human, which is
+        // not acceptable behaviour for an opt-in convenience.
+        //
+        // The superseded recording is finalised rather than discarded: it is
+        // real evidence about this boot, and up to two minutes of it may already
+        // be recorded. Persisted below, after the slot guard is released.
+        let mut superseded: Option<ValidationSession> = None;
+        if let Some(current) = slot.as_mut() {
+            if current.is_recording() {
+                if !current.auto_started {
+                    return Err(StartError::AlreadyRecording);
+                }
+                finalise_in_place(
+                    current,
+                    STATE_COMPLETED,
+                    Some("superseded by an operator-started session".to_string()),
+                );
+                log::info!(
+                    "Startup auto-record {} superseded by an operator-started session",
+                    current.session_id
+                );
+                superseded = Some(current.clone());
+            }
         }
         let mut session = session;
         session.events.push(ValidationEvent {
@@ -289,11 +429,24 @@ impl ValidationEngine {
         // See `session::max_samples_for`.
         *self.max_samples.lock() =
             super::session::max_samples_for(&session, constants::VALIDATION_MAX_SAMPLE_BYTES);
+        // Cleared, not discovered: the first tick resolves it off the async
+        // runtime, and clearing is what gives this session a fresh RAPL
+        // baseline rather than the previous session's. See the field.
+        *self.power.lock() = None;
         *self.member_ids.lock() = ids;
         let started = session.clone();
         self.refresh_live(&session);
         *slot = Some(session);
         drop(slot);
+
+        // After the guard, never under it: `persist` takes the save lock and
+        // writes a document that `AUD3-i` measures at up to ~5.7 MiB. A failure
+        // here is logged and not propagated — the operator's session started
+        // successfully, and failing their request because a superseded
+        // background recording could not be filed would be the wrong trade.
+        if let Some(old) = superseded {
+            self.persist(&old);
+        }
 
         if let Err(e) = store::save(&started) {
             // Roll the slot back: a session that cannot be persisted cannot be
@@ -316,6 +469,32 @@ impl ValidationEngine {
         self.finish(STATE_COMPLETED, None)
     }
 
+    /// Finalise **only if `session_id` is still the installed session.**
+    ///
+    /// The startup auto-record's timer fires ~120 s after it opened, and by then
+    /// an operator may have pre-empted it. `stop()` finalises whatever is in the
+    /// slot, so checking `recording_session_id()` and then calling it is a
+    /// check-and-act with a `spawn_blocking` dispatch in the gap — long enough
+    /// for a `POST /validation/session` to install an operator's session and
+    /// have this finalise *theirs*, seconds after it started. That is the exact
+    /// outcome the auto-record is supposed to be incapable of.
+    ///
+    /// The comparison happens under the same guard as the finalisation, so there
+    /// is no gap. Found by `ofc:concurrency-reviewer`.
+    pub fn stop_if(&self, session_id: &str) -> Option<ValidationSession> {
+        let mut slot = self.slot.lock();
+        let session = slot.as_mut()?;
+        if session.session_id != session_id || !session.is_recording() {
+            return None;
+        }
+        finalise_in_place(session, STATE_COMPLETED, None);
+        let done = session.clone();
+        self.refresh_live(session);
+        drop(slot);
+        self.persist(&done);
+        Some(done)
+    }
+
     /// End without finalising.
     pub fn cancel(&self) -> Option<ValidationSession> {
         self.finish(STATE_CANCELLED, None)
@@ -327,20 +506,7 @@ impl ValidationEngine {
         if !session.is_recording() {
             return Some(session.clone());
         }
-        let now = unix_ms();
-        session.events.push(ValidationEvent {
-            elapsed_ms: now.saturating_sub(session.started_unix_ms),
-            unix_ms: now,
-            kind: EV_SESSION_STOPPED.to_string(),
-            detail: reason.clone(),
-            member_id: None,
-        });
-        session.state = state.to_string();
-        session.completed_unix_ms = Some(now);
-        session.interrupted_reason = reason;
-        // The summary is derived once, here, by the pure summariser. Nothing
-        // downstream recalculates backend meaning (§16).
-        session.findings = summary::summarise(session);
+        finalise_in_place(session, state, reason);
         let done = session.clone();
         self.refresh_live(session);
         drop(slot);
@@ -562,6 +728,34 @@ impl ValidationEngine {
             }
         }
 
+        // Power, sampled BEFORE the slot guard for exactly the reason the
+        // controller read above is: this is blocking sysfs I/O — a
+        // `/sys/class/hwmon` + `/sys/class/powercap` walk on the first tick,
+        // then an `energy_uj` read and an amdgpu `power1_average` read on every
+        // tick. An amdgpu read can park on the SMU lock during a GPU reset, and
+        // holding the session slot across that stalls every handler that calls
+        // `snapshot()` or `recording_session_id()`, plus the shutdown flush.
+        // The first draft did this inside the guarded region. Found by
+        // `ofc:concurrency-reviewer`.
+        //
+        // Gated on `is_recording()` so an idle daemon never touches sysfs at
+        // all. The check is advisory — a session can finish between here and the
+        // guard — but a wasted read is free, and the guard below is what decides
+        // whether the values are used.
+        let (package_power_w, gpu_power_w) = if self.is_recording() {
+            let mut guard = self.power.lock();
+            let power = guard.get_or_insert_with(|| SessionPower::discover(ctx));
+            (
+                power.package.sample(std::time::Instant::now()),
+                power
+                    .gpu_hwmon
+                    .as_deref()
+                    .and_then(crate::hwmon::gpu_detect::read_gpu_power_w),
+            )
+        } else {
+            (None, None)
+        };
+
         let mut slot = self.slot.lock();
         let Some(session) = slot.as_mut() else {
             return false;
@@ -627,6 +821,8 @@ impl ValidationEngine {
             temperature_c,
             temperature_sensor,
             coolant_c,
+            package_power_w,
+            gpu_power_w,
             thermal_state: thermal_state.clone(),
             members,
         });

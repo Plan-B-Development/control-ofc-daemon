@@ -1001,6 +1001,21 @@ pub struct ControlCapability {
     /// `GET`/`DELETE /diagnostics/control-path` pair, plus the
     /// `control_path_discovery` token on a validation session's `diagnostics[]`.
     pub control_path_discovery: bool,
+    /// AIO Phase 8 Batch 3a, daemon >= 2.41.0. Gates the
+    /// `thermal_observation` session kind and the package/GPU power fields on a
+    /// validation sample.
+    ///
+    /// **Required, not a convenience.** `POST /validation/session` falls back to
+    /// `kind: "validation"` for a kind it does not recognise rather than
+    /// rejecting it, so without this flag an older daemon accepts a thermal
+    /// request, records an ordinary validation session, and returns 200 — and
+    /// the client then labels and interprets it as a thermal observation. The
+    /// flag is the only thing that distinguishes the two before the request.
+    ///
+    /// Carries `#[serde(default)]`, unlike the Batch 1 pair above: absent means
+    /// "an older daemon", which is exactly a denial here.
+    #[serde(default)]
+    pub thermal_observation: bool,
     /// AIO Phase 8 Batch 1, daemon >= 2.39.0. Gates `GET /diagnostics/preflight`.
     ///
     /// A SEPARATE flag from `control_path_discovery`, deliberately: preflight is

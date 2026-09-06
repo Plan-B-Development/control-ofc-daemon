@@ -24,6 +24,7 @@ pub mod nvidia;
 pub mod nvml;
 pub mod nvml_sys;
 pub mod plausibility;
+pub mod power;
 pub mod pwm_control;
 pub mod pwm_discovery;
 pub mod reader;

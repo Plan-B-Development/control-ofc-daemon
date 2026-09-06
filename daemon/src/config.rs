@@ -174,6 +174,35 @@ pub struct StartupConfig {
     /// Useful for waiting for USB or hwmon devices to appear after boot.
     #[serde(default)]
     pub delay_secs: u64,
+
+    /// Record a short lifecycle session automatically at daemon start
+    /// (AIO Phase 8 Batch 3a §1, DEC-335). **Defaults to `false`.**
+    ///
+    /// # Why this exists
+    ///
+    /// §1's headline example is a startup override observed for ~50 s. A
+    /// session must be started by a human, and by the time anyone opens the GUI
+    /// that window is long over — so without this the feature can only ever
+    /// capture daemon restarts and resumes an operator happens to be present
+    /// for, and the example it was specified from is unreachable.
+    ///
+    /// # Why it is off by default
+    ///
+    /// It is the only autonomous behaviour this batch adds. It writes no
+    /// hardware, claims no verify slot and holds no lease — it is a recorder —
+    /// but it does open a session with nobody watching, and this project's bar
+    /// for the daemon acting on its own is deliberately high. An operator who
+    /// wants the startup fingerprint opts in.
+    ///
+    /// # What it will not do
+    ///
+    /// It never blocks an operator. A session started through the API cancels
+    /// the auto-record and takes the slot; the partial recording is still saved.
+    /// The reverse — a background diagnostic making `POST /validation/session`
+    /// return `409 already_recording` on a freshly booted machine — is not
+    /// acceptable behaviour and is asserted against.
+    #[serde(default)]
+    pub record_startup: bool,
 }
 
 // Default: delay_secs = 0 (no startup delay).

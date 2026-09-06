@@ -1,5 +1,42 @@
 # Changelog
 
+## [2.41.0] — 2026-09-06
+
+**AIO Phase 8 Batch 3a (DEC-335): lifecycle fingerprint, thermal observation and
+steady-state detection.** Pairs with `control-ofc-gui` >= v2.64.0. Additive and
+capability-gated on the new `control.thermal_observation` flag.
+
+### Added
+- **A thermal observation session kind.** Records how a cooler responds to a
+  workload you run yourself — temperature, CPU package power, pump and radiator
+  duty and RPM. Control-OFC never starts, stops or controls the workload.
+- **CPU package power**, where the machine exposes it. Read from a CPU chip's
+  hwmon power attribute if there is one, otherwise derived from the powercap RAPL
+  energy counter. Sampled only while a session records, never on the 1 Hz poll.
+  A machine that exposes neither reports the value as unknown — never as zero,
+  which would claim an idle CPU.
+- **Steady-state detection.** A conservative rolling-window test on temperature
+  trend and variance decides whether an observation reached equilibrium, and the
+  exact criterion is reported alongside the verdict. Too little data reports
+  "insufficient data" rather than forcing a conclusion, and a run that never
+  settles is reported as an observation about the run — never as a fault in the
+  cooler.
+- **A startup fingerprint per member.** Override duration, peak and settled RPM,
+  and the duty commanded and read back while it happened. A cooler that spins its
+  fans up at power-on and then obeys the duty is reported as a device behaviour;
+  it is explicitly never reported as failed PWM control.
+- **An opt-in startup recording**, `[startup] record_startup` in `runtime.toml`,
+  **off by default**. Records a bounded window at daemon start so the startup
+  behaviour above can be captured without somebody being at the machine. It never
+  blocks you: starting a session yourself takes over immediately and the partial
+  recording is still saved, and these recordings are retained separately so they
+  cannot displace sessions you made by hand.
+
+### Changed
+- A session document now carries the startup fingerprints and the steady-state
+  result. The per-session sample limit was re-derived from a measured sample, so
+  the extra fields cannot push a recording past the size it can be read back at.
+
 ## [2.40.0] — 2026-09-06
 
 **AIO Phase 8 Batch 2 (DEC-334): PWM behaviour characterisation.** Pairs with

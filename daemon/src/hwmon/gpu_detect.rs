@@ -387,6 +387,43 @@ fn lookup_marketing_name(device_id: u16, revision: u8) -> Option<String> {
     }
 }
 
+/// Instantaneous GPU power draw in watts, from an already-resolved GPU hwmon
+/// directory (AIO Phase 8 Batch 3a, DEC-335).
+///
+/// **This lives here, and not in [`crate::hwmon::power`], on purpose.** The
+/// project rule is that GPU hardware is owned by the GPU subsystem and never by
+/// hwmon discovery, which excludes `amdgpu` outright. That rule is about fans,
+/// and a power read is neither a fan nor a write — but resolving an `amdgpu`
+/// directory from the hwmon walk in order to read it would reintroduce exactly
+/// the coupling the rule exists to prevent, for a value this module already has
+/// a device handle for. The caller passes [`AmdGpuInfo::hwmon_path`].
+///
+/// Read-only, and `None` for every failure: absent attribute, unreadable file,
+/// unparseable contents, or a value outside
+/// [`crate::constants::POWER_MAX_PLAUSIBLE_W`]. Never zero-on-failure — a GPU
+/// reported as drawing 0 W is a claim, not an absence.
+///
+/// `power1_average` is preferred over `power1_input` here, which is the opposite
+/// of the CPU-side preference and is deliberate: on `amdgpu` the instantaneous
+/// value swings hard with shader clocks between two 1 Hz samples, so an
+/// averaged reading describes the heat actually going into the case, which is
+/// the only reason a thermal observation records it at all.
+pub fn read_gpu_power_w(hwmon_path: &Path) -> Option<f64> {
+    for attr in ["power1_average", "power1_input"] {
+        let Ok(raw) = read_sysfs_string(&hwmon_path.join(attr)) else {
+            continue;
+        };
+        let Ok(microwatts) = raw.trim().parse::<f64>() else {
+            continue;
+        };
+        let watts = microwatts / 1_000_000.0;
+        if watts.is_finite() && (0.0..=crate::constants::POWER_MAX_PLAUSIBLE_W).contains(&watts) {
+            return Some(watts);
+        }
+    }
+    None
+}
+
 /// Select the primary (preferred) AMD GPU from detected GPUs.
 ///
 /// Preference: GPUs with fan interfaces first, then discrete VGA > render-only,
