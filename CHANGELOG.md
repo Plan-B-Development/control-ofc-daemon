@@ -4,9 +4,10 @@
 
 **Run 2 of the session-lifecycle block (DEC-338).** The daemon half of the defect
 GUI v2.65.1 made legible: a validation, lifecycle or thermal session had no
-terminating condition. Pairs with `control-ofc-gui` >= v2.66.0, which is what
-offers the new option — this release is additive and changes nothing for a caller
-that does not ask for it.
+terminating condition. Pairs with `control-ofc-gui` >= v2.23.0 as before — the
+floor does not move, because this release is purely additive and changes nothing
+for a caller that does not ask for the new option. GUI **v2.66.0** is the version
+that offers it.
 
 ### Added
 - **A session can now finalise itself when its diagnostics finish.**
