@@ -166,8 +166,28 @@ struct ThermalTrip {
     /// sub-samples in a window depends on the window length and the sample
     /// interval, so an index would silently stop landing where intended the
     /// moment either changed — and the test would go green for the wrong reason.
+    ///
+    /// **Must differ from the rig's starting duty.** `run_discovery` reads once
+    /// before it writes anything, so a trip keyed on the duty the rig already
+    /// holds fires on that first read and silently degenerates into the
+    /// already-forcing-at-entry case — a different test, which passes with the
+    /// mid-run gates deleted.
     once_duty_is: u8,
-    state: &'static str,
+    kind: TripKind,
+}
+
+/// Which thermal limb a [`ThermalTrip`] engages.
+///
+/// Both exist because they are not the same test (DEC-297): the ladder limb is
+/// the engine declaring itself the writer, the sensor limb is this diagnostic's
+/// own voluntary 85 °C abort, and they are read by two different predicates.
+#[derive(Clone, Copy)]
+enum TripKind {
+    /// Engage the thermal ladder — the `thermal_force_state` limb.
+    Ladder(&'static str),
+    /// Push the CPU reading to this temperature — the `check_thermal_safety`
+    /// limb. Pass something above `CALIBRATION_MAX_TEMP_C`.
+    Sensor(f64),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -214,7 +234,32 @@ async fn sweep(
         let d = *duty_r.lock().unwrap();
         if let Some(t) = &trip {
             if d == t.once_duty_is {
-                trip_cache.record_engine_tick(t.state, constants::THERMAL_EMERGENCY_TRIGGER_C);
+                match t.kind {
+                    TripKind::Ladder(state) => {
+                        trip_cache
+                            .record_engine_tick(state, constants::THERMAL_EMERGENCY_TRIGGER_C);
+                    }
+                    // Re-publishing the reading is what `update_sensors` does on
+                    // the real 1 Hz path, so the gate sees a FRESH hot reading
+                    // rather than a stale one — otherwise the freshness refusal
+                    // would fire first and the test would prove the wrong limb.
+                    TripKind::Sensor(temp_c) => {
+                        trip_cache.update_sensors(vec![CachedSensorReading {
+                            id: "cpu".into(),
+                            kind: SensorKind::CpuTemp,
+                            label: "Tctl".into(),
+                            value_c: temp_c,
+                            source: DeviceLabel::Hwmon,
+                            updated_at: Instant::now(),
+                            rate_c_per_s: None,
+                            session_min_c: None,
+                            session_max_c: None,
+                            chip_name: "k10temp".into(),
+                            temp_type: None,
+                            thresholds: None,
+                        }]);
+                    }
+                }
             }
         }
         disc::DiscoverySample {
@@ -533,7 +578,7 @@ async fn a_forcing_ladder_aborts_and_the_restore_stands_down() {
         // provably moved before the ladder engages.
         Some(ThermalTrip {
             once_duty_is: 70,
-            state: "emergency",
+            kind: TripKind::Ladder("emergency"),
         }),
         &cancel,
         &report,
@@ -561,6 +606,311 @@ async fn a_forcing_ladder_aborts_and_the_restore_stands_down() {
     );
     // ...and it did NOT write the captured duty back over the forced duty.
     assert_ne!(rig.writes().last().copied(), Some(45));
+}
+
+// ── DEC-339 (`P8-u`): a write is never issued on an un-re-read cache ─────
+
+/// [SAFETY] **The perturbed duty is never commanded after the ladder engaged
+/// during the baseline window.** This is register row `P8-u`.
+///
+/// The shape that makes this a real defect rather than a late abort: the
+/// perturbation here moves the header DOWN (60 → 45 → 20), so the write under
+/// test actively reduces cooling on a machine the daemon already knows is being
+/// force-cooled. Before DEC-339 the three thermal predicates ran once at the top
+/// of the cycle and a cycle issues two writes, so the gate had last looked a
+/// full observation window earlier.
+///
+/// Asserted as the **realised artefact** — the exact write sequence — not as
+/// "the run aborted". A run that aborts at the top of the next cycle also
+/// reports `STATE_ABORTED`, and that is precisely the pre-fix behaviour, so an
+/// assertion on the state alone passes with the fix deleted.
+///
+/// The trip duty (45) differs from the rig's starting duty (60) on purpose; see
+/// `ThermalTrip::once_duty_is`.
+#[tokio::test]
+async fn the_perturbed_duty_is_not_written_after_a_mid_window_ladder_trip() {
+    let rig = Rig::new(60);
+    let cache = Arc::new(cache_at(40.0, Some("normal")));
+    let chans = channels(&[("pump", true)]);
+    let report = RestoreReport::new();
+    let cancel = AtomicBool::new(false);
+
+    let outcome = sweep(
+        &rig,
+        &cache,
+        &chans,
+        45,
+        20,
+        2,
+        0,
+        false,
+        |_, duty| Some(u16::from(duty) * 20),
+        None,
+        // Fires while the BASELINE duty is being held — i.e. after the cycle-top
+        // gate has already passed, which is the whole window the row is about.
+        Some(ThermalTrip {
+            once_duty_is: 45,
+            kind: TripKind::Ladder("emergency"),
+        }),
+        &cancel,
+        &report,
+    )
+    .await;
+
+    assert_eq!(outcome.state, disc::STATE_ABORTED);
+    // The baseline write proves the run got far enough to matter (a run that
+    // refused at entry writes nothing and would satisfy a bare "20 is absent"),
+    // and the absence of 20 is the fix. One assertion carries both.
+    assert_eq!(
+        rig.writes(),
+        vec![45],
+        "the lower perturbed duty was commanded after the ladder engaged"
+    );
+    assert_eq!(report.get(), RestoreOutcome::SkippedThermalForce);
+}
+
+/// [SAFETY] The other limb (DEC-297): a sensor crossing
+/// `CALIBRATION_MAX_TEMP_C` mid-window stops the perturbed write too.
+///
+/// Not a duplicate of the test above — `check_thermal_safety` and
+/// `thermal_force_state` are separate predicates read from separate cache
+/// fields, and this file already keeps one test per limb for the entry case.
+/// The ladder is left at `normal` throughout, so only the sensor limb can fire;
+/// the restore therefore proceeds normally, which is the second thing this
+/// asserts.
+#[tokio::test]
+async fn the_perturbed_duty_is_not_written_after_a_mid_window_sensor_trip() {
+    let rig = Rig::new(60);
+    let cache = Arc::new(cache_at(40.0, Some("normal")));
+    let chans = channels(&[("pump", true)]);
+    let report = RestoreReport::new();
+    let cancel = AtomicBool::new(false);
+
+    let outcome = sweep(
+        &rig,
+        &cache,
+        &chans,
+        45,
+        20,
+        2,
+        0,
+        false,
+        |_, duty| Some(u16::from(duty) * 20),
+        None,
+        Some(ThermalTrip {
+            once_duty_is: 45,
+            kind: TripKind::Sensor(constants::CALIBRATION_MAX_TEMP_C + 1.0),
+        }),
+        &cancel,
+        &report,
+    )
+    .await;
+
+    assert_eq!(outcome.state, disc::STATE_ABORTED);
+    assert!(
+        rig.writes().contains(&45),
+        "precondition: the run must reach the baseline write, else nothing is proven"
+    );
+    assert!(
+        !rig.writes().contains(&20),
+        "the lower perturbed duty was commanded after the sensor passed the limit: {:?}",
+        rig.writes()
+    );
+    // No force is active, so the restore is NOT skipped — it puts the header
+    // back at the duty the run captured. This is what separates the two limbs.
+    assert_eq!(report.get(), RestoreOutcome::Restored);
+    assert_eq!(rig.writes().last().copied(), Some(60));
+}
+
+/// [SAFETY] **A force landing in the FINAL window aborts the run, so its
+/// contaminated measurements are never persisted — and the end-of-run write does
+/// not fight the ladder.**
+///
+/// Both halves of the end-of-run defect in one interleaving, because they share
+/// it. One cycle, so the trip lands during the run's last hold and there is no
+/// next cycle top to catch it.
+///
+/// **This test asserted `STATE_COMPLETE` in its first draft, and that was the
+/// defect rather than the specification** — caught by `ofc:concurrency-reviewer`,
+/// and recorded here because the reasoning is easy to repeat. "The measurements
+/// completed, only the restore stood down" sounds right and is wrong: a ladder
+/// engagement force-takes the hwmon lease and drives every writable header to
+/// `max(commanded, forced)`, so the final window's tach readings move for a
+/// reason that has nothing to do with our perturbation. `reclaim_or_lost_pump`
+/// cannot notice — it keys on `pwm_enable != 1` and the force re-asserts
+/// `pwm_enable = 1` deliberately (`on_lease_released`). `handlers::discovery`
+/// then persists a `ControlPathRecord` **iff** the state is `complete`, so a
+/// `complete` verdict here durably records a PWM→tach mapping derived from a
+/// foreign 100 % write. A wrong mapping is worse than no mapping.
+#[tokio::test]
+async fn a_force_in_the_final_window_aborts_rather_than_persisting_the_run() {
+    let rig = Rig::new(60);
+    let cache = Arc::new(cache_at(40.0, Some("normal")));
+    let chans = channels(&[("pump", true)]);
+    let report = RestoreReport::new();
+    let cancel = AtomicBool::new(false);
+
+    let outcome = sweep(
+        &rig,
+        &cache,
+        &chans,
+        45,
+        70,
+        1,
+        0,
+        false,
+        |_, duty| Some(u16::from(duty) * 20),
+        None,
+        Some(ThermalTrip {
+            once_duty_is: 70,
+            kind: TripKind::Ladder("emergency"),
+        }),
+        &cancel,
+        &report,
+    )
+    .await;
+
+    // `aborted`, NOT `complete` — this is what suppresses the persist at
+    // `handlers/discovery.rs`'s `if outcome.state == disc::STATE_COMPLETE`.
+    assert_eq!(
+        outcome.state,
+        disc::STATE_ABORTED,
+        "a complete verdict here is what lets a contaminated cycle be persisted"
+    );
+    assert!(
+        outcome
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("thermal safety"),
+        "the operator must be told it was the heat, not a generic failure: {:?}",
+        outcome.detail
+    );
+    // Precondition: the run really did reach and hold the perturbed duty, so the
+    // final window genuinely existed. Without this the abort could be anything.
+    assert_eq!(
+        rig.writes(),
+        vec![45, 70],
+        "a third write means the run put its own baseline over the forced duty"
+    );
+    assert_eq!(report.get(), RestoreOutcome::SkippedThermalForce);
+    assert!(
+        report.get().header_left_moved(),
+        "the guard must still report the header as left moved"
+    );
+}
+
+/// [SAFETY] **A thermal trip is reported as thermal, even though it also kills
+/// the lease.**
+///
+/// The ordering half of DEC-339, and the one no other test can see: a ladder
+/// engagement force-takes the hwmon lease, so `keepalive()` fails on the *same*
+/// condition that trips the thermal gate. Whichever runs first writes the abort
+/// detail. Checked in the wrong order the operator is told "superseded by a
+/// later diagnostic; this run's lease is gone" — false, and it points them at a
+/// competing diagnostic rather than at the heat.
+///
+/// Modelled by tripping the ladder during the baseline window *and* failing the
+/// perturbed window's renewal (`keepalive` index 1), which is what production
+/// does. Every other test in this group uses an always-succeeding keepalive and
+/// therefore cannot distinguish the two orderings at all.
+#[tokio::test]
+async fn a_thermal_trip_that_also_kills_the_lease_is_reported_as_thermal() {
+    let mut rig = Rig::new(60);
+    rig.keepalive_fails_at = Some(1);
+    let cache = Arc::new(cache_at(40.0, Some("normal")));
+    let chans = channels(&[("pump", true)]);
+    let report = RestoreReport::new();
+    let cancel = AtomicBool::new(false);
+
+    let outcome = sweep(
+        &rig,
+        &cache,
+        &chans,
+        45,
+        20,
+        2,
+        0,
+        false,
+        |_, duty| Some(u16::from(duty) * 20),
+        None,
+        Some(ThermalTrip {
+            once_duty_is: 45,
+            kind: TripKind::Ladder("emergency"),
+        }),
+        &cancel,
+        &report,
+    )
+    .await;
+
+    assert_eq!(outcome.state, disc::STATE_ABORTED);
+    let detail = outcome.detail.as_deref().unwrap_or_default().to_string();
+    assert!(
+        detail.contains("thermal safety"),
+        "the thermal cause must win over the lease symptom it caused: {detail:?}"
+    );
+    assert!(
+        !detail.contains("superseded"),
+        "reported the lease symptom instead of the thermal cause: {detail:?}"
+    );
+    // The ordering itself, stated directly: exactly ONE renewal happened — the
+    // baseline window's — so the thermal gate decided before liveness was even
+    // consulted. The rig is armed to fail the SECOND renewal, so the wrong order
+    // is fully observable: it would reach index 1, fail, and report "superseded".
+    // Counting is what distinguishes "the gate ran first" from "the keepalive
+    // happened to pass".
+    assert_eq!(
+        rig.keepalive_count(),
+        1,
+        "the perturbed window's renewal was consulted before the thermal gate"
+    );
+    assert!(
+        !rig.writes().contains(&20),
+        "the lower perturbed duty was still commanded: {:?}",
+        rig.writes()
+    );
+}
+
+/// The control for all three above: with nothing thermal happening, every gate
+/// passes and both duties are written on every cycle.
+///
+/// Without this the three tests are satisfiable by a gate that refuses
+/// unconditionally — "assert you did not skip every case". It also pins the
+/// write count as a RELATIONSHIP to the cycle count rather than as a literal.
+#[tokio::test]
+async fn a_healthy_run_is_not_refused_and_writes_both_duties_every_cycle() {
+    let rig = Rig::new(60);
+    let cache = Arc::new(cache_at(40.0, Some("normal")));
+    let chans = channels(&[("pump", true)]);
+    let report = RestoreReport::new();
+    let cancel = AtomicBool::new(false);
+    let cycles = 3u8;
+
+    let outcome = sweep(
+        &rig,
+        &cache,
+        &chans,
+        45,
+        20,
+        cycles,
+        0,
+        false,
+        |_, duty| Some(u16::from(duty) * 20),
+        None,
+        None,
+        &cancel,
+        &report,
+    )
+    .await;
+
+    assert_eq!(outcome.state, disc::STATE_COMPLETE);
+    assert_eq!(outcome.cycles.len(), usize::from(cycles));
+    assert_eq!(
+        rig.writes().iter().filter(|&&d| d == 20).count(),
+        usize::from(cycles),
+        "the perturbed duty must be written once per cycle"
+    );
+    assert_eq!(report.get(), RestoreOutcome::Restored);
 }
 
 /// The ladder forcing at ENTRY refuses before writing anything, and the guard

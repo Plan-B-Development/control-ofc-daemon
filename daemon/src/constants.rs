@@ -973,6 +973,14 @@ const _: () = assert!(DISCOVERY_TARGET_OVER_NOISE > 1);
 // ever moved back to per-cycle, this assertion must become
 // `CHARACTERIZATION_SETTLE_MAX_S * 4 <= …`, which does not hold, which is the
 // point of writing it this way.
+//
+// **DEC-339 (`P8-u`) attached a SECOND invariant to this same cadence:** the
+// three thermal gates are now evaluated beside every `keepalive()`, so the
+// thermal check interval IS the renewal interval. Moving the renewal therefore
+// silently moves how long a run may hold a duty after the 85 °C voluntary abort
+// or a ladder force became true — which this assertion does **not** catch,
+// because it constrains only the deadman. Anyone loosening the cadence has two
+// invariants to re-argue, not one.
 const _: () = assert!(CHARACTERIZATION_SETTLE_MAX_S * 2 <= VERIFY_PAUSE_DEADMAN.as_secs());
 const _: () = assert!(CONTROL_PATHS_MAX_ENTRIES > 0);
 const _: () = assert!(CONTROL_PATH_MAX_TEXT_BYTES > 0);

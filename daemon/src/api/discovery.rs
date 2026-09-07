@@ -668,6 +668,25 @@ where
     let wrote_any = AtomicBool::new(false);
     let run_started = tokio::time::Instant::now();
 
+    // [SAFETY] Bound BEFORE `_restore`, deliberately. `_restore` must remain the
+    // last binding in this scope so it drops first (see its own comment below),
+    // and while this closure is `Drop`-free — it captures one shared reference —
+    // relying on that would leave the guard's stated invariant false at its own
+    // site and would silently mis-order the next binding someone adds here.
+    // Keep new bindings above `_restore`.
+    let thermal_gate = || -> Option<String> {
+        if let Err(e) = check_thermal_safety(cache) {
+            return Some(e.to_string());
+        }
+        if let Some(state) = thermal_force_state(cache) {
+            return Some(format!(
+                "thermal safety is forcing fan output ({state}); control-path \
+                 discovery cannot write"
+            ));
+        }
+        stale_temperature_refusal(cache, DISCOVERY_DIAGNOSTIC)
+    };
+
     // Declared LAST so it drops FIRST — while the caller's lease guard is still
     // held. Reversed, the restore write fails `InvalidLease` and the header is
     // parked at the last perturbed duty. Same invariant, same reason, as
@@ -696,6 +715,34 @@ where
         };
     }
 
+    // [SAFETY] DEC-339 (`P8-u`): the three thermal gates, defined ONCE and
+    // evaluated before EVERY duty-lowering write this function issues.
+    //
+    // The rule this closure exists to make unbreakable: **a write is never
+    // issued on a cache that has not been re-read since the previous write.**
+    // Before DEC-339 the three predicates were spelled out inline at the top of
+    // the cycle and nowhere else, so they ran once per *cycle* while a cycle
+    // issues *two* writes and holds two observation windows. The perturbed
+    // write — the one that can command a header DOWN by up to
+    // `DISCOVERY_DELTA_MAX_PCT` points — was therefore issued on a reading up
+    // to one window old (15 s at the documented maximum), and the resulting
+    // duty was then held for a second window before anything looked again. The
+    // daemon could actively reduce cooling on a machine it already knew was
+    // over `CALIBRATION_MAX_TEMP_C`, and take ~30 s to notice.
+    //
+    // Order matters and is the pre-existing one: the two cheap `value_c`
+    // comparisons first, then the freshness refusal, which is the only one that
+    // can see a poll loop that has STOPPED (DEC-336, `P8-p`) — the other two
+    // keep passing on last-known-good readings against a frozen cache.
+    //
+    // Returns the abort detail, because all three produce `STATE_ABORTED`;
+    // collapsing them to one shape is deliberate, per DEC-336's finding that
+    // two gating shapes for one safety rule is how a site ends up checking a
+    // subset. A fourth write site added later gets all three or none.
+    //
+    // The closure itself is defined above, before `_restore`, so the guard stays
+    // the last binding in scope.
+
     for cycle in 1..=cycle_count {
         // [SAFETY] The same four gates the characterisation sweep applies at the
         // top of every point, for the same reasons. The shutdown check is not
@@ -711,37 +758,8 @@ where
                 format!("cancelled after {} of {cycle_count} cycles", cycle - 1)
             );
         }
-        if let Err(e) = check_thermal_safety(cache) {
-            bail!(STATE_ABORTED, e.to_string());
-        }
-        if let Some(state) = thermal_force_state(cache) {
-            bail!(
-                STATE_ABORTED,
-                format!(
-                    "thermal safety is forcing fan output ({state}); control-path \
-                     discovery cannot write"
-                )
-            );
-        }
-        // [SAFETY] DEC-336 (`P8-p`): the third thermal gate, and the only one
-        // that can see a poll loop that has stopped. The two above compare
-        // `value_c` against a limit; neither has a view of how OLD that value
-        // is, so a reader wedged mid-run freezes the cache and both keep
-        // passing on last-known-good readings while this sweep goes on writing.
-        // Evaluated ONCE PER CYCLE, alongside its two siblings — **not** ahead
-        // of every `keepalive()`, which an earlier draft of this comment
-        // claimed. A cycle holds two observation windows and therefore two
-        // keepalives, so a poll that wedges just after this check leaves the
-        // header at the perturbed duty for up to two windows (~30 s at the
-        // documented 15 s maximum) before the run aborts and restores. That is
-        // the same cadence `check_thermal_safety` and `thermal_force_state`
-        // have always run at, so this matches its siblings rather than
-        // introducing a new gap — and tightening all three to per-window is
-        // register row `P8-u`, deliberately out of scope here. The comment is
-        // corrected rather than the code because a safety comment that
-        // overstates its own cadence is how the next reader concludes the gap
-        // is already covered.
-        if let Some(reason) = stale_temperature_refusal(cache, DISCOVERY_DIAGNOSTIC) {
+        // Gate 1 of 2 per cycle — guards the BASELINE write below.
+        if let Some(reason) = thermal_gate() {
             bail!(STATE_ABORTED, reason);
         }
         // ── Baseline window ──
@@ -807,6 +825,35 @@ where
         }
 
         // ── Perturbed window ──
+        // [SAFETY] Gate 2 of 2 per cycle (DEC-339, `P8-u`) — and the site the
+        // register row was actually about. The baseline window has just elapsed,
+        // so the reading the cycle-top gate passed on is up to `window` old; the
+        // write below is the one that can lower the duty. Checking here makes the
+        // thermal cadence exactly equal to the keepalive cadence — one evaluation
+        // per observation window — which is the invariant the DEC-296 note below
+        // already establishes for liveness. Read the two together: this function
+        // proves liveness AND thermal safety before every window, never once per
+        // cycle for two windows.
+        //
+        // **Ordered ABOVE `keepalive()`, matching the cycle top and
+        // `characterization.rs`'s in-hold block — do not swap them.** A ladder
+        // engagement force-takes the hwmon lease (`backends.rs`
+        // `force_take_lease(ThermalSafety)`), so `keepalive()` fails on the very
+        // same condition. Checked in the other order, a thermal trip reports
+        // `"superseded by a later diagnostic; this run's lease is gone"` — false,
+        // and it points the operator at a competing diagnostic instead of at the
+        // heat. The hardware outcome is identical either way; the abort *detail*
+        // is not, and it is what the UI shows. The characterisation sweep states
+        // this reasoning at its own renewal site.
+        //
+        // It stays ABOVE the shutdown check too: `shutting_down()` is
+        // load-bearing *immediately* before the write, because `observe` can
+        // return one read after a shutdown began and a write landing after
+        // `restore_hwmon_to_auto` would re-assert `pwm_enable=1` on a header the
+        // firmware has been handed back (the DEC-290 / 277-c hazard).
+        if let Some(reason) = thermal_gate() {
+            bail!(STATE_ABORTED, reason);
+        }
         // Second renewal of the cycle — see the note above the first.
         if !keepalive() {
             bail!(
@@ -877,11 +924,63 @@ where
         publish(done);
     }
 
+    // [SAFETY] DEC-339, second review round: the gate has to reach the VERDICT,
+    // not just the writes.
+    //
+    // Every write above is now preceded by a fresh evaluation — but the last
+    // observation window has no write after it, so without this nothing
+    // re-examines the conditions under which that window's DATA was collected.
+    // That matters here in a way it does not on the characterisation path,
+    // because this run's output is persisted as a durable claim about the
+    // hardware: `handlers::discovery` writes a `ControlPathRecord` if and only
+    // if `state == STATE_COMPLETE`, on the stated reasoning that "a cancelled or
+    // aborted run measured a partial window, and recording it as 'last
+    // validated' would be the §5 error of turning absent evidence into a
+    // result".
+    //
+    // A ladder engagement during the final window is exactly that error wearing
+    // a `complete` label. `force_all_with_floor` force-takes the hwmon lease and
+    // drives every writable header to `max(commanded, forced)` — and
+    // `on_lease_released()` is called specifically so the force re-asserts
+    // `pwm_enable=1`, which means `reclaim_or_lost_pump` **cannot** see it: that
+    // predicate keys on `pwm_enable != 1`. So every watched tach jumps for a
+    // reason unrelated to our perturbation, the deltas are meaningless, and the
+    // run would otherwise persist them as a confirmed PWM→tach mapping that
+    // later runs and the UI treat as measured fact. A wrong mapping is worse
+    // than no mapping.
+    //
+    // Reported as an abort rather than silently suppressing the persist, so the
+    // operator is told the measurement was abandoned instead of watching a run
+    // succeed and quietly record nothing.
+    if let Some(reason) = thermal_gate() {
+        bail!(STATE_ABORTED, reason);
+    }
+
     // Return to the baseline before the guard runs, so a run whose captured
     // original duty is unreadable still leaves the header somewhere deliberate
     // rather than at the perturbed duty. Guarded by the same shutdown re-check
     // as the two writes above, and for the same reason.
-    if !shutting_down() {
+    //
+    // [SAFETY] The thermal-force term is kept even though the gate above
+    // subsumes it today: it is the TOCTOU backstop for a force that engages in
+    // the microseconds between, and it is the condition `RestoreOnDrop` — which
+    // runs on the very next line — uses for its own stand-down before logging
+    // that the header was "left at the thermal-safety forced duty". Before
+    // DEC-339 this write ran unconditionally, so it could move the header off
+    // the forced duty and make the guard's own log line false: the one write in
+    // this function that could fight the ladder, immediately above the code that
+    // stood down from exactly that.
+    //
+    // **Direction note, corrected in review.** An earlier draft justified
+    // exempting this write from the other two predicates by saying refusal
+    // "would strand the header at the perturbed duty". That is backwards for the
+    // common case: `perturbation_target` picks `up` whenever `room_up >=
+    // room_down`, which is any baseline at or below ~60, so the perturbed duty is
+    // usually HIGHER and returning to baseline is the duty-lowering move. The
+    // exemption is now moot for the voluntary-abort limbs — the gate above bails
+    // before reaching this line — and what remains true is only the narrow claim
+    // about a force.
+    if !shutting_down() && thermal_force_state(cache).is_none() {
         let _ = write_fn(baseline_pct);
     }
 

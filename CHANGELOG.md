@@ -1,5 +1,61 @@
 # Changelog
 
+## [2.43.1] — 2026-09-07
+
+**A control-path discovery run now re-checks thermal safety before every write it
+issues, not once per cycle (DEC-339, register row `P8-u`).** Pairs with
+`control-ofc-gui` >= v2.23.0 as before; no wire shape, capability or error code
+changes, so no GUI release is required.
+
+*Why this is a patch where the comparable DEC-336 fix (2.42.0) was a minor:* that
+release made the daemon perform a refusal it had been publishing and never
+executing, which is a **new reachable outcome** — a `409` a compliant client
+could not previously receive. This one adds no outcome. Every state, code and
+`detail` string it can produce was already producible; only the timing moves, and
+one write is skipped in a case where the engine is the writer anyway. A client
+that depended on the old timing would be depending on a race it never had a way
+to observe.
+
+### Fixed
+- **The perturbed duty could be commanded on a temperature reading up to a full
+  observation window old.** `POST /hwmon/{id}/discover-control-path` evaluates
+  three thermal gates — the 85 °C voluntary abort, the thermal-ladder force
+  check, and the DEC-336 staleness refusal — and they ran once at the top of each
+  cycle. A cycle issues **two** PWM writes and holds **two** observation windows,
+  so the second write, which is the one that can command a header *down* by up to
+  `DISCOVERY_DELTA_MAX_PCT` points, was issued on a reading the gates had last
+  looked at up to 15 s earlier, and the resulting duty was then held for a second
+  window before anything looked again. On a machine already over 85 °C the daemon
+  could therefore actively reduce cooling and take about 30 s to notice. All
+  three gates now run before **every** write, so the thermal cadence is exactly
+  the keepalive cadence — one evaluation per observation window — and the worst
+  case between checks halves from two windows to one. DEC-334 fixed the same
+  shape on the characterisation path in 2.40.0; this is its sibling.
+- **The end-of-run return-to-baseline write could fight the thermal ladder.**
+  That write ran unconditionally except for a shutdown check, one line above the
+  restore guard that *does* stand down under an active force and then logs that
+  the header was "left at the thermal-safety forced duty" — so the header had in
+  fact just been moved off it and the log line was false. It now obeys the same
+  force skip as the guard below it.
+- **A run whose final observation window was measured under a thermal force
+  reported `complete` and persisted its result.** Every write is gated, but the
+  last window has no write after it, so nothing re-examined the conditions the
+  final measurements were taken under. A ladder engagement force-takes the hwmon
+  lease and drives every writable header to `max(commanded, forced)`, and it
+  re-asserts `pwm_enable = 1` deliberately — which is precisely the value the
+  run's own foreign-writer check treats as "still mine", so it could not notice.
+  Every watched tachometer therefore moved for a reason unrelated to the
+  perturbation, and the run stored those readings as a durable PWM-to-tachometer
+  mapping that later runs and the UI treat as measured fact. A wrong mapping is
+  worse than no mapping, so the run now aborts and records nothing.
+- **A thermal abort could be reported as a lost lease.** Because the ladder
+  force-takes the lease, the liveness check fails on the same condition that
+  trips the thermal gate; whichever ran first wrote the abort reason. The
+  perturbed window consulted liveness first, so a genuine overheat was reported
+  as "superseded by a later diagnostic; this run's lease is gone" — pointing the
+  operator at a competing diagnostic instead of at the heat. The thermal gate now
+  runs first, matching the characterisation sweep.
+
 ## [2.43.0] — 2026-09-07
 
 **Run 2 of the session-lifecycle block (DEC-338).** The daemon half of the defect
