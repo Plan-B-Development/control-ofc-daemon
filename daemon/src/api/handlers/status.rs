@@ -360,6 +360,10 @@ pub async fn capabilities_handler(
             // optional: the session-kind fallback makes an older daemon
             // indistinguishable from a supporting one without it.
             thermal_observation: true,
+            // AIO Phase 8 Run 2, daemon >= 2.43.0. Required rather than
+            // optional: an older daemon parses and drops the request field, so
+            // a 200 alone does not tell a client the session will stop itself.
+            validation_auto_stop: true,
             // `WIRE-k`: five features that shipped before this block had keys
             // for them, so clients gated on a version string or on a probe's
             // 404. All true here — the flag exists so a client can stop

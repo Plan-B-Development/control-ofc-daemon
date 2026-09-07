@@ -1016,6 +1016,21 @@ pub struct ControlCapability {
     /// "an older daemon", which is exactly a denial here.
     #[serde(default)]
     pub thermal_observation: bool,
+    /// AIO Phase 8 Run 2, daemon >= 2.43.0. Gates the
+    /// `stop_when_diagnostics_complete` field on `POST /validation/session` and
+    /// its echo on the session document (`P8-az`).
+    ///
+    /// **Required, and for the same reason as `thermal_observation` above.**
+    /// `serde` ignores an unknown field rather than rejecting it, so a daemon
+    /// without this returns `200` for a request carrying the flag and then
+    /// records for the full two-hour sample cap. Neither the status code nor the
+    /// response body distinguishes the two — the echoed field is absent, which
+    /// `#[serde(default)]` renders as `false` on a client that has the field and
+    /// as nothing at all on one that does not. This flag is what lets a client
+    /// decide whether to OFFER the option; the echoed field is what it renders
+    /// once a session exists.
+    #[serde(default)]
+    pub validation_auto_stop: bool,
     /// AIO Phase 8 Batch 1, daemon >= 2.39.0. Gates `GET /diagnostics/preflight`.
     ///
     /// A SEPARATE flag from `control_path_discovery`, deliberately: preflight is

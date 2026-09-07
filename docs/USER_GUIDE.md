@@ -199,6 +199,41 @@ As of 2.0.0 the profile engine is the **sole writer** (DEC-159 / DEC-165) — th
 | `GET /validation/sessions` | The last five retained sessions, newest first (DEC-317) |
 | `POST /config/cooling-device` | Create or replace one cooling device by id (DEC-316). Body `{"id": "<id>", "name"?, "kind"?, "pump_member"?, "radiator_members"?, "device_policy_id"?, ...}`. Safety limits are **not** settable — a policy is chosen by id and `minimum_safe_pwm` & siblings are rejected |
 | `DELETE /config/cooling-device/{id}` | Remove one cooling device (DEC-316) |
+| `POST /validation/session` | Start recording one session against a cooling device (DEC-317). Body `{"cooling_device_id": "<id>", "kind"?, "diagnostics"?, "sweep_members"?, "metadata"?, "stop_when_diagnostics_complete"?}`. **Read the lifecycle note below before starting one** — a session does not end when its diagnostics do unless you ask it to |
+| `POST /validation/session/stop` | Finalise the session: compute the summary and findings, and persist it. **This is how a session ends.** Returns the finalised document |
+| `DELETE /validation/session` | Finalise the session and record it as `cancelled`. **Not a discard** — a cancelled session carries the same samples, analysis and summary as a stopped one and is persisted identically; only `state` differs |
+| `POST /validation/session/event` | Place a user marker on the session timeline. Body `{"detail"?, "member_id"?}` |
+| `POST /validation/session/measurement` | Attach an external instrument reading (a meter, a scope) to the session. Body `{"kind": "<kind>", "value": N, "unit"?, "member_id"?, "note"?}` |
+
+#### How a validation session ends
+
+This is the part that surprises people, so it is stated plainly.
+
+A session **records until you stop it.** Finishing the diagnostics you asked for
+does **not** end it, and neither does closing the GUI window — the recording
+lives in the daemon. Left completely alone a session stops by itself only when
+it reaches the daemon's sample cap, which is 7200 samples at one per second:
+**two hours.** With every diagnostic enabled the diagnostics themselves finish in
+roughly four minutes, so the remaining hour and fifty-six minutes is passive
+recording. That is deliberate — it is what lets you run a workload and capture
+what the cooler did — but it is not what most people expect.
+
+There are three ways to end one:
+
+1. **`POST /validation/session/stop`** (the GUI's *Stop & Save*) — finalise and
+   keep the evidence. This is the normal way.
+2. **`DELETE /validation/session`** (the GUI's *Stop & Mark Cancelled*) —
+   also finalises and also keeps the evidence, recorded as `cancelled`.
+3. **`"stop_when_diagnostics_complete": true` at start** — the session finalises
+   itself the moment the diagnostics you asked for have all run. Requires
+   `control.validation_auto_stop` (daemon 2.43.0+) and at least one entry in
+   `diagnostics`; asking for it with none is rejected, because there would be
+   nothing to complete. Opt-in: the default is `false`, so a client that does not
+   send it gets exactly the behaviour described above.
+
+A session that is interrupted — the daemon stopped, the machine rebooted — is
+recorded as `interrupted` at the last sample it actually took. Samples are never
+invented for the gap.
 
 **Diagnostics / maintenance:**
 

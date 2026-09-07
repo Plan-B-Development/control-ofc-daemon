@@ -181,6 +181,9 @@ The profile engine is the **sole writer** as of 2.0.0 (DEC-159/DEC-165); the GUI
 | `GET /inventory/cooling-devices` | Cooling-device topology + the shipped device policies (DEC-316). Metadata — the profile engine never reads a device |
 | `GET /validation/session` | The current or most recent validation session in full (DEC-317). The engine is an observer that may orchestrate the existing verify/characterize handlers; it never writes a duty itself |
 | `GET /validation/sessions`, `/validation/sessions/{id}` | Retained session index (last 5) and one session in full (DEC-317) |
+| `POST /validation/session` | Start a session (DEC-317). `stop_when_diagnostics_complete` (2.43.0+, gated on `control.validation_auto_stop`) makes the orchestrator finalise the session through the id-fenced `stop_if` when its walk completes normally — **never** from the shutdown or superseded early-returns. Requires a non-empty `diagnostics[]`; the combination is rejected rather than ignored, because `spawn_orchestration` is not spawned for an empty one and there would be no task to carry the hop |
+| `POST /validation/session/stop`, `DELETE /validation/session` | Finalise as `completed` / as `cancelled`. Both go through `finalise_in_place`, so a cancel is **not** a discard — same samples, analysis and summary, `state` is the only difference (`P8-bc`) |
+| `POST /validation/session/event`, `/validation/session/measurement` | User marker and external instrument reading. Both free-text fields are bounded at `VALIDATION_MAX_TEXT_FIELD_BYTES` at ingest (DEC-320) |
 | `POST /config/cooling-device` | Create/replace a cooling device. Confers **no** pump protection: that is still `/config/header-role` (DEC-316) |
 | `DELETE /config/cooling-device/{id}` | Remove a cooling device (DEC-316) |
 | `POST /fans/openfan/{ch}/calibrate` | Run a PWM-to-RPM calibration sweep |

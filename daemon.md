@@ -437,6 +437,7 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 | GET | `/profile/active` | Current active profile or `{"active": false}` |
 | GET | `/diagnostics/hardware` | Hardware readiness report (hwmon chips, GPU, thermal safety, kernel modules, ACPI conflicts, board info, and `board_firmware_counts` — the board's own firmware-declared fan/temp/volt counts where `it87` publishes the Gigabyte SIV, `X87-d`; a measurement beside `expected_chips`' DMI-table inference; compare against `hwmon.total_headers`, which is `pwmN`-capable headers only — monitor-only tachometers are disjoint and live on `/inventory/hwmon`) |
 | GET | `/inventory/hwmon` | Read-only structured inventory: temp sensors (each with a fine `classification`/`confidence`/`rationale` + an advisory `default_cpu`), controllable PWM headers, and monitor-only fan tachometers (`fanN_input` with no matching `pwmN`) |
+| GET | `/diagnostics/preflight?header=&diagnostic=` | The daemon's own safety verdict for one header and one diagnostic, **before anything is driven** (DEC-333, 2.39.0+, `control.diagnostic_preflight`). Read-only: no lease, no slot, nothing reserved — a `ready` verdict describes *now*, and the diagnostic's own POST still runs its own guards. Returns `{verdict, checks[], blocking[]}` with `verdict` in `ready`\|`warn`\|`blocked`. A stale temperature source **blocks** control-path discovery and only **warns** for verify and characterisation, because those two do not refuse on it and a preflight must not promise a refusal the daemon will not perform |
 | GET | `/inventory/cooling-devices` | Configured cooling-device topology + every device policy the daemon ships (DEC-316). Metadata — the profile engine never reads a device |
 | GET | `/validation/session` | The current or most recent validation session in full — metadata, samples, event timeline, referenced diagnostics, findings (DEC-317). `404` when none has ever run |
 | GET | `/validation/sessions`, `/validation/sessions/{id}` | The retained session index (last 5, newest first) and one session in full (DEC-317) |
@@ -636,6 +637,9 @@ commands still gets the forced duty, which is what keeps the reach above true.
 | POST | `/hwmon/{header_id}/characterize` | Start a PWM/RPM response sweep (AIO-MB Phase 3, DEC-313). Returns `202` and runs detached; alongside the quick verify, never replacing it. Points clamped to `[max(20, header floor)..100]` — **0% is unreachable** — and swept ascending. Since 2.40.0 (DEC-334) `bidirectional` walks them down from the top and back up, ending high, and `stability_seconds` adds a dwell at up to 3 daemon-chosen duties; both gated on `control.pwm_behaviour_characterization` |
 | GET | `/diagnostics/characterization` | Current or most recent characterisation run, including points measured so far (live progress) |
 | DELETE | `/diagnostics/characterization` | Ask a running sweep to stop; the header is restored either way, except where something with more authority owns it (a thermal force, or shutdown) — reported as `restore_outcome`, never as a silent success |
+| POST | `/hwmon/{header_id}/discover-control-path` | Establish which tach channel(s) this PWM output actually drives, **by measurement rather than by sysfs numbering** (AIO Phase 8 Batch 1, DEC-333, 2.39.0+, `control.control_path_discovery`). Returns `202` and runs detached; poll `GET /diagnostics/control-path`. Optional `{"delta_pct", "cycles", "window_seconds"}`, all clamped server-side. Deliberately **not** `pwmconfig`'s stop-the-fan model: the perturbation moves away from the nearer rail so there is always headroom, every commanded duty is clamped into `[max(20, header floor)..100]` — **0% is unreachable for any header** — and a pump-protected header never crosses its 30% floor. Claims the **same** single-flight verify slot as verify/calibrate/characterize, so at most one of the four ever drives hardware. **DEC-336 (2.42.0):** refuses with `409 validation_error` and aborts a run in flight when every temperature reading is stale — the refusal `GET /diagnostics/preflight` publishes, built from the same predicate |
+| GET | `/diagnostics/control-path` | Current or most recent discovery run, **plus every persisted relationship**. Records survive a restart, are keyed by the header's stable id — so a board or driver change invalidates one by construction — and are pruned at boot to whatever discovery still sees. `no_tach_response` is a legitimate result and **not** a fault: the header may drive no tach-reporting device, or one running under its own internal control |
+| DELETE | `/diagnostics/control-path` | Ask a running discovery to stop. Same cooperative-cancel and restore semantics, and the same two deliberate skips, as the characterisation sweep above |
 | POST | `/hwmon/rescan` | Re-enumerate hwmon devices and return fresh header list |
 | POST | `/fans/openfan/rescan` | Look for an OpenFanController and adopt it without a restart (DEC-265) |
 
@@ -649,11 +653,36 @@ commands still gets the forced duty, which is what keeps the reach above true.
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| POST | `/validation/session` | Start recording against a configured cooling device. Optionally **orchestrates** `pwm_verify` / `pwm_characterization` against named `sweep_members` (default: the pump member). `409` if one is already recording |
+| POST | `/validation/session` | Start recording against a configured cooling device. Optionally **orchestrates** `pwm_verify` / `pwm_characterization` against named `sweep_members` (default: the pump member). `409` if one is already recording. `stop_when_diagnostics_complete` (2.43.0+, `control.validation_auto_stop`) makes the session finalise itself when its orchestration walk completes — see **How a session ends** below; `400 validation_error` if it is set with an empty `diagnostics[]` |
 | POST | `/validation/session/stop` | Finalise and compute the evidence summary. **Also ends the diagnostic the session started** — see below. `404` only when no session has ever been started; `500 internal_error` if the finaliser itself broke, in which case the session is **still recording** |
 | DELETE | `/validation/session` | Finalise and persist, recording the session as `cancelled`. **Not a discard** (`P8-bc`): `cancel()` is `finish(STATE_CANCELLED)` and finalises exactly as `stop` does — same findings, same samples, same persistence; only `state` differs. Same three outcomes as `stop` |
 | POST | `/validation/session/event` | Place a user marker on the timeline |
 | POST | `/validation/session/measurement` | Attach an external measurement — **untrusted; no control path reads one** |
+
+**How a session ends (`P8-az`, `P8-bf`).** No document said this before daemon 2.43.0, and
+its absence was the defect: a session **records until it is stopped**, and finishing the
+diagnostics it orchestrated does not stop it. The daemon's only unprompted finalise is the
+sample cap — `VALIDATION_MAX_SAMPLES` (7200) x `VALIDATION_SAMPLE_INTERVAL` (1 s), a flat
+**two hours**, and `max_samples_for` does not shorten it for a real cooler. With every
+diagnostic requested the orchestration finishes in ~4 min (verify ~10 s, basic sweep ~50 s,
+behaviour sweep ~2.5 min, discovery ~25 s, per member) and the recorder then runs for the
+remaining ~1 h 56 m. That passive tail is the point of the feature — it is what captures a
+workload — but nothing told the operator it was there.
+
+So there are three ways one ends, and since 2.43.0 the third is the caller's choice:
+
+1. `POST /validation/session/stop` — finalise and keep the evidence.
+2. `DELETE /validation/session` — the same, recorded as `cancelled`. Not a discard.
+3. `stop_when_diagnostics_complete: true` at start — `spawn_orchestration` finalises the
+   session on its way out. **Only on normal completion**: neither the shutdown early-return
+   nor the superseded early-return takes the hop, because a `completed` stamped on the way
+   out of a shutdown would be a fabricated verdict where the boot sweep would otherwise
+   report `interrupted` honestly, and a superseded task has nothing of its own left to stop.
+   The finalise is `stop_if`, fenced on the session id under the same guard — an operator can
+   stop and restart in the gap, and an unfenced `stop()` would finalise *their* session. It
+   runs through `spawn_blocking` (`AUD3-n`), and prunes afterwards exactly as the manual stop
+   does, so an auto-stop is indistinguishable from the operator pressing Stop. Default
+   `false`, so a client that does not send it sees the behaviour above unchanged.
 
 **A session is an observer that may orchestrate, and never a second writer.** The recorder
 performs no sysfs I/O and plants no hooks in the engine or the write path. Where a session

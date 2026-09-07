@@ -97,6 +97,11 @@ pub enum StartError {
     UnknownDiagnostic(String),
     /// A bound was exceeded.
     TooMany(String),
+    /// The request is internally inconsistent: one field asks for behaviour
+    /// that nothing else in the same request can deliver. Distinct from
+    /// `TooMany`, which is a bound — this one is a contradiction, and both
+    /// render as `400 validation_error`.
+    Unsatisfiable(String),
     /// The session could not be persisted.
     Persistence(String),
 }

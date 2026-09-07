@@ -46,6 +46,23 @@ pub struct StartSessionRequest {
     /// safety decision.
     #[serde(default)]
     pub metadata: std::collections::BTreeMap<String, String>,
+    /// Finalise the session as soon as the orchestrated diagnostics finish
+    /// (`P8-az`).
+    ///
+    /// **Opt-in, and the default is deliberately `false`.** Before this field a
+    /// session ended only when an operator stopped it or the sample cap was hit
+    /// — [`constants::VALIDATION_MAX_SAMPLES`] x
+    /// [`constants::VALIDATION_SAMPLE_INTERVAL`], a flat two hours — so with
+    /// everything ticked the diagnostics finished in ~4 min and the recorder ran
+    /// for the remaining ~1 h 56 m. Defaulting this to `true` would change what
+    /// an existing client and every `curl` user already gets, so the daemon keeps
+    /// today's behaviour and the *caller* asks.
+    ///
+    /// Requires at least one entry in `diagnostics`: see
+    /// [`start_session_handler`], which rejects the combination rather than
+    /// accepting a flag nothing can act on.
+    #[serde(default)]
+    pub stop_when_diagnostics_complete: bool,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -167,6 +184,9 @@ pub async fn start_auto_startup_record(state: &Arc<AppState>) -> Option<String> 
         interrupted_reason: None,
         truncated_at_unix_ms: None,
         auto_started: true,
+        // The startup record orchestrates no diagnostics at all; its bound is
+        // `STARTUP_RECORD_WINDOW_S` through `stop_auto_startup_record`.
+        stop_when_diagnostics_complete: false,
         startup_fingerprints: Vec::new(),
         steady_state: None,
     };
@@ -354,7 +374,7 @@ fn start_error_response(e: StartError) -> (StatusCode, Json<serde_json::Value>) 
             StatusCode::BAD_REQUEST,
             &ErrorEnvelope::validation(format!("unknown diagnostic '{d}'")),
         ),
-        StartError::TooMany(what) => {
+        StartError::TooMany(what) | StartError::Unsatisfiable(what) => {
             error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(&what))
         }
         StartError::Persistence(e) => error_response(
@@ -488,6 +508,45 @@ pub async fn start_session_handler(
         }
     }
 
+    // `stop_when_diagnostics_complete` with nothing to complete (`P8-az`).
+    //
+    // **Placed here, after the sweep is resolved, and that position is the
+    // rule.** The hop's real precondition is not "the caller named a
+    // diagnostic" but "the orchestration walk has something to walk", and those
+    // two differ: `spawn_orchestration` iterates `members x diagnostics`, so an
+    // empty resolved sweep walks zero members and drops straight into the
+    // terminal hop. Checking only `diagnostics` — which is where this guard was
+    // first written — left that reachable, and it was reachable from an
+    // ordinary configuration rather than a contrived one: `pump_member` is
+    // `Option` and `validate_device` does not require it, so an air-cooler or
+    // custom-loop device with only radiator members resolves `sweep` to `[]`
+    // whenever the caller omits `sweep_members`. Measured before this moved: a
+    // `200`, then `completed` with **0 samples and 0 evidence** within
+    // milliseconds.
+    //
+    // Rejected rather than ignored, in both cases. An empty `diagnostics` array
+    // is a legitimate passive recording session — but combined with this flag
+    // there is no task to carry the stop, so the session would run to the
+    // two-hour cap while `GET /validation/session` echoed a flag saying it stops
+    // when the diagnostics finish. And accepting the empty-sweep case produces
+    // the near-empty document that reads as a failed start, which is exactly the
+    // alternative rejected when this feature was specified. Found by
+    // `ofc:concurrency-reviewer`.
+    if body.stop_when_diagnostics_complete {
+        if body.diagnostics.is_empty() {
+            return start_error_response(StartError::Unsatisfiable(
+                "stop_when_diagnostics_complete requires at least one diagnostic".to_string(),
+            ));
+        }
+        if sweep.is_empty() {
+            return start_error_response(StartError::Unsatisfiable(
+                "stop_when_diagnostics_complete requires at least one sweep member, and this \
+                 cooling device has no pump member to default to — name one in sweep_members"
+                    .to_string(),
+            ));
+        }
+    }
+
     // Bound the user metadata (§11).
     if body.metadata.len() > constants::VALIDATION_MAX_METADATA_KEYS {
         return start_error_response(StartError::TooMany(format!(
@@ -554,6 +613,9 @@ pub async fn start_session_handler(
         // flag to decide whether an in-flight session may be pre-empted, so a
         // hand-started session must never carry it.
         auto_started: false,
+        // Rejected above unless at least one diagnostic was requested, so this
+        // is never true on a session `spawn_orchestration` will not be given.
+        stop_when_diagnostics_complete: body.stop_when_diagnostics_complete,
         // Both are derived at finalisation from the recorded samples, never
         // during recording: a fingerprint or a steady-state verdict computed
         // from a partial run would have to be recomputed anyway, and publishing
@@ -612,6 +674,7 @@ pub async fn start_session_handler(
                     started.session_id.clone(),
                     started.requested_diagnostics.clone(),
                     targets,
+                    started.stop_when_diagnostics_complete,
                 );
             }
             prune_sessions_off_runtime().await;
@@ -819,11 +882,16 @@ pub async fn get_session_by_id_handler(
 /// header that fails verify is exactly §10's device-override signature, so the
 /// sweep that follows is more valuable, not less, and `unavailable` never
 /// becomes `fail` (§7).
+///
+/// When `auto_stop` is set the task finalises the session on its way out —
+/// **only** by falling off the end of the walk, never from either early return.
+/// See the hop itself for why that distinction is the whole safety argument.
 fn spawn_orchestration(
     state: Arc<AppState>,
     session_id: String,
     diagnostics: Vec<String>,
     members: Vec<(String, bool)>,
+    auto_stop: bool,
 ) {
     // Shutdown-aware, because this task is detached and is NOT in `task_handles`.
     //
@@ -886,6 +954,87 @@ fn spawn_orchestration(
                     DIAG_CONTROL_PATH => run_discovery(&state, &session_id, member).await,
                     _ => {}
                 }
+            }
+        }
+        // ── The terminal hop (`P8-az`) ───────────────────────────────────
+        //
+        // Reached ONLY by falling off the end of the walk. Both early returns
+        // above — the shutdown check and the superseded check — leave without
+        // touching the session, and that asymmetry is the whole safety
+        // argument, not a tidiness preference:
+        //
+        //   * shutdown: `shutdown_sequence` is already finalising the world.
+        //     Racing it with a finalise of our own would write the session
+        //     document a second time from a detached task the shutdown does not
+        //     wait for, against the store the boot sweep is about to read.
+        //     An interrupted session is represented honestly as `interrupted`
+        //     (§15); a `completed` stamped on the way out of a shutdown would
+        //     be a fabricated verdict.
+        //   * superseded: the slot no longer holds our session, so there is
+        //     nothing of ours left to stop. `stop_if` would refuse anyway — the
+        //     early return simply means we do not pay a `spawn_blocking` hop to
+        //     be told so.
+        //
+        // The shutdown flag is re-read HERE and not merely inherited from the
+        // loop, because the loop's check is per-diagnostic: a shutdown signalled
+        // after the last one would otherwise slip through the gap and take the
+        // hop, which is the one case the paragraph above says cannot happen.
+        // (`stop_if`'s own `is_recording()` guard makes either ordering benign
+        // against the shutdown flush — but "benign by luck of the interleaving"
+        // is not the invariant this comment claims, and a comment that overstates
+        // its code is how the next reader is misled.)
+        //
+        // A walk with no members cannot reach this: the start handler refuses
+        // the flag when the RESOLVED sweep is empty, not merely when
+        // `diagnostics` is. That claim used to read the other way round — "it
+        // is deliberate, the operator learns at once" — and it was wrong; the
+        // artefact is a `completed` session with 0 samples and 0 evidence.
+        //
+        // `stop_if`, never `stop`: the id comparison must happen under the SAME
+        // guard as the finalisation. Between the last diagnostic and this line
+        // an operator can stop the session and start another, and the unfenced
+        // `stop()` would then finalise THEIRS — seconds after it began, from a
+        // task that belongs to a session that has already ended. This is
+        // `stop_auto_startup_record`'s lesson, and it is the same call for the
+        // same reason.
+        //
+        // `AUD3-n`: finalising summarises and persists (`write` + `fsync` +
+        // `rename` + a directory `fsync`, over a document `AUD3-i` measures at
+        // up to ~5.7 MiB) and blocks on the slot lock to do it — so it goes off
+        // the runtime the 1 Hz profile engine shares, exactly as the two
+        // request handlers and the startup record do. A source-scanning guard
+        // in `validation_phase5.rs` enforces this.
+        if auto_stop && !*shutdown.borrow() {
+            let engine = state.validation.clone();
+            let owned = session_id.clone();
+            match tokio::task::spawn_blocking(move || engine.stop_if(&owned)).await {
+                Ok(Some(s)) => {
+                    log::info!(
+                        "Validation session {} finalised on diagnostic completion ({} samples, \
+                         {} evidence record(s))",
+                        s.session_id,
+                        s.samples.len(),
+                        s.evidence.len()
+                    );
+                    // The governing rule for this whole hop: an auto-stop must
+                    // be indistinguishable from the operator pressing Stop.
+                    // `stop_session_handler` prunes after a successful finalise
+                    // — a persisted session can push retention over its bound —
+                    // and skipping it here would make the retained set depend on
+                    // *how* a session ended.
+                    prune_sessions_off_runtime().await;
+                }
+                // Stopped, cancelled or pre-empted between the last diagnostic
+                // and here. Not an error: the operator got there first.
+                Ok(None) => log::debug!(
+                    "Validation session {session_id} was already finalised; nothing to stop"
+                ),
+                // The session stays installed and recording, which the operator
+                // can still stop by hand and the boot sweep represents as
+                // `interrupted`. Never a fabricated `completed`.
+                Err(e) => log::warn!(
+                    "Validation session {session_id} could not be finalised automatically: {e}"
+                ),
             }
         }
     });
@@ -1399,6 +1548,7 @@ mod tests {
             interrupted_reason: None,
             truncated_at_unix_ms: None,
             auto_started: false,
+            stop_when_diagnostics_complete: false,
             startup_fingerprints: vec![],
             steady_state: None,
         }

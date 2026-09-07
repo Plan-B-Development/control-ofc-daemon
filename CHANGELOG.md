@@ -1,5 +1,52 @@
 # Changelog
 
+## [2.43.0] — 2026-09-07
+
+**Run 2 of the session-lifecycle block (DEC-338).** The daemon half of the defect
+GUI v2.65.1 made legible: a validation, lifecycle or thermal session had no
+terminating condition. Pairs with `control-ofc-gui` >= v2.66.0, which is what
+offers the new option — this release is additive and changes nothing for a caller
+that does not ask for it.
+
+### Added
+- **A session can now finalise itself when its diagnostics finish.**
+  `POST /validation/session` accepts `stop_when_diagnostics_complete` (default
+  `false`), and the session document echoes it back. Until now a session ended
+  only when it was stopped by hand or when it reached the sample cap —
+  `VALIDATION_MAX_SAMPLES` (7200) x `VALIDATION_SAMPLE_INTERVAL` (1 s), **a flat
+  two hours**, not shortened for a real cooler. With every diagnostic requested
+  the orchestration finishes in about four minutes and the recorder then ran for
+  the remaining hour and fifty-six. The default stays `false` so an older client
+  and every `curl` user get exactly the previous behaviour.
+  - The stop fires **only when the orchestration walk completes normally**.
+    Neither the shutdown early-return nor the superseded early-return takes it:
+    a `completed` stamped on the way out of a shutdown would be a fabricated
+    verdict where the boot sweep reports `interrupted` honestly, and a superseded
+    task has nothing of its own left to stop.
+  - It finalises through the id-fenced `stop_if`, off the async runtime, and
+    prunes afterwards — so an auto-stop is indistinguishable from an operator
+    pressing Stop, including when one stops and starts another session in the gap.
+  - Requesting it with an empty `diagnostics[]` is **rejected**
+    (`400 validation_error`) rather than ignored: no orchestration task is spawned
+    for an empty array, so the session would have recorded to the cap while
+    reporting that it would not.
+- **New capability `control.validation_auto_stop`.** Gate the option on it. An
+  older daemon parses and *drops* the unknown request field rather than rejecting
+  it, so it answers `200` and then records for two hours — neither the status code
+  nor the body distinguishes the two.
+
+### Documentation
+- **The five `POST`/`DELETE` validation routes are documented.** They appeared in
+  neither `docs/USER_GUIDE.md` nor `docs/DEVELOPER_HANDOVER.md`, so a user reading
+  the guide had **no documented way to stop a session** — which was the
+  user-facing consequence of the defect above. Both now carry them, and the user
+  guide gains a *How a validation session ends* section stating the two-hour
+  ceiling in plain terms.
+- **`daemon.md` gains the control-path routes**, of which it contained zero
+  occurrences: `POST /hwmon/{id}/discover-control-path`, `GET`/`DELETE
+  /diagnostics/control-path` and `GET /diagnostics/preflight` (DEC-333) were
+  missing from its route tables entirely.
+
 ## [2.42.0] — 2026-09-06
 
 **Two audit findings from the 2026-09-06 cross-stack audit (DEC-336).** Pairs

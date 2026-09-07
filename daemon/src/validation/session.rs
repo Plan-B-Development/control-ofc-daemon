@@ -596,6 +596,21 @@ pub struct ValidationSession {
     /// cannot evict hand-made sessions.
     #[serde(default)]
     pub auto_started: bool,
+    /// This session finalises itself when its orchestrated diagnostics finish
+    /// (`P8-az`), because the caller asked it to at start.
+    ///
+    /// **Echoed so the client renders the daemon's answer, not its own request
+    /// memory.** A GUI that remembers what it asked for cannot tell an accepted
+    /// request from one an older daemon parsed and dropped — `serde` ignores an
+    /// unknown field rather than rejecting it, so the pre-`P8-az` daemon returns
+    /// `200` for a request carrying this flag and then records for the full two
+    /// hours. `control.validation_auto_stop` is what a client gates the OFFER on;
+    /// this field is what it renders once a session exists.
+    ///
+    /// Never true without at least one requested diagnostic — the start handler
+    /// rejects that combination.
+    #[serde(default)]
+    pub stop_when_diagnostics_complete: bool,
     /// Per-member startup behaviour (Batch 3a §1). Empty when nothing was
     /// derivable — never a row of zeroes.
     #[serde(default)]

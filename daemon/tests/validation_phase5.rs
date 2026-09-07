@@ -86,6 +86,7 @@ fn session() -> ValidationSession {
         interrupted_reason: None,
         truncated_at_unix_ms: None,
         auto_started: false,
+        stop_when_diagnostics_complete: false,
         startup_fingerprints: vec![],
         steady_state: None,
     }
@@ -655,6 +656,12 @@ fn the_serialized_session_contains_only_cooling_relevant_keys() {
         "auto_started",
         "startup_fingerprints",
         "steady_state",
+        // `P8-az` (Run 2). The session's own end condition — whether it
+        // finalises itself when its diagnostics finish. Cooling-relevant and
+        // identity-free: it is a property of the recording, and it is echoed
+        // precisely so a client renders the daemon's answer rather than its own
+        // request memory.
+        "stop_when_diagnostics_complete",
     ];
     for key in obj.keys() {
         assert!(
@@ -935,6 +942,27 @@ fn the_session_lifecycle_writes_stay_off_the_async_runtime() {
     assert!(
         handler[..call].contains("spawn_blocking"),
         "`start` writes the session document inline on the request path (`AUD3-n`)"
+    );
+
+    // The `P8-az` terminal hop finalises too, from a detached task on the same
+    // runtime — and it is the one finalise that is NOT on a request path, so
+    // nothing upstream would ever notice the latency it added.
+    let at = body
+        .find("fn spawn_orchestration")
+        .expect("the orchestrator must still exist");
+    let orch = &body[at..];
+    // Match the CALL SHAPE, not a window containing both tokens. The first
+    // draft asserted `orch[..hop].contains("spawn_blocking")`, which passes if
+    // *any* `spawn_blocking` appears anywhere earlier in the function — so
+    // moving the finalise back onto the async worker would have kept it green
+    // while a sibling call held the token. A guard that passes when its own
+    // property is violated is worse than no guard. Found by
+    // `ofc:concurrency-reviewer`.
+    assert!(
+        orch.contains("spawn_blocking(move || engine.stop_if("),
+        "the orchestrator's terminal hop no longer finalises through \
+         `spawn_blocking(move || engine.stop_if(...))` — it either persists inline \
+         on the async runtime (`AUD3-n`) or has lost its id fence (`P8-az`)"
     );
 
     // And the 1 Hz recorder tick, whose 30th flush rewrites the whole document.
@@ -2656,5 +2684,64 @@ fn the_example_config_documents_record_startup_under_startup() {
     assert!(
         section.contains("# record_startup = false"),
         "the documented default is not a directly uncommentable line:\n{section}"
+    );
+}
+
+/// The `P8-az` hop's id fence, asserted directly rather than through the wire.
+///
+/// The hop calls `stop_if` and not `stop` because an operator can stop their
+/// session and start another between the last diagnostic and the finalise — and
+/// the unfenced `stop()` finalises whatever is in the slot, which would be
+/// *their new session*, seconds after it began, from a task belonging to a
+/// session that has already ended.
+///
+/// Driven through the engine directly: no server, no timing, no sleeps. The
+/// integration test proves the hop fires; this proves the call it makes cannot
+/// hit the wrong session, which is the half a wire test cannot force
+/// deterministically. Recommended by `ofc:concurrency-reviewer`.
+#[test]
+fn the_terminal_hop_cannot_finalise_a_session_that_replaced_ours() {
+    use control_ofc_daemon::validation::recorder::ValidationEngine;
+
+    let _tmp = temp_state_dir();
+    let engine = ValidationEngine::new();
+    let ctx = test_context();
+
+    let a = engine
+        .start(unique_session("hopfence-a"), &ctx)
+        .expect("A must start");
+    assert_eq!(a.session_id, "val-hopfence-a");
+    // The operator stops A and starts B — exactly the window the fence covers.
+    engine.stop().expect("A must stop");
+    let b = engine
+        .start(unique_session("hopfence-b"), &ctx)
+        .expect("B must start");
+    assert!(
+        b.is_recording(),
+        "B must be recording, or this asserts nothing"
+    );
+
+    // A's orchestration task now reaches its terminal hop, late.
+    assert!(
+        engine.stop_if("val-hopfence-a").is_none(),
+        "A's late hop finalised something — with `stop()` this would have been B"
+    );
+
+    let live = engine
+        .snapshot()
+        .expect("a session must still be installed");
+    assert_eq!(
+        live.session_id, "val-hopfence-b",
+        "the slot no longer holds B"
+    );
+    assert!(
+        live.is_recording(),
+        "B was finalised by a hop belonging to a session that had already ended"
+    );
+
+    // The opposite branch, or a `stop_if` stuck at `None` would pass the above.
+    assert!(
+        engine.stop_if("val-hopfence-b").is_some(),
+        "`stop_if` refuses its OWN session, so the fence above proves nothing"
     );
 }

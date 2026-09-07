@@ -7128,3 +7128,321 @@ async fn a_blocked_preflight_and_a_refused_post_agree_on_one_cache() {
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
 }
+
+// ── `P8-az` / Run 2: a session can finalise itself when its diagnostics end ──
+
+/// A cooling-device fixture whose members are **not writable**.
+///
+/// The point is the orchestration walk. A writable member sends the orchestrator
+/// into the real verify handler — lease, settle, restore — which is seconds of
+/// wall clock and hardware-shaped timing that this test has no business waiting
+/// on. A non-writable member takes the `unavailable` branch instead: the walk
+/// records one evidence row per diagnostic and falls off the end immediately,
+/// which is the SAME normal-completion exit the terminal hop hangs off. So the
+/// path under test is exercised in full, at nothing per member.
+fn read_only_cooling_device_state() -> (Arc<AppState>, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut h1 = make_test_header("h1", "CHA_FAN1", 20);
+    let mut h2 = make_test_header("h2", "CPU_FAN", 30);
+    h1.is_writable = false;
+    h2.is_writable = false;
+    let mut state = test_app_state_with_headers(vec![h1, h2]);
+    {
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.runtime_config_path = tmp.path().join("runtime.toml");
+    }
+    (state, tmp)
+}
+
+/// Poll `GET /validation/session` until it leaves `recording`, or the deadline
+/// passes. Returns the last body seen either way.
+///
+/// A bounded poll against a deadline, never a bare sleep: the terminal hop is a
+/// detached task and a fixed sleep would either be flaky-short or waste the
+/// difference. The CALLER decides what a timeout means — for the auto-stop case
+/// it is a failure, and for the control case it is the expected outcome.
+async fn poll_until_not_recording(
+    socket_path: &str,
+    within: std::time::Duration,
+) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        let (_status, last) = uds_get(socket_path, "/validation/session").await;
+        if last["state"] != "recording" || std::time::Instant::now() >= deadline {
+            return last;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+async fn configure_read_only_device(socket_path: &str) {
+    let (status, json) = uds_post(
+        socket_path,
+        "/config/cooling-device",
+        &serde_json::json!({"id": "aio-1", "pump_member": "h2", "radiator_members": ["h1"]}),
+    )
+    .await;
+    assert_eq!(status, 200, "the fixture device must configure: {json}");
+}
+
+/// `stop_when_diagnostics_complete` with no diagnostics to complete is refused,
+/// rather than accepted and silently ignored.
+///
+/// `spawn_orchestration` is only spawned when `diagnostics[]` is non-empty, so
+/// there would be no task to carry the terminal hop — the session would run to
+/// the two-hour sample cap while the session document echoed a flag promising it
+/// stops when the diagnostics finish. That is `P8-az` itself, wearing the shape
+/// of its own fix.
+#[tokio::test]
+async fn auto_stop_is_refused_when_there_is_nothing_to_complete() {
+    ipc_temp_state_dir();
+    let (state, _tmp) = read_only_cooling_device_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+    configure_read_only_device(&path).await;
+
+    // The precondition that makes the rejection below mean something: the SAME
+    // passive session without the flag is legitimate and still starts. Without
+    // this the test would pass against a route that had simply broken.
+    let (status, json) = uds_post(
+        &path,
+        "/validation/session",
+        &serde_json::json!({"cooling_device_id": "aio-1"}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a passive session with no diagnostics is legitimate and must still start: {json}"
+    );
+    assert_eq!(
+        json["stop_when_diagnostics_complete"], false,
+        "a session that did not ask for auto-stop must not echo it: {json}"
+    );
+    let _ = uds_delete(&path, "/validation/session").await;
+
+    let (status, json) = uds_post(
+        &path,
+        "/validation/session",
+        &serde_json::json!({
+            "cooling_device_id": "aio-1",
+            "diagnostics": [],
+            "stop_when_diagnostics_complete": true,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "auto-stop with no diagnostics must be refused, not silently ignored: {json}"
+    );
+    assert_eq!(json["error"]["code"], "validation_error");
+
+    let _ = uds_delete(&path, "/validation/session").await;
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// **The `P8-az` regression test.** A session that asked for auto-stop finalises
+/// itself when the orchestrated diagnostics finish; one that did not, does not.
+///
+/// Both halves are here on purpose, and the second is what makes the first
+/// evidence. A test that only asserted "it completed" passes against a hop that
+/// fires unconditionally — which would end every diagnostic-bearing session the
+/// moment its sweep finished, including the ones an operator started precisely
+/// to keep recording afterwards. The control branch is the term that pins the
+/// flag as the cause, and it is asserted as a RELATIONSHIP between the two runs
+/// rather than against a literal.
+///
+/// The waits are bounded polls against a deadline, and the two are asymmetric on
+/// purpose: the auto-stop half fails if it has NOT finished inside the window,
+/// the control half fails if it HAS.
+#[tokio::test]
+async fn a_session_finalises_itself_only_when_it_asked_to() {
+    ipc_temp_state_dir();
+    let (state, _tmp) = read_only_cooling_device_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+    configure_read_only_device(&path).await;
+
+    // The daemon that ACTS on the field must also ADVERTISE it. A client gates
+    // the offer on `control.validation_auto_stop`, so a build that honoured the
+    // field without publishing the flag would serve a feature no GUI ever
+    // offers — the DEC-334 shape, from the other side of the wire.
+    let (_status, caps) = uds_get(&path, "/capabilities").await;
+    assert_eq!(
+        caps["control"]["validation_auto_stop"], true,
+        "this daemon honours `stop_when_diagnostics_complete` but does not \
+         advertise it, so no capability-gated client will ever offer it: {caps}"
+    );
+
+    // ── Asked for it: the session must end by itself ─────────────────────
+    let (status, json) = uds_post(
+        &path,
+        "/validation/session",
+        &serde_json::json!({
+            "cooling_device_id": "aio-1",
+            "diagnostics": ["pwm_verify"],
+            "sweep_members": ["h2"],
+            "stop_when_diagnostics_complete": true,
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(
+        json["state"], "recording",
+        "the session must actually be recording when it starts, or the finish \
+         below proves nothing: {json}"
+    );
+    assert_eq!(
+        json["stop_when_diagnostics_complete"], true,
+        "the daemon must ECHO the accepted flag — a client cannot otherwise tell \
+         an accepted request from one an older daemon parsed and dropped: {json}"
+    );
+
+    let auto = poll_until_not_recording(&path, std::time::Duration::from_secs(10)).await;
+    assert_eq!(
+        auto["state"], "completed",
+        "a session that asked to stop when its diagnostics finish is still \
+         recording after the walk ended (`P8-az`): {auto}"
+    );
+    // The hop must not finalise an EMPTY session: it runs after the walk, so the
+    // evidence the walk recorded has to be in the finalised document.
+    assert!(
+        auto["evidence"].as_array().is_some_and(|e| !e.is_empty()),
+        "the auto-stop fired before the diagnostics were walked: {auto}"
+    );
+    assert_eq!(
+        auto["stop_when_diagnostics_complete"], true,
+        "the flag must survive finalisation: {auto}"
+    );
+
+    // ── Did not ask: the identical session must keep recording ───────────
+    let (status, json) = uds_post(
+        &path,
+        "/validation/session",
+        &serde_json::json!({
+            "cooling_device_id": "aio-1",
+            "diagnostics": ["pwm_verify"],
+            "sweep_members": ["h2"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json["stop_when_diagnostics_complete"], false);
+
+    let control = poll_until_not_recording(&path, std::time::Duration::from_secs(2)).await;
+    assert_eq!(
+        control["state"], "recording",
+        "a session that did NOT ask for auto-stop was finalised anyway — the hop \
+         is firing unconditionally and every diagnostic-bearing session now ends \
+         at its sweep: {control}"
+    );
+    // The precondition for the sentence above: the walk really did finish, so
+    // "still recording" is the flag being honoured and not merely the sweep
+    // being slower than the deadline.
+    assert!(
+        control["evidence"]
+            .as_array()
+            .is_some_and(|e| !e.is_empty()),
+        "the control run's diagnostics never completed, so this half asserts \
+         nothing about auto-stop: {control}"
+    );
+
+    let _ = uds_delete(&path, "/validation/session").await;
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// **The regression test for the empty RESOLVED sweep** (`P8-az`, found by
+/// `ofc:concurrency-reviewer`).
+///
+/// The first draft of the guard tested `diagnostics[]`, but the terminal hop's
+/// real precondition is that the walk has something to walk — and
+/// `spawn_orchestration` iterates `members x diagnostics`. `pump_member` is
+/// `Option` and `validate_device` does not require one, so an air-cooler or
+/// custom-loop device with only radiator members resolves the sweep to `[]`
+/// whenever the caller omits `sweep_members`. Measured before the fix: `200`,
+/// then `completed` with **0 samples and 0 evidence** in milliseconds — the
+/// near-empty document that reads as a failed start, which is precisely the
+/// behaviour rejected when this feature was specified.
+#[tokio::test]
+async fn auto_stop_is_refused_when_the_resolved_sweep_is_empty() {
+    ipc_temp_state_dir();
+    let (state, _tmp) = read_only_cooling_device_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    // No `pump_member` — the shape that makes the default sweep empty.
+    let (status, json) = uds_post(
+        &path,
+        "/config/cooling-device",
+        &serde_json::json!({"id": "aio-1", "radiator_members": ["h1"]}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a device with no pump member must still be configurable — if this ever \
+         becomes a 400 the defect below is unreachable and this test is moot: {json}"
+    );
+
+    // The precondition, and the half that keeps this from passing vacuously: the
+    // SAME session without the flag is still accepted, so the rejection below is
+    // the new guard firing rather than the route or the fixture being broken.
+    let (status, json) = uds_post(
+        &path,
+        "/validation/session",
+        &serde_json::json!({"cooling_device_id": "aio-1", "diagnostics": ["pwm_verify"]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(
+        json["sweep_members"].as_array().map(|a| a.len()),
+        Some(0),
+        "this device must resolve to an EMPTY sweep, or the guard under test is \
+         never reached: {json}"
+    );
+    let _ = uds_delete(&path, "/validation/session").await;
+
+    let (status, json) = uds_post(
+        &path,
+        "/validation/session",
+        &serde_json::json!({
+            "cooling_device_id": "aio-1",
+            "diagnostics": ["pwm_verify"],
+            "stop_when_diagnostics_complete": true,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "auto-stop over an empty resolved sweep must be refused: the walk would \
+         complete instantly and finalise a 0-sample, 0-evidence session: {json}"
+    );
+    assert_eq!(json["error"]["code"], "validation_error");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("sweep member")),
+        "the message must name the sweep, not the diagnostics — they are \
+         different refusals and a user can only act on the right one: {json}"
+    );
+
+    // Naming a member explicitly makes the same request legitimate. Without this
+    // the guard could reject every auto-stop on this device and still pass.
+    let (status, json) = uds_post(
+        &path,
+        "/validation/session",
+        &serde_json::json!({
+            "cooling_device_id": "aio-1",
+            "diagnostics": ["pwm_verify"],
+            "sweep_members": ["h1"],
+            "stop_when_diagnostics_complete": true,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a pump-less device must still be able to auto-stop over a named \
+         member: {json}"
+    );
+
+    let _ = uds_delete(&path, "/validation/session").await;
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
