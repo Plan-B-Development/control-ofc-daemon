@@ -495,7 +495,15 @@ impl ValidationEngine {
         Some(done)
     }
 
-    /// End without finalising.
+    /// Finalise, recording the session as `cancelled` rather than `completed`.
+    ///
+    /// **NOT a discard, despite the name** (`P8-bc`). This delegates to `finish`,
+    /// which calls `finalise_in_place` unconditionally — so a cancelled session
+    /// carries the same derived analysis, summary and samples as a stopped one
+    /// and is persisted identically. `state` is the only thing that differs.
+    /// This comment read "End without finalising" and was wrong; the GUI client
+    /// and `docs/08` repeated it, and a `danger`-styled "Cancel Session" button
+    /// in the GUI told users it destroyed their evidence.
     pub fn cancel(&self) -> Option<ValidationSession> {
         self.finish(STATE_CANCELLED, None)
     }

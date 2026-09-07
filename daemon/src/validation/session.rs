@@ -21,7 +21,10 @@ pub const STATE_IDLE: &str = "idle";
 pub const STATE_RECORDING: &str = "recording";
 /// Finalised normally, summary computed.
 pub const STATE_COMPLETED: &str = "completed";
-/// Ended by the user before finalisation.
+/// Ended by the user. **Finalised like `COMPLETED`** — same summary, same
+/// samples, same persistence; this token records only that the operator ended
+/// the run deliberately rather than letting it finish (`P8-bc`). It said
+/// "before finalisation", which was wrong: `cancel()` goes through `finish()`.
 pub const STATE_CANCELLED: &str = "cancelled";
 /// Recording stopped without finalising and cannot be resumed — canonically a
 /// daemon restart. **Never fabricated telemetry for the gap** (§15).

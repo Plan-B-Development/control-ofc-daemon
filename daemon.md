@@ -651,7 +651,7 @@ commands still gets the forced duty, which is what keeps the reach above true.
 |--------|------|---------|
 | POST | `/validation/session` | Start recording against a configured cooling device. Optionally **orchestrates** `pwm_verify` / `pwm_characterization` against named `sweep_members` (default: the pump member). `409` if one is already recording |
 | POST | `/validation/session/stop` | Finalise and compute the evidence summary. **Also ends the diagnostic the session started** — see below. `404` only when no session has ever been started; `500 internal_error` if the finaliser itself broke, in which case the session is **still recording** |
-| DELETE | `/validation/session` | End without finalising. Same three outcomes as `stop` |
+| DELETE | `/validation/session` | Finalise and persist, recording the session as `cancelled`. **Not a discard** (`P8-bc`): `cancel()` is `finish(STATE_CANCELLED)` and finalises exactly as `stop` does — same findings, same samples, same persistence; only `state` differs. Same three outcomes as `stop` |
 | POST | `/validation/session/event` | Place a user marker on the timeline |
 | POST | `/validation/session/measurement` | Attach an external measurement — **untrusted; no control path reads one** |
 
