@@ -647,7 +647,7 @@ commands still gets the forced duty, which is what keeps the reach above true.
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| POST | `/inventory/superio/probe` | Opt-in active Super-I/O `/dev/port` probe (DEC-203) — a deliberate one-shot that identifies an UNBOUND chip so the user can be told which driver to load. Refuses unless `[detection] allow_port_probe` + `CAP_SYS_RAWIO`; skips ports claimed by a driver/ACPI; single-flight + 10 s cooldown. Returns the `/inventory/superio` shape enriched with probe hits |
+| POST | `/inventory/superio/probe` | Opt-in active Super-I/O `/dev/port` probe (DEC-203) — a deliberate one-shot that identifies an UNBOUND chip so the user can be told which driver to load. Refuses unless `[detection] allow_port_probe` + `CAP_SYS_RAWIO`; skips ports claimed by a driver/ACPI; single-flight + 10 s cooldown. Reads the DEVID with no unlock and writes one only on `0xffff` (DEC-332), and on a board the DMI table says is ITE-only it **withholds the Nuvoton `0x87,0x87` leg entirely** — the sequence that latches the eSPI→LPC bridge, keyed on the same board list as the shipped modprobe guard (`X87-k`); the skip is reported in `notes[]`. Returns the `/inventory/superio` shape enriched with probe hits |
 
 ### Write endpoints — validation sessions (DEC-317, AIO-MB Phase 5)
 

@@ -25,6 +25,15 @@
 //!   the fixed DEVID registers and **never** write a configuration value,
 //!   `force_id`, or the hardware-monitor block. A vendor whose unlock did not
 //!   take stays locked and ignores our writes.
+//! - **Never write the Nuvoton unlock on an all-ITE board.** `0x87,0x87` is the
+//!   sequence DEC-332 measured latching the IT8883 bridge, and
+//!   `packaging/control-ofc-superio-guard` exists to stop `nct6775`/`w83627ehf`
+//!   writing it on the boards in `chip_db::GIGABYTE_DUAL_CHIP_BOARDS`. This
+//!   probe now consults the same table: where DMI says the board's Super-I/O
+//!   complement is ITE-only, the Nuvoton fall-through is **withheld** rather
+//!   than written, so the daemon cannot inflict the damage its own packaging
+//!   guards against. The ITE legs are untouched, which is the diagnostic those
+//!   users actually came for. See [`NuvotonUnlockPolicy`] (`X87-k`).
 //! - **One-shot.** Driven by a deliberate `POST`; never in a loop, never at
 //!   startup.
 //! - **Safe Rust.** `/dev/port` via positioned `FileExt` I/O — no `unsafe`, no
@@ -33,6 +42,7 @@
 use std::io;
 use std::os::unix::fs::FileExt;
 
+use crate::api::responses::BoardInfo;
 use crate::hwmon::superio::SuperIoVendor;
 
 /// The two canonical Super-I/O configuration base ports. The index port is the
@@ -219,6 +229,74 @@ fn is_valid_family_devid(devid: u16) -> bool {
     devid != 0xffff && devid != 0x0000
 }
 
+/// Whether the Nuvoton/Winbond `0x87,0x87` config-mode unlock may be written on
+/// this machine at all.
+///
+/// **Deliberately opaque, within honest limits.** The `permitted` field is
+/// private, so no call site can write a permissive value directly, and
+/// [`NuvotonUnlockPolicy::for_board`] takes the whole [`BoardInfo`] so the
+/// vendor and the board name cannot be transposed (they are both `String`, and
+/// transposing them silently yields "permitted" — the table is vendor-gated).
+///
+/// What this does **not** prevent: `BoardInfo`'s fields are `pub`, so a caller
+/// can hand `for_board` a board it made up, and an empty one is permissive.
+/// That is a visible, deliberate act rather than a silent slip, and it is the
+/// gap `the_probe_call_site_derives_its_policy_from_the_dmi_tree` covers by
+/// driving the whole chain from a DMI directory. `CLAUDE.md` records fourteen
+/// occasions where a rule was extracted, tested, and then not actually applied
+/// at its call site: the two shapes the compiler can rule out here are ruled
+/// out by the compiler, and the one it cannot is pinned by that test.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NuvotonUnlockPolicy {
+    permitted: bool,
+}
+
+impl NuvotonUnlockPolicy {
+    /// Derive the policy from the running board's DMI identity.
+    ///
+    /// Forbidden exactly when the curated board table expects an ITE-only
+    /// Super-I/O complement here — on such a board no Nuvoton chip can be
+    /// waiting behind the unlock, so the write has nothing to gain and a latched
+    /// bridge to lose. Every other board (including every board the table does
+    /// not know) keeps the leg.
+    pub fn for_board(board: &BoardInfo) -> Self {
+        Self {
+            permitted: !crate::hwmon::chip_db::board_expects_only_ite_chips(
+                &board.vendor,
+                &board.name,
+            ),
+        }
+    }
+
+    /// Whether [`probe_base`] may write `0x87,0x87` at a base that answered
+    /// nothing to every earlier leg.
+    pub fn permits_unlock(self) -> bool {
+        self.permitted
+    }
+}
+
+/// What probing one base produced.
+enum BaseOutcome {
+    Chip(ProbedChip),
+    /// Nothing answered, and nothing was held back.
+    Nothing,
+    /// Every earlier leg read as no-response, so the Nuvoton unlock was the only
+    /// thing left to try — and [`NuvotonUnlockPolicy`] forbids writing it here.
+    /// Kept distinct from [`BaseOutcome::Nothing`] because the two are
+    /// indistinguishable to a user and mean opposite things: one says the base
+    /// is empty, the other says we deliberately did not ask.
+    NuvotonUnlockWithheld,
+}
+
+/// The result of probing a set of bases.
+pub struct PortProbeOutcome {
+    /// Every chip identified, in base order.
+    pub chips: Vec<ProbedChip>,
+    /// Bases where the probe reached the Nuvoton leg and the board policy
+    /// declined it. Surfaced to the user — see [`BaseOutcome::NuvotonUnlockWithheld`].
+    pub nuvoton_withheld_bases: Vec<u16>,
+}
+
 /// RAII guard that issues the matching Super-I/O config-mode *exit* on drop, so
 /// a probe that dies mid-sequence (canonically the DEVID read erroring right
 /// after the unlock) can never leave the chip in unlock/config mode. Mirrors the
@@ -277,28 +355,37 @@ impl Drop for SioExitGuard<'_> {
 ///   4. **`0xffff` only** — nothing answered, so fall through to the vendor
 ///      unlock sequences unchanged: ITE first (short-circuiting on a match so
 ///      the wrong vendor's exit never runs on an identified chip), then the
-///      Nuvoton/Winbond family. Each attempt arms a [`SioExitGuard`] right after
-///      its unlock, so the matching exit runs on every path out of the block —
-///      including an early `?` return when the DEVID read itself errors
-///      (DEC-203 config-mode-leak fix).
-fn probe_base(r: &dyn SuperIoPortReader, base: u16) -> io::Result<Option<ProbedChip>> {
+///      Nuvoton/Winbond family **if `policy` licenses it**. Each attempt arms a
+///      [`SioExitGuard`] right after its unlock, so the matching exit runs on
+///      every path out of the block — including an early `?` return when the
+///      DEVID read itself errors (DEC-203 config-mode-leak fix).
+///
+/// The `policy` gate sits at step 4's Nuvoton leg and nowhere earlier, which is
+/// the whole point of placing it there: on an affected board the no-enter read
+/// and the ITE unlock are exactly the diagnostic the user needs, and gating the
+/// base as a whole would take that away on the one population it is for.
+fn probe_base(
+    r: &dyn SuperIoPortReader,
+    base: u16,
+    policy: NuvotonUnlockPolicy,
+) -> io::Result<BaseOutcome> {
     // ── 1-3: the no-enter read, before any write reaches this base ──
     let unlocked_devid = sio_devid(r, base)?;
     match classify_devid(unlocked_devid) {
-        DevidVerdict::Bridge => return Ok(Some(bridge_report(base, unlocked_devid))),
+        DevidVerdict::Bridge => return Ok(BaseOutcome::Chip(bridge_report(base, unlocked_devid))),
         DevidVerdict::IteChip => {
             // A FEAT_NOCONF chip, already in config mode at power-on. Identified
             // without a single UNLOCK byte reaching the port — `sio_inb` still
             // writes the register index (0x20/0x21) to select it, which is a
             // read protocol, not an unlock. The tests assert on that distinction.
-            return Ok(Some(ProbedChip {
+            return Ok(BaseOutcome::Chip(ProbedChip {
                 base,
                 vendor: SuperIoVendor::Ite,
                 devid: unlocked_devid,
                 chip_name: Some(format!("it{unlocked_devid:04x}")),
             }));
         }
-        DevidVerdict::UnknownResponder => return Ok(None),
+        DevidVerdict::UnknownResponder => return Ok(BaseOutcome::Nothing),
         DevidVerdict::NoResponse => { /* fall through: an unlock is licensed */ }
     }
 
@@ -321,9 +408,9 @@ fn probe_base(r: &dyn SuperIoPortReader, base: u16) -> io::Result<Option<ProbedC
             // `0x87,0x87` — the exact sequence measured to cause the latch — and
             // the hit was then reported as Nuvoton, recommending the very module
             // the packaged guard exists to block.
-            DevidVerdict::Bridge => return Ok(Some(bridge_report(base, devid))),
+            DevidVerdict::Bridge => return Ok(BaseOutcome::Chip(bridge_report(base, devid))),
             DevidVerdict::IteChip => {
-                return Ok(Some(ProbedChip {
+                return Ok(BaseOutcome::Chip(ProbedChip {
                     base,
                     vendor: SuperIoVendor::Ite,
                     devid,
@@ -333,12 +420,27 @@ fn probe_base(r: &dyn SuperIoPortReader, base: u16) -> io::Result<Option<ProbedC
             // Something answered the ITE unlock that is not ITE and not a
             // bridge. A locked Nuvoton chip reads as no-response here, so this
             // is not the Nuvoton case — do not write a second unlock at it.
-            DevidVerdict::UnknownResponder => return Ok(None),
+            DevidVerdict::UnknownResponder => return Ok(BaseOutcome::Nothing),
             DevidVerdict::NoResponse => { /* fall through to the Nuvoton leg */ }
         }
     }
 
     // ── Nuvoton / Winbond family ──
+    //
+    // `X87-k`: this is the one leg whose unlock the daemon's own packaging
+    // blocks other callers from writing. On a board whose expected complement is
+    // ITE-only there is no Nuvoton chip to find here, so the write can only
+    // latch the bridge — the state DEC-332 measured surviving a reboot and
+    // clearing only at the wall. Withhold it and say so.
+    if !policy.permits_unlock() {
+        log::info!(
+            "Super-I/O base {base:#06x}: nothing answered and the Nuvoton/Winbond \
+             config-mode unlock was withheld — this board's expected Super-I/O \
+             complement is ITE-only, and that write is what latches the ITE \
+             eSPI-to-LPC bridge (DEC-332)."
+        );
+        return Ok(BaseOutcome::NuvotonUnlockWithheld);
+    }
     {
         nuvoton_enter(r, base)?;
         let _exit = SioExitGuard {
@@ -348,7 +450,7 @@ fn probe_base(r: &dyn SuperIoPortReader, base: u16) -> io::Result<Option<ProbedC
         };
         let devid = sio_devid(r, base)?;
         if is_valid_family_devid(devid) {
-            return Ok(Some(ProbedChip {
+            return Ok(BaseOutcome::Chip(ProbedChip {
                 base,
                 vendor: SuperIoVendor::Nuvoton,
                 devid,
@@ -357,17 +459,30 @@ fn probe_base(r: &dyn SuperIoPortReader, base: u16) -> io::Result<Option<ProbedC
         }
     }
 
-    Ok(None)
+    Ok(BaseOutcome::Nothing)
 }
 
 /// Probe each supplied base (the caller MUST pass only unclaimed bases). A probe
 /// error on one base is logged and skipped, not fatal.
-pub fn probe_ports(r: &dyn SuperIoPortReader, bases: &[u16]) -> Vec<ProbedChip> {
-    let mut out = Vec::new();
+///
+/// `policy` is threaded down to [`probe_base`]'s Nuvoton leg. It is a parameter
+/// rather than something read here so this module stays free of DMI/sysfs
+/// access — the same pure/gather split as `pick_probe_bases`/`safe_probe_bases`
+/// in `api::handlers::inventory`.
+pub fn probe_ports(
+    r: &dyn SuperIoPortReader,
+    bases: &[u16],
+    policy: NuvotonUnlockPolicy,
+) -> PortProbeOutcome {
+    let mut out = PortProbeOutcome {
+        chips: Vec::new(),
+        nuvoton_withheld_bases: Vec::new(),
+    };
     for &base in bases {
-        match probe_base(r, base) {
-            Ok(Some(chip)) => out.push(chip),
-            Ok(None) => {}
+        match probe_base(r, base, policy) {
+            Ok(BaseOutcome::Chip(chip)) => out.chips.push(chip),
+            Ok(BaseOutcome::NuvotonUnlockWithheld) => out.nuvoton_withheld_bases.push(base),
+            Ok(BaseOutcome::Nothing) => {}
             Err(e) => log::warn!("superio port probe: base 0x{base:04x} read failed: {e}"),
         }
     }
@@ -439,6 +554,47 @@ pub fn base_claimed(proc_ioports: &str, base: u16) -> bool {
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+
+    fn board_info(vendor: &str, name: &str) -> BoardInfo {
+        BoardInfo {
+            vendor: vendor.to_string(),
+            name: name.to_string(),
+            bios_version: String::new(),
+        }
+    }
+
+    /// A machine the curated board table says nothing about — the ordinary case,
+    /// and the one where the Nuvoton leg stays licensed. Asserts that rather
+    /// than assuming it, so every test built on it fails loudly if the default
+    /// ever inverts.
+    fn permissive() -> NuvotonUnlockPolicy {
+        let p = NuvotonUnlockPolicy::for_board(&board_info("", ""));
+        assert!(
+            p.permits_unlock(),
+            "a board the table does not cover must keep the Nuvoton leg"
+        );
+        p
+    }
+
+    /// `probe_base` reduced to its pre-`X87-k` shape, for the tests that predate
+    /// the policy and are about something else entirely.
+    fn probed_chip(r: &dyn SuperIoPortReader, base: u16) -> io::Result<Option<ProbedChip>> {
+        Ok(match probe_base(r, base, permissive())? {
+            BaseOutcome::Chip(c) => Some(c),
+            BaseOutcome::Nothing | BaseOutcome::NuvotonUnlockWithheld => None,
+        })
+    }
+
+    /// Did the *Nuvoton* unlock reach this base? It is a `0x87` **pair** written
+    /// back to back; the ITE sequence opens with a single `0x87` and continues
+    /// `0x01,0x55,…`, so matching the consecutive pair discriminates the two
+    /// without counting anything.
+    fn wrote_the_nuvoton_unlock(p: &FakePort, base: u16) -> bool {
+        p.writes
+            .borrow()
+            .windows(2)
+            .any(|w| w == [(base, 0x87u8), (base, 0x87u8)])
+    }
 
     /// Fake port device: records every write, and answers reads from a map keyed
     /// by (port, current-index). Lets tests assert the exact protocol bytes and
@@ -624,7 +780,7 @@ mod tests {
     #[test]
     fn probe_identifies_ite_chip_and_derives_name() {
         let p = FakePort::ite(0x8688);
-        let chip = probe_base(&p, 0x2e).unwrap().unwrap();
+        let chip = probed_chip(&p, 0x2e).unwrap().unwrap();
         assert_eq!(chip.vendor, SuperIoVendor::Ite);
         assert_eq!(chip.devid, 0x8688);
         assert_eq!(chip.chip_name.as_deref(), Some("it8688"));
@@ -635,7 +791,7 @@ mod tests {
     #[test]
     fn probe_identifies_nuvoton_family_at_vendor_level() {
         let p = FakePort::nuvoton(0xd592);
-        let chip = probe_base(&p, 0x2e).unwrap().unwrap();
+        let chip = probed_chip(&p, 0x2e).unwrap().unwrap();
         assert_eq!(chip.vendor, SuperIoVendor::Nuvoton);
         assert_eq!(chip.devid, 0xd592);
         assert_eq!(chip.chip_name, None); // vendor-level only
@@ -649,7 +805,7 @@ mod tests {
     #[test]
     fn probe_empty_base_returns_none_and_still_exits_cleanly() {
         let p = FakePort::empty();
-        assert!(probe_base(&p, 0x2e).unwrap().is_none());
+        assert!(probed_chip(&p, 0x2e).unwrap().is_none());
         let writes = p.writes.borrow();
         // BOTH vendor exits must run so no chip is ever left in config mode.
         assert!(
@@ -680,7 +836,7 @@ mod tests {
         // land there would assert nothing about the guard — it would just
         // observe an error path that writes no unlock at all.
         let p = FakePort::ite(0x8688).failing_after(2);
-        let err = probe_base(&p, 0x2e).unwrap_err();
+        let err = probed_chip(&p, 0x2e).unwrap_err();
         assert_eq!(
             err.kind(),
             io::ErrorKind::Other,
@@ -710,7 +866,7 @@ mod tests {
         // ever changes, bump this — otherwise the fault lands on an earlier leg
         // and silently stops exercising the Nuvoton guard.
         let p = FakePort::nuvoton(0xd428).failing_after(4);
-        let err = probe_base(&p, 0x2e).unwrap_err();
+        let err = probed_chip(&p, 0x2e).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Other);
         let writes = p.writes.borrow();
         assert!(
@@ -731,7 +887,7 @@ mod tests {
         // Exercises the full probe flow at 0x4E, where the 4th ITE enter byte is
         // 0xaa (not 0x55) and the data port is 0x4f.
         let p = FakePort::ite_at(0x4e, 0x8628);
-        let chip = probe_base(&p, 0x4e).unwrap().unwrap();
+        let chip = probed_chip(&p, 0x4e).unwrap().unwrap();
         assert_eq!(chip.base, 0x4e);
         assert_eq!(chip.chip_name.as_deref(), Some("it8628"));
         let writes = p.writes.borrow();
@@ -750,7 +906,7 @@ mod tests {
     fn probe_ports_over_multiple_bases_collects_each_hit() {
         // A fake with an ITE chip responding at BOTH bases → two hits.
         let p = FakePort::ite_any(0x8688);
-        let hits = probe_ports(&p, &SIO_BASES);
+        let hits = probe_ports(&p, &SIO_BASES, permissive()).chips;
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].base, 0x2e);
         assert_eq!(hits[1].base, 0x4e);
@@ -759,7 +915,7 @@ mod tests {
     #[test]
     fn probe_ports_collects_hits() {
         let p = FakePort::ite(0x8628);
-        let hits = probe_ports(&p, &[0x2e]);
+        let hits = probe_ports(&p, &[0x2e], permissive()).chips;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].chip_name.as_deref(), Some("it8628"));
     }
@@ -812,7 +968,7 @@ mod tests {
         // power-on. `it87_find` reads them with `noentry=true` and never writes;
         // so must we, because that write is what latches a bridge.
         let p = FakePort::noconf(0x8695);
-        let hits = probe_ports(&p, &[0x4e]);
+        let hits = probe_ports(&p, &[0x4e], permissive()).chips;
 
         assert_eq!(hits.len(), 1, "a NOCONF chip must still be found");
         assert_eq!(hits[0].chip_name.as_deref(), Some("it8695"));
@@ -827,7 +983,7 @@ mod tests {
     #[test]
     fn latched_bridge_is_reported_as_a_bridge_and_never_unlocked() {
         let p = FakePort::bridge();
-        let hits = probe_ports(&p, &[0x4e]);
+        let hits = probe_ports(&p, &[0x4e], permissive()).chips;
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].devid, IT8883_BRIDGE_DEVID);
@@ -854,7 +1010,7 @@ mod tests {
         // Nuvoton chip, recommending `modprobe nct6775`: the exact module the
         // packaged guard exists to block, on the exact board it protects.
         let p = FakePort::bridge_latched_by_our_own_unlock();
-        let hits = probe_ports(&p, &[0x4e]);
+        let hits = probe_ports(&p, &[0x4e], permissive()).chips;
 
         assert_eq!(hits.len(), 1, "the bridge must still be reported");
         assert_eq!(hits[0].devid, IT8883_BRIDGE_DEVID);
@@ -910,7 +1066,7 @@ mod tests {
         // The complement, without which the two tests above pass against a
         // probe that simply never writes anything and finds nothing.
         let p = FakePort::ite(0x8628);
-        let hits = probe_ports(&p, &[0x2e]);
+        let hits = probe_ports(&p, &[0x2e], permissive()).chips;
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].chip_name.as_deref(), Some("it8628"));
@@ -918,6 +1074,97 @@ mod tests {
             wrote_an_unlock(&p),
             "a LOCKED chip returns 0xffff to the no-enter read, which is the \
              one case that still licenses the unlock sequence"
+        );
+    }
+
+    // ── `X87-k`: the Nuvoton unlock is withheld on an all-ITE board ──
+
+    #[test]
+    fn nuvoton_unlock_is_withheld_on_a_board_whose_complement_is_ite_only() {
+        let (vendor, name) = crate::hwmon::chip_db::any_ite_only_board_for_test();
+        // Precondition: the fixture is what the test claims it is. It comes from
+        // the table rather than from a literal, so this cannot go stale silently.
+        assert!(
+            crate::hwmon::chip_db::board_expects_only_ite_chips(vendor, name),
+            "fixture must be a listed ITE-only board"
+        );
+        let policy = NuvotonUnlockPolicy::for_board(&board_info(vendor, name));
+
+        // A real Nuvoton chip is sitting at the base: it answers nothing until
+        // the 0x87,0x87 pair is written. That makes the two branches genuinely
+        // distinguishable — with the unlock, this test finds a chip.
+        let p = FakePort::nuvoton(0xd592);
+        let outcome = probe_ports(&p, &[0x2e], policy);
+
+        // The load-bearing assertion is on the WRITE LOG, not on the return:
+        // an empty base yields no chip either way, so a `None` return cannot
+        // tell "we withheld the write" from "we wrote it and nothing answered".
+        assert!(
+            !wrote_the_nuvoton_unlock(&p, 0x2e),
+            "the 0x87,0x87 pair must never reach an ITE-only board. Writes: {:?}",
+            p.writes.borrow()
+        );
+        assert_eq!(
+            outcome.nuvoton_withheld_bases,
+            vec![0x2e],
+            "the skip must be reported, or the user cannot tell it from an empty base"
+        );
+        assert!(outcome.chips.is_empty());
+    }
+
+    #[test]
+    fn the_nuvoton_leg_still_runs_on_a_board_the_table_does_not_cover() {
+        // The discriminating arm. A withheld leg and an absent chip both produce
+        // "no hit", so the only observation that proves the gate is not stuck
+        // closed is the one where the unlock DOES run and DOES find something.
+        let p = FakePort::nuvoton(0xd592);
+        let outcome = probe_ports(&p, &[0x2e], permissive());
+
+        assert!(wrote_the_nuvoton_unlock(&p, 0x2e));
+        assert_eq!(
+            outcome.chips.len(),
+            1,
+            "an unlisted board must still get the Nuvoton diagnostic"
+        );
+        assert_eq!(outcome.chips[0].vendor, SuperIoVendor::Nuvoton);
+        assert_eq!(outcome.chips[0].devid, 0xd592);
+        assert!(outcome.nuvoton_withheld_bases.is_empty());
+    }
+
+    #[test]
+    fn withholding_the_nuvoton_leg_leaves_the_ite_legs_intact() {
+        // The gate sits at step 4's Nuvoton leg, not at the top of `probe_base`.
+        // Placed any earlier it would strip the ITE unlock too — on exactly the
+        // population that is hunting a missing ITE chip.
+        let (vendor, name) = crate::hwmon::chip_db::any_ite_only_board_for_test();
+        let policy = NuvotonUnlockPolicy::for_board(&board_info(vendor, name));
+
+        let p = FakePort::ite(0x8628); // locked: only answers after its unlock
+        let outcome = probe_ports(&p, &[0x2e], policy);
+
+        assert_eq!(outcome.chips.len(), 1);
+        assert_eq!(outcome.chips[0].chip_name.as_deref(), Some("it8628"));
+        assert!(
+            outcome.nuvoton_withheld_bases.is_empty(),
+            "the leg was never reached here, so nothing was withheld"
+        );
+    }
+
+    #[test]
+    fn the_policy_reads_the_vendor_and_the_name_from_their_own_fields() {
+        // `BoardInfo`'s two `String` fields are transposable at a call site and
+        // the failure is silent: the table is vendor-gated, so a swap reads as
+        // "unknown board" and quietly re-permits the write. Passing the struct
+        // makes that unrepresentable — this pins the mapping inside `for_board`.
+        let (vendor, name) = crate::hwmon::chip_db::any_ite_only_board_for_test();
+        assert!(
+            !NuvotonUnlockPolicy::for_board(&board_info(vendor, name)).permits_unlock(),
+            "a listed ITE-only board must forbid the unlock"
+        );
+        assert!(
+            NuvotonUnlockPolicy::for_board(&board_info(name, vendor)).permits_unlock(),
+            "control: the fields are not interchangeable — if this also forbids, \
+             the predicate is not reading the fields it claims to"
         );
     }
 }

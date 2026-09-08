@@ -579,12 +579,12 @@ fn build_superio_probe_response(
                 .to_string(),
         ),
         Ok(bases) => {
-            let probed = superio_probe::probe_ports(&reader, &bases);
-            if probed.is_empty() {
-                report.notes.push(
-                    "Active port probe found no unbound Super-I/O chip at 0x2E/0x4E.".to_string(),
-                );
-            }
+            let (probed, probe_notes) = run_port_probe(
+                &reader,
+                &bases,
+                std::path::Path::new(crate::hwmon::chip_db::DMI_SYSFS_ROOT),
+            );
+            report.notes.extend(probe_notes);
             for p in &probed {
                 let chip = probed_to_superio_chip(p);
                 // Fold a probe hit into an existing same-name passive card
@@ -612,6 +612,76 @@ fn build_superio_probe_response(
         StatusCode::OK,
         map_superio_report(&report, true, "available".to_string()),
     )
+}
+
+/// Run the active port probe and render its outcome as `(chips, user-visible
+/// notes)`. Thin wrapper over [`run_port_probe_with_board`] that reads the DMI
+/// board — the same split as [`safe_probe_bases`]/[`pick_probe_bases`] below.
+///
+/// `dmi_root` is a **parameter** rather than a constant read inside, so a test
+/// can drive the whole chain — DMI tree → board table → policy → the withheld
+/// leg — from a fixture directory. That is the `CLAUDE.md` gatherer trap: a
+/// policy constructor is worth nothing if the code that feeds it is executed by
+/// no test. `polling.rs` uses a fixture DMI tree for the same reason (a test
+/// reading the host's DMI behaves differently on the reviewer's machine).
+fn run_port_probe(
+    reader: &dyn superio_probe::SuperIoPortReader,
+    bases: &[u16],
+    dmi_root: &std::path::Path,
+) -> (Vec<superio_probe::ProbedChip>, Vec<String>) {
+    run_port_probe_with_board(
+        reader,
+        bases,
+        &crate::hwmon::chip_db::read_board_info_from(dmi_root),
+    )
+}
+
+/// Probe `bases` under the Nuvoton-unlock policy this `board` licenses, and turn
+/// a withheld leg into a note the user can act on (pure, so it is unit-tested).
+///
+/// The note matters as much as the gate. `X87-k`: without it an affected board
+/// reports only "found no unbound Super-I/O chip", which is the identical
+/// message a genuinely empty base produces — so the one machine where we
+/// deliberately declined to look would say nothing about having declined.
+fn run_port_probe_with_board(
+    reader: &dyn superio_probe::SuperIoPortReader,
+    bases: &[u16],
+    board: &BoardInfo,
+) -> (Vec<superio_probe::ProbedChip>, Vec<String>) {
+    let outcome = superio_probe::probe_ports(
+        reader,
+        bases,
+        superio_probe::NuvotonUnlockPolicy::for_board(board),
+    );
+    let mut notes = Vec::new();
+    // Say "found nothing" only about bases we actually examined. Suppressing it
+    // whenever *any* base was withheld loses the report for a sibling base that
+    // was probed and simply had nothing — e.g. 0x2E withheld while 0x4E returned
+    // an unrecognised responder, where the reply would otherwise mention 0x4E
+    // not at all.
+    let examined_a_base = bases
+        .iter()
+        .any(|b| !outcome.nuvoton_withheld_bases.contains(b));
+    if outcome.chips.is_empty() && examined_a_base {
+        notes.push("Active port probe found no unbound Super-I/O chip at 0x2E/0x4E.".to_string());
+    }
+    if !outcome.nuvoton_withheld_bases.is_empty() {
+        let ports = outcome
+            .nuvoton_withheld_bases
+            .iter()
+            .map(|b| format!("0x{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(" and ");
+        notes.push(format!(
+            "Active port probe: nothing answered at {ports}, and the Nuvoton/Winbond \
+             config-mode unlock was deliberately NOT attempted there. This board's \
+             expected Super-I/O complement is ITE-only, and that write is what latches \
+             the ITE eSPI-to-LPC bridge — a state only a full power cut clears, not a \
+             reboot. If fan headers are missing, the it87 driver is the one to pursue; \
+             see the Hardware Troubleshooting guide."
+        ));
+    }
+    (outcome.chips, notes)
 }
 
 /// The Super-I/O config bases (0x2E/0x4E) safe to probe. Thin wrapper over the
@@ -1026,5 +1096,230 @@ mod tests {
         // the /proc/ioports fence is the backstop for a port it actually holds).
         let bases = pick_probe_bases(&["brandnewchip99".to_string()], Some("")).unwrap();
         assert_eq!(bases, vec![0x2e, 0x4e]);
+    }
+
+    // ── The port-probe call site (`X87-k`) ──────────────────────────
+    //
+    // These exercise `run_port_probe_with_board`, i.e. the code that actually
+    // hands `probe_ports` its policy and turns a withheld leg into a note.
+    // Testing `NuvotonUnlockPolicy::for_board` alone would be the trap
+    // `CLAUDE.md` records fourteen times: a rule extracted, tested, and never
+    // shown to be applied where it matters. The only line left uncovered is the
+    // `read_board_info()` gather in `run_port_probe`, which is the same seam
+    // `safe_probe_bases` leaves over `pick_probe_bases` above.
+
+    /// A base where **only** the Nuvoton leg could ever produce a hit: it reads
+    /// as empty until `0x87,0x87` is written, then reports DEVID 0xd592.
+    #[derive(Default)]
+    struct NuvotonOnlyPort {
+        writes: std::cell::RefCell<Vec<(u16, u8)>>,
+        /// Index-port writes in order — both the unlock bytes and the register
+        /// selection, exactly as the real chip sees them.
+        entered: std::cell::RefCell<Vec<u8>>,
+    }
+
+    impl NuvotonOnlyPort {
+        fn unlocked(&self) -> bool {
+            self.entered.borrow().windows(2).any(|w| w == [0x87, 0x87])
+        }
+        fn wrote_the_nuvoton_unlock(&self, base: u16) -> bool {
+            self.writes
+                .borrow()
+                .windows(2)
+                .any(|w| w == [(base, 0x87u8), (base, 0x87u8)])
+        }
+    }
+
+    impl superio_probe::SuperIoPortReader for NuvotonOnlyPort {
+        fn write_port(&self, port: u16, value: u8) -> std::io::Result<()> {
+            self.writes.borrow_mut().push((port, value));
+            if port.is_multiple_of(2) {
+                self.entered.borrow_mut().push(value);
+            }
+            Ok(())
+        }
+        fn read_port(&self, _port: u16) -> std::io::Result<u8> {
+            if !self.unlocked() {
+                return Ok(0xff);
+            }
+            match self.entered.borrow().last() {
+                Some(0x20) => Ok(0xd5),
+                Some(0x21) => Ok(0x92),
+                _ => Ok(0xff),
+            }
+        }
+    }
+
+    fn board_info(vendor: &str, name: &str) -> BoardInfo {
+        BoardInfo {
+            vendor: vendor.to_string(),
+            name: name.to_string(),
+            bios_version: String::new(),
+        }
+    }
+
+    #[test]
+    fn the_probe_call_site_withholds_the_nuvoton_unlock_on_an_ite_only_board() {
+        let (vendor, name) = crate::hwmon::chip_db::any_ite_only_board_for_test();
+        let p = NuvotonOnlyPort::default();
+
+        let (chips, notes) = run_port_probe_with_board(&p, &[0x2e], &board_info(vendor, name));
+
+        // Assert on the write log: a withheld unlock and an empty base both
+        // yield no chip, so the return value alone cannot tell them apart.
+        assert!(
+            !p.wrote_the_nuvoton_unlock(0x2e),
+            "the 0x87,0x87 pair must not reach an ITE-only board. Writes: {:?}",
+            p.writes.borrow()
+        );
+        assert!(chips.is_empty());
+        assert_eq!(notes.len(), 1, "the skip must be explained: {notes:?}");
+        assert!(
+            notes[0].contains("0x2E"),
+            "the note must name the base it declined: {}",
+            notes[0]
+        );
+    }
+
+    #[test]
+    fn the_probe_call_site_still_runs_the_nuvoton_leg_on_an_unlisted_board() {
+        // The discriminating arm — the only observation a stuck-closed gate
+        // cannot produce, since "withheld" and "nothing there" look identical.
+        let name = "MEG X670E ACE";
+        assert!(
+            !crate::hwmon::chip_db::board_expects_only_ite_chips("Micro-Star International", name),
+            "fixture must be a board the table does not cover"
+        );
+        let p = NuvotonOnlyPort::default();
+
+        let (chips, notes) =
+            run_port_probe_with_board(&p, &[0x2e], &board_info("Micro-Star International", name));
+
+        assert!(p.wrote_the_nuvoton_unlock(0x2e));
+        assert_eq!(chips.len(), 1, "the Nuvoton chip must still be found");
+        assert_eq!(chips[0].devid, 0xd592);
+        assert_eq!(chips[0].vendor, superio::SuperIoVendor::Nuvoton);
+        assert!(notes.is_empty(), "nothing was withheld: {notes:?}");
+    }
+
+    #[test]
+    fn the_probe_call_site_derives_its_policy_from_the_dmi_tree() {
+        // The gatherer, not just the rule. `run_port_probe_with_board` above is
+        // fed a hand-built `BoardInfo`, so on its own it proves only that the
+        // policy is honoured once someone supplies a board — the exact half
+        // `CLAUDE.md` records going untested fourteen times. This drives the
+        // whole chain from a DMI directory instead.
+        //
+        // A fixture tree, never the host's: the table is vendor-gated, so a test
+        // reading real DMI would assert something different on every machine
+        // (the `polling.rs` precedent).
+        let (vendor, name) = crate::hwmon::chip_db::any_ite_only_board_for_test();
+        let dmi = tempfile::tempdir().unwrap();
+        std::fs::write(dmi.path().join("board_vendor"), format!("{vendor}\n")).unwrap();
+        std::fs::write(dmi.path().join("board_name"), format!("{name}\n")).unwrap();
+
+        let p = NuvotonOnlyPort::default();
+        let (chips, notes) = run_port_probe(&p, &[0x2e], dmi.path());
+
+        assert!(
+            !p.wrote_the_nuvoton_unlock(0x2e),
+            "the board named by the DMI tree must reach the policy. Writes: {:?}",
+            p.writes.borrow()
+        );
+        assert!(chips.is_empty());
+        assert!(
+            notes.iter().any(|n| n.contains("ITE-only")),
+            "the withheld leg must be explained: {notes:?}"
+        );
+
+        // The discriminating arm: the same code, the same port, a DMI tree the
+        // table does not list. Without it a gather that ignored `dmi_root`
+        // entirely would still pass the assertions above on this machine.
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join("board_vendor"), "ASUSTeK COMPUTER INC.\n").unwrap();
+        std::fs::write(other.path().join("board_name"), "PRIME X670-P\n").unwrap();
+
+        let q = NuvotonOnlyPort::default();
+        let (chips, notes) = run_port_probe(&q, &[0x2e], other.path());
+
+        assert!(q.wrote_the_nuvoton_unlock(0x2e));
+        assert_eq!(chips.len(), 1, "an unlisted board must still be probed");
+        assert!(notes.is_empty(), "nothing was withheld: {notes:?}");
+    }
+
+    /// 0x2E answers an unrecognised DEVID with no unlock written; 0x4E never
+    /// answers at all. That is the **only** shape in which "withheld" and
+    /// "examined" can coexist: the policy is per-machine, not per-base, so on an
+    /// ITE-only board every base that falls through to the Nuvoton leg is
+    /// withheld — a base can only be examined-and-empty by bailing out earlier,
+    /// which is what an unrecognised responder does.
+    struct OneRespondingBasePort {
+        selected: std::cell::Cell<u8>,
+    }
+
+    impl superio_probe::SuperIoPortReader for OneRespondingBasePort {
+        fn write_port(&self, port: u16, value: u8) -> std::io::Result<()> {
+            if port.is_multiple_of(2) {
+                self.selected.set(value);
+            }
+            Ok(())
+        }
+        fn read_port(&self, port: u16) -> std::io::Result<u8> {
+            if port != 0x2f {
+                return Ok(0xff); // 0x4E's data port: nothing there
+            }
+            match self.selected.get() {
+                0x20 => Ok(0xd4), // DEVID 0xd428 — a responder we cannot name
+                0x21 => Ok(0x28),
+                _ => Ok(0xff),
+            }
+        }
+    }
+
+    #[test]
+    fn a_base_that_was_examined_is_still_reported_when_a_sibling_was_withheld() {
+        // Withholding 0x4E must not silence the report for 0x2E, which WAS
+        // probed and simply had nothing nameable. Suppressing the generic line
+        // whenever any base was withheld loses that entirely, and the withheld
+        // note names only the withheld base — so 0x2E would go unmentioned.
+        let (vendor, name) = crate::hwmon::chip_db::any_ite_only_board_for_test();
+        let p = OneRespondingBasePort {
+            selected: std::cell::Cell::new(0),
+        };
+
+        let (chips, notes) =
+            run_port_probe_with_board(&p, &[0x2e, 0x4e], &board_info(vendor, name));
+
+        assert!(chips.is_empty(), "0xd428 is not a nameable chip");
+        assert_eq!(
+            notes.len(),
+            2,
+            "both statements are needed: 0x2E was examined and empty, 0x4E was \
+             withheld. Got: {notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("found no unbound Super-I/O chip")),
+            "the examined base must still be reported: {notes:?}"
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("ITE-only")),
+            "the withheld base must still be explained: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn the_generic_line_is_suppressed_when_every_base_was_withheld() {
+        // The complement, without which the test above is satisfied by never
+        // suppressing at all — which would put "found no unbound Super-I/O chip
+        // at 0x2E/0x4E" on a machine where neither base was examined.
+        let (vendor, name) = crate::hwmon::chip_db::any_ite_only_board_for_test();
+        let p = NuvotonOnlyPort::default();
+
+        let (_, notes) = run_port_probe_with_board(&p, &[0x2e, 0x4e], &board_info(vendor, name));
+
+        assert_eq!(notes.len(), 1, "only the withheld note: {notes:?}");
+        assert!(notes[0].contains("ITE-only"));
     }
 }

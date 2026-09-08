@@ -1,5 +1,56 @@
 # Changelog
 
+## [2.43.5] — 2026-09-08
+
+**The active Super-I/O probe no longer writes the config-mode unlock its own
+packaging guards against (DEC-343, register package `G34` — row `X87-k`).**
+Daemon-only. No wire shape, capability or error code changes; pairs with
+`control-ofc-gui` >= v2.23.0 as before.
+
+*Why this is a patch:* a hardening fix on an opt-in diagnostic. No response
+shape, status code or written duty changes; the only observable difference is
+one extra `notes[]` line on the boards concerned, in an array that has always
+been free text.
+
+**`POST /inventory/superio/probe` could write the config-mode unlock that hides
+a board's Super-I/O — on the exact boards this package protects from it.** DEC-332 measured
+that exact sequence latching an ITE eSPI-to-LPC bridge into configuration mode,
+hiding the Super-I/O behind it and every fan header on it until the machine is
+disconnected at the wall — a reboot does not clear it — and shipped
+`control-ofc-superio-guard` to keep `nct6775`/`w83627ehf` from writing it. That
+guard is keyed on the curated DMI board table; the daemon's own probe leg was
+not, so the one process that knows the board best could still inflict the damage
+its packaging prevents everywhere else. The leg is now keyed on the same table.
+On an ITE-only board there is no Nuvoton chip behind that write to find, so the
+skip costs nothing; every other board — including every board the table does not
+list — keeps the leg, because an unbound Nuvoton chip there is exactly what the
+probe exists to diagnose.
+
+The reach is narrow and it was pre-existing: the leg is reached only after the
+no-enter read and the ITE unlock both came back no-response, and the whole probe
+still needs `allow_port_probe`, `CAP_SYS_RAWIO`, and no recognised Super-I/O
+already bound. But the population that reaches it is precisely the one DEC-332
+is about — a user hunting headers that a latched bridge has hidden — and the
+cost of being wrong is a power cut.
+
+**A withheld leg is now reported, not silent.** Without a note the response
+said only "found no unbound Super-I/O chip at 0x2E/0x4E", which is the identical
+message a genuinely empty base produces: the one machine where the daemon
+deliberately declined to look said nothing about having declined. The response
+now carries a `notes[]` entry naming the base and the reason, and the generic
+line is suppressed where that fuller answer applies. Clients render `notes[]`
+already, so no GUI change is required.
+
+Two shapes of wiring bug are made **unrepresentable** rather than merely tested
+for: the policy's field is private, so no call site can write a permissive
+literal, and its constructor takes the whole `BoardInfo`, so the vendor and the
+board name cannot be transposed (both are `String`, and transposing them reads
+as "unknown board" and silently re-permits the write). The third shape — handing
+that constructor a board the caller invented — the compiler cannot rule out, so
+the probe's board lookup is a parameter and a test drives the whole chain from a
+fixture DMI tree. `CLAUDE.md` records fourteen occasions where a rule was
+extracted, tested, and then not actually applied where it mattered.
+
 ## [2.43.4] — 2026-09-08
 
 **Blocking sysfs I/O no longer runs where it can stall an unrelated request

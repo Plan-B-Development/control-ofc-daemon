@@ -535,8 +535,13 @@ pub fn detect_acpi_conflicts_from(proc_ioports: &Path) -> Vec<AcpiConflictInfo> 
 use crate::api::responses::BoardInfo;
 
 /// Read motherboard identification from DMI sysfs (world-readable, no root required).
+/// The DMI sysfs directory. Public so callers that want their board lookup to be
+/// a *parameter* — and therefore testable against a fixture tree — can name the
+/// production path without spelling the literal a second time.
+pub const DMI_SYSFS_ROOT: &str = "/sys/class/dmi/id";
+
 pub fn read_board_info() -> BoardInfo {
-    read_board_info_from(Path::new("/sys/class/dmi/id"))
+    read_board_info_from(Path::new(DMI_SYSFS_ROOT))
 }
 
 /// Testable variant with injectable path.
@@ -841,6 +846,56 @@ pub fn expected_chips_for_board(board_vendor: &str, board_name: &str) -> Vec<Str
         }
     }
     Vec::new()
+}
+
+/// Does the DMI board table expect this board's Super-I/O complement to be
+/// **ITE-only**?
+///
+/// This is the board-level licence question for the Nuvoton/Winbond `0x87,0x87`
+/// config-mode unlock (`X87-k`). DEC-332 measured that write latching an IT8883
+/// eSPI→LPC bridge into configuration mode, hiding the Super-I/O behind it until
+/// a full power cut, and shipped `packaging/control-ofc-superio-guard` to stop
+/// `nct6775`/`w83627ehf` writing it. That guard is keyed on
+/// [`GIGABYTE_DUAL_CHIP_BOARDS`]; so is this, which is what stops the daemon's
+/// own port probe writing the sequence its packaging exists to prevent.
+///
+/// `false` when the board is not in the table: an unknown board rules nothing
+/// out, and an unbound Nuvoton chip there is precisely what the probe exists to
+/// diagnose. Chip → vendor is decided by [`expected_driver_for_chip`] and not by
+/// a name prefix, so *this predicate* would re-license the unlock on its own if
+/// a Nuvoton board were ever enrolled.
+///
+/// **But do not enrol one.** [`GIGABYTE_DUAL_CHIP_BOARDS`] is not only a lookup
+/// — it is also the suppression list `packaging/control-ofc-superio-guard`
+/// declines to load `nct6775`/`w83627ehf` on, pinned row-for-row by
+/// `superio_guard_board_list_matches_chip_db` with **no ITE filter**. Adding a
+/// Nuvoton row would therefore stop that board's own driver loading and cost it
+/// every sensor, while the guard's header ("Every board matched below has an
+/// ITE Super-I/O") became silently false. A Nuvoton dual-chip board needs a
+/// second table, not a row in this one.
+pub fn board_expects_only_ite_chips(board_vendor: &str, board_name: &str) -> bool {
+    let chips = expected_chips_for_board(board_vendor, board_name);
+    !chips.is_empty() && chips.iter().all(|c| expected_driver_for_chip(c) == "it87")
+}
+
+/// A `(board_vendor, board_name)` pair the table lists with an ITE-only
+/// complement, for tests in sibling modules.
+///
+/// Exists so those fixtures are bound to the real table rather than to a
+/// board-name literal: a literal keeps passing after the row it names has been
+/// renamed or dropped, which is the trap `CLAUDE.md` records as "assert a
+/// relationship, never a literal".
+#[cfg(test)]
+pub(crate) fn any_ite_only_board_for_test() -> (&'static str, &'static str) {
+    let entry = GIGABYTE_DUAL_CHIP_BOARDS
+        .iter()
+        .find(|e| {
+            e.chips
+                .iter()
+                .all(|c| expected_driver_for_chip(c) == "it87")
+        })
+        .expect("the dual-chip table must list at least one ITE-only board");
+    ("Gigabyte Technology Co., Ltd.", entry.board_name)
 }
 
 // ── Kernel-level chip detection (DEC-101) ──────────────────────────
@@ -1978,5 +2033,61 @@ mod tests {
         );
         // Module not in any collision pair → no conflict.
         assert_eq!(conflicting_loaded_module("it87", &loaded), None);
+    }
+
+    // ── The ITE-only board predicate (`X87-k`) ──────────────────────
+
+    #[test]
+    fn the_ite_only_predicate_agrees_with_every_row_of_its_own_table() {
+        // A relationship, not a literal. The right-hand side is derived from the
+        // row's own `chips` through the same driver mapping the rest of the
+        // module uses, so enrolling a Nuvoton board makes this test demand that
+        // the predicate re-licenses the unlock for it.
+        let mut ite_only_rows = 0;
+        for entry in GIGABYTE_DUAL_CHIP_BOARDS {
+            let table_says_ite_only = entry
+                .chips
+                .iter()
+                .all(|c| expected_driver_for_chip(c) == "it87");
+            assert_eq!(
+                board_expects_only_ite_chips("Gigabyte", entry.board_name),
+                table_says_ite_only,
+                "{}: the predicate disagrees with its own table row (chips {:?})",
+                entry.board_name,
+                entry.chips
+            );
+            if table_says_ite_only {
+                ite_only_rows += 1;
+            }
+        }
+        // Without this the loop asserts nothing the day the table is emptied,
+        // and a predicate stuck at `false` would sail through it.
+        assert!(
+            ite_only_rows > 0,
+            "no ITE-only row exercised the predicate's true branch"
+        );
+    }
+
+    #[test]
+    fn a_board_the_table_does_not_cover_is_not_ite_only() {
+        let (vendor, listed) = any_ite_only_board_for_test();
+        // Presence before absence: the same name under its own vendor MUST be
+        // ITE-only, or every assertion below passes for the wrong reason.
+        assert!(
+            board_expects_only_ite_chips(vendor, listed),
+            "control: a listed board must read as ITE-only"
+        );
+
+        assert!(
+            !board_expects_only_ite_chips(vendor, "MEG X670E ACE"),
+            "an unlisted board rules nothing out — the Nuvoton leg is what \
+             diagnoses it"
+        );
+        assert!(!board_expects_only_ite_chips("", ""));
+        assert!(
+            !board_expects_only_ite_chips("ASUSTeK COMPUTER INC.", listed),
+            "the table is vendor-gated; a same-named board from another vendor \
+             is not covered by it"
+        );
     }
 }
