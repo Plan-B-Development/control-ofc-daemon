@@ -362,7 +362,7 @@ pub async fn calibrate_openfan_channel(
         .get(&channel)
         .and_then(|f| f.last_commanded_pwm);
 
-    let fan_id = format!("openfan:ch{channel:02}");
+    let fan_id = crate::serial::openfan_member_id(channel);
     let step_size = 100.0 / steps as f64;
 
     // Sweep from 0% to 100%. Runs as an inner block so every exit —

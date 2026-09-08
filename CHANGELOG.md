@@ -53,6 +53,16 @@ last retained slot before the bound applies, in lockstep across both vectors. No
 reachable on consumer hardware (the cap is ~4x the largest observed count), which
 is why it was P3.
 
+**Internal: the `openfan:ch{NN}` member id has one producer and one parser
+(register package `G36` — row `P8-bq`).** No behaviour change and nothing
+user-visible; recorded because the mapping had six inline copies, two of them on
+the single-writer path, and a seventh would eventually have been written
+slightly differently. The id shape is byte-identical and pinned by a test,
+because that string is persisted in saved profiles and cooling-device configs.
+The shared parser reports its two failure modes apart rather than as one
+`Option`, so the profile engine's distinct "malformed member_id" and
+"unparseable channel" warnings survive unchanged.
+
 ## [2.43.5] — 2026-09-08
 
 **The active Super-I/O probe no longer writes the config-mode unlock its own

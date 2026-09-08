@@ -372,6 +372,25 @@ pub(crate) struct OpenFanBackend {
     stall_logged: bool,
 }
 
+/// Which of the engine's two drop warnings a bad OpenFan member id earns.
+///
+/// `P8-bq`: the classification lives in `serial::openfan_channel_of` and the
+/// wording lives here, so before this existed the two could be swapped and
+/// everything still compiled and passed — the `let-else` chain it replaced made
+/// that structurally impossible, and centralising the parse quietly gave the
+/// mismatch somewhere to hide. A pure function is the cheap way to get it back
+/// under test without a log capture: `the_engine_names_each_bad_id_kind_correctly`
+/// pins the pairing.
+///
+/// The strings are substituted into "Profile engine: dropping openfan command
+/// with {}: {member_id:?}" and reproduce the two messages verbatim.
+fn openfan_drop_reason(why: crate::serial::OpenFanMemberIdError) -> &'static str {
+    match why {
+        crate::serial::OpenFanMemberIdError::NotOpenFan => "malformed member_id",
+        crate::serial::OpenFanMemberIdError::UnparseableChannel => "unparseable channel",
+    }
+}
+
 impl OpenFanBackend {
     pub(crate) fn new(
         ctrl: Arc<Mutex<crate::serial::controller::FanController>>,
@@ -497,19 +516,20 @@ impl WriteBackend for OpenFanBackend {
             .iter()
             .filter(|c| c.source == "openfan")
             .filter_map(|cmd| {
-                let Some(ch_str) = cmd.member_id.strip_prefix("openfan:ch") else {
-                    log::warn!(
-                        "Profile engine: dropping openfan command with malformed member_id: {:?}",
-                        cmd.member_id
-                    );
-                    return None;
-                };
-                let Ok(ch) = ch_str.parse::<u8>() else {
-                    log::warn!(
-                        "Profile engine: dropping openfan command with unparseable channel: {:?}",
-                        cmd.member_id
-                    );
-                    return None;
+                // `P8-bq`: one parser, but the TWO log messages are kept apart
+                // — they are an operator's only signal for which kind of bad id
+                // reached the single-writer path, which is why the shared parser
+                // returns a two-variant error rather than an `Option`.
+                let ch = match crate::serial::openfan_channel_of(&cmd.member_id) {
+                    Ok(ch) => ch,
+                    Err(why) => {
+                        log::warn!(
+                            "Profile engine: dropping openfan command with {}: {:?}",
+                            openfan_drop_reason(why),
+                            cmd.member_id
+                        );
+                        return None;
+                    }
                 };
                 Some((ch, cmd.pwm_percent))
             })
@@ -606,7 +626,7 @@ impl SafetyWriteBackend for OpenFanBackend {
             .iter()
             .filter(|c| c.source == "openfan")
             .filter_map(|c| {
-                let ch = c.member_id.strip_prefix("openfan:ch")?.parse::<u8>().ok()?;
+                let ch = crate::serial::openfan_channel_of(&c.member_id).ok()?;
                 Some((ch, c.pwm_percent))
             })
             .collect();
@@ -2935,6 +2955,31 @@ mod tests {
             written,
             cache,
         )
+    }
+
+    /// `P8-bq`: the parse classifies and the engine words it, in two modules.
+    /// Nothing else pins the pairing — swapping the arms compiles, and
+    /// `openfan_backend_drops_malformed_member_ids` below only asserts that
+    /// nothing was written, so it stays green either way.
+    #[test]
+    fn the_engine_names_each_bad_id_kind_correctly() {
+        use crate::serial::OpenFanMemberIdError as E;
+        assert_eq!(openfan_drop_reason(E::NotOpenFan), "malformed member_id");
+        assert_eq!(
+            openfan_drop_reason(E::UnparseableChannel),
+            "unparseable channel"
+        );
+        // Anchored to what the parser actually returns for each shape, so the
+        // pairing is pinned end to end rather than against my memory of it.
+        assert_eq!(
+            crate::serial::openfan_channel_of("hwmon:it8696:isa-0a40:pwm5:PUMP")
+                .map_err(openfan_drop_reason),
+            Err("malformed member_id")
+        );
+        assert_eq!(
+            crate::serial::openfan_channel_of("openfan:chXX").map_err(openfan_drop_reason),
+            Err("unparseable channel")
+        );
     }
 
     #[tokio::test]

@@ -210,14 +210,14 @@ fn supporting_cooling(state: &Arc<AppState>, header_id: &str) -> pf::SupportingC
 ///
 /// The id shape is `openfan:ch{NN}` and the cache is keyed by the bare channel,
 /// so a member cannot be looked up without this transform — which is the whole
-/// reason `supporting_cooling` used to miss every OpenFan sibling. Mirrors the
-/// parse already in `profile_engine::backends`, and the prefix test already in
-/// `cooling_device::unknown_member`; that the mapping has no single producer is
-/// recorded as its own register row rather than centralised from here, because
-/// re-pointing the engine's copy would drag the single-writer path into this
-/// diff.
+/// reason `supporting_cooling` used to miss every OpenFan sibling.
+///
+/// A thin local alias for [`crate::serial::openfan_channel_of`], which is the
+/// single producer/parser pair for this id since `G36` closed `P8-bq`. Local
+/// because this module wants the `Option` shape; the shared parser returns a
+/// `Result` so the engine can log its two failure modes apart.
 fn openfan_channel_of(member_id: &str) -> Option<u8> {
-    member_id.strip_prefix("openfan:ch")?.parse::<u8>().ok()
+    crate::serial::openfan_channel_of(member_id).ok()
 }
 
 /// Observe one sibling member, in whichever cache holds its source.

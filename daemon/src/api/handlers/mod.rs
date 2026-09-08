@@ -153,7 +153,7 @@ pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntr
             None
         };
         fans.push(FanEntry {
-            id: format!("openfan:ch{ch:02}"),
+            id: crate::serial::openfan_member_id(*ch),
             source: "openfan".into(),
             // OFS-l: a channel the daemon has only ever WRITTEN has `rpm == 0`
             // because that is the struct's initial value, not because anything

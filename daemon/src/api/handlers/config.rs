@@ -1418,7 +1418,7 @@ pub async fn set_cooling_device_handler(
         .snapshot()
         .openfan_fans
         .keys()
-        .map(|ch| format!("openfan:ch{ch:02}"))
+        .map(|ch| crate::serial::openfan_member_id(*ch))
         .collect();
     if let Some(m) =
         crate::hwmon::cooling_device::unknown_member(&dev.all_members(), &hwmon_ids, &openfan_ids)
