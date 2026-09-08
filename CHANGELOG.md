@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [2.43.6] — 2026-09-09
 
 **In-code documentation: a retracted safety claim standing at three sites, a
 worst case that was really a typical case, and one new guard (DEC-347, register
