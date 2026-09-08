@@ -333,6 +333,15 @@ pub const CHARACTERIZATION_MIN_PCT: u8 = 20;
 /// calibration's ~325 s and inside its accepted engine-pause precedent.
 pub const CHARACTERIZATION_MAX_POINTS: usize = 20;
 
+// `P8-g`/DEC-344: `resolve_points` bounds the duty list with `thin_to`, which
+// returns its input UNTHINNED when `max < 2` (there is no meaningful "keep the
+// first and last" below two). The `truncate` it replaced was total for every
+// value, so this floor is what keeps the swap safe: below 2 the [SAFETY] cap
+// would silently stop binding and an 81-entry list would reach
+// `requested_points_pct`, session `evidence[]` and every export — a DEC-320
+// shaped unbounded copy with nothing to catch it. Found in review of DEC-344.
+const _: () = assert!(CHARACTERIZATION_MAX_POINTS >= 2);
+
 /// Settle window per point, and its clamp. Default matches
 /// [`VERIFY_WAIT_SECONDS`] — raised to 6 s for exactly this reason (DEC-101):
 /// slow-spinning pumps need >3 s or they report a false `no_response`.

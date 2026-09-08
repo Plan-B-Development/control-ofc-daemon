@@ -1,5 +1,58 @@
 # Changelog
 
+## [Unreleased]
+
+**Three diagnostics kept the wrong end of what they were bounding, and two watch
+loops leaked the run they were watching (DEC-344, register package `G26` — rows
+`P8-ap`, `P8-bk`, `P8-g`, `P8-an`).** Daemon-only. No wire shape, capability or
+error-code change; one response's *content* changes, described below.
+
+**A sweep that outlived its watch window was left running (`P8-ap`, `P8-bk`).**
+Both session-orchestration watch loops have four exits, and only one of them
+cancelled. The session-ended branch returns early having called
+`cancel_run_fenced`; the deadline break fell through without it — and that is
+the exit reached with the sweep *still running*, so it carried on driving the
+header and renewing the engine's write-pause, the exact `AUD3-j` shape the
+sibling branch was written to close. Since v2.43.0 it had a second consequence:
+with `stop_when_diagnostics_complete` the session was then stamped `completed`
+while its diagnostic was still going. **The fix narrows that window rather than
+closing it, and the difference is worth stating:** cancelling only *requests* a
+stop, and the sweep observes the flag at its next step boundary — up to one
+settle, or one stability dwell — so the orchestrator can still reach the terminal
+hop first. What changes is that the window is now bounded by one step instead of
+by the sweep's entire remaining length. The fix is one fenced cancel after each
+loop rather than one inside the break — `cancel_run_fenced` acts only on a
+*running* run whose `run_id` matches, so it is a no-op by construction for the
+other three exits, and its own documentation names those four cases as its
+inputs. Not on the thermal path: the forced-duty branch runs above the
+`verify_active` gate, so this was lost control intent and a false record, never
+lost cooling.
+
+**A fine-grained characterisation request was served its bottom quarter and told
+it was the sweep (`P8-g`).** `resolve_points` capped an over-long duty list by
+`truncate`, keeping the first 20 ascending values — so 20..100 in steps of 1 came
+back as 20-39%. It now thins across the range, keeping the lowest and highest
+requested duties. **This changes what an existing request returns**, which is why
+it is called out here and in `docs/08`; the response shape is unchanged and no
+client branches on it. `resolve_points` is `[SAFETY]`, and both invariants it
+exists to guarantee survive by construction — thinning only ever *selects* from
+an already-clamped, already-sorted list, so no point can fall below
+`max(CHARACTERIZATION_MIN_PCT, floor)` or reach zero, and the index map is
+monotonic so the list stays ascending, which is what makes an aborted sweep leave
+the header at the highest duty it reached.
+
+**The pump-stall abort could be disarmed by the observation bound (`P8-an`).**
+Control-path discovery bounds its tach set at `DISCOVERY_MAX_TACH_CHANNELS`, and
+headers are enumerated before monitor-only fans — so on a board with more
+tach-carrying channels than the cap, the *target header's own* channel could sit
+past the cut. `target_idx` is derived after that truncation, so losing it made
+`had_target_tach` false, and `pump_tach_lost` — the one abort separating
+"perturbing a healthy pump" from "the pump has stopped" — is gated on having had
+a tach at start and could then never fire. The target is now swapped into the
+last retained slot before the bound applies, in lockstep across both vectors. Not
+reachable on consumer hardware (the cap is ~4x the largest observed count), which
+is why it was P3.
+
 ## [2.43.5] — 2026-09-08
 
 **The active Super-I/O probe no longer writes the config-mode unlock its own

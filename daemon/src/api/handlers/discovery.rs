@@ -264,6 +264,53 @@ fn observe_sibling(
     pf::SiblingObservation::Unknown
 }
 
+/// Bound the observation set, keeping the **target header's own channel**.
+///
+/// [SAFETY] The bound itself is DEC-320: every observation is copied into the
+/// run, into a session's `evidence[]`, and into every export, so the set has to
+/// be finite. What this function adds is `P8-an` — *which* channels the bound
+/// keeps.
+///
+/// Headers are enumerated before monitor-only fans, so on a board with more
+/// tach-carrying channels than the cap, the target header's own channel can sit
+/// past the cut. `run_discovery` derives `target_idx` from `is_target_header`
+/// **after** this runs, so dropping it makes `had_target_tach` false — and
+/// `pump_tach_lost`, the one abort separating "perturbing a healthy pump" from
+/// "the pump has stopped", is gated on having had a tach at start and can then
+/// never fire.
+///
+/// The target is swapped into the last retained slot rather than the list being
+/// reordered: exactly one non-target channel is displaced — the one that was at
+/// `keep - 1`, which the old bound WOULD have retained, so the swap does cost one
+/// observation. That is the price of the trade and it is worth naming: one
+/// arbitrary chassis tach for the one channel the diagnostic is actually about.
+/// Every other retained channel keeps its position, and both vectors get the same
+/// swap so the lockstep pairing holds — a channel without its path would read as
+/// permanently unavailable rather than absent.
+///
+/// Extracted from the handler so the rule has a test that runs it; inline, the
+/// only available check was a source scan (`CLAUDE.md`: extracting a rule does
+/// not test the call site, so the call site is guarded too).
+fn bound_tach_channels(channels: &mut Vec<disc::TachChannel>, tach_paths: &mut Vec<String>) {
+    let keep = crate::constants::DISCOVERY_MAX_TACH_CHANNELS;
+    if channels.len() <= keep {
+        return;
+    }
+    log::warn!(
+        "control-path discovery: {} tach channels found, observing {keep} \
+         (the target header's own channel is kept when it has one)",
+        channels.len()
+    );
+    if let Some(t) = channels.iter().position(|c| c.is_target_header) {
+        if t >= keep {
+            channels.swap(t, keep - 1);
+            tach_paths.swap(t, keep - 1);
+        }
+    }
+    channels.truncate(keep);
+    tach_paths.truncate(keep);
+}
+
 // ── POST /hwmon/{header_id}/discover-control-path ────────────────────
 
 /// Start a control-path discovery run. Returns **202** with the run snapshot;
@@ -402,19 +449,7 @@ pub async fn discover_control_path_handler(
         }
     }
 
-    // [SAFETY] Bound the observation set (DEC-320): every observation is copied
-    // into the run, into a session's `evidence[]`, and into every export.
-    if channels.len() > crate::constants::DISCOVERY_MAX_TACH_CHANNELS {
-        log::warn!(
-            "control-path discovery: {} tach channels found, observing the first {}",
-            channels.len(),
-            crate::constants::DISCOVERY_MAX_TACH_CHANNELS
-        );
-        // Truncate in lockstep — a channel without its path would read as
-        // permanently unavailable rather than being absent.
-        channels.truncate(crate::constants::DISCOVERY_MAX_TACH_CHANNELS);
-        tach_paths.truncate(crate::constants::DISCOVERY_MAX_TACH_CHANNELS);
-    }
+    bound_tach_channels(&mut channels, &mut tach_paths);
 
     // Claim the SAME single-flight slot verify, calibrate and characterise use,
     // so at most one of the four ever drives hardware.
@@ -1073,5 +1108,103 @@ mod tests {
         assert!(s.tachs.iter().all(Option::is_none));
         assert!(s.header.pwm_percent.is_none());
         assert!(s.header.rpm.is_none());
+    }
+
+    // ── `P8-an`: the target header's channel survives the bound ──
+
+    fn ch(i: usize, target: bool) -> disc::TachChannel {
+        disc::TachChannel {
+            tach_id: format!("hwmon:c:d:fan{i}:L{i}"),
+            label: format!("L{i}"),
+            monitor_only: !target,
+            is_target_header: target,
+        }
+    }
+
+    /// Build `n` channels with the target at `target_at`, plus lockstep paths.
+    fn channels_with_target(n: usize, target_at: usize) -> (Vec<disc::TachChannel>, Vec<String>) {
+        let chans: Vec<_> = (0..n).map(|i| ch(i, i == target_at)).collect();
+        let paths: Vec<_> = (0..n).map(|i| format!("/p/fan{i}")).collect();
+        (chans, paths)
+    }
+
+    #[test]
+    fn the_target_channel_survives_a_bound_that_would_have_dropped_it() {
+        // THE discriminating arm (DEC-340): a test that only asserted "no target
+        // present" would be the PRE-FIX answer by construction. The observation
+        // that the old code cannot produce is the target being *found* after a
+        // truncation that put it past the cut.
+        let keep = crate::constants::DISCOVERY_MAX_TACH_CHANNELS;
+        let over = keep + 5;
+        let target_at = over - 1; // last — well past the cut
+        let (mut chans, mut paths) = channels_with_target(over, target_at);
+
+        // Precondition: the bound must actually engage, or this asserts nothing.
+        assert!(chans.len() > keep, "fixture must exceed the cap");
+        assert!(target_at >= keep, "target must start past the cut");
+
+        bound_tach_channels(&mut chans, &mut paths);
+
+        assert_eq!(chans.len(), keep, "the bound must still bind");
+        assert_eq!(paths.len(), keep, "lockstep: paths bound with channels");
+        let idx = chans
+            .iter()
+            .position(|c| c.is_target_header)
+            .expect("the target header's channel must survive the bound");
+        // ...and its PATH must be the target's path, not the displaced one's —
+        // a swap applied to one vector and not the other would pass the line
+        // above and silently read the wrong sysfs file.
+        assert_eq!(
+            paths[idx],
+            format!("/p/fan{target_at}"),
+            "the swap must be applied in lockstep to both vectors"
+        );
+        assert_eq!(
+            chans[idx].tach_id,
+            format!("hwmon:c:d:fan{target_at}:L{target_at}")
+        );
+    }
+
+    #[test]
+    fn a_target_already_inside_the_bound_is_not_moved() {
+        // The complement: without it, a rule that unconditionally swapped would
+        // pass the test above while scrambling every ordinary board.
+        let keep = crate::constants::DISCOVERY_MAX_TACH_CHANNELS;
+        let (mut chans, mut paths) = channels_with_target(keep + 3, 2);
+        bound_tach_channels(&mut chans, &mut paths);
+
+        assert_eq!(chans.len(), keep);
+        assert!(
+            chans[2].is_target_header,
+            "an in-bounds target must not move"
+        );
+        assert_eq!(paths[2], "/p/fan2");
+        // Every other retained channel keeps its position too.
+        assert_eq!(chans[0].tach_id, "hwmon:c:d:fan0:L0");
+        assert_eq!(paths[keep - 2], format!("/p/fan{}", keep - 2));
+    }
+
+    #[test]
+    fn a_set_within_the_bound_is_left_alone_entirely() {
+        let keep = crate::constants::DISCOVERY_MAX_TACH_CHANNELS;
+        let (mut chans, mut paths) = channels_with_target(keep, keep - 1);
+        let before = chans.clone();
+        bound_tach_channels(&mut chans, &mut paths);
+        assert_eq!(chans.len(), before.len());
+        assert!(chans[keep - 1].is_target_header);
+    }
+
+    #[test]
+    fn a_bound_with_no_target_channel_still_binds() {
+        // A header with no tach of its own: nothing to preserve, but the bound
+        // must still apply or DEC-320's reservation is breached.
+        let keep = crate::constants::DISCOVERY_MAX_TACH_CHANNELS;
+        let n = keep + 4;
+        let mut chans: Vec<_> = (0..n).map(|i| ch(i, false)).collect();
+        let mut paths: Vec<_> = (0..n).map(|i| format!("/p/fan{i}")).collect();
+        bound_tach_channels(&mut chans, &mut paths);
+        assert_eq!(chans.len(), keep);
+        assert_eq!(paths.len(), keep);
+        assert!(!chans.iter().any(|c| c.is_target_header));
     }
 }

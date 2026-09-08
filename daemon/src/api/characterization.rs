@@ -516,8 +516,20 @@ pub fn resolve_points(requested: Option<&[u8]>, floor: u8) -> Vec<u8> {
         .collect();
     out.sort_unstable();
     out.dedup();
-    out.truncate(constants::CHARACTERIZATION_MAX_POINTS);
-    out
+    // `P8-g`: THIN, never truncate. Truncating kept the first N ascending values,
+    // so a request for 20..100 in steps of 1 was served 20-39% and reported as
+    // the sweep — the bottom quarter of the range, silently. `thin_to` keeps the
+    // first and last and samples between them, so the cap and the RANGE hold
+    // together.
+    //
+    // [SAFETY] Both invariants this function exists to guarantee survive the
+    // swap, because `thin_to` only ever SELECTS elements of an already-clamped,
+    // already-sorted list: every retained value was clamped to
+    // `max(CHARACTERIZATION_MIN_PCT, floor)` before it got here, so no point can
+    // be below the floor or zero; and its index map is monotonically
+    // non-decreasing, so the list stays ascending — which is the property that
+    // makes an aborted sweep leave the header at the highest duty it reached.
+    thin_to(&out, constants::CHARACTERIZATION_MAX_POINTS)
 }
 
 /// Which leg of a walk a step belongs to (DEC-334).
@@ -3671,5 +3683,123 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── `P8-g`: the cap thins, it does not truncate ──
+
+    #[test]
+    fn a_fine_grained_request_is_thinned_across_the_range_not_truncated_to_its_bottom() {
+        // The defect: `truncate` kept the first 20 ascending values, so 20..100
+        // in steps of 1 was served 20-39% and reported as the sweep. Assert the
+        // RANGE, which is what truncation destroys and thinning preserves —
+        // asserting the length alone passes with the defect in place.
+        let requested: Vec<u8> = (20..=100).collect();
+        let pts = resolve_points(Some(&requested), 20);
+
+        assert!(
+            pts.len() <= constants::CHARACTERIZATION_MAX_POINTS,
+            "the cap must still bind: {pts:?}"
+        );
+        assert_eq!(
+            pts.first().copied(),
+            Some(20),
+            "the bottom of the range is kept"
+        );
+        assert_eq!(
+            pts.last().copied(),
+            Some(100),
+            "the TOP of the range is kept — this is the assertion truncation fails"
+        );
+        // Precondition that the input really was over the cap, or the test is
+        // asserting nothing about thinning at all.
+        assert!(requested.len() > constants::CHARACTERIZATION_MAX_POINTS);
+    }
+
+    #[test]
+    fn thinning_preserves_the_floor_and_the_ascending_order() {
+        // [SAFETY] The two invariants `resolve_points` exists to guarantee. They
+        // must hold for a thinned list exactly as they did for a truncated one:
+        // no point below the effective floor, none at zero, and ascending — the
+        // property that makes an aborted sweep leave the header at the highest
+        // duty it reached.
+        for floor in [0u8, 20, PUMP_FLOOR, 55] {
+            let requested: Vec<u8> = (0..=100).collect();
+            let pts = resolve_points(Some(&requested), floor);
+            let effective = floor.max(constants::CHARACTERIZATION_MIN_PCT);
+
+            assert!(!pts.is_empty(), "floor {floor}: a sweep must have points");
+            assert!(
+                pts.iter().all(|&p| p >= effective),
+                "floor {floor}: every point must be at or above {effective}: {pts:?}"
+            );
+            assert!(
+                pts.iter().all(|&p| p > 0),
+                "floor {floor}: no point may be zero: {pts:?}"
+            );
+            assert!(
+                pts.windows(2).all(|w| w[0] < w[1]),
+                "floor {floor}: points must stay strictly ascending: {pts:?}"
+            );
+            assert!(
+                pts.len() <= constants::CHARACTERIZATION_MAX_POINTS,
+                "floor {floor}: cap must bind: {pts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn thinning_twice_still_keeps_both_ends_at_every_size() {
+        // A bidirectional request is thinned TWICE — `resolve_points` to
+        // `MAX_POINTS`, then `resolve_sweep_plan` to
+        // `MAX_UNIQUE_BIDIRECTIONAL`. Both reviewers reached "first and last
+        // survive" algebraically; this checks it instead of arguing it, across
+        // every input size that can reach the two-stage path.
+        for n in 2..=101usize {
+            let src: Vec<u8> = (0..n).map(|i| (i % 101) as u8).collect();
+            let mut src: Vec<u8> = src.into_iter().collect();
+            src.sort_unstable();
+            src.dedup();
+            if src.len() < 2 {
+                continue;
+            }
+            let (lo, hi) = (src[0], src[src.len() - 1]);
+
+            let once = thin_to(&src, constants::CHARACTERIZATION_MAX_POINTS);
+            let twice = thin_to(&once, constants::CHARACTERIZATION_MAX_UNIQUE_BIDIRECTIONAL);
+
+            assert_eq!(
+                once.first().copied(),
+                Some(lo),
+                "n={n}: first lost at stage 1"
+            );
+            assert_eq!(
+                once.last().copied(),
+                Some(hi),
+                "n={n}: last lost at stage 1"
+            );
+            assert_eq!(
+                twice.first().copied(),
+                Some(lo),
+                "n={n}: first lost at stage 2"
+            );
+            assert_eq!(
+                twice.last().copied(),
+                Some(hi),
+                "n={n}: last lost at stage 2"
+            );
+            assert!(
+                twice.windows(2).all(|w| w[0] < w[1]),
+                "n={n}: two-stage thinning must stay strictly ascending: {twice:?}"
+            );
+            assert!(twice.len() <= constants::CHARACTERIZATION_MAX_UNIQUE_BIDIRECTIONAL);
+        }
+    }
+
+    #[test]
+    fn a_request_within_the_cap_is_returned_unchanged() {
+        // The complement: thinning must not disturb a list that already fits,
+        // or every ordinary request silently changes shape.
+        let pts = resolve_points(Some(&[20, 40, 60, 80, 100]), 20);
+        assert_eq!(pts, vec![20, 40, 60, 80, 100]);
     }
 }

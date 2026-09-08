@@ -1347,6 +1347,18 @@ async fn run_characterization(
         }
     }
 
+    // `P8-ap`/`P8-bk` (DEC-344): the loop has four exits and only the
+    // session-ended one used to cancel — but the DEADLINE break is the exit
+    // reached with our sweep still running. Unconditional here rather than
+    // inside that break: the fence acts only on a running run whose `run_id` is
+    // ours, so it is a no-op for the other three by construction. It only
+    // REQUESTS cancellation; the sweep observes it at its next step boundary.
+    cancel_run_fenced(
+        &state.characterization,
+        &state.characterization_cancel,
+        run_id.as_deref(),
+    );
+
     let outcome = match &final_run {
         Some(run) if run.state == "complete" => RESULT_OBSERVED,
         Some(_) => RESULT_INTERRUPTED,
@@ -1473,6 +1485,18 @@ async fn run_discovery(state: &Arc<AppState>, session_id: &str, member: &str) {
             return;
         }
     }
+
+    // `P8-ap`/`P8-bk` (DEC-344): the loop has four exits and only the
+    // session-ended one used to cancel — but the DEADLINE break is the exit
+    // reached with our sweep still running. Unconditional here rather than
+    // inside that break: the fence acts only on a running run whose `run_id` is
+    // ours, so it is a no-op for the other three by construction. It only
+    // REQUESTS cancellation; the sweep observes it at its next step boundary.
+    cancel_run_fenced(
+        &state.control_path,
+        &state.control_path_cancel,
+        run_id.as_deref(),
+    );
 
     let outcome = match &final_run {
         Some(run) if run.state == crate::api::discovery::STATE_COMPLETE => RESULT_OBSERVED,
@@ -1816,6 +1840,73 @@ mod tests {
                 state_of(&behaviour, id),
                 state_of(&basic, id),
                 "a behaviour run must feed {id} exactly as a basic run does"
+            );
+        }
+    }
+
+    /// `P8-ap`/`P8-bk`: both watch loops must cancel on every fall-through exit.
+    ///
+    /// A source-scanning guard, and its limit is stated rather than glossed:
+    /// `cancel_run_fenced`'s own four cases are unit-tested above, and what this
+    /// adds is that the two loops actually REACH that call — the call-site half
+    /// `CLAUDE.md` records going untested fourteen times. Driving the real
+    /// deadline would mean stubbing `hwmon_characterize_handler`, which drives
+    /// hardware; that is out of proportion to a five-line call, so the residual
+    /// is recorded as a register row instead of hidden here.
+    ///
+    /// Matched at STATEMENT indentation, never as a substring. The pre-fix code
+    /// already contained `cancel_run_fenced(` a few lines earlier — inside the
+    /// session-ended `if`, at deeper indent — so a substring search passes with
+    /// the fix deleted. That is `CLAUDE.md`'s "match in attribute position, not
+    /// as a substring" in a second coat.
+    #[test]
+    fn every_watch_loop_cancels_its_run_before_recording_the_outcome() {
+        let src = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/api/handlers/validation.rs"
+        ));
+        let production = src.split("#[cfg(test)]").next().expect("production half");
+        let lines: Vec<&str> = production.lines().collect();
+
+        let outcome_sites: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.trim_start() == "let outcome = match &final_run {")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            outcome_sites.len(),
+            2,
+            "expected the two watch loops (discovery, characterization); a third \
+             would need its own cancel and this guard extended: {outcome_sites:?}"
+        );
+
+        for site in outcome_sites {
+            let from = site.saturating_sub(30);
+            // The pair matters as much as the presence: passing one
+            // diagnostic's slot with the other's cancel flag would take down
+            // the wrong run, and every test would still pass. So require the
+            // two argument lines to name the SAME state field.
+            let cancelled_with_a_matching_pair = lines[from..site].windows(3).any(|w| {
+                w[0] == "    cancel_run_fenced("
+                    && w[1]
+                        .trim_end_matches(',')
+                        .trim()
+                        .strip_prefix("&state.")
+                        .is_some_and(|slot| {
+                            w[2].trim_end_matches(',').trim() == format!("&state.{slot}_cancel")
+                        })
+            });
+            assert!(
+                cancelled_with_a_matching_pair,
+                "the watch loop ending at line {} falls through to its outcome \
+                 without cancelling. The deadline break reaches this point with \
+                 the sweep STILL RUNNING, so it keeps driving the header and \
+                 renewing the engine's write-pause (`AUD3-j`). A call nested \
+                 inside the session-ended `if` does not count — that branch \
+                 returns early and never reaches here. A crossed slot/cancel \
+                 pair does not count either.",
+                site + 1
             );
         }
     }
