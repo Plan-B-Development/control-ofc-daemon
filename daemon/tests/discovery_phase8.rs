@@ -229,6 +229,11 @@ async fn sweep(
     };
 
     let trip_cache = cache.clone();
+    // `P8-am`: `read_fn` now returns a FUTURE, so production can dispatch its
+    // ~35 blocking `std::fs` reads to the blocking pool. This harness has
+    // nothing to block on — the body stays synchronous and is wrapped in
+    // `std::future::ready`, which keeps the observation cadence and the
+    // interleaving with `write_fn` exactly as they were.
     let read_fn = move || {
         reads.fetch_add(1, Ordering::SeqCst);
         let d = *duty_r.lock().unwrap();
@@ -262,7 +267,7 @@ async fn sweep(
                 }
             }
         }
-        disc::DiscoverySample {
+        std::future::ready(disc::DiscoverySample {
             header: HwmonVerifyState {
                 pwm_enable: match *enable.lock().unwrap() {
                     EnableModel::Fixed(v) => v,
@@ -274,7 +279,7 @@ async fn sweep(
                 rpm: rpm_for(usize::MAX, d),
             },
             tachs: (0..n).map(|i| rpm_for(i, d)).collect(),
-        }
+        })
     };
 
     disc::run_discovery(

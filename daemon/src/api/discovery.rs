@@ -622,7 +622,7 @@ pub struct DiscoveryOutcome {
 /// down (→ `aborted`), and **a pump-protected header whose tach disappears**
 /// (→ `aborted`).
 #[allow(clippy::too_many_arguments)]
-pub async fn run_discovery<W, R, P, S, K>(
+pub async fn run_discovery<W, R, Fut, P, S, K>(
     cache: &StateCache,
     header_id: &str,
     channels: &[TachChannel],
@@ -639,6 +639,9 @@ pub async fn run_discovery<W, R, P, S, K>(
     pump_protected: bool,
     window: Duration,
     write_fn: W,
+    // One observation, resolved as a **future** so the caller can put the
+    // blocking `std::fs` reads it performs on the blocking pool (`P8-am`).
+    // A test that has nothing to block on returns `std::future::ready`.
     read_fn: R,
     cancel: &AtomicBool,
     shutting_down: S,
@@ -648,12 +651,13 @@ pub async fn run_discovery<W, R, P, S, K>(
 ) -> DiscoveryOutcome
 where
     W: Fn(u8) -> Result<(), String>,
-    R: Fn() -> DiscoverySample,
+    R: Fn() -> Fut,
+    Fut: std::future::Future<Output = DiscoverySample>,
     P: FnMut(DiscoveryCycle),
     S: Fn() -> bool,
     K: Fn() -> bool,
 {
-    let first = read_fn();
+    let first = read_fn().await;
     let original_pct = first.header.pwm_percent;
     // Which tach belongs to the header being perturbed, if any. Captured before
     // anything is written so `pump_tach_lost` compares against the pre-run truth.
@@ -1040,7 +1044,7 @@ struct Observed {
 
 /// Hold for `window`, sub-sampling every channel. `None` means the daemon began
 /// shutting down mid-window, which the caller turns into an abort.
-async fn observe<R, S>(
+async fn observe<R, Fut, S>(
     read_fn: &R,
     window: Duration,
     shutting_down: &S,
@@ -1049,7 +1053,8 @@ async fn observe<R, S>(
     sample_count: &mut u32,
 ) -> Option<Observed>
 where
-    R: Fn() -> DiscoverySample,
+    R: Fn() -> Fut,
+    Fut: std::future::Future<Output = DiscoverySample>,
     S: Fn() -> bool,
 {
     // `tokio::time::Instant`, NOT `std::time::Instant`: the latter does not
@@ -1066,7 +1071,11 @@ where
         if shutting_down() {
             return None;
         }
-        let sample = read_fn();
+        // `.await`, not a call: the production `read_fn` dispatches this
+        // sample's ~35 blocking `std::fs` reads to the blocking pool, so a tach
+        // `open(2)` wedged in the driver parks a pool thread instead of a tokio
+        // worker (`P8-am`). The cadence below is unchanged.
+        let sample = read_fn().await;
         *sample_count = sample_count.saturating_add(1);
         let at_ms = run_started.elapsed().as_millis() as u64;
         for (i, slot) in per_channel.iter_mut().enumerate() {

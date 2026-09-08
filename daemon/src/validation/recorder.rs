@@ -9,9 +9,18 @@
 //! Batch 3a samples CPU package and GPU power, which are sysfs reads. The
 //! invariant that actually holds — and the one the safety argument below now
 //! rests on — is narrower and still structural: every read here is **read-only**,
-//! and none of it happens **under the session slot guard**. Power is sampled
-//! before the guard is taken, exactly as the controller read already was, so a
-//! blocking sysfs read still cannot stall a start or stop request.
+//! and none of it happens **under the session slot guard**. `tick` samples power
+//! before the guard is taken, exactly as the controller read already was.
+//!
+//! That narrowed form was itself untrue at `start` until DEC-342 (`P8-v`), which
+//! is worth stating because it is the shape the bug takes here: `start` did no
+//! sysfs I/O of its own, but it cleared the power sampler **under the slot
+//! guard**, and `tick` holds that same mutex across its reads. A wedged read
+//! therefore stalled `start` beneath the guard without either function
+//! containing a blocking call in the wrong place. `start` no longer touches the
+//! sampler at all — it is keyed by session id — so the invariant now holds at
+//! every entry point, and a blocking sysfs read cannot stall a start or stop
+//! request.
 //!
 //! Once per second it reads the
 //! `StateCache` snapshot the poll loop already fills, plus four cheap handles
@@ -190,16 +199,30 @@ pub struct ValidationEngine {
     max_samples: Mutex<usize>,
     /// Power telemetry for the current session (Batch 3a §2).
     ///
-    /// `None` means **not yet resolved**, and `start` sets it so deliberately:
-    /// discovery is a sysfs directory walk, and `start` is reached from an axum
-    /// handler on the async runtime while `tick` already runs off it
-    /// (`AUD3-n`). Resolving lazily on the first tick keeps the blocking read
-    /// where the other blocking reads already are, which is the distinction
-    /// `P8-b` is about.
+    /// `None` means **not yet resolved**: discovery is a sysfs directory walk,
+    /// and `start` is reached from an axum handler on the async runtime while
+    /// `tick` already runs off it (`AUD3-n`). Resolving lazily on the first tick
+    /// keeps the blocking read where the other blocking reads already are, which
+    /// is the distinction `P8-b` is about.
     ///
-    /// Rebuilding it per session also resets the RAPL baseline. Carrying one
+    /// [LOCK ORDER] **Keyed by session id, and `start` never touches this
+    /// mutex** (`P8-v`). `start` used to clear it to `None` — under the slot
+    /// guard, because that is where the rest of its installation happens. But
+    /// `tick` holds this same mutex across blocking sysfs I/O (the discovery
+    /// walk, then an `energy_uj` read and an amdgpu `power1_average` read every
+    /// tick), so a read wedged on the SMU lock during a GPU reset stalled
+    /// `start` *underneath the slot guard* — and every `slot` reader with it:
+    /// `GET /validation/session`, `recording_session_id()`, `stop_if()` and the
+    /// shutdown flush, all non-cancellable `parking_lot` acquisitions.
+    ///
+    /// Carrying the id instead is what lets `start` leave the mutex alone
+    /// entirely: `tick` compares the stored id against the recording session's
+    /// and rediscovers on a mismatch, which resets the RAPL baseline exactly
+    /// where the clear used to. That reset is not optional — carrying a sampler
     /// over would charge the whole idle gap between two sessions to the second
-    /// session's first sample.
+    /// session's first sample, which is why `try_lock`-and-skip on the clear was
+    /// rejected as the fix: under the very contention it exists to survive, it
+    /// would silently publish that inflated first wattage.
     power: Mutex<Option<SessionPower>>,
 }
 
@@ -234,6 +257,12 @@ fn finalise_in_place(session: &mut ValidationSession, state: &str, reason: Optio
 
 /// Per-session power sources, resolved together on the first tick.
 struct SessionPower {
+    /// The session these sources belong to.
+    ///
+    /// The cache key, not decoration: `tick` rediscovers whenever this differs
+    /// from the recording session's id, which is what gives each session a fresh
+    /// RAPL baseline without `start` ever taking this mutex (`P8-v`).
+    session_id: String,
     /// CPU package power. Stateful — a RAPL wattage is a difference between
     /// two ticks.
     package: PowerSampler,
@@ -254,8 +283,9 @@ impl SessionPower {
     /// `hwmon/power.rs` was explicitly built to avoid, and which this project's
     /// rule against hardware-dependent tests forbids. Found by
     /// `ofc:concurrency-reviewer`.
-    fn discover(ctx: &RecorderContext) -> Self {
+    fn discover(ctx: &RecorderContext, session_id: String) -> Self {
         Self {
+            session_id,
             package: PowerSampler::discover(&ctx.hwmon_root, &ctx.powercap_root),
             gpu_hwmon: crate::hwmon::gpu_detect::detect_amd_gpus(&ctx.hwmon_root)
                 .first()
@@ -434,10 +464,12 @@ impl ValidationEngine {
         // See `session::max_samples_for`.
         *self.max_samples.lock() =
             super::session::max_samples_for(&session, constants::VALIDATION_MAX_SAMPLE_BYTES);
-        // Cleared, not discovered: the first tick resolves it off the async
-        // runtime, and clearing is what gives this session a fresh RAPL
-        // baseline rather than the previous session's. See the field.
-        *self.power.lock() = None;
+        // [LOCK ORDER] The power sampler is deliberately NOT touched here
+        // (`P8-v`). It is keyed by session id, so `tick` rediscovers it — off
+        // the async runtime, with a fresh RAPL baseline — on the first tick
+        // whose session id differs from the stored one. Clearing it here instead
+        // meant taking a mutex that `tick` holds across blocking sysfs I/O,
+        // while holding the slot guard; see the field's own comment.
         *self.member_ids.lock() = ids;
         let started = session.clone();
         self.refresh_live(&session);
@@ -751,13 +783,24 @@ impl ValidationEngine {
         // The first draft did this inside the guarded region. Found by
         // `ofc:concurrency-reviewer`.
         //
-        // Gated on `is_recording()` so an idle daemon never touches sysfs at
-        // all. The check is advisory — a session can finish between here and the
-        // guard — but a wasted read is free, and the guard below is what decides
-        // whether the values are used.
-        let (package_power_w, gpu_power_w) = if self.is_recording() {
+        // Gated on the recording session's id so an idle daemon never touches
+        // sysfs at all. The check is advisory — a session can finish between here
+        // and the guard — but a wasted read is free, and the guard below is what
+        // decides whether the values are used.
+        //
+        // The id is also the sampler's cache key (`P8-v`): rediscovering on a
+        // mismatch is what resets the RAPL baseline per session, and it does so
+        // HERE, off the async runtime, instead of in `start` under the slot
+        // guard. `recording_session_id()` costs the same brief slot lock the
+        // `is_recording()` it replaced already took.
+        let (package_power_w, gpu_power_w) = if let Some(sid) = self.recording_session_id() {
             let mut guard = self.power.lock();
-            let power = guard.get_or_insert_with(|| SessionPower::discover(ctx));
+            let power = match guard.take() {
+                Some(p) if p.session_id == sid => guard.insert(p),
+                // Either nothing resolved yet, or the stored sampler belongs to
+                // a previous session. Dropping it is the baseline reset.
+                _ => guard.insert(SessionPower::discover(ctx, sid)),
+            };
             (
                 power.package.sample(std::time::Instant::now()),
                 power

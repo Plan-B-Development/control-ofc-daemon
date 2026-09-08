@@ -1,5 +1,63 @@
 # Changelog
 
+## [2.43.4] — 2026-09-08
+
+**Blocking sysfs I/O no longer runs where it can stall an unrelated request
+(DEC-342, register package `G25` — rows `P8-v`, `P8-am`, `P8-al`).** Daemon-only.
+No wire shape, capability or error code changes; pairs with `control-ofc-gui` >=
+v2.23.0 as before.
+
+*Why this is a patch:* three internal robustness fixes. Every response shape,
+every status code and every duty written is unchanged, and no client can observe
+a difference except that a wedged sensor now degrades one reading instead of a
+subsystem.
+
+**Starting a validation session could be stalled by a wedged power sensor, and
+every reader of the session slot with it (`P8-v`).** `start()` cleared the
+per-session power sampler while holding the session slot guard, and the recorder
+tick holds that same mutex across blocking sysfs reads — the hwmon/powercap
+discovery walk, then an `energy_uj` read and an amdgpu `power1_average` read on
+every tick. An amdgpu read parked on the SMU lock during a GPU reset therefore
+blocked `start` *beneath* the guard, and with it `GET /validation/session`,
+`recording_session_id()`, `stop_if()` and the shutdown flush — all
+non-cancellable acquisitions. `/status` and `/poll` were never affected (separate
+mutex). The sampler is now keyed by session id and `start` does not touch it at
+all: the tick rediscovers it on a session change, which is where the per-session
+RAPL baseline reset moved to. That reset is why the sampler is not simply
+`try_lock`ed and skipped — under exactly the contention it would exist to
+survive, a carried-over sampler charges the whole idle gap between two sessions
+to the second session's first wattage.
+
+**A wedged tach read during control-path discovery no longer parks a runtime
+worker (`P8-am`).** Each observation is up to `DISCOVERY_MAX_TACH_CHANNELS + 3`
+= 35 blocking `std::fs` reads, taken every 500 ms for the length of a run
+(~186 samples) from a plain spawned task. `AIO3-d` accepted that shape on the
+characterisation sweep at **three** reads per sample; discovery multiplies it
+~11x over a wider chip set. One tach `open(2)` stuck in a driver parked a tokio
+worker uncancellably, starving every unrelated task scheduled on it. The sample
+now runs on the blocking pool, the same shape DEC-290 uses for the verify path,
+so a stuck header consumes a pool thread — sized for exactly that — instead of a
+slice of the runtime. Sample cadence, observation windows and every written duty
+are unchanged.
+
+*What this does not fix, stated plainly because the original note implied
+otherwise.* A wedged read still stalls the run itself: `keepalive()` cannot be
+reached with data that never arrives, so the verify pause and hwmon lease can
+still lapse, the run can still be superseded, and its restore can still fail
+`InvalidLease` with the header left at the perturbed duty — which is at or above
+its floor, so never a stopped pump. That outcome is unchanged by this release. A
+watchdog for a genuinely wedged run remains its own open item.
+
+**One unreadable hwmon directory no longer abandons the whole CPU-power scan
+(`P8-al`).** The per-chip attribute scan used `read_dir(dir).ok()?`, whose `?`
+returned from the entire function rather than skipping that chip, so the first
+unreadable directory discarded every chip sorted after it. It was benign in
+practice because discovery falls through to powercap RAPL, and on the reference
+host RAPL is the only path anyway — but the loop read as though it continued, and
+a future caller without that fallback would have lost the branch silently. It now
+skips the chip, and reads each directory once instead of once per attribute
+suffix.
+
 ## [2.43.3] — 2026-09-08
 
 **A validation session's persisted document is bounded by a measurement now, not

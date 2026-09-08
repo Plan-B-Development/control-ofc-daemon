@@ -3200,3 +3200,265 @@ fn the_terminal_hop_cannot_finalise_a_session_that_replaced_ours() {
         "`stop_if` refuses its OWN session, so the fence above proves nothing"
     );
 }
+
+// ── `P8-v`: `start` must not take the power mutex under the slot guard ───
+
+/// A FIFO whose reader blocks in `open(2)` until this test opens the write end.
+///
+/// The wedge has to be a genuine kernel-level block, not a `sleep`: `CLAUDE.md`
+/// records that DEC-278's three tests all passed while modelling a wedge the way
+/// their author imagined it rather than the way it happens. A `power1_average`
+/// parked on the amdgpu SMU lock blocks in the kernel, and so does this.
+struct FifoWedge {
+    path: std::path::PathBuf,
+    writer: Option<std::os::fd::OwnedFd>,
+}
+
+/// How long the watchdog below waits before releasing the wedge unconditionally.
+/// Far beyond `engage`'s own 5 s deadline and the 2 s observation window, so it
+/// never fires on a healthy run.
+const WEDGE_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl FifoWedge {
+    fn new(path: std::path::PathBuf) -> Self {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path that outlives the call.
+        let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o644) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+
+        // The watchdog, and it is not belt-and-braces — it is the release for
+        // the path `engage` cannot cover. If `engage` times out (a loaded runner
+        // where the recorder thread reaches `open(2)` after its 5 s deadline) it
+        // returns `false` having opened nothing, so `release()` has no writer to
+        // drop and the reader blocks forever: `ticker.join()` never returns, the
+        // `assert!(engaged, …)` is never reached, and a test that should be RED
+        // becomes a hung CI job. That is `CLAUDE.md`'s tokio trap 3 arriving
+        // through the fixture instead of the runtime, and the sibling wedge in
+        // `api/handlers/discovery.rs` already had a timed writer for it. Found by
+        // `ofc:concurrency-reviewer`.
+        //
+        // Opening the write end releases a reader parked in `open(2)`; dropping
+        // it gives EOF only once EVERY writer has closed, so this cannot cut a
+        // healthy run's wedge short while the test still holds its own.
+        let guarded = path.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(WEDGE_WATCHDOG);
+            let _ = std::fs::OpenOptions::new().write(true).open(&guarded);
+        });
+
+        Self { path, writer: None }
+    }
+
+    /// Block until a reader is inside `open(2)` on the FIFO, then hold the write
+    /// end open.
+    ///
+    /// This is the precondition detector AND the thing that keeps the wedge
+    /// wedged. `open(O_WRONLY|O_NONBLOCK)` on a FIFO fails `ENXIO` while no
+    /// reader is present and succeeds the moment one is — so a success proves
+    /// the reader got in. It also releases that reader from `open`, which is
+    /// why the fd is then **held**: with a writer attached and no bytes queued,
+    /// the reader blocks again in `read(2)`.
+    ///
+    /// Returns `false` if no reader arrived before the deadline, so the caller
+    /// fails loudly instead of asserting nothing.
+    fn engage(&mut self, deadline: std::time::Duration) -> bool {
+        use std::os::fd::FromRawFd;
+        let c = std::ffi::CString::new(self.path.as_os_str().as_encoded_bytes()).unwrap();
+        let until = std::time::Instant::now() + deadline;
+        while std::time::Instant::now() < until {
+            // SAFETY: `c` is a valid NUL-terminated path that outlives the call.
+            let fd = unsafe { libc::open(c.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+            if fd >= 0 {
+                // SAFETY: `fd` is a fresh, open, owned descriptor.
+                self.writer = Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// Let the wedged reader go: closing the last writer gives it EOF, so
+    /// `read_to_string` returns `""` and discovery carries on normally.
+    fn release(&mut self) {
+        self.writer.take();
+    }
+}
+
+/// [P8-v] `start()` completes while `tick()` holds the power sampler across a
+/// wedged sysfs read.
+///
+/// `start` used to clear `self.power` **under the slot guard**, and `tick` holds
+/// that same mutex across blocking sysfs I/O. So a read parked in the kernel —
+/// canonically an amdgpu `power1_average` during a GPU reset — stalled `start`
+/// underneath `slot`, and with it every `slot` reader: `GET /validation/session`,
+/// `recording_session_id()`, `stop_if()` and the shutdown flush, all
+/// non-cancellable `parking_lot` acquisitions.
+///
+/// The assertion is deliberately made **while the wedge is still held** and only
+/// reported after it is released: releasing first would let a defective `start`
+/// finish late and pass.
+#[test]
+fn start_completes_while_a_wedged_power_read_holds_the_sampler() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    temp_state_dir();
+    let engine = Arc::new(ValidationEngine::new());
+
+    // The recorder tick reads power only for a RECORDING session, so one has to
+    // be live before the wedge can engage.
+    let ctx = test_context();
+    engine
+        .start(unique_session("p8v-a"), &ctx)
+        .expect("the first session starts");
+
+    // A CPU chip whose power attribute is the wedge. `name` is a real file, so
+    // discovery resolves the source and `detect_amd_gpus` classifies the chip —
+    // both without touching the FIFO. It is `PowerSampler::sample`'s read of
+    // `power1_input` that blocks, which is the per-tick read the register names
+    // (an amdgpu `power1_average` on the SMU lock) rather than the one-off walk.
+    //
+    // Read exactly ONCE, deliberately: a wedge on `name` would be re-entered by
+    // the GPU scan after release and hang the test rather than fail it.
+    let sysfs = tempfile::tempdir().unwrap();
+    let chip = sysfs.path().join("hwmon/hwmon0");
+    std::fs::create_dir_all(&chip).unwrap();
+    std::fs::write(chip.join("name"), "k10temp\n").unwrap();
+    let mut wedge = FifoWedge::new(chip.join("power1_input"));
+    let mut wedged_ctx = test_context();
+    wedged_ctx.hwmon_root = sysfs.path().join("hwmon");
+    wedged_ctx.powercap_root = sysfs.path().join("powercap");
+
+    // T: wedges inside `SessionPower::discover`, holding the power mutex.
+    let t_engine = engine.clone();
+    let ticker = std::thread::spawn(move || {
+        t_engine.tick(&wedged_ctx);
+    });
+
+    let engaged = wedge.engage(std::time::Duration::from_secs(5));
+
+    // With the sampler held, close the live session and start a second one. The
+    // stop is what lets `start` past its `AlreadyRecording` early return and on
+    // to the installation sequence that used to touch `self.power`.
+    engine.stop().expect("the first session stops");
+
+    let started = Arc::new(AtomicBool::new(false));
+    let s_engine = engine.clone();
+    let s_flag = started.clone();
+    let starter = std::thread::spawn(move || {
+        let ctx = test_context();
+        s_engine
+            .start(unique_session("p8v-b"), &ctx)
+            .expect("the second session starts");
+        s_flag.store(true, Ordering::SeqCst);
+    });
+
+    // Observed WHILE the wedge is held. With the defect this stays false: the
+    // starter is parked on `power.lock()` with `slot` in hand.
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !started.load(Ordering::SeqCst) && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let start_completed_under_the_wedge = started.load(Ordering::SeqCst);
+
+    // Release, join, THEN assert — so a failure does not leave two blocked
+    // threads and an undeletable fixture behind.
+    wedge.release();
+    ticker.join().expect("the recorder tick thread");
+    starter.join().expect("the start thread");
+
+    assert!(
+        engaged,
+        "the wedge never engaged, so this test asserted nothing about `start`"
+    );
+    assert!(
+        start_completed_under_the_wedge,
+        "`start` blocked while `tick` held the power sampler — it is taking that \
+         mutex under the slot guard again (`P8-v`)"
+    );
+}
+
+/// [P8-v] Keying the sampler by session id still gives each session a FRESH RAPL
+/// baseline.
+///
+/// This is the guarantee that `start`'s `*self.power.lock() = None` used to
+/// provide, and moving it is only safe if it still holds: a sampler carried
+/// across sessions charges the whole idle gap between them to the second
+/// session's first sample. RAPL is a cumulative counter, so "fresh" is directly
+/// observable — the first sample of a session must be `None` (one reading of a
+/// counter is not a power), and only a *rediscovered* sampler reports `None`
+/// again for session B.
+///
+/// It is also why `try_lock`-and-skip on the old clear was rejected as the fix:
+/// under contention it would have silently published that inflated wattage.
+#[test]
+fn each_session_gets_a_fresh_power_baseline_without_start_touching_the_sampler() {
+    temp_state_dir();
+
+    // A powercap package zone whose counter this test advances by hand.
+    let sysfs = tempfile::tempdir().unwrap();
+    let zone = sysfs.path().join("powercap/intel-rapl:0");
+    std::fs::create_dir_all(&zone).unwrap();
+    std::fs::create_dir_all(sysfs.path().join("hwmon")).unwrap();
+    std::fs::write(zone.join("name"), "package-0\n").unwrap();
+    std::fs::write(zone.join("max_energy_range_uj"), "65532610987\n").unwrap();
+    let energy = zone.join("energy_uj");
+    let mut counter: u64 = 1_000_000;
+    std::fs::write(&energy, format!("{counter}\n")).unwrap();
+
+    let mut ctx = test_context();
+    ctx.hwmon_root = sysfs.path().join("hwmon");
+    ctx.powercap_root = sysfs.path().join("powercap");
+
+    // Long enough that `elapsed_us` cannot round to a wattage the plausibility
+    // cap rejects; the assertions below are on `Some`/`None`, never on timing.
+    let settle = std::time::Duration::from_millis(50);
+    let advance = |counter: &mut u64| {
+        std::thread::sleep(settle);
+        *counter += 100_000;
+        std::fs::write(&energy, format!("{counter}\n")).unwrap();
+    };
+
+    let engine = ValidationEngine::new();
+
+    // ── Session A ────────────────────────────────────────────────────
+    engine
+        .start(unique_session("p8v-fresh-a"), &ctx)
+        .expect("session A starts");
+    engine.tick(&ctx); // primes the counter
+    advance(&mut counter);
+    engine.tick(&ctx); // first real wattage
+
+    let a = engine.snapshot().expect("A is installed");
+    assert_eq!(a.samples.len(), 2, "A recorded two samples");
+    assert!(
+        a.samples[0].package_power_w.is_none(),
+        "A's first sample primed the counter, so it cannot be a wattage"
+    );
+    // The presence half, asserted BEFORE the absence it makes meaningful: if the
+    // fixture never produced a wattage at all, B's `None` below would prove
+    // nothing.
+    assert!(
+        a.samples[1].package_power_w.is_some(),
+        "the fixture never produced a wattage, so this test cannot detect a \
+         carried-over baseline"
+    );
+
+    engine.stop().expect("session A stops");
+
+    // ── Session B ────────────────────────────────────────────────────
+    engine
+        .start(unique_session("p8v-fresh-b"), &ctx)
+        .expect("session B starts");
+    advance(&mut counter);
+    engine.tick(&ctx);
+
+    let b = engine.snapshot().expect("B is installed");
+    assert_eq!(b.samples.len(), 1, "B recorded one sample");
+    assert!(
+        b.samples[0].package_power_w.is_none(),
+        "B's first sample reported a wattage, so it inherited A's sampler — the \
+         session-id key is not resetting the RAPL baseline (`P8-v`)"
+    );
+}

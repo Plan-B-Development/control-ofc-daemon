@@ -215,15 +215,36 @@ fn discover_hwmon_cpu_power(hwmon_root: &Path) -> Option<PowerSource> {
         if !CPU_POWER_CHIPS.contains(&chip.as_str()) {
             continue;
         }
+        // Read the directory ONCE per chip, and skip only THIS chip when it is
+        // unreadable (`P8-al`).
+        //
+        // This was `std::fs::read_dir(&dir).ok()?` inside the suffix loop, and
+        // that `?` returned from the **whole function**: one unreadable chip
+        // directory abandoned every chip after it as well, while the loop read
+        // as though it continued to the next one. It was benign only because
+        // `PowerSampler::discover` falls through to RAPL via `or_else` — a
+        // future caller without that fallback would lose the branch silently.
+        //
+        // Hoisting it also removes the second, identical `read_dir` the
+        // `_average` pass used to issue over the same directory.
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            log::debug!(
+                "cpu power: hwmon directory {} is unreadable; skipping this chip",
+                dir.display()
+            );
+            continue;
+        };
+        let names: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
         // `_input` before `_average`: an instantaneous reading is what a thermal
         // observation wants, and an averaged one lags the workload it is meant
         // to explain.
         for suffix in ["_input", "_average"] {
-            let mut channels: Vec<u8> = std::fs::read_dir(&dir)
-                .ok()?
-                .filter_map(|e| e.ok())
-                .filter_map(|e| {
-                    let name = e.file_name().to_string_lossy().to_string();
+            let mut channels: Vec<u8> = names
+                .iter()
+                .filter_map(|name| {
                     name.strip_prefix("power")
                         .and_then(|s| s.strip_suffix(suffix))
                         .and_then(|n| n.parse::<u8>().ok())
@@ -319,6 +340,59 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(path, contents).unwrap();
+    }
+
+    /// `P8-al`: one unreadable chip directory skips THAT CHIP, not the scan.
+    ///
+    /// The defect was `std::fs::read_dir(&dir).ok()?` inside the suffix loop,
+    /// whose `?` returned from the whole function — so the first unreadable
+    /// hwmon directory abandoned every chip sorted after it.
+    ///
+    /// The fixture needs a directory that is **searchable but not readable**
+    /// (mode `0o111`): `name` opens fine, because opening a file inside a
+    /// directory needs `+x`, while `read_dir` needs `+r`. Root bypasses both, so
+    /// the precondition is asserted rather than assumed — see the skip below.
+    #[test]
+    fn an_unreadable_chip_directory_skips_that_chip_and_not_the_scan() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Sorted first, so it is reached first: a real CPU chip whose directory
+        // cannot be listed.
+        let locked = root.join("hwmon0");
+        write(&locked.join("name"), "k10temp\n");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o111)).unwrap();
+
+        // Sorted second: the chip the scan must still reach.
+        write(&root.join("hwmon1/name"), "k10temp\n");
+        write(&root.join("hwmon1/power1_input"), "15000000\n");
+
+        // Precondition. Without this the test passes vacuously as root, which is
+        // exactly the "something changed is not evidence a rule fired" trap: with
+        // the permission bypassed, `hwmon0` merely lists no `power*` file and the
+        // loop reaches `hwmon1` even with the defect present.
+        if fs::read_dir(&locked).is_ok() {
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!(
+                "skipped: this process can read a 0o111 directory (running as root?), \
+                 so the fixture cannot reproduce an unreadable chip"
+            );
+            return;
+        }
+
+        let found = discover_hwmon_cpu_power(root);
+
+        // Restore before asserting, so a failure still leaves a removable tree.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let src = found.expect("the readable chip must still be found");
+        assert_eq!(src.kind, POWER_SOURCE_HWMON);
+        assert_eq!(
+            src.path,
+            root.join("hwmon1/power1_input"),
+            "the scan must continue past the unreadable chip to hwmon1"
+        );
     }
 
     // ── watts_from_energy_delta: the pure core ───────────────────────

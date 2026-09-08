@@ -529,22 +529,31 @@ pub async fn discover_control_path_handler(
                     .map(|_| ())
                     .map_err(|e| e.to_string())
             };
-            // Same known limitation as the characterisation sweep (`AIO3-d`):
-            // these are blocking `std::fs` reads issued from the async runtime.
-            // The channel count makes this run's per-sample cost higher than
-            // characterisation's, which is exactly why
-            // `DISCOVERY_MAX_TACH_CHANNELS` bounds it.
-            let read_fn = || disc::DiscoverySample {
-                header: super::hwmon_ctl::read_header_state(&pwm_path, &enable_path, &rpm_path),
-                tachs: tach_paths
-                    .iter()
-                    .map(|p| {
-                        std::fs::read_to_string(p)
-                            .ok()
-                            .and_then(|s| s.trim().parse::<u16>().ok())
-                    })
-                    .collect(),
-            };
+            // Every sample is `DISCOVERY_MAX_TACH_CHANNELS + 3 = 35` blocking
+            // `std::fs` reads, taken every 500 ms for the whole run (~186
+            // samples), over a chip set drawn from a full `/sys/class/hwmon`
+            // walk. `AIO3-d` accepted this shape on the characterisation sweep
+            // at **three** reads per sample; discovery multiplies it ~11× and
+            // widens the chip set, which is what makes it worth the dispatch
+            // here (`P8-am`).
+            //
+            // On the blocking pool, per the DEC-290 precedent: a tach `open(2)`
+            // wedged in a driver then parks a pool thread — sized for exactly
+            // that — instead of parking a tokio worker uncancellably, where it
+            // would starve unrelated tasks on the same worker. It does not make
+            // a wedged read *fast*; `keepalive()` still cannot be reached with
+            // data that never arrives. It stops one stuck header taking a slice
+            // of the runtime down with it.
+            //
+            // `Arc`, so each sample's dispatch clones a pointer rather than four
+            // strings, and so the closure stays `Fn` rather than `FnOnce`.
+            let sample_paths = std::sync::Arc::new(SamplePaths {
+                pwm: pwm_path.clone(),
+                enable: enable_path.clone(),
+                rpm: rpm_path.clone(),
+                tachs: tach_paths.clone(),
+            });
+            let read_fn = move || sample_off_runtime(sample_paths.clone());
             // Fenced on `run_id`: a run whose deadman elapsed can be superseded
             // (`try_begin_verify` deliberately permits the steal), and without
             // the fence the loser would append its cycles into the winner's list
@@ -698,6 +707,116 @@ fn control_paths_dir() -> std::path::PathBuf {
     crate::daemon_state::state_dir_path()
 }
 
+/// The four sysfs paths one discovery observation reads.
+///
+/// A struct rather than four separately captured strings because the sample is
+/// dispatched to the blocking pool (`P8-am`), so it must OWN what it reads. It
+/// is shared behind an `Arc`, which is what keeps the per-sample cost a pointer
+/// clone instead of four string allocations, ~186 times a run.
+struct SamplePaths {
+    pwm: String,
+    enable: Option<String>,
+    rpm: Option<String>,
+    tachs: Vec<String>,
+}
+
+/// One observation, taken on the blocking pool.
+///
+/// A named function rather than an inline closure so this dispatch has a call
+/// site a test can actually reach: DEC-324's rule is that an extracted rule
+/// nothing asserts about the production path is an untested rule, and "the
+/// sample runs off the runtime" is precisely such a rule. Its only caller is the
+/// `read_fn` handed to `run_discovery` below.
+async fn sample_off_runtime(paths: std::sync::Arc<SamplePaths>) -> disc::DiscoverySample {
+    let channels = paths.tachs.len();
+    sample_or_unreadable(
+        tokio::task::spawn_blocking(move || paths.sample()).await,
+        channels,
+    )
+}
+
+/// Map a finished sample task onto a sample, or onto absence.
+///
+/// Split out from [`sample_off_runtime`] so the failure arm has a call site a
+/// test can reach: `SamplePaths::sample` contains no panicking path, so the arm
+/// is otherwise unreachable from any test and would ship unexercised — DEC-324's
+/// rule, raised against the first draft by `ofc:concurrency-reviewer`.
+fn sample_or_unreadable(
+    joined: Result<disc::DiscoverySample, tokio::task::JoinError>,
+    channels: usize,
+) -> disc::DiscoverySample {
+    joined.unwrap_or_else(|e| {
+        // The join failed, so the read never completed — the closure panicked, or
+        // the runtime is going down. Reported as unreadable rather than as a
+        // value: that is the same shape an unreadable chip already produces, and
+        // `observe`'s next `shutting_down()` check is what turns a teardown into
+        // an abort.
+        //
+        // **One consumer does read it differently, and it is worth naming.** On
+        // the PRE-RUN sample — `run_discovery`'s `first` — an unreadable header
+        // makes `original_pct` `None`, so `RestoreOnDrop` takes its
+        // `NoOriginalDuty` branch and leaves the header alone instead of
+        // restoring it. That needs this arm to fire on the very first sample,
+        // before any duty has been written: the teardown case bails at the
+        // `shutting_down()` check before `wrote_any` is set, and leaving an
+        // as-yet-unperturbed header alone is the right answer anyway. Narrow,
+        // not absent — the first draft of this comment claimed no consumer
+        // needed a new branch, which was too broad.
+        log::warn!(
+            "control-path discovery: sample task failed ({e}); \
+             recording this sample as unreadable"
+        );
+        SamplePaths::unreadable(channels)
+    })
+}
+
+impl SamplePaths {
+    /// One observation.
+    ///
+    /// **Blocking**, deliberately: `DISCOVERY_MAX_TACH_CHANNELS + 3` `std::fs`
+    /// reads. Never call this on the async runtime — that is the whole point of
+    /// the `spawn_blocking` at its only call site.
+    fn sample(&self) -> disc::DiscoverySample {
+        disc::DiscoverySample {
+            header: super::hwmon_ctl::read_header_state(&self.pwm, &self.enable, &self.rpm),
+            tachs: self
+                .tachs
+                .iter()
+                .map(|p| {
+                    std::fs::read_to_string(p)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u16>().ok())
+                })
+                .collect(),
+        }
+    }
+
+    /// What an observation that could not run at all reports: every field
+    /// unreadable.
+    ///
+    /// Not a new state — it is exactly the sample an unreadable chip already
+    /// produces, so no consumer needs a new branch (with one narrow exception,
+    /// named at [`sample_or_unreadable`]).
+    ///
+    /// `tachs` is sized to the channel count for legibility, **not** because
+    /// anything depends on it: every reader in `api/discovery.rs` goes through
+    /// `tachs.get(i)`, so a short vector is already indistinguishable from one
+    /// full of `None`. Stated explicitly because the first draft claimed the
+    /// count was load-bearing — which would have invited a test asserting a
+    /// property no consumer can observe, i.e. one that passes by construction.
+    fn unreadable(channels: usize) -> disc::DiscoverySample {
+        disc::DiscoverySample {
+            header: crate::api::responses::HwmonVerifyState {
+                pwm_enable: None,
+                pwm_raw: None,
+                pwm_percent: None,
+                rpm: None,
+            },
+            tachs: vec![None; channels],
+        }
+    }
+}
+
 /// The driver's declared telemetry cadence, in ms, if it publishes one (§4).
 ///
 /// hwmon's `update_interval` is a chip-level attribute beside the `pwmN` files.
@@ -792,4 +911,167 @@ pub fn prune_store_to_live(
         );
     }
     next
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// A FIFO nothing writes to for `delay`, so a reader blocks in `open(2)`.
+    ///
+    /// A genuine kernel-level block, not a `sleep`: `CLAUDE.md` records that
+    /// DEC-278's three tests all passed while modelling a wedge the way their
+    /// author imagined it rather than the way it happens. A tach `open(2)` stuck
+    /// in a driver blocks in the kernel, and so does this. The writer arriving on
+    /// a timer is what stops a failure becoming a hung CI job.
+    fn wedged_fifo(dir: &std::path::Path, delay: Duration) -> String {
+        let path = dir.join("pwm1");
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path that outlives the call.
+        let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o644) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+        let releaser = path.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            // Opening the write end releases the reader from `open`; dropping it
+            // immediately gives it EOF, so the read returns an empty string.
+            let _ = std::fs::OpenOptions::new().write(true).open(&releaser);
+        });
+        path.display().to_string()
+    }
+
+    /// [P8-am] The sample runs on the blocking pool, so a wedged read cannot
+    /// starve the runtime.
+    ///
+    /// Each sample is up to `DISCOVERY_MAX_TACH_CHANNELS + 3` blocking `std::fs`
+    /// reads, taken every 500 ms for the whole run. Issued inline from the
+    /// `tokio::spawn`ed sweep they park a worker uncancellably; the register's
+    /// consequence is that `keepalive()` is never reached, the run is superseded,
+    /// and its restore fails `InvalidLease` with the header left perturbed.
+    ///
+    /// One worker thread is what makes the difference observable rather than
+    /// probabilistic: an inline blocking read has nowhere else to put the other
+    /// tasks. The counter is read on the `block_on` thread — which is not a
+    /// worker — **while the read is still wedged**, so the reading cannot be
+    /// contaminated by the tasks that run once it completes.
+    #[test]
+    fn the_sample_runs_off_the_runtime_so_a_wedged_read_cannot_starve_it() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Arc::new(SamplePaths {
+            pwm: wedged_fifo(tmp.path(), Duration::from_millis(600)),
+            enable: None,
+            rpm: None,
+            tachs: vec![],
+        });
+
+        rt.block_on(async {
+            let progressed = Arc::new(AtomicUsize::new(0));
+            let counter = progressed.clone();
+
+            let sample = tokio::spawn(sample_off_runtime(paths));
+            let ticker = tokio::spawn(async move {
+                loop {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            });
+
+            // Mid-wedge, on the caller thread.
+            std::thread::sleep(Duration::from_millis(200));
+            let during = progressed.load(Ordering::SeqCst);
+
+            let out = sample.await.expect("the sample task");
+            ticker.abort();
+
+            // Not a tuned threshold. Under the defect the ticker can complete AT
+            // MOST one iteration — it is spawned second, and its second poll
+            // needs the very worker the inline read is sitting on — so 2 is the
+            // structural boundary between "the sample yielded the worker" and
+            // "it did not". With the fix this is in the hundreds.
+            assert!(
+                during >= 2,
+                "the runtime advanced {during} times while one sample was wedged; \
+                 the sample is running on a worker instead of the blocking pool \
+                 (`P8-am`)"
+            );
+            // The wedge really was a wedge: an unreadable header, not a value.
+            assert!(
+                out.header.pwm_percent.is_none(),
+                "the fixture returned a duty, so the read was not wedged and the \
+                 progress count above proves nothing"
+            );
+        });
+    }
+
+    /// [P8-am] A sample task that FAILED is reported as absence, not as a value.
+    ///
+    /// The arm is unreachable from production input — `SamplePaths::sample` has
+    /// no panicking path — so it is exercised through `sample_or_unreadable`
+    /// with a **real** `JoinError`, obtained by aborting a task rather than
+    /// hand-rolling one. An aborted join is the shutdown case the arm names, and
+    /// it keeps the test output free of a panic backtrace.
+    ///
+    /// Both arms, deliberately: with only the `Err` case a `sample_or_unreadable`
+    /// that ignored its argument and always returned `unreadable` would pass.
+    #[test]
+    fn a_failed_sample_task_is_reported_as_unreadable_not_as_a_value() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt.block_on(async {
+            let h = tokio::spawn(std::future::pending::<disc::DiscoverySample>());
+            h.abort();
+            h.await.expect_err("an aborted task must yield a JoinError")
+        });
+
+        let failed = sample_or_unreadable(Err(err), 4);
+        assert!(
+            failed.header.pwm_percent.is_none() && failed.header.rpm.is_none(),
+            "a failed join must report absence, never a duty or an RPM"
+        );
+        assert_eq!(failed.tachs.len(), 4);
+        assert!(failed.tachs.iter().all(Option::is_none));
+
+        // The success arm passes the reading through untouched.
+        let read = sample_or_unreadable(
+            Ok(disc::DiscoverySample {
+                header: crate::api::responses::HwmonVerifyState {
+                    pwm_enable: Some(1),
+                    pwm_raw: Some(128),
+                    pwm_percent: Some(50),
+                    rpm: Some(900),
+                },
+                tachs: vec![Some(1200)],
+            }),
+            4,
+        );
+        assert_eq!(read.header.pwm_percent, Some(50));
+        assert_eq!(read.tachs, vec![Some(1200)]);
+    }
+
+    /// [P8-am] `unreadable` is sized from the channel count.
+    ///
+    /// A legibility property, **not** a behavioural one: every consumer in
+    /// `api/discovery.rs` reads through `tachs.get(i)`, so a short vector is
+    /// indistinguishable from one full of `None`. Asserted so the constructor
+    /// keeps saying what it means, and labelled so nobody later mistakes it for
+    /// a regression guard over something a consumer can observe.
+    #[test]
+    fn an_unreadable_sample_is_sized_from_the_channel_count() {
+        let s = SamplePaths::unreadable(7);
+        assert_eq!(s.tachs.len(), 7);
+        assert!(s.tachs.iter().all(Option::is_none));
+        assert!(s.header.pwm_percent.is_none());
+        assert!(s.header.rpm.is_none());
+    }
 }
