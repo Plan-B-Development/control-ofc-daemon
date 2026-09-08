@@ -2239,3 +2239,671 @@ fn the_diagnostic_budget_never_undercuts_the_ladders_own_trust_window() {
         constants::DIAGNOSTIC_TEMP_MAX_AGE
     );
 }
+
+// ── §1/§6.1: the preflight CALL SITE (register rows `P8-t`, `P8-ab`) ──
+
+// Everything above this line exercises `pf::build_report` against hand-built
+// `PreflightInputs`. That proves the eleven *decisions*, and proves nothing at
+// all about the ~90 lines of live-state mapping that produce those inputs from
+// an `AppState` — which is how `P8-p` stayed invisible through two releases,
+// and is the recorded extract-the-rule-but-not-the-call-site failure in its
+// fourteenth instance. The tests below drive `preflight_handler` itself.
+
+use control_ofc_daemon::api::handlers::AppState;
+use control_ofc_daemon::error::HwmonError;
+use control_ofc_daemon::health::state::{AmdGpuFanState, HwmonFanState, OpenFanState};
+use control_ofc_daemon::hwmon::cooling_device::CoolingDeviceConfig;
+use control_ofc_daemon::hwmon::pwm_control::SysfsWriter;
+use control_ofc_daemon::hwmon::roles::{HeaderRole, RoleSource};
+
+/// The header under test: a pump, so the pump-protected branch of the live
+/// mapping is the one exercised.
+const TARGET: &str = "hwmon:it8696:isa-0a40:pwm5:AIO_PUMP";
+/// A radiator fan on a motherboard header — the source the old mapping could see.
+const HWMON_SIBLING: &str = "hwmon:it8696:isa-0a40:pwm1:SYS_FAN1";
+/// A radiator fan on the OpenFan controller — the source it could not, and the
+/// project's canonical AIO configuration.
+const OPENFAN_SIBLING: &str = "openfan:ch03";
+const OPENFAN_SIBLING_CH: u8 = 3;
+
+/// A writer that refuses every call.
+///
+/// `preflight_handler`'s own docstring says it "**Writes nothing.**" Passing a
+/// writer that panics turns that sentence into something the suite enforces: if
+/// the preflight ever grows a write, these tests fail loudly rather than
+/// silently touching a path.
+struct RefusingWriter;
+
+impl SysfsWriter for RefusingWriter {
+    fn write_file(&mut self, path: &str, value: &str) -> Result<(), HwmonError> {
+        panic!("the preflight must never write hardware (tried {path} = {value:?})");
+    }
+    fn read_file(&self, path: &str) -> Result<String, HwmonError> {
+        std::fs::read_to_string(path).map_err(|e| HwmonError::ReadError {
+            path: path.to_string(),
+            message: e.to_string(),
+        })
+    }
+}
+
+/// An `AppState` carrying one pump header, one cooling device, and whatever
+/// cache the caller has already shaped with `cache_at` / `cache_aged`.
+///
+/// The tempdir is returned because the header's `pwmN` files must outlive the
+/// state: `gather_preflight` reads them for the readback, and a dropped tempdir
+/// would turn every readback into `None` and quietly change what is asserted.
+fn preflight_state(cache: StateCache) -> (Arc<AppState>, CoolingDeviceConfig, tempfile::TempDir) {
+    preflight_state_with_aux(cache, Vec::new())
+}
+
+/// [`preflight_state`], plus auxiliary members — so a source that is not a
+/// plausible radiator fan can still be given a sibling row to resolve.
+fn preflight_state_with_aux(
+    cache: StateCache,
+    auxiliary_members: Vec<String>,
+) -> (Arc<AppState>, CoolingDeviceConfig, tempfile::TempDir) {
+    preflight_state_with_members(
+        cache,
+        vec![HWMON_SIBLING.into(), OPENFAN_SIBLING.into()],
+        auxiliary_members,
+    )
+}
+
+/// [`preflight_state`] with the radiator membership chosen by the caller — the
+/// only way to express a cooler whose siblings are ALL on one source, which is
+/// what the verdict claim below turns on.
+fn preflight_state_with_members(
+    cache: StateCache,
+    radiator_members: Vec<String>,
+    auxiliary_members: Vec<String>,
+) -> (Arc<AppState>, CoolingDeviceConfig, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let pwm = dir.path().join("pwm5");
+    let enable = dir.path().join("pwm5_enable");
+    std::fs::write(&pwm, "115\n").unwrap();
+    std::fs::write(&enable, "1\n").unwrap();
+
+    let header = control_ofc_daemon::hwmon::pwm_discovery::PwmHeaderDescriptor {
+        id: TARGET.into(),
+        label: "AIO_PUMP".into(),
+        chip_name: "it8696".into(),
+        device_id: "isa-0a40".into(),
+        pwm_index: 5,
+        supports_enable: true,
+        pwm_path: pwm.display().to_string(),
+        enable_path: Some(enable.display().to_string()),
+        rpm_available: false,
+        rpm_path: None,
+        min_pwm_percent: 0,
+        max_pwm_percent: 100,
+        is_writable: true,
+        pwm_mode: None,
+        is_aio: true,
+        role: HeaderRole::Pump,
+        role_source: RoleSource::Label,
+        ..Default::default()
+    };
+
+    let device = CoolingDeviceConfig {
+        id: "aio0".into(),
+        name: "Test AIO".into(),
+        kind: "aio".into(),
+        pump_member: Some(TARGET.into()),
+        radiator_members,
+        auxiliary_members,
+        ..Default::default()
+    };
+
+    let cache = Arc::new(cache);
+    let ctrl = control_ofc_daemon::hwmon::pwm_control::HwmonPwmController::new(
+        vec![header],
+        control_ofc_daemon::hwmon::lease::LeaseManager::new(),
+        Box::new(RefusingWriter),
+        cache.clone(),
+    );
+    let readiness_rollup = Arc::new(parking_lot::Mutex::new(None));
+    let state = Arc::new(AppState {
+        cache,
+        staleness_config: control_ofc_daemon::health::staleness::StalenessConfig::default(),
+        daemon_version: "0.0.0-test".into(),
+        fan_controller: Arc::new(parking_lot::RwLock::new(None)),
+        openfan_runtime: control_ofc_daemon::api::handlers::OpenFanRuntime {
+            timeout: Duration::from_millis(500),
+            interval: Duration::from_millis(1000),
+            shutdown: tokio::sync::watch::channel(false).1,
+        },
+        hwmon_controller: Some(Arc::new(parking_lot::Mutex::new(ctrl))),
+        start_time: Instant::now(),
+        history: Arc::new(control_ofc_daemon::health::history::HistoryRing::new(250)),
+        active_profile: Arc::new(parking_lot::Mutex::new(None)),
+        calibrating: AtomicBool::new(false),
+        characterization: Arc::new(parking_lot::Mutex::new(None)),
+        validation: Arc::new(Default::default()),
+        characterization_cancel: Arc::new(AtomicBool::new(false)),
+        control_path: Arc::new(parking_lot::Mutex::new(None)),
+        control_path_cancel: Arc::new(AtomicBool::new(false)),
+        control_paths: Arc::new(parking_lot::RwLock::new(Default::default())),
+        pwm_baselines: Default::default(),
+        openfan_rescanning: AtomicBool::new(false),
+        last_openfan_rescan: Arc::new(parking_lot::Mutex::new(None)),
+        adopted_poll_handles: Arc::new(parking_lot::Mutex::new(Vec::new())),
+        amd_gpus: Vec::new(),
+        intel_gpus: Vec::new(),
+        nvidia_gpus: Vec::new(),
+        profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
+        config_path: String::new(),
+        runtime_config_path: Default::default(),
+        sensor_rescan_requested: Arc::new(AtomicBool::new(false)),
+        header_roles: Arc::new(parking_lot::RwLock::new(Arc::new(Default::default()))),
+        cooling_devices: Arc::new(parking_lot::RwLock::new(Arc::new(vec![device.clone()]))),
+        override_table: Arc::new(parking_lot::Mutex::new(
+            control_ofc_daemon::control_override::OverrideTable::new(),
+        )),
+        allow_port_probe: false,
+        running_config: Default::default(),
+        readiness_rollup: readiness_rollup.clone(),
+        config_write: Default::default(),
+        runtime_config_degraded: Default::default(),
+        assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
+            readiness_rollup,
+        )),
+    });
+    (state, device, dir)
+}
+
+/// Both radiator siblings, spinning, in the two different caches that hold them.
+fn seed_spinning_siblings(state: &AppState) {
+    state.cache.update_hwmon_fans(vec![HwmonFanState {
+        id: HWMON_SIBLING.into(),
+        rpm: Some(1400),
+        last_commanded_pwm: Some(55),
+        pwm_readback_pct: Some(55),
+        pwm_commanded_pct: None,
+        updated_at: Instant::now(),
+        alarm: None,
+        pwm_enable_mode: Some(1),
+    }]);
+    state.cache.update_openfan_fans(vec![OpenFanState {
+        channel: OPENFAN_SIBLING_CH,
+        rpm: 1500,
+        last_commanded_pwm: Some(140),
+        updated_at: Instant::now(),
+        rpm_polled: true,
+    }]);
+}
+
+/// Drive the real route handler and deserialise the report it published.
+async fn run_preflight(state: &Arc<AppState>, diagnostic: &str) -> pf::PreflightReport {
+    let mut params = std::collections::HashMap::new();
+    params.insert("header".to_string(), TARGET.to_string());
+    params.insert("diagnostic".to_string(), diagnostic.to_string());
+    let (status, body) = control_ofc_daemon::api::handlers::discovery::preflight_handler(
+        axum::extract::State(state.clone()),
+        axum::extract::Query(params),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{:?}", body.0);
+    serde_json::from_value(body.0).expect("the handler must publish a PreflightReport")
+}
+
+/// `P8-t`: every sibling source is observed, not only the hwmon one.
+///
+/// The canonical AIO on this project's own reference hardware puts the pump on a
+/// motherboard header and the radiator fans on an OpenFan controller. The live
+/// mapping resolved every sibling through `hwmon_fans` alone, so the OpenFan
+/// radiator fan fell through to "unknown" — and with one hwmon sibling stopped
+/// or absent the whole check reported "No sibling member's state could be read"
+/// while `/poll` was publishing that fan's RPM in the same second.
+///
+/// The assertions are RELATIONSHIPS, not counts: `running == siblings` and
+/// `unknown == 0` hold for any topology, where "2 of 2" would be satisfied by a
+/// mapping that happened to find two of something else. The **preconditions**
+/// are what make the test able to fail at all — without them it passes on a
+/// fixture whose siblings all live in `hwmon_fans`, which is the very case the
+/// old code got right.
+#[tokio::test]
+async fn every_sibling_source_is_observed_not_just_hwmon() {
+    let (state, device, _tmp) = preflight_state(cache_at(45.0, Some("normal")));
+    seed_spinning_siblings(&state);
+
+    // Preconditions. The fixture must genuinely straddle two caches, or this
+    // test cannot detect the defect it exists for.
+    let snap = state.cache.snapshot();
+    assert!(
+        snap.hwmon_fans.contains_key(HWMON_SIBLING),
+        "the hwmon sibling must be in `hwmon_fans`"
+    );
+    assert!(
+        !snap.hwmon_fans.contains_key(OPENFAN_SIBLING),
+        "the OpenFan sibling must NOT be in `hwmon_fans` — that is the whole point"
+    );
+    assert!(
+        snap.openfan_fans.contains_key(&OPENFAN_SIBLING_CH),
+        "the OpenFan sibling must be in `openfan_fans`"
+    );
+
+    let r = run_preflight(&state, "control_path_discovery").await;
+    let c = check(&r, pf::CHECK_SUPPORTING);
+
+    // The realised artefact: the published check, not a re-derivation of the
+    // rule that produced it.
+    let siblings = device.all_members().len() - 1;
+    assert_eq!(
+        c.state,
+        pf::CHECK_PASS,
+        "every sibling is spinning, so the check must pass: {}",
+        c.detail
+    );
+    assert!(
+        c.detail.contains(&format!("{siblings} of {siblings}")),
+        "all {siblings} siblings must be counted as running, got: {}",
+        c.detail
+    );
+    assert_eq!(r.verdict, pf::VERDICT_READY, "{:?}", r.checks);
+}
+
+/// The opposite branch, so a stuck predicate cannot pass both.
+///
+/// With the same topology and the OpenFan channel *stopped*, the check must warn
+/// rather than pass — and must NOT report the sibling as unreadable, because it
+/// was read: it read zero. "Not moving" and "cannot tell" are different reports.
+#[tokio::test]
+async fn a_stopped_openfan_sibling_warns_rather_than_reading_as_unknown() {
+    let (state, _device, _tmp) = preflight_state(cache_at(45.0, Some("normal")));
+    state.cache.update_hwmon_fans(vec![HwmonFanState {
+        id: HWMON_SIBLING.into(),
+        rpm: Some(0),
+        last_commanded_pwm: Some(0),
+        pwm_readback_pct: Some(0),
+        pwm_commanded_pct: None,
+        updated_at: Instant::now(),
+        alarm: None,
+        pwm_enable_mode: Some(1),
+    }]);
+    state.cache.update_openfan_fans(vec![OpenFanState {
+        channel: OPENFAN_SIBLING_CH,
+        rpm: 0,
+        last_commanded_pwm: Some(0),
+        updated_at: Instant::now(),
+        rpm_polled: true,
+    }]);
+
+    let r = run_preflight(&state, "control_path_discovery").await;
+    let c = check(&r, pf::CHECK_SUPPORTING);
+    assert_eq!(
+        c.state,
+        pf::CHECK_WARN,
+        "both siblings read as stopped, which warns: {}",
+        c.detail
+    );
+    assert!(
+        c.detail.contains("0 of 2 unreadable"),
+        "a sibling that read zero is stopped, not unreadable: {}",
+        c.detail
+    );
+}
+
+/// `OpenFanState::rpm` is a plain `u16`, so a channel with no reading is not
+/// representable in the value — `rpm_polled` carries it, and it is load-bearing:
+/// `force_all_with_floor` mints an entry for every channel during a thermal
+/// emergency, whether or not the firmware reports it. Reading such an entry as a
+/// confident 0 RPM would report a *stopped radiator fan* during the very
+/// emergency that created the entry.
+///
+/// **Both arms of `rpm_polled`, deliberately.** The unpolled arm alone passes
+/// with the whole OpenFan lookup deleted — an unresolvable member is `unknown`
+/// either way, so it cannot tell the fix from its absence. The polled-at-zero
+/// arm is the one that discriminates: only a mapping that actually reached
+/// `openfan_fans` can report that channel as *read and stopped* rather than
+/// unreadable. Found by running the fix-out-must-fail check, not by reading the
+/// test.
+///
+/// The hwmon sibling is left out of the cache in both arms, so the OpenFan
+/// channel is the only evidence either way.
+#[tokio::test]
+async fn an_unpolled_openfan_channel_is_unknown_rather_than_stopped() {
+    // Arm 1 — polled, and reading zero. Read, and stopped: one sibling
+    // unreadable (the absent hwmon one), not two.
+    let (state, _device, _tmp) = preflight_state(cache_at(45.0, Some("normal")));
+    state.cache.update_openfan_fans(vec![OpenFanState {
+        channel: OPENFAN_SIBLING_CH,
+        rpm: 0,
+        last_commanded_pwm: Some(0),
+        updated_at: Instant::now(),
+        rpm_polled: true,
+    }]);
+    let r = run_preflight(&state, "control_path_discovery").await;
+    let c = check(&r, pf::CHECK_SUPPORTING);
+    assert_eq!(
+        c.state,
+        pf::CHECK_WARN,
+        "a channel read at zero is stopped, so not every sibling is unreadable: {}",
+        c.detail
+    );
+    assert!(
+        c.detail.contains("1 of 2 unreadable"),
+        "only the absent hwmon sibling is unreadable: {}",
+        c.detail
+    );
+
+    // Arm 2 — the shape `force_all_with_floor` leaves behind: an entry that no
+    // poll has ever confirmed. Now genuinely unread, so BOTH siblings are.
+    let (state, _device, _tmp) = preflight_state(cache_at(45.0, Some("normal")));
+    state.cache.update_openfan_fans(vec![OpenFanState {
+        channel: OPENFAN_SIBLING_CH,
+        rpm: 0,
+        last_commanded_pwm: Some(255),
+        updated_at: Instant::now(),
+        rpm_polled: false,
+    }]);
+    let r = run_preflight(&state, "control_path_discovery").await;
+    let c = check(&r, pf::CHECK_SUPPORTING);
+    assert_eq!(
+        c.state,
+        pf::CHECK_UNKNOWN,
+        "an unpolled channel is unread, never a confident zero: {}",
+        c.detail
+    );
+}
+
+/// The third source. A GPU fan is not a plausible radiator member — the
+/// cooling-device validator rejects one wherever hwmon has been discovered — but
+/// a member the daemon CAN resolve must never be published as unreadable, and
+/// that rule is about the member, not about GPUs.
+#[tokio::test]
+async fn a_gpu_sibling_is_resolved_through_the_gpu_cache() {
+    const GPU: &str = "amd_gpu:0000:03:00.0";
+    let (state, device, _tmp) =
+        preflight_state_with_aux(cache_at(45.0, Some("normal")), vec![GPU.into()]);
+    seed_spinning_siblings(&state);
+    state.cache.update_gpu_fans(vec![AmdGpuFanState {
+        id: GPU.into(),
+        rpm: Some(900),
+        last_commanded_pct: None,
+        duty_pct: None,
+        updated_at: Instant::now(),
+    }]);
+
+    let snap = state.cache.snapshot();
+    assert!(
+        !snap.hwmon_fans.contains_key(GPU) && snap.gpu_fans.contains_key(GPU),
+        "precondition: the GPU sibling lives only in `gpu_fans`"
+    );
+
+    let siblings = device.all_members().len() - 1;
+    let r = run_preflight(&state, "control_path_discovery").await;
+    let c = check(&r, pf::CHECK_SUPPORTING);
+    assert!(
+        c.detail.contains(&format!("{siblings} of {siblings}")),
+        "all three sources must resolve: {}",
+        c.detail
+    );
+}
+
+/// `P8-ab`: the [SAFETY] pump-protection mapping, asserted as a relationship.
+///
+/// A literal `30` would be satisfied by a call site that hardcodes 30; a literal
+/// `true` for pump-protection would be satisfied by a call site reading the wire
+/// `role` instead of the union predicate (DEC-312). So the fixture is a header
+/// the hardware labels `AIO_PUMP` and the assertion is against the floor the
+/// daemon's own policy resolves.
+#[tokio::test]
+async fn the_call_site_maps_pump_protection_and_its_floor() {
+    let (state, _device, _tmp) = preflight_state(cache_at(45.0, Some("normal")));
+    seed_spinning_siblings(&state);
+    let r = run_preflight(&state, "control_path_discovery").await;
+
+    let role = check(&r, pf::CHECK_ROLE);
+    assert!(
+        role.detail.contains("pump-protected")
+            && !role.detail.contains("not pump-protected")
+            && role.detail.contains(&format!("{}%", pump_floor())),
+        "the live mapping must reach `header_is_pump_protected` and its floor: {}",
+        role.detail
+    );
+
+    // And the clamp the sweep will actually use, which is the max of the two.
+    let floor = pump_floor().max(constants::DISCOVERY_MIN_PCT);
+    assert!(
+        check(&r, pf::CHECK_SAFE_MINIMUM)
+            .detail
+            .contains(&format!("{floor}%")),
+        "{:?}",
+        check(&r, pf::CHECK_SAFE_MINIMUM).detail
+    );
+
+    // The readback comes from the header's real `pwmN` file — 115/255 = 45%.
+    assert_eq!(check(&r, pf::CHECK_READBACK).state, pf::CHECK_PASS);
+    assert_eq!(check(&r, pf::CHECK_TARGET).state, pf::CHECK_PASS);
+    assert_eq!(check(&r, pf::CHECK_WRITABLE).state, pf::CHECK_PASS);
+}
+
+/// `P8-ab`: the [SAFETY] thermal mapping. A cache over the calibration ceiling
+/// must reach `too_hot` through the live gather, not merely through a
+/// hand-built input.
+#[tokio::test]
+async fn a_hot_cache_blocks_through_the_call_site() {
+    let hot = constants::CALIBRATION_MAX_TEMP_C + 5.0;
+    let (state, _device, _tmp) = preflight_state(cache_at(hot, Some("emergency")));
+    seed_spinning_siblings(&state);
+    let r = run_preflight(&state, "control_path_discovery").await;
+
+    assert_eq!(r.verdict, pf::VERDICT_BLOCKED, "{:?}", r.checks);
+    assert_eq!(check(&r, pf::CHECK_THERMAL).state, pf::CHECK_FAIL);
+    assert!(
+        r.blocking.iter().any(|b| b == pf::CHECK_THERMAL),
+        "the thermal check must be named as blocking: {:?}",
+        r.blocking
+    );
+}
+
+/// `P8-ab`: the [SAFETY] staleness selection — the DEC-336 rule whose call site
+/// was the reason `P8-p` shipped unevaluated for two releases.
+///
+/// Aged by construction, never by waiting: `Instant` does not advance under a
+/// paused runtime, so a sleeping test would age by ~0 ms and pass vacuously.
+#[tokio::test]
+async fn a_stale_cache_blocks_discovery_through_the_call_site() {
+    let stale = constants::DIAGNOSTIC_TEMP_MAX_AGE + Duration::from_secs(5);
+    let (state, _device, _tmp) = preflight_state(cache_aged(45.0, stale));
+    seed_spinning_siblings(&state);
+    let r = run_preflight(&state, "control_path_discovery").await;
+
+    assert_eq!(check(&r, pf::CHECK_TEMPERATURE).state, pf::CHECK_FAIL);
+    assert_eq!(r.verdict, pf::VERDICT_BLOCKED, "{:?}", r.checks);
+
+    // The other half of the DEC-336 asymmetry: the same stale cache does NOT
+    // block verify, which has shipped without a staleness gate since 2.32.0.
+    // Asserting only the FAIL above would pass with the diagnostic discriminator
+    // deleted and every diagnostic blocked.
+    let verify = run_preflight(&state, "pwm_verify").await;
+    assert_eq!(check(&verify, pf::CHECK_TEMPERATURE).state, pf::CHECK_WARN);
+    assert_ne!(verify.verdict, pf::VERDICT_BLOCKED, "{:?}", verify.checks);
+}
+
+/// `P8-ab`: the single-flight slot, read live rather than passed in.
+#[tokio::test]
+async fn a_claimed_verify_slot_blocks_through_the_call_site() {
+    let (state, _device, _tmp) = preflight_state(cache_at(45.0, Some("normal")));
+    seed_spinning_siblings(&state);
+
+    assert_eq!(
+        check(
+            &run_preflight(&state, "control_path_discovery").await,
+            pf::CHECK_OWNERSHIP
+        )
+        .state,
+        pf::CHECK_PASS,
+        "precondition: the slot starts free"
+    );
+
+    let _epoch = state
+        .cache
+        .try_begin_verify(Duration::from_secs(30))
+        .expect("the slot must be claimable");
+
+    let r = run_preflight(&state, "control_path_discovery").await;
+    assert_eq!(check(&r, pf::CHECK_OWNERSHIP).state, pf::CHECK_FAIL);
+    assert_eq!(r.verdict, pf::VERDICT_BLOCKED, "{:?}", r.checks);
+}
+
+/// The pure rule the three source arms share, as a truth table.
+///
+/// The tach wins wherever it exists — a header reporting 0 RPM is stopped even
+/// at a non-zero readback, because a commanded fan that is not turning is the
+/// case the operator most needs told.
+#[test]
+fn classify_sibling_truth_table() {
+    use pf::SiblingObservation::*;
+    assert_eq!(pf::classify_sibling(Some(1400), None), Running);
+    assert_eq!(pf::classify_sibling(Some(1400), Some(0)), Running);
+    assert_eq!(pf::classify_sibling(Some(0), Some(80)), Stopped);
+    assert_eq!(pf::classify_sibling(Some(0), None), Stopped);
+    assert_eq!(pf::classify_sibling(None, Some(80)), Running);
+    assert_eq!(pf::classify_sibling(None, Some(0)), Stopped);
+    assert_eq!(pf::classify_sibling(None, None), Unknown);
+}
+
+// ── §6.3: the boot PRUNE wiring (register row `P8-ac`) ───────────────
+
+/// Drop comment lines before scanning source.
+///
+/// **Defensive, not currently load-bearing — measured, not assumed.** None of
+/// the five tokens below appears in a `main.rs` comment today, so the scan would
+/// discriminate without this. It is kept because the failure it prevents is
+/// silent and the cost is nothing: `main.rs` describes both prune blocks in
+/// prose immediately above them, and a future edit that names a symbol in that
+/// prose would leave the guard green with the code deleted. That is the
+/// recorded `polling.rs` trap — a source-scanning guard matching its own
+/// explanation — and matching the existing pattern in `validation_phase5.rs`
+/// costs less than rediscovering it.
+fn strip_comments(src: &str) -> String {
+    src.lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !t.starts_with("//") && !t.starts_with("*") && !t.starts_with("/*")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `P8-ac`: both persisted stores are pruned to live headers **at boot**.
+///
+/// Each store's `prune_to_live` is unit-tested; neither call site was. Delete
+/// either block from `main.rs` and every one of those unit tests stays green
+/// while a stale PWM→tach control path or learned baseline survives a board or
+/// driver change — defeating the "structural, not a policy anyone has to
+/// remember" invalidation the adjacent comment claims, because the invalidation
+/// is only structural if something actually runs it.
+///
+/// **Honest limit:** this is a source scan, so it proves the call is written,
+/// not that it runs. That is the weaker of the two claims, and it is the one
+/// that was missing — the prune functions' own behaviour is already covered by
+/// `pwm_baselines` and `control_paths` unit tests. Extracting the two boot
+/// blocks into testable functions is the stronger fix and is deliberately not
+/// taken here: it restructures the boot sequence, which is a much wider blast
+/// radius than the gap being closed.
+#[test]
+fn both_persisted_stores_are_pruned_to_live_headers_at_boot() {
+    let main_body = strip_comments(include_str!("../src/main.rs"));
+
+    // The control-path store (§6.3). Pruned, and the pruned copy written back —
+    // an in-memory prune alone would let the stale record return on the next
+    // boot, which is the failure this store's id-keying exists to prevent.
+    assert!(
+        main_body.contains("discovery::prune_store_to_live"),
+        "boot must prune the control-path store to live headers"
+    );
+    assert!(
+        main_body.contains("control_paths::save_to"),
+        "boot must write the pruned control-path store back"
+    );
+
+    // The learned-response store (DEC-334 §6), pruned by the same rule.
+    assert!(
+        main_body.contains("prune_to_live"),
+        "boot must prune the PWM baseline store to live headers"
+    );
+    assert!(
+        main_body.contains("pwm_baselines::save_to"),
+        "boot must write the pruned PWM baseline store back"
+    );
+
+    // Both prunes must be keyed on the ids discovery actually returned. A prune
+    // against an empty or unrelated list either drops everything or nothing, and
+    // both are silent.
+    assert!(
+        main_body.contains("hwmon_headers_for_poll"),
+        "the live-id list must come from hwmon discovery"
+    );
+}
+
+/// The user-visible verdict consequence, pinned rather than left in the CHANGELOG.
+///
+/// `verdict_for` warns on any `warn` row and **ignores `unknown` ones**. So for a
+/// cooler whose siblings are ALL on OpenFan and all currently stopped — zero-RPM
+/// mode, which is normal below a temperature threshold — making this row honest
+/// also moves the verdict `ready` → `warn`: before, every sibling was unreadable
+/// and the report said nothing; now they are read, found stopped, and the report
+/// says so. It is the same verdict a motherboard-header cooler has always
+/// produced in that state.
+///
+/// **All-OpenFan is load-bearing, and a mixed-source fixture cannot show this.**
+/// With even one hwmon sibling the row warns either way — the hwmon fan is read
+/// at 0 RPM, so `siblings_unknown != siblings` and the check never reaches the
+/// `unknown` branch. That is why the assertion lives in its own test with its own
+/// topology instead of riding along on the mixed one, where it would have been
+/// true but unable to fail. Found by running the closure check.
+#[tokio::test]
+async fn an_all_openfan_cooler_at_rest_warns_where_it_used_to_say_nothing() {
+    const OPENFAN_SIBLING_B: &str = "openfan:ch04";
+    const OPENFAN_SIBLING_B_CH: u8 = 4;
+
+    let (state, device, _tmp) = preflight_state_with_members(
+        cache_at(45.0, Some("normal")),
+        vec![OPENFAN_SIBLING.into(), OPENFAN_SIBLING_B.into()],
+        Vec::new(),
+    );
+    for ch in [OPENFAN_SIBLING_CH, OPENFAN_SIBLING_B_CH] {
+        state.cache.update_openfan_fans(vec![OpenFanState {
+            channel: ch,
+            rpm: 0,
+            last_commanded_pwm: Some(0),
+            updated_at: Instant::now(),
+            rpm_polled: true,
+        }]);
+    }
+
+    // Precondition: NO sibling is resolvable through `hwmon_fans`, or the
+    // `unknown` branch is unreachable and this test asserts nothing.
+    let snap = state.cache.snapshot();
+    for m in device.all_members() {
+        if m == TARGET {
+            continue;
+        }
+        assert!(
+            !snap.hwmon_fans.contains_key(m),
+            "every sibling must be off-hwmon for this topology: {m}"
+        );
+    }
+
+    let r = run_preflight(&state, "control_path_discovery").await;
+    assert_eq!(
+        check(&r, pf::CHECK_SUPPORTING).state,
+        pf::CHECK_WARN,
+        "{:?}",
+        r.checks
+    );
+    assert_eq!(
+        r.verdict,
+        pf::VERDICT_WARN,
+        "a cooler at rest must warn, not read as ready: {:?}",
+        r.checks
+    );
+    // And the half that must NOT change: warning is not blocking.
+    assert!(
+        r.blocking.is_empty(),
+        "supporting cooling must never block: {:?}",
+        r.blocking
+    );
+}

@@ -187,20 +187,13 @@ fn supporting_cooling(state: &Arc<AppState>, header_id: &str) -> pf::SupportingC
     let mut running = 0usize;
     let mut unknown = 0usize;
     for member in &siblings {
-        match snap.hwmon_fans.get(member) {
-            // "Observably moving": a non-zero tach, or a non-zero readback where
-            // the header reports no tach at all. A zero readback with no tach is
-            // NOT counted as running — that is the case the operator needs told.
-            Some(f) => {
-                let moving = f.rpm.is_some_and(|r| r > 0)
-                    || (f.rpm.is_none() && f.pwm_readback_pct.is_some_and(|p| p > 0));
-                if moving {
-                    running += 1;
-                } else if f.rpm.is_none() && f.pwm_readback_pct.is_none() {
-                    unknown += 1;
-                }
-            }
-            None => unknown += 1,
+        match observe_sibling(&snap, member) {
+            pf::SiblingObservation::Running => running += 1,
+            pf::SiblingObservation::Unknown => unknown += 1,
+            // Read, and not moving. Counted as neither — the report distinguishes
+            // "nothing is running" from "nothing could be read", and this is the
+            // first of those.
+            pf::SiblingObservation::Stopped => {}
         }
     }
 
@@ -211,6 +204,64 @@ fn supporting_cooling(state: &Arc<AppState>, header_id: &str) -> pf::SupportingC
         siblings_running: running,
         siblings_unknown: unknown,
     }
+}
+
+/// The OpenFan channel a member id names, or `None` if it names anything else.
+///
+/// The id shape is `openfan:ch{NN}` and the cache is keyed by the bare channel,
+/// so a member cannot be looked up without this transform — which is the whole
+/// reason `supporting_cooling` used to miss every OpenFan sibling. Mirrors the
+/// parse already in `profile_engine::backends`, and the prefix test already in
+/// `cooling_device::unknown_member`; that the mapping has no single producer is
+/// recorded as its own register row rather than centralised from here, because
+/// re-pointing the engine's copy would drag the single-writer path into this
+/// diff.
+fn openfan_channel_of(member_id: &str) -> Option<u8> {
+    member_id.strip_prefix("openfan:ch")?.parse::<u8>().ok()
+}
+
+/// Observe one sibling member, in whichever cache holds its source.
+///
+/// **Every source, not just hwmon** (register row `P8-t`). This resolved members
+/// through `hwmon_fans` alone, so on an AIO whose radiator fans hang off an
+/// OpenFan controller — the project's canonical configuration — every sibling
+/// fell through to "unknown" and the preflight reported "No sibling member's
+/// state could be read" while `/poll` was concurrently publishing their RPM.
+/// Stating an absence of evidence the daemon actually holds is worse than
+/// saying nothing, because the operator reads it as a fault in the cooling.
+///
+/// Each arm passes the source's **measured** pair to [`pf::classify_sibling`],
+/// never a commanded one — see that function's safety note.
+fn observe_sibling(
+    snap: &crate::health::state::DaemonState,
+    member: &str,
+) -> pf::SiblingObservation {
+    if let Some(channel) = openfan_channel_of(member) {
+        // `OpenFanState::rpm` is a plain `u16`, so "no reading" is not
+        // representable in the value — `rpm_polled` is what carries it, and it is
+        // load-bearing here: `force_all_with_floor` mints an entry for every
+        // channel the firmware does not report, which would otherwise read as a
+        // confident 0 RPM. The controller publishes no duty readback at all
+        // (`last_commanded_pwm` is the daemon's own command), so there is no
+        // second reading to fall back on.
+        return match snap.openfan_fans.get(&channel) {
+            Some(f) if f.rpm_polled => pf::classify_sibling(Some(f.rpm), None),
+            _ => pf::SiblingObservation::Unknown,
+        };
+    }
+    if let Some(f) = snap.hwmon_fans.get(member) {
+        return pf::classify_sibling(f.rpm, f.pwm_readback_pct);
+    }
+    // Looked up by id rather than by prefix, so this covers every vendor's
+    // `<vendor>_gpu:<bdf>` without a list of prefixes to keep in step. A GPU fan
+    // is not a plausible AIO member — `cooling_device::unknown_member` rejects
+    // one wherever hwmon has been discovered at all — but a member that IS
+    // resolvable should never be reported unreadable, which is this row's rule
+    // rather than a claim about GPUs.
+    if let Some(g) = snap.gpu_fans.get(member) {
+        return pf::classify_sibling(g.rpm, g.duty_pct);
+    }
+    pf::SiblingObservation::Unknown
 }
 
 // ── POST /hwmon/{header_id}/discover-control-path ────────────────────

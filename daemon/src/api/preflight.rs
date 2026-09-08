@@ -222,11 +222,67 @@ pub struct SupportingCooling {
     pub device_id: Option<String>,
     /// Sibling members of the same cooling device, excluding this header.
     pub siblings: usize,
-    /// Siblings observably moving air or coolant — a non-zero tach, or a
-    /// non-zero PWM readback where no tach exists.
+    /// Siblings observably moving air or coolant. The rule is
+    /// [`classify_sibling`] and is stated only there — every source resolves
+    /// through it, so "observably moving" cannot come to mean three things.
     pub siblings_running: usize,
-    /// Siblings whose state could not be read at all.
+    /// Siblings whose state could not be read at all. Distinct from *read, and
+    /// not moving*, which counts towards neither total.
     pub siblings_unknown: usize,
+}
+
+/// What one sibling member of a cooling device is observably doing.
+///
+/// Three states, not two. "Not moving" and "cannot tell" are different reports
+/// to an operator — one is a warning about the cooling, the other an admission
+/// about the telemetry — and collapsing them is exactly the defect this type
+/// exists to make hard to reintroduce (register row `P8-t`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SiblingObservation {
+    /// A non-zero tach, or a non-zero duty readback where the source has no tach.
+    Running,
+    /// Read successfully, and not moving.
+    Stopped,
+    /// Neither a tach nor a duty readback could be obtained.
+    Unknown,
+}
+
+/// Classify one sibling from the two readings any fan source can offer: a tach
+/// and a duty **readback**.
+///
+/// Pure, and shared by all three sources, so "observably moving" means one thing
+/// across hwmon, OpenFan and GPU rather than three things that drifted. The
+/// caller owns the source-specific question of *which* fields carry those two
+/// readings; this owns what the pair means.
+///
+/// [SAFETY-adjacent] `duty_readback_pct` must be a **measured** duty, never a
+/// commanded one (`CLAUDE.md`: "`rpm` is hardware-measured; `last_commanded_pwm`
+/// is daemon-tracked — never conflate"). A commanded duty says what the daemon
+/// asked for, which is precisely the claim this check exists to avoid making on
+/// the operator's behalf: the check is asked whether the cooling is *running*,
+/// not whether it was *told to*.
+///
+/// The tach wins wherever it exists: a header reporting 0 RPM is `Stopped` even
+/// at a non-zero readback, because a commanded fan that is not turning is the
+/// case the operator most needs told.
+pub fn classify_sibling(rpm: Option<u16>, duty_readback_pct: Option<u8>) -> SiblingObservation {
+    match (rpm, duty_readback_pct) {
+        (Some(r), _) => {
+            if r > 0 {
+                SiblingObservation::Running
+            } else {
+                SiblingObservation::Stopped
+            }
+        }
+        (None, Some(p)) => {
+            if p > 0 {
+                SiblingObservation::Running
+            } else {
+                SiblingObservation::Stopped
+            }
+        }
+        (None, None) => SiblingObservation::Unknown,
+    }
 }
 
 /// Everything [`build_report`] needs. Gathered by the handler; plain data so the

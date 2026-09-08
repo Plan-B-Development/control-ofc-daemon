@@ -1,5 +1,59 @@
 # Changelog
 
+## [2.43.2] — 2026-09-08
+
+**The safety preflight now reads every fan source, not just the motherboard's
+(DEC-340, register row `P8-t`).** No wire shape, capability or error code
+changes, and no GUI release is required — the same `supporting_cooling` check,
+in the same place, simply stops claiming it could not read siblings it can.
+
+*Why this is a patch:* the report's shape, its check ids and its five state
+tokens are unchanged, and no verdict that was `blocked` becomes runnable —
+`supporting_cooling` has never blocked anything and still cannot. What moves is
+the truth of one advisory row.
+
+**One preflight you have seen before may now read `warn` where it read `ready`,
+and that is the fix working.** A verdict is `warn` if any row warns, and
+`unknown` rows do not warn — so a cooler whose radiator fans are all on OpenFan
+and all currently stopped (zero-RPM mode is normal below a temperature
+threshold) used to produce "state could not be read", which is silent, and now
+produces "no sibling member is observably running", which is not. It is the same
+report a motherboard-header cooler has always given in that state; the two
+merely disagreed because one of them could not see its own fans. **It still does
+not block** — Start stays enabled and nothing new is refused.
+
+### Fixed
+- **"No sibling member's state could be read" on an AIO whose radiator fans are
+  on an OpenFan controller.** The preflight resolved every cooling-device member
+  through the hwmon fan cache alone, so on the canonical configuration — pump on
+  a motherboard header, radiator fans on OpenFan — every sibling fell through to
+  *unreadable*, and the check reported an absence of evidence the daemon was
+  publishing on `/poll` in the same second. An operator reads that as a fault in
+  their cooling. Members are now resolved against the source that owns them:
+  OpenFan channels through the OpenFan cache, GPU fans through the GPU cache,
+  everything else through hwmon as before.
+- **An OpenFan channel that no poll has confirmed now reports as *unread*, not as
+  a confident 0 RPM.** The thermal emergency's `force_all_with_floor` mints a
+  cache entry for every channel whether or not the firmware reports it, so
+  trusting the value would have reported a stopped radiator fan during the very
+  emergency that created the entry.
+
+### Internal
+- The "observably moving" rule is now one pure function, `preflight::classify_sibling`,
+  shared by all three sources rather than restated per source. It takes a
+  **measured** duty readback and never a commanded one — for OpenFan, which
+  publishes no readback at all, the tach is the only evidence and the absence of
+  one is reported as such.
+- **Test: the preflight's call site is now covered** (`P8-ab`). Every existing
+  preflight test drove the pure `build_report` against hand-built inputs, leaving
+  ~90 lines of live-state mapping — the `[SAFETY]` staleness selection, the
+  thermal gates, pump protection, the single-flight slot and this defect —
+  executed by nothing. Nine tests now drive `preflight_handler` against a real
+  `AppState`, and the writer they are given panics if the preflight ever writes.
+- **Test: both persisted stores' boot prune is now pinned** (`P8-ac`). Deleting
+  either block from `main.rs` previously left the whole suite green while a stale
+  PWM→tach control path or learned baseline survived a board or driver change.
+
 ## [2.43.1] — 2026-09-07
 
 **A control-path discovery run now re-checks thermal safety before every write it
