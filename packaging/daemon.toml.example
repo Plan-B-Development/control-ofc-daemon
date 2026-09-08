@@ -18,7 +18,7 @@
 #   [detection] enable_nvidia_telemetry  POST /config/nvidia-telemetry
 #
 # The API's bounds on the two interval keys are deliberately TIGHTER than what
-# this file accepts: they bound how stale a temperature the 105 C thermal rule
+# this file accepts: they bound how stale a temperature the thermal emergency
 # can act on, and the API is reachable by any local user while this file is not.
 #
 # If an edit here appears not to take effect, a runtime override is shadowing it:

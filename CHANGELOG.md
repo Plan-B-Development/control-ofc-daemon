@@ -63,6 +63,18 @@ The shared parser reports its two failure modes apart rather than as one
 `Option`, so the profile engine's distinct "malformed member_id" and
 "unparseable channel" warnings survive unchanged.
 
+**The shipped example config no longer calls it "the 105 C thermal rule"
+(register package `G32` — row `P8-ax`).** `packaging/daemon.toml.example` is
+installed as `/etc/control-ofc/daemon.toml`, so this is text an operator reads
+on their own machine. DEC-308 made the trip point per-machine — 105 °C is the
+floor and the fallback, raised to `min(CPU-reported ceiling + 5, 115)` where the
+kernel publishes one — and a name with the old constant baked into it is wrong
+on every machine that derives a different one. It now reads "the thermal
+emergency", with no figure at all: `emergency_threshold_c` on
+`/diagnostics/hardware` is the value to read, and DEC-292's lesson is that a
+threshold spelled into a *name* falsifies everywhere at once the moment the
+threshold moves.
+
 ## [2.43.5] — 2026-09-08
 
 **The active Super-I/O probe no longer writes the config-mode unlock its own
