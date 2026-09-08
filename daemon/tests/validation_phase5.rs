@@ -896,7 +896,9 @@ fn abandoning_a_run_cancels_it_rather_than_leaving_it_sweeping() {
 }
 
 /// `AUD3-n`. The session document is written with `write` + `fsync` + `rename` +
-/// a directory `fsync`, over up to ~5.7 MiB (`AUD3-i`). None of that belongs on
+/// a directory `fsync`, over a document `AUD3-i` measures at ~5.7 MiB for a
+/// realistic two-member session and `VALIDATION_MAX_SESSION_BYTES` bounds at
+/// 28 MiB. None of that belongs on
 /// the worker threads the 1 Hz profile engine — and therefore the thermal-safety
 /// decision — is scheduled on.
 ///

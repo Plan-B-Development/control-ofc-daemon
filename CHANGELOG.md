@@ -2,6 +2,36 @@
 
 ## [Unreleased]
 
+**In-code documentation: a retracted safety claim standing at three sites, a
+worst case that was really a typical case, and one new guard (DEC-347, register
+package `G31` — rows `P8-ao`, `P8-bt`, `P8-as`).** Comments and one test. No
+wire shape, capability, error code or runtime behaviour change.
+
+**"The recorder performs no sysfs I/O" was retracted by DEC-335 and still stood
+in three places.** `validation/recorder.rs` has documented the narrower
+invariant that actually holds since Batch 3a added power sampling — every read
+is read-only and none happens under the session slot guard — but the two safety
+arguments that *rest* on it (`main.rs`'s spawn site and the `AppState` field
+doc) and the prose in `daemon.md` still asserted the retracted form. All three
+now state the narrowed invariant and note that it only became true at `start`
+with DEC-342.
+
+**Six off-runtime comments called ~5.7 MiB an upper bound.** It is a realistic
+two-member session; the document is bounded by `VALIDATION_MAX_SESSION_BYTES` at
+28 MiB, and DEC-341 measured the worst case at 24,710,972 bytes. Each of the six
+now names the constant. The bare sweep over `daemon/src` **and** `daemon/tests`
+returns fifteen sites and all fifteen were read — the other nine already name the
+bounding constant or record a measured historical defect, and were deliberately
+left alone.
+
+**`GET /diagnostics/preflight` now has a test saying which status codes it may
+answer.** The GUI calls that route unconditionally and maps any `404` to "this
+daemon has no preflight", which is only sound because `preflight_handler` has no
+`404` branch of its own — a property that was argued in prose in two repos with
+nothing checking it. `the_preflight_handler_answers_only_200_or_400` asserts the
+set of status codes the handler writes, so a `404`, `409`, `410` or `503` added
+later fails with a message naming the GUI behaviour it would break.
+
 **Three diagnostics kept the wrong end of what they were bounding, and two watch
 loops leaked the run they were watching (DEC-344, register package `G26` — rows
 `P8-ap`, `P8-bk`, `P8-g`, `P8-an`).** Daemon-only. No wire shape, capability or

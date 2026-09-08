@@ -415,7 +415,9 @@ enum Finalise {
 /// `stop`/`cancel` summarise the session and then persist it, and that write is
 /// the expensive half of this request: `atomic_io::write_atomic` does `write` +
 /// `fsync` + `rename` + a directory `fsync` over a document `AUD3-i` measures at
-/// up to ~5.7 MiB. Running it inline blocked a tokio worker — the same runtime
+/// a document bounded by `VALIDATION_MAX_SESSION_BYTES` (28 MiB; ~5.7 MiB for a
+/// realistic two-member session). Running it inline blocked a tokio worker —
+/// the same runtime
 /// the 1 Hz profile engine, and therefore the thermal-safety decision, is
 /// scheduled on — while `prune_sessions_off_runtime()` on the very next line was
 /// already careful to go off-runtime for a strictly cheaper read.
@@ -639,9 +641,11 @@ pub async fn start_session_handler(
     let ctx = recorder_context(&state);
     // `AUD3-n`: off the async runtime. `start` writes the session document —
     // `write` + `fsync` + `rename` + a directory `fsync`, over a document
-    // `AUD3-i` measures at up to ~5.7 MiB — and blocks on the slot lock to do
-    // it, all on the worker thread the 1 Hz profile engine shares. Wrapping the
-    // whole call rather than only the write keeps `start`'s admit-only-if-
+    // `AUD3-i` measures at ~5.7 MiB for a realistic two-member session and
+    // `VALIDATION_MAX_SESSION_BYTES` bounds at 28 MiB — and blocks on the slot
+    // lock to do it, all on the worker thread the 1 Hz profile engine shares.
+    // Wrapping the whole call rather than only the write keeps
+    // `start`'s admit-only-if-
     // persisted rollback where it belongs, inside the engine.
     let started = {
         let engine = state.validation.clone();
@@ -1012,8 +1016,10 @@ fn spawn_orchestration(
         //
         // `AUD3-n`: finalising summarises and persists (`write` + `fsync` +
         // `rename` + a directory `fsync`, over a document `AUD3-i` measures at
-        // up to ~5.7 MiB) and blocks on the slot lock to do it — so it goes off
-        // the runtime the 1 Hz profile engine shares, exactly as the two
+        // ~5.7 MiB for a realistic two-member session, bounded at 28 MiB by
+        // `VALIDATION_MAX_SESSION_BYTES`) and blocks on the slot lock to do
+        // it — so it goes off the runtime the 1 Hz profile engine shares,
+        // exactly as the two
         // request handlers and the startup record do. A source-scanning guard
         // in `validation_phase5.rs` enforces this.
         if auto_stop && !*shutdown.borrow() {

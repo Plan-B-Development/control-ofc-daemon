@@ -1898,10 +1898,14 @@ async fn async_main() {
 
     // ── Spawn the validation recorder (AIO-MB Phase 5) ──────────────
     //
-    // Always alive, idle until a session records. A PURE OBSERVER: it reads the
-    // state cache the poll already fills and performs no sysfs I/O, so it cannot
-    // perturb a control decision and a fault in it cannot take down the sensor
-    // feed (§15).
+    // Always alive, idle until a session records. A PURE OBSERVER in the
+    // narrowed sense `validation/recorder.rs` documents: it reads the state
+    // cache the poll already fills, and the sysfs reads DEC-335 added for power
+    // sampling are read-only and taken outside the session slot guard — so it
+    // still cannot perturb a control decision, and a fault in it cannot take
+    // down the sensor feed (§15). "Performs no sysfs I/O" was the original claim
+    // and is retracted (`P8-ao`); the narrowed one only became true at `start`
+    // with DEC-342 (`P8-v`), which is why it is worth stating precisely.
     //
     // A plain `tokio::spawn`, NOT `spawn_supervised`: a dead recorder loses
     // evidence, which is not a reason to kill a daemon that is still controlling
@@ -1937,7 +1941,8 @@ async fn async_main() {
                         }
                         // `AUD3-n`: off the async runtime. One tick in 30 flushes
                         // the whole session document — `write` + `fsync` +
-                        // `rename` + a directory `fsync`, over up to ~5.7 MiB
+                        // `rename` + a directory `fsync`, over ~5.7 MiB for a
+                        // realistic two-member session (28 MiB bound)
                         // (`AUD3-i`) — and every tick can wait on the hwmon
                         // controller lock. Neither belongs on the worker threads
                         // the 1 Hz profile engine, and therefore the

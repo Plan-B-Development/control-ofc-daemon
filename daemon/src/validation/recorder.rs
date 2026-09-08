@@ -477,8 +477,10 @@ impl ValidationEngine {
         drop(slot);
 
         // After the guard, never under it: `persist` takes the save lock and
-        // writes a document that `AUD3-i` measures at up to ~5.7 MiB. A failure
-        // here is logged and not propagated — the operator's session started
+        // writes a document `AUD3-i` measures at ~5.7 MiB for a realistic
+        // two-member session, bounded at 28 MiB by
+        // `VALIDATION_MAX_SESSION_BYTES`. A failure here is logged and not
+        // propagated — the operator's session started
         // successfully, and failing their request because a superseded
         // background recording could not be filed would be the wrong trade.
         if let Some(old) = superseded {

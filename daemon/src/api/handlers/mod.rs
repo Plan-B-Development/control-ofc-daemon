@@ -310,9 +310,15 @@ pub struct AppState {
     /// The validation-session engine (AIO-MB Phase 5).
     ///
     /// Holds at most one session and derives its event timeline by diffing the
-    /// state cache. It is a **pure observer**: it performs no sysfs I/O, plants
-    /// no hooks in the engine or the write path, and contains no code that
-    /// commands a duty. Where a session runs a diagnostic it calls the existing
+    /// state cache. It is a **pure observer**, in the narrowed sense
+    /// `validation/recorder.rs` states at length: it plants no hooks in the
+    /// engine or the write path and contains no code that commands a duty, and
+    /// every sysfs read it does perform is **read-only and outside the session
+    /// slot guard**. The stronger "performs no sysfs I/O" was true until DEC-335
+    /// added power sampling and is retracted (`P8-ao`); the narrowed form was
+    /// itself untrue at `start` until DEC-342 (`P8-v`).
+    ///
+    /// Where a session runs a diagnostic it calls the existing
     /// verify/characterize handler, which already owns the lease, the pump floor
     /// and the thermal refusal — so this adds no second PWM ownership path (§2).
     pub validation: Arc<crate::validation::recorder::ValidationEngine>,

@@ -685,7 +685,10 @@ So there are three ways one ends, and since 2.43.0 the third is the caller's cho
    `false`, so a client that does not send it sees the behaviour above unchanged.
 
 **A session is an observer that may orchestrate, and never a second writer.** The recorder
-performs no sysfs I/O and plants no hooks in the engine or the write path. Where a session
+plants no hooks in the engine or the write path, and every sysfs read it performs is
+**read-only and outside the session slot guard** — the narrowed invariant that replaced
+"performs no sysfs I/O" when DEC-335 added power sampling (`P8-ao`), and which DEC-342
+(`P8-v`) made true at `start` as well as in `tick`. Where a session
 runs a diagnostic it invokes the **existing** verify/characterize handler, which already owns
 the hwmon lease, the pump floor clamp, the thermal refusal and restore-on-drop. There is no
 code in `validation/` or `api/handlers/validation.rs` that commands a duty, and tests assert

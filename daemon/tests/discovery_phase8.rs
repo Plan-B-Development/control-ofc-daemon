@@ -2912,3 +2912,59 @@ async fn an_all_openfan_cooler_at_rest_warns_where_it_used_to_say_nothing() {
         r.blocking
     );
 }
+
+/// `P8-as`: the preflight route answers only `200` or `400`, never `404`.
+///
+/// The GUI calls `GET /diagnostics/preflight` **unconditionally** and maps any
+/// `404` to "this daemon has no preflight". Every sibling capability entry in
+/// the GUI's `docs/08_API_Integration_Contract.md` says to gate on the flag
+/// rather than probe, and the shared reason is that a route-fallback `404`
+/// cannot be told from a handler's own `404`. `P8-as` adjudicated that probing
+/// is nonetheless correct **here**, on the evidence that this handler has no
+/// `404` branch at all — so the fallback is the only source of one and the
+/// mapping cannot misfire.
+///
+/// That evidence is a property of this file, and it was a prose claim in two
+/// repos with nothing checking it. Add a `NOT_FOUND` return to
+/// `preflight_handler` — an unknown header is the obvious candidate — and the
+/// GUI silently starts telling operators their daemon is too old. This asserts
+/// the set of status codes the handler can produce, rather than the absence of
+/// one token, so a `410`, a `409` or a `503` fails it too.
+///
+/// **Honest limit:** a source scan. It proves no other `StatusCode` is written
+/// in this function, not that the two written ones are reachable — their
+/// behaviour is covered by the request tests above.
+#[test]
+fn the_preflight_handler_answers_only_200_or_400() {
+    let src = strip_comments(include_str!("../src/api/handlers/discovery.rs"));
+    let start = src
+        .find("pub async fn preflight_handler(")
+        .expect("preflight_handler must exist in discovery.rs");
+    // The function ends at the first `}` in column 0 after its signature.
+    let rest = &src[start..];
+    let end = rest
+        .find("\n}\n")
+        .expect("preflight_handler must be closed by a column-0 brace");
+    let body = &rest[..end];
+
+    let mut codes: Vec<&str> = body
+        .match_indices("StatusCode::")
+        .map(|(i, _)| {
+            let tail = &body[i + "StatusCode::".len()..];
+            let n = tail
+                .find(|c: char| !c.is_ascii_uppercase() && c != '_')
+                .unwrap_or(tail.len());
+            &tail[..n]
+        })
+        .collect();
+    codes.sort_unstable();
+    codes.dedup();
+
+    assert_eq!(
+        codes,
+        vec!["BAD_REQUEST", "OK"],
+        "the GUI probes this route instead of capability-gating it (`P8-as`), \
+         which is only sound while a 404 can come from the route fallback alone. \
+         `preflight_handler` now writes: {codes:?}"
+    );
+}
