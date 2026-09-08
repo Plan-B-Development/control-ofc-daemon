@@ -119,12 +119,67 @@ pub const DIAG_CONTROL_PATH: &str = "control_path_discovery";
 /// behaviour sweep — see `ordered_diagnostics`.
 pub const DIAG_BEHAVIOUR: &str = "pwm_behaviour_characterization";
 
+/// Every diagnostic a session knows how to run.
+///
+/// An array rather than a `matches!` arm list because two things now derive from
+/// it — the predicate below and the ingest bound in `normalise_diagnostics` — and
+/// a set with two definitions is a set that drifts.
+pub const KNOWN_DIAGNOSTICS: [&str; 4] = [
+    DIAG_CHARACTERIZATION,
+    DIAG_VERIFY,
+    DIAG_CONTROL_PATH,
+    DIAG_BEHAVIOUR,
+];
+
 /// Is this a diagnostic the session knows how to run?
 pub fn is_known_diagnostic(token: &str) -> bool {
-    matches!(
-        token,
-        DIAG_CHARACTERIZATION | DIAG_VERIFY | DIAG_CONTROL_PATH | DIAG_BEHAVIOUR
-    )
+    KNOWN_DIAGNOSTICS.contains(&token)
+}
+
+/// Drop repeats from a requested-diagnostic list, keeping first-occurrence order.
+///
+/// **This is what bounds the list (`P8-s`), and the bound is `KNOWN_DIAGNOSTICS`
+/// rather than a number.** Each token was validated individually and the *count*
+/// was not, so `[DIAG_VERIFY; 320_000]` — comfortably inside the 4 MiB body limit
+/// — passed every check and was then copied verbatim into the persisted document.
+/// Two costs:
+///
+///   * `requested_diagnostics` is serialised into the session file, so ~400k
+///     repeats add ~7 MB to a document the store refuses to read past
+///     [`crate::constants::VALIDATION_MAX_SESSION_BYTES`] — and since DEC-320 an
+///     over-cap document is classified `TooLarge` and **deleted** by `prune`, so this
+///     is a way to destroy an operator's evidence rather than merely to waste disk.
+///     Unlike the reservation half of `P8-s` this one is reachable today: the
+///     worst-case document sits 444 KiB under the cap, and ~7 MB of repeats clears it;
+///   * every `ordered_diagnostics` call — one per member, twice in
+///     `spawn_orchestration` — runs a `.any()` scan per token over the whole
+///     list, so the repeats are re-walked `members x 4` times.
+///
+/// **What this is NOT.** An earlier draft of this comment claimed the unbounded
+/// list made the `evidence` array unbounded too. It did not, and
+/// `ofc:security-reviewer` caught it: `ordered_diagnostics` pushes at most one
+/// entry per distinct diagnostic (each arm is a single `push` guarded by
+/// `.any()`), so evidence was already bounded at `sweep_members x 3` and still
+/// is. Recorded because a false rule is worse than none — someone would
+/// eventually weaken that collapse believing this function was the bound.
+///
+/// Deduplicating rather than rejecting: the set is closed and running the same
+/// diagnostic twice on the same member is not a thing a caller can want, so a
+/// `400` would refuse a harmless request. It is not silent either — the start
+/// response echoes `requested_diagnostics`, so a caller sees the list it got.
+///
+/// Post-condition, given every token has passed [`is_known_diagnostic`]: the
+/// result holds at most `KNOWN_DIAGNOSTICS.len()` entries. Deriving it from the
+/// set is the point — a fifth diagnostic raises the bound by construction, where
+/// a literal would have to be remembered.
+pub fn normalise_diagnostics(requested: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(requested.len().min(KNOWN_DIAGNOSTICS.len()));
+    for d in requested {
+        if !out.iter().any(|seen| seen == d) {
+            out.push(d.clone());
+        }
+    }
+    out
 }
 
 // ── Member roles within a session ───────────────────────────────────────────
@@ -296,11 +351,22 @@ const WIDEST_POWER_SAMPLE: f64 = 10.0 / 900_000.0;
 const _: () = assert!(WIDEST_POWER_SAMPLE > 0.0);
 const _: () = assert!(WIDEST_POWER_SAMPLE <= crate::constants::POWER_MAX_PLAUSIBLE_W);
 
-/// Worst-case serialised bytes for one sample of `session`.
+/// The worst-case sample [`probe_sample_bytes`] measures, as a value.
 ///
 /// Built to be a genuine upper bound rather than a typical case: every optional
 /// field is present, every integer sits at its widest decimal width, and the
 /// longest role and ownership tokens are used.
+///
+/// **Public because the byte-bound test must fill a session with the sample the
+/// probe actually measures, and `P8-ae` is what happens when it does not.** That
+/// test built its own fixture by hand — an 18-char power float against this
+/// function's 23, `enable_revert_count: 0` against `u64::MAX`, `"normal"`
+/// against `"no_sensor_fallback"` — leaving ~1.8 kB of slack per sample at 65
+/// members. The realised file therefore sat far under its budget whatever the
+/// probe said, so **any probe under-count smaller than that slack stayed green**,
+/// including the 10-byte power-rendering error that `WIDEST_POWER_SAMPLE` below
+/// exists to fix. One constructor, two callers, no drift: the fixture cannot
+/// stop being the worst case without this function stopping being it too.
 ///
 /// **Every variable-length field is taken from the session itself, never
 /// assumed.** An earlier version used a 128-byte placeholder for
@@ -310,14 +376,14 @@ const _: () = assert!(WIDEST_POWER_SAMPLE <= crate::constants::POWER_MAX_PLAUSIB
 /// `POST /config/cooling-device`, which is client-supplied. A long one made the
 /// probe under-count without bound and reproduced `AUD3-i` exactly, inside its
 /// own fix. Caught by `ofc:security-reviewer`. A guess is not a bound.
-fn probe_sample_bytes(session: &ValidationSession) -> usize {
+pub fn worst_case_sample(session: &ValidationSession) -> ValidationSample {
     let member_ids: Vec<String> = session
         .metadata
         .members
         .iter()
         .map(|m| m.member_id.clone())
         .collect();
-    let probe = ValidationSample {
+    ValidationSample {
         elapsed_ms: u64::MAX,
         unix_ms: u64::MAX,
         temperature_c: Some(-100.5),
@@ -361,7 +427,13 @@ fn probe_sample_bytes(session: &ValidationSession) -> usize {
                 ownership: OWNERSHIP_EXTERNAL.to_string(),
             })
             .collect(),
-    };
+    }
+}
+
+/// Worst-case serialised bytes for one sample of `session`, measured from
+/// [`worst_case_sample`].
+fn probe_sample_bytes(session: &ValidationSession) -> usize {
+    let probe = worst_case_sample(session);
     // Measured as the MARGINAL cost of one sample inside a `samples` field, not
     // as a standalone value. Two reasons, both of which would otherwise
     // under-count and so reintroduce the very defect this bounds:

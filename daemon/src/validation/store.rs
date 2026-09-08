@@ -69,9 +69,16 @@ pub fn load_from(dir: &Path, session_id: &str) -> Result<Option<ValidationSessio
 /// destroyed on a guess.
 #[derive(Debug)]
 enum SessionReadError {
-    /// Larger than [`constants::VALIDATION_MAX_SESSION_BYTES`]. Only a daemon
-    /// predating the write-side byte budget could have produced this. It is
-    /// deleted by [`prune`], because nothing will ever read it again.
+    /// Larger than [`constants::VALIDATION_MAX_SESSION_BYTES`]. It is deleted by
+    /// [`prune`], because *this* daemon will never read it again.
+    ///
+    /// Produced by a daemon whose cap **differed** — which since v2.43.3 means a
+    /// newer one as well as an older one, not only "one predating the write-side
+    /// byte budget" as this said before. The cap moved 24 -> 28 MiB, so a
+    /// 24-28 MiB document written by v2.43.3 is over-cap to v2.43.2 and is
+    /// reclaimed by it on downgrade. That is the intended behaviour — an
+    /// unreadable file must not leak for ever — but it is a *version* mismatch,
+    /// never corruption, and reading it as corruption would be wrong.
     TooLarge(u64),
     /// Within the cap but unreadable or unparseable. Logged and skipped, never
     /// deleted.

@@ -1,5 +1,42 @@
 # Changelog
 
+## [2.43.3] — 2026-09-08
+
+**A validation session's persisted document is bounded by a measurement now, not
+by an estimate (DEC-341, register rows `P8-s` and `P8-ae`).** Daemon-only. No
+wire shape, capability or error code changes; pairs with `control-ofc-gui` >=
+v2.23.0 as before.
+
+*Why this is a patch:* one request field gains a normalisation, and two internal
+byte budgets are corrected upward. Nothing a client could previously do is
+refused, and no response shape moves.
+
+**Repeated diagnostics in `POST /validation/session` are now dropped at ingest.**
+Each token was validated individually and the list length was not, so a request
+naming the same diagnostic 2000 times was accepted, copied verbatim into the
+session document, and re-scanned once per member by the orchestration walk. The
+list is now reduced to at most one of each — the response echoes what was actually
+taken, so a caller can see it — and the bound is the size of the diagnostic set
+rather than a chosen number. The recorded evidence was never affected: the walk
+already collapsed repeats, and only the persisted request list grew.
+
+**The guarantee that a session at every cap reads back was unsound.** The
+reservation for non-sample content was derived in prose at ~3.4 MiB against a
+4 MiB budget. Measured as a realised file it is **7,938,808 bytes**: an event may
+carry two 512-byte text fields rather than one, a measurement four, and
+`evidence`, `findings` and `startup_fingerprints` were not counted at all.
+
+*No session was actually being lost, and it is worth being exact about that.* The
+full worst-case document measures **24,710,972 bytes** and the read cap was
+25,165,824 — it fitted, by 444 KiB. What was wrong is that the compile-time
+assertion guaranteeing it fits was computed from a reservation covering 4 MiB of a
+7.57 MiB reality, so that 1.8% margin was **accidental rather than designed**: one
+more field on an event, or a raised event cap, would have crossed it silently while
+the reservation still claimed 4 MiB of room. Since v2.35.0 an unreadable session is
+classified `TooLarge` and reclaimed by `prune`, so crossing it would have destroyed
+an operator's evidence rather than merely wasted disk. The reservation is now
+10 MiB and the read cap 28 MiB, both sized above a measurement a test re-takes.
+
 ## [2.43.2] — 2026-09-08
 
 **The safety preflight now reads every fan source, not just the motherboard's

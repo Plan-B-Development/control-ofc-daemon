@@ -709,7 +709,16 @@ pub const VALIDATION_MAX_SAMPLE_BYTES: usize = 16 * 1024 * 1024;
 /// the assertion below is what keeps the two from drifting apart again. The slack
 /// over [`VALIDATION_MAX_SAMPLE_BYTES`] covers the non-sample content: events,
 /// external measurements, metadata and the summary.
-pub const VALIDATION_MAX_SESSION_BYTES: u64 = 24 * 1024 * 1024;
+///
+/// **24 -> 28 MiB, 2026-09-08 (`P8-s`).** The ancillary reservation below was an
+/// under-count by 1.9x, and correcting it to the measured figure left 24 MiB
+/// unable to hold `SAMPLE + ANCILLARY`. Raising the read cap is the right lever
+/// rather than shrinking either budget: the alternative was cutting the event or
+/// measurement caps, which is a functional regression in the one artefact whose
+/// job is collecting evidence — and the paragraph above already establishes that
+/// the daemon holds the whole document in memory while recording, so a larger
+/// read cap costs nothing the write side has not already paid.
+pub const VALIDATION_MAX_SESSION_BYTES: u64 = 28 * 1024 * 1024;
 
 /// Reservation for everything in a session document that is NOT a sample:
 /// events, external measurements, user metadata, the member snapshot and the
@@ -719,10 +728,52 @@ pub const VALIDATION_MAX_SESSION_BYTES: u64 = 24 * 1024 * 1024;
 /// believing it was is how `AUD3-i` nearly recurred inside its own fix.** The
 /// `const` assertion below is only meaningful if the ancillary content is itself
 /// bounded, which is what `VALIDATION_MAX_TEXT_FIELD_BYTES` and
-/// `VALIDATION_MAX_METADATA_KEY_BYTES` are for. Worst case with those in force:
-/// 4096 events x ~760 B = ~3.0 MiB, 512 measurements x ~810 B = ~0.4 MiB,
-/// 16 metadata pairs = ~10 KB, 65 members = ~16 KB — ~3.4 MiB against this 4 MiB.
-pub const VALIDATION_MAX_ANCILLARY_BYTES: usize = 4 * 1024 * 1024;
+/// `VALIDATION_MAX_METADATA_KEY_BYTES` are for.
+///
+/// **4 -> 10 MiB, 2026-09-08 (`P8-s`), and the derivation is now a MEASUREMENT.**
+/// The figure here was reasoned about in prose — "4096 events x ~760 B = ~3.0
+/// MiB, 512 measurements x ~810 B = ~0.4 MiB … ~3.4 MiB against this 4 MiB" —
+/// and was wrong three separate ways at once, which is why the replacement is a
+/// realised file rather than better arithmetic (DEC-320):
+///
+///   * an event may carry `detail` **and** `member_id`, each at
+///     `VALIDATION_MAX_TEXT_FIELD_BYTES`, so 4096 events realise **4.96 MB**, not
+///     3.0 MiB — the term the estimate came closest to and still under-counted;
+///   * a measurement may carry `kind`, `unit`, `note` **and** `member_id` at that
+///     bound, realising **1.13 MB** against the ~0.4 MiB claimed;
+///   * `evidence`, `findings` and `startup_fingerprints` were **not in the list at
+///     all**, and evidence alone realises **1.51 MB** — each entry carries a full
+///     Phase 3 run, and the array is bounded only by the orchestration walk.
+///
+/// Measured total at every cap: **7,938,808 bytes**, against the 4 MiB this
+/// reserved. `the_ancillary_reservation_covers_the_worst_case_ancillary_document`
+/// writes that document and asserts the realised length both ways — under this
+/// reservation, and over half of it, so the reservation cannot quietly become
+/// padding either.
+///
+/// **Honest limits — two, and neither is closed by this reservation.**
+///
+/// The event, measurement and metadata terms are bounded by the constants above,
+/// and the evidence array's *length* by the orchestration walk. Two ancillary
+/// text sources are not:
+///
+///   * **cooling-device member ids** (`P8-bs`). `validate_device` bounds `name`,
+///     `kind`, the three sensors and `device_policy_id` at `MAX_DEVICE_TEXT_BYTES`
+///     and bounds the member lists by **count only**. Those ids are copied into
+///     `members[].member_id` and `.label`, `radiator_members`, `sweep_members`,
+///     and every `evidence`/`findings`/`startup_fingerprints` entry — so they are
+///     client-supplied ancillary text with no length bound, exactly the shape
+///     `preferred_sensor` was given one for seven lines above. Found by
+///     `ofc:security-reviewer`; an earlier draft of this paragraph asserted the
+///     opposite.
+///   * **daemon-formatted `detail` strings** on `EvidenceRef` and
+///     `CharacterizationRun` (`P8-br`), bounded by nothing but what the daemon
+///     formats into them.
+///
+/// The measurement below is therefore a bound on the terms that ARE bounded, and
+/// the fixture that takes it uses realistic member ids. Neither gap is reachable
+/// in normal operation; both are recorded rather than assumed away.
+pub const VALIDATION_MAX_ANCILLARY_BYTES: usize = 10 * 1024 * 1024;
 
 /// Bound on each free-text field a client may attach to a session (an event
 /// `detail`, a measurement `kind`/`unit`/`note`/`member_id`, a metadata value).

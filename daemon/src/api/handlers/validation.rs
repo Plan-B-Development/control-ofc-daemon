@@ -37,6 +37,10 @@ pub struct StartSessionRequest {
     pub kind: Option<String>,
     /// Diagnostics to run. **Empty (or absent) is legitimate** — a passive
     /// recording session — and yields `not_tested`, never `pass` (§7).
+    ///
+    /// Repeats are dropped at ingest by `normalise_diagnostics` (`P8-s`), so the
+    /// session records at most one of each and the response echoes what was
+    /// actually taken. Unknown tokens are still rejected outright.
     #[serde(default)]
     pub diagnostics: Vec<String>,
     /// Members those diagnostics sweep. Absent defaults to the pump member.
@@ -478,12 +482,20 @@ pub async fn start_session_handler(
         return start_error_response(StartError::UnknownDevice(body.cooling_device_id));
     };
 
-    // Validate diagnostics.
+    // Validate diagnostics, then bound the list.
+    //
+    // Validation is per token and says nothing about the COUNT, which is what
+    // `P8-s` was: every entry of `[DIAG_VERIFY; 320_000]` is a known diagnostic.
+    // `normalise_diagnostics` bounds it at the size of the closed token set, and
+    // from here on the normalised list is the only one this handler reads — the
+    // request field is not consulted again, so there is one shape for this value
+    // rather than two that can disagree.
     for d in &body.diagnostics {
         if !is_known_diagnostic(d) {
             return start_error_response(StartError::UnknownDiagnostic(d.clone()));
         }
     }
+    let diagnostics = normalise_diagnostics(&body.diagnostics);
 
     // Resolve the sweep set. Absent means the pump member, which is what a
     // caller asking for a diagnostic without naming members almost always wants
@@ -533,7 +545,7 @@ pub async fn start_session_handler(
     // alternative rejected when this feature was specified. Found by
     // `ofc:concurrency-reviewer`.
     if body.stop_when_diagnostics_complete {
-        if body.diagnostics.is_empty() {
+        if diagnostics.is_empty() {
             return start_error_response(StartError::Unsatisfiable(
                 "stop_when_diagnostics_complete requires at least one diagnostic".to_string(),
             ));
@@ -599,7 +611,7 @@ pub async fn start_session_handler(
         started_unix_ms: unix_ms(),
         completed_unix_ms: None,
         metadata,
-        requested_diagnostics: body.diagnostics.clone(),
+        requested_diagnostics: diagnostics.clone(),
         sweep_members: sweep.clone(),
         samples: Vec::new(),
         events: Vec::new(),

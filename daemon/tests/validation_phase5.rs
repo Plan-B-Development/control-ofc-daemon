@@ -1705,39 +1705,31 @@ fn sized_session(tag: &str, n: usize, sensor: &str) -> ValidationSession {
     s
 }
 
-/// Fill `s` to its derived cap with samples of the shape the recorder writes.
+/// Fill `s` to its derived cap with **the sample the probe measures** (`P8-ae`).
+///
+/// `worst_case_sample` is the production constructor `probe_sample_bytes` divides
+/// the budget by, so filling from it makes the realised file land *at* the budget
+/// rather than under it — which is what gives this fixture the power to detect an
+/// under-count at all.
+///
+/// It did not, until 2026-09-08. The fixture built its own sample by hand and was
+/// systematically narrower than the probe at nearly every field — an 18-char power
+/// float against the probe's 23, `enable_revert_count: 0` against `u64::MAX`,
+/// `"normal"` against `"no_sensor_fallback"`, mid-range integers against
+/// `u8::MAX`/`u16::MAX` — for roughly 1.8 kB of slack per sample at 65 members.
+/// Its own comment claimed the opposite ("the cap probe assumes every optional
+/// field is PRESENT at its widest"), which is true of *presence* and was false of
+/// *width*, and that is exactly the gap the comment hid. The realised file
+/// therefore sat far below its budget however wrong the probe was, so **any probe
+/// under-count smaller than the slack passed** — including the 10-byte power
+/// rendering error caught by review rather than by this test.
 fn fill_to_cap(s: &mut ValidationSession) -> usize {
     let cap = max_samples_for(
         s,
         control_ofc_daemon::constants::VALIDATION_MAX_SAMPLE_BYTES,
     );
-    let ids: Vec<String> = s
-        .metadata
-        .members
-        .iter()
-        .map(|m| m.member_id.clone())
-        .collect();
-    let sensor = s.metadata.temperature_sensor.clone();
-    s.samples = (0..cap)
-        .map(|i| ValidationSample {
-            elapsed_ms: i as u64 * 1000,
-            unix_ms: 1_757_000_000_000 + i as u64 * 1000,
-            temperature_c: Some(65.5),
-            temperature_sensor: sensor.clone(),
-            coolant_c: Some(32.5),
-            // The cap probe assumes every optional field is PRESENT at its
-            // widest; a fixture that left these `None` would measure a smaller
-            // sample than production writes and the derived cap would be wrong
-            // in the unsafe direction (DEC-320).
-            package_power_w: Some(123.45678901234567),
-            gpu_power_w: Some(123.45678901234567),
-            thermal_state: "normal".into(),
-            members: ids
-                .iter()
-                .map(|id| member_sample(id, MEMBER_RADIATOR, Some(50), Some(50), Some(2100)))
-                .collect(),
-        })
-        .collect();
+    let probe = worst_case_sample(s);
+    s.samples = vec![probe; cap];
     cap
 }
 
@@ -1855,6 +1847,469 @@ fn every_topology_writes_a_file_the_store_can_read_back() {
         derivation_bound_at_least_once,
         "no topology in this sweep was actually bounded by the byte budget"
     );
+}
+
+// ── P8-s: the ancillary reservation must cover the ancillary content ──────────
+
+/// The widest an `f64` in this document renders.
+///
+/// Same reasoning as `session::WIDEST_POWER_SAMPLE`, and the same trap: the
+/// widest rendering is **not** a full-precision value near the top of the range
+/// but a small arbitrary quotient, which switches to compact scientific notation
+/// below ~1e-5 and serialises to 23 characters. Pinned by
+/// `the_widest_measurement_value_is_really_the_widest`.
+const WIDEST_MEASUREMENT_VALUE: f64 = 10.0 / 900_000.0;
+
+/// Allowance for a **daemon-produced** token — a verdict, a direction, an
+/// interpretation state, a provenance key.
+///
+/// These are not client text and must not be measured as if they were: padding
+/// every enum to `VALIDATION_MAX_TEXT_FIELD_BYTES` inflated the evidence term
+/// from ~0.3 MB to 4.2 MB, which would have sized the reservation from a fiction.
+/// A bound that is mostly padding is not a bound. Pinned by
+/// `no_daemon_token_exceeds_the_evidence_allowance`, which sweeps the real ones.
+const WIDEST_DAEMON_TOKEN: usize = 64;
+
+/// A `CharacterizationRun` at every cap it has, for the `evidence` term.
+///
+/// Every array is at its constant-defined length and every optional field is
+/// present at its widest, so this over-states a real run rather than modelling
+/// one. See the `evidence` note on `VALIDATION_MAX_ANCILLARY_BYTES` for the
+/// honest limit: the run's own size is bounded by these caps, not by a byte
+/// budget of its own.
+fn widest_characterization_run() -> control_ofc_daemon::api::characterization::CharacterizationRun {
+    use control_ofc_daemon::api::characterization as ch;
+    let t = control_ofc_daemon::constants::VALIDATION_MAX_TEXT_FIELD_BYTES;
+    let tok = WIDEST_DAEMON_TOKEN;
+    let n = control_ofc_daemon::constants::CHARACTERIZATION_MAX_POINTS;
+    ch::CharacterizationRun {
+        run_id: text_at(tok),
+        header_id: text_at(tok),
+        state: text_at(tok),
+        requested_points_pct: vec![u8::MAX; n],
+        settle_seconds: u64::MAX,
+        points: (0..n)
+            .map(|_| ch::CharPoint {
+                requested_pct: u8::MAX,
+                command_accepted: true,
+                readback_pct: Some(u8::MAX),
+                readback_raw: Some(u8::MAX),
+                pwm_enable: Some(u8::MAX),
+                rpm_before: Some(u16::MAX),
+                rpm_after: Some(u16::MAX),
+                settle_ms: u64::MAX,
+                first_change_ms: Some(u64::MAX),
+                readback_verdict: text_at(tok),
+                rpm_verdict: text_at(tok),
+                direction: text_at(tok),
+                step_index: u16::MAX,
+                settled_ms: Some(u64::MAX),
+                stability: Some(ch::PointStability {
+                    samples: u32::MAX,
+                    usable: u32::MAX,
+                    dropouts: u32::MAX,
+                    outliers: u32::MAX,
+                    mean_rpm: Some(WIDEST_MEASUREMENT_VALUE),
+                    median_rpm: Some(u16::MAX),
+                    min_rpm: Some(u16::MAX),
+                    max_rpm: Some(u16::MAX),
+                    stddev_rpm: Some(WIDEST_MEASUREMENT_VALUE),
+                    cv_pct: Some(WIDEST_MEASUREMENT_VALUE),
+                    verdict: text_at(tok),
+                    sample_interval_ms: u64::MAX,
+                    dwell_ms: u64::MAX,
+                }),
+                estimated_physical_rpm: Some(ch::EstimatedRpm {
+                    value: u16::MAX,
+                    provenance: text_at(tok),
+                    correction_factor: WIDEST_MEASUREMENT_VALUE,
+                    correction_source: text_at(tok),
+                }),
+            })
+            .collect(),
+        summary: Some(ch::CharSummary {
+            command_acceptance: text_at(tok),
+            pwm_readback: text_at(tok),
+            rpm_response: text_at(tok),
+            min_tested_pct: Some(u8::MAX),
+            max_tested_pct: Some(u8::MAX),
+            min_rpm: Some(u16::MAX),
+            max_rpm: Some(u16::MAX),
+            monotonic: Some(true),
+            dead_zone_upper_pct: Some(u8::MAX),
+            clamp_pct: Some(u8::MAX),
+            possible_device_override: true,
+            interference_detected: true,
+            hysteresis_pct: Some(WIDEST_MEASUREMENT_VALUE),
+            hysteresis_verdict: text_at(tok),
+            hysteresis_worst_duty_pct: Some(u8::MAX),
+            hysteresis_worst_delta_rpm: Some(u16::MAX),
+            hysteresis_compared_points: u32::MAX,
+            min_responsive_pct: Some(u8::MAX),
+            max_responsive_pct: Some(u8::MAX),
+            low_plateau_to_pct: Some(u8::MAX),
+            saturation_from_pct: Some(u8::MAX),
+            plateaus: vec![
+                ch::PlateauSpan {
+                    from_pct: u8::MAX,
+                    to_pct: u8::MAX,
+                    rpm_min: u16::MAX,
+                    rpm_max: u16::MAX,
+                };
+                n
+            ],
+            stability_verdict: text_at(tok),
+            worst_cv_pct: Some(WIDEST_MEASUREMENT_VALUE),
+            total_dropouts: u32::MAX,
+            total_outliers: u32::MAX,
+            measurement_resolution_ms: Some(u64::MAX),
+            typical_response_ms: Some(u64::MAX),
+            typical_settling_ms: Some(u64::MAX),
+            outside_learned_range: Some(true),
+            learned_range_note: Some(text_at(t)),
+            interpretation_states: vec![text_at(tok); n],
+        }),
+        original_pct: Some(u8::MAX),
+        restore_failed: true,
+        restore_outcome: text_at(tok),
+        detail: Some(text_at(t)),
+        bidirectional: true,
+        stability_seconds: u64::MAX,
+        completed_unix_ms: Some(u64::MAX),
+        provenance: (0..n)
+            .map(|i| (format!("{i:02}{}", text_at(tok - 2)), text_at(tok)))
+            .collect(),
+    }
+}
+
+/// A string of exactly `n` bytes, which is what every bounded text field is
+/// allowed to be. `too_long` rejects `len() > BOUND`, so `BOUND` itself passes.
+fn text_at(n: usize) -> String {
+    "x".repeat(n)
+}
+
+/// A session holding the worst-case **ancillary** content and no samples: every
+/// non-sample array at its cap, every bounded text field at its bound.
+///
+/// This is the document `VALIDATION_MAX_ANCILLARY_BYTES` reserves for, built
+/// from the caps that bound it rather than from a per-item byte estimate — the
+/// estimate is what `P8-s` was.
+fn worst_case_ancillary_session(tag: &str) -> ValidationSession {
+    use control_ofc_daemon::constants as k;
+    let t = k::VALIDATION_MAX_TEXT_FIELD_BYTES;
+
+    // 65 members = the maximum a device may claim (1 pump + 2 x MAX_MEMBERS_PER_LIST),
+    // the same ceiling `every_topology_writes_a_file_the_store_can_read_back` sweeps to.
+    let ids = aio_member_ids(65);
+    let mut s = session();
+    s.session_id = format!("val-{tag}");
+    s.state = STATE_COMPLETED.into();
+    s.completed_unix_ms = Some(u64::MAX);
+    s.interrupted_reason = Some(text_at(t));
+    s.truncated_at_unix_ms = Some(u64::MAX);
+    s.sample_limit_reached = true;
+
+    s.metadata.temperature_sensor = Some(text_at(t));
+    s.metadata.coolant_sensor = Some(text_at(t));
+    s.metadata.active_profile_id = Some(text_at(t));
+    s.metadata.active_profile_name = Some(text_at(t));
+    s.metadata.members = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| member(id, if i == 0 { MEMBER_PUMP } else { MEMBER_RADIATOR }))
+        .collect();
+    s.metadata.radiator_members = ids.clone();
+    s.metadata.user_metadata = (0..k::VALIDATION_MAX_METADATA_KEYS)
+        .map(|i| {
+            (
+                format!(
+                    "{i:02}{}",
+                    text_at(k::VALIDATION_MAX_METADATA_KEY_BYTES - 2)
+                ),
+                text_at(k::VALIDATION_MAX_METADATA_VALUE_BYTES),
+            )
+        })
+        .collect();
+
+    // Bounded at ingest by `normalise_diagnostics` to the size of the token set.
+    s.requested_diagnostics = KNOWN_DIAGNOSTICS.iter().map(|d| d.to_string()).collect();
+    s.sweep_members = ids
+        .iter()
+        .take(k::VALIDATION_MAX_SWEEP_MEMBERS)
+        .cloned()
+        .collect();
+
+    // `detail` AND `member_id` are each permitted at the text bound — which is
+    // the arithmetic `P8-s` found wrong: the reservation was derived from ~760 B
+    // per event against a real worst case of ~1.1 kB.
+    s.events = (0..k::VALIDATION_MAX_EVENTS)
+        .map(|_| ValidationEvent {
+            elapsed_ms: u64::MAX,
+            unix_ms: u64::MAX,
+            kind: EV_DISCOVERY_COMPLETED.into(),
+            detail: Some(text_at(t)),
+            member_id: Some(text_at(t)),
+        })
+        .collect();
+
+    // Four bounded text fields each, so a measurement is wider than an event.
+    s.external_measurements = (0..k::VALIDATION_MAX_EXTERNAL_MEASUREMENTS)
+        .map(|_| ExternalMeasurement {
+            unix_ms: u64::MAX,
+            kind: text_at(t),
+            value: WIDEST_MEASUREMENT_VALUE,
+            unit: text_at(t),
+            member_id: Some(text_at(t)),
+            note: Some(text_at(t)),
+        })
+        .collect();
+
+    // One finding per member per finding id is far above what `summarise`
+    // produces, and the summariser is the only writer.
+    s.findings = ids
+        .iter()
+        .flat_map(|id| {
+            [F_PWM_HEADER_CONTROL, F_PWM_READBACK, F_PUMP_RPM].map(move |f| ValidationFinding {
+                id: f.into(),
+                state: RESULT_NOT_TESTED.into(),
+                detail: Some(text_at(t)),
+                member_id: Some(id.clone()),
+                evidence_kind: Some(text_at(t)),
+            })
+        })
+        .collect();
+
+    s.startup_fingerprints = ids
+        .iter()
+        .map(|id| StartupFingerprint {
+            member_id: id.clone(),
+            role: MEMBER_AUXILIARY.into(),
+            override_observed: true,
+            override_duration_ms: Some(u64::MAX),
+            peak_rpm: Some(u16::MAX),
+            requested_pct_during: Some(u8::MAX),
+            readback_pct_during: Some(u8::MAX),
+            post_override_rpm: Some(u16::MAX),
+            transition_ms: Some(u64::MAX),
+            interpretation: text_at(t),
+        })
+        .collect();
+
+    s.steady_state = Some(control_ofc_daemon::api::stats::SteadyState {
+        verdict: text_at(t),
+        start_ms: Some(u64::MAX),
+        warmup_ms: Some(u64::MAX),
+        slope_c_per_min: Some(WIDEST_MEASUREMENT_VALUE),
+        stddev_c: Some(WIDEST_MEASUREMENT_VALUE),
+        mean_c: Some(WIDEST_MEASUREMENT_VALUE),
+        peak_c: Some(WIDEST_MEASUREMENT_VALUE),
+        confidence: text_at(t),
+        criterion: text_at(t),
+    });
+
+    // Evidence is bounded by the orchestration walk, not by a cap of its own:
+    // `ordered_diagnostics` collapses repeats, so production reaches at most
+    // `sweep_members x 3`. 32 here deliberately over-states that. Each entry
+    // carries a full Phase 3 run, which is the term the old derivation omitted.
+    s.evidence = s
+        .sweep_members
+        .iter()
+        .flat_map(|id| {
+            KNOWN_DIAGNOSTICS.map(move |kind| EvidenceRef {
+                kind: kind.into(),
+                member_id: id.clone(),
+                run_id: Some(text_at(t)),
+                started_unix_ms: u64::MAX,
+                completed_unix_ms: Some(u64::MAX),
+                outcome: text_at(t),
+                detail: Some(text_at(t)),
+                characterization: Some(widest_characterization_run()),
+                verify: None,
+                control_path: None,
+            })
+        })
+        .collect();
+    s
+}
+
+/// `WIDEST_DAEMON_TOKEN` must really cover the tokens the daemon puts in an
+/// evidence entry, or the ancillary measurement is sized from a fiction in the
+/// other direction.
+///
+/// Scanned from the source rather than from a hand-list, because a hand-list is
+/// what stops covering a token the moment someone adds one. **Comment lines are
+/// excluded before matching**, which is the whole trick: this file's own prose
+/// explains the rule and names the fields, and a naive substring sweep would
+/// match its own explanation — the `polling.rs` trap in `CLAUDE.md`. Matching
+/// only outside `//` lines keeps the scan pointed at code.
+#[test]
+fn no_daemon_token_exceeds_the_evidence_allowance() {
+    let whole = include_str!("../src/api/characterization.rs");
+    // Production only: an assertion message in the module's own test block is not
+    // a wire token, and one of them is 71 bytes.
+    let source = whole.split("#[cfg(test)]").next().unwrap();
+    let mut widest = 0usize;
+    let mut widest_token = String::new();
+    let mut checked = 0usize;
+    for line in source.lines() {
+        let code = line.trim_start();
+        if code.starts_with("//") {
+            continue;
+        }
+        for lit in code.split('"').skip(1).step_by(2) {
+            // A token has no whitespace — that is what distinguishes one from a
+            // log line or an error message, and both of those also live in
+            // string literals here. Format strings carry runtime values.
+            if lit.is_empty() || lit.contains('{') || lit.split_whitespace().count() != 1 {
+                continue;
+            }
+            checked += 1;
+            if lit.len() > widest {
+                widest = lit.len();
+                widest_token = lit.to_string();
+            }
+        }
+    }
+    // Or the scan found nothing and the assertion below is vacuous — the same
+    // precondition discipline the byte-bound tests use.
+    assert!(
+        checked > 50,
+        "the token scan matched only {checked} literals; it has stopped scanning"
+    );
+    assert!(
+        widest <= WIDEST_DAEMON_TOKEN,
+        "'{widest_token}' is {widest} bytes, over the {WIDEST_DAEMON_TOKEN}-byte \
+         allowance the ancillary measurement gives a daemon token — that measurement \
+         now under-counts every evidence entry"
+    );
+}
+
+/// **The regression test for `P8-s`.** The ancillary reservation must cover the
+/// ancillary content, measured as a realised file rather than estimated.
+///
+/// The reservation was derived in prose from ~760 B per event and ~810 B per
+/// measurement. Both were under-counts: `too_long` permits an event's `detail`
+/// **and** its `member_id` at 512 B each, and a measurement's `kind`, `unit`,
+/// `note` and `member_id` likewise, so 4096 events and 512 measurements at their
+/// caps are far larger than the arithmetic said. The reservation is the term the
+/// `VALIDATION_MAX_SESSION_BYTES > SAMPLE + ANCILLARY` assertion rests on, and an
+/// under-count there makes that assertion decorative: it certifies a fit it has not
+/// measured. Measured, the worst-case document is 24,710,972 B against a cap of
+/// 29,360,128 — and was 444 KiB under the *old* cap, so nothing was being lost yet.
+/// That margin was accidental, which is the defect: the reservation claimed 4 MiB of
+/// room against 7.57 MiB of content, so one more event field would have crossed it in
+/// silence, and since DEC-320 `prune` **deletes** what it cannot read.
+///
+/// Asserting the length of the file that is actually written is what keeps this
+/// from being a second copy of the same arithmetic (DEC-320).
+#[test]
+fn the_ancillary_reservation_covers_the_worst_case_ancillary_document() {
+    use control_ofc_daemon::constants as k;
+    let tmp = tempfile::tempdir().unwrap();
+    let s = worst_case_ancillary_session("ancillary");
+
+    // Preconditions: the fixture must really be at the caps, or a passing
+    // assertion says nothing about the worst case.
+    assert_eq!(s.events.len(), k::VALIDATION_MAX_EVENTS);
+    assert_eq!(
+        s.external_measurements.len(),
+        k::VALIDATION_MAX_EXTERNAL_MEASUREMENTS
+    );
+    assert_eq!(
+        s.metadata.user_metadata.len(),
+        k::VALIDATION_MAX_METADATA_KEYS
+    );
+    assert_eq!(s.sweep_members.len(), k::VALIDATION_MAX_SWEEP_MEMBERS);
+    assert!(
+        s.events.iter().all(|e| e.detail.as_ref().unwrap().len()
+            == k::VALIDATION_MAX_TEXT_FIELD_BYTES
+            && e.member_id.as_ref().unwrap().len() == k::VALIDATION_MAX_TEXT_FIELD_BYTES),
+        "every event must carry BOTH text fields at the bound — carrying one is \
+         the under-count this test exists to catch"
+    );
+    assert!(
+        s.samples.is_empty(),
+        "the ancillary measurement must exclude samples, which have their own budget"
+    );
+
+    let len = saved_len(tmp.path(), &s) as usize;
+    assert!(
+        len <= k::VALIDATION_MAX_ANCILLARY_BYTES,
+        "the worst-case ancillary document realised {len} bytes against a \
+         {} reservation — the reservation is an under-count, so the \
+         SESSION > SAMPLE + ANCILLARY assertion certifies a fit nothing measured",
+        k::VALIDATION_MAX_ANCILLARY_BYTES
+    );
+    // The reservation must not have been inflated past the point where it means
+    // anything either: it is sized above the measurement, not orders above it.
+    assert!(
+        len > k::VALIDATION_MAX_ANCILLARY_BYTES / 2,
+        "the fixture realised {len} bytes, under half the {} reservation — either \
+         the fixture stopped being the worst case or the reservation is padding",
+        k::VALIDATION_MAX_ANCILLARY_BYTES
+    );
+}
+
+/// And the two budgets must hold **together**, as one realised file.
+///
+/// This is the assertion the `const` assert stands in for at compile time, and
+/// the only one that exercises what a real session actually is: worst-case
+/// ancillary content *and* samples to the derived cap, written and read back.
+/// Either budget being an under-count fails here, whatever the arithmetic says.
+#[test]
+fn a_session_at_every_cap_at_once_still_reads_back_from_the_store() {
+    use control_ofc_daemon::constants as k;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = worst_case_ancillary_session("everycap");
+    let cap = fill_to_cap(&mut s);
+    assert!(cap > 0, "a 65-member session must still record a sample");
+
+    let len = saved_len(tmp.path(), &s) as usize;
+    assert!(
+        len <= k::VALIDATION_MAX_SESSION_BYTES as usize,
+        "a session at every cap wrote {len} bytes, over the {} the store can read \
+         — it would be written, then classified TooLarge, then deleted by prune",
+        k::VALIDATION_MAX_SESSION_BYTES
+    );
+    let back = store::load_from(tmp.path(), "val-everycap")
+        .expect("a session the store wrote must be readable");
+    let back = back.expect("the session must load, not vanish");
+    assert_eq!(back.samples.len(), cap);
+    assert_eq!(back.events.len(), k::VALIDATION_MAX_EVENTS);
+    assert_eq!(
+        store::list_from(tmp.path()).len(),
+        1,
+        "and it must be listed"
+    );
+}
+
+/// `WIDEST_MEASUREMENT_VALUE` must really be the widest `f64` rendering, for the
+/// same reason `WIDEST_POWER_SAMPLE` is pinned: the intuitive choice — a
+/// full-precision value near the top of the range — is six characters short of a
+/// small arbitrary quotient, and a probe built on the intuitive one under-counts.
+#[test]
+fn the_widest_measurement_value_is_really_the_widest() {
+    let widest = serde_json::to_string(&WIDEST_MEASUREMENT_VALUE)
+        .unwrap()
+        .len();
+    for candidate in [
+        999.9999999999999_f64,
+        123.45678901234567,
+        f64::MAX,
+        f64::MIN_POSITIVE,
+        -100.5,
+        1.0 / 3.0,
+        2.0 / 3.0,
+        1e-5,
+        9.999999999999999e-5,
+    ] {
+        let n = serde_json::to_string(&candidate).unwrap().len();
+        assert!(
+            n <= widest,
+            "{candidate} renders in {n} bytes, wider than the {widest} the probe \
+             assumes — the ancillary measurement under-counts every f64 field"
+        );
+    }
 }
 
 /// **Regression for the defect found INSIDE the fix.** The per-sample probe used
