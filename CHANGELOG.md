@@ -5,7 +5,8 @@
 **The safety preflight now reads every fan source, not just the motherboard's
 (DEC-340, register row `P8-t`).** No wire shape, capability or error code
 changes, and no GUI release is required — the same `supporting_cooling` check,
-in the same place, simply stops claiming it could not read siblings it can.
+in the same place, simply stops claiming it could not read siblings it can. Pairs
+with `control-ofc-gui` >= v2.23.0 as before.
 
 *Why this is a patch:* the report's shape, its check ids and its five state
 tokens are unchanged, and no verdict that was `blocked` becomes runnable —
