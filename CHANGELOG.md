@@ -1,6 +1,53 @@
 # Changelog
 
-## [Unreleased]
+## [2.43.7] — 2026-09-09
+
+**A cooling-device member id is now bounded by LENGTH, not only by list count
+(DEC-349, register package `G38` — rows `P8-bs`, `P8-ca`).** One behaviour change
+on `POST /config/cooling-device`; the rest is test coverage.
+
+**`validate_device` bounded `name`, `kind`, the three sensors and
+`device_policy_id` at 256 bytes and bounded the member lists by entry count
+alone** — 32 per list, each entry unbounded. Those ids are copied verbatim into a
+validation session's `members[].member_id` and `.label`, `radiator_members`,
+`sweep_members` and every `findings[]`, `evidence[]` and `startup_fingerprints[]`
+entry — `findings` and `evidence` being the largest terms — which is ancillary text
+`VALIDATION_MAX_ANCILLARY_BYTES` has to cover and was the one term of it no
+constant bounded. It matters because a document that outgrows the reservation is
+not truncated but **deleted** — `prune` reclaims what it cannot read — and
+`unknown_member` short-circuits when no hwmon controller is present, so on such a
+host the ids were accepted unverified. Every entry of `pump_member`,
+`radiator_members[]` and `auxiliary_members[]` is now bounded at the same 256
+bytes, `400 validation_error` beyond it. No real id comes close: the daemon's own
+stable ids run about 40 bytes, so a client posting ids it discovered from
+`/hwmon/headers` or `/fans` cannot hit this.
+
+**The reservation was re-measured rather than re-reasoned.** Its fixture used
+*realistic* member ids, because while the ids were unbounded there was no worst
+case to measure — so the measurement was an under-count for exactly the term this
+change bounds. The fixture now takes them at the ingest bound and asserts it does;
+the worst-case document realises **8,047,435 bytes** against the 10 MiB
+reservation, up from 7,938,808. The ~106 KB of growth is what the reservation had
+been silently carrying as an unknown. `constants.rs` drops member ids from its
+"honest limits" list, which is down to one (`P8-br`).
+
+**The Phase 8 wire pin was one-sided and is now bilateral.** `G33` declared 16
+structs — preflight, control-path discovery, PWM characterisation, steady state,
+the startup fingerprint — in the GUI's `wire_fields.json` only. That catches the
+GUI dropping a field it should model; it does not catch the daemon renaming one,
+because the fixture is static data and never queries a live daemon, so a rename
+left the declared list stale and the GUI test green. `wire_field_surface_is_pinned`
+now constructs all 29. Verified to bite: renaming `CharSummary.typical_response_ms`
+on the wire reddens it.
+
+**What that does and does not buy, stated precisely.** A daemon-side rename now
+reds the Rust test, where before it reddened nothing. It does **not** make the two
+declared lists self-synchronising: the Rust arm's `want` list and the GUI fixture's
+`fields` list are each checked only against their own side, and nothing compares
+them to each other. A developer who renames a field and updates the Rust arm — as
+they must, to get green — can still leave the fixture stale. Keeping the two in
+step remains manual, and the failure message says so by naming all three places to
+update.
 
 **A flaky test on the thermal-emergency path, and a precondition that shared the
 defect's blind spot (DEC-348, register package `G37` — row `P8-bw`).** Test only.

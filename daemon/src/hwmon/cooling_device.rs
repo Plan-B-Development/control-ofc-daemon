@@ -275,6 +275,29 @@ pub fn validate_device(dev: &CoolingDeviceConfig) -> Result<(), String> {
     if dev.all_members().iter().any(|m| m.is_empty()) {
         return Err("member ids must not be empty".into());
     }
+    // Bound member id LENGTH, not just count (`P8-bs`). The lists above are
+    // bounded by entry count; each entry was bounded by nothing. These ids are
+    // client-supplied and are copied VERBATIM into a validation session's
+    // `members[].member_id` and `.label`, `radiator_members`, `sweep_members`, and
+    // every `findings[]`, `evidence[]` and `startup_fingerprints[]` entry — the
+    // first two of which are the LARGEST terms, together ~46% of the id
+    // occurrences in a worst-case document — ancillary text that
+    // `VALIDATION_MAX_ANCILLARY_BYTES` must cover, and the one term of it that no
+    // constant bounded. That matters because a document which outgrows the
+    // reservation is not truncated, it is DELETED: `prune` reclaims what it
+    // cannot read. `unknown_member` also short-circuits when no hwmon controller
+    // is present, so on such a host these ids are accepted unverified.
+    //
+    // Same constant and same reason as `preferred_sensor` above (DEC-320): bound
+    // at ingest, which is also what keeps "too large to read" meaning "written by
+    // a daemon older than this one" and therefore safe to reclaim.
+    if dev
+        .all_members()
+        .iter()
+        .any(|m| m.len() > MAX_DEVICE_TEXT_BYTES)
+    {
+        return Err(format!("a member id exceeds {MAX_DEVICE_TEXT_BYTES} bytes"));
+    }
     // A header in two roles of one device would make "what is this channel?"
     // unanswerable, and the GUI renders per-role rows.
     let mut seen = std::collections::HashSet::new();
@@ -519,6 +542,87 @@ mod tests {
             ..aio()
         };
         assert!(validate_device(&too_many).is_err());
+    }
+
+    /// `P8-bs`: a member id is bounded by LENGTH, not only by list count.
+    ///
+    /// Each list was bounded at `MAX_MEMBERS_PER_LIST` entries and each entry by
+    /// nothing, so a client could hand the daemon ~2.5 MB of ids across 65
+    /// members. They are copied verbatim into a validation session's
+    /// `members[].member_id`/`.label`, `radiator_members` and `sweep_members` —
+    /// ancillary text `VALIDATION_MAX_ANCILLARY_BYTES` must cover, and a document
+    /// that outgrows it is deleted by `prune`, not truncated.
+    ///
+    /// **Both branches, deliberately.** A predicate stuck at "reject" satisfies
+    /// the three rejection cases on its own, so the at-the-bound acceptances are
+    /// what make this test able to fail for the right reason. Sized from the
+    /// constant rather than from a literal, so moving the bound moves the test.
+    #[test]
+    fn validate_device_bounds_member_id_length_in_every_role() {
+        let over = "a".repeat(MAX_DEVICE_TEXT_BYTES + 1);
+        let at = "a".repeat(MAX_DEVICE_TEXT_BYTES);
+
+        let over_cases = [
+            (
+                "pump_member",
+                CoolingDeviceConfig {
+                    pump_member: Some(over.clone()),
+                    ..aio()
+                },
+            ),
+            (
+                "radiator_members",
+                CoolingDeviceConfig {
+                    radiator_members: vec![over.clone()],
+                    ..aio()
+                },
+            ),
+            (
+                "auxiliary_members",
+                CoolingDeviceConfig {
+                    auxiliary_members: vec![over.clone()],
+                    ..aio()
+                },
+            ),
+        ];
+        for (role, dev) in &over_cases {
+            assert!(
+                validate_device(dev).is_err(),
+                "an id one byte over the bound must be rejected at ingest in {role}"
+            );
+        }
+
+        let at_cases = [
+            (
+                "pump_member",
+                CoolingDeviceConfig {
+                    pump_member: Some(at.clone()),
+                    ..aio()
+                },
+            ),
+            (
+                "radiator_members",
+                CoolingDeviceConfig {
+                    radiator_members: vec![at.clone()],
+                    ..aio()
+                },
+            ),
+            (
+                "auxiliary_members",
+                CoolingDeviceConfig {
+                    auxiliary_members: vec![at.clone()],
+                    ..aio()
+                },
+            ),
+        ];
+        for (role, dev) in &at_cases {
+            assert!(
+                validate_device(dev).is_ok(),
+                "an id exactly at the {MAX_DEVICE_TEXT_BYTES}-byte bound must be \
+                 accepted in {role}, got {:?}",
+                validate_device(dev).err()
+            );
+        }
     }
 
     /// One bad hand-edited device must not cost the user the good ones.

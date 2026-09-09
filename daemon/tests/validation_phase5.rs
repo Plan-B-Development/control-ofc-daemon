@@ -1692,6 +1692,31 @@ fn aio_member_ids(n: usize) -> Vec<String> {
         .collect()
 }
 
+/// Member ids at `MAX_DEVICE_TEXT_BYTES` — the widest a client can now get past
+/// `validate_device` (`P8-bs`).
+///
+/// The ancillary reservation has to be measured against THIS, not against
+/// `aio_member_ids`' realistic ~40-byte ids. These strings are copied verbatim
+/// into `members[].member_id` and `.label`, `radiator_members` and
+/// `sweep_members`, and until `P8-bs` they were bounded by nothing — which is
+/// exactly why `VALIDATION_MAX_ANCILLARY_BYTES` recorded them as a term its
+/// measurement could not cover. Now that they are bounded, the worst case is
+/// computable and the fixture must take it (DEC-320: measure the realised
+/// artefact, and bound the input at ingest).
+fn aio_member_ids_at_bound(n: usize) -> Vec<String> {
+    let bound = control_ofc_daemon::hwmon::cooling_device::MAX_DEVICE_TEXT_BYTES;
+    (0..n)
+        .map(|i| {
+            let head = format!("hwmon:it8696:isa-0a40:pwm{i}:CHA_FAN{i}:");
+            assert!(
+                head.len() <= bound,
+                "the distinguishing prefix no longer fits the ingest bound"
+            );
+            format!("{head}{}", "a".repeat(bound - head.len()))
+        })
+        .collect()
+}
+
 /// A session over `n` members whose samples carry `sensor` as their
 /// `temperature_sensor` — the field `recorder.rs` copies into every sample.
 fn sized_session(tag: &str, n: usize, sensor: &str) -> ValidationSession {
@@ -2002,7 +2027,8 @@ fn worst_case_ancillary_session(tag: &str) -> ValidationSession {
 
     // 65 members = the maximum a device may claim (1 pump + 2 x MAX_MEMBERS_PER_LIST),
     // the same ceiling `every_topology_writes_a_file_the_store_can_read_back` sweeps to.
-    let ids = aio_member_ids(65);
+    // At the INGEST BOUND, not realistic (`P8-bs`) — see `aio_member_ids_at_bound`.
+    let ids = aio_member_ids_at_bound(65);
     let mut s = session();
     s.session_id = format!("val-{tag}");
     s.state = STATE_COMPLETED.into();
@@ -2222,6 +2248,47 @@ fn the_ancillary_reservation_covers_the_worst_case_ancillary_document() {
         k::VALIDATION_MAX_METADATA_KEYS
     );
     assert_eq!(s.sweep_members.len(), k::VALIDATION_MAX_SWEEP_MEMBERS);
+    // `P8-bs`: member ids are ancillary text bounded at ingest, so the worst case
+    // uses them at that bound. With realistic ids this measurement is an
+    // under-count and a passing assertion says nothing about the worst case —
+    // the same defect `P8-ae` closed for the sample probe.
+    let id_bound = control_ofc_daemon::hwmon::cooling_device::MAX_DEVICE_TEXT_BYTES;
+    // ALL SIX arrays, not the three that are easiest to reach. `findings` and
+    // `evidence` alone are 227 of the 495 at-bound id occurrences, so a
+    // precondition over `members`/`radiator_members`/`sweep_members` pins 28% of
+    // the term it exists to pin — and `aio_member_ids`, the realistic helper, is
+    // still here and still used elsewhere, so a later edit re-pointing one array
+    // at it would leave this green while the measurement silently reverted to an
+    // under-count.
+    assert!(
+        s.metadata
+            .radiator_members
+            .iter()
+            .all(|m| m.len() == id_bound)
+            && s.metadata
+                .members
+                .iter()
+                .all(|m| m.member_id.len() == id_bound)
+            && s.sweep_members.iter().all(|m| m.len() == id_bound)
+            && s.findings
+                .iter()
+                .all(|f| f.member_id.as_ref().is_some_and(|m| m.len() == id_bound))
+            && s.startup_fingerprints
+                .iter()
+                .all(|f| f.member_id.len() == id_bound)
+            && s.evidence.iter().all(|e| e.member_id.len() == id_bound),
+        "every member id must be at the {id_bound}-byte ingest bound"
+    );
+    // The label is a RELATIONSHIP to the id, not a literal: `member()` builds it
+    // as `{id} label`, so a byte count here would stop tracking the id bound the
+    // moment that format changed.
+    assert!(
+        s.metadata
+            .members
+            .iter()
+            .all(|m| m.label.len() == m.member_id.len() + " label".len()),
+        "each member label must still derive from its id, or it stops scaling with the bound"
+    );
     assert!(
         s.events.iter().all(|e| e.detail.as_ref().unwrap().len()
             == k::VALIDATION_MAX_TEXT_FIELD_BYTES

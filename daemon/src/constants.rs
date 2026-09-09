@@ -754,34 +754,38 @@ pub const VALIDATION_MAX_SESSION_BYTES: u64 = 28 * 1024 * 1024;
 ///     all**, and evidence alone realises **1.51 MB** — each entry carries a full
 ///     Phase 3 run, and the array is bounded only by the orchestration walk.
 ///
-/// Measured total at every cap: **7,938,808 bytes**, against the 4 MiB this
-/// reserved. `the_ancillary_reservation_covers_the_worst_case_ancillary_document`
-/// writes that document and asserts the realised length both ways — under this
+/// Measured total at every cap: **8,047,435 bytes**, against the 4 MiB the
+/// pre-`P8-s` version reserved.
+/// `the_ancillary_reservation_covers_the_worst_case_ancillary_document` writes
+/// that document and asserts the realised length both ways — under this
 /// reservation, and over half of it, so the reservation cannot quietly become
 /// padding either.
 ///
-/// **Honest limits — two, and neither is closed by this reservation.**
+/// **That figure was 7,938,808 B until `P8-bs` (2026-09-09), and the increase is
+/// the point.** The fixture used *realistic* ~40-byte member ids because member
+/// ids were bounded by nothing, so no worst case existed to measure; they are now
+/// bounded at `MAX_DEVICE_TEXT_BYTES` at ingest, the fixture takes them at that
+/// bound, and the measurement covers the term for the first time. The ~106 KB it
+/// adds is what the reservation was silently carrying as an unknown.
 ///
-/// The event, measurement and metadata terms are bounded by the constants above,
-/// and the evidence array's *length* by the orchestration walk. Two ancillary
-/// text sources are not:
+/// **Honest limit — one, and it is not closed by this reservation.**
 ///
-///   * **cooling-device member ids** (`P8-bs`). `validate_device` bounds `name`,
-///     `kind`, the three sensors and `device_policy_id` at `MAX_DEVICE_TEXT_BYTES`
-///     and bounds the member lists by **count only**. Those ids are copied into
-///     `members[].member_id` and `.label`, `radiator_members`, `sweep_members`,
-///     and every `evidence`/`findings`/`startup_fingerprints` entry — so they are
-///     client-supplied ancillary text with no length bound, exactly the shape
-///     `preferred_sensor` was given one for seven lines above. Found by
-///     `ofc:security-reviewer`; an earlier draft of this paragraph asserted the
-///     opposite.
+/// The event, measurement, metadata and member-id terms are bounded by the
+/// constants above, and the evidence array's *length* by the orchestration walk.
+/// The member-id term lands in `members[].member_id` and `.label`,
+/// `radiator_members`, `sweep_members`, and every `findings[]`, `evidence[]` and
+/// `startup_fingerprints[]` entry — `findings` and `evidence` being the two
+/// largest, so an enumeration that omits them under-counts the term by about
+/// half. One ancillary text source is still unbounded:
+///
 ///   * **daemon-formatted `detail` strings** on `EvidenceRef` and
 ///     `CharacterizationRun` (`P8-br`), bounded by nothing but what the daemon
 ///     formats into them.
 ///
 /// The measurement below is therefore a bound on the terms that ARE bounded, and
-/// the fixture that takes it uses realistic member ids. Neither gap is reachable
-/// in normal operation; both are recorded rather than assumed away.
+/// the fixture that takes it uses member ids at their ingest bound. The remaining
+/// gap is not reachable in normal operation; it is recorded rather than assumed
+/// away.
 pub const VALIDATION_MAX_ANCILLARY_BYTES: usize = 10 * 1024 * 1024;
 
 /// Bound on each free-text field a client may attach to a session (an event

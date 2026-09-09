@@ -2156,22 +2156,37 @@ mod tests {
     ///
     /// The GUI's `tests/fixtures/wire_fields.json` declares the same lists and
     /// `tests/test_wire_field_coverage.py` asserts each has a model slot there.
-    /// Neither copy can drift alone: adding a field here reds this test, and
-    /// updating the fixture to match then reds the Python one until the GUI
-    /// models it. That is the pairing the 2026-09-05 wire sweep found missing —
+    /// Adding a field reds this test, and updating the fixture to match then reds
+    /// the Python one until the GUI models it. **That is a workflow, not an
+    /// interlock** — the `want` lists below and the fixture's `fields` lists are
+    /// each checked only against their own side, and nothing compares the two, so
+    /// a rename fixed here and not in the fixture leaves the fixture stale and
+    /// both tests green. The assertion message names all three places for that
+    /// reason. That is the pairing the 2026-09-05 wire sweep found missing —
     /// 41 divergences, none of which anything compared (register row `WIRE-aj`).
     ///
-    /// Every `Option` is `Some` and every `Vec` non-empty on purpose: these
-    /// structs are dense with `skip_serializing_if`, so a `None` would drop the
-    /// key and the assertion would silently stop covering it.
+    /// Every `Option` is `Some` and every `Vec` non-empty on purpose: the structs
+    /// in THIS module are dense with `skip_serializing_if`, so a `None` would drop
+    /// the key and the assertion would silently stop covering it. The 16 Phase 8
+    /// structs added by `P8-ca` carry none, so their key set is unconditional and
+    /// populating them is realism rather than necessity — but keep doing it, since
+    /// a future `skip_serializing_if` would otherwise change what this pins.
     ///
-    /// Scope is deliberately partial — the structs behind `/sensors`, `/fans`,
-    /// `/poll`, `/hwmon/headers`, `/inventory/hwmon`, `/inventory/cooling-devices`,
+    /// Scope covers the structs behind `/sensors`, `/fans`, `/poll`,
+    /// `/hwmon/headers`, `/inventory/hwmon`, `/inventory/cooling-devices`,
     /// `/capabilities` (`Limits`) and `/diagnostics/hardware` (`VoltageEntry`),
-    /// i.e. where drift has actually happened or where a struct is new enough
-    /// that it has not had the chance yet. Adding a struct is an arm here plus a
-    /// fixture entry; it is not automatic. **Keep this list current** — it is
-    /// what the next person reads to decide whether a struct belongs.
+    /// plus the Phase 8 diagnostic surfaces — preflight, control-path discovery,
+    /// PWM characterisation, steady state and the startup fingerprint.
+    ///
+    /// **All 29 fixture entries now have a daemon-side arm (`P8-ca`)** — each
+    /// side is pinned to its own source, which is what a rename needs to red
+    /// something; see the interlock caveat above. `G33`
+    /// declared the 16 Phase 8 structs in the GUI fixture alone, which catches the
+    /// GUI dropping a field it should model and NOT the daemon renaming one: that
+    /// fixture is static data, never a live query, so a daemon-side rename left the
+    /// declared list stale and the Python test green. Adding a struct is an arm
+    /// here plus a fixture entry; it is not automatic. **Keep this list current** —
+    /// it is what the next person reads to decide whether a struct belongs.
     #[test]
     fn wire_field_surface_is_pinned() {
         fn keys(v: &serde_json::Value) -> Vec<String> {
@@ -2519,6 +2534,465 @@ mod tests {
                 "label",
                 "value_v",
                 "identified",
+            ],
+        );
+
+        // ── `P8-ca`: the 16 structs `G33` pinned on the GUI side ONLY ──
+        //
+        // `G33` declared these in `tests/fixtures/wire_fields.json` so the GUI
+        // cannot drop a field it should model. That half is fixture-driven and
+        // never queries a live daemon, so it catches the GUI dropping a field and
+        // NOT the daemon renaming one — a rename left the declared list stale and
+        // the GUI test green. These arms are the other half.
+        //
+        // Unlike the structs above, none of these carries `skip_serializing_if`,
+        // so their serialised key set is unconditional and populating the
+        // `Option`s is realism rather than necessity.
+        use crate::api::characterization::{
+            CharPoint, CharSummary, EstimatedRpm, PlateauSpan, PointStability,
+        };
+        use crate::api::discovery::{
+            ControlPathCandidate, ControlPathRun, DiscoveryCycle, DiscoverySummary, TachChannel,
+            TachObservation,
+        };
+        use crate::api::preflight::{PreflightCheck, PreflightReport};
+        use crate::api::stats::SteadyState;
+        use crate::control_paths::ControlPathRecord;
+        use crate::validation::session::StartupFingerprint;
+
+        let check = PreflightCheck {
+            check_id: "thermal_state".into(),
+            state: "pass".into(),
+            detail: "thermal_state=normal".into(),
+        };
+        expect(
+            &serde_json::to_value(&check).unwrap(),
+            "PreflightCheck",
+            &["check_id", "state", "detail"],
+        );
+
+        let report = PreflightReport {
+            header_id: "hwmon:it8696:isa-0a40:pwm1:CPU_FAN".into(),
+            diagnostic: "control_path_discovery".into(),
+            verdict: "blocked".into(),
+            checks: vec![check],
+            blocking: vec!["pump_protected".into()],
+        };
+        expect(
+            &serde_json::to_value(&report).unwrap(),
+            "PreflightReport",
+            &["header_id", "diagnostic", "verdict", "checks", "blocking"],
+        );
+
+        let observation = TachObservation {
+            tach_id: "hwmon:it8696:isa-0a40:fan1".into(),
+            baseline_rpm: Some(820),
+            perturbed_rpm: Some(1180),
+            delta_rpm: Some(360),
+            noise_floor_rpm: 30,
+            responded: true,
+        };
+        expect(
+            &serde_json::to_value(&observation).unwrap(),
+            "TachObservation",
+            &[
+                "tach_id",
+                "baseline_rpm",
+                "perturbed_rpm",
+                "delta_rpm",
+                "noise_floor_rpm",
+                "responded",
+            ],
+        );
+
+        let channel = TachChannel {
+            tach_id: "hwmon:it8696:isa-0a40:fan1".into(),
+            label: "CPU_FAN".into(),
+            monitor_only: false,
+            is_target_header: true,
+        };
+        expect(
+            &serde_json::to_value(&channel).unwrap(),
+            "TachChannel",
+            &["tach_id", "label", "monitor_only", "is_target_header"],
+        );
+
+        let cycle = DiscoveryCycle {
+            cycle: 1,
+            baseline_pct: 40,
+            perturbed_pct: 70,
+            direction: "up".into(),
+            observations: vec![observation],
+        };
+        expect(
+            &serde_json::to_value(&cycle).unwrap(),
+            "DiscoveryCycle",
+            &[
+                "cycle",
+                "baseline_pct",
+                "perturbed_pct",
+                "direction",
+                "observations",
+            ],
+        );
+
+        let candidate = ControlPathCandidate {
+            tach_id: "hwmon:it8696:isa-0a40:fan1".into(),
+            label: "CPU_FAN".into(),
+            monitor_only: false,
+            confidence: "high".into(),
+            direction: "up".into(),
+            baseline_rpm: Some(820),
+            perturbed_rpm: Some(1180),
+            change_pct: Some(43.9),
+            cycles_responded: 2,
+            cycles_total: 2,
+        };
+        expect(
+            &serde_json::to_value(&candidate).unwrap(),
+            "ControlPathCandidate",
+            &[
+                "tach_id",
+                "label",
+                "monitor_only",
+                "confidence",
+                "direction",
+                "baseline_rpm",
+                "perturbed_rpm",
+                "change_pct",
+                "cycles_responded",
+                "cycles_total",
+            ],
+        );
+
+        let summary = DiscoverySummary {
+            relationship: "drives".into(),
+            confidence: "high".into(),
+            candidates: vec![candidate],
+            measurement_resolution_ms: Some(500),
+            sample_interval_ms: 500,
+            sample_count: 24,
+            confidence_notes: vec!["two of two cycles responded".into()],
+        };
+        expect(
+            &serde_json::to_value(&summary).unwrap(),
+            "DiscoverySummary",
+            &[
+                "relationship",
+                "confidence",
+                "candidates",
+                "measurement_resolution_ms",
+                "sample_interval_ms",
+                "sample_count",
+                "confidence_notes",
+            ],
+        );
+
+        let run = ControlPathRun {
+            run_id: "cpd-1".into(),
+            header_id: "hwmon:it8696:isa-0a40:pwm1:CPU_FAN".into(),
+            state: "completed".into(),
+            delta_pct: 30,
+            requested_cycles: 2,
+            window_seconds: 12,
+            baseline_pct: 40,
+            perturbed_pct: 70,
+            direction: "up".into(),
+            channels: vec![channel],
+            cycles: vec![cycle],
+            summary: Some(summary),
+            original_pct: Some(40),
+            restore_failed: false,
+            restore_outcome: "restored".into(),
+            detail: Some("two cycles, one responder".into()),
+            completed_unix_ms: Some(1_757_000_000_000),
+        };
+        expect(
+            &serde_json::to_value(&run).unwrap(),
+            "ControlPathRun",
+            &[
+                "run_id",
+                "header_id",
+                "state",
+                "delta_pct",
+                "requested_cycles",
+                "window_seconds",
+                "baseline_pct",
+                "perturbed_pct",
+                "direction",
+                "channels",
+                "cycles",
+                "summary",
+                "original_pct",
+                "restore_failed",
+                "restore_outcome",
+                "detail",
+                "completed_unix_ms",
+            ],
+        );
+
+        let record = ControlPathRecord {
+            header_id: "hwmon:it8696:isa-0a40:pwm1:CPU_FAN".into(),
+            relationship: "drives".into(),
+            confidence: "high".into(),
+            tach_ids: vec!["hwmon:it8696:isa-0a40:fan1".into()],
+            tach_labels: vec!["CPU_FAN".into()],
+            direction: "up".into(),
+            baseline_rpm: Some(820),
+            perturbed_rpm: Some(1180),
+            change_pct: Some(43.9),
+            run_id: "cpd-1".into(),
+            validated_unix_ms: 1_757_000_000_000,
+        };
+        expect(
+            &serde_json::to_value(&record).unwrap(),
+            "ControlPathRecord",
+            &[
+                "header_id",
+                "relationship",
+                "confidence",
+                "tach_ids",
+                "tach_labels",
+                "direction",
+                "baseline_rpm",
+                "perturbed_rpm",
+                "change_pct",
+                "run_id",
+                "validated_unix_ms",
+            ],
+        );
+
+        let stability = PointStability {
+            samples: 24,
+            usable: 23,
+            dropouts: 1,
+            outliers: 0,
+            mean_rpm: Some(1180.4),
+            median_rpm: Some(1181),
+            min_rpm: Some(1160),
+            max_rpm: Some(1200),
+            stddev_rpm: Some(11.2),
+            cv_pct: Some(0.95),
+            verdict: "stable".into(),
+            sample_interval_ms: 500,
+            dwell_ms: 12_000,
+        };
+        expect(
+            &serde_json::to_value(&stability).unwrap(),
+            "PointStability",
+            &[
+                "samples",
+                "usable",
+                "dropouts",
+                "outliers",
+                "mean_rpm",
+                "median_rpm",
+                "min_rpm",
+                "max_rpm",
+                "stddev_rpm",
+                "cv_pct",
+                "verdict",
+                "sample_interval_ms",
+                "dwell_ms",
+            ],
+        );
+
+        let estimated = EstimatedRpm {
+            value: 1180,
+            provenance: "measured".into(),
+            correction_factor: 1.0,
+            correction_source: "none".into(),
+        };
+        expect(
+            &serde_json::to_value(&estimated).unwrap(),
+            "EstimatedRpm",
+            &[
+                "value",
+                "provenance",
+                "correction_factor",
+                "correction_source",
+            ],
+        );
+
+        let plateau = PlateauSpan {
+            from_pct: 20,
+            to_pct: 35,
+            rpm_min: 640,
+            rpm_max: 700,
+        };
+        expect(
+            &serde_json::to_value(plateau).unwrap(),
+            "PlateauSpan",
+            &["from_pct", "to_pct", "rpm_min", "rpm_max"],
+        );
+
+        let point = CharPoint {
+            requested_pct: 70,
+            command_accepted: true,
+            readback_pct: Some(70),
+            readback_raw: Some(178),
+            pwm_enable: Some(1),
+            rpm_before: Some(820),
+            rpm_after: Some(1180),
+            settle_ms: 6_000,
+            first_change_ms: Some(400),
+            readback_verdict: "exact".into(),
+            rpm_verdict: "responded".into(),
+            direction: "up".into(),
+            step_index: 3,
+            settled_ms: Some(5_400),
+            stability: Some(stability),
+            estimated_physical_rpm: Some(estimated),
+        };
+        expect(
+            &serde_json::to_value(&point).unwrap(),
+            "CharPoint",
+            &[
+                "requested_pct",
+                "command_accepted",
+                "readback_pct",
+                "readback_raw",
+                "pwm_enable",
+                "rpm_before",
+                "rpm_after",
+                "settle_ms",
+                "first_change_ms",
+                "readback_verdict",
+                "rpm_verdict",
+                "direction",
+                "step_index",
+                "settled_ms",
+                "stability",
+                "estimated_physical_rpm",
+            ],
+        );
+
+        let char_summary = CharSummary {
+            command_acceptance: "accepted".into(),
+            pwm_readback: "exact".into(),
+            rpm_response: "monotonic".into(),
+            min_tested_pct: Some(20),
+            max_tested_pct: Some(100),
+            min_rpm: Some(640),
+            max_rpm: Some(1900),
+            monotonic: Some(true),
+            dead_zone_upper_pct: Some(15),
+            clamp_pct: None,
+            possible_device_override: false,
+            interference_detected: false,
+            hysteresis_pct: Some(3.2),
+            hysteresis_verdict: "low".into(),
+            hysteresis_worst_duty_pct: Some(45),
+            hysteresis_worst_delta_rpm: Some(80),
+            hysteresis_compared_points: 9,
+            min_responsive_pct: Some(20),
+            max_responsive_pct: Some(95),
+            low_plateau_to_pct: Some(35),
+            saturation_from_pct: Some(95),
+            plateaus: vec![plateau],
+            stability_verdict: "stable".into(),
+            worst_cv_pct: Some(1.8),
+            total_dropouts: 1,
+            total_outliers: 0,
+            measurement_resolution_ms: Some(500),
+            typical_response_ms: Some(400),
+            typical_settling_ms: Some(5_400),
+            outside_learned_range: Some(false),
+            learned_range_note: Some("within the learned range".into()),
+            interpretation_states: vec!["monotonic".into()],
+        };
+        expect(
+            &serde_json::to_value(&char_summary).unwrap(),
+            "CharSummary",
+            &[
+                "command_acceptance",
+                "pwm_readback",
+                "rpm_response",
+                "min_tested_pct",
+                "max_tested_pct",
+                "min_rpm",
+                "max_rpm",
+                "monotonic",
+                "dead_zone_upper_pct",
+                "clamp_pct",
+                "possible_device_override",
+                "interference_detected",
+                "hysteresis_pct",
+                "hysteresis_verdict",
+                "hysteresis_worst_duty_pct",
+                "hysteresis_worst_delta_rpm",
+                "hysteresis_compared_points",
+                "min_responsive_pct",
+                "max_responsive_pct",
+                "low_plateau_to_pct",
+                "saturation_from_pct",
+                "plateaus",
+                "stability_verdict",
+                "worst_cv_pct",
+                "total_dropouts",
+                "total_outliers",
+                "measurement_resolution_ms",
+                "typical_response_ms",
+                "typical_settling_ms",
+                "outside_learned_range",
+                "learned_range_note",
+                "interpretation_states",
+            ],
+        );
+
+        let steady = SteadyState {
+            verdict: "steady".into(),
+            start_ms: Some(240_000),
+            warmup_ms: Some(240_000),
+            slope_c_per_min: Some(0.04),
+            stddev_c: Some(0.31),
+            mean_c: Some(48.2),
+            peak_c: Some(49.1),
+            confidence: "high".into(),
+            criterion: "slope_and_stddev".into(),
+        };
+        expect(
+            &serde_json::to_value(&steady).unwrap(),
+            "SteadyState",
+            &[
+                "verdict",
+                "start_ms",
+                "warmup_ms",
+                "slope_c_per_min",
+                "stddev_c",
+                "mean_c",
+                "peak_c",
+                "confidence",
+                "criterion",
+            ],
+        );
+
+        let fingerprint = StartupFingerprint {
+            member_id: "hwmon:it8696:isa-0a40:pwm5:PUMP".into(),
+            role: "pump".into(),
+            override_observed: true,
+            override_duration_ms: Some(4_200),
+            peak_rpm: Some(2_900),
+            requested_pct_during: Some(30),
+            readback_pct_during: Some(100),
+            post_override_rpm: Some(1_400),
+            transition_ms: Some(900),
+            interpretation: "device_startup_override".into(),
+        };
+        expect(
+            &serde_json::to_value(&fingerprint).unwrap(),
+            "StartupFingerprint",
+            &[
+                "member_id",
+                "role",
+                "override_observed",
+                "override_duration_ms",
+                "peak_rpm",
+                "requested_pct_during",
+                "readback_pct_during",
+                "post_override_rpm",
+                "transition_ms",
+                "interpretation",
             ],
         );
     }
