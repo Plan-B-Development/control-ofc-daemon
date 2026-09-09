@@ -1,5 +1,44 @@
 # Changelog
 
+## [Unreleased]
+
+**A flaky test on the thermal-emergency path, and a precondition that shared the
+defect's blind spot (DEC-348, register package `G37` — row `P8-bw`).** Test only.
+No product code, wire shape, capability, error code or runtime behaviour changed.
+
+**`hwmon_force_all_completes_every_header_despite_midscan_verify_preempt` raced
+its own preemptor.** It spawned a thread to force-take the hwmon lease "mid-scan"
+and asserted that `force_all_with_floor` had re-taken it, but nothing checked the
+take had actually landed while the scan was still running — so under full-suite
+load the thread could be scheduled after the last header, where `Verify` is the
+legitimate owner. Measured at 1 failure in 3 full-suite runs against 3/3 passes
+in isolation. The product half was never in doubt: the same failing run's
+per-header assertions (every `pwmN` forced to raw `255`) passed. It still
+mattered, because a test that reddens at random on the emergency path is one that
+gets re-run until green.
+
+The preemptor now snapshots the scan's progress while it still holds the
+controller lock, and an attempt whose take arrived too late is retried rather
+than asserted on. Exhausting the attempt bound is a failure, not a skip.
+
+**The first draft of that fix reproduced the defect inside its own
+precondition**, and the mandated fix-out check is what caught it. It gated the
+retry on the write log's final length — a quantity the defect moves, because a
+missing lease re-take stops the scan writing at the preempt. With the fix
+disabled the gate could never open and the test failed with "the window never
+opened", pointing at the harness instead of at the missing re-take. It now counts
+headers already forced at the moment of the take, which is fixed before the
+defect can act; the same disabled-fix run fails with `header pwm2 was not forced
+(partial-write bug)`.
+
+**And that message used to name a different header on every run.** The test
+fixture gave all eight headers the same `(chip_name, pwm_index)` sort key, so
+`headers()`' stable sort left them in `HashMap` order, reseeded per process. The
+scan order — and therefore the header named in the failure — was random. Nothing
+the tests assert depended on it, but a regression test's red has to be
+reproducible to serve as evidence. The fixture now sets a distinct `pwm_index`.
+
+
 ## [2.43.6] — 2026-09-09
 
 **In-code documentation: a retracted safety claim standing at three sites, a

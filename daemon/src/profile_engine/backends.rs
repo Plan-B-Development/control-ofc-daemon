@@ -2746,6 +2746,15 @@ mod tests {
 
     fn header_with_paths(i: usize) -> PwmHeaderDescriptor {
         let mut h = make_header(&format!("hwmon:it8696:pwm{i}"));
+        // Distinct `pwm_index`, or the SCAN ORDER IS RANDOM. `headers()` sorts by
+        // `(chip_name, pwm_index)` and `make_header` hardcodes both, so every
+        // fixture shared one sort key; `sort_by_key` is stable, so what survived
+        // was `HashMap::values()` order, reseeded per process. Nothing these tests
+        // assert depends on order — they all check every header — but the failure
+        // MESSAGE named a different header on each run, which is how the recorded
+        // fix-out evidence for `P8-bw` came to read as self-contradictory in
+        // review. A regression test's red must be reproducible to be usable.
+        h.pwm_index = i as u8;
         h.pwm_path = format!("/sys/class/hwmon/hwmon0/pwm{i}");
         h.enable_path = Some(format!("/sys/class/hwmon/hwmon0/pwm{i}_enable"));
         h
@@ -2848,71 +2857,210 @@ mod tests {
         );
     }
 
+    /// `[SAFETY]` Regression for the `force_all_with_floor` partial-write bug —
+    /// and, since `P8-bw`, a test whose own preemption is OBSERVED rather than
+    /// assumed.
+    ///
+    /// DEC-099 drops the controller lock between headers, so a GUI verify can
+    /// force-take the lease mid-scan and invalidate `force_all_with_floor`'s. The
+    /// retry-on-lease-error fix re-takes thermal-safety and still forces EVERY
+    /// header; without it the header after the preemption is silently left
+    /// un-forced during a thermal emergency.
+    ///
+    /// **`P8-bw`: what was wrong with this test.** The preemptor was sequenced by
+    /// a 20 ms sleep inside the first write and *nothing checked that its take had
+    /// actually landed mid-scan*. Under full-suite load the thread could be
+    /// scheduled after the scan's last re-take, at which point the final lease
+    /// owner is legitimately `Verify` and the assertion failed for a reason that
+    /// was not a defect — measured 2026-09-08 at **1 failure in 3 full-suite
+    /// runs**, against 3/3 passes in isolation. A test that reddens at random on
+    /// the emergency path is one that gets re-run until green, which is how a real
+    /// regression gets waved through.
+    ///
+    /// The preemptor now reports **how much of the scan had happened when its take
+    /// landed**, captured while it still holds the controller lock so the scan
+    /// cannot advance underneath the observation. An attempt whose take arrived
+    /// after the last header exercises no re-take at all and is *retried*, not
+    /// asserted on. So a missed window is a retry and an unhittable window is a
+    /// **failure** — there is no ordering under which this passes without
+    /// exercising what it claims to.
+    ///
+    /// **The precondition counts HEADERS ALREADY FORCED, not writes in the log,
+    /// and that distinction is load-bearing.** The first draft measured the take
+    /// against the log's final length, which the defect itself moves: with the
+    /// lease-retry removed the scan stops writing at the preempt, so
+    /// `take == final length` always and the test reported "the window never
+    /// opened" — red, but for a reason that reads as a broken harness rather than
+    /// a broken emergency. Headers-forced-at-take is fixed by the time the take
+    /// happens and no later failure can move it, so the same run now fails with
+    /// `header pwm2 was not forced (partial-write bug)`. This is DEC-340's rule:
+    /// pick the arm the fix's absence cannot forge.
     #[tokio::test]
     async fn hwmon_force_all_completes_every_header_despite_midscan_verify_preempt() {
-        // Regression for the force_all_with_floor partial-write bug. DEC-099 drops the
-        // controller lock between headers, so a GUI verify can force-take the
-        // lease mid-scan and invalidate force_all_with_floor's. The retry-on-lease-error
-        // fix re-takes thermal-safety and still forces EVERY header; without it
-        // the header after the preemption is silently left un-forced during a
-        // thermal emergency.
         const N: usize = 8;
-        let writes: WriteLog = Arc::new(Mutex::new(Vec::new()));
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
-        let writer = SignalOnFirstWriter {
-            writes: writes.clone(),
-            tx,
-            signaled: false,
-        };
-        let headers: Vec<_> = (1..=N).map(header_with_paths).collect();
-        let cache = Arc::new(StateCache::new());
-        let ctrl = HwmonPwmController::new(headers, LeaseManager::new(), Box::new(writer), cache);
-        let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl)));
+        // Generous. The window is hit on the first attempt in isolation; this
+        // bound exists so a machine that can never hit it fails LOUDLY instead of
+        // spinning.
+        const ATTEMPTS: usize = 64;
 
-        // Exactly one mid-scan preemption: a GUI verify force-takes the lease
-        // once force_all_with_floor is past the first header.
-        let ctrl_for_preempt = be.ctrl.clone();
-        let preemptor = std::thread::spawn(move || {
-            rx.recv()
-                .expect("force_all_with_floor must write at least one header");
-            ctrl_for_preempt
+        fn pwm_path(i: usize) -> String {
+            format!("/sys/class/hwmon/hwmon0/pwm{i}")
+        }
+        /// How many of the `n` headers had been forced when this log was taken.
+        fn headers_forced(log: &[(String, String)], n: usize) -> usize {
+            (1..=n)
+                .filter(|i| log.iter().any(|(p, _)| *p == pwm_path(*i)))
+                .count()
+        }
+
+        /// One run of the scenario. Returns the write log as it stood when the
+        /// verify preempt took the lease, the full log, and the lease owner left
+        /// behind — or `None` if the scan outlived `WRITE_JOIN_BUDGET`, which makes
+        /// the attempt unusable rather than failing.
+        async fn attempt(
+            n: usize,
+        ) -> Option<(
+            Vec<(String, String)>,
+            Vec<(String, String)>,
+            Option<HwmonWriter>,
+        )> {
+            let writes: WriteLog = Arc::new(Mutex::new(Vec::new()));
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            let writer = SignalOnFirstWriter {
+                writes: writes.clone(),
+                tx,
+                signaled: false,
+            };
+            let headers: Vec<_> = (1..=n).map(header_with_paths).collect();
+            let cache = Arc::new(StateCache::new());
+            let ctrl =
+                HwmonPwmController::new(headers, LeaseManager::new(), Box::new(writer), cache);
+            let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl)));
+
+            // Exactly one mid-scan preemption: a GUI verify force-takes the lease
+            // once force_all_with_floor is past the first header.
+            let ctrl_for_preempt = be.ctrl.clone();
+            let writes_for_preempt = writes.clone();
+            let preemptor = std::thread::spawn(move || {
+                rx.recv()
+                    .expect("force_all_with_floor must write at least one header");
+                let mut guard = ctrl_for_preempt.lock();
+                guard
+                    .lease_manager_mut()
+                    .force_take_lease(HwmonWriter::Verify);
+                // Snapshot the scan's progress while STILL holding the controller
+                // lock — otherwise the scan advances between the take and the
+                // observation and the snapshot means nothing. Lock order is
+                // ctrl -> writes here and in the writer, so this cannot deadlock.
+                writes_for_preempt.lock().clone()
+            });
+
+            be.force_all_with_floor(100, &[]).await;
+            // `BoundedWrite::run` RETAINS the spawned handle and reports
+            // `in_flight` when the closure outlives `WRITE_JOIN_BUDGET` (1 s), so
+            // the scan may still be writing when this returns. Observing the log
+            // or the lease now would capture a PARTIAL scan and red as
+            // "header pwmN was not forced" — the misleading emergency-path red
+            // this test exists to remove, re-entering through the harness. Detect
+            // it BEFORE draining (`drain` takes the handle unconditionally, so a
+            // later `writes_stalled()` cannot tell us), drain so nothing is left
+            // running, and discard the attempt.
+            let overran = be.writes_stalled();
+            be.drain_writes(std::time::Duration::from_secs(30)).await;
+            // Joined either way: an abandoned preemptor would outlive the attempt.
+            let at_take = preemptor.join().unwrap();
+            if overran {
+                return None;
+            }
+
+            let owner = be
+                .ctrl
                 .lock()
-                .lease_manager_mut()
-                .force_take_lease(HwmonWriter::Verify);
-        });
+                .lease_manager()
+                .active_lease()
+                .cloned()
+                .map(|l| l.owner);
+            let log = writes.lock().clone();
+            Some((at_take, log, owner))
+        }
 
-        be.force_all_with_floor(100, &[]).await;
-        preemptor.join().unwrap();
+        let mut observed = None;
+        let mut late_takes = 0usize;
+        let mut overruns = 0usize;
+        for _ in 0..ATTEMPTS {
+            let Some((at_take, log, owner)) = attempt(N).await else {
+                overruns += 1;
+                continue;
+            };
+            let forced_at_take = headers_forced(&at_take, N);
+            // INVARIANT, not a retry condition. The preemptor cannot take the
+            // lease until header 1's ENTIRE `set_pwm` has returned, because that
+            // call holds the controller lock throughout — so at least one header
+            // is always forced by then. Note what does NOT establish this: the
+            // signal the preemptor waits on fires during the first `write_file`,
+            // which is the `pwm_enable` write (`pwm_control.rs`, enable-then-duty),
+            // at which point NOTHING is forced yet. It is the lock, not the
+            // signal. Reaching 0 therefore means `set_pwm` began releasing the
+            // lock between its two writes, making a mid-HEADER preempt possible
+            // and this test's window arithmetic wrong — a defect to surface, not
+            // an attempt to retry.
+            assert!(
+                forced_at_take > 0,
+                "the verify preempt took the lease with no header yet forced: \
+                 `set_pwm` must no longer hold the controller lock across its \
+                 enable and duty writes, so this test's mid-scan window is no \
+                 longer the thing it measures"
+            );
+            // PRECONDITION, and the whole point of `P8-bw`: the take must have
+            // landed with at least one header still to go. `N` means every header
+            // was already forced, so nothing followed the take, no re-take was
+            // required, and the run proves nothing about the retry path.
+            if forced_at_take < N {
+                observed = Some((forced_at_take, log, owner));
+                break;
+            }
+            late_takes += 1;
+        }
+        let (forced_at_take, w, owner) = observed.unwrap_or_else(|| {
+            panic!(
+                "the verify preempt never landed mid-scan in {ATTEMPTS} attempts \
+                 ({late_takes} took the lease after the last header, {overruns} \
+                 scans outlived WRITE_JOIN_BUDGET): the window this test exists to \
+                 exercise was never opened, so nothing was verified"
+            )
+        });
 
         // Every header must have been forced to 100% despite the mid-scan
         // preemption. Assert the VALUE (raw "255"), not just presence — the
         // failure message already claims "100%", so prove it.
-        let w = writes.lock();
         for i in 1..=N {
-            let pwm_path = format!("/sys/class/hwmon/hwmon0/pwm{i}");
             let vals: Vec<_> = w
                 .iter()
-                .filter(|(p, _)| *p == pwm_path)
+                .filter(|(p, _)| *p == pwm_path(i))
                 .map(|(_, v)| v.trim())
                 .collect();
             assert!(
                 !vals.is_empty(),
-                "header pwm{i} was not forced (partial-write bug); writes={w:?}"
+                "header pwm{i} was not forced (partial-write bug); the verify \
+                 preempt landed with {forced_at_take} of {N} headers forced; \
+                 writes={w:?}"
             );
             assert!(
                 vals.iter().all(|v| *v == "255"),
                 "header pwm{i} must be forced to 100% (raw 255); got {vals:?}"
             );
         }
-        drop(w);
 
         // force_all_with_floor reclaimed the lease from the verify preemptor — proof the
-        // re-take (not just a lucky race) carried the scan to completion.
-        let lease = be.ctrl.lock().lease_manager().active_lease().cloned();
+        // re-take (not just a lucky race) carried the scan to completion. Safe to
+        // assert unconditionally now: the precondition above established that at
+        // least one header followed the preempt, so a correct scan MUST have
+        // re-taken.
         assert_eq!(
-            lease.map(|l| l.owner),
+            owner,
             Some(HwmonWriter::ThermalSafety),
-            "force_all_with_floor must re-take thermal-safety after a mid-scan verify preempt"
+            "force_all_with_floor must re-take thermal-safety after a mid-scan verify \
+             preempt (landed with {forced_at_take} of {N} headers forced)"
         );
     }
 
