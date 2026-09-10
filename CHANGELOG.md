@@ -46,6 +46,22 @@ copies (`control_paths.rs`, `pwm_baselines.rs`) and needed a third. It is now on
 `text::truncate`, with the character-boundary cases — a bound landing
 mid-codepoint, and one below the first character — under test for the first time.
 
+**Two cross-repo pins became interlocks instead of workflows (`P8-cb`).**
+`wire_field_surface_is_pinned` carried 29 literal `want` arrays and
+`get_config_key_set_and_mutability_are_pinned` carried a literal list of the nine
+`GET /config` keys, while the GUI declared the same lists in
+`tests/fixtures/wire_fields.json` and `tests/fixtures/daemon_config_keys.json`.
+Each side was checked only against its own source and **nothing compared the two**,
+so a rename fixed here and forgotten in the GUI fixture left that fixture stale
+with both suites green. Both tests now read the fixture — carried here as a
+byte-identical copy under `daemon/tests/fixtures/`, the `parity_vectors.json`
+shape (DEC-126) — so there is one declaration and no second list to forget. The
+wire pin also asserts coverage **both ways**: a struct declared in the fixture
+with no arm here fails, and so does an arm here for a struct the fixture does not
+declare. `parity.yml` gains both files, and the GUI gains a byte-identity test for
+each. Test-side only: no shipped code, no wire shape and no behaviour changes, so
+this ships inside 2.43.8 rather than taking a version of its own.
+
 ## [2.43.7] — 2026-09-09
 
 **A cooling-device member id is now bounded by LENGTH, not only by list count

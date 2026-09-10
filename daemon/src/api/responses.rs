@@ -2152,18 +2152,27 @@ mod tests {
         assert_eq!(ok.override_token, 7);
     }
 
-    /// Every key the GUI-consumed structs put on the wire, pinned.
+    /// Every key the GUI-consumed structs put on the wire, pinned **against the
+    /// shared oracle** `tests/fixtures/wire_fields.json` (`P8-cb`).
     ///
-    /// The GUI's `tests/fixtures/wire_fields.json` declares the same lists and
-    /// `tests/test_wire_field_coverage.py` asserts each has a model slot there.
-    /// Adding a field reds this test, and updating the fixture to match then reds
-    /// the Python one until the GUI models it. **That is a workflow, not an
-    /// interlock** — the `want` lists below and the fixture's `fields` lists are
-    /// each checked only against their own side, and nothing compares the two, so
-    /// a rename fixed here and not in the fixture leaves the fixture stale and
-    /// both tests green. The assertion message names all three places for that
-    /// reason. That is the pairing the 2026-09-05 wire sweep found missing —
-    /// 41 divergences, none of which anything compared (register row `WIRE-aj`).
+    /// That file is the single declaration. This test reads it and asserts each
+    /// struct's serialised key set against the declared `fields`; the GUI's
+    /// `tests/test_wire_field_coverage.py` asserts the same lists against its
+    /// dataclasses. So a rename here reds this test naming the fixture, and there
+    /// is no second list to forget.
+    ///
+    /// **This used to be a workflow and not an interlock, and that is what
+    /// `P8-cb` closed.** The `want` lists lived here as 29 literal arrays, the
+    /// fixture declared the same lists over there, each was checked only against
+    /// its own side, and nothing compared the two — so a rename fixed here and
+    /// forgotten in the fixture left the fixture stale with both suites green.
+    /// That is the pairing the 2026-09-05 wire sweep found missing — 41
+    /// divergences, none of which anything compared (register row `WIRE-aj`).
+    ///
+    /// The oracle is shared in the `parity_vectors.json` shape (DEC-126): one
+    /// byte-identical copy per repo, compared by the GUI's
+    /// `test_fixture_copies_are_byte_identical` when both repos are siblings and
+    /// by `.github/workflows/parity.yml` in single-repo CI.
     ///
     /// Every `Option` is `Some` and every `Vec` non-empty on purpose: the structs
     /// in THIS module are dense with `skip_serializing_if`, so a `None` would drop
@@ -2178,17 +2187,20 @@ mod tests {
     /// plus the Phase 8 diagnostic surfaces — preflight, control-path discovery,
     /// PWM characterisation, steady state and the startup fingerprint.
     ///
-    /// **All 29 fixture entries now have a daemon-side arm (`P8-ca`)** — each
-    /// side is pinned to its own source, which is what a rename needs to red
-    /// something; see the interlock caveat above. `G33`
-    /// declared the 16 Phase 8 structs in the GUI fixture alone, which catches the
-    /// GUI dropping a field it should model and NOT the daemon renaming one: that
-    /// fixture is static data, never a live query, so a daemon-side rename left the
-    /// declared list stale and the Python test green. Adding a struct is an arm
-    /// here plus a fixture entry; it is not automatic. **Keep this list current** —
-    /// it is what the next person reads to decide whether a struct belongs.
+    /// **All 29 fixture entries have a daemon-side arm (`P8-ca`), and the
+    /// coverage is now asserted BOTH WAYS at the foot of this test.** A struct
+    /// declared in the fixture with no arm here fails, and so does an arm here
+    /// for a struct the fixture does not declare — the first is the `P8-ca` gap
+    /// (16 entries `G33` declared on the GUI side alone, which catches the GUI
+    /// dropping a field it should model and never the daemon renaming one), and
+    /// the second is its mirror. Adding a struct is an arm here plus a fixture
+    /// entry; it is not automatic, but forgetting either half is no longer
+    /// silent. **Keep the scope list above current** — it is what the next person
+    /// reads to decide whether a struct belongs.
     #[test]
     fn wire_field_surface_is_pinned() {
+        use std::collections::BTreeSet;
+
         fn keys(v: &serde_json::Value) -> Vec<String> {
             let mut k: Vec<String> = v
                 .as_object()
@@ -2199,17 +2211,66 @@ mod tests {
             k.sort();
             k
         }
-        fn expect(v: &serde_json::Value, name: &str, want: &[&str]) {
-            let mut w: Vec<String> = want.iter().map(|s| s.to_string()).collect();
+
+        // The ONE declaration, shared byte-for-byte with the GUI (`P8-cb`).
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/wire_fields.json"
+        );
+        let text =
+            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read wire oracle: {e}"));
+        let oracle: serde_json::Value = serde_json::from_str(&text).expect("parse wire oracle");
+        let structs = oracle["structs"].as_array().expect("structs array");
+        assert!(!structs.is_empty(), "an empty oracle asserts nothing");
+
+        let declared = |name: &str| -> Vec<String> {
+            let mut lists: Vec<Vec<String>> = structs
+                .iter()
+                .filter(|s| s["daemon"] == name)
+                .map(|s| {
+                    s["fields"]
+                        .as_array()
+                        .unwrap_or_else(|| panic!("{name}: fixture entry has no fields array"))
+                        .iter()
+                        .map(|f| f.as_str().expect("field name is a string").to_string())
+                        .collect()
+                })
+                .collect();
+            let first = lists.pop().unwrap_or_else(|| {
+                panic!(
+                    "{name} is pinned here but absent from wire_fields.json — add the \
+                     fixture entry, or this arm asserts against nothing"
+                )
+            });
+            // One wire struct may be modelled by two GUI dataclasses, and then it
+            // gets two fixture entries. They must declare ONE key set: the two
+            // drifting apart while both looked maintained IS `WIRE-h`
+            // (`PwmHeaderEntry` as `HwmonHeader` and as `InventoryPwmControl`).
+            for other in &lists {
+                assert_eq!(
+                    other, &first,
+                    "{name}: two fixture entries for one wire struct declare \
+                     different field sets — one shape, one list"
+                );
+            }
+            first
+        };
+
+        // `RefCell` so both closures below can be `Fn` and one can call the other.
+        let exercised: std::cell::RefCell<BTreeSet<String>> = Default::default();
+        let expect_at = |v: &serde_json::Value, name: &str, at: &str| {
+            let mut w = declared(name);
             w.sort();
+            exercised.borrow_mut().insert(name.to_string());
             assert_eq!(
                 keys(v),
                 w,
-                "{name}: serialised key set has drifted from the pinned list. \
-                 Update this arm AND the GUI's tests/fixtures/wire_fields.json \
-                 AND docs/08."
+                "{at}: serialised key set has drifted from wire_fields.json. That \
+                 fixture is the single declaration both repos check against, so fix \
+                 the struct or the fixture (both copies, byte-identical) — and docs/08."
             );
-        }
+        };
+        let expect = |v: &serde_json::Value, name: &str| expect_at(v, name, name);
 
         let thresholds = SensorThresholdsResponse {
             max_c: Some(90.0),
@@ -2240,25 +2301,7 @@ mod tests {
             thresholds: Some(thresholds),
             control_eligible: true,
         };
-        expect(
-            &serde_json::to_value(&sensor).unwrap(),
-            "SensorEntry",
-            &[
-                "id",
-                "kind",
-                "label",
-                "value_c",
-                "source",
-                "age_ms",
-                "rate_c_per_s",
-                "session_min_c",
-                "session_max_c",
-                "chip_name",
-                "temp_type",
-                "thresholds",
-                "control_eligible",
-            ],
-        );
+        expect(&serde_json::to_value(&sensor).unwrap(), "SensorEntry");
 
         let fan = FanEntry {
             id: "hwmon:it8696:pci0:pwm1".into(),
@@ -2273,23 +2316,7 @@ mod tests {
             pwm_readback_pct: Some(40),
             pwm_commanded_pct: Some(40),
         };
-        expect(
-            &serde_json::to_value(&fan).unwrap(),
-            "FanEntry",
-            &[
-                "id",
-                "source",
-                "rpm",
-                "last_commanded_pwm",
-                "duty_pct",
-                "age_ms",
-                "stall_detected",
-                "pwm_enable_mode",
-                "fan_alarm",
-                "pwm_readback_pct",
-                "pwm_commanded_pct",
-            ],
-        );
+        expect(&serde_json::to_value(&fan).unwrap(), "FanEntry");
 
         let header = PwmHeaderEntry {
             id: "hwmon:it8696:pci0:pwm3:AIO_PUMP".into(),
@@ -2315,35 +2342,7 @@ mod tests {
             rpm_max_threshold: Some(3000),
             tach_pulses_per_rev: Some(2),
         };
-        let header_keys = [
-            "id",
-            "label",
-            "chip_name",
-            "device_id",
-            "pwm_index",
-            "supports_enable",
-            "rpm_available",
-            "min_pwm_percent",
-            "max_pwm_percent",
-            "is_writable",
-            "pwm_mode",
-            "is_aio",
-            "role",
-            "role_source",
-            "effective_min_pwm_pct",
-            "stop_permitted",
-            "cooling_device_id",
-            "pwm_freq_hz",
-            "supported_pwm_enable_modes",
-            "rpm_min_threshold",
-            "rpm_max_threshold",
-            "tach_pulses_per_rev",
-        ];
-        expect(
-            &serde_json::to_value(&header).unwrap(),
-            "PwmHeaderEntry",
-            &header_keys,
-        );
+        expect(&serde_json::to_value(&header).unwrap(), "PwmHeaderEntry");
 
         // `temp_sensors[]` flattens the whole SensorEntry alongside the
         // refinement — the exact shape whose six dropped keys were `WIRE-h`.
@@ -2356,24 +2355,6 @@ mod tests {
         expect(
             &serde_json::to_value(&inv_sensor).unwrap(),
             "InventoryTempSensor",
-            &[
-                "id",
-                "kind",
-                "label",
-                "value_c",
-                "source",
-                "age_ms",
-                "rate_c_per_s",
-                "session_min_c",
-                "session_max_c",
-                "chip_name",
-                "temp_type",
-                "thresholds",
-                "control_eligible",
-                "classification",
-                "confidence",
-                "rationale",
-            ],
         );
 
         let fan_input = FanInputEntry {
@@ -2383,11 +2364,7 @@ mod tests {
             label: "SYS_FAN5".into(),
             fan_index: 5,
         };
-        expect(
-            &serde_json::to_value(&fan_input).unwrap(),
-            "FanInputEntry",
-            &["id", "source", "chip_name", "label", "fan_index"],
-        );
+        expect(&serde_json::to_value(&fan_input).unwrap(), "FanInputEntry");
 
         let default_cpu = DefaultCpuEntry {
             sensor_id: "hwmon:k10temp:pci0:Tctl".into(),
@@ -2398,7 +2375,6 @@ mod tests {
         expect(
             &serde_json::to_value(&default_cpu).unwrap(),
             "DefaultCpuEntry",
-            &["sensor_id", "confidence", "rationale", "source"],
         );
 
         let inventory = HwmonInventoryResponse {
@@ -2415,21 +2391,13 @@ mod tests {
         expect(
             &serde_json::to_value(&inventory).unwrap(),
             "HwmonInventoryResponse",
-            &[
-                "api_version",
-                "temp_sensors",
-                "pwm_controls",
-                "monitor_only_fans",
-                "default_cpu",
-                "preferences",
-            ],
         );
         // `pwm_controls[]` is this same PwmHeaderEntry — one wire struct behind
         // two GUI names, which is how half of `WIRE-h` stayed invisible.
-        expect(
+        expect_at(
             &serde_json::to_value(&inventory).unwrap()["pwm_controls"][0],
+            "PwmHeaderEntry",
             "HwmonInventoryResponse.pwm_controls[]",
-            &header_keys,
         );
 
         let policy = DevicePolicySummary {
@@ -2445,16 +2413,6 @@ mod tests {
         expect(
             &serde_json::to_value(&policy).unwrap(),
             "DevicePolicySummary",
-            &[
-                "id",
-                "display_name",
-                "minimum_safe_pwm_pct",
-                "supports_stop",
-                "startup_override_seconds",
-                "expected_rpm_min",
-                "expected_rpm_max",
-                "internal_control_possible",
-            ],
         );
 
         let device = CoolingDeviceEntry {
@@ -2473,19 +2431,6 @@ mod tests {
         expect(
             &serde_json::to_value(&device).unwrap(),
             "CoolingDeviceEntry",
-            &[
-                "id",
-                "name",
-                "kind",
-                "pump_member",
-                "radiator_members",
-                "auxiliary_members",
-                "preferred_sensor",
-                "fallback_sensor",
-                "coolant_sensor",
-                "coolant_telemetry",
-                "device_policy",
-            ],
         );
 
         let limits = Limits {
@@ -2493,15 +2438,7 @@ mod tests {
             pwm_percent_max: 100,
             openfan_stop_timeout_s: 8,
         };
-        expect(
-            &serde_json::to_value(&limits).unwrap(),
-            "Limits",
-            &[
-                "pwm_percent_min",
-                "pwm_percent_max",
-                "openfan_stop_timeout_s",
-            ],
-        );
+        expect(&serde_json::to_value(&limits).unwrap(), "Limits");
 
         let devices = CoolingDevicesResponse {
             api_version: API_VERSION,
@@ -2511,7 +2448,6 @@ mod tests {
         expect(
             &serde_json::to_value(&devices).unwrap(),
             "CoolingDevicesResponse",
-            &["api_version", "cooling_devices", "available_policies"],
         );
 
         // `WIRE-ag`. Pinned from the first release that publishes it, so the
@@ -2524,18 +2460,7 @@ mod tests {
             value_v: 3.288,
             identified: true,
         };
-        expect(
-            &serde_json::to_value(&rail).unwrap(),
-            "VoltageEntry",
-            &[
-                "id",
-                "chip_name",
-                "channel",
-                "label",
-                "value_v",
-                "identified",
-            ],
-        );
+        expect(&serde_json::to_value(&rail).unwrap(), "VoltageEntry");
 
         // ── `P8-ca`: the 16 structs `G33` pinned on the GUI side ONLY ──
         //
@@ -2565,11 +2490,7 @@ mod tests {
             state: "pass".into(),
             detail: "thermal_state=normal".into(),
         };
-        expect(
-            &serde_json::to_value(&check).unwrap(),
-            "PreflightCheck",
-            &["check_id", "state", "detail"],
-        );
+        expect(&serde_json::to_value(&check).unwrap(), "PreflightCheck");
 
         let report = PreflightReport {
             header_id: "hwmon:it8696:isa-0a40:pwm1:CPU_FAN".into(),
@@ -2578,11 +2499,7 @@ mod tests {
             checks: vec![check],
             blocking: vec!["pump_protected".into()],
         };
-        expect(
-            &serde_json::to_value(&report).unwrap(),
-            "PreflightReport",
-            &["header_id", "diagnostic", "verdict", "checks", "blocking"],
-        );
+        expect(&serde_json::to_value(&report).unwrap(), "PreflightReport");
 
         let observation = TachObservation {
             tach_id: "hwmon:it8696:isa-0a40:fan1".into(),
@@ -2595,14 +2512,6 @@ mod tests {
         expect(
             &serde_json::to_value(&observation).unwrap(),
             "TachObservation",
-            &[
-                "tach_id",
-                "baseline_rpm",
-                "perturbed_rpm",
-                "delta_rpm",
-                "noise_floor_rpm",
-                "responded",
-            ],
         );
 
         let channel = TachChannel {
@@ -2611,11 +2520,7 @@ mod tests {
             monitor_only: false,
             is_target_header: true,
         };
-        expect(
-            &serde_json::to_value(&channel).unwrap(),
-            "TachChannel",
-            &["tach_id", "label", "monitor_only", "is_target_header"],
-        );
+        expect(&serde_json::to_value(&channel).unwrap(), "TachChannel");
 
         let cycle = DiscoveryCycle {
             cycle: 1,
@@ -2624,17 +2529,7 @@ mod tests {
             direction: "up".into(),
             observations: vec![observation],
         };
-        expect(
-            &serde_json::to_value(&cycle).unwrap(),
-            "DiscoveryCycle",
-            &[
-                "cycle",
-                "baseline_pct",
-                "perturbed_pct",
-                "direction",
-                "observations",
-            ],
-        );
+        expect(&serde_json::to_value(&cycle).unwrap(), "DiscoveryCycle");
 
         let candidate = ControlPathCandidate {
             tach_id: "hwmon:it8696:isa-0a40:fan1".into(),
@@ -2651,18 +2546,6 @@ mod tests {
         expect(
             &serde_json::to_value(&candidate).unwrap(),
             "ControlPathCandidate",
-            &[
-                "tach_id",
-                "label",
-                "monitor_only",
-                "confidence",
-                "direction",
-                "baseline_rpm",
-                "perturbed_rpm",
-                "change_pct",
-                "cycles_responded",
-                "cycles_total",
-            ],
         );
 
         let summary = DiscoverySummary {
@@ -2674,19 +2557,7 @@ mod tests {
             sample_count: 24,
             confidence_notes: vec!["two of two cycles responded".into()],
         };
-        expect(
-            &serde_json::to_value(&summary).unwrap(),
-            "DiscoverySummary",
-            &[
-                "relationship",
-                "confidence",
-                "candidates",
-                "measurement_resolution_ms",
-                "sample_interval_ms",
-                "sample_count",
-                "confidence_notes",
-            ],
-        );
+        expect(&serde_json::to_value(&summary).unwrap(), "DiscoverySummary");
 
         let run = ControlPathRun {
             run_id: "cpd-1".into(),
@@ -2707,29 +2578,7 @@ mod tests {
             detail: Some("two cycles, one responder".into()),
             completed_unix_ms: Some(1_757_000_000_000),
         };
-        expect(
-            &serde_json::to_value(&run).unwrap(),
-            "ControlPathRun",
-            &[
-                "run_id",
-                "header_id",
-                "state",
-                "delta_pct",
-                "requested_cycles",
-                "window_seconds",
-                "baseline_pct",
-                "perturbed_pct",
-                "direction",
-                "channels",
-                "cycles",
-                "summary",
-                "original_pct",
-                "restore_failed",
-                "restore_outcome",
-                "detail",
-                "completed_unix_ms",
-            ],
-        );
+        expect(&serde_json::to_value(&run).unwrap(), "ControlPathRun");
 
         let record = ControlPathRecord {
             header_id: "hwmon:it8696:isa-0a40:pwm1:CPU_FAN".into(),
@@ -2744,23 +2593,7 @@ mod tests {
             run_id: "cpd-1".into(),
             validated_unix_ms: 1_757_000_000_000,
         };
-        expect(
-            &serde_json::to_value(&record).unwrap(),
-            "ControlPathRecord",
-            &[
-                "header_id",
-                "relationship",
-                "confidence",
-                "tach_ids",
-                "tach_labels",
-                "direction",
-                "baseline_rpm",
-                "perturbed_rpm",
-                "change_pct",
-                "run_id",
-                "validated_unix_ms",
-            ],
-        );
+        expect(&serde_json::to_value(&record).unwrap(), "ControlPathRecord");
 
         let stability = PointStability {
             samples: 24,
@@ -2777,25 +2610,7 @@ mod tests {
             sample_interval_ms: 500,
             dwell_ms: 12_000,
         };
-        expect(
-            &serde_json::to_value(&stability).unwrap(),
-            "PointStability",
-            &[
-                "samples",
-                "usable",
-                "dropouts",
-                "outliers",
-                "mean_rpm",
-                "median_rpm",
-                "min_rpm",
-                "max_rpm",
-                "stddev_rpm",
-                "cv_pct",
-                "verdict",
-                "sample_interval_ms",
-                "dwell_ms",
-            ],
-        );
+        expect(&serde_json::to_value(&stability).unwrap(), "PointStability");
 
         let estimated = EstimatedRpm {
             value: 1180,
@@ -2803,16 +2618,7 @@ mod tests {
             correction_factor: 1.0,
             correction_source: "none".into(),
         };
-        expect(
-            &serde_json::to_value(&estimated).unwrap(),
-            "EstimatedRpm",
-            &[
-                "value",
-                "provenance",
-                "correction_factor",
-                "correction_source",
-            ],
-        );
+        expect(&serde_json::to_value(&estimated).unwrap(), "EstimatedRpm");
 
         let plateau = PlateauSpan {
             from_pct: 20,
@@ -2820,11 +2626,7 @@ mod tests {
             rpm_min: 640,
             rpm_max: 700,
         };
-        expect(
-            &serde_json::to_value(plateau).unwrap(),
-            "PlateauSpan",
-            &["from_pct", "to_pct", "rpm_min", "rpm_max"],
-        );
+        expect(&serde_json::to_value(plateau).unwrap(), "PlateauSpan");
 
         let point = CharPoint {
             requested_pct: 70,
@@ -2844,28 +2646,7 @@ mod tests {
             stability: Some(stability),
             estimated_physical_rpm: Some(estimated),
         };
-        expect(
-            &serde_json::to_value(&point).unwrap(),
-            "CharPoint",
-            &[
-                "requested_pct",
-                "command_accepted",
-                "readback_pct",
-                "readback_raw",
-                "pwm_enable",
-                "rpm_before",
-                "rpm_after",
-                "settle_ms",
-                "first_change_ms",
-                "readback_verdict",
-                "rpm_verdict",
-                "direction",
-                "step_index",
-                "settled_ms",
-                "stability",
-                "estimated_physical_rpm",
-            ],
-        );
+        expect(&serde_json::to_value(&point).unwrap(), "CharPoint");
 
         let char_summary = CharSummary {
             command_acceptance: "accepted".into(),
@@ -2901,44 +2682,7 @@ mod tests {
             learned_range_note: Some("within the learned range".into()),
             interpretation_states: vec!["monotonic".into()],
         };
-        expect(
-            &serde_json::to_value(&char_summary).unwrap(),
-            "CharSummary",
-            &[
-                "command_acceptance",
-                "pwm_readback",
-                "rpm_response",
-                "min_tested_pct",
-                "max_tested_pct",
-                "min_rpm",
-                "max_rpm",
-                "monotonic",
-                "dead_zone_upper_pct",
-                "clamp_pct",
-                "possible_device_override",
-                "interference_detected",
-                "hysteresis_pct",
-                "hysteresis_verdict",
-                "hysteresis_worst_duty_pct",
-                "hysteresis_worst_delta_rpm",
-                "hysteresis_compared_points",
-                "min_responsive_pct",
-                "max_responsive_pct",
-                "low_plateau_to_pct",
-                "saturation_from_pct",
-                "plateaus",
-                "stability_verdict",
-                "worst_cv_pct",
-                "total_dropouts",
-                "total_outliers",
-                "measurement_resolution_ms",
-                "typical_response_ms",
-                "typical_settling_ms",
-                "outside_learned_range",
-                "learned_range_note",
-                "interpretation_states",
-            ],
-        );
+        expect(&serde_json::to_value(&char_summary).unwrap(), "CharSummary");
 
         let steady = SteadyState {
             verdict: "steady".into(),
@@ -2951,21 +2695,7 @@ mod tests {
             confidence: "high".into(),
             criterion: "slope_and_stddev".into(),
         };
-        expect(
-            &serde_json::to_value(&steady).unwrap(),
-            "SteadyState",
-            &[
-                "verdict",
-                "start_ms",
-                "warmup_ms",
-                "slope_c_per_min",
-                "stddev_c",
-                "mean_c",
-                "peak_c",
-                "confidence",
-                "criterion",
-            ],
-        );
+        expect(&serde_json::to_value(&steady).unwrap(), "SteadyState");
 
         let fingerprint = StartupFingerprint {
             member_id: "hwmon:it8696:isa-0a40:pwm5:PUMP".into(),
@@ -2982,18 +2712,32 @@ mod tests {
         expect(
             &serde_json::to_value(&fingerprint).unwrap(),
             "StartupFingerprint",
-            &[
-                "member_id",
-                "role",
-                "override_observed",
-                "override_duration_ms",
-                "peak_rpm",
-                "requested_pct_during",
-                "readback_pct_during",
-                "post_override_rpm",
-                "transition_ms",
-                "interpretation",
-            ],
+        );
+
+        // **Both directions, and this is what makes the oracle an interlock
+        // rather than a workflow (`P8-cb`).** A struct declared in the fixture
+        // with no arm here is the `P8-ca` gap — sixteen entries the GUI checked
+        // against its own dataclasses while nothing checked them against the
+        // daemon. An arm here for a struct the fixture does not declare is the
+        // mirror: a key set pinned on this side that the GUI never models.
+        // Neither can be reported by an equality that only runs per-arm, because
+        // a missing arm runs nothing at all.
+        let all: BTreeSet<String> = structs
+            .iter()
+            .map(|s| {
+                s["daemon"]
+                    .as_str()
+                    .expect("daemon name is a string")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            *exercised.borrow(),
+            all,
+            "wire_fields.json and this test cover different struct sets. Declared \
+             but not pinned here: {:?}. Pinned here but not declared: {:?}.",
+            all.difference(&exercised.borrow()).collect::<Vec<_>>(),
+            exercised.borrow().difference(&all).collect::<Vec<_>>(),
         );
     }
 

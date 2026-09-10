@@ -4995,10 +4995,41 @@ async fn get_config_key_set_and_mutability_are_pinned() {
     // which is how `profiles.search_dirs` came to be editable over the API with
     // no UI anywhere and no way to prune what the GUI kept adding.
     //
-    // Adding a key is deliberate work: update this list, the GUI's
-    // `tests/fixtures/daemon_config_keys.json`, and `docs/08` § Config
-    // management. Order is asserted too — `keys[]` is a list, and the GUI's
-    // fixture is diffed against it.
+    // **The expected list is READ FROM THE SHARED ORACLE, not written out here
+    // (`P8-cb`).** It used to be a literal array in this function while the GUI
+    // declared the same nine keys in its own fixture, each checked only against
+    // its own side — so a key added here and forgotten there (or the reverse)
+    // left one list stale with both suites green. `DECISIONS.md` asserted
+    // "neither copy can drift alone" about this pair, which was not true until
+    // now. One byte-identical copy per repo, in the `parity_vectors.json` shape
+    // (DEC-126), compared by the GUI's `test_fixture_copies_are_byte_identical`
+    // when both repos are siblings and by `parity.yml` in single-repo CI.
+    //
+    // Adding a key is now: update the fixture (both copies) and `docs/08`
+    // § Config management. Order is asserted too — `keys[]` is a list.
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/daemon_config_keys.json"
+    );
+    let text =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read config-key oracle: {e}"));
+    let oracle: serde_json::Value = serde_json::from_str(&text).expect("parse config-key oracle");
+    let expected: Vec<(String, bool)> = oracle["keys"]
+        .as_array()
+        .expect("keys array")
+        .iter()
+        .map(|k| {
+            (
+                k["key"].as_str().expect("key is a string").to_string(),
+                k["mutable"].as_bool().expect("mutable is a bool"),
+            )
+        })
+        .collect();
+    assert!(
+        !expected.is_empty(),
+        "an empty oracle asserts nothing — the fixture must declare the key set"
+    );
+
     let (state, _tmp) = config_test_state("");
     let (path, shutdown, _dir) = start_test_server(state).await;
 
@@ -5015,27 +5046,14 @@ async fn get_config_key_set_and_mutability_are_pinned() {
         })
         .collect();
 
-    let expected: Vec<(String, bool)> = [
-        ("profiles.search_dirs", true),
-        ("startup.delay_secs", true),
-        ("polling.poll_interval_ms", true),
-        ("serial.port", true),
-        ("serial.timeout_ms", true),
-        ("detection.allow_port_probe", true),
-        ("detection.enable_nvidia_telemetry", true),
-        // Read-only by design: a bad socket path locks every client out
-        // permanently, and moving the state dir orphans runtime.toml and the
-        // profile store.
-        ("ipc.socket_path", false),
-        ("state.state_dir", false),
-    ]
-    .iter()
-    .map(|(k, m)| (k.to_string(), *m))
-    .collect();
-
+    // `ipc.socket_path` and `state.state_dir` are declared immutable in the
+    // oracle by design: a bad socket path locks every client out permanently,
+    // and moving the state dir orphans runtime.toml and the profile store.
     assert_eq!(
         reported, expected,
-        "GET /config's key set changed — update the GUI fixture and docs/08 too"
+        "GET /config's key set disagrees with tests/fixtures/daemon_config_keys.json \
+         — that fixture is the single declaration both repos check against, so fix \
+         the handler or the fixture (both copies, byte-identical) and docs/08."
     );
 
     let _ = shutdown.send(());
