@@ -1,0 +1,37 @@
+[package]
+name = "control-ofc-tray"
+# Kept in lockstep with `daemon/Cargo.toml` by
+# `daemon/tests/packaging_version.rs::tray_version_matches_daemon_version`.
+#
+# Deliberately a LITERAL, not `version.workspace = true`. The release chain reads
+# this value textually — `.github/workflows/release.yml` does
+# `grep '^version' daemon/Cargo.toml | cut -d'"' -f2` — and an inherited version
+# line makes that expression evaluate to the string `version.workspace = true`,
+# which fails the tag check AFTER the tag is public (DEC-263 made `ci-green`
+# fail-closed, so recovery means delete-and-retag). Measured, not assumed.
+version = "2.44.0"
+edition = "2021"
+license = "MIT"
+description = "KDE/freedesktop system-tray client for the Control-OFC daemon"
+repository = "https://github.com/Plan-B-Development/control-ofc-daemon"
+authors = ["Plan-B-Development <https://github.com/Plan-B-Development>"]
+
+[dependencies]
+# StatusNotifierItem + com.canonical.dbusmenu, pure Rust, no GUI toolkit.
+# `default` pulls in the `tokio` feature (and `zbus/tokio`); `blocking` adds the
+# synchronous `spawn()`/`Handle` wrappers and is itself dependency-free.
+#
+# Feature choice is load-bearing: `async-io` instead of `tokio` costs 41 new
+# crates against the workspace rather than 28, and mixing runtimes is the
+# precondition for the zbus mixed-runtime panic (z-galaxy/zbus#526). The
+# workspace already carries tokio, so `tokio` is both smaller and safer here.
+#
+# Unlicense — a public-domain dedication, allow-listed in deny.toml (DEC-352).
+ksni = { version = "0.3.6", features = ["blocking"] }
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

@@ -129,6 +129,39 @@ Create `/etc/control-ofc/daemon.toml`:
 # state_dir = "/var/lib/control-ofc"
 ```
 
+## The system tray
+
+The package installs a second program, `control-ofc-tray`, alongside the daemon.
+It puts a Control-OFC icon in the KDE Plasma system tray and starts
+automatically when you log in.
+
+- **Left click** opens the GUI.
+- **Right click** shows the running daemon's version, the list of profiles with
+  the active one marked, an action to stop profile control, and an action to
+  open the GUI.
+- If the daemon reports a thermal event, the menu says so. Note that switching
+  to a quieter profile during one will not quieten the fans: the forced duties
+  are floors *over* whatever the profile asks for.
+
+It is purely a convenience. It never controls fans itself — it asks the daemon,
+exactly as the GUI does — and fan control does not depend on it in any way. If
+you close it, or it never starts, nothing about cooling changes.
+
+It only starts if `control-ofc-gui` is installed, so a headless or
+server install never runs it.
+
+To turn it off permanently: **System Settings → Autostart**.
+
+To start, stop or read its logs by hand:
+
+```bash
+systemctl --user status  'app-control\x2dofc\x2dtray@autostart.service'
+systemctl --user restart 'app-control\x2dofc\x2dtray@autostart.service'
+journalctl --user -u     'app-control\x2dofc\x2dtray@autostart.service'
+```
+
+Full detail: `man control-ofc-tray`.
+
 ## Checking daemon status
 
 ```bash

@@ -17,10 +17,16 @@ Rust workspace for the Control-OFC fan control daemon.
 ```text
 .
 ├── Cargo.toml                # workspace manifest
-├── daemon/                   # control-ofc-daemon crate (the binary)
+├── daemon/                   # control-ofc-daemon crate (the service binary)
 │   ├── src/                  # daemon source (see daemon.md for module map)
 │   └── README.md             # build, install, CLI, env vars, API quick-start
-├── packaging/                # systemd unit, udev rules, shutdown restore script
+├── tray/                     # control-ofc-tray crate — KDE system-tray CLIENT
+│                             #   (DEC-352). Ships in the same package; talks to
+│                             #   the daemon only over the API. The daemon has no
+│                             #   dependency on it.
+├── man/                      # scdoc sources for both man pages
+├── packaging/                # systemd unit, udev rules, shutdown restore script,
+│                             #   tray autostart entry + panel icon
 ├── docs/                     # user + developer documentation
 │   ├── USER_GUIDE.md
 │   ├── DEVELOPER_HANDOVER.md

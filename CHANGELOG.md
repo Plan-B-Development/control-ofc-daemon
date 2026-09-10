@@ -1,5 +1,63 @@
 # Changelog
 
+## [2.44.0] — 2026-09-10
+
+**New: `control-ofc-tray`, a system-tray client for KDE Plasma (DEC-352).** The
+package now installs a second binary and an autostart entry, giving a persistent
+Control-OFC icon in the Plasma system tray: right-click for the profile list with
+the active one checked, the **running** daemon's version, and an action to open
+the GUI; left-click opens the GUI directly.
+
+**It is a client, not a second controller.** The tray calls `GET /status`,
+`GET /profiles`, `POST /profile/activate` and `POST /profile/deactivate`, and
+nothing else. It holds no lease, writes no PWM, evaluates no curve and reads no
+hardware, and the daemon has no knowledge of it and no dependency on it — killing
+the tray, or never starting it, changes nothing about fan control. It lives in
+its own workspace crate so that boundary is enforced by the crate graph rather
+than by convention.
+
+**No API change was needed.** `daemon_version`, `active_profile_id`,
+`active_profile_name` and `thermal_state` were already on `GET /status`, so one
+request serves the whole menu.
+
+**It costs nothing when idle.** There is no timer and no polling loop: Plasma
+calls `AboutToShow` on every context-menu open, and the tray reads the daemon
+there and nowhere else, so an idle tray issues zero requests and runs zero
+timers.
+
+Measured on this release build: 5.6 MB stripped, linking **only** `libc`,
+`libm`, `libgcc_s` and the loader. No OpenGL, Vulkan, EGL, Qt, GTK, wayland or
+Mesa library is linked at all, so the tray cannot interfere with a GPU-heavy
+workload.
+
+**Behaviour worth knowing:**
+
+- **Double-click is not a thing the protocol has.** Plasma routes a left click
+  straight to `Activate` and the StatusNotifierItem interface has no
+  double-click member, so a double-click simply opens the GUI twice. The GUI
+  gained a single-instance guard in the same release window (GUI 2.68.0) which
+  makes the second one raise the first instead.
+- **A thermal event is surfaced.** When `thermal_state` is anything but
+  `normal`, the menu carries a line saying so. Switching to a quieter profile
+  during a thermal event will not do what it looks like it does — the forced
+  duties are floors *over* the profile's output (DEC-307) — so a silent tray
+  would be misleading. No temperature is named, because the trip point is
+  per-machine (DEC-308).
+- **An unreachable daemon is a state, not an error.** The menu says so and keeps
+  the GUI action working; there is no retry storm and no crash loop.
+- Profiles that share a name are disambiguated by id — `/profiles` is a union
+  across search directories deduped by id, so duplicate names are normal.
+- Autostart is enabled by default via `/etc/xdg/autostart/`, and is one click to
+  disable in System Settings → Autostart. `TryExec=control-ofc-gui` means a
+  headless, daemon-only install never starts it.
+
+**Packaging:** `deny.toml` gains `Unlicense` for the `ksni` dependency — a
+public-domain dedication, i.e. the opposite of the re-linking obligation DEC-043
+exists to block. `tray/Cargo.toml` carries a literal version pinned to the
+daemon's by a new guard in `packaging_version.rs`; it is deliberately not
+`version.workspace = true`, because an inherited version line makes the release
+workflow's textual version check fail after the tag is already public.
+
 ## [2.43.8] — 2026-09-10
 
 **Two bounding fixes, both from the open-items register (`P8-cc`, `P8-br`).** One

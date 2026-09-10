@@ -9,9 +9,25 @@ A Rust daemon (`control-ofc-daemon`) that controls PC fans via three backends:
 
 Exposes an HTTP API over a Unix domain socket for the PySide6 GUI.
 
+**The workspace also builds a second binary, `control-ofc-tray` (DEC-352).** It
+is a KDE/freedesktop StatusNotifierItem *client* that ships in the same package:
+it reads `GET /status` and `GET /profiles` and can `POST /profile/activate` /
+`POST /profile/deactivate`, and does nothing else — no lease, no PWM write, no
+curve evaluation, no hardware read. **Nothing in this document depends on it.**
+The daemon has no knowledge of the tray and no dependency on it; it is a
+separate crate specifically so that boundary is enforced by the crate graph.
+See `tray/src/lib.rs` and `man control-ofc-tray`.
+
 ## Module Map
 
 ```
+tray/src/              — control-ofc-tray: an API client, not part of the daemon
+  main.rs              — arg parsing, single-instance guard, tray registration
+  client.rs            — blocking HTTP/1.1 over the Unix socket + wire models
+  menu.rs              — the StatusNotifierItem: what is shown, what clicks do
+  launch.rs            — starting control-ofc-gui, detached
+  single_instance.rs   — one tray per user (abstract-namespace socket)
+
 daemon/src/
   main.rs              — startup, config, signal handling, shutdown
   config.rs            — TOML config parsing + validation

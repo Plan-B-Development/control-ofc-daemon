@@ -1,12 +1,12 @@
 # Maintainer: Plan-B-Development <https://github.com/Plan-B-Development>
 pkgname=control-ofc-daemon
-pkgver=2.43.8
+pkgver=2.44.0
 pkgrel=1
 pkgdesc="Hardware fan control daemon for Linux (OpenFan, hwmon, GPU)"
 arch=('x86_64')
 url="https://github.com/Plan-B-Development/control-ofc-daemon"
 license=('MIT')
-depends=('glibc' 'systemd-libs' 'libgcc')
+depends=('glibc' 'systemd-libs' 'libgcc' 'hicolor-icon-theme')
 conflicts=('control-ofc-gui<2.0.0')
 optdepends=(
     'lm_sensors: sensors verification CLI; sensors-detect (last resort) for chips not covered by the built-in module list'
@@ -44,8 +44,9 @@ build() {
     export CARGO_TARGET_DIR=target
     cargo build --frozen --release
 
-    # Render man page from scdoc source.
+    # Render man pages from scdoc source.
     scdoc < man/control-ofc-daemon.1.scd > control-ofc-daemon.1
+    scdoc < man/control-ofc-tray.1.scd > control-ofc-tray.1
 }
 
 check() {
@@ -63,6 +64,25 @@ package() {
 
     # Restore script (runs on daemon stop to return fans to automatic)
     install -Dm755 packaging/control-ofc-restore-auto.sh "$pkgdir/usr/bin/control-ofc-restore-auto"
+
+    # System-tray client (DEC-352). Built by the same `cargo build --release`
+    # above, which has no `-p` and so covers every workspace member.
+    #
+    # This is a desktop-session component, not a daemon one: it is a read-mostly
+    # API client and the daemon neither knows nor cares whether it is running.
+    # It ships here because it is a Rust binary and this is the package with a
+    # Rust toolchain; a headless install carries ~5.6 MB it never executes,
+    # because the autostart entry's TryExec names the GUI.
+    install -Dm755 target/release/control-ofc-tray "$pkgdir/usr/bin/control-ofc-tray"
+    install -Dm644 packaging/control-ofc-tray.desktop \
+        "$pkgdir/etc/xdg/autostart/control-ofc-tray.desktop"
+
+    # Tray panel glyph. Deliberately owned by THIS package rather than reusing
+    # the GUI's `control-ofc` brand icon: the tray must render correctly on a
+    # daemon-only install where the GUI package (and therefore that icon) is
+    # absent. Monochrome and recolourable per the Breeze convention.
+    install -Dm644 packaging/control-ofc-symbolic.svg \
+        "$pkgdir/usr/share/icons/hicolor/scalable/apps/control-ofc-symbolic.svg"
 
     # systemd service
     install -Dm644 packaging/control-ofc-daemon.service "$pkgdir/usr/lib/systemd/system/control-ofc-daemon.service"
@@ -126,6 +146,8 @@ package() {
     # Man page (rendered in build())
     install -Dm644 control-ofc-daemon.1 \
         "$pkgdir/usr/share/man/man1/control-ofc-daemon.1"
+    install -Dm644 control-ofc-tray.1 \
+        "$pkgdir/usr/share/man/man1/control-ofc-tray.1"
 
     # Shell completions — installed unconditionally; missing shells ignore them.
     install -Dm644 completions/control-ofc-daemon.bash \

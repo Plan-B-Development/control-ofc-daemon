@@ -27,6 +27,16 @@ ignore = []
 #                   licence, functionally MIT-equivalent (a simplified 2-clause
 #                   BSD/MIT). Pulled in for runtime dlopen of libnvidia-ml.so.1
 #                   (opt-in, read-only NVIDIA telemetry). No copyleft obligation.
+#   Unlicense     — ksni (DEC-352), the StatusNotifierItem implementation behind
+#                   control-ofc-tray. The Unlicense is a PUBLIC-DOMAIN DEDICATION,
+#                   i.e. the opposite of the re-linking obligation DEC-043 exists
+#                   to block: it imposes no condition of any kind, copyleft or
+#                   attribution. OSI-approved and FSF Free/Libre. Widening the
+#                   gate in this direction is a direction DEC-043 is indifferent
+#                   to, which is why it is allowed rather than waived per-crate.
+#                   ksni is the ONLY crate in the tree carrying it — verified by
+#                   reading the licence of all 38 crates the tray added; every
+#                   other one is MIT, Apache-2.0, or a dual of the two.
 # Notably ABSENT (therefore denied): every LGPL/GPL-only variant (DEC-043).
 # Scope: this gate governs the statically-linked Rust dependency tree ONLY. The
 # GUI's PySide6 (LGPL-3.0) is a separate, compliant concern — used via dynamic
@@ -49,6 +59,7 @@ allow = [
     "Unicode-3.0",
     "MPL-2.0",
     "ISC",
+    "Unlicense",
 ]
 confidence-threshold = 0.9
 

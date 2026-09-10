@@ -1,0 +1,30 @@
+[Desktop Entry]
+# Autostart entry for control-ofc-tray, installed to /etc/xdg/autostart/.
+#
+# On a modern Plasma session systemd's xdg-autostart-generator turns this file
+# into an `app-control\x2dofc\x2dtray@autostart.service` user unit, which gives
+# journald logging, `systemctl --user start/stop`, and a single-instance
+# guarantee for free. On a non-systemd session the desktop's own autostart
+# handler runs it directly; the tray's own guard covers that case.
+#
+# TryExec is load-bearing, not decoration. Both the XDG autostart spec and
+# systemd-xdg-autostart-generator(8) skip an entry whose TryExec binary does not
+# exist or is not executable — and it names the GUI, not the tray. That is what
+# stops a headless, daemon-only install from autostarting a tray whose headline
+# action (open the GUI) could not work. The tray binary ships with the daemon
+# package regardless; it simply never starts itself where there is no GUI.
+#
+# To disable: System Settings -> Autostart, which writes Hidden=true into
+# ~/.config/autostart/ per the spec's documented per-user override. Do not edit
+# this file to disable it; it is package-owned and will be replaced on upgrade.
+Type=Application
+Name=Control-OFC Tray
+GenericName=Fan control tray
+Comment=Quick access to Control-OFC profiles from the system tray
+Exec=control-ofc-tray
+TryExec=control-ofc-gui
+Icon=control-ofc-symbolic
+Terminal=false
+Categories=System;
+Keywords=fan;cooling;temperature;profile;tray;
+X-GNOME-Autostart-enabled=true

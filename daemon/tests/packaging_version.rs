@@ -30,6 +30,43 @@ fn cargo_version_matches_pkgbuild_pkgver() {
     );
 }
 
+/// `control-ofc-tray` ships inside this package, so its version must move with
+/// the daemon's (DEC-352).
+///
+/// Nothing else pins it. `packaging/PKGBUILD` builds the whole workspace
+/// (`cargo build --frozen --release`, no `-p`), so `/usr/bin/control-ofc-tray`
+/// is whatever `tray/Cargo.toml` says; `release.yml`'s tag check reads only
+/// `daemon/Cargo.toml`, and the guard above compares `pkgver` against *this*
+/// crate's `CARGO_PKG_VERSION`. A forgotten tray bump would therefore ship a
+/// binary whose `--version` is stale, with every existing gate green.
+///
+/// **Deliberately not solved with `[workspace.package] version`.** An inherited
+/// `version.workspace = true` line makes `release.yml`'s extraction —
+/// `grep '^version' daemon/Cargo.toml | cut -d'"' -f2` — evaluate to the
+/// literal string `version.workspace = true`, which fails the tag check *after
+/// the tag is public*; DEC-263 made `ci-green` fail-closed, so recovery is
+/// delete-and-retag. Measured, not assumed. Two literals plus this guard is the
+/// cheaper shape.
+#[test]
+fn tray_version_matches_daemon_version() {
+    let manifest =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../tray/Cargo.toml"))
+            .expect("read tray/Cargo.toml");
+    let tray_version = manifest
+        .lines()
+        .find_map(|l| l.strip_prefix("version = "))
+        .expect("tray/Cargo.toml must carry a literal `version = \"X.Y.Z\"` line")
+        .trim()
+        .trim_matches('"');
+    assert_eq!(
+        tray_version,
+        env!("CARGO_PKG_VERSION"),
+        "tray/Cargo.toml version ({tray_version}) != daemon/Cargo.toml version ({}); \
+         both ship in control-ofc-daemon and must be bumped together",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
 /// DEC-199 regression: the systemd sandbox's writable sysfs carve-out must
 /// target the device tree (`/sys/devices`), not the `/sys/class/{hwmon,drm}`
 /// symlink directories.

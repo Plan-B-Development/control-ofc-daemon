@@ -1,5 +1,5 @@
 [workspace]
-members = ["daemon"]
+members = ["daemon", "tray"]
 resolver = "2"
 
 # Dev/test build weight.

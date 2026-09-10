@@ -7,6 +7,15 @@ post_install() {
    Setup guide:      man control-ofc-daemon
    Hardware check:   open the GUI -> Hardware page
 
+   System tray:      this package also installs control-ofc-tray, a small
+                     StatusNotifierItem client for KDE Plasma. It starts at
+                     your next login and gives you profile switching and the
+                     running daemon version from the panel. It only starts
+                     where control-ofc-gui is installed, and it is purely a
+                     convenience -- fan control never depends on it.
+                     Disable it in System Settings -> Autostart.
+                     Details: man control-ofc-tray
+
    Fan-control prerequisites — if a motherboard header or GPU fan is
    discovered but never responds, one of these is usually missing:
      * Super I/O driver: motherboard headers need the matching chip driver
@@ -37,6 +46,15 @@ EOF
 post_upgrade() {
     echo ":: Restart to apply changes:"
     echo "   sudo systemctl restart control-ofc-daemon"
+    # The tray is a session process, not a systemd system service: an upgrade
+    # replaces the binary on disk but the running one keeps going until the
+    # user logs out. Say so, rather than leaving them wondering why a fixed bug
+    # is still present.
+    if [[ -x /usr/bin/control-ofc-tray ]] && pgrep -x control-ofc-tray >/dev/null 2>&1; then
+        echo ":: A control-ofc-tray is running from the previous version. It will pick up"
+        echo "   this one at your next login, or immediately with:"
+        echo "   systemctl --user restart 'app-control\\x2dofc\\x2dtray@autostart.service'"
+    fi
     if [[ -f /etc/systemd/system/control-ofc-daemon.service.d/superio-port-probe.conf ]]; then
         echo ":: Opt-in Super-I/O port-probe drop-in detected — review it against the"
         echo "   updated example in case the required directives changed:"
