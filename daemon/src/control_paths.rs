@@ -132,6 +132,7 @@ impl ControlPathRecord {
     /// compile-time assertion in `constants.rs` can then prove the file bound is
     /// reachable-but-not-exceedable.
     fn clamp_text(&mut self) {
+        use crate::text::truncate;
         let cap = constants::CONTROL_PATH_MAX_TEXT_BYTES;
         truncate(&mut self.header_id, cap);
         truncate(&mut self.relationship, cap);
@@ -146,19 +147,6 @@ impl ControlPathRecord {
             truncate(s, cap);
         }
     }
-}
-
-/// Truncate on a **character** boundary, never a byte one: `String::truncate`
-/// panics mid-codepoint, and a label can legitimately contain non-ASCII.
-fn truncate(s: &mut String, max_bytes: usize) {
-    if s.len() <= max_bytes {
-        return;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s.truncate(end);
 }
 
 /// Path of the store inside a given state directory.

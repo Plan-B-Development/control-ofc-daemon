@@ -2139,6 +2139,15 @@ fn worst_case_ancillary_session(tag: &str) -> ValidationSession {
     // `ordered_diagnostics` collapses repeats, so production reaches at most
     // `sweep_members x 3`. 32 here deliberately over-states that. Each entry
     // carries a full Phase 3 run, which is the term the old derivation omitted.
+    //
+    // `verify` and `control_path` are `None` deliberately, and that is not a
+    // gap: the three payloads are **mutually exclusive** in production — each
+    // `attach_evidence_for` call site sets exactly one (`handlers/validation.rs`
+    // :1138, :1270, :1513) — and `widest_characterization_run()` is by far the
+    // largest of the three, so taking it every time over-states a real entry.
+    // All four of their `detail` fields are still bounded; that is asserted at
+    // the call site by `every_daemon_formatted_detail_is_bounded_when_evidence_is_filed`,
+    // which is where a forgotten arm belongs, rather than here.
     s.evidence = s
         .sweep_members
         .iter()
@@ -2296,6 +2305,24 @@ fn the_ancillary_reservation_covers_the_worst_case_ancillary_document() {
         "every event must carry BOTH text fields at the bound — carrying one is \
          the under-count this test exists to catch"
     );
+    // `P8-br`: the "bounding the daemon's `detail` moved no measurement"
+    // argument rests entirely on these two already being at the bound here, and
+    // nothing asserted it — the same unasserted-fixture gap `P8-bs` closed for
+    // member ids one field over. Re-point either at a realistic string and this
+    // fails rather than silently reverting the measurement to an under-count.
+    assert!(
+        s.evidence.iter().all(|e| e
+            .detail
+            .as_ref()
+            .is_some_and(|d| d.len() == k::VALIDATION_MAX_TEXT_FIELD_BYTES)
+            && e.characterization
+                .as_ref()
+                .and_then(|c| c.detail.as_ref())
+                .is_some_and(|d| d.len() == k::VALIDATION_MAX_TEXT_FIELD_BYTES)),
+        "every evidence entry must carry its own `detail` AND its run's at the \
+         {}-byte bound `clamp_detail` enforces",
+        k::VALIDATION_MAX_TEXT_FIELD_BYTES
+    );
     assert!(
         s.samples.is_empty(),
         "the ancillary measurement must exclude samples, which have their own budget"
@@ -2317,6 +2344,142 @@ fn the_ancillary_reservation_covers_the_worst_case_ancillary_document() {
          the fixture stopped being the worst case or the reservation is padding",
         k::VALIDATION_MAX_ANCILLARY_BYTES
     );
+}
+
+/// A `ControlPathRun` carrying nothing but the `detail` under test.
+///
+/// Written out rather than derived from `Default`, because adding a derive to a
+/// pinned wire struct for a test's convenience is a production change this test
+/// does not need.
+fn control_path_run(detail: &str) -> control_ofc_daemon::api::discovery::ControlPathRun {
+    control_ofc_daemon::api::discovery::ControlPathRun {
+        run_id: "cp-1".into(),
+        header_id: "hwmon:it87:pwm2:PUMP".into(),
+        state: "complete".into(),
+        delta_pct: 10,
+        requested_cycles: 2,
+        window_seconds: 6,
+        baseline_pct: 40,
+        perturbed_pct: 50,
+        direction: "up".into(),
+        channels: vec![],
+        cycles: vec![],
+        summary: None,
+        original_pct: Some(40),
+        restore_failed: false,
+        restore_outcome: "restored".into(),
+        detail: Some(detail.to_string()),
+        completed_unix_ms: Some(2),
+    }
+}
+
+/// One evidence entry with the same `detail` prose in all four places it can
+/// appear — the entry's own, and each of the three runs it may carry.
+fn evidence_with_detail_everywhere(detail: &str) -> EvidenceRef {
+    EvidenceRef {
+        kind: DIAG_CHARACTERIZATION.into(),
+        member_id: "hwmon:it87:pwm2:PUMP".into(),
+        run_id: Some("run-1".into()),
+        started_unix_ms: 1,
+        completed_unix_ms: Some(2),
+        outcome: RESULT_OBSERVED.into(),
+        detail: Some(detail.to_string()),
+        characterization: Some(
+            control_ofc_daemon::api::characterization::CharacterizationRun {
+                detail: Some(detail.to_string()),
+                ..Default::default()
+            },
+        ),
+        verify: Some(VerifyEvidence {
+            header_id: "hwmon:it87:pwm2:PUMP".into(),
+            write_ok: true,
+            readback_pct: Some(50),
+            requested_pct: Some(50),
+            rpm_before: Some(900),
+            rpm_after: Some(1400),
+            detail: Some(detail.to_string()),
+        }),
+        control_path: Some(control_path_run(detail)),
+    }
+}
+
+/// Every `detail` on one evidence entry, in wire order. The helper exists so a
+/// field added to the clamp is added here too rather than silently unasserted.
+fn details_of(ev: &EvidenceRef) -> Vec<&str> {
+    vec![
+        ev.detail.as_deref().expect("entry detail"),
+        ev.characterization
+            .as_ref()
+            .and_then(|c| c.detail.as_deref())
+            .expect("characterization detail"),
+        ev.verify
+            .as_ref()
+            .and_then(|v| v.detail.as_deref())
+            .expect("verify detail"),
+        ev.control_path
+            .as_ref()
+            .and_then(|c| c.detail.as_deref())
+            .expect("control_path detail"),
+    ]
+}
+
+/// **The regression test for `P8-br`.** Daemon-formatted `detail` prose was the
+/// last unbounded ancillary text in the document, so the reservation above was a
+/// bound on the terms that *are* bounded and said nothing about these.
+///
+/// Asserted at the **call site** — through `attach_evidence_for`, the one route
+/// an entry takes into a session — never against `clamp_detail` alone. A unit
+/// test on the rule proves the rule exists and not that anything applies it,
+/// which is the trap `CLAUDE.md § Hard-won lessons` records fourteen times.
+///
+/// All four `detail` fields are over the bound at once, so an arm the clamp
+/// forgets fails here rather than in the arm nobody thought to write a test for.
+/// The second entry is the opposite branch: without it, a clamp that overwrote
+/// every `detail` unconditionally would pass.
+#[test]
+fn every_daemon_formatted_detail_is_bounded_when_evidence_is_filed() {
+    use control_ofc_daemon::constants as k;
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let ctx = test_context();
+    engine.start(unique_session("detail-bound"), &ctx).unwrap();
+    let sid = "val-detail-bound".to_string();
+
+    // Eight times the bound — far more than any `format!` in the daemon
+    // produces today, which is the point: nothing stopped one tomorrow.
+    let over = "d".repeat(k::VALIDATION_MAX_TEXT_FIELD_BYTES * 8);
+    let short = "restore of pwm2 to 40% failed".to_string();
+    assert!(
+        over.len() > k::VALIDATION_MAX_TEXT_FIELD_BYTES
+            && short.len() < k::VALIDATION_MAX_TEXT_FIELD_BYTES,
+        "the fixtures must straddle the bound, or neither branch tests anything"
+    );
+
+    assert!(engine.attach_evidence_for(&sid, evidence_with_detail_everywhere(&over)));
+    assert!(engine.attach_evidence_for(&sid, evidence_with_detail_everywhere(&short)));
+
+    let s = engine.snapshot().unwrap();
+    assert_eq!(s.evidence.len(), 2, "both entries must have been filed");
+
+    for (i, d) in details_of(&s.evidence[0]).iter().enumerate() {
+        // A RELATIONSHIP to the constant, not the literal 512: asserting the
+        // number would keep passing if the constant moved and the clamp did not.
+        assert_eq!(
+            d.len(),
+            k::VALIDATION_MAX_TEXT_FIELD_BYTES,
+            "detail #{i} landed at {} bytes, not the {}-byte bound — an \
+             unbounded detail is ancillary text the reservation never measured, \
+             and a document over the reservation is DELETED by prune, not truncated",
+            d.len(),
+            k::VALIDATION_MAX_TEXT_FIELD_BYTES
+        );
+    }
+    for (i, d) in details_of(&s.evidence[1]).iter().enumerate() {
+        assert_eq!(
+            *d, short,
+            "detail #{i} was already inside the bound and must be left alone"
+        );
+    }
 }
 
 /// And the two budgets must hold **together**, as one realised file.

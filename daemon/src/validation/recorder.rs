@@ -616,6 +616,11 @@ impl ValidationEngine {
         if session.session_id != session_id || !session.is_recording() {
             return false;
         }
+        // `P8-br`: the one place an entry enters the document, so the one place
+        // its daemon-formatted prose has to be bounded. See
+        // `EvidenceRef::clamp_detail`.
+        let mut ev = ev;
+        ev.clamp_detail();
         session.evidence.push(ev);
         self.refresh_live(session);
         true

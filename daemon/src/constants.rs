@@ -768,7 +768,15 @@ pub const VALIDATION_MAX_SESSION_BYTES: u64 = 28 * 1024 * 1024;
 /// bound, and the measurement covers the term for the first time. The ~106 KB it
 /// adds is what the reservation was silently carrying as an unknown.
 ///
-/// **Honest limit — one, and it is not closed by this reservation.**
+/// **Honest limits — two, both narrower than the one `P8-br` closed.**
+///
+/// An earlier draft of this note replaced `P8-br`'s entry with a categorical
+/// "every ancillary text term is now bounded". That was false, and it is
+/// recorded here rather than quietly corrected because the failure mode is the
+/// one this project keeps paying for: a *correction* arrives with the authority
+/// of having just done the research, so it skips the check the original skipped
+/// (DEC-347). Retiring a true honest limit in favour of a false all-clear is
+/// strictly worse than the limit.
 ///
 /// The event, measurement, metadata and member-id terms are bounded by the
 /// constants above, and the evidence array's *length* by the orchestration walk.
@@ -776,16 +784,39 @@ pub const VALIDATION_MAX_SESSION_BYTES: u64 = 28 * 1024 * 1024;
 /// `radiator_members`, `sweep_members`, and every `findings[]`, `evidence[]` and
 /// `startup_fingerprints[]` entry — `findings` and `evidence` being the two
 /// largest, so an enumeration that omits them under-counts the term by about
-/// half. One ancillary text source is still unbounded:
+/// half. `P8-br` closed the largest remaining source, **daemon-formatted
+/// `detail` prose** on `EvidenceRef` and the runs it carries: client text was
+/// bounded at ingest and daemon text was bounded by nothing but what a
+/// `format!` produced.
+/// [`crate::validation::session::EvidenceRef::clamp_detail`] now truncates all
+/// four at this same constant, applied at `attach_evidence_for` — the one route
+/// an entry takes into a session — so the largest ancillary term the
+/// measurement below could not vouch for is now one it can.
 ///
-///   * **daemon-formatted `detail` strings** on `EvidenceRef` and
-///     `CharacterizationRun` (`P8-br`), bounded by nothing but what the daemon
-///     formats into them.
+/// The measurement did not move, and that is the useful part: the fixture
+/// already took `EvidenceRef::detail` and `CharacterizationRun::detail` at this
+/// bound, so the code has been brought up to what the reservation was already
+/// reserving. This is the opposite of `P8-bs`, where bounding a term made the
+/// fixture stop being the worst case and the figure had to be re-measured.
 ///
-/// The measurement below is therefore a bound on the terms that ARE bounded, and
-/// the fixture that takes it uses member ids at their ingest bound. The remaining
-/// gap is not reachable in normal operation; it is recorded rather than assumed
-/// away.
+/// The two that remain, both pre-existing and neither closed by `P8-br`:
+///
+///   * **`findings[].detail` and `startup_fingerprints[].interpretation`
+///     (`P8-ce`)** — daemon-`format!`ed by `summary.rs` and clamped by nothing.
+///     Two terms in them scale with a vector rather than with a token:
+///     `summary.rs:461-465` joins `interpretation_states` into a finding, and
+///     `:744-761` joins one `parts` entry per fingerprint. The fixture takes
+///     both at this constant, so the measurement is honest **only while a real
+///     one stays under it** — about 250 B today against the 512 B assumed.
+///     Not clamped here because it is pre-existing and outside `P8-br`'s
+///     blast radius, not because it is safe.
+///   * **The live-slot copy of a run (`P8-cd`)** — not a document term at all.
+///     The clamp runs where evidence is *filed*, so the copy published by
+///     `GET /diagnostics/characterization` and `/diagnostics/control-path` is
+///     unclamped and an over-long `detail` would differ between that response
+///     and the session document. No file, no reservation, nothing `prune` can
+///     delete. Clamping at the terminal publish would put that change inside
+///     the sweep write path for a reporting concern.
 pub const VALIDATION_MAX_ANCILLARY_BYTES: usize = 10 * 1024 * 1024;
 
 /// Bound on each free-text field a client may attach to a session (an event

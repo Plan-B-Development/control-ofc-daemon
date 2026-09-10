@@ -525,6 +525,47 @@ pub struct EvidenceRef {
     pub control_path: Option<crate::api::discovery::ControlPathRun>,
 }
 
+impl EvidenceRef {
+    /// `P8-br`: bound every daemon-formatted `detail` in this entry at the same
+    /// constant the client's text fields are bounded by at ingest.
+    ///
+    /// **This is the largest unbounded ancillary text in the document — not the
+    /// last of it.** Events and measurements are capped by
+    /// `VALIDATION_MAX_TEXT_FIELD_BYTES` at ingest, member ids by
+    /// `MAX_DEVICE_TEXT_BYTES` (`P8-bs`), and the evidence array's *length* by
+    /// the orchestration walk — but a `detail` is prose the daemon `format!`s,
+    /// and nothing capped it. That matters because a document which outgrows
+    /// `VALIDATION_MAX_ANCILLARY_BYTES` is not truncated but DELETED: `prune`
+    /// reclaims what it cannot read (DEC-320). `findings[].detail` and
+    /// `startup_fingerprints[].interpretation` are the same class and are still
+    /// unclamped — see `P8-ce` and the honest-limits note on
+    /// [`crate::constants::VALIDATION_MAX_ANCILLARY_BYTES`].
+    ///
+    /// Applied at the ONE point an entry enters a session
+    /// ([`crate::validation::recorder::ValidationEngine::attach_evidence_for`])
+    /// rather than at each of the ~15 `SweepOutcome` construction sites, so a
+    /// diagnostic added later is bounded without its author knowing this rule
+    /// exists. Only `detail` is touched: `member_id` is already bounded at
+    /// ingest, and `kind`/`outcome`/`run_id` are daemon tokens pinned at 64
+    /// bytes by `no_daemon_token_exceeds_the_evidence_allowance`.
+    pub fn clamp_detail(&mut self) {
+        let cap = crate::constants::VALIDATION_MAX_TEXT_FIELD_BYTES;
+        for d in [
+            self.detail.as_mut(),
+            self.characterization
+                .as_mut()
+                .and_then(|c| c.detail.as_mut()),
+            self.control_path.as_mut().and_then(|c| c.detail.as_mut()),
+            self.verify.as_mut().and_then(|v| v.detail.as_mut()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            crate::text::truncate(d, cap);
+        }
+    }
+}
+
 /// The result of a PWM write/readback verification, flattened for evidence.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VerifyEvidence {

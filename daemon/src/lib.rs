@@ -18,4 +18,5 @@ pub mod pwm_baselines;
 pub mod runtime_config;
 pub mod safety;
 pub mod serial;
+pub mod text;
 pub mod validation;

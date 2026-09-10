@@ -171,6 +171,7 @@ impl PwmBaselineRecord {
     /// assertion in `constants.rs` can prove the file bound is reachable but not
     /// exceedable.
     fn clamp(&mut self) {
+        use crate::text::truncate;
         let cap = constants::PWM_BASELINE_MAX_TEXT_BYTES;
         truncate(&mut self.header_id, cap);
         truncate(&mut self.run_id, cap);
@@ -178,19 +179,6 @@ impl PwmBaselineRecord {
         self.points.dedup_by_key(|p| p.duty_pct);
         self.points.truncate(constants::PWM_BASELINE_MAX_POINTS);
     }
-}
-
-/// Truncate on a **character** boundary, never a byte one: `String::truncate`
-/// panics mid-codepoint, and a header label can legitimately contain non-ASCII.
-fn truncate(s: &mut String, max_bytes: usize) {
-    if s.len() <= max_bytes {
-        return;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s.truncate(end);
 }
 
 pub fn store_path_in(dir: &Path) -> PathBuf {

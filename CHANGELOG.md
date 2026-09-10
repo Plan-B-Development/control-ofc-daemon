@@ -1,5 +1,51 @@
 # Changelog
 
+## [2.43.8] — 2026-09-10
+
+**Two bounding fixes, both from the open-items register (`P8-cc`, `P8-br`).** One
+changes an error a client could not act on; the other closes the last unbounded
+term in the validation-session reservation.
+
+**A cooling device the daemon rejects no longer spends a slot the client cannot
+free (`P8-cc`).** Devices are sanitised on read, so an entry `validate_device`
+rejects — a hand-edited `runtime.toml` line, or a member id over the 256-byte
+bound added in 2.43.7 — is absent from `GET /inventory/cooling-devices` and its
+id is therefore never disclosed. `POST /config/cooling-device` counted the raw
+rows anyway, so sixteen rows with one bad entry published fifteen devices and
+answered the next create with `409 already_exists "cooling device limit reached
+(16)"`, with nothing visible to `DELETE` to make room. The cap now counts the
+sanitised list, so the error means what a client can act on. The bad row is not
+deleted — it stays in the file and stays reachable by id — it simply stops
+costing a slot.
+
+**Daemon-formatted evidence `detail` prose is now bounded at
+`VALIDATION_MAX_TEXT_FIELD_BYTES`, like every other ancillary term (`P8-br`).**
+A client's session text was bounded at ingest; the daemon's own `format!`-built
+`detail` on an evidence entry and on the characterisation, control-path and
+verify runs it carries was bounded by nothing. That is ancillary text the 10 MiB
+reservation has to cover, and a document which outgrows it is not truncated but
+**deleted**, since `prune` reclaims what it cannot read. `EvidenceRef::clamp_detail`
+truncates all four on a character boundary at `attach_evidence_for` — the one
+route an entry takes into a session — rather than at the ~15 sites that build a
+`SweepOutcome`, so a diagnostic added later is bounded without its author
+knowing the rule exists. No measurement moved: the reservation's fixture already
+took both of the named fields at this bound, so this brings the code up to what
+the fixture was already reserving.
+
+**`constants.rs`' "honest limits" note is not empty, and a draft of this change
+said it was.** Review caught the claim before it shipped. `findings[].detail` and
+`startup_fingerprints[].interpretation` are daemon-`format!`ed by the same
+summariser and clamped by nothing, and two of their terms scale with a vector
+rather than a token. They are pre-existing, outside this change's blast radius,
+and now recorded as `P8-ce` — not as an all-clear. The note lists them plus
+`P8-cd`, the unclamped copy on the live `GET /diagnostics/*` response, which is
+not a document term at all.
+
+**Internal:** the UTF-8-safe truncation helper had two byte-identical private
+copies (`control_paths.rs`, `pwm_baselines.rs`) and needed a third. It is now one
+`text::truncate`, with the character-boundary cases — a bound landing
+mid-codepoint, and one below the first character — under test for the first time.
+
 ## [2.43.7] — 2026-09-09
 
 **A cooling-device member id is now bounded by LENGTH, not only by list count

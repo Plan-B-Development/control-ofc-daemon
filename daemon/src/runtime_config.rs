@@ -477,6 +477,21 @@ impl RuntimeConfig {
 
     /// Create or replace a cooling device, keyed by id. Returns false when the
     /// table is already full and this would be a new device.
+    ///
+    /// **The cap counts the SANITISED list, not the raw one (`P8-cc`).** Devices
+    /// are sanitised on read, so a persisted entry `sanitize` drops is published
+    /// by nothing: it is absent from `/inventory/cooling-devices`, its id is
+    /// therefore never disclosed, and `DELETE /config/cooling-device/{id}` cannot
+    /// be aimed at it. Counting it here spent a slot the client could neither see
+    /// nor free — sixteen devices with one bad entry published fifteen and
+    /// answered the next create with `409 cooling device limit reached (16)`,
+    /// which is unactionable advice. Counting what the client can see makes the
+    /// error true and the remedy reachable.
+    ///
+    /// The raw list stays bounded regardless: the handler validates before
+    /// calling this, so every device it admits survives `sanitize`, and the only
+    /// excess is whatever invalid entries a hand-edited `runtime.toml` already
+    /// held.
     pub fn set_cooling_device(
         &mut self,
         dev: crate::hwmon::cooling_device::CoolingDeviceConfig,
@@ -485,7 +500,7 @@ impl RuntimeConfig {
             *slot = dev;
             return true;
         }
-        if self.cooling_devices.len() >= crate::hwmon::cooling_device::MAX_COOLING_DEVICES {
+        if self.cooling_devices().len() >= crate::hwmon::cooling_device::MAX_COOLING_DEVICES {
             return false;
         }
         self.cooling_devices.push(dev);
@@ -1311,6 +1326,74 @@ mod tests {
             name: "still editable".into(),
             ..Default::default()
         }));
+    }
+
+    /// **The regression test for `P8-cc`.** A persisted device that `sanitize`
+    /// drops must not spend a slot the client can neither see nor free.
+    ///
+    /// The invalid entry is absent from `cooling_devices()`, so it is absent
+    /// from `/inventory/cooling-devices`, so its id is never disclosed and
+    /// `DELETE /config/cooling-device/{id}` cannot be aimed at it. Counting it
+    /// against the cap answered the next create with `409 cooling device limit
+    /// reached (16)` while showing fifteen — an error whose remedy did not
+    /// exist.
+    #[test]
+    fn a_device_sanitize_drops_does_not_spend_a_slot() {
+        let cap = crate::hwmon::cooling_device::MAX_COOLING_DEVICES;
+
+        // A hand-edited `runtime.toml`: the table full to the cap, one entry of
+        // which `validate_device` rejects (a space is outside the id charset).
+        let mut cfg = RuntimeConfig {
+            cooling_devices: (0..cap)
+                .map(|i| CoolingDeviceConfig {
+                    id: if i == 0 {
+                        "bad id".into()
+                    } else {
+                        format!("dev-{i}")
+                    },
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+
+        // Preconditions — or a passing assertion below says nothing. The raw
+        // table is at the cap while the published one is one short, which is
+        // exactly the divergence the defect lived in.
+        assert_eq!(cfg.cooling_devices.len(), cap, "the raw table must be full");
+        assert_eq!(
+            cfg.cooling_devices().len(),
+            cap - 1,
+            "sanitize must really drop the bad entry, or this tests nothing"
+        );
+
+        assert!(
+            cfg.set_cooling_device(CoolingDeviceConfig {
+                id: "dev-new".into(),
+                ..Default::default()
+            }),
+            "a create must be admitted while a slot is free in the list the \
+             client can actually see"
+        );
+        assert_eq!(
+            cfg.cooling_devices().len(),
+            cap,
+            "and it must be visible once admitted"
+        );
+
+        // The opposite branch: the cap still binds once the VISIBLE list is
+        // full. Without this, counting nothing at all would pass the assertion
+        // above.
+        assert!(
+            !cfg.set_cooling_device(CoolingDeviceConfig {
+                id: "dev-one-too-many".into(),
+                ..Default::default()
+            }),
+            "the cap must still refuse a create once the visible list is full"
+        );
+        // The invalid entry is still on disk and still reachable by id — the fix
+        // stops it costing a slot, it does not delete the user's line.
+        assert!(cfg.remove_cooling_device("bad id"));
     }
 
     /// A hand-edited file with one bad device keeps the good ones and never
