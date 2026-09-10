@@ -34,7 +34,7 @@ jobs:
     name: fmt + clippy + test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install build deps
         # serialport pulls libudev-sys on Linux (see Cargo.lock); it needs
         # libudev-dev + pkg-config to link. This is the one CI-specific bit that
@@ -61,7 +61,7 @@ jobs:
           # SHA on the next line, per the supply-chain note at the top of the
           # file, so the bundled one is turned off rather than layered on top.
           cache: false
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
       # `--locked` is load-bearing, not tidiness (DEC-272 round 2). Without it
@@ -104,7 +104,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install build deps
         run: |
           sudo apt-get update
@@ -120,7 +120,7 @@ jobs:
       # with one deliberately stable across jobs, which is the opposite of what is
       # wanted — it was set here briefly with a comment claiming it provided the
       # separation the default already provides.
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # Both steps below set RUSTUP_TOOLCHAIN, and it is load-bearing rather than
       # belt-and-braces. The rustup shim reads the repo's pin file and would
       # override whatever the action above installed, so WITHOUT this the job
@@ -156,7 +156,7 @@ jobs:
           - bans licenses sources
     continue-on-error: ${{ matrix.checks == 'advisories' }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check ${{ matrix.checks }}
