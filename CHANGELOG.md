@@ -2,6 +2,14 @@
 
 ## [2.44.0] — 2026-09-10
 
+**No wire shape, capability or error code changes; pairs with `control-ofc-gui`
+>= v2.23.0 as before.** The new tray is a client of endpoints that already
+existed, so no daemon API moved and no capability flag was added. It launches
+whatever `control-ofc-gui` is installed; with **GUI >= v2.68.0** a second launch
+raises the existing window instead of opening a duplicate, which is what makes
+clicking the tray icon twice harmless. Older GUIs work — they just open a second
+window on a double click, exactly as they do from the application menu today.
+
 **New: `control-ofc-tray`, a system-tray client for KDE Plasma (DEC-352).** The
 package now installs a second binary and an autostart entry, giving a persistent
 Control-OFC icon in the Plasma system tray: right-click for the profile list with
