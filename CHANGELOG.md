@@ -1,5 +1,57 @@
 # Changelog
 
+## [2.44.1] — 2026-09-11
+
+**No wire shape, capability or error code changes; the daemon itself is
+untouched.** Every change here is inside `control-ofc-tray`. Pairs with
+`control-ofc-gui` >= v2.23.0 exactly as 2.44.0 did.
+
+**The tray's journal is readable again (DEC-353).** `control-ofc-tray` set its
+log filter globally, so `zbus` — which it reaches through `ksni` — logged its
+D-Bus handshake and *every* dispatched method call at INFO, raw message bodies
+included. Measured on a live Plasma session: one boot's journal held **11 lines
+under `control-ofc-tray` and not one of them was the tray's own**. The default is
+now this crate at `info` and everything else at `warn`, so a real `zbus` warning
+still appears and the tray's own lines are findable. `RUST_LOG` overrides it as
+before — `RUST_LOG=debug control-ofc-tray` is unchanged.
+
+This is listed first because the two fixes below report themselves through the
+log, and a log nobody can read is not a report.
+
+**A profile switch the daemon refuses no longer looks like one it applied
+(DEC-353).** Clicking a profile closes the menu, and the panel leaves the item
+you clicked ticked — so a switch rejected by the daemon (a profile that fails
+validation, or one deleted since the menu was drawn) was indistinguishable from a
+switch that worked, while the previous profile carried on driving the fans. The
+next menu now opens with a line naming what is actually running — "Profile not
+switched — 'Balanced' is still active" — and refusing to stop profile control says
+so too, in its own words. The line clears as soon as an action succeeds.
+
+The wording comes from the re-read that follows the request, never from the
+request's own reply, and that distinction is load-bearing: a tray call is bounded
+at 300 ms and the daemon applies a switch before it answers, so on a loaded
+machine a switch that *worked* can still report a timeout. Deciding from the reply
+would have printed "the previous one is still active" underneath a correctly
+ticked new profile. Where the re-read fails as well, the line says only that the
+daemon is not answering — it does not guess what is driving the fans.
+
+It appears below the thermal warning where both are present, since fans forced to
+maximum is the more urgent fact.
+
+**One tray per user no longer depends on nobody else guessing a name
+(DEC-353).** The guard used a Linux abstract-namespace socket, which has no
+permission check on a fully predictable name — so any other local user could
+claim `control-ofc-tray.<uid>` first and the real owner's tray would then exit
+quietly at every login, with systemd recording a clean start. It is now an
+advisory lock (`flock`) on a file in `$XDG_RUNTIME_DIR`, which no other user can
+write to. Nothing about this is visible in normal use: the lock is released by
+the kernel however the process exits, a lock file left behind by a crash is
+inert, and a duplicate launch still exits quietly.
+
+If `$XDG_RUNTIME_DIR` is missing or is not private to you, the tray now starts
+**without** the guard and says so, rather than trusting a shared location. The
+worst case is a second tray icon.
+
 ## [2.44.0] — 2026-09-10
 
 **No wire shape, capability or error code changes; pairs with `control-ofc-gui`

@@ -26,7 +26,7 @@ tray/src/              — control-ofc-tray: an API client, not part of the daem
   client.rs            — blocking HTTP/1.1 over the Unix socket + wire models
   menu.rs              — the StatusNotifierItem: what is shown, what clicks do
   launch.rs            — starting control-ofc-gui, detached
-  single_instance.rs   — one tray per user (abstract-namespace socket)
+  single_instance.rs   — one tray per user (flock in $XDG_RUNTIME_DIR)
 
 daemon/src/
   main.rs              — startup, config, signal handling, shutdown

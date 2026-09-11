@@ -19,6 +19,10 @@ use control_ofc_tray::menu::ControlOfcTray;
 pub struct FakeDaemon {
     status: Mutex<Result<Status, ClientError>>,
     profiles: Mutex<Result<Vec<ProfileSummary>, ClientError>>,
+    /// What `activate_profile` / `deactivate_profile` return. `Ok(())` unless a
+    /// test scripts a refusal — the daemon validates, so a rejected switch is a
+    /// real case and not a hypothetical one (`T1-k`).
+    action_result: Mutex<Result<(), ClientError>>,
     pub calls: Mutex<Vec<String>>,
 }
 
@@ -27,6 +31,7 @@ impl FakeDaemon {
         Arc::new(Self {
             status: Mutex::new(Ok(status)),
             profiles: Mutex::new(Ok(profiles)),
+            action_result: Mutex::new(Ok(())),
             calls: Mutex::new(Vec::new()),
         })
     }
@@ -36,6 +41,7 @@ impl FakeDaemon {
         Arc::new(Self {
             status: Mutex::new(Err(ClientError::Unavailable("test".into()))),
             profiles: Mutex::new(Err(ClientError::Unavailable("test".into()))),
+            action_result: Mutex::new(Ok(())),
             calls: Mutex::new(Vec::new()),
         })
     }
@@ -46,6 +52,11 @@ impl FakeDaemon {
 
     pub fn set_profiles(&self, profiles: Result<Vec<ProfileSummary>, ClientError>) {
         *self.profiles.lock().unwrap() = profiles;
+    }
+
+    /// Script what the next profile action returns.
+    pub fn set_action_result(&self, result: Result<(), ClientError>) {
+        *self.action_result.lock().unwrap() = result;
     }
 
     pub fn calls(&self) -> Vec<String> {
@@ -75,12 +86,12 @@ impl DaemonApi for SharedDaemon {
             .lock()
             .unwrap()
             .push(format!("activate:{profile_id}"));
-        Ok(())
+        self.0.action_result.lock().unwrap().clone()
     }
 
     fn deactivate_profile(&self) -> Result<(), ClientError> {
         self.0.calls.lock().unwrap().push("deactivate".into());
-        Ok(())
+        self.0.action_result.lock().unwrap().clone()
     }
 }
 

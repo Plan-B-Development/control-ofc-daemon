@@ -11,6 +11,47 @@ use control_ofc_tray::single_instance::{self, AcquireError};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Default log filter: this crate at `info`, everything else at `warn`.
+///
+/// **A bare `"info"` here is a GLOBAL default, and that is the defect this
+/// constant exists to prevent.** `ksni` reaches D-Bus through `zbus`, which logs
+/// its connection handshake and *every dispatched method call* at INFO — raw
+/// message bodies included, as byte arrays. Measured on a live Plasma session
+/// 2026-09-11: one boot's journal held **11 lines under tag `control-ofc-tray`
+/// and none of them were the tray's own**, which makes the two lines an operator
+/// actually needs — an already-running tray, and a profile switch the daemon
+/// refused — unfindable in the noise.
+///
+/// `warn` rather than `off` for the rest deliberately: a real `zbus` warning is
+/// worth seeing. `RUST_LOG` still overrides the whole thing, as
+/// control-ofc-tray(1) documents.
+///
+/// The daemon's own `main` carries the same bare-`info` line and is left alone:
+/// it has no chatty D-Bus dependency, so the global default costs it nothing.
+const DEFAULT_LOG_FILTER: &str = "control_ofc_tray=info,warn";
+
+/// Build the logger for a filter spec.
+///
+/// Split out from `main` so the filter's **behaviour** is testable rather than
+/// its spelling: the test builds through this same function with the same
+/// constant and asserts which of five targets survive. Asserting on the string
+/// would only prove `env_logger` parses it.
+///
+/// `Builder::new()` reads no environment at all, unlike the `from_env` this
+/// replaced — which is the point, because it is what makes the test
+/// deterministic whatever `RUST_LOG` the developer has exported. `RUST_LOG`
+/// itself is therefore resolved by the caller. `RUST_LOG_STYLE` is not, so it is
+/// re-honoured here: `from_env` applied it via `Env::get_write_style`, and
+/// dropping it silently would have been an unannounced behaviour change.
+fn log_builder(filter: &str) -> env_logger::Builder {
+    let mut builder = env_logger::Builder::new();
+    builder.parse_filters(filter);
+    if let Ok(style) = std::env::var("RUST_LOG_STYLE") {
+        builder.parse_write_style(&style);
+    }
+    builder
+}
+
 const USAGE: &str = "\
 control-ofc-tray — system-tray client for the Control-OFC daemon
 
@@ -28,7 +69,12 @@ start and read the logs of a running tray.
 ";
 
 fn main() -> ExitCode {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // `RUST_LOG` wins where it is set, which is the documented escape hatch;
+    // otherwise the crate-scoped default above. Read explicitly rather than via
+    // `Env::default().default_filter_or(..)` so `log_builder` takes a resolved
+    // spec and the test can drive it deterministically.
+    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| DEFAULT_LOG_FILTER.to_string());
+    log_builder(&filter).init();
 
     let socket_path = match parse_args(std::env::args().skip(1)) {
         Ok(Action::Run { socket_path }) => socket_path,
@@ -44,9 +90,17 @@ fn main() -> ExitCode {
 
     // Belt-and-braces: on a systemd session the generated autostart unit already
     // guarantees one instance. This covers a manual launch and non-systemd
-    // sessions. Held for the life of the process; released by the kernel however
-    // the process exits.
-    let _guard = match single_instance::acquire(&single_instance::default_instance_name()) {
+    // sessions. Held for the life of the process; the kernel releases the lock
+    // however the process exits, SIGKILL included.
+    //
+    // `info` and not `warn` for the AlreadyRunning arm, deliberately. `T1-h`
+    // offered raising the level as the *alternative* to moving the guard off the
+    // abstract namespace, because there the branch could mean a stranger had
+    // taken the name. The lock now lives in a verified-private
+    // $XDG_RUNTIME_DIR, so this arm means what it says — your own tray is
+    // already running — and promoting it would put routine noise back into the
+    // journal the filter above was just narrowed to clear.
+    let _guard = match single_instance::acquire_default() {
         Ok(guard) => Some(guard),
         Err(AcquireError::AlreadyRunning) => {
             log::info!("a Control-OFC tray is already running for this user; exiting");
@@ -145,6 +199,49 @@ mod tests {
     #[test]
     fn unrecognised_arguments_are_rejected_rather_than_ignored() {
         assert!(parse(&["--wat"]).is_err());
+    }
+
+    /// The `T1-l` guard. This asserts the built logger's **behaviour** for five
+    /// targets, not the spelling of the filter — a source scan or a string
+    /// comparison would pass against any spec `env_logger` happens to accept,
+    /// including the bare `"info"` this replaced.
+    #[test]
+    fn the_default_filter_admits_the_tray_and_silences_its_dbus_stack() {
+        use log::{Level, Log, MetadataBuilder};
+
+        let logger = log_builder(DEFAULT_LOG_FILTER).build();
+        let enabled = |target: &str, level: Level| {
+            logger.enabled(&MetadataBuilder::new().target(target).level(level).build())
+        };
+
+        // The tray's own lines must survive — this is the half a too-aggressive
+        // filter would break, and without it the fix could "pass" by silencing
+        // everything.
+        assert!(
+            enabled("control_ofc_tray", Level::Info),
+            "the tray's own info lines must be logged"
+        );
+        assert!(
+            enabled("control_ofc_tray::menu", Level::Info),
+            "a module inside the tray must be logged too"
+        );
+
+        // The measured defect: zbus INFO drowning the above.
+        assert!(
+            !enabled("zbus::connection::handshake::common", Level::Info),
+            "zbus INFO is what produced 11 journal lines and zero tray lines"
+        );
+        assert!(
+            !enabled("tracing::span", Level::Info),
+            "the tracing->log bridge is the other half of the same noise"
+        );
+
+        // But a genuine dependency warning must still reach the journal, or the
+        // fix has traded one silence for another.
+        assert!(
+            enabled("zbus::connection", Level::Warn),
+            "a real zbus warning must still be logged"
+        );
     }
 
     #[test]

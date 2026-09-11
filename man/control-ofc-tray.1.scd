@@ -107,10 +107,22 @@ systemctl --user restart 'app-control\x2dofc\x2dtray@autostart.service'
 journalctl --user -u 'app-control\x2dofc\x2dtray@autostart.service'
 ```
 
+By default the tray logs its own messages at _info_ and everything from its
+libraries at _warn_. That is deliberate: the D-Bus stack it uses logs every
+message it dispatches at _info_, which buries the tray's own lines in a journal
+where they are the ones worth reading.
+
 To run it by hand with verbose logging, after stopping the unit:
 
 ```
 RUST_LOG=debug control-ofc-tray
+```
+
+*RUST_LOG* overrides the default completely, so it is also how to get the D-Bus
+internals back when diagnosing a registration problem:
+
+```
+RUST_LOG=control_ofc_tray=debug,zbus=info control-ofc-tray
 ```
 
 To disable it permanently, use System Settings → Autostart, which writes a
@@ -125,6 +137,13 @@ than exiting, so it survives *plasmashell --replace* and a Plasma restart.
 
 _/run/control-ofc/control-ofc.sock_
 	The daemon socket the tray reads.
+
+_$XDG_RUNTIME_DIR/control-ofc-tray.lock_
+	Advisory lock holding the one-tray-per-user guarantee. Created on
+	demand; the kernel releases it however the process exits, so a file
+	left behind by a crash is harmless and needs no cleaning up. If
+	*$XDG_RUNTIME_DIR* is unset or is not private to you, the tray runs
+	without the guard and logs the reason.
 
 _/etc/xdg/autostart/control-ofc-tray.desktop_
 	Autostart entry. Package-owned.

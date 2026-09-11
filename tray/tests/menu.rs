@@ -10,6 +10,7 @@ mod common;
 
 use common::*;
 use control_ofc_tray::client::ClientError;
+use control_ofc_tray::menu::{thermal_label, ControlOfcTray};
 use ksni::Tray;
 
 #[test]
@@ -416,4 +417,311 @@ fn a_missing_gui_disables_the_open_item_and_never_panics() {
     // Brief §9: a failed launch must not destabilise the tray.
     tray.activate(0, 0);
     assert_eq!(launcher.launches(), 1, "it still tried");
+}
+
+// --- T1-k: a refused profile action must not look like an applied one --------
+//
+// The panel's dbusmenu client leaves the clicked radio item CHECKED after the
+// menu closes, so "refused" and "applied" are visually identical until the menu
+// is reopened. These two tests are a pair on purpose: the first proves the
+// explanation appears, the second proves it is not simply always there. Without
+// the second, a `disabled(...)` line pushed unconditionally would pass.
+
+/// The action-error lines the menu carries, identified by their leading marker
+/// rather than by their full wording — asserting whole sentences would make every
+/// copy edit a test failure, while the marker is what separates them from an
+/// ordinary status line.
+///
+/// **The thermal line shares that marker**, so it is excluded by comparing
+/// against the real `thermal_label` for the snapshot's own state. Deriving the
+/// exclusion from the production function rather than from a copied string is
+/// what keeps this correct if the thermal wording changes — and without it a
+/// future test with an abnormal state would fail here for a reason that has
+/// nothing to do with what it was testing.
+fn action_error_lines(
+    tray: &ControlOfcTray,
+    items: &[ksni::menu::MenuItem<ControlOfcTray>],
+) -> Vec<String> {
+    let thermal = tray
+        .snapshot()
+        .status
+        .as_ref()
+        .map(|s| thermal_label(&s.thermal_state));
+    top_labels(items)
+        .into_iter()
+        .filter(|label| label.starts_with('⚠') && Some(label) != thermal.as_ref())
+        .collect()
+}
+
+#[test]
+fn a_profile_switch_the_daemon_refuses_is_reported_in_the_menu() {
+    let profiles = vec![profile("quiet", "Quiet"), profile("balanced", "Balanced")];
+    let daemon = FakeDaemon::new(status("2.44.0", "normal", Some("quiet")), profiles);
+    let launcher = RecordingLauncher::new(true);
+    let mut tray = make_tray(&daemon, &launcher);
+    tray.refresh();
+
+    // Precondition: nothing is complaining yet, so a line found after the click
+    // was produced by the click.
+    let before = action_error_lines(&tray, &tray.menu());
+    assert!(
+        before.is_empty(),
+        "a healthy tray must carry no warning line; got {before:?}"
+    );
+
+    // The daemon validates and rejects — a profile that fails validate() is a
+    // 400, one that has been deleted since the menu was built is a 404.
+    daemon.set_action_result(Err(control_ofc_tray::client::ClientError::Daemon {
+        status: 400,
+        code: "validation_error".into(),
+        message: "curve 'cpu' references an unknown sensor".into(),
+    }));
+
+    // Driven through the real radio callback, not by calling activate_profile:
+    // the callback IS the call site, and a test that skips it cannot tell a
+    // wired menu from an unwired one.
+    let items = tray.menu();
+    let radio = profile_radio(&items).expect("radio");
+    (radio.select)(&mut tray, 1);
+
+    let after = action_error_lines(&tray, &tray.menu());
+    assert_eq!(
+        after.len(),
+        1,
+        "a refused switch must say so exactly once; got {after:?}"
+    );
+    // The user's question is "is the thing I clicked running?", so the answer
+    // has to be about what IS active, not merely that an error occurred.
+    assert!(
+        after[0].contains("still active"),
+        "the line must say the previous profile is still running, or it does not \
+         correct the checkmark the panel is showing; got {:?}",
+        after[0]
+    );
+}
+
+#[test]
+fn a_switch_that_succeeds_carries_no_warning_and_clears_an_earlier_one() {
+    let profiles = vec![profile("quiet", "Quiet"), profile("balanced", "Balanced")];
+    let daemon = FakeDaemon::new(status("2.44.0", "normal", Some("quiet")), profiles);
+    let launcher = RecordingLauncher::new(true);
+    let mut tray = make_tray(&daemon, &launcher);
+    tray.refresh();
+
+    // Fail once, so there is something to clear. Asserting only the clean case
+    // would pass against a tray that never sets the line at all.
+    daemon.set_action_result(Err(control_ofc_tray::client::ClientError::Daemon {
+        status: 404,
+        code: "not_found".into(),
+        message: "no such profile".into(),
+    }));
+    let items = tray.menu();
+    (profile_radio(&items).expect("radio").select)(&mut tray, 1);
+    assert_eq!(
+        action_error_lines(&tray, &tray.menu()).len(),
+        1,
+        "precondition: the failure must have registered, or the clear below proves nothing"
+    );
+
+    // Now let it through.
+    daemon.set_action_result(Ok(()));
+    let items = tray.menu();
+    (profile_radio(&items).expect("radio").select)(&mut tray, 1);
+
+    let after = action_error_lines(&tray, &tray.menu());
+    assert!(
+        after.is_empty(),
+        "a successful switch must clear the stale complaint; got {after:?}"
+    );
+}
+
+#[test]
+fn a_refused_stop_is_reported_too() {
+    // The other half of the same path. `deactivate` has its own wording because
+    // "the previous profile is still active" is the wrong sentence for it.
+    let profiles = vec![profile("quiet", "Quiet")];
+    let daemon = FakeDaemon::new(status("2.44.0", "normal", Some("quiet")), profiles);
+    let launcher = RecordingLauncher::new(true);
+    let mut tray = make_tray(&daemon, &launcher);
+    tray.refresh();
+
+    daemon.set_action_result(Err(control_ofc_tray::client::ClientError::Daemon {
+        status: 503,
+        code: "hardware_unavailable".into(),
+        message: "the engine is mid-write".into(),
+    }));
+
+    let items = tray.menu();
+    let sub = find_submenu(&items, "Profile").expect("submenu");
+    let stop = find_standard(&sub.submenu, "Stop profile control").expect("stop item");
+    (stop.activate)(&mut tray);
+
+    let after = action_error_lines(&tray, &tray.menu());
+    assert_eq!(after.len(), 1, "a refused stop must say so; got {after:?}");
+    assert!(
+        after[0].contains("still controlling"),
+        "the line must say fans are still under control; got {:?}",
+        after[0]
+    );
+}
+
+#[test]
+fn a_thermal_warning_outranks_a_refused_action_in_the_menu() {
+    // The ordering is a deliberate choice, not an accident of insertion order:
+    // `CLAUDE.md`'s visible-warning hierarchy puts the more severe fact first,
+    // and fans forced to maximum outranks a click that did not take. Pinned
+    // because nothing else would notice the two being swapped — and they are
+    // adjacent for a reason, since a force-all is a plausible cause of a 503.
+    let profiles = vec![profile("quiet", "Quiet"), profile("balanced", "Balanced")];
+    let daemon = FakeDaemon::new(status("2.44.0", "emergency", Some("quiet")), profiles);
+    let launcher = RecordingLauncher::new(true);
+    let mut tray = make_tray(&daemon, &launcher);
+    tray.refresh();
+
+    daemon.set_action_result(Err(control_ofc_tray::client::ClientError::Daemon {
+        status: 503,
+        code: "hardware_unavailable".into(),
+        message: "thermal force-all is active".into(),
+    }));
+    let items = tray.menu();
+    (profile_radio(&items).expect("radio").select)(&mut tray, 1);
+
+    let labels = top_labels(&tray.menu());
+    let thermal_at = labels
+        .iter()
+        .position(|l| l.contains("Thermal emergency"))
+        .unwrap_or_else(|| panic!("the thermal line must be present; got {labels:?}"));
+    let error_at = labels
+        .iter()
+        .position(|l| l.contains("still active"))
+        .unwrap_or_else(|| panic!("the action error must be present; got {labels:?}"));
+
+    assert!(
+        thermal_at < error_at,
+        "the thermal warning must come first; got {labels:?}"
+    );
+    // And the helper the other tests use must not have counted the thermal line.
+    assert_eq!(
+        action_error_lines(&tray, &tray.menu()).len(),
+        1,
+        "exactly one action-error line, with the thermal line excluded"
+    );
+}
+
+#[test]
+fn an_activation_that_timed_out_but_actually_applied_is_not_reported_as_refused() {
+    // `ofc:security-reviewer`, finding 1. `DEFAULT_TIMEOUT` bounds a whole call
+    // at 300 ms and the daemon applies an activation before it answers, so a
+    // loaded machine can return `Unavailable("request timed out")` for a switch
+    // that really happened. Keying the menu line off the REPLY would then print
+    // "the previous one is still active" under a correctly ticked new profile.
+    //
+    // This is the arm that discriminates: a failing reply whose re-read shows the
+    // request DID take effect. The refused-switch test above cannot distinguish
+    // "decided from the reply" from "decided from the re-read", because there
+    // both agree.
+    let profiles = vec![profile("quiet", "Quiet"), profile("balanced", "Balanced")];
+    let daemon = FakeDaemon::new(status("2.44.1", "normal", Some("quiet")), profiles);
+    let launcher = RecordingLauncher::new(true);
+    let mut tray = make_tray(&daemon, &launcher);
+    tray.refresh();
+
+    // The POST reports a timeout...
+    daemon.set_action_result(Err(control_ofc_tray::client::ClientError::Unavailable(
+        "request timed out".into(),
+    )));
+    // ...but the daemon had already applied it, so the re-read reports the new
+    // profile active. That is exactly the state the 300 ms budget produces.
+    daemon.set_status(Ok(status("2.44.1", "normal", Some("balanced"))));
+
+    let items = tray.menu();
+    (profile_radio(&items).expect("radio").select)(&mut tray, 1);
+
+    // Precondition: the re-read really did land, or this asserts nothing.
+    assert_eq!(
+        tray.snapshot()
+            .status
+            .as_ref()
+            .and_then(|s| s.active_profile_id.as_deref()),
+        Some("balanced"),
+        "precondition: the re-read must show the switch applied"
+    );
+    let after = action_error_lines(&tray, &tray.menu());
+    assert!(
+        after.is_empty(),
+        "a switch the daemon applied must not be reported as refused, whatever the \
+         reply said; got {after:?}"
+    );
+}
+
+#[test]
+fn a_refusal_names_the_profile_that_is_actually_running() {
+    // The complement: the message must be built from the re-read too, not from a
+    // fixed string. A literal "the previous one" would pass the refused-switch
+    // test while telling the user nothing they can act on.
+    let profiles = vec![profile("quiet", "Quiet"), profile("balanced", "Balanced")];
+    let daemon = FakeDaemon::new(status("2.44.1", "normal", Some("quiet")), profiles);
+    let launcher = RecordingLauncher::new(true);
+    let mut tray = make_tray(&daemon, &launcher);
+    tray.refresh();
+
+    daemon.set_action_result(Err(control_ofc_tray::client::ClientError::Daemon {
+        status: 400,
+        code: "validation_error".into(),
+        message: "curve references an unknown sensor".into(),
+    }));
+    let items = tray.menu();
+    (profile_radio(&items).expect("radio").select)(&mut tray, 1);
+
+    let after = action_error_lines(&tray, &tray.menu());
+    assert_eq!(after.len(), 1, "expected one line; got {after:?}");
+    let running = tray
+        .snapshot()
+        .status
+        .as_ref()
+        .and_then(|s| s.active_profile_name.clone())
+        .expect("the fixture reports an active profile");
+    assert!(
+        after[0].contains(&running),
+        "the line must name what the re-read says is running ({running}); got {:?}",
+        after[0]
+    );
+}
+
+#[test]
+fn a_failed_action_with_no_answer_at_all_claims_nothing_about_the_fans() {
+    // Third arm: the action failed AND the re-read failed. Nothing may be
+    // asserted about what is driving the fans, because nothing is known —
+    // "X is still controlling the fans" would be invented.
+    let profiles = vec![profile("quiet", "Quiet")];
+    let daemon = FakeDaemon::new(status("2.44.1", "normal", Some("quiet")), profiles);
+    let launcher = RecordingLauncher::new(true);
+    let mut tray = make_tray(&daemon, &launcher);
+    tray.refresh();
+
+    let items = tray.menu();
+    let sub = find_submenu(&items, "Profile").expect("submenu");
+    let stop = find_standard(&sub.submenu, "Stop profile control").expect("stop item");
+
+    daemon.set_action_result(Err(ClientError::Unavailable("socket gone".into())));
+    daemon.set_status(Err(ClientError::Unavailable("socket gone".into())));
+    (stop.activate)(&mut tray);
+
+    // Precondition: the re-read really did fail.
+    assert!(
+        tray.snapshot().status.is_none(),
+        "precondition: the daemon must be unreachable for this arm"
+    );
+    let after = action_error_lines(&tray, &tray.menu());
+    assert_eq!(after.len(), 1, "expected one line; got {after:?}");
+    assert!(
+        !after[0].contains("controlling the fans"),
+        "with no answer, the menu must not claim anything is controlling the fans; got {:?}",
+        after[0]
+    );
+    assert!(
+        after[0].contains("not answering"),
+        "it must say what is actually known instead; got {:?}",
+        after[0]
+    );
 }

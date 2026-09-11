@@ -37,6 +37,16 @@ pub struct ControlOfcTray {
     api: Box<dyn DaemonApi>,
     launcher: Box<dyn GuiLauncher>,
     snapshot: Snapshot,
+    /// Why the user's last profile action did not happen, rendered at the top of
+    /// the next menu build (`T1-k`).
+    ///
+    /// **Deliberately NOT a `Snapshot` field**, which is where `T1-k` proposed
+    /// putting it. `Snapshot` is documented as "what the last refresh saw" and
+    /// `refresh()` replaces it wholesale — on both the success and the
+    /// daemon-unreachable path — so an error stored there would be erased by the
+    /// very `refresh()` that runs immediately after the failed POST. Storing it
+    /// beside the snapshot rather than inside it is what makes it survive.
+    last_action_error: Option<String>,
     quit: Box<dyn Fn() + Send>,
 }
 
@@ -46,8 +56,9 @@ impl ControlOfcTray {
             api,
             launcher,
             snapshot: Snapshot::default(),
+            last_action_error: None,
             // Ending the process IS the correct shutdown for a tray: there is
-            // nothing to flush, and the single-instance name is released by the
+            // nothing to flush, and the single-instance lock is released by the
             // kernel however we exit.
             quit: Box::new(|| std::process::exit(0)),
         }
@@ -97,19 +108,74 @@ impl ControlOfcTray {
     }
 
     fn activate_profile(&mut self, profile_id: &str) {
-        if let Err(e) = self.api.activate_profile(profile_id) {
+        let outcome = self.api.activate_profile(profile_id);
+        if let Err(e) = &outcome {
             log::warn!("could not activate profile '{profile_id}': {e}");
         }
         // Re-read rather than assume the request did what was asked: the daemon
         // validates, and it is the authority on what is now active.
         self.refresh();
+        // Then decide what to SAY from that re-read, never from the reply.
+        //
+        // The distinction is load-bearing and not defensive. `DEFAULT_TIMEOUT`
+        // bounds a whole call at 300 ms, and the daemon applies an activation
+        // *before* it answers — so a slow-but-successful switch comes back as
+        // `Unavailable("request timed out")` while the profile really is running.
+        // Keying the message off the error would then print "the previous one is
+        // still active" directly beneath a correctly ticked new profile: a false
+        // claim about what is driving the fans, which is the whole thing `T1-k`
+        // exists to prevent, reintroduced from the other side.
+        self.last_action_error = if outcome.is_ok() || self.active_profile_id() == Some(profile_id)
+        {
+            None
+        } else {
+            Some(match self.active_profile_label() {
+                // Truthful because it comes from the re-read, not the request.
+                Some(active) => format!("⚠ Profile not switched — {active} is still active"),
+                // The re-read failed too, so nothing may be claimed about what
+                // is running; say only what is known.
+                None => "⚠ Profile switch failed, and the daemon is not answering".to_string(),
+            })
+        };
     }
 
     fn deactivate_profile(&mut self) {
-        if let Err(e) = self.api.deactivate_profile() {
+        let outcome = self.api.deactivate_profile();
+        if let Err(e) = &outcome {
             log::warn!("could not deactivate the active profile: {e}");
         }
         self.refresh();
+        // Same rule as `activate_profile`: adjudicate against the re-read. Here
+        // "it worked" means the re-read reports nothing active at all.
+        let stopped = self
+            .snapshot
+            .status
+            .as_ref()
+            .is_some_and(|s| s.active_profile_id.is_none());
+        self.last_action_error = if outcome.is_ok() || stopped {
+            None
+        } else {
+            Some(match self.active_profile_label() {
+                Some(active) => format!("⚠ Not stopped — {active} is still controlling the fans"),
+                None => "⚠ Stop failed, and the daemon is not answering".to_string(),
+            })
+        };
+    }
+
+    /// The active profile id as of the last refresh, if the daemon answered.
+    fn active_profile_id(&self) -> Option<&str> {
+        self.snapshot.status.as_ref()?.active_profile_id.as_deref()
+    }
+
+    /// How to name the active profile to a human. Prefers the daemon's name and
+    /// falls back to the id, matching what the radio group shows.
+    fn active_profile_label(&self) -> Option<String> {
+        let status = self.snapshot.status.as_ref()?;
+        let id = status.active_profile_id.as_deref()?;
+        Some(match status.active_profile_name.as_deref() {
+            Some(name) if !name.is_empty() => format!("'{name}'"),
+            _ => format!("'{id}'"),
+        })
     }
 
     fn open_gui(&self) {
@@ -231,6 +297,18 @@ impl ksni::Tray for ControlOfcTray {
             if status.thermal_is_abnormal() {
                 items.push(disabled(&thermal_label(&status.thermal_state)));
             }
+        }
+
+        // AFTER the thermal line, not before it: `CLAUDE.md`'s visible-warning
+        // hierarchy puts the more severe fact first, and fans forced to maximum
+        // outranks a click that did not take. They are adjacent on purpose —
+        // a force-all is a plausible *reason* for a refused switch (503).
+        //
+        // Sticky until an action succeeds: "the last thing you asked for did not
+        // happen and nothing has since" stays true until it does, and `menu()`
+        // takes `&self` so it could not clear after rendering anyway.
+        if let Some(error) = &self.last_action_error {
+            items.push(disabled(error));
         }
 
         items.push(MenuItem::Separator);
