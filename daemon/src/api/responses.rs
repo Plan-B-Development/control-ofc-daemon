@@ -1575,6 +1575,20 @@ pub struct HwmonDiagnostics {
     /// Cumulative BIOS pwm_enable reclaim events per header ID.
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub enable_revert_counts: HashMap<String, u64>,
+    /// Age in ms of the most recent counted reclaim, per header ID (DEC-360).
+    ///
+    /// Dates the counts beside it rather than replacing them. `enable_revert_counts`
+    /// is monotonic for the life of the PWM controller and has no reset path, so a
+    /// client reading it alone cannot tell an active BIOS fight from a single
+    /// reclaim three weeks ago that the watchdog already remediated — and was
+    /// therefore forced to present both identically, permanently.
+    ///
+    /// Shares a lifetime with the counts: both live on the controller and reset
+    /// together, so an age here can never describe a different daemon's count.
+    /// A header in `enable_revert_counts` but absent here means the age is
+    /// **unknown**, never "just now" — clients must not default it to 0.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub enable_revert_last_seen_ms: HashMap<String, u64>,
 }
 
 /// Per-chip identification and driver info.
@@ -2787,6 +2801,7 @@ mod tests {
                     total_headers: 0,
                     writable_headers: 0,
                     enable_revert_counts: HashMap::new(),
+                    enable_revert_last_seen_ms: HashMap::new(),
                 },
                 gpu: None,
                 intel_gpu: None,

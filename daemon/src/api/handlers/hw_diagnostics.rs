@@ -237,10 +237,19 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
     let acpi_conflicts = diagnostics::detect_acpi_conflicts();
 
     // Revert counts from pwm_enable watchdog
-    let enable_revert_counts = state
+    let (enable_revert_counts, enable_revert_last_seen_ms) = state
         .hwmon_controller
         .as_ref()
-        .map(|c| c.lock().enable_revert_counts().clone())
+        .map(|c| {
+            // One lock, both maps: taken separately they could straddle a
+            // reclaim and publish a count without the age that dates it.
+            let ctrl = c.lock();
+            let now = std::time::Instant::now();
+            (
+                ctrl.enable_revert_counts().clone(),
+                ctrl.enable_revert_ages_ms(now),
+            )
+        })
         .unwrap_or_default();
 
     // DMI board identification
@@ -319,6 +328,7 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
                 total_headers,
                 writable_headers,
                 enable_revert_counts,
+                enable_revert_last_seen_ms,
             },
             gpu: gpu_diag,
             intel_gpu: intel_gpu_diag,

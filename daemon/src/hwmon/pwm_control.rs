@@ -172,6 +172,20 @@ pub struct HwmonPwmController {
     write_state: HashMap<String, HeaderWriteState>,
     /// Cumulative BIOS pwm_enable reclaim events per header. Persists across leases.
     enable_revert_counts: HashMap<String, u64>,
+    /// When the most recent reclaim was *counted*, per header (DEC-360).
+    ///
+    /// Deliberately NOT `WatchdogLogState::last_emit_at`, which is what the GUI
+    /// register row originally proposed reusing. That field records the last
+    /// *log emission*, and emission is throttled — first reclaim WARN, the rest
+    /// DEBUG, one summary per interval — so it stops advancing on exactly the
+    /// busy headers whose activity matters most, and a client ranking recency
+    /// from it would read a grinding contention as stale.
+    ///
+    /// `Instant`, not a wall clock: it is monotonic, and it shares a lifetime
+    /// with `enable_revert_counts` (both live on the controller and both reset
+    /// together when it is rebuilt), so an age derived from it can never
+    /// describe a different daemon's counts.
+    enable_revert_last_at: HashMap<String, Instant>,
     /// Per-header log throttle state for the pwm_enable watchdog. Persists
     /// across leases so the first WARN is emitted at most once per controller
     /// lifetime per header — subsequent reverts collapse into periodic INFO
@@ -201,6 +215,7 @@ impl HwmonPwmController {
             cache,
             write_state: HashMap::new(),
             enable_revert_counts: HashMap::new(),
+            enable_revert_last_at: HashMap::new(),
             watchdog_log_state: HashMap::new(),
             verify_mismatch_counts: HashMap::new(),
         }
@@ -243,6 +258,26 @@ impl HwmonPwmController {
     /// Cumulative BIOS pwm_enable reclaim events per header (persists across leases).
     pub fn enable_revert_counts(&self) -> &HashMap<String, u64> {
         &self.enable_revert_counts
+    }
+
+    /// Age in milliseconds of the most recent counted reclaim, per header.
+    ///
+    /// Computed at read time because `Instant` is not serialisable and an
+    /// absolute daemon-local timestamp would be meaningless to a client anyway.
+    /// A header present in `enable_revert_counts` but absent here can only mean
+    /// a count recorded before this field existed, which cannot happen within
+    /// one process — so the client may treat a missing entry as "unknown age",
+    /// never as "just now".
+    pub fn enable_revert_ages_ms(&self, now: Instant) -> HashMap<String, u64> {
+        self.enable_revert_last_at
+            .iter()
+            .map(|(id, at)| {
+                (
+                    id.clone(),
+                    now.saturating_duration_since(*at).as_millis() as u64,
+                )
+            })
+            .collect()
     }
 
     /// The duty this controller last COMMANDED for a header, as a percent
@@ -364,6 +399,10 @@ impl HwmonPwmController {
                 .enable_revert_counts
                 .entry(header_id.to_string())
                 .or_insert(0) += 1;
+            // Stamped on every counted reclaim, beside the count it dates and
+            // before any throttling decision — the two must not diverge.
+            self.enable_revert_last_at
+                .insert(header_id.to_string(), Instant::now());
             let count = self
                 .enable_revert_counts
                 .get(header_id)
@@ -1254,6 +1293,88 @@ mod tests {
         assert_eq!(w.len(), 4);
         assert_eq!(w[0].1, "1"); // first enable
         assert_eq!(w[2].1, "1"); // watchdog re-wrote enable
+    }
+
+    /// A controller whose mock always reports pwm_enable="2" (BIOS auto), so
+    /// every write after the first is seen as a reclaim. Mirrors
+    /// `watchdog_detects_bios_reclaim`'s setup, which is the only way to make
+    /// the watchdog fire.
+    fn reclaiming_controller() -> (HwmonPwmController, crate::hwmon::lease::HwmonLease) {
+        let (mut ctrl, _writes, _cache) =
+            setup_controller_with_enable(vec![make_header("h1", "CHA_FAN1", 0)], "2");
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap();
+        ctrl.set_pwm("h1", 50, &lease.lease_id).unwrap(); // primes manual_mode_set
+        (ctrl, lease)
+    }
+
+    #[test]
+    fn reclaim_stamps_an_age_beside_the_count() {
+        // DEC-360: the count alone cannot distinguish an active BIOS fight from
+        // one reclaim the watchdog already remediated, because the map is
+        // monotonic with no reset path.
+        let (mut ctrl, lease) = reclaiming_controller();
+        assert!(
+            ctrl.enable_revert_ages_ms(Instant::now()).is_empty(),
+            "precondition: nothing dated before a reclaim is counted"
+        );
+
+        ctrl.set_pwm("h1", 60, &lease.lease_id).unwrap();
+        assert_eq!(ctrl.enable_revert_counts().get("h1"), Some(&1));
+        assert!(
+            ctrl.enable_revert_ages_ms(Instant::now())
+                .contains_key("h1"),
+            "a counted reclaim must be dated"
+        );
+    }
+
+    #[test]
+    fn the_age_advances_with_the_clock_not_with_logging() {
+        // The GUI register row proposed reusing `WatchdogLogState::last_emit_at`.
+        // That field records the last LOG EMISSION and emission is throttled —
+        // first reclaim WARN, the rest DEBUG — so on a busy header it stops
+        // advancing, and an age derived from it would read as stale on exactly
+        // the machines where contention is worst. Taking `now` as a parameter is
+        // what makes the age independent of whether anything was logged.
+        let (mut ctrl, lease) = reclaiming_controller();
+        ctrl.set_pwm("h1", 60, &lease.lease_id).unwrap();
+
+        let t0 = Instant::now();
+        let near = ctrl.enable_revert_ages_ms(t0)["h1"];
+        let later = ctrl.enable_revert_ages_ms(t0 + Duration::from_secs(60))["h1"];
+        assert!(
+            later >= near + 59_000,
+            "the age must advance with the clock: near={near} later={later}"
+        );
+    }
+
+    #[test]
+    fn a_later_reclaim_freshens_the_age_but_the_count_still_accumulates() {
+        // The two answer different questions and must not be conflated: the
+        // count says how much has happened, the age says how recently.
+        let (mut ctrl, lease) = reclaiming_controller();
+        ctrl.set_pwm("h1", 60, &lease.lease_id).unwrap();
+
+        let future = Instant::now() + Duration::from_secs(3600);
+        let aged = ctrl.enable_revert_ages_ms(future)["h1"];
+        assert!(
+            aged >= 3_600_000,
+            "precondition: the first reclaim must look old"
+        );
+
+        ctrl.set_pwm("h1", 70, &lease.lease_id).unwrap();
+        assert_eq!(
+            ctrl.enable_revert_counts().get("h1"),
+            Some(&2),
+            "the count must keep accumulating"
+        );
+        let fresh = ctrl.enable_revert_ages_ms(future)["h1"];
+        assert!(
+            fresh < aged,
+            "a newer reclaim must make the age younger: aged={aged} fresh={fresh}"
+        );
     }
 
     // ── [HOST-a / DEC-326] the driver's full-speed alias ─────────────

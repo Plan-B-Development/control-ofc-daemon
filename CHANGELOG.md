@@ -1,5 +1,35 @@
 # Changelog
 
+## [2.46.0] — 2026-09-11
+
+**Additive wire field on `/diagnostics/hardware`; `API_VERSION` unchanged.** No
+capability, endpoint or error code moves, and no existing field changes shape.
+An older GUI ignores it.
+
+**BIOS reclaim counts are now dated.** `hwmon.enable_revert_counts` is
+cumulative for the life of the PWM controller and has no reset path — a rescan
+deliberately does not rebuild the controller — so a client reading it alone
+could not tell a BIOS actively fighting for a header from one reclaim hours ago
+that the watchdog had already remediated, and had to present both identically,
+for as long as the daemon kept running.
+
+`hwmon.enable_revert_last_seen_ms` reports, per header, the age in milliseconds
+of the most recent **counted** reclaim. It dates the evidence rather than
+discarding it: the count is unchanged and still cumulative.
+
+Two details that are easy to get wrong, so they are fixed here by construction:
+
+- It is the age of the **reclaim**, not of the last log line. The watchdog
+  throttles logging — first reclaim WARN, the rest DEBUG, one summary per
+  interval — so a timestamp taken from emission would stop advancing on exactly
+  the busy headers whose activity matters most.
+- It shares a lifetime with the counts. Both live on the controller and reset
+  together, so an age can never describe a different daemon's count.
+
+The field is omitted when empty, and a header that has a count but no age means
+the age is **unknown** — never "just now". The daemon takes no view on what
+counts as old; that is the client's policy.
+
 ## [2.45.0] — 2026-09-11
 
 **Additive wire field on `/status` + `/poll`; `API_VERSION` unchanged.** No
