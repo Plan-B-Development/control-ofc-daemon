@@ -67,6 +67,132 @@ fn tray_version_matches_daemon_version() {
     );
 }
 
+/// Substring match with flag boundaries, for the guard below.
+///
+/// A bare `text.contains("-h")` is satisfied by `--help`, so dropping the short
+/// flag from a completion file would go unnoticed by the very test written to
+/// notice it. Requiring the preceding character not to be `-`, and the following
+/// one not to continue the flag, makes each assertion discriminate.
+fn declares(text: &str, token: &str) -> bool {
+    let bytes = text.as_bytes();
+    text.match_indices(token).any(|(i, _)| {
+        let before_ok = i == 0 || bytes[i - 1] != b'-';
+        let after = i + token.len();
+        let after_ok =
+            after >= bytes.len() || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'-');
+        before_ok && after_ok
+    })
+}
+
+/// `control-ofc-tray` has its own CLI and its own completions (`T1-f`), and
+/// nothing else pins the two together.
+///
+/// The authority is the parser, not a list written here: the flag set is
+/// extracted from `parse_args`' own match arms, so adding a flag and forgetting
+/// the completions fails this test rather than shipping three files that quietly
+/// describe an older CLI. A hardcoded expectation would be satisfied by exactly
+/// the drift it exists to catch.
+///
+/// Extraction is scoped to the `parse_args` body and keyed on `=>`, because
+/// `USAGE` names every one of these flags too — matching them as bare substrings
+/// would make the guard pass off its own help text (`CLAUDE.md`: a
+/// source-scanning guard matches its own explanation).
+#[test]
+fn tray_completions_cover_every_flag_the_cli_accepts() {
+    let main_rs =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../tray/src/main.rs"))
+            .expect("read tray/src/main.rs");
+
+    let body = {
+        let start = main_rs
+            .find("fn parse_args")
+            .expect("tray/src/main.rs must define `parse_args`");
+        let rest = &main_rs[start..];
+        // To the next column-0 `}`, i.e. the end of the function. Keeps the
+        // `#[cfg(test)]` module below out of the scan.
+        let end = rest.find("\n}").map(|i| i + 2).unwrap_or(rest.len());
+        &rest[..end]
+    };
+
+    let mut flags: Vec<String> = Vec::new();
+    for line in body.lines().filter(|l| l.contains("=>")) {
+        for token in line.split('"').skip(1).step_by(2) {
+            if token.starts_with('-') && !flags.iter().any(|f| f == token) {
+                flags.push(token.to_string());
+            }
+        }
+    }
+
+    // Precondition, not decoration: a restructured `parse_args` that this scan
+    // no longer understands yields an empty set, and every assertion below then
+    // passes by asserting nothing.
+    assert!(
+        !flags.is_empty(),
+        "extracted no flags from `parse_args` — the scan no longer matches the \
+         parser's shape, so this guard is vacuous and must be re-pointed"
+    );
+
+    for (file, label) in [
+        ("control-ofc-tray.bash", "bash"),
+        ("_control-ofc-tray", "zsh"),
+        ("control-ofc-tray.fish", "fish"),
+    ] {
+        let path = format!("{}/../completions/{}", env!("CARGO_MANIFEST_DIR"), file);
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {file}: {e}"));
+        for flag in &flags {
+            // Per-shell spelling, NOT the bare name: fish writes `-l socket` /
+            // `-s h`, so a literal `--socket` would false-negative there — and
+            // the reverse shortcut, searching for the undashed name, makes `-h`
+            // into `contains("h")`, which every one of these files satisfies
+            // trivially. Either way the assertion stops discriminating.
+            let expected = match (label, flag.strip_prefix("--")) {
+                ("fish", Some(long)) => format!("-l {long}"),
+                ("fish", None) => format!("-s {}", flag.trim_start_matches('-')),
+                _ => flag.clone(),
+            };
+            assert!(
+                declares(&text, &expected),
+                "{label} completions ({file}) do not declare `{flag}` (looked for \
+                 `{expected}`), which `parse_args` accepts"
+            );
+        }
+    }
+}
+
+/// The three files above reach the package. Without this, `T1-f` could be closed
+/// by files that are never installed — which is the state this row describes.
+#[test]
+fn tray_completions_are_installed_by_the_package() {
+    let pkgbuild = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../packaging/PKGBUILD"
+    ))
+    .expect("read PKGBUILD");
+    let flat = pkgbuild.replace("\\\n", " ");
+    for (src, dest) in [
+        (
+            "completions/control-ofc-tray.bash",
+            "/usr/share/bash-completion/completions/control-ofc-tray",
+        ),
+        (
+            "completions/_control-ofc-tray",
+            "/usr/share/zsh/site-functions/_control-ofc-tray",
+        ),
+        (
+            "completions/control-ofc-tray.fish",
+            "/usr/share/fish/vendor_completions.d/control-ofc-tray.fish",
+        ),
+    ] {
+        let installed = flat
+            .lines()
+            .any(|l| l.contains("install -Dm644") && l.contains(src) && l.contains(dest));
+        assert!(
+            installed,
+            "packaging/PKGBUILD must `install -Dm644 {src}` to `{dest}`"
+        );
+    }
+}
+
 /// DEC-199 regression: the systemd sandbox's writable sysfs carve-out must
 /// target the device tree (`/sys/devices`), not the `/sys/class/{hwmon,drm}`
 /// symlink directories.

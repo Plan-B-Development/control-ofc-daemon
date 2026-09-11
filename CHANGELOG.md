@@ -1,5 +1,24 @@
 # Changelog
 
+## [2.44.2] — 2026-09-11
+
+**No wire shape, capability or error code changes; neither the daemon nor the
+tray binary is touched.** Packaging only. Pairs with `control-ofc-gui` >= v2.23.0
+exactly as 2.44.1 did.
+
+**`control-ofc-tray` now tab-completes (`T1-f`).** The tray has had its own CLI
+since it shipped — `--socket <PATH>`, `--version`, `-h`/`--help` — but the
+package installed completions for `control-ofc-daemon` only, so typing
+`control-ofc-tray --<TAB>` in bash, zsh or fish offered nothing. Three files now
+install alongside the daemon's own, in the same three directories.
+
+Two guards ship with them, because a completion file is the kind of thing that
+silently stops describing its program. The flag list is **extracted from the
+tray's own argument parser** rather than restated in the test, so adding a flag
+and forgetting the completions fails at commit time; and a second guard checks
+all three files are actually installed by `PKGBUILD`, since files that exist but
+are never packaged would look exactly like this fix being done.
+
 ## [2.44.1] — 2026-09-11
 
 **No wire shape, capability or error code changes; the daemon itself is

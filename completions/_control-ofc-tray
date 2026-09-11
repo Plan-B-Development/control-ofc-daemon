@@ -1,0 +1,10 @@
+#compdef control-ofc-tray
+
+_control-ofc-tray() {
+    _arguments \
+        '--socket[Daemon socket (default: /run/control-ofc/control-ofc.sock)]:socket path:_files' \
+        '--version[Print the tray version and exit]' \
+        '(-h --help)'{-h,--help}'[Print help and exit]'
+}
+
+_control-ofc-tray "$@"

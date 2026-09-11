@@ -1,6 +1,6 @@
 # Maintainer: Plan-B-Development <https://github.com/Plan-B-Development>
 pkgname=control-ofc-daemon
-pkgver=2.44.1
+pkgver=2.44.2
 pkgrel=1
 pkgdesc="Hardware fan control daemon for Linux (OpenFan, hwmon, GPU)"
 arch=('x86_64')
@@ -156,6 +156,14 @@ package() {
         "$pkgdir/usr/share/zsh/site-functions/_control-ofc-daemon"
     install -Dm644 completions/control-ofc-daemon.fish \
         "$pkgdir/usr/share/fish/vendor_completions.d/control-ofc-daemon.fish"
+    # The tray is a second binary in this package with its own CLI (DEC-352),
+    # so it gets its own three files rather than sharing the daemon's.
+    install -Dm644 completions/control-ofc-tray.bash \
+        "$pkgdir/usr/share/bash-completion/completions/control-ofc-tray"
+    install -Dm644 completions/_control-ofc-tray \
+        "$pkgdir/usr/share/zsh/site-functions/_control-ofc-tray"
+    install -Dm644 completions/control-ofc-tray.fish \
+        "$pkgdir/usr/share/fish/vendor_completions.d/control-ofc-tray.fish"
 
     # User-facing documentation. The post_install message points users here,
     # so they actually find a setup guide instead of just the udev example.
