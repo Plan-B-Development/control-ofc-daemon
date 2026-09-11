@@ -827,6 +827,12 @@ pub(crate) fn build_status_response(
         .as_ref()
         .map(|p| (Some(p.id.clone()), Some(p.name.clone())))
         .unwrap_or((None, None));
+    // `CTRL-d`: derived from the id built immediately above — the same value, not
+    // a second read of `state.active_profile` and not a daemon-version constant.
+    // Two arguments to the same response drawn from different sources eventually
+    // disagree (DEC-325), and here the whole point of the field is that a client
+    // may trust it when the id is absent.
+    let has_active_profile = active_profile_id.is_some();
 
     // DEC-206: mirror the cached readiness rollup for the GUI Dashboard chip.
     // Cheap — clones a small `Option<ReadinessRollup>` under a tight lock (no
@@ -872,6 +878,7 @@ pub(crate) fn build_status_response(
             }),
         active_profile_id,
         active_profile_name,
+        has_active_profile,
         readiness,
         // `WIRE-n`: extracted by the caller under the same cache read guard the
         // rest of this response is built from, because `Cache::verify_active`

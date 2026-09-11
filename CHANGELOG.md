@@ -1,5 +1,39 @@
 # Changelog
 
+## [2.45.0] — 2026-09-11
+
+**Additive wire field on `/status` + `/poll`; `API_VERSION` unchanged.** No
+capability, endpoint or error code moves, and no existing field changes shape. An
+older client ignores the new key. Pairs with `control-ofc-gui` >= v2.23.0; the GUI
+reads the new field from v2.69.0.
+
+**`has_active_profile` on `/status` and `/poll` (`CTRL-d`).** DEC-194 mirrors the
+active profile's id and name onto the poll surface and omits both keys whenever no
+profile is active. That left clients unable to tell "this daemon is running
+nothing" from "this daemon predates the mirror" — so a client could not safely
+clear a profile name it had already shown, and the control-ofc GUI left a stale
+one in its sidebar and status banner until it reconnected.
+
+The new field is **always serialised, including when false**, for the same reason
+`verify_active` is: it is the *presence* of the key that tells a client this daemon
+reports the state at all. Three readings:
+
+| wire | meaning |
+|---|---|
+| key absent | daemon < 2.45.0 — unknown; fall back to `GET /profile/active` |
+| `false` | authoritatively nothing is active |
+| `true` | `active_profile_id` and `active_profile_name` are present and current |
+
+`active_profile_id` itself is deliberately **unchanged** — it is still omitted
+rather than serialised as `""`, because `control-ofc-tray` reads
+`active_profile_id.is_none()` as "no profile is active" and an empty string is
+`is_some()`.
+
+`control-ofc-tray` is bumped to 2.45.0 with no behaviour change — it ships in this
+package and its version is kept in lockstep (`packaging_version.rs`).
+
+See `control-ofc-gui/DECISIONS.md` DEC-355 (the canonical ADR log for both repos).
+
 ## [2.44.2] — 2026-09-11
 
 **No wire shape, capability or error code changes; neither the daemon nor the

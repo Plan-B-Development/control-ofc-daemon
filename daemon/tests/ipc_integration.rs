@@ -307,6 +307,13 @@ async fn status_and_poll_surface_active_profile() {
     // are OMITTED when no profile is active, keeping the additive wire shape
     // unchanged — a client treats an absent key as "unknown" and falls back to
     // /profile/active.
+    //
+    // `CTRL-d` adds `has_active_profile`, which is ALWAYS serialised and is the
+    // only field that tells those two absences apart. Asserted below as a
+    // RELATIONSHIP against the id's presence, never as a literal: a builder that
+    // hardcoded `true`, or derived the flag from a daemon-version constant
+    // instead of from the profile it describes, satisfies a literal and fails
+    // this.
     let state = test_app_state();
     let active = state.active_profile.clone();
     let (path, shutdown, _dir) = start_test_server(state).await;
@@ -319,8 +326,22 @@ async fn status_and_poll_surface_active_profile() {
         "active_profile_id must be omitted when no profile is active"
     );
     assert!(json.get("active_profile_name").is_none());
+    assert!(
+        json.get("has_active_profile").is_some(),
+        "has_active_profile must be serialised even when false — its ABSENCE is \
+         what marks a pre-2.45.0 daemon, so omitting it here makes the two \
+         indistinguishable again"
+    );
+    assert_eq!(
+        json["has_active_profile"],
+        serde_json::Value::Bool(json.get("active_profile_id").is_some())
+    );
     let (_, poll) = uds_get(&path, "/poll").await;
     assert!(poll["status"].get("active_profile_name").is_none());
+    assert_eq!(
+        poll["status"]["has_active_profile"],
+        serde_json::Value::Bool(poll["status"].get("active_profile_id").is_some())
+    );
 
     // Activate a profile → id+name appear on both surfaces (same StatusResponse).
     *active.lock() = Some(DaemonProfile {
@@ -334,9 +355,17 @@ async fn status_and_poll_surface_active_profile() {
     let (_, json) = uds_get(&path, "/status").await;
     assert_eq!(json["active_profile_id"], "silent");
     assert_eq!(json["active_profile_name"], "Silent");
+    assert_eq!(
+        json["has_active_profile"],
+        serde_json::Value::Bool(json.get("active_profile_id").is_some())
+    );
     let (_, poll) = uds_get(&path, "/poll").await;
     assert_eq!(poll["status"]["active_profile_id"], "silent");
     assert_eq!(poll["status"]["active_profile_name"], "Silent");
+    assert_eq!(
+        poll["status"]["has_active_profile"],
+        serde_json::Value::Bool(poll["status"].get("active_profile_id").is_some())
+    );
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);

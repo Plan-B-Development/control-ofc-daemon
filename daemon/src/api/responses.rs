@@ -90,12 +90,41 @@ pub struct StatusResponse {
     /// systemd) is reflected within one 1 Hz poll instead of the GUI's slow
     /// `/profile/active` refresh (DEC-194). Both omitted when no profile is
     /// active, so the common-case wire shape is unchanged (additive) — a client
-    /// treats an absent key (old daemon, or genuinely no profile) as "unknown"
-    /// and falls back to `/profile/active`.
+    /// treats an absent key as "unknown" and falls back to `/profile/active`.
+    ///
+    /// **Which of the two reasons for that absence applies is answered by
+    /// `has_active_profile` below, not by these fields.** Do not read an absent
+    /// id as "no profile is active": until daemon 2.45.0 there was no way to
+    /// tell that apart from "this daemon predates the mirror", and a client that
+    /// guessed left a stale profile named in its UI forever (`CTRL-d`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_profile_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_profile_name: Option<String>,
+    /// Whether a profile is active (`CTRL-d`, daemon >= 2.45.0) — the
+    /// authoritative answer that the two `skip_serializing_if` fields above
+    /// cannot give.
+    ///
+    /// Always serialised, including when false, for the `verify_active`
+    /// reason: it is the *presence of the key* that tells a client this daemon
+    /// reports the state at all. So there are three readings, not two:
+    ///
+    /// | wire | meaning |
+    /// |---|---|
+    /// | key absent | daemon < 2.45.0 — unknown, fall back to `/profile/active` |
+    /// | `false` | **authoritatively nothing is active** — clear the cached id/name |
+    /// | `true` | the id/name above are present and current |
+    ///
+    /// Derived from `active_profile_id.is_some()` in the same statement that
+    /// builds it, never from a sibling fact about the daemon, so the two can
+    /// never disagree (the DEC-325 rule). The redundancy when `true` is the
+    /// point — it is what makes `false` mean something.
+    ///
+    /// The wire shape of `active_profile_id` itself is deliberately NOT changed
+    /// to an always-serialised `""`: `control-ofc-tray` reads
+    /// `active_profile_id.is_none()` as "no profile active"
+    /// (`tray/src/menu.rs`), and an empty string is `is_some()`.
+    pub has_active_profile: bool,
     /// Compact hardware-readiness rollup (DEC-206) for the GUI Dashboard health
     /// chip: overall severity + per-severity counts + the most-severe item's
     /// summary/code (for a deep-link). Cached in `AppState` and mirrored here so
@@ -2926,6 +2955,7 @@ mod tests {
             validation_session: None,
             active_profile_id: None,
             active_profile_name: None,
+            has_active_profile: false,
             readiness: None,
             verify_active: false,
         };
@@ -2947,6 +2977,14 @@ mod tests {
         // DEC-194: active_profile_* omitted when no profile is active (additive).
         assert!(json.get("active_profile_id").is_none());
         assert!(json.get("active_profile_name").is_none());
+        // `CTRL-d`: has_active_profile is always serialised, including when
+        // false — its presence is what marks a daemon that reports the state at
+        // all, exactly as for verify_active below. Asserted as a relationship
+        // against the id, so a hardcoded literal would not satisfy it.
+        assert_eq!(
+            json["has_active_profile"],
+            serde_json::Value::Bool(json.get("active_profile_id").is_some())
+        );
         // DEC-206: readiness rollup omitted when None (old daemon / pre-startup).
         assert!(json.get("readiness").is_none());
     }
@@ -2972,6 +3010,7 @@ mod tests {
             validation_session: None,
             active_profile_id: None,
             active_profile_name: None,
+            has_active_profile: false,
             readiness: Some(ReadinessRollup {
                 overall: ReadinessSeverity::Warning,
                 critical: 0,
@@ -3014,6 +3053,7 @@ mod tests {
             validation_session: None,
             active_profile_id: None,
             active_profile_name: None,
+            has_active_profile: false,
             readiness: None,
             verify_active: false,
         };
@@ -3049,6 +3089,7 @@ mod tests {
             validation_session: None,
             active_profile_id: None,
             active_profile_name: None,
+            has_active_profile: false,
             readiness: None,
             verify_active: false,
         };
@@ -3084,6 +3125,7 @@ mod tests {
             validation_session: None,
             active_profile_id: None,
             active_profile_name: None,
+            has_active_profile: false,
             readiness: None,
             verify_active: false,
         };
