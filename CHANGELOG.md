@@ -1,5 +1,59 @@
 # Changelog
 
+## [2.47.0] — 2026-09-12
+
+**Additive `skipped_controls[].reason` token; `API_VERSION` unchanged.** No
+capability, endpoint or error code moves, and no existing field changes shape. A
+client that already renders unrecognised tokens — which the contract has always
+required — needs no change.
+
+**The OpenFanController is optional hardware, and a machine without one now says
+so once, quietly, instead of behaving like something is broken.** Four changes,
+all of them on the boot path (register `OFN`):
+
+- **Boot no longer stalls for ~31 s on a machine with no controller.** The
+  adoption ladder slept 1+2+4+8+16 s across six attempts with **no early exit** —
+  an empty candidate list suppressed a log line, never the loop. The socket is
+  bound before the ladder but `axum::serve` is not spawned until after it, so a
+  client connecting during that window waited rather than being refused, and a
+  GUI autostarted at login could render as disconnected. The engine — the sole
+  PWM writer, and the evaluator of the thermal emergency — also starts after the
+  ladder, so its evaluation began ~31 s late on these machines. The schedule is
+  now a short universal floor (two attempts, ~3 s) when no `[serial] port` is
+  configured, and the historical ladder is kept **unchanged** where one is: there
+  the user named a device, so its absence is a fault worth waiting out.
+- **Unrelated USB-serial devices are no longer opened up to twelve times per
+  boot.** Opening a tty asserts DTR, which resets Arduino-class boards, and
+  `auto_detect_port` returned from its libudev pass only on *success* — so a
+  machine where nothing identified fell through to its own `/dev/ttyACM0..9` +
+  `/dev/ttyUSB0..9` scan and opened every one of the same nodes a second time,
+  six attempts deep. Boot now uses the non-opening enumerator DEC-291 built for
+  `POST /fans/openfan/rescan` and opens each candidate at most once per attempt;
+  `auto_detect_port` itself (still used by the reconnect probe) de-duplicates.
+- **Absence is logged at `info`, not `warn`.** The unit ships `RUST_LOG=info` to
+  journald, so "No OpenFanController found" appeared in `systemctl status` and
+  every support bundle for every hwmon-only user. A **configured** port that does
+  not yield a controller stays a warning, and DEC-250's identity-rejection
+  warning is unchanged for that port — a tty that opens but is not an
+  OpenFanController accepts every write with `Ok`, so that one is a safety
+  signal. An auto-enumerated stranger that fails to identify is now `debug`.
+- **A control that can deliver to nothing is no longer silent** — new
+  `skipped_controls[].reason` token **`backend_unavailable`**. The write phase is
+  `if let Some(be) = openfan_be`, so on a machine with no controller an
+  `openfan:` member's commands were built, never delivered, never logged and
+  never listed: no journal line, no `/status` field, nothing. Reachable by
+  ordinary means — a profile exported from a machine that has a controller
+  imports cleanly onto one that does not. Deliberately **not** OpenFan-specific:
+  an `hwmon:` member on a board with no writable header reports identically.
+  Raised only when **every** member is undeliverable; a partly-live control is
+  still commanding fans, so it is logged once per activation rather than listed,
+  because `/status`'s contract for that list is that nothing is commanded.
+
+Quietening the boot message is only safe *because* of the last item: the case
+that genuinely warrants a warning — a profile that expects hardware which is not
+there — now has one, and it fires whenever the profile is active rather than only
+at startup.
+
 ## [2.46.0] — 2026-09-12
 
 **Additive wire field on `/diagnostics/hardware`; `API_VERSION` unchanged.** No

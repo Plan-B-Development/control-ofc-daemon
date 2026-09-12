@@ -59,6 +59,64 @@ pub struct SkipRecord {
     pub reason: SkipReason,
 }
 
+/// How much of a control this daemon can actually write (`OFN-j`).
+///
+/// Distinct from every other skip reason: the curve resolved and an output was
+/// computed: it is the *delivery* that has nowhere to go, because the backend
+/// for a member's source is absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Deliverability {
+    /// No members at all. Not a fault — a member-less control still publishes a
+    /// tick output for any Sync that mirrors it (DEC-151).
+    NoMembers,
+    /// Every member's backend is present.
+    All,
+    /// Some members can be written and some cannot. The control IS commanding
+    /// fans, so it must not be reported as uncommanded — see `BackendUnavailable`.
+    Partial,
+    /// No member's backend is present: the control commands nothing at all.
+    None,
+}
+
+/// Whether a member `source` can be written on this daemon right now.
+///
+/// GPU sources are always deliverable: the GPU backend is not optional in the
+/// tick body (`gpu_be` is a value, not an `Option`), and a GPU with no writable
+/// fan path is rejected far earlier, at profile validation (DEC-102).
+pub fn source_is_deliverable(source: &str, openfan_available: bool, hwmon_available: bool) -> bool {
+    match source {
+        "openfan" => openfan_available,
+        "hwmon" => hwmon_available,
+        _ => true,
+    }
+}
+
+/// Classify one control against the backends this daemon actually has.
+///
+/// Pure, and deliberately clock-free and profile-shaped like its neighbours in
+/// this module, so the rule is testable without an engine, a serial device or a
+/// sysfs tree.
+pub fn control_deliverability(
+    control: &crate::profile::LogicalControl,
+    openfan_available: bool,
+    hwmon_available: bool,
+) -> Deliverability {
+    if control.members.is_empty() {
+        return Deliverability::NoMembers;
+    }
+    let total = control.members.len();
+    let live = control
+        .members
+        .iter()
+        .filter(|m| source_is_deliverable(&m.source, openfan_available, hwmon_available))
+        .count();
+    match live {
+        0 => Deliverability::None,
+        n if n == total => Deliverability::All,
+        _ => Deliverability::Partial,
+    }
+}
+
 /// A transition worth one journal line. Emitted at most once per transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipEvent {
@@ -364,6 +422,7 @@ mod tests {
             SkipReason::SensorUnavailable,
             SkipReason::MixUnresolvable,
             SkipReason::SyncUnresolvable,
+            SkipReason::BackendUnavailable,
         ];
         let tokens: std::collections::HashSet<&str> = all.iter().map(|r| r.as_token()).collect();
         assert_eq!(tokens.len(), all.len(), "wire tokens must be distinct");
@@ -379,5 +438,98 @@ mod tests {
                 r.as_token()
             );
         }
+    }
+
+    // ── `OFN-j`: deliverability ───────────────────────────────────────────────
+
+    fn control_with(sources: &[&str]) -> crate::profile::LogicalControl {
+        crate::profile::LogicalControl {
+            id: "ctl".into(),
+            name: "Ctl".into(),
+            mode: "curve".into(),
+            curve_id: "c".into(),
+            manual_output_pct: 0.0,
+            members: sources
+                .iter()
+                .enumerate()
+                .map(|(i, src)| crate::profile::ControlMember {
+                    source: (*src).to_string(),
+                    member_id: format!("{src}:{i}"),
+                    member_label: String::new(),
+                    fan_zero_rpm: false,
+                })
+                .collect(),
+            step_up_pct: 100.0,
+            step_down_pct: 100.0,
+            offset_pct: 0.0,
+            minimum_pct: 0.0,
+            start_pct: 0.0,
+            stop_pct: 0.0,
+        }
+    }
+
+    #[test]
+    fn an_openfan_only_control_is_undeliverable_without_a_controller() {
+        // The DISCRIMINATING arm (DEC-340): this is the case only the new lookup
+        // can report. Asserted against BOTH backend states in one loop, because
+        // the `false` arm alone would pass against a classifier that always says
+        // `None`, and the `true` arm alone against one that always says `All`.
+        for openfan in [true, false] {
+            let got = control_deliverability(&control_with(&["openfan"]), openfan, true);
+            let want = if openfan {
+                Deliverability::All
+            } else {
+                Deliverability::None
+            };
+            assert_eq!(
+                got, want,
+                "openfan-only control with openfan_available={openfan}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_rule_is_not_openfan_specific() {
+        // `backend_unavailable` means what its name says. An hwmon member on a
+        // board with no writable header is the same defect, and gating this on
+        // OpenFan alone would be the two-shapes-for-one-flag trap (DEC-334).
+        assert_eq!(
+            control_deliverability(&control_with(&["hwmon"]), true, false),
+            Deliverability::None
+        );
+        // GPU is never a backend that can be absent here — `gpu_be` is a value,
+        // not an `Option` — so a GPU-only control is always deliverable.
+        assert_eq!(
+            control_deliverability(&control_with(&["amd_gpu"]), false, false),
+            Deliverability::All
+        );
+    }
+
+    #[test]
+    fn a_control_with_one_live_member_is_partial_not_none() {
+        // The rule that keeps `/status` honest: this control IS commanding its
+        // hwmon fan, so it must never be reported as uncommanded. Without this
+        // arm, an `any`-shaped predicate would pass every other test here.
+        assert_eq!(
+            control_deliverability(&control_with(&["openfan", "hwmon"]), false, true),
+            Deliverability::Partial
+        );
+        // ...and with neither backend the same control IS fully undeliverable,
+        // which is what proves the `Partial` answer came from the member split
+        // rather than from the member count.
+        assert_eq!(
+            control_deliverability(&control_with(&["openfan", "hwmon"]), false, false),
+            Deliverability::None
+        );
+    }
+
+    #[test]
+    fn a_member_less_control_is_not_a_fault() {
+        // It still publishes a tick output for any Sync that mirrors it
+        // (DEC-151), so it must not be reported as uncommanded.
+        assert_eq!(
+            control_deliverability(&control_with(&[]), false, false),
+            Deliverability::NoMembers
+        );
     }
 }

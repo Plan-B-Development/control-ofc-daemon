@@ -11,6 +11,14 @@ use std::time::Duration;
 
 /// Decide which serial port paths to try, in order, for one connect attempt.
 ///
+/// **No production caller since `OFN-b` (2026-09-12).** Boot adoption — its only
+/// one — moved to [`serial_port_candidates_enumerated`], because the `detect`
+/// injected here is `auto_detect_port`, which OPENS each candidate to identify
+/// it. This function is kept for its DEC-250 ordering tests, which are the record
+/// of why a configured port must never suppress detection; that rule now lives in
+/// the enumerated variant, which carries equivalent tests. Do not reintroduce a
+/// caller without re-reading that variant's doc comment first.
+///
 /// [SAFETY] The configured port is tried FIRST but is never the only candidate:
 /// auto-detection is always appended as a fallback. This used to be
 /// `configured.or_else(auto_detect)`, so a configured port suppressed detection
@@ -83,6 +91,42 @@ pub fn same_port_set(a: &[String], b: &[String]) -> bool {
     a == b
 }
 
+/// How long to wait before each boot adoption retry, in order.
+///
+/// An empty return means "one attempt, no retries"; `n` entries mean `n + 1`
+/// attempts. Pure so the policy is unit-testable without a serial device, for
+/// the same reason as its neighbours — and because until now it was not a
+/// function at all. The ladder was five literal sleeps inline in `async_main`,
+/// which nothing tested.
+///
+/// The retry exists for USB enumeration timing: a controller attached at boot
+/// can take a moment to appear as `/dev/ttyACM*`. That is a real need — but only
+/// for a machine that HAS one, and the daemon cannot know that before it looks.
+/// So the schedule splits on the one durable signal that the user expects the
+/// hardware: a configured `serial.port`.
+///
+/// * **Configured** (`daemon.toml` / `runtime.toml` / `POST /config/serial-port`) —
+///   the user named a device, so its absence is a fault worth waiting out. Keeps
+///   the historical 1+2+4+8+16 s ladder unchanged.
+/// * **Not configured** — auto-detect. A short universal floor: one retry after
+///   3 s, so a slow enumeration is still caught, and a machine that simply has no
+///   OpenFanController pays ~3 s instead of ~31 s. OpenFan support is optional,
+///   and its absence must not look like a fault (`OFN-a`).
+///
+/// The floor is deliberately not zero. Dropping straight to a single attempt
+/// would disadvantage the auto-detect user whose device enumerates slowly, and
+/// they are the case the ladder was written for.
+pub fn boot_retry_schedule(configured: bool) -> Vec<Duration> {
+    if configured {
+        vec![1, 2, 4, 8, 16]
+    } else {
+        vec![3]
+    }
+    .into_iter()
+    .map(Duration::from_secs)
+    .collect()
+}
+
 /// Connect to the first candidate that opens **and** identifies as an
 /// OpenFanController.
 ///
@@ -107,21 +151,39 @@ pub fn same_port_set(a: &[String], b: &[String]) -> bool {
 /// the property under test, and a caller cannot accidentally skip it.
 pub fn first_openfan_port<T: crate::serial::transport::SerialTransport>(
     candidates: &[String],
+    configured: Option<&str>,
     timeout: Duration,
     mut open: impl FnMut(&str) -> Result<T, crate::error::SerialError>,
 ) -> Option<(String, T)> {
     for port in candidates {
+        // OFN-c: a rejected CONFIGURED port is a fault — the user named that
+        // device and the daemon could not adopt it — and stays a warning, which
+        // is the DEC-250 signal above. A rejected *enumerated* candidate is not:
+        // on a machine with no OpenFanController, every unrelated USB-serial
+        // device on the bus lands here, and calling that a warning told every
+        // hwmon-only user with an Arduino that something was broken. Note the
+        // old wording made the same mistake in prose — "Failed to open
+        // OpenFanController on /dev/ttyACM0" names a device that, in the case
+        // that actually fires, is not one.
+        let user_named = configured.is_some_and(|c| c == port.as_str());
         match open(port) {
             Ok(mut transport) => {
                 match crate::serial::transport::verify_openfan_identity(&mut transport, timeout) {
                     Ok(()) => return Some((port.clone(), transport)),
-                    Err(e) => log::warn!(
+                    Err(e) if user_named => log::warn!(
+                        "Configured serial port {port} opened but did not identify as an \
+                         OpenFanController ({e}) — not using it"
+                    ),
+                    Err(e) => log::debug!(
                         "{port} opened but did not identify as an OpenFanController ({e}) \
                          — not using it"
                     ),
                 }
             }
-            Err(e) => log::warn!("Failed to open OpenFanController on {port}: {e}"),
+            Err(e) if user_named => {
+                log::warn!("Failed to open configured serial port {port}: {e}")
+            }
+            Err(e) => log::debug!("Could not open serial candidate {port}: {e}"),
         }
     }
     None
@@ -130,6 +192,55 @@ pub fn first_openfan_port<T: crate::serial::transport::SerialTransport>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── `OFN-a`: the boot retry schedule ──────────────────────────────────────
+
+    #[test]
+    fn an_unconfigured_machine_gets_a_short_floor_not_the_full_ladder() {
+        // The DISCRIMINATING arm. A machine with no OpenFanController and no
+        // configured port used to sleep 1+2+4+8+16 = 31 s at every boot, during
+        // which the daemon answered no API requests at all — the socket is bound
+        // before this runs but `axum::serve` is spawned after it.
+        let unconfigured = boot_retry_schedule(false);
+        let total: Duration = unconfigured.iter().sum();
+        assert_eq!(
+            unconfigured.len() + 1,
+            2,
+            "an auto-detect machine should get a short floor of 2 attempts"
+        );
+        assert!(
+            total <= Duration::from_secs(5),
+            "the floor must stay short; got {total:?}"
+        );
+        // Deliberately NOT zero: an auto-detect user whose device enumerates
+        // slowly is the case the ladder was written for, so one retry survives.
+        assert!(
+            !unconfigured.is_empty(),
+            "a single attempt would disadvantage slow USB enumeration"
+        );
+    }
+
+    #[test]
+    fn a_configured_port_keeps_the_full_ladder() {
+        // The opposite arm, and the reason the floor is safe: where the user
+        // NAMED a device, its absence is a fault worth waiting out, so nothing
+        // about that case changes. Without this arm a schedule that always
+        // returned the short floor would pass the test above.
+        let configured = boot_retry_schedule(true);
+        let unconfigured = boot_retry_schedule(false);
+        assert!(
+            configured.len() > unconfigured.len(),
+            "a configured port must be waited out longer than an auto-detect one"
+        );
+        assert_eq!(
+            configured,
+            vec![1, 2, 4, 8, 16]
+                .into_iter()
+                .map(Duration::from_secs)
+                .collect::<Vec<_>>(),
+            "the historical ladder for a configured port is unchanged"
+        );
+    }
 
     /// The configured port is tried FIRST — the ordering rule this function
     /// exists to keep testable (DEC-250's sibling property, DEC-291).

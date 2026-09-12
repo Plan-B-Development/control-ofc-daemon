@@ -181,7 +181,10 @@ pub struct SkippedControlEntry {
     pub control_id: String,
     pub control_name: String,
     /// Stable token, not prose: `curve_not_found` | `sensor_unavailable` |
-    /// `mix_unresolvable` | `sync_unresolvable`. The client renders the wording,
+    /// `mix_unresolvable` | `sync_unresolvable` | `backend_unavailable`. The
+    /// last is the only one that is not a curve-resolution failure — the curve
+    /// resolved and every member's backend is absent (`OFN-j`). The client
+    /// renders the wording,
     /// so it can be styled and localised there; the daemon's own sentence goes
     /// to the journal. Adding a token is additive; renaming one is breaking.
     pub reason: String,

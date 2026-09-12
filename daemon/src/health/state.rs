@@ -210,7 +210,7 @@ pub struct UnavailableSensor {
     pub since: Instant,
 }
 
-/// Why a control could not be resolved.
+/// Why a control is not being commanded.
 ///
 /// These are stable wire tokens — [`SkipReason::as_token`] is what reaches
 /// `/status`, and the GUI branches on it to render user-facing text. Renaming
@@ -230,6 +230,21 @@ pub enum SkipReason {
     /// A Sync whose target is unset, is the control itself, or has not been
     /// computed this tick (target skipped, or a cycle).
     SyncUnresolvable,
+    /// Every one of the control's members targets a backend this daemon does not
+    /// have, so the control resolves perfectly and commands nothing (`OFN-j`).
+    ///
+    /// Unlike its four siblings this is not a curve-resolution failure: the curve
+    /// evaluated, the output was computed, and the *delivery* has nowhere to go.
+    /// Canonically an `openfan:` member on a machine with no OpenFanController —
+    /// a profile exported from a machine that has one imports cleanly onto one
+    /// that does not — but it is deliberately not OpenFan-specific: an
+    /// `hwmon:` member on a board with no writable header reaches it identically.
+    ///
+    /// Raised only when EVERY member is undeliverable. A control with one live
+    /// member and one dead one is still commanding fans, and `/status`'s contract
+    /// for this list is "nothing is commanded and its fans hold their last
+    /// speed" — listing a partly-live control would make that false.
+    BackendUnavailable,
 }
 
 impl SkipReason {
@@ -240,6 +255,7 @@ impl SkipReason {
             SkipReason::SensorUnavailable => "sensor_unavailable",
             SkipReason::MixUnresolvable => "mix_unresolvable",
             SkipReason::SyncUnresolvable => "sync_unresolvable",
+            SkipReason::BackendUnavailable => "backend_unavailable",
         }
     }
 
@@ -252,6 +268,9 @@ impl SkipReason {
             SkipReason::SensorUnavailable => "its sensor is not available",
             SkipReason::MixUnresolvable => "none of its combined inputs could be resolved",
             SkipReason::SyncUnresolvable => "the control it mirrors was not computed",
+            SkipReason::BackendUnavailable => {
+                "none of its fans are attached to hardware this daemon can write"
+            }
         }
     }
 }

@@ -31,7 +31,8 @@ pub use crate::health::state::ControlOutput;
 pub(crate) use curve_eval::*;
 pub(crate) use safety_tick::*;
 pub use skipped::{
-    SkipEvent, SkipReason, SkipRecord, SkippedControl, SkippedControlTracker, SKIP_DEBOUNCE_TICKS,
+    control_deliverability, source_is_deliverable, Deliverability, SkipEvent, SkipReason,
+    SkipRecord, SkippedControl, SkippedControlTracker, SKIP_DEBOUNCE_TICKS,
 };
 pub(crate) use tuning::*;
 
@@ -122,6 +123,12 @@ pub struct ProfileEngineState {
     skipped_this_tick: Vec<SkipRecord>,
     /// 273-i: debounced skip state, surfaced on `/status`.
     skipped_tracker: SkippedControlTracker,
+    /// `OFN-j`: control ids already logged as PARTIALLY undeliverable, so the
+    /// line is emitted once per activation rather than once per tick. Partial
+    /// controls are deliberately not listed on `/status` — they are still
+    /// commanding their live members — so the journal is their only surface and
+    /// it must not become a 1 Hz repeat.
+    partial_delivery_logged: std::collections::HashSet<String>,
     /// 277-k: this tick's applied output per control id, for the `/status` and
     /// `/poll` surfaces. Overwritten by every `evaluate_profile_with_overrides`,
     /// exactly like `skipped_this_tick` above and for the same reason — the
@@ -168,6 +175,76 @@ impl ProfileEngineState {
     pub fn commit_skips(&mut self, now: std::time::Instant) -> Vec<SkipEvent> {
         self.skipped_tracker
             .record_tick(&self.skipped_this_tick, now)
+    }
+
+    /// Record controls that resolved but can deliver to nothing (`OFN-j`).
+    ///
+    /// Appends a `BackendUnavailable` record for every control whose members ALL
+    /// target an absent backend, and returns the ids of controls that are only
+    /// PARTIALLY deliverable and have not been reported yet — the caller logs
+    /// those and does not list them, because a partly-live control is still
+    /// commanding fans and `/status`'s contract for this list is that nothing is.
+    ///
+    /// Called from the tick body rather than from the evaluator, because the
+    /// evaluator must not learn about backends: it is the function the parity
+    /// oracle runs (DEC-126), and it is pure over (profile, sensors, state) by
+    /// design. Two controls are deliberately never recorded here:
+    ///
+    /// * one already skipped this tick — its curve did not resolve, which is a
+    ///   more specific answer than "and also it has nowhere to go";
+    /// * one under a manual override — `/status`'s documented invariant is that
+    ///   an overridden control never appears in this list, and an override has
+    ///   its own surface on the Controls page.
+    pub fn note_backend_unavailable(
+        &mut self,
+        profile: &DaemonProfile,
+        overrides: &OverrideSnapshot,
+        openfan_available: bool,
+        hwmon_available: bool,
+    ) -> Vec<String> {
+        let mut partial_to_log = Vec::new();
+        for control in &profile.controls {
+            if overrides.controls.contains_key(&control.id)
+                || self
+                    .skipped_this_tick
+                    .iter()
+                    .any(|r| r.control_id == control.id)
+            {
+                continue;
+            }
+            match control_deliverability(control, openfan_available, hwmon_available) {
+                Deliverability::None => {
+                    self.skipped_this_tick.push(SkipRecord {
+                        control_id: control.id.clone(),
+                        control_name: control.name.clone(),
+                        reason: SkipReason::BackendUnavailable,
+                    });
+                    // 277-k invariant, documented in `docs/08`: "a control is
+                    // absent from `control_outputs` whenever the engine did not
+                    // evaluate it, which covers ... the control is listed in
+                    // `skipped_controls[]`". This is the ONE skip reason reached
+                    // after the evaluator has already published an output — its
+                    // curve resolved, so `tick_outputs` has an entry — and
+                    // leaving it there would put the same control in both arrays
+                    // and tell a client a duty was applied when nothing was.
+                    //
+                    // Safe to drop here because Sync mirroring reads the
+                    // evaluator's LOCAL `tick_outputs` during its loop; this is
+                    // the copy handed over at the end, which only
+                    // `outputs_snapshot()` reads. A Sync targeting this control
+                    // therefore still mirrors it, which is correct — the curve
+                    // resolved, and it is delivery that failed.
+                    self.tick_outputs.remove(&control.id);
+                }
+                Deliverability::Partial => {
+                    if self.partial_delivery_logged.insert(control.id.clone()) {
+                        partial_to_log.push(control.id.clone());
+                    }
+                }
+                Deliverability::All | Deliverability::NoMembers => {}
+            }
+        }
+        partial_to_log
     }
 
     /// Controls currently listed as skipped, sorted by id (273-i).
@@ -313,6 +390,10 @@ impl ProfileEngineState {
         // `deactivate_tuning_only`, which exists precisely to leave it alone.
         self.skipped_this_tick.clear();
         self.skipped_tracker.clear();
+        // `OFN-j`: a new activation gets a fresh report, for the same reason the
+        // skip tracker does — the operator who just switched profiles needs to
+        // see what the NEW one cannot deliver.
+        self.partial_delivery_logged.clear();
     }
 
     /// Drop all cross-tick state for a single control so its next evaluation
@@ -1180,12 +1261,42 @@ pub async fn profile_engine_loop(
             }
 
             match *profile_guard {
-                Some(ref active_profile) => Some(evaluate_profile_with_overrides(
-                    active_profile,
-                    &sensors,
-                    &mut engine_state,
-                    &override_snapshot,
-                )),
+                Some(ref active_profile) => {
+                    let cmds = evaluate_profile_with_overrides(
+                        active_profile,
+                        &sensors,
+                        &mut engine_state,
+                        &override_snapshot,
+                    );
+                    // `OFN-j`: the evaluator resolves curves; it does not know
+                    // which backends exist, and must not — it is the function the
+                    // parity oracle runs (DEC-126). So the "this control can
+                    // deliver to nothing" case is classified HERE, where the
+                    // backend slots live, and folded into the same skip list the
+                    // evaluator just filled. Read `openfan_be` AFTER the DEC-265
+                    // late-adoption check above, so a controller adopted by
+                    // rescan clears these on the very next tick.
+                    //
+                    // Until this existed, an `openfan:` member on a machine with
+                    // no OpenFanController was dropped in total silence: the write
+                    // phase below is `if let Some(be) = openfan_be`, so the
+                    // commands were built, never delivered, never logged and never
+                    // listed. A profile exported from a machine that HAS a
+                    // controller imports cleanly onto one that does not.
+                    for id in engine_state.note_backend_unavailable(
+                        active_profile,
+                        &override_snapshot,
+                        openfan_be.is_some(),
+                        hwmon_be.is_some(),
+                    ) {
+                        log::info!(
+                            "Control '{id}' has members this daemon cannot write (no backend for \
+                             their source) alongside members it can — the rest are still being \
+                             commanded, so it is not listed as uncommanded"
+                        );
+                    }
+                    Some(cmds)
+                }
                 None => {
                     // No profile loaded — drop any leftover tuning state so a
                     // later activation doesn't pick up stale cross-cycle outputs.
@@ -1458,6 +1569,174 @@ mod tests {
     }
 
     // ── DEC-150 Mix / DEC-151 Sync (composite curves) ───────────────────
+
+    // ── `OFN-j`: controls that resolve but can deliver to nothing ─────────────
+
+    fn one_openfan_control_profile() -> DaemonProfile {
+        DaemonProfile {
+            id: "p".into(),
+            name: "P".into(),
+            version: 7,
+            description: String::new(),
+            controls: vec![openfan_control("c", "cv", "openfan:ch00")],
+            curves: vec![linear_curve("cv", "cpu")],
+        }
+    }
+
+    #[test]
+    fn an_openfan_control_with_no_controller_is_listed_as_backend_unavailable() {
+        // The DISCRIMINATING arm (DEC-340). Before this existed, the engine built
+        // the command, the write phase's `if let Some(be) = openfan_be` dropped
+        // it, and nothing was logged, listed or published — the quietest failure
+        // in the system, and reachable by importing a profile from a machine that
+        // HAS a controller.
+        let profile = one_openfan_control_profile();
+        let mut state = ProfileEngineState::new();
+        let partial = state.note_backend_unavailable(
+            &profile,
+            &OverrideSnapshot::default(),
+            false, // no OpenFan backend
+            true,
+        );
+        assert!(partial.is_empty(), "nothing is partial in this fixture");
+
+        // The listing is debounced (SKIP_DEBOUNCE_TICKS), so drive enough ticks
+        // for it to publish rather than asserting on an internal.
+        for _ in 0..=SKIP_DEBOUNCE_TICKS {
+            state.note_backend_unavailable(&profile, &OverrideSnapshot::default(), false, true);
+            state.commit_skips(std::time::Instant::now());
+        }
+        let snap = state.skipped_snapshot();
+        assert_eq!(snap.len(), 1, "the control should be listed");
+        assert_eq!(snap[0].control_id, "c");
+        assert_eq!(snap[0].reason, SkipReason::BackendUnavailable);
+    }
+
+    #[test]
+    fn the_same_control_is_not_listed_once_a_controller_exists() {
+        // The opposite arm. Without it, a method that listed EVERY control would
+        // pass the test above. This is also the DEC-265 late-adoption path: a
+        // controller adopted by rescan must clear the listing on the next tick.
+        let profile = one_openfan_control_profile();
+        let mut state = ProfileEngineState::new();
+        for _ in 0..=SKIP_DEBOUNCE_TICKS {
+            state.note_backend_unavailable(&profile, &OverrideSnapshot::default(), true, true);
+            state.commit_skips(std::time::Instant::now());
+        }
+        assert!(
+            state.skipped_snapshot().is_empty(),
+            "a control whose backend exists must never be listed as unavailable"
+        );
+    }
+
+    #[test]
+    fn a_backend_unavailable_control_is_absent_from_control_outputs() {
+        // The 277-k invariant `docs/08` states: a control listed in
+        // `skipped_controls[]` must be ABSENT from `control_outputs`. This is the
+        // only skip reason raised AFTER the evaluator published an output (its
+        // curve resolved fine), so it is the only one that can violate it — and
+        // the first draft of this change did, putting the same control in both
+        // arrays and reporting a duty that nothing received.
+        let profile = one_openfan_control_profile();
+        let cache = make_cache_with_sensors(&[("cpu".into(), 50.0)]);
+        let mut state = ProfileEngineState::new();
+
+        evaluate_profile(&profile, &cache.sensors_snapshot(), &mut state);
+        assert!(
+            state.outputs_snapshot().iter().any(|o| o.control_id == "c"),
+            "precondition: the evaluator publishes an output for this control, \
+             otherwise the assertion below would hold vacuously"
+        );
+
+        state.note_backend_unavailable(&profile, &OverrideSnapshot::default(), false, true);
+
+        assert!(
+            !state.outputs_snapshot().iter().any(|o| o.control_id == "c"),
+            "a control reported as commanding nothing must not also publish an applied duty"
+        );
+    }
+
+    #[test]
+    fn a_deliverable_control_keeps_its_published_output() {
+        // The opposite arm: without it, dropping EVERY output would pass above.
+        let profile = one_openfan_control_profile();
+        let cache = make_cache_with_sensors(&[("cpu".into(), 50.0)]);
+        let mut state = ProfileEngineState::new();
+        evaluate_profile(&profile, &cache.sensors_snapshot(), &mut state);
+        state.note_backend_unavailable(&profile, &OverrideSnapshot::default(), true, true);
+        assert!(state.outputs_snapshot().iter().any(|o| o.control_id == "c"));
+    }
+
+    #[test]
+    fn an_overridden_control_is_never_listed() {
+        // `/status`'s documented invariant: an overridden control does not appear
+        // in this list. An override has its own surface on the Controls page.
+        let profile = one_openfan_control_profile();
+        let mut overrides = OverrideSnapshot::default();
+        overrides.controls.insert("c".to_string(), 50);
+        let mut state = ProfileEngineState::new();
+        for _ in 0..=SKIP_DEBOUNCE_TICKS {
+            state.note_backend_unavailable(&profile, &overrides, false, true);
+            state.commit_skips(std::time::Instant::now());
+        }
+        assert!(state.skipped_snapshot().is_empty());
+    }
+
+    #[test]
+    fn a_partially_deliverable_control_is_logged_once_and_never_listed() {
+        // A control commanding its hwmon fan is NOT uncommanded, so listing it
+        // would make `/status`'s contract false. It is reported through the
+        // journal instead — once per activation, not once per tick at 1 Hz.
+        let mut profile = one_openfan_control_profile();
+        profile.controls[0].members.push(ControlMember {
+            source: "hwmon".into(),
+            member_id: "hwmon:x:pwm1".into(),
+            member_label: String::new(),
+            fan_zero_rpm: false,
+        });
+        let mut state = ProfileEngineState::new();
+
+        let first = state.note_backend_unavailable(
+            &profile,
+            &OverrideSnapshot::default(),
+            false, // openfan member undeliverable
+            true,  // hwmon member deliverable
+        );
+        assert_eq!(
+            first,
+            vec!["c".to_string()],
+            "the partial case is reported once"
+        );
+
+        let second =
+            state.note_backend_unavailable(&profile, &OverrideSnapshot::default(), false, true);
+        assert!(second.is_empty(), "and not again on the next tick");
+
+        for _ in 0..=SKIP_DEBOUNCE_TICKS {
+            state.note_backend_unavailable(&profile, &OverrideSnapshot::default(), false, true);
+            state.commit_skips(std::time::Instant::now());
+        }
+        assert!(
+            state.skipped_snapshot().is_empty(),
+            "a partly-live control must never be reported as uncommanded"
+        );
+    }
+
+    /// A control whose member the ENGINE TEST HARNESS can deliver to.
+    ///
+    /// `run_engine_ticks_until` passes no OpenFan controller and no hwmon
+    /// controller, so since `OFN-j` an openfan-member control in that harness is
+    /// correctly classified `BackendUnavailable` — listed as skipped, and absent
+    /// from `control_outputs` per the 277-k invariant. The GPU backend is not
+    /// optional in the tick body, so a GPU member is deliverable there.
+    ///
+    /// Use this wherever a test needs a control that genuinely COMMANDS
+    /// something; use `openfan_control` where the member source is the subject.
+    fn deliverable_control(id: &str, curve_id: &str) -> LogicalControl {
+        let mut c = openfan_control(id, curve_id, "amd_gpu:0000:03:00.0");
+        c.members[0].source = "amd_gpu".into();
+        c
+    }
 
     fn openfan_control(id: &str, curve_id: &str, member: &str) -> LogicalControl {
         LogicalControl {
@@ -2361,7 +2640,11 @@ mod tests {
             name: "P".into(),
             version: 7,
             description: "".into(),
-            controls: vec![openfan_control("ctl", "lin", "openfan:ch00")],
+            // `deliverable_control`, not `openfan_control`: the harness provides
+            // no OpenFan backend, so since `OFN-j` such a control commands nothing
+            // and correctly publishes no output. The subject here is the tick
+            // body's output feed, not the member source.
+            controls: vec![deliverable_control("ctl", "lin")],
             curves: vec![linear_curve("lin", "cpu")],
         };
         let cache = make_cache_with_sensor("cpu", 40.0);
@@ -2411,7 +2694,10 @@ mod tests {
             name: "P".into(),
             version: 7,
             description: "".into(),
-            controls: vec![openfan_control("ctl", "lin", "openfan:ch00")],
+            // See `deliverable_control` — this test's precondition is that a real
+            // duty reaches the wire BEFORE the emergency, which a control with no
+            // backend can no longer produce (`OFN-j`).
+            controls: vec![deliverable_control("ctl", "lin")],
             curves: vec![linear_curve("lin", "cpu")],
         };
         let cache = make_cache_with_sensor("cpu", 40.0); // nowhere near emergency

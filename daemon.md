@@ -296,7 +296,7 @@ inside the band cannot pin the pre-settle fan speed indefinitely.
      `skipped_controls[] = {control_id, control_name, reason, skipped_for_ms}`.
      It is logged once more when it resolves. `reason` is a stable token —
      `curve_not_found` | `sensor_unavailable` | `mix_unresolvable` |
-     `sync_unresolvable` — and the client owns the wording
+     `sync_unresolvable` | `backend_unavailable` — and the client owns the wording
    - The debounce is load-bearing, not politeness: `curve_eligible`'s freshness
      budget floors at 5 s, so a sensor on that boundary flaps, and edge-triggering
      at 1 Hz would reproduce exactly the journal spam DEC-193 was written to stop
@@ -491,7 +491,13 @@ consecutive skipped ticks it is logged once at WARN and surfaced on `/status` +
 `/poll` as `skipped_controls[] = {control_id, control_name, reason,
 skipped_for_ms}`, and logged once more when it resolves. `reason` is a stable
 token (`curve_not_found` | `sensor_unavailable` | `mix_unresolvable` |
-`sync_unresolvable`); the client owns the wording. Additive and omitted when
+`sync_unresolvable` | `backend_unavailable`); the client owns the wording.
+`backend_unavailable` (2.47.0, `OFN-j`) is the odd one out: the curve resolved
+and an output was computed, and every member's BACKEND is absent, so the control
+commands nothing — canonically an `openfan:` member with no OpenFanController
+adopted, though an `hwmon:` member on a board with no writable header reports
+identically. Raised only when EVERY member is undeliverable; a partly-live
+control is still commanding fans and is logged once per activation instead. Additive and omitted when
 empty, so an older client sees the wire shape it always did and a newer client
 reads `skipped_controls = []` from an older daemon. See Safety Model item 3.
 

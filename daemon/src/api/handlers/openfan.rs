@@ -365,7 +365,7 @@ pub async fn openfan_rescan_handler(
             // The SAME list the cooldown was evaluated against — recomputing it
             // here could probe a set the cooldown never saw, and stamp a set that
             // was never probed.
-            first_openfan_port(&candidates, timeout, |p| {
+            first_openfan_port(&candidates, configured.as_deref(), timeout, |p| {
                 RealSerialTransport::open(p, timeout)
             })
         })

@@ -303,7 +303,9 @@ use control_ofc_daemon::runtime_config::{
 };
 use control_ofc_daemon::safety::ThermalSafetyRule;
 use control_ofc_daemon::serial::controller::FanController;
-use control_ofc_daemon::serial::real_transport::{auto_detect_port, RealSerialTransport};
+use control_ofc_daemon::serial::real_transport::{
+    enumerate_serial_candidates, RealSerialTransport,
+};
 use tokio::net::UnixListener;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1406,46 +1408,71 @@ async fn async_main() {
         Arc<Mutex<Box<dyn control_ofc_daemon::serial::transport::SerialTransport + Send>>>,
     >;
 
-    let max_serial_retries = 5;
+    // [SAFETY] OpenFan adoption. The controller is OPTIONAL hardware, so a
+    // machine without one must pay neither a long boot stall nor a warning that
+    // reads like a fault (OFN-a/OFN-b/OFN-c). What it must still pay is the
+    // DEC-250 identity handshake on everything it does adopt.
+    let serial_configured = config.serial.port.is_some();
+    let retry_delays = control_ofc_daemon::serial::adoption::boot_retry_schedule(serial_configured);
+    let total_attempts = retry_delays.len() + 1;
     let mut serial_connected = false;
     let mut fc: Option<Arc<Mutex<FanController>>> = None;
     let mut ot: Option<
         Arc<Mutex<Box<dyn control_ofc_daemon::serial::transport::SerialTransport + Send>>>,
     > = None;
 
-    for attempt in 0..=max_serial_retries {
+    for attempt in 0..total_attempts {
         if attempt > 0 {
-            let delay = Duration::from_secs(1 << (attempt - 1).min(4)); // 1s, 2s, 4s, 8s, 16s
+            let delay = retry_delays[attempt - 1];
             log::info!(
-                "Serial retry {attempt}/{max_serial_retries}: waiting {delay:?} for device..."
+                "Serial retry {attempt}/{}: waiting {delay:?} for device...",
+                total_attempts - 1
             );
             // std::thread::sleep is acceptable here — no async tasks running yet during init (P2-R2)
             std::thread::sleep(delay);
         }
 
-        // [SAFETY] Try the configured port first, then auto-detection. The
-        // ordering rule lives in `serial_port_candidates` so it is unit-testable
-        // without a serial device — see its doc comment for why a configured
-        // port must never be the only candidate.
-        let candidates = control_ofc_daemon::serial::adoption::serial_port_candidates(
+        // [SAFETY] Try the configured port first, then every enumerated
+        // candidate. The ordering rule lives in
+        // `serial_port_candidates_enumerated` so it is unit-testable without a
+        // serial device — see its doc comment for why a configured port must
+        // never be the only candidate.
+        //
+        // ENUMERATE rather than auto-detect (OFN-b). `auto_detect_port` *opens*
+        // each candidate in order to identify it, and on Linux opening a tty
+        // asserts DTR — which resets Arduino-class boards. Worse, it probed the
+        // libudev list and then fell through to its own `/dev/ttyACM0..9` +
+        // `/dev/ttyUSB0..9` scan without deduplicating, so every candidate was
+        // opened TWICE per attempt. DEC-291 built this non-opening path for
+        // `POST /fans/openfan/rescan` and boot was never moved onto it.
+        // `first_openfan_port` below still opens — it must, to run the DEC-250
+        // handshake — but now exactly once per candidate per attempt.
+        let candidates = control_ofc_daemon::serial::adoption::serial_port_candidates_enumerated(
             config.serial.port.as_deref(),
-            || {
-                log::info!("Auto-detecting OpenFanController serial port...");
-                auto_detect_port(serial_timeout)
-            },
+            enumerate_serial_candidates,
         );
 
         if candidates.is_empty() && attempt == 0 {
-            log::info!("No serial port configured and none detected");
+            log::info!("No serial port configured and no serial candidates present");
         }
 
         // [SAFETY] Accept only a candidate that also *identifies* as an
         // OpenFanController — see `first_openfan_port`.
         if let Some((port, transport)) = control_ofc_daemon::serial::adoption::first_openfan_port(
             &candidates,
+            config.serial.port.as_deref(),
             serial_timeout,
             |p| {
-                log::info!("Opening OpenFanController on {p}");
+                // `OFN-c`: at the SAME level as the outcome in `first_openfan_port`,
+                // which is `debug` for an auto-enumerated stranger. Logging the
+                // attempt at info while its result is debug is worse than the
+                // single line it replaced — the hwmon-only user this change exists
+                // to protect would see a probe start and never a probe finish.
+                if config.serial.port.as_deref() == Some(p) {
+                    log::info!("Opening configured serial port {p}");
+                } else {
+                    log::debug!("Probing serial candidate {p} for an OpenFanController");
+                }
                 RealSerialTransport::open(p, serial_timeout)
             },
         ) {
@@ -1463,10 +1490,27 @@ async fn async_main() {
     }
 
     if !serial_connected {
-        log::warn!(
-            "No OpenFanController found after {} attempts — running without serial fan control",
-            max_serial_retries + 1
-        );
+        // OFN-c: absence of OPTIONAL hardware is not a fault, and this line ships
+        // to journald at info, so a `warn!` here put "No OpenFanController found"
+        // into `systemctl status` and every support bundle for every hwmon-only
+        // user — the canonical "is my install broken?" surface.
+        //
+        // A CONFIGURED port that did not yield a controller is different: the
+        // user named a device and the daemon could not adopt it. That stays a
+        // warning. The per-candidate identity rejection in `first_openfan_port`
+        // is likewise still a warning, and deliberately so (DEC-250) — a tty that
+        // opens but is not an OpenFanController accepts every write with `Ok`.
+        if serial_configured {
+            log::warn!(
+                "No OpenFanController adopted after {total_attempts} attempt(s) — the configured \
+                 serial port did not identify as one, and no detected candidate did either. \
+                 Running without serial fan control"
+            );
+        } else {
+            log::info!(
+                "No OpenFanController detected — motherboard and GPU fan control are unaffected"
+            );
+        }
     }
 
     fan_controller = fc;
@@ -2737,6 +2781,93 @@ mod tests {
         }
     }
 
+    /// `OFN-b`: opening asserts DTR, which resets Arduino-class boards, so the
+    /// number of opens IS the property — not an efficiency note.
+    ///
+    /// Boot adoption used to reach hardware through `auto_detect_port`, which
+    /// probed the libudev list and then fell through to its own
+    /// `/dev/ttyACM0..9` + `/dev/ttyUSB0..9` scan without deduplicating, so every
+    /// candidate was opened TWICE per attempt — six attempts deep. Boot now
+    /// enumerates without opening and hands the list here, which is the only
+    /// place that opens.
+    #[test]
+    fn each_candidate_is_opened_at_most_once_per_attempt() {
+        let candidates = ports(&["/dev/ttyACM0", "/dev/ttyUSB0", "/dev/ttyACM1"]);
+        let mut opened: Vec<String> = Vec::new();
+        let chosen = control_ofc_daemon::serial::adoption::first_openfan_port(
+            &candidates,
+            None,
+            Duration::from_millis(50),
+            |p| {
+                opened.push(p.to_string());
+                Ok(ScriptedPort::wrong_device())
+            },
+        );
+
+        assert!(chosen.is_none(), "no candidate identifies in this fixture");
+        assert_eq!(
+            opened,
+            vec!["/dev/ttyACM0", "/dev/ttyUSB0", "/dev/ttyACM1"],
+            "every candidate is opened exactly once, in order"
+        );
+        for c in &candidates {
+            assert_eq!(
+                opened.iter().filter(|o| *o == c).count(),
+                1,
+                "{c} was opened more than once — each open is a DTR reset"
+            );
+        }
+    }
+
+    /// `OFN-b`, the CALL SITE — the half a unit test cannot reach.
+    ///
+    /// `probe_order` and `first_openfan_port` pin "each candidate is opened at
+    /// most once", but neither proves BOOT goes through them. The defect was
+    /// precisely a call site: boot called `auto_detect_port`, whose own doc
+    /// comment says it is not the function to call merely to learn what ports
+    /// exist. DEC-291 built the non-opening path for the rescan endpoint and
+    /// boot was never moved onto it. This is `CLAUDE.md`'s most-recorded failure
+    /// mode — an extracted rule with thorough tests and an untested caller.
+    ///
+    /// Comment lines are stripped before matching. A source-scanning guard that
+    /// matches its own explanation is its own recorded trap: this file's
+    /// adoption block *names* `auto_detect_port` in prose to explain why it is
+    /// no longer called, and a substring scan would fire on that.
+    #[test]
+    fn boot_adoption_does_not_open_ports_merely_to_enumerate_them() {
+        let src = include_str!("main.rs");
+        // Production source only. Scanning the whole file matches THIS TEST's own
+        // assertion strings, which name the forbidden function in order to
+        // explain it — measured, on the first run of this guard. Stripping
+        // comments is not enough for that; the strings are code.
+        let production = src
+            .split_once("#[cfg(test)]")
+            .expect("main.rs has a test module")
+            .0;
+        let code: String = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !code.contains("auto_detect_port"),
+            "boot adoption must not call auto_detect_port — it OPENS every candidate to \
+             identify it, and opening asserts DTR, which resets Arduino-class boards. Use \
+             enumerate_serial_candidates + first_openfan_port (DEC-291)."
+        );
+        // A CALL, not a bare identifier: the first draft asserted
+        // `contains("enumerate_serial_candidates")`, which the `use` line at the
+        // top of this file satisfies on its own — so the guard stayed green for a
+        // boot path that had stopped calling it and merely kept the import.
+        assert!(
+            code.contains("serial_port_candidates_enumerated("),
+            "boot adoption must build its candidate list with the non-opening \
+             enumerator; asserting the absence above alone would pass against a boot \
+             path that adopted nothing at all"
+        );
+    }
+
     fn ports(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
     }
@@ -2752,6 +2883,7 @@ mod tests {
         // reported success while driving nothing.
         let chosen = control_ofc_daemon::serial::adoption::first_openfan_port(
             &ports(&["/dev/ttyACM9", "/dev/ttyACM0"]),
+            None,
             Duration::from_millis(50),
             |p| {
                 Ok(if p == "/dev/ttyACM9" {
@@ -2777,6 +2909,7 @@ mod tests {
         // control (and says so) rather than holding a handle to the wrong tty.
         let chosen = control_ofc_daemon::serial::adoption::first_openfan_port(
             &ports(&["/dev/ttyACM9"]),
+            None,
             Duration::from_millis(50),
             |_| Ok(ScriptedPort::wrong_device()),
         );
@@ -2789,6 +2922,7 @@ mod tests {
         // skipped and the next candidate is still tried.
         let chosen = control_ofc_daemon::serial::adoption::first_openfan_port(
             &ports(&["/dev/ttyACM9", "/dev/ttyACM0"]),
+            None,
             Duration::from_millis(50),
             |p| {
                 if p == "/dev/ttyACM9" {

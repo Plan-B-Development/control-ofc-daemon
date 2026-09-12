@@ -165,46 +165,84 @@ pub fn enumerate_serial_candidates() -> Vec<String> {
 ///
 /// Opening asserts DTR, which resets Arduino-class boards — so this is NOT the
 /// function to call merely to learn what ports exist. Use
-/// [`enumerate_serial_candidates`] for that (DEC-291).
+/// [`enumerate_serial_candidates`] for that (DEC-291). Boot adoption no longer
+/// calls this at all for that reason (OFN-b); the remaining caller is the
+/// OpenFan poll loop's reconnect probe, which runs only after a controller that
+/// was already adopted has dropped off.
+///
+/// **Each candidate is opened at most once per call.** It did not used to be:
+/// the libudev pass returns early only on *success*, so a machine where nothing
+/// identified fell through to the direct path scan below and opened every one of
+/// the same nodes a second time — two DTR resets per unrelated device per call,
+/// where the whole point of the split with [`enumerate_serial_candidates`] is to
+/// ration exactly that. The `probed` set below is the same guard
+/// `enumerate_serial_candidates` already applies to its own two passes.
 pub fn auto_detect_port(timeout: Duration) -> Option<String> {
-    // Try libudev enumeration first
-    match serialport::available_ports() {
+    // libudev first; an enumeration failure is not fatal, it just leaves the
+    // path scan in `probe_order` as the only source (see its doc comment).
+    let enumerated: Vec<String> = match serialport::available_ports() {
         Ok(ports) => {
-            let candidates: Vec<_> = ports
-                .iter()
-                .filter(|p| p.port_name.contains("ttyACM") || p.port_name.contains("ttyUSB"))
+            let found: Vec<String> = ports
+                .into_iter()
+                .map(|p| p.port_name)
+                .filter(|n| n.contains("ttyACM") || n.contains("ttyUSB"))
                 .collect();
-            log::info!(
-                "serialport enumeration found {} candidate(s)",
-                candidates.len()
-            );
-
-            for port_info in &candidates {
-                if let Some(found) = probe_port(&port_info.port_name, timeout) {
-                    return Some(found);
-                }
-            }
+            // Only on the Ok path. "found 0 candidate(s)" after an enumeration
+            // that FAILED is a different fact from one that succeeded and matched
+            // nothing, and the failure branch already says so above — this is the
+            // one path where an operator needs the two kept apart.
+            log::info!("serialport enumeration found {} candidate(s)", found.len());
+            found
         }
         Err(e) => {
             log::warn!("serialport::available_ports() failed: {e} — falling back to direct probe");
+            Vec::new()
         }
-    }
+    };
 
-    // Fallback: probe /dev/ttyACM0..9 and /dev/ttyUSB0..9 directly
-    // (works even without libudev; covers both CDC-ACM and FTDI/CH340 adapters)
-    for prefix in &["/dev/ttyACM", "/dev/ttyUSB"] {
-        log::info!("Probing {prefix}0..9 directly");
-        for i in constants::SERIAL_PROBE_RANGE {
-            let path = format!("{prefix}{i}");
-            if Path::new(&path).exists() {
-                if let Some(found) = probe_port(&path, timeout) {
-                    return Some(found);
-                }
-            }
+    for path in probe_order(&enumerated, |p| Path::new(p).exists()) {
+        if let Some(found) = probe_port(&path, timeout) {
+            return Some(found);
         }
     }
 
     None
+}
+
+/// The de-duplicated order in which [`auto_detect_port`] opens candidates.
+///
+/// Split out and made pure so "each candidate is opened AT MOST ONCE" is a
+/// testable property rather than a claim (`OFN-b`). It did not hold: the two
+/// passes below used to be two loops, the first of which returned early only on
+/// *success*, so on a machine where nothing identified every node was opened
+/// twice per call — and opening a tty asserts DTR, which resets Arduino-class
+/// boards. That is the precise cost `enumerate_serial_candidates` exists to
+/// ration, and this function is where the rationing has to be true.
+///
+/// The path scan still runs when enumeration SUCCEEDED but matched nothing:
+/// `available_ports()` can return `Ok(vec![])` where the device nodes exist,
+/// which is the case the fallback was written for. Re-probing nodes already
+/// covered was the bug, not the second pass itself.
+///
+/// `node_exists` is injected for the same reason `open` is injected into
+/// `first_openfan_port`: it is the only part that touches the filesystem.
+pub fn probe_order(enumerated: &[String], node_exists: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for p in enumerated {
+        if !out.contains(p) {
+            out.push(p.clone());
+        }
+    }
+    // Covers both CDC-ACM and FTDI/CH340 adapters, and works without libudev.
+    for prefix in &["/dev/ttyACM", "/dev/ttyUSB"] {
+        for i in constants::SERIAL_PROBE_RANGE {
+            let path = format!("{prefix}{i}");
+            if !out.contains(&path) && node_exists(&path) {
+                out.push(path);
+            }
+        }
+    }
+    out
 }
 
 /// Try to open a port and send ReadAllRpm to see if it's an OpenFanController.
@@ -240,6 +278,51 @@ fn probe_port(path: &str, timeout: Duration) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── `OFN-b`: probe order and de-duplication ───────────────────────────────
+
+    #[test]
+    fn a_node_reported_by_libudev_is_not_scanned_again() {
+        // The DISCRIMINATING arm: before the fix, `auto_detect_port` returned
+        // from its libudev pass only on SUCCESS, so a machine where nothing
+        // identified fell through to the path scan and opened every one of the
+        // same nodes a second time. Each of those opens asserts DTR and resets an
+        // Arduino-class board.
+        let enumerated = vec!["/dev/ttyACM0".to_string(), "/dev/ttyUSB0".to_string()];
+        let order = probe_order(&enumerated, |p| {
+            // Both enumerated nodes also exist on disk — exactly the arrangement
+            // that produced the double probe.
+            p == "/dev/ttyACM0" || p == "/dev/ttyUSB0"
+        });
+        assert_eq!(
+            order,
+            vec!["/dev/ttyACM0", "/dev/ttyUSB0"],
+            "a node already enumerated must not be re-probed by the path scan"
+        );
+        for p in &enumerated {
+            assert_eq!(
+                order.iter().filter(|o| *o == p).count(),
+                1,
+                "{p} appears twice in the probe order"
+            );
+        }
+    }
+
+    #[test]
+    fn the_path_scan_still_covers_nodes_libudev_did_not_report() {
+        // The opposite arm, and the reason the second pass was not simply
+        // deleted: `available_ports()` returns `Ok(vec![])` where the device
+        // nodes exist (no libudev in a sandboxed unit), which is the case the
+        // fallback was written for. Without this, a "fix" that dropped the scan
+        // whenever enumeration succeeded would pass the test above.
+        let order = probe_order(&[], |p| p == "/dev/ttyACM3");
+        assert_eq!(order, vec!["/dev/ttyACM3"]);
+    }
+
+    #[test]
+    fn a_node_that_does_not_exist_is_never_probed() {
+        assert!(probe_order(&[], |_| false).is_empty());
+    }
 
     #[test]
     fn allowed_serial_paths() {

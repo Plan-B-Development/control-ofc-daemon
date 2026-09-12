@@ -368,7 +368,31 @@ curl -s --unix-socket $SOCK \
 
 ## Serial device setup (OpenFanController)
 
-The daemon auto-detects the OpenFanController by probing `/dev/ttyACM*` and `/dev/ttyUSB*` devices. For reliable detection across reboots, use a stable device path:
+**The OpenFanController is optional.** If you do not have one, nothing here applies
+and nothing is wrong: the daemon notes once at `info` that it found none, and
+motherboard and GPU fan control are unaffected.
+
+At startup the daemon lists the `/dev/ttyACM*` and `/dev/ttyUSB*` devices that
+exist, then opens each one in turn and asks it to identify itself. Only a device
+that answers as an OpenFanController is adopted.
+
+Two consequences worth knowing if you have **other** USB-serial hardware attached
+(an Arduino, a 3D printer, a modem):
+
+- Identifying a device means opening it, and on Linux opening a serial port
+  asserts DTR — which **resets Arduino-class boards**. The daemon therefore opens
+  each candidate at most once per attempt, and enumerates without opening
+  wherever it can, but it cannot identify a device without opening it.
+- How hard it tries depends on whether you have named a port. With **no**
+  `[serial] port` configured it makes two attempts about three seconds apart and
+  then carries on without one. With a port configured it retries for about 30
+  seconds, because you have told it the device is there and its absence is a
+  fault worth waiting out.
+
+If a controller is attached but was not detected — a slow-enumerating hub, say —
+use **Rescan Hardware** in the GUI (`POST /fans/openfan/rescan`) rather than
+restarting, or pin the port as below. For reliable detection across reboots, use a
+stable device path:
 
 ```bash
 # Find your device's stable path
