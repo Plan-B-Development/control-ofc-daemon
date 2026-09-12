@@ -5807,6 +5807,66 @@ async fn openfan_rescan_cooldown_yields_when_the_ports_change() {
     );
 }
 
+/// `OFN-w`: a refused rescan must leave the cooldown stamp exactly where it was.
+///
+/// This is the half of the post-boot loop's retry accounting that lives in the
+/// handler. The loop decides whether a probe actually RAN by reading
+/// `last_openfan_rescan` either side of the call — a fact rather than a copy of
+/// the handler's predicate — and that is only sound while a refusal is
+/// stamp-neutral. `RescanGuard` stamps on drop and is built after the cooldown
+/// branch, the already-connected return and the single-flight CAS, so today it
+/// is; moving its construction earlier would silently make every refused tick
+/// cost the late-answering board one of its retries again.
+///
+/// Deterministic despite the host's real serial hardware, by the same
+/// construction as the sibling test above: the stamped candidate set is computed
+/// exactly the way the handler computes it, so the two match whatever is plugged
+/// in — and the cooldown therefore refuses before anything is opened.
+#[tokio::test]
+async fn openfan_rescan_cooldown_does_not_advance_the_probe_stamp() {
+    let state = test_app_state();
+
+    let configured = state.running_config.serial.port.clone();
+    let candidates = control_ofc_daemon::serial::adoption::serial_port_candidates_enumerated(
+        configured.as_deref(),
+        control_ofc_daemon::serial::real_transport::enumerate_serial_candidates,
+    );
+    let stamped_at = std::time::Instant::now();
+    *state.last_openfan_rescan.lock() = Some(control_ofc_daemon::api::handlers::LastRescan {
+        at: stamped_at,
+        candidates,
+    });
+
+    let (sock_str, _tx, _tmp) = start_test_server(state.clone()).await;
+    let (code, body) = uds_post(&sock_str, "/fans/openfan/rescan", &serde_json::json!({})).await;
+
+    // Precondition: this must be the COOLDOWN refusing, not some other 409 and
+    // not a probe that happened to find nothing. Without it the stamp assertion
+    // below would hold vacuously against a build where the cooldown never fires.
+    assert_eq!(
+        code, 409,
+        "precondition: the cooldown must refuse here: {body}"
+    );
+    let msg = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("moments ago"),
+        "precondition: must be the cooldown refusal, not the single-flight 409: {body}"
+    );
+
+    let after = state
+        .last_openfan_rescan
+        .lock()
+        .as_ref()
+        .map(|l| l.at)
+        .expect("the stamp must still be there at all");
+    assert_eq!(
+        after, stamped_at,
+        "a refused rescan opened no tty, so it must not restamp the cooldown — the \
+         post-boot loop reads exactly this to tell a real probe from a refusal, and \
+         would spend a handshake retry on a tick that did nothing"
+    );
+}
+
 #[tokio::test]
 async fn openfan_rescan_rejects_a_second_rescan_while_one_is_running() {
     // The other half: the CAS must actually reject. Two concurrent probes would

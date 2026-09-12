@@ -44,33 +44,70 @@ pub const POST_BOOT_ADOPTION_INTERVAL: Duration = Duration::from_secs(5);
 /// retries for exactly that, and they are consumed only after a set change — a
 /// machine whose serial devices never change spends none of them, and is never
 /// re-probed at all.
+///
+/// **They are spent per REAL probe, never per tick (`OFN-w`).** The loop drives
+/// [`openfan_rescan_handler`], which carries a cooldown of its own; a tick that
+/// cooldown refuses has opened nothing, so it costs nothing from this budget.
+/// Spending on refusals left one probe of the four on a slow bus. See
+/// [`post_boot_adoption_loop`].
 const POST_BOOT_HANDSHAKE_RETRIES: u32 = 3;
+
+/// What one tick of the post-boot loop should do (`OFN-r`, `OFN-w`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Probe {
+    /// The candidate set changed: probe, and refresh the retry budget.
+    Fresh,
+    /// Unchanged set with budget remaining: probe, and spend one **only if that
+    /// probe actually runs**.
+    Retry,
+    /// Unchanged set, budget spent: do nothing at all.
+    Skip,
+}
 
 /// Whether this tick of the post-boot loop should probe (`OFN-r`).
 ///
-/// Pure over its inputs so BOTH arms are testable without a serial device — the
-/// loop-level test can only safely exercise the "do not probe" arm, because
-/// actually probing opens whatever ttys the host really has.
+/// Pure over its inputs — it mutates nothing and spends nothing — so all three
+/// arms are testable without a serial device, and the two state updates a
+/// decision implies stay visible at the call site, next to the spend rule that
+/// `OFN-w` put there.
 ///
 /// A changed candidate set always probes and refreshes the retry budget; an
 /// unchanged one probes only while that budget lasts, which covers the board
 /// whose tty enumerates a moment before its firmware answers the handshake.
-fn should_probe(
-    last_probed: &mut Vec<String>,
-    candidates: Vec<String>,
-    retries_left: &mut u32,
-) -> bool {
-    if crate::serial::adoption::same_port_set(last_probed, &candidates) {
-        if *retries_left == 0 {
-            return false;
-        }
-        *retries_left -= 1;
-        true
+fn probe_decision(last_probed: &[String], candidates: &[String], retries_left: u32) -> Probe {
+    if !crate::serial::adoption::same_port_set(last_probed, candidates) {
+        Probe::Fresh
+    } else if retries_left == 0 {
+        Probe::Skip
     } else {
-        *last_probed = candidates;
-        *retries_left = POST_BOOT_HANDSHAKE_RETRIES;
-        true
+        Probe::Retry
     }
+}
+
+/// When the last REAL probe ended, or `None` if none has run.
+///
+/// This is the one fact that separates a probe from a refusal: [`RescanGuard`]
+/// stamps it on drop, when the probe task actually finishes, and every refusal in
+/// [`openfan_rescan_handler`] — the cooldown, the already-connected return, the
+/// single-flight CAS — returns before that guard is ever built.
+///
+/// Read as a **fact rather than by re-testing the handler’s predicate**. Copying
+/// that predicate here would create a second place to keep in step with the
+/// first, and drifting from it is the exact mistake `OFN-r` made: the loop’s
+/// first draft reasoned about [`OPENFAN_RESCAN_COOLDOWN`] from memory instead of
+/// reading it, and got the `&&` backwards.
+///
+/// **It says "somebody probed", not "this loop probed", and that is accepted.**
+/// `LastRescan` records only `at` and `candidates`, so a probe cannot be
+/// attributed to its caller. A user `POST /fans/openfan/rescan` in flight when the
+/// loop attempts one will win the single-flight CAS and stamp before the loop's
+/// second read, and the loop will then spend a retry on an attempt it did not make
+/// itself. Left as is because the error is **conservative in the direction that
+/// matters** — it can only ever cost the loop probes, never grant it extra ones,
+/// so the DTR bound `OFN-b` cares about cannot be exceeded by the race — and
+/// because the bus really was walked with the same candidate set, by someone.
+fn probe_stamp(state: &AppState) -> Option<Instant> {
+    state.last_openfan_rescan.lock().as_ref().map(|l| l.at)
 }
 
 /// Keep looking for an OpenFanController after boot, off the critical path.
@@ -106,14 +143,76 @@ fn should_probe(
 /// [`POST_BOOT_HANDSHAKE_RETRIES`] for the device that enumerates before its
 /// firmware answers.
 ///
+/// **And those retries are spent per real probe, not per tick (`OFN-w`).** The
+/// budget was originally decremented before the handler was called, whose result
+/// the loop discards — so a tick the handler refused on its own cooldown still
+/// cost a retry. Since the loop ticks at [`POST_BOOT_ADOPTION_INTERVAL`] against
+/// a longer [`OPENFAN_RESCAN_COOLDOWN`], stamped at probe END, that spent the
+/// budget on refusals: 2 real probes of the intended 4 on a quick bus, 1 when a
+/// slow probe overran a tick. Raising the interval to match the cooldown does NOT
+/// fix it and was rejected — the stamp lands when the probe finishes, so the next
+/// tick is still inside the window by however long the probe took. What the loop
+/// does instead is read [`probe_stamp`] either side of the call and spend only
+/// when it moved.
+///
 /// Stops early on the first adoption, and on shutdown.
 pub async fn post_boot_adoption_loop(
     state: Arc<AppState>,
     window: Duration,
     interval: Duration,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
     boot_candidates: Vec<String>,
 ) {
+    let enumerating = Arc::clone(&state);
+    let probing = Arc::clone(&state);
+    post_boot_adoption_loop_with(
+        state,
+        window,
+        interval,
+        shutdown,
+        boot_candidates,
+        // Enumerate — a config read plus a sysfs scan, opening nothing.
+        move || {
+            crate::serial::adoption::serial_port_candidates_enumerated(
+                enumerating.running_config.serial.port.as_deref(),
+                crate::serial::real_transport::enumerate_serial_candidates,
+            )
+        },
+        // The result is deliberately discarded: every outcome is either already
+        // logged by the handler or is the expected one. "Not found" is the normal
+        // answer on a machine that has no controller, and must stay silent — it is
+        // the whole point of `OFN-c`. Whether a probe actually RAN is read from
+        // the cooldown stamp instead, never from this value (`OFN-w`).
+        move || {
+            let state = Arc::clone(&probing);
+            async move {
+                let _ = openfan_rescan_handler(axum::extract::State(state)).await;
+            }
+        },
+    )
+    .await
+}
+
+/// [`post_boot_adoption_loop`] with its two hardware touchpoints injected.
+///
+/// The seam exists for the `OFN-w` regression test and for nothing else: the
+/// budget rule below is about how the loop reacts to a probe that did *not* run,
+/// and there is no way to produce one from a real handler without a serial bus to
+/// stage. Production passes the real enumeration and the real handler, so the
+/// tested body is the shipped body rather than a model of it.
+async fn post_boot_adoption_loop_with<E, P, Fut>(
+    state: Arc<AppState>,
+    window: Duration,
+    interval: Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    boot_candidates: Vec<String>,
+    mut enumerate: E,
+    mut probe: P,
+) where
+    E: FnMut() -> Vec<String>,
+    P: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     // Seeded with what BOOT already probed, so an unchanged bus is never
     // re-probed at all — and a device that appeared between boot's probe and this
     // loop's first tick still reads as a change.
@@ -121,6 +220,11 @@ pub async fn post_boot_adoption_loop(
     let mut retries_left: u32 = 0;
     let deadline = tokio::time::Instant::now() + window;
     let mut ticker = tokio::time::interval(interval);
+    // A probe can overrun several ticks, and the default `Burst` then fires every
+    // missed one back to back the instant it returns — a flurry of attempts
+    // against a cooldown stamped moments earlier, which is pure waste now that
+    // they no longer cost budget. `polling.rs` makes the same choice.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // `interval` yields immediately on its first tick; boot has just probed, so
     // skip it rather than probing twice in the same instant.
     ticker.tick().await;
@@ -156,21 +260,37 @@ pub async fn post_boot_adoption_loop(
             return;
         }
 
-        // Enumerate — a config read plus a sysfs scan, opening nothing — and probe
-        // only if the world actually changed since the last thing that DID probe.
-        let candidates = crate::serial::adoption::serial_port_candidates_enumerated(
-            state.running_config.serial.port.as_deref(),
-            crate::serial::real_transport::enumerate_serial_candidates,
-        );
-        if !should_probe(&mut last_probed, candidates, &mut retries_left) {
-            continue;
+        // Probe only if the world actually changed since the last thing that DID
+        // probe, or if the handshake-retry budget still has something in it.
+        let candidates = enumerate();
+        let decision = probe_decision(&last_probed, &candidates, retries_left);
+        match decision {
+            Probe::Skip => continue,
+            Probe::Fresh => {
+                last_probed = candidates;
+                retries_left = POST_BOOT_HANDSHAKE_RETRIES;
+            }
+            Probe::Retry => {}
         }
 
-        // The result is deliberately discarded: every outcome is either already
-        // logged by the handler or is the expected one. "Not found" is the normal
-        // answer on a machine that has no controller, and must stay silent — it is
-        // the whole point of `OFN-c`.
-        let _ = openfan_rescan_handler(axum::extract::State(Arc::clone(&state))).await;
+        // `OFN-w`: spend a retry only for a probe that actually ran — see
+        // `probe_stamp` for why "ran" here means "by someone", and why that is
+        // the safe way round to be wrong.
+        //
+        // The handler refuses a probe of its own accord — `OPENFAN_RESCAN_COOLDOWN`
+        // spaces repeats to one per ten seconds — and this loop ticks faster than
+        // that. Decrementing before the call therefore spent the budget on ticks
+        // that opened nothing: 2 real probes of the intended 4 on a quick bus, and
+        // 1 where the probe itself outran a tick. The board those retries exist
+        // for — a tty that enumerates before its firmware answers — got a single
+        // attempt, and `force_all_with_floor` is guarded by `if let Some(be) =
+        // openfan_be`, so a missed adoption is the thermal emergency losing its
+        // only route to those fans.
+        let before = probe_stamp(&state);
+        probe().await;
+        if decision == Probe::Retry && probe_stamp(&state) != before {
+            retries_left -= 1;
+        }
 
         if state.openfan().is_some() {
             // The handler already logged the adoption and the port; this only
@@ -692,74 +812,60 @@ mod tests {
     // ── `OFN-r`: probe only when the bus actually changed ────────────────────
 
     #[test]
-    fn an_unchanged_candidate_set_stops_probing_once_its_retries_are_spent() {
-        // The DISCRIMINATING arm, and the defect this replaced. The first draft
-        // leaned on OPENFAN_RESCAN_COOLDOWN to make repeat ticks free; that
-        // predicate is `elapsed < COOLDOWN && same_port_set(..)`, an AND, so it
-        // only SPACES repeats — every tick past the cooldown would have opened
-        // every unrelated tty again, asserting DTR and resetting Arduino-class
-        // boards ~6 times a boot instead of the 2 this change advertises.
-        let mut last = vec!["/dev/ttyACM0".to_string()];
-        let mut retries = POST_BOOT_HANDSHAKE_RETRIES;
+    fn an_unchanged_candidate_set_stops_being_probed_once_its_retries_are_spent() {
+        // The DISCRIMINATING arm, and the defect the OFN-r design replaced. The
+        // first draft leaned on OPENFAN_RESCAN_COOLDOWN to make repeat ticks
+        // free; that predicate is `elapsed < COOLDOWN && same_port_set(..)`, an
+        // AND, so it only SPACES repeats — every tick past the cooldown would
+        // have opened every unrelated tty again, asserting DTR and resetting
+        // Arduino-class boards ~6 times a boot.
+        let last = vec!["/dev/ttyACM0".to_string()];
+        let same = vec!["/dev/ttyACM0".to_string()];
 
-        let mut probes = 0;
-        for _ in 0..50 {
-            if should_probe(&mut last, vec!["/dev/ttyACM0".to_string()], &mut retries) {
-                probes += 1;
-            }
-        }
         assert_eq!(
-            probes, POST_BOOT_HANDSHAKE_RETRIES as usize,
-            "an unchanged bus must be probed only for the handshake-retry budget, \
-             then never again — each probe is a DTR reset of somebody's Arduino"
+            probe_decision(&last, &same, POST_BOOT_HANDSHAKE_RETRIES),
+            Probe::Retry,
+            "an unchanged bus is still worth a retry while the budget lasts"
+        );
+        assert_eq!(
+            probe_decision(&last, &same, 0),
+            Probe::Skip,
+            "an unchanged bus with no budget left must never be probed again — \
+             each probe is a DTR reset of somebody's Arduino"
         );
     }
 
     #[test]
-    fn a_changed_candidate_set_probes_and_refreshes_the_budget() {
-        // The opposite arm: without it, a `should_probe` that always returned
-        // false would pass the test above, and a controller plugged in during the
-        // window would never be adopted.
-        let mut last = vec!["/dev/ttyACM0".to_string()];
-        let mut retries = 0;
+    fn a_changed_candidate_set_is_always_probed() {
+        // The opposite arm: without it, a `probe_decision` that always returned
+        // `Skip` would pass the test above, and a controller plugged in during
+        // the window would never be adopted.
+        let last = vec!["/dev/ttyACM0".to_string()];
+        let changed = vec!["/dev/ttyACM0".to_string(), "/dev/ttyACM1".to_string()];
 
-        assert!(
-            should_probe(
-                &mut last,
-                vec!["/dev/ttyACM0".into(), "/dev/ttyACM1".into()],
-                &mut retries
-            ),
+        assert_eq!(
+            probe_decision(&last, &changed, 0),
+            Probe::Fresh,
             "a newly appeared tty must be probed at once, even with no retries left"
         );
-        assert_eq!(
-            retries, POST_BOOT_HANDSHAKE_RETRIES,
-            "a change refreshes the budget"
-        );
-        assert_eq!(
-            last.len(),
-            2,
-            "and becomes the set future ticks compare against"
-        );
     }
 
     #[test]
-    fn the_retry_budget_covers_a_tty_that_appears_before_its_firmware_answers() {
-        // Why the budget is not zero: a board can enumerate its tty a moment
-        // before it will answer the DEC-250 handshake, so the first probe after a
-        // change can fail on a device that is genuinely there.
-        let mut last: Vec<String> = Vec::new();
-        let mut retries = 0;
-        assert!(should_probe(
-            &mut last,
-            vec!["/dev/ttyACM0".into()],
-            &mut retries
-        ));
-        for i in 0..POST_BOOT_HANDSHAKE_RETRIES {
-            assert!(
-                should_probe(&mut last, vec!["/dev/ttyACM0".into()], &mut retries),
-                "retry {i} must still be permitted after the tty appeared"
-            );
-        }
+    fn a_fresh_probe_does_not_come_out_of_the_retry_budget() {
+        // Why the budget is not zero, and why the fresh probe is a separate arm:
+        // a board can enumerate its tty a moment before it will answer the
+        // DEC-250 handshake, so the first probe after a change can fail on a
+        // device that is genuinely there. `Fresh` and `Retry` are distinct
+        // precisely so the loop knows which of the two it is spending.
+        let last: Vec<String> = Vec::new();
+        let appeared = vec!["/dev/ttyACM0".to_string()];
+        assert_eq!(probe_decision(&last, &appeared, 0), Probe::Fresh);
+        assert_ne!(
+            probe_decision(&last, &appeared, 0),
+            Probe::Retry,
+            "the probe that follows a change is not one of the retries; conflating \
+             them costs the late-answering board one of its attempts"
+        );
     }
 
     /// The call site, on the arm that is safe to run: an unchanged bus must not
@@ -793,6 +899,125 @@ mod tests {
             state.last_openfan_rescan.lock().is_none(),
             "the loop probed an unchanged bus — every probe opens a tty and asserts \
              DTR, which resets Arduino-class boards"
+        );
+    }
+
+    /// Drive the loop with a probe double and report (attempts, real probes).
+    ///
+    /// The double models the ONE contract the loop reads: a real probe stamps
+    /// `last_openfan_rescan` when its task ends, and every refusal in
+    /// `openfan_rescan_handler` returns before `RescanGuard` is built, so it
+    /// leaves the stamp alone. That contract is pinned independently at the
+    /// handler by `openfan_rescan_cooldown_does_not_advance_the_probe_stamp`
+    /// (`tests/ipc_integration.rs`) — a double is only honest while the half it
+    /// stands in for is tested too.
+    ///
+    /// `refuse_ratio` is how many attempts out of each group of that size are
+    /// refused: 3 means one real probe then two refusals, the spacing this loop
+    /// actually meets against a 10 s cooldown at a 5 s tick. 1 means every
+    /// attempt runs.
+    async fn drive_loop_with_probe(window: Duration, refuse_ratio: u32) -> (u32, u32) {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let state = adoption_state(rx.clone());
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let reals = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let probe_state = Arc::clone(&state);
+        let a = Arc::clone(&attempts);
+        let r = Arc::clone(&reals);
+
+        let finished = tokio::time::timeout(
+            window + Duration::from_secs(5),
+            post_boot_adoption_loop_with(
+                Arc::clone(&state),
+                window,
+                Duration::from_millis(2),
+                rx,
+                vec!["/dev/ttyBOOT".to_string()],
+                // The bus changed once against what boot probed, then never
+                // again — a controller attached during the window.
+                || vec!["/dev/ttyBOOT".to_string(), "/dev/ttyNEW".to_string()],
+                move || {
+                    let st = Arc::clone(&probe_state);
+                    let a = Arc::clone(&a);
+                    let r = Arc::clone(&r);
+                    async move {
+                        if a.fetch_add(1, Ordering::SeqCst)
+                            .is_multiple_of(refuse_ratio)
+                        {
+                            r.fetch_add(1, Ordering::SeqCst);
+                            *st.last_openfan_rescan.lock() = Some(LastRescan {
+                                at: Instant::now(),
+                                candidates: vec!["/dev/ttyNEW".to_string()],
+                            });
+                        }
+                    }
+                },
+            ),
+        )
+        .await;
+        assert!(finished.is_ok(), "the loop must end at its window");
+        (
+            attempts.load(Ordering::SeqCst),
+            reals.load(Ordering::SeqCst),
+        )
+    }
+
+    /// `OFN-w`: a probe the handler REFUSED must not cost a handshake retry.
+    ///
+    /// The defect this replaced spent the budget in `should_probe` *before*
+    /// calling the handler, whose result the loop discards. The handler refuses
+    /// on a cooldown of its own, and this loop ticks faster than that cooldown —
+    /// so the four intended probes became two on a quick bus, and one where the
+    /// probe itself outran a tick. The board those retries exist for, whose tty
+    /// enumerates before its firmware answers, got a single attempt; and
+    /// `force_all_with_floor` is guarded by `if let Some(be) = openfan_be`, so a
+    /// missed adoption is the thermal emergency losing its route to those fans.
+    #[tokio::test]
+    async fn refused_probes_do_not_spend_the_handshake_retry_budget() {
+        let (attempted, ran) = drive_loop_with_probe(Duration::from_millis(400), 3).await;
+
+        // Precondition on the fixture: the situation this test is about must
+        // actually have arisen. With nothing refused there is no accounting for
+        // the loop to get wrong, and the assertion below would hold against the
+        // defect it exists to catch.
+        assert!(
+            attempted > ran,
+            "precondition: no probe was refused ({attempted} attempts, {ran} ran), \
+             so the retry accounting was never exercised"
+        );
+        assert_eq!(
+            ran,
+            1 + POST_BOOT_HANDSHAKE_RETRIES,
+            "a refused probe opened no tty, so it must not cost a handshake retry: \
+             the fresh probe and all {POST_BOOT_HANDSHAKE_RETRIES} retries must \
+             reach the bus ({attempted} attempts made, {ran} ran)"
+        );
+    }
+
+    /// The arm that must not regress while fixing the one above: the budget still
+    /// BOUNDS real probes.
+    ///
+    /// Every probe opens whatever ttys the host has and asserts DTR, which resets
+    /// Arduino-class boards. A spend rule that never fired would make this loop
+    /// probe once per tick for the whole window — `OFN-b`'s twelve resets a boot,
+    /// back again and worse.
+    #[tokio::test]
+    async fn the_handshake_retry_budget_still_bounds_real_probes() {
+        // Every attempt runs, over a window with room for far more ticks than the
+        // budget allows.
+        let (attempted, ran) = drive_loop_with_probe(Duration::from_millis(400), 1).await;
+
+        assert_eq!(
+            ran,
+            1 + POST_BOOT_HANDSHAKE_RETRIES,
+            "an unchanged bus must be probed for the fresh probe plus the budget \
+             and then never again ({attempted} attempts, {ran} ran)"
+        );
+        assert_eq!(
+            attempted, ran,
+            "with nothing refused, every attempt must have been a real probe — \
+             otherwise this test is measuring the refusal path, not the bound"
         );
     }
 

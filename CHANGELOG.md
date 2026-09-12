@@ -1,5 +1,26 @@
 # Changelog
 
+## [2.47.1] — 2026-09-12
+
+**The post-boot OpenFan search now gets all the retries it was designed to have
+(DEC-362, register row `OFN-w`).** v2.47.0 gave the background search a budget of
+three handshake retries, for the board whose tty enumerates a moment before its
+firmware answers. The budget was spent per *tick* rather than per probe that
+actually ran — and because the loop ticks faster than the rescan cooldown that
+refuses repeat probes, most of those ticks opened nothing. The four intended
+probes were two in practice, or one where a slow probe overran a tick, so a
+controller attached during the window could get a single attempt: the one most
+likely to fail, since opening the tty resets the board.
+
+The loop now reads the cooldown stamp either side of each call and spends a retry
+only when a probe really ran. The bound is unchanged — still one fresh probe plus
+three retries, and still only after the set of serial devices changes — so the
+DTR-reset saving that motivated the whole design is untouched. The ticker also
+takes `MissedTickBehavior::Skip`, so a slow probe is no longer followed by a
+burst of catch-up ticks.
+
+No API, capability or configuration change.
+
 ## [2.47.0] — 2026-09-12
 
 **Additive `skipped_controls[].reason` token; `API_VERSION` unchanged.** No
