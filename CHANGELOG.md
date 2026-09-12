@@ -1,6 +1,6 @@
 # Changelog
 
-## [2.46.0] — 2026-09-11
+## [2.46.0] — 2026-09-12
 
 **Additive wire field on `/diagnostics/hardware`; `API_VERSION` unchanged.** No
 capability, endpoint or error code moves, and no existing field changes shape.
