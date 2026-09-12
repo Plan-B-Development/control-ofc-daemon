@@ -19,7 +19,8 @@ DTR-reset saving that motivated the whole design is untouched. The ticker also
 takes `MissedTickBehavior::Skip`, so a slow probe is no longer followed by a
 burst of catch-up ticks.
 
-No API, capability or configuration change.
+No API, capability or configuration change. Pairs with `control-ofc-gui` >= v2.23.0,
+unchanged — this release advertises no new capability.
 
 ## [2.47.0] — 2026-09-12
 
