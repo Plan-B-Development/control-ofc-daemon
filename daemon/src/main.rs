@@ -1402,43 +1402,45 @@ async fn async_main() {
     let cache = Arc::new(StateCache::new());
     let serial_timeout = Duration::from_millis(config.serial.timeout_ms);
 
-    // ── Initialize OpenFanController (with retry for USB enumeration timing) ──
+    // ── Initialize OpenFanController ─────────────────────────────────────────
     let fan_controller: Option<Arc<Mutex<FanController>>>;
     let openfan_transport: Option<
         Arc<Mutex<Box<dyn control_ofc_daemon::serial::transport::SerialTransport + Send>>>,
     >;
 
-    // [SAFETY] OpenFan adoption. The controller is OPTIONAL hardware, so a
-    // machine without one must pay neither a long boot stall nor a warning that
-    // reads like a fault (OFN-a/OFN-b/OFN-c). What it must still pay is the
-    // DEC-250 identity handshake on everything it does adopt.
+    // [SAFETY] OpenFan adoption, and the critical path is the whole point
+    // (`OFN-a`/`OFN-r`/`OFN-s`). The controller is OPTIONAL hardware, so a
+    // machine without one must pay neither a boot stall nor a warning that reads
+    // like a fault. What it must still pay is the DEC-250 identity handshake on
+    // anything it does adopt.
+    //
+    // **Exactly ONE attempt here.** This used to be a ladder of up to six
+    // attempts sleeping 1+2+4+8+16 s, and it ran ahead of `axum::serve`, both
+    // poll loops and the profile engine — so the daemon answered nothing, and
+    // evaluated no thermal safety, for the whole of it. Everything past this one
+    // attempt now runs in `post_boot_adoption_loop`, spawned once the server is
+    // up, which is strictly better in both directions: no stall for a machine
+    // without a controller, and a far LONGER search for one whose device
+    // enumerates late than the ladder ever gave it.
     let serial_configured = config.serial.port.is_some();
-    let retry_delays = control_ofc_daemon::serial::adoption::boot_retry_schedule(serial_configured);
-    let total_attempts = retry_delays.len() + 1;
     let mut serial_connected = false;
     let mut fc: Option<Arc<Mutex<FanController>>> = None;
     let mut ot: Option<
         Arc<Mutex<Box<dyn control_ofc_daemon::serial::transport::SerialTransport + Send>>>,
     > = None;
 
-    for attempt in 0..total_attempts {
-        if attempt > 0 {
-            let delay = retry_delays[attempt - 1];
-            log::info!(
-                "Serial retry {attempt}/{}: waiting {delay:?} for device...",
-                total_attempts - 1
-            );
-            // std::thread::sleep is acceptable here — no async tasks running yet during init (P2-R2)
-            std::thread::sleep(delay);
-        }
-
+    // Hoisted rather than block-scoped: `post_boot_adoption_loop` is seeded with
+    // this list so it can tell "the bus changed" from "the bus is the same", and
+    // therefore never re-probes hardware boot already tried (`OFN-r`).
+    let boot_candidates;
+    {
         // [SAFETY] Try the configured port first, then every enumerated
         // candidate. The ordering rule lives in
         // `serial_port_candidates_enumerated` so it is unit-testable without a
         // serial device — see its doc comment for why a configured port must
         // never be the only candidate.
         //
-        // ENUMERATE rather than auto-detect (OFN-b). `auto_detect_port` *opens*
+        // ENUMERATE rather than auto-detect (`OFN-b`). `auto_detect_port` *opens*
         // each candidate in order to identify it, and on Linux opening a tty
         // asserts DTR — which resets Arduino-class boards. Worse, it probed the
         // libudev list and then fell through to its own `/dev/ttyACM0..9` +
@@ -1446,13 +1448,13 @@ async fn async_main() {
         // opened TWICE per attempt. DEC-291 built this non-opening path for
         // `POST /fans/openfan/rescan` and boot was never moved onto it.
         // `first_openfan_port` below still opens — it must, to run the DEC-250
-        // handshake — but now exactly once per candidate per attempt.
+        // handshake — but now exactly once per candidate.
         let candidates = control_ofc_daemon::serial::adoption::serial_port_candidates_enumerated(
             config.serial.port.as_deref(),
             enumerate_serial_candidates,
         );
 
-        if candidates.is_empty() && attempt == 0 {
+        if candidates.is_empty() {
             log::info!("No serial port configured and no serial candidates present");
         }
 
@@ -1485,8 +1487,8 @@ async fn async_main() {
             fc = Some(Arc::new(Mutex::new(ctrl)));
             ot = Some(shared);
             serial_connected = true;
-            break;
         }
+        boot_candidates = candidates;
     }
 
     if !serial_connected {
@@ -1502,9 +1504,9 @@ async fn async_main() {
         // opens but is not an OpenFanController accepts every write with `Ok`.
         if serial_configured {
             log::warn!(
-                "No OpenFanController adopted after {total_attempts} attempt(s) — the configured \
-                 serial port did not identify as one, and no detected candidate did either. \
-                 Running without serial fan control"
+                "No OpenFanController adopted at startup — the configured serial port did not \
+                 identify as one, and no detected candidate did either. Still looking in the \
+                 background; running without serial fan control until one appears"
             );
         } else {
             log::info!(
@@ -2087,6 +2089,38 @@ async fn async_main() {
         }
     });
 
+    // ── Keep looking for an OpenFanController, off the critical path ────────
+    // `OFN-r`/`OFN-s`. Boot made ONE adoption attempt; this is the rest of the
+    // search, and it runs only if that attempt found nothing. Spawned AFTER the
+    // IPC server so the daemon is already answering — which is the whole reason
+    // the ladder could be taken off the critical path.
+    //
+    // [SAFETY] It drives `POST /fans/openfan/rescan`'s own handler rather than
+    // probing directly, so it cannot skip the DEC-250 handshake, the DEC-266
+    // conditional install, the poll-loop spawn or the 277-c handle registration,
+    // and it shares the single-flight guard with a user-triggered rescan. A
+    // controller it adopts registers its poll loop in `adopted_poll_handles`,
+    // which `task_handles` already drains below on the same terms as a
+    // boot-adopted one.
+    let post_boot_adoption_handle = if serial_connected {
+        None
+    } else {
+        let adopt_state = app_state.clone();
+        let adopt_shutdown = poll_shutdown_tx.subscribe();
+        let window =
+            control_ofc_daemon::serial::adoption::post_boot_adoption_window(serial_configured);
+        Some(tokio::spawn(async move {
+            control_ofc_daemon::api::handlers::post_boot_adoption_loop(
+                adopt_state,
+                window,
+                control_ofc_daemon::api::handlers::POST_BOOT_ADOPTION_INTERVAL,
+                adopt_shutdown,
+                boot_candidates,
+            )
+            .await;
+        }))
+    };
+
     log::info!("Daemon ready — waiting for shutdown signal");
 
     // Handle SIGHUP (config reload), SIGINT/SIGTERM (shutdown), and IPC task
@@ -2156,6 +2190,7 @@ async fn async_main() {
         ("openfan-poll", openfan_poll_handle),
         ("profile-engine", Some(engine_handle)),
         ("validation-recorder", Some(validation_handle)),
+        ("openfan-post-boot-adoption", post_boot_adoption_handle),
     ]
     .into_iter()
     .filter_map(|(name, handle)| handle.map(|h| (name, h)))

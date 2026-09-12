@@ -383,14 +383,18 @@ Two consequences worth knowing if you have **other** USB-serial hardware attache
   asserts DTR — which **resets Arduino-class boards**. The daemon therefore opens
   each candidate at most once per attempt, and enumerates without opening
   wherever it can, but it cannot identify a device without opening it.
-- How hard it tries depends on whether you have named a port. With **no**
-  `[serial] port` configured it makes two attempts about three seconds apart and
-  then carries on without one. With a port configured it retries for about 30
-  seconds, because you have told it the device is there and its absence is a
-  fault worth waiting out.
+- Startup makes **one** attempt, then gets out of the way. The search continues
+  in the background once the daemon is up and answering, for **60 seconds** by
+  default or **180** if you have named a `[serial] port` — you have told it the
+  device is there, so it stays interested longer. Nothing is delayed by this: the
+  daemon is fully running throughout.
+- The background search costs nothing when nothing changes. It compares the list
+  of serial devices each time, and only opens anything when that list actually
+  changes — so plugging the controller in during the window is picked up within a
+  few seconds, while a machine whose devices never change is never re-probed.
 
-If a controller is attached but was not detected — a slow-enumerating hub, say —
-use **Rescan Hardware** in the GUI (`POST /fans/openfan/rescan`) rather than
+If a controller is attached but was not detected — it appeared after the window,
+say — use **Rescan Hardware** in the GUI (`POST /fans/openfan/rescan`) rather than
 restarting, or pin the port as below. For reliable detection across reboots, use a
 stable device path:
 

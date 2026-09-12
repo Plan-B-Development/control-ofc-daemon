@@ -91,40 +91,35 @@ pub fn same_port_set(a: &[String], b: &[String]) -> bool {
     a == b
 }
 
-/// How long to wait before each boot adoption retry, in order.
+/// How long to keep looking for an OpenFanController AFTER boot.
 ///
-/// An empty return means "one attempt, no retries"; `n` entries mean `n + 1`
-/// attempts. Pure so the policy is unit-testable without a serial device, for
-/// the same reason as its neighbours — and because until now it was not a
-/// function at all. The ladder was five literal sleeps inline in `async_main`,
-/// which nothing tested.
+/// Boot itself now makes exactly **one** adoption attempt and then gets out of
+/// the way (`OFN-r`/`OFN-s`); everything after that runs detached, off the
+/// critical path, driven by `post_boot_adoption_loop`. This returns how long
+/// that detached search stays interested.
 ///
-/// The retry exists for USB enumeration timing: a controller attached at boot
-/// can take a moment to appear as `/dev/ttyACM*`. That is a real need — but only
-/// for a machine that HAS one, and the daemon cannot know that before it looks.
-/// So the schedule splits on the one durable signal that the user expects the
-/// hardware: a configured `serial.port`.
+/// The window replaced a synchronous retry ladder that slept up to ~31 s before
+/// the API server, both poll loops and the profile engine were started. Two
+/// things were wrong with it: a machine with no controller paid the whole stall
+/// for nothing, and a machine WITH one got no second chance at all if the device
+/// enumerated late — the reconnect probe lives inside the OpenFan poll loop,
+/// which is only spawned when boot already adopted something, so a miss was
+/// terminal for the process lifetime.
 ///
 /// * **Configured** (`daemon.toml` / `runtime.toml` / `POST /config/serial-port`) —
-///   the user named a device, so its absence is a fault worth waiting out. Keeps
-///   the historical 1+2+4+8+16 s ladder unchanged.
-/// * **Not configured** — auto-detect. A short universal floor: one retry after
-///   3 s, so a slow enumeration is still caught, and a machine that simply has no
-///   OpenFanController pays ~3 s instead of ~31 s. OpenFan support is optional,
-///   and its absence must not look like a fault (`OFN-a`).
+///   the user named a device, so its absence is worth staying interested in.
+/// * **Not configured** — auto-detect. Shorter, but still far longer than the
+///   ~31 s ladder it replaces, because waiting now costs nothing: the daemon is
+///   fully serving throughout.
 ///
-/// The floor is deliberately not zero. Dropping straight to a single attempt
-/// would disadvantage the auto-detect user whose device enumerates slowly, and
-/// they are the case the ladder was written for.
-pub fn boot_retry_schedule(configured: bool) -> Vec<Duration> {
-    if configured {
-        vec![1, 2, 4, 8, 16]
-    } else {
-        vec![3]
-    }
-    .into_iter()
-    .map(Duration::from_secs)
-    .collect()
+/// Cheap regardless of length, because the loop **compares the candidate set
+/// itself** and probes only when it changes. Do not attribute that to DEC-291's
+/// rescan cooldown: that predicate is `elapsed < COOLDOWN && same_port_set(..)`,
+/// an AND, so it spaces repeat probes to one per ten seconds and never skips
+/// one — relying on it would have re-opened every unrelated tty for the whole
+/// window. See `post_boot_adoption_loop`.
+pub fn post_boot_adoption_window(configured: bool) -> Duration {
+    Duration::from_secs(if configured { 180 } else { 60 })
 }
 
 /// Connect to the first candidate that opens **and** identifies as an
@@ -193,53 +188,28 @@ pub fn first_openfan_port<T: crate::serial::transport::SerialTransport>(
 mod tests {
     use super::*;
 
-    // ── `OFN-a`: the boot retry schedule ──────────────────────────────────────
+    // ── `OFN-a`/`OFN-r`: the post-boot adoption window ───────────────────────
 
     #[test]
-    fn an_unconfigured_machine_gets_a_short_floor_not_the_full_ladder() {
-        // The DISCRIMINATING arm. A machine with no OpenFanController and no
-        // configured port used to sleep 1+2+4+8+16 = 31 s at every boot, during
-        // which the daemon answered no API requests at all — the socket is bound
-        // before this runs but `axum::serve` is spawned after it.
-        let unconfigured = boot_retry_schedule(false);
-        let total: Duration = unconfigured.iter().sum();
-        assert_eq!(
-            unconfigured.len() + 1,
-            2,
-            "an auto-detect machine should get a short floor of 2 attempts"
-        );
+    fn an_unconfigured_machine_still_gets_a_long_look_after_boot() {
+        // The DISCRIMINATING arm. Boot pays ONE attempt now, so the thing that
+        // decides whether a late-enumerating controller is ever found is this
+        // window — and it must be generous, because it costs nothing: the daemon
+        // is fully serving throughout, and a tick over unchanged hardware opens
+        // no device at all.
+        let w = post_boot_adoption_window(false);
         assert!(
-            total <= Duration::from_secs(5),
-            "the floor must stay short; got {total:?}"
-        );
-        // Deliberately NOT zero: an auto-detect user whose device enumerates
-        // slowly is the case the ladder was written for, so one retry survives.
-        assert!(
-            !unconfigured.is_empty(),
-            "a single attempt would disadvantage slow USB enumeration"
+            w >= Duration::from_secs(31),
+            "the detached window must exceed the ~31 s synchronous ladder it replaced, \
+             or a late controller is found LESS often than before; got {w:?}"
         );
     }
 
     #[test]
-    fn a_configured_port_keeps_the_full_ladder() {
-        // The opposite arm, and the reason the floor is safe: where the user
-        // NAMED a device, its absence is a fault worth waiting out, so nothing
-        // about that case changes. Without this arm a schedule that always
-        // returned the short floor would pass the test above.
-        let configured = boot_retry_schedule(true);
-        let unconfigured = boot_retry_schedule(false);
-        assert!(
-            configured.len() > unconfigured.len(),
-            "a configured port must be waited out longer than an auto-detect one"
-        );
-        assert_eq!(
-            configured,
-            vec![1, 2, 4, 8, 16]
-                .into_iter()
-                .map(Duration::from_secs)
-                .collect::<Vec<_>>(),
-            "the historical ladder for a configured port is unchanged"
-        );
+    fn a_configured_port_is_waited_on_longer() {
+        // The opposite arm: without it, a constant window would pass above. Where
+        // the user NAMED a device, its absence is worth staying interested in.
+        assert!(post_boot_adoption_window(true) > post_boot_adoption_window(false));
     }
 
     /// The configured port is tried FIRST — the ordering rule this function

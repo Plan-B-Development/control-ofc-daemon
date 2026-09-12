@@ -8,8 +8,8 @@ client that already renders unrecognised tokens — which the contract has alway
 required — needs no change.
 
 **The OpenFanController is optional hardware, and a machine without one now says
-so once, quietly, instead of behaving like something is broken.** Four changes,
-all of them on the boot path (register `OFN`):
+so once, quietly, instead of behaving like something is broken.** Five changes,
+four of them on the boot path (register `OFN`):
 
 - **Boot no longer stalls for ~31 s on a machine with no controller.** The
   adoption ladder slept 1+2+4+8+16 s across six attempts with **no early exit** —
@@ -18,10 +18,27 @@ all of them on the boot path (register `OFN`):
   client connecting during that window waited rather than being refused, and a
   GUI autostarted at login could render as disconnected. The engine — the sole
   PWM writer, and the evaluator of the thermal emergency — also starts after the
-  ladder, so its evaluation began ~31 s late on these machines. The schedule is
-  now a short universal floor (two attempts, ~3 s) when no `[serial] port` is
-  configured, and the historical ladder is kept **unchanged** where one is: there
-  the user named a device, so its absence is a fault worth waiting out.
+  ladder, so its evaluation began ~31 s late on these machines. **Startup now
+  makes exactly one attempt**, for everyone, configured port or not.
+- **The rest of the search moved off the critical path entirely.** A missed boot
+  adoption used to be terminal for the process lifetime — the only automatic
+  reconnect probe lives inside the OpenFan poll loop, which is only spawned when
+  boot already adopted something, so a controller that enumerated late was never
+  found and the thermal emergency never reached its fans. A detached
+  `post_boot_adoption_loop` now keeps looking once the API server is up, for 60 s
+  (180 s with a `[serial] port` configured) — a far **longer** search than the
+  ~31 s ladder it replaces, at zero boot cost. It drives `POST
+  /fans/openfan/rescan`'s own handler rather than probing directly, so it cannot
+  skip the DEC-250 identity handshake, the DEC-266 conditional install, the
+  poll-loop spawn or the 277-c handle registration, and it shares that endpoint's
+  single-flight guard with a user-triggered rescan. It **compares the candidate
+  set itself** and probes only when that set changes (plus a small retry budget
+  for a board whose tty appears before its firmware answers), so a machine whose
+  serial devices never change is never re-probed and `OFN-b`'s saving survives a
+  generous window, while a newly attached controller is picked up within ~5 s.
+  This also removes
+  the ~31 s stall a **configured-but-absent** port imposed on every boot, which
+  blocked the API server, both poll loops and the profile engine.
 - **Unrelated USB-serial devices are no longer opened up to twelve times per
   boot.** Opening a tty asserts DTR, which resets Arduino-class boards, and
   `auto_detect_port` returned from its libudev pass only on *success* — so a
