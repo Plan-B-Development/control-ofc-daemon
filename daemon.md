@@ -197,6 +197,76 @@ swap and the bump are observed together), and the deadband self-releases for one
 tick after `DEADBAND_MAX_HOLD_CYCLES` (~30 s) so a temperature that settles just
 inside the band cannot pin the pre-settle fan speed indefinitely.
 
+## Startup Sequence — OpenFan adoption (DEC-291 / DEC-361)
+
+The OpenFanController is **optional** hardware, and nothing on the critical path
+may assume it exists. `main` therefore makes **exactly one** adoption attempt and
+then gets out of the way:
+
+```
+main
+ │
+ ├─ serial_port_candidates_enumerated()      # libudev + path scan, OPENS NOTHING
+ │    configured [serial] port first, but never the only candidate (DEC-250)
+ │
+ ├─ first_openfan_port()                     # opens each candidate AT MOST ONCE,
+ │    accepts only one answering `ReadAllRpm` (DEC-250 identity handshake)
+ │
+ ├─ spawn hwmon poll · spawn profile_engine · server::serve()
+ │    ↑ these run whether or not a controller was adopted.
+ │    `openfan_poll_loop` does NOT — it is gated on `Some(transport)`
+ │    (`main.rs:1885`), which is why adoption must spawn it (DEC-266)
+ │
+ └─ post_boot_adoption_loop()                # ONLY if nothing was adopted
+      detached, after the IPC server is already answering
+```
+
+**Why one attempt.** This used to be a ladder of up to six tries sleeping
+1+2+4+8+16 s, and it ran *ahead* of `axum::serve`, both poll loops and the
+profile engine — so the daemon answered no API request and evaluated no thermal
+safety for ~31 s, on every machine, including the overwhelming majority that have
+no controller at all.
+
+**Enumerate, then identify.** The two halves are separate functions because the
+difference is a hardware side effect: `open(2)` on a tty asserts DTR, which
+resets Arduino-class boards. `enumerate_serial_candidates` is a libudev/sysfs read
+plus `Path::exists`; `auto_detect_port` — which opens — has exactly one remaining
+caller, the OpenFan poll loop's reconnect probe, and that runs only after a
+controller that was *already adopted* has dropped off.
+
+**The detached search** (`post_boot_adoption_loop`, `api/handlers/openfan.rs`):
+
+| | |
+|---|---|
+| Window | `post_boot_adoption_window(configured)` — **60s**, or **180s** with `[serial] port` set |
+| Tick | `POST_BOOT_ADOPTION_INTERVAL` = 5s, `MissedTickBehavior::Skip` |
+| Probes when | the enumerated candidate set differs from the one boot last tried — seeded with `boot_candidates` |
+| Handshake retries | `POST_BOOT_HANDSHAKE_RETRIES` = 3, spent only on a probe that **actually ran**, read from the cooldown stamp either side of the call (`OFN-w`) |
+| Stops on | first adoption, window expiry, or shutdown — including mid-probe (`OFN-v`) |
+
+Both windows are *longer* than the ~31 s ladder they replace, because waiting now
+costs nothing: the daemon is fully serving throughout.
+
+**[SAFETY] It drives `openfan_rescan_handler` rather than probing directly.** A
+second probe-and-install path would be a second chance to skip the DEC-250
+identity handshake, the DEC-266 conditional install, the poll-loop spawn or the
+277-c handle registration. It also inherits the handler's single-flight guard, so
+this loop and a user clicking *Rescan Hardware* can never probe the same ports
+concurrently.
+
+**The loop owns its own "has anything changed?" test, and must.** Do not
+re-derive it from `OPENFAN_RESCAN_COOLDOWN`: that predicate is
+`elapsed < COOLDOWN && same_port_set(..)`, an **AND**, so it *spaces* repeat
+probes to one per ten seconds and never skips one. Leaning on it would have
+opened every unrelated tty ~6 times per boot (18 with a configured port) — worse
+than the 12 DEC-361 set out to remove.
+
+**Why any of this is a safety concern.** `force_all_with_floor` reaches OpenFan
+fans only through the adopted backend (`force_present_backends`, DEC-371), so an
+adoption that never happens is the thermal emergency losing its only route to
+those fans. That is why the retry budget, the probe accounting and the shutdown
+gating each have their own register rows and regression tests.
+
 ## Safety Model
 
 1. **ThermalSafetyRule** (`safety.rs`): Emergency CPU override
