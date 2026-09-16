@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [2.48.1] — 2026-09-16
 
 ### Documentation
 
