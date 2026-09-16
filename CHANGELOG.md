@@ -1,5 +1,20 @@
 # Changelog
 
+## [2.47.2] — 2026-09-16
+
+**No daemon behaviour change whatsoever — one test fixture, updated so it still
+matches the GUI's copy byte for byte.**
+
+`daemon/tests/fixtures/wire_fields.json` is a shared oracle: one byte-identical
+copy in each repository, compared by `parity.yml` in both (`P8-cb`). The GUI's
+DEC-367 reclassified every field in it — each is now marked as read, deliberately
+unread, or unprovable, so adding a field to the wire forces that choice — and this
+release carries the matching copy. `api/responses.rs::tests::wire_field_surface_is_pinned`
+reads only the `daemon` and `fields` keys and is unaffected; it passes against the
+new file unchanged. No source and no API surface changed. `tray/Cargo.toml` moves
+to 2.47.2 with the daemon because the two ship together and
+`packaging_version::tray_version_matches_daemon_version` requires it.
+
 ## [2.47.1] — 2026-09-12
 
 **The post-boot OpenFan search now gets all the retries it was designed to have
