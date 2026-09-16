@@ -283,8 +283,24 @@ pub async fn capabilities_handler(
         devices: DeviceCapabilities {
             openfan: OpenfanCapability {
                 present: openfan_present,
-                channels: 10,
-                rpm_support: true,
+                // `OFN-k`: every field here is derived, none is a literal.
+                // `channels`/`rpm_support` used to be hardcoded `10`/`true`, so a
+                // machine with no controller was told it had ten channels of
+                // hardware that does not exist. Both GUI consumers happened to
+                // read `channels` only inside their `present` branch, which is
+                // what kept it latent rather than live — and is exactly why it
+                // was worth fixing before the next client forgot to.
+                //
+                // The present-branch count comes from the protocol layer's own
+                // `NUM_CHANNELS`, the constant `Channel::new` validates against,
+                // for the reason stated on `openfan_stop_timeout_s` below: a
+                // second literal drifts silently the moment the first one moves.
+                channels: if openfan_present {
+                    crate::serial::protocol::NUM_CHANNELS
+                } else {
+                    0
+                },
+                rpm_support: openfan_present,
                 write_support: openfan_present,
             },
             hwmon: HwmonCapability {

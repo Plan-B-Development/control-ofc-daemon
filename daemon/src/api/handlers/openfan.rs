@@ -781,8 +781,19 @@ where
                 &ErrorEnvelope {
                     error: ErrorBody {
                         code: "validation_error".into(),
+                        // `OFN-u`: "a probe", not "an OpenFan rescan". The
+                        // daemon's own post-boot loop probes on the same guard,
+                        // so the last probe the cooldown is rationing is often
+                        // one the *daemon* made — and the old wording
+                        // ("an OpenFan rescan ... was attempted") told the user
+                        // they had done something they had not. `RescanGuard`'s
+                        // drop re-stamps `last_openfan_rescan` with the new
+                        // candidate set, so the loop can even consume the
+                        // set-change exemption a user's "plug it in and click
+                        // rescan" was meant to get. Naming the actor neutrally is
+                        // the whole fix; the rationing itself is unchanged.
                         message: format!(
-                            "an OpenFan rescan over the same ports was attempted \
+                            "a probe over the same ports was attempted \
                              moments ago — each probe resets Arduino-class boards, so \
                              retry in {wait}s, or retry immediately once the attached \
                              hardware changes"
@@ -2221,6 +2232,20 @@ mod tests {
         assert!(
             msg.contains("moments ago"),
             "the refusal must be the cooldown, not a leaked single-flight flag: {:?}",
+            body2.0
+        );
+        // `OFN-u`: and it must not blame the caller for it. The daemon's own
+        // post-boot loop probes on this same guard, so the probe being rationed
+        // is frequently one the daemon made — the previous wording ("an OpenFan
+        // rescan over the same ports was attempted") asserted an action by the
+        // client. Asserted as the whole phrase rather than as an absence of
+        // "rescan": the word legitimately appears in the sibling single-flight
+        // message, so `!msg.contains("rescan")` would be a guard on the wrong
+        // string and would pass against any rewording at all.
+        assert!(
+            msg.contains("a probe over the same ports was attempted moments ago"),
+            "the cooldown message must name the actor neutrally — the probe it is \
+             rationing is often the daemon's own: {:?}",
             body2.0
         );
 

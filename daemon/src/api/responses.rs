@@ -958,6 +958,15 @@ pub struct ControlCapability {
     /// that appeared after boot, without a restart (DEC-265). An older daemon
     /// omits the field, so a client defaults it to `false` and hides the action
     /// rather than offering a button that 404s.
+    ///
+    /// **Hardcoded `true`, and correctly so — unlike the `devices.openfan` fields
+    /// this flag does NOT describe hardware** (`OFN-k`). It advertises the
+    /// *endpoint's* existence, which is a property of the build, so it stays
+    /// `true` on a machine that has never had a controller; the endpoint's job
+    /// there is to answer `503 hardware_unavailable`. The name invites the other
+    /// reading, which is why it is written down here: do not "fix" it to track
+    /// `openfan_present`, or a client on a controller-less machine loses the one
+    /// action that could adopt one.
     #[serde(default)]
     pub openfan_rescan: bool,
     /// `POST /config/profile-search-dirs` accepts a `remove` array, so a client
@@ -1264,11 +1273,27 @@ pub struct NvidiaGpuCapability {
 }
 
 /// OpenFanController capability details.
+///
+/// **Every field describes the attached hardware, and every one is derived from
+/// whether a controller is actually adopted (`OFN-k`, daemon >= 2.47.4).** Until
+/// that fix `channels` and `rpm_support` were the literals `10` and `true`, so a
+/// machine with no controller reported ten RPM-capable channels; a client that
+/// checked `present` first was unaffected, and one that did not was lied to.
+/// Read `present` first regardless — that is the field the other three qualify.
 #[derive(Debug, Clone, Serialize)]
 pub struct OpenfanCapability {
+    /// Whether an OpenFanController is adopted on this machine.
     pub present: bool,
+    /// Channel count of the attached controller, or `0` when none is attached.
+    /// Fixed at `NUM_CHANNELS` (10) for OpenFan v1 hardware, which is the only
+    /// hardware this daemon speaks to — so this varies with *presence*, not with
+    /// the device.
     pub channels: u8,
+    /// Whether the attached controller reports tachometer RPM. `false` when none
+    /// is attached.
     pub rpm_support: bool,
+    /// Whether PWM can be written to the attached controller. `false` when none
+    /// is attached.
     pub write_support: bool,
 }
 

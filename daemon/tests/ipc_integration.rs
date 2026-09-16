@@ -1048,6 +1048,109 @@ async fn capabilities_includes_intel_gpu_absent_by_default() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// `OFN-k`: `devices.openfan` describes the hardware, so with none attached it
+/// must report `channels: 0` / `rpm_support: false` — not the literals `10` and
+/// `true` it carried until 2.47.4.
+///
+/// Driven over the real route rather than against a hand-built
+/// `OpenfanCapability`, because the defect was in the **call site**: the struct
+/// was always able to hold `0`/`false`, and `api/responses.rs`'s serialisation
+/// test already proved it round-trips. What nothing exercised was the handler
+/// that fills it (`CLAUDE.md`: extracting a rule does not test the call site).
+#[tokio::test]
+async fn capabilities_openfan_absent_reports_no_channels() {
+    let state = test_app_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/capabilities").await;
+    assert_eq!(status, 200);
+    let of = &json["devices"]["openfan"];
+
+    // Precondition: this test is about the absent branch, and `test_app_state`
+    // populating the fan *cache* with OpenFan RPM does not adopt a controller.
+    // Without this, a future helper that did adopt one would turn the assertions
+    // below into a silent pass against the wrong branch.
+    assert_eq!(
+        of["present"], false,
+        "fixture must have no controller: {of}"
+    );
+
+    assert_eq!(
+        of["channels"], 0,
+        "no controller means no channels — reporting 10 tells a client that \
+         forgets to check `present` about hardware that does not exist: {of}"
+    );
+    assert_eq!(
+        of["rpm_support"], false,
+        "no controller means no tachs: {of}"
+    );
+    assert_eq!(of["write_support"], false);
+
+    // `control.openfan_rescan` is a hardcoded `true` and correctly so: it
+    // advertises the ENDPOINT, not the hardware, and a controller-less machine is
+    // exactly where a client needs that action offered. Asserted here so the fix
+    // above is never "completed" by making this one track presence too.
+    assert_eq!(
+        json["control"]["openfan_rescan"], true,
+        "the rescan flag describes the endpoint, not the hardware: {}",
+        json["control"]
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The opposite branch of `OFN-k`, without which a stuck `channels: 0` passes.
+///
+/// Asserts the RELATIONSHIP — `channels == NUM_CHANNELS` — rather than the
+/// literal 10. A test written as `== 10` is satisfied by the hardcoded literal
+/// this change removed, i.e. by the defect itself.
+#[tokio::test]
+async fn capabilities_openfan_present_reports_the_protocol_channel_count() {
+    let state = test_app_state();
+
+    struct DeadTransport;
+    impl control_ofc_daemon::serial::transport::SerialTransport for DeadTransport {
+        fn write_line(&mut self, _d: &str) -> Result<(), control_ofc_daemon::error::SerialError> {
+            Ok(())
+        }
+        fn read_line(
+            &mut self,
+            _t: std::time::Duration,
+        ) -> Result<String, control_ofc_daemon::error::SerialError> {
+            Err(control_ofc_daemon::error::SerialError::Timeout { timeout_ms: 1 })
+        }
+    }
+    let ctrl = control_ofc_daemon::serial::controller::FanController::new(
+        Box::new(DeadTransport),
+        state.cache.clone(),
+        std::time::Duration::from_millis(50),
+    );
+    *state.fan_controller.write() = Some(Arc::new(parking_lot::Mutex::new(ctrl)));
+
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/capabilities").await;
+    assert_eq!(status, 200);
+    let of = &json["devices"]["openfan"];
+
+    assert_eq!(
+        of["present"], true,
+        "precondition: controller adopted: {of}"
+    );
+    assert_eq!(
+        of["channels"],
+        control_ofc_daemon::serial::protocol::NUM_CHANNELS,
+        "an adopted controller reports the protocol layer's own channel count, \
+         so the wire cannot disagree with what `Channel::new` validates: {of}"
+    );
+    assert_eq!(of["rpm_support"], true);
+    assert_eq!(of["write_support"], true);
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
 /// Build an AppState carrying one NVIDIA GPU identity for the DEC-204
 /// capability/diagnostics boundary tests.
 fn test_app_state_with_nvidia_gpu(

@@ -1,10 +1,18 @@
 #compdef control-ofc-daemon
 
+# `T1-q`: no `=` suffix on any spec. In `_arguments`, `-opt=` means "the value
+# may be the next word OR joined in the same word after an `=`" (zshcompsys(1)),
+# but `resolve_config_path`/`parse_profile_arg` in daemon/src/main.rs match these
+# as EXACT strings and never split on `=`. A user who accepted the joined form
+# got `--profile=name`, which falls through the parser's `_ => {}` arm and is
+# silently ignored — the daemon boots with no profile and says nothing. The
+# separated form is the only one the parser accepts, so it is the only one
+# advertised here. `daemon/tests/packaging_version.rs` guards this.
 _control-ofc-daemon() {
     _arguments \
-        '--config=[Path to daemon.toml]:config path:_files' \
-        '--profile=[Load a named profile from search paths]:profile name:' \
-        '--profile-file=[Load a profile from an absolute file path]:profile path:_files' \
+        '--config[Path to daemon.toml]:config path:_files' \
+        '--profile[Load a named profile from search paths]:profile name:' \
+        '--profile-file[Load a profile from an absolute file path]:profile path:_files' \
         '--allow-non-root[Skip root privilege check (dev only)]'
 }
 

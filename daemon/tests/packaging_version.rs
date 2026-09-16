@@ -159,6 +159,120 @@ fn tray_completions_cover_every_flag_the_cli_accepts() {
     }
 }
 
+/// No zsh completion may advertise a joined `--opt=value` form, because neither
+/// CLI in this package splits on `=` (`T1-q`).
+///
+/// `zshcompsys(1)` on `_arguments`: an optspec ending `=` means "the argument may
+/// appear as the next word, **or in same word as the option name provided that it
+/// is separated from it by an equals sign**", and `+` means the same for a
+/// directly-abutted value. `resolve_config_path` and `parse_profile_arg`
+/// (`daemon/src/main.rs`) match `--config`/`--profile`/`--profile-file` as exact
+/// strings and fall through `_ => {}` on anything else; the tray's `parse_args`
+/// returns `Err`. So a user who accepted the joined form the completion offered
+/// got a flag the daemon silently ignored — it booted with no profile and said
+/// nothing — or a tray that refused to start.
+///
+/// **This is a category guard, not a list of the three specs that were wrong.**
+/// An opt-in list can only confirm the instances someone already thought of and
+/// can never discover a new one, which is the only thing the category is about
+/// (`WIRE-ak`, DEC-367). So it scans every optspec in every zsh completion and
+/// fails on any joining suffix at all, including on a flag added tomorrow.
+///
+/// `-optname-` (value must abut, no separator) is deliberately NOT checked: a
+/// trailing hyphen is indistinguishable from one inside a flag name, and
+/// `--profile-file` is such a name. `=` and `+` are the two that are both
+/// unambiguous and actually offered by the completion UI.
+#[test]
+fn zsh_completions_advertise_no_joined_value_form() {
+    let mut specs_seen = 0usize;
+    for file in ["_control-ofc-daemon", "_control-ofc-tray"] {
+        let path = format!("{}/../completions/{}", env!("CARGO_MANIFEST_DIR"), file);
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {file}: {e}"));
+
+        // Comments explain the rule and may quote the very syntax it forbids, so
+        // they must not be scanned — a source-scanning guard that matches its own
+        // explanation is a documented failure mode here (`CLAUDE.md`).
+        let body: String = text
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Single-quoted segments are the optspecs. `skip(1).step_by(2)` takes the
+        // inside of each quoted run, matching the extraction the tray guard above
+        // uses on double quotes.
+        for spec in body.split('\'').skip(1).step_by(2) {
+            if !spec.starts_with('-') {
+                continue; // `(-h --help)` mutex groups, `[explanation]` fragments
+            }
+            let name_len = spec
+                .char_indices()
+                .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_'))
+                .map_or(spec.len(), |(i, _)| i);
+            specs_seen += 1;
+            let suffix = spec[name_len..].chars().next();
+            assert!(
+                suffix != Some('=') && suffix != Some('+'),
+                "{file}: optspec `{spec}` advertises a joined value form \
+                 (`{}` suffix), but this package's CLI parsers match flags as \
+                 exact strings and never split on `=` — the joined form would be \
+                 silently ignored (daemon) or rejected (tray)",
+                suffix.unwrap_or(' ')
+            );
+        }
+    }
+
+    // Precondition, not decoration: a restructured completion this scan no longer
+    // understands yields zero specs, and the loop above then asserts nothing.
+    // Six today — four daemon flags, and two of the tray's three. The tray's
+    // `'(-h --help)'{-h,--help}'[…]'` is a mutex spec whose flag names sit in a
+    // brace expansion OUTSIDE the quotes, so it is not an optspec this scan can
+    // see; it is also the one form that cannot carry a joining suffix, because
+    // the explanation is appended to the expansion rather than to a name. (The
+    // first draft asserted seven and failed here, which is the precondition doing
+    // its job rather than a bug in the file.)
+    assert!(
+        specs_seen >= 6,
+        "extracted only {specs_seen} optspecs from the zsh completions — the scan \
+         no longer matches their shape, so this guard is vacuous and must be \
+         re-pointed"
+    );
+}
+
+/// The daemon's own three completion files reach the package, for the same reason
+/// the tray's must (`T1-q` was found in a file whose installation nothing pinned).
+#[test]
+fn daemon_completions_are_installed_by_the_package() {
+    let pkgbuild = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../packaging/PKGBUILD"
+    ))
+    .expect("read PKGBUILD");
+    let flat = pkgbuild.replace("\\\n", " ");
+    for (src, dest) in [
+        (
+            "completions/control-ofc-daemon.bash",
+            "/usr/share/bash-completion/completions/control-ofc-daemon",
+        ),
+        (
+            "completions/_control-ofc-daemon",
+            "/usr/share/zsh/site-functions/_control-ofc-daemon",
+        ),
+        (
+            "completions/control-ofc-daemon.fish",
+            "/usr/share/fish/vendor_completions.d/control-ofc-daemon.fish",
+        ),
+    ] {
+        let installed = flat
+            .lines()
+            .any(|l| l.contains("install -Dm644") && l.contains(src) && l.contains(dest));
+        assert!(
+            installed,
+            "packaging/PKGBUILD must `install -Dm644 {src}` to `{dest}`"
+        );
+    }
+}
+
 /// The three files above reach the package. Without this, `T1-f` could be closed
 /// by files that are never installed — which is the state this row describes.
 #[test]

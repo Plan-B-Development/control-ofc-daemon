@@ -1,5 +1,50 @@
 # Changelog
 
+## [2.47.4] — 2026-09-16
+
+**Three truthfulness fixes on surfaces a client or a user reads (DEC-370;
+register rows `OFN-k`, `OFN-u`, `T1-q`). No change to fan control, to any
+commanded duty, or to the thermal emergency.**
+
+**`GET /capabilities` advertised OpenFan hardware that was not there (`OFN-k`).**
+`devices.openfan.channels` and `rpm_support` were the literals `10` and `true`
+regardless of whether a controller was attached — only `write_support` was
+derived — so a machine that has never had an OpenFanController reported ten
+RPM-capable channels. Both fields are now derived from presence: `0` and `false`
+with no controller, and the present-branch count comes from the protocol layer's
+own `NUM_CHANNELS` rather than a second literal that could drift away from the
+first. **No user-visible change in this GUI**, which reads `channels` only inside
+its `present` branch; the point is that the next client to forget that check is
+no longer lied to. `control.openfan_rescan` stays hardcoded `true` and is
+correct: it advertises the *endpoint*, not the hardware, and a controller-less
+machine is exactly where that action must still be offered.
+
+**The rescan cooldown blamed the user for a probe the daemon had made
+(`OFN-u`).** `POST /fans/openfan/rescan` refuses a repeat probe over an unchanged
+port set with a `409`, and the message read *"an OpenFan rescan over the same
+ports was attempted moments ago"* — but the post-boot adoption loop probes
+through the same handler, so the probe being rationed is frequently the daemon's
+own. It now reads *"a probe over the same ports was attempted moments ago"*. The
+rationing itself is unchanged, and `retryable: true` and the named wait are
+unchanged. `docs/08_API_Integration_Contract.md` (GUI repo) is updated in the
+same change, including a correction it had been owed since 2026-09-12: that
+document claimed a retry over newly attached hardware is "*not* refused", which
+is false once the loop has probed first — `RescanGuard`'s drop re-stamps the
+cooldown with the **new** candidate set, so a user clicking inside the 10-second
+window meets `elapsed < COOLDOWN && same_port_set(new)` and is refused.
+
+**The zsh completion offered a `--opt=value` form the daemon silently ignores
+(`T1-q`).** `_control-ofc-daemon` declared `--config=`, `--profile=` and
+`--profile-file=`, and in `_arguments` a trailing `=` means the value may be
+joined to the option name with an equals sign. `resolve_config_path` and
+`parse_profile_arg` match those flags as exact strings and never split on `=`,
+so accepting the completion literally produced `--profile=name`, which fell
+through the parser's catch-all arm — the daemon booted with no profile and said
+nothing. The three specs now advertise only the separated form the parser
+accepts. The bash and fish completions were already correct, and the tray's
+instance was fixed in 2.44.2. A new guard fails on *any* joining suffix in
+*any* zsh completion, so a flag added tomorrow cannot reintroduce it.
+
 ## [2.47.3] — 2026-09-16
 
 **Three shutdown- and executor-correctness fixes in the OpenFan adoption path
