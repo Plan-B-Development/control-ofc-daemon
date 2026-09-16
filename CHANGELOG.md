@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+### Documentation
+
+**The man page described the thermal ladder in two ways that were wrong, plus one
+that was missing.** `control-ofc-daemon(1)` said the post-emergency 60% recovery
+floor holds "for one cycle" — it holds **two**, the release cycle and one more —
+and said the emergency "drives all fans to 100% PWM", which GPU fans are
+structurally excluded from (DEC-130: `GpuBackend` does not implement
+`SafetyWriteBackend`). It also omitted DEC-307 entirely: all three forced duties
+are **floors** over the active profile's output, `max(commanded, forced)`, never
+replacements for it — which is what stops the 60% and 40% rungs ever *lowering*
+cooling. Every other prose site in both repos already stated all three correctly,
+so this was one stale page rather than a disagreement about the rule. **No daemon
+behaviour changed**; only what the shipped man page claims about it.
+
+`daemon.md`'s module map also gained the three current modules it omitted —
+`serial/adoption.rs`, `hwmon/plausibility.rs` (the cross-sensor filter that stops a
+bogus-LOW CPU reading defeating DEC-190's 40% fallback) and `hwmon/power.rs` — and
+its "25C hysteresis" aside no longer bakes in `105 − 80`, an arithmetic DEC-308's
+per-machine trip point falsifies on any part that derives a higher limit.
+
+Register rows `DOC-a`, `DOC-b`, `DOC-c` and `DOC-i`, from the 2026-09-16
+`/ofc:docs-correctness` audit.
+
 ### Internal
 
 **Nothing you can see changed, and nothing the daemon does changed.** A PWM

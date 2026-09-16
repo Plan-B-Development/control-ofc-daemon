@@ -41,11 +41,20 @@ daemon/src/
     real_transport.rs  — serialport impl + auto-detect
     protocol.rs        — OpenFan wire protocol encode/decode
     controller.rs      — FanController (set_pwm, read_rpm, calibration)
+    adoption.rs        — [SAFETY] the single path deciding which port becomes the fan
+                         controller, shared by boot adoption and POST /fans/openfan/rescan
+                         (DEC-265). One copy on purpose — two would be two chances to skip
+                         the DEC-250 identity handshake. Detailed below
 
   hwmon/
     mod.rs             — hwmon subsystem re-exports
     discovery.rs       — sensor enumeration + stable ID generation
     reader.rs          — temperature reading from sysfs
+    plausibility.rs    — [SAFETY] cross-sensor plausibility filter for CPU temps (`294-c`).
+                         reader.rs's [-50, 250]C bound (DEC-288) is per-sensor, so it
+                         cannot see a value that is absurd only beside its neighbours. The
+                         bogus-LOW CPU channel is the dangerous case because it is silent:
+                         the sensor IS present, so DEC-190's 40% floor never engages
     types.rs           — SensorKind, SensorReading, SensorDescriptor
     inventory.rs       — structured read-only hwmon inventory: temps + PWM headers + monitor-only tachometers (DEC-200)
     classify.rs        — refines each temp sensor's CPU/motherboard classification for the inventory (DEC-200)
@@ -93,6 +102,10 @@ daemon/src/
                          carries `identified` — true only where the driver labelled the
                          channel; an unlabelled channel is a raw ADC pin whose reading
                          is NOT the rail voltage. Read-only sysfs, no port I/O
+    power.rs           — CPU package power, read only inside a validation session
+                         (DEC-335). Never on the 1 Hz poll and never consulted by the
+                         control path. Deliberately NOT a SensorReading — a watt in
+                         `value_c` would lie to curve binding and the thermal path
     util.rs            — shared sysfs path helpers
 
   health/
@@ -298,7 +311,10 @@ gating each have their own register rows and regression tests.
    - GPU fans are deliberately excluded (DEC-130) — there is no GPU emergency
      threshold; AMD PMFW firmware owns GPU thermal protection (junction-temp
      throttling, firmware fan ramp) independently of OS fan control
-   - Holds until CpuTemp <= 80C (25C hysteresis)
+   - Holds until CpuTemp <= 80C. The release threshold is a genuine constant
+     (THERMAL_EMERGENCY_RELEASE_C), but the hysteresis SPAN is not — it follows
+     the per-machine trip point: 25C at the 105 floor, 35C at the 115 cap. Do
+     not restate the span as a fixed number (DEC-292/305)
    - 60% recovery floor for two cycles after release (the release cycle + a
      one-cycle recovery floor), then control returns to the profile
    - If no CpuTemp sensor is found — or none is still updating (DEC-267: a

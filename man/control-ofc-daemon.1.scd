@@ -18,10 +18,18 @@ autonomously.
 
 The daemon owns thermal safety: the emergency limit (at least 105°C, raised
 per-machine to min(CPU-reported design ceiling + 5°C, 115°C) where the kernel
-publishes the ceiling) drives all fans to 100% PWM, holds
-until temperature falls below 80°C, then applies a 60% PWM recovery floor
-for one cycle before returning to active control. Forces 40% if no CPU
-sensor is reachable for 5 consecutive poll cycles.
+publishes the ceiling) drives every OpenFan channel and writable hwmon header
+present on the machine to 100% PWM, holds until temperature falls below 80°C,
+then applies a 60% PWM recovery floor for two cycles (the release cycle and one
+more) before returning to active control. Forces 40% if no CPU sensor is
+reachable for 5 consecutive poll cycles.
+
+All three duties are *floors* over the active profile's output, never
+replacements for it: each output receives max(commanded, forced), and an output
+no control commands still receives the forced duty. The ladder can therefore
+only raise a fan, never lower one. GPU fans are excluded by design — there is no
+GPU emergency threshold, because AMD PMFW firmware owns GPU thermal protection
+independently of OS fan control.
 
 # OPTIONS
 
