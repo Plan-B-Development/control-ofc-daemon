@@ -260,6 +260,85 @@ pub struct OpenFanRuntime {
     pub shutdown: tokio::sync::watch::Receiver<bool>,
 }
 
+/// Poll-loop handles for post-boot OpenFan adoptions, plus the one-way flag that
+/// closes registration once shutdown has begun (`OFN-t`).
+///
+/// The flag and the list live under **one** lock deliberately. Splitting them —
+/// an `AtomicBool` beside a `Mutex<Vec<_>>`, say — would let an installer read
+/// "open", be descheduled, and push after the drain had already taken
+/// everything: precisely the race this type exists to remove. Closing-and-taking
+/// is one critical section; so is checking-then-registering
+/// ([`AppState::adopt_openfan_controller`], the only thing that may push).
+#[derive(Default)]
+pub struct AdoptedTasks {
+    handles: Vec<tokio::task::JoinHandle<()>>,
+    closed: bool,
+}
+
+impl AdoptedTasks {
+    /// Whether registration has closed — i.e. shutdown has taken the list.
+    ///
+    /// Only meaningful while the caller still holds the guard it was read
+    /// through. A caller that drops the lock between this and a `push` has
+    /// reintroduced the race.
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Register a poll handle.
+    ///
+    /// Deliberately **private to this module**, so the only route to it is
+    /// [`AppState::adopt_openfan_controller`], which checks [`Self::is_closed`]
+    /// under the same guard. A public `push` would be an invitation to do the
+    /// check-then-act across two lock acquisitions.
+    fn push(&mut self, handle: tokio::task::JoinHandle<()>) {
+        debug_assert!(
+            !self.closed,
+            "a poll handle was registered after registration closed — it will never be joined"
+        );
+        self.handles.push(handle);
+    }
+
+    /// Close registration and take everything registered so far, atomically.
+    ///
+    /// The ONE call `main` makes at shutdown. Closing and taking must be the
+    /// same critical section: closing first and draining second would let an
+    /// install that had already passed its check push into a list that was about
+    /// to be emptied, and draining first would leave the window open for a
+    /// fresh registration.
+    pub fn close_and_drain(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
+        self.closed = true;
+        std::mem::take(&mut self.handles)
+    }
+
+    /// Whether any poll loop is registered.
+    ///
+    /// The only accessor a caller needs. A sibling `len()` was written alongside
+    /// it and had no caller at all — a public method produced and read by
+    /// nothing is the `ACK-y`/`AU-h` shape, and clippy cannot see it because
+    /// `pub` items in a lib are never dead code.
+    pub fn is_empty(&self) -> bool {
+        self.handles.is_empty()
+    }
+}
+
+/// What [`AppState::adopt_openfan_controller`] did (DEC-265/266, `OFN-t`).
+///
+/// Module-private for the same reason the method is: it appears in no public
+/// signature, so widening it would only widen the set of callers whose closures
+/// have to obey a rule the type cannot state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AdoptOutcome {
+    /// Installed, and its poll loop is registered for the shutdown drain.
+    Adopted,
+    /// A concurrent adoption had already installed one; this controller was
+    /// discarded rather than replacing the live one (DEC-266).
+    AlreadyAdopted,
+    /// Registration has closed — the daemon is shutting down, so nothing was
+    /// installed and no loop was started.
+    ShuttingDown,
+}
+
 /// Shared application state passed to all handlers.
 pub struct AppState {
     pub cache: Arc<StateCache>,
@@ -359,8 +438,9 @@ pub struct AppState {
     /// A successful adoption never reaches the check at all: the handler returns
     /// early once a controller is connected.
     pub last_openfan_rescan: Arc<Mutex<Option<LastRescan>>>,
-    /// Poll-loop handles for OpenFan controllers adopted *after* boot (DEC-265,
-    /// register row 277-c).
+    /// Poll-loop handles for OpenFan controllers adopted *after* boot, and the
+    /// flag that closes registration at shutdown (DEC-265, register rows 277-c
+    /// and `OFN-t`).
     ///
     /// `main` builds its `task_handles` list once at startup, long before a
     /// rescan can adopt anything, so a poll loop spawned by the rescan path had
@@ -370,7 +450,17 @@ pub struct AppState {
     /// established for a rescan-adopted controller, and any future write added
     /// there would have fallen silently outside the drain invariant. Drained
     /// alongside `task_handles` so the invariant holds for both.
-    pub adopted_poll_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    ///
+    /// **The drain alone did not establish it, which is `OFN-t`.** `main` drained
+    /// this list into `task_handles` and only *then* called `finish_shutdown`,
+    /// whose first act is to set the shutdown watch — so the drain provably runs
+    /// BEFORE the signal, and an adoption completing in between registered a
+    /// handle into a list nothing would read again. Nothing on the install path
+    /// consulted a shutdown signal at any point, so a controller could be
+    /// installed and its loop spawned after `restore_hardware()` had run. It is
+    /// a [`AdoptedTasks`] rather than a bare `Vec` for exactly that: closing and
+    /// draining is one critical section, and so is checking-then-registering.
+    pub adopted_poll_tasks: Arc<Mutex<AdoptedTasks>>,
     /// Detected AMD GPU info (populated at startup). Empty if no AMD GPU found.
     pub amd_gpus: Vec<crate::hwmon::gpu_detect::AmdGpuInfo>,
     /// Detected Intel discrete GPU info (populated at startup). Empty if none
@@ -530,6 +620,83 @@ impl AppState {
     /// runtime, and a handler that held it open would block a rescan.
     pub fn openfan(&self) -> Option<Arc<Mutex<FanController>>> {
         self.fan_controller.read().clone()
+    }
+
+    /// Install a freshly probed OpenFanController and start its poll loop —
+    /// **or refuse, in one critical section** (DEC-265/266, `OFN-t`).
+    ///
+    /// [SAFETY] This is the only place a post-boot adoption may install, and the
+    /// only route to [`AdoptedTasks::push`]. Three things have to be indivisible
+    /// and this is what makes them so:
+    ///
+    /// 1. the shutdown check, so a controller is never installed into a daemon
+    ///    that has already restored its hardware and is on its way out;
+    /// 2. the DEC-266 conditional install, so two concurrent adoptions cannot
+    ///    both write the slot and leave one poll loop reading a transport
+    ///    nothing writes through;
+    /// 3. the 277-c handle registration, so the loop this spawns is in the list
+    ///    `shutdown_sequence` drains.
+    ///
+    /// Doing (1) and (3) under separate acquisitions is the `OFN-t` race itself:
+    /// `main` takes the list and closes it in one go, so an installer holding
+    /// this guard either registers into a list that will still be drained, or
+    /// sees `closed` and does not install at all. There is no third outcome.
+    ///
+    /// **Lock order is `adopted_poll_tasks` → `fan_controller`, and nothing
+    /// takes them the other way round** — [`Self::openfan`] takes only the
+    /// controller lock and drops it, and `main`'s shutdown drain takes only this
+    /// one.
+    ///
+    /// **`start_poll_loop` runs under the guard, and must therefore be a bare
+    /// `tokio::spawn` — no blocking, no `.await`.** `main`'s `close_and_drain()`
+    /// waits on this same lock, on the shutdown path, ahead of
+    /// `restore_hardware()`, so a closure that did real work here would delay the
+    /// hardware restore. **That is why this method is module-private rather than
+    /// `pub`**: a rule your code needs is a rule your code should enforce
+    /// (DEC-361), and stating it in a doc comment on a `pub` signature enforces
+    /// nothing. Private to `api::handlers`, the set of callers is the one below
+    /// plus anything a future edit to this module adds, which is a set a reader
+    /// can actually check. Taking a `JoinHandle` by value instead was considered
+    /// and rejected: it would spawn the poll loop *before* the install race is
+    /// decided, so a losing probe's loop could write RPM into the shared cache
+    /// before it was aborted.
+    fn adopt_openfan_controller(
+        &self,
+        controller: FanController,
+        start_poll_loop: impl FnOnce() -> tokio::task::JoinHandle<()>,
+    ) -> AdoptOutcome {
+        let mut adopted = self.adopted_poll_tasks.lock();
+        if adopted.is_closed() {
+            return AdoptOutcome::ShuttingDown;
+        }
+
+        // DEC-266: check AND set under one write guard. The caller's
+        // `already_connected` early return and its single-flight CAS are two
+        // adjacent statements with no `.await` between them, but on the
+        // multi-thread runtime two handlers on different OS threads can still
+        // interleave there — B reads the slot empty, A wins the CAS, probes,
+        // installs and releases, then B's CAS succeeds and B installs a SECOND
+        // controller over A's. The engine only re-reads the slot while it has no
+        // backend, so it would keep writing through A's controller while B's
+        // poll loop read a different transport.
+        let won = {
+            let mut slot = self.fan_controller.write();
+            if slot.is_none() {
+                *slot = Some(Arc::new(Mutex::new(controller)));
+                true
+            } else {
+                false
+            }
+        };
+        if !won {
+            return AdoptOutcome::AlreadyAdopted;
+        }
+
+        // Install BEFORE spawning the loop: the engine polls this slot every
+        // tick while it has no backend, and a controller that is reachable but
+        // not yet polled is strictly better than the reverse.
+        adopted.push(start_poll_loop());
+        AdoptOutcome::Adopted
     }
 
     /// The current header-role assignment map (DEC-311).

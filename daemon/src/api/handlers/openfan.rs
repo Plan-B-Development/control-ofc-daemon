@@ -9,7 +9,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 
-use super::{error_response, json_ok, AppState, LastRescan};
+use super::{error_response, json_ok, AdoptOutcome, AppState, LastRescan};
 use crate::api::responses::*;
 use crate::serial::controller::FanControlError;
 
@@ -31,9 +31,19 @@ const OPENFAN_RESCAN_COOLDOWN: Duration = Duration::from_secs(10);
 
 /// How often the post-boot adoption loop ENUMERATES (it rarely probes).
 ///
-/// Enumeration is a config read plus a sysfs scan and opens nothing, so this
-/// interval is what bounds "how long after a device appears until the daemon
-/// notices it". Five seconds keeps that inside a user's attention span.
+/// Enumeration opens no *candidate* port — that is what lets it run on a timer
+/// at all — so this interval is what bounds "how long after a device appears
+/// until the daemon notices it". Five seconds keeps that inside a user's
+/// attention span.
+///
+/// **It is not free, and the flat "opens nothing" it used to claim was wrong
+/// (`OFN-x`).** `serialport::available_ports()` opens the devnode of any tty
+/// whose parent driver is `serial8250`, *before*
+/// [`crate::serial::real_transport::enumerate_serial_candidates`]'s
+/// `ttyACM`/`ttyUSB` filter runs — a blocking `open(2)`. Harmless on the
+/// packaged daemon, whose unit carries `DeviceAllow=char-ttyACM/ttyUSB`, but
+/// blocking all the same, which is why the loop runs it under `spawn_blocking`
+/// rather than inline on a runtime worker.
 pub const POST_BOOT_ADOPTION_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Probes permitted over an UNCHANGED candidate set, after a change (`OFN-r`).
@@ -110,6 +120,71 @@ fn probe_stamp(state: &AppState) -> Option<Instant> {
     state.last_openfan_rescan.lock().as_ref().map(|l| l.at)
 }
 
+/// Build the candidate list on the BLOCKING pool, never on a runtime worker
+/// (`OFN-x`).
+///
+/// [`crate::serial::real_transport::enumerate_serial_candidates`] opens no
+/// *candidate* port — that is what lets the rescan cooldown ration DTR resets at
+/// all, and it is load-bearing — but `serialport::available_ports()` opens the
+/// devnode of any tty whose parent driver is `serial8250` *before* the
+/// `ttyACM`/`ttyUSB` filter runs. That is a blocking `open(2)`, and
+/// [`post_boot_adoption_loop`] runs it every
+/// [`POST_BOOT_ADOPTION_INTERVAL`] for the whole adoption window, so inline it
+/// would park a runtime worker on somebody's serial bus once every five seconds
+/// for 60-180 s of every boot. It was reachable only on an explicit user rescan
+/// before the loop existed, which is why the cadence — not the call — is what
+/// changed.
+///
+/// The enumerator is a parameter so the property above is testable without a
+/// serial bus: a test can pass a genuinely blocking double and observe that the
+/// executor kept running. Production passes the real one.
+///
+/// **`None` means "could not enumerate", and must NOT be flattened to an empty
+/// set.** The first draft returned `Vec::new()` on a `JoinError`, with a comment
+/// arguing that was bounded because an empty set differs from the last probed set
+/// exactly once. Both halves were wrong, and the review found them. An empty set
+/// **bypasses [`crate::serial::adoption::serial_port_candidates_enumerated`]
+/// entirely**, so a configured `[serial] port` — which that function prepends
+/// unconditionally, without enumerating anything — is dropped from the candidate
+/// list too. And a failure that alternates with success makes *every* alternation
+/// a set change, so [`probe_decision`] returns `Probe::Fresh` and **refreshes**
+/// the retry budget each time rather than spending it: the "an unchanged bus is
+/// never re-probed" guarantee is gone, and the only remaining bound is
+/// [`OPENFAN_RESCAN_COOLDOWN`] at one DTR sweep per ten seconds — 6-18 per window,
+/// which is the number [`post_boot_adoption_loop`]'s own doc calls worse than the
+/// twelve `OFN-b` removed. A failed enumeration is *unknown*, not *empty*, and the
+/// caller skips the tick.
+async fn enumerate_off_executor<E>(configured: Option<String>, enumerate: E) -> Option<Vec<String>>
+where
+    E: FnOnce() -> Vec<String> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(move || {
+        crate::serial::adoption::serial_port_candidates_enumerated(configured.as_deref(), enumerate)
+    })
+    .await
+    {
+        Ok(candidates) => Some(candidates),
+        Err(e) => {
+            log::warn!("serial enumeration task failed: {e} — skipping this adoption tick");
+            None
+        }
+    }
+}
+
+/// The post-boot adoption window closed with nothing adopted, and no probe in
+/// flight — so the advice is true.
+///
+/// Extracted because it is emitted from two arms of two different `select!`s and
+/// a drifting copy of an operator-facing line is its own defect. The third
+/// deadline arm — the one that fires while a probe is still running — deliberately
+/// says something else (`OFN-c`): that probe is detached and may yet adopt.
+fn log_adoption_window_expired(window: Duration) {
+    log::debug!(
+        "No OpenFanController appeared within the post-boot adoption window \
+         ({window:?}) — use POST /fans/openfan/rescan if one is attached later"
+    );
+}
+
 /// Keep looking for an OpenFanController after boot, off the critical path.
 ///
 /// [SAFETY] This is what makes a one-attempt boot safe (`OFN-r`, `OFN-s`).
@@ -155,7 +230,14 @@ fn probe_stamp(state: &AppState) -> Option<Instant> {
 /// does instead is read [`probe_stamp`] either side of the call and spend only
 /// when it moved.
 ///
-/// Stops early on the first adoption, and on shutdown.
+/// **Stops early on the first adoption, and on shutdown — including while a
+/// probe is still running (`OFN-v`).** The probe itself cannot be cancelled and
+/// is not: it is detached so a dropped caller never discards a controller that
+/// was found (DEC-266). Only the waiting stops, which is what keeps a SIGTERM
+/// mid-probe from adding `SHUTDOWN_TASK_TIMEOUT` to shutdown. An install that
+/// lands after this task has returned is safe because
+/// [`AppState::adopt_openfan_controller`] is the only route to one: it either
+/// registers into a list `shutdown_sequence` will still drain, or refuses.
 pub async fn post_boot_adoption_loop(
     state: Arc<AppState>,
     window: Duration,
@@ -171,10 +253,11 @@ pub async fn post_boot_adoption_loop(
         interval,
         shutdown,
         boot_candidates,
-        // Enumerate — a config read plus a sysfs scan, opening nothing.
+        // Enumerate, OFF the executor (`OFN-x`) — see `enumerate_off_executor`.
         move || {
-            crate::serial::adoption::serial_port_candidates_enumerated(
-                enumerating.running_config.serial.port.as_deref(),
+            let configured = enumerating.running_config.serial.port.clone();
+            enumerate_off_executor(
+                configured,
                 crate::serial::real_transport::enumerate_serial_candidates,
             )
         },
@@ -200,7 +283,7 @@ pub async fn post_boot_adoption_loop(
 /// and there is no way to produce one from a real handler without a serial bus to
 /// stage. Production passes the real enumeration and the real handler, so the
 /// tested body is the shipped body rather than a model of it.
-async fn post_boot_adoption_loop_with<E, P, Fut>(
+async fn post_boot_adoption_loop_with<E, EFut, P, PFut>(
     state: Arc<AppState>,
     window: Duration,
     interval: Duration,
@@ -209,9 +292,10 @@ async fn post_boot_adoption_loop_with<E, P, Fut>(
     mut enumerate: E,
     mut probe: P,
 ) where
-    E: FnMut() -> Vec<String>,
-    P: FnMut() -> Fut,
-    Fut: std::future::Future<Output = ()>,
+    E: FnMut() -> EFut,
+    EFut: std::future::Future<Output = Option<Vec<String>>>,
+    P: FnMut() -> PFut,
+    PFut: std::future::Future<Output = ()>,
 {
     // Seeded with what BOOT already probed, so an unchanged bus is never
     // re-probed at all — and a device that appeared between boot's probe and this
@@ -244,10 +328,7 @@ async fn post_boot_adoption_loop_with<E, P, Fut>(
         tokio::select! {
             _ = shutdown.changed() => return,
             _ = tokio::time::sleep_until(deadline) => {
-                log::debug!(
-                    "No OpenFanController appeared within the post-boot adoption window \
-                     ({window:?}) — use POST /fans/openfan/rescan if one is attached later"
-                );
+                log_adoption_window_expired(window);
                 return;
             }
             _ = ticker.tick() => {}
@@ -262,7 +343,32 @@ async fn post_boot_adoption_loop_with<E, P, Fut>(
 
         // Probe only if the world actually changed since the last thing that DID
         // probe, or if the handshake-retry budget still has something in it.
-        let candidates = enumerate();
+        //
+        // `OFN-v`, second await. Enumeration was a synchronous call until `OFN-x`
+        // moved it to the blocking pool, and a `spawn_blocking` cannot be
+        // cancelled — so leaving this await unguarded put the same unobserved wait
+        // back one line above the one that had just been fixed. `available_ports()`
+        // opens each `serial8250` devnode (with `O_NONBLOCK`, so it cannot hang,
+        // but it is not free either) and this task is drained ahead of
+        // `restore_hardware()`. Returning abandons the wait, never the work: the
+        // blocking task finishes on its own and its result is simply dropped.
+        let candidates = tokio::select! {
+            c = enumerate() => c,
+            _ = shutdown.changed() => return,
+            _ = tokio::time::sleep_until(deadline) => {
+                // Truthful here, unlike the probe arm below: nothing is in flight
+                // that could still adopt.
+                log_adoption_window_expired(window);
+                return;
+            }
+        };
+        // `None` is "could not enumerate", never "no ports" — see
+        // `enumerate_off_executor`. Skipping leaves `last_probed` and
+        // `retries_left` untouched, so a failure costs nothing and cannot be
+        // mistaken for the bus changing.
+        let Some(candidates) = candidates else {
+            continue;
+        };
         let decision = probe_decision(&last_probed, &candidates, retries_left);
         match decision {
             Probe::Skip => continue,
@@ -287,7 +393,38 @@ async fn post_boot_adoption_loop_with<E, P, Fut>(
         // openfan_be`, so a missed adoption is the thermal emergency losing its
         // only route to those fans.
         let before = probe_stamp(&state);
-        probe().await;
+        // `OFN-v`: the probe is the one place this loop waits for something it
+        // does not control, and it used to wait for it unconditionally — so a
+        // SIGTERM landing mid-probe added up to `SHUTDOWN_TASK_TIMEOUT` (3 s) to
+        // shutdown while `main` sat in the per-task drain, and a probe started
+        // just under the deadline ran the window past its own end.
+        //
+        // Returning does NOT cancel the probe, and cannot: the handler's work is
+        // an uncancellable `spawn_blocking` behind a oneshot, and it is detached
+        // precisely so a dropped caller never discards a controller that was
+        // found (DEC-266). All that stops is this loop *waiting* for it. That was
+        // the reason this row was left unfixed — abandoning the wait meant the
+        // install could land after the task had returned and register a handle
+        // nothing would join, i.e. it traded a bounded delay for a more likely
+        // `OFN-t`. `AdoptedTasks` removes that trade: a late install either
+        // registers into a list that will still be drained, or is refused.
+        tokio::select! {
+            _ = probe() => {}
+            _ = shutdown.changed() => return,
+            _ = tokio::time::sleep_until(deadline) => {
+                // Deliberately NOT `log_adoption_window_expired` (`OFN-c`). A
+                // probe is still running, it is detached, and it will install
+                // whatever it finds — so telling the operator that nothing
+                // appeared and that they should run a rescan would be advice to
+                // act on a conclusion that has not been reached.
+                log::debug!(
+                    "The post-boot adoption window ({window:?}) expired while a probe was \
+                     still running — that probe is detached and will still adopt a \
+                     controller if it finds one"
+                );
+                return;
+            }
+        }
         if decision == Probe::Retry && probe_stamp(&state) != before {
             retries_left -= 1;
         }
@@ -513,6 +650,29 @@ pub async fn openfan_rescan_handler(
     use crate::serial::real_transport::{enumerate_serial_candidates, RealSerialTransport};
     use crate::serial::transport::SerialTransport;
 
+    // `OFN-t`, first thing and before anything touches the bus. The
+    // authoritative check is the one inside `adopt_openfan_controller`, which
+    // holds the lock that makes it race-free; this one is an early out, and it
+    // is here rather than beside the CAS because ENUMERATION itself is not free.
+    // `available_ports()` opens the devnode of any tty whose parent driver is
+    // `serial8250` before the ttyACM/ttyUSB filter runs, and `first_openfan_port`
+    // then opens every candidate — each open asserts DTR and resets
+    // Arduino-class boards. Walking somebody's bus on behalf of a daemon that is
+    // already restoring hardware and exiting buys nothing at all.
+    //
+    // Being racy is fine HERE and only here: the watch can flip the instant
+    // after this reads it, and the probe then runs to completion and is refused
+    // at the install instead. What this cannot do is let an adoption through —
+    // that is the other check's job.
+    if *state.openfan_runtime.shutdown.borrow() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::hardware_unavailable(
+                "the daemon is shutting down — no OpenFan probe was started",
+            ),
+        );
+    }
+
     let timeout = state.openfan_runtime.timeout;
     let configured = state.running_config.serial.port.clone();
     // Enumerating candidates is a config read plus a sysfs/dev scan. It does NOT
@@ -651,43 +811,19 @@ pub async fn openfan_rescan_handler(
                 let ctrl =
                     FanController::new_shared(shared.clone(), task_state.cache.clone(), timeout);
 
-                // Install BEFORE spawning the loop: the engine polls this slot
-                // every tick while it has no backend, and a controller that is
-                // reachable but not yet polled is strictly better than the
-                // reverse.
-                //
-                // DEC-266: check AND set under one write guard. The
-                // `already_connected` early return and the CAS above are two
-                // adjacent statements with no `.await` between them, but on the
-                // multi-thread runtime two handlers on different OS threads can
-                // still interleave there — B reads the slot empty, A wins the CAS,
-                // probes, installs and releases, then B's CAS succeeds and B
-                // installs a SECOND controller over A's. The engine only re-reads
-                // the slot while it has no backend, so it would keep writing
-                // through A's controller while B's poll loop read a different
-                // transport. Making the install itself conditional closes the
-                // window and makes `polling.rs`'s "written once, never replaced"
-                // invariant true rather than nearly true.
-                let won = {
-                    let mut slot = task_state.fan_controller.write();
-                    if slot.is_none() {
-                        *slot = Some(Arc::new(parking_lot::Mutex::new(ctrl)));
-                        true
-                    } else {
-                        false
-                    }
-                };
-
-                if !won {
-                    log::warn!(
-                        "OpenFanController found on {port} but another rescan had already \
-                         adopted one — discarding this probe rather than replacing it"
-                    );
-                    RescanOutcome::AlreadyAdopted
-                } else {
-                    let rt = task_state.openfan_runtime.clone();
-                    let poll_cache = task_state.cache.clone();
-                    let poll_handle = tokio::spawn(async move {
+                // The install, the DEC-266 conditional and the 277-c handle
+                // registration all happen inside `adopt_openfan_controller`,
+                // under ONE lock (`OFN-t`). They used to be three statements
+                // here, and the shutdown check that belongs with them was
+                // nowhere at all — `main` drains the handle list *before*
+                // `finish_shutdown` sets the shutdown watch, so an adoption
+                // completing in between registered a poll loop that nothing
+                // would ever join, and one completing later could install a
+                // controller after `restore_hardware()` had already run.
+                let rt = task_state.openfan_runtime.clone();
+                let poll_cache = task_state.cache.clone();
+                match task_state.adopt_openfan_controller(ctrl, || {
+                    tokio::spawn(async move {
                         crate::polling::openfan_poll_loop(
                             poll_cache,
                             shared,
@@ -696,23 +832,34 @@ pub async fn openfan_rescan_handler(
                             rt.shutdown,
                         )
                         .await;
-                    });
-                    // 277-c: register the handle so `shutdown_sequence` DRAINS
-                    // this loop, not merely signals it. `main`'s `task_handles`
-                    // was built at boot and cannot know about a loop started
-                    // here. Nothing in this loop writes PWM today, so the fix is
-                    // pre-emptive — but the drain invariant is what makes the
-                    // restore the guaranteed last writer, and a loop outside it
-                    // would break that silently the first time one did.
-                    task_state.adopted_poll_handles.lock().push(poll_handle);
-
-                    // Deliberately no trigger in the wording: this path is reached both by
-                    // `POST /fans/openfan/rescan` and by the post-boot adoption loop,
-                    // and the old "via rescan" told an operator they had performed an
-                    // action they had not (`OFN-c` is a log-honesty register). Each
-                    // caller records its own context.
-                    log::info!("OpenFanController adopted on {port}");
-                    RescanOutcome::Adopted(port)
+                    })
+                }) {
+                    AdoptOutcome::Adopted => {
+                        // Deliberately no trigger in the wording: this path is reached both by
+                        // `POST /fans/openfan/rescan` and by the post-boot adoption loop,
+                        // and the old "via rescan" told an operator they had performed an
+                        // action they had not (`OFN-c` is a log-honesty register). Each
+                        // caller records its own context.
+                        log::info!("OpenFanController adopted on {port}");
+                        RescanOutcome::Adopted(port)
+                    }
+                    AdoptOutcome::AlreadyAdopted => {
+                        log::warn!(
+                            "OpenFanController found on {port} but another rescan had already \
+                             adopted one — discarding this probe rather than replacing it"
+                        );
+                        RescanOutcome::AlreadyAdopted
+                    }
+                    AdoptOutcome::ShuttingDown => {
+                        // Found, identified, and deliberately discarded. Logged at
+                        // info rather than warn: it is the correct outcome, not a
+                        // fault, and the operator asked for the shutdown.
+                        log::info!(
+                            "OpenFanController found on {port} while the daemon was shutting \
+                             down — not adopted; it will be picked up on the next start"
+                        );
+                        RescanOutcome::ShuttingDown
+                    }
                 }
             }
             Ok(None) => RescanOutcome::NotFound,
@@ -755,6 +902,18 @@ pub async fn openfan_rescan_handler(
                 message: "an OpenFanController is already connected".into(),
             },
         ),
+        // Deliberately NOT reported as `NotFound`: a controller was found and
+        // identified, and telling the operator otherwise is the log/report
+        // dishonesty the `OFN-*` register exists for (`OFN-c`). Same 503
+        // `hardware_unavailable` code — this is retryable and self-clearing on
+        // the next start — with a message that says which of the two happened.
+        Ok(RescanOutcome::ShuttingDown) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::hardware_unavailable(
+                "an OpenFanController was found but the daemon is shutting down — \
+                 it will be adopted on the next start",
+            ),
+        ),
         Ok(RescanOutcome::NotFound) => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             &ErrorEnvelope::hardware_unavailable(
@@ -777,6 +936,9 @@ enum RescanOutcome {
     /// A concurrent rescan won the install race; this probe's controller was
     /// discarded rather than replacing the live one (DEC-266).
     AlreadyAdopted,
+    /// Registration had closed before the probe finished — the daemon is
+    /// shutting down, so nothing was installed (`OFN-t`).
+    ShuttingDown,
     NotFound,
     ProbeFailed,
 }
@@ -936,7 +1098,7 @@ mod tests {
                 vec!["/dev/ttyBOOT".to_string()],
                 // The bus changed once against what boot probed, then never
                 // again — a controller attached during the window.
-                || vec!["/dev/ttyBOOT".to_string(), "/dev/ttyNEW".to_string()],
+                || async { Some(vec!["/dev/ttyBOOT".to_string(), "/dev/ttyNEW".to_string()]) },
                 move || {
                     let st = Arc::clone(&probe_state);
                     let a = Arc::clone(&a);
@@ -1051,7 +1213,7 @@ mod tests {
             pwm_baselines: Default::default(),
             openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
             last_openfan_rescan: Arc::new(parking_lot::Mutex::new(None)),
-            adopted_poll_handles: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            adopted_poll_tasks: Arc::new(parking_lot::Mutex::new(Default::default())),
             amd_gpus: Vec::new(),
             intel_gpus: Vec::new(),
             nvidia_gpus: Vec::new(),
@@ -1242,6 +1404,535 @@ mod tests {
         assert_eq!(
             calibration_pause_window(99, 99),
             calibration_pause_window(20, 15)
+        );
+    }
+
+    // ── `OFN-t`: adoption racing shutdown ────────────────────────────────────
+
+    /// A transport that answers nothing. Enough to build a `FanController`,
+    /// which is all the gate tests need — none of them talks to it.
+    struct SilentTransport;
+    impl crate::serial::transport::SerialTransport for SilentTransport {
+        fn write_line(&mut self, _data: &str) -> Result<(), crate::error::SerialError> {
+            Ok(())
+        }
+        fn read_line(&mut self, _timeout: Duration) -> Result<String, crate::error::SerialError> {
+            Err(crate::error::SerialError::Timeout { timeout_ms: 1 })
+        }
+    }
+
+    fn silent_controller(state: &AppState) -> crate::serial::controller::FanController {
+        let boxed: Box<dyn crate::serial::transport::SerialTransport + Send> =
+            Box::new(SilentTransport);
+        crate::serial::controller::FanController::new_shared(
+            Arc::new(parking_lot::Mutex::new(boxed)),
+            state.cache.clone(),
+            Duration::from_millis(1),
+        )
+    }
+
+    /// A poll-loop stand-in: parks until the runtime drops it, so a handle that
+    /// leaks is a handle that would genuinely have needed joining.
+    fn spawn_stub_loop() -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async {
+            std::future::pending::<()>().await;
+        })
+    }
+
+    /// The DISCRIMINATING arm: once shutdown has TAKEN the list, an adoption must
+    /// not install and must not register.
+    ///
+    /// This is the defect. `main` drains `adopted_poll_tasks` into `task_handles`
+    /// and only then calls `finish_shutdown`, whose first act is to set the
+    /// shutdown watch — so the drain provably runs before the signal, and nothing
+    /// on the install path consulted a shutdown signal at any point. A controller
+    /// probed in that window was installed, its poll loop spawned, and its handle
+    /// pushed into a list nothing would read again; one probed later could be
+    /// installed after `restore_hardware()` had already run.
+    #[tokio::test]
+    async fn an_adoption_after_the_drain_is_refused_rather_than_leaking_an_unjoined_loop() {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let state = adoption_state(rx);
+
+        // Exactly what `main` does at shutdown assembly.
+        let drained = state.adopted_poll_tasks.lock().close_and_drain();
+        assert!(
+            drained.is_empty(),
+            "precondition: nothing was adopted before the drain, so anything the \
+             drain returns came from somewhere this test does not model"
+        );
+
+        let outcome = state.adopt_openfan_controller(silent_controller(&state), spawn_stub_loop);
+
+        assert_eq!(
+            outcome,
+            AdoptOutcome::ShuttingDown,
+            "an adoption completing after the drain must be refused — registering \
+             would put a poll handle in a list nothing will ever read again"
+        );
+        assert!(
+            state.openfan().is_none(),
+            "nothing may be installed once shutdown has taken the list: the engine \
+             is stopped and `restore_hardware()` may already have run"
+        );
+        assert!(
+            state.adopted_poll_tasks.lock().is_empty(),
+            "a refused adoption must register no handle"
+        );
+    }
+
+    /// The OPPOSITE arm, without which the test above passes against an
+    /// `adopt_openfan_controller` that refuses unconditionally — and the daemon
+    /// would then never adopt a controller at all.
+    #[tokio::test]
+    async fn an_adoption_before_the_drain_registers_a_handle_the_drain_takes() {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let state = adoption_state(rx);
+
+        let outcome = state.adopt_openfan_controller(silent_controller(&state), spawn_stub_loop);
+
+        assert_eq!(outcome, AdoptOutcome::Adopted);
+        assert!(
+            state.openfan().is_some(),
+            "a controller adopted before shutdown must be installed, or the engine \
+             — and with it `force_all_with_floor` — has no OpenFan backend"
+        );
+
+        let drained = state.adopted_poll_tasks.lock().close_and_drain();
+        assert_eq!(
+            drained.len(),
+            1,
+            "the poll loop must be in the list `shutdown_sequence` joins (277-c)"
+        );
+        assert!(
+            state.adopted_poll_tasks.lock().is_closed(),
+            "close_and_drain must CLOSE as well as take — taking alone leaves the \
+             window this fix exists to remove"
+        );
+        for h in drained {
+            h.abort();
+        }
+    }
+
+    /// DEC-266's arm, which must not regress while the gate is added: a second
+    /// adoption never replaces a live controller.
+    #[tokio::test]
+    async fn a_second_adoption_does_not_replace_a_live_controller() {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let state = adoption_state(rx);
+
+        assert_eq!(
+            state.adopt_openfan_controller(silent_controller(&state), spawn_stub_loop),
+            AdoptOutcome::Adopted
+        );
+        let first = state.openfan().expect("the first adoption installed");
+
+        assert_eq!(
+            state.adopt_openfan_controller(silent_controller(&state), spawn_stub_loop),
+            AdoptOutcome::AlreadyAdopted,
+            "the loser of the install race must discard its probe, not overwrite \
+             the winner — the engine only re-reads the slot while it has no \
+             backend, so it would keep writing through the first controller while \
+             the second's poll loop read a different transport"
+        );
+        assert!(
+            Arc::ptr_eq(&first, &state.openfan().expect("still installed")),
+            "the installed controller must still be the FIRST one"
+        );
+        let drained = state.adopted_poll_tasks.lock().close_and_drain();
+        assert_eq!(
+            drained.len(),
+            1,
+            "the refused adoption must not have registered a second poll loop"
+        );
+        for h in drained {
+            h.abort();
+        }
+    }
+
+    /// The handler's early out (`OFN-t`): a rescan arriving during shutdown is
+    /// refused before anything touches the bus.
+    ///
+    /// The message is the discriminator, and it has to be: the only other 503 on
+    /// this route says "no OpenFanController found", which would be a lie about a
+    /// probe that never ran. `last_openfan_rescan` staying unset is what proves
+    /// no probe ran — `RescanGuard` stamps it when a probe task ends, and every
+    /// refusal returns before that guard is built.
+    #[tokio::test]
+    async fn a_rescan_during_shutdown_is_refused_without_probing() {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let state = adoption_state(rx);
+        tx.send(true).expect("the receiver is alive in AppState");
+
+        let (status, body) = openfan_rescan_handler(axum::extract::State(state.clone())).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let message = body["error"]["message"]
+            .as_str()
+            .expect("the error envelope carries a message")
+            .to_string();
+        assert!(
+            message.contains("shutting down"),
+            "the refusal must say WHICH refusal it is; got {message:?}"
+        );
+        assert!(
+            !message.contains("not found") && !message.contains("No OpenFanController"),
+            "reporting a shutdown refusal as 'not found' tells the operator a probe \
+             ran and came back empty, which is the log-honesty defect `OFN-c` is \
+             about; got {message:?}"
+        );
+        assert!(
+            state.last_openfan_rescan.lock().is_none(),
+            "no probe may have run — every probe opens a tty and asserts DTR, which \
+             resets Arduino-class boards, and this daemon is already exiting"
+        );
+    }
+
+    // ── `OFN-v`: the loop must not WAIT for a probe it no longer needs ───────
+
+    /// Run the loop with a probe that takes `probe_for`, and report how long the
+    /// loop took to return once `after_probe_starts` had elapsed and `act` ran.
+    ///
+    /// Every wait is a bounded poll against a deadline, never a bare sleep: a
+    /// missed window must make this red, not green (`CLAUDE.md`, tokio trap 3).
+    async fn time_loop_exit_during_a_probe(
+        window: Duration,
+        probe_for: Duration,
+        act: impl FnOnce(&tokio::sync::watch::Sender<bool>),
+    ) -> (Duration, u32) {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let state = adoption_state(rx.clone());
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let a = Arc::clone(&attempts);
+        let handle = tokio::spawn(post_boot_adoption_loop_with(
+            Arc::clone(&state),
+            window,
+            Duration::from_millis(2),
+            rx,
+            vec!["/dev/ttyBOOT".to_string()],
+            || async { Some(vec!["/dev/ttyNEW".to_string()]) },
+            move || {
+                let a = Arc::clone(&a);
+                async move {
+                    a.fetch_add(1, Ordering::SeqCst);
+                    // Self-releasing, so a test that fails an assertion cannot
+                    // leave an unbounded wedge behind and turn a red test into a
+                    // hung CI job (tokio trap 3).
+                    tokio::time::sleep(probe_for).await;
+                }
+            },
+        ));
+
+        // Bounded poll until the probe is genuinely in flight. Without this the
+        // measurement below could be of a loop that had not yet started waiting,
+        // which is the case the row is not about.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while attempts.load(Ordering::SeqCst) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "precondition: no probe ever started, so nothing was measured"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        act(&tx);
+        let started = tokio::time::Instant::now();
+        let finished = tokio::time::timeout(probe_for * 3, handle).await;
+        assert!(
+            finished.is_ok(),
+            "the loop never returned at all — it outlasted three times the probe"
+        );
+        (started.elapsed(), attempts.load(Ordering::SeqCst))
+    }
+
+    /// `OFN-v`: a SIGTERM landing mid-probe must not add the probe's remaining
+    /// time to shutdown.
+    ///
+    /// The loop is in `main`'s `task_handles`, so `shutdown_sequence` joins it
+    /// with a `timeout(SHUTDOWN_TASK_TIMEOUT)` — waiting for the probe therefore
+    /// delayed the hardware restore by up to 3 s. Returning does NOT cancel the
+    /// probe and is not meant to: it is detached precisely so a dropped caller
+    /// never discards a controller that was found (DEC-266), and a late install
+    /// is safe because `adopt_openfan_controller` either registers into a list
+    /// that will still be drained or refuses.
+    ///
+    /// The window is long, so the deadline arm cannot be what ends this loop —
+    /// only the shutdown arm can.
+    #[tokio::test]
+    async fn a_shutdown_during_a_probe_is_not_waited_out() {
+        let probe_for = Duration::from_millis(600);
+        let (elapsed, attempts) =
+            time_loop_exit_during_a_probe(Duration::from_secs(60), probe_for, |tx| {
+                tx.send(true).expect("the loop holds a receiver");
+            })
+            .await;
+
+        assert!(attempts >= 1, "precondition: the probe must have started");
+        assert!(
+            elapsed < probe_for / 2,
+            "the loop waited out the probe before honouring shutdown ({elapsed:?} of \
+             a {probe_for:?} probe) — that time is added to `shutdown_sequence`'s \
+             per-task drain, and the hardware restore is behind it"
+        );
+    }
+
+    /// `OFN-v`, the other arm: a probe started just under the deadline must not
+    /// carry the loop past its own window.
+    ///
+    /// Shutdown is never signalled here, so the shutdown arm cannot be what ends
+    /// it — this measures the deadline arm specifically.
+    #[tokio::test]
+    async fn a_probe_that_outruns_the_window_does_not_extend_it() {
+        let probe_for = Duration::from_millis(600);
+        let (elapsed, attempts) =
+            time_loop_exit_during_a_probe(Duration::from_millis(30), probe_for, |_tx| {}).await;
+
+        assert!(attempts >= 1, "precondition: the probe must have started");
+        assert!(
+            elapsed < probe_for / 2,
+            "the loop ran past its adoption window waiting for a probe ({elapsed:?} \
+             of a {probe_for:?} probe) — the window is what bounds how long this \
+             task stays alive into shutdown"
+        );
+    }
+
+    /// `OFN-x` round 2: a failed enumeration must SKIP the tick, never read as
+    /// "no ports".
+    ///
+    /// The first draft returned `Vec::new()` on a `JoinError` and argued it was
+    /// bounded. It is not: an empty set bypasses
+    /// `serial_port_candidates_enumerated`, dropping a configured `[serial] port`
+    /// as well, and a failure that alternates with success makes every alternation
+    /// a `Probe::Fresh` — which REFRESHES the retry budget instead of spending it.
+    /// The bound would then be `OPENFAN_RESCAN_COOLDOWN` alone: one DTR sweep per
+    /// ten seconds, 6-18 per window, which `post_boot_adoption_loop`'s own doc
+    /// calls worse than the twelve `OFN-b` removed.
+    ///
+    /// Alternating is what discriminates. A *constant* failure would also probe
+    /// zero times under the old `Vec::new()` once its four attempts were spent, so
+    /// a test that never enumerated successfully would pass against the defect.
+    #[tokio::test]
+    async fn an_enumeration_that_fails_never_looks_like_the_bus_changing() {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let state = adoption_state(rx.clone());
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let a = Arc::clone(&attempts);
+        let c = Arc::clone(&calls);
+        let finished = tokio::time::timeout(
+            Duration::from_secs(5),
+            post_boot_adoption_loop_with(
+                Arc::clone(&state),
+                Duration::from_millis(300),
+                Duration::from_millis(2),
+                rx,
+                // Exactly what boot probed, so a successful enumeration is NOT a
+                // change and must never be probed — the only thing that can make
+                // this loop probe is a failure being mistaken for a change.
+                vec!["/dev/ttyBOOT".to_string()],
+                move || {
+                    let n = c.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if n.is_multiple_of(2) {
+                            None
+                        } else {
+                            Some(vec!["/dev/ttyBOOT".to_string()])
+                        }
+                    }
+                },
+                move || {
+                    let a = Arc::clone(&a);
+                    async move {
+                        a.fetch_add(1, Ordering::SeqCst);
+                    }
+                },
+            ),
+        )
+        .await;
+
+        assert!(finished.is_ok(), "the loop must end at its window");
+        let calls = calls.load(Ordering::SeqCst);
+        assert!(
+            calls >= 4,
+            "precondition: the alternation must actually have run several times \
+             ({calls} enumerations) — with too few, nothing was measured"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            0,
+            "a failed enumeration must skip the tick. Reading it as an empty port \
+             set makes every alternation a `Fresh` decision, which refreshes the \
+             handshake budget rather than spending it — and every probe opens each \
+             candidate tty and asserts DTR, resetting Arduino-class boards \
+             ({calls} enumerations)"
+        );
+    }
+
+    /// `OFN-v`, third arm: a shutdown landing while ENUMERATION is in flight must
+    /// not be waited out either.
+    ///
+    /// Enumeration was a synchronous call until `OFN-x` moved it to the blocking
+    /// pool, where it cannot be cancelled — so leaving its await unguarded put the
+    /// same unobserved wait one line above the one that had just been fixed. This
+    /// task is drained by `shutdown_sequence` ahead of `restore_hardware()`.
+    #[tokio::test]
+    async fn a_shutdown_during_enumeration_is_not_waited_out() {
+        let enumerate_for = Duration::from_millis(600);
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let state = adoption_state(rx.clone());
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let c = Arc::clone(&calls);
+        let handle = tokio::spawn(post_boot_adoption_loop_with(
+            Arc::clone(&state),
+            Duration::from_secs(60),
+            Duration::from_millis(2),
+            rx,
+            vec!["/dev/ttyBOOT".to_string()],
+            move || {
+                let c = Arc::clone(&c);
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    // Self-releasing, so a failed assertion cannot leave an
+                    // unbounded wedge and turn a red test into a hung CI job.
+                    tokio::time::sleep(enumerate_for).await;
+                    Some(vec!["/dev/ttyBOOT".to_string()])
+                }
+            },
+            || async {
+                unreachable!("an unchanged bus must never be probed by this test");
+            },
+        ));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while calls.load(Ordering::SeqCst) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "precondition: enumeration never started, so nothing was measured"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        tx.send(true).expect("the loop holds a receiver");
+        let started = tokio::time::Instant::now();
+        let finished = tokio::time::timeout(enumerate_for * 3, handle).await;
+        assert!(finished.is_ok(), "the loop never returned at all");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < enumerate_for / 2,
+            "the loop waited out the enumeration before honouring shutdown \
+             ({elapsed:?} of a {enumerate_for:?} enumeration) — that time is added \
+             to `shutdown_sequence`'s per-task drain, and the hardware restore is \
+             behind it"
+        );
+    }
+
+    // ── `OFN-x`: enumeration must not sit on a runtime worker ────────────────
+
+    /// A CURRENT-THREAD runtime, so an enumeration left inline starves the
+    /// executor and the ordering below inverts.
+    ///
+    /// `available_ports()` opens the devnode of any `serial8250` tty before the
+    /// ttyACM/ttyUSB filter runs — a real blocking `open(2)`, which the loop runs
+    /// every five seconds for the whole adoption window. The double blocks the
+    /// same way (`std::thread::sleep`, not `tokio::time::sleep`, which would
+    /// yield and prove nothing).
+    ///
+    /// **The first draft used `flavor = "multi_thread", worker_threads = 1` and
+    /// passed with the fix deleted** — measured, by the fix-out-must-fail check.
+    /// A multi-thread runtime runs the test body on the CALLING thread via
+    /// `block_on` and gives spawned tasks the worker, so the observer had a
+    /// thread of its own whether or not the enumeration blocked, and the
+    /// ordering held for a reason that had nothing to do with the fix. On
+    /// `current_thread` the body and the observer share one thread, which is what
+    /// makes the ordering discriminate. `spawn_blocking` still uses the separate
+    /// blocking pool there, so the fixed path is unaffected.
+    #[tokio::test]
+    async fn enumeration_does_not_block_the_executor() {
+        let order: Arc<parking_lot::Mutex<Vec<&'static str>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let observer_order = Arc::clone(&order);
+        let observer = tokio::spawn(async move {
+            // Only reachable if the executor is still able to run tasks WHILE the
+            // enumeration is in flight.
+            let _ = started_rx.await;
+            observer_order.lock().push("executor-ran");
+        });
+
+        let candidates = enumerate_off_executor(None, move || {
+            let _ = started_tx.send(());
+            std::thread::sleep(Duration::from_millis(300));
+            vec!["/dev/ttyACM7".to_string()]
+        })
+        .await;
+        let candidates = candidates.expect("a successful enumeration is Some");
+        order.lock().push("enumerate-returned");
+        let _ = observer.await;
+
+        assert_eq!(
+            candidates,
+            vec!["/dev/ttyACM7".to_string()],
+            "precondition: the enumerator's result must still reach the caller — \
+             moving it off the executor must not lose it"
+        );
+        assert_eq!(
+            order.lock().as_slice(),
+            ["executor-ran", "enumerate-returned"],
+            "the executor was parked for the whole enumeration: with the call \
+             inline, nothing else on this runtime can run until it returns"
+        );
+    }
+
+    /// The CALL SITE, which the test above cannot see: the production loop must
+    /// actually route its enumeration through `enumerate_off_executor`, and the
+    /// handler's shutdown check must come before anything that touches the bus.
+    ///
+    /// Both are one-line facts about where a call sits, and neither can be
+    /// observed at runtime without a real serial bus — the whole point is that
+    /// the real enumerator must never run in a test. Scoped to production source
+    /// (everything before the test module) so this guard cannot match its own
+    /// explanation, which is how the `polling.rs` precedent failed.
+    #[test]
+    fn the_production_paths_enumerate_off_the_executor_and_refuse_during_shutdown() {
+        let whole = include_str!("openfan.rs");
+        let src = whole
+            .split_once("\n#[cfg(test)]")
+            .map(|(before, _)| before)
+            .expect("openfan.rs has a test module");
+
+        let loop_at = src
+            .find("pub async fn post_boot_adoption_loop(")
+            .expect("the post-boot loop exists");
+        let seam_at = src
+            .find("async fn post_boot_adoption_loop_with")
+            .expect("the injected-seam variant exists");
+        assert!(
+            src[loop_at..seam_at].contains("enumerate_off_executor("),
+            "the production loop must enumerate through the blocking-pool helper; \
+             calling the enumerator inline parks a runtime worker on the serial \
+             bus once every tick for the whole adoption window"
+        );
+
+        let handler_at = src
+            .find("pub async fn openfan_rescan_handler(")
+            .expect("the rescan handler exists");
+        let handler = &src[handler_at..];
+        let refusal_at = handler
+            .find(".shutdown.borrow()")
+            .expect("the handler must consult the shutdown watch");
+        let enumerate_at = handler
+            .find("serial_port_candidates_enumerated(")
+            .expect("the handler must build its candidate list");
+        assert!(
+            refusal_at < enumerate_at,
+            "the shutdown refusal must come BEFORE the candidate list is built — \
+             building it opens every serial8250 tty, and probing opens every \
+             candidate, each open asserting DTR and resetting Arduino-class \
+             boards on behalf of a daemon that is already exiting"
         );
     }
 }

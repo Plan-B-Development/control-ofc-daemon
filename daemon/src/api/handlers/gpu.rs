@@ -794,7 +794,7 @@ mod tests {
             pwm_baselines: Default::default(),
             openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
             last_openfan_rescan: Arc::new(parking_lot::Mutex::new(None)),
-            adopted_poll_handles: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            adopted_poll_tasks: Arc::new(parking_lot::Mutex::new(Default::default())),
             amd_gpus: vec![gpu],
             intel_gpus: Vec::new(),
             nvidia_gpus: Vec::new(),

@@ -1,5 +1,53 @@
 # Changelog
 
+## [2.47.3] — 2026-09-16
+
+**Three shutdown- and executor-correctness fixes in the OpenFan adoption path
+(DEC-368; register rows `OFN-t`, `OFN-v`, `OFN-x`). No change to fan control, to
+any commanded duty, or to the thermal emergency.**
+
+**An OpenFanController adopted in the instant the daemon was shutting down could
+leave a poll loop nothing ever joined (`OFN-t`).** `main` collected the poll
+handles of post-boot adoptions into its shutdown list and only *then* began the
+shutdown sequence, whose first act is to signal every loop to stop — so the
+collection provably ran before the signal, and an adoption completing in between
+registered a handle into a list nothing would read again. Nothing on the install
+path consulted a shutdown signal at all, so a controller could be installed, and
+its poll loop started, after the daemon had already handed the motherboard fans
+back to firmware. Harmless in practice — that loop only reads RPM — but the
+guarantee that "the hardware restore is the last writer" was not actually
+established for it. Closing the list and taking it are now one indivisible step,
+and so are checking-then-registering, so an adoption racing shutdown is either
+drained with everything else or refused outright. A rescan arriving once shutdown
+has begun is now refused *before* anything touches the serial bus, and answers
+`503` with a message saying so rather than the misleading "no OpenFanController
+found" — each probe opens every candidate tty and asserts DTR, which resets
+Arduino-class boards, and doing that on behalf of an exiting daemon buys nothing.
+
+**A `systemctl stop` landing while the post-boot search was mid-probe added up to
+three seconds to shutdown (`OFN-v`).** The background search waited for its probe
+unconditionally, and that task is drained before the hardware restore runs — so
+the restore sat behind it. It now stops waiting on shutdown, and on its own
+adoption-window deadline, which a long probe could previously overrun — at both
+points it waits, the probe and the port enumeration. The probe itself is still
+never cancelled: it is detached precisely so a caller that gives up does not
+discard a controller that was found. Relatedly, the "nothing appeared, try a
+rescan" log line is no longer emitted when the window closes while a probe is
+still running, because that probe may yet adopt something.
+
+**Serial enumeration no longer runs on an async worker thread (`OFN-x`).** Listing
+candidate ports opens no candidate — that is what lets the rescan cooldown ration
+DTR resets, and it is unchanged — but the underlying `available_ports()` opens the
+devnode of any legacy `serial8250` tty before the USB-serial filter applies. The
+post-boot search runs that every five seconds for the whole adoption window, so it
+now runs on the blocking pool instead of parking a runtime worker on somebody's
+serial bus. The packaged unit already blocked those opens
+(`DeviceAllow=char-ttyACM/ttyUSB`), so this was a development- and
+container-only exposure. An enumeration that fails now **skips** the tick rather
+than reading as "no ports": an empty list would have dropped a configured
+`[serial] port` as well, and would have made each recovery look like the hardware
+changing, which is what earns a fresh round of probes.
+
 ## [2.47.2] — 2026-09-16
 
 **No daemon behaviour change whatsoever — one test fixture, updated so it still

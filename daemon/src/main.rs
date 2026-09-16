@@ -1735,7 +1735,7 @@ async fn async_main() {
         pwm_baselines: Arc::new(parking_lot::RwLock::new(Arc::new(pwm_baselines_at_boot))),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
-        adopted_poll_handles: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+        adopted_poll_tasks: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
         amd_gpus,
         intel_gpus,
         nvidia_gpus,
@@ -2099,9 +2099,10 @@ async fn async_main() {
     // probing directly, so it cannot skip the DEC-250 handshake, the DEC-266
     // conditional install, the poll-loop spawn or the 277-c handle registration,
     // and it shares the single-flight guard with a user-triggered rescan. A
-    // controller it adopts registers its poll loop in `adopted_poll_handles`,
-    // which `task_handles` already drains below on the same terms as a
-    // boot-adopted one.
+    // controller it adopts registers its poll loop in `adopted_poll_tasks`,
+    // which `task_handles` drains below on the same terms as a boot-adopted one
+    // — atomically with closing registration, so an adoption racing shutdown is
+    // either drained or refused (`OFN-t`).
     let post_boot_adoption_handle = if serial_connected {
         None
     } else {
@@ -2201,11 +2202,20 @@ async fn async_main() {
     // the shared shutdown watch but was never *joined*. Drain those handles in
     // here, so "the restore is the guaranteed last writer" holds for a
     // rescan-adopted controller on the same terms as a boot-time one.
+    //
+    // `close_and_drain`, not a bare drain (`OFN-t`). A plain drain left a window
+    // this comment implicitly denied: it runs HERE, and the shutdown watch is not
+    // set until `finish_shutdown` calls `shutdown_sequence` below — so an
+    // adoption completing in between registered a handle into a list nothing
+    // would read again, and one completing later could install a controller after
+    // `restore_hardware()` had run. Closing and taking in one critical section is
+    // what makes the drain a guarantee rather than a snapshot.
     task_handles.extend(
         app_state
-            .adopted_poll_handles
+            .adopted_poll_tasks
             .lock()
-            .drain(..)
+            .close_and_drain()
+            .into_iter()
             .map(|h| ("openfan-poll (adopted)", h)),
     );
 
@@ -3779,44 +3789,66 @@ mod tests {
         );
     }
 
-    /// 277-c — the adopted-poll-handle drain, which behaviour cannot see.
+    /// 277-c / `OFN-t` — the adopted-poll-task drain, which behaviour cannot see.
     ///
     /// The drain is inline in `async_main`, so no in-process test can invoke it;
     /// and it shipped with no test at all, which is how a shutdown guarantee
-    /// quietly stops being one. Dropping the `.extend(...drain...)` line leaves
-    /// the whole suite green — an adopted OpenFan poll loop is then signalled but
-    /// never joined, and "the restore is the guaranteed last writer" stops being
-    /// established for a rescan-adopted controller.
+    /// quietly stops being one. Dropping the `.extend(...close_and_drain...)`
+    /// line leaves the whole suite green — an adopted OpenFan poll loop is then
+    /// signalled but never joined, and "the restore is the guaranteed last
+    /// writer" stops being established for a rescan-adopted controller.
     ///
-    /// The ORDERING assertion is the load-bearing half. Draining after
-    /// `finish_shutdown` would compile, read plausibly, and do nothing whatsoever
-    /// — the handles would be collected after the drain that was supposed to
-    /// consume them.
+    /// Two assertions are load-bearing and neither is about the `extend`.
+    ///
+    /// **The ORDERING one**: draining after `finish_shutdown` would compile, read
+    /// plausibly, and do nothing whatsoever — the handles would be collected
+    /// after the drain that was supposed to consume them.
+    ///
+    /// **The `close_and_drain` one (`OFN-t`)**: a bare `drain(..)` compiles here
+    /// too, passes the ordering assertion, and is exactly the defect. Because the
+    /// drain runs BEFORE the shutdown watch is set, taking the list without
+    /// closing it leaves an adoption completing a moment later free to register a
+    /// handle that nothing will read again. `close_and_drain` is the only API on
+    /// `AdoptedTasks` that does both, so asserting the call is asserting the
+    /// atomicity — and asserting the ABSENCE of `.drain(..)` on this field is
+    /// what stops the two-call spelling (`closed = true;` then `drain`) that
+    /// reopens the window while reading as equivalent.
     ///
     /// Harmless today: that loop only reads status and RPM (verified — it sends
     /// `Command::ReadAllRpm` and its only mutation is a cache update), so there
     /// is no PWM hazard now. The guard is pre-emptive, and it says so rather than
     /// implying it is protecting live users.
     #[test]
-    fn adopted_poll_handles_are_drained_before_shutdown() {
+    fn adopted_poll_tasks_are_closed_and_drained_before_shutdown() {
         let whole = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
         let src = whole
             .split_once("#[cfg(test)]")
             .map(|(before, _)| before)
             .expect("main.rs has a #[cfg(test)] module");
 
-        // Anchor on the FIELD ACCESS (`.adopted_poll_handles`), not on the bare
+        // Anchor on the FIELD ACCESS (`.adopted_poll_tasks`), not on the bare
         // name: the first bare occurrence in this file is the struct-construction
         // site a few hundred lines earlier, so anchoring there asserted a window
         // of source that never contains the drain, and the guard failed against
         // correct code the moment it was written.
         let drain_at = src
-            .find(".adopted_poll_handles")
-            .expect("the adopted poll handles must be drained into task_handles (277-c)");
+            .find(".adopted_poll_tasks")
+            .expect("the adopted poll tasks must be drained into task_handles (277-c)");
+        // Bounded: the drain sits mid-file today, but a guard that panics with
+        // a slice-index message instead of its own assertion is a guard that
+        // tells the next maintainer nothing.
+        let window = &src[drain_at..(drain_at + 200).min(src.len())];
         assert!(
-            src[drain_at..drain_at + 200].contains("drain(..)"),
-            "the handles must be DRAINED, not merely referenced — a clone or a \
-             length check would leave the loops unjoined"
+            window.contains("close_and_drain()"),
+            "the tasks must be taken with close_and_drain() — a bare drain runs \
+             BEFORE the shutdown watch is set, so an adoption completing a moment \
+             later registers a handle nothing will ever join (`OFN-t`)"
+        );
+        assert!(
+            !window.contains(".drain(.."),
+            "closing and taking must be ONE call. Spelling it as two — set the \
+             flag, then drain — reads as equivalent and is not: it reopens the \
+             window between them"
         );
         assert!(
             src[..drain_at].contains("task_handles.extend("),

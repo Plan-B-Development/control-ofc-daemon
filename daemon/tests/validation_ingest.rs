@@ -81,7 +81,7 @@ fn validation_app_state(
         pwm_baselines: Default::default(),
         openfan_rescanning: AtomicBool::new(false),
         last_openfan_rescan: Arc::new(parking_lot::Mutex::new(None)),
-        adopted_poll_handles: Arc::new(parking_lot::Mutex::new(Vec::new())),
+        adopted_poll_tasks: Arc::new(parking_lot::Mutex::new(Default::default())),
         amd_gpus: Vec::new(),
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
