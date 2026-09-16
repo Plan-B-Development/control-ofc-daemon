@@ -1,5 +1,58 @@
 # Changelog
 
+## [2.48.0] — 2026-09-16
+
+**A PWM verify no longer says "PWM values held" when it could not read the header
+back (DEC-373, register row `ACK-m`). No change to fan control, to any commanded
+duty, or to the thermal emergency.** Pairs with GUI v2.76.0, but needs no
+particular GUI — an older one renders the new result and says it needs upgrading.
+
+**What a verify told you could be more than it had checked.** The PWM verify
+writes a test duty, waits six seconds, reads the header back, then restores it.
+It decides what happened by running two checks — did the firmware take the
+header back, and did the value get clamped — and then looking at the tach.
+
+Both checks are written so that *no value* means *no problem*. That is right when
+the file simply is not there, which is ordinary on some headers. It is wrong when
+the file is there and the read **failed** — a transient I/O error, or the sensor
+chip being removed or its driver unbound while the test ran. In that case the
+checks were skipped rather than passed, and on a header with no usable tach the
+verify still answered:
+
+> PWM values held but RPM sensor unavailable or too low to verify
+
+Nothing had established that the values held. The verify reported a check it
+never performed.
+
+**The daemon now says so.** That case gets its own result,
+`pwm_readback_unavailable`, which tells you plainly that the readback failed, so
+whether the write held is unknown — and that this is **not** evidence the write
+failed or that your firmware interfered. Re-running is the fix; if it repeats,
+`dmesg` will usually show the chip's driver going away.
+
+Two readbacks reach it: `pwmN` itself, and a `pwmN_enable` that was readable
+*before* the write and not after. **A header with no `pwmN_enable` file at all is
+ordinary hardware and is unaffected** — it reads absent both times and still
+reports `rpm_unavailable`.
+
+**A fan that visibly responded is still a pass.** The new result is used only
+where `rpm_unavailable` would have been. If the tach moved after the write, that
+is evidence in its own right, and the verify still reports `effective` even
+though the readback failed. GPU fan verify already handled this case correctly
+and is unchanged.
+
+### Contract
+
+- `POST /hwmon/{header_id}/verify` gains a sixth `result` token,
+  `pwm_readback_unavailable`. **No capability flag**, and none is needed: a
+  client that does not know it must render it rather than drop it (273-i), and
+  the GUI's unknown-token path already treats it as neutral and inconclusive,
+  which is the correct verdict.
+- `rpm_unavailable`'s documented meaning **narrows** and is now exact — both
+  guards passed, only the tach confirmation is missing.
+- `docs/08_API_Integration_Contract.md` updated in the GUI repo in the same
+  window.
+
 ## [2.47.6] — 2026-09-16
 
 **The thermal-emergency log lines claimed a reach the daemon did not have

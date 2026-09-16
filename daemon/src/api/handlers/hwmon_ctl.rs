@@ -672,6 +672,35 @@ fn classify_verify_result(
         }
     }
 
+    // [`ACK-m`] Which post-write readback, if any, produced no value.
+    //
+    // The fall-through arm below says "PWM values held", and that claim rests
+    // on the two guards above having **passed**. Both are `if let Some(..)`, so
+    // a readback that failed SKIPS them rather than failing them, and the
+    // verdict inherited a pass nothing had established.
+    //
+    // `pwm_enable` is `None` for two different reasons — the header has no
+    // `pwmN_enable` file at all, or the read of one that exists failed — and
+    // this function cannot see the path to tell them apart. It does not need
+    // to: `initial.pwm_enable` was read from that same path moments earlier, so
+    // a value there and none here means the file exists and the second read
+    // failed. A header with no enable file reads `None` in both snapshots and
+    // is correctly unaffected.
+    //
+    // Deliberately consulted **only** by the fall-through. `effective` and
+    // `no_rpm_effect` below rest on the tach moving (or not) after the write,
+    // which is evidence independent of the readback, and downgrading a fan that
+    // demonstrably responded would discard a true positive to fix a claim it
+    // never made.
+    let pwm_unread = final_state.pwm_raw.is_none();
+    let enable_unread = initial.pwm_enable.is_some() && final_state.pwm_enable.is_none();
+    let unreadable = match (pwm_unread, enable_unread) {
+        (true, true) => Some("Neither pwmN nor pwmN_enable could be read back"),
+        (true, false) => Some("pwmN could not be read back"),
+        (false, true) => Some("pwmN_enable could not be read back"),
+        (false, false) => None,
+    };
+
     // Check RPM change (if available)
     match (initial.rpm, final_state.rpm) {
         (Some(init_rpm), Some(final_rpm)) if init_rpm > 100 => {
@@ -693,6 +722,20 @@ fn classify_verify_result(
             (
                 "effective".into(),
                 format!("PWM control verified: RPM changed {init_rpm} \u{2192} {final_rpm}"),
+            )
+        }
+        _ if unreadable.is_some() => {
+            let what = unreadable.unwrap_or_default();
+            (
+                "pwm_readback_unavailable".into(),
+                format!(
+                    "{what} after the {VERIFY_WAIT_SECONDS}s test window, so whether the \
+                     written duty held is unknown \u{2014} and no usable RPM reading is \
+                     available to corroborate it independently. Most likely cause: a \
+                     transient sysfs I/O error, or the chip being removed or its driver \
+                     unbound during the test. This is NOT evidence that the write failed \
+                     or that the firmware interfered; re-run to get a conclusive result."
+                ),
             )
         }
         _ => (
@@ -1916,6 +1959,160 @@ mod tests {
         assert!(
             details.contains("Re-run with no profile active"),
             "details: {details:?}"
+        );
+    }
+
+    // ── `ACK-m`: a skipped guard is not a passed guard ───────────────
+
+    /// The defect itself: no tach, and the post-write `pwmN` readback failed.
+    ///
+    /// Before the fix the clamp guard's `if let Some(final_raw)` was *skipped*
+    /// rather than failed, and the fall-through returned `rpm_unavailable`,
+    /// whose message asserts "PWM values held" — a claim nothing established.
+    #[test]
+    fn an_unreadable_pwm_readback_is_not_reported_as_values_held() {
+        let initial = HwmonVerifyState {
+            pwm_enable: Some(1),
+            pwm_raw: Some(128),
+            pwm_percent: Some(50),
+            rpm: None,
+        };
+        // The write went out; the readback after the settle produced nothing.
+        let final_state = HwmonVerifyState {
+            pwm_enable: Some(1),
+            pwm_raw: None,
+            pwm_percent: None,
+            rpm: None,
+        };
+        let (result, details) = classify_verify_result(&initial, &final_state, 20);
+        assert_eq!(result, "pwm_readback_unavailable");
+        assert!(
+            details.contains("pwmN could not be read back"),
+            "details must name what was unreadable: {details:?}"
+        );
+        // The retracted claim must be gone, not merely re-worded around.
+        assert!(
+            !details.contains("PWM values held"),
+            "the verdict must not inherit the claim it could not establish: {details:?}"
+        );
+        // ...and it must not read as a hardware fault either, which is the
+        // other way this token could lie. `inconclusive`, not `ineffective`.
+        assert!(details.contains("NOT evidence"), "details: {details:?}");
+    }
+
+    /// The `pwm_enable` half of the same guard (`ACK-m`, Q3).
+    ///
+    /// `pwm_enable: None` means two different things, and only one of them is
+    /// a failed readback. The discriminator is `initial.pwm_enable`: read from
+    /// the same path moments earlier, so a value there and none here means the
+    /// file exists and the second read failed.
+    #[test]
+    fn an_enable_file_that_read_before_the_write_and_not_after_is_a_failed_readback() {
+        let initial = HwmonVerifyState {
+            pwm_enable: Some(1),
+            pwm_raw: Some(128),
+            pwm_percent: Some(50),
+            rpm: None,
+        };
+        let final_state = HwmonVerifyState {
+            pwm_enable: None,
+            // The duty read back fine — only the mode did not, so this case is
+            // reachable ONLY through the enable term.
+            pwm_raw: Some(51),
+            pwm_percent: Some(20),
+            rpm: None,
+        };
+        let (result, details) = classify_verify_result(&initial, &final_state, 20);
+        assert_eq!(result, "pwm_readback_unavailable");
+        assert!(
+            details.contains("pwmN_enable could not be read back"),
+            "details: {details:?}"
+        );
+    }
+
+    /// The opposite branch, or the predicate above is satisfied by a stuck
+    /// `true`: a header with **no** `pwmN_enable` file at all reads `None` in
+    /// both snapshots and is ordinary hardware, not a failed readback.
+    #[test]
+    fn a_header_with_no_enable_file_still_reports_rpm_unavailable() {
+        let initial = HwmonVerifyState {
+            pwm_enable: None,
+            pwm_raw: Some(128),
+            pwm_percent: Some(50),
+            rpm: None,
+        };
+        let final_state = HwmonVerifyState {
+            pwm_enable: None,
+            pwm_raw: Some(51),
+            pwm_percent: Some(20),
+            rpm: None,
+        };
+        let (result, details) = classify_verify_result(&initial, &final_state, 20);
+        assert_eq!(result, "rpm_unavailable");
+        assert!(details.contains("PWM values held"), "details: {details:?}");
+    }
+
+    /// The reach bound, decided with the user: the new token is consulted
+    /// **only** by the fall-through. A tach that moved after the write is
+    /// evidence independent of the readback, so a header whose fan
+    /// demonstrably responded still verifies as `effective` even though its
+    /// `pwmN` readback failed.
+    ///
+    /// **This test passes with the fix removed, by construction** — `effective`
+    /// is the pre-fix answer here too (`CLAUDE.md § Hard-won lessons`, DEC-340).
+    /// That is not a blind test, because detecting the defect is not its job:
+    /// it fails if someone later widens the new arm to preempt the RPM match,
+    /// which is the decision this pins and the only way this case can move.
+    #[test]
+    fn a_failed_readback_does_not_downgrade_a_fan_that_demonstrably_responded() {
+        let initial = HwmonVerifyState {
+            pwm_enable: Some(1),
+            pwm_raw: Some(128),
+            pwm_percent: Some(50),
+            rpm: Some(800),
+        };
+        let final_state = HwmonVerifyState {
+            pwm_enable: Some(1),
+            pwm_raw: None,
+            pwm_percent: None,
+            rpm: Some(1900),
+        };
+        let (result, _) = classify_verify_result(&initial, &final_state, 100);
+        assert_eq!(
+            result, "effective",
+            "the tach is independent evidence; discarding it would trade a true \
+             positive for a claim the effective arm never made"
+        );
+    }
+
+    /// And the whole point of the split, asserted as the disagreement itself:
+    /// the two inputs differ in exactly one field — whether the readback
+    /// landed — and they must not produce the same token.
+    #[test]
+    fn readback_failed_and_readback_showed_no_clamp_are_different_verdicts() {
+        let initial = HwmonVerifyState {
+            pwm_enable: Some(1),
+            pwm_raw: Some(128),
+            pwm_percent: Some(50),
+            rpm: None,
+        };
+        let read_ok = HwmonVerifyState {
+            pwm_enable: Some(1),
+            pwm_raw: Some(51),
+            pwm_percent: Some(20),
+            rpm: None,
+        };
+        let read_failed = HwmonVerifyState {
+            pwm_raw: None,
+            pwm_percent: None,
+            ..read_ok.clone()
+        };
+        let (a, _) = classify_verify_result(&initial, &read_ok, 20);
+        let (b, _) = classify_verify_result(&initial, &read_failed, 20);
+        assert_eq!(a, "rpm_unavailable");
+        assert_ne!(
+            a, b,
+            "a skipped guard and a passed guard must not classify identically"
         );
     }
 

@@ -1822,7 +1822,15 @@ pub struct BoardInfo {
 pub struct HwmonVerifyResponse {
     pub header_id: String,
     /// "effective", "pwm_enable_reverted", "pwm_value_clamped",
-    /// "no_rpm_effect", or "rpm_unavailable"
+    /// "no_rpm_effect", "rpm_unavailable", or — daemon >= 2.48.0, `ACK-m` —
+    /// "pwm_readback_unavailable".
+    ///
+    /// The last is the one case `rpm_unavailable` used to absorb: no usable
+    /// tach reading AND a post-write readback of `pwmN` (or of a `pwmN_enable`
+    /// that was readable before the write) that produced nothing, so the
+    /// "PWM values held" the older token asserts was never established. It is
+    /// inconclusive, not a failure. An older client that does not know the
+    /// token must render it rather than drop it (273-i).
     pub result: String,
     pub initial_state: HwmonVerifyState,
     pub final_state: HwmonVerifyState,
