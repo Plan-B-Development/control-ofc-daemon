@@ -25,6 +25,18 @@ per-machine trip point falsifies on any part that derives a higher limit.
 Register rows `DOC-a`, `DOC-b`, `DOC-c` and `DOC-i`, from the 2026-09-16
 `/ofc:docs-correctness` audit.
 
+**The thermal emergency's reach is now described the same way everywhere.** DEC-371
+qualified it in the daemon's own source — the ladder drives every OpenFan channel and
+writable hwmon header **the machine has**, which on a GPU-only box or a board whose
+every `pwmN` is read-only is none at all — but roughly a dozen prose sites across both
+repos still said "all OpenFan and hwmon fans" without the qualifier. They were
+*unqualified* rather than false ("all OpenFan channels" over a machine with none is
+vacuously true), and `docs/08` had reached the point of contradicting itself: one
+paragraph carried the qualifier and two did not. **Nothing about what the daemon does
+has changed, and the reach itself is unchanged** — DEC-307 still gives every output
+`max(commanded, forced)`, and an output no control commands still receives the forced
+duty, which is what preserves the emergency's reach. Register row `OFN-ag`.
+
 ### Internal
 
 **Nothing you can see changed, and nothing the daemon does changed.** A PWM

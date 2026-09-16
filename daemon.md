@@ -726,8 +726,8 @@ assignment, so an assignment can add that protection but not remove it. A header
 with no evidence and no assignment is treated as an ordinary fan and stopped. **Accepted, bounded risk** (2026-07-21 audit: accept + document): identification
 requires stopping any fan by design (DEC-166); the deadman auto-restore limits an abandoned stop
 to one TTL; and a thermal emergency outranks the identify overlay entirely — the engine's
-`force_all_with_floor` path (thermal emergency, and the no-sensor 40 % fallback) drives every OpenFan +
-writable hwmon header to **at least** the forced duty, spinning a stalled pump back up regardless of
+`force_all_with_floor` path (thermal emergency, and the no-sensor 40 % fallback) drives every OpenFan channel +
+writable hwmon header the machine has to **at least** the forced duty, spinning a stalled pump back up regardless of
 standing stops. Since DEC-307 that duty is a floor over the profile's own output rather than a
 replacement for it, so a control already asking for more keeps its higher duty; an output no control
 commands still gets the forced duty, which is what keeps the reach above true.

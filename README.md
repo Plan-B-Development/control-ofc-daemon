@@ -206,8 +206,8 @@ Full build / install / CLI / environment reference lives in
 - **HTTP over Unix domain socket** at `/run/control-ofc/control-ofc.sock`, exposing
   snapshot reads (`/poll`) — the GUI's 1 Hz poll path (the unused `/events` SSE
   stream was removed at v2.5.0, DEC-198).
-- **Thermal safety** is daemon-enforced: at the CPU trip point → all OpenFan and
-  motherboard (hwmon) fans to 100%, hysteresis down to 80°C, 40% floor when no CPU
+- **Thermal safety** is daemon-enforced: at the CPU trip point → every OpenFan channel and
+  writable motherboard (hwmon) header the machine has to 100%, hysteresis down to 80°C, 40% floor when no CPU
   sensor reports for 5 cycles. The trip point is **per-machine** — at least 105°C,
   raised to `min(ceiling + 5 °C, 115 °C)` where the kernel publishes the CPU's own
   design ceiling (DEC-308) — and every duty is a **floor** over the active profile's output
