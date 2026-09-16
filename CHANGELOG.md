@@ -2,19 +2,42 @@
 
 ## [2.47.6] — 2026-09-16
 
-**Two follow-ups to DEC-371, both opened by its own review (DEC-372; register
-rows `OFN-ad`, `OFN-af`). No change to fan control, to any commanded duty, or to
-the reach of the thermal emergency.**
+**The thermal-emergency log lines claimed a reach the daemon did not have
+(DEC-371 and its two review follow-ups, DEC-372; register rows `OFN-n`,
+`OFN-ad`, `OFN-af`). No change to fan control, to any commanded duty, or to the
+reach of the thermal emergency itself.**
 
-**A board whose every `pwmN` is read-only was told the force was holding headers
-that do not exist (`OFN-ad`).** The daemon builds its hwmon backend from any
-discovered header without consulting writability, so such a board has a real
-backend that writes nothing — and 2.47.5 reported it as a driven backend, which
-was the defect 2.47.5 set out to remove, reproduced inside its own fix. The
-reported scope now comes from whether a backend has **at least one output it can
-actually drive**, so that board correctly reaches the *"Thermal safety override
-reached NO fans"* alarm. The forced write itself is unchanged: every present
-backend is still asked to force, whatever it reports about its targets.
+**What an operator was told during a thermal event overstated what the daemon
+did.** All three safety log lines read *"forcing all OpenFan+hwmon fans to N%"*
+regardless of which backends existed — so on a machine with no OpenFanController,
+which is most machines, the highest-stakes message this daemon emits claimed a
+reach it did not have. The line was already correct about the *threshold*, which
+it interpolates per-machine rather than restating (DEC-292/DEC-308); this is the
+same drift one noun over.
+
+The engine's line now reports what it **actually wrote** — `all OpenFan channels
+and writable hwmon headers`, `all writable hwmon headers`, or `all OpenFan
+channels`, derived per tick from the backends actually asked to force. The two
+lines emitted from pure decision functions, which have no view of the backends,
+now state the duty and claim no reach: *"THERMAL EMERGENCY: CPU Tctl 106.2°C >=
+105°C — forcing fans to 100%"*.
+
+**A machine where the emergency reaches nothing now says so.** With neither
+backend present — a GPU-only box, or a VM with no fan hardware — the ladder
+latches, publishes `thermal_state: "emergency"` and writes to no fan at all (GPU
+fans are excluded by design, DEC-130). That case previously produced the most
+false version of the message; it now logs at ERROR: *"Thermal safety override
+reached NO fans — this daemon has no writable fan backend…"*. No version of this
+daemon has previously reported it.
+
+**A board whose every `pwmN` is read-only reaches that alarm too (`OFN-ad`).**
+The daemon builds its hwmon backend from any discovered header without consulting
+writability — `main.rs` gates that on discovering *any* header, not a writable one
+— so such a board has a real backend that writes nothing, and would otherwise have
+been reported as driven. The reported scope comes from whether a backend has **at
+least one output it can actually drive**, rather than merely from which backends
+were asked to force. The forced write itself is unchanged: every present backend
+is still asked to force, whatever it reports about its targets.
 
 **The forced branch logged every second for the whole hold, with nothing
 throttling it (`OFN-af`).** There is no in-process rate limiter and the packaged
@@ -32,50 +55,6 @@ write-failure throttle, because a thermal event outranks one.
 continues for two recovery ticks past that and a no-sensor force ending logged
 nothing at all, so nothing ever said the fans were back under the profile.
 
-`OFN-ah` — an unrelated contract divergence found while researching `OFN-ad`, in
-which a control bound to read-only headers is not reported as
-`backend_unavailable` — is **deliberately still open**. The gating fix that would
-have closed it changes what `/status` publishes, and was judged a separate
-decision.
-
-## [2.47.5] — 2026-09-16
-
-**The thermal-emergency log lines named OpenFan on machines that have none
-(DEC-371; register row `OFN-n`). No change to fan control, to any commanded duty,
-or to the reach of the thermal emergency itself.**
-
-**What an operator was told during a thermal event overstated what the daemon
-did.** All three safety log lines read *"forcing all OpenFan+hwmon fans to N%"*
-regardless of which backends existed — so on a machine with no OpenFanController,
-which is most machines, the highest-stakes message this daemon emits claimed a
-reach it did not have. The line was already correct about the *threshold*, which
-it interpolates per-machine rather than restating (DEC-292/DEC-308); this is the
-same drift one noun over.
-
-The engine's line now reports what it **actually wrote** — `all OpenFan channels
-and writable hwmon headers`, `all writable hwmon headers`, or `all OpenFan
-channels`, derived per tick from the backends actually asked to force. The two lines emitted
-from pure decision functions, which have no view of the backends, now state the
-duty and claim no reach: *"THERMAL EMERGENCY: CPU Tctl 106.2°C >= 105°C — forcing
-fans to 100%"*.
-
-**A machine where the emergency reaches nothing now says so.** With neither
-backend present — a GPU-only box, or a VM with no fan hardware — the ladder
-latches, publishes `thermal_state: "emergency"` and writes to no fan at all (GPU
-fans are excluded by design, DEC-130). That case previously produced the most
-false version of the message; it now logs at ERROR: *"Thermal safety override
-reached NO fans — this daemon has no writable fan backend…"*. No version of this
-daemon has previously reported it.
-
-**One machine is deliberately NOT covered, and it is recorded rather than
-implied (`OFN-ad`):** a board whose every `pwmN` is read-only still builds an
-hwmon backend — `main.rs` gates that on discovering *any* header, not a writable
-one — so it takes the ordinary arm and reports "all writable hwmon headers"
-while writing nothing. The reported scope is *which backends were asked to
-force*, not *what was written*; closing the gap needs the write path to report
-what it drove, which it cannot do today because the hwmon write is handed to the
-blocking pool and may still be in flight when the call returns.
-
 **Unchanged and verified:** the two forced writes happen in the same order, with
 the same floor and the same baseline. The OpenFan-before-hwmon ordering that
 `update_serial_timeout_handler`'s 1000 ms ceiling depends on is now pinned by a
@@ -87,6 +66,12 @@ reach to uncommanded OpenFan channels.
 `+ Send` bound on its returned future (compile-time only; both implementations
 are unchanged), without which the new generic helper could not live inside the
 spawned engine loop.
+
+`OFN-ah` — an unrelated contract divergence found while researching `OFN-ad`, in
+which a control bound to read-only headers is not reported as
+`backend_unavailable` — is **deliberately still open**. The gating fix that would
+have closed it changes what `/status` publishes, and was judged a separate
+decision.
 
 ## [2.47.4] — 2026-09-16
 
