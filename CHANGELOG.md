@@ -1,5 +1,29 @@
 # Changelog
 
+## [Unreleased]
+
+### Internal
+
+**Nothing you can see changed, and nothing the daemon does changed.** A PWM
+verify, a characterisation sweep and a control-path discovery all behave exactly
+as they did in v2.48.0.
+
+The two diagnostics a validation session can orchestrate each watch their run to
+completion, and those two watch loops were near-identical copies. That is not a
+theoretical cost: daemon v2.43.6 had to apply one fix to both of them, and the
+register carried it as two separate defects because one rule in two copies is two
+rules to anyone counting. They are now one loop, so the next fix lands once.
+
+The rule that loop enforces is the one worth naming: **a diagnostic must not
+outlive the session that asked for it.** A sweep left running keeps driving the
+header and keeps renewing the engine's write-pause, which suspends curve control
+after the user has already ended the session. (It never suspended *cooling* —
+the thermal emergency's forced-duty branch runs above that gate.) Both exits
+where that can happen — the session ending, and the orchestrator giving up at its
+deadline — cancel the sweep, as before; what is new is that both are now proved
+by tests that actually run the loop, rather than by guards that scanned the
+source for the call. DEC-374, register row `P8-bu`.
+
 ## [2.48.0] — 2026-09-16
 
 **A PWM verify no longer says "PWM values held" when it could not read the header

@@ -1229,6 +1229,89 @@ fn cancel_run_fenced<R: CancellableRun>(
     }
 }
 
+/// What watching a detached diagnostic run to its end came to.
+enum Watched<R> {
+    /// The watch ended on the run's own terms. `Some(run)` is the terminal
+    /// snapshot; `None` means the run left no such snapshot to attach —
+    /// superseded by a successor, never installed, or the deadline elapsed with
+    /// it still sweeping.
+    Finished(Option<R>),
+    /// The session that asked for this run stopped being the recording one
+    /// while it was still going. The caller must return WITHOUT attaching
+    /// evidence — see the fence note on `attach_evidence_for`.
+    SessionEnded,
+}
+
+/// Watch a detached diagnostic run until it leaves `running`, then cancel it.
+///
+/// ONE definition of the watch, for the same reason [`cancel_run_fenced`] is one
+/// definition of the fence (DEC-276). Both session-orchestrated diagnostics walk
+/// an identical loop over a process-global slot, differing only in which
+/// slot/cancel pair they watch and how their deadline is derived. That
+/// duplication was not theoretical: DEC-344 had to apply one cancel fix twice,
+/// once per copy — `P8-ap` and `P8-bk` were the same defect in the same file, in
+/// two functions. Extracted by DEC-374 (`P8-bu`), which also retires the TWO
+/// source-scanning guards that stood in for a runtime test — the one here that
+/// pinned the fall-through cancel at both copies, and the one in
+/// `tests/validation_phase5.rs` that pinned the session fence.
+///
+/// Every wait is a bounded poll against `deadline`, never a bare sleep.
+///
+/// Two cancels, and both are load-bearing:
+///
+/// * **The session fence** (`AUD3-j`). Returning alone left the detached sweep
+///   still driving the header AND still renewing the engine's write-pause once
+///   per point, so ending a session suspended curve control for up to the
+///   sweep's full worst case after the user had ended it. Thermal safety still
+///   outranked that — the forced-duty branch runs above the `verify_active`
+///   gate — so it was lost control intent, never lost cooling; it was still a
+///   diagnostic that outlived the thing that asked for it.
+/// * **The fall-through** (`P8-ap`/`P8-bk`, DEC-344). The loop has four exits
+///   and only the session-ended one used to cancel — but the deadline break is
+///   the exit reached with our sweep STILL RUNNING. Unconditional here rather
+///   than inside that break: the fence acts only on a running run whose
+///   `run_id` is ours, so it is a no-op for the other three by construction.
+///
+/// Cancellation is only ever a REQUEST; the sweep observes it at its next step
+/// boundary.
+async fn watch_run<R: CancellableRun + Clone>(
+    slot: &parking_lot::Mutex<Option<R>>,
+    cancel: &std::sync::atomic::AtomicBool,
+    run_id: Option<&str>,
+    deadline: tokio::time::Instant,
+    session_live: impl Fn() -> bool,
+) -> Watched<R> {
+    let mut final_run = None;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let snap = slot.lock().clone();
+        match snap {
+            Some(run) if Some(run.run_id()) == run_id => {
+                if !CancellableRun::is_running(&run) {
+                    final_run = Some(run);
+                    break;
+                }
+            }
+            // A different run took the slot — ours is gone, and attributing
+            // someone else's evidence to this session is the exact defect the
+            // `run_id` fence exists to prevent.
+            Some(_) => break,
+            None => break,
+        }
+        // Stop if THIS session is no longer the live one...
+        if !session_live() {
+            // ...and take the sweep down with us (`AUD3-j`).
+            cancel_run_fenced(slot, cancel, run_id);
+            return Watched::SessionEnded;
+        }
+    }
+    cancel_run_fenced(slot, cancel, run_id);
+    Watched::Finished(final_run)
+}
+
 async fn run_characterization(
     state: &Arc<AppState>,
     session_id: &str,
@@ -1313,60 +1396,24 @@ async fn run_characterization(
                 * 2
                 + 60,
         );
-    let mut final_run = None;
-    loop {
-        if tokio::time::Instant::now() >= deadline {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let snap = state.characterization.lock().clone();
-        match snap {
-            Some(run) if Some(&run.run_id) == run_id.as_ref() => {
-                if !run.is_running() {
-                    final_run = Some(run);
-                    break;
-                }
-            }
-            // A different run took the slot — ours is gone and we must not
-            // attribute someone else's evidence to this session.
-            Some(_) => break,
-            None => break,
-        }
-        // Stop if THIS session is no longer the live one — see the fence note
-        // on `attach_evidence_for`.
-        if state.validation.recording_session_id().as_deref() != Some(session_id) {
-            // ...and take the sweep down with us (`AUD3-j`). Returning alone left
-            // the detached sweep in `hwmon_characterize_handler` still driving the
-            // header AND still renewing the engine's write-pause once per point,
-            // so ending a session suspended curve control for up to
-            // `CHARACTERIZATION_MAX_POINTS × CHARACTERIZATION_SETTLE_MAX_S` after
-            // the user had ended it. Thermal safety still outranked that — the
-            // forced-duty branch runs above the `verify_active` gate — so it was
-            // lost control intent, never lost cooling; it was still a diagnostic
-            // that outlived the thing that asked for it.
-            cancel_run_fenced(
-                &state.characterization,
-                &state.characterization_cancel,
-                run_id.as_deref(),
-            );
-            return;
-        }
-    }
-
-    // `P8-ap`/`P8-bk` (DEC-344): the loop has four exits and only the
-    // session-ended one used to cancel — but the DEADLINE break is the exit
-    // reached with our sweep still running. Unconditional here rather than
-    // inside that break: the fence acts only on a running run whose `run_id` is
-    // ours, so it is a no-op for the other three by construction. It only
-    // REQUESTS cancellation; the sweep observes it at its next step boundary.
-    cancel_run_fenced(
+    let final_run = match watch_run(
         &state.characterization,
         &state.characterization_cancel,
         run_id.as_deref(),
-    );
+        deadline,
+        || state.validation.recording_session_id().as_deref() == Some(session_id),
+    )
+    .await
+    {
+        // The session that asked for this run is gone. `watch_run` has already
+        // cancelled the sweep (`AUD3-j`); attaching evidence now would file it
+        // against a session that is no longer recording.
+        Watched::SessionEnded => return,
+        Watched::Finished(run) => run,
+    };
 
     let outcome = match &final_run {
-        Some(run) if run.state == "complete" => RESULT_OBSERVED,
+        Some(run) if run.state == crate::api::characterization::STATE_COMPLETE => RESULT_OBSERVED,
         Some(_) => RESULT_INTERRUPTED,
         None => RESULT_UNKNOWN,
     };
@@ -1459,50 +1506,21 @@ async fn run_discovery(state: &Arc<AppState>, session_id: &str, member: &str) {
                 * 2
                 + 60,
         );
-    let mut final_run = None;
-    loop {
-        if tokio::time::Instant::now() >= deadline {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let snap = state.control_path.lock().clone();
-        match snap {
-            Some(run) if Some(&run.run_id) == run_id.as_ref() => {
-                if !run.is_running() {
-                    final_run = Some(run);
-                    break;
-                }
-            }
-            // A different run took the slot — ours is gone, and attributing
-            // someone else's evidence to this session is the exact defect the
-            // `run_id` fence exists to prevent.
-            Some(_) => break,
-            None => break,
-        }
-        if state.validation.recording_session_id().as_deref() != Some(session_id) {
-            // ...and take the sweep down with us (`AUD3-j`): a detached run left
-            // alive would keep driving the header AND keep renewing the engine's
-            // write-pause after the user ended the session.
-            cancel_run_fenced(
-                &state.control_path,
-                &state.control_path_cancel,
-                run_id.as_deref(),
-            );
-            return;
-        }
-    }
-
-    // `P8-ap`/`P8-bk` (DEC-344): the loop has four exits and only the
-    // session-ended one used to cancel — but the DEADLINE break is the exit
-    // reached with our sweep still running. Unconditional here rather than
-    // inside that break: the fence acts only on a running run whose `run_id` is
-    // ours, so it is a no-op for the other three by construction. It only
-    // REQUESTS cancellation; the sweep observes it at its next step boundary.
-    cancel_run_fenced(
+    let final_run = match watch_run(
         &state.control_path,
         &state.control_path_cancel,
         run_id.as_deref(),
-    );
+        deadline,
+        || state.validation.recording_session_id().as_deref() == Some(session_id),
+    )
+    .await
+    {
+        // The session that asked for this run is gone. `watch_run` has already
+        // cancelled the sweep (`AUD3-j`); attaching evidence now would file it
+        // against a session that is no longer recording.
+        Watched::SessionEnded => return,
+        Watched::Finished(run) => run,
+    };
 
     let outcome = match &final_run {
         Some(run) if run.state == crate::api::discovery::STATE_COMPLETE => RESULT_OBSERVED,
@@ -1850,23 +1868,206 @@ mod tests {
         }
     }
 
-    /// `P8-ap`/`P8-bk`: both watch loops must cancel on every fall-through exit.
+    // ── `P8-bu` (DEC-374): the watch loop, tested at the loop ────────
+    //
+    // Both rules below used to be pinned by source-scanning guards — one here
+    // and one in `tests/validation_phase5.rs` — because neither watch loop was
+    // reachable without stubbing `hwmon_characterize_handler`, which drives
+    // hardware. Extracting `watch_run` removes that obstacle: the loop takes
+    // its slot, its cancel flag, its deadline and its liveness predicate as
+    // arguments, so the two exits that matter can be driven directly. The
+    // guards are retired in favour of these.
+    //
+    // Time is virtual (`start_paused`), and that is sound here in a way it is
+    // not everywhere: the loop ages against `tokio::time::Instant`, which
+    // paused time DOES advance — unlike `std::time::Instant`, the trap
+    // `CLAUDE.md` records. No `spawn_blocking` is outstanding, so auto-advance
+    // is not inhibited either.
+
+    /// `P8-ap`/`P8-bk` (DEC-344): the deadline exit must cancel.
     ///
-    /// A source-scanning guard, and its limit is stated rather than glossed:
-    /// `cancel_run_fenced`'s own four cases are unit-tested above, and what this
-    /// adds is that the two loops actually REACH that call — the call-site half
-    /// `CLAUDE.md` records going untested fourteen times. Driving the real
-    /// deadline would mean stubbing `hwmon_characterize_handler`, which drives
-    /// hardware; that is out of proportion to a five-line call, so the residual
-    /// is recorded as a register row instead of hidden here.
+    /// It is the one exit reached with our sweep STILL RUNNING. Without the
+    /// cancel the detached sweep keeps driving the header and keeps renewing
+    /// the engine's write-pause long after the orchestrator has stopped waiting
+    /// and filed `RESULT_UNKNOWN` against it.
     ///
-    /// Matched at STATEMENT indentation, never as a substring. The pre-fix code
-    /// already contained `cancel_run_fenced(` a few lines earlier — inside the
-    /// session-ended `if`, at deeper indent — so a substring search passes with
-    /// the fix deleted. That is `CLAUDE.md`'s "match in attribute position, not
-    /// as a substring" in a second coat.
+    /// The precondition matters as much as the assertion: without it a loop
+    /// that fell out for some other reason would satisfy the cancel check and
+    /// prove nothing about the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn the_deadline_exit_cancels_a_sweep_that_is_still_running() {
+        let slot = parking_lot::Mutex::new(Some(run("char-11", ch::STATE_RUNNING)));
+        let cancel = AtomicBool::new(false);
+        let started = tokio::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(2);
+
+        let watched = watch_run(&slot, &cancel, Some("char-11"), deadline, || true).await;
+
+        assert!(
+            tokio::time::Instant::now() >= deadline,
+            "precondition: the loop must actually have run to its deadline, or \
+             this test is asserting about some other exit"
+        );
+        assert!(
+            matches!(watched, Watched::Finished(None)),
+            "a sweep still running at the deadline leaves no terminal snapshot \
+             to attach — the caller files RESULT_UNKNOWN"
+        );
+        assert!(
+            cancel.load(Ordering::SeqCst),
+            "the sweep is still driving the header; the orchestrator must ask \
+             it to stop before it walks away"
+        );
+    }
+
+    /// The opposite branch, and it is what stops an unconditional `store(true)`
+    /// satisfying the test above: a run that reached a terminal state on its own
+    /// is attached and must NOT be cancelled. Its successor clears the flag
+    /// under the slot lock at install, so arming it for a finished run is a race
+    /// to lose.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_that_finishes_while_watched_is_attached_and_not_cancelled() {
+        let slot = std::sync::Arc::new(parking_lot::Mutex::new(Some(run(
+            "char-12",
+            ch::STATE_RUNNING,
+        ))));
+        let cancel = AtomicBool::new(false);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+
+        // Flip it mid-watch rather than seeding a terminal run: the loop must be
+        // shown to WATCH a running run until it leaves `running`, not merely to
+        // read a slot that was already finished when it arrived.
+        let flipper = slot.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            *flipper.lock() = Some(run("char-12", ch::STATE_COMPLETE));
+        });
+
+        let watched = watch_run(&slot, &cancel, Some("char-12"), deadline, || true).await;
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "precondition: this must be the run-finished exit, not the deadline"
+        );
+        match watched {
+            Watched::Finished(Some(r)) => assert_eq!(
+                r.state,
+                ch::STATE_COMPLETE,
+                "the terminal snapshot is attached verbatim"
+            ),
+            _ => panic!("a run that finished must be attached"),
+        }
+        assert!(
+            !cancel.load(Ordering::SeqCst),
+            "a run that finished on its own needs no cancelling"
+        );
+    }
+
+    /// `AUD3-j`: ending a session must end the sweep that session started.
+    ///
+    /// Returning alone left the detached sweep still driving the header AND
+    /// still renewing the engine's write-pause once per point, so ending a
+    /// session suspended curve control for up to
+    /// `CHARACTERIZATION_MAX_POINTS × CHARACTERIZATION_SETTLE_MAX_S` after the
+    /// user had ended it. Thermal safety still outranked that — the forced-duty
+    /// branch runs above the `verify_active` gate — so it was lost control
+    /// intent, never lost cooling; it was still a diagnostic that outlived the
+    /// thing that asked for it.
+    ///
+    /// `SessionEnded` is the half the caller reads: it is what makes the
+    /// orchestrator return WITHOUT attaching evidence to a session that is no
+    /// longer recording.
+    #[tokio::test(start_paused = true)]
+    async fn ending_the_session_cancels_the_sweep_and_refuses_to_attach() {
+        let slot = parking_lot::Mutex::new(Some(run("char-13", ch::STATE_RUNNING)));
+        let cancel = AtomicBool::new(false);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+
+        let watched = watch_run(&slot, &cancel, Some("char-13"), deadline, || false).await;
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "precondition: the session fence must be what ended this watch, not \
+             the deadline"
+        );
+        assert!(
+            matches!(watched, Watched::SessionEnded),
+            "the caller must be told to abandon the run rather than file it"
+        );
+        assert!(
+            cancel.load(Ordering::SeqCst),
+            "the sweep the ended session started must be asked to stop"
+        );
+    }
+
+    /// The `run_id` fence, at the loop rather than at [`cancel_run_fenced`].
+    ///
+    /// A successor legally takes the slot once the predecessor's deadman
+    /// elapses (DEC-296). Watching on past that point would attribute a
+    /// stranger's evidence to this session — and cancelling would abort a sweep
+    /// this session never started.
+    #[tokio::test(start_paused = true)]
+    async fn a_superseded_or_absent_run_is_neither_attached_nor_cancelled() {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+
+        let taken = parking_lot::Mutex::new(Some(run("char-15", ch::STATE_RUNNING)));
+        let cancel = AtomicBool::new(false);
+        let watched = watch_run(&taken, &cancel, Some("char-14"), deadline, || true).await;
+        // Per half, not once at the end: both halves share one `deadline`, and
+        // without this the test cannot tell the fence from the deadline.
+        // Measured, not feared — with `Some(_) => break` changed to a no-op the
+        // loop spins to the 30 s deadline, `cancel_run_fenced` no-ops anyway on
+        // the id mismatch, and BOTH assertions below still hold. This test
+        // passed with the fence it exists to pin removed.
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "precondition: the `run_id` fence must be what ended this watch. \
+             Reaching the deadline means the superseded arm stopped breaking, \
+             which would stall the orchestration walk for the sweep's whole \
+             worst case before filing RESULT_UNKNOWN"
+        );
+        assert!(
+            matches!(watched, Watched::Finished(None)),
+            "a successor's run is not ours to attach"
+        );
+        assert!(
+            !cancel.load(Ordering::SeqCst),
+            "a run this session did not start must never be cancelled"
+        );
+
+        let empty: parking_lot::Mutex<Option<ch::CharacterizationRun>> =
+            parking_lot::Mutex::new(None);
+        let cancel = AtomicBool::new(false);
+        let watched = watch_run(&empty, &cancel, Some("char-14"), deadline, || true).await;
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "precondition: the empty-slot arm must be what ended this watch"
+        );
+        assert!(
+            matches!(watched, Watched::Finished(None)),
+            "an empty slot leaves nothing to attach"
+        );
+        assert!(!cancel.load(Ordering::SeqCst));
+    }
+
+    /// `P8-bu` (DEC-374): the watch loop must stay ONE loop.
+    ///
+    /// The two orchestrated diagnostics used to carry a copy each, and the cost
+    /// was not hypothetical — DEC-344 had to apply one cancel fix twice, once
+    /// per copy. The four tests above exercise `watch_run`'s exits directly,
+    /// but they would stay green over a third copy they never see, which is
+    /// exactly how `P8-ap` and `P8-bk` came to be two rows instead of one.
+    ///
+    /// **Its limit, stated rather than glossed:** this is a drift tripwire, not
+    /// a proof. A third loop written with a differently-named local would evade
+    /// it. What it does catch is the cheap, likely mistake — copying an existing
+    /// orchestrator and editing the slot — and the assertion message says what
+    /// to do instead.
+    ///
+    /// Matched at statement indentation, never as a substring, and over the
+    /// production half only: this guard's own prose would otherwise match it.
     #[test]
-    fn every_watch_loop_cancels_its_run_before_recording_the_outcome() {
+    fn the_slot_watch_loop_has_exactly_one_definition() {
         let src = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/src/api/handlers/validation.rs"
@@ -1874,45 +2075,72 @@ mod tests {
         let production = src.split("#[cfg(test)]").next().expect("production half");
         let lines: Vec<&str> = production.lines().collect();
 
-        let outcome_sites: Vec<usize> = lines
+        let watchers = lines
+            .iter()
+            .filter(|l| l.starts_with("async fn watch_run<"))
+            .count();
+        let loop_locals = lines
+            .iter()
+            .filter(|l| **l == "    let mut final_run = None;")
+            .count();
+
+        assert_eq!(
+            watchers, 1,
+            "there must be exactly one slot-watching helper"
+        );
+        assert_eq!(
+            loop_locals, 1,
+            "the slot-watch loop count is not 1. TWO different edits land here. \
+             0: `watch_run`'s own `let mut final_run = None;` was renamed or \
+             re-indented — re-point this guard, nothing is wrong. 2 or more: a \
+             second watch loop has appeared, and a diagnostic that watches its \
+             own run must call `watch_run` rather than hand-roll it — a copy \
+             carries its own two cancels, and a fix to one does not reach the \
+             other (`P8-ap`/`P8-bk`, DEC-344)."
+        );
+
+        // The PAIR matters as much as the presence, and this half is inherited
+        // from the retired guard rather than invented: passing one diagnostic's
+        // slot with the other's cancel flag takes down the wrong run, and it
+        // COMPILES — both flags are `Arc<AtomicBool>` and deref-coerce
+        // identically, while `R` is inferred from the slot alone (measured: a
+        // crossed pair builds clean). Nothing else pins this — the unit tests
+        // above never read the call sites, which is `CLAUDE.md`'s "extracting a
+        // rule does not test the call site" in another coat.
+        let call_sites: Vec<usize> = lines
             .iter()
             .enumerate()
-            .filter(|(_, l)| l.trim_start() == "let outcome = match &final_run {")
+            .filter(|(_, l)| l.trim_end().ends_with("watch_run(") && !l.contains("async fn"))
             .map(|(i, _)| i)
             .collect();
         assert_eq!(
-            outcome_sites.len(),
+            call_sites.len(),
             2,
-            "expected the two watch loops (discovery, characterization); a third \
-             would need its own cancel and this guard extended: {outcome_sites:?}"
+            "expected the two orchestrators (characterization, discovery); a \
+             third would need its pairing checked here too: {call_sites:?}"
         );
-
-        for site in outcome_sites {
-            let from = site.saturating_sub(30);
-            // The pair matters as much as the presence: passing one
-            // diagnostic's slot with the other's cancel flag would take down
-            // the wrong run, and every test would still pass. So require the
-            // two argument lines to name the SAME state field.
-            let cancelled_with_a_matching_pair = lines[from..site].windows(3).any(|w| {
-                w[0] == "    cancel_run_fenced("
-                    && w[1]
-                        .trim_end_matches(',')
-                        .trim()
-                        .strip_prefix("&state.")
-                        .is_some_and(|slot| {
-                            w[2].trim_end_matches(',').trim() == format!("&state.{slot}_cancel")
-                        })
-            });
-            assert!(
-                cancelled_with_a_matching_pair,
-                "the watch loop ending at line {} falls through to its outcome \
-                 without cancelling. The deadline break reaches this point with \
-                 the sweep STILL RUNNING, so it keeps driving the header and \
-                 renewing the engine's write-pause (`AUD3-j`). A call nested \
-                 inside the session-ended `if` does not count — that branch \
-                 returns early and never reaches here. A crossed slot/cancel \
-                 pair does not count either.",
-                site + 1
+        for i in call_sites {
+            let slot = lines[i + 1]
+                .trim()
+                .trim_end_matches(',')
+                .strip_prefix("&state.")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the `watch_run` call at line {} must pass a `&state.` \
+                         slot as its first argument, found: {}",
+                        i + 2,
+                        lines[i + 1]
+                    )
+                });
+            assert_eq!(
+                lines[i + 2].trim().trim_end_matches(','),
+                format!("&state.{slot}_cancel"),
+                "the `watch_run` call at line {} crosses its slot and cancel \
+                 flag. It would ask the WRONG diagnostic to stop: the ended \
+                 session's own sweep keeps driving the header and renewing the \
+                 engine's write-pause (`AUD3-j`), while an unrelated run is \
+                 aborted mid-restore. This compiles, and every other test passes.",
+                i + 1
             );
         }
     }

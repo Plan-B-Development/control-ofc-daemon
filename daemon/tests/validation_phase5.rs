@@ -861,39 +861,13 @@ fn the_orchestrator_delegates_rather_than_reimplementing_safety() {
     }
 }
 
-/// `AUD3-j`, at the call site. The fence's four cases have their own unit tests
-/// in `api::handlers::validation::tests`; this asserts that the path which
-/// abandons a run actually *uses* them.
-///
-/// `CLAUDE.md` records "extracting a rule into a testable function does NOT test
-/// the call site" as having recurred six times, and this is exactly that shape:
-/// a correct `cancel_run_fenced` reached from nowhere would leave the sweep
-/// running, every unit test still green. The assertion is positional rather than
-/// a mere `contains` — between the session fence and the `return` it guards,
-/// the cancel must appear — because a cancel that had drifted out of that block
-/// would satisfy a whole-file search and stop nothing.
-#[test]
-fn abandoning_a_run_cancels_it_rather_than_leaving_it_sweeping() {
-    let body = strip_comments(include_str!("../src/api/handlers/validation.rs"));
-
-    // `Some(session_id)` exactly: the sibling fence in `spawn_orchestration`
-    // writes `Some(session_id.as_str())` and has no run in flight to cancel.
-    let marker = "recording_session_id().as_deref() != Some(session_id)";
-    let at = body
-        .find(marker)
-        .expect("the orchestrator's session fence must still be there");
-    let after = &body[at..];
-    let ret = after
-        .find("return;")
-        .expect("the session fence must still abandon the run");
-    assert!(
-        after[..ret].contains("cancel_run_fenced("),
-        "the orchestrator returns without cancelling the sweep it started — the \
-         header keeps being driven and the engine write-pause keeps being renewed \
-         for up to CHARACTERIZATION_MAX_POINTS x CHARACTERIZATION_SETTLE_MAX_S \
-         after the session ended (`AUD3-j`)"
-    );
-}
+// `AUD3-j`'s call-site guard was RETIRED by DEC-374 (`P8-bu`), not dropped.
+// It scanned this source for a `cancel_run_fenced(` between the orchestrator's
+// session fence and the `return;` it guards, because neither watch loop was
+// reachable without stubbing `hwmon_characterize_handler`, which drives
+// hardware. Extracting `watch_run` removed that obstacle, and the rule is now
+// asserted by running the loop:
+// `api::handlers::validation::tests::ending_the_session_cancels_the_sweep_and_refuses_to_attach`.
 
 /// `AUD3-n`. The session document is written with `write` + `fsync` + `rename` +
 /// a directory `fsync`, over a document `AUD3-i` measures at ~5.7 MiB for a
