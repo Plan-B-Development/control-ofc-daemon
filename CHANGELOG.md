@@ -3,7 +3,8 @@
 ## [2.47.3] — 2026-09-16
 
 **Three shutdown- and executor-correctness fixes in the OpenFan adoption path
-(DEC-368; register rows `OFN-t`, `OFN-v`, `OFN-x`). No change to fan control, to
+(DEC-368; register rows `OFN-t`, `OFN-v`, `OFN-x`), plus one developer-facing fix
+(DEC-369, `OFN-ab`). No change to fan control, to
 any commanded duty, or to the thermal emergency.**
 
 **An OpenFanController adopted in the instant the daemon was shutting down could
@@ -47,6 +48,17 @@ container-only exposure. An enumeration that fails now **skips** the tick rather
 than reading as "no ports": an empty list would have dropped a configured
 `[serial] port` as well, and would have made each recovery look like the hardware
 changing, which is what earns a fresh round of probes.
+
+**Running the test suite no longer resets your serial hardware (`OFN-ab`).** Three
+tests drove `POST /fans/openfan/rescan` against whatever was actually plugged into
+the machine — six probes per `cargo test` run, each opening every `ttyACM`/`ttyUSB`
+and asserting DTR, which resets Arduino-class boards. Anyone running the project's
+own test suite on a machine with an OpenFanController attached was resetting it
+every time. The rescan handler now takes its port enumeration and its serial open
+as parameters, so those tests drive a fake bus and keep every assertion they had;
+real serial opens in the suite are down from six per run to none. No change to the
+endpoint's behaviour, its payloads or its status codes — the shipped path passes
+the same two functions it always called directly.
 
 ## [2.47.2] — 2026-09-16
 

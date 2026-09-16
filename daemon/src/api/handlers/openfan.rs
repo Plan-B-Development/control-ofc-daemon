@@ -640,14 +640,71 @@ pub async fn calibrate_openfan_handler(
 /// and identified — losing the thermal emergency's OpenFan leg from a request
 /// that merely *looked* like it timed out. Probe, install and single-flight
 /// release all live in a detached task; the handler only waits for the answer.
+///
+/// **Everything above describes `openfan_rescan_with`, which this delegates to
+/// (`OFN-ab`).** The two are one function split in two, and the split is the only
+/// difference: the wrapper's whole body is the pair of real hardware functions
+/// the body used to name inline — `enumerate_serial_candidates` and
+/// `RealSerialTransport::open`. The doc stays here because this is the route's
+/// entry point and the name a reader looks for; the reasoning applies to the
+/// code below it.
 pub async fn openfan_rescan_handler(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    openfan_rescan_with(
+        state,
+        crate::serial::real_transport::enumerate_serial_candidates,
+        crate::serial::real_transport::RealSerialTransport::open,
+    )
+    .await
+}
+
+/// [`openfan_rescan_handler`] with its two hardware touchpoints injected
+/// (`OFN-ab`).
+///
+/// **The seam exists so the suite can stop probing the developer's bus, and that
+/// was a real defect rather than a tidiness argument.** Three integration tests
+/// drove this route with `running_config` defaulted — so `port: None`,
+/// auto-detect — and their load-bearing assertions could only be reached by
+/// letting the probe run: one asserts [`RescanGuard`]'s drop cleared the
+/// single-flight flag, which only happens when a probe really ran; another that a
+/// completed probe stamps the cooldown and that the cooldown lapses rather than
+/// latches. Six real probes per `cargo test` run, each opening every enumerated
+/// `ttyACM*`/`ttyUSB*` and asserting DTR, which resets Arduino-class boards. On a
+/// machine with hardware attached the canonical gate was therefore resetting the
+/// operator's own controller on every run — the exact harm `OFN-b` removed from
+/// boot and [`OPENFAN_RESCAN_COOLDOWN`] exists to ration, arriving through the
+/// test suite instead of through production. One test even carried the comment
+/// "No serial hardware in CI", which is true of CI and false of a workstation.
+///
+/// **Deliberately module-private, not `pub`.** `open` is a hardware primitive:
+/// exposing a way to hand this route a different one would be exposing a way to
+/// bypass `RealSerialTransport::open`'s allow-list, and a seam nothing constrains
+/// is a rule the type cannot state (DEC-361, and the same reasoning that made
+/// [`AppState::adopt_openfan_controller`] private). The cost is that the three
+/// tests that need a fake bus live in this module's `#[cfg(test)]` block rather
+/// than in `tests/ipc_integration.rs`; the ones that never probe stay there, over
+/// real HTTP, so route registration and envelope serialisation keep their
+/// coverage.
+///
+/// `enumerate` is called INLINE here, not under `spawn_blocking` — unchanged, and
+/// deliberately so: `OFN-x` scoped that fix to the post-boot loop, whose cadence
+/// is what made it matter, and explicitly left this call as pre-existing and off
+/// any timer.
+async fn openfan_rescan_with<E, O, T>(
+    state: Arc<AppState>,
+    enumerate: E,
+    open: O,
+) -> (StatusCode, Json<serde_json::Value>)
+where
+    E: FnOnce() -> Vec<String>,
+    O: FnMut(&str, Duration) -> Result<T, crate::error::SerialError> + Send + 'static,
+    T: crate::serial::transport::SerialTransport + Send + 'static,
+{
     use crate::serial::adoption::{
         first_openfan_port, same_port_set, serial_port_candidates_enumerated,
     };
     use crate::serial::controller::FanController;
-    use crate::serial::real_transport::{enumerate_serial_candidates, RealSerialTransport};
     use crate::serial::transport::SerialTransport;
 
     // `OFN-t`, first thing and before anything touches the bus. The
@@ -685,8 +742,7 @@ pub async fn openfan_rescan_handler(
     // cooldown rationed nothing. Identification still happens, once, in
     // `first_openfan_port` below, on the far side of the cooldown and the
     // single-flight guard. Keep enumeration non-opening: it is load-bearing.
-    let candidates =
-        serial_port_candidates_enumerated(configured.as_deref(), enumerate_serial_candidates);
+    let candidates = serial_port_candidates_enumerated(configured.as_deref(), enumerate);
 
     // 10-e: space repeated probes. **Checked BEFORE the already-connected return
     // below (DEC-291) — this ordering was deliberately the other way round until
@@ -798,8 +854,9 @@ pub async fn openfan_rescan_handler(
             // The SAME list the cooldown was evaluated against — recomputing it
             // here could probe a set the cooldown never saw, and stamp a set that
             // was never probed.
+            let mut open = open;
             first_openfan_port(&candidates, configured.as_deref(), timeout, |p| {
-                RealSerialTransport::open(p, timeout)
+                open(p, timeout)
             })
         })
         .await;
@@ -1917,9 +1974,63 @@ mod tests {
              bus once every tick for the whole adoption window"
         );
 
+        // Anchored on the INJECTED variant, not the thin `openfan_rescan_handler`
+        // wrapper that delegates to it (`OFN-ab`): the wrapper contains neither
+        // the check nor the enumeration, so anchoring there would assert an
+        // ordering over a window that merely happens to follow it in the file.
         let handler_at = src
+            .find("async fn openfan_rescan_with<")
+            .expect("the rescan handler's injected variant exists");
+
+        // ...but re-anchoring narrowed this guard's reach, and the wrapper is now
+        // the one place in the file whose whole job is NAMING the two hardware
+        // functions — with nothing observing that it names the right ones. No test
+        // can: the three that drive the route pass their own pair, and the one
+        // that drives `openfan_rescan_handler` returns at the shutdown check
+        // before the opener is reached. So a later edit could swap
+        // `RealSerialTransport::open` for a raw opener and take
+        // `is_allowed_serial_path` — the only path guard on a client-supplied
+        // `serial.port` — off this route with the whole suite green. Before the
+        // split this could not be wrong by construction, because there was no
+        // binding to get wrong.
+        //
+        // Comments are STRIPPED first: both function names appear in the prose of
+        // the doc comment that sits between the wrapper and the seam, so an
+        // unstripped window would satisfy every assertion below by quoting itself
+        // — the `polling.rs` self-match trap, and the reason `main.rs`'s sibling
+        // guard strips too.
+        let wrapper_at = src
             .find("pub async fn openfan_rescan_handler(")
-            .expect("the rescan handler exists");
+            .expect("the rescan route's entry point exists");
+        let wrapper_code: String = src[wrapper_at..handler_at]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            wrapper_code.contains("RealSerialTransport::open"),
+            "the shipped route must pass the allow-listed opener; swapping it here \
+             removes `is_allowed_serial_path` from the only endpoint that opens a \
+             client-named serial path"
+        );
+        assert!(
+            wrapper_code.contains("enumerate_serial_candidates"),
+            "the shipped route must pass the NON-opening enumerator — the one whose \
+             result the DEC-291 cooldown compares"
+        );
+        assert!(
+            !wrapper_code.contains("RealSerialTransport::open("),
+            "the opener must be PASSED as a fn item, not called in the wrapper: an \
+             open here would happen before the seam's shutdown refusal"
+        );
+        assert!(
+            !wrapper_code.contains("serial_port_candidates_enumerated("),
+            "the wrapper must not touch the bus before delegating. It is the natural \
+             place to add one now that it is where hardware facts are named, and \
+             anything here runs BEFORE the `OFN-t` shutdown refusal — enumerating on \
+             behalf of a daemon that is already exiting"
+        );
+
         let handler = &src[handler_at..];
         let refusal_at = handler
             .find(".shutdown.borrow()")
@@ -1933,6 +2044,293 @@ mod tests {
              building it opens every serial8250 tty, and probing opens every \
              candidate, each open asserting DTR and resetting Arduino-class \
              boards on behalf of a daemon that is already exiting"
+        );
+    }
+
+    // ── `OFN-ab`: the rescan route, driven over a FAKE bus ───────────────────
+    //
+    // These three moved here from `tests/ipc_integration.rs`, where they drove
+    // the real route over a UDS socket with `running_config` defaulted — so
+    // `port: None`, auto-detect — and every load-bearing assertion could only be
+    // reached by letting the probe run: `RescanGuard`'s drop only happens when a
+    // probe really ran, and "a completed probe stamps the cooldown" is not
+    // observable without one. Six real probes per `cargo test` run between them,
+    // each opening every enumerated `ttyACM*`/`ttyUSB*` and asserting DTR, which
+    // resets Arduino-class boards. On a workstation with hardware attached the
+    // canonical gate was resetting the operator's own controller on every run.
+    //
+    // They live here rather than there because `openfan_rescan_with` is
+    // module-private and must stay so — `open` is a hardware primitive, and a
+    // `pub` seam handing this route a different one is a `pub` way around
+    // `RealSerialTransport::open`'s allow-list. The four rescan tests that never
+    // probe stayed in `ipc_integration.rs`, over real HTTP, so route
+    // registration and envelope serialisation keep their coverage.
+
+    /// Ports that exist only in this test file.
+    fn fake_enumerate() -> Vec<String> {
+        vec!["/dev/ttyFAKE0".to_string(), "/dev/ttyFAKE1".to_string()]
+    }
+
+    /// Opens anything and identifies as nothing: [`SilentTransport::read_line`]
+    /// times out, so `verify_openfan_identity`'s `ReadAllRpm` fails and the
+    /// handler concludes `NotFound` — the same answer the real bus gives a
+    /// machine with no controller, which is what all three of these tests
+    /// assumed and none of them could previously guarantee.
+    ///
+    /// Records what it opened, so each test can assert as a **precondition** that
+    /// the probe really ran *and that it ran on the fake bus*. Without that, a
+    /// handler that silently stopped probing would satisfy every assertion below.
+    fn recording_opener(
+        opened: Arc<parking_lot::Mutex<Vec<String>>>,
+    ) -> impl FnMut(&str, Duration) -> Result<SilentTransport, crate::error::SerialError> + Send + 'static
+    {
+        move |path, _timeout| {
+            opened.lock().push(path.to_string());
+            Ok(SilentTransport)
+        }
+    }
+
+    fn rescan_state() -> Arc<AppState> {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        adoption_state(rx)
+    }
+
+    /// DEC-266. The single-flight flag is set by a CAS in the handler and cleared
+    /// by a `Drop` guard that lives in a DETACHED task, so a client disconnect
+    /// cannot release it early while the uncancellable probe still holds a tty.
+    /// The risk of moving it there is the opposite failure: never releasing it.
+    /// That would wedge this route at 409 for the whole process lifetime — on the
+    /// one endpoint whose entire purpose is recovering without a restart.
+    ///
+    /// Gutting `RescanGuard::drop` leaves every other test in the suite green.
+    /// This one fails.
+    #[tokio::test]
+    async fn openfan_rescan_releases_its_single_flight_flag_when_the_probe_ends() {
+        let state = rescan_state();
+        let opened = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+        let (code, body) = openfan_rescan_with(
+            Arc::clone(&state),
+            fake_enumerate,
+            recording_opener(Arc::clone(&opened)),
+        )
+        .await;
+        assert_ne!(
+            code,
+            StatusCode::CONFLICT,
+            "the first rescan cannot conflict with itself: {:?}",
+            body.0
+        );
+        assert_eq!(
+            *opened.lock(),
+            fake_enumerate(),
+            "precondition: the probe must actually have run, and on the FAKE bus — \
+             a handler that stopped probing would satisfy the flag assertion below \
+             while testing nothing"
+        );
+
+        assert!(
+            !state
+                .openfan_rescanning
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the single-flight flag must be clear once the probe has finished"
+        );
+
+        // 10-e: clear the cooldown before the second probe. Without this the call
+        // below is rejected by the rate limit, which runs BEFORE the single-flight
+        // CAS — so it would never reach the flag at all and this test would assert
+        // nothing while still looking like it did. Gutting `RescanGuard::drop` must
+        // fail here, and it can only do that if the request gets far enough to try
+        // the CAS.
+        *state.last_openfan_rescan.lock() = None;
+
+        let (code2, body2) = openfan_rescan_with(
+            Arc::clone(&state),
+            fake_enumerate,
+            recording_opener(Arc::clone(&opened)),
+        )
+        .await;
+        assert_ne!(
+            code2,
+            StatusCode::CONFLICT,
+            "a second rescan after the first completed must not be rejected as \
+             'already in progress' — the flag leaked: {:?}",
+            body2.0
+        );
+    }
+
+    /// 10-e. `openfan_rescanning` bounds concurrency; nothing bounded repetition,
+    /// and every probe asserts DTR across each candidate tty — which RESETS
+    /// Arduino-class boards. So a client looping on a failing rescan was holding
+    /// unrelated serial hardware in reset, indefinitely.
+    ///
+    /// Asserted as an OUTCOME (the second call is refused) rather than by reading
+    /// the timestamp: a cooldown that records a stamp nothing consults would pass
+    /// a state assertion and change no behaviour at all.
+    #[tokio::test]
+    async fn openfan_rescan_spaces_repeated_probes() {
+        let state = rescan_state();
+        let opened = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+        let (code, body) = openfan_rescan_with(
+            Arc::clone(&state),
+            fake_enumerate,
+            recording_opener(Arc::clone(&opened)),
+        )
+        .await;
+        assert_ne!(
+            code,
+            StatusCode::CONFLICT,
+            "the first probe must not be rate-limited: {:?}",
+            body.0
+        );
+        assert_eq!(
+            *opened.lock(),
+            fake_enumerate(),
+            "precondition: the first call must really have probed the fake bus"
+        );
+        assert!(
+            state.last_openfan_rescan.lock().is_some(),
+            "a completed probe must stamp the cooldown, or nothing is ever spaced"
+        );
+
+        let opened_before = opened.lock().len();
+        let (code2, body2) = openfan_rescan_with(
+            Arc::clone(&state),
+            fake_enumerate,
+            recording_opener(Arc::clone(&opened)),
+        )
+        .await;
+        assert_eq!(
+            code2,
+            StatusCode::CONFLICT,
+            "an immediate second probe must be refused: {:?}",
+            body2.0
+        );
+        assert_eq!(
+            opened.lock().len(),
+            opened_before,
+            "a refused rescan must open nothing — the refusal exists to ration \
+             exactly those opens"
+        );
+        // Distinguish the two 409s. They are the same status by design (docs/08's
+        // code set is a contract), so only the message separates "too soon" from
+        // "already running" — and a test that cannot tell them apart would pass
+        // against a cooldown that never fired but a leaked single-flight flag.
+        let msg = body2["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("moments ago"),
+            "the refusal must be the cooldown, not a leaked single-flight flag: {:?}",
+            body2.0
+        );
+
+        // The 409 must advertise itself as RETRYABLE. This one clears on its own in
+        // seconds and the message says so, so reporting `retryable: false` — the
+        // default for `validation_error` — tells a client keying its backoff off that
+        // field, which is the field's documented purpose, that the wait is permanent.
+        assert_eq!(
+            body2["error"]["retryable"], true,
+            "a cooldown that expires in seconds must not present as permanent: {:?}",
+            body2.0
+        );
+
+        // And it must expire rather than latch — a rate limit that never lifts is
+        // the same wedged route DEC-266's guard exists to prevent.
+        *state.last_openfan_rescan.lock() = Some(LastRescan {
+            at: Instant::now() - Duration::from_secs(3600),
+            candidates: Vec::new(),
+        });
+        let opened_before_lapse = opened.lock().len();
+        let (code3, body3) = openfan_rescan_with(
+            Arc::clone(&state),
+            fake_enumerate,
+            recording_opener(Arc::clone(&opened)),
+        )
+        .await;
+        assert_ne!(
+            code3,
+            StatusCode::CONFLICT,
+            "the cooldown must lapse, not latch the route closed: {:?}",
+            body3.0
+        );
+        assert!(
+            opened.lock().len() > opened_before_lapse,
+            "the lapse must reach the PROBE, not merely return a different status — \
+             an assertion on the code alone holds against a handler that lapsed the \
+             cooldown and then did nothing"
+        );
+    }
+
+    /// 10-e, round 2. Rate-limiting on elapsed time ALONE refused the single most
+    /// likely legitimate retry: plug a controller in, click rescan. That is a
+    /// human action measured in seconds, so the device went unadopted and the GUI
+    /// showed nothing — transiently re-opening the "restart the daemon" mis-advice
+    /// DEC-265/266 exists to remove, on the one endpoint whose whole purpose is
+    /// recovery without a restart.
+    ///
+    /// The cooldown therefore applies only while the candidate port set is
+    /// UNCHANGED. A newly attached controller enumerates a new tty, so the sets
+    /// differ and the retry proceeds at once.
+    #[tokio::test]
+    async fn openfan_rescan_cooldown_yields_when_the_ports_change() {
+        let state = rescan_state();
+        let opened = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+        let (code, body) = openfan_rescan_with(
+            Arc::clone(&state),
+            fake_enumerate,
+            recording_opener(Arc::clone(&opened)),
+        )
+        .await;
+        assert_ne!(
+            code,
+            StatusCode::CONFLICT,
+            "the first probe must not be rate-limited: {:?}",
+            body.0
+        );
+
+        // Establish the PRESENCE of the cooldown before asserting it yields —
+        // otherwise this passes against a build where the cooldown never fires at
+        // all, proving nothing about the bypass (DEC-272).
+        let (blocked, blocked_body) = openfan_rescan_with(
+            Arc::clone(&state),
+            fake_enumerate,
+            recording_opener(Arc::clone(&opened)),
+        )
+        .await;
+        assert_eq!(
+            blocked,
+            StatusCode::CONFLICT,
+            "precondition: an unchanged port set must still be spaced: {:?}",
+            blocked_body.0
+        );
+
+        // Now claim the last probe walked a DIFFERENT set — the state a freshly
+        // attached controller produces — with the clock left well inside the window.
+        *state.last_openfan_rescan.lock() = Some(LastRescan {
+            at: Instant::now(),
+            candidates: vec!["/dev/ttyFAKE-was-not-here-before".to_string()],
+        });
+        let opened_before = opened.lock().len();
+        let (code2, body2) = openfan_rescan_with(
+            Arc::clone(&state),
+            fake_enumerate,
+            recording_opener(Arc::clone(&opened)),
+        )
+        .await;
+        assert_ne!(
+            code2,
+            StatusCode::CONFLICT,
+            "a changed candidate set must bypass the cooldown — otherwise plugging a \
+             controller in and rescanning immediately is refused, which is exactly \
+             the recovery this endpoint exists for: {:?}",
+            body2.0
+        );
+        assert!(
+            opened.lock().len() > opened_before,
+            "the bypass must reach the PROBE, not merely return a different status \
+             — an assertion on the code alone holds against a handler that yielded \
+             the cooldown and then did nothing"
         );
     }
 }

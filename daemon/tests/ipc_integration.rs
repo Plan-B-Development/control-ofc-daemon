@@ -5552,10 +5552,18 @@ async fn serial_port_length_is_bounded() {
 
 #[tokio::test]
 async fn openfan_rescan_short_circuits_when_a_controller_is_already_adopted() {
-    // The idempotent path, and the only one testable without a serial device: it
-    // must answer from the shared slot WITHOUT probing any tty. A rescan that
-    // re-probed while connected would tear down a working controller to
-    // rediscover it, and the sole PWM writer would lose its backend mid-tick.
+    // The idempotent path: it must answer from the shared slot WITHOUT probing
+    // any tty. A rescan that re-probed while connected would tear down a working
+    // controller to rediscover it, and the sole PWM writer would lose its backend
+    // mid-tick.
+    //
+    // This used to say "and the only one testable without a serial device". That
+    // stopped being true with `OFN-ab`: `openfan_rescan_with` takes its enumerator
+    // and its opener as parameters, so the three tests whose assertions genuinely
+    // need a probe to have run now drive a fake bus, in
+    // `api/handlers/openfan.rs`'s own test module. What stayed here is the set
+    // that never probes, kept over real HTTP so route registration and envelope
+    // serialisation keep their coverage.
     let state = test_app_state();
     // Adopt a controller the way the rescan handler does.
     struct DeadTransport;
@@ -5653,157 +5661,6 @@ async fn openfan_rescan_cooldown_outranks_the_already_connected_return() {
     assert!(
         !msg.contains("found nothing"),
         "the refusal states something it cannot know, and which is false here: {body}"
-    );
-}
-
-#[tokio::test]
-async fn openfan_rescan_releases_its_single_flight_flag_when_the_probe_ends() {
-    // DEC-266. The flag is set by a CAS in the handler and cleared by a `Drop`
-    // guard that now lives in a DETACHED task, so that a client disconnect cannot
-    // release it early while the uncancellable probe still holds a tty. The risk
-    // of moving it there is the opposite failure: never releasing it. That would
-    // wedge this route at 409 for the whole process lifetime — on the one endpoint
-    // whose entire purpose is recovering without a restart.
-    //
-    // Gutting `RescanGuard::drop` leaves every other test in the suite green.
-    // This one fails.
-    let state = test_app_state();
-    let (sock_str, _tx, _tmp) = start_test_server(state.clone()).await;
-
-    let (code, body) = uds_post(&sock_str, "/fans/openfan/rescan", &serde_json::json!({})).await;
-    // No serial hardware in CI, so this is 503 "nothing found" — but assert on the
-    // flag, not the outcome, so the test holds on a machine that does have one.
-    assert_ne!(
-        code, 409,
-        "the first rescan cannot conflict with itself: {body}"
-    );
-
-    assert!(
-        !state
-            .openfan_rescanning
-            .load(std::sync::atomic::Ordering::SeqCst),
-        "the single-flight flag must be clear once the probe has finished"
-    );
-
-    // 10-e: clear the cooldown before the second probe. Without this the request
-    // below is rejected by the rate limit, which runs BEFORE the single-flight
-    // CAS — so it would never reach the flag at all and this test would assert
-    // nothing while still looking like it did. Gutting `RescanGuard::drop` must
-    // fail here, and it can only do that if the request gets far enough to try
-    // the CAS.
-    *state.last_openfan_rescan.lock() = None;
-
-    let (code2, body2) = uds_post(&sock_str, "/fans/openfan/rescan", &serde_json::json!({})).await;
-    assert_ne!(
-        code2, 409,
-        "a second rescan after the first completed must not be rejected as \
-         'already in progress' — the flag leaked: {body2}"
-    );
-}
-
-#[tokio::test]
-async fn openfan_rescan_spaces_repeated_probes() {
-    // 10-e. `openfan_rescanning` bounds concurrency; nothing bounded repetition,
-    // and every probe asserts DTR across each candidate tty — which RESETS
-    // Arduino-class boards. So a client looping on a failing rescan was holding
-    // unrelated serial hardware in reset, indefinitely.
-    //
-    // Asserted as an OUTCOME (the second call is refused) rather than by reading
-    // the timestamp: a cooldown that records a stamp nothing consults would pass
-    // a state assertion and change no behaviour at all.
-    let state = test_app_state();
-    let (sock_str, _tx, _tmp) = start_test_server(state.clone()).await;
-
-    let (code, body) = uds_post(&sock_str, "/fans/openfan/rescan", &serde_json::json!({})).await;
-    assert_ne!(
-        code, 409,
-        "the first probe must not be rate-limited: {body}"
-    );
-    assert!(
-        state.last_openfan_rescan.lock().is_some(),
-        "a completed probe must stamp the cooldown, or nothing is ever spaced"
-    );
-
-    let (code2, body2) = uds_post(&sock_str, "/fans/openfan/rescan", &serde_json::json!({})).await;
-    assert_eq!(
-        code2, 409,
-        "an immediate second probe must be refused: {body2}"
-    );
-    // Distinguish the two 409s. They are the same status by design (docs/08's
-    // code set is a contract), so only the message separates "too soon" from
-    // "already running" — and a test that cannot tell them apart would pass
-    // against a cooldown that never fired but a leaked single-flight flag.
-    let msg = body2["error"]["message"].as_str().unwrap_or_default();
-    assert!(
-        msg.contains("moments ago"),
-        "the refusal must be the cooldown, not a leaked single-flight flag: {body2}"
-    );
-
-    // The 409 must advertise itself as RETRYABLE. This one clears on its own in
-    // seconds and the message says so, so reporting `retryable: false` — the
-    // default for `validation_error` — tells a client keying its backoff off that
-    // field, which is the field's documented purpose, that the wait is permanent.
-    assert_eq!(
-        body2["error"]["retryable"], true,
-        "a cooldown that expires in seconds must not present as permanent: {body2}"
-    );
-
-    // And it must expire rather than latch — a rate limit that never lifts is
-    // the same wedged route DEC-266's guard exists to prevent.
-    *state.last_openfan_rescan.lock() = Some(control_ofc_daemon::api::handlers::LastRescan {
-        at: std::time::Instant::now() - std::time::Duration::from_secs(3600),
-        candidates: Vec::new(),
-    });
-    let (code3, body3) = uds_post(&sock_str, "/fans/openfan/rescan", &serde_json::json!({})).await;
-    assert_ne!(
-        code3, 409,
-        "the cooldown must lapse, not latch the route closed: {body3}"
-    );
-}
-
-#[tokio::test]
-async fn openfan_rescan_cooldown_yields_when_the_ports_change() {
-    // 10-e, round 2. Rate-limiting on elapsed time ALONE refused the single most
-    // likely legitimate retry: plug a controller in, click rescan. That is a
-    // human action measured in seconds, so the device went unadopted and the GUI
-    // showed nothing — transiently re-opening the "restart the daemon" mis-advice
-    // DEC-265/266 exists to remove, on the one endpoint whose whole purpose is
-    // recovery without a restart.
-    //
-    // The cooldown therefore applies only while the candidate port set is
-    // UNCHANGED. A newly attached controller enumerates a new tty, so the sets
-    // differ and the retry proceeds at once.
-    let state = test_app_state();
-    let (sock_str, _tx, _tmp) = start_test_server(state.clone()).await;
-
-    let (code, body) = uds_post(&sock_str, "/fans/openfan/rescan", &serde_json::json!({})).await;
-    assert_ne!(
-        code, 409,
-        "the first probe must not be rate-limited: {body}"
-    );
-
-    // Establish the PRESENCE of the cooldown before asserting it yields —
-    // otherwise this passes against a build where the cooldown never fires at
-    // all, proving nothing about the bypass (DEC-272).
-    let (blocked, blocked_body) =
-        uds_post(&sock_str, "/fans/openfan/rescan", &serde_json::json!({})).await;
-    assert_eq!(
-        blocked, 409,
-        "precondition: an unchanged port set must still be spaced: {blocked_body}"
-    );
-
-    // Now claim the last probe walked a DIFFERENT set — the state a freshly
-    // attached controller produces — with the clock left well inside the window.
-    *state.last_openfan_rescan.lock() = Some(control_ofc_daemon::api::handlers::LastRescan {
-        at: std::time::Instant::now(),
-        candidates: vec!["/dev/ttyUSB-was-not-here-before".to_string()],
-    });
-    let (code2, body2) = uds_post(&sock_str, "/fans/openfan/rescan", &serde_json::json!({})).await;
-    assert_ne!(
-        code2, 409,
-        "a changed candidate set must bypass the cooldown — otherwise plugging a \
-         controller in and rescanning immediately is refused, which is exactly \
-         the recovery this endpoint exists for: {body2}"
     );
 }
 
