@@ -1,5 +1,43 @@
 # Changelog
 
+## [2.47.6] — 2026-09-16
+
+**Two follow-ups to DEC-371, both opened by its own review (DEC-372; register
+rows `OFN-ad`, `OFN-af`). No change to fan control, to any commanded duty, or to
+the reach of the thermal emergency.**
+
+**A board whose every `pwmN` is read-only was told the force was holding headers
+that do not exist (`OFN-ad`).** The daemon builds its hwmon backend from any
+discovered header without consulting writability, so such a board has a real
+backend that writes nothing — and 2.47.5 reported it as a driven backend, which
+was the defect 2.47.5 set out to remove, reproduced inside its own fix. The
+reported scope now comes from whether a backend has **at least one output it can
+actually drive**, so that board correctly reaches the *"Thermal safety override
+reached NO fans"* alarm. The forced write itself is unchanged: every present
+backend is still asked to force, whatever it reports about its targets.
+
+**The forced branch logged every second for the whole hold, with nothing
+throttling it (`OFN-af`).** There is no in-process rate limiter and the packaged
+unit sets no `LogRateLimit*`, so journald's default never engaged at 1 Hz — and
+on a VM, where a missing CPU sensor forces the no-sensor floor indefinitely, the
+line repeated forever. It is now first / periodic summary / recovery, keyed on
+the forced duty **and** the driven backend set, so the ladder's 100 → 60 step and
+a mid-hold OpenFan adoption are still announced the moment they happen rather
+than waiting for a summary. Summaries fall due every
+`THERMAL_FORCE_LOG_SUMMARY_TICKS` (60) ticks — deliberately more often than the
+write-failure throttle, because a thermal event outranks one.
+
+**Forcing now reports when it ends.** *"Thermal force ended after N tick(s)"*.
+`safety.rs` already logged the emergency's release at 80 °C, but forcing
+continues for two recovery ticks past that and a no-sensor force ending logged
+nothing at all, so nothing ever said the fans were back under the profile.
+
+`OFN-ah` — an unrelated contract divergence found while researching `OFN-ad`, in
+which a control bound to read-only headers is not reported as
+`backend_unavailable` — is **deliberately still open**. The gating fix that would
+have closed it changes what `/status` publishes, and was judged a separate
+decision.
+
 ## [2.47.5] — 2026-09-16
 
 **The thermal-emergency log lines named OpenFan on machines that have none

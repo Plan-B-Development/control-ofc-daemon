@@ -16,7 +16,8 @@ pub(crate) struct SafetyDecision {
     ///
     /// The enumeration is the design, not a message (DEC-371): this is a pure
     /// decision with no view of the backends, so the log line below names a duty
-    /// and leaves the reach to the engine, which reports what it actually drove.
+    /// and leaves the reach to the engine, which reports which backends had
+    /// something to drive (DEC-372 — not which writes landed; see `ForcedScope`).
     pub(crate) forced_pct: Option<u8>,
 }
 

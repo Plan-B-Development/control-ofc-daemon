@@ -229,6 +229,28 @@ impl HwmonPwmController {
         &self.verify_mismatch_counts
     }
 
+    /// The header ids the thermal force actually drives — every **writable**
+    /// header, in `headers()` order.
+    ///
+    /// [SAFETY] `OFN-ad`, DEC-372. This is the ONE definition of the forced
+    /// target set. It was inlined in `HwmonBackend::force_all_with_floor`'s
+    /// blocking closure, and `HwmonBackend::new` now derives
+    /// `has_forced_targets` from the same expression — so the set that is
+    /// written and the claim the log line makes about it cannot drift apart
+    /// (DEC-334: one flag, one gating shape).
+    ///
+    /// Safe to call once at construction and cache the emptiness of:
+    /// `is_writable` is read from the sysfs permission bit at discovery
+    /// (`pwm_discovery.rs`) and never recomputed — `hwmon_rescan_handler` does
+    /// not replace a running controller.
+    pub fn forced_target_ids(&self) -> Vec<String> {
+        self.headers()
+            .iter()
+            .filter(|h| h.is_writable)
+            .map(|h| h.id.clone())
+            .collect()
+    }
+
     /// Get the list of discovered PWM headers.
     pub fn headers(&self) -> Vec<&PwmHeaderDescriptor> {
         let mut headers: Vec<_> = self.headers.values().collect();

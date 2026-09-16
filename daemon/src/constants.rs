@@ -169,6 +169,23 @@ pub const NO_SENSOR_CYCLE_THRESHOLD: u32 = 5;
 /// `NO_SENSOR_CYCLE_THRESHOLD` consecutive cycles.
 pub const NO_SENSOR_SAFE_PCT: u8 = 40;
 
+/// Ticks between "still forcing" summaries while the thermal force holds at an
+/// unchanged duty and backend set (`OFN-af`, DEC-372).
+///
+/// The forced branch used to log every tick for the whole hold — 1 Hz, and
+/// *indefinitely* on a VM, where a missing CPU sensor forces
+/// `NO_SENSOR_SAFE_PCT` forever. There is no in-process throttle (`main.rs`
+/// installs a bare `env_logger`) and the packaged unit sets no `LogRateLimit*`,
+/// so journald's 10 000/30 s default never engages at that rate: nothing was
+/// throttling it at all.
+///
+/// Shorter than [`HWMON_FAIL_SUMMARY_INTERVAL`] by design — a thermal event
+/// outranks a per-member write failure, so it gets a ~1 min heartbeat rather
+/// than ~5 min. A *change* of duty or of driven backend is announced
+/// immediately and does not wait for this interval, so the ladder's
+/// 100 → 60 → profile steps are never hidden by it.
+pub const THERMAL_FORCE_LOG_SUMMARY_TICKS: u32 = 60;
+
 // ── Profile engine — OpenFan write-failure alerting (audit P3-5) ──────
 
 /// Consecutive write failures — per channel, or across the whole link — before

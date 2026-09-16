@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use super::CpuReading;
 use super::PwmCommand;
 use crate::clock::Clock;
 use crate::constants;
@@ -351,13 +352,33 @@ pub(crate) trait SafetyWriteBackend: WriteBackend {
         pct: u8,
         commands: &[PwmCommand],
     ) -> impl std::future::Future<Output = ()> + Send;
+
+    /// Does this backend have **at least one output the force can actually
+    /// drive**?
+    ///
+    /// [SAFETY] `OFN-ad`, DEC-372. This is what [`ForcedScope`] reports, and it
+    /// is deliberately NOT "does this backend exist": `main.rs` builds
+    /// `hwmon_controller` from any non-empty `discover_pwm_headers` result
+    /// without consulting `is_writable`, so a board whose every `pwmN` is
+    /// read-only has a perfectly real `HwmonBackend` that writes nothing.
+    /// Reporting presence there told an operator the force was holding headers
+    /// that do not exist — DEC-371's own defect class inside DEC-371's fix.
+    ///
+    /// Answered from state fixed at construction, never by taking the
+    /// controller lock: that lock is held for the whole of an uncancellable
+    /// blocking `std::fs::write`, so asking on the async side is the freeze
+    /// `BoundedWrite`/DEC-289 exists to prevent (and DEC-278's "moved the block
+    /// into the kernel driver lock" one file over). Safe to cache because
+    /// `is_writable` is read at discovery and never recomputed.
+    fn has_forced_targets(&self) -> bool;
 }
 
-/// Which safety backends a forced tick actually drove (`OFN-n`, DEC-371).
+/// Which safety backends a forced tick had something to drive (`OFN-n`, DEC-371;
+/// `OFN-ad`, DEC-372).
 ///
 /// [SAFETY] This exists so the operator-facing line that follows a forced write
-/// names the set that was **written**, instead of an enumeration baked into a
-/// format string. Until DEC-371 all three thermal log lines read "all
+/// names the set the force could actually reach, instead of an enumeration baked
+/// into a format string. Until DEC-371 all three thermal log lines read "all
 /// OpenFan+hwmon fans" unconditionally, so a machine with no OpenFanController —
 /// most machines — was told the force had a reach it did not have, in the
 /// highest-stakes message this daemon emits. It is the drift DEC-292/DEC-308
@@ -370,21 +391,27 @@ pub(crate) trait SafetyWriteBackend: WriteBackend {
 /// different sources — the `AUD2-g`/DEC-325 trap, where a flag describing an
 /// argument was taken from a sibling fact that usually implied it.
 ///
-/// **Read the flag precisely: it means the backend was PRESENT and was asked to
-/// force, not that any output was written.** The two diverge on exactly one
-/// machine, and the gap is recorded as `OFN-ad` rather than papered over:
-/// `main.rs` builds `hwmon_controller` from any non-empty `discover_pwm_headers`
-/// result **without consulting `is_writable`**, while `HwmonBackend::
-/// force_all_with_floor` filters to writable headers — so a board whose every
-/// `pwmN` is read-only yields `hwmon: true` and writes nothing. Closing it needs
-/// the write path to report what it drove, which it cannot do today because the
-/// hwmon write is handed to the blocking pool inside a `BoundedWrite` and may
-/// still be in flight when this returns.
+/// **The flag is [`SafetyWriteBackend::has_forced_targets`], not presence**
+/// (`OFN-ad`, DEC-372). DEC-371 set it unconditionally inside each arm, which
+/// was wrong on exactly one machine: a board whose every `pwmN` is read-only
+/// has a real `HwmonBackend` — `main.rs` gates that on discovering *any* header
+/// — that writes nothing, and it was told the force was holding headers that do
+/// not exist. That was DEC-371's own defect class reproduced inside its fix.
+///
+/// **It is still not "wrote", and no arrangement of this type makes it so.** A
+/// backend's write may be issued and not yet complete — [`BoundedWrite`] returns
+/// once its budget expires and reports the stall separately — so the honest
+/// reading is *"had at least one output the force can drive, and was asked to
+/// drive it"*. Distinguishing a landed write would mean reporting from the
+/// blocking pool, which is the freeze [`SafetyWriteBackend::has_forced_targets`]
+/// explains this type deliberately avoids.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ForcedScope {
-    /// An OpenFan backend was present and was driven this tick.
+    /// The OpenFan backend had at least one output the force can drive, and was
+    /// asked to drive it. Not "the write landed" — see the type's docs.
     pub(crate) openfan: bool,
-    /// A hwmon backend was present and was driven this tick.
+    /// The hwmon backend had at least one **writable** header, and was asked to
+    /// drive it. Not "the write landed" — see the type's docs.
     pub(crate) hwmon: bool,
 }
 
@@ -398,9 +425,8 @@ impl ForcedScope {
     /// (GPU fans are excluded by design, DEC-130). The caller must say that
     /// plainly rather than print an enumeration of the empty set.
     ///
-    /// It does **not** cover the board whose every `pwmN` is read-only: that one
-    /// has a present `HwmonBackend` and so takes the `Some` arm while writing
-    /// nothing. See [`ForcedScope`] and register row `OFN-ad`.
+    /// Since DEC-372 it **also** covers the board whose every `pwmN` is
+    /// read-only, which has a real `HwmonBackend` that drives nothing.
     pub(crate) fn describe(self) -> Option<&'static str> {
         match (self.openfan, self.hwmon) {
             (true, true) => Some("all OpenFan channels and writable hwmon headers"),
@@ -408,6 +434,104 @@ impl ForcedScope {
             (false, true) => Some("all writable hwmon headers"),
             (false, false) => None,
         }
+    }
+}
+
+/// What the forced branch should emit this tick (`OFN-af`, DEC-372).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForceLogAction {
+    /// First tick of a forcing episode, or the duty or the driven set changed —
+    /// report in full, immediately.
+    Announce,
+    /// Nothing has changed and the summary is not due: say nothing.
+    Silent,
+    /// Unchanged for `ticks` consecutive ticks: a periodic "still forcing" line.
+    Summary { ticks: u32 },
+}
+
+/// Throttle for the forced branch's operator-facing log (`OFN-af`, DEC-372).
+///
+/// The forced branch logged **every tick for the whole hold**, and nothing was
+/// throttling it: `main.rs` installs a bare `env_logger`, the packaged unit sets
+/// no `LogRateLimit*`, and journald's 10 000/30 s default never engages at 1 Hz.
+/// On a VM that is unbounded — a missing CPU sensor forces `NO_SENSOR_SAFE_PCT`
+/// forever, so the line repeats once a second indefinitely.
+///
+/// **A pure edge-trigger — [`HwmonBackend::stall_logged`]'s shape — is the wrong
+/// mechanism here, and that distinction is the point.** `stall_logged` guards a
+/// *transient* stall that resolves. This condition can be permanent, so a pure
+/// edge means one line and then total silence about a machine the daemon cannot
+/// cool. The repo's idiom for a *persistent* fault is DEC-199's three parts —
+/// first, periodic summary, recovery edge — used by `note_outcomes` in this same
+/// file. The kernel draws the same distinction between `pr_*_once()` and
+/// `pr_*_ratelimited()`; see <https://docs.kernel.org/core-api/printk-basics.html>.
+///
+/// **Keyed on the duty AND the driven set, not merely on "am I forcing".** Both
+/// change during a real event and both matter: the ladder steps 100 → 60 → back
+/// to the profile, and `profile_engine_loop` can adopt an OpenFan controller
+/// *mid-hold* (DEC-265), which hands the emergency a whole extra backend. Keying
+/// on the forced state alone would hide either transition for up to a full
+/// summary interval — exactly the moment an operator is reading the log.
+#[derive(Debug, Default)]
+pub(crate) struct ForceLogThrottle {
+    /// The (duty, scope, reading-kind) currently being reported. `None` between
+    /// episodes.
+    ///
+    /// The reading's **discriminant** is in the key because the emitted line
+    /// carries it: a Fresh → Stale transition at an unchanged duty and scope
+    /// changes what the operator is told, and DEC-269 calls stale "the one an
+    /// operator most needs to tell apart". Without it that transition is
+    /// suppressed for up to a full summary interval during a latched emergency
+    /// going blind (`held_while_stale` holds the duty at 100, so nothing else in
+    /// the key moves). The *discriminant* and not the temperature — keying on
+    /// the value would defeat the throttle entirely, since it changes every tick.
+    current: Option<(u8, ForcedScope, std::mem::Discriminant<CpuReading>)>,
+    /// Consecutive ticks at `current`, which drives the summary cadence.
+    held_ticks: u32,
+    /// Ticks in the whole forcing episode, for the recovery line.
+    episode_ticks: u32,
+}
+
+impl ForceLogThrottle {
+    /// Record a forced tick and say what to log.
+    pub(crate) fn on_forced_tick(
+        &mut self,
+        pct: u8,
+        scope: ForcedScope,
+        reading: std::mem::Discriminant<CpuReading>,
+    ) -> ForceLogAction {
+        self.episode_ticks = self.episode_ticks.saturating_add(1);
+        if self.current != Some((pct, scope, reading)) {
+            self.current = Some((pct, scope, reading));
+            self.held_ticks = 1;
+            return ForceLogAction::Announce;
+        }
+        self.held_ticks = self.held_ticks.saturating_add(1);
+        if self
+            .held_ticks
+            .is_multiple_of(constants::THERMAL_FORCE_LOG_SUMMARY_TICKS)
+        {
+            ForceLogAction::Summary {
+                ticks: self.held_ticks,
+            }
+        } else {
+            ForceLogAction::Silent
+        }
+    }
+
+    /// Record a tick that forced nothing.
+    ///
+    /// Returns the length of the episode that just ended, once, on the recovery
+    /// edge — and `None` on every other normal tick. `safety.rs` logs its own
+    /// line when the *emergency* releases at 80 °C, but forcing continues for two
+    /// more recovery ticks after that, and a no-sensor force ending logs nothing
+    /// at all; this is the only report that the fans are back under the profile.
+    pub(crate) fn on_normal_tick(&mut self) -> Option<u32> {
+        self.current.take()?;
+        let ticks = self.episode_ticks;
+        self.episode_ticks = 0;
+        self.held_ticks = 0;
+        Some(ticks)
     }
 }
 
@@ -438,11 +562,11 @@ where
     let mut scope = ForcedScope::default();
     if let Some(be) = openfan {
         be.force_all_with_floor(pct, baseline).await;
-        scope.openfan = true;
+        scope.openfan = be.has_forced_targets();
     }
     if let Some(be) = hwmon {
         be.force_all_with_floor(pct, baseline).await;
-        scope.hwmon = true;
+        scope.hwmon = be.has_forced_targets();
     }
     scope
 }
@@ -708,6 +832,14 @@ impl WriteBackend for OpenFanBackend {
 }
 
 impl SafetyWriteBackend for OpenFanBackend {
+    /// Always true: an adopted controller has [`NUM_CHANNELS`] channels and the
+    /// forced write drives `0..NUM_CHANNELS` unconditionally, so if this
+    /// backend exists at all it has outputs to drive. Unlike hwmon there is no
+    /// per-channel writability bit to consult.
+    fn has_forced_targets(&self) -> bool {
+        true
+    }
+
     /// Drive every OpenFan channel to at least `pct` (D1-j).
     ///
     /// Every channel is written, including ones no control commands — that is
@@ -1244,15 +1376,54 @@ pub(crate) struct HwmonBackend {
     /// legitimately slow emergency write reports its transition once instead of
     /// once per tick for the whole emergency-to-release hold.
     stall_logged: bool,
+    /// Whether this controller has any **writable** header, i.e. whether the
+    /// thermal force has anything here to drive (`OFN-ad`, DEC-372).
+    ///
+    /// Derived once, at construction, from the same
+    /// `HwmonPwmController::forced_target_ids` the forced write uses, so the
+    /// claim and the write cannot drift. Cached rather than asked per tick
+    /// because the controller lock is held for the whole of an uncancellable
+    /// blocking `std::fs::write`; `is_writable` is fixed at discovery, so
+    /// there is nothing to re-read.
+    has_forced_targets: bool,
 }
 
 impl HwmonBackend {
     pub(crate) fn new(ctrl: Arc<Mutex<crate::hwmon::pwm_control::HwmonPwmController>>) -> Self {
+        // [SAFETY] Timed, and it fails toward OVER-claiming. `tokio::spawn`
+        // only queues the engine task, so "the engine is spawned before
+        // `axum::serve` accepts" does not mean this line runs first — a handler
+        // can hold the controller lock here, and a blocking sysfs write holds it
+        // for the whole of an uncancellable `std::fs::write`. A plain `.lock()`
+        // would park the engine before its first tick, which is the delay-to-
+        // thermal-evaluation `OFN-a` was about.
+        //
+        // On timeout assume the backend HAS targets: that degrades to the
+        // DEC-371 reporting (a possible over-claim on a read-only board) rather
+        // than emitting a false "reached NO fans", which is the worse error on
+        // the highest-stakes line the daemon writes. Nothing else changes —
+        // the forced write is unaffected either way.
+        let has_forced_targets = match ctrl.try_lock_for(std::time::Duration::from_millis(250)) {
+            Some(guard) => !guard.forced_target_ids().is_empty(),
+            None => {
+                // Startup-only, so it cannot spam — and without it an
+                // ASSUMED claim is indistinguishable from a measured one on
+                // the highest-stakes line this daemon writes, for the rest
+                // of the boot.
+                log::warn!(
+                    "hwmon controller was locked at engine start — assuming it has \
+                         writable headers, so a thermal force will report it as driven \
+                         whether or not it can drive anything"
+                );
+                true
+            }
+        };
         Self {
             ctrl,
             member_failures: HashMap::new(),
             writes: BoundedWrite::default(),
             stall_logged: false,
+            has_forced_targets,
         }
     }
 
@@ -1443,6 +1614,11 @@ impl WriteBackend for HwmonBackend {
 }
 
 impl SafetyWriteBackend for HwmonBackend {
+    /// Whether any header is writable, decided at construction (`OFN-ad`).
+    fn has_forced_targets(&self) -> bool {
+        self.has_forced_targets
+    }
+
     /// Drive every writable hwmon header to at least `pct` (D1-j),
     /// auto-leasing for safety writes.
     ///
@@ -1488,12 +1664,7 @@ impl SafetyWriteBackend for HwmonBackend {
                 // at the moment they matter most. Not a loss of reach: the rule
                 // is scoped to writable headers (`safety.rs`), so a read-only
                 // one was never going to be driven.
-                let hdr_ids: Vec<String> = guard
-                    .headers()
-                    .iter()
-                    .filter(|h| h.is_writable)
-                    .map(|h| h.id.clone())
-                    .collect();
+                let hdr_ids: Vec<String> = guard.forced_target_ids();
                 let lease_id = guard
                     .lease_manager_mut()
                     .force_take_lease(HwmonWriter::ThermalSafety)
@@ -2668,6 +2839,75 @@ mod tests {
         assert_eq!(lease.map(|l| l.owner), Some(HwmonWriter::Engine));
     }
 
+    /// [SAFETY] `OFN-ad`, DEC-372 — the **discriminating** arm.
+    ///
+    /// `main.rs` builds `hwmon_controller` from any non-empty
+    /// `discover_pwm_headers` result without consulting `is_writable`, so a board
+    /// whose every `pwmN` is read-only has a perfectly real `HwmonBackend` that
+    /// writes nothing. DEC-371 reported it as a driven backend, telling an
+    /// operator mid-thermal-event that the force was holding headers that do not
+    /// exist.
+    ///
+    /// The writable arm below returns the pre-fix answer (`true`) by
+    /// construction, so a test built only from that arm passes with the fix
+    /// deleted (DEC-340). This one is the arm that can fail.
+    #[test]
+    fn hwmon_backend_has_no_forced_targets_when_every_header_is_read_only() {
+        let mut ro1 = make_header_idx("hwmon:it8696:pwm1", 1);
+        ro1.is_writable = false;
+        let mut ro2 = make_header_idx("hwmon:it8696:pwm2", 2);
+        ro2.is_writable = false;
+
+        let (be, _writes) = hwmon_backend(vec![ro1, ro2]);
+
+        assert!(
+            !be.has_forced_targets(),
+            "a controller whose every header is read-only drives nothing and must \
+             not be reported as a driven backend (OFN-ad)"
+        );
+    }
+
+    /// The opposite arm of `OFN-ad`, without which a stuck `false` passes.
+    #[test]
+    fn hwmon_backend_has_forced_targets_when_any_header_is_writable() {
+        let mut ro = make_header_idx("hwmon:it8696:pwm1", 1);
+        ro.is_writable = false;
+        let rw = make_header_idx("hwmon:it8696:pwm2", 2);
+
+        let (be, _writes) = hwmon_backend(vec![ro, rw]);
+
+        assert!(
+            be.has_forced_targets(),
+            "one writable header among read-only ones is still a driven backend"
+        );
+    }
+
+    /// The cached flag must agree with the ONE definition of the forced target
+    /// set, on both arms — asserted as a relationship, never against a literal
+    /// (DEC-324). A test written as `assert!(!be.has_forced_targets())` alone is
+    /// satisfied by a flag that is always false.
+    #[test]
+    fn hwmon_forced_targets_flag_matches_the_controllers_own_target_set() {
+        for writable in [false, true] {
+            let mut h = make_header_idx("hwmon:it8696:pwm1", 1);
+            h.is_writable = writable;
+            let (be, _writes) = hwmon_backend(vec![h]);
+
+            let from_controller = !be.ctrl.lock().forced_target_ids().is_empty();
+            assert_eq!(
+                be.has_forced_targets(),
+                from_controller,
+                "the cached flag disagrees with forced_target_ids() (writable={writable})"
+            );
+            // Precondition: without this the assertion above is satisfied by a
+            // target set that never tracks writability at all.
+            assert_eq!(
+                from_controller, writable,
+                "precondition: the forced target set must follow is_writable"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn hwmon_apply_skips_read_only_header() {
         // DEC-102 engine-path backstop: a read-only header (is_writable=false)
@@ -3736,6 +3976,10 @@ mod forced_scope_tests {
         name: &'static str,
         order: Arc<Mutex<Vec<&'static str>>>,
         forced: Vec<(u8, Vec<String>)>,
+        /// Lets "present" and "has outputs to drive" diverge, which is the whole
+        /// of `OFN-ad`. A fake that always reports targets cannot tell the two
+        /// apart, and the pre-DEC-372 version of this file had exactly that.
+        has_targets: bool,
     }
 
     impl RecordingBackend {
@@ -3744,6 +3988,16 @@ mod forced_scope_tests {
                 name,
                 order,
                 forced: Vec::new(),
+                has_targets: true,
+            }
+        }
+
+        /// A present backend with nothing it can drive — the read-only-`pwmN`
+        /// board.
+        fn without_targets(name: &'static str, order: Arc<Mutex<Vec<&'static str>>>) -> Self {
+            Self {
+                has_targets: false,
+                ..Self::new(name, order)
             }
         }
 
@@ -3760,6 +4014,10 @@ mod forced_scope_tests {
     }
 
     impl SafetyWriteBackend for RecordingBackend {
+        fn has_forced_targets(&self) -> bool {
+            self.has_targets
+        }
+
         async fn force_all_with_floor(&mut self, pct: u8, commands: &[PwmCommand]) {
             self.order.lock().push(self.name);
             self.forced
@@ -3942,5 +4200,222 @@ mod forced_scope_tests {
                 be.name
             );
         }
+    }
+
+    /// [SAFETY] `OFN-ad`, DEC-372 — the call-site test for the corrected flag.
+    ///
+    /// DEC-371 set the scope flags to `true` inside each write arm, which means
+    /// "was asked to force" and is NOT the same as "had anything to force". The
+    /// two diverge on a board whose every `pwmN` is read-only.
+    ///
+    /// **The present-but-no-targets row is the discriminating one.** Absent and
+    /// present-with-targets both return the pre-fix answer by construction
+    /// (DEC-340), so a test built only from those passes with the fix deleted.
+    #[tokio::test]
+    async fn force_present_backends_reports_targets_not_mere_presence() {
+        for (present, has_targets, expected) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false), // the read-only-`pwmN` board — OFN-ad
+            (true, true, true),
+        ] {
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let mut hwmon = if has_targets {
+                RecordingBackend::new("hwmon", order.clone())
+            } else {
+                RecordingBackend::without_targets("hwmon", order.clone())
+            };
+
+            let scope = force_present_backends(
+                None::<&mut RecordingBackend>,
+                present.then_some(&mut hwmon),
+                100,
+                &[],
+            )
+            .await;
+
+            assert_eq!(
+                scope.hwmon, expected,
+                "present={present} has_targets={has_targets}: scope.hwmon must report \
+                 whether there was anything to drive, not mere presence"
+            );
+            // [SAFETY] Reach: a present backend is ALWAYS asked to force,
+            // whatever it reports about its targets. Narrowing the *write* to
+            // backends we believe have targets would be the v2.38.0 P1 shape —
+            // this flag governs the message only.
+            assert_eq!(
+                hwmon.was_forced(),
+                present,
+                "present={present}: a present backend must be asked to force \
+                 regardless of what it reports about its targets"
+            );
+        }
+    }
+
+    // ── OFN-af: the forced branch's log throttle ────────────────────────
+
+    const SCOPE_HWMON: ForcedScope = ForcedScope {
+        openfan: false,
+        hwmon: true,
+    };
+
+    /// The reading-kind key term. Discriminants only — the *temperature* must
+    /// never enter the key or the throttle would never suppress anything.
+    fn fresh() -> std::mem::Discriminant<CpuReading> {
+        std::mem::discriminant(&CpuReading::Fresh(70.0))
+    }
+    fn stale() -> std::mem::Discriminant<CpuReading> {
+        std::mem::discriminant(&CpuReading::Stale(70.0))
+    }
+
+    /// First tick announces; the hold is silent until the summary falls due.
+    #[test]
+    fn the_force_log_announces_once_then_summarises_periodically() {
+        let mut t = ForceLogThrottle::default();
+        assert_eq!(
+            t.on_forced_tick(100, SCOPE_HWMON, fresh()),
+            ForceLogAction::Announce,
+            "the first tick of an episode must be reported"
+        );
+        for tick in 2..constants::THERMAL_FORCE_LOG_SUMMARY_TICKS {
+            assert_eq!(
+                t.on_forced_tick(100, SCOPE_HWMON, fresh()),
+                ForceLogAction::Silent,
+                "tick {tick} of an unchanged hold must be silent"
+            );
+        }
+        assert_eq!(
+            t.on_forced_tick(100, SCOPE_HWMON, fresh()),
+            ForceLogAction::Summary {
+                ticks: constants::THERMAL_FORCE_LOG_SUMMARY_TICKS
+            },
+            "the summary must fall due at the interval, not one tick either side"
+        );
+    }
+
+    /// The ladder steps 100 → 60 mid-hold. Waiting up to a full interval to say
+    /// so hides the transition an operator is watching for.
+    #[test]
+    fn a_duty_change_is_announced_immediately() {
+        let mut t = ForceLogThrottle::default();
+        assert_eq!(
+            t.on_forced_tick(100, SCOPE_HWMON, fresh()),
+            ForceLogAction::Announce
+        );
+        assert_eq!(
+            t.on_forced_tick(100, SCOPE_HWMON, fresh()),
+            ForceLogAction::Silent
+        );
+        assert_eq!(
+            t.on_forced_tick(60, SCOPE_HWMON, fresh()),
+            ForceLogAction::Announce,
+            "a change of forced duty must not wait for the next summary"
+        );
+    }
+
+    /// DEC-265 adoption can hand the emergency a whole extra backend mid-hold.
+    #[test]
+    fn a_scope_change_is_announced_immediately() {
+        let both = ForcedScope {
+            openfan: true,
+            hwmon: true,
+        };
+        let mut t = ForceLogThrottle::default();
+        assert_eq!(
+            t.on_forced_tick(100, SCOPE_HWMON, fresh()),
+            ForceLogAction::Announce
+        );
+        assert_eq!(
+            t.on_forced_tick(100, SCOPE_HWMON, fresh()),
+            ForceLogAction::Silent
+        );
+        assert_eq!(
+            t.on_forced_tick(100, both, fresh()),
+            ForceLogAction::Announce,
+            "gaining a backend mid-hold must not wait for the next summary"
+        );
+    }
+
+    /// The recovery edge fires once, and a LATER episode announces again.
+    ///
+    /// That second half is why this is not a plain edge trigger: the condition
+    /// can be permanent, and a pure `stall_logged`-style latch would report a
+    /// machine the daemon cannot cool exactly once, ever.
+    #[test]
+    fn the_force_log_reports_the_episode_length_once_on_the_recovery_edge() {
+        let mut t = ForceLogThrottle::default();
+        assert_eq!(
+            t.on_normal_tick(),
+            None,
+            "no episode has run, so there is nothing to report"
+        );
+
+        for _ in 0..5 {
+            t.on_forced_tick(100, SCOPE_HWMON, fresh());
+        }
+
+        assert_eq!(
+            t.on_normal_tick(),
+            Some(5),
+            "the episode ran for five ticks"
+        );
+        assert_eq!(
+            t.on_normal_tick(),
+            None,
+            "the recovery edge fires once, not on every subsequent normal tick"
+        );
+        assert_eq!(
+            t.on_forced_tick(100, SCOPE_HWMON, fresh()),
+            ForceLogAction::Announce,
+            "a later episode must announce again rather than stay silent forever"
+        );
+    }
+
+    /// [SAFETY] `OFN-af` round 2: the emitted line carries the CPU reading's
+    /// kind, so that kind must be in the throttle key.
+    ///
+    /// The case that matters is a latched emergency going blind: `held_while_stale`
+    /// keeps the duty at 100 and the scope does not move, so without this term a
+    /// Fresh → Stale transition is suppressed for up to a full summary interval —
+    /// and DEC-269 calls stale "the one an operator most needs to tell apart".
+    /// Found by `ofc:concurrency-reviewer`, not by the first draft of these tests.
+    #[test]
+    fn a_reading_kind_change_is_announced_immediately() {
+        let mut t = ForceLogThrottle::default();
+        assert_eq!(
+            t.on_forced_tick(100, SCOPE_HWMON, fresh()),
+            ForceLogAction::Announce
+        );
+        assert_eq!(
+            t.on_forced_tick(100, SCOPE_HWMON, fresh()),
+            ForceLogAction::Silent
+        );
+        assert_eq!(
+            t.on_forced_tick(100, SCOPE_HWMON, stale()),
+            ForceLogAction::Announce,
+            "the sensor going stale under an unchanged duty and scope must not wait \
+             for the next summary"
+        );
+        // ...and the same kind again is silent, or the key is not a key at all.
+        assert_eq!(
+            t.on_forced_tick(100, SCOPE_HWMON, stale()),
+            ForceLogAction::Silent,
+            "an unchanged reading kind must still be throttled"
+        );
+    }
+
+    /// The episode length spans the ladder's duty changes — it is the length of
+    /// the whole force, not of the last duty held.
+    #[test]
+    fn the_episode_length_spans_duty_changes() {
+        let mut t = ForceLogThrottle::default();
+        t.on_forced_tick(100, SCOPE_HWMON, fresh());
+        t.on_forced_tick(100, SCOPE_HWMON, fresh());
+        t.on_forced_tick(60, SCOPE_HWMON, fresh());
+        assert_eq!(
+            t.on_normal_tick(),
+            Some(3),
+            "a duty change restarts the summary cadence but not the episode"
+        );
     }
 }

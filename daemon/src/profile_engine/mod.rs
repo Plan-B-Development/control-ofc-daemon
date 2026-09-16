@@ -10,7 +10,9 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use backends::{GpuBackend, HwmonBackend, OpenFanBackend, WriteBackend};
+use backends::{
+    ForceLogAction, ForceLogThrottle, GpuBackend, HwmonBackend, OpenFanBackend, WriteBackend,
+};
 
 use crate::constants;
 use crate::control_override::OverrideSnapshot;
@@ -1070,6 +1072,12 @@ pub async fn profile_engine_loop(
     // If no CpuTemp sensor is found for N cycles, force fans to a safe minimum.
     let mut no_cpu_sensor_cycles: u32 = 0;
 
+    // DEC-372 (`OFN-af`): throttle for the forced branch's operator-facing log,
+    // which used to emit every tick for the whole hold — unbounded on a machine
+    // whose force never ends. See `ForceLogThrottle` for why this is a
+    // first/summary/recovery shape rather than a plain edge trigger.
+    let mut force_log = ForceLogThrottle::default();
+
     // Cross-cycle tuning state for `evaluate_profile`. Cleared when the active
     // profile changes or is deactivated so step-rate limiting and start/stop
     // hysteresis don't leak between unrelated profiles.
@@ -1367,39 +1375,61 @@ pub async fn profile_engine_loop(
             )
             .await;
 
-            // DEC-269: name the three cases distinctly. "stale" is the one an
-            // operator most needs to tell apart — the sensor is still listed,
-            // so a log saying "no CPU temp sensor" would contradict the UI.
-            let reason = match hottest_cpu_c {
-                CpuReading::Fresh(temp) => format!("CPU temp {temp:.1}°C"),
-                CpuReading::Stale(temp) => {
-                    format!("CPU temp {temp:.1}°C, STALE — the sensor has stopped updating")
+            // DEC-372 (`OFN-af`): this branch used to log every tick for the
+            // whole hold, with nothing throttling it. Now first / periodic
+            // summary / recovery, keyed on the duty AND the driven set so the
+            // ladder's 100 → 60 step and a mid-hold OpenFan adoption are both
+            // announced at once rather than hidden until the next summary.
+            // `reason` is built only when something is emitted: it allocates,
+            // and this runs at 1 Hz for the length of an emergency.
+            let action = force_log.on_forced_tick(
+                forced_pct,
+                forced_scope,
+                std::mem::discriminant(&hottest_cpu_c),
+            );
+            if action != ForceLogAction::Silent {
+                // DEC-269: name the three cases distinctly. "stale" is the one an
+                // operator most needs to tell apart — the sensor is still listed,
+                // so a log saying "no CPU temp sensor" would contradict the UI.
+                let reason = match hottest_cpu_c {
+                    CpuReading::Fresh(temp) => format!("CPU temp {temp:.1}°C"),
+                    CpuReading::Stale(temp) => {
+                        format!("CPU temp {temp:.1}°C, STALE — the sensor has stopped updating")
+                    }
+                    CpuReading::Absent => "no CPU temp sensor".to_string(),
+                };
+                // DEC-371/372: the reach is reported from the backends that had
+                // outputs to drive, never from a literal. The `None` arm is a
+                // real machine — a GPU-only box, a VM, or (since DEC-372) a
+                // board whose every `pwmN` is read-only — where the ladder
+                // latches and publishes `emergency` while reaching no fan at
+                // all. It is louder because it is the one case an operator can
+                // act on, and the pre-DEC-371 message actively hid it.
+                let held = match action {
+                    ForceLogAction::Summary { ticks } => Some(ticks),
+                    _ => None,
+                };
+                match (forced_scope.describe(), held) {
+                    (Some(scope), None) => log::warn!(
+                        "Thermal safety override: holding {scope} at \
+                         {forced_pct}% or above ({reason})"
+                    ),
+                    (Some(scope), Some(ticks)) => log::warn!(
+                        "Thermal safety override: STILL holding {scope} at \
+                         {forced_pct}% or above after {ticks} ticks ({reason})"
+                    ),
+                    (None, None) => log::error!(
+                        "Thermal safety override reached NO fans — this daemon has no \
+                         fan output it can drive (no OpenFan controller, and no \
+                         writable hwmon header); {forced_pct}% or above was \
+                         requested ({reason})"
+                    ),
+                    (None, Some(ticks)) => log::error!(
+                        "Thermal safety override STILL reaching no fans after {ticks} \
+                         ticks — this daemon has no fan output it can drive; \
+                         {forced_pct}% or above was requested ({reason})"
+                    ),
                 }
-                CpuReading::Absent => "no CPU temp sensor".to_string(),
-            };
-            // DEC-371: the reach is reported from the backends actually asked
-            // to force, never from a literal. The `None` arm is a real machine,
-            // not a formatting edge case — a GPU-only box, or a VM with no fan
-            // hardware — where the ladder latches and publishes `emergency`
-            // while reaching no fan at all. It is louder than the normal arm
-            // because it is the one case an operator can act on, and the old
-            // message actively hid it.
-            //
-            // Known gap, recorded as `OFN-ad` rather than left implicit: a board
-            // whose every `pwmN` is read-only has a present `HwmonBackend` and so
-            // takes the `Some` arm while writing nothing. `ForcedScope` reports
-            // presence, not writes — see its doc comment for why the write path
-            // cannot report the latter today.
-            match forced_scope.describe() {
-                Some(scope) => log::warn!(
-                    "Thermal safety override: holding {scope} at \
-                     {forced_pct}% or above ({reason})"
-                ),
-                None => log::error!(
-                    "Thermal safety override reached NO fans — this daemon has no \
-                     writable fan backend (no OpenFan controller, and no writable \
-                     hwmon header); {forced_pct}% or above was requested ({reason})"
-                ),
             }
             // P3-2: drop the step-rate anchor so post-override evaluation
             // starts fresh instead of step-rate-clamping from a pre-emergency
@@ -1450,6 +1480,31 @@ pub async fn profile_engine_loop(
             // list — a card showing "—" — remains the only honest answer, and
             // `reset_for_forced_tick` has already cleared them.
             continue;
+        } else if let Some(ticks) = force_log.on_normal_tick() {
+            // DEC-372 (`OFN-af`): the recovery edge of DEC-199's three-part
+            // shape.
+            //
+            // Attached as the `else` of the forced branch rather than placed
+            // after it. The first draft sat below and relied on that branch
+            // ending in an unconditional `continue` — true, but a rule asserted
+            // in a comment, which a later `continue` anywhere in those ~140
+            // lines would silently break: the episode would then never reset, so
+            // the NEXT force at the same duty and scope would skip its
+            // `Announce` and fall straight into the summary cadence, and the
+            // recovery line would report two merged episodes. "A rule your code
+            // needs is a rule your code should enforce" (DEC-361), and there is
+            // no wiring test that would catch the loss — the throttle's tests
+            // are pure unit tests on `ForceLogThrottle`, and the daemon has no
+            // log-capture harness — so structure is the only guard available.
+            //
+            // `safety.rs` logs the emergency's own release at 80 °C, but forcing
+            // continues for two recovery ticks past that and a no-sensor force
+            // ending logs nothing at all — this is the only line that says the
+            // fans are back under the profile.
+            log::info!(
+                "Thermal force ended after {ticks} tick(s) — fan control returns to \
+                 the active profile"
+            );
         }
 
         // No profile loaded: nothing to apply, so end the tick here. Deliberately
