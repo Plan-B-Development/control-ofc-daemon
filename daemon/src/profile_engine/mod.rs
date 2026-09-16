@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use backends::{GpuBackend, HwmonBackend, OpenFanBackend, SafetyWriteBackend, WriteBackend};
+use backends::{GpuBackend, HwmonBackend, OpenFanBackend, WriteBackend};
 
 use crate::constants;
 use crate::control_override::OverrideSnapshot;
@@ -1338,28 +1338,34 @@ pub async fn profile_engine_loop(
         tick_done.set_skipped(engine_state.skipped_snapshot());
 
         if let Some(forced_pct) = decision.forced_pct {
-            // Forced safety override — all OpenFan channels and writable
-            // hwmon headers. GPU fans are deliberately excluded (DEC-130):
-            // AMD PMFW firmware owns GPU thermal protection (junction-temp
-            // throttle, firmware fan ramp) independently of OS fan control,
-            // and forcing PMFW curve commits from a CPU emergency would add
-            // SMU churn without improving GPU safety. There is no GPU
+            // Forced safety override — every OpenFan channel and writable
+            // hwmon header THIS MACHINE HAS. GPU fans are deliberately excluded
+            // (DEC-130): AMD PMFW firmware owns GPU thermal protection
+            // (junction-temp throttle, firmware fan ramp) independently of OS fan
+            // control, and forcing PMFW curve commits from a CPU emergency would
+            // add SMU churn without improving GPU safety. There is no GPU
             // emergency threshold; the exclusion is structural — GpuBackend
             // does not implement SafetyWriteBackend.
             //
+            // DEC-371: "this machine has" is the qualifier that was missing, and
+            // its absence reached the operator. Do NOT restate the enumeration
+            // above in the log line below — it is derived from `ForcedScope`,
+            // which `force_present_backends` sets from inside each write arm.
+            //
             // [SAFETY] D1-j / DEC-307: `forced_pct` is a FLOOR over the profile's
             // own commands, not a replacement for them. Every OpenFan channel and
-            // writable hwmon header is still written — including the ones no
-            // control commands, which is what preserves the emergency's reach —
+            // writable hwmon header present is still written — including the ones
+            // no control commands, which is what preserves the emergency's reach —
             // but a commanded output gets `max(commanded, forced_pct)`. Passing
             // an empty slice (no profile) reproduces the old behaviour exactly.
             let baseline = profile_commands.as_deref().unwrap_or(&[]);
-            if let Some(be) = openfan_be.as_mut() {
-                be.force_all_with_floor(forced_pct, baseline).await;
-            }
-            if let Some(be) = hwmon_be.as_mut() {
-                be.force_all_with_floor(forced_pct, baseline).await;
-            }
+            let forced_scope = backends::force_present_backends(
+                openfan_be.as_mut(),
+                hwmon_be.as_mut(),
+                forced_pct,
+                baseline,
+            )
+            .await;
 
             // DEC-269: name the three cases distinctly. "stale" is the one an
             // operator most needs to tell apart — the sensor is still listed,
@@ -1371,10 +1377,30 @@ pub async fn profile_engine_loop(
                 }
                 CpuReading::Absent => "no CPU temp sensor".to_string(),
             };
-            log::warn!(
-                "Thermal safety override: holding all OpenFan+hwmon fans at \
-                 {forced_pct}% or above ({reason})"
-            );
+            // DEC-371: the reach is reported from the backends actually asked
+            // to force, never from a literal. The `None` arm is a real machine,
+            // not a formatting edge case — a GPU-only box, or a VM with no fan
+            // hardware — where the ladder latches and publishes `emergency`
+            // while reaching no fan at all. It is louder than the normal arm
+            // because it is the one case an operator can act on, and the old
+            // message actively hid it.
+            //
+            // Known gap, recorded as `OFN-ad` rather than left implicit: a board
+            // whose every `pwmN` is read-only has a present `HwmonBackend` and so
+            // takes the `Some` arm while writing nothing. `ForcedScope` reports
+            // presence, not writes — see its doc comment for why the write path
+            // cannot report the latter today.
+            match forced_scope.describe() {
+                Some(scope) => log::warn!(
+                    "Thermal safety override: holding {scope} at \
+                     {forced_pct}% or above ({reason})"
+                ),
+                None => log::error!(
+                    "Thermal safety override reached NO fans — this daemon has no \
+                     writable fan backend (no OpenFan controller, and no writable \
+                     hwmon header); {forced_pct}% or above was requested ({reason})"
+                ),
+            }
             // P3-2: drop the step-rate anchor so post-override evaluation
             // starts fresh instead of step-rate-clamping from a pre-emergency
             // anchor — the fans are physically at or above `forced_pct`, not at
@@ -1405,8 +1431,9 @@ pub async fn profile_engine_loop(
             // is LIVE during a forced tick rather than frozen — see the note
             // there. Read a listed control correctly during an event: it means "this
             // control's curve is unresolvable", NOT "this fan is stopped".
-            // The forced write reaches OpenFan channels and writable hwmon
-            // headers but excludes GPU fans by design (DEC-130), so a GPU-bound
+            // The forced write reaches whichever of OpenFan channels and
+            // writable hwmon headers this machine has (DEC-371), and excludes
+            // GPU fans by design (DEC-130), so a GPU-bound
             // control with an unresolvable curve genuinely is uncommanded
             // throughout — which is precisely the case that must not go silent.
             // The thermal banner already explains the override for everything

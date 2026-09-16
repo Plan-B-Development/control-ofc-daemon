@@ -10,8 +10,13 @@ pub(crate) struct SafetyDecision {
     /// reported to the cache and surfaced via `GET /status` (DEC-132) and
     /// `/diagnostics/hardware`.
     pub(crate) thermal_state: &'static str,
-    /// When `Some`, every OpenFan channel + hwmon header is forced to this
-    /// PWM this tick. GPU fans are excluded by design (DEC-130).
+    /// When `Some`, every OpenFan channel and writable hwmon header the machine
+    /// HAS is forced to this PWM this tick. GPU fans are excluded by design
+    /// (DEC-130).
+    ///
+    /// The enumeration is the design, not a message (DEC-371): this is a pure
+    /// decision with no view of the backends, so the log line below names a duty
+    /// and leaves the reach to the engine, which reports what it actually drove.
     pub(crate) forced_pct: Option<u8>,
 }
 
@@ -182,8 +187,7 @@ pub(crate) fn evaluate_safety_tick(
         };
         match forced_pct {
             Some(pct) => log::error!(
-                "SAFETY: {cause} for {} consecutive cycles — forcing all \
-                 OpenFan+hwmon fans to {pct}%",
+                "SAFETY: {cause} for {} consecutive cycles — forcing fans to {pct}%",
                 constants::NO_SENSOR_CYCLE_THRESHOLD
             ),
             None => log::warn!(

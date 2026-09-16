@@ -1,5 +1,55 @@
 # Changelog
 
+## [2.47.5] — 2026-09-16
+
+**The thermal-emergency log lines named OpenFan on machines that have none
+(DEC-371; register row `OFN-n`). No change to fan control, to any commanded duty,
+or to the reach of the thermal emergency itself.**
+
+**What an operator was told during a thermal event overstated what the daemon
+did.** All three safety log lines read *"forcing all OpenFan+hwmon fans to N%"*
+regardless of which backends existed — so on a machine with no OpenFanController,
+which is most machines, the highest-stakes message this daemon emits claimed a
+reach it did not have. The line was already correct about the *threshold*, which
+it interpolates per-machine rather than restating (DEC-292/DEC-308); this is the
+same drift one noun over.
+
+The engine's line now reports what it **actually wrote** — `all OpenFan channels
+and writable hwmon headers`, `all writable hwmon headers`, or `all OpenFan
+channels`, derived per tick from the backends actually asked to force. The two lines emitted
+from pure decision functions, which have no view of the backends, now state the
+duty and claim no reach: *"THERMAL EMERGENCY: CPU Tctl 106.2°C >= 105°C — forcing
+fans to 100%"*.
+
+**A machine where the emergency reaches nothing now says so.** With neither
+backend present — a GPU-only box, or a VM with no fan hardware — the ladder
+latches, publishes `thermal_state: "emergency"` and writes to no fan at all (GPU
+fans are excluded by design, DEC-130). That case previously produced the most
+false version of the message; it now logs at ERROR: *"Thermal safety override
+reached NO fans — this daemon has no writable fan backend…"*. No version of this
+daemon has previously reported it.
+
+**One machine is deliberately NOT covered, and it is recorded rather than
+implied (`OFN-ad`):** a board whose every `pwmN` is read-only still builds an
+hwmon backend — `main.rs` gates that on discovering *any* header, not a writable
+one — so it takes the ordinary arm and reports "all writable hwmon headers"
+while writing nothing. The reported scope is *which backends were asked to
+force*, not *what was written*; closing the gap needs the write path to report
+what it drove, which it cannot do today because the hwmon write is handed to the
+blocking pool and may still be in flight when the call returns.
+
+**Unchanged and verified:** the two forced writes happen in the same order, with
+the same floor and the same baseline. The OpenFan-before-hwmon ordering that
+`update_serial_timeout_handler`'s 1000 ms ceiling depends on is now pinned by a
+test rather than left implicit in two adjacent statements. Confirmed by the
+parity oracle and by the v2.38.0 P1 regression test that pins the emergency's
+reach to uncommanded OpenFan channels.
+
+`SafetyWriteBackend::force_all_with_floor` is now spelled with an explicit
+`+ Send` bound on its returned future (compile-time only; both implementations
+are unchanged), without which the new generic helper could not live inside the
+spawned engine loop.
+
 ## [2.47.4] — 2026-09-16
 
 **Three truthfulness fixes on surfaces a client or a user reads (DEC-370;

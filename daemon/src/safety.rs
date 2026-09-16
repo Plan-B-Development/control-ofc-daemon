@@ -1,7 +1,8 @@
 //! CPU Tctl emergency thermal safety rule.
 //!
 //! Single latched rule: at [`crate::constants::THERMAL_EMERGENCY_TRIGGER_C`],
-//! force all OpenFan channels and writable hwmon headers to 100%. Hold until
+//! force every OpenFan channel and writable hwmon header the machine HAS to
+//! 100% — on most machines that is hwmon alone. Hold until
 //! Tctl drops to [`crate::constants::THERMAL_EMERGENCY_RELEASE_C`], then hold
 //! 60% for two cycles (the release cycle that drops out of emergency, plus one
 //! more) before returning control to the active profile. The thresholds are
@@ -10,10 +11,19 @@
 //!
 //! **Every value this rule returns is a FLOOR, and since DEC-307 the engine
 //! implements it as one.** Each reaches the engine as `decision.forced_pct`,
-//! and the forced branch calls `force_all_with_floor(pct, &commands)`: every
-//! OpenFan channel and writable hwmon header is written — including the ones no
-//! control commands, which is what preserves the emergency's reach — and a
-//! commanded output gets `max(commanded, pct)`.
+//! and the forced branch calls `force_present_backends(..)`, which drives every
+//! OpenFan channel and writable hwmon header present through
+//! `force_all_with_floor(pct, &commands)` — including the ones no control
+//! commands, which is what preserves the emergency's reach — and a commanded
+//! output gets `max(commanded, pct)`.
+//!
+//! **This enumeration describes the DESIGN; it is not a message (DEC-371).**
+//! What an operator is told is derived per tick from `ForcedScope`, which
+//! `force_present_backends` sets from inside each write arm. `evaluate` below
+//! cannot know the reach — it returns a duty — so its own log line names one
+//! deliberately. Do not restate the enumeration there: this file said
+//! "all OpenFan+hwmon fans" unconditionally for the project's whole life, and on
+//! most machines that overstated the highest-stakes line the daemon emits.
 //!
 //! It was not always so, and the history is the point (`D1-j`). Until DEC-307
 //! the branch called `force_all(pct)` and `continue`d, skipping profile
@@ -75,7 +85,7 @@ impl ThermalSafetyRule {
             self.active = true;
             self.recovery = false;
             log::warn!(
-                "THERMAL EMERGENCY: CPU Tctl {:.1}°C >= {}°C — forcing all OpenFan+hwmon fans to {}%",
+                "THERMAL EMERGENCY: CPU Tctl {:.1}°C >= {}°C — forcing fans to {}%",
                 tctl_c,
                 self.trigger_temp_c,
                 self.forced_output_pct

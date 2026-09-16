@@ -194,8 +194,8 @@ fn log_adoption_window_expired(window: Duration) {
 /// whose controller enumerated late got no second chance ever: the reconnect
 /// probe lives inside the OpenFan poll loop, which is only spawned when boot
 /// already adopted something. Losing adoption is not merely losing fan control;
-/// the thermal emergency's `force_all_with_floor` is guarded by
-/// `if let Some(be) = openfan_be`, so it loses its only path to those fans.
+/// the thermal emergency's forced write skips an absent backend
+/// (`force_present_backends`, DEC-371), so it loses its only path to those fans.
 ///
 /// **It drives `openfan_rescan_handler` rather than probing directly, and that
 /// is the design.** A second probe-and-install path would be a second chance to
@@ -389,9 +389,9 @@ async fn post_boot_adoption_loop_with<E, EFut, P, PFut>(
         // that opened nothing: 2 real probes of the intended 4 on a quick bus, and
         // 1 where the probe itself outran a tick. The board those retries exist
         // for — a tty that enumerates before its firmware answers — got a single
-        // attempt, and `force_all_with_floor` is guarded by `if let Some(be) =
-        // openfan_be`, so a missed adoption is the thermal emergency losing its
-        // only route to those fans.
+        // attempt, and the forced write skips an absent backend
+        // (`force_present_backends`, DEC-371), so a missed adoption is the thermal
+        // emergency losing its only route to those fans.
         let before = probe_stamp(&state);
         // `OFN-v`: the probe is the one place this loop waits for something it
         // does not control, and it used to wait for it unconditionally — so a
@@ -619,8 +619,8 @@ pub async fn calibrate_openfan_handler(
 /// nothing could subsequently write. A device that enumerated a second too late,
 /// or that failed its DEC-250 identity handshake once, therefore left the daemon
 /// with no OpenFan backend for the entire process lifetime — and the profile
-/// engine's thermal `force_all_with_floor` is guarded by `if let Some(be) = openfan_be`, so
-/// the thermal emergency silently lost its reach to every OpenFan-attached fan
+/// engine's thermal force skips an absent backend (`force_present_backends`,
+/// DEC-371), so the thermal emergency silently lost its reach to every OpenFan-attached fan
 /// too. A failed boot connect only logs a warning, so `Restart=on-failure` never
 /// fired and nothing recovered it.
 ///
@@ -1201,8 +1201,9 @@ mod tests {
     /// so the four intended probes became two on a quick bus, and one where the
     /// probe itself outran a tick. The board those retries exist for, whose tty
     /// enumerates before its firmware answers, got a single attempt; and
-    /// `force_all_with_floor` is guarded by `if let Some(be) = openfan_be`, so a
-    /// missed adoption is the thermal emergency losing its route to those fans.
+    /// the forced write skips an absent backend (`force_present_backends`,
+    /// DEC-371), so a missed adoption is the thermal emergency losing its route
+    /// to those fans.
     #[tokio::test]
     async fn refused_probes_do_not_spend_the_handshake_retry_budget() {
         let (attempted, ran) = drive_loop_with_probe(Duration::from_millis(400), 3).await;

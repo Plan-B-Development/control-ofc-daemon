@@ -209,8 +209,10 @@ inside the band cannot pin the pre-settle fan speed indefinitely.
      were replacements, so the 60% and 40% rungs could drive a fan *below* what
      its curve was asking for; the 100% emergency was never affected, because
      100 is the maximum
-   - Triggers at hottest CpuTemp >= the trip point, forcing all OpenFan channels
-     and writable hwmon headers to 100%
+   - Triggers at hottest CpuTemp >= the trip point, forcing every OpenFan
+     channel and writable hwmon header THE MACHINE HAS to 100% (DEC-371 — the
+     log line names the backends actually driven; do not restate this
+     enumeration in a message)
    - **The trip point is per-machine (DEC-308).** 105C is the floor and the
      fallback; where the kernel publishes the CPU's own design ceiling
      (`tempN_crit` — `coretemp` documents it as the maximum junction temperature)
@@ -231,8 +233,8 @@ inside the band cannot pin the pre-settle fan speed indefinitely.
      one-cycle recovery floor), then control returns to the profile
    - If no CpuTemp sensor is found — or none is still updating (DEC-267: a
      reading older than 5 poll intervals counts as absent) — for 5 consecutive
-     cycles, forces all
-     OpenFan+hwmon fans to 40%; a sensor that *vanishes* while an emergency is
+     cycles, forces every OpenFan channel and writable hwmon header the
+     machine has to 40%; a sensor that *vanishes* while an emergency is
      latched forces 40% immediately (from the first missing cycle) and reports
      `no_sensor_fallback` rather than dropping to profile control (DEC-190),
      whereas one that merely goes *stale* holds the emergency's own 100% output

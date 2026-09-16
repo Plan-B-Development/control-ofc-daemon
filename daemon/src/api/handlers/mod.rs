@@ -352,7 +352,8 @@ pub struct AppState {
     /// enumerated late — or failed its identity probe once — left the daemon with
     /// no OpenFan backend for the whole process lifetime, and no way to recover
     /// short of a restart. That is not only lost fan control: the profile engine's
-    /// thermal `force_all_with_floor` is guarded by `if let Some(be) = openfan_be`, so the
+    /// thermal force skips any backend that is absent (`force_present_backends`,
+    /// DEC-371 — it was an inline `if let Some(be) = openfan_be` until then), so the
     /// thermal emergency lost its reach to every OpenFan-attached fan too.
     /// `POST /fans/openfan/rescan` is what fills it. Read it through
     /// [`AppState::openfan`] rather than locking by hand.

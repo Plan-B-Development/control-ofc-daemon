@@ -337,7 +337,114 @@ pub(crate) trait SafetyWriteBackend: WriteBackend {
     /// Async since DEC-146 P3-8: implementations run their blocking
     /// serial/sysfs writes on the blocking pool instead of pinning a tokio
     /// worker for up to `channels × serial-timeout` during an emergency.
-    async fn force_all_with_floor(&mut self, pct: u8, commands: &[PwmCommand]);
+    ///
+    /// Spelled as RPITIT with an explicit `+ Send` rather than as a bare
+    /// `async fn` (DEC-371). The two are identical for a caller holding a
+    /// concrete backend, and implementations still write `async fn`. The bound
+    /// matters only to a *generic* caller: a bare `async fn` in a trait yields
+    /// an opaque future with no `Send` bound, so `force_present_backends` —
+    /// which is generic precisely so a test can drive it with fake backends —
+    /// would produce a non-`Send` future and could not live inside the
+    /// `tokio::spawn`ed engine loop.
+    fn force_all_with_floor(
+        &mut self,
+        pct: u8,
+        commands: &[PwmCommand],
+    ) -> impl std::future::Future<Output = ()> + Send;
+}
+
+/// Which safety backends a forced tick actually drove (`OFN-n`, DEC-371).
+///
+/// [SAFETY] This exists so the operator-facing line that follows a forced write
+/// names the set that was **written**, instead of an enumeration baked into a
+/// format string. Until DEC-371 all three thermal log lines read "all
+/// OpenFan+hwmon fans" unconditionally, so a machine with no OpenFanController —
+/// most machines — was told the force had a reach it did not have, in the
+/// highest-stakes message this daemon emits. It is the drift DEC-292/DEC-308
+/// removed for the *threshold*, one noun over: a hardware name baked into a
+/// message goes stale exactly the way a number does.
+///
+/// The flags are set by [`force_present_backends`] **inside** each write arm, so
+/// they cannot name a backend the force did not reach *for*. The write and the
+/// claim made about it are one statement rather than two facts derived from
+/// different sources — the `AUD2-g`/DEC-325 trap, where a flag describing an
+/// argument was taken from a sibling fact that usually implied it.
+///
+/// **Read the flag precisely: it means the backend was PRESENT and was asked to
+/// force, not that any output was written.** The two diverge on exactly one
+/// machine, and the gap is recorded as `OFN-ad` rather than papered over:
+/// `main.rs` builds `hwmon_controller` from any non-empty `discover_pwm_headers`
+/// result **without consulting `is_writable`**, while `HwmonBackend::
+/// force_all_with_floor` filters to writable headers — so a board whose every
+/// `pwmN` is read-only yields `hwmon: true` and writes nothing. Closing it needs
+/// the write path to report what it drove, which it cannot do today because the
+/// hwmon write is handed to the blocking pool inside a `BoundedWrite` and may
+/// still be in flight when this returns.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ForcedScope {
+    /// An OpenFan backend was present and was driven this tick.
+    pub(crate) openfan: bool,
+    /// A hwmon backend was present and was driven this tick.
+    pub(crate) hwmon: bool,
+}
+
+impl ForcedScope {
+    /// The operator-facing name of the set that was driven, or `None` when the
+    /// force reached nothing at all.
+    ///
+    /// `None` is not a formatting edge case. It is a real machine — a GPU-only
+    /// box, or a VM with no fan hardware at all — on which the ladder latches,
+    /// publishes `thermal_state: "emergency"`, and writes to no fan whatsoever
+    /// (GPU fans are excluded by design, DEC-130). The caller must say that
+    /// plainly rather than print an enumeration of the empty set.
+    ///
+    /// It does **not** cover the board whose every `pwmN` is read-only: that one
+    /// has a present `HwmonBackend` and so takes the `Some` arm while writing
+    /// nothing. See [`ForcedScope`] and register row `OFN-ad`.
+    pub(crate) fn describe(self) -> Option<&'static str> {
+        match (self.openfan, self.hwmon) {
+            (true, true) => Some("all OpenFan channels and writable hwmon headers"),
+            (true, false) => Some("all OpenFan channels"),
+            (false, true) => Some("all writable hwmon headers"),
+            (false, false) => None,
+        }
+    }
+}
+
+/// Drive every **present** safety backend to at least `pct`, reporting which
+/// ones were actually driven.
+///
+/// [SAFETY] The engine's forced branch calls this and nothing else. The two
+/// `if let Some(be) = …` arms it replaces were identical apart from the binding;
+/// folding them in here is what lets the returned [`ForcedScope`] be set from
+/// inside the write itself instead of re-derived beside it.
+///
+/// **OpenFan is awaited before hwmon, and that order is load-bearing** rather
+/// than incidental: `update_serial_timeout_handler` caps the serial timeout at
+/// 1000 ms *because* this await costs up to `channels × timeout` on a wedged
+/// link before the hwmon leg runs at all (`api/handlers/config.rs`), and
+/// `health/staleness.rs` derives its worst-legitimate-tick budget from the same
+/// sequence. Pinned by `force_present_backends_drives_openfan_before_hwmon`.
+pub(crate) async fn force_present_backends<O, H>(
+    openfan: Option<&mut O>,
+    hwmon: Option<&mut H>,
+    pct: u8,
+    baseline: &[PwmCommand],
+) -> ForcedScope
+where
+    O: SafetyWriteBackend,
+    H: SafetyWriteBackend,
+{
+    let mut scope = ForcedScope::default();
+    if let Some(be) = openfan {
+        be.force_all_with_floor(pct, baseline).await;
+        scope.openfan = true;
+    }
+    if let Some(be) = hwmon {
+        be.force_all_with_floor(pct, baseline).await;
+        scope.hwmon = true;
+    }
+    scope
 }
 
 // ─── OpenFan (serial) ────────────────────────────────────────────────────
@@ -3613,5 +3720,227 @@ mod tests {
             cache.is_gpu_fan_relinquished("amd_gpu:0000:0a:00.0"),
             "the other GPU's reset must survive"
         );
+    }
+}
+
+#[cfg(test)]
+mod forced_scope_tests {
+    use super::*;
+
+    /// A [`SafetyWriteBackend`] that records what it was actually asked to force.
+    ///
+    /// Two of these share one `order` log, so the OpenFan-before-hwmon sequence
+    /// — which `update_serial_timeout_handler`'s 1000 ms ceiling depends on — is
+    /// observable rather than assumed.
+    struct RecordingBackend {
+        name: &'static str,
+        order: Arc<Mutex<Vec<&'static str>>>,
+        forced: Vec<(u8, Vec<String>)>,
+    }
+
+    impl RecordingBackend {
+        fn new(name: &'static str, order: Arc<Mutex<Vec<&'static str>>>) -> Self {
+            Self {
+                name,
+                order,
+                forced: Vec::new(),
+            }
+        }
+
+        /// Did this backend actually receive a forced write?
+        fn was_forced(&self) -> bool {
+            !self.forced.is_empty()
+        }
+    }
+
+    impl WriteBackend for RecordingBackend {
+        async fn apply(&mut self, _commands: &[PwmCommand]) {
+            unreachable!("the forced branch drives force_all_with_floor, never apply");
+        }
+    }
+
+    impl SafetyWriteBackend for RecordingBackend {
+        async fn force_all_with_floor(&mut self, pct: u8, commands: &[PwmCommand]) {
+            self.order.lock().push(self.name);
+            self.forced
+                .push((pct, commands.iter().map(|c| c.member_id.clone()).collect()));
+        }
+    }
+
+    fn cmd(member_id: &str) -> PwmCommand {
+        PwmCommand {
+            member_id: member_id.to_string(),
+            source: "hwmon".to_string(),
+            pwm_percent: 55,
+            gpu_fan_zero_rpm: false,
+        }
+    }
+
+    /// DEC-371: the label may name a backend **if and only if** that backend was
+    /// driven.
+    ///
+    /// Asserted as a relationship rather than against the four expected strings:
+    /// a literal-by-literal test is satisfied by any hardcoded label per arm,
+    /// which is precisely the defect `OFN-n` records. `contains` in both
+    /// directions is what a stuck or copy-pasted arm fails.
+    #[test]
+    fn forced_scope_describe_names_exactly_the_backends_driven() {
+        let mut described = 0;
+        for openfan in [false, true] {
+            for hwmon in [false, true] {
+                let scope = ForcedScope { openfan, hwmon };
+                match scope.describe() {
+                    None => assert!(
+                        !openfan && !hwmon,
+                        "describe() returned None for {scope:?}, which drove something"
+                    ),
+                    Some(label) => {
+                        described += 1;
+                        assert!(
+                            openfan || hwmon,
+                            "describe() named {label:?} for a scope that drove nothing"
+                        );
+                        assert_eq!(
+                            label.contains("OpenFan"),
+                            openfan,
+                            "label {label:?} names OpenFan but openfan={openfan}"
+                        );
+                        assert_eq!(
+                            label.contains("hwmon"),
+                            hwmon,
+                            "label {label:?} names hwmon but hwmon={hwmon}"
+                        );
+                    }
+                }
+            }
+        }
+        // Precondition: without this the loop could pass by describing nothing.
+        assert_eq!(
+            described, 3,
+            "three of the four combinations must describe a non-empty set"
+        );
+    }
+
+    /// [SAFETY] DEC-371 — **the call-site test.**
+    ///
+    /// `describe()` having thorough unit tests proves nothing about whether the
+    /// flags handed to it are true; that is `CLAUDE.md`'s most-recurring lesson
+    /// (an extracted rule with no call-site test is an untested rule), and its
+    /// DEC-340 sharpening — a function split into *do the work* and *describe
+    /// it* has two call sites to test, and tests land on the pure half because
+    /// it is the easy one.
+    ///
+    /// So this asserts the RELATIONSHIP the log line depends on: the reported
+    /// scope names a backend exactly when that backend recorded a forced write.
+    /// Both directions, over all four presence combinations.
+    #[tokio::test]
+    async fn force_present_backends_reports_exactly_what_it_drove() {
+        let mut ever_wrote = false;
+        for have_openfan in [false, true] {
+            for have_hwmon in [false, true] {
+                let order = Arc::new(Mutex::new(Vec::new()));
+                let mut openfan = RecordingBackend::new("openfan", order.clone());
+                let mut hwmon = RecordingBackend::new("hwmon", order.clone());
+
+                let scope = force_present_backends(
+                    have_openfan.then_some(&mut openfan),
+                    have_hwmon.then_some(&mut hwmon),
+                    77,
+                    &[],
+                )
+                .await;
+
+                assert_eq!(
+                    scope.openfan,
+                    openfan.was_forced(),
+                    "scope claims openfan={} but the backend {} written \
+                     (have_openfan={have_openfan}, have_hwmon={have_hwmon})",
+                    scope.openfan,
+                    if openfan.was_forced() {
+                        "WAS"
+                    } else {
+                        "was NOT"
+                    }
+                );
+                assert_eq!(
+                    scope.hwmon,
+                    hwmon.was_forced(),
+                    "scope claims hwmon={} but the backend {} written \
+                     (have_openfan={have_openfan}, have_hwmon={have_hwmon})",
+                    scope.hwmon,
+                    if hwmon.was_forced() { "WAS" } else { "was NOT" }
+                );
+
+                // Pick the sample that can move (DEC-314): without these, both
+                // assertions above are satisfied by a helper that writes nothing
+                // and claims nothing.
+                assert_eq!(
+                    openfan.was_forced(),
+                    have_openfan,
+                    "a present OpenFan backend must be driven, an absent one must not"
+                );
+                assert_eq!(
+                    hwmon.was_forced(),
+                    have_hwmon,
+                    "a present hwmon backend must be driven, an absent one must not"
+                );
+                ever_wrote |= openfan.was_forced() || hwmon.was_forced();
+            }
+        }
+        assert!(
+            ever_wrote,
+            "precondition: no combination drove anything, so nothing was tested"
+        );
+    }
+
+    /// [SAFETY] OpenFan is awaited before hwmon, and that order is load-bearing:
+    /// `update_serial_timeout_handler` caps the serial timeout at 1000 ms
+    /// because this await costs up to `channels × timeout` on a wedged link
+    /// *before* the hwmon leg runs, and `health/staleness.rs` derives its
+    /// worst-legitimate-tick budget from the same sequence.
+    #[tokio::test]
+    async fn force_present_backends_drives_openfan_before_hwmon() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut openfan = RecordingBackend::new("openfan", order.clone());
+        let mut hwmon = RecordingBackend::new("hwmon", order.clone());
+
+        let scope = force_present_backends(Some(&mut openfan), Some(&mut hwmon), 100, &[]).await;
+
+        assert_eq!(
+            scope,
+            ForcedScope {
+                openfan: true,
+                hwmon: true
+            }
+        );
+        assert_eq!(
+            &*order.lock(),
+            &["openfan", "hwmon"],
+            "the emergency must await OpenFan before hwmon"
+        );
+    }
+
+    /// [SAFETY] DEC-307: the floor and the per-output baseline must reach every
+    /// present backend unchanged. This is the regression net for the refactor
+    /// itself — `force_present_backends` replaced two inline `if let` arms, and
+    /// dropping either argument would silently shrink the emergency's reach.
+    #[tokio::test]
+    async fn force_present_backends_passes_the_floor_and_baseline_to_every_backend() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut openfan = RecordingBackend::new("openfan", order.clone());
+        let mut hwmon = RecordingBackend::new("hwmon", order.clone());
+        let baseline = vec![cmd("hwmon:chip:dev:pwm1:CPU_FAN"), cmd("openfan:0")];
+
+        force_present_backends(Some(&mut openfan), Some(&mut hwmon), 60, &baseline).await;
+
+        let expected: Vec<String> = baseline.iter().map(|c| c.member_id.clone()).collect();
+        for be in [&openfan, &hwmon] {
+            assert_eq!(
+                be.forced,
+                vec![(60u8, expected.clone())],
+                "{} did not receive the floor and baseline unchanged",
+                be.name
+            );
+        }
     }
 }

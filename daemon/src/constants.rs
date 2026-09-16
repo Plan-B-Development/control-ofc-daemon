@@ -157,12 +157,16 @@ pub const IDENTIFY_PUMP_BASELINE_FALLBACK_PCT: u8 = 60;
 // ── Profile engine — no-sensor safety ────────────────────────────────
 
 /// If no CPU temperature sensor is found for this many consecutive
-/// cycles, force all OpenFan+hwmon fans to `NO_SENSOR_SAFE_PCT`
-/// (GPU fans excluded — DEC-130).
+/// cycles, force every OpenFan channel and writable hwmon header the machine
+/// HAS to `NO_SENSOR_SAFE_PCT` (GPU fans excluded — DEC-130).
+///
+/// The enumeration is the design, not a message (DEC-371) — what the operator
+/// is told is derived from the backends actually driven.
 pub const NO_SENSOR_CYCLE_THRESHOLD: u32 = 5;
 
-/// PWM percent forced on all OpenFan+hwmon fans when no CPU temperature
-/// sensor is found for `NO_SENSOR_CYCLE_THRESHOLD` consecutive cycles.
+/// PWM percent forced on every OpenFan channel and writable hwmon header the
+/// machine has, when no CPU temperature sensor is found for
+/// `NO_SENSOR_CYCLE_THRESHOLD` consecutive cycles.
 pub const NO_SENSOR_SAFE_PCT: u8 = 40;
 
 // ── Profile engine — OpenFan write-failure alerting (audit P3-5) ──────
@@ -218,7 +222,7 @@ pub const HWMON_FAN_STALE_INTERVALS: u32 = 5;
 // ── Thermal emergency ────────────────────────────────────────────────
 
 /// CPU temperature (°C) at which the thermal emergency latches, forcing every
-/// OpenFan channel and writable hwmon header to 100%.
+/// OpenFan channel and writable hwmon header the machine has to 100%.
 ///
 /// **This is the single source for the trip point (DEC-292).** It had been
 /// written out four times — here in a compile-time assert, in
