@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [2.49.1] — 2026-09-17
 
 ### Internal
 
