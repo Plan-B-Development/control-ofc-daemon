@@ -2,6 +2,63 @@
 
 ## [Unreleased]
 
+### Internal
+
+**The two legs of a forced safety write are now distinct types, so they cannot
+be passed the wrong way round** (`OFN-ae`, DEC-378). `force_present_backends`
+was generified in DEC-371 to fold two inline `if let` arms into one helper, and
+bounding both of its type parameters by `SafetyWriteBackend` made them
+interchangeable: `force_present_backends(hwmon_be.as_mut(), openfan_be.as_mut(),
+..)` compiled cleanly, which was measured before the fix rather than assumed.
+Before DEC-371 those arms named `openfan_be` and `hwmon_be` explicitly and the
+mistake was unrepresentable.
+
+A swap would have inverted an await order that two other rules are derived from
+— `update_serial_timeout_handler` caps the serial timeout at 1000 ms *because*
+the OpenFan leg runs first, and `health/staleness.rs` builds its
+worst-legitimate-tick budget from the same sequence — and would have inverted
+the two `ForcedScope` labels, so the operator line printed after a forced write
+would have named the backend that was not driven.
+
+Two empty marker traits, `OpenFanSafetyWrite` and `HwmonSafetyWrite`, each with
+exactly one production implementor, now bound the parameters separately. A
+swapped call site fails to **compile** rather than being merely easier to spot
+in review. Zero runtime change, no new dependency: today's call site was already
+correct, so this is latent-defect hardening on the force-all path, not a fix to
+observable behaviour. Verified by re-running the swap after the fix and reading
+which error fired — `HwmonBackend: OpenFanSafetyWrite is not satisfied`,
+`required by a bound in force_present_backends`.
+
+The one-implementor-per-leg invariant that makes the compiler's answer correct is
+itself unenforceable in Rust — a trait cannot be sealed against a second in-crate
+impl and negative impls are nightly — so a second `impl OpenFanSafetyWrite for
+HwmonBackend {}` would silently reopen `OFN-ae` with nothing failing, the
+invariant having no runtime signature for CI or the parity oracle to see. It is
+pinned by `each_safety_leg_has_exactly_one_production_implementor`, which asserts
+the implementor **set** in impl position at line start (raised as a P3 by
+`ofc:concurrency-reviewer` in this change's own review).
+
+### Tests
+
+**The tray's process-liveness budget is 30 s, held in one named const**
+(`T1-r`). `tray/tests/launch.rs` gave two spawned `/bin/sh` processes 5 s to
+prove they ran, which is not enough under a saturated `cargo test
+--all-targets`: `launching_twice_starts_two_processes` failed once in two
+consecutive full-gate runs during DEC-370, then passed on re-run, passed alone,
+and passed 6/6 concurrently as a standalone binary — wall-clock contention, not
+a defect in `ProcessLauncher`.
+
+**This widens a failure budget; it does not remove the wall clock.** The
+structural fix — waiting on the spawned `Child` — is not reachable, because
+`GuiLauncher::launch` returns `Result<(), LaunchError>` and the `Child` is moved
+into a detached reaper thread, so no handle ever reaches a test. It costs
+nothing on the happy path: `wait_until` returns on the first true poll and the
+whole binary finishes in 0.01 s idle, so only a run that was going to fail
+anyway spends the difference. 30 s matches the existing precedent in
+`daemon/src/main.rs`. One const rather than two literals because
+`an_absolute_path_is_launched_and_reaped` shares the hazard and was simply the
+one not yet observed failing.
+
 ### Documentation
 
 **The OpenFan reconnect backoff was described in seconds; it is a count of poll

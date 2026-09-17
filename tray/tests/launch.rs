@@ -10,6 +10,31 @@ use std::time::{Duration, Instant};
 
 use control_ofc_tray::launch::{GuiLauncher, LaunchError, ProcessLauncher, GUI_BINARY};
 
+/// How long a spawned process gets to prove it ran (`T1-r`).
+///
+/// This is a **failure** budget, not a success cost. `wait_until` returns on the
+/// first true poll, so the happy path pays one 10 ms tick and only a run that
+/// was going to fail anyway spends the difference — measured 2026-09-17, the
+/// whole of this test binary finishes in 0.01 s idle.
+///
+/// Widened from 5 s because 5 s is not enough under a saturated
+/// `cargo test --all-targets`: `launching_twice_starts_two_processes` failed
+/// once in two consecutive full-gate runs during DEC-370, then passed on re-run,
+/// passed alone, and passed 6/6 concurrently as a standalone binary — wall-clock
+/// contention, not a defect in `ProcessLauncher`. 30 s matches the in-repo
+/// precedent at `daemon/src/main.rs` (*"probe child did not exit within 30s"*).
+///
+/// **This widens the wall clock; it does not remove it.** The structural fix —
+/// waiting on the spawned `Child` — is not reachable: `GuiLauncher::launch`
+/// returns `Result<(), LaunchError>` and the `Child` is moved into a detached
+/// reaper thread (`tray/src/launch.rs`), so no handle ever reaches a test, and
+/// getting one would mean changing a production trait for a test's benefit.
+///
+/// One const, not two literals, because **both** process-liveness tests share
+/// the hazard: `an_absolute_path_is_launched_and_reaped` waits on the same
+/// wall clock and was simply the one not yet observed failing.
+const PROCESS_LIVENESS_BUDGET: Duration = Duration::from_secs(30);
+
 /// Wait for a condition on a deadline. Never a bare sleep: a bare sleep either
 /// flakes under load or wastes the difference on every run.
 fn wait_until(deadline: Duration, mut done: impl FnMut() -> bool) -> bool {
@@ -84,7 +109,7 @@ fn an_absolute_path_is_launched_and_reaped() {
     launcher.launch().expect("should spawn");
 
     assert!(
-        wait_until(Duration::from_secs(5), || marker.exists()),
+        wait_until(PROCESS_LIVENESS_BUDGET, || marker.exists()),
         "the launched process must actually run"
     );
 }
@@ -109,7 +134,7 @@ fn launching_twice_starts_two_processes() {
     launcher.launch().expect("second");
 
     assert!(
-        wait_until(Duration::from_secs(5), || {
+        wait_until(PROCESS_LIVENESS_BUDGET, || {
             std::fs::read_to_string(&counter)
                 .map(|s| s.lines().count() == 2)
                 .unwrap_or(false)

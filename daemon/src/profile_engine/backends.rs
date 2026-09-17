@@ -8,7 +8,10 @@
 //! per backend. (The GUI-deferral gate was removed at 2.0.0 — DEC-165.)
 //!
 //! Backends that participate in forced safety writes (thermal emergency,
-//! no-CPU-sensor fallback) additionally implement [`SafetyWriteBackend`].
+//! no-CPU-sensor fallback) additionally implement [`SafetyWriteBackend`], and
+//! each one *also* implements the marker trait for its own leg —
+//! [`OpenFanSafetyWrite`] or [`HwmonSafetyWrite`] — so that the two cannot be
+//! passed to [`force_present_backends`] the wrong way round (`OFN-ae`).
 //! [`GpuBackend`] deliberately does NOT (DEC-130): there is no GPU
 //! emergency threshold. AMD PMFW firmware owns GPU thermal protection
 //! (junction-temp throttling, firmware fan ramp) independently of OS fan
@@ -354,6 +357,43 @@ pub(crate) trait SafetyWriteBackend: WriteBackend {
     ) -> impl std::future::Future<Output = ()> + Send;
 }
 
+/// The **OpenFan** leg of a forced safety write.
+///
+/// [SAFETY] Empty by design: it carries no method, only an identity.
+/// [`force_present_backends`] takes its two backends positionally, and until
+/// this existed both parameters were bounded only by [`SafetyWriteBackend`], so
+/// passing them the other way round **type-checked** (`OFN-ae`, opened by
+/// DEC-371's own review and measured again before this fix — the swapped call
+/// site compiled cleanly).
+///
+/// That swap is not cosmetic. It inverts an await order that two other rules are
+/// derived from — `update_serial_timeout_handler` caps the serial timeout at
+/// 1000 ms *because* the OpenFan leg runs first (`api/handlers/config.rs`), and
+/// `health/staleness.rs` builds its worst-legitimate-tick budget from the same
+/// sequence — and it inverts the two [`ForcedScope`] labels, so the operator
+/// line that follows a forced write would name the backend that was not driven.
+///
+/// Before DEC-371 generified those arms they named `openfan_be` and `hwmon_be`
+/// explicitly and the mistake was **unrepresentable**. This restores that, as a
+/// compile error rather than as a convention — which is the distinction the row
+/// asked for: the alternatives considered (a named-field struct, an engine-loop
+/// ordering assertion) leave the swap type-checking and only make it visible, or
+/// detect it after the fact.
+///
+/// Exactly one production implementor, by design — and Rust cannot express that,
+/// so it is pinned by `each_safety_leg_has_exactly_one_production_implementor`
+/// rather than by prose. The `#[cfg(test)]` `RecordingBackend` implements this
+/// **and** [`HwmonSafetyWrite`], which is what lets the helper tests keep driving
+/// both legs with two fakes of one type — and is also the honest limit of this
+/// fix: it is the compiler, not a test, that closes the *swap*. The test guards
+/// the implementor set that makes the compiler's answer correct; nothing in the
+/// suite can observe a swapped call site itself.
+pub(crate) trait OpenFanSafetyWrite: SafetyWriteBackend {}
+
+/// The **hwmon** leg of a forced safety write. See [`OpenFanSafetyWrite`] for
+/// why the two legs are distinct types rather than one bound used twice.
+pub(crate) trait HwmonSafetyWrite: SafetyWriteBackend {}
+
 /// Which safety backends a forced tick had something to drive (`OFN-n`, DEC-371;
 /// `OFN-ad`, DEC-372).
 ///
@@ -552,8 +592,11 @@ pub(crate) async fn force_present_backends<O, H>(
     baseline: &[PwmCommand],
 ) -> ForcedScope
 where
-    O: SafetyWriteBackend,
-    H: SafetyWriteBackend,
+    // [SAFETY] Distinct bounds, not `SafetyWriteBackend` twice: that made a
+    // positional swap of the two legs type-check (`OFN-ae`). See
+    // [`OpenFanSafetyWrite`].
+    O: OpenFanSafetyWrite,
+    H: HwmonSafetyWrite,
 {
     let mut scope = ForcedScope::default();
     if let Some(be) = openfan {
@@ -833,6 +876,9 @@ impl WriteBackend for OpenFanBackend {
         }
     }
 }
+
+/// The only production implementor (`OFN-ae`).
+impl OpenFanSafetyWrite for OpenFanBackend {}
 
 impl SafetyWriteBackend for OpenFanBackend {
     /// Drive every OpenFan channel to at least `pct` (D1-j).
@@ -1632,6 +1678,9 @@ impl WriteBackend for HwmonBackend {
         }
     }
 }
+
+/// The only production implementor (`OFN-ae`).
+impl HwmonSafetyWrite for HwmonBackend {}
 
 impl SafetyWriteBackend for HwmonBackend {
     /// Drive every writable hwmon header to at least `pct` (D1-j),
@@ -4055,6 +4104,11 @@ mod forced_scope_tests {
         }
     }
 
+    // Both legs, deliberately: the helper tests drive OpenFan-then-hwmon with
+    // two fakes of one type, and `OFN-ae`'s fix must not cost them that shape.
+    impl OpenFanSafetyWrite for RecordingBackend {}
+    impl HwmonSafetyWrite for RecordingBackend {}
+
     impl SafetyWriteBackend for RecordingBackend {
         async fn force_all_with_floor(&mut self, pct: u8, commands: &[PwmCommand]) {
             self.order.lock().push(self.name);
@@ -4070,6 +4124,83 @@ mod forced_scope_tests {
             pwm_percent: 55,
             gpu_fan_zero_rpm: false,
         }
+    }
+
+    /// Each safety leg has exactly ONE production implementor — pinned here,
+    /// because Rust cannot pin it (`OFN-ae`, DEC-378).
+    ///
+    /// [SAFETY] `OpenFanSafetyWrite`/`HwmonSafetyWrite` restore a compile-time
+    /// distinction *by* having one implementor each. A trait cannot be sealed
+    /// against a second in-crate impl and negative impls are nightly-only, so
+    /// `impl OpenFanSafetyWrite for HwmonBackend {}` would make the two legs
+    /// interchangeable again and silently reopen `OFN-ae` with the ADR still
+    /// recorded as closed. **Nothing else can catch that**: the invariant has no
+    /// runtime signature, so CI and the parity oracle — which DEC-283 names as
+    /// the compensating controls for its capped specialist count — are blind to
+    /// it by construction. Raised by `ofc:concurrency-reviewer` in DEC-378's own
+    /// review, which also noted that this file *normalises* the move that
+    /// dissolves the guard: `RecordingBackend` implements both, under a comment
+    /// saying "Both legs, deliberately".
+    ///
+    /// Matched in **impl position at line start**, never as a substring: this
+    /// file's doc comments name both traits about a dozen times, which is the
+    /// self-matching trap `CLAUDE.md` records for `polling.rs`. The
+    /// `#[cfg(test)]` impls are indented inside this module, so the line-start
+    /// anchor excludes them with no carve-out — and if one is ever moved to
+    /// column 0 this test fails, which is the correct answer.
+    ///
+    /// Asserts the **set**, not a count (DEC-367): a new backend must fail here
+    /// until somebody decides which leg it is, rather than pass because a number
+    /// was bumped.
+    #[test]
+    fn each_safety_leg_has_exactly_one_production_implementor() {
+        let src = include_str!("backends.rs");
+
+        fn production_impls<'a>(src: &'a str, marker: &str) -> Vec<&'a str> {
+            let prefix = format!("impl {marker} for ");
+            src.lines()
+                .filter_map(|l| l.strip_prefix(prefix.as_str()))
+                .map(|rest| rest.trim_end_matches([' ', '{', '}']).trim())
+                .collect()
+        }
+
+        // Presence before absence: prove the line-start anchor is excluding
+        // something real, or this test goes green because the test impls vanished
+        // rather than because the anchor works.
+        //
+        // Written as an impl-POSITION scan, deliberately not `src.contains("    impl
+        // ..RecordingBackend {}")`. Measured while running the fix-out check on this
+        // very test: that `contains` matches THIS TEST'S OWN argument string, so it
+        // is true even with both impls deleted — `CLAUDE.md`'s "a source-scanning
+        // guard matches its own explanation", reintroduced in the precondition after
+        // being avoided in the assertions below. A line of this test never *begins*
+        // with `impl` once trimmed, so the trimmed-prefix form cannot self-match.
+        let indented_marker_impls = src
+            .lines()
+            .filter(|l| {
+                l.starts_with(' ')
+                    && l.trim_start().starts_with("impl ")
+                    && l.contains("SafetyWrite for RecordingBackend")
+            })
+            .count();
+        assert_eq!(
+            indented_marker_impls, 2,
+            "both #[cfg(test)] dual impls must still exist AND still be indented — \
+             they are what this test's line-start anchor is excluding"
+        );
+
+        assert_eq!(
+            production_impls(src, "OpenFanSafetyWrite"),
+            vec!["OpenFanBackend"],
+            "exactly one production type may be the OpenFan leg of a forced write; \
+             a second makes the two legs interchangeable again and reopens `OFN-ae`"
+        );
+        assert_eq!(
+            production_impls(src, "HwmonSafetyWrite"),
+            vec!["HwmonBackend"],
+            "exactly one production type may be the hwmon leg of a forced write; \
+             a second makes the two legs interchangeable again and reopens `OFN-ae`"
+        );
     }
 
     /// DEC-371: the label may name a backend **if and only if** that backend was
