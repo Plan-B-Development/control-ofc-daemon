@@ -352,25 +352,6 @@ pub(crate) trait SafetyWriteBackend: WriteBackend {
         pct: u8,
         commands: &[PwmCommand],
     ) -> impl std::future::Future<Output = ()> + Send;
-
-    /// Does this backend have **at least one output the force can actually
-    /// drive**?
-    ///
-    /// [SAFETY] `OFN-ad`, DEC-372. This is what [`ForcedScope`] reports, and it
-    /// is deliberately NOT "does this backend exist": `main.rs` builds
-    /// `hwmon_controller` from any non-empty `discover_pwm_headers` result
-    /// without consulting `is_writable`, so a board whose every `pwmN` is
-    /// read-only has a perfectly real `HwmonBackend` that writes nothing.
-    /// Reporting presence there told an operator the force was holding headers
-    /// that do not exist — DEC-371's own defect class inside DEC-371's fix.
-    ///
-    /// Answered from state fixed at construction, never by taking the
-    /// controller lock: that lock is held for the whole of an uncancellable
-    /// blocking `std::fs::write`, so asking on the async side is the freeze
-    /// `BoundedWrite`/DEC-289 exists to prevent (and DEC-278's "moved the block
-    /// into the kernel driver lock" one file over). Safe to cache because
-    /// `is_writable` is read at discovery and never recomputed.
-    fn has_forced_targets(&self) -> bool;
 }
 
 /// Which safety backends a forced tick had something to drive (`OFN-n`, DEC-371;
@@ -391,20 +372,35 @@ pub(crate) trait SafetyWriteBackend: WriteBackend {
 /// different sources — the `AUD2-g`/DEC-325 trap, where a flag describing an
 /// argument was taken from a sibling fact that usually implied it.
 ///
-/// **The flag is [`SafetyWriteBackend::has_forced_targets`], not presence**
-/// (`OFN-ad`, DEC-372). DEC-371 set it unconditionally inside each arm, which
-/// was wrong on exactly one machine: a board whose every `pwmN` is read-only
-/// has a real `HwmonBackend` — `main.rs` gates that on discovering *any* header
-/// — that writes nothing, and it was told the force was holding headers that do
-/// not exist. That was DEC-371's own defect class reproduced inside its fix.
+/// **Presence IS the predicate, because presence is now gated on writability**
+/// (`OFN-ah`, DEC-376). Read the history, because the obvious reading of this
+/// code is the one that was wrong twice. DEC-371 set each flag unconditionally
+/// inside its arm, which over-claimed on exactly one machine: a board whose
+/// every `pwmN` is read-only had a real `HwmonBackend` that wrote nothing.
+/// DEC-372 fixed that with a separate `has_forced_targets` predicate on the
+/// backend. DEC-376 moved the same predicate up to
+/// [`HwmonBackend::new`], which now returns `None` on such a board — so a
+/// constructed hwmon backend always has a writable header and the second
+/// predicate was unconditionally `true` on both implementors. Keeping it would
+/// have been two gating shapes for one flag, which is DEC-334's trap. The
+/// invariant did not go away with it: it is pinned at the gate by
+/// `hwmon_backend_is_not_constructed_when_every_header_is_read_only`.
+///
+/// One over-claim survives by design and is the same one DEC-372 accepted: if
+/// the controller lock is held at engine start, [`HwmonBackend::new`] keeps the
+/// backend rather than measuring, so a read-only board can still report
+/// `hwmon: true` for that boot. Failing the other way would emit a false
+/// "reached NO fans" on the highest-stakes line the daemon writes.
 ///
 /// **It is still not "wrote", and no arrangement of this type makes it so.** A
 /// backend's write may be issued and not yet complete — [`BoundedWrite`] returns
 /// once its budget expires and reports the stall separately — so the honest
 /// reading is *"had at least one output the force can drive, and was asked to
 /// drive it"*. Distinguishing a landed write would mean reporting from the
-/// blocking pool, which is the freeze [`SafetyWriteBackend::has_forced_targets`]
-/// explains this type deliberately avoids.
+/// blocking pool, where the controller lock is held for the whole of an
+/// uncancellable `std::fs::write` — the freeze `BoundedWrite`/DEC-289 exists to
+/// prevent, and the reason this type is derived at construction rather than
+/// asked per tick.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ForcedScope {
     /// The OpenFan backend had at least one output the force can drive, and was
@@ -562,11 +558,18 @@ where
     let mut scope = ForcedScope::default();
     if let Some(be) = openfan {
         be.force_all_with_floor(pct, baseline).await;
-        scope.openfan = be.has_forced_targets();
+        // Set from INSIDE the arm, never beside it: the flag and the write are
+        // then one statement rather than two facts from different sources
+        // (`AUD2-g`/DEC-325). Truthful because a backend that exists can drive
+        // something — `OpenFanBackend` has `NUM_CHANNELS` unconditionally, and
+        // `HwmonBackend::new` refuses to build on a board with no writable
+        // header (`OFN-ah`, DEC-376). See [`ForcedScope`] for why that gate sits
+        // at construction and not here.
+        scope.openfan = true;
     }
     if let Some(be) = hwmon {
         be.force_all_with_floor(pct, baseline).await;
-        scope.hwmon = be.has_forced_targets();
+        scope.hwmon = true;
     }
     scope
 }
@@ -832,14 +835,6 @@ impl WriteBackend for OpenFanBackend {
 }
 
 impl SafetyWriteBackend for OpenFanBackend {
-    /// Always true: an adopted controller has [`NUM_CHANNELS`] channels and the
-    /// forced write drives `0..NUM_CHANNELS` unconditionally, so if this
-    /// backend exists at all it has outputs to drive. Unlike hwmon there is no
-    /// per-channel writability bit to consult.
-    fn has_forced_targets(&self) -> bool {
-        true
-    }
-
     /// Drive every OpenFan channel to at least `pct` (D1-j).
     ///
     /// Every channel is written, including ones no control commands — that is
@@ -1376,21 +1371,40 @@ pub(crate) struct HwmonBackend {
     /// legitimately slow emergency write reports its transition once instead of
     /// once per tick for the whole emergency-to-release hold.
     stall_logged: bool,
-    /// Whether this controller has any **writable** header, i.e. whether the
-    /// thermal force has anything here to drive (`OFN-ad`, DEC-372).
-    ///
-    /// Derived once, at construction, from the same
-    /// `HwmonPwmController::forced_target_ids` the forced write uses, so the
-    /// claim and the write cannot drift. Cached rather than asked per tick
-    /// because the controller lock is held for the whole of an uncancellable
-    /// blocking `std::fs::write`; `is_writable` is fixed at discovery, so
-    /// there is nothing to re-read.
-    has_forced_targets: bool,
 }
 
 impl HwmonBackend {
-    pub(crate) fn new(ctrl: Arc<Mutex<crate::hwmon::pwm_control::HwmonPwmController>>) -> Self {
-        // [SAFETY] Timed, and it fails toward OVER-claiming. `tokio::spawn`
+    /// Build the engine's hwmon backend, or `None` when this controller has no
+    /// **writable** header for it to drive.
+    ///
+    /// [SAFETY] `OFN-ah`/`OFN-ad`, DEC-376 (superseding DEC-372's predicate).
+    /// `main.rs` builds `hwmon_controller` from any non-empty
+    /// `discover_pwm_headers` result without consulting `is_writable`, so a
+    /// board whose every `pwmN` is read-only had a perfectly real backend that
+    /// wrote nothing. The engine then read `hwmon_be.is_some()` as "this daemon
+    /// can write hwmon" in two places, and both were wrong there: the thermal
+    /// log claimed a reach it did not have (`OFN-ad`, fixed once by DEC-372),
+    /// and `note_backend_unavailable` could never raise `backend_unavailable`
+    /// for an hwmon-only control, which `docs/08` has promised since 2.47.0
+    /// (`OFN-ah`). Gating construction answers both with **one** predicate
+    /// rather than patching each reader — DEC-334's "one flag, one gating
+    /// shape".
+    ///
+    /// **This does not narrow the emergency's reach.** The forced write already
+    /// filters to `forced_target_ids()` (DEC-295), so on a board this returns
+    /// `None` for, the write it skips is a write that would have driven nothing.
+    /// It is the same predicate, moved earlier — not a new belief about the
+    /// hardware.
+    ///
+    /// Safe to decide once: `is_writable` is read from the sysfs permission bit
+    /// at discovery and never recomputed, and `hwmon_rescan_handler` does not
+    /// replace a running controller (it says so in its own doc comment) — so
+    /// there is no arrangement under which a header becomes writable later in
+    /// this process.
+    pub(crate) fn new(
+        ctrl: Arc<Mutex<crate::hwmon::pwm_control::HwmonPwmController>>,
+    ) -> Option<Self> {
+        // [SAFETY] Timed, and it fails toward KEEPING the backend. `tokio::spawn`
         // only queues the engine task, so "the engine is spawned before
         // `axum::serve` accepts" does not mean this line runs first — a handler
         // can hold the controller lock here, and a blocking sysfs write holds it
@@ -1398,12 +1412,12 @@ impl HwmonBackend {
         // would park the engine before its first tick, which is the delay-to-
         // thermal-evaluation `OFN-a` was about.
         //
-        // On timeout assume the backend HAS targets: that degrades to the
-        // DEC-371 reporting (a possible over-claim on a read-only board) rather
-        // than emitting a false "reached NO fans", which is the worse error on
-        // the highest-stakes line the daemon writes. Nothing else changes —
-        // the forced write is unaffected either way.
-        let has_forced_targets = match ctrl.try_lock_for(std::time::Duration::from_millis(250)) {
+        // On timeout assume the backend HAS targets and build it: that degrades
+        // to the pre-DEC-372 reporting (a possible over-claim on a read-only
+        // board) rather than dropping the hwmon leg of the thermal force on a
+        // board that may well have writable headers. Dropping it would be the
+        // v2.38.0 P1 — an emergency losing its reach — reached by timeout.
+        let has_writable_header = match ctrl.try_lock_for(std::time::Duration::from_millis(250)) {
             Some(guard) => !guard.forced_target_ids().is_empty(),
             None => {
                 // Startup-only, so it cannot spam — and without it an
@@ -1418,13 +1432,19 @@ impl HwmonBackend {
                 true
             }
         };
-        Self {
+        if !has_writable_header {
+            log::info!(
+                "hwmon has no writable PWM header — the profile engine will not take an \
+                 hwmon backend, and hwmon-only controls will report `backend_unavailable`"
+            );
+            return None;
+        }
+        Some(Self {
             ctrl,
             member_failures: HashMap::new(),
             writes: BoundedWrite::default(),
             stall_logged: false,
-            has_forced_targets,
-        }
+        })
     }
 
     /// True while a write issued on an earlier tick has not returned (DEC-289).
@@ -1614,11 +1634,6 @@ impl WriteBackend for HwmonBackend {
 }
 
 impl SafetyWriteBackend for HwmonBackend {
-    /// Whether any header is writable, decided at construction (`OFN-ad`).
-    fn has_forced_targets(&self) -> bool {
-        self.has_forced_targets
-    }
-
     /// Drive every writable hwmon header to at least `pct` (D1-j),
     /// auto-leasing for safety writes.
     ///
@@ -2578,7 +2593,8 @@ mod tests {
             }),
             cache,
         );
-        let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl)));
+        let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl)))
+            .expect("this fixture's headers are writable");
 
         // Tick 1: an emergency force_all_with_floor wedges.
         be.force_all_with_floor(100, &[]).await;
@@ -2652,7 +2668,23 @@ mod tests {
         );
     }
 
+    /// A backend over `headers`, for the majority of tests whose subject is not
+    /// the construction gate. Panics if the gate refuses — see
+    /// `try_hwmon_backend` for the tests that are about the gate itself.
     fn hwmon_backend(headers: Vec<PwmHeaderDescriptor>) -> (HwmonBackend, WriteLog) {
+        let (be, writes) = try_hwmon_backend(headers);
+        (
+            be.expect(
+                "these headers include a writable one, so HwmonBackend::new must build \
+                 (OFN-ah, DEC-376)",
+            ),
+            writes,
+        )
+    }
+
+    /// As `hwmon_backend`, but hands back the `Option` so a test can assert on
+    /// the construction gate itself (`OFN-ah`, DEC-376).
+    fn try_hwmon_backend(headers: Vec<PwmHeaderDescriptor>) -> (Option<HwmonBackend>, WriteLog) {
         let writes: WriteLog = Arc::new(Mutex::new(Vec::new()));
         let writer = TestWriter {
             writes: writes.clone(),
@@ -2750,7 +2782,11 @@ mod tests {
         };
         let cache = Arc::new(StateCache::new());
         let ctrl = HwmonPwmController::new(headers, LeaseManager::new(), Box::new(writer), cache);
-        (HwmonBackend::new(Arc::new(Mutex::new(ctrl))), frag)
+        (
+            HwmonBackend::new(Arc::new(Mutex::new(ctrl)))
+                .expect("carveout fixtures always include a writable header"),
+            frag,
+        )
     }
 
     #[tokio::test]
@@ -2805,7 +2841,8 @@ mod tests {
             Box::new(writer),
             cache,
         );
-        let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl)));
+        let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl)))
+            .expect("this fixture's headers are writable");
 
         // 1. Engine controls the header → first pwm_enable=1 write.
         be.apply(&[cmd("hwmon:it8696:pwm1", "hwmon", 40)]).await;
@@ -2839,65 +2876,83 @@ mod tests {
         assert_eq!(lease.map(|l| l.owner), Some(HwmonWriter::Engine));
     }
 
-    /// [SAFETY] `OFN-ad`, DEC-372 — the **discriminating** arm.
+    /// [SAFETY] `OFN-ad`/`OFN-ah`, DEC-372 → DEC-376 — the **discriminating** arm.
     ///
     /// `main.rs` builds `hwmon_controller` from any non-empty
     /// `discover_pwm_headers` result without consulting `is_writable`, so a board
-    /// whose every `pwmN` is read-only has a perfectly real `HwmonBackend` that
-    /// writes nothing. DEC-371 reported it as a driven backend, telling an
-    /// operator mid-thermal-event that the force was holding headers that do not
-    /// exist.
+    /// whose every `pwmN` is read-only had a perfectly real `HwmonBackend` that
+    /// wrote nothing. Everything downstream reads `hwmon_be.is_some()` as "this
+    /// daemon can write hwmon": DEC-371's thermal log claimed a reach it did not
+    /// have, and `note_backend_unavailable` could never raise
+    /// `backend_unavailable` for an hwmon-only control. DEC-372 fixed the first
+    /// with a second predicate; DEC-376 moved that predicate to the gate below,
+    /// which is what fixes both.
     ///
-    /// The writable arm below returns the pre-fix answer (`true`) by
-    /// construction, so a test built only from that arm passes with the fix
-    /// deleted (DEC-340). This one is the arm that can fail.
+    /// The writable arm returns the pre-fix answer (`Some`) by construction, so
+    /// a test built only from that arm passes with the gate deleted (DEC-340).
+    /// This one is the arm that can fail.
     #[test]
-    fn hwmon_backend_has_no_forced_targets_when_every_header_is_read_only() {
+    fn hwmon_backend_is_not_constructed_when_every_header_is_read_only() {
         let mut ro1 = make_header_idx("hwmon:it8696:pwm1", 1);
         ro1.is_writable = false;
         let mut ro2 = make_header_idx("hwmon:it8696:pwm2", 2);
         ro2.is_writable = false;
 
-        let (be, _writes) = hwmon_backend(vec![ro1, ro2]);
+        let (be, _writes) = try_hwmon_backend(vec![ro1, ro2]);
 
         assert!(
-            !be.has_forced_targets(),
-            "a controller whose every header is read-only drives nothing and must \
-             not be reported as a driven backend (OFN-ad)"
+            be.is_none(),
+            "a controller whose every header is read-only drives nothing, so the \
+             engine must take no hwmon backend — otherwise hwmon_be.is_some() \
+             claims a write path that does not exist (OFN-ah)"
         );
     }
 
-    /// The opposite arm of `OFN-ad`, without which a stuck `false` passes.
+    /// The opposite arm of `OFN-ah`, without which a gate stuck at `None` passes.
     #[test]
-    fn hwmon_backend_has_forced_targets_when_any_header_is_writable() {
+    fn hwmon_backend_is_constructed_when_any_header_is_writable() {
         let mut ro = make_header_idx("hwmon:it8696:pwm1", 1);
         ro.is_writable = false;
         let rw = make_header_idx("hwmon:it8696:pwm2", 2);
 
-        let (be, _writes) = hwmon_backend(vec![ro, rw]);
+        let (be, _writes) = try_hwmon_backend(vec![ro, rw]);
 
         assert!(
-            be.has_forced_targets(),
-            "one writable header among read-only ones is still a driven backend"
+            be.is_some(),
+            "one writable header among read-only ones is still a backend the force \
+             and the engine can drive"
         );
     }
 
-    /// The cached flag must agree with the ONE definition of the forced target
-    /// set, on both arms — asserted as a relationship, never against a literal
-    /// (DEC-324). A test written as `assert!(!be.has_forced_targets())` alone is
-    /// satisfied by a flag that is always false.
+    /// The gate must agree with the ONE definition of the forced target set, on
+    /// both arms — asserted as a relationship, never against a literal
+    /// (DEC-324). A test written as `assert!(be.is_none())` alone is satisfied
+    /// by a gate that refuses everything.
     #[test]
-    fn hwmon_forced_targets_flag_matches_the_controllers_own_target_set() {
+    fn hwmon_backend_construction_matches_the_controllers_own_target_set() {
         for writable in [false, true] {
             let mut h = make_header_idx("hwmon:it8696:pwm1", 1);
             h.is_writable = writable;
-            let (be, _writes) = hwmon_backend(vec![h]);
 
-            let from_controller = !be.ctrl.lock().forced_target_ids().is_empty();
+            // Build the controller separately so the target set can be read
+            // even on the arm where no backend is constructed.
+            let cache = Arc::new(StateCache::new());
+            let writer = TestWriter {
+                writes: Arc::new(Mutex::new(Vec::new())),
+            };
+            let ctrl = Arc::new(Mutex::new(HwmonPwmController::new(
+                vec![h],
+                LeaseManager::new(),
+                Box::new(writer),
+                cache,
+            )));
+            let from_controller = !ctrl.lock().forced_target_ids().is_empty();
+
             assert_eq!(
-                be.has_forced_targets(),
+                HwmonBackend::new(ctrl).is_some(),
                 from_controller,
-                "the cached flag disagrees with forced_target_ids() (writable={writable})"
+                "the construction gate disagrees with forced_target_ids() \
+                 (writable={writable})"
             );
             // Precondition: without this the assertion above is satisfied by a
             // target set that never tracks writability at all.
@@ -3282,7 +3337,8 @@ mod tests {
             let cache = Arc::new(StateCache::new());
             let ctrl =
                 HwmonPwmController::new(headers, LeaseManager::new(), Box::new(writer), cache);
-            let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl)));
+            let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl)))
+                .expect("this fixture's headers are writable");
 
             // Exactly one mid-scan preemption: a GUI verify force-takes the lease
             // once force_all_with_floor is past the first header.
@@ -3976,10 +4032,6 @@ mod forced_scope_tests {
         name: &'static str,
         order: Arc<Mutex<Vec<&'static str>>>,
         forced: Vec<(u8, Vec<String>)>,
-        /// Lets "present" and "has outputs to drive" diverge, which is the whole
-        /// of `OFN-ad`. A fake that always reports targets cannot tell the two
-        /// apart, and the pre-DEC-372 version of this file had exactly that.
-        has_targets: bool,
     }
 
     impl RecordingBackend {
@@ -3988,16 +4040,6 @@ mod forced_scope_tests {
                 name,
                 order,
                 forced: Vec::new(),
-                has_targets: true,
-            }
-        }
-
-        /// A present backend with nothing it can drive — the read-only-`pwmN`
-        /// board.
-        fn without_targets(name: &'static str, order: Arc<Mutex<Vec<&'static str>>>) -> Self {
-            Self {
-                has_targets: false,
-                ..Self::new(name, order)
             }
         }
 
@@ -4014,10 +4056,6 @@ mod forced_scope_tests {
     }
 
     impl SafetyWriteBackend for RecordingBackend {
-        fn has_forced_targets(&self) -> bool {
-            self.has_targets
-        }
-
         async fn force_all_with_floor(&mut self, pct: u8, commands: &[PwmCommand]) {
             self.order.lock().push(self.name);
             self.forced
@@ -4212,19 +4250,17 @@ mod forced_scope_tests {
     /// present-with-targets both return the pre-fix answer by construction
     /// (DEC-340), so a test built only from those passes with the fix deleted.
     #[tokio::test]
-    async fn force_present_backends_reports_targets_not_mere_presence() {
-        for (present, has_targets, expected) in [
-            (false, false, false),
-            (false, true, false),
-            (true, false, false), // the read-only-`pwmN` board — OFN-ad
-            (true, true, true),
-        ] {
+    async fn force_present_backends_reports_and_forces_exactly_the_present_backends() {
+        // `OFN-ad` used to be tested here, with a fake whose "present" and "has
+        // outputs to drive" could diverge. Since DEC-376 they cannot: the
+        // divergence is resolved at `HwmonBackend::new`, which refuses to build
+        // on a read-only board, and the gate is pinned by
+        // `hwmon_backend_is_not_constructed_when_every_header_is_read_only`.
+        // What this test still owns is the helper's own contract — the flag
+        // tracks presence, and presence is always forced.
+        for present in [false, true] {
             let order = Arc::new(Mutex::new(Vec::new()));
-            let mut hwmon = if has_targets {
-                RecordingBackend::new("hwmon", order.clone())
-            } else {
-                RecordingBackend::without_targets("hwmon", order.clone())
-            };
+            let mut hwmon = RecordingBackend::new("hwmon", order.clone());
 
             let scope = force_present_backends(
                 None::<&mut RecordingBackend>,
@@ -4235,19 +4271,18 @@ mod forced_scope_tests {
             .await;
 
             assert_eq!(
-                scope.hwmon, expected,
-                "present={present} has_targets={has_targets}: scope.hwmon must report \
-                 whether there was anything to drive, not mere presence"
+                scope.hwmon, present,
+                "present={present}: scope.hwmon must be set from inside the write \
+                 arm, so it cannot name a backend the force did not reach for"
             );
-            // [SAFETY] Reach: a present backend is ALWAYS asked to force,
-            // whatever it reports about its targets. Narrowing the *write* to
-            // backends we believe have targets would be the v2.38.0 P1 shape —
-            // this flag governs the message only.
+            // [SAFETY] Reach: a present backend is ALWAYS asked to force. This
+            // is the assertion that would catch a future "optimisation" that
+            // skips the write for a backend it believes has nothing to drive —
+            // the v2.38.0 P1 shape.
             assert_eq!(
                 hwmon.was_forced(),
                 present,
-                "present={present}: a present backend must be asked to force \
-                 regardless of what it reports about its targets"
+                "present={present}: a present backend must be asked to force"
             );
         }
     }

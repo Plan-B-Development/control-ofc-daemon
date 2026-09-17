@@ -138,11 +138,33 @@ pub async fn capabilities_handler(
 ) -> Json<CapabilitiesResponse> {
     let openfan_present = state.openfan().is_some();
     let hwmon_present = state.hwmon_controller.is_some();
-    let hwmon_header_count = state
-        .hwmon_controller
-        .as_ref()
-        .map(|c| c.lock().headers().len())
-        .unwrap_or(0);
+    // `OFN-ak`, DEC-376: presence and WRITE support are different questions, and
+    // deriving both from `is_some()` made the second one untruthful on a board
+    // whose every `pwmN` is read-only — the daemon advertised a write path it
+    // does not have, and the GUI's "headers detected but all are read-only"
+    // banner (`dashboard_view.py`, `hw.present and not hw.write_support`) was
+    // unreachable because its two operands were two copies of one expression
+    // (`AUD2-g`/DEC-325, inverted). Write support is the same "≥ 1 writable
+    // header" predicate the profile engine gates its backend on
+    // (`HwmonBackend::new`) and the thermal force filters to
+    // (`forced_target_ids`, DEC-295/DEC-372) — one definition, three readers.
+    //
+    // These two values come from ONE lock acquisition rather than two. The
+    // controller lock is held for the whole of an uncancellable blocking
+    // `std::fs::write`, so an avoidable second acquisition is avoidable
+    // exposure. Note this is NOT a claim about the handler as a whole — it takes
+    // the lock again below for the AIO header fold, which is safe (the
+    // descriptors are frozen at discovery, so the two acquisitions cannot tear)
+    // but means the honest statement is "one acquisition for these two reads",
+    // not "one for the handler". Raised by `ofc:concurrency-reviewer` against an
+    // earlier wording of this comment that claimed the latter.
+    let (hwmon_header_count, hwmon_writable) = match state.hwmon_controller.as_ref() {
+        Some(c) => {
+            let guard = c.lock();
+            (guard.headers().len(), !guard.forced_target_ids().is_empty())
+        }
+        None => (0, false),
+    };
 
     // AMD GPU detection
     let primary_gpu = crate::hwmon::gpu_detect::select_primary_gpu(&state.amd_gpus);
@@ -306,7 +328,8 @@ pub async fn capabilities_handler(
             hwmon: HwmonCapability {
                 present: hwmon_present,
                 pwm_header_count: hwmon_header_count,
-                write_support: hwmon_present,
+                // Not `hwmon_present` — see `hwmon_writable` above (`OFN-ak`).
+                write_support: hwmon_writable,
             },
             amd_gpu: amd_gpu_cap,
             intel_gpu: intel_gpu_cap,
@@ -319,7 +342,8 @@ pub async fn capabilities_handler(
         },
         features: FeatureFlags {
             openfan_write_supported: openfan_present,
-            hwmon_write_supported: hwmon_present,
+            // Not `hwmon_present` — see `hwmon_writable` above (`OFN-ak`).
+            hwmon_write_supported: hwmon_writable,
         },
         limits: Limits {
             pwm_percent_min: 0,

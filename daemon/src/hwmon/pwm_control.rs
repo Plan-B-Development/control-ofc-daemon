@@ -232,12 +232,15 @@ impl HwmonPwmController {
     /// The header ids the thermal force actually drives — every **writable**
     /// header, in `headers()` order.
     ///
-    /// [SAFETY] `OFN-ad`, DEC-372. This is the ONE definition of the forced
-    /// target set. It was inlined in `HwmonBackend::force_all_with_floor`'s
-    /// blocking closure, and `HwmonBackend::new` now derives
-    /// `has_forced_targets` from the same expression — so the set that is
-    /// written and the claim the log line makes about it cannot drift apart
-    /// (DEC-334: one flag, one gating shape).
+    /// [SAFETY] `OFN-ad`, DEC-372; `OFN-ah`/`OFN-ak`, DEC-376. This is the ONE
+    /// definition of "a hwmon output this daemon can drive", and it now has
+    /// three readers, all of which must agree or the daemon lies about itself:
+    /// `HwmonBackend::force_all_with_floor` (the set it actually writes),
+    /// `HwmonBackend::new` (which refuses to build a backend when this is empty,
+    /// so the engine's `hwmon_be.is_some()` means what its readers assume), and
+    /// `capabilities_handler` (`devices.hwmon.write_support` and
+    /// `features.hwmon_write_supported`). Derived, never restated —
+    /// DEC-334's "one flag, one gating shape".
     ///
     /// Safe to call once at construction and cache the emptiness of:
     /// `is_writable` is read from the sysfs permission bit at discovery

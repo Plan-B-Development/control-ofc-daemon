@@ -1066,7 +1066,12 @@ pub async fn profile_engine_loop(
         .clone()
         .map(|ctrl| OpenFanBackend::new(ctrl, cache.clone()));
     let mut gpu_be = GpuBackend::new(cache.clone(), Arc::new(gpu_infos));
-    let mut hwmon_be = hwmon_controller.map(HwmonBackend::new);
+    // `and_then`, not `map` (`OFN-ah`, DEC-376): `HwmonBackend::new` returns
+    // `None` on a board whose every `pwmN` is read-only. Everything downstream
+    // reads `hwmon_be.is_some()` as "this daemon can write hwmon" — the thermal
+    // log's reach and `note_backend_unavailable`'s `hwmon_available` both do —
+    // and that reading is only true once the gate is here.
+    let mut hwmon_be = hwmon_controller.and_then(HwmonBackend::new);
 
     // Track consecutive cycles with no CPU temperature sensor (P0-R1).
     // If no CpuTemp sensor is found for N cycles, force fans to a safe minimum.
@@ -6543,6 +6548,224 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         let _ = handle.await;
         let _ = std::fs::remove_file(&fifo);
+    }
+
+    /// A read-only-`pwmN` board: same descriptor as `writable_pwm_header`, with
+    /// the one bit that decides everything flipped (`OFN-ah`).
+    fn read_only_pwm_header(id: &str) -> crate::hwmon::pwm_discovery::PwmHeaderDescriptor {
+        crate::hwmon::pwm_discovery::PwmHeaderDescriptor {
+            is_writable: false,
+            ..writable_pwm_header(id)
+        }
+    }
+
+    fn hwmon_control(id: &str, curve_id: &str, member: &str) -> LogicalControl {
+        let mut c = openfan_control(id, curve_id, member);
+        c.members[0].source = "hwmon".into();
+        c
+    }
+
+    /// Spin the real loop with `hwmon_headers` until `ready` observes what the
+    /// caller is about to assert, and return the cache it wrote.
+    ///
+    /// Real (not paused) time, because the skip listing is debounced over
+    /// `SKIP_DEBOUNCE_TICKS` real 1 Hz ticks and every age in this engine is
+    /// measured against `std::time::Instant`, which paused time does not advance
+    /// (DEC-272 trap 1).
+    ///
+    /// **The sensor is RE-STAMPED every 100 ms, and that is load-bearing rather
+    /// than tidy.** The first draft stamped it once and then ran a fixed
+    /// 3.2 s + 4.0 s budget against it. A CPU reading goes stale at
+    /// `CPU_TEMP_STALE_INTERVALS` x 1 s = **5 s**, after which
+    /// `NO_SENSOR_CYCLE_THRESHOLD` = **5** further cycles trip DEC-190's 40 %
+    /// no-sensor fallback at ~10 s — and a forced tick `continue`s at
+    /// `:1487`, *before* `tick_done.set_outputs(..)`, so `TickCompletion::drop`
+    /// publishes an **empty** `control_outputs`. That is precisely what the
+    /// writable arm asserts is non-empty, so the test was running to 72 % of its
+    /// own failure threshold and would have reddened under a loaded parallel
+    /// `cargo test` — with a message pointing at the change under review rather
+    /// than at the clock. **Measured, not reasoned:** raising only the poll
+    /// budget to 12 s reproduced it exactly (`must still publish its applied
+    /// duty — got []`). Re-stamping removes the deadline instead of racing it,
+    /// and `ready` lets each arm stop as soon as its own subject is observable.
+    /// Raised as a P2 by `ofc:concurrency-reviewer` during DEC-376's review.
+    async fn run_loop_with_hwmon_headers(
+        profile: DaemonProfile,
+        hwmon_headers: Vec<crate::hwmon::pwm_discovery::PwmHeaderDescriptor>,
+        ready: impl Fn(&crate::health::state::DaemonState) -> bool,
+    ) -> Arc<StateCache> {
+        let cache = make_cache_with_sensor("cpu", 50.0); // well under any trigger
+        let writes: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let ctrl = crate::hwmon::pwm_control::HwmonPwmController::new(
+            hwmon_headers,
+            crate::hwmon::lease::LeaseManager::new(),
+            Box::new(RecordingSysfsWriter {
+                writes: writes.clone(),
+            }),
+            cache.clone(),
+        );
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(profile_engine_loop(
+            cache.clone(),
+            Arc::new(Mutex::new(Some(profile))),
+            Arc::new(parking_lot::RwLock::new(None)), // no OpenFan — isolates the hwmon leg
+            Some(Arc::new(Mutex::new(ctrl))),
+            vec![], // no GPU
+            Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new())),
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
+            shutdown_rx,
+        ));
+
+        // One loop, re-stamping as it goes. Both arms must clear the debounce
+        // window before asserting: the read-only arm needs it for the listing to
+        // appear, and the writable arm's "nothing was skipped" is vacuous until
+        // the same window has passed. After it, poll `ready` so each arm exits on
+        // its own subject instead of on a fixed margin.
+        let debounce_ms = 200 + 1000 * u64::from(SKIP_DEBOUNCE_TICKS);
+        let mut elapsed_ms = 0u64;
+        loop {
+            // Keep the CPU reading current — see this function's docs. Without
+            // it the run trips the 40% no-sensor fallback at ~10s and every
+            // assertion below becomes an assertion about a forced tick.
+            cache.update_sensors(vec![CachedSensorReading {
+                id: "cpu".into(),
+                kind: SensorKind::CpuTemp,
+                label: "Tctl".into(),
+                value_c: 50.0,
+                source: DeviceLabel::Hwmon,
+                updated_at: Instant::now(),
+                rate_c_per_s: None,
+                session_min_c: None,
+                session_max_c: None,
+                chip_name: "k10temp".into(),
+                temp_type: None,
+                thresholds: None,
+            }]);
+            if elapsed_ms >= debounce_ms && cache.read_with(|snap| ready(snap)) {
+                break;
+            }
+            if elapsed_ms >= debounce_ms + 4000 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            elapsed_ms += 100;
+        }
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let _ = handle.await;
+
+        // Precondition for BOTH arms: the run must never have been forced. A
+        // forced tick publishes an empty `control_outputs` and skips the write
+        // phase, so without this a re-stamping regression would turn the
+        // writable arm's failure into a mystery and could make the read-only
+        // arm pass for the wrong reason.
+        // `Some("normal")` rather than `None`, and the difference matters: `None`
+        // means the engine never wrote thermal state at all, i.e. it never
+        // ticked, which would make every assertion below vacuous. The first
+        // draft asserted `None` and failed on the healthy path — a precondition
+        // that cannot hold when the code is correct is DEC-348's trap, caught
+        // here by running it rather than by reading it.
+        assert_eq!(
+            cache.snapshot().thermal_override_state.as_deref(),
+            Some("normal"),
+            "precondition: the engine must have ticked and never been forced — the \
+             sensor re-stamping above exists to guarantee the second half, and a \
+             forced tick publishes an empty control_outputs that would make these \
+             assertions measure the ladder instead of the change"
+        );
+        cache
+    }
+
+    /// [SAFETY-adjacent] `OFN-ah`, DEC-376 — the CALL SITE, not the rule.
+    ///
+    /// `control_deliverability` has always classified this case correctly and
+    /// `skipped.rs` has always tested it. What nothing tested was the argument
+    /// the tick body hands it: `hwmon_be.is_some()`, which on a board whose every
+    /// `pwmN` is read-only was `true`, because `main.rs` built the controller
+    /// from any non-empty discovery result. So `docs/08`'s promise — an `hwmon:`
+    /// member on a board with no writable header reports `backend_unavailable` —
+    /// was unreachable, and the control published a duty nothing applied (277-k).
+    /// The fifteenth instance of extract-the-rule-but-not-the-call-site, and the
+    /// reason this test drives the real loop instead of calling
+    /// `note_backend_unavailable` with a hand-built bool.
+    ///
+    /// **The read-only board is the discriminating arm.** A board with no headers
+    /// at all already passed before the fix, by construction (DEC-340).
+    #[tokio::test]
+    async fn loop_reports_an_hwmon_control_as_backend_unavailable_on_a_read_only_board() {
+        let profile = DaemonProfile {
+            id: "p".into(),
+            name: "P".into(),
+            version: 7,
+            description: String::new(),
+            controls: vec![hwmon_control("c", "cv", "hwmon:it8696:pwm1")],
+            curves: vec![linear_curve("cv", "cpu")],
+        };
+
+        let cache = run_loop_with_hwmon_headers(
+            profile,
+            vec![read_only_pwm_header("hwmon:it8696:pwm1")],
+            |s| !s.skipped_controls.is_empty(),
+        )
+        .await;
+
+        let (skipped, outputs) =
+            cache.read_with(|s| (s.skipped_controls.clone(), s.control_outputs.clone()));
+
+        assert_eq!(
+            skipped.len(),
+            1,
+            "an hwmon-only control on a board with no writable header must be \
+             listed — got {skipped:?}"
+        );
+        assert_eq!(skipped[0].control_id, "c");
+        assert_eq!(
+            skipped[0].reason,
+            SkipReason::BackendUnavailable,
+            "the curve resolved; it is DELIVERY that has nowhere to go"
+        );
+        // 277-k: the same control must not also publish an applied duty.
+        assert!(
+            !outputs.iter().any(|o| o.control_id == "c"),
+            "a control reported as commanding nothing must be absent from \
+             control_outputs — got {outputs:?}"
+        );
+    }
+
+    /// The opposite arm, without which a gate stuck at "never deliverable"
+    /// passes: one writable header and the same control is commanded normally.
+    #[tokio::test]
+    async fn loop_keeps_commanding_an_hwmon_control_when_a_header_is_writable() {
+        let profile = DaemonProfile {
+            id: "p".into(),
+            name: "P".into(),
+            version: 7,
+            description: String::new(),
+            controls: vec![hwmon_control("c", "cv", "hwmon:it8696:pwm1")],
+            curves: vec![linear_curve("cv", "cpu")],
+        };
+
+        let cache = run_loop_with_hwmon_headers(
+            profile,
+            vec![writable_pwm_header("hwmon:it8696:pwm1")],
+            |s| !s.control_outputs.is_empty(),
+        )
+        .await;
+
+        let (skipped, outputs) =
+            cache.read_with(|s| (s.skipped_controls.clone(), s.control_outputs.clone()));
+
+        assert!(
+            skipped.is_empty(),
+            "a writable header is a deliverable backend — got {skipped:?}"
+        );
+        assert!(
+            outputs.iter().any(|o| o.control_id == "c"),
+            "and the control must still publish its applied duty — got {outputs:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

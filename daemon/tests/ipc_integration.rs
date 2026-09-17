@@ -1625,6 +1625,77 @@ async fn capabilities_with_hwmon_shows_headers() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// `OFN-ak`, DEC-376 — the **discriminating** arm.
+///
+/// Presence and write support were two copies of one expression
+/// (`hwmon_controller.is_some()`), so a board whose every `pwmN` is read-only
+/// was told the daemon could write it. That also made the GUI's
+/// "headers detected but all are read-only" banner structurally unreachable,
+/// because its condition is `present and not write_support`.
+///
+/// The writable board asserts `write_support == true`, which is the pre-fix
+/// answer by construction (DEC-340) — it is the opposite arm, not the test.
+/// This one is the arm that can fail.
+#[tokio::test]
+async fn capabilities_report_no_hwmon_write_support_when_every_header_is_read_only() {
+    let mut h1 = make_test_header("h1", "CHA_FAN1", 20);
+    h1.is_writable = false;
+    let mut h2 = make_test_header("h2", "CPU_FAN", 30);
+    h2.is_writable = false;
+    let state = test_app_state_with_headers(vec![h1, h2]);
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/capabilities").await;
+
+    assert_eq!(status, 200);
+    // Presence is unchanged — the headers are real and the Hardware page must
+    // still list them. It is the WRITE claim that was untrue.
+    assert_eq!(
+        json["devices"]["hwmon"]["present"], true,
+        "read-only headers are still discovered headers"
+    );
+    assert_eq!(json["devices"]["hwmon"]["pwm_header_count"], 2);
+    assert_eq!(
+        json["devices"]["hwmon"]["write_support"], false,
+        "no writable pwmN means no hwmon write path — claiming one is the \
+         GPU rule (`CLAUDE.md` § GPU support rules) one subsystem over"
+    );
+    assert_eq!(
+        json["features"]["hwmon_write_supported"], false,
+        "the feature flag and the device capability must not disagree"
+    );
+    // The two fields must be able to DIVERGE — that is the whole defect, and a
+    // test asserting each against a literal would pass with both wired to one
+    // expression again (`AUD2-g`/DEC-325).
+    assert_ne!(
+        json["devices"]["hwmon"]["present"], json["devices"]["hwmon"]["write_support"],
+        "presence and write support must be independently derived"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The opposite arm: one writable header among read-only ones still advertises
+/// a write path. Without it, a predicate stuck at `false` passes above.
+#[tokio::test]
+async fn capabilities_report_hwmon_write_support_when_any_header_is_writable() {
+    let mut ro = make_test_header("h1", "CHA_FAN1", 20);
+    ro.is_writable = false;
+    let rw = make_test_header("h2", "CPU_FAN", 30);
+    let state = test_app_state_with_headers(vec![ro, rw]);
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/capabilities").await;
+
+    assert_eq!(status, 200);
+    assert_eq!(json["devices"]["hwmon"]["write_support"], true);
+    assert_eq!(json["features"]["hwmon_write_supported"], true);
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
 #[tokio::test]
 async fn unknown_endpoint_returns_error_envelope() {
     let state = test_app_state();

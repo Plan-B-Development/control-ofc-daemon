@@ -1,5 +1,50 @@
 # Changelog
 
+## [2.49.0] — 2026-09-17
+
+### Fixed
+
+**A board whose every `pwmN` is read-only was told the daemon could control it,
+twice over.** Two fields answered "can this daemon write hwmon?" from header
+*presence* rather than from whether any header is actually writable, and on such
+a board those are different answers.
+
+- **`skipped_controls[]` could never report an `hwmon:` control as
+  `backend_unavailable`** (`OFN-ah`). The profile engine built its hwmon backend
+  from any non-empty discovery result, so the `hwmon_available` flag it hands the
+  deliverability rule was `true` even where nothing could be driven. The control
+  therefore resolved, computed an output, published it in `control_outputs[]` —
+  and delivered nothing, silently. That is the silence `backend_unavailable`
+  exists to remove (2.47.0, `OFN-j`), and it also broke the 277-k invariant that
+  a control listed as skipped is absent from `control_outputs[]`: the daemon
+  published a duty nothing applied. `docs/08` has promised the hwmon case in
+  those exact words since 2.47.0; it is now true. The engine takes no hwmon
+  backend on such a board, so hwmon controls there are listed as
+  `backend_unavailable` and drop out of `control_outputs[]`.
+- **`devices.hwmon.write_support` and `features.hwmon_write_supported` claimed a
+  write path that does not exist** (`OFN-ak`). Both were the same expression as
+  `devices.hwmon.present`, so no client could distinguish the two — any branch of
+  the form `present and not write_support` was structurally unreachable, which
+  includes the GUI's "motherboard fan headers detected but all are read-only"
+  banner. Both now report "at least one writable header". `present` is unchanged:
+  a read-only header is a real header and is still listed.
+
+**Client-visible on an affected board, and only there.** A machine with at least
+one writable `pwmN` — every machine the project has been tested on — sees no
+change in any field. The emergency's reach is unchanged on every board: the
+forced write already filtered to writable headers (DEC-295), so the write now
+skipped is one that would have driven nothing.
+
+All three answers are derived from one predicate,
+`HwmonPwmController::forced_target_ids()`, which is also the set the thermal force
+writes — so the claim and the write cannot drift (DEC-334, one flag one gating
+shape). DEC-372's `SafetyWriteBackend::has_forced_targets` is retired with it:
+gating construction makes it unconditionally true on both backends, and its
+invariant moved to the gate's own test.
+
+DEC-376. Register rows `OFN-ah` and `OFN-ak`, from the 2026-09-16/17
+`/ofc:investigate-bug` sessions.
+
 ## [2.48.1] — 2026-09-16
 
 ### Documentation

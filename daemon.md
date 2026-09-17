@@ -584,7 +584,9 @@ token (`curve_not_found` | `sensor_unavailable` | `mix_unresolvable` |
 and an output was computed, and every member's BACKEND is absent, so the control
 commands nothing — canonically an `openfan:` member with no OpenFanController
 adopted, though an `hwmon:` member on a board with no writable header reports
-identically. Raised only when EVERY member is undeliverable; a partly-live
+identically from **2.49.0** (`OFN-ah`, DEC-376 — until then the engine took an
+hwmon backend from any discovered header, so the hwmon half of this promise was
+unreachable). Raised only when EVERY member is undeliverable; a partly-live
 control is still commanding fans and is logged once per activation instead. Additive and omitted when
 empty, so an older client sees the wire shape it always did and a newer client
 reads `skipped_controls = []` from an older daemon. See Safety Model item 3.
