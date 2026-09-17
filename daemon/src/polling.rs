@@ -768,7 +768,11 @@ fn read_nvml_states(backend: &dyn NvmlBackend) -> (Vec<SensorReading>, Vec<AmdGp
 ///
 /// Sends `ReadAllRpm` every `interval` and pushes fan state into the cache.
 /// After 5 consecutive errors, enters reconnect mode: attempts `auto_detect_port`
-/// with exponential backoff (1s..30s) until the device reappears.
+/// on a doubling backoff **capped at 30 poll intervals** until the device
+/// reappears. The backoff is a count of loop cycles, not of seconds
+/// (`attempts_reconnect_this_cycle`), so it reads as 1 s..30 s only at the
+/// default 1000 ms `polling.poll_interval_ms` and is proportionally shorter
+/// wherever that has been lowered (`OFN-aj`).
 /// Verify and adopt a re-opened OpenFan transport, or refuse it (DEC-260).
 ///
 /// Extracted from `openfan_poll_loop` for the same reason `first_openfan_port`

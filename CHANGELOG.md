@@ -1,5 +1,27 @@
 # Changelog
 
+## [Unreleased]
+
+### Documentation
+
+**The OpenFan reconnect backoff was described in seconds; it is a count of poll
+ticks** (`OFN-aj`). `reconnect_backoff = (reconnect_backoff * 2).min(30)` is
+consumed by `attempts_reconnect_this_cycle` as a number of *loop cycles*, and
+the loop's period is `polling.poll_interval_ms`. So the documented "1s..30s"
+holds only at the default 1000 ms interval — at the API's 250 ms floor the real
+range is 250 ms–7.5 s, and the admin file allows 100 ms (→ 100 ms–3 s). An
+operator who has tuned the poll interval was reading a reconnect-timing bound
+that does not hold for them. `polling.rs`'s doc comment now states the cap in
+poll intervals and gives the seconds reading as a default-interval example.
+That comment is the site worth fixing first because it is what the next doc
+writer copies — which is exactly how the figure reached the GUI's
+`daemon-end-to-end.md`, where DEC-375 corrected it in its own diff. The GUI
+manual carries the matching correction in the same window.
+
+No behaviour change: the 30-cycle cap, `attempts_reconnect_this_cycle` and every
+config clamp are untouched. `polling.rs:860` already said "cycles" and is
+unchanged.
+
 ## [2.49.0] — 2026-09-17
 
 ### Fixed
