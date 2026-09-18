@@ -16,6 +16,7 @@ const WATCHDOG_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
 use crate::error::HwmonError;
 use crate::health::cache::StateCache;
 use crate::health::state::HwmonFanState;
+use crate::hwmon::handback::{HandBack, HandBackLedger, HandBackOutcome};
 use crate::hwmon::lease::{LeaseError, LeaseManager};
 use crate::hwmon::pwm_discovery::PwmHeaderDescriptor;
 
@@ -27,7 +28,10 @@ use crate::hwmon::pwm_discovery::PwmHeaderDescriptor;
 ///   2 = automatic/thermal cruise (driver-specific)
 ///   3+ = driver-specific (e.g., NCT6775 Speed Cruise, Smart Fan III/IV)
 ///
-/// This daemon only writes value 1 (manual), which is safe across all drivers.
+/// The daemon TAKES a header by writing 1 (manual), which every driver supports.
+/// Giving one back writes whatever the header reported before the first take —
+/// never an assumed "automatic" value, because 2 means something different on
+/// every driver family (`hwmon::handback`, DEC-382).
 const PWM_ENABLE_MANUAL: &str = "1";
 
 use crate::pwm::{percent_to_raw, raw_to_percent};
@@ -196,6 +200,11 @@ pub struct HwmonPwmController {
     /// PWM=N but read back PWM≠N — a strong signal of BIOS/EC interference,
     /// clamping, or a concurrent in-process writer.
     verify_mismatch_counts: HashMap<String, u64>,
+    /// Which headers this controller has taken from firmware, and what each one
+    /// gets back (DEC-382). Shared, not owned: the shutdown restore and the panic
+    /// hook read it without this controller's mutex, which a wedged sysfs write
+    /// can hold for good.
+    handback: Arc<HandBackLedger>,
 }
 
 impl HwmonPwmController {
@@ -205,6 +214,7 @@ impl HwmonPwmController {
         writer: Box<dyn SysfsWriter>,
         cache: Arc<StateCache>,
     ) -> Self {
+        let handback = Arc::new(HandBackLedger::new(&headers));
         let header_map: HashMap<String, PwmHeaderDescriptor> =
             headers.into_iter().map(|h| (h.id.clone(), h)).collect();
 
@@ -218,7 +228,50 @@ impl HwmonPwmController {
             enable_revert_last_at: HashMap::new(),
             watchdog_log_state: HashMap::new(),
             verify_mismatch_counts: HashMap::new(),
+            handback,
         }
+    }
+
+    /// The hand-back ledger (DEC-382). Clone the `Arc` before wrapping the
+    /// controller in its mutex for anything that must reach it without the lock.
+    pub fn handback(&self) -> &Arc<HandBackLedger> {
+        &self.handback
+    }
+
+    /// Give `header_id` back to what it was doing before the daemon first took
+    /// it (DEC-382). Requires a valid lease, like every other write.
+    ///
+    /// `Ok(None)` when the daemon does not hold the header: there is nothing to
+    /// give back, and nothing is written.
+    pub fn hand_back(
+        &mut self,
+        header_id: &str,
+        lease_id: &str,
+    ) -> Result<Option<HandBackOutcome>, HwmonControlError> {
+        self.lease_manager
+            .validate_lease(lease_id)
+            .map_err(HwmonControlError::Lease)?;
+        let Some(taken) = self.handback.taken_header(header_id) else {
+            return Ok(None);
+        };
+        let outcome = crate::hwmon::handback::hand_back(
+            &mut *self.writer,
+            &taken.enable_path,
+            &taken.pwm_path,
+            taken.action,
+        );
+        if outcome.released() {
+            self.handback.note_handed_back(header_id);
+            // [SAFETY] Forget this header's write state. The watchdog in
+            // `set_pwm` reads any mode other than 1 on a header it believes it set
+            // as a firmware reclaim, so keeping `manual_mode_set` would count the
+            // daemon's own hand-back as one the next time something takes the
+            // header — the obstacle that withdrew `D1-m`. It also makes that next
+            // take re-assert `pwm_enable=1` from a clean slate.
+            self.write_state.remove(header_id);
+            self.cache.clear_hwmon_commanded(header_id);
+        }
+        Ok(Some(outcome))
     }
 
     /// Cumulative PWM verify-after-write mismatch events per header.
@@ -345,7 +398,7 @@ impl HwmonPwmController {
         }
 
         // Look up header — extract needed fields to avoid cloning the full descriptor.
-        let (pwm_path, enable_path, supports_enable, rpm_path) = {
+        let (pwm_path, enable_path, supports_enable, rpm_path, chip_name) = {
             let h = self.headers.get(header_id).ok_or_else(|| {
                 HwmonControlError::Validation(format!("unknown header: {header_id}"))
             })?;
@@ -354,6 +407,7 @@ impl HwmonPwmController {
                 h.enable_path.clone(),
                 h.supports_enable,
                 h.rpm_path.clone(),
+                h.chip_name.clone(),
             )
         };
 
@@ -506,6 +560,22 @@ impl HwmonPwmController {
         // Write pwm_enable if not yet set (or if BIOS reclaimed it).
         if !ws.manual_mode_set && supports_enable {
             if let Some(ref ep) = enable_path {
+                // [SAFETY] DEC-382: this write is the TAKE. Read what the header
+                // was doing BEFORE it — on the first take only; every later one
+                // starts from state the daemon or the firmware left — and record
+                // the take before switching, so a process that dies between the
+                // two leaves a record that replays as a no-op instead of a
+                // manual-mode header nothing will give back.
+                let original = if self.handback.needs_original(header_id) {
+                    Some(HandBack::from_reading(
+                        &chip_name,
+                        crate::hwmon::handback::read_u8(&*self.writer, ep),
+                        crate::hwmon::handback::read_u8(&*self.writer, &pwm_path),
+                    ))
+                } else {
+                    None
+                };
+                self.handback.note_take(header_id, original);
                 self.writer
                     .write_file(ep, PWM_ENABLE_MANUAL)
                     .map_err(HwmonControlError::Hardware)?;
@@ -1938,5 +2008,164 @@ mod tests {
             ),
             WatchdogLogAction::Warn,
         );
+    }
+
+    // ── DEC-382: take and give back ──────────────────────────────────────
+
+    /// A sysfs whose files change when written, shared with the test so it can
+    /// play the firmware. `MockSysfsWriter` never updates what it reads back,
+    /// which is exactly the property these tests need: a capture made AFTER the
+    /// `pwm_enable=1` write reads `1` here, so they can tell "read before the
+    /// take" from "read after it".
+    #[derive(Clone, Default)]
+    struct LiveSysfs(Arc<Mutex<StdHashMap<String, String>>>);
+
+    impl LiveSysfs {
+        fn set(&self, path: &str, value: &str) {
+            self.0.lock().insert(path.into(), value.into());
+        }
+        fn get(&self, path: &str) -> Option<String> {
+            self.0.lock().get(path).cloned()
+        }
+    }
+
+    impl SysfsWriter for LiveSysfs {
+        fn write_file(&mut self, path: &str, value: &str) -> Result<(), HwmonError> {
+            self.set(path, value.trim());
+            Ok(())
+        }
+        fn read_file(&self, path: &str) -> Result<String, HwmonError> {
+            self.get(path)
+                .map(|v| format!("{v}\n"))
+                .ok_or(HwmonError::ReadError {
+                    path: path.into(),
+                    message: "not found".into(),
+                })
+        }
+    }
+
+    const ENABLE: &str = "/sys/class/hwmon/hwmon0/pwm1_enable";
+    const PWM: &str = "/sys/class/hwmon/hwmon0/pwm1";
+
+    fn live_controller(
+        enable: &str,
+        pwm: &str,
+    ) -> (HwmonPwmController, LiveSysfs, Arc<StateCache>, String) {
+        let sysfs = LiveSysfs::default();
+        sysfs.set(ENABLE, enable);
+        sysfs.set(PWM, pwm);
+        let cache = Arc::new(StateCache::new());
+        let mut ctrl = HwmonPwmController::new(
+            vec![make_header("h1", "CPU_FAN", 0)],
+            LeaseManager::new(),
+            Box::new(sysfs.clone()),
+            cache.clone(),
+        );
+        let lease = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap()
+            .lease_id;
+        (ctrl, sysfs, cache, lease)
+    }
+
+    /// [SAFETY] DEC-382 (`TS-a`), at the call site: the mode recorded is the one
+    /// the header had BEFORE `set_pwm` switched it to manual. Recorded after the
+    /// switch, it would be `1` — and a hand-back would then leave the header in
+    /// manual mode, which is the defect with the value-of-`2` part removed.
+    #[test]
+    fn the_first_take_records_the_mode_the_header_had_before_it() {
+        let (mut ctrl, sysfs, _cache, lease) = live_controller("5", "90");
+        ctrl.set_pwm("h1", 60, &lease).unwrap();
+        assert_eq!(
+            sysfs.get(ENABLE).as_deref(),
+            Some("1"),
+            "precondition: the take switched the header to manual"
+        );
+        assert_eq!(
+            ctrl.handback().taken_header("h1").map(|t| t.action),
+            Some(HandBack::Mode(5))
+        );
+    }
+
+    /// A firmware reclaim makes the next write take the header again. The first
+    /// original must survive that: the reclaimed mode is firmware re-asserting
+    /// itself, not what the header was doing before the daemon arrived.
+    #[test]
+    fn a_retake_after_a_firmware_reclaim_keeps_the_first_original() {
+        let (mut ctrl, sysfs, _cache, lease) = live_controller("5", "90");
+        ctrl.set_pwm("h1", 60, &lease).unwrap();
+        sysfs.set(ENABLE, "2");
+        ctrl.set_pwm("h1", 61, &lease).unwrap();
+        assert_eq!(
+            ctrl.enable_revert_counts().get("h1"),
+            Some(&1),
+            "precondition: the watchdog saw the reclaim and took the header again"
+        );
+        assert_eq!(
+            ctrl.handback().taken_header("h1").map(|t| t.action),
+            Some(HandBack::Mode(5))
+        );
+    }
+
+    /// [SAFETY] The obstacle that withdrew `D1-m`: after a hand-back the header
+    /// reads its firmware mode, and the next take must NOT count that as a
+    /// firmware reclaim. `hand_back` forgets the write state for exactly this.
+    #[test]
+    fn a_hand_back_is_not_counted_as_a_firmware_reclaim() {
+        let (mut ctrl, sysfs, _cache, lease) = live_controller("5", "90");
+        ctrl.set_pwm("h1", 60, &lease).unwrap();
+        assert_eq!(
+            ctrl.hand_back("h1", &lease).unwrap(),
+            Some(HandBackOutcome::Restored)
+        );
+        assert_eq!(
+            sysfs.get(ENABLE).as_deref(),
+            Some("5"),
+            "the recorded mode is back"
+        );
+        assert!(!ctrl.handback().is_taken("h1"));
+
+        ctrl.set_pwm("h1", 60, &lease).unwrap();
+        assert!(
+            ctrl.enable_revert_counts().get("h1").is_none(),
+            "the daemon's own hand-back must not read as a reclaim; got {:?}",
+            ctrl.enable_revert_counts()
+        );
+        assert_eq!(
+            sysfs.get(ENABLE).as_deref(),
+            Some("1"),
+            "the next take re-asserts manual mode"
+        );
+        assert!(ctrl.handback().is_taken("h1"));
+    }
+
+    #[test]
+    fn a_hand_back_needs_a_lease_and_writes_nothing_for_an_untaken_header() {
+        let (mut ctrl, sysfs, _cache, lease) = live_controller("5", "90");
+        assert!(matches!(
+            ctrl.hand_back("h1", "no-lease"),
+            Err(HwmonControlError::Lease(_))
+        ));
+        assert_eq!(ctrl.hand_back("h1", &lease).unwrap(), None);
+        assert_eq!(sysfs.get(ENABLE).as_deref(), Some("5"));
+        assert_eq!(sysfs.get(PWM).as_deref(), Some("90"));
+    }
+
+    /// After a hand-back the daemon no longer commands the header, and the cache
+    /// must stop saying it does.
+    #[test]
+    fn a_hand_back_clears_the_commanded_duty_from_the_cache() {
+        let (mut ctrl, _sysfs, cache, lease) = live_controller("5", "90");
+        ctrl.set_pwm("h1", 60, &lease).unwrap();
+        let commanded = |c: &StateCache| {
+            c.snapshot()
+                .hwmon_fans
+                .get("h1")
+                .and_then(|f| f.pwm_commanded_pct)
+        };
+        assert_eq!(commanded(&cache), Some(60), "precondition");
+        ctrl.hand_back("h1", &lease).unwrap();
+        assert_eq!(commanded(&cache), None);
     }
 }

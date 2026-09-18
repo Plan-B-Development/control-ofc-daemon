@@ -18,7 +18,7 @@
 //! control, and forcing PMFW curve commits from a CPU emergency would add
 //! SMU churn without improving GPU safety.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -28,8 +28,9 @@ use super::PwmCommand;
 use crate::clock::Clock;
 use crate::constants;
 use crate::health::cache::StateCache;
+use crate::hwmon::handback::HandBackOutcome;
 use crate::hwmon::lease::HwmonWriter;
-use crate::hwmon::pwm_control::HwmonControlError;
+use crate::hwmon::pwm_control::{HwmonControlError, HwmonPwmController};
 use crate::serial::protocol::NUM_CHANNELS;
 
 /// How long the engine will wait for one backend's blocking write before it
@@ -138,10 +139,10 @@ impl<T: Send + 'static> BoundedWrite<T> {
     /// free, because the loop could not end a tick with a write in flight. It can
     /// now — that is the whole point of the bound — so without this the drain
     /// resolves instantly while a detached write still holds the controller
-    /// mutex. `restore_hwmon_to_auto` would then miss its `try_lock_for`, take
-    /// the fallback path, and the still-running `set_pwm` would re-assert manual
-    /// mode *after* the restore handed the fans back: fans latched in manual
-    /// after exit, silently, on the `Restart=on-failure` path where
+    /// mutex, and the still-running `set_pwm` would re-assert manual mode *after*
+    /// `hand_back_hwmon` gave the fans back (it reads the ledger, not the
+    /// controller, so nothing about the lock would stop it): fans latched in
+    /// manual after exit, silently, on the `Restart=on-failure` path where
     /// `ExecStopPost` never runs.
     pub(crate) async fn drain(&mut self, deadline: std::time::Duration) {
         let Some(handle) = self.pending.take() else {
@@ -331,12 +332,22 @@ pub(crate) trait SafetyWriteBackend: WriteBackend {
     /// for far more than 60%, and the 40% no-sensor fallback did the same to a
     /// control driven by a still-healthy GPU or coolant sensor.
     ///
-    /// Each output now gets `max(commanded, pct)`; an output no control
-    /// commands still gets `pct`. That is what keeps the emergency's **reach**
-    /// intact — clamping the command list alone would shrink the force to
-    /// controlled fans only, which is the v2.38.0 P1 shape. The result is
-    /// monotone against the old behaviour: no output is ever driven lower than
-    /// `force_all(pct)` would have driven it.
+    /// Each output in `reach` gets `max(commanded, pct)`, and one no control
+    /// commands gets `pct`.
+    ///
+    /// [SAFETY] DEC-382 narrowed the reach, and only below 100 %. At 100 % —
+    /// the emergency — `reach` is [`ForceReach::All`] and every output this
+    /// backend can drive is taken, exactly as DEC-307 had it: clamping to the
+    /// command list there would shrink the emergency to controlled fans, which
+    /// is the v2.38.0 P1 shape. Below 100 % `reach` is the profile's members,
+    /// because a sub-100 duty on a header nothing in the profile controls
+    /// replaces a firmware curve it can run *below* — the reduction DEC-307
+    /// removed for commanded outputs, still standing for everything else. A
+    /// sub-100 force also gives back what an earlier one took and nothing
+    /// holds any more (see each implementation).
+    ///
+    /// Returns whether this backend had at least one output in `reach` — the
+    /// input to [`ForcedScope`], never "the write landed".
     ///
     /// Async since DEC-146 P3-8: implementations run their blocking
     /// serial/sysfs writes on the blocking pool instead of pinning a tokio
@@ -354,7 +365,92 @@ pub(crate) trait SafetyWriteBackend: WriteBackend {
         &mut self,
         pct: u8,
         commands: &[PwmCommand],
-    ) -> impl std::future::Future<Output = ()> + Send;
+        reach: ForceReach<'_>,
+    ) -> impl std::future::Future<Output = bool> + Send;
+}
+
+/// The outputs the active profile's controls name, by backend (DEC-382).
+///
+/// Every member of every control counts — commanded this tick, skipped, or
+/// overridden — because "a profile controls this fan" does not change when one
+/// tick's curve fails to resolve. Built once per tick from the profile itself,
+/// never from the command list, which omits skipped controls.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ProfileMembers {
+    /// hwmon header ids.
+    pub(crate) hwmon: HashSet<String>,
+    /// OpenFan channel numbers.
+    pub(crate) openfan: HashSet<u8>,
+}
+
+impl ProfileMembers {
+    /// The members of `profile`'s controls. GPU members are not collected: the
+    /// thermal force never reaches a GPU fan (DEC-130), and nothing gives one back.
+    pub(crate) fn of(profile: &crate::profile::DaemonProfile) -> Self {
+        let mut members = Self::default();
+        for member in profile.controls.iter().flat_map(|c| &c.members) {
+            match member.source.as_str() {
+                "hwmon" => {
+                    members.hwmon.insert(member.member_id.clone());
+                }
+                "openfan" => {
+                    // A malformed id is `apply`'s to report; here it simply names
+                    // no channel.
+                    if let Ok(ch) = crate::serial::openfan_channel_of(&member.member_id) {
+                        members.openfan.insert(ch);
+                    }
+                }
+                _ => {}
+            }
+        }
+        members
+    }
+}
+
+/// Which outputs a forced tick may take (DEC-382).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ForceReach<'a> {
+    /// Every output a backend can drive. The 100 % emergency only: at maximum
+    /// duty no firmware curve it displaces can have been running a header faster.
+    All,
+    /// Only the outputs a profile control names. Every duty below 100 % —
+    /// the recovery floor and the no-sensor floor.
+    ProfileMembers {
+        members: &'a ProfileMembers,
+        /// May outputs the profile does not name, taken by an earlier 100 %
+        /// tick, be given back this tick? `false` while the emergency is still
+        /// LATCHED — the blind case, where DEC-190 drops the duty to 40 % because
+        /// the sensor vanished, not because anything cooled. Giving back there
+        /// would return an OpenFan channel to its pre-emergency duty mid-emergency.
+        give_back: bool,
+    },
+}
+
+impl<'a> ForceReach<'a> {
+    /// The reach a forced `pct` is allowed.
+    ///
+    /// [SAFETY] Keyed on the DUTY, not on which rung produced it, because the
+    /// duty is what decides whether taking a header can lower its cooling: only
+    /// 100 % cannot. A future rung that forces 100 % for a new reason reaches
+    /// everything without anyone remembering to say so; one that forces less
+    /// reaches only the profile. What it may give back is keyed on the LATCH,
+    /// because "the duty fell below 100 %" and "the emergency is over" are
+    /// different events, and only the second one returns anything.
+    pub(crate) fn for_duty(pct: u8, members: &'a ProfileMembers, emergency_latched: bool) -> Self {
+        if pct >= 100 {
+            Self::All
+        } else {
+            Self::ProfileMembers {
+                members,
+                give_back: !emergency_latched,
+            }
+        }
+    }
+
+    /// True when the reach is limited to the profile's members.
+    pub(crate) fn members_only(self) -> bool {
+        matches!(self, Self::ProfileMembers { .. })
+    }
 }
 
 /// The **OpenFan** leg of a forced safety write.
@@ -449,6 +545,11 @@ pub(crate) struct ForcedScope {
     /// The hwmon backend had at least one **writable** header, and was asked to
     /// drive it. Not "the write landed" — see the type's docs.
     pub(crate) hwmon: bool,
+    /// The force was limited to the profile's members ([`ForceReach`], DEC-382),
+    /// so the two flags above count only those outputs and [`Self::describe`]
+    /// must not say "all". Derived from the duty ([`ForceReach::for_duty`]), so
+    /// it never changes without the duty — which the log throttle already keys on.
+    pub(crate) members_only: bool,
 }
 
 impl ForcedScope {
@@ -462,13 +563,19 @@ impl ForcedScope {
     /// plainly rather than print an enumeration of the empty set.
     ///
     /// Since DEC-372 it **also** covers the board whose every `pwmN` is
-    /// read-only, which has a real `HwmonBackend` that drives nothing.
+    /// read-only, which has a real `HwmonBackend` that drives nothing — and
+    /// since DEC-382 a sub-100 force on a machine where no profile controls any
+    /// fan, which is the caller's to word differently: there the fans are not
+    /// unreachable, they are deliberately left to their firmware.
     pub(crate) fn describe(self) -> Option<&'static str> {
-        match (self.openfan, self.hwmon) {
-            (true, true) => Some("all OpenFan channels and writable hwmon headers"),
-            (true, false) => Some("all OpenFan channels"),
-            (false, true) => Some("all writable hwmon headers"),
-            (false, false) => None,
+        match (self.openfan, self.hwmon, self.members_only) {
+            (true, true, false) => Some("all OpenFan channels and writable hwmon headers"),
+            (true, false, false) => Some("all OpenFan channels"),
+            (false, true, false) => Some("all writable hwmon headers"),
+            (true, true, true) => Some("the OpenFan channels and hwmon headers a profile controls"),
+            (true, false, true) => Some("the OpenFan channels a profile controls"),
+            (false, true, true) => Some("the hwmon headers a profile controls"),
+            (false, false, _) => None,
         }
     }
 }
@@ -590,6 +697,7 @@ pub(crate) async fn force_present_backends<O, H>(
     hwmon: Option<&mut H>,
     pct: u8,
     baseline: &[PwmCommand],
+    reach: ForceReach<'_>,
 ) -> ForcedScope
 where
     // [SAFETY] Distinct bounds, not `SafetyWriteBackend` twice: that made a
@@ -598,21 +706,23 @@ where
     O: OpenFanSafetyWrite,
     H: HwmonSafetyWrite,
 {
-    let mut scope = ForcedScope::default();
+    let mut scope = ForcedScope {
+        members_only: reach.members_only(),
+        ..ForcedScope::default()
+    };
     if let Some(be) = openfan {
-        be.force_all_with_floor(pct, baseline).await;
-        // Set from INSIDE the arm, never beside it: the flag and the write are
-        // then one statement rather than two facts from different sources
-        // (`AUD2-g`/DEC-325). Truthful because a backend that exists can drive
-        // something — `OpenFanBackend` has `NUM_CHANNELS` unconditionally, and
-        // `HwmonBackend::new` refuses to build on a board with no writable
-        // header (`OFN-ah`, DEC-376). See [`ForcedScope`] for why that gate sits
-        // at construction and not here.
-        scope.openfan = true;
+        // Set from INSIDE the arm, from what the write itself reports, never
+        // beside it: the flag and the write are then one statement rather than
+        // two facts from different sources (`AUD2-g`/DEC-325). At full reach a
+        // backend that exists always has something — `OpenFanBackend` has
+        // `NUM_CHANNELS` unconditionally, and `HwmonBackend::new` refuses to
+        // build on a board with no writable header (`OFN-ah`, DEC-376) — so the
+        // report can only be `false` under DEC-382's members-only reach, where
+        // the profile names none of this backend's outputs.
+        scope.openfan = be.force_all_with_floor(pct, baseline, reach).await;
     }
     if let Some(be) = hwmon {
-        be.force_all_with_floor(pct, baseline).await;
-        scope.hwmon = true;
+        scope.hwmon = be.force_all_with_floor(pct, baseline, reach).await;
     }
     scope
 }
@@ -647,6 +757,17 @@ pub(crate) struct OpenFanBackend {
     /// legitimately slow emergency write reports its transition once instead of
     /// once per tick for the whole emergency-to-release hold.
     stall_logged: bool,
+    /// Every channel's duty from just before the current 100 % emergency, taken
+    /// on its first forced tick (DEC-382). When the emergency ends, each channel
+    /// no profile controls gets its entry back — an OpenFan channel has no
+    /// firmware curve to return to, so its own last duty is what "give back what
+    /// was taken" means. `None` outside an emergency; an entry of `None` is a
+    /// channel this daemon had not set, which stays at the forced duty rather
+    /// than being guessed down.
+    ///
+    /// Shared with the blocking write task because that is where the controller
+    /// lock is held; it is never locked at the same time as the controller.
+    pre_emergency: Arc<Mutex<Option<Vec<Option<u8>>>>>,
 }
 
 /// Which of the engine's two drop warnings a bad OpenFan member id earns.
@@ -680,12 +801,136 @@ impl OpenFanBackend {
             cache,
             writes: BoundedWrite::default(),
             stall_logged: false,
+            pre_emergency: Arc::new(Mutex::new(None)),
         }
     }
 
     /// True while a write issued on an earlier tick has not returned (DEC-289).
     pub(crate) fn writes_stalled(&self) -> bool {
         self.writes.stalled()
+    }
+
+    /// Write this tick's commands and give back what nothing holds any more, in
+    /// ONE blocking task (DEC-382).
+    ///
+    /// One task, not two: [`BoundedWrite::run`] may wait out a full budget on a
+    /// write still in flight, so a second call in the same tick could double a
+    /// slow tick — and `health/staleness.rs` derives its worst-legitimate-tick
+    /// budget from exactly one await per backend.
+    ///
+    /// "Give back" here means the pre-emergency duties: when a 100 % emergency
+    /// has ended, every channel `members` does not name gets its duty from before
+    /// the force. With no emergency behind it this is [`WriteBackend::apply`].
+    pub(crate) async fn apply_and_give_back(
+        &mut self,
+        commands: &[PwmCommand],
+        members: &ProfileMembers,
+    ) {
+        let give_back = self
+            .pre_emergency
+            .lock()
+            .is_some()
+            .then(|| members.openfan.clone());
+        self.write(commands, give_back).await;
+    }
+
+    /// `apply`'s body, with the optional give-back folded into the same task.
+    async fn write(&mut self, commands: &[PwmCommand], give_back: Option<HashSet<u8>>) {
+        let chans: Vec<(u8, u8)> = commands
+            .iter()
+            .filter(|c| c.source == "openfan")
+            .filter_map(|cmd| {
+                // `P8-bq`: one parser, but the TWO log messages are kept apart
+                // — they are an operator's only signal for which kind of bad id
+                // reached the single-writer path, which is why the shared parser
+                // returns a two-variant error rather than an `Option`.
+                let ch = match crate::serial::openfan_channel_of(&cmd.member_id) {
+                    Ok(ch) => ch,
+                    Err(why) => {
+                        log::warn!(
+                            "Profile engine: dropping openfan command with {}: {:?}",
+                            openfan_drop_reason(why),
+                            cmd.member_id
+                        );
+                        return None;
+                    }
+                };
+                Some((ch, cmd.pwm_percent))
+            })
+            .collect();
+        // DEC-289: only a true no-op when nothing is outstanding either. With a
+        // write still pending, this call is what re-awaits it — returning here
+        // would leave a finished write unharvested and its stall stamp set
+        // forever, reporting `crit` for a device that had recovered.
+        if chans.is_empty() && give_back.is_none() && !self.writes.outstanding() {
+            return;
+        }
+        let ctrl = self.ctrl.clone();
+        let cache = self.cache.clone();
+        let pre_emergency = self.pre_emergency.clone();
+        let join = self
+            .writes
+            .run(WRITE_JOIN_BUDGET, move || {
+                let mut results = chans
+                    .into_iter()
+                    .filter_map(|(ch, pct)| {
+                        // Lock per command (DEC-099) so GUI API requests can
+                        // interleave between channel writes.
+                        let mut guard = ctrl.lock();
+                        // DEC-191: re-check the engine write-pause while HOLDING the
+                        // controller lock, so the check-and-write is atomic against a
+                        // concurrent OpenFan calibration sweep (whose test writes take
+                        // this same lock). An engine tick already in flight when the
+                        // sweep claims the pause must not overwrite the sweep's test
+                        // PWM; checking before the lock left a narrow window where one
+                        // channel's write could still land just after the sweep
+                        // claimed the pause, corrupting its first RPM readback. A
+                        // skipped channel records no outcome (it was not attempted),
+                        // so it neither counts as a failure nor resets a streak.
+                        if cache.verify_active() {
+                            return None;
+                        }
+                        let res = guard
+                            .set_pwm(ch, pct)
+                            .map(|_| ())
+                            .map_err(|e| e.to_string());
+                        Some((ch, res))
+                    })
+                    .collect::<Vec<(u8, Result<(), String>)>>();
+                if let Some(members) = give_back {
+                    results.extend(give_back_pre_emergency(
+                        &ctrl,
+                        &cache,
+                        &pre_emergency,
+                        &members,
+                    ));
+                }
+                results
+            })
+            .await;
+        // DEC-298: route EVERY write that completed — a harvested one from an
+        // earlier tick and this call's own. A channel that was not attempted
+        // (nothing completed) records no outcome, so its failure streak neither
+        // advances nor resets, exactly as DEC-289 intended.
+        //
+        // `&mut self` state can't cross into the 'static closure, so the
+        // per-channel + whole-link failure bookkeeping runs here on the returned
+        // results (audit P3-5).
+        for joined in join.completed() {
+            match joined {
+                Ok(results) => self.note_outcomes(&results),
+                Err(e) => {
+                    // Concurrency review D3: a panic inside the blocking task
+                    // must not be silent. The whole write task died, so account
+                    // it as a whole-link failure (audit P3-5) and alert now.
+                    let n = self.note_task_panic();
+                    log::error!(
+                        "SAFETY: Profile engine OpenFan write task panicked: {e} \
+                         (link-down streak {n})"
+                    );
+                }
+            }
+        }
     }
 
     /// Await any in-flight write at shutdown (DEC-289). See [`BoundedWrite::drain`].
@@ -788,103 +1033,104 @@ impl WriteBackend for OpenFanBackend {
     /// (matching `GpuBackend::apply` and both poll loops) instead of pinning
     /// a tokio worker. The mutex is still taken per command (DEC-099) so
     /// concurrent API requests interleave exactly as before.
+    ///
+    /// Gives nothing back: it has no member set to judge "nothing holds this"
+    /// by. The engine calls [`OpenFanBackend::apply_and_give_back`] (DEC-382).
     async fn apply(&mut self, commands: &[PwmCommand]) {
-        let chans: Vec<(u8, u8)> = commands
-            .iter()
-            .filter(|c| c.source == "openfan")
-            .filter_map(|cmd| {
-                // `P8-bq`: one parser, but the TWO log messages are kept apart
-                // — they are an operator's only signal for which kind of bad id
-                // reached the single-writer path, which is why the shared parser
-                // returns a two-variant error rather than an `Option`.
-                let ch = match crate::serial::openfan_channel_of(&cmd.member_id) {
-                    Ok(ch) => ch,
-                    Err(why) => {
-                        log::warn!(
-                            "Profile engine: dropping openfan command with {}: {:?}",
-                            openfan_drop_reason(why),
-                            cmd.member_id
-                        );
-                        return None;
-                    }
-                };
-                Some((ch, cmd.pwm_percent))
-            })
-            .collect();
-        // DEC-289: only a true no-op when nothing is outstanding either. With a
-        // write still pending, this call is what re-awaits it — returning here
-        // would leave a finished write unharvested and its stall stamp set
-        // forever, reporting `crit` for a device that had recovered.
-        if chans.is_empty() && !self.writes.outstanding() {
-            return;
-        }
-        let ctrl = self.ctrl.clone();
-        let cache = self.cache.clone();
-        let join = self
-            .writes
-            .run(WRITE_JOIN_BUDGET, move || {
-                chans
-                    .into_iter()
-                    .filter_map(|(ch, pct)| {
-                        // Lock per command (DEC-099) so GUI API requests can
-                        // interleave between channel writes.
-                        let mut guard = ctrl.lock();
-                        // DEC-191: re-check the engine write-pause while HOLDING the
-                        // controller lock, so the check-and-write is atomic against a
-                        // concurrent OpenFan calibration sweep (whose test writes take
-                        // this same lock). An engine tick already in flight when the
-                        // sweep claims the pause must not overwrite the sweep's test
-                        // PWM; checking before the lock left a narrow window where one
-                        // channel's write could still land just after the sweep
-                        // claimed the pause, corrupting its first RPM readback. A
-                        // skipped channel records no outcome (it was not attempted),
-                        // so it neither counts as a failure nor resets a streak.
-                        if cache.verify_active() {
-                            return None;
-                        }
-                        let res = guard
-                            .set_pwm(ch, pct)
-                            .map(|_| ())
-                            .map_err(|e| e.to_string());
-                        Some((ch, res))
-                    })
-                    .collect::<Vec<(u8, Result<(), String>)>>()
-            })
-            .await;
-        // DEC-298: route EVERY write that completed — a harvested one from an
-        // earlier tick and this call's own. A channel that was not attempted
-        // (nothing completed) records no outcome, so its failure streak neither
-        // advances nor resets, exactly as DEC-289 intended.
-        //
-        // `&mut self` state can't cross into the 'static closure, so the
-        // per-channel + whole-link failure bookkeeping runs here on the returned
-        // results (audit P3-5).
-        for joined in join.completed() {
-            match joined {
-                Ok(results) => self.note_outcomes(&results),
-                Err(e) => {
-                    // Concurrency review D3: a panic inside the blocking task
-                    // must not be silent. The whole write task died, so account
-                    // it as a whole-link failure (audit P3-5) and alert now.
-                    let n = self.note_task_panic();
-                    log::error!(
-                        "SAFETY: Profile engine OpenFan write task panicked: {e} \
-                         (link-down streak {n})"
-                    );
-                }
-            }
-        }
+        self.write(commands, None).await;
     }
+}
+
+/// Snapshot every channel's last commanded duty, once per emergency (DEC-382).
+///
+/// The controller lock is taken, read and released BEFORE the snapshot slot is
+/// locked, so the two are never held together — the async side peeks at the
+/// slot, and must never wait behind a serial write for it.
+///
+/// [SAFETY] While the write pause is held, every entry is recorded as unknown.
+/// An OpenFan calibration owns its channel then, and its last commanded duty is a
+/// sweep step — 0 % on the early ones. The calibration aborts under the force and
+/// skips its own restore (`api/calibration.rs`), so a snapshot of that step would
+/// be the only thing ever writing the channel again, and it would stop the fan.
+/// Unknown stays at the forced duty (DEC-382 review, security F2).
+fn record_pre_emergency(
+    ctrl: &Mutex<crate::serial::controller::FanController>,
+    cache: &StateCache,
+    pre_emergency: &Mutex<Option<Vec<Option<u8>>>>,
+) {
+    if pre_emergency.lock().is_some() {
+        return;
+    }
+    let duties: Vec<Option<u8>> = if cache.verify_active() {
+        vec![None; NUM_CHANNELS as usize]
+    } else {
+        let guard = ctrl.lock();
+        (0..NUM_CHANNELS)
+            .map(|ch| guard.last_commanded_pct(ch))
+            .collect()
+    };
+    let mut slot = pre_emergency.lock();
+    if slot.is_none() {
+        *slot = Some(duties);
+    }
+}
+
+/// Give every channel `members` does not name its pre-emergency duty back, and
+/// clear the snapshot (DEC-382). Returns the writes it attempted, for the
+/// ordinary failure accounting.
+///
+/// Skipped while the engine write-pause is held: an OpenFan calibration owns
+/// the channels then, and the snapshot is kept for the first tick after it.
+fn give_back_pre_emergency(
+    ctrl: &Mutex<crate::serial::controller::FanController>,
+    cache: &StateCache,
+    pre_emergency: &Mutex<Option<Vec<Option<u8>>>>,
+    members: &HashSet<u8>,
+) -> Vec<(u8, Result<(), String>)> {
+    if cache.verify_active() {
+        return Vec::new();
+    }
+    let Some(duties) = pre_emergency.lock().take() else {
+        return Vec::new();
+    };
+    let mut results = Vec::new();
+    for (ch, duty) in (0..NUM_CHANNELS).zip(duties) {
+        // A member is the profile's to drive, and an unknown duty is not
+        // guessed: that channel stays at the forced duty.
+        let Some(duty) = duty.filter(|_| !members.contains(&ch)) else {
+            continue;
+        };
+        let res = ctrl
+            .lock()
+            .set_pwm(ch, duty)
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        match &res {
+            Ok(()) => log::info!(
+                "Thermal emergency over: OpenFan ch{ch} (no profile controls it) returned \
+                 to its pre-emergency {duty}%"
+            ),
+            Err(e) => log::warn!(
+                "Thermal emergency over: OpenFan ch{ch} could not be returned to its \
+                 pre-emergency {duty}% and stays at the forced duty: {e}"
+            ),
+        }
+        results.push((ch, res));
+    }
+    results
 }
 
 /// The only production implementor (`OFN-ae`).
 impl OpenFanSafetyWrite for OpenFanBackend {}
 
 impl SafetyWriteBackend for OpenFanBackend {
-    /// Drive every OpenFan channel to at least `pct` (D1-j).
+    /// Drive every OpenFan channel in `reach` to at least `pct` (D1-j).
     ///
-    /// Every channel is written, including ones no control commands — that is
-    /// the reach the emergency depends on. A commanded channel gets
+    /// At [`ForceReach::All`] every channel is written, including ones no
+    /// control commands — that is the reach the emergency depends on — and each
+    /// channel's duty from before the emergency is recorded on its first forced
+    /// tick. Below 100 % only the profile's channels are written, and the rest
+    /// get their pre-emergency duty back (DEC-382). A commanded channel gets
     /// `max(commanded, pct)`.
     ///
     /// DEC-099: drop the lock between channels so GUI requests can
@@ -894,7 +1140,29 @@ impl SafetyWriteBackend for OpenFanBackend {
     /// DEC-146 P3-8: runs on the blocking pool — worst case is
     /// `NUM_CHANNELS × serial-timeout` (10 × 500 ms default), far too long
     /// to pin a tokio worker during a thermal emergency.
-    async fn force_all_with_floor(&mut self, pct: u8, commands: &[PwmCommand]) {
+    async fn force_all_with_floor(
+        &mut self,
+        pct: u8,
+        commands: &[PwmCommand],
+        reach: ForceReach<'_>,
+    ) -> bool {
+        let targets: Vec<u8> = match reach {
+            ForceReach::All => (0..NUM_CHANNELS).collect(),
+            ForceReach::ProfileMembers { members, .. } => (0..NUM_CHANNELS)
+                .filter(|ch| members.openfan.contains(ch))
+                .collect(),
+        };
+        let reached = !targets.is_empty();
+        let record_snapshot = matches!(reach, ForceReach::All);
+        let give_back = match reach {
+            ForceReach::ProfileMembers {
+                members,
+                give_back: true,
+            } => Some(members.openfan.clone()),
+            _ => None,
+        };
+        let cache = self.cache.clone();
+        let pre_emergency = self.pre_emergency.clone();
         let ctrl = self.ctrl.clone();
         // D1-j: this tick's profile duty per channel, so `pct` acts as a floor
         // over it rather than replacing it. Parsed silently — `apply` owns the
@@ -916,7 +1184,13 @@ impl SafetyWriteBackend for OpenFanBackend {
         let join = self
             .writes
             .run(WRITE_JOIN_BUDGET, move || {
-                for ch in 0..NUM_CHANNELS {
+                if record_snapshot {
+                    // [SAFETY] Before the first write of the emergency, never
+                    // after: once a channel has been forced, its last commanded
+                    // duty IS the forced one.
+                    record_pre_emergency(&ctrl, &cache, &pre_emergency);
+                }
+                for ch in targets {
                     let duty = floors
                         .get(&ch)
                         .map_or(pct, |commanded| (*commanded).max(pct));
@@ -925,7 +1199,12 @@ impl SafetyWriteBackend for OpenFanBackend {
                         log::error!("THERMAL SAFETY: OpenFan ch{ch} write FAILED: {e}");
                     }
                 }
-                Vec::new()
+                match give_back {
+                    Some(members) => {
+                        give_back_pre_emergency(&ctrl, &cache, &pre_emergency, &members)
+                    }
+                    None => Vec::new(),
+                }
             })
             .await;
         // DEC-298: "stalled" is *nothing completed*, not *something in flight* —
@@ -973,6 +1252,7 @@ impl SafetyWriteBackend for OpenFanBackend {
             self.stall_logged = false;
             log::warn!("THERMAL SAFETY: OpenFan force_all_with_floor writes are landing again");
         }
+        reached
     }
 }
 
@@ -1417,6 +1697,11 @@ pub(crate) struct HwmonBackend {
     /// legitimately slow emergency write reports its transition once instead of
     /// once per tick for the whole emergency-to-release hold.
     stall_logged: bool,
+    /// The writable header ids, measured once at construction — `None` when the
+    /// controller lock was contended there, the case `new` already assumes the
+    /// best of. Lets a members-only force report its reach without locking the
+    /// controller on the async side (DEC-382).
+    writable: Option<HashSet<String>>,
 }
 
 impl HwmonBackend {
@@ -1463,8 +1748,11 @@ impl HwmonBackend {
         // board) rather than dropping the hwmon leg of the thermal force on a
         // board that may well have writable headers. Dropping it would be the
         // v2.38.0 P1 — an emergency losing its reach — reached by timeout.
-        let has_writable_header = match ctrl.try_lock_for(std::time::Duration::from_millis(250)) {
-            Some(guard) => !guard.forced_target_ids().is_empty(),
+        let writable: Option<HashSet<String>> = ctrl
+            .try_lock_for(std::time::Duration::from_millis(250))
+            .map(|guard| guard.forced_target_ids().into_iter().collect());
+        let has_writable_header = match &writable {
+            Some(ids) => !ids.is_empty(),
             None => {
                 // Startup-only, so it cannot spam — and without it an
                 // ASSUMED claim is indistinguishable from a measured one on
@@ -1490,7 +1778,23 @@ impl HwmonBackend {
             member_failures: HashMap::new(),
             writes: BoundedWrite::default(),
             stall_logged: false,
+            writable,
         })
+    }
+
+    /// Would this tick give anything back? A non-blocking peek at the ledger,
+    /// so a tick with nothing to command does not spawn a write task just to
+    /// find out (DEC-298). A contended lock answers `true`: the task then
+    /// decides under the lock, as every write task does.
+    fn may_give_back(&self, members: &ProfileMembers) -> bool {
+        match self.ctrl.try_lock() {
+            Some(guard) => guard
+                .handback()
+                .taken_ids()
+                .iter()
+                .any(|id| !members.hwmon.contains(id)),
+            None => true,
+        }
     }
 
     /// True while a write issued on an earlier tick has not returned (DEC-289).
@@ -1545,27 +1849,36 @@ impl HwmonBackend {
     }
 }
 
-impl WriteBackend for HwmonBackend {
-    /// hwmon writes (auto-lease for headless profile mode).
+impl HwmonBackend {
+    /// Write this tick's commands and give back every header the daemon holds
+    /// that `members` does not name, in ONE blocking task (DEC-382).
     ///
-    /// The profile engine auto-acquires the lease when writing hwmon members
-    /// and is the steady-state holder (DEC-165 — the GUI no longer takes the
-    /// lease). DEC-146 P3-8: the body runs on the blocking pool (matching the
-    /// hwmon poll loop). DEC-154: the lease-acquire → per-header write → renew
-    /// sequence locks the controller mutex PER COMMAND (like `force_all_with_floor` and
-    /// `OpenFanBackend`), not once for the whole batch, so concurrent API
-    /// requests are not starved for the duration of a multi-header tick. A
-    /// thermal force-take mid-scan fails the remaining writes with InvalidLease;
-    /// the next 1 Hz tick re-acquires.
-    async fn apply(&mut self, commands: &[PwmCommand]) {
+    /// One task, not two, for the reason on [`OpenFanBackend::apply_and_give_back`]:
+    /// a second [`BoundedWrite::run`] in the same tick can double a slow tick.
+    /// This is the hand-back for every route by which a header stops being held —
+    /// a thermal force ending, a diagnostic ending, a profile deactivated or
+    /// switched to one that no longer names the header — because they all reduce
+    /// to the same observable fact: the daemon holds a header nothing wants.
+    pub(crate) async fn apply_and_give_back(
+        &mut self,
+        commands: &[PwmCommand],
+        members: &ProfileMembers,
+    ) {
+        let give_back = self.may_give_back(members).then(|| members.hwmon.clone());
+        self.write(commands, give_back).await;
+    }
+
+    /// `apply`'s body, with the optional give-back folded into the same task.
+    async fn write(&mut self, commands: &[PwmCommand], give_back: Option<HashSet<String>>) {
         let hwmon_cmds: Vec<(String, u8)> = commands
             .iter()
             .filter(|c| c.source == "hwmon")
             .map(|c| (c.member_id.clone(), c.pwm_percent))
             .collect();
+        let nothing_to_do = hwmon_cmds.is_empty() && give_back.is_none();
         // DEC-289: see the note on `OpenFanBackend::apply` — an outstanding write
         // must still be re-awaited on a tick that has no commands of its own.
-        if hwmon_cmds.is_empty() && !self.writes.outstanding() {
+        if nothing_to_do && !self.writes.outstanding() {
             return;
         }
         // DEC-298: harvest the outstanding write, but do NOT issue a new one when
@@ -1575,7 +1888,7 @@ impl WriteBackend for HwmonBackend {
         // a tick that writes no PWM at all. No hardware effect — `take_lease` is
         // bookkeeping — but a 60 s lease acquired to command nothing is a lie
         // about who owns the header.
-        if hwmon_cmds.is_empty() {
+        if nothing_to_do {
             let progress = self.writes.harvest_only(WRITE_JOIN_BUDGET).await;
             for joined in progress.completed() {
                 match joined {
@@ -1626,7 +1939,8 @@ impl WriteBackend for HwmonBackend {
                 };
                 // No lease this tick (e.g. a hardware verify holds it) ⇒ nothing was
                 // attempted; return an empty outcome set so no member's failure
-                // streak is advanced or reset.
+                // streak is advanced or reset. A give-back waits for a later tick
+                // too: the verify owns the header it is testing.
                 let Some(lease_id) = lease_id else {
                     return Vec::new();
                 };
@@ -1658,8 +1972,21 @@ impl WriteBackend for HwmonBackend {
                     outcomes.push((member_id.clone(), res));
                 }
 
-                // Phase 3: renew under a brief lock to keep it alive for next cycle.
-                if let Err(e) = ctrl.lock().lease_manager_mut().renew_lease(&lease_id) {
+                // Phase 2b (DEC-382): give back what nothing holds any more.
+                if let Some(members) = &give_back {
+                    give_back_unheld(&ctrl, &lease_id, members);
+                }
+
+                // Phase 3: renew under a brief lock to keep it alive for next
+                // cycle — unless this task commanded nothing and ran only to give
+                // headers back. A lease kept for that would claim ownership of
+                // headers the daemon has just returned (DEC-298's reasoning).
+                let mut guard = ctrl.lock();
+                if hwmon_cmds.is_empty() {
+                    if let Err(e) = guard.lease_manager_mut().release_lease(&lease_id) {
+                        log::debug!("lease release after a hand-back failed: {e}");
+                    }
+                } else if let Err(e) = guard.lease_manager_mut().renew_lease(&lease_id) {
                     log::debug!("lease renewal failed (will re-acquire next cycle): {e}");
                 }
                 outcomes
@@ -1679,15 +2006,77 @@ impl WriteBackend for HwmonBackend {
     }
 }
 
+impl WriteBackend for HwmonBackend {
+    /// hwmon writes (auto-lease for headless profile mode).
+    ///
+    /// The profile engine auto-acquires the lease when writing hwmon members
+    /// and is the steady-state holder (DEC-165 — the GUI no longer takes the
+    /// lease). DEC-146 P3-8: the body runs on the blocking pool (matching the
+    /// hwmon poll loop). DEC-154: the lease-acquire → per-header write → renew
+    /// sequence locks the controller mutex PER COMMAND (like `force_all_with_floor` and
+    /// `OpenFanBackend`), not once for the whole batch, so concurrent API
+    /// requests are not starved for the duration of a multi-header tick. A
+    /// thermal force-take mid-scan fails the remaining writes with InvalidLease;
+    /// the next 1 Hz tick re-acquires.
+    ///
+    /// Gives nothing back: it has no member set to judge "nothing holds this"
+    /// by. The engine calls [`HwmonBackend::apply_and_give_back`] (DEC-382).
+    async fn apply(&mut self, commands: &[PwmCommand]) {
+        self.write(commands, None).await;
+    }
+}
+
+/// Give back every header the daemon holds that `members` does not name
+/// (DEC-382), one controller lock per header like every other write here.
+///
+/// Called only from inside a write task that already holds a valid lease. A
+/// header whose lease is lost mid-scan (a verify force-took it) is skipped, not
+/// forced: the verify owns it now, and a later tick gives it back.
+fn give_back_unheld(ctrl: &Mutex<HwmonPwmController>, lease_id: &str, members: &HashSet<String>) {
+    let unheld: Vec<String> = ctrl
+        .lock()
+        .handback()
+        .taken_ids()
+        .into_iter()
+        .filter(|id| !members.contains(id))
+        .collect();
+    for id in unheld {
+        let mut guard = ctrl.lock();
+        match guard.hand_back(&id, lease_id) {
+            Ok(Some(HandBackOutcome::Restored)) => log::info!(
+                "hwmon {id}: nothing holds it any more — handed back to what it was doing \
+                 before the daemon took it"
+            ),
+            Ok(Some(HandBackOutcome::FullSpeed)) => log::warn!(
+                "hwmon {id}: nothing holds it any more, but its recorded mode could not be \
+                 given back, so it was left at FULL SPEED"
+            ),
+            Ok(Some(HandBackOutcome::Failed)) => {
+                if guard.handback().note_hand_back_failed(&id) {
+                    log::error!(
+                        "hwmon {id}: could not be handed back — nothing could be written, \
+                         so it stays at its last duty in manual mode; retrying every tick"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(e) => log::debug!("hwmon {id}: hand-back deferred: {e}"),
+        }
+    }
+}
+
 /// The only production implementor (`OFN-ae`).
 impl HwmonSafetyWrite for HwmonBackend {}
 
 impl SafetyWriteBackend for HwmonBackend {
-    /// Drive every writable hwmon header to at least `pct` (D1-j),
+    /// Drive every writable hwmon header in `reach` to at least `pct` (D1-j),
     /// auto-leasing for safety writes.
     ///
-    /// Every writable header is written, including ones no control commands —
-    /// that is the reach the emergency depends on. A commanded header gets
+    /// At [`ForceReach::All`] — the 100 % emergency — every writable header is
+    /// written, including ones no control commands: that is the reach the
+    /// emergency depends on. Below 100 % only the profile's headers are, and
+    /// every other header the daemon holds is given back to what it was doing
+    /// before the daemon took it (DEC-382). A commanded header gets
     /// `max(commanded, pct)`.
     ///
     /// Force-takes the lease as thermal-safety, then re-locks the controller per
@@ -1700,8 +2089,29 @@ impl SafetyWriteBackend for HwmonBackend {
     /// un-forced. (The lease system is hwmon-only; the OpenFan path has none.)
     /// DEC-146 P3-8: runs on the blocking pool; the re-lock-per-header structure
     /// (DEC-099) is preserved inside the closure.
-    async fn force_all_with_floor(&mut self, pct: u8, commands: &[PwmCommand]) {
+    async fn force_all_with_floor(
+        &mut self,
+        pct: u8,
+        commands: &[PwmCommand],
+        reach: ForceReach<'_>,
+    ) -> bool {
         let ctrl = self.ctrl.clone();
+        // DEC-382: below 100 % only the profile's headers are forced, and the
+        // rest are given back. `reached` is measured against the writable set
+        // taken at construction, so it never claims a read-only member.
+        let (members, give_back): (Option<HashSet<String>>, bool) = match reach {
+            ForceReach::All => (None, false),
+            ForceReach::ProfileMembers { members, give_back } => {
+                (Some(members.hwmon.clone()), give_back)
+            }
+        };
+        let reached = match reach {
+            ForceReach::All => true,
+            ForceReach::ProfileMembers { members: m, .. } => match &self.writable {
+                Some(writable) => m.hwmon.iter().any(|id| writable.contains(id)),
+                None => !m.hwmon.is_empty(),
+            },
+        };
         // D1-j: this tick's profile duty per header, so `pct` acts as a floor
         // over it rather than replacing it. A header missing from this map is
         // uncommanded and gets the bare floor — the pre-D1-j behaviour for every
@@ -1728,7 +2138,22 @@ impl SafetyWriteBackend for HwmonBackend {
                 // at the moment they matter most. Not a loss of reach: the rule
                 // is scoped to writable headers (`safety.rs`), so a read-only
                 // one was never going to be driven.
-                let hdr_ids: Vec<String> = guard.forced_target_ids();
+                let mut hdr_ids: Vec<String> = guard.forced_target_ids();
+                if let Some(m) = &members {
+                    hdr_ids.retain(|id| m.contains(id));
+                    // A members-only force with nothing to force and nothing to
+                    // give back takes nothing — not even the lease, which would
+                    // otherwise reset every header's write state for no write.
+                    let give_back_pending = give_back
+                        && guard
+                            .handback()
+                            .taken_ids()
+                            .iter()
+                            .any(|id| !m.contains(id));
+                    if hdr_ids.is_empty() && !give_back_pending {
+                        return Vec::new();
+                    }
+                }
                 let lease_id = guard
                     .lease_manager_mut()
                     .force_take_lease(HwmonWriter::ThermalSafety)
@@ -1777,6 +2202,9 @@ impl SafetyWriteBackend for HwmonBackend {
                     }
                 }
             }
+            if let (Some(m), true) = (&members, give_back) {
+                give_back_unheld(&ctrl, &lease_id, m);
+            }
             Vec::new()
         })
         .await;
@@ -1814,6 +2242,7 @@ impl SafetyWriteBackend for HwmonBackend {
             self.stall_logged = false;
             log::warn!("THERMAL SAFETY: hwmon force_all_with_floor writes are landing again");
         }
+        reached
     }
 }
 
@@ -2646,7 +3075,7 @@ mod tests {
             .expect("this fixture's headers are writable");
 
         // Tick 1: an emergency force_all_with_floor wedges.
-        be.force_all_with_floor(100, &[]).await;
+        be.force_all_with_floor(100, &[], ForceReach::All).await;
         // DEC-298: `writes_stalled` rather than the old `writes_outstanding` —
         // a STRONGER assertion for this test's intent. "Outstanding" is merely
         // "something is in flight"; "stalled" additionally requires that nothing
@@ -2896,7 +3325,7 @@ mod tests {
         // 1. Engine controls the header → first pwm_enable=1 write.
         be.apply(&[cmd("hwmon:it8696:pwm1", "hwmon", 40)]).await;
         // 2. Thermal safety force-takes the lease and forces 100%.
-        be.force_all_with_floor(100, &[]).await;
+        be.force_all_with_floor(100, &[], ForceReach::All).await;
 
         let enable_writes = writes
             .lock()
@@ -3141,7 +3570,7 @@ mod tests {
             .lease_manager_mut()
             .force_take_lease(HwmonWriter::Engine);
 
-        be.force_all_with_floor(100, &[]).await;
+        be.force_all_with_floor(100, &[], ForceReach::All).await;
 
         let lease = be.ctrl.lock().lease_manager().active_lease().cloned();
         assert_eq!(lease.map(|l| l.owner), Some(HwmonWriter::ThermalSafety));
@@ -3211,41 +3640,59 @@ mod tests {
         h
     }
 
-    /// [SAFETY] D1-j / DEC-307: the hwmon twin of
-    /// `the_recovery_rung_floors_a_curve_it_used_to_replace`.
+    /// [SAFETY] D1-j / DEC-307, narrowed by DEC-382: a floor below 100 %.
     ///
-    /// A commanded header keeps its own higher duty; an uncommanded one still
-    /// gets the bare floor. The second half is what preserves the emergency's
-    /// reach — flooring only the command list would leave every header no
-    /// control happens to drive untouched during a thermal event, which is the
-    /// v2.38.0 P1 shape.
+    /// Over the profile's members it is still a FLOOR, never a replacement: a
+    /// commanded member keeps a higher duty, a member commanded below the floor
+    /// is raised to it, and a member with no command this tick — its control was
+    /// skipped — still gets the bare floor. What DEC-382 removed is the reach to
+    /// a header NO control names: 60 % there would replace a firmware curve that
+    /// may be running it faster, so it is not written at all. The emergency's full
+    /// reach at 100 % is pinned by
+    /// `hwmon_force_all_takes_thermal_safety_lease_and_writes_every_header`.
     #[tokio::test]
-    async fn hwmon_force_with_floor_raises_a_low_command_and_keeps_a_high_one() {
-        let commanded = header_with_paths(1);
-        let uncommanded = header_with_paths(2);
-        let (mut be, writes) = hwmon_backend(vec![commanded, uncommanded]);
+    async fn a_sub_100_floor_raises_the_profiles_headers_and_leaves_the_rest_alone() {
+        let (mut be, writes) = hwmon_backend(vec![
+            header_with_paths(1),
+            header_with_paths(2),
+            header_with_paths(3),
+            header_with_paths(4),
+        ]);
+        let members = ProfileMembers {
+            hwmon: [
+                "hwmon:it8696:pwm1",
+                "hwmon:it8696:pwm2",
+                "hwmon:it8696:pwm3",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+            ..ProfileMembers::default()
+        };
+        let command = |id: &str, pct: u8| PwmCommand {
+            member_id: id.into(),
+            source: "hwmon".into(),
+            pwm_percent: pct,
+            gpu_fan_zero_rpm: false,
+        };
 
-        be.force_all_with_floor(
-            60,
-            &[
-                PwmCommand {
-                    member_id: "hwmon:it8696:pwm1".into(),
-                    source: "hwmon".into(),
-                    pwm_percent: 84,
-                    gpu_fan_zero_rpm: false,
+        let reached = be
+            .force_all_with_floor(
+                60,
+                &[
+                    command("hwmon:it8696:pwm1", 84),
+                    command("hwmon:it8696:pwm3", 10),
+                ],
+                ForceReach::ProfileMembers {
+                    members: &members,
+                    give_back: true,
                 },
-                // A command BELOW the floor must not lower the header; the floor
-                // wins. This is the direction the pre-D1-j code got right and the
-                // one a naive "always take the command" fix would break.
-                PwmCommand {
-                    member_id: "hwmon:it8696:pwm3".into(),
-                    source: "hwmon".into(),
-                    pwm_percent: 10,
-                    gpu_fan_zero_rpm: false,
-                },
-            ],
-        )
-        .await;
+            )
+            .await;
+        assert!(
+            reached,
+            "the profile names writable headers, so the force reached something"
+        );
 
         let w = writes.lock();
         let vals = |path: &str| -> Vec<String> {
@@ -3254,17 +3701,50 @@ mod tests {
                 .map(|(_, v)| v.trim().to_string())
                 .collect()
         };
-        assert!(
-            vals("/sys/class/hwmon/hwmon0/pwm1")
-                .contains(&crate::pwm::percent_to_raw(84).to_string()),
-            "a commanded header above the floor must keep its own duty (84%); got {:?}",
-            vals("/sys/class/hwmon/hwmon0/pwm1")
+        let raw = |pct: u8| crate::pwm::percent_to_raw(pct).to_string();
+        assert_eq!(
+            vals("/sys/class/hwmon/hwmon0/pwm1"),
+            vec![raw(84)],
+            "a member above the floor keeps its duty"
         );
+        assert_eq!(
+            vals("/sys/class/hwmon/hwmon0/pwm2"),
+            vec![raw(60)],
+            "a skipped member still gets the floor"
+        );
+        assert_eq!(
+            vals("/sys/class/hwmon/hwmon0/pwm3"),
+            vec![raw(60)],
+            "a member below the floor is raised"
+        );
+        // Presence above, absence here: the three writes prove the force ran,
+        // so an empty list below cannot be a force that did nothing at all.
         assert!(
-            vals("/sys/class/hwmon/hwmon0/pwm2")
-                .contains(&crate::pwm::percent_to_raw(60).to_string()),
-            "an uncommanded header must still get the bare floor (60%); got {:?}",
-            vals("/sys/class/hwmon/hwmon0/pwm2")
+            vals("/sys/class/hwmon/hwmon0/pwm4").is_empty()
+                && vals("/sys/class/hwmon/hwmon0/pwm4_enable").is_empty(),
+            "a header no control names must not be taken by a sub-100 floor; got {w:?}"
+        );
+    }
+
+    /// A sub-100 force on a machine where no profile controls anything reaches
+    /// nothing — and says so, so the operator line does not name a fan set.
+    #[tokio::test]
+    async fn a_sub_100_floor_with_no_profile_members_reaches_nothing() {
+        let (mut be, writes) = hwmon_backend(vec![header_with_paths(1), header_with_paths(2)]);
+        let reached = be
+            .force_all_with_floor(
+                40,
+                &[],
+                ForceReach::ProfileMembers {
+                    members: &ProfileMembers::default(),
+                    give_back: true,
+                },
+            )
+            .await;
+        assert!(!reached);
+        assert!(
+            writes.lock().is_empty(),
+            "nothing is taken, not even pwm_enable"
         );
     }
 
@@ -3287,7 +3767,7 @@ mod tests {
         let rw = header_with_paths(2);
         let (mut be, writes) = hwmon_backend(vec![ro, rw]);
 
-        be.force_all_with_floor(100, &[]).await;
+        be.force_all_with_floor(100, &[], ForceReach::All).await;
 
         let w = writes.lock();
         assert!(
@@ -3407,7 +3887,7 @@ mod tests {
                 writes_for_preempt.lock().clone()
             });
 
-            be.force_all_with_floor(100, &[]).await;
+            be.force_all_with_floor(100, &[], ForceReach::All).await;
             // `BoundedWrite::run` RETAINS the spawned handle and reports
             // `in_flight` when the closure outlives `WRITE_JOIN_BUDGET` (1 s), so
             // the scan may still be writing when this returns. Observing the log
@@ -3683,7 +4163,7 @@ mod tests {
     async fn openfan_force_all_writes_every_channel() {
         let (mut be, written, _cache) = openfan_backend();
 
-        be.force_all_with_floor(100, &[]).await;
+        be.force_all_with_floor(100, &[], ForceReach::All).await;
 
         let w = written.lock();
         let set_pwm: Vec<_> = w.iter().filter(|c| c.starts_with(">02")).collect();
@@ -3701,6 +4181,48 @@ mod tests {
                 "thermal force must drive every OpenFan channel to 100% (raw FF); got {frame:?}"
             );
         }
+    }
+
+    /// [SAFETY] DEC-382 review (security F2): an emergency that trips during an
+    /// OpenFan calibration snapshots nothing, so no channel is later given back a
+    /// sweep step. The calibration aborts under the force and skips its own restore,
+    /// so a snapshot of its 0 % step would stop the fan once the emergency ended.
+    #[tokio::test]
+    async fn an_emergency_during_a_calibration_gives_no_channel_back_its_step() {
+        let (mut be, written, cache) = openfan_backend();
+        // A calibration step has ch0 at 0 % and holds the write pause. Channel 0,
+        // because this fixture's transport ACKs channel 0 only (DEC-301 rejects a
+        // reply for any other channel), and the step must really be the channel's
+        // last commanded duty or the snapshot has nothing to get wrong.
+        be.ctrl.lock().set_pwm(0, 0).unwrap();
+        let epoch = cache
+            .try_begin_verify(std::time::Duration::from_secs(60))
+            .expect("the pause is free");
+
+        be.force_all_with_floor(100, &[], ForceReach::All).await;
+        assert!(
+            written.lock().iter().any(|f| f.trim_end() == ">0200FF"),
+            "precondition: the emergency still drives the calibrating channel"
+        );
+        cache.end_verify(epoch);
+
+        let before = written.lock().len();
+        let members = ProfileMembers::default();
+        be.force_all_with_floor(
+            60,
+            &[],
+            ForceReach::ProfileMembers {
+                members: &members,
+                give_back: true,
+            },
+        )
+        .await;
+        let w = written.lock();
+        assert!(
+            w[before..].is_empty(),
+            "no channel may be given back a calibration step; got {:?}",
+            &w[before..]
+        );
     }
 
     /// A toggleable serial transport: `write_line` fails (link "vanished")
@@ -4081,6 +4603,10 @@ mod forced_scope_tests {
         name: &'static str,
         order: Arc<Mutex<Vec<&'static str>>>,
         forced: Vec<(u8, Vec<String>)>,
+        /// The reach each forced call was given: `true` = members only.
+        members_only: Vec<bool>,
+        /// What this fake reports it had in reach (DEC-382).
+        reports: bool,
     }
 
     impl RecordingBackend {
@@ -4089,6 +4615,8 @@ mod forced_scope_tests {
                 name,
                 order,
                 forced: Vec::new(),
+                members_only: Vec::new(),
+                reports: true,
             }
         }
 
@@ -4110,10 +4638,17 @@ mod forced_scope_tests {
     impl HwmonSafetyWrite for RecordingBackend {}
 
     impl SafetyWriteBackend for RecordingBackend {
-        async fn force_all_with_floor(&mut self, pct: u8, commands: &[PwmCommand]) {
+        async fn force_all_with_floor(
+            &mut self,
+            pct: u8,
+            commands: &[PwmCommand],
+            reach: ForceReach<'_>,
+        ) -> bool {
             self.order.lock().push(self.name);
             self.forced
                 .push((pct, commands.iter().map(|c| c.member_id.clone()).collect()));
+            self.members_only.push(reach.members_only());
+            self.reports
         }
     }
 
@@ -4213,38 +4748,55 @@ mod forced_scope_tests {
     #[test]
     fn forced_scope_describe_names_exactly_the_backends_driven() {
         let mut described = 0;
-        for openfan in [false, true] {
-            for hwmon in [false, true] {
-                let scope = ForcedScope { openfan, hwmon };
-                match scope.describe() {
-                    None => assert!(
-                        !openfan && !hwmon,
-                        "describe() returned None for {scope:?}, which drove something"
-                    ),
-                    Some(label) => {
-                        described += 1;
-                        assert!(
-                            openfan || hwmon,
-                            "describe() named {label:?} for a scope that drove nothing"
-                        );
-                        assert_eq!(
-                            label.contains("OpenFan"),
-                            openfan,
-                            "label {label:?} names OpenFan but openfan={openfan}"
-                        );
-                        assert_eq!(
-                            label.contains("hwmon"),
-                            hwmon,
-                            "label {label:?} names hwmon but hwmon={hwmon}"
-                        );
+        for members_only in [false, true] {
+            for openfan in [false, true] {
+                for hwmon in [false, true] {
+                    let scope = ForcedScope {
+                        openfan,
+                        hwmon,
+                        members_only,
+                    };
+                    match scope.describe() {
+                        None => assert!(
+                            !openfan && !hwmon,
+                            "describe() returned None for {scope:?}, which drove something"
+                        ),
+                        Some(label) => {
+                            described += 1;
+                            assert!(
+                                openfan || hwmon,
+                                "describe() named {label:?} for a scope that drove nothing"
+                            );
+                            assert_eq!(
+                                label.contains("OpenFan"),
+                                openfan,
+                                "label {label:?} names OpenFan but openfan={openfan}"
+                            );
+                            assert_eq!(
+                                label.contains("hwmon"),
+                                hwmon,
+                                "label {label:?} names hwmon but hwmon={hwmon}"
+                            );
+                            // DEC-382: a members-only force must never claim "all".
+                            assert_eq!(
+                                label.starts_with("all "),
+                                !members_only,
+                                "label {label:?} vs members_only={members_only}"
+                            );
+                            assert_eq!(
+                                label.contains("a profile controls"),
+                                members_only,
+                                "label {label:?} vs members_only={members_only}"
+                            );
+                        }
                     }
                 }
             }
         }
         // Precondition: without this the loop could pass by describing nothing.
         assert_eq!(
-            described, 3,
-            "three of the four combinations must describe a non-empty set"
+            described, 6,
+            "six of the eight combinations must describe a non-empty set"
         );
     }
 
@@ -4274,6 +4826,7 @@ mod forced_scope_tests {
                     have_hwmon.then_some(&mut hwmon),
                     77,
                     &[],
+                    ForceReach::All,
                 )
                 .await;
 
@@ -4331,13 +4884,21 @@ mod forced_scope_tests {
         let mut openfan = RecordingBackend::new("openfan", order.clone());
         let mut hwmon = RecordingBackend::new("hwmon", order.clone());
 
-        let scope = force_present_backends(Some(&mut openfan), Some(&mut hwmon), 100, &[]).await;
+        let scope = force_present_backends(
+            Some(&mut openfan),
+            Some(&mut hwmon),
+            100,
+            &[],
+            ForceReach::All,
+        )
+        .await;
 
         assert_eq!(
             scope,
             ForcedScope {
                 openfan: true,
-                hwmon: true
+                hwmon: true,
+                members_only: false,
             }
         );
         assert_eq!(
@@ -4357,8 +4918,19 @@ mod forced_scope_tests {
         let mut openfan = RecordingBackend::new("openfan", order.clone());
         let mut hwmon = RecordingBackend::new("hwmon", order.clone());
         let baseline = vec![cmd("hwmon:chip:dev:pwm1:CPU_FAN"), cmd("openfan:0")];
+        let members = ProfileMembers::default();
 
-        force_present_backends(Some(&mut openfan), Some(&mut hwmon), 60, &baseline).await;
+        force_present_backends(
+            Some(&mut openfan),
+            Some(&mut hwmon),
+            60,
+            &baseline,
+            ForceReach::ProfileMembers {
+                members: &members,
+                give_back: true,
+            },
+        )
+        .await;
 
         let expected: Vec<String> = baseline.iter().map(|c| c.member_id.clone()).collect();
         for be in [&openfan, &hwmon] {
@@ -4368,7 +4940,55 @@ mod forced_scope_tests {
                 "{} did not receive the floor and baseline unchanged",
                 be.name
             );
+            // [SAFETY] DEC-382: the reach reaches BOTH legs unchanged. A helper
+            // that handed one leg `All` below 100 % would silently restore the
+            // sub-100 reach to fans no profile controls on that leg.
+            assert_eq!(
+                be.members_only,
+                vec![true],
+                "{} did not receive the members-only reach",
+                be.name
+            );
         }
+    }
+
+    /// [SAFETY] DEC-382 — the call-site test for the scope flags. Each flag is
+    /// now what that leg REPORTS it had in reach, not "the leg exists". The
+    /// discriminating arm is a present leg that reports nothing: before DEC-382
+    /// the flag was set unconditionally inside the arm, so only this arm can
+    /// tell the two derivations apart (DEC-340).
+    #[tokio::test]
+    async fn force_present_backends_reports_what_each_leg_had_in_reach() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut openfan = RecordingBackend::new("openfan", order.clone());
+        openfan.reports = false;
+        let mut hwmon = RecordingBackend::new("hwmon", order.clone());
+        let members = ProfileMembers::default();
+
+        let scope = force_present_backends(
+            Some(&mut openfan),
+            Some(&mut hwmon),
+            40,
+            &[],
+            ForceReach::ProfileMembers {
+                members: &members,
+                give_back: true,
+            },
+        )
+        .await;
+
+        assert!(
+            openfan.was_forced(),
+            "precondition: the leg was still asked"
+        );
+        assert_eq!(
+            scope,
+            ForcedScope {
+                openfan: false,
+                hwmon: true,
+                members_only: true,
+            }
+        );
     }
 
     /// [SAFETY] `OFN-ad`, DEC-372 — the call-site test for the corrected flag.
@@ -4398,6 +5018,7 @@ mod forced_scope_tests {
                 present.then_some(&mut hwmon),
                 100,
                 &[],
+                ForceReach::All,
             )
             .await;
 
@@ -4423,6 +5044,7 @@ mod forced_scope_tests {
     const SCOPE_HWMON: ForcedScope = ForcedScope {
         openfan: false,
         hwmon: true,
+        members_only: false,
     };
 
     /// The reading-kind key term. Discriminants only — the *temperature* must
@@ -4485,6 +5107,7 @@ mod forced_scope_tests {
         let both = ForcedScope {
             openfan: true,
             hwmon: true,
+            members_only: false,
         };
         let mut t = ForceLogThrottle::default();
         assert_eq!(

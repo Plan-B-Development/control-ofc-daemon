@@ -337,7 +337,7 @@ pub async fn hwmon_verify_handler(
     // tasks and restores hardware, so no request could arrive this late. The
     // validation orchestrator calls this handler as a FUNCTION from a detached
     // task, which breaks that invariant — and a diagnostic that starts after
-    // `restore_hwmon_to_auto` writes its duty, re-asserts `pwm_enable=1` through
+    // `hand_back_hwmon` writes its duty, re-asserts `pwm_enable=1` through
     // `set_pwm`'s reclaim watchdog, and then deliberately skips its own restore
     // (DEC-290), leaving the header latched in manual with no daemon left to
     // drive it. Guarding at entry closes that for every caller, present and
@@ -438,9 +438,9 @@ pub async fn hwmon_verify_handler(
     // restore. Making the sequence uncancellable also made it survive the
     // shutdown that used to cancel it, and `main.rs` guarantees "the restore is
     // the guaranteed last writer" (277-c). Without this check a verify caught by
-    // SIGTERM writes its duty AFTER `restore_hwmon_to_auto` has handed the
-    // header back — and `set_pwm`'s enable watchdog reads the `pwm_enable=2` that
-    // restore just wrote, classifies it as a BIOS reclaim, and re-asserts
+    // SIGTERM writes its duty AFTER `hand_back_hwmon` has handed the
+    // header back — and `set_pwm`'s enable watchdog reads the firmware mode that
+    // hand-back just wrote, classifies it as a BIOS reclaim, and re-asserts
     // `pwm_enable=1`. The daemon then exits with the header latched in manual at
     // a fixed duty and nothing left to drive it.
     let bg_shutdown = state.openfan_runtime.shutdown.clone();
@@ -776,7 +776,7 @@ pub async fn hwmon_characterize_handler(
     // tasks and restores hardware, so no request could arrive this late. The
     // validation orchestrator calls this handler as a FUNCTION from a detached
     // task, which breaks that invariant — and a diagnostic that starts after
-    // `restore_hwmon_to_auto` writes its duty, re-asserts `pwm_enable=1` through
+    // `hand_back_hwmon` writes its duty, re-asserts `pwm_enable=1` through
     // `set_pwm`'s reclaim watchdog, and then deliberately skips its own restore
     // (DEC-290), leaving the header latched in manual with no daemon left to
     // drive it. Guarding at entry closes that for every caller, present and
@@ -1698,8 +1698,8 @@ mod tests {
     /// survive the shutdown that used to cancel it — and `main.rs` guarantees
     /// "the restore is the guaranteed last writer" (277-c). Without the shutdown
     /// check, a verify caught by SIGTERM writes its duty AFTER
-    /// `restore_hwmon_to_auto` hands the header back, and `set_pwm`'s enable
-    /// watchdog then reads that restore's `pwm_enable=2`, calls it a BIOS reclaim,
+    /// `hand_back_hwmon` hands the header back, and `set_pwm`'s enable
+    /// watchdog then reads the firmware mode that hand-back wrote, calls it a BIOS reclaim,
     /// and re-asserts `pwm_enable=1` — leaving the header latched in manual at a
     /// fixed duty with no writer left in the process.
     ///

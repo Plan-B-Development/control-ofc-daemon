@@ -329,7 +329,7 @@ pub async fn discover_control_path_handler(
 ) -> (StatusCode, Json<serde_json::Value>) {
     // [SAFETY] Refuse once the daemon is going down (DEC-317). Same first guard,
     // same reason, as verify and characterise: a diagnostic that starts after
-    // `restore_hwmon_to_auto` has run would re-assert `pwm_enable=1` through
+    // `hand_back_hwmon` has run would re-assert `pwm_enable=1` through
     // `set_pwm`'s reclaim watchdog and then skip its own restore, leaving the
     // header latched in manual with no daemon left to drive it.
     if *state.openfan_runtime.shutdown.borrow() {

@@ -330,6 +330,20 @@ impl StateCache {
     }
 
     /// Update all hwmon fan readings as a batch.
+    /// Forget the duty the write path last commanded for hwmon header `id`
+    /// (DEC-382).
+    ///
+    /// Called when the daemon gives a header back to firmware. `pwm_commanded_pct`
+    /// has exactly one producer — the write path — and [`Self::update_hwmon_fans`]
+    /// carries a `None` forward rather than clearing it, so without this a header
+    /// firmware now drives would go on reporting the last duty the daemon asked
+    /// for, and the Hardware page would show a request nobody is making.
+    pub fn clear_hwmon_commanded(&self, id: &str) {
+        if let Some(fan) = self.inner.write().hwmon_fans.get_mut(id) {
+            fan.pwm_commanded_pct = None;
+        }
+    }
+
     pub fn update_hwmon_fans(&self, fans: Vec<HwmonFanState>) {
         let now = Instant::now();
         let mut state = self.inner.write();

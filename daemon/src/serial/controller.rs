@@ -68,6 +68,20 @@ impl FanController {
         }
     }
 
+    /// The duty this controller last put on `channel`, or `None` when it has not
+    /// written one since it started or since the device may have lost it (a
+    /// reconnect or resume clears every channel — DEC-256).
+    ///
+    /// Read by the thermal force to remember what a channel no profile controls
+    /// was doing before an emergency, so it can be given back afterwards
+    /// (DEC-382). `None` there means "unknown", and an unknown channel stays at
+    /// the forced duty rather than being guessed down.
+    pub fn last_commanded_pct(&self, channel: u8) -> Option<u8> {
+        self.channels
+            .get(channel as usize)
+            .and_then(|c| c.last_commanded_pct)
+    }
+
     /// Set PWM on a single channel. `pwm_percent` is 0–100.
     ///
     /// - 0% is allowed for up to `constants::STOP_TIMEOUT` (8s), after which it's rejected.

@@ -51,6 +51,34 @@ const LIQUID_COOLER_CHIPS: &[&str] = &[
 /// on external probes.
 const COOLANT_TEMP_CHIPS: &[&str] = &["x53", "z53", "kraken2023", "kraken2023elite", "kraken2"];
 
+/// hwmon `name` strings the **`nzxt-kraken3`** driver registers — the subset of
+/// [`LIQUID_COOLER_CHIPS`] that driver owns (`kraken2` is a different driver, with
+/// no `pwm*_enable` at all).
+///
+/// [SAFETY] DEC-382. Named on its own because one rule keys on the DRIVER, not on
+/// "is a cooler": `nzxt-kraken3`'s `pwm_enable=2` uploads the channel's curve
+/// buffer, which `devm_kzalloc` zeroes at probe and nothing but a userspace curve
+/// write ever fills. Writing `2` back to a Kraken therefore puts the pump on a 0 %
+/// curve, so `hwmon::handback` never hands one back that way.
+///
+/// `kraken2024elite` (USB 1e71:3012) is newer than this file's other lists, which
+/// do not carry it; added from mainline `kraken3_probe` (DEC-382 review), where it
+/// maps to the same `KRAKEN2023` kind and therefore the same zeroed buffer.
+const NZXT_KRAKEN3_CHIPS: &[&str] = &[
+    "x53",
+    "z53",
+    "kraken2023",
+    "kraken2023elite",
+    "kraken2024elite",
+];
+
+/// True when `chip_name` is a device driven by the `nzxt-kraken3` driver
+/// (case-insensitive exact match against [`NZXT_KRAKEN3_CHIPS`]).
+pub fn is_nzxt_kraken3_chip(chip_name: &str) -> bool {
+    let lower = chip_name.to_lowercase();
+    NZXT_KRAKEN3_CHIPS.contains(&lower.as_str())
+}
+
 /// Coolant-temperature label keywords (case-insensitive substring match). A
 /// lower-confidence fallback so a coolant channel on any chip — or an unlisted
 /// cooler — still classifies when the vendor labels it (covers Aquacomputer
@@ -85,6 +113,32 @@ mod tests {
     fn kraken_chips_are_liquid_coolers() {
         for chip in ["x53", "z53", "kraken2023", "kraken2023elite", "kraken2"] {
             assert!(is_liquid_cooler_chip(chip), "{chip} should be a cooler");
+        }
+    }
+
+    /// DEC-382: the hand-back's Kraken rule keys on the DRIVER. `kraken2` is a
+    /// cooler too but a different driver with no `pwm*_enable`, so it must not
+    /// match; the opposite arm is what a stuck predicate would fail.
+    #[test]
+    fn only_nzxt_kraken3_devices_match_the_kraken3_predicate() {
+        for chip in [
+            "x53",
+            "z53",
+            "kraken2023",
+            "kraken2023elite",
+            "kraken2024elite",
+            "KRAKEN2023",
+        ] {
+            assert!(
+                is_nzxt_kraken3_chip(chip),
+                "{chip} is an nzxt-kraken3 device"
+            );
+        }
+        for chip in ["kraken2", "d5next", "it8696", "nct6798", ""] {
+            assert!(
+                !is_nzxt_kraken3_chip(chip),
+                "{chip} is not an nzxt-kraken3 device"
+            );
         }
     }
 

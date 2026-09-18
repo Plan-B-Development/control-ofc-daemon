@@ -285,10 +285,14 @@ gating each have their own register rows and regression tests.
 1. **ThermalSafetyRule** (`safety.rs`): Emergency CPU override
    - **Every duty below is a FLOOR over the active profile's output, not a
      replacement for it (DEC-307).** The engine calls
-     `force_all_with_floor(pct, &commands)`: each OpenFan channel and writable
-     hwmon header gets `max(commanded, pct)`, and one no control commands still
-     gets the bare `pct` — that second half is what preserves the emergency's
-     reach. The ladder can therefore only ever raise a fan. Until DEC-307 these
+     `force_all_with_floor(pct, &commands, reach)`: each output in reach gets
+     `max(commanded, pct)`. At 100 % the reach is every OpenFan channel and
+     writable hwmon header, and one no control commands still gets the bare
+     `pct` — that is what preserves the emergency's reach. Below 100 % the reach
+     is the profile's own outputs only (DEC-382, `ForceReach::for_duty`): a
+     sub-100 duty on a header nothing controls would replace a firmware curve
+     that may be running it faster, and every output an earlier 100 % tick took
+     that the profile does not name is given back in the same write. The ladder can therefore only ever raise a fan. Until DEC-307 these
      were replacements, so the 60% and 40% rungs could drive a fan *below* what
      its curve was asking for; the 100% emergency was never affected, because
      100 is the maximum
@@ -316,11 +320,14 @@ gating each have their own register rows and regression tests.
      the per-machine trip point: 25C at the 105 floor, 35C at the 115 cap. Do
      not restate the span as a fixed number (DEC-292/305)
    - 60% recovery floor for two cycles after release (the release cycle + a
-     one-cycle recovery floor), then control returns to the profile
+     one-cycle recovery floor) on the profile's outputs, then control returns to
+     the profile; every other output the emergency took is given back at the
+     release — an hwmon header to its recorded mode, an OpenFan channel to its
+     pre-emergency duty (DEC-382)
    - If no CpuTemp sensor is found — or none is still updating (DEC-267: a
      reading older than 5 poll intervals counts as absent) — for 5 consecutive
-     cycles, forces every OpenFan channel and writable hwmon header the
-     machine has to 40%; a sensor that *vanishes* while an emergency is
+     cycles, floors the profile's outputs at 40% (DEC-382: outputs no profile
+     controls stay under firmware, and with no profile nothing is forced); a sensor that *vanishes* while an emergency is
      latched forces 40% immediately (from the first missing cycle) and reports
      `no_sensor_fallback` rather than dropping to profile control (DEC-190),
      whereas one that merely goes *stale* holds the emergency's own 100% output
@@ -416,10 +423,10 @@ gating each have their own register rows and regression tests.
      against channel-tracking drift, not a periodic re-arm requirement
 
 6. **ExecStopPost restore** (`packaging/control-ofc-restore-auto.sh`):
-   - Restores `pwm_enable=2` (auto) on any service **stop job**, including SIGKILL
+   - Replays the hwmon hand-back record (DEC-382): each header the daemon took gets back exactly what it had — its recorded `pwm_enable`, or its duty if it was already manual — confirmed by read-back, with `fancontrol`'s full-speed fallback; headers the daemon never took are not touched. On any service **stop job**, including SIGKILL
    - Resets GPU fan curves to automatic
    - Re-enables `fan_zero_rpm_enable=1` for every GPU exposing it (DEC-100 — closes the SIGKILL/OOM path the panic hook can't cover)
-   - **It is not a universal backstop, and this qualification is load-bearing (278-b).** `ExecStopPost` runs as part of a *stop job*, and the `Restart=on-failure` path has none — so when the daemon exits non-zero and systemd restarts it, this script does not run at all. That path is covered **in-process** instead, by the bounded restore in `main.rs` (DEC-278/279): `restore_gpu_fans_to_auto` then `restore_hwmon_to_auto`, each on its own deadline. Read this bullet as "any stop", never as "any exit"; the earlier wording said "ANY service stop (including SIGKILL)", which invited the second reading on the one path where it is false.
+   - **It is not a universal backstop, and this qualification is load-bearing (278-b).** `ExecStopPost` runs as part of a *stop job*, and the `Restart=on-failure` path has none — so when the daemon exits non-zero and systemd restarts it, this script does not run at all. That path is covered **in-process** instead, by the bounded restore in `main.rs` (DEC-278/279): `restore_gpu_fans_to_auto` then `hand_back_hwmon`, each on its own deadline. Read this bullet as "any stop", never as "any exit"; the earlier wording said "ANY service stop (including SIGKILL)", which invited the second reading on the one path where it is false.
 
 7. **Kernel-version regression catalogue** (`hwmon/kernel_warnings.rs`, DEC-098):
    - Curated list of published amdgpu regressions keyed by kernel version + GPU PCI device ID
@@ -728,8 +735,8 @@ assignment, so an assignment can add that protection but not remove it. A header
 with no evidence and no assignment is treated as an ordinary fan and stopped. **Accepted, bounded risk** (2026-07-21 audit: accept + document): identification
 requires stopping any fan by design (DEC-166); the deadman auto-restore limits an abandoned stop
 to one TTL; and a thermal emergency outranks the identify overlay entirely — the engine's
-`force_all_with_floor` path (thermal emergency, and the no-sensor 40 % fallback) drives every OpenFan channel +
-writable hwmon header the machine has to **at least** the forced duty, spinning a stalled pump back up regardless of
+`force_all_with_floor` path drives every OpenFan channel + writable hwmon header the machine has to **at
+least** 100 % in an emergency (and, below 100 %, every output the profile controls — DEC-382), spinning a stalled pump back up regardless of
 standing stops. Since DEC-307 that duty is a floor over the profile's own output rather than a
 replacement for it, so a control already asking for more keeps its higher duty; an output no control
 commands still gets the forced duty, which is what keeps the reach above true.

@@ -11,7 +11,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use backends::{
-    ForceLogAction, ForceLogThrottle, GpuBackend, HwmonBackend, OpenFanBackend, WriteBackend,
+    ForceLogAction, ForceLogThrottle, ForceReach, GpuBackend, HwmonBackend, OpenFanBackend,
+    ProfileMembers, WriteBackend,
 };
 
 use crate::constants;
@@ -1145,7 +1146,7 @@ pub async fn profile_engine_loop(
         let snapshot_taken_at = std::time::Instant::now();
         let mut sensors = cache.sensors_snapshot();
         let stale_after = cache.cpu_temp_stale_after();
-        let (decision, hottest_cpu_c, effective_trigger) = {
+        let (decision, hottest_cpu_c, effective_trigger, emergency_latched) = {
             // DEC-267/269: classify the reading before acting on it. `now` is
             // sampled BEFORE the snapshot above, so any reading written during
             // the gap saturates to age 0 (fresh) rather than being judged late —
@@ -1161,7 +1162,14 @@ pub async fn profile_engine_loop(
             safety_guard.set_trigger_temp_c(effective_trigger_c(&sensors));
             let decision =
                 evaluate_safety_tick(cpu_reading, &mut no_cpu_sensor_cycles, &mut safety_guard);
-            (decision, cpu_reading, safety_guard.trigger_temp_c())
+            (
+                decision,
+                cpu_reading,
+                safety_guard.trigger_temp_c(),
+                // DEC-382: read under the same guard as the decision, so a forced
+                // tick's give-back is judged against the latch that produced it.
+                safety_guard.is_active(),
+            )
         };
 
         // DEC-272 (01-a): the safety leg above has had the raw snapshot; from here
@@ -1257,7 +1265,11 @@ pub async fn profile_engine_loop(
         //      rebuilt per tick during a hold. Measured cheap against the 1 Hz
         //      budget, and the alternative is a safety rung that cannot see what
         //      it is supposed to be flooring.
-        let profile_commands: Option<Vec<PwmCommand>> = {
+        //
+        // DEC-382: the profile's MEMBERS are taken here too, under the same lock
+        // and from the same profile, so a tick's reach and its give-back can never
+        // be judged against a different profile than the one it commanded.
+        let (profile_commands, members): (Option<Vec<PwmCommand>>, ProfileMembers) = {
             let profile_guard = profile.lock();
 
             // DEC-188: re-anchor on an activation epoch bump. Read under the
@@ -1308,13 +1320,13 @@ pub async fn profile_engine_loop(
                              commanded, so it is not listed as uncommanded"
                         );
                     }
-                    Some(cmds)
+                    (Some(cmds), ProfileMembers::of(active_profile))
                 }
                 None => {
                     // No profile loaded — drop any leftover tuning state so a
                     // later activation doesn't pick up stale cross-cycle outputs.
                     engine_state.deactivate();
-                    None
+                    (None, ProfileMembers::default())
                 }
             }
         };
@@ -1371,12 +1383,23 @@ pub async fn profile_engine_loop(
             // no control commands, which is what preserves the emergency's reach —
             // but a commanded output gets `max(commanded, forced_pct)`. Passing
             // an empty slice (no profile) reproduces the old behaviour exactly.
+            //
+            // [SAFETY] DEC-382: the reach is decided by the duty. At 100 % every
+            // output is taken, as above; below it — the recovery and no-sensor
+            // floors — only the profile's members are, and anything an earlier
+            // 100 % tick took that the profile does not name is given back in the
+            // same write task, but only once the emergency has RELEASED: while it
+            // is still latched (DEC-190's blind 40 %) those outputs stay where the
+            // emergency put them. A sub-100 floor on a header nothing controls would
+            // replace its firmware curve, and could run it slower than that curve.
             let baseline = profile_commands.as_deref().unwrap_or(&[]);
+            let reach = ForceReach::for_duty(forced_pct, &members, emergency_latched);
             let forced_scope = backends::force_present_backends(
                 openfan_be.as_mut(),
                 hwmon_be.as_mut(),
                 forced_pct,
                 baseline,
+                reach,
             )
             .await;
 
@@ -1415,6 +1438,14 @@ pub async fn profile_engine_loop(
                     _ => None,
                 };
                 match (forced_scope.describe(), held) {
+                    // DEC-382: a sub-100 force whose reach — the profile's
+                    // members — holds nothing this daemon can drive. Not the error
+                    // below: nothing is unreachable, the reach is limited on
+                    // purpose.
+                    (None, _) if forced_scope.members_only => log::warn!(
+                        "Thermal safety: {forced_pct}% or above applies only to fans a \
+                         profile controls, and none of those can be driven here ({reason})"
+                    ),
                     (Some(scope), None) => log::warn!(
                         "Thermal safety override: holding {scope} at \
                          {forced_pct}% or above ({reason})"
@@ -1516,7 +1547,22 @@ pub async fn profile_engine_loop(
         // AFTER the safety branch (D1-j) — a daemon with no profile must still
         // get the thermal force, and this `continue` used to sit above it only
         // because the force did not need the commands.
+        //
+        // DEC-382: but not before giving back what nothing holds. With no profile
+        // loaded nothing holds any header, so everything the daemon took — by a
+        // thermal force, a diagnostic, or a profile just deactivated — goes back
+        // here. Same gates as the write phase below: never mid-shutdown (the
+        // shutdown restore owns that), never under a verify's write-pause (the
+        // diagnostic owns its header, and gives it back when it ends).
         let Some(commands) = profile_commands else {
+            if !*shutdown.borrow() && !cache.verify_active() {
+                if let Some(be) = openfan_be.as_mut() {
+                    be.apply_and_give_back(&[], &members).await;
+                }
+                if let Some(be) = hwmon_be.as_mut() {
+                    be.apply_and_give_back(&[], &members).await;
+                }
+            }
             continue;
         };
 
@@ -1555,13 +1601,17 @@ pub async fn profile_engine_loop(
         // Thermal safety force_all_with_floor runs earlier this tick and `continue`s before
         // here, so a verify never suppresses an emergency. Deadman-bounded
         // (DEC-165).
+        //
+        // DEC-382: the OpenFan and hwmon writes also give back, in the same task,
+        // whatever the daemon took that this profile does not name — the end of a
+        // force, the end of a diagnostic, or a profile switch that dropped a header.
         if !cache.verify_active() {
             if let Some(be) = openfan_be.as_mut() {
-                be.apply(&commands).await;
+                be.apply_and_give_back(&commands, &members).await;
             }
             gpu_be.apply(&commands).await;
             if let Some(be) = hwmon_be.as_mut() {
-                be.apply(&commands).await;
+                be.apply_and_give_back(&commands, &members).await;
             }
         }
         // DEC-289: refresh after the write phase so a wedge starting THIS tick is
@@ -6816,6 +6866,332 @@ mod tests {
         );
     }
 
+    // ── DEC-382: give back what nothing holds ────────────────────────────
+
+    /// A sysfs whose writes land, shared with the test so it can read back the
+    /// mode a header is in after the loop has run — the property the recording
+    /// writers above do not have. Every write is also logged, so "nothing was
+    /// taken" is observable as an empty log.
+    #[derive(Clone, Default)]
+    struct LiveHwmonSysfs {
+        files: Arc<Mutex<HashMap<String, String>>>,
+        log: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    impl LiveHwmonSysfs {
+        fn with(self, path: &str, value: &str) -> Self {
+            self.files.lock().insert(path.into(), value.into());
+            self
+        }
+        fn get(&self, path: &str) -> Option<String> {
+            self.files.lock().get(path).cloned()
+        }
+        fn writes_to(&self, path: &str) -> usize {
+            self.log.lock().iter().filter(|(p, _)| p == path).count()
+        }
+    }
+
+    impl crate::hwmon::pwm_control::SysfsWriter for LiveHwmonSysfs {
+        fn write_file(&mut self, path: &str, value: &str) -> Result<(), crate::error::HwmonError> {
+            self.log.lock().push((path.into(), value.into()));
+            self.files.lock().insert(path.into(), value.trim().into());
+            Ok(())
+        }
+        fn read_file(&self, path: &str) -> Result<String, crate::error::HwmonError> {
+            self.get(path)
+                .map(|v| format!("{v}\n"))
+                .ok_or(crate::error::HwmonError::ReadError {
+                    path: path.into(),
+                    message: "not found".into(),
+                })
+        }
+    }
+
+    const H1: &str = "hwmon:it8696:pwm1";
+    const H2: &str = "hwmon:it8696:pwm2";
+    const EN1: &str = "/sys/class/hwmon/hwmon0/pwm1_enable";
+    const EN2: &str = "/sys/class/hwmon/hwmon0/pwm2_enable";
+    const PWM1: &str = "/sys/class/hwmon/hwmon0/pwm1";
+
+    fn second_header() -> crate::hwmon::pwm_discovery::PwmHeaderDescriptor {
+        let mut h = writable_pwm_header(H2);
+        h.pwm_index = 2;
+        h.pwm_path = "/sys/class/hwmon/hwmon0/pwm2".into();
+        h.enable_path = Some(EN2.into());
+        h
+    }
+
+    /// `make_profile`'s single control, driving the given hwmon headers.
+    fn hwmon_profile(ids: &[&str]) -> DaemonProfile {
+        let mut p = make_profile("curve", "graph", 50.0);
+        p.controls[0].members = ids
+            .iter()
+            .map(|id| ControlMember {
+                source: "hwmon".into(),
+                member_id: (*id).into(),
+                member_label: "".into(),
+                fan_zero_rpm: false,
+            })
+            .collect();
+        p
+    }
+
+    fn spawn_engine(
+        cache: Arc<StateCache>,
+        profile_arc: Arc<Mutex<Option<DaemonProfile>>>,
+        sysfs: &LiveHwmonSysfs,
+        headers: Vec<crate::hwmon::pwm_discovery::PwmHeaderDescriptor>,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::watch::Sender<bool>,
+    ) {
+        let ctrl = crate::hwmon::pwm_control::HwmonPwmController::new(
+            headers,
+            crate::hwmon::lease::LeaseManager::new(),
+            Box::new(sysfs.clone()),
+            cache.clone(),
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(profile_engine_loop(
+            cache,
+            profile_arc,
+            Arc::new(parking_lot::RwLock::new(None)),
+            Some(Arc::new(Mutex::new(ctrl))),
+            vec![],
+            Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new())),
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
+            shutdown_rx,
+        ));
+        (handle, shutdown_tx)
+    }
+
+    async fn stop(
+        handle: tokio::task::JoinHandle<()>,
+        shutdown_tx: tokio::sync::watch::Sender<bool>,
+    ) {
+        shutdown_tx.send(true).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let _ = handle.await;
+    }
+
+    /// [SAFETY] DEC-382 (`TS-b`): the emergency takes a header no profile controls
+    /// — that reach is unchanged — and gives it back to the mode it found when the
+    /// 100 % phase ends. Before DEC-382 it stayed in manual at the forced duty for
+    /// the daemon's lifetime, BIOS curve off, while `/status` said `normal`.
+    #[tokio::test(start_paused = true)]
+    async fn an_emergency_gives_back_a_header_no_profile_controls_when_it_ends() {
+        let cache = make_cache_with_sensor("cpu", TRIGGER + 1.0);
+        let sysfs = LiveHwmonSysfs::default().with(EN1, "5").with(PWM1, "90");
+        let (handle, shutdown_tx) = spawn_engine(
+            cache.clone(),
+            Arc::new(Mutex::new(None)),
+            &sysfs,
+            vec![writable_pwm_header(H1)],
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert_eq!(
+            (sysfs.get(EN1).as_deref(), sysfs.get(PWM1).as_deref()),
+            (Some("1"), Some("255")),
+            "precondition: the emergency took the header and forced it to 100%"
+        );
+
+        cache.update_sensors(vec![cpu_reading("cpu", 70.0, Instant::now())]);
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        stop(handle, shutdown_tx).await;
+
+        assert_eq!(
+            sysfs.get(EN1).as_deref(),
+            Some("5"),
+            "the end of the 100% phase must give the header its own mode back"
+        );
+    }
+
+    /// [SAFETY] DEC-382: deactivating a profile leaves nothing holding its
+    /// headers, so they go back — a route the 2026-09-18 audit did not name, and
+    /// that nothing before DEC-382 took (the handler releases the lease only).
+    #[tokio::test(start_paused = true)]
+    async fn deactivating_the_profile_gives_its_headers_back() {
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let sysfs = LiveHwmonSysfs::default().with(EN1, "5").with(PWM1, "90");
+        let profile_arc = Arc::new(Mutex::new(Some(hwmon_profile(&[H1]))));
+        let (handle, shutdown_tx) = spawn_engine(
+            cache.clone(),
+            profile_arc.clone(),
+            &sysfs,
+            vec![writable_pwm_header(H1)],
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert_eq!(
+            sysfs.get(EN1).as_deref(),
+            Some("1"),
+            "precondition: the profile took the header"
+        );
+
+        *profile_arc.lock() = None;
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        stop(handle, shutdown_tx).await;
+
+        assert_eq!(sysfs.get(EN1).as_deref(), Some("5"));
+    }
+
+    /// A profile switch gives back exactly the headers the new profile drops —
+    /// and the one it keeps is still the profile's, so it stays in manual.
+    #[tokio::test(start_paused = true)]
+    async fn a_profile_switch_gives_back_only_the_header_it_drops() {
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let sysfs = LiveHwmonSysfs::default()
+            .with(EN1, "5")
+            .with(PWM1, "90")
+            .with(EN2, "2")
+            .with("/sys/class/hwmon/hwmon0/pwm2", "90");
+        let profile_arc = Arc::new(Mutex::new(Some(hwmon_profile(&[H1, H2]))));
+        let (handle, shutdown_tx) = spawn_engine(
+            cache.clone(),
+            profile_arc.clone(),
+            &sysfs,
+            vec![writable_pwm_header(H1), second_header()],
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert_eq!(
+            (sysfs.get(EN1).as_deref(), sysfs.get(EN2).as_deref()),
+            (Some("1"), Some("1")),
+            "precondition: the first profile took both headers"
+        );
+
+        *profile_arc.lock() = Some(hwmon_profile(&[H1]));
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        stop(handle, shutdown_tx).await;
+
+        assert_eq!(
+            sysfs.get(EN2).as_deref(),
+            Some("2"),
+            "the dropped header goes back"
+        );
+        assert_eq!(
+            sysfs.get(EN1).as_deref(),
+            Some("1"),
+            "the kept header stays the profile's"
+        );
+    }
+
+    /// [SAFETY] DEC-382: with no CPU sensor the no-sensor floor holds for as long
+    /// as the sensor is missing — forever, on a CPU `k10temp` does not match. Its
+    /// 40 % reaches only what a profile controls; with no profile it takes no
+    /// header at all, so firmware keeps regulating every fan. Before DEC-382 every
+    /// writable header sat at a flat 40 % in manual mode for the daemon's life.
+    #[tokio::test(start_paused = true)]
+    async fn the_no_sensor_floor_takes_no_header_when_no_profile_controls_one() {
+        let cache = Arc::new(StateCache::new());
+        let sysfs = LiveHwmonSysfs::default().with(EN1, "5").with(PWM1, "90");
+        let (handle, shutdown_tx) = spawn_engine(
+            cache.clone(),
+            Arc::new(Mutex::new(None)),
+            &sysfs,
+            vec![writable_pwm_header(H1)],
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(8500)).await;
+        // Presence before absence: the fallback really is active.
+        assert_eq!(
+            cache.snapshot().thermal_override_state.as_deref(),
+            Some("no_sensor_fallback"),
+            "precondition: the no-sensor floor is in force"
+        );
+        stop(handle, shutdown_tx).await;
+
+        assert_eq!(
+            (sysfs.writes_to(EN1), sysfs.writes_to(PWM1)),
+            (0, 0),
+            "a 40% floor must not take a header nothing controls"
+        );
+        assert_eq!(sysfs.get(EN1).as_deref(), Some("5"));
+    }
+
+    /// [SAFETY] DEC-382 self-review finding: a duty below 100 % is not the end of
+    /// the emergency. When the CPU sensor VANISHES mid-emergency, DEC-190 drops the
+    /// forced duty to 40 % while the rule stays latched. Giving back there would
+    /// return an OpenFan channel no profile controls to its pre-emergency duty (35 %
+    /// here) — below even DEC-190's 40 % — in the middle of a live emergency, and
+    /// hand a BIOS header back mid-emergency. Both must stay where the emergency put
+    /// them until a fresh reading releases the latch; only then are they given back.
+    #[tokio::test(start_paused = true)]
+    async fn a_blind_latched_emergency_gives_nothing_back_until_it_releases() {
+        let cache = make_cache_with_sensor("cpu", TRIGGER + 1.0);
+        let (transport, written) = LoopTestTransport::new(30);
+        let fan_ctrl = Arc::new(Mutex::new(crate::serial::controller::FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            std::time::Duration::from_millis(500),
+        )));
+        // t0: a channel no profile control names, at a duty this daemon set.
+        fan_ctrl.lock().set_pwm(3, 35).unwrap();
+        let sysfs = LiveHwmonSysfs::default().with(EN1, "5").with(PWM1, "90");
+        let hwmon = crate::hwmon::pwm_control::HwmonPwmController::new(
+            vec![writable_pwm_header(H1)],
+            crate::hwmon::lease::LeaseManager::new(),
+            Box::new(sysfs.clone()),
+            cache.clone(),
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(profile_engine_loop(
+            cache.clone(),
+            Arc::new(Mutex::new(None)),
+            Arc::new(parking_lot::RwLock::new(Some(fan_ctrl))),
+            Some(Arc::new(Mutex::new(hwmon))),
+            vec![],
+            Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new())),
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
+            shutdown_rx,
+        ));
+        let hex = |pct: u8| format!("{:02X}", crate::pwm::percent_to_raw(pct));
+        let ch3 = |w: &[String]| -> Vec<String> {
+            w.iter()
+                .filter(|c| c.starts_with(">0203"))
+                .map(|c| c[c.len() - 3..c.len() - 1].to_string())
+                .collect()
+        };
+
+        // t1: the emergency takes everything.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert_eq!(
+            sysfs.get(EN1).as_deref(),
+            Some("1"),
+            "precondition: the emergency took the header"
+        );
+
+        // The CPU sensor vanishes: the latch holds and DEC-190's 40 % runs, blind.
+        cache.retain_sensors(&HashSet::new());
+        tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+        assert_eq!(
+            cache.snapshot().thermal_override_state.as_deref(),
+            Some("no_sensor_fallback"),
+            "precondition: the blind latched rung really ran"
+        );
+        assert_eq!(
+            ch3(&written.lock()),
+            vec![hex(35), hex(100)],
+            "a latched emergency must not return a channel to its pre-emergency duty, blind or not"
+        );
+        assert_eq!(
+            sysfs.get(EN1).as_deref(),
+            Some("1"),
+            "a latched emergency must not hand a header back, blind or not"
+        );
+
+        // A fresh reading at 70 °C releases the latch — now both are given back.
+        cache.update_sensors(vec![cpu_reading("cpu", 70.0, Instant::now())]);
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        stop(handle, shutdown_tx).await;
+
+        assert_eq!(ch3(&written.lock()), vec![hex(35), hex(100), hex(35)]);
+        assert_eq!(sysfs.get(EN1).as_deref(), Some("5"));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn loop_writes_thermal_state_to_cache_during_emergency() {
         // A2: the engine loop must write `thermal_state` to the cache on the
@@ -6984,15 +7360,20 @@ mod tests {
     /// for 84%; the old code drove the fan to 60% instead, a 24-point reduction
     /// in cooling caused by the safety ladder itself.
     ///
-    ///   t1: trigger+1 °C → emergency, every channel → 100%
+    ///   t0: ch3 (no profile controls it) is at 35%, set before the loop runs
+    ///   t1: trigger+1 °C → emergency, EVERY channel → 100% (the full reach)
     ///   t2: 70 °C → release + recovery.
     ///       ch0 (controlled, curve = 84%) → max(84, 60) = 84%
-    ///       ch1-9 (uncommanded)           → the bare 60%
+    ///       ch3 (not controlled)          → its pre-emergency 35% back
+    ///       ch1,2,4-9 (never set)         → left at the forced 100%
     ///
-    /// The second half is the one that must not regress: an uncommanded channel
-    /// still gets the floor. Flooring the command list alone would shrink the
-    /// emergency's reach to controlled fans only — the v2.38.0 P1 shape, which
-    /// removed the emergency's reach to OpenFan fans entirely.
+    /// DEC-382 replaced the second half. The 60% rung used to write a bare 60%
+    /// to every channel no profile controls, and then nothing ever gave those
+    /// channels back. Now a sub-100 rung reaches only the profile's channels,
+    /// and the end of the 100% phase gives every other channel the duty it had
+    /// before the emergency; a channel this daemon never set has no such duty
+    /// and is not guessed down. The full reach at 100% is unchanged and still
+    /// asserted here (t1), which is what guards the v2.38.0 P1 shape.
     #[tokio::test(start_paused = true)]
     async fn the_recovery_rung_floors_a_curve_it_used_to_replace() {
         let cache = make_cache_with_sensor("cpu", TRIGGER + 1.0);
@@ -7007,7 +7388,10 @@ mod tests {
             cache.clone(),
             std::time::Duration::from_millis(500),
         );
-        let fan_ctrl = Some(Arc::new(Mutex::new(fan_ctrl)));
+        let fan_ctrl = Arc::new(Mutex::new(fan_ctrl));
+        // t0: a channel no profile control names, at a duty this daemon set.
+        fan_ctrl.lock().set_pwm(3, 35).unwrap();
+        let fan_ctrl = Some(fan_ctrl);
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let handle = tokio::spawn(profile_engine_loop(
@@ -7051,12 +7435,19 @@ mod tests {
                 .filter(|c| c.starts_with(">02"))
                 .collect::<Vec<_>>()
         );
-        for ch in 1..crate::serial::protocol::NUM_CHANNELS {
+        assert_eq!(
+            values_for(3),
+            vec![hex(35), hex(100), hex(35)],
+            "a channel no profile controls must be forced to 100% by the emergency \
+             and then get its own pre-emergency duty back — never the 60% floor"
+        );
+        for ch in (1..crate::serial::protocol::NUM_CHANNELS).filter(|&ch| ch != 3) {
             assert_eq!(
                 values_for(ch),
-                vec![hex(100), hex(60)],
-                "uncommanded channel {ch} must still receive the bare floor — \
-                 that is the reach the emergency depends on"
+                vec![hex(100)],
+                "channel {ch} was never set before the emergency, so it has no duty \
+                 to give back: the emergency must still reach it (100%), and the \
+                 sub-100 rung must not take it (no 60%)"
             );
         }
     }

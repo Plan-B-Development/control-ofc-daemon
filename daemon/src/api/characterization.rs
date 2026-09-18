@@ -44,7 +44,7 @@
 //!   spec's illustrative rising-then-falling order would have ended every
 //!   completed run at the LOWEST duty, and `RestoreOnDrop` has four exits that
 //!   leave the header where the sweep put it — the two deliberate skips, an
-//!   unreadable pre-sweep duty, and a shutdown whose `restore_hwmon_to_auto`
+//!   unreadable pre-sweep duty, and a shutdown whose `hand_back_hwmon`
 //!   found no `pwmN_enable` to hand back (`main.rs`, `NothingToRestore` /
 //!   `WritesTimedOut` / `Unresolvable`). Ending high keeps all four benign.
 //! - The invariant that holds in **both** modes, and the one to reason from:
@@ -1318,9 +1318,9 @@ where
         // [SAFETY] Stop writing the moment the daemon starts going down. The
         // drop guard's shutdown skip covers the RESTORE, but not this loop: the
         // task is detached, so it keeps running through `shutdown_sequence` and
-        // can land a `set_pwm` AFTER `restore_hwmon_to_auto` has handed the
+        // can land a `set_pwm` AFTER `hand_back_hwmon` has handed the
         // header back to firmware. `set_pwm`'s reclaim watchdog would then see
-        // the `pwm_enable=2` that restore just wrote, call it a BIOS reclaim and
+        // the firmware mode that hand-back just wrote, call it a BIOS reclaim and
         // re-assert `pwm_enable=1` at the swept duty — a header latched in manual
         // with no writer left. That is the DEC-290 / 277-c hazard, and checking
         // only in `Drop` does not close it.
@@ -2817,7 +2817,7 @@ mod tests {
     }
 
     /// [SAFETY] Shutdown must stop the sweep WRITING, not merely skip the
-    /// restore. The task is detached, so it outlives `restore_hwmon_to_auto`.
+    /// restore. The task is detached, so it outlives `hand_back_hwmon`.
     #[tokio::test(start_paused = true)]
     async fn a_shutdown_part_way_through_stops_writing_immediately() {
         let cache = cache_at(45.0, Some("normal"));

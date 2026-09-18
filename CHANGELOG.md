@@ -1,5 +1,48 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+**The daemon now gives each motherboard fan back exactly the way it found it**
+(`TS-a`, `TS-b`, `TS-c`, DEC-382). Every way the daemon let go of a fan header —
+stopping, crashing, panicking — wrote `pwm_enable=2` to every header on the
+machine, touched or not. `2` means "automatic" only on the it87 driver. On
+nct6775 boards (common on ASUS and ASRock) it selects Thermal Cruise instead of
+the BIOS's Smart Fan IV, and on an NZXT Kraken it applies a curve that is all
+zeros — the pump on a 0 % curve. The daemon now reads each header's mode just
+before it first takes it, keeps a record of every header it holds, and gives back
+exactly that: the mode it found, or the duty if the header was already in manual
+mode. A header whose mode cannot be restored is set to full speed instead, as
+lm-sensors `fancontrol` does, and a header the daemon never took is never
+written. After a crash, `ExecStopPost` replays the same record.
+
+**Fans are given back as soon as nothing holds them.** A thermal emergency ending,
+a Test PWM Control, Characterise or discovery run ending, deactivating a profile,
+and switching to a profile that no longer controls a header each used to leave the
+header in manual mode at its last duty, BIOS curve off, until the daemon stopped.
+Each now hands it back on the next tick. OpenFan channels no profile controls get
+their pre-emergency speed back when an emergency ends; a channel the daemon had
+never set stays at 100 %.
+
+### Changed
+
+**The 60 % recovery floor and the 40 % no-CPU-sensor floor now apply only to the
+fans your active profile controls** (DEC-382). The 100 % thermal emergency still
+takes every fan. A 60 % or 40 % floor on a fan nothing controls replaced its BIOS
+curve, which could be running it faster — and with no CPU temperature sensor at all
+(a new AMD CPU on an older kernel, say) every such fan sat at a flat 40 % for as
+long as the daemon ran. Those fans now stay under their BIOS curve, and with no
+profile active the no-sensor floor forces nothing.
+
+**An NZXT Kraken runs its pump and fans at 100 % after the daemon stops.** Its
+kernel driver has no way to hand the device back to its own behaviour, and full
+speed is what the pump makers recommend.
+
+**Upgrading:** the first stop after upgrading still runs the previous version's
+shutdown, so the next start records whatever that left — Thermal Cruise on an
+nct6775 board — until the next reboot resets every header.
+
 ## [2.49.1] — 2026-09-17
 
 ### Internal

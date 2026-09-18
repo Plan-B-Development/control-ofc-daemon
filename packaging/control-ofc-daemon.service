@@ -45,13 +45,14 @@ RestartSec=3
 # task (IPC server + up to three poll/engine tasks) and the runtime teardown adds
 # at most RUNTIME_SHUTDOWN_TIMEOUT (2 s). Those parts total ~14 s.
 #
-# Since 2.21.1 the restore is bounded too (277-b), in BOTH halves: it resolves the
-# header list under a SHUTDOWN_TASK_TIMEOUT (3 s) lock deadline, then performs the
+# Since 2.21.1 the restore is bounded too (277-b), in BOTH halves: it reads the
+# hand-back ledger — which headers the daemon holds, and what each gets back
+# (DEC-382) — under a SHUTDOWN_TASK_TIMEOUT (3 s) lock deadline, then performs the
 # writes on a detached thread under another 3 s deadline. The second bound is the
-# load-bearing one — the only reason the engine holds that mutex indefinitely is a
-# sysfs write wedged in the kernel, and most boards put every header on one
-# Super-I/O chip whose driver serialises attribute stores, so bounding just the
-# lock would move the hang to the kernel rather than remove it.
+# load-bearing one: a sysfs write wedged in the kernel holds the chip's driver
+# lock, and most boards put every header on one Super-I/O chip whose driver
+# serialises attribute stores, so bounding just the lock would move the hang to
+# the kernel rather than remove it.
 #
 # Before that the restore took the mutex unconditionally and stalled past every
 # timeout above — including on the Restart=on-failure path, where systemd runs no
@@ -72,7 +73,9 @@ RestartSec=3
 #
 # This line remains as defence in depth, not as the mechanism. Note what
 # ExecStopPost=control-ofc-restore-auto does and does NOT cover: the script
-# restores hwmon `pwm*_enable` and GPU `fan_curve` only. OpenFan channels are
+# replays the daemon's hand-back record — each hwmon header the daemon holds goes
+# back to what it was doing before the daemon took it (DEC-382), and nothing else
+# is touched — and resets GPU `fan_curve`. OpenFan channels are
 # USB-serial with no firmware-auto to fall back to, so they stay latched at the
 # last commanded duty until a daemon owns them again. Fans hold, never fall — but
 # this is not a full hand-back and must not be read as one.

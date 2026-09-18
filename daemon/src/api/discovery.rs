@@ -752,7 +752,7 @@ where
         // top of every point, for the same reasons. The shutdown check is not
         // covered by the drop guard's own skip: this task is detached, so it
         // keeps running through `shutdown_sequence` and could otherwise land a
-        // write after `restore_hwmon_to_auto` handed the header back to firmware.
+        // write after `hand_back_hwmon` handed the header back to firmware.
         if shutting_down() {
             bail!(STATE_ABORTED, "the daemon is shutting down".into());
         }
@@ -792,7 +792,7 @@ where
         // [SAFETY] Re-check immediately before the write. `observe` checks at the
         // top of each sample iteration, but returns after one more read — up to
         // `DISCOVERY_MAX_TACH_CHANNELS` blocking sysfs reads later — so shutdown
-        // can land in that gap and a write issued after `restore_hwmon_to_auto`
+        // can land in that gap and a write issued after `hand_back_hwmon`
         // would re-assert `pwm_enable=1` at a fixed duty with no writer left
         // (the DEC-290 / 277-c hazard the drop guard's own skip exists for).
         if shutting_down() {
@@ -853,7 +853,7 @@ where
         // It stays ABOVE the shutdown check too: `shutting_down()` is
         // load-bearing *immediately* before the write, because `observe` can
         // return one read after a shutdown began and a write landing after
-        // `restore_hwmon_to_auto` would re-assert `pwm_enable=1` on a header the
+        // `hand_back_hwmon` would re-assert `pwm_enable=1` on a header the
         // firmware has been handed back (the DEC-290 / 277-c hazard).
         if let Some(reason) = thermal_gate() {
             bail!(STATE_ABORTED, reason);

@@ -207,8 +207,9 @@ Full build / install / CLI / environment reference lives in
   snapshot reads (`/poll`) — the GUI's 1 Hz poll path (the unused `/events` SSE
   stream was removed at v2.5.0, DEC-198).
 - **Thermal safety** is daemon-enforced: at the CPU trip point → every OpenFan channel and
-  writable motherboard (hwmon) header the machine has to 100%, hysteresis down to 80°C, 40% floor when no CPU
-  sensor reports for 5 cycles. The trip point is **per-machine** — at least 105°C,
+  writable motherboard (hwmon) header the machine has to 100%, hysteresis down to 80°C, and a 40% floor on the
+  fans the active profile controls when no CPU sensor reports for 5 cycles (fans no profile controls stay under
+  their firmware curve). The trip point is **per-machine** — at least 105°C,
   raised to `min(ceiling + 5 °C, 115 °C)` where the kernel publishes the CPU's own
   design ceiling (DEC-308) — and every duty is a **floor** over the active profile's output
   rather than a replacement for it (DEC-307), so the ladder can only raise a fan. GPU fans are excluded — AMD PMFW firmware owns
@@ -222,8 +223,10 @@ Full build / install / CLI / environment reference lives in
   **internally** by the profile engine, to guard against conflicting external
   hwmon writers. The GUI holds no lease (DEC-165).
 - **Systemd-hardened** (`ProtectHome=read-only`, `ProtectSystem=strict`,
-  `SystemCallFilter=@system-service`, etc.); shutdown restores
-  `pwm_enable=2` and GPU fan curves to automatic via `ExecStopPost`.
+  `SystemCallFilter=@system-service`, etc.); on stop, every motherboard fan
+  header the daemon took goes back to exactly what it was doing before (its BIOS
+  mode, or its duty if it was already manual), and GPU fan curves to automatic —
+  in-process, and again via `ExecStopPost`, which replays the daemon's record.
 
 ## Pairing with the GUI
 

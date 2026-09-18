@@ -62,7 +62,7 @@ package() {
     # Binary
     install -Dm755 target/release/control-ofc-daemon "$pkgdir/usr/bin/control-ofc-daemon"
 
-    # Restore script (runs on daemon stop to return fans to automatic)
+    # Restore script (runs on daemon stop to give each fan back what the daemon found)
     install -Dm755 packaging/control-ofc-restore-auto.sh "$pkgdir/usr/bin/control-ofc-restore-auto"
 
     # System-tray client (DEC-352). Built by the same `cargo build --release`

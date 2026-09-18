@@ -14,6 +14,7 @@ pub mod discovery;
 pub mod gigabyte_siv;
 pub mod gpu_detect;
 pub mod gpu_fan;
+pub mod handback;
 pub mod header_caps;
 pub mod intel_gpu_detect;
 pub mod inventory;
