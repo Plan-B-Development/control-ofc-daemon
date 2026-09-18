@@ -397,6 +397,26 @@ fn the_unit_waits_for_readiness_and_watches_the_engine() {
     );
 }
 
+/// [SAFETY] DEC-388 (`TS-al`). A watchdog timeout asks for the graceful stop,
+/// because only the in-process stop can apply the exit floor to OpenFan
+/// channels — `ExecStopPost` cannot reach serial. Measured on systemd 261: the
+/// SIGTERM handler runs, the result is still `watchdog`, and on-failure
+/// restarts. The abort window must be set, and shorter than the ordinary stop
+/// window, or a starved runtime waits the full `TimeoutStopSec` for SIGKILL.
+#[test]
+fn a_watchdog_timeout_asks_for_the_graceful_stop() {
+    let unit = daemon_unit();
+    assert_eq!(
+        unit_value(&unit, "WatchdogSignal").as_deref(),
+        Some("SIGTERM")
+    );
+    let abort = unit_secs(&unit, "TimeoutAbortSec");
+    assert!(
+        abort > 0 && abort < unit_secs(&unit, "TimeoutStopSec"),
+        "TimeoutAbortSec={abort} must be set and shorter than TimeoutStopSec"
+    );
+}
+
 /// [SAFETY] Under `Type=notify` the whole start-up — the startup delay included —
 /// runs inside `TimeoutStartSec=`. The manager's default is a distribution choice
 /// (CachyOS ships 15 s), so the unit must pin a value above the longest delay the

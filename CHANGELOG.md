@@ -17,6 +17,18 @@ whose devices take more than about ten seconds to suspend and resume, the daemon
 may be restarted as the machine wakes; a systemd drop-in raising `WatchdogSec`
 avoids it there.
 
+**OpenFan fans no longer stop at whatever speed the daemon last gave them**
+(`TS-j`, `TS-y`, DEC-388). An OpenFan channel has no firmware behaviour to fall back
+to, so after the daemon stopped it held its last speed indefinitely — 20 % if the
+machine was idle at the time, even under a heavy load that followed. On a clean
+stop each channel the daemon drove is now left at its last speed or the **exit
+minimum**, whichever is higher (50 % by default), and at 100 % if the daemon had
+lost track of its speed. The same applies to motherboard headers that have no
+automatic mode to hand back to. Set the minimum in the GUI (Settings → Daemon
+Configuration → Exit minimum), with `POST /config/exit-floor`, or with
+`[shutdown] exit_floor_pct`; it applies at once, and 0 turns it off. A crash cannot
+run it, since nothing outside the daemon can reach the OpenFan controller.
+
 ### Fixed
 
 **The daemon now gives each motherboard fan back exactly the way it found it**
@@ -94,6 +106,12 @@ is fast again. The startup delay is also capped at 30 seconds when it is set by
 hand in `runtime.toml`, as it already was everywhere else, because systemd now
 waits for the daemon to finish starting.
 
+**A watchdog restart is now a graceful stop** (DEC-388). When the watchdog finds
+the control loop hung, systemd now asks the daemon to stop, so its normal shutdown
+— the exit minimum included — runs before the restart; if it cannot within 10
+seconds it is killed. The daemon's stop timeout rises from 30 to 40 seconds to
+cover the two new shutdown steps.
+
 **A thermal emergency stays at 100 % until the CPU is measured cool again**
 (DEC-386). If the CPU temperature sensor disappeared entirely during an emergency,
 the daemon used to drop the fans to 40 %. It now holds 100 % whether the sensor has
@@ -122,8 +140,8 @@ shutdown, so the next start records whatever that left — Thermal Cruise on an
 nct6775 board — until the next reboot resets every header. And because the
 daemon running during the upgrade predates the watchdog, systemd restarts it onto
 the new version by itself when pacman reloads systemd at the end of the upgrade:
-the journal shows one "Watchdog timeout" and a core dump for the old process. That
-is expected, and happens once.
+the journal shows one "Watchdog timeout" for the old process. That is expected, and
+happens once.
 
 ### Documentation
 

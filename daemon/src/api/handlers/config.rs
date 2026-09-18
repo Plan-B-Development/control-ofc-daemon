@@ -681,6 +681,9 @@ pub fn effective_on_disk_paths(
     if let Some(e) = runtime.enable_nvidia_telemetry() {
         cfg.detection.enable_nvidia_telemetry = e;
     }
+    if let Some(p) = runtime.exit_floor_pct() {
+        cfg.shutdown.exit_floor_pct = p;
+    }
     // DEC-270: the same clamp `apply_runtime_overlay` applies, for the same
     // reason the doc comment above gives. Without it this copy reports the
     // hand-edited value while the process runs the clamped one, so
@@ -689,6 +692,9 @@ pub fn effective_on_disk_paths(
     if cfg.polling.poll_interval_ms > crate::health::cache::MAX_SUPERVISABLE_POLL_INTERVAL_MS {
         cfg.polling.poll_interval_ms = crate::health::cache::MAX_SUPERVISABLE_POLL_INTERVAL_MS;
     }
+    // DEC-388: the same clamp `apply_runtime_overlay` applies to a hand-edited
+    // `runtime.toml`, for the reason the doc comment above gives.
+    cfg.shutdown.exit_floor_pct = cfg.shutdown.exit_floor_pct.min(100);
     (cfg, runtime)
 }
 
@@ -752,7 +758,8 @@ pub async fn get_config_handler(
     };
 
     let keys = vec![
-        // The ONLY key that applies live: `update_profile_search_dirs_handler`
+        // One of the two keys that apply live (the other is
+        // `shutdown.exit_floor_pct`, below): `update_profile_search_dirs_handler`
         // swaps `state.profile_search_dirs` in-process, and SIGHUP re-applies it
         // too. So `requires_restart` is false, and the running value is read
         // from that live lock rather than from `running_config` (which is frozen
@@ -839,6 +846,21 @@ pub async fn get_config_handler(
                 "also requires the /dev/nvidia* systemd drop-in \
                  (nvidia-telemetry.conf.example)",
             ),
+        ),
+        // DEC-388: applies LIVE, like the search dirs — the handler updates the
+        // running daemon as well as `runtime.toml`, and the shutdown reads the
+        // value in force at the moment of the stop. So the running value comes
+        // from the cache rather than the frozen `running_config`, and nothing is
+        // ever owed to a restart.
+        config_key(
+            "shutdown.exit_floor_pct",
+            serde_json::json!(disk.shutdown.exit_floor_pct),
+            serde_json::json!(state.cache.exit_floor_pct()),
+            runtime.exit_floor_pct().is_some(),
+            admin_has("shutdown.exit_floor_pct"),
+            true,
+            false,
+            None,
         ),
         // Read-only by design (DEC-243). Editing either from an unprivileged
         // client is self-destructive: a bad socket path locks every client out
@@ -1112,6 +1134,65 @@ pub async fn update_serial_timeout_handler(
     };
     runtime.set_serial_timeout_ms(Some(ms));
     persist_runtime(&state, &runtime, "serial.timeout_ms", serde_json::json!(ms)).await
+}
+
+/// POST /config/exit-floor — `{"exit_floor_pct": 0..=100}` (DEC-388).
+///
+/// The lowest duty a clean stop leaves an output at when it has no firmware
+/// mode to be given back to (OpenFan channels, hwmon headers with no
+/// `pwmN_enable`); `0` turns the exit floor off. **Applies live**, unlike the
+/// DEC-243 setters: the value is persisted first and only then put in force, so
+/// a failed persist changes nothing — the same order the search-dir setter
+/// uses. The full range is allowed: every value is safe, since the floor can
+/// only raise a duty, never lower one.
+pub async fn update_exit_floor_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let pct = match body.get("exit_floor_pct").and_then(|v| v.as_u64()) {
+        Some(v) if v <= 100 => v as u8,
+        Some(v) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(format!("exit_floor_pct must be 0-100, got {v}")),
+            );
+        }
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation("missing 'exit_floor_pct' (integer 0-100)"),
+            );
+        }
+    };
+    let (_config_guard, mut runtime) = match runtime_for_update(&state).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    runtime.set_exit_floor_pct(pct);
+    let runtime_owned = runtime.clone();
+    let path = state.runtime_config_path.clone();
+    if let Err(e) = super::persist_off_runtime(move || runtime_owned.save_to(&path)).await {
+        log::error!(
+            "Failed to persist shutdown.exit_floor_pct to {}: {e}",
+            state.runtime_config_path.display()
+        );
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::persistence_failed("failed to persist runtime configuration"),
+        );
+    }
+    state.cache.set_exit_floor_pct(pct);
+    log::info!("shutdown.exit_floor_pct set to {pct} (in force now)");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "api_version": API_VERSION,
+            "updated": true,
+            "key": "shutdown.exit_floor_pct",
+            "value": pct,
+            "note": "In force now; applies at the daemon's next stop",
+        })),
+    )
 }
 
 /// Shared body parse for the two `[detection]` opt-ins.

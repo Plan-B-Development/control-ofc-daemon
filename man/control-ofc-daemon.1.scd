@@ -82,8 +82,9 @@ _/run/control-ofc/control-ofc.sock_
 
 *SIGHUP*
 	Reload configuration from daemon.toml and runtime.toml without
-	restarting. Only the *profile search directories* are re-applied to
-	the running daemon. Every other key -- polling interval, serial port
+	restarting. Only the *profile search directories* and the *exit
+	floor* (*[shutdown] exit_floor_pct*) are re-applied to the running
+	daemon. Every other key -- polling interval, serial port
 	and timeout, socket path, state directory, startup delay, and the
 	*[detection]* opt-ins -- is consumed once at process start, so
 	changing it requires a restart. *GET /config* reports which keys have

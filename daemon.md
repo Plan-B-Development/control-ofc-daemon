@@ -430,7 +430,7 @@ gating each have their own register rows and regression tests.
    - Replays the hwmon hand-back record (DEC-382): each header the daemon took gets back exactly what it had — its recorded `pwm_enable`, or its duty if it was already manual — confirmed by read-back, with `fancontrol`'s full-speed fallback; headers the daemon never took are not touched. Runs once the daemon has exited, whatever ended it — a requested stop, a crash, a SIGKILL, a watchdog kill (DEC-387)
    - Resets GPU fan curves to automatic
    - Re-enables `fan_zero_rpm_enable=1` for every GPU exposing it (DEC-100 — closes the SIGKILL/OOM path the panic hook can't cover)
-   - **What it cannot do is end a stall, and this qualification is load-bearing.** `ExecStopPost` runs after *every* exit, the `Restart=on-failure` path included — systemd runs it before scheduling the restart (`systemd.service(5)`: also when the service "exited unexpectedly"; measured on systemd 261, DEC-387). But it runs only once the process HAS exited, so a restore stalled inside the daemon would hold it off for good. That is why the in-process restore in `main.rs` is bounded (DEC-278/279: `restore_gpu_fans_to_auto` then `hand_back_hwmon`, each on its own deadline), and why, since DEC-387, a self-stop announces itself with `STOPPING=1` so that systemd's `TimeoutStopSec=` bounds it too. OpenFan channels are outside both mechanisms: USB-serial, with no firmware mode to return to. *(Corrected by DEC-387, `TS-k`: 278-b said this script "does not run at all" when the daemon exits non-zero and is restarted. It does; the load-bearing fact was always the stall, not the path.)*
+   - **What it cannot do is end a stall, and this qualification is load-bearing.** `ExecStopPost` runs after *every* exit, the `Restart=on-failure` path included — systemd runs it before scheduling the restart (`systemd.service(5)`: also when the service "exited unexpectedly"; measured on systemd 261, DEC-387). But it runs only once the process HAS exited, so a restore stalled inside the daemon would hold it off for good. That is why the in-process restore in `main.rs` is bounded (DEC-278/279: `restore_gpu_fans_to_auto` then `hand_back_hwmon`, each on its own deadline), and why, since DEC-387, a self-stop announces itself with `STOPPING=1` so that systemd's `TimeoutStopSec=` bounds it too. OpenFan channels are out of `ExecStopPost`'s reach — USB-serial, with no firmware mode to return to: a clean stop leaves them at the exit floor (item 11), a crash at their last duty. *(Corrected by DEC-387, `TS-k`: 278-b said this script "does not run at all" when the daemon exits non-zero and is restarted. It does; the load-bearing fact was always the stall, not the path.)*
 
 7. **Kernel-version regression catalogue** (`hwmon/kernel_warnings.rs`, DEC-098):
    - Curated list of published amdgpu regressions keyed by kernel version + GPU PCI device ID
@@ -463,8 +463,10 @@ gating each have their own register rows and regression tests.
     keep-alive (`WATCHDOG=1`) is sent from `TickCompletion::drop` and nowhere
     else, so it measures exactly "a tick completed". A slow or wedged *device*
     does not stop it: since DEC-289 the loop keeps ticking past a write that has
-    not returned. On a timeout systemd SIGABRTs the daemon, runs `ExecStopPost`
-    and restarts it; restarts back off exponentially (3 s → 60 s) instead of
+    not returned. On a timeout systemd asks the daemon to stop (`WatchdogSignal=SIGTERM`,
+    DEC-388 — so the graceful stop, exit floor included, runs) and SIGKILLs it
+    after `TimeoutAbortSec=10` if it cannot, then runs `ExecStopPost` and
+    restarts it; restarts back off exponentially (3 s → 60 s) instead of
     hitting a start limit, and the daemon sends `RESTART_RESET=1` after five
     minutes of completed ticks so an unrelated later fault restarts fast again.
     `READY=1` is sent once the engine is ticking, the API is serving and SIGTERM
@@ -477,6 +479,23 @@ gating each have their own register rows and regression tests.
     user space is frozen while devices suspend and resume, and that stretch counts
     against the watchdog, so hardware whose device suspend and resume exceed ~10 s
     can see the daemon restarted at resume (`TS-ao`).
+
+11. **Exit floor** (`main.rs::apply_exit_floor`, DEC-388, `TS-j`/`TS-y`): on a
+    clean stop, every output the daemon cannot give back to firmware is left at
+    `max(its last duty, [shutdown] exit_floor_pct)` — default 50 %, settable live
+    via `POST /config/exit-floor` — or at 100 % where the daemon wrote it but no
+    longer knows its duty (a failed reply, a reconnect). That is each OpenFan
+    channel the daemon has written (serial, no firmware curve) and each hwmon
+    header with no `pwmN_enable`; outputs it never wrote are left alone, headers
+    WITH a mode switch are DEC-382's hand-back, and `0` turns it off. It runs FIRST
+    in the restore, because a watchdog stop's abort window is 10 s — enough while
+    the hung engine is the only task that will not drain — and it latches: once it
+    has run, `FanController::set_pwm` raises any lower command to it, so an OpenFan
+    calibration still running inside its request or an engine write that outlived
+    the drains cannot take a channel back down (a no-mode header has no latch yet,
+    `TS-ar`). `ExecStopPost`
+    cannot repeat it — serial is out of its reach — so after a crash or SIGKILL
+    those outputs keep their last duty.
 
 ## Running
 
@@ -507,7 +526,8 @@ Configuration lives in two files (see `docs/ADRs/002-runtime-config-split.md`):
 - **Runtime config** — `{state_dir}/runtime.toml`
   (default `/var/lib/control-ofc/runtime.toml`).
   Managed by the daemon. Holds the keys that API endpoints mutate at
-  runtime: `[profiles] search_dirs`, `[startup] delay_secs`, and
+  runtime: `[profiles] search_dirs`, `[startup] delay_secs`,
+  `[shutdown] exit_floor_pct` (DEC-388) and
   `[hardware] preferred_cpu_sensor` / `preferred_mb_sensor` (DEC-200). Written
   with 0600 permissions via atomic tmp+rename.
 
@@ -866,6 +886,7 @@ that run. Thermal safety never depended on this — the forced-duty branch runs 
 | POST | `/config/poll-interval` | Set the sensor/fan poll interval, 250-2000 ms (DEC-243; persists to `runtime.toml`, restart to apply). **[SAFETY]** the ceiling bounds how stale a temperature the thermal-emergency rule can act on |
 | POST | `/config/serial-port` | Set the OpenFan serial device (`null` = auto-detect). Validated against the transport's own allowlist and capped at 256 chars; a configured port that fails to open **or fails to answer the `ReadAllRpm` handshake** falls back to auto-detection, so neither a bad value nor a wrong-but-openable device can remove OpenFan control. DEC-243 / DEC-250; restart to apply |
 | POST | `/config/serial-timeout` | Set the serial read timeout, 50-1000 ms (DEC-243; restart to apply). **[SAFETY]** bounds emergency `force_all_with_floor` latency |
+| POST | `/config/exit-floor` | Set the exit floor, `{"exit_floor_pct": 0-100}` (DEC-388): the lowest speed a clean stop leaves a fan the daemon cannot hand back to firmware at. **Applies live** — persisted, then put in force — so `GET /config` reports `shutdown.exit_floor_pct` with `requires_restart: false`. Gated by `control.exit_floor`; 503 `persistence_failed` on write error |
 | POST | `/config/allow-port-probe` | Opt into the active Super-I/O probe (DEC-243). **Also needs the `CAP_SYS_RAWIO` drop-in** — the flag alone does not enable it |
 | POST | `/config/nvidia-telemetry` | Opt into read-only NVML telemetry (DEC-243). **Also needs the `/dev/nvidia*` drop-in** |
 | POST | `/config/startup-delay` | Set startup delay seconds, 0-30 (persists to `runtime.toml`, takes effect on restart; 503 `persistence_failed` on write error). Since 2.23.0 the reply also carries the shared DEC-243 setter shape (`key`/`value`) alongside the original `delay_secs`, so one client parser covers every `POST /config/*` |

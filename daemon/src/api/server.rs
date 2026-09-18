@@ -238,6 +238,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/config/startup-delay",
             post(handlers::update_startup_delay_handler),
         )
+        // DEC-388: the clean-stop exit floor. Applies live, not at next start.
+        .route(
+            "/config/exit-floor",
+            post(handlers::update_exit_floor_handler),
+        )
         // Persisted preferred CPU / motherboard sensor (Phase 5, DEC-200). Set
         // via {"sensor_id": "<id>"} or clear via {"sensor_id": null}. Advisory —
         // thermal safety still uses the hottest CpuTemp.

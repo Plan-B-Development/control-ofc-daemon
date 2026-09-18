@@ -5509,6 +5509,98 @@ async fn poll_interval_rejects_out_of_range() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// [SAFETY] DEC-388. The exit floor applies LIVE: the POST puts it in force as
+/// well as persisting it, `GET /config` reports the running value from the cache
+/// with nothing owed to a restart, and the build that serves the route also
+/// advertises the capability a client gates its control on (the DEC-334 shape,
+/// from the daemon's side).
+#[tokio::test]
+async fn the_exit_floor_applies_live_and_is_advertised() {
+    let (state, _tmp) = config_test_state("");
+    let cache = state.cache.clone();
+    let runtime_path = state.runtime_config_path.clone();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (_status, caps) = uds_get(&path, "/capabilities").await;
+    assert_eq!(
+        caps["control"]["exit_floor"], true,
+        "this daemon serves POST /config/exit-floor but does not advertise it: {caps}"
+    );
+    assert_eq!(
+        cache.exit_floor_pct(),
+        control_ofc_daemon::constants::DEFAULT_EXIT_FLOOR_PCT,
+        "precondition: the default is in force"
+    );
+
+    let (status, json) = uds_post(
+        &path,
+        "/config/exit-floor",
+        &serde_json::json!({"exit_floor_pct": 70}),
+    )
+    .await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json["value"], 70);
+    assert_eq!(
+        cache.exit_floor_pct(),
+        70,
+        "in force at once, not at the next start"
+    );
+    assert_eq!(
+        control_ofc_daemon::runtime_config::RuntimeConfig::load_from(&runtime_path)
+            .exit_floor_pct(),
+        Some(70),
+        "and persisted, so the next start keeps it"
+    );
+
+    let (_status, cfg) = uds_get(&path, "/config").await;
+    let key = cfg["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["key"] == "shutdown.exit_floor_pct")
+        .expect("GET /config reports the exit floor");
+    assert_eq!(key["value"], 70);
+    assert_eq!(
+        key["running_value"], 70,
+        "read live, not from the frozen startup config"
+    );
+    assert_eq!(key["source"], "runtime");
+    assert_eq!(key["requires_restart"], false);
+    assert_eq!(key["restart_pending"], false);
+    assert_eq!(cfg["restart_pending"], false);
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn the_exit_floor_rejects_out_of_range_and_changes_nothing() {
+    let (state, _tmp) = config_test_state("");
+    let cache = state.cache.clone();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+    let before = cache.exit_floor_pct();
+
+    for bad in [
+        serde_json::json!({"exit_floor_pct": 101}),
+        serde_json::json!({"exit_floor_pct": 255}),
+        serde_json::json!({"exit_floor_pct": -1}),
+        serde_json::json!({"exit_floor_pct": "50"}),
+        serde_json::json!({}),
+    ] {
+        let (status, json) = uds_post(&path, "/config/exit-floor", &bad).await;
+        assert_eq!(status, 400, "{bad} must be rejected: {json}");
+        assert_eq!(json["error"]["code"], "validation_error");
+    }
+    assert_eq!(
+        cache.exit_floor_pct(),
+        before,
+        "a rejected write changes nothing"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
 #[tokio::test]
 async fn serial_port_is_confined_to_dev() {
     // The daemon opens this path as root. Without confinement an unprivileged

@@ -27,6 +27,9 @@ pub struct DaemonConfig {
 
     #[serde(default)]
     pub detection: DetectionConfig,
+
+    #[serde(default)]
+    pub shutdown: ShutdownConfig,
 }
 
 /// Serial port configuration.
@@ -234,6 +237,31 @@ pub struct DetectionConfig {
     pub enable_nvidia_telemetry: bool,
 }
 
+/// What the daemon leaves behind when it stops (DEC-388).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShutdownConfig {
+    /// The lowest duty, in percent, that a clean stop leaves an output at when
+    /// the output has no firmware mode to be given back to — an OpenFan channel,
+    /// or an hwmon header with no `pwmN_enable`. Each gets `max(its last duty,
+    /// this)`; `0` holds the last duty exactly, as before DEC-388. Applies live:
+    /// the value in force at the moment of the stop is the one used.
+    #[serde(default = "default_exit_floor_pct")]
+    pub exit_floor_pct: u8,
+}
+
+impl Default for ShutdownConfig {
+    fn default() -> Self {
+        Self {
+            exit_floor_pct: default_exit_floor_pct(),
+        }
+    }
+}
+
+fn default_exit_floor_pct() -> u8 {
+    crate::constants::DEFAULT_EXIT_FLOOR_PCT
+}
+
 impl DaemonConfig {
     /// Parse configuration from a TOML string.
     pub fn from_toml(input: &str) -> Result<Self, ConfigError> {
@@ -280,6 +308,13 @@ impl DaemonConfig {
             return Err(ConfigError::Validation {
                 field: "startup.delay_secs".into(),
                 message: format!("must be <= {}", crate::constants::MAX_STARTUP_DELAY_SECS),
+            });
+        }
+
+        if self.shutdown.exit_floor_pct > 100 {
+            return Err(ConfigError::Validation {
+                field: "shutdown.exit_floor_pct".into(),
+                message: "must be 0-100".into(),
             });
         }
 
@@ -467,5 +502,24 @@ delay_secs = 60
         let config = DaemonConfig::from_toml(toml).unwrap();
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("startup.delay_secs"));
+    }
+
+    #[test]
+    fn the_exit_floor_defaults_to_fifty_and_parses() {
+        let config = DaemonConfig::from_toml("").unwrap();
+        assert_eq!(
+            config.shutdown.exit_floor_pct,
+            crate::constants::DEFAULT_EXIT_FLOOR_PCT
+        );
+        let config = DaemonConfig::from_toml("[shutdown]\nexit_floor_pct = 70\n").unwrap();
+        assert_eq!(config.shutdown.exit_floor_pct, 70);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn an_exit_floor_above_100_is_rejected() {
+        let config = DaemonConfig::from_toml("[shutdown]\nexit_floor_pct = 101\n").unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("shutdown.exit_floor_pct"));
     }
 }

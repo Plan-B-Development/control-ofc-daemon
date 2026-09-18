@@ -550,6 +550,10 @@ fn apply_runtime_overlay(config: &mut DaemonConfig, runtime: &RuntimeConfig, adm
         log::info!("runtime.toml overrides [detection] enable_nvidia_telemetry = {enable}");
         config.detection.enable_nvidia_telemetry = enable;
     }
+    if let Some(pct) = runtime.exit_floor_pct() {
+        log::info!("runtime.toml overrides [shutdown] exit_floor_pct = {pct}");
+        config.shutdown.exit_floor_pct = pct;
+    }
 
     // Sanity: if the admin config *also* has non-default runtime-mutable keys,
     // the runtime values still win — but warn so the admin knows their edits
@@ -588,6 +592,16 @@ fn apply_runtime_overlay(config: &mut DaemonConfig, runtime: &RuntimeConfig, adm
         );
         config.polling.poll_interval_ms = MAX_SUPERVISABLE_POLL_INTERVAL_MS;
     }
+
+    // DEC-388: `daemon.toml` validation refuses more than 100, but `runtime.toml`
+    // is not re-validated. A duty above 100 % means nothing to either backend.
+    if config.shutdown.exit_floor_pct > 100 {
+        log::warn!(
+            "[shutdown] exit_floor_pct = {} is above 100 — using 100",
+            config.shutdown.exit_floor_pct
+        );
+        config.shutdown.exit_floor_pct = 100;
+    }
 }
 
 /// Reload the daemon config and runtime overlay, updating the shared
@@ -612,6 +626,7 @@ fn apply_config_reload(
     runtime_config_path: &Path,
     profile_search_dirs: &parking_lot::RwLock<Vec<std::path::PathBuf>>,
     degraded: &parking_lot::RwLock<Option<RuntimeConfigDegraded>>,
+    cache: &StateCache,
 ) -> Result<Vec<std::path::PathBuf>, String> {
     let mut new_config =
         DaemonConfig::load(config_path).map_err(|e| format!("config reload failed: {e}"))?;
@@ -658,6 +673,9 @@ fn apply_config_reload(
     );
     log::info!("Config reloaded — profile search dirs: {:?}", new_dirs);
     *profile_search_dirs.write() = new_dirs.clone();
+    // DEC-388: the exit floor applies live, so a reload re-applies it as it does
+    // the search dirs.
+    cache.set_exit_floor_pct(new_config.shutdown.exit_floor_pct);
     Ok(new_dirs)
 }
 
@@ -834,6 +852,173 @@ const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 /// extension only ever moves the start deadline later, so a generous value
 /// costs nothing but a slower kill of a start that has genuinely stopped.
 const BOOT_PROBE_EXTENSION_SLACK: Duration = Duration::from_secs(30);
+
+/// What the exit floor did (DEC-388). Returned, like [`HwmonRestore`], so the
+/// outcome is testable without log capture.
+#[derive(Debug, PartialEq, Eq)]
+enum ExitFloor {
+    /// `exit_floor_pct` is 0: every output keeps the duty it holds.
+    Off,
+    /// Both steps ran. `raised` outputs were written up to their exit duty and
+    /// `failed` writes did not land; outputs already at or above it are in
+    /// neither count.
+    Done { raised: usize, failed: usize },
+    /// A controller was still locked — a wedged write holds it — or a step
+    /// outlived its deadline, so some outputs keep their last duty.
+    Incomplete,
+}
+
+/// The exit floor (DEC-388, `TS-j`, `TS-y`): on a clean stop, every output the
+/// daemon cannot give back to firmware is left at `max(its last duty, the
+/// floor)`, or at full speed where that duty is unknown. That is each OpenFan
+/// channel the daemon has written — serial, no firmware curve, so it holds
+/// whatever a stop leaves it at — and each hwmon header with no `pwmN_enable`.
+/// Outputs the daemon never wrote are left alone.
+///
+/// **Runs FIRST in the restore closure, and that is load-bearing.** Since
+/// DEC-388 a watchdog timeout sends SIGTERM rather than SIGABRT, so a hung loop
+/// takes this path too — but under `TimeoutAbortSec=10`, not the ordinary
+/// `TimeoutStopSec`.
+/// The engine drain (3 s) plus these two steps (at most 3 s each) fit inside
+/// that when the hung engine is the only task that will not drain; a deadlock
+/// that also stalls the IPC server or a poll task costs up to 3 s more per
+/// stuck drain, and SIGKILL can then land before this runs. The GPU reset and
+/// hwmon hand-back that follow may be cut too, but `ExecStopPost` repeats both.
+/// It cannot repeat this: serial is out of its reach, and it has no record of a
+/// no-mode header's duty.
+///
+/// **Taking a controller's lock is not proof the engine is done with it.** A
+/// final batch that outlived the drains locks per channel (DEC-099), so it can
+/// resume between this step's writes. For OpenFan that is harmless: the floor
+/// latches in `FanController` and `set_pwm` raises anything lower to it — which
+/// also covers a calibration sweep still running inside an HTTP request that
+/// outlived the server drain. A no-mode hwmon header has no such latch yet, so a
+/// changed engine duty can still land after it (`TS-ar`).
+///
+/// Bounded like its siblings: each backend's lock wait and its writes run on a
+/// detached thread under `step_timeout`, one step per backend so a wedged serial
+/// link cannot keep the headers from being reached.
+fn apply_exit_floor(
+    openfan: Option<Arc<Mutex<FanController>>>,
+    hwmon: Option<Arc<Mutex<HwmonPwmController>>>,
+    floor_pct: u8,
+    step_timeout: Duration,
+) -> ExitFloor {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    if floor_pct == 0 {
+        log::info!(
+            "exit floor is 0 — OpenFan channels and headers with no mode switch keep \
+             the duty they hold"
+        );
+        return ExitFloor::Off;
+    }
+    let raised = Arc::new(AtomicUsize::new(0));
+    let failed = Arc::new(AtomicUsize::new(0));
+    let complete = Arc::new(AtomicBool::new(true));
+
+    if let Some(ctrl) = openfan {
+        let (r, f, c) = (raised.clone(), failed.clone(), complete.clone());
+        let finished = run_bounded("exit-floor-openfan", step_timeout, move || {
+            let Some(mut guard) = ctrl.try_lock_for(step_timeout) else {
+                c.store(false, SeqCst);
+                log::error!(
+                    "OpenFan controller still locked after {}s — its channels keep their \
+                     last duty",
+                    step_timeout.as_secs()
+                );
+                return;
+            };
+            for w in guard.apply_exit_floor(floor_pct) {
+                match &w.result {
+                    Ok(done) if done.coalesced => {}
+                    Ok(_) => {
+                        r.fetch_add(1, SeqCst);
+                        log::info!(
+                            "OpenFan channel {}: left at {} % on stop (was {})",
+                            w.channel,
+                            w.target_pct,
+                            w.was_pct
+                                .map_or("unknown".to_string(), |p| format!("{p} %"))
+                        );
+                    }
+                    Err(e) => {
+                        f.fetch_add(1, SeqCst);
+                        log::error!(
+                            "OpenFan channel {}: the {} % exit floor did not land ({e}) — it \
+                             keeps its last duty",
+                            w.channel,
+                            w.target_pct
+                        );
+                    }
+                }
+            }
+        });
+        if !finished {
+            complete.store(false, SeqCst);
+            log::error!(
+                "OpenFan exit floor did not finish within {}s — the link is not \
+                 responding; channels not yet written keep their last duty",
+                step_timeout.as_secs()
+            );
+        }
+    }
+
+    if let Some(ctrl) = hwmon {
+        let (r, f, c) = (raised.clone(), failed.clone(), complete.clone());
+        let finished = run_bounded("exit-floor-hwmon", step_timeout, move || {
+            let Some(mut guard) = ctrl.try_lock_for(step_timeout) else {
+                c.store(false, SeqCst);
+                log::error!(
+                    "hwmon controller still locked after {}s — headers with no mode switch \
+                     keep their last duty",
+                    step_timeout.as_secs()
+                );
+                return;
+            };
+            for w in guard.apply_exit_floor(floor_pct) {
+                match &w.result {
+                    None => {}
+                    Some(Ok(())) => {
+                        r.fetch_add(1, SeqCst);
+                        log::info!(
+                            "hwmon {}: left at {} % on stop (was {}) — it has no mode to be \
+                             given back",
+                            w.header_id,
+                            w.target_pct,
+                            w.was_pct
+                                .map_or("unknown".to_string(), |p| format!("{p} %"))
+                        );
+                    }
+                    Some(Err(e)) => {
+                        f.fetch_add(1, SeqCst);
+                        log::error!(
+                            "hwmon {}: the {} % exit floor did not land ({e}) — it keeps its \
+                             last duty",
+                            w.header_id,
+                            w.target_pct
+                        );
+                    }
+                }
+            }
+        });
+        if !finished {
+            complete.store(false, SeqCst);
+            log::error!(
+                "hwmon exit floor did not finish within {}s — a chip is not responding \
+                 to writes",
+                step_timeout.as_secs()
+            );
+        }
+    }
+
+    if !complete.load(SeqCst) {
+        return ExitFloor::Incomplete;
+    }
+    ExitFloor::Done {
+        raised: raised.load(SeqCst),
+        failed: failed.load(SeqCst),
+    }
+}
 
 /// What the hwmon hand-back actually did.
 ///
@@ -1278,8 +1463,9 @@ async fn finish_shutdown<F>(
     // its watchdog on any keep-alive whatever the unit's state, and the engine
     // completes ticks until `shutdown_sequence` stops it — so without this, one
     // late tick would arm a fresh `WatchdogSec` timer over the hardware restore
-    // below, and a restore slower than that would be SIGABRT'd part-way through
-    // handing the fans back. `stopping` disarms the watchdog for good.
+    // below, and a restore slower than that would be killed part-way through
+    // handing the fans back (`WatchdogSignal`, then SIGKILL after
+    // `TimeoutAbortSec`). `stopping` disarms the watchdog for good.
     if let Some(n) = notifier {
         n.stopping();
     }
@@ -1488,6 +1674,8 @@ async fn async_main() {
     if let Some(n) = &notifier {
         cache.attach_notifier(Arc::clone(n));
     }
+    // DEC-388: the exit floor in force until an API write or a SIGHUP changes it.
+    cache.set_exit_floor_pct(config.shutdown.exit_floor_pct);
     let serial_timeout = Duration::from_millis(config.serial.timeout_ms);
 
     // ── Initialize OpenFanController ─────────────────────────────────────────
@@ -2276,6 +2464,7 @@ async fn async_main() {
                     &runtime_config_path,
                     &app_state.profile_search_dirs,
                     &app_state.runtime_config_degraded,
+                    &app_state.cache,
                 ) {
                     log::error!("{e}");
                 }
@@ -2332,6 +2521,19 @@ async fn async_main() {
         SHUTDOWN_TASK_TIMEOUT,
         must_restart,
         || {
+            // [SAFETY] DEC-388: the exit floor FIRST — see `apply_exit_floor` for
+            // why the order is load-bearing under a watchdog stop's shorter abort
+            // timeout. Nothing after it in this closure touches what it reaches,
+            // `ExecStopPost` cannot redo it, and it latches in `FanController`,
+            // so no OpenFan write that outlives the drains can lower a channel
+            // below it (a no-mode hwmon header is not latched yet — `TS-ar`).
+            let _ = apply_exit_floor(
+                app_state.fan_controller.read().clone(),
+                app_state.hwmon_controller.clone(),
+                app_state.cache.exit_floor_pct(),
+                SHUTDOWN_TASK_TIMEOUT,
+            );
+
             // Reset GPU fans to automatic before shutting down (re-enables
             // zero-RPM). Bounded since 278-c: this step runs FIRST, so leaving it
             // unbounded meant a wedged PMFW write blocked here and the bounded
@@ -2648,6 +2850,7 @@ mod tests {
         runtime.set_poll_interval_ms(Some(1500));
         runtime.set_allow_port_probe(Some(true));
         runtime.set_enable_nvidia_telemetry(Some(true));
+        runtime.set_exit_floor_pct(65);
 
         apply_runtime_overlay(&mut config, &runtime, "/etc/control-ofc/daemon.toml");
 
@@ -2656,6 +2859,34 @@ mod tests {
         assert_eq!(config.polling.poll_interval_ms, 1500);
         assert!(config.detection.allow_port_probe);
         assert!(config.detection.enable_nvidia_telemetry);
+        assert_eq!(config.shutdown.exit_floor_pct, 65);
+    }
+
+    /// DEC-388: `runtime.toml` is not re-validated, and a duty above 100 %
+    /// means nothing to either backend — clamped by BOTH copies of the merge.
+    #[test]
+    fn an_exit_floor_above_100_is_clamped_by_both_copies_of_the_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let admin_path = dir.path().join("daemon.toml");
+        std::fs::write(&admin_path, "").unwrap();
+        let runtime_path = dir.path().join("runtime.toml");
+        let mut runtime = RuntimeConfig::default();
+        runtime.set_exit_floor_pct(150);
+        runtime.save_to(&runtime_path).unwrap();
+
+        let mut via_overlay = DaemonConfig::load(admin_path.to_str().unwrap()).unwrap();
+        apply_runtime_overlay(
+            &mut via_overlay,
+            &RuntimeConfig::load_from(&runtime_path),
+            admin_path.to_str().unwrap(),
+        );
+        let (via_api, _) = control_ofc_daemon::api::handlers::config::effective_on_disk_paths(
+            admin_path.to_str().unwrap(),
+            &runtime_path,
+        );
+
+        assert_eq!(via_overlay.shutdown.exit_floor_pct, 100);
+        assert_eq!(via_api.shutdown.exit_floor_pct, 100);
     }
 
     #[test]
@@ -2795,6 +3026,7 @@ mod tests {
         runtime.set_serial_port(Some("/dev/ttyACM2".into()));
         runtime.set_poll_interval_ms(Some(1750));
         runtime.set_allow_port_probe(Some(true));
+        runtime.set_exit_floor_pct(70);
         runtime.save_to(&runtime_path).unwrap();
 
         let mut via_overlay = DaemonConfig::load(admin_path.to_str().unwrap()).unwrap();
@@ -2828,6 +3060,203 @@ mod tests {
             via_api.profiles.search_dirs
         );
         assert_eq!(via_overlay.startup.delay_secs, via_api.startup.delay_secs);
+        assert_eq!(via_overlay.shutdown.exit_floor_pct, 70, "precondition");
+        assert_eq!(
+            via_overlay.shutdown.exit_floor_pct,
+            via_api.shutdown.exit_floor_pct
+        );
+    }
+
+    // ── [SAFETY] DEC-388: the exit floor ─────────────────────────────────
+
+    #[test]
+    fn a_zero_exit_floor_is_off() {
+        assert_eq!(
+            apply_exit_floor(None, None, 0, Duration::from_secs(1)),
+            ExitFloor::Off
+        );
+    }
+
+    /// [SAFETY] Through the REAL controller over real files: a header with no
+    /// mode switch that the daemon left below the floor is raised to it, and a
+    /// header WITH one is left alone — its mode is DEC-382's hand-back to give.
+    #[test]
+    fn the_exit_floor_raises_a_no_mode_header_and_leaves_moded_ones_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let (ctrl, _ledger) = controller_with_taken(
+            vec![
+                handback_header(d, 1, None),
+                handback_header(d, 2, Some("2")),
+            ],
+            &["h1", "h2"],
+        );
+        let raw_60 = control_ofc_daemon::pwm::percent_to_raw(60).to_string();
+        assert_eq!(
+            read_trimmed(&d.join("pwm1")),
+            raw_60,
+            "precondition: taken at 60 %"
+        );
+
+        let outcome = apply_exit_floor(None, Some(ctrl), 80, Duration::from_secs(3));
+
+        assert_eq!(
+            outcome,
+            ExitFloor::Done {
+                raised: 1,
+                failed: 0
+            }
+        );
+        assert_eq!(
+            read_trimmed(&d.join("pwm1")),
+            control_ofc_daemon::pwm::percent_to_raw(80).to_string(),
+            "the no-mode header is raised to the floor"
+        );
+        assert_eq!(
+            read_trimmed(&d.join("pwm2")),
+            raw_60,
+            "the moded header's duty is not the exit floor's to write"
+        );
+        assert_eq!(read_trimmed(&d.join("pwm2_enable")), "1");
+    }
+
+    /// A controller a wedged write still holds cannot be read, so the step gives
+    /// up at its deadline rather than holding the stop — and says so.
+    #[test]
+    fn a_locked_controller_makes_the_exit_floor_incomplete_within_its_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ctrl, _ledger) =
+            controller_with_taken(vec![handback_header(tmp.path(), 1, None)], &["h1"]);
+        let held = ctrl.lock();
+        let started = Instant::now();
+
+        let outcome = apply_exit_floor(
+            None,
+            Some(Arc::clone(&ctrl)),
+            80,
+            Duration::from_millis(150),
+        );
+
+        assert_eq!(outcome, ExitFloor::Incomplete);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the step must give up at its deadline, took {:?}",
+            started.elapsed()
+        );
+        drop(held);
+    }
+
+    /// [SAFETY] The exit floor runs FIRST in the restore. Under a watchdog stop
+    /// the abort window is 10 s, not `TimeoutStopSec`'s 40: the engine drain
+    /// plus these two steps fit inside it, and what follows may not.
+    /// `ExecStopPost` can redo the GPU reset and the hwmon hand-back; it cannot
+    /// redo this.
+    #[test]
+    fn the_exit_floor_runs_first_in_the_restore() {
+        let whole = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let src = whole
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .expect("main.rs has a #[cfg(test)] module");
+        let call = src
+            .find("    finish_shutdown(\n")
+            .expect("async_main calls finish_shutdown");
+        let restore = &src[call..];
+        let floor = restore
+            .find("apply_exit_floor(")
+            .expect("the restore applies the exit floor");
+        let gpu = restore
+            .find("restore_gpu_fans_to_auto(")
+            .expect("GPU reset");
+        let hwmon = restore.find("hand_back_hwmon(").expect("hwmon hand-back");
+        assert!(
+            floor < gpu && floor < hwmon,
+            "the exit floor must run before the GPU reset and the hwmon hand-back"
+        );
+    }
+
+    /// [SAFETY] A watchdog stop is SIGTERM under `TimeoutAbortSec`, which must
+    /// cover the engine drain (the hung engine — assumed to be the only task that
+    /// will not drain; the unit's comment gives the limit of that assumption)
+    /// and both exit-floor steps — each bounded by `SHUTDOWN_TASK_TIMEOUT` — and
+    /// must be shorter than the ordinary `TimeoutStopSec`, or it buys nothing.
+    #[test]
+    fn the_watchdog_abort_window_covers_the_drain_and_the_exit_floor() {
+        let unit = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../packaging/control-ofc-daemon.service"
+        ))
+        .expect("read the daemon unit");
+        let secs = |key: &str| -> u64 {
+            unit.lines()
+                .map(str::trim)
+                .filter(|l| !l.starts_with('#'))
+                .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+                .unwrap_or_else(|| panic!("the unit sets {key}"))
+                .parse()
+                .unwrap_or_else(|_| panic!("{key} is a bare number of seconds"))
+        };
+        let abort = Duration::from_secs(secs("TimeoutAbortSec"));
+        let needed = SHUTDOWN_TASK_TIMEOUT * 3;
+        assert!(
+            abort >= needed,
+            "TimeoutAbortSec {abort:?} cannot fit the engine drain and the two exit-floor \
+             steps ({needed:?})"
+        );
+        assert!(abort < Duration::from_secs(secs("TimeoutStopSec")));
+    }
+
+    /// [SAFETY] The ordinary stop window must cover the bounded stop's worst
+    /// case, as the unit's `TimeoutStopSec` comment derives it: four task drains
+    /// and the runtime teardown, plus every restore step at its deadline — the two
+    /// exit-floor steps (DEC-388), the GPU reset, the hwmon lock and its writes.
+    /// DEC-388's two steps took the old 30 s to within 1 s of that; this fails
+    /// the next time a step is added without the window growing with it.
+    #[test]
+    fn the_stop_window_covers_the_bounded_stop() {
+        let unit = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../packaging/control-ofc-daemon.service"
+        ))
+        .expect("read the daemon unit");
+        let stop: u64 = unit
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with('#'))
+            .find_map(|l| l.strip_prefix("TimeoutStopSec="))
+            .expect("the unit sets TimeoutStopSec")
+            .parse()
+            .expect("TimeoutStopSec is a bare number of seconds");
+        let drains = SHUTDOWN_TASK_TIMEOUT * 4 + RUNTIME_SHUTDOWN_TIMEOUT;
+        let restore = SHUTDOWN_TASK_TIMEOUT * 5;
+        assert!(
+            Duration::from_secs(stop) > drains + restore,
+            "TimeoutStopSec={stop} does not cover the bounded stop ({:?})",
+            drains + restore
+        );
+    }
+
+    /// DEC-388: the exit floor applies live, so a SIGHUP re-applies it from the
+    /// files, as it does the search dirs.
+    #[test]
+    fn a_config_reload_reapplies_the_exit_floor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("daemon.toml");
+        std::fs::write(&config_path, "[shutdown]\nexit_floor_pct = 40\n").unwrap();
+        let runtime_path = tmp.path().join("runtime.toml");
+        let cache = StateCache::new();
+        assert_ne!(cache.exit_floor_pct(), 40, "precondition");
+
+        apply_config_reload(
+            config_path.to_str().unwrap(),
+            &runtime_path,
+            &parking_lot::RwLock::new(Vec::new()),
+            &parking_lot::RwLock::new(None),
+            &cache,
+        )
+        .unwrap();
+
+        assert_eq!(cache.exit_floor_pct(), 40);
     }
 
     // ── [SAFETY] serial port fallback (DEC-243) ──────────────────────────
@@ -3200,7 +3629,7 @@ mod tests {
     /// hardware restore runs. systemd re-arms its watchdog on any keep-alive
     /// whatever the unit's state, and the engine keeps completing ticks until
     /// `shutdown_sequence` stops it, so a disarm that came after the restore
-    /// began would leave a slow restore exposed to a SIGABRT part-way through.
+    /// began would leave a slow restore exposed to a watchdog kill part-way through.
     /// Measured against systemd 261 in DEC-387; this pins the ordering here.
     #[tokio::test]
     async fn stopping_is_announced_before_the_hardware_restore() {
@@ -4242,6 +4671,7 @@ search_dirs = ["/custom/profiles", "/other/profiles"]
             &runtime_path,
             &search_dirs,
             &parking_lot::RwLock::new(None),
+            &StateCache::new(),
         );
         assert!(result.is_ok());
 
@@ -4285,6 +4715,7 @@ search_dirs = ["/custom/profiles", "/other/profiles"]
             &runtime_path,
             &search_dirs,
             &degraded,
+            &StateCache::new(),
         )
         .expect("a corrupt runtime.toml must not fail the reload");
 
@@ -4321,6 +4752,7 @@ search_dirs = ["/custom/profiles", "/other/profiles"]
             &runtime_path,
             &search_dirs,
             &degraded,
+            &StateCache::new(),
         )
         .unwrap();
 
@@ -4364,6 +4796,7 @@ search_dirs = ["/custom/profiles", "/other/profiles"]
             &runtime_path,
             &search_dirs,
             &degraded,
+            &StateCache::new(),
         )
         .expect("a corrupt runtime.toml must still not fail the reload");
 
@@ -4398,6 +4831,7 @@ search_dirs = ["/custom/profiles", "/other/profiles"]
             &runtime_path,
             &search_dirs,
             &degraded,
+            &StateCache::new(),
         )
         .unwrap();
         let first = degraded.read().clone().expect("first failure recorded");
@@ -4413,6 +4847,7 @@ search_dirs = ["/custom/profiles", "/other/profiles"]
             &runtime_path,
             &search_dirs,
             &degraded,
+            &StateCache::new(),
         )
         .unwrap();
         let second = degraded.read().clone().expect("second failure recorded");
@@ -4453,6 +4888,7 @@ search_dirs = ["/etc/control-ofc/profiles"]
             &runtime_path,
             &search_dirs,
             &parking_lot::RwLock::new(None),
+            &StateCache::new(),
         );
         assert!(result.is_ok());
 
@@ -4483,6 +4919,7 @@ search_dirs = ["/etc/control-ofc/profiles"]
             &runtime_path,
             &search_dirs,
             &parking_lot::RwLock::new(None),
+            &StateCache::new(),
         );
         assert!(result.is_err());
 

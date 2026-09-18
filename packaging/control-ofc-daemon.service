@@ -33,9 +33,9 @@ NotifyAccess=main
 # stops cycling — a deadlock, an await that never resolves, a starved runtime.
 # That is the one state DEC-266 cannot see, because the task is alive: every fan
 # holds its last duty and nothing evaluates the thermal ladder. On a timeout
-# systemd sends SIGABRT (a core dump shows where the loop stopped), runs
-# ExecStopPost (which hands the hwmon headers back and resets GPU curves) and
-# restarts the daemon under the backoff below.
+# systemd sends WatchdogSignal (below), runs ExecStopPost (which hands the hwmon
+# headers back and resets GPU curves) and restarts the daemon under the backoff
+# below.
 #
 # A slow or wedged DEVICE does not stop the pings, deliberately: since DEC-289 each
 # backend write is joined for at most one second (WRITE_JOIN_BUDGET), after which
@@ -55,6 +55,25 @@ NotifyAccess=main
 # unit's state, and a late tick would otherwise arm a fresh 15 s over the
 # hardware restore below.
 WatchdogSec=15
+# DEC-388 (TS-al, the user's choice): a watchdog timeout asks for a GRACEFUL stop
+# rather than aborting. Only the in-process stop can apply the exit floor to the
+# OpenFan channels — ExecStopPost cannot reach serial — and a hung LOOP usually
+# leaves the rest of the runtime able to run it. The cost is the core dump that
+# SIGABRT would have left to show where the loop stopped.
+WatchdogSignal=SIGTERM
+# How long that graceful stop gets before SIGKILL — for a watchdog stop only;
+# every other stop keeps TimeoutStopSec. Derived from the ORDER of the stop,
+# ASSUMING the hung engine is the one task that will not drain: its drain
+# (SHUTDOWN_TASK_TIMEOUT, 3 s), then the exit floor, which runs first in the
+# restore (two steps, 3 s each at most). 10 s covers those; the GPU reset and
+# hwmon hand-back after them may be cut, and ExecStopPost repeats both. The
+# assumption is the limit: a deadlock that also stalls an in-flight API request
+# or a poll task costs up to 3 s more per stuck drain, and SIGKILL can then land
+# before the exit floor — those outputs keep their last duty, as before DEC-388.
+# Not raised to cover that: every second here is a second with no thermal
+# ladder, and a runtime too starved to act on SIGTERM at all is killed at 10 s
+# instead of at TimeoutStopSec's 40.
+TimeoutAbortSec=10
 # Pinned, never the manager default: that default is a distribution choice, and
 # CachyOS ships DefaultTimeoutStartSec=15s — under Type=notify the whole start-up
 # runs inside this window, and 15 s would kill a daemon configured with a startup
@@ -131,8 +150,9 @@ RestartMaxDelaySec=60
 # bounding the hwmon half alone achieved nothing. Each step now runs through the
 # shared `run_bounded` helper with its OWN 3 s deadline (DEC-279) — they do not
 # share one deadline between them, so the restore closure's worst case is the
-# SUM: 3 s GPU + 3 s hwmon lock + 3 s hwmon writes = 9 s. See the arithmetic
-# below; reading "bounded" here as a single 3 s step would understate it by 6 s.
+# SUM: 3 s OpenFan exit floor + 3 s hwmon exit floor (both DEC-388, run first) +
+# 3 s GPU + 3 s hwmon lock + 3 s hwmon writes = 15 s. See the arithmetic below;
+# reading "bounded" here as a single 3 s step would understate it by 12 s.
 # Note the honest limit: exiting is guaranteed, restoring the hardware is not. If
 # the chip is genuinely unresponsive nothing can restore it, and those fans hold
 # their last duty until something owns them again.
@@ -141,24 +161,26 @@ RestartMaxDelaySec=60
 # ExecStopPost=control-ofc-restore-auto does and does NOT cover: the script
 # replays the daemon's hand-back record — each hwmon header the daemon holds goes
 # back to what it was doing before the daemon took it (DEC-382), and nothing else
-# is touched — and resets GPU `fan_curve`. OpenFan channels are
-# USB-serial with no firmware-auto to fall back to, so they stay latched at the
-# last commanded duty until a daemon owns them again. Fans hold, never fall — but
-# this is not a full hand-back and must not be read as one.
+# is touched — and resets GPU `fan_curve`. OpenFan channels are USB-serial, out of
+# its reach, and have no firmware-auto to fall back to: a clean stop leaves them at
+# the exit floor first (DEC-388), but after a crash or SIGKILL they stay latched
+# at the last commanded duty until a daemon owns them again. Fans hold, never
+# fall — but this is not a full hand-back and must not be read as one.
 #
 # The number is DERIVED, not picked. An ordinary (non-wedged) stop costs up to
 # SHUTDOWN_TASK_TIMEOUT (3 s) per sequential task drain — four of them — plus
 # RUNTIME_SHUTDOWN_TIMEOUT (2 s): ~14 s worst case. The uncontended restore adds
 # nothing measurable — an uncontended `try_lock_for` returns immediately and the
-# writes complete — while a fully wedged machine adds at most 3 s for the GPU
-# curve reset (278-c), plus 3 s for the hwmon lock, plus 3 s for the hwmon
-# writes: ~23 s in the worst case. (It was ~20 s before 2.22.0 bounded the GPU
-# step — that step was previously unbounded, so the old figure described a case
-# that could not actually be exceeded because it could not actually terminate.)
-# At 23 s a loaded machine whose drains each run near their cap would trip
-# SIGKILL on every routine `systemctl restart` — not a fault, but it WOULD make a
-# genuine wedge look routine in the journal. 30 s keeps a real margin over both
-# paths, and the margin over the new worst case is now 7 s rather than 10 s.
+# writes complete — while a fully wedged machine adds at most 3 s for each exit
+# floor step (DEC-388: OpenFan, then hwmon), 3 s for the GPU curve reset (278-c),
+# 3 s for the hwmon lock and 3 s for the hwmon writes: ~29 s in the worst case.
+# (It was ~23 s before DEC-388 added the two exit-floor steps, and ~20 s before
+# 2.22.0 bounded the GPU step — that step was previously unbounded, so the old
+# figure described a case that could not actually be exceeded because it could
+# not actually terminate.) At 29 s against the old 30 s a loaded machine whose
+# drains each run near their cap would trip SIGKILL on a routine `systemctl
+# restart` — not a fault, but it WOULD make a genuine wedge look routine in the
+# journal. 40 s restores a real margin, 11 s over the new worst case (DEC-388).
 #
 # The drain count stays at four despite 277-c adding rescan-adopted OpenFan poll
 # loops to that same list, and this is worth stating because it looks like it
@@ -171,7 +193,7 @@ RestartMaxDelaySec=60
 # Raise this if the drain budget above ever grows. Lowering it is now a smaller
 # question than it was: with the restore bounded, SIGKILL is no longer what ends
 # a wedged stop, so this cap governs the margin rather than the outcome.
-TimeoutStopSec=30
+TimeoutStopSec=40
 
 # Privilege model: daemon runs as root, declared explicitly via User=root
 # (identical to the prior implicit default — root is what a User=-less system

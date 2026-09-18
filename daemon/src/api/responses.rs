@@ -1074,6 +1074,13 @@ pub struct ControlCapability {
     /// once a session exists.
     #[serde(default)]
     pub validation_auto_stop: bool,
+    /// Daemon applies an exit floor on a clean stop and accepts
+    /// `POST /config/exit-floor`; `GET /config` reports
+    /// `shutdown.exit_floor_pct` (DEC-388). A client must gate on this rather
+    /// than probing: an older daemon 404s the POST and leaves every OpenFan
+    /// channel at its last duty whatever the client shows.
+    #[serde(default)]
+    pub exit_floor: bool,
     /// AIO Phase 8 Batch 1, daemon >= 2.39.0. Gates `GET /diagnostics/preflight`.
     ///
     /// A SEPARATE flag from `control_path_discovery`, deliberately: preflight is

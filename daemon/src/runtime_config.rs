@@ -66,6 +66,11 @@ pub struct RuntimeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detection: Option<RuntimeDetection>,
 
+    /// The exit floor (DEC-388). A new top-level section, so an older daemon
+    /// ignores it rather than failing to parse the file (see the doc above).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shutdown: Option<RuntimeShutdown>,
+
     /// Cooling-device topology (AIO-MB Phase 4, DEC-316).
     ///
     /// **Top-level, deliberately** — not a key under `[hardware]` beside
@@ -139,6 +144,15 @@ pub struct RuntimeProfiles {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeStartup {
     pub delay_secs: u64,
+}
+
+/// Runtime override for `[shutdown]` (DEC-388). Unlike the DEC-243 keys this
+/// one applies live — `POST /config/exit-floor` updates the running daemon as
+/// well as this file — because it is read only at the moment of a stop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeShutdown {
+    pub exit_floor_pct: u8,
 }
 
 /// User-approved hardware selections (Phase 5). Persisted by stable sensor id
@@ -390,6 +404,18 @@ impl RuntimeConfig {
     /// Return the `startup.delay_secs` value if present.
     pub fn startup_delay_secs(&self) -> Option<u64> {
         self.startup.as_ref().map(|s| s.delay_secs)
+    }
+
+    /// Return the `shutdown.exit_floor_pct` value if present (DEC-388).
+    pub fn exit_floor_pct(&self) -> Option<u8> {
+        self.shutdown.as_ref().map(|s| s.exit_floor_pct)
+    }
+
+    /// Set `shutdown.exit_floor_pct`, creating the section if absent.
+    pub fn set_exit_floor_pct(&mut self, pct: u8) {
+        self.shutdown = Some(RuntimeShutdown {
+            exit_floor_pct: pct,
+        });
     }
 
     /// Set `profiles.search_dirs`, creating the section if absent.
@@ -723,6 +749,17 @@ mod tests {
             ]
         );
         assert!(loaded.startup_delay_secs().is_none());
+    }
+
+    #[test]
+    fn roundtrip_exit_floor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("runtime.toml");
+        let mut cfg = RuntimeConfig::default();
+        assert!(cfg.exit_floor_pct().is_none(), "absent until set");
+        cfg.set_exit_floor_pct(65);
+        cfg.save_to(&path).unwrap();
+        assert_eq!(RuntimeConfig::load_from(&path).exit_floor_pct(), Some(65));
     }
 
     #[test]

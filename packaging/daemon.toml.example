@@ -16,6 +16,7 @@
 #   [serial]   timeout_ms             POST /config/serial-timeout     (50-1000)
 #   [detection] allow_port_probe      POST /config/allow-port-probe
 #   [detection] enable_nvidia_telemetry  POST /config/nvidia-telemetry
+#   [shutdown] exit_floor_pct         POST /config/exit-floor         (0-100, applies at once)
 #
 # The API's bounds on the two interval keys are deliberately TIGHTER than what
 # this file accepts: they bound how stale a temperature the thermal emergency
@@ -76,3 +77,13 @@
 # hardware. The open nouveau driver is read via hwmon and needs neither this
 # flag nor the drop-in.
 # enable_nvidia_telemetry = false
+
+[shutdown]
+# The exit floor (DEC-388). On a clean stop, a fan the daemon cannot hand back to
+# firmware — an OpenFan channel, or a motherboard header with no pwmN_enable — is
+# left at max(its last speed, this); one whose speed the daemon no longer knows
+# goes to 100 %. Fans the daemon never drove are left alone. 0 turns it off.
+# Also settable from the GUI (Settings -> Daemon Configuration -> Exit minimum),
+# which applies at once. A crash or SIGKILL cannot run it: OpenFan channels then
+# keep their last speed.
+# exit_floor_pct = 50

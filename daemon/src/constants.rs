@@ -247,6 +247,16 @@ pub const HWMON_FAN_STALE_INTERVALS: u32 = 5;
 /// value's derivation in `packaging/control-ofc-daemon.service` assumes this cap.
 pub const MAX_STARTUP_DELAY_SECS: u64 = 30;
 
+/// The default exit floor, in percent (DEC-388).
+///
+/// On a clean stop, an output the daemon cannot give back to firmware — an
+/// OpenFan channel, or an hwmon header with no `pwmN_enable` — is left at
+/// `max(its last duty, the floor)`. Fifty is the user's choice (2026-09-18):
+/// enough to carry a machine's idle-to-moderate load with no controller
+/// running, quieter than `fancontrol`'s full speed on every restart. Settable
+/// through `[shutdown] exit_floor_pct` and `POST /config/exit-floor`.
+pub const DEFAULT_EXIT_FLOOR_PCT: u8 = 50;
+
 // ── Thermal emergency ────────────────────────────────────────────────
 
 /// CPU temperature (°C) at which the thermal emergency latches, forcing every

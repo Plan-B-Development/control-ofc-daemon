@@ -404,6 +404,8 @@ pub async fn capabilities_handler(
             // optional: an older daemon parses and drops the request field, so
             // a 200 alone does not tell a client the session will stop itself.
             validation_auto_stop: true,
+            // DEC-388: the clean-stop exit floor, its setter and its config key.
+            exit_floor: true,
             // `WIRE-k`: five features that shipped before this block had keys
             // for them, so clients gated on a version string or on a probe's
             // 404. All true here — the flag exists so a client can stop

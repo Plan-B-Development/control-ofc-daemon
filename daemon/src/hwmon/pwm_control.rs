@@ -205,6 +205,28 @@ pub struct HwmonPwmController {
     /// hook read it without this controller's mutex, which a wedged sysfs write
     /// can hold for good.
     handback: Arc<HandBackLedger>,
+    /// Headers with NO `pwmN_enable` this controller has written, and the duty
+    /// each last took (DEC-388, `TS-y`); `None` = written, but whether the last
+    /// write landed is unknown.
+    ///
+    /// Such a header has no mode to take or give back, so DEC-382's ledger does
+    /// not track it — yet its duty register holds the daemon's last write after
+    /// exit. The exit floor reads this. Deliberately NOT `write_state`, which
+    /// `on_lease_released` clears on every profile deactivation: a header the
+    /// deactivated profile left at 20 % would then be invisible at the stop that
+    /// followed while still running at 20 %.
+    exit_record: HashMap<String, Option<u8>>,
+}
+
+/// One header's exit-floor write (DEC-388), for the caller's report.
+#[derive(Debug)]
+pub struct HwmonExitFloorWrite {
+    pub header_id: String,
+    /// What the controller last knew the header held; `None` = unknown.
+    pub was_pct: Option<u8>,
+    pub target_pct: u8,
+    /// `None` when the header already held the target, so nothing was written.
+    pub result: Option<Result<(), HwmonError>>,
 }
 
 impl HwmonPwmController {
@@ -229,7 +251,52 @@ impl HwmonPwmController {
             watchdog_log_state: HashMap::new(),
             verify_mismatch_counts: HashMap::new(),
             handback,
+            exit_record: HashMap::new(),
         }
+    }
+
+    /// The exit floor for headers with no `pwmN_enable` (DEC-388, `TS-y`): leave
+    /// each one this controller has written at `max(its last duty, floor_pct)`,
+    /// or at 100 % where it no longer knows that duty. The same rule as the
+    /// OpenFan channels (`FanController::apply_exit_floor`), because it is the
+    /// same situation: nothing for the firmware to take back. A header this
+    /// controller never wrote is left alone, and a `floor_pct` of 0 turns the
+    /// step off.
+    ///
+    /// Headers WITH `pwmN_enable` are not touched here — DEC-382 hands them back
+    /// to the mode they had. Written straight through the writer, without the
+    /// lease: this is the shutdown, and the engine that held the lease is gone.
+    pub fn apply_exit_floor(&mut self, floor_pct: u8) -> Vec<HwmonExitFloorWrite> {
+        if floor_pct == 0 {
+            return Vec::new();
+        }
+        let mut ids: Vec<String> = self.exit_record.keys().cloned().collect();
+        ids.sort();
+        let mut out = Vec::with_capacity(ids.len());
+        for header_id in ids {
+            let Some(pwm_path) = self.headers.get(&header_id).map(|h| h.pwm_path.clone()) else {
+                continue;
+            };
+            let was_pct = self.exit_record.get(&header_id).copied().flatten();
+            let target_pct = crate::pwm::exit_duty(was_pct, floor_pct);
+            let result = if was_pct == Some(target_pct) {
+                None
+            } else {
+                let written = self
+                    .writer
+                    .write_file(&pwm_path, &percent_to_raw(target_pct).to_string());
+                self.exit_record
+                    .insert(header_id.clone(), written.is_ok().then_some(target_pct));
+                Some(written)
+            };
+            out.push(HwmonExitFloorWrite {
+                header_id,
+                was_pct,
+                target_pct,
+                result,
+            });
+        }
+        out
     }
 
     /// The hand-back ledger (DEC-382). Clone the `Arc` before wrapping the
@@ -584,9 +651,19 @@ impl HwmonPwmController {
 
         // Write PWM value
         let raw = percent_to_raw(effective_pct);
+        if !supports_enable {
+            // DEC-388 (`TS-y`): recorded before the write, as unknown — from here
+            // the header may hold our duty whether or not the write reports
+            // success — and confirmed below once it has.
+            self.exit_record.insert(header_id.to_string(), None);
+        }
         self.writer
             .write_file(&pwm_path, &raw.to_string())
             .map_err(HwmonControlError::Hardware)?;
+        if !supports_enable {
+            self.exit_record
+                .insert(header_id.to_string(), Some(effective_pct));
+        }
 
         // Verify write: read back and compare (best-effort). On mismatch,
         // increment a per-header counter so the discrepancy is observable
@@ -775,6 +852,141 @@ mod tests {
             Some("CHA_FAN2")
         );
         assert!(ctrl.header("missing").is_none());
+    }
+
+    // ── DEC-388 (`TS-y`): the exit floor for headers with no mode switch ──
+
+    /// A header with `pwmN` but no `pwmN_enable` — nothing for firmware to take
+    /// back, so the exit floor is what reaches it.
+    fn no_mode_header(id: &str, n: u8) -> PwmHeaderDescriptor {
+        PwmHeaderDescriptor {
+            supports_enable: false,
+            enable_path: None,
+            pwm_path: format!("/sys/class/hwmon/hwmon0/pwm{n}"),
+            pwm_index: n,
+            ..make_header(id, id, 0)
+        }
+    }
+
+    fn engine_lease(ctrl: &mut HwmonPwmController) -> String {
+        ctrl.lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap()
+            .lease_id
+    }
+
+    /// [SAFETY] A no-mode header the daemon left below the floor is raised to it
+    /// on stop; one above the floor is not rewritten; one it never wrote is left
+    /// alone.
+    #[test]
+    fn the_exit_floor_raises_a_header_with_no_mode_switch() {
+        let (mut ctrl, writes, _cache) = setup_controller(vec![
+            no_mode_header("low", 2),
+            no_mode_header("high", 3),
+            no_mode_header("never", 4),
+        ]);
+        let lease = engine_lease(&mut ctrl);
+        ctrl.set_pwm("low", 30, &lease).unwrap();
+        ctrl.set_pwm("high", 80, &lease).unwrap();
+        let before = writes.lock().len();
+
+        let out = ctrl.apply_exit_floor(50);
+
+        let summary: Vec<_> = out
+            .iter()
+            .map(|w| {
+                (
+                    w.header_id.as_str(),
+                    w.was_pct,
+                    w.target_pct,
+                    w.result.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [("high", Some(80), 80, false), ("low", Some(30), 50, true)]
+        );
+        let new_writes = writes.lock()[before..].to_vec();
+        assert_eq!(
+            new_writes,
+            [(
+                "/sys/class/hwmon/hwmon0/pwm2".to_string(),
+                percent_to_raw(50).to_string()
+            )]
+        );
+    }
+
+    /// A header WITH `pwmN_enable` belongs to DEC-382's hand-back, which gives it
+    /// the mode it had; the exit floor must not write a duty over it.
+    #[test]
+    fn a_header_with_a_mode_switch_is_left_to_the_hand_back() {
+        let (mut ctrl, writes, _cache) = setup_controller(vec![make_header("h1", "CHA_FAN1", 0)]);
+        let lease = engine_lease(&mut ctrl);
+        ctrl.set_pwm("h1", 30, &lease).unwrap();
+        let before = writes.lock().len();
+
+        assert!(ctrl.apply_exit_floor(50).is_empty());
+        assert_eq!(writes.lock().len(), before);
+    }
+
+    /// [SAFETY] The record survives the lease release that a profile
+    /// deactivation performs — `write_state` does not — so a header the
+    /// deactivated profile left at 20 % is still raised at the stop.
+    #[test]
+    fn the_exit_record_survives_a_profile_deactivation() {
+        let (mut ctrl, writes, _cache) = setup_controller(vec![no_mode_header("h", 2)]);
+        let lease = engine_lease(&mut ctrl);
+        ctrl.set_pwm("h", 20, &lease).unwrap();
+        ctrl.on_lease_released();
+        let before = writes.lock().len();
+
+        let out = ctrl.apply_exit_floor(50);
+
+        assert_eq!(
+            out.len(),
+            1,
+            "precondition: the header is still on the record"
+        );
+        assert_eq!((out[0].was_pct, out[0].target_pct), (Some(20), 50));
+        assert_eq!(writes.lock().len(), before + 1);
+    }
+
+    /// [SAFETY] A write that failed leaves the duty unknown, and an unknown duty
+    /// leaves at full speed.
+    #[test]
+    fn a_failed_write_leaves_the_exit_duty_at_full_speed() {
+        let (mut ctrl, writes, _cache) = setup_scripted_controller(
+            vec![no_mode_header("h", 2)],
+            vec![Err(HwmonError::WriteError {
+                path: "/sys/class/hwmon/hwmon0/pwm2".to_string(),
+                message: "EIO".to_string(),
+            })],
+        );
+        let lease = engine_lease(&mut ctrl);
+        assert!(
+            ctrl.set_pwm("h", 30, &lease).is_err(),
+            "precondition: the write failed"
+        );
+
+        let out = ctrl.apply_exit_floor(50);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].was_pct, out[0].target_pct), (None, 100));
+        assert_eq!(
+            writes.lock().last().map(|(_, v)| v.clone()),
+            Some(percent_to_raw(100).to_string())
+        );
+    }
+
+    #[test]
+    fn a_zero_exit_floor_leaves_every_header_alone() {
+        let (mut ctrl, writes, _cache) = setup_controller(vec![no_mode_header("h", 2)]);
+        let lease = engine_lease(&mut ctrl);
+        ctrl.set_pwm("h", 20, &lease).unwrap();
+        let before = writes.lock().len();
+        assert!(ctrl.apply_exit_floor(0).is_empty());
+        assert_eq!(writes.lock().len(), before);
     }
 
     #[test]

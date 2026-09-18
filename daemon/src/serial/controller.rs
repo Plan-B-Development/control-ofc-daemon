@@ -24,6 +24,35 @@ use crate::pwm::percent_to_raw;
 struct ChannelControl {
     last_commanded_pct: Option<u8>,
     stop_started_at: Option<Instant>,
+    /// Whether this controller has ever sent the channel a duty (DEC-388).
+    ///
+    /// Never cleared. A reconnect or a failed reply makes the channel's duty
+    /// UNKNOWN (`last_commanded_pct = None`), which is not the same as never
+    /// having touched it — and the exit floor tells them apart: a channel the
+    /// daemon never wrote is left alone, one whose duty it lost goes to full
+    /// speed.
+    written: bool,
+    /// The lowest duty this channel may be written at from now on (DEC-388):
+    /// latched by [`FanController::apply_exit_floor`] and never cleared.
+    ///
+    /// Once the stop has left a channel at its exit duty, nothing that runs
+    /// after it may lower it — an OpenFan calibration sweep's next step or its
+    /// drop-restore (the sweep runs inside an HTTP request, which outlives the
+    /// server drain), or an engine batch that outlived the task drain.
+    /// [`FanController::set_pwm`] raises any such command to this, under the
+    /// same mutex the floor was applied under, so there is no window between a
+    /// check and a write. Raising is never refused: a forced 100 % still lands.
+    exit_min: Option<u8>,
+}
+
+/// One channel's exit-floor write (DEC-388), for the caller's report.
+#[derive(Debug)]
+pub struct ExitFloorWrite {
+    pub channel: u8,
+    /// What the controller last knew the channel held; `None` = unknown.
+    pub was_pct: Option<u8>,
+    pub target_pct: u8,
+    pub result: Result<SetPwmResult, FanControlError>,
 }
 
 /// Fan controller that serialises access to the OpenFanController.
@@ -83,28 +112,63 @@ impl FanController {
             .and_then(|c| c.last_commanded_pct)
     }
 
-    /// Set PWM on a single channel. `pwm_percent` is 0–100.
+    /// The exit floor (DEC-388, `TS-j`): leave every channel this controller has
+    /// ever written at `max(its last duty, floor_pct)`, or at 100 % where it no
+    /// longer knows that duty. A channel it never wrote is left alone, and a
+    /// `floor_pct` of 0 turns the whole step off — every channel keeps what it
+    /// holds, as before DEC-388.
     ///
-    /// - 0% is allowed for up to `constants::STOP_TIMEOUT` (8s), after which it's rejected.
-    /// - Values are passed through as-is (0–100).
-    /// - If the value equals the last commanded value, the write is coalesced (skipped).
-    pub fn set_pwm(
-        &mut self,
-        channel: u8,
-        pwm_percent: u8,
-    ) -> Result<SetPwmResult, FanControlError> {
-        if channel >= NUM_CHANNELS {
-            return Err(FanControlError::Validation(format!(
-                "channel {channel} out of range (0–{})",
-                NUM_CHANNELS - 1
-            )));
+    /// OpenFan channels have no firmware curve to fall back to, so whatever a
+    /// stop leaves them at they hold until a daemon owns them again. Goes through
+    /// [`Self::set_pwm`], so a channel already at or above the floor coalesces
+    /// and nothing is written to it.
+    ///
+    /// It also LATCHES the floor ([`ChannelControl::exit_min`]): each written
+    /// channel at its exit duty, every other one at `floor_pct`. From then on no
+    /// command can lower a channel below that, whoever sends it — the promise the
+    /// stop logs has to survive the writers that outlive the drains.
+    pub fn apply_exit_floor(&mut self, floor_pct: u8) -> Vec<ExitFloorWrite> {
+        if floor_pct == 0 {
+            return Vec::new();
         }
-        if pwm_percent > 100 {
-            return Err(FanControlError::Validation(format!(
-                "pwm_percent {pwm_percent} out of range (0–100)"
-            )));
+        // A reconnect or resume the next `set_pwm` has not yet seen would leave
+        // `last_commanded_pct` describing a device that may have come back at its
+        // power-on default — observe it first, so such a channel reads UNKNOWN
+        // and goes to full speed rather than to `max(stale, floor)`.
+        self.observe_write_generation();
+        let targets: Vec<(u8, Option<u8>)> = self
+            .channels
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.written)
+            .map(|(ch, c)| (ch as u8, c.last_commanded_pct))
+            .collect();
+        for c in &mut self.channels {
+            c.exit_min = Some(if c.written {
+                crate::pwm::exit_duty(c.last_commanded_pct, floor_pct)
+            } else {
+                floor_pct
+            });
         }
+        targets
+            .into_iter()
+            .map(|(channel, was_pct)| {
+                let target_pct = crate::pwm::exit_duty(was_pct, floor_pct);
+                ExitFloorWrite {
+                    channel,
+                    was_pct,
+                    target_pct,
+                    result: self.set_pwm(channel, target_pct),
+                }
+            })
+            .collect()
+    }
 
+    /// Forget every channel's duty if the device may have lost it (DEC-256).
+    ///
+    /// Called at the top of [`Self::set_pwm`] and of [`Self::apply_exit_floor`],
+    /// which both act on `last_commanded_pct` and must not act on a stale one.
+    fn observe_write_generation(&mut self) {
         // DEC-256: a resume or a serial reconnect means the device may no longer
         // hold what we last commanded — the poll loop swaps the transport
         // underneath us after a USB re-enumeration, and the controller may come
@@ -141,6 +205,47 @@ impl FanController {
                 ch.stop_started_at = None;
             }
         }
+    }
+
+    /// Set PWM on a single channel. `pwm_percent` is 0–100.
+    ///
+    /// - 0% is allowed for up to `constants::STOP_TIMEOUT` (8s), after which it's rejected.
+    /// - Values are passed through as-is (0–100).
+    /// - If the value equals the last commanded value, the write is coalesced (skipped).
+    pub fn set_pwm(
+        &mut self,
+        channel: u8,
+        pwm_percent: u8,
+    ) -> Result<SetPwmResult, FanControlError> {
+        if channel >= NUM_CHANNELS {
+            return Err(FanControlError::Validation(format!(
+                "channel {channel} out of range (0–{})",
+                NUM_CHANNELS - 1
+            )));
+        }
+        if pwm_percent > 100 {
+            return Err(FanControlError::Validation(format!(
+                "pwm_percent {pwm_percent} out of range (0–100)"
+            )));
+        }
+
+        self.observe_write_generation();
+
+        // DEC-388: once the stop's exit floor has run, a command may raise a
+        // channel but never take it below the duty the floor left it at —
+        // raised BEFORE the coalesce check, so a lower command against a channel
+        // already at its exit duty writes nothing.
+        let requested = pwm_percent;
+        let pwm_percent = match self.channels[channel as usize].exit_min {
+            Some(min) if pwm_percent < min => {
+                log::info!(
+                    "OpenFan channel {channel}: {requested} % raised to {min} % — the exit \
+                     floor has already run"
+                );
+                min
+            }
+            _ => pwm_percent,
+        };
 
         let ch_ctrl = &self.channels[channel as usize];
 
@@ -164,6 +269,10 @@ impl FanController {
         let raw = percent_to_raw(effective_pct);
         let ch = Channel::new(channel).map_err(FanControlError::Serial)?;
         let cmd = Command::SetPwm(ch, raw);
+
+        // DEC-388: marked before the frame goes out — a frame whose reply fails
+        // may still have landed, so from here the device may hold our duty.
+        self.channels[channel as usize].written = true;
 
         let mut transport = self.transport.lock();
         let sent = send_command(&mut **transport, &cmd, self.timeout);
@@ -335,6 +444,124 @@ mod tests {
             Arc::new(StateCache::new()),
             Duration::from_millis(500),
         )
+    }
+
+    // ── DEC-388: the exit floor ─────────────────────────────────────
+
+    /// [SAFETY] A channel below the floor is raised to it; one above it is not
+    /// rewritten; one the controller never wrote is left alone entirely.
+    #[test]
+    fn the_exit_floor_raises_written_channels_and_leaves_the_rest() {
+        let (transport, written) = MockTransport::with_ok_responses(3);
+        let mut ctrl = make_controller(transport);
+        ctrl.set_pwm(0, 30).unwrap();
+        ctrl.set_pwm(1, 80).unwrap();
+        let before = written.lock().len();
+
+        let out = ctrl.apply_exit_floor(50);
+
+        let summary: Vec<_> = out
+            .iter()
+            .map(|w| (w.channel, w.was_pct, w.target_pct))
+            .collect();
+        assert_eq!(
+            summary,
+            [(0, Some(30), 50), (1, Some(80), 80)],
+            "only the two written channels, each at max(last, floor)"
+        );
+        assert!(!out[0].result.as_ref().unwrap().coalesced);
+        assert!(
+            out[1].result.as_ref().unwrap().coalesced,
+            "a channel already above the floor is not rewritten"
+        );
+        let frames = written.lock()[before..].to_vec();
+        assert_eq!(frames.len(), 1, "one frame, for channel 0: {frames:?}");
+        assert_eq!(ctrl.last_commanded_pct(0), Some(50));
+    }
+
+    /// [SAFETY] A reconnect or resume makes every duty unknown (DEC-256), and an
+    /// unknown duty leaves at FULL speed — even when no `set_pwm` has run since
+    /// to notice the invalidation, which is the case at a stop.
+    #[test]
+    fn a_channel_whose_duty_was_lost_goes_to_full_speed_on_stop() {
+        let (transport, written) = MockTransport::with_ok_responses(2);
+        let cache = Arc::new(StateCache::new());
+        let mut ctrl = FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            Duration::from_millis(500),
+        );
+        ctrl.set_pwm(3, 40).unwrap();
+        cache.invalidate_openfan_writes();
+
+        let out = ctrl.apply_exit_floor(50);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            (out[0].channel, out[0].was_pct, out[0].target_pct),
+            (3, None, 100)
+        );
+        assert!(!out[0].result.as_ref().unwrap().coalesced);
+        let last = written.lock().last().cloned().unwrap();
+        assert!(
+            last.contains("FF"),
+            "the exit frame carries raw 255 (100 %): {last}"
+        );
+    }
+
+    /// [SAFETY] Nothing that runs after the exit floor can lower a channel
+    /// below it: a calibration sweep's step or its drop-restore, or an engine
+    /// batch that outlived the drain, all write through `set_pwm`. A channel the
+    /// floor had to write is held at its exit duty, one it never wrote at the
+    /// floor itself, and a command above either still lands.
+    #[test]
+    fn nothing_after_the_exit_floor_can_lower_a_channel() {
+        let (transport, written) = MockTransport::with_ok_responses(4);
+        let mut ctrl = make_controller(transport);
+        ctrl.set_pwm(0, 30).unwrap();
+        ctrl.apply_exit_floor(50);
+        assert_eq!(ctrl.last_commanded_pct(0), Some(50), "precondition");
+        let before = written.lock().len();
+
+        let lower = ctrl.set_pwm(0, 20).unwrap();
+        assert_eq!((lower.pwm_percent, lower.coalesced), (50, true));
+        assert_eq!(
+            written.lock().len(),
+            before,
+            "a lower command against a channel at its exit duty writes nothing"
+        );
+        assert_eq!(ctrl.last_commanded_pct(0), Some(50));
+
+        let unwritten = ctrl.set_pwm(1, 10).unwrap();
+        assert_eq!(
+            (unwritten.pwm_percent, unwritten.coalesced),
+            (50, false),
+            "a channel first written after the floor is raised to the floor"
+        );
+        assert_eq!(ctrl.last_commanded_pct(1), Some(50));
+
+        let higher = ctrl.set_pwm(0, 80).unwrap();
+        assert_eq!((higher.pwm_percent, higher.coalesced), (80, false));
+        assert_eq!(ctrl.last_commanded_pct(0), Some(80));
+    }
+
+    /// A floor of 0 turns the exit floor off: nothing is written at all, as
+    /// before DEC-388 — even to a channel whose duty is unknown.
+    #[test]
+    fn a_zero_exit_floor_writes_nothing() {
+        let (transport, written) = MockTransport::with_ok_responses(1);
+        let cache = Arc::new(StateCache::new());
+        let mut ctrl = FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            Duration::from_millis(500),
+        );
+        ctrl.set_pwm(2, 20).unwrap();
+        cache.invalidate_openfan_writes();
+        let before = written.lock().len();
+
+        assert!(ctrl.apply_exit_floor(0).is_empty());
+        assert_eq!(written.lock().len(), before);
     }
 
     // ── Set PWM per channel ─────────────────────────────────────────

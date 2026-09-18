@@ -35,7 +35,10 @@
 //! `WatchdogSec` would be killed part-way through handing the fans back. Measured
 //! on systemd 261 with a transient unit, `WatchdogSec=2`: a ping sent 0.2 s after
 //! `STOPPING=1` drew `Watchdog timeout (limit 2s)!` and SIGABRT 2 s later, in the
-//! middle of a 5 s simulated restore; with `WATCHDOG_USEC=0` in the same message
+//! middle of a 5 s simulated restore (SIGABRT was systemd's default
+//! `WatchdogSignal`; since DEC-388 the unit sends SIGTERM, which a stopping daemon
+//! ignores, and SIGKILL follows `TimeoutAbortSec` later — the restore is still
+//! cut, only later); with `WATCHDOG_USEC=0` in the same message
 //! as `STOPPING=1` the same late ping was harmless. A zero override disarms the
 //! watchdog for this invocation whatever arrives after it, and systemd clears
 //! the override on the next start (`service_start`).

@@ -125,6 +125,9 @@ Create `/etc/control-ofc/daemon.toml`:
 [ipc]
 # socket_path = "/run/control-ofc/control-ofc.sock"
 
+[shutdown]
+# exit_floor_pct = 50       # the exit minimum for fans with no firmware fallback (0 = off)
+
 [state]
 # state_dir = "/var/lib/control-ofc"
 ```
@@ -567,9 +570,9 @@ While a profile is active the profile engine is the **sole writer** of every bac
 Configuration is split between two files (see `docs/ADRs/002-runtime-config-split.md`):
 
 - **`/etc/control-ofc/daemon.toml`** — admin-owned, hand-edited. Contains static topology: serial port, polling interval, socket path, state directory. Never rewritten by the daemon.
-- **`/var/lib/control-ofc/runtime.toml`** — daemon-managed. Contains settings that API endpoints mutate at runtime: profile search directories, startup delay, and the preferred CPU/motherboard temp sensors (DEC-200). Written with 0600 permissions via atomic rename.
+- **`/var/lib/control-ofc/runtime.toml`** — daemon-managed. Contains settings that API endpoints mutate at runtime: profile search directories, startup delay, the preferred CPU/motherboard temp sensors (DEC-200), and the exit minimum (DEC-388). Written with 0600 permissions via atomic rename.
 
-On startup the daemon loads `daemon.toml`, then overlays `runtime.toml` on top (runtime values win). `SIGHUP` / `systemctl reload` re-reads both files, but only the **profile search directories** are applied live — changes to the startup delay, serial port, polling interval, or socket path are read but take effect only on the next restart.
+On startup the daemon loads `daemon.toml`, then overlays `runtime.toml` on top (runtime values win). `SIGHUP` / `systemctl reload` re-reads both files, but only the **profile search directories** and the **exit minimum** are applied live — changes to the startup delay, serial port, polling interval, or socket path are read but take effect only on the next restart.
 
 ### Startup delay
 
@@ -637,4 +640,5 @@ The daemon enforces the following safety rules:
 - **OpenFanController stop timeout** — 0% PWM is allowed for a maximum of 8 seconds per channel, after which further 0% commands are rejected until a non-zero value is sent.
 - **Per-member minimum floors (DEC-162)** — the daemon reports no per-*header* floor (`min_pwm_percent: 0` for every hwmon header), but it **does** enforce the role-aware minimum the GUI bakes into each control's `minimum_pct`. A profile whose pump/CPU control drops below the hard `HARD_PUMP_CPU_FLOOR_PCT` (30%) is rejected at validation with `400 validation_error` (`FLOOR_TOO_LOW`), and the profile engine re-clamps every member to its effective floor on each eval tick (`member_effective_floor`). So floor safety is daemon-enforced, not merely a GUI profile constraint.
 - **GPU fan curves and hwmon headers** are given back on daemon shutdown — GPU curves to PMFW control, and each motherboard header the daemon took to exactly what it was doing before (DEC-382): its recorded `pwm_enable`, or its duty if it was already in manual mode. A header whose mode cannot be restored is set to full speed instead, as lm-sensors `fancontrol` does. The daemon never writes a fixed "automatic" value: `2` is automatic on `it87` but Thermal Cruise on `nct6775`, and on an NZXT Kraken it applies an empty curve. Two mechanisms cover this: the daemon does it **in-process** as it shuts down, and `ExecStopPost` in the systemd unit repeats it once the daemon has exited, whatever ended it — a normal stop, a crash, a SIGKILL the daemon could not respond to, or the watchdog restarting a daemon that stopped responding. The in-process one is bounded, so a restore that hangs cannot keep the daemon from exiting, and `ExecStopPost` from running.
+- **OpenFan fans, and motherboard headers with no mode switch, are left at a minimum on stop** (DEC-388). These have no firmware behaviour to go back to — an OpenFan channel holds whatever it was last told, indefinitely — so on a clean stop (including `systemctl restart`, a reboot, or the watchdog restarting a daemon that stopped responding) each one the daemon drove is left at its last speed or the **exit minimum**, whichever is higher: 50 % unless you change it in the GUI (Settings → Daemon Configuration → Exit minimum) or with `[shutdown] exit_floor_pct`. A fan whose last speed the daemon lost track of is left at 100 %; a fan it never drove is not touched; 0 turns the minimum off. A crash or SIGKILL cannot run this — `ExecStopPost` cannot reach the OpenFan controller — so after one those fans keep their last speed until the daemon is back.
 - **Neither guarantees the hardware actually came back.** Each restore step gives up after a few seconds so the daemon can always exit; if a chip or card has stopped accepting writes, nothing can restore it and those fans hold their last speed until something takes them over again.

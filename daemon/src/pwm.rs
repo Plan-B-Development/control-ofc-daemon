@@ -8,6 +8,20 @@ pub fn percent_to_raw(percent: u8) -> u8 {
     ((percent as u16 * 255 + 50) / 100) as u8
 }
 
+/// The duty a clean stop leaves an output at (DEC-388, `TS-j`/`TS-y`) — for an
+/// output with no firmware mode to be given back to.
+///
+/// Its last duty raised to the floor; full speed when the daemon wrote it but
+/// no longer knows what it holds (a failed reply, a reconnect), which is
+/// `fancontrol`'s fallback for an output it cannot vouch for. A `floor_pct` of
+/// 0 is handled by the callers, not here: it turns the exit floor off.
+pub fn exit_duty(last_pct: Option<u8>, floor_pct: u8) -> u8 {
+    match last_pct {
+        Some(d) => d.max(floor_pct).min(100),
+        None => 100,
+    }
+}
+
 /// Convert a raw PWM value (0–255) back to percent (0–100).
 pub fn raw_to_percent(raw: u8) -> u8 {
     ((raw as u16 * 100 + 127) / 255) as u8
@@ -87,6 +101,18 @@ pub fn is_full_speed_alias(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// DEC-388: a known duty is raised to the floor and never lowered; an
+    /// unknown one goes to full speed whatever the floor.
+    #[test]
+    fn the_exit_duty_raises_to_the_floor_and_never_lowers() {
+        assert_eq!(exit_duty(Some(30), 50), 50);
+        assert_eq!(exit_duty(Some(80), 50), 80);
+        assert_eq!(exit_duty(Some(50), 50), 50);
+        assert_eq!(exit_duty(None, 50), 100);
+        assert_eq!(exit_duty(None, 10), 100);
+        assert_eq!(exit_duty(Some(0), 100), 100);
+    }
 
     #[test]
     fn percent_to_raw_boundaries() {

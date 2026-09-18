@@ -175,6 +175,13 @@ pub struct StateCache {
     /// exported to systemd. Empty in tests and when the daemon is run by hand,
     /// which makes [`Self::watchdog_tick`] a no-op there.
     notifier: std::sync::OnceLock<Arc<crate::sd_notify::Notifier>>,
+    /// The exit floor in force right now (DEC-388), in percent.
+    ///
+    /// Here rather than in the frozen `running_config` because it applies live:
+    /// `POST /config/exit-floor` and a SIGHUP both update it, and the shutdown
+    /// reads it at the moment of the stop. Seeded by `main` from the effective
+    /// config; the default only covers tests and a cache nothing configured.
+    exit_floor_pct: std::sync::atomic::AtomicU8,
 }
 
 impl StateCache {
@@ -189,7 +196,20 @@ impl StateCache {
             openfan_write_generation: AtomicU64::new(0),
             resume_generation: AtomicU64::new(0),
             notifier: std::sync::OnceLock::new(),
+            exit_floor_pct: std::sync::atomic::AtomicU8::new(
+                crate::constants::DEFAULT_EXIT_FLOOR_PCT,
+            ),
         }
+    }
+
+    /// The exit floor in force now (DEC-388) — read by the shutdown path.
+    pub fn exit_floor_pct(&self) -> u8 {
+        self.exit_floor_pct.load(Ordering::Relaxed)
+    }
+
+    /// Set the exit floor in force (DEC-388), clamped to 100.
+    pub fn set_exit_floor_pct(&self, pct: u8) {
+        self.exit_floor_pct.store(pct.min(100), Ordering::Relaxed);
     }
 
     /// Attach systemd's notification channel (DEC-387). Called once, from `main`;

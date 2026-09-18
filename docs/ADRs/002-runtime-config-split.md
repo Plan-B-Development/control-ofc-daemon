@@ -70,6 +70,7 @@ Widened by **DEC-243**. The original set was `[profiles] search_dirs` and
 | `[polling]` | `poll_interval_ms` | `POST /config/poll-interval` |
 | `[serial]` | `port`, `timeout_ms` | `POST /config/serial-port`, `POST /config/serial-timeout` |
 | `[detection]` | `allow_port_probe`, `enable_nvidia_telemetry` | `POST /config/allow-port-probe`, `POST /config/nvidia-telemetry` |
+| `[shutdown]` | `exit_floor_pct` | `POST /config/exit-floor` (applies live, DEC-388) |
 
 **Never runtime-mutable:** `ipc.socket_path` (a bad value locks every client,
 including the one writing it, out of the daemon) and `state.state_dir` (moving it
