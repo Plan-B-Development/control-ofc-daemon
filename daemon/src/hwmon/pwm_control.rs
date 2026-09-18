@@ -216,6 +216,18 @@ pub struct HwmonPwmController {
     /// deactivated profile left at 20 % would then be invisible at the stop that
     /// followed while still running at 20 %.
     exit_record: HashMap<String, Option<u8>>,
+    /// The lowest duty each header with no `pwmN_enable` may be written at from
+    /// now on (DEC-392, `TS-ar`): latched by [`Self::apply_exit_floor`] and never
+    /// cleared — the hwmon half of `FanController`'s `exit_min`.
+    ///
+    /// The floor holds this controller's lock for its whole step, but the engine
+    /// takes it per header, so the floor can run between two headers of a final
+    /// batch that outlived the drains — and the rest of that batch then lands
+    /// after it, a lower duty on a header the floor had already raised.
+    /// [`Self::set_pwm`] raises any such command to this, under the same
+    /// mutex the floor ran under, so there is no window between a check and a
+    /// write. Raising is never refused: a forced 100 % still lands.
+    exit_min: HashMap<String, u8>,
 }
 
 /// One header's exit-floor write (DEC-388), for the caller's report.
@@ -252,6 +264,7 @@ impl HwmonPwmController {
             verify_mismatch_counts: HashMap::new(),
             handback,
             exit_record: HashMap::new(),
+            exit_min: HashMap::new(),
         }
     }
 
@@ -266,9 +279,22 @@ impl HwmonPwmController {
     /// Headers WITH `pwmN_enable` are not touched here — DEC-382 hands them back
     /// to the mode they had. Written straight through the writer, without the
     /// lease: this is the shutdown, and the engine that held the lease is gone.
+    ///
+    /// It also LATCHES the floor ([`Self::exit_min`], DEC-392): each header with
+    /// no mode switch at its exit duty if this controller wrote it, at
+    /// `floor_pct` if not. From then on `set_pwm` raises any lower command for
+    /// such a header to that — an engine batch that outlived the drains, or a
+    /// verify's restore — so the duty the stop logs is the duty it leaves.
     pub fn apply_exit_floor(&mut self, floor_pct: u8) -> Vec<HwmonExitFloorWrite> {
         if floor_pct == 0 {
             return Vec::new();
+        }
+        for h in self.headers.values().filter(|h| !h.supports_enable) {
+            let min = match self.exit_record.get(&h.id) {
+                Some(was) => crate::pwm::exit_duty(*was, floor_pct),
+                None => floor_pct,
+            };
+            self.exit_min.insert(h.id.clone(), min);
         }
         let mut ids: Vec<String> = self.exit_record.keys().cloned().collect();
         ids.sort();
@@ -287,6 +313,13 @@ impl HwmonPwmController {
                     .write_file(&pwm_path, &percent_to_raw(target_pct).to_string());
                 self.exit_record
                     .insert(header_id.clone(), written.is_ok().then_some(target_pct));
+                // Keep the coalesce truthful: once the floor has landed, a late
+                // command the latch raises to the same duty writes nothing.
+                if written.is_ok() {
+                    if let Some(ws) = self.write_state.get_mut(&header_id) {
+                        ws.last_commanded_pct = Some(target_pct);
+                    }
+                }
                 Some(written)
             };
             out.push(HwmonExitFloorWrite {
@@ -485,7 +518,20 @@ impl HwmonPwmController {
             )));
         }
 
-        let effective_pct = pwm_percent;
+        // DEC-392 (`TS-ar`): once the stop's exit floor has run, a command may
+        // raise a header with no mode switch but never take it below the duty
+        // the floor left it at — raised BEFORE the coalesce check, so a lower
+        // command against a header already at its exit duty writes nothing.
+        let effective_pct = match self.exit_min.get(header_id) {
+            Some(&min) if pwm_percent < min => {
+                log::info!(
+                    "hwmon {header_id}: {pwm_percent} % raised to {min} % — the exit floor \
+                     has already run"
+                );
+                min
+            }
+            _ => pwm_percent,
+        };
 
         // ── pwm_enable watchdog ─────────────────────────────────────
         // When we believe manual mode is already set, read back pwm_enable
@@ -987,6 +1033,98 @@ mod tests {
         let before = writes.lock().len();
         assert!(ctrl.apply_exit_floor(0).is_empty());
         assert_eq!(writes.lock().len(), before);
+    }
+
+    // ── DEC-392 (`TS-ar`): the exit floor latches ──
+
+    /// [SAFETY] Nothing that runs after the exit floor can lower a header with
+    /// no mode switch: an engine batch that outlived the drains, or a verify's
+    /// restore, writes through `set_pwm`. A header the floor raised is held at
+    /// its exit duty, one first written after the floor at the floor itself, and
+    /// a command above either still lands.
+    #[test]
+    fn nothing_after_the_exit_floor_can_lower_a_header_with_no_mode_switch() {
+        let (mut ctrl, writes, _cache) =
+            setup_controller(vec![no_mode_header("low", 2), no_mode_header("never", 3)]);
+        let lease = engine_lease(&mut ctrl);
+        ctrl.set_pwm("low", 30, &lease).unwrap();
+        let out = ctrl.apply_exit_floor(50);
+        assert_eq!(
+            (out.len(), out[0].target_pct),
+            (1, 50),
+            "precondition: the floor raised the header it had written"
+        );
+        let before = writes.lock().len();
+
+        let lower = ctrl.set_pwm("low", 20, &lease).unwrap();
+        assert_eq!(lower.pwm_percent, 50);
+        assert_eq!(
+            writes.lock().len(),
+            before,
+            "a lower command against a header at its exit duty writes nothing"
+        );
+        assert_eq!(ctrl.last_commanded_pct("low"), Some(50));
+
+        let unwritten = ctrl.set_pwm("never", 10, &lease).unwrap();
+        assert_eq!(
+            unwritten.pwm_percent, 50,
+            "a header first written after the floor is raised to the floor"
+        );
+        assert_eq!(
+            writes.lock().last().cloned(),
+            Some((
+                "/sys/class/hwmon/hwmon0/pwm3".to_string(),
+                percent_to_raw(50).to_string()
+            ))
+        );
+
+        let higher = ctrl.set_pwm("low", 80, &lease).unwrap();
+        assert_eq!(higher.pwm_percent, 80);
+        assert_eq!(
+            writes.lock().last().cloned(),
+            Some((
+                "/sys/class/hwmon/hwmon0/pwm2".to_string(),
+                percent_to_raw(80).to_string()
+            ))
+        );
+    }
+
+    /// [SAFETY] A header whose duty the floor could not vouch for was left at
+    /// full speed, and the latch holds it there.
+    #[test]
+    fn an_unknown_duty_latches_at_full_speed() {
+        let (mut ctrl, writes, _cache) = setup_scripted_controller(
+            vec![no_mode_header("h", 2)],
+            vec![Err(HwmonError::WriteError {
+                path: "/sys/class/hwmon/hwmon0/pwm2".to_string(),
+                message: "EIO".to_string(),
+            })],
+        );
+        let lease = engine_lease(&mut ctrl);
+        assert!(ctrl.set_pwm("h", 30, &lease).is_err(), "precondition");
+        assert_eq!(ctrl.apply_exit_floor(50)[0].target_pct, 100, "precondition");
+
+        assert_eq!(ctrl.set_pwm("h", 30, &lease).unwrap().pwm_percent, 100);
+        assert_eq!(
+            writes.lock().last().map(|(_, v)| v.clone()),
+            Some(percent_to_raw(100).to_string())
+        );
+    }
+
+    /// The latch is the no-mode headers' only: a header WITH `pwmN_enable` is
+    /// DEC-382's hand-back, and a zero floor latches nothing at all.
+    #[test]
+    fn the_latch_leaves_mode_switch_headers_and_a_zero_floor_alone() {
+        let (mut ctrl, _writes, _cache) = setup_controller(vec![make_header("h1", "CHA_FAN1", 0)]);
+        let lease = engine_lease(&mut ctrl);
+        ctrl.apply_exit_floor(50);
+        assert_eq!(ctrl.set_pwm("h1", 20, &lease).unwrap().pwm_percent, 20);
+
+        let (mut ctrl, _writes, _cache) = setup_controller(vec![no_mode_header("h", 2)]);
+        let lease = engine_lease(&mut ctrl);
+        ctrl.set_pwm("h", 30, &lease).unwrap();
+        ctrl.apply_exit_floor(0);
+        assert_eq!(ctrl.set_pwm("h", 20, &lease).unwrap().pwm_percent, 20);
     }
 
     #[test]

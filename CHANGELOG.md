@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+**A motherboard header with no mode switch can no longer be lowered after the
+exit minimum was applied on stop** (`TS-ar`, DEC-392). On a clean stop the daemon
+raises each header that has a `pwmN` but no `pwmN_enable` to at least the exit
+minimum (DEC-388). A final control-loop write that was still in flight — possible
+only when sysfs writes had wedged long enough to outlast the shutdown drains —
+could land after that and leave the header below the minimum you set. The minimum
+now latches for these headers exactly as it already did for OpenFan channels: once
+it has run, any lower write to such a header is raised to it, and a higher one
+still lands.
+
 ## [2.51.0] — 2026-09-19
 
 ### Fixed

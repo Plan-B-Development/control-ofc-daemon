@@ -498,10 +498,10 @@ gating each have their own register rows and regression tests.
     WITH a mode switch are DEC-382's hand-back, and `0` turns it off. It runs FIRST
     in the restore, because a watchdog stop's abort window is 10 s — enough while
     the hung engine is the only task that will not drain — and it latches: once it
-    has run, `FanController::set_pwm` raises any lower command to it, so an OpenFan
-    calibration still running inside its request or an engine write that outlived
-    the drains cannot take a channel back down (a no-mode header has no latch yet,
-    `TS-ar`). `ExecStopPost`
+    has run, `FanController::set_pwm` and `HwmonPwmController::set_pwm` (DEC-392)
+    raise any lower command to it, so an OpenFan calibration still running inside
+    its request, a verify restore, or an engine write that outlived the drains
+    cannot take an output back down. `ExecStopPost`
     cannot repeat it — serial is out of its reach — so after a crash or SIGKILL
     those outputs keep their last duty.
 

@@ -887,12 +887,14 @@ enum ExitFloor {
 /// no-mode header's duty.
 ///
 /// **Taking a controller's lock is not proof the engine is done with it.** A
-/// final batch that outlived the drains locks per channel (DEC-099), so it can
-/// resume between this step's writes. For OpenFan that is harmless: the floor
-/// latches in `FanController` and `set_pwm` raises anything lower to it — which
-/// also covers a calibration sweep still running inside an HTTP request that
-/// outlived the server drain. A no-mode hwmon header has no such latch yet, so a
-/// changed engine duty can still land after it (`TS-ar`).
+/// final batch that outlived the drains locks per channel or header (DEC-099,
+/// DEC-154), so this step can run between two of its writes and the rest of the
+/// batch lands after it. That is harmless because the floor latches:
+/// `FanController::set_pwm` raises anything lower to it — which also covers a
+/// calibration sweep still running inside an HTTP request that outlived the
+/// server drain — and a header with no mode switch is latched the same way in
+/// `HwmonPwmController` (DEC-392), so an engine write or a verify restore that
+/// outlived the drains cannot lower it either.
 ///
 /// Bounded like its siblings: each backend's lock wait and its writes run on a
 /// detached thread under `step_timeout`, one step per backend so a wedged serial
@@ -2525,9 +2527,9 @@ async fn async_main() {
             // [SAFETY] DEC-388: the exit floor FIRST — see `apply_exit_floor` for
             // why the order is load-bearing under a watchdog stop's shorter abort
             // timeout. Nothing after it in this closure touches what it reaches,
-            // `ExecStopPost` cannot redo it, and it latches in `FanController`,
-            // so no OpenFan write that outlives the drains can lower a channel
-            // below it (a no-mode hwmon header is not latched yet — `TS-ar`).
+            // `ExecStopPost` cannot redo it, and it latches in `FanController`
+            // and `HwmonPwmController` (DEC-392), so no write that outlives the
+            // drains can lower an OpenFan channel or a no-mode header below it.
             let _ = apply_exit_floor(
                 app_state.fan_controller.read().clone(),
                 app_state.hwmon_controller.clone(),
