@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Added
+
+**The daemon is restarted if its control loop stops running** (`TS-d`, DEC-387).
+If the loop that drives the fans and watches for a thermal emergency stopped
+making progress while the daemon stayed up — a bug that hangs rather than one
+that crashes — every fan held its last speed, no emergency could fire, and nothing
+noticed: to systemd the service looked healthy. The daemon now tells systemd each
+time the loop completes a pass, and systemd restarts it if 15 seconds go by
+without one, handing the motherboard fans back to the BIOS in between. A fan whose
+hardware is merely slow to respond does not trigger it. `systemctl start` now also
+waits until the daemon is actually controlling the fans. One limit: on a machine
+whose devices take more than about ten seconds to suspend and resume, the daemon
+may be restarted as the machine wakes; a systemd drop-in raising `WatchdogSec`
+avoids it there.
+
 ### Fixed
 
 **The daemon now gives each motherboard fan back exactly the way it found it**
@@ -70,6 +85,15 @@ unknown. They now keep their last speed under the floor.
 
 ### Changed
 
+**A daemon that keeps failing is restarted more and more slowly, instead of being
+given up on** (DEC-387). systemd used to stop restarting the daemon after five
+failed starts in a minute, leaving the machine with no fan control until someone
+intervened. Restarts now back off instead — 3 s, then about 5, 10, 18 and 33 s,
+then once a minute — and never stop. After five healthy minutes the next restart
+is fast again. The startup delay is also capped at 30 seconds when it is set by
+hand in `runtime.toml`, as it already was everywhere else, because systemd now
+waits for the daemon to finish starting.
+
 **A thermal emergency stays at 100 % until the CPU is measured cool again**
 (DEC-386). If the CPU temperature sensor disappeared entirely during an emergency,
 the daemon used to drop the fans to 40 %. It now holds 100 % whether the sensor has
@@ -95,7 +119,20 @@ speed is what the pump makers recommend.
 
 **Upgrading:** the first stop after upgrading still runs the previous version's
 shutdown, so the next start records whatever that left — Thermal Cruise on an
-nct6775 board — until the next reboot resets every header.
+nct6775 board — until the next reboot resets every header. And because the
+daemon running during the upgrade predates the watchdog, systemd restarts it onto
+the new version by itself when pacman reloads systemd at the end of the upgrade:
+the journal shows one "Watchdog timeout" and a core dump for the old process. That
+is expected, and happens once.
+
+### Documentation
+
+**`ExecStopPost` does run when the daemon crashes and is restarted** (`TS-k`,
+DEC-387). The user guide and `daemon.md` said it runs only for a requested stop,
+and that after an internal failure only the daemon's own restore gave the fans
+back. systemd runs it after every exit, before scheduling any restart — measured
+on systemd 261. What it cannot do is rescue a restore that hangs inside the
+daemon, which is why that restore is bounded.
 
 ## [2.49.1] — 2026-09-17
 

@@ -276,10 +276,10 @@ impl DaemonConfig {
             });
         }
 
-        if self.startup.delay_secs > 30 {
+        if self.startup.delay_secs > crate::constants::MAX_STARTUP_DELAY_SECS {
             return Err(ConfigError::Validation {
                 field: "startup.delay_secs".into(),
-                message: "must be <= 30".into(),
+                message: format!("must be <= {}", crate::constants::MAX_STARTUP_DELAY_SECS),
             });
         }
 

@@ -844,6 +844,16 @@ impl Drop for TickCompletion<'_> {
         // the "tick still running" ladder never fires.
         self.cache
             .record_engine_write_stall(self.writes_outstanding);
+        // DEC-387 (`TS-d`): systemd's watchdog keep-alive, sent from here and
+        // nowhere else, because "a tick completed" is exactly the liveness it
+        // measures. Every exit from the tick body passes this point, so the
+        // emergency `continue` and the verify skip count; a slow or wedged device
+        // write does not stop it (DEC-289 keeps the loop ticking past one). Not
+        // while unwinding: a tick that panicked did not complete, and its death
+        // belongs to DEC-266's supervisor, not to the watchdog.
+        if !std::thread::panicking() {
+            self.cache.watchdog_tick();
+        }
     }
 }
 
@@ -1705,6 +1715,7 @@ mod tests {
     use crate::health::state::{CachedSensorReading, DeviceLabel};
     use crate::hwmon::types::SensorKind;
     use crate::profile::{ControlMember, CurveConfig, CurvePoint, LogicalControl};
+    use std::os::unix::net::UnixDatagram;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -2541,6 +2552,153 @@ mod tests {
             );
         }
         assert_eq!(cache.read_with(|s| s.skipped_controls.len()), 1);
+    }
+
+    // ── DEC-387 (`TS-d`): the systemd watchdog keep-alive ────────────────────
+
+    /// A socket standing in for systemd, and a notifier with a watchdog aimed at
+    /// it, attached to `cache` the way `main` attaches the real one. Keep the
+    /// returned directory alive for as long as the socket is used.
+    fn attach_fake_systemd(cache: &StateCache) -> (tempfile::TempDir, UnixDatagram) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("notify");
+        let rx = UnixDatagram::bind(&path).expect("bind the fake notify socket");
+        rx.set_nonblocking(true).expect("nonblocking receiver");
+        let notifier = crate::sd_notify::Notifier::new(
+            path.to_str().expect("utf-8 path"),
+            Some(Duration::from_secs(15)),
+        )
+        .expect("notifier");
+        assert!(cache.attach_notifier(Arc::new(notifier)));
+        (dir, rx)
+    }
+
+    /// Every datagram the fake systemd has received so far, in order.
+    fn received(rx: &UnixDatagram) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 128];
+        while let Ok(n) = rx.recv(&mut buf) {
+            out.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+        }
+        out
+    }
+
+    #[test]
+    fn a_completed_tick_pings_the_systemd_watchdog_once() {
+        let cache = Arc::new(StateCache::new());
+        let (_dir, rx) = attach_fake_systemd(&cache);
+        drop(TickCompletion::new(&cache));
+        assert_eq!(received(&rx), ["WATCHDOG=1"]);
+    }
+
+    /// [SAFETY] A tick that panicked did not complete, so it must not tell
+    /// systemd the loop is alive — its death is DEC-266's supervisor's to act
+    /// on. Presence first: the same guard, dropped normally, does ping.
+    #[test]
+    fn a_tick_that_panics_does_not_ping_the_watchdog() {
+        let cache = Arc::new(StateCache::new());
+        let (_dir, rx) = attach_fake_systemd(&cache);
+        drop(TickCompletion::new(&cache));
+        assert_eq!(
+            received(&rx),
+            ["WATCHDOG=1"],
+            "precondition: a completed tick pings"
+        );
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = TickCompletion::new(&cache);
+            panic!("a tick that dies part-way");
+        }));
+        assert!(unwound.is_err(), "precondition: the tick really panicked");
+        assert!(
+            received(&rx).is_empty(),
+            "an unwinding tick must not tell systemd the loop is alive"
+        );
+    }
+
+    /// The CALL SITE, not just the guard: the running loop pings on its own, one
+    /// keep-alive per tick, and stops when the loop stops. The second half is
+    /// what rules out a ping on a timer — a sender that outlived the loop would
+    /// keep systemd satisfied while the loop it watches sat wedged.
+    #[tokio::test]
+    async fn the_running_engine_pings_every_tick_and_only_while_it_runs() {
+        let cache = Arc::new(StateCache::new());
+        let (_dir, rx) = attach_fake_systemd(&cache);
+        let seen = std::sync::Mutex::new(Vec::new());
+        run_engine_ticks_until(cache.clone(), None, 2, || {
+            let mut seen = seen.lock().expect("seen");
+            seen.extend(received(&rx));
+            seen.len() >= 2
+        })
+        .await;
+        // The loop has exited (the helper joins it); collect anything it sent
+        // on the way out.
+        let mut seen = seen.into_inner().expect("seen");
+        seen.extend(received(&rx));
+        assert!(seen.len() >= 2, "two ticks ran, so two pings: {seen:?}");
+        assert!(seen.iter().all(|m| m == "WATCHDOG=1"), "{seen:?}");
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            received(&rx).is_empty(),
+            "the loop has stopped, so nothing may keep pinging on its behalf"
+        );
+    }
+
+    /// [SAFETY] DEC-387: the keep-alive has exactly one sender — the tick guard
+    /// — plus the cache method that forwards it. A second sender (a heartbeat
+    /// task on a timer, say) would keep systemd satisfied while the loop it is
+    /// meant to watch sat wedged, which is the one failure the watchdog exists to
+    /// catch. Scans every source file, not just this one, because that is where
+    /// such a sender would be added.
+    #[test]
+    fn the_watchdog_keep_alive_is_sent_from_the_tick_guard_only() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sites = Vec::new();
+        let mut dirs = vec![root.clone()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read a source directory") {
+                let path = entry.expect("directory entry").path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let whole = std::fs::read_to_string(&path).expect("read a source file");
+                    // Production half. Split on the conventional test-module
+                    // header, not on the first `#[cfg(test)]`, which may mark a
+                    // helper with production code after it. A file without the
+                    // header is scanned whole — conservative, it can only add sites.
+                    let production = whole
+                        .split_once("#[cfg(test)]\nmod tests")
+                        .map_or(whole.as_str(), |(before, _)| before);
+                    let rel = path.strip_prefix(&root).expect("under src/");
+                    for _ in production.matches(".watchdog_tick()") {
+                        sites.push(rel.display().to_string());
+                    }
+                }
+            }
+        }
+        sites.sort();
+        assert_eq!(
+            sites,
+            ["health/cache.rs", "profile_engine/mod.rs"],
+            "the watchdog keep-alive must be sent from TickCompletion::drop only, \
+             forwarded by StateCache::watchdog_tick"
+        );
+
+        let engine = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/profile_engine/mod.rs"
+        ));
+        let drop_impl = engine
+            .find("impl Drop for TickCompletion")
+            .expect("the guard's Drop impl");
+        let drop_body = &engine[drop_impl..];
+        let drop_body = &drop_body[..drop_body.find("\n}\n").expect("end of the impl")];
+        assert!(
+            drop_body.contains(".watchdog_tick()"),
+            "the engine's one keep-alive must live in TickCompletion::drop, so it \
+             is sent exactly when a tick completes"
+        );
     }
 
     /// [SAFETY-adjacent] 273-i — the END-TO-END path, which nothing else covers.

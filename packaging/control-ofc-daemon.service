@@ -9,13 +9,65 @@ After=local-fs.target
 Wants=modprobe@cdc_acm.service
 After=modprobe@cdc_acm.service
 
-# Cap restart storms: at most 5 starts per 60 s window (works with Restart=on-failure
-# below). These are [Unit]-section directives since systemd v230.
-StartLimitIntervalSec=60
-StartLimitBurst=5
+# No start rate limit (DEC-387). It was 5 starts per 60 s, after which the unit
+# stayed failed until someone ran `systemctl reset-failed` — so a fault that
+# recurred quickly left the machine with no fan daemon at all, and DEC-272
+# rejected a watchdog for exactly that reason: restarting a wedge that keeps
+# coming back would burn the budget. The exponential backoff under Restart=
+# below paces restarts instead, slowing a fault that keeps recurring to one start
+# a minute without ever giving up. A [Unit]-section directive since systemd v230.
+StartLimitIntervalSec=0
 
 [Service]
-Type=simple
+# DEC-387 (`TS-d`): the daemon reports its own readiness. It sends READY=1 once
+# the profile engine is ticking, the API is serving and its signal handlers are
+# live, so `systemctl start` (and multi-user.target, which is ordered after this
+# unit) waits for a daemon that is actually controlling the fans.
+Type=notify
+# Only the daemon's own process may notify. It spawns no children in production;
+# this says so to the service manager as well. Its tokio worker threads share
+# its PID, so a ping sent from one is attributed to it (measured on systemd 261).
+NotifyAccess=main
+# [SAFETY] The watchdog (DEC-387, `TS-d`). The daemon sends WATCHDOG=1 from each
+# COMPLETED profile-engine tick and from nowhere else, so it fires when the loop
+# stops cycling — a deadlock, an await that never resolves, a starved runtime.
+# That is the one state DEC-266 cannot see, because the task is alive: every fan
+# holds its last duty and nothing evaluates the thermal ladder. On a timeout
+# systemd sends SIGABRT (a core dump shows where the loop stopped), runs
+# ExecStopPost (which hands the hwmon headers back and resets GPU curves) and
+# restarts the daemon under the backoff below.
+#
+# A slow or wedged DEVICE does not stop the pings, deliberately: since DEC-289 each
+# backend write is joined for at most one second (WRITE_JOIN_BUDGET), after which
+# the tick carries on and the write finishes in the background — restarting could
+# not unwedge a kernel driver anyway. So a legitimate tick completes within one
+# 1 s period plus the three bounded writes (1 s each for OpenFan and hwmon, 1.75 s
+# for GPU including its lock wait): the gap between pings is at most ~5 s, and
+# 15 s is three times that. (DEC-259's ~10 s figure is how long a degraded serial
+# WRITE can take; the tick no longer waits for it.) Suspend is not entirely free:
+# the clock is CLOCK_MONOTONIC, which does not advance during the sleep itself, but
+# user space is frozen while devices suspend and resume and that stretch DOES count
+# — so a machine whose device suspend + resume exceeds ~10 s can have the daemon
+# restarted as it resumes (TS-ao; widen WatchdogSec in a drop-in on such a box).
+#
+# While stopping, the daemon disarms the watchdog itself — STOPPING=1 with
+# WATCHDOG_USEC=0 — because systemd re-arms it on any keep-alive whatever the
+# unit's state, and a late tick would otherwise arm a fresh 15 s over the
+# hardware restore below.
+WatchdogSec=15
+# Pinned, never the manager default: that default is a distribution choice, and
+# CachyOS ships DefaultTimeoutStartSec=15s — under Type=notify the whole start-up
+# runs inside this window, and 15 s would kill a daemon configured with a startup
+# delay on every boot. Derived: the startup delay, capped at 30 s
+# (MAX_STARTUP_DELAY_SECS, enforced even on a hand-edited runtime.toml), and the
+# config and state loads ahead of it must fit, with room to spare. The boot-time
+# serial probe does NOT have to: before each candidate the daemon sends
+# EXTEND_TIMEOUT_USEC sized to that probe's own bound, so neither the number of
+# serial devices nor serial.timeout_ms (which the admin file does not cap) counts
+# against this window, while a probe that never returns stops extending it. A
+# start that overruns it really is wedged, and is killed and restarted like any
+# other failure.
+TimeoutStartSec=120
 ExecStart=/usr/bin/control-ofc-daemon
 ExecStopPost=/usr/bin/control-ofc-restore-auto
 ExecReload=/bin/kill -HUP $MAINPID
@@ -36,9 +88,20 @@ Environment=RUST_LOG=info
 # the resolved path stays obvious and independent of NSS (systemd.exec(5)).
 Environment=HOME=/root
 
-# Restart on crash
+# Restart on a crash, a non-zero exit (DEC-266's engine or sensor-feed death) or
+# a watchdog timeout — on-failure covers all three.
 Restart=on-failure
+# Exponential backoff (DEC-387), replacing the start limit above: 3 s, then about
+# 5.5, 10, 18 and 33 s, then 60 s for every restart after that. The first restart
+# after an isolated fault is as fast as before; one that keeps recurring slows to
+# one start a minute, which also bounds how often a restart re-probes the serial
+# bus. systemd grows the delay with its restart COUNTER, which only a manual start
+# resets — so after five minutes of completed ticks the daemon sends
+# RESTART_RESET=1 (systemd >= 258; older managers ignore it) and a later,
+# unrelated fault starts again from 3 s. Needs systemd >= 254.
 RestartSec=3
+RestartSteps=5
+RestartMaxDelaySec=60
 
 # Defence in depth — NOT the mechanism that bounds shutdown (273-b).
 # The daemon bounds most of its own teardown: `shutdown_sequence` allows 3 s per
@@ -55,9 +118,12 @@ RestartSec=3
 # the kernel rather than remove it.
 #
 # Before that the restore took the mutex unconditionally and stalled past every
-# timeout above — including on the Restart=on-failure path, where systemd runs no
-# stop job and neither this line nor ExecStopPost applies at all. A wedged stop is
-# therefore now ~20 s for the hwmon hand-back, rather than unbounded.
+# timeout above — including on the path where the daemon stops ITSELF to be
+# restarted (DEC-266), where systemd had no stop job and so this line did not
+# apply; ExecStopPost runs only once the process has exited, which a stalled
+# restore never did. A wedged stop is therefore now ~20 s for the hwmon hand-back,
+# rather than unbounded. Since DEC-387 that self-stop also announces itself with
+# STOPPING=1, so systemd applies this line to it as well.
 #
 # As of 2.22.0 that IS a total bound on the restore closure: the GPU `fan_curve`
 # reset runs FIRST in the same closure and used to be unbounded (278-c), so a

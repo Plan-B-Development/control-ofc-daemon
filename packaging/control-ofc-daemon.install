@@ -46,6 +46,22 @@ EOF
 post_upgrade() {
     echo ":: Restart to apply changes:"
     echo "   sudo systemctl restart control-ofc-daemon"
+    # DEC-387: the first upgrade onto the systemd watchdog. pacman reloads systemd
+    # at the END of the transaction, after this runs; from then on the new unit's
+    # WatchdogSec applies to the daemon that is ALREADY running, and that daemon
+    # predates it and sends no keep-alives — so systemd times it out and restarts
+    # it onto this version. Detected by what systemd has loaded right now (a
+    # watchdog of 0), not by a version compare, so it fires exactly once whatever
+    # version the upgrade comes from. Said here so a one-off "Watchdog timeout" and
+    # core dump in the journal is not read as a crash.
+    if systemctl is-active --quiet control-ofc-daemon.service 2>/dev/null &&
+       [[ "$(systemctl show -p WatchdogUSec --value control-ofc-daemon.service 2>/dev/null)" == 0 ]]; then
+        echo ":: This version adds a systemd watchdog. When pacman reloads systemd at the"
+        echo "   end of this upgrade, the running daemon (which predates it) is restarted"
+        echo "   onto the new version automatically; the journal shows one 'Watchdog"
+        echo "   timeout' and a core dump for the old process. That is expected, and"
+        echo "   happens only on this upgrade."
+    fi
     # The tray is a session process, not a systemd system service: an upgrade
     # replaces the binary on disk but the running one keeps going until the
     # user logs out. Say so, rather than leaving them wondering why a fixed bug

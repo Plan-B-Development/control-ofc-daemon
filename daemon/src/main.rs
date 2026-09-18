@@ -490,6 +490,28 @@ fn preflight_check(config: &DaemonConfig, allow_non_root: bool) -> UnixListener 
     listener
 }
 
+/// The startup delay actually slept: `configured_secs`, capped at
+/// [`control_ofc_daemon::constants::MAX_STARTUP_DELAY_SECS`] (DEC-387).
+///
+/// Both setters already refuse more — `daemon.toml` validation and
+/// `POST /config/startup-delay` — but `runtime.toml` is re-read on every start
+/// and a hand-edit bypasses both. Since the unit became `Type=notify` the delay
+/// runs inside `TimeoutStartSec=`, whose derivation assumes this cap: an uncapped
+/// delay longer than that would have systemd kill the daemon before it ever
+/// reported ready, and restart it into the same delay, on every boot.
+fn effective_startup_delay(configured_secs: u64) -> u64 {
+    let max = control_ofc_daemon::constants::MAX_STARTUP_DELAY_SECS;
+    if configured_secs > max {
+        log::warn!(
+            "startup.delay_secs = {configured_secs} exceeds the {max}s maximum — \
+             sleeping {max}s"
+        );
+        max
+    } else {
+        configured_secs
+    }
+}
+
 /// Apply runtime.toml overrides onto the in-memory `DaemonConfig`.
 /// Any key present in runtime.toml shadows the admin-owned daemon.toml value.
 fn apply_runtime_overlay(config: &mut DaemonConfig, runtime: &RuntimeConfig, admin_path: &str) {
@@ -805,6 +827,13 @@ const SHUTDOWN_TASK_TIMEOUT: Duration = Duration::from_secs(3);
 ///
 /// Bound the read case and let the leaked thread die with the process.
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Start-up time asked of systemd on top of each boot-time serial probe's own
+/// bound (DEC-387): enough for everything that follows the last probe before
+/// `READY=1` — sysfs discovery, GPU detection, the opt-in NVML load. The
+/// extension only ever moves the start deadline later, so a generous value
+/// costs nothing but a slower kill of a start that has genuinely stopped.
+const BOOT_PROBE_EXTENSION_SLACK: Duration = Duration::from_secs(30);
 
 /// What the hwmon hand-back actually did.
 ///
@@ -1138,8 +1167,8 @@ fn hand_back_hwmon(
 /// await is bounded by `task_timeout` so a hung task or a lingering connection
 /// (e.g. a slow client holding a request open) can never block the safety restore; on timeout
 /// we log and proceed. `ExecStopPost=control-ofc-restore-auto` backstops
-/// production on any path that has a systemd **stop job** — which is not every
-/// path; see the note at the foot of this comment.
+/// production once the process has exited, whatever ended it — but only once it
+/// HAS exited; see the note at the foot of this comment.
 ///
 /// The engine task drains its backend writes before it ends, so draining its
 /// task handle here also drains those writes — a blocking write cannot be left
@@ -1160,9 +1189,13 @@ fn hand_back_hwmon(
 /// which is why they now share `run_bounded` rather than each carrying a
 /// hand-rolled deadline (DEC-279).
 ///
-/// The `ExecStopPost` backstop remains, but note it does **not** cover the
-/// `Restart=on-failure` path, where systemd runs no stop job at all — that path
-/// is covered in-process, by the two bounded steps above and nothing else.
+/// The `ExecStopPost` backstop remains, and it runs after every exit — the
+/// `Restart=on-failure` path included: systemd runs it before scheduling the
+/// restart (278-b said otherwise; measured false on systemd 261, `TS-k`, DEC-387).
+/// What it cannot do is end a stall. It runs only once the process has exited,
+/// so a restore that never returned would hold it off for good — which is what
+/// the two bounded steps above prevent. Since DEC-387 a self-stop also sends
+/// `STOPPING=1`, so systemd's `TimeoutStopSec=` bounds that path as well.
 async fn shutdown_sequence<F>(
     poll_shutdown_tx: &tokio::sync::watch::Sender<bool>,
     server_shutdown_tx: tokio::sync::oneshot::Sender<()>,
@@ -1226,7 +1259,11 @@ async fn shutdown_sequence<F>(
 /// re-executes this very function in a child process and observes both.
 ///
 /// Diverges (never returns) when `must_restart` is set.
+// Every argument is a distinct piece of the stop the caller owns; bundling them
+// into a struct would only add indirection (same call as `profile_engine_loop`).
+#[allow(clippy::too_many_arguments)]
 async fn finish_shutdown<F>(
+    notifier: Option<&control_ofc_daemon::sd_notify::Notifier>,
     poll_shutdown_tx: &tokio::sync::watch::Sender<bool>,
     server_shutdown_tx: tokio::sync::oneshot::Sender<()>,
     server_handle: tokio::task::JoinHandle<()>,
@@ -1237,6 +1274,16 @@ async fn finish_shutdown<F>(
 ) where
     F: FnOnce(),
 {
+    // [SAFETY] DEC-387: FIRST, before the engine is told to stop. systemd re-arms
+    // its watchdog on any keep-alive whatever the unit's state, and the engine
+    // completes ticks until `shutdown_sequence` stops it — so without this, one
+    // late tick would arm a fresh `WatchdogSec` timer over the hardware restore
+    // below, and a restore slower than that would be SIGABRT'd part-way through
+    // handing the fans back. `stopping` disarms the watchdog for good.
+    if let Some(n) = notifier {
+        n.stopping();
+    }
+
     shutdown_sequence(
         poll_shutdown_tx,
         server_shutdown_tx,
@@ -1319,6 +1366,19 @@ async fn async_main() {
 
     log::info!("control-ofc-daemon v{VERSION} starting");
 
+    // DEC-387 (`TS-d`): systemd's notification channel — `None` when not run by
+    // a unit that asked for one, which makes every use of it below a no-op.
+    let notifier = control_ofc_daemon::sd_notify::Notifier::from_env().map(Arc::new);
+    if let Some(n) = notifier.as_deref() {
+        match n.watchdog() {
+            Some(timeout) => log::info!(
+                "systemd watchdog: {}s, kept alive by each completed engine tick",
+                timeout.as_secs_f64()
+            ),
+            None => log::info!("systemd notification socket present; no watchdog configured"),
+        }
+    }
+
     let config_path = resolve_config_path();
     log::info!("Config path: {config_path}");
 
@@ -1398,9 +1458,10 @@ async fn async_main() {
     let listener = preflight_check(&config, allow_non_root);
 
     // Configurable startup delay — wait for hardware to appear after boot
-    if config.startup.delay_secs > 0 {
-        log::info!("Startup delay: {}s", config.startup.delay_secs);
-        std::thread::sleep(Duration::from_secs(config.startup.delay_secs));
+    let startup_delay = effective_startup_delay(config.startup.delay_secs);
+    if startup_delay > 0 {
+        log::info!("Startup delay: {startup_delay}s");
+        std::thread::sleep(Duration::from_secs(startup_delay));
     }
 
     // Build profile search dirs from config, with the daemon-owned profile
@@ -1424,6 +1485,9 @@ async fn async_main() {
     log::info!("Profile search dirs: {:?}", profile_search_dirs);
 
     let cache = Arc::new(StateCache::new());
+    if let Some(n) = &notifier {
+        cache.attach_notifier(Arc::clone(n));
+    }
     let serial_timeout = Duration::from_millis(config.serial.timeout_ms);
 
     // ── Initialize OpenFanController ─────────────────────────────────────────
@@ -1498,6 +1562,17 @@ async fn async_main() {
                     log::info!("Opening configured serial port {p}");
                 } else {
                     log::debug!("Probing serial candidate {p} for an OpenFanController");
+                }
+                // DEC-387: under `Type=notify` this probe runs inside the unit's
+                // start window, and neither the number of candidates nor
+                // `serial.timeout_ms` has a hard ceiling in the admin file. So
+                // start-up is bounded by progress: ask for this probe's own bound
+                // — the open, then an identity exchange whose final read can run
+                // a full timeout past its deadline — plus the slack for the rest.
+                // A probe that never returns stops extending, and the start times
+                // out as it always did.
+                if let Some(n) = notifier.as_deref() {
+                    n.extend_timeout(serial_timeout * 2 + BOOT_PROBE_EXTENSION_SLACK);
                 }
                 RealSerialTransport::open(p, serial_timeout)
             },
@@ -2180,6 +2255,15 @@ async fn async_main() {
             }
         };
 
+        // DEC-387 (`TS-d`): start-up is complete — the engine is ticking, the API
+        // is serving, and SIGTERM now reaches the graceful path. systemd holds
+        // the start job (and so `multi-user.target`) until this, and starts the
+        // watchdog clock from it. Sent after the signal handlers are registered
+        // so that any stop arriving after readiness takes the graceful path.
+        if let Some(n) = notifier.as_deref() {
+            n.ready();
+        }
+
         wait_for_stop(
             sighup,
             sigterm,
@@ -2240,6 +2324,7 @@ async fn async_main() {
     );
 
     finish_shutdown(
+        notifier.as_deref(),
         &poll_shutdown_tx,
         shutdown_tx,
         server_handle,
@@ -3109,6 +3194,137 @@ mod tests {
         );
     }
 
+    // ── DEC-387 (`TS-d`): systemd readiness and watchdog ─────────────────
+
+    /// [SAFETY] The stop is announced — and the watchdog disarmed — BEFORE the
+    /// hardware restore runs. systemd re-arms its watchdog on any keep-alive
+    /// whatever the unit's state, and the engine keeps completing ticks until
+    /// `shutdown_sequence` stops it, so a disarm that came after the restore
+    /// began would leave a slow restore exposed to a SIGABRT part-way through.
+    /// Measured against systemd 261 in DEC-387; this pins the ordering here.
+    #[tokio::test]
+    async fn stopping_is_announced_before_the_hardware_restore() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("notify");
+        let rx = std::os::unix::net::UnixDatagram::bind(&path).expect("bind the fake socket");
+        rx.set_nonblocking(true).expect("nonblocking receiver");
+        let notifier = control_ofc_daemon::sd_notify::Notifier::new(
+            path.to_str().expect("utf-8 path"),
+            Some(Duration::from_secs(15)),
+        )
+        .expect("notifier");
+
+        let (poll_tx, _poll_rx) = tokio::sync::watch::channel(false);
+        let (server_tx, server_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_handle = tokio::spawn(async move {
+            let _ = server_rx.await;
+        });
+        let at_restore: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let seen = at_restore.clone();
+        finish_shutdown(
+            Some(&notifier),
+            &poll_tx,
+            server_tx,
+            server_handle,
+            vec![],
+            Duration::from_secs(3),
+            false,
+            move || {
+                let mut buf = [0u8; 64];
+                let got = rx.recv(&mut buf).map_or_else(
+                    |e| format!("<nothing: {e}>"),
+                    |n| String::from_utf8_lossy(&buf[..n]).into_owned(),
+                );
+                *seen.lock().unwrap() = Some(got);
+            },
+        )
+        .await;
+
+        assert_eq!(
+            at_restore.lock().unwrap().as_deref(),
+            Some("STOPPING=1\nWATCHDOG_USEC=0"),
+            "by the time the restore runs, systemd must already have been told the \
+             daemon is stopping and that its watchdog no longer applies"
+        );
+    }
+
+    /// The CALL SITES of both DEC-387 start-up rules, which no in-process test
+    /// can reach: `async_main` is never run by the suite. Same tool and reasoning
+    /// as `the_shutdown_restore_goes_through_the_bounded_helper`.
+    ///
+    /// READY=1 must follow everything it vouches for — the engine spawned, the
+    /// API server spawned, SIGTERM's handler registered — and precede the wait.
+    /// Sent early, systemd would start the watchdog clock (and release
+    /// `multi-user.target`) for a daemon that is not yet controlling anything; a
+    /// stop arriving in between would kill it without the graceful restore.
+    #[test]
+    fn readiness_is_reported_after_what_it_vouches_for_and_the_delay_is_capped() {
+        let whole = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let src = whole
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .expect("main.rs has a #[cfg(test)] module");
+
+        let at = |needle: &str| {
+            src.find(needle)
+                .unwrap_or_else(|| panic!("async_main no longer contains `{needle}`"))
+        };
+        assert_eq!(
+            src.matches(".ready()").count(),
+            1,
+            "READY=1 must be sent from exactly one place"
+        );
+        let ready = at(".ready()");
+        for before in [
+            "profile_engine::profile_engine_loop(",
+            "server::serve(",
+            "SignalKind::terminate()",
+        ] {
+            assert!(
+                at(before) < ready,
+                "READY=1 is sent before `{before}` — systemd would call the daemon \
+                 ready before it is"
+            );
+        }
+        assert!(
+            ready < at("wait_for_stop(\n            sighup,"),
+            "READY=1 must be sent before the main loop starts waiting"
+        );
+
+        // Each boot-time serial probe extends the start deadline by its own
+        // bound, so start-up is limited by progress rather than by an assumed
+        // number of candidates — the extension must sit INSIDE the probe closure,
+        // ahead of the open it pays for.
+        let probe = at("serial::adoption::first_openfan_port(");
+        let extend = at(".extend_timeout(");
+        let open = at("RealSerialTransport::open(p, serial_timeout)");
+        assert!(
+            probe < extend && extend < open,
+            "the start-timeout extension must be requested inside the boot probe \
+             closure, before each candidate is opened"
+        );
+
+        assert!(
+            src.contains("effective_startup_delay(config.startup.delay_secs)"),
+            "the startup delay must go through the cap"
+        );
+        assert!(
+            !src.contains("from_secs(config.startup.delay_secs)"),
+            "the uncapped delay is being slept directly again"
+        );
+    }
+
+    /// `runtime.toml` bypasses both setters' validation, and under `Type=notify`
+    /// an uncapped delay would outlast `TimeoutStartSec=` on every boot.
+    #[test]
+    fn the_startup_delay_is_capped_at_the_documented_maximum() {
+        let max = control_ofc_daemon::constants::MAX_STARTUP_DELAY_SECS;
+        assert_eq!(effective_startup_delay(0), 0);
+        assert_eq!(effective_startup_delay(max), max);
+        assert_eq!(effective_startup_delay(max + 1), max);
+        assert_eq!(effective_startup_delay(600), max);
+    }
+
     // ── 273-b / 273-a: bounded process exit, and the restart exit's ordering ──
 
     /// Env var carrying the marker path to the re-executed child (273-a).
@@ -3170,6 +3386,7 @@ mod tests {
                 let _ = server_rx.await;
             });
             finish_shutdown(
+                None,
                 &poll_tx,
                 server_tx,
                 server_handle,
@@ -3357,8 +3574,10 @@ mod tests {
     // `spawn_blocking` sysfs write, so a chip wedged mid-write holds it for as
     // long as it stays wedged. Everything that could otherwise backstop a stall
     // in the restore — SHUTDOWN_TASK_TIMEOUT, RUNTIME_SHUTDOWN_TIMEOUT, the
-    // `must_restart` exit(1), TimeoutStopSec, ExecStopPost — runs AFTER it, and
-    // on the Restart=on-failure path systemd runs no stop job at all.
+    // `must_restart` exit(1), TimeoutStopSec, ExecStopPost — runs AFTER it:
+    // ExecStopPost only once the process has exited, and TimeoutStopSec only
+    // where systemd has a stop in progress, which a self-stop lacked until
+    // DEC-387 made it send STOPPING=1.
 
     use control_ofc_daemon::hwmon::pwm_discovery::PwmHeaderDescriptor;
 
@@ -3735,8 +3954,8 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(2),
             "a PMFW write that never returns must not stall shutdown: it runs \
-             ahead of the hwmon restore, and on the Restart=on-failure path there \
-             is no stop job, so nothing downstream can rescue the process; took \
+             ahead of the hwmon restore, which it would keep from ever running, and \
+             ExecStopPost cannot run until the process exits; took \
              {elapsed:?}"
         );
     }

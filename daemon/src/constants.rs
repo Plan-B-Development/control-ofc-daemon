@@ -236,6 +236,17 @@ pub const SENSOR_READ_FAIL_REDISCOVER_STREAK: u32 = 5;
 /// across both writers.
 pub const HWMON_FAN_STALE_INTERVALS: u32 = 5;
 
+// ── Service lifecycle (DEC-387) ──────────────────────────────────────
+
+/// The longest `startup.delay_secs` the daemon will sleep before discovery.
+///
+/// One definition for three consumers: `daemon.toml` validation,
+/// `POST /config/startup-delay`, and the clamp `main` applies to whatever
+/// `runtime.toml` holds (a hand-edit bypasses both setters). Since DEC-387 the
+/// unit is `Type=notify`, so the delay runs inside `TimeoutStartSec=`, and that
+/// value's derivation in `packaging/control-ofc-daemon.service` assumes this cap.
+pub const MAX_STARTUP_DELAY_SECS: u64 = 30;
+
 // ── Thermal emergency ────────────────────────────────────────────────
 
 /// CPU temperature (°C) at which the thermal emergency latches, forcing every

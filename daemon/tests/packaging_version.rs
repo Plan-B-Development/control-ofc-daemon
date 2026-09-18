@@ -339,6 +339,119 @@ fn service_readwritepaths_covers_device_tree() {
 }
 
 // ---------------------------------------------------------------------------
+// DEC-387 (`TS-d`) — readiness, the watchdog, and restart backoff. Each of these
+// is a property the daemon's own code depends on and cannot enforce: the
+// daemon sends READY=1 and pings from each completed tick, but only the unit
+// decides whether systemd waits for the one and acts on the absence of the
+// other.
+// ---------------------------------------------------------------------------
+
+fn daemon_unit() -> String {
+    std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../packaging/control-ofc-daemon.service"
+    ))
+    .expect("read control-ofc-daemon.service")
+}
+
+/// The value the unit assigns to `key`, comments excluded. The LAST assignment,
+/// because that is the one systemd keeps for a scalar setting.
+fn unit_value(unit: &str, key: &str) -> Option<String> {
+    unit.lines()
+        .rev()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+        .map(|v| v.trim().to_string())
+}
+
+fn unit_secs(unit: &str, key: &str) -> u64 {
+    unit_value(unit, key)
+        .unwrap_or_else(|| panic!("the unit must set {key}"))
+        .parse()
+        .unwrap_or_else(|_| panic!("{key} must be a bare number of seconds"))
+}
+
+/// Without `Type=notify` systemd never reads READY=1 and never arms the watchdog,
+/// so everything the daemon now sends is silently ignored — the daemon would
+/// still ping, and a wedged loop would still hold every fan with nothing to
+/// restart it.
+#[test]
+fn the_unit_waits_for_readiness_and_watches_the_engine() {
+    let unit = daemon_unit();
+    assert_eq!(unit_value(&unit, "Type").as_deref(), Some("notify"));
+    assert_eq!(
+        unit_value(&unit, "NotifyAccess").as_deref(),
+        Some("main"),
+        "only the daemon's own process may notify"
+    );
+    assert!(
+        unit_secs(&unit, "WatchdogSec") > 0,
+        "WatchdogSec=0 disables the watchdog the engine pings"
+    );
+    assert_eq!(
+        unit_value(&unit, "Restart").as_deref(),
+        Some("on-failure"),
+        "on-failure is what restarts a watchdog timeout, a crash and DEC-266's \
+         non-zero self-stop alike"
+    );
+}
+
+/// [SAFETY] Under `Type=notify` the whole start-up — the startup delay included —
+/// runs inside `TimeoutStartSec=`. The manager's default is a distribution choice
+/// (CachyOS ships 15 s), so the unit must pin a value above the longest delay the
+/// daemon will sleep, or a machine with a startup delay is killed and restarted
+/// into the same delay on every boot.
+#[test]
+fn the_start_timeout_is_pinned_above_the_longest_startup_delay() {
+    let unit = daemon_unit();
+    let start = unit_secs(&unit, "TimeoutStartSec");
+    let max_delay = control_ofc_daemon::constants::MAX_STARTUP_DELAY_SECS;
+    assert!(
+        start > max_delay,
+        "TimeoutStartSec={start} does not outlast the {max_delay}s maximum startup \
+         delay, so the daemon could never report ready in time"
+    );
+}
+
+/// DEC-272 rejected a watchdog because a recurring wedge would burn the start
+/// limit and leave the machine with no daemon. The limit is gone and restarts
+/// back off instead — which works only with BOTH backoff settings present
+/// (systemd ignores either alone) and a non-zero base delay.
+#[test]
+fn restarts_back_off_instead_of_hitting_a_start_limit() {
+    let unit = daemon_unit();
+    assert_eq!(
+        unit_value(&unit, "StartLimitIntervalSec").as_deref(),
+        Some("0"),
+        "a start limit would leave a recurring fault with no daemon at all"
+    );
+    assert_eq!(unit_value(&unit, "StartLimitBurst"), None);
+
+    let base = unit_secs(&unit, "RestartSec");
+    let max = unit_secs(&unit, "RestartMaxDelaySec");
+    let steps = unit_secs(&unit, "RestartSteps");
+    assert!(
+        base > 0 && steps > 0,
+        "backoff needs RestartSec > 0 and RestartSteps > 0"
+    );
+    assert!(
+        max > base,
+        "RestartMaxDelaySec must exceed RestartSec to back off at all"
+    );
+
+    // The daemon resets the restart counter after a healthy stretch; that stretch
+    // must be longer than the longest delay, or a fault recurring just after it
+    // would never back off.
+    let healthy = control_ofc_daemon::sd_notify::RESTART_RESET_AFTER_TICKS;
+    assert!(
+        healthy >= 5 * max,
+        "RESTART_RESET_AFTER_TICKS ({healthy} one-second ticks) must be several \
+         times RestartMaxDelaySec ({max}s)"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // DEC-239 — the GitHub Release carries the clean-room package as an asset so
 // `pacman -U` is a complete install path while the AUR is read-only (the
 // 2026-08-02 freeze stranded the GUI's v2.34.0 for over a day). Each failure

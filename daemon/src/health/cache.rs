@@ -168,6 +168,13 @@ pub struct StateCache {
     /// The validation recorder compares this against its own last-seen value to
     /// emit a `resume` event marker, and never mutates it.
     resume_generation: AtomicU64,
+    /// systemd's notification channel, attached once by `main` (DEC-387).
+    ///
+    /// Held here because the engine's completion guard already reaches the
+    /// cache, and the watchdog keep-alive is that guard's completion stamp
+    /// exported to systemd. Empty in tests and when the daemon is run by hand,
+    /// which makes [`Self::watchdog_tick`] a no-op there.
+    notifier: std::sync::OnceLock<Arc<crate::sd_notify::Notifier>>,
 }
 
 impl StateCache {
@@ -181,6 +188,21 @@ impl StateCache {
             gpu_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             openfan_write_generation: AtomicU64::new(0),
             resume_generation: AtomicU64::new(0),
+            notifier: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Attach systemd's notification channel (DEC-387). Called once, from `main`;
+    /// returns `false` if one was already attached, which is a wiring bug.
+    pub fn attach_notifier(&self, notifier: Arc<crate::sd_notify::Notifier>) -> bool {
+        self.notifier.set(notifier).is_ok()
+    }
+
+    /// Send systemd its watchdog keep-alive (DEC-387). Called from the engine's
+    /// `TickCompletion::drop` and nowhere else; a no-op with nothing attached.
+    pub fn watchdog_tick(&self) {
+        if let Some(notifier) = self.notifier.get() {
+            notifier.watchdog_tick();
         }
     }
 

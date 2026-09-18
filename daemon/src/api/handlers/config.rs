@@ -291,18 +291,19 @@ pub async fn update_startup_delay_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let max = crate::constants::MAX_STARTUP_DELAY_SECS;
     let delay = match body.get("delay_secs").and_then(|v| v.as_u64()) {
-        Some(d) if d <= 30 => d,
+        Some(d) if d <= max => d,
         Some(d) => {
             return error_response(
                 StatusCode::BAD_REQUEST,
-                &ErrorEnvelope::validation(format!("delay_secs must be 0-30, got {d}")),
+                &ErrorEnvelope::validation(format!("delay_secs must be 0-{max}, got {d}")),
             );
         }
         None => {
             return error_response(
                 StatusCode::BAD_REQUEST,
-                &ErrorEnvelope::validation("missing 'delay_secs' (integer 0-30)"),
+                &ErrorEnvelope::validation(format!("missing 'delay_secs' (integer 0-{max})")),
             );
         }
     };

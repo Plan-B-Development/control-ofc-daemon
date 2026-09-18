@@ -427,10 +427,10 @@ gating each have their own register rows and regression tests.
      against channel-tracking drift, not a periodic re-arm requirement
 
 6. **ExecStopPost restore** (`packaging/control-ofc-restore-auto.sh`):
-   - Replays the hwmon hand-back record (DEC-382): each header the daemon took gets back exactly what it had — its recorded `pwm_enable`, or its duty if it was already manual — confirmed by read-back, with `fancontrol`'s full-speed fallback; headers the daemon never took are not touched. On any service **stop job**, including SIGKILL
+   - Replays the hwmon hand-back record (DEC-382): each header the daemon took gets back exactly what it had — its recorded `pwm_enable`, or its duty if it was already manual — confirmed by read-back, with `fancontrol`'s full-speed fallback; headers the daemon never took are not touched. Runs once the daemon has exited, whatever ended it — a requested stop, a crash, a SIGKILL, a watchdog kill (DEC-387)
    - Resets GPU fan curves to automatic
    - Re-enables `fan_zero_rpm_enable=1` for every GPU exposing it (DEC-100 — closes the SIGKILL/OOM path the panic hook can't cover)
-   - **It is not a universal backstop, and this qualification is load-bearing (278-b).** `ExecStopPost` runs as part of a *stop job*, and the `Restart=on-failure` path has none — so when the daemon exits non-zero and systemd restarts it, this script does not run at all. That path is covered **in-process** instead, by the bounded restore in `main.rs` (DEC-278/279): `restore_gpu_fans_to_auto` then `hand_back_hwmon`, each on its own deadline. Read this bullet as "any stop", never as "any exit"; the earlier wording said "ANY service stop (including SIGKILL)", which invited the second reading on the one path where it is false.
+   - **What it cannot do is end a stall, and this qualification is load-bearing.** `ExecStopPost` runs after *every* exit, the `Restart=on-failure` path included — systemd runs it before scheduling the restart (`systemd.service(5)`: also when the service "exited unexpectedly"; measured on systemd 261, DEC-387). But it runs only once the process HAS exited, so a restore stalled inside the daemon would hold it off for good. That is why the in-process restore in `main.rs` is bounded (DEC-278/279: `restore_gpu_fans_to_auto` then `hand_back_hwmon`, each on its own deadline), and why, since DEC-387, a self-stop announces itself with `STOPPING=1` so that systemd's `TimeoutStopSec=` bounds it too. OpenFan channels are outside both mechanisms: USB-serial, with no firmware mode to return to. *(Corrected by DEC-387, `TS-k`: 278-b said this script "does not run at all" when the daemon exits non-zero and is restarted. It does; the load-bearing fact was always the stall, not the path.)*
 
 7. **Kernel-version regression catalogue** (`hwmon/kernel_warnings.rs`, DEC-098):
    - Curated list of published amdgpu regressions keyed by kernel version + GPU PCI device ID
@@ -454,6 +454,29 @@ gating each have their own register rows and regression tests.
    `aio_hwmon` capability). This is detection only — there is **deliberately no
    coolant thermal-override rule**; the CPU-only `ThermalSafetyRule` is the sole
    emergency backstop. Scope is hwmon-only (USB-only coolers are out of scope).
+
+10. **Engine liveness watchdog** (`sd_notify.rs`, DEC-387): the unit is
+    `Type=notify` with `WatchdogSec=15`. DEC-266 restarts the daemon when the
+    engine task *dies*; this covers the engine that is alive but no longer
+    ticking — a deadlock, an await that never resolves, a starved runtime —
+    which holds every fan at its last duty with no thermal ladder. The
+    keep-alive (`WATCHDOG=1`) is sent from `TickCompletion::drop` and nowhere
+    else, so it measures exactly "a tick completed". A slow or wedged *device*
+    does not stop it: since DEC-289 the loop keeps ticking past a write that has
+    not returned. On a timeout systemd SIGABRTs the daemon, runs `ExecStopPost`
+    and restarts it; restarts back off exponentially (3 s → 60 s) instead of
+    hitting a start limit, and the daemon sends `RESTART_RESET=1` after five
+    minutes of completed ticks so an unrelated later fault restarts fast again.
+    `READY=1` is sent once the engine is ticking, the API is serving and SIGTERM
+    reaches the graceful path; before it, each boot-time serial probe extends the
+    start deadline by its own bound (`EXTEND_TIMEOUT_USEC`), so start-up is limited
+    by progress rather than by how many serial devices the machine has.
+    `STOPPING=1` with `WATCHDOG_USEC=0` opens every shutdown, because systemd
+    re-arms its watchdog on any keep-alive whatever the unit's state, and a late
+    tick would otherwise arm a fresh timer over the hardware restore. One limit:
+    user space is frozen while devices suspend and resume, and that stretch counts
+    against the watchdog, so hardware whose device suspend and resume exceed ~10 s
+    can see the daemon restarted at resume (`TS-ao`).
 
 ## Running
 

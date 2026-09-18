@@ -141,9 +141,10 @@ impl<T: Send + 'static> BoundedWrite<T> {
     /// resolves instantly while a detached write still holds the controller
     /// mutex, and the still-running `set_pwm` would re-assert manual mode *after*
     /// `hand_back_hwmon` gave the fans back (it reads the ledger, not the
-    /// controller, so nothing about the lock would stop it): fans latched in
-    /// manual after exit, silently, on the `Restart=on-failure` path where
-    /// `ExecStopPost` never runs.
+    /// controller, so nothing about the lock would stop it): fans back in manual
+    /// after the daemon's own restore, silently. The re-take is recorded before
+    /// it is written, so `ExecStopPost`'s replay of the hand-back record is left
+    /// to catch it after exit — and outside systemd nothing is.
     pub(crate) async fn drain(&mut self, deadline: std::time::Duration) {
         let Some(handle) = self.pending.take() else {
             return;
@@ -2348,6 +2349,40 @@ mod tests {
     use crate::hwmon::lease::LeaseManager;
     use crate::hwmon::pwm_control::{HwmonPwmController, SysfsWriter};
     use crate::hwmon::pwm_discovery::PwmHeaderDescriptor;
+
+    /// [SAFETY] DEC-387: systemd's watchdog must outlast the longest gap a
+    /// HEALTHY engine can leave between two completed ticks, or it kills a daemon
+    /// that is merely busy. That gap is the loop's 1 s period plus every bounded
+    /// wait one tick can make — so it is derived here from the budgets the writes
+    /// actually use, at the 3x margin the unit file's comment claims. Raise a
+    /// budget and this fails until `WatchdogSec` is revisited.
+    #[test]
+    fn the_systemd_watchdog_outlasts_the_slowest_healthy_tick() {
+        let unit = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../packaging/control-ofc-daemon.service"
+        ))
+        .expect("read the daemon unit");
+        let watchdog: u64 = unit
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with('#'))
+            .find_map(|l| l.strip_prefix("WatchdogSec="))
+            .expect("the unit sets WatchdogSec")
+            .parse()
+            .expect("WatchdogSec is a bare number of seconds");
+
+        let slowest_gap = std::time::Duration::from_secs(1) // the loop's 1 Hz period
+            + WRITE_JOIN_BUDGET // OpenFan
+            + constants::GPU_RESET_LOCK_WAIT // GPU: the write-lock wait, then
+            + GPU_WRITE_JOIN_BUDGET // its bounded join
+            + WRITE_JOIN_BUDGET; // hwmon
+        assert!(
+            std::time::Duration::from_secs(watchdog) >= slowest_gap * 3,
+            "WatchdogSec={watchdog} leaves less than 3x the slowest healthy tick \
+             ({slowest_gap:?}) — systemd would kill a daemon that is only busy"
+        );
+    }
 
     // ── DEC-289: bounded write joins ────────────────────────────────
     //
