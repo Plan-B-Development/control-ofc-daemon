@@ -122,16 +122,23 @@ const ENGINE_REASONS: SubsystemReasons = SubsystemReasons {
     never: "never ticked",
 };
 
-/// How long a single tick may legitimately take before it counts as wedged
-/// rather than slow (DEC-259), as a multiple of the nominal 1 Hz period.
+/// How long a backend write may legitimately stay in flight, or a tick keep
+/// running, before it counts as wedged rather than slow (DEC-259), as a
+/// multiple of the nominal 1 Hz period.
 ///
-/// Derived, not guessed. The worst legitimate tick is a thermal `force_all_with_floor` over
-/// a degraded-but-open serial link: `NUM_CHANNELS` (10) writes, each bounded by
-/// `serial.timeout_ms`, which the API caps at 1000 ms — so ~10 s for OpenFan
-/// alone, plus the hwmon leg. 30× leaves room for that and for a slow sysfs
-/// without ever reporting a genuinely dead engine as merely busy: past this
-/// bound the tick is not slow, it is stuck, and the distinction stops being
-/// useful to a user.
+/// Derived from the WRITE, not the tick. The worst legitimate write is a thermal
+/// `force_all_with_floor` over a degraded-but-open serial link: `NUM_CHANNELS`
+/// (10) writes, each bounded by `serial.timeout_ms`, which the API caps at
+/// 1000 ms — so ~10 s for OpenFan alone, plus the hwmon leg. Since DEC-289 the
+/// tick no longer waits for it: each backend is joined for at most
+/// `WRITE_JOIN_BUDGET` and the write finishes in the background, reported by the
+/// write-stall ladder below, so the longest healthy tick is ~4.75 s (DEC-387,
+/// `the_systemd_watchdog_outlasts_the_slowest_healthy_tick`). 30× leaves room for
+/// the slow write without ever reporting a genuinely dead engine as merely busy,
+/// and for a tick it is far past anything healthy: past this bound nothing is
+/// slow, it is stuck, and the distinction stops being useful to a user. Under
+/// systemd the watchdog restarts an engine that stops completing ticks long
+/// before a tick reaches it (DEC-387).
 const WEDGED_TICK_MULTIPLE: u32 = 30;
 
 /// Engine liveness, which is a different question from data freshness.

@@ -13,10 +13,11 @@
 //! [`OpenFanSafetyWrite`] or [`HwmonSafetyWrite`] — so that the two cannot be
 //! passed to [`force_present_backends`] the wrong way round (`OFN-ae`).
 //! [`GpuBackend`] deliberately does NOT (DEC-130): there is no GPU
-//! emergency threshold. AMD PMFW firmware owns GPU thermal protection
-//! (junction-temp throttling, firmware fan ramp) independently of OS fan
-//! control, and forcing PMFW curve commits from a CPU emergency would add
-//! SMU churn without improving GPU safety.
+//! emergency threshold. AMD PMFW protects the GPU by throttling its clocks on
+//! junction temperature, independently of OS fan control — it does not ramp a
+//! fan past a curve the daemon committed (`TS-i`) — and forcing PMFW curve
+//! commits from a CPU emergency would add SMU churn without improving GPU
+//! safety.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

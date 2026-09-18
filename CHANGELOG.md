@@ -123,10 +123,10 @@ the daemon held your profile's fans at 60 % for two seconds before handing them
 back; it now hands them back at once. `thermal_state` no longer reports
 `"recovery"` — clients still recognise it from older daemons.
 
-**The 60 % recovery floor and the 40 % no-CPU-sensor floor now apply only to the
-fans your active profile controls** (DEC-382). The 100 % thermal emergency still
-takes every fan. A 60 % or 40 % floor on a fan nothing controls replaced its BIOS
-curve, which could be running it faster — and with no CPU temperature sensor at all
+**The 40 % no-CPU-sensor floor now applies only to the fans your active profile
+controls** (DEC-382). The 100 % thermal emergency still takes every fan. A 40 %
+floor on a fan nothing controls replaced its BIOS curve, which could be running it
+faster — and with no CPU temperature sensor at all
 (a new AMD CPU on an older kernel, say) every such fan sat at a flat 40 % for as
 long as the daemon ran. Those fans now stay under their BIOS curve, and with no
 profile active the no-sensor floor forces nothing.

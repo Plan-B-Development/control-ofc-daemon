@@ -752,7 +752,8 @@ fn parse_profile_arg(search_dirs: &[std::path::PathBuf]) -> Option<std::path::Pa
 ///
 /// This is the boot-time fail-safe (DEC-165): a persisted profile that has gone
 /// bad on disk must never crash startup — the daemon falls back to imperative
-/// mode (no autonomous writes) and waits for a valid profile to be activated.
+/// mode (no curve evaluation; only the thermal ladder writes on its own) and
+/// waits for a valid profile to be activated.
 /// Pure over an injected `load` fn so the fail-safe is unit-testable without the
 /// real state file. The caller logs the success case (it owns the "restored"
 /// message); this fn logs the warn-level failure cases.
@@ -2186,8 +2187,9 @@ async fn async_main() {
     // ── Spawn profile engine ─────────────────────────────────────────
     // Evaluates curves and writes PWM headlessly at 1Hz. The engine is the
     // sole PWM writer (DEC-159/DEC-165). In imperative mode (no active profile)
-    // nothing autonomous runs — the daemon only writes in response to explicit
-    // API intent (manual override, fan identify); the GUI never writes PWM.
+    // no curve is evaluated — the daemon writes for explicit API intent (manual
+    // override, fan identify) and for the thermal ladder, which acts with or
+    // without a profile (`TS-k`); the GUI never writes PWM.
     //
     // DEC-266: the engine is SUPERVISED. Its task dying is not a contained
     // failure — it is the loss of the only PWM writer, and with it the thermal

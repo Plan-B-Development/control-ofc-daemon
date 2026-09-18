@@ -313,9 +313,17 @@ gating each have their own register rows and regression tests.
      Intel-only in practice: `k10temp` on Zen publishes no `crit`, so AMD keeps
      the 105 floor, which is right — with a ~95C ceiling it was never the broken
      case. `/diagnostics/hardware` reports the value actually acted on
+   - **A backstop, not a cooling-failure detector (`TS-m`).** The trip point
+     sits above the CPU's own throttle point on purpose, and a CPU holds itself
+     there by throttling, so a stopped pump or stalled fans show up as a CPU
+     pinned at its ceiling — not as an emergency. The ladder catches a CPU that
+     can no longer protect itself, not a cooling fault
    - GPU fans are deliberately excluded (DEC-130) — there is no GPU emergency
-     threshold; AMD PMFW firmware owns GPU thermal protection (junction-temp
-     throttling, firmware fan ramp) independently of OS fan control
+     threshold; AMD PMFW firmware protects the GPU by throttling its clocks on
+     junction temperature, independently of OS fan control. It does not ramp a
+     fan past a curve the daemon has committed (`TS-i`), so while the daemon
+     drives a GPU fan, throttling is the GPU's protection; the curve returns to
+     firmware when the daemon exits
    - Holds until CpuTemp <= 80C. The release threshold is a genuine constant
      (THERMAL_EMERGENCY_RELEASE_C), but the hysteresis SPAN is not — it follows
      the per-machine trip point: 25C at the 105 floor, 35C at the 115 cap. Do

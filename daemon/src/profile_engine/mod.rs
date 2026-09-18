@@ -1400,12 +1400,13 @@ pub async fn profile_engine_loop(
         if let Some(forced_pct) = decision.forced_pct {
             // Forced safety override — every OpenFan channel and writable
             // hwmon header THIS MACHINE HAS. GPU fans are deliberately excluded
-            // (DEC-130): AMD PMFW firmware owns GPU thermal protection
-            // (junction-temp throttle, firmware fan ramp) independently of OS fan
-            // control, and forcing PMFW curve commits from a CPU emergency would
-            // add SMU churn without improving GPU safety. There is no GPU
-            // emergency threshold; the exclusion is structural — GpuBackend
-            // does not implement SafetyWriteBackend.
+            // (DEC-130): AMD PMFW protects the GPU by throttling its clocks on
+            // junction temperature, independently of OS fan control — it does not
+            // ramp a fan past a curve the daemon committed (`TS-i`) — and forcing
+            // PMFW curve commits from a CPU emergency would add SMU churn without
+            // improving GPU safety. There is no GPU emergency threshold; the
+            // exclusion is structural — GpuBackend does not implement
+            // SafetyWriteBackend.
             //
             // DEC-371: "this machine has" is the qualifier that was missing, and
             // its absence reached the operator. Do NOT restate the enumeration

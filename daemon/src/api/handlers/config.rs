@@ -1108,12 +1108,16 @@ pub async fn update_serial_timeout_handler(
     Json(body): Json<serde_json::Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let ms = match body.get("timeout_ms").and_then(|v| v.as_u64()) {
-        // [SAFETY] Ceiling of 1000 ms, tighter than the admin file allows. An
-        // emergency `force_all_with_floor` awaits the OpenFan backend before the hwmon one,
-        // costing up to `channels x timeout` on a wedged serial link — at 5000 ms
-        // that is ~40 s for 8 channels, during which no further safety
-        // evaluation runs. Same reasoning as the poll ceiling: the API is
-        // unprivileged-reachable, the file is not.
+        // [SAFETY] Ceiling of 1000 ms, tighter than the admin file allows. The
+        // thermal force writes the OpenFan channels one after another, so a
+        // wedged serial link costs up to `channels x timeout` before it reaches
+        // the last fan — at 5000 ms that is ~40 s for 8 channels. Since DEC-289
+        // the tick does not wait for that (it stops joining after
+        // `WRITE_JOIN_BUDGET` and the write finishes in the background), so
+        // safety evaluation carries on; what the ceiling still bounds is how
+        // long the force takes to land and how long the write-stall ladder
+        // reports "in flight" before "wedged" (`TS-am`). Same reasoning as the
+        // poll ceiling: the API is unprivileged-reachable, the file is not.
         Some(v) if (50..=1_000).contains(&v) => v,
         Some(v) => {
             return error_response(

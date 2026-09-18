@@ -48,9 +48,9 @@
 //! old `force_all(pct)` would have driven it.
 //!
 //! GPU fans are deliberately excluded from this rule (DEC-130): there is no
-//! GPU emergency threshold. AMD PMFW firmware owns GPU thermal protection
-//! (junction-temp throttling and firmware fan ramp) independently of OS fan
-//! control.
+//! GPU emergency threshold. AMD PMFW protects the GPU by throttling its clocks
+//! on junction temperature, independently of OS fan control; it does not ramp
+//! a fan past a curve the daemon has committed (`TS-i`).
 
 /// Emergency thermal safety override for CPU temperature.
 ///
