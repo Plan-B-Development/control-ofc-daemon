@@ -105,8 +105,21 @@ impl FanController {
     /// Read by the thermal force to remember what a channel no profile controls
     /// was doing before an emergency, so it can be given back afterwards
     /// (DEC-382). `None` there means "unknown", and an unknown channel stays at
-    /// the forced duty rather than being guessed down.
+    /// the forced duty rather than being guessed down. Also read by the
+    /// no-sensor floor to hold a skipped control's channel at its last duty
+    /// (`TS-p`, DEC-386).
+    ///
+    /// [SAFETY] `TS-ak`: a reconnect or resume that no [`Self::set_pwm`] has
+    /// observed yet already makes every duty unknown. The stored value is only
+    /// cleared when the next write observes the bump, so the accessor checks the
+    /// generation itself — otherwise a read before that write returns the
+    /// pre-reconnect duty, and the force floors or snapshots a channel at a duty
+    /// the device may no longer hold. Read-only: the clearing stays in
+    /// [`Self::observe_write_generation`], so this takes `&self`.
     pub fn last_commanded_pct(&self, channel: u8) -> Option<u8> {
+        if self.cache.openfan_write_generation() != self.last_write_generation {
+            return None;
+        }
         self.channels
             .get(channel as usize)
             .and_then(|c| c.last_commanded_pct)
@@ -774,6 +787,36 @@ mod tests {
             "after a reconnect the same value must reach the wire again"
         );
         assert_eq!(written.lock().len(), 2);
+    }
+
+    /// [SAFETY] `TS-ak`: after a reconnect or resume, the accessor reports every
+    /// channel's duty as unknown straight away — not only once the next
+    /// `set_pwm` has observed the bump. The thermal force reads it BEFORE its
+    /// first write, so a stale answer there floors or snapshots a channel at a
+    /// duty the device may no longer hold.
+    #[test]
+    fn a_pending_invalidation_makes_the_last_duty_unknown_before_any_write() {
+        let (transport, _written) = MockTransport::with_ok_responses(3);
+        let cache = Arc::new(StateCache::new());
+        let mut ctrl = FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            Duration::from_millis(500),
+        );
+        ctrl.set_pwm(0, 85).unwrap();
+        ctrl.set_pwm(1, 40).unwrap();
+        assert_eq!(ctrl.last_commanded_pct(0), Some(85), "precondition");
+
+        cache.invalidate_openfan_writes();
+
+        assert_eq!(ctrl.last_commanded_pct(0), None);
+        assert_eq!(ctrl.last_commanded_pct(1), None);
+
+        // Observing the bump does not bring the stale value back, and the next
+        // landed write is known again.
+        ctrl.set_pwm(0, 60).unwrap();
+        assert_eq!(ctrl.last_commanded_pct(0), Some(60));
+        assert_eq!(ctrl.last_commanded_pct(1), None);
     }
 
     #[test]

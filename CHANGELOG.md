@@ -14,6 +14,18 @@ now latches for these headers exactly as it already did for OpenFan channels: on
 it has run, any lower write to such a header is raised to it, and a higher one
 still lands.
 
+**An OpenFan channel's duty is treated as unknown straight after a reconnect or
+resume** (`TS-ak`, DEC-393). After the controller reconnected or the system resumed,
+the daemon went on treating each channel's last commanded duty as current until its
+next write to any channel, although the device may have come back at its power-on
+default. Two things read it in that window. A thermal emergency's record of what to
+give back afterwards could return a channel to that old duty; such a channel now
+stays at full speed instead. And under the missing-CPU-sensor 40 % floor, the
+profile's lowest-numbered OpenFan channel, when its control was skipped, was held at
+the old duty while every other skipped channel already dropped to the floor. All of
+them now get the floor, which for that one channel can be lower than before, and it
+stays there while the control is skipped.
+
 ## [2.51.0] — 2026-09-19
 
 ### Fixed

@@ -1230,6 +1230,10 @@ impl SafetyWriteBackend for OpenFanBackend {
         };
         // `TS-p`: the channels of controls skipped this tick hold their last
         // duty under the floor. Read per channel under the lock the write takes.
+        // A channel whose duty is unknown — never written, a failed reply, or
+        // lost to a reconnect or resume (`TS-ak`) — gets the bare floor
+        // (DEC-386 decision 4); whether it should get full speed instead is
+        // `TS-av`.
         let held: HashSet<u8> = match reach {
             ForceReach::ProfileMembers { held, .. } => held.0.openfan.clone(),
             ForceReach::All => HashSet::new(),
@@ -4003,6 +4007,81 @@ mod tests {
                 &w[before..]
             );
         }
+    }
+
+    /// [SAFETY] `TS-ak`: after a reconnect or resume the held channel's last
+    /// duty is unknown, so it is floored at the bare floor — not at the duty it
+    /// held before the device may have lost it. Channel 0 is the force's first
+    /// target, so no `set_pwm` has observed the bump when it is read.
+    #[tokio::test]
+    async fn a_held_openfan_channel_whose_duty_was_lost_gets_the_bare_floor() {
+        let (mut be, written, cache) = openfan_backend();
+        be.ctrl.lock().set_pwm(0, 85).unwrap();
+        cache.invalidate_openfan_writes();
+        let before = written.lock().len();
+        let members = ProfileMembers {
+            openfan: [0u8].into(),
+            ..ProfileMembers::default()
+        };
+        let held = HeldMembers(members.clone());
+
+        be.force_all_with_floor(
+            40,
+            &[],
+            ForceReach::ProfileMembers {
+                members: &members,
+                give_back: true,
+                held: &held,
+            },
+        )
+        .await;
+
+        let w = written.lock();
+        let frame_40 = format!(">0200{:02X}", crate::pwm::percent_to_raw(40));
+        assert_eq!(
+            w[before..]
+                .iter()
+                .map(|f| f.trim_end().to_string())
+                .collect::<Vec<_>>(),
+            [frame_40],
+            "one frame, at the floor rather than the pre-reconnect 85 %"
+        );
+    }
+
+    /// [SAFETY] `TS-ak`: a reconnect or resume before an emergency leaves every
+    /// channel's pre-emergency duty unknown, and an unknown duty is never given
+    /// back — the channel stays at the forced duty rather than returning to one
+    /// the device may no longer have held.
+    #[tokio::test]
+    async fn a_duty_lost_before_the_emergency_is_not_given_back() {
+        let (mut be, written, cache) = openfan_backend();
+        be.ctrl.lock().set_pwm(0, 30).unwrap();
+        cache.invalidate_openfan_writes();
+
+        be.force_all_with_floor(100, &[], ForceReach::All).await;
+        assert!(
+            written.lock().iter().any(|f| f.trim_end() == ">0200FF"),
+            "precondition: the emergency drives channel 0"
+        );
+
+        let before = written.lock().len();
+        let members = ProfileMembers::default();
+        be.force_all_with_floor(
+            60,
+            &[],
+            ForceReach::ProfileMembers {
+                members: &members,
+                give_back: true,
+                held: &HeldMembers::default(),
+            },
+        )
+        .await;
+        let w = written.lock();
+        assert!(
+            w[before..].is_empty(),
+            "no channel may be given back a pre-reconnect duty; got {:?}",
+            &w[before..]
+        );
     }
 
     /// A sub-100 force on a machine where no profile controls anything reaches
