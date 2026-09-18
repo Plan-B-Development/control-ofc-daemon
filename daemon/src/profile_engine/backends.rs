@@ -762,7 +762,8 @@ pub(crate) struct OpenFanBackend {
     /// no profile controls gets its entry back — an OpenFan channel has no
     /// firmware curve to return to, so its own last duty is what "give back what
     /// was taken" means. `None` outside an emergency; an entry of `None` is a
-    /// channel this daemon had not set, which stays at the forced duty rather
+    /// channel whose duty this daemon does not know — never set, or its last
+    /// command's reply failed (DEC-383) — which stays at the forced duty rather
     /// than being guessed down.
     ///
     /// Shared with the blocking write task because that is where the controller
@@ -1110,9 +1111,14 @@ fn give_back_pre_emergency(
                 "Thermal emergency over: OpenFan ch{ch} (no profile controls it) returned \
                  to its pre-emergency {duty}%"
             ),
+            // Not "stays at the forced duty": a failed reply says nothing about
+            // whether the command landed (DEC-383), so the duty is unknown — and
+            // the controller now tracks it as unknown, so the next command to
+            // this channel is always written.
             Err(e) => log::warn!(
-                "Thermal emergency over: OpenFan ch{ch} could not be returned to its \
-                 pre-emergency {duty}% and stays at the forced duty: {e}"
+                "Thermal emergency over: returning OpenFan ch{ch} to its pre-emergency \
+                 {duty}% was not confirmed ({e}) — its duty is unknown until the next \
+                 command reaches it"
             ),
         }
         results.push((ch, res));

@@ -68,9 +68,10 @@ impl FanController {
         }
     }
 
-    /// The duty this controller last put on `channel`, or `None` when it has not
-    /// written one since it started or since the device may have lost it (a
-    /// reconnect or resume clears every channel — DEC-256).
+    /// The duty this controller last put on `channel`, or `None` when it does not
+    /// know it: nothing written since it started, the device may have lost it (a
+    /// reconnect or resume clears every channel — DEC-256), or the last command's
+    /// reply failed, so it may or may not have landed (DEC-383).
     ///
     /// Read by the thermal force to remember what a channel no profile controls
     /// was doing before an emergency, so it can be given back afterwards
@@ -165,10 +166,29 @@ impl FanController {
         let cmd = Command::SetPwm(ch, raw);
 
         let mut transport = self.transport.lock();
-
-        send_command(&mut **transport, &cmd, self.timeout).map_err(FanControlError::Serial)?;
-
+        let sent = send_command(&mut **transport, &cmd, self.timeout);
         drop(transport);
+
+        if let Err(e) = sent {
+            // [SAFETY] TS-o / DEC-383. `send_command` writes the frame BEFORE it
+            // waits for the reply, so a reply that times out, arrives garbled or
+            // answers something else says nothing about whether the device applied
+            // this duty. Keeping the old value as "last commanded" then coalesced
+            // every later identical command into silence: a channel tracked at 100
+            // that took a 60 whose reply failed skipped every forced 100 % for the
+            // rest of an emergency while the cache reported 100. The device's duty
+            // is unknown, so the tracking says so.
+            //
+            // The stop clock goes with it, for the reason the reconnect path above
+            // gives: clearing only `last_commanded_pct` would stop a 0 % hold from
+            // coalescing while a stale `stop_started_at` rejects every wire-bound
+            // 0 % past the timeout — forever, because the write never lands to
+            // update either field.
+            let ch = &mut self.channels[channel as usize];
+            ch.last_commanded_pct = None;
+            ch.stop_started_at = None;
+            return Err(FanControlError::Serial(e));
+        }
 
         // Update tracking state
         self.channels[channel as usize].last_commanded_pct = Some(effective_pct);
@@ -599,6 +619,71 @@ mod tests {
         let snap = cache.snapshot();
         let fan = snap.openfan_fans.get(&3).unwrap();
         assert_eq!(fan.last_commanded_pwm, Some(75));
+    }
+
+    fn ack(pct: u8) -> String {
+        crate::serial::protocol::firmware_echo_for(
+            &Command::SetPwm(Channel::new(0).unwrap(), percent_to_raw(pct)).encode(),
+        )
+    }
+
+    /// [SAFETY] TS-o / DEC-383, the audit's own scenario. A channel tracked at 100
+    /// takes a 60 % whose frame is written and whose reply fails, so the device
+    /// may well be at 60 %. The next 100 % must reach the wire; before the fix it
+    /// coalesced against the stale 100, and so did every forced 100 % after it.
+    #[test]
+    fn a_failed_reply_forgets_the_duty_so_the_next_identical_write_lands() {
+        let (transport, written) = MockTransport::with_responses(vec![
+            Ok(ack(100)),
+            Err(SerialError::Timeout { timeout_ms: 500 }),
+            Ok(ack(100)),
+        ]);
+        let mut ctrl = make_controller(transport);
+
+        ctrl.set_pwm(0, 100).unwrap();
+        assert!(
+            ctrl.set_pwm(0, 60).is_err(),
+            "precondition: the 60 % reply failed"
+        );
+        assert_eq!(
+            written.lock().len(),
+            2,
+            "precondition: the 60 % frame reached the wire before its reply failed"
+        );
+
+        let again = ctrl.set_pwm(0, 100).unwrap();
+        assert!(
+            !again.coalesced,
+            "the device may be at 60 %, so 100 % must be written again"
+        );
+        assert_eq!(written.lock().len(), 3);
+    }
+
+    /// The other half of the same reset. A channel parked at 0 % past the stop
+    /// timeout, whose next non-zero write fails, must not keep its stale stop
+    /// clock once its tracking is cleared: the curve's next 0 % would no longer
+    /// coalesce and the timeout would reject it every tick, forever.
+    #[test]
+    fn a_failed_reply_also_restarts_the_stop_clock() {
+        let (transport, written) = MockTransport::with_responses(vec![
+            Err(SerialError::Timeout { timeout_ms: 500 }),
+            Ok(ack(0)),
+        ]);
+        let mut ctrl = make_controller(transport);
+        ctrl.channels[0].last_commanded_pct = Some(0);
+        ctrl.channels[0].stop_started_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(9));
+
+        assert!(
+            ctrl.set_pwm(0, 30).is_err(),
+            "precondition: the 30 % reply failed"
+        );
+        let stop = ctrl.set_pwm(0, 0);
+        assert!(
+            stop.as_ref().is_ok_and(|r| !r.coalesced),
+            "the next 0 % must reach the wire, not be rejected by a stale stop clock: {stop:?}"
+        );
+        assert_eq!(written.lock().len(), 2);
     }
 
     #[test]

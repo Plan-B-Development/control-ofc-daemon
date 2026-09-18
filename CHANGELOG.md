@@ -22,8 +22,18 @@ a Test PWM Control, Characterise or discovery run ending, deactivating a profile
 and switching to a profile that no longer controls a header each used to leave the
 header in manual mode at its last duty, BIOS curve off, until the daemon stopped.
 Each now hands it back on the next tick. OpenFan channels no profile controls get
-their pre-emergency speed back when an emergency ends; a channel the daemon had
-never set stays at 100 %.
+their pre-emergency speed back when an emergency ends; a channel whose speed the
+daemon does not know — never set, or its last command unconfirmed — stays at 100 %.
+
+**An OpenFan fan can no longer miss a thermal emergency because one reply
+failed** (`TS-o`, DEC-383). The daemon sends a speed command and then waits for the
+controller's reply. If that reply timed out or arrived garbled, the command may
+well have been applied — but the daemon kept its previous record of the channel's
+speed. A channel it believed was at 100 % that took a 60 % whose reply failed
+could then sit at 60 % for a whole emergency, because every forced 100 % matched
+the stale record and was skipped as a duplicate, while `/status` reported 100 %.
+A failed reply now leaves the channel's speed unknown, so the next command is
+always sent.
 
 ### Changed
 
