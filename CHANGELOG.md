@@ -59,7 +59,27 @@ temperature reading is fresh, and a sweep already running stops at its next step
 The safety preflight now reports this as blocking for verify and characterisation
 too, where it used to be only a warning.
 
+**A fan keeps its speed when the no-sensor floor applies, if its own curve can no
+longer be read** (`TS-p`, DEC-386). When every CPU temperature reading fails, the
+daemon stops trusting the sensor and, after a few more seconds, holds your
+profile's fans at no less than 40 %. A control whose sensor was gone had already
+stopped being updated — its fans keep their last speed — but that 40 % floor then
+treated them as if nothing were driving them and set them to 40 %. A CPU curve that
+had been running its fans at 90 % dropped to 40 %, with the CPU's temperature
+unknown. They now keep their last speed under the floor.
+
 ### Changed
+
+**A thermal emergency stays at 100 % until the CPU is measured cool again**
+(DEC-386). If the CPU temperature sensor disappeared entirely during an emergency,
+the daemon used to drop the fans to 40 %. It now holds 100 % whether the sensor has
+stopped updating or vanished, and the emergency ends only on a fresh reading at or
+below 80 °C.
+
+**The emergency no longer steps through 60 % on its way out** (DEC-386). On release
+the daemon held your profile's fans at 60 % for two seconds before handing them
+back; it now hands them back at once. `thermal_state` no longer reports
+`"recovery"` — clients still recognise it from older daemons.
 
 **The 60 % recovery floor and the 40 % no-CPU-sensor floor now apply only to the
 fans your active profile controls** (DEC-382). The 100 % thermal emergency still

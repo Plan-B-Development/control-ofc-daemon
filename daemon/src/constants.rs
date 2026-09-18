@@ -182,8 +182,8 @@ pub const NO_SENSOR_SAFE_PCT: u8 = 40;
 /// Shorter than [`HWMON_FAIL_SUMMARY_INTERVAL`] by design — a thermal event
 /// outranks a per-member write failure, so it gets a ~1 min heartbeat rather
 /// than ~5 min. A *change* of duty or of driven backend is announced
-/// immediately and does not wait for this interval, so the ladder's
-/// 100 → 60 → profile steps are never hidden by it.
+/// immediately and does not wait for this interval, so a duty change (a blind
+/// 40 % hold turning into the 100 % emergency) is never hidden by it.
 pub const THERMAL_FORCE_LOG_SUMMARY_TICKS: u32 = 60;
 
 // ── Profile engine — OpenFan write-failure alerting (audit P3-5) ──────
@@ -306,9 +306,11 @@ pub const THERMAL_TRIGGER_MARGIN_C: f64 = 5.0;
 /// the derived trigger is always within `[105, 115]`.
 pub const THERMAL_TRIGGER_MAX_C: f64 = 115.0;
 
-/// CPU temperature (°C) at which a latched thermal emergency releases into its
-/// recovery floor. Deliberately far below the trigger: the gap is the hysteresis
-/// that stops the emergency flapping. See [`THERMAL_EMERGENCY_TRIGGER_C`].
+/// CPU temperature (°C) at or below which a FRESH reading releases a latched
+/// thermal emergency, handing control straight back to the profile (DEC-386
+/// removed the 60% recovery floor that used to follow). Deliberately far below
+/// the trigger: the gap is the hysteresis that stops the emergency flapping. See
+/// [`THERMAL_EMERGENCY_TRIGGER_C`].
 pub const THERMAL_EMERGENCY_RELEASE_C: f64 = 80.0;
 
 // ── Calibration ──────────────────────────────────────────────────────

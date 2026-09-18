@@ -197,7 +197,8 @@ impl StateCache {
     ///
     /// [SAFETY] This is what converts "the poll loop died" into "no CPU sensor",
     /// which is a state the daemon already handles correctly and has tested
-    /// (DEC-132's 5-cycle fallback, DEC-190's latched-emergency dropout). Without
+    /// (DEC-132's 5-cycle fallback, and a latched emergency held while blind —
+    /// DEC-190, then DEC-386). Without
     /// it a dead poll loop freezes the last reading, the thermal ladder is
     /// evaluated forever against a temperature that can no longer rise, and
     /// `/status` reports a healthy engine throughout — because the engine *is*

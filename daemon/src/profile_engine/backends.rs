@@ -387,8 +387,26 @@ impl ProfileMembers {
     /// The members of `profile`'s controls. GPU members are not collected: the
     /// thermal force never reaches a GPU fan (DEC-130), and nothing gives one back.
     pub(crate) fn of(profile: &crate::profile::DaemonProfile) -> Self {
+        Self::collect(profile.controls.iter())
+    }
+
+    /// The members of the named controls only — `TS-p`'s held set: the controls
+    /// this tick skipped, whose fans hold their last duty (DEC-386).
+    pub(crate) fn of_controls(
+        profile: &crate::profile::DaemonProfile,
+        control_ids: &HashSet<String>,
+    ) -> Self {
+        Self::collect(
+            profile
+                .controls
+                .iter()
+                .filter(|c| control_ids.contains(&c.id)),
+        )
+    }
+
+    fn collect<'p>(controls: impl Iterator<Item = &'p crate::profile::LogicalControl>) -> Self {
         let mut members = Self::default();
-        for member in profile.controls.iter().flat_map(|c| &c.members) {
+        for member in controls.flat_map(|c| &c.members) {
             match member.source.as_str() {
                 "hwmon" => {
                     members.hwmon.insert(member.member_id.clone());
@@ -407,22 +425,52 @@ impl ProfileMembers {
     }
 }
 
+/// The members of controls SKIPPED this tick (`TS-p`, DEC-386).
+///
+/// A distinct type from [`ProfileMembers`] on purpose: [`ForceReach::for_duty`]
+/// takes both, and with one type a swap compiled — measured — and would have
+/// frozen every EVALUATED control during a no-sensor hold while holding the
+/// skipped ones. Two parameters that share a type are interchangeable; this is
+/// DEC-378's lesson, and its remedy.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct HeldMembers(pub(crate) ProfileMembers);
+
+impl HeldMembers {
+    /// The members of `profile`'s controls named in `skipped`.
+    pub(crate) fn of_skipped(
+        profile: &crate::profile::DaemonProfile,
+        skipped: &HashSet<String>,
+    ) -> Self {
+        Self(ProfileMembers::of_controls(profile, skipped))
+    }
+}
+
 /// Which outputs a forced tick may take (DEC-382).
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ForceReach<'a> {
     /// Every output a backend can drive. The 100 % emergency only: at maximum
     /// duty no firmware curve it displaces can have been running a header faster.
     All,
-    /// Only the outputs a profile control names. Every duty below 100 % —
-    /// the recovery floor and the no-sensor floor.
+    /// Only the outputs a profile control names. Every duty below 100 % — since
+    /// DEC-386 that is the no-sensor floor alone.
     ProfileMembers {
         members: &'a ProfileMembers,
         /// May outputs the profile does not name, taken by an earlier 100 %
         /// tick, be given back this tick? `false` while the emergency is still
-        /// LATCHED — the blind case, where DEC-190 drops the duty to 40 % because
-        /// the sensor vanished, not because anything cooled. Giving back there
-        /// would return an OpenFan channel to its pre-emergency duty mid-emergency.
+        /// LATCHED. Since DEC-386 a latched emergency always forces 100 % and so
+        /// never reaches this arm; the flag stays so a future sub-100 rung that
+        /// runs while latched cannot give an output back mid-emergency.
         give_back: bool,
+        /// [SAFETY] `TS-p` / DEC-386: the members of controls SKIPPED this tick.
+        /// Each is floored against the duty its backend last wrote to it, not
+        /// treated as uncommanded — an ordinary tick writes nothing for a skipped
+        /// control, so its fans hold, and a force below them must not change
+        /// that. Before this, a CPU sensor that failed every read was evicted,
+        /// its control skipped, and the no-sensor floor then wrote a bare 40 % to
+        /// fans the curve had been running at, say, 85 %. A member whose last
+        /// duty is unknown (never written, handed back, a failed reply) gets the
+        /// bare floor, as before.
+        held: &'a HeldMembers,
     },
 }
 
@@ -436,13 +484,22 @@ impl<'a> ForceReach<'a> {
     /// reaches only the profile. What it may give back is keyed on the LATCH,
     /// because "the duty fell below 100 %" and "the emergency is over" are
     /// different events, and only the second one returns anything.
-    pub(crate) fn for_duty(pct: u8, members: &'a ProfileMembers, emergency_latched: bool) -> Self {
+    ///
+    /// `held` matters only below 100 %: at maximum duty nothing can be lower
+    /// than the force.
+    pub(crate) fn for_duty(
+        pct: u8,
+        members: &'a ProfileMembers,
+        held: &'a HeldMembers,
+        emergency_latched: bool,
+    ) -> Self {
         if pct >= 100 {
             Self::All
         } else {
             Self::ProfileMembers {
                 members,
                 give_back: !emergency_latched,
+                held,
             }
         }
     }
@@ -610,8 +667,9 @@ pub(crate) enum ForceLogAction {
 /// `pr_*_ratelimited()`; see <https://docs.kernel.org/core-api/printk-basics.html>.
 ///
 /// **Keyed on the duty AND the driven set, not merely on "am I forcing".** Both
-/// change during a real event and both matter: the ladder steps 100 → 60 → back
-/// to the profile, and `profile_engine_loop` can adopt an OpenFan controller
+/// change during a real event and both matter: the duty moves (since DEC-386, a
+/// blind 40 % hold becomes the 100 % emergency when a fresh hot reading arrives),
+/// and `profile_engine_loop` can adopt an OpenFan controller
 /// *mid-hold* (DEC-265), which hands the emergency a whole extra backend. Keying
 /// on the forced state alone would hide either transition for up to a full
 /// summary interval — exactly the moment an operator is reading the log.
@@ -666,9 +724,9 @@ impl ForceLogThrottle {
     ///
     /// Returns the length of the episode that just ended, once, on the recovery
     /// edge — and `None` on every other normal tick. `safety.rs` logs its own
-    /// line when the *emergency* releases at 80 °C, but forcing continues for two
-    /// more recovery ticks after that, and a no-sensor force ending logs nothing
-    /// at all; this is the only report that the fans are back under the profile.
+    /// line when the *emergency* releases at 80 °C, and a no-sensor force ending
+    /// logs nothing at all; this is the only report that the fans are back under
+    /// the profile.
     pub(crate) fn on_normal_tick(&mut self) -> Option<u32> {
         self.current.take()?;
         let ticks = self.episode_ticks;
@@ -1164,8 +1222,15 @@ impl SafetyWriteBackend for OpenFanBackend {
             ForceReach::ProfileMembers {
                 members,
                 give_back: true,
+                ..
             } => Some(members.openfan.clone()),
             _ => None,
+        };
+        // `TS-p`: the channels of controls skipped this tick hold their last
+        // duty under the floor. Read per channel under the lock the write takes.
+        let held: HashSet<u8> = match reach {
+            ForceReach::ProfileMembers { held, .. } => held.0.openfan.clone(),
+            ForceReach::All => HashSet::new(),
         };
         let cache = self.cache.clone();
         let pre_emergency = self.pre_emergency.clone();
@@ -1197,10 +1262,17 @@ impl SafetyWriteBackend for OpenFanBackend {
                     record_pre_emergency(&ctrl, &cache, &pre_emergency);
                 }
                 for ch in targets {
+                    let mut guard = ctrl.lock();
+                    let held_duty = held
+                        .contains(&ch)
+                        .then(|| guard.last_commanded_pct(ch))
+                        .flatten();
                     let duty = floors
                         .get(&ch)
-                        .map_or(pct, |commanded| (*commanded).max(pct));
-                    let mut guard = ctrl.lock();
+                        .copied()
+                        .into_iter()
+                        .chain(held_duty)
+                        .fold(pct, u8::max);
                     if let Err(e) = guard.set_pwm(ch, duty) {
                         log::error!("THERMAL SAFETY: OpenFan ch{ch} write FAILED: {e}");
                     }
@@ -2105,12 +2177,15 @@ impl SafetyWriteBackend for HwmonBackend {
         // DEC-382: below 100 % only the profile's headers are forced, and the
         // rest are given back. `reached` is measured against the writable set
         // taken at construction, so it never claims a read-only member.
-        let (members, give_back): (Option<HashSet<String>>, bool) = match reach {
-            ForceReach::All => (None, false),
-            ForceReach::ProfileMembers { members, give_back } => {
-                (Some(members.hwmon.clone()), give_back)
-            }
-        };
+        let (members, give_back, held): (Option<HashSet<String>>, bool, HashSet<String>) =
+            match reach {
+                ForceReach::All => (None, false, HashSet::new()),
+                ForceReach::ProfileMembers {
+                    members,
+                    give_back,
+                    held,
+                } => (Some(members.hwmon.clone()), give_back, held.0.hwmon.clone()),
+            };
         let reached = match reach {
             ForceReach::All => true,
             ForceReach::ProfileMembers { members: m, .. } => match &self.writable {
@@ -2131,8 +2206,16 @@ impl SafetyWriteBackend for HwmonBackend {
         // Same outcome type as `apply` so both share one `BoundedWrite`
         // (DEC-289); this path logs inline, so the vec is always empty.
         let join = self.writes.run(WRITE_JOIN_BUDGET, move || {
-            let (hdr_ids, mut lease_id) = {
+            let (hdr_ids, mut lease_id, held_duties) = {
                 let mut guard = ctrl.lock();
+                // [SAFETY] `TS-p`: the duty each held header was last written.
+                // Read before the force-take below; since DEC-386's review the
+                // take resets only the mode flag, so the record also survives
+                // to the next tick when a write here fails.
+                let held_duties: HashMap<String, u8> = held
+                    .iter()
+                    .filter_map(|id| guard.last_commanded_pct(id).map(|p| (id.clone(), p)))
+                    .collect();
                 // DEC-295: skip headers discovered read-only, exactly as `apply`
                 // does via the DEC-102 backstop a few hundred lines up. Without
                 // it every read-only header attempted a write that could only
@@ -2169,16 +2252,22 @@ impl SafetyWriteBackend for HwmonBackend {
                 // (manual_mode_set) is stale. Reset it so thermal safety
                 // unconditionally re-asserts pwm_enable=1 on its first forced
                 // write — defense in depth alongside the per-write readback
-                // watchdog in HwmonPwmController::set_pwm.
-                guard.on_lease_released();
-                (hdr_ids, lease_id)
+                // watchdog in HwmonPwmController::set_pwm. Only the mode flag:
+                // the last duty is what `TS-p` holds a skipped header at next
+                // tick, and `on_lease_released` would wipe it (DEC-386).
+                guard.forget_manual_mode();
+                (hdr_ids, lease_id, held_duties)
             };
             for hdr_id in &hdr_ids {
-                // D1-j: floor, not replacement. Resolved once per header so the
-                // lease-retry below writes the identical duty.
+                // D1-j: floor, not replacement — over the profile's command, or
+                // over a held header's last duty (`TS-p`). Resolved once per header
+                // so the lease-retry below writes the identical duty.
                 let duty = floors
                     .get(hdr_id)
-                    .map_or(pct, |commanded| (*commanded).max(pct));
+                    .into_iter()
+                    .chain(held_duties.get(hdr_id))
+                    .copied()
+                    .fold(pct, u8::max);
                 let mut guard = ctrl.lock();
                 match guard.set_pwm(hdr_id, duty, &lease_id) {
                     Ok(_) => {}
@@ -2196,7 +2285,7 @@ impl SafetyWriteBackend for HwmonBackend {
                             .lease_manager_mut()
                             .force_take_lease(HwmonWriter::ThermalSafety)
                             .lease_id;
-                        guard.on_lease_released();
+                        guard.forget_manual_mode();
                         if let Err(e) = guard.set_pwm(hdr_id, duty, &lease_id) {
                             log::error!(
                                 "THERMAL SAFETY: hwmon {hdr_id} write FAILED after lease re-take: {e}"
@@ -3650,8 +3739,10 @@ mod tests {
     ///
     /// Over the profile's members it is still a FLOOR, never a replacement: a
     /// commanded member keeps a higher duty, a member commanded below the floor
-    /// is raised to it, and a member with no command this tick — its control was
-    /// skipped — still gets the bare floor. What DEC-382 removed is the reach to
+    /// is raised to it, and a member with no command and no known last duty gets
+    /// the bare floor. (A member of a control skipped this tick keeps its last
+    /// duty under the floor since DEC-386 — `TS-p`, pinned by
+    /// `a_held_member_keeps_its_last_duty_under_a_sub_100_floor`.) What DEC-382 removed is the reach to
     /// a header NO control names: 60 % there would replace a firmware curve that
     /// may be running it faster, so it is not written at all. The emergency's full
     /// reach at 100 % is pinned by
@@ -3692,6 +3783,7 @@ mod tests {
                 ForceReach::ProfileMembers {
                     members: &members,
                     give_back: true,
+                    held: &HeldMembers::default(),
                 },
             )
             .await;
@@ -3732,6 +3824,151 @@ mod tests {
         );
     }
 
+    /// [SAFETY] `TS-p` / DEC-386: a member of a control SKIPPED this tick is
+    /// floored against the duty it was last written, not treated as uncommanded.
+    /// An ordinary tick writes nothing for a skipped control, so its fans hold;
+    /// before this, the no-sensor floor then wrote a bare 40 % over them.
+    ///
+    /// The last duty has to be read BEFORE the force-take, which clears every
+    /// header's write state — so this also pins that order. Both arms: the same
+    /// header, not held, gets the bare floor.
+    #[tokio::test]
+    async fn a_held_member_keeps_its_last_duty_under_a_sub_100_floor() {
+        let id = "hwmon:it8696:pwm1";
+        for held_it in [true, false] {
+            let (mut be, writes) = hwmon_backend(vec![header_with_paths(1)]);
+            be.apply(&[PwmCommand {
+                member_id: id.into(),
+                source: "hwmon".into(),
+                pwm_percent: 85,
+                gpu_fan_zero_rpm: false,
+            }])
+            .await;
+            writes.lock().clear();
+            let members = ProfileMembers {
+                hwmon: [id.to_string()].into(),
+                ..ProfileMembers::default()
+            };
+            let held = if held_it {
+                HeldMembers(members.clone())
+            } else {
+                HeldMembers::default()
+            };
+
+            be.force_all_with_floor(
+                40,
+                &[],
+                ForceReach::ProfileMembers {
+                    members: &members,
+                    give_back: true,
+                    held: &held,
+                },
+            )
+            .await;
+
+            let w = writes.lock();
+            let pwm: Vec<String> = w
+                .iter()
+                .filter(|(p, _)| p == "/sys/class/hwmon/hwmon0/pwm1")
+                .map(|(_, v)| v.trim().to_string())
+                .collect();
+            let expected = crate::pwm::percent_to_raw(if held_it { 85 } else { 40 }).to_string();
+            assert_eq!(pwm, vec![expected], "held {held_it}: {w:?}");
+        }
+    }
+
+    /// [SAFETY] DEC-386 review (concurrency P2): the held duty must survive a
+    /// forced tick whose own write to that header FAILS. The force-take used to
+    /// call `on_lease_released`, which wiped the header's `last_commanded_pct`, and
+    /// a failed write never set it again — so the next forced tick found no
+    /// record and wrote the bare 40 % over a fan the curve had left at 85 %. The
+    /// take now resets only the mode flag.
+    ///
+    /// Two consecutive forces, the first failing that header's writes once;
+    /// asserted on the controller's own record of what it last wrote.
+    #[tokio::test]
+    async fn a_held_duty_survives_a_forced_tick_whose_write_failed() {
+        let id = "hwmon:it8696:pwm1";
+        let (mut be, fail) = hwmon_backend_carveout(vec![header_with_paths(1)], None);
+        be.apply(&[PwmCommand {
+            member_id: id.into(),
+            source: "hwmon".into(),
+            pwm_percent: 85,
+            gpu_fan_zero_rpm: false,
+        }])
+        .await;
+        assert_eq!(
+            be.ctrl.lock().last_commanded_pct(id),
+            Some(85),
+            "precondition: the curve left the header at 85%"
+        );
+        let members = ProfileMembers {
+            hwmon: [id.to_string()].into(),
+            ..ProfileMembers::default()
+        };
+        let held = HeldMembers(members.clone());
+        let reach = || ForceReach::ProfileMembers {
+            members: &members,
+            give_back: true,
+            held: &held,
+        };
+
+        *fail.lock() = Some("pwm1".into());
+        be.force_all_with_floor(40, &[], reach()).await;
+        *fail.lock() = None;
+        be.force_all_with_floor(40, &[], reach()).await;
+
+        assert_eq!(
+            be.ctrl.lock().last_commanded_pct(id),
+            Some(85),
+            "one failed forced write must not drop a held fan to the bare floor"
+        );
+    }
+
+    /// The OpenFan leg of the same rule. A held channel is floored against the
+    /// controller's own last duty, read under the lock the write takes; at that
+    /// duty the write coalesces, so NO frame is sent — and the not-held arm sends
+    /// the 40 % frame, which is what shows the difference.
+    #[tokio::test]
+    async fn a_held_openfan_channel_keeps_its_last_duty_under_a_sub_100_floor() {
+        for held_it in [true, false] {
+            // Channel 0: this fixture's transport ACKs channel 0 only.
+            let (mut be, written, _cache) = openfan_backend();
+            be.ctrl.lock().set_pwm(0, 85).unwrap();
+            let before = written.lock().len();
+            let members = ProfileMembers {
+                openfan: [0u8].into(),
+                ..ProfileMembers::default()
+            };
+            let held = if held_it {
+                HeldMembers(members.clone())
+            } else {
+                HeldMembers::default()
+            };
+
+            be.force_all_with_floor(
+                40,
+                &[],
+                ForceReach::ProfileMembers {
+                    members: &members,
+                    give_back: true,
+                    held: &held,
+                },
+            )
+            .await;
+
+            let w = written.lock();
+            let frame_40 = format!(">0200{:02X}", crate::pwm::percent_to_raw(40));
+            let sent_40 = w[before..].iter().any(|f| f.trim_end() == frame_40);
+            assert_eq!(
+                sent_40,
+                !held_it,
+                "held {held_it}: frames after the force {:?}",
+                &w[before..]
+            );
+        }
+    }
+
     /// A sub-100 force on a machine where no profile controls anything reaches
     /// nothing — and says so, so the operator line does not name a fan set.
     #[tokio::test]
@@ -3744,6 +3981,7 @@ mod tests {
                 ForceReach::ProfileMembers {
                     members: &ProfileMembers::default(),
                     give_back: true,
+                    held: &HeldMembers::default(),
                 },
             )
             .await;
@@ -4220,6 +4458,7 @@ mod tests {
             ForceReach::ProfileMembers {
                 members: &members,
                 give_back: true,
+                held: &HeldMembers::default(),
             },
         )
         .await;
@@ -4934,6 +5173,7 @@ mod forced_scope_tests {
             ForceReach::ProfileMembers {
                 members: &members,
                 give_back: true,
+                held: &HeldMembers::default(),
             },
         )
         .await;
@@ -4979,6 +5219,7 @@ mod forced_scope_tests {
             ForceReach::ProfileMembers {
                 members: &members,
                 give_back: true,
+                held: &HeldMembers::default(),
             },
         )
         .await;
@@ -5087,8 +5328,10 @@ mod forced_scope_tests {
         );
     }
 
-    /// The ladder steps 100 → 60 mid-hold. Waiting up to a full interval to say
-    /// so hides the transition an operator is watching for.
+    /// A duty change mid-hold — since DEC-386, a blind 40 % hold that a fresh hot
+    /// reading turns into the 100 % emergency; the duties here are arbitrary, the
+    /// throttle is duty-agnostic. Waiting up to a full interval to say so hides
+    /// the transition an operator is watching for.
     #[test]
     fn a_duty_change_is_announced_immediately() {
         let mut t = ForceLogThrottle::default();

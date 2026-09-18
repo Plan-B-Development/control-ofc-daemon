@@ -2,12 +2,19 @@
 //!
 //! Single latched rule: at [`crate::constants::THERMAL_EMERGENCY_TRIGGER_C`],
 //! force every OpenFan channel and writable hwmon header the machine HAS to
-//! 100% — on most machines that is hwmon alone. Hold until
-//! Tctl drops to [`crate::constants::THERMAL_EMERGENCY_RELEASE_C`], then hold
-//! 60% for two cycles (the release cycle that drops out of emergency, plus one
-//! more) before returning control to the active profile. The thresholds are
-//! deliberately not restated here — DEC-292 reduced them to one definition each
-//! precisely because a doc that spells a threshold out drifts from it.
+//! 100% — on most machines that is hwmon alone. Hold until a FRESH Tctl reading
+//! at or below [`crate::constants::THERMAL_EMERGENCY_RELEASE_C`], then return
+//! control to the active profile. The thresholds are deliberately not restated
+//! here — DEC-292 reduced them to one definition each precisely because a doc
+//! that spells a threshold out drifts from it.
+//!
+//! **There is no recovery rung since DEC-386 (`TS-l`).** Release used to hold
+//! 60 % for two 1 Hz ticks before handing back — two seconds, which is
+//! thermally meaningless, and since DEC-307 a floor the curve already exceeds
+//! at that temperature. It also gave the tick a third rule state whose
+//! interactions with a stale or absent reading were the source of most of the
+//! ladder's special cases. The rule is now only idle or latched; the tick's
+//! decision table lives in `profile_engine::safety_tick`.
 //!
 //! **Every value this rule returns is a FLOOR, and since DEC-307 the engine
 //! implements it as one.** Each reaches the engine as `decision.forced_pct`,
@@ -57,9 +64,7 @@ pub struct ThermalSafetyRule {
     trigger_temp_c: f64,
     release_temp_c: f64,
     forced_output_pct: u8,
-    recovery_output_pct: u8,
     active: bool,
-    recovery: bool,
 }
 
 impl ThermalSafetyRule {
@@ -69,59 +74,39 @@ impl ThermalSafetyRule {
             trigger_temp_c: crate::constants::THERMAL_EMERGENCY_TRIGGER_C,
             release_temp_c: crate::constants::THERMAL_EMERGENCY_RELEASE_C,
             forced_output_pct: 100,
-            recovery_output_pct: 60,
             active: false,
-            recovery: false,
         }
     }
 
-    /// Evaluate the rule against the current CPU Tctl temperature.
+    /// Apply a FRESH CPU Tctl reading — the only thing that may move the latch.
     ///
-    /// Returns `Some(forced_pct)` if the override is active (fans should be forced),
-    /// or `None` if normal profile control should proceed.
+    /// Returns `Some(forced_pct)` while the emergency is latched after this
+    /// reading, `None` when profile control should proceed. Latches at the
+    /// trigger; releases at or below the release temperature and hands control
+    /// straight back (DEC-386 — no recovery rung).
+    ///
+    /// [SAFETY] Never call it with a stale reading: a stale value is evidence of
+    /// what WAS true, and must neither release the latch nor raise it (DEC-269).
+    /// `safety_tick` calls this only from its fresh-reading arm.
     pub fn evaluate(&mut self, tctl_c: f64) -> Option<u8> {
-        // Check for trigger (not yet active)
         if !self.active && tctl_c >= self.trigger_temp_c {
             self.active = true;
-            self.recovery = false;
             log::warn!(
                 "THERMAL EMERGENCY: CPU Tctl {:.1}°C >= {}°C — forcing fans to {}%",
                 tctl_c,
                 self.trigger_temp_c,
                 self.forced_output_pct
             );
-            return Some(self.forced_output_pct);
+        } else if self.active && tctl_c <= self.release_temp_c {
+            self.active = false;
+            log::info!(
+                "Thermal emergency released: CPU Tctl {:.1}°C <= {}°C — control returns \
+                 to the profile",
+                tctl_c,
+                self.release_temp_c
+            );
         }
-
-        // While emergency is active
-        if self.active {
-            if tctl_c <= self.release_temp_c {
-                // Temperature dropped below release threshold — exit emergency
-                self.active = false;
-                self.recovery = true;
-                log::info!(
-                    "Thermal emergency released: CPU Tctl {:.1}°C <= {}°C — recovery at {}%",
-                    tctl_c,
-                    self.release_temp_c,
-                    self.recovery_output_pct
-                );
-                return Some(self.recovery_output_pct);
-            }
-            // Still above release threshold — hold at 100%
-            return Some(self.forced_output_pct);
-        }
-
-        // Second of the two recovery-floor cycles: the first 60% tick was the
-        // release return above (the release_temp crossing), this one completes
-        // the floor before control returns to the profile — pinned by
-        // `recovery_floor_spans_exactly_two_60pct_cycles`.
-        if self.recovery {
-            self.recovery = false;
-            return Some(self.recovery_output_pct);
-        }
-
-        // Normal operation — no override
-        None
+        self.active.then_some(self.forced_output_pct)
     }
 
     /// Whether the emergency override is currently active.
@@ -165,27 +150,16 @@ impl ThermalSafetyRule {
         self.trigger_temp_c = trigger_c;
     }
 
-    /// The output this rule is already holding, read **without** a temperature.
+    /// The duty a latched emergency forces — what the tick holds while blind.
     ///
-    /// [SAFETY] DEC-269. For the case where the CPU reading is *stale* rather
-    /// than *absent*: the poll loop has stopped updating, but the last thing it
-    /// told us still stands as evidence. A latched emergency means we saw at
-    /// least the trigger and have never since seen the release point or below, and that remains
-    /// true while we are blind — so the safe response to losing sight is to keep
-    /// forcing what we were already forcing, not to fall back to a lower floor.
-    ///
-    /// Deliberately **non-mutating**, unlike [`Self::evaluate`]. A stale reading
-    /// must not clear the latch, advance the two-cycle recovery counter, or
-    /// trigger a new emergency — it is not evidence of anything *current*, only
-    /// of what was last true.
-    pub fn held_output_pct(&self) -> Option<u8> {
-        if self.active {
-            Some(self.forced_output_pct)
-        } else if self.recovery {
-            Some(self.recovery_output_pct)
-        } else {
-            None
-        }
+    /// [SAFETY] DEC-269 / DEC-386. A latched emergency means a fresh reading at
+    /// or above the trigger was seen and none at or below release since, and that
+    /// stays true while the sensor is stale OR gone — so going blind keeps the
+    /// forced duty rather than falling to a lower floor. (DEC-190 dropped a
+    /// VANISHED sensor to 40 %; DEC-386 retired that.) Non-mutating: only
+    /// [`Self::evaluate`], with a fresh reading, moves the latch.
+    pub fn forced_output_pct(&self) -> u8 {
+        self.forced_output_pct
     }
 }
 
@@ -231,68 +205,26 @@ mod tests {
         assert!(rule.is_active());
     }
 
+    /// DEC-386: release hands control straight back — no recovery rung. The
+    /// release reading itself returns `None`, and so does every one after it.
     #[test]
-    fn releases_at_80_with_recovery() {
+    fn release_returns_control_to_the_profile_at_once() {
         let mut rule = ThermalSafetyRule::new();
         rule.evaluate(TRIGGER); // trigger
-        assert_eq!(rule.evaluate(80.0), Some(60)); // release + recovery
-        assert!(!rule.is_active());
-    }
-
-    #[test]
-    fn recovery_lasts_one_cycle() {
-        let mut rule = ThermalSafetyRule::new();
-        rule.evaluate(TRIGGER); // trigger
-        rule.evaluate(80.0); // release → recovery
-        assert_eq!(rule.evaluate(70.0), Some(60)); // one-cycle recovery floor
-        assert_eq!(rule.evaluate(70.0), None); // back to normal
-    }
-
-    #[test]
-    fn recovery_floor_spans_exactly_two_60pct_cycles() {
-        // Pins the module-doc invariant: after release, the 60% floor is held
-        // for TWO cycles — the release cycle plus one recovery-floor cycle —
-        // before control returns to the active profile.
-        let mut rule = ThermalSafetyRule::new();
-        rule.evaluate(TRIGGER); // trigger → emergency
-        assert_eq!(rule.evaluate(80.0), Some(60)); // cycle 1: release at 60%
-        assert_eq!(rule.evaluate(70.0), Some(60)); // cycle 2: recovery floor at 60%
-        assert_eq!(rule.evaluate(70.0), None); // cycle 3: back to profile control
-    }
-
-    #[test]
-    fn held_output_reports_what_the_rule_is_forcing_without_a_reading() {
-        // DEC-269. This is what a stale reading holds onto, so it must track the
-        // rule's real state — and must not mutate it.
-        let mut rule = ThermalSafetyRule::new();
-        assert_eq!(rule.held_output_pct(), None, "nothing forced at rest");
-
-        rule.evaluate(TRIGGER + 1.0);
-        assert_eq!(rule.held_output_pct(), Some(100), "latched");
-        assert_eq!(rule.held_output_pct(), Some(100), "and it is idempotent");
-        assert!(rule.is_active(), "reading it must not clear the latch");
-
-        rule.evaluate(70.0); // release -> recovery
-        assert_eq!(rule.held_output_pct(), Some(60), "recovery floor");
-        // Reading it repeatedly must not consume the two-cycle recovery window.
-        assert_eq!(rule.held_output_pct(), Some(60));
         assert_eq!(
-            rule.evaluate(70.0),
-            Some(60),
-            "the second recovery cycle must still be owed — held_output_pct \
-             advanced the state machine"
+            rule.evaluate(80.0),
+            None,
+            "the release reading forces nothing"
         );
-        assert_eq!(rule.evaluate(70.0), None);
-        assert_eq!(rule.held_output_pct(), None);
+        assert!(!rule.is_active());
+        assert_eq!(rule.evaluate(70.0), None, "and nothing is owed after it");
     }
 
     #[test]
-    fn retrigger_after_recovery() {
+    fn retrigger_after_release() {
         let mut rule = ThermalSafetyRule::new();
         rule.evaluate(TRIGGER); // trigger
         rule.evaluate(80.0); // release
-        rule.evaluate(70.0); // recovery
-        rule.evaluate(70.0); // normal
 
         // Heat up again
         assert_eq!(rule.evaluate(TRIGGER + 1.0), Some(100));
@@ -334,7 +266,7 @@ mod tests {
         assert!(rule.is_active());
 
         // Only releases when temp actually drops to the release threshold
-        assert_eq!(rule.evaluate(80.0), Some(60)); // release → recovery
+        assert_eq!(rule.evaluate(80.0), None); // release → profile control
         assert!(!rule.is_active());
     }
 }

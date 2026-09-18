@@ -654,6 +654,24 @@ impl HwmonPwmController {
     pub fn on_lease_released(&mut self) {
         self.write_state.clear();
     }
+
+    /// Reset every header's `manual_mode_set` — and ONLY that — so the next write
+    /// re-asserts `pwm_enable=1` (Audit P1-E), while each `last_commanded_pct`
+    /// survives.
+    ///
+    /// [SAFETY] `TS-p` / DEC-386. The thermal force used `on_lease_released`,
+    /// which also wiped `last_commanded_pct` — the one record of what a skipped
+    /// control's header is running at, which the force floors against every tick.
+    /// It came back only when that tick's own write succeeded, so a single failed
+    /// write, or a verify that force-took the lease mid-scan, left no record and
+    /// the next forced tick wrote the bare floor. Keeping the duty is safe for
+    /// the two readers of the pair: coalescing and the reclaim watchdog both
+    /// require `manual_mode_set`, which this clears.
+    pub fn forget_manual_mode(&mut self) {
+        for ws in self.write_state.values_mut() {
+            ws.manual_mode_set = false;
+        }
+    }
 }
 
 #[cfg(test)]

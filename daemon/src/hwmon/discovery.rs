@@ -128,7 +128,7 @@ fn warn_once_about_cpu_classification(descriptors: &[SensorDescriptor], board_ve
     // (2) The residual accepted with DEC-294's second half: a PECI/TSI channel is
     // the kernel's prescribed CPU source on these boards, but is reported on some
     // boards to read 0 C or ~10 C low. As the SOLE CpuTemp a bogus-low value is a
-    // silent false negative — it suppresses the DEC-190 absent-sensor floor,
+    // silent false negative — it suppresses the no-sensor floor,
     // because a sensor *is* present.
     let cpu: Vec<&SensorDescriptor> = descriptors
         .iter()

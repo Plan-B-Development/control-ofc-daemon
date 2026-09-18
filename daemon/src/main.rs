@@ -1844,8 +1844,9 @@ async fn async_main() {
     // DEC-269 corrects what this comment used to claim. Stale readings do NOT
     // simply "present as absent": a stale reading last seen at or above the
     // release temperature keeps fan curves running on it, and one seen while an
-    // emergency or recovery floor was active holds that output. Only a stale-
-    // and-cool reading reaches NO_SENSOR_SAFE_PCT. Either way, none of those is
+    // emergency is latched holds it (as, since DEC-386, does a vanished one).
+    // Only a stale-and-cool or absent reading with nothing latched reaches
+    // NO_SENSOR_SAFE_PCT. Either way, none of those is
     // a resting state to leave a machine in with no path back — hence the
     // restore-and-exit, so systemd brings the daemon back with a live loop.
     //

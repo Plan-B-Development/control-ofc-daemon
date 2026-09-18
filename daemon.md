@@ -54,7 +54,7 @@ daemon/src/
                          reader.rs's [-50, 250]C bound (DEC-288) is per-sensor, so it
                          cannot see a value that is absurd only beside its neighbours. The
                          bogus-LOW CPU channel is the dangerous case because it is silent:
-                         the sensor IS present, so DEC-190's 40% floor never engages
+                         the sensor IS present, so the no-sensor 40% floor never engages
     types.rs           — SensorKind, SensorReading, SensorDescriptor
     inventory.rs       — structured read-only hwmon inventory: temps + PWM headers + monitor-only tachometers (DEC-200)
     classify.rs        — refines each temp sensor's CPU/motherboard classification for the inventory (DEC-200)
@@ -176,7 +176,7 @@ daemon/src/
     mod.rs             — loop body / coordinator: orchestrates safety_tick + curve_eval + tuning + backends
     curve_eval.rs      — deadband + trigger latch + Mix/Sync composites (topological order)
     tuning.rs          — offset→floor→step-rate→stop-snap→start-kick→clamp + floor policy
-    safety_tick.rs     — thermal ladder (trigger/release/recovery) + no-sensor fallback (DEC-190)
+    safety_tick.rs     — thermal ladder + no-sensor fallback as ONE exhaustive decision table (DEC-386)
     backends.rs        — WriteBackend per fan backend (gating/coalescing)
     skipped.rs         — debounced tracking of controls that cannot be resolved (273-i)
   control_override.rs  — manual-override + fan-identify state (expiring, fencing-guarded, deadman; DEC-163/166)
@@ -320,22 +320,25 @@ gating each have their own register rows and regression tests.
      (THERMAL_EMERGENCY_RELEASE_C), but the hysteresis SPAN is not — it follows
      the per-machine trip point: 25C at the 105 floor, 35C at the 115 cap. Do
      not restate the span as a fixed number (DEC-292/305)
-   - 60% recovery floor for two cycles after release (the release cycle + a
-     one-cycle recovery floor) on the profile's outputs, then control returns to
-     the profile; every other output the emergency took is given back at the
-     release — an hwmon header to its recorded mode, an OpenFan channel to its
-     pre-emergency duty (DEC-382)
-   - If no CpuTemp sensor is found — or none is still updating (DEC-267: a
-     reading older than 5 poll intervals counts as absent) — for 5 consecutive
-     cycles, floors the profile's outputs at 40% (DEC-382: outputs no profile
-     controls stay under firmware, and with no profile nothing is forced); a sensor that *vanishes* while an emergency is
-     latched forces 40% immediately (from the first missing cycle) and reports
-     `no_sensor_fallback` rather than dropping to profile control (DEC-190),
-     whereas one that merely goes *stale* holds the emergency's own 100% output
-     — losing sight of a sensor must never lower an already-forced safety
-     output (DEC-269)
+   - Release needs a FRESH reading at or below 80C, and hands control straight
+     back to the profile — there is no recovery rung since DEC-386 (it held 60%
+     for two 1 Hz ticks, which was thermally meaningless). Every other output the
+     emergency took is given back at the release — an hwmon header to its
+     recorded mode, an OpenFan channel to its pre-emergency duty (DEC-382)
+   - A latched emergency whose CPU sensor goes stale OR vanishes holds 100%
+     until that fresh reading — losing sight of a sensor must never lower an
+     already-forced safety output (DEC-269; DEC-386 retired DEC-190's 40% for a
+     vanished sensor)
+   - With nothing latched: if no CpuTemp reading is fresh (DEC-267: older than 5
+     poll intervals counts as absent) for 5 consecutive cycles, floors the
+     profile's outputs at 40% (DEC-382: outputs no profile controls stay under
+     firmware, and with no profile nothing is forced) — unless the last stale
+     reading was at or above release, when curves keep running on it (DEC-269). A
+     control skipped that tick keeps its fans at their last duty under the floor
+     (DEC-386, `TS-p`)
    - Override state is surfaced as `thermal_state` in `GET /status`
-     (`normal` | `recovery` | `emergency` | `no_sensor_fallback`, DEC-132)
+     (`normal` | `emergency` | `no_sensor_fallback`, DEC-132; `recovery` was
+     emitted before DEC-386)
      so the GUI shows a poll-driven thermal banner (DEC-165 — there is no GUI
      loop to stand down; the daemon owns control)
 

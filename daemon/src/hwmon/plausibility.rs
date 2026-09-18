@@ -10,7 +10,7 @@
 //! fallback built for a *missing* sensor: `hottest_cpu_reading` max-reduces, so
 //! with a single `CpuTemp` reading 0°C there is nothing to out-rank it;
 //! `safety_tick` sees a sensor that *is* present and therefore resets
-//! `no_cpu_sensor_cycles`, so DEC-190's 40% floor never engages;
+//! `no_cpu_sensor_cycles`, so the no-sensor 40% floor never engages;
 //! `ThermalSafetyRule::evaluate(0.0)` returns `None`; `thermal_state` stays
 //! `"normal"`; and every curve runs at 0°C with nothing logged. The machine has
 //! no thermal protection and no indication that anything is wrong.

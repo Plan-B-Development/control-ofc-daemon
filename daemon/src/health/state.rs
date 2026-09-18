@@ -386,7 +386,8 @@ pub struct DaemonState {
     pub aio: AioPumpState,
     /// Per-subsystem last-update timestamps.
     pub subsystem_timestamps: SubsystemTimestamps,
-    /// Thermal safety override state: "normal", "emergency", or "recovery".
+    /// Thermal safety override state: "normal", "emergency" or
+    /// "no_sensor_fallback" ("recovery" before DEC-386).
     pub thermal_override_state: Option<String>,
     /// The emergency trip point the engine ACTED on at its last tick (DEC-308).
     /// Per-machine since the trigger is derived from the CPU's own reported

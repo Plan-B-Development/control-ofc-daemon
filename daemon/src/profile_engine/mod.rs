@@ -11,8 +11,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use backends::{
-    ForceLogAction, ForceLogThrottle, ForceReach, GpuBackend, HwmonBackend, OpenFanBackend,
-    ProfileMembers, WriteBackend,
+    ForceLogAction, ForceLogThrottle, ForceReach, GpuBackend, HeldMembers, HwmonBackend,
+    OpenFanBackend, ProfileMembers, WriteBackend,
 };
 
 use crate::constants;
@@ -248,6 +248,17 @@ impl ProfileEngineState {
             }
         }
         partial_to_log
+    }
+
+    /// The ids of the controls THIS tick's evaluation skipped — raw, before the
+    /// debounce `skipped_snapshot` applies. `TS-p`: a forced tick floors their
+    /// members against their last duty, from the first skipped tick on, because
+    /// an ordinary tick holds them from the first skipped tick on.
+    pub(crate) fn skipped_ids_this_tick(&self) -> std::collections::HashSet<String> {
+        self.skipped_this_tick
+            .iter()
+            .map(|r| r.control_id.clone())
+            .collect()
     }
 
     /// Controls currently listed as skipped, sorted by id (273-i).
@@ -846,7 +857,11 @@ impl Drop for TickCompletion<'_> {
 /// deliberately, and routing a stale reading into that same branch silently
 /// extended a decision made about one state to a materially different one —
 /// dropping a latched thermal emergency from 100% to 40% on a CPU last seen at
-/// 95 C, and flapping between the two as readings crossed the budget.
+/// 95 C, and flapping between the two as readings crossed the budget. (DEC-386
+/// later retired DEC-190's 40% as well: a latched emergency holds 100% whether
+/// its sensor is stale or gone. The distinction still matters with nothing
+/// latched, where a stale-but-hot reading keeps curves running and a vanished
+/// one does not.)
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum CpuReading {
     /// Updated within the freshness budget — safe to drive the rule with.
@@ -1269,7 +1284,11 @@ pub async fn profile_engine_loop(
         // DEC-382: the profile's MEMBERS are taken here too, under the same lock
         // and from the same profile, so a tick's reach and its give-back can never
         // be judged against a different profile than the one it commanded.
-        let (profile_commands, members): (Option<Vec<PwmCommand>>, ProfileMembers) = {
+        let (profile_commands, members, held): (
+            Option<Vec<PwmCommand>>,
+            ProfileMembers,
+            HeldMembers,
+        ) = {
             let profile_guard = profile.lock();
 
             // DEC-188: re-anchor on an activation epoch bump. Read under the
@@ -1320,13 +1339,19 @@ pub async fn profile_engine_loop(
                              commanded, so it is not listed as uncommanded"
                         );
                     }
-                    (Some(cmds), ProfileMembers::of(active_profile))
+                    // `TS-p`: the skipped controls' members, from the same
+                    // profile under the same lock, for a forced tick to hold.
+                    let held = HeldMembers::of_skipped(
+                        active_profile,
+                        &engine_state.skipped_ids_this_tick(),
+                    );
+                    (Some(cmds), ProfileMembers::of(active_profile), held)
                 }
                 None => {
                     // No profile loaded — drop any leftover tuning state so a
                     // later activation doesn't pick up stale cross-cycle outputs.
                     engine_state.deactivate();
-                    (None, ProfileMembers::default())
+                    (None, ProfileMembers::default(), HeldMembers::default())
                 }
             }
         };
@@ -1385,15 +1410,16 @@ pub async fn profile_engine_loop(
             // an empty slice (no profile) reproduces the old behaviour exactly.
             //
             // [SAFETY] DEC-382: the reach is decided by the duty. At 100 % every
-            // output is taken, as above; below it — the recovery and no-sensor
-            // floors — only the profile's members are, and anything an earlier
+            // output is taken, as above; below it — since DEC-386 the no-sensor
+            // floor alone — only the profile's members are, a skipped control's
+            // members held at their last duty (`TS-p`), and anything an earlier
             // 100 % tick took that the profile does not name is given back in the
-            // same write task, but only once the emergency has RELEASED: while it
-            // is still latched (DEC-190's blind 40 %) those outputs stay where the
-            // emergency put them. A sub-100 floor on a header nothing controls would
+            // same write task — but never while the emergency is still latched
+            // (since DEC-386 a latched emergency always forces 100 %, so that gate
+            // is defensive). A sub-100 floor on a header nothing controls would
             // replace its firmware curve, and could run it slower than that curve.
             let baseline = profile_commands.as_deref().unwrap_or(&[]);
-            let reach = ForceReach::for_duty(forced_pct, &members, emergency_latched);
+            let reach = ForceReach::for_duty(forced_pct, &members, &held, emergency_latched);
             let forced_scope = backends::force_present_backends(
                 openfan_be.as_mut(),
                 hwmon_be.as_mut(),
@@ -1405,8 +1431,9 @@ pub async fn profile_engine_loop(
 
             // DEC-372 (`OFN-af`): this branch used to log every tick for the
             // whole hold, with nothing throttling it. Now first / periodic
-            // summary / recovery, keyed on the duty AND the driven set so the
-            // ladder's 100 → 60 step and a mid-hold OpenFan adoption are both
+            // summary / recovery, keyed on the duty AND the driven set so a duty
+            // change (since DEC-386: a blind 40 % hold that a fresh hot reading
+            // turns into the 100 % emergency) and a mid-hold OpenFan adoption are both
             // announced at once rather than hidden until the next summary.
             // `reason` is built only when something is emitted: it allocates,
             // and this runs at 1 Hz for the length of an emergency.
@@ -1533,10 +1560,10 @@ pub async fn profile_engine_loop(
             // are pure unit tests on `ForceLogThrottle`, and the daemon has no
             // log-capture harness — so structure is the only guard available.
             //
-            // `safety.rs` logs the emergency's own release at 80 °C, but forcing
-            // continues for two recovery ticks past that and a no-sensor force
-            // ending logs nothing at all — this is the only line that says the
-            // fans are back under the profile.
+            // `safety.rs` logs the emergency's own release at 80 °C, and a
+            // no-sensor force ending logs nothing at all — this is the only line
+            // that says the fans are back under the profile. (Before DEC-386 the
+            // force also ran two recovery ticks past the release.)
             log::info!(
                 "Thermal force ended after {ticks} tick(s) — fan control returns to \
                  the active profile"
@@ -3554,7 +3581,8 @@ mod tests {
         // freshness budget — task still alive, so supervision never fires —
         // used to drop every fan from 100% to 40% on a CPU last measured at
         // 95 C, mid-emergency. DEC-190's 40% was chosen for a *vanished*
-        // sensor; a stale one is different evidence.
+        // sensor; a stale one is different evidence. (DEC-386 has since held the
+        // vanished case at 100% too.)
         let mut safety = latched_emergency();
         let mut cycles = 0u32;
 
@@ -3585,33 +3613,46 @@ mod tests {
     }
 
     #[test]
-    fn an_absent_sensor_during_a_latched_emergency_still_forces_40_per_dec190() {
-        // DEC-190 unchanged, and deliberately so: a vanished sensor cannot
-        // confirm a live emergency, and 40% over holding 100% was an explicit
-        // user decision. DEC-269 narrows which situations reach this branch; it
-        // does not revisit the branch.
+    fn an_absent_sensor_during_a_latched_emergency_holds_the_emergency() {
+        // DEC-386 retires DEC-190's 40 %: the latch means the trigger was seen and
+        // release has not been since, and a VANISHED sensor is no more evidence of
+        // cooling than a stale one. The user's decision, 2026-09-18.
         let mut safety = latched_emergency();
         let mut cycles = 0u32;
 
         let decision = evaluate_safety_tick(CpuReading::Absent, &mut cycles, &mut safety);
 
-        assert_eq!(decision.forced_pct, Some(constants::NO_SENSOR_SAFE_PCT));
-        assert_eq!(decision.thermal_state, "no_sensor_fallback");
+        assert_eq!(
+            decision,
+            SafetyDecision {
+                thermal_state: "emergency",
+                forced_pct: Some(100),
+            }
+        );
+        assert!(safety.is_active(), "going blind must not clear the latch");
     }
 
     #[test]
-    fn a_stale_reading_during_recovery_holds_the_recovery_floor() {
-        // Same invariant one rung down: mid-recovery the rule is holding 60%,
-        // and a stale tick used to let fans fall to the curve for that tick.
-        let mut safety = crate::safety::ThermalSafetyRule::new();
-        safety.evaluate(TRIGGER + 1.0);
-        assert_eq!(safety.evaluate(70.0), Some(60), "precondition: in recovery");
+    fn release_hands_back_at_once_and_a_blind_tick_after_it_forces_nothing() {
+        // DEC-386: no recovery rung. The release reading hands control back, and a
+        // stale reading right after it is an ordinary blind tick inside the
+        // debounce — nothing is owed.
+        let mut safety = latched_emergency();
         let mut cycles = 0u32;
 
-        let decision = evaluate_safety_tick(CpuReading::Stale(70.0), &mut cycles, &mut safety);
+        let released = evaluate_safety_tick(CpuReading::Fresh(70.0), &mut cycles, &mut safety);
+        let after = evaluate_safety_tick(CpuReading::Stale(70.0), &mut cycles, &mut safety);
 
-        assert_eq!(decision.forced_pct, Some(60));
-        assert_eq!(decision.thermal_state, "recovery");
+        for d in [released, after] {
+            assert_eq!(
+                d,
+                SafetyDecision {
+                    thermal_state: "normal",
+                    forced_pct: None,
+                }
+            );
+        }
+        assert!(!safety.is_active());
     }
 
     #[test]
@@ -3634,68 +3675,73 @@ mod tests {
 
     #[test]
     fn losing_sight_never_lowers_an_already_forced_output() {
-        // The invariant itself, stated as a property over the whole matrix
-        // rather than as one example — so a new state cannot be added that
-        // quietly violates it.
-        for (name, mut safety, forced_before) in [
-            ("latched", latched_emergency(), 100u8),
-            (
-                "recovery",
-                {
-                    let mut s = crate::safety::ThermalSafetyRule::new();
-                    s.evaluate(TRIGGER + 1.0);
-                    s.evaluate(70.0);
-                    s
-                },
-                60u8,
-            ),
+        // The invariant as a property: with the emergency latched, going blind —
+        // stale, OR since DEC-386 absent — never lowers the forced duty, on any
+        // tick of the blind spell, including past the no-sensor debounce where
+        // DEC-190 used to drop a vanished sensor to 40 %.
+        for (name, reading) in [
+            ("stale", CpuReading::Stale(90.0)),
+            ("absent", CpuReading::Absent),
         ] {
+            let mut safety = latched_emergency();
             let mut cycles = 0u32;
-            let decision = evaluate_safety_tick(CpuReading::Stale(90.0), &mut cycles, &mut safety);
-            let after = decision.forced_pct.unwrap_or(0);
-            assert!(
-                after >= forced_before,
-                "{name}: going blind lowered the forced output from {forced_before}% to \
-                 {after}% — losing sight of a sensor must never reduce cooling"
-            );
+            for tick in 1..=(constants::NO_SENSOR_CYCLE_THRESHOLD + 2) {
+                let after = evaluate_safety_tick(reading, &mut cycles, &mut safety)
+                    .forced_pct
+                    .unwrap_or(0);
+                assert!(
+                    after >= 100,
+                    "{name}, blind tick {tick}: going blind lowered the forced output to \
+                     {after}% — losing sight of a sensor must never reduce cooling"
+                );
+            }
         }
     }
 
     #[test]
-    fn a_stale_recovery_hold_is_reported_as_recovery_past_the_debounce() {
-        // DEC-269 round 2. Four reviewers found this independently, and it
-        // slipped the round-1 tests because they drove exactly ONE stale tick —
-        // the branch only flips once the no-sensor counter crosses its 5-cycle
-        // threshold. Past that point the daemon reported "no_sensor_fallback"
-        // (which means 40%) while actually holding the 60% recovery floor, so
-        // `thermal_state` meant two different duties.
-        let mut safety = crate::safety::ThermalSafetyRule::new();
-        safety.evaluate(TRIGGER + 1.0);
-        assert_eq!(safety.evaluate(70.0), Some(60), "precondition: in recovery");
-        let mut cycles = 0u32;
-
-        let mut decision = SafetyDecision {
-            thermal_state: "unset",
-            forced_pct: None,
-        };
-        for _ in 0..(constants::NO_SENSOR_CYCLE_THRESHOLD + 3) {
-            decision = evaluate_safety_tick(CpuReading::Stale(70.0), &mut cycles, &mut safety);
+    fn the_reported_state_and_the_forced_duty_never_disagree() {
+        // TS-l / DEC-386. The old tick computed `thermal_state` and `forced_pct` in
+        // two separate chains, and they disagreed once (DEC-269 round 2 reported
+        // `no_sensor_fallback` while holding the 60 % recovery floor). Every row of
+        // the table now returns both together; this walks every combination of
+        // reading, latch and debounce, and asserts the pairing the contract
+        // promises — and that `recovery` is never produced.
+        let readings = [
+            CpuReading::Fresh(45.0),
+            CpuReading::Fresh(90.0),
+            CpuReading::Fresh(TRIGGER + 1.0),
+            CpuReading::Stale(45.0),
+            CpuReading::Stale(90.0),
+            CpuReading::Absent,
+        ];
+        let mut seen = HashSet::new();
+        for latched in [false, true] {
+            for already_blind in [0, constants::NO_SENSOR_CYCLE_THRESHOLD] {
+                for reading in readings {
+                    let mut safety = if latched {
+                        latched_emergency()
+                    } else {
+                        crate::safety::ThermalSafetyRule::new()
+                    };
+                    let mut cycles = already_blind;
+                    let d = evaluate_safety_tick(reading, &mut cycles, &mut safety);
+                    let expected = match d.thermal_state {
+                        "emergency" => Some(100),
+                        "no_sensor_fallback" => Some(constants::NO_SENSOR_SAFE_PCT),
+                        "normal" => None,
+                        other => panic!("a state this daemon no longer produces: {other}"),
+                    };
+                    assert_eq!(
+                        d.forced_pct, expected,
+                        "{reading:?}, latched {latched}, blind {already_blind}: {d:?}"
+                    );
+                    seen.insert(d.thermal_state);
+                }
+            }
         }
-
-        assert!(
-            cycles > constants::NO_SENSOR_CYCLE_THRESHOLD,
-            "precondition: we are past the debounce"
-        );
-        assert_eq!(
-            decision.forced_pct,
-            Some(60),
-            "the recovery floor still holds"
-        );
-        assert_eq!(
-            decision.thermal_state, "recovery",
-            "state must describe the duty actually being forced, not the branch \
-             that proposed a different one"
-        );
+        // Presence: the walk reached all three states, or it proved nothing about
+        // the pairing of the one it missed.
+        assert_eq!(seen.len(), 3, "states reached: {seen:?}");
     }
 
     #[test]
@@ -3763,18 +3809,15 @@ mod tests {
             assert_eq!((d.forced_pct, d.thermal_state), (Some(100), "emergency"));
         }
 
-        // Fresh readings resume, below the release threshold.
-        let d = evaluate_safety_tick(CpuReading::Fresh(70.0), &mut cycles, &mut safety);
-        assert_eq!((d.forced_pct, d.thermal_state), (Some(60), "recovery"));
-        assert_eq!(cycles, 0, "a fresh reading resets the no-sensor debounce");
-        let d = evaluate_safety_tick(CpuReading::Fresh(70.0), &mut cycles, &mut safety);
-        assert_eq!((d.forced_pct, d.thermal_state), (Some(60), "recovery"));
+        // Fresh readings resume, below the release threshold: straight back to
+        // the profile (DEC-386 — no recovery rung).
         let d = evaluate_safety_tick(CpuReading::Fresh(70.0), &mut cycles, &mut safety);
         assert_eq!(
             (d.forced_pct, d.thermal_state),
             (None, "normal"),
             "the emergency must end — a stale-hold that cannot clear is a stuck force"
         );
+        assert_eq!(cycles, 0, "a fresh reading resets the no-sensor debounce");
     }
 
     // ── DEC-289: a wedged write must stay visible on /status ────────
@@ -6627,7 +6670,7 @@ mod tests {
     /// than tidy.** The first draft stamped it once and then ran a fixed
     /// 3.2 s + 4.0 s budget against it. A CPU reading goes stale at
     /// `CPU_TEMP_STALE_INTERVALS` x 1 s = **5 s**, after which
-    /// `NO_SENSOR_CYCLE_THRESHOLD` = **5** further cycles trip DEC-190's 40 %
+    /// `NO_SENSOR_CYCLE_THRESHOLD` = **5** further cycles trip the 40 %
     /// no-sensor fallback at ~10 s — and a forced tick `continue`s at
     /// `:1487`, *before* `tick_done.set_outputs(..)`, so `TickCompletion::drop`
     /// publishes an **empty** `control_outputs`. That is precisely what the
@@ -7111,13 +7154,14 @@ mod tests {
         assert_eq!(sysfs.get(EN1).as_deref(), Some("5"));
     }
 
-    /// [SAFETY] DEC-382 self-review finding: a duty below 100 % is not the end of
-    /// the emergency. When the CPU sensor VANISHES mid-emergency, DEC-190 drops the
-    /// forced duty to 40 % while the rule stays latched. Giving back there would
-    /// return an OpenFan channel no profile controls to its pre-emergency duty (35 %
-    /// here) — below even DEC-190's 40 % — in the middle of a live emergency, and
-    /// hand a BIOS header back mid-emergency. Both must stay where the emergency put
-    /// them until a fresh reading releases the latch; only then are they given back.
+    /// [SAFETY] DEC-382 self-review finding: a blind emergency is not the end of the
+    /// emergency. When the CPU sensor VANISHES mid-emergency the rule stays latched
+    /// — and since DEC-386 keeps forcing 100 % (DEC-190 dropped it to 40 %, the case
+    /// this test was written for). Giving back there would return an OpenFan channel
+    /// no profile controls to its pre-emergency duty (35 % here) in the middle of a
+    /// live emergency, and hand a BIOS header back mid-emergency. Both must stay
+    /// where the emergency put them until a fresh reading releases the latch; only
+    /// then are they given back.
     #[tokio::test(start_paused = true)]
     async fn a_blind_latched_emergency_gives_nothing_back_until_it_releases() {
         let cache = make_cache_with_sensor("cpu", TRIGGER + 1.0);
@@ -7164,13 +7208,13 @@ mod tests {
             "precondition: the emergency took the header"
         );
 
-        // The CPU sensor vanishes: the latch holds and DEC-190's 40 % runs, blind.
+        // The CPU sensor vanishes: the latch holds, and so does the emergency.
         cache.retain_sensors(&HashSet::new());
         tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
         assert_eq!(
             cache.snapshot().thermal_override_state.as_deref(),
-            Some("no_sensor_fallback"),
-            "precondition: the blind latched rung really ran"
+            Some("emergency"),
+            "precondition: the blind latched emergency really ran"
         );
         assert_eq!(
             ch3(&written.lock()),
@@ -7241,11 +7285,10 @@ mod tests {
     /// Timeline (1 tick/s, paused time):
     ///   t1: 79°C → curve 98.4% → writes 98%   (anchor now 98.4)
     ///   t2: 106°C → EMERGENCY, all 10 ch → 100%, state cleared
-    ///   t3: 60°C → release + recovery floor. Since D1-j the floor is a floor:
-    ///       ch0 (controlled) → max(curve 68%, 60%) = 68% (raw 0xAD);
-    ///       ch1-9 (uncommanded) → the bare 60% (raw 0x99).
-    ///   t4: recovery floor (one extra cycle) → coalesced, no writes
-    ///   t5: normal eval at 60°C → curve 68%, coalesced (ch0 is already there).
+    ///   t3: 60°C → release, straight back to the profile (DEC-386 — there is no
+    ///       recovery rung): ch0 evaluates its curve at 68% (raw 0xAD); ch1-9 were
+    ///       never set, so they have no pre-emergency duty and stay at 100%.
+    ///   t4, t5: normal eval at 60°C → 68%, coalesced (ch0 is already there).
     ///       Fixed: fresh state → ch0 shows 68% (raw 0xAD).
     ///       Bug: stale anchor 98.4 with step_down 2%/cycle → 96% (raw 0xF5).
     #[tokio::test(start_paused = true)]
@@ -7275,10 +7318,9 @@ mod tests {
         let profile_arc = Arc::new(Mutex::new(Some(profile)));
         let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
 
-        // 1 (t1) + 10 (t2) + 10 (t3) + 0 (t4 coalesced) + 0 (t5 coalesced) = 21
-        // writes. t5 coalesces because D1-j lets ch0 reach its curve value at t3
-        // (the floor no longer drags it down to 60%), so the normal tick has
-        // nothing new to say.
+        // 1 (t1) + 10 (t2) + 1 (t3) + 0 (t4, t5 coalesced) = 12 writes: at t3 ch0
+        // reaches its curve value directly (DEC-386 removed the 60% rung), and
+        // nothing else is written.
         let (transport, written) = LoopTestTransport::new(30);
         let fan_ctrl = crate::serial::controller::FanController::new(
             Box::new(transport),
@@ -7308,10 +7350,10 @@ mod tests {
         // on its premise, which is a much harder failure to read).
         cache.update_sensors(vec![cpu_reading(TRIGGER + 1.0)]);
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-        // t3 @3.0s: release + recovery floor.
+        // t3 @3.0s: release — control returns to the curve at once.
         cache.update_sensors(vec![cpu_reading(60.0)]);
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-        // t4 @4.0s: one-cycle recovery floor (writes coalesce at 60%).
+        // t4 @4.0s: normal evaluation (coalesced).
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
         // t5 @5.0s: normal evaluation resumes at 60°C.
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
@@ -7324,12 +7366,10 @@ mod tests {
         let set_pwm_cmds: Vec<_> = cmds.iter().filter(|c| c.starts_with(">02")).collect();
         // Channel 0 is the profile's controlled member. Read ITS writes rather
         // than the last write on the link: this assertion used to be
-        // `set_pwm_cmds.last()`, which was a positional proxy that only held
-        // while the recovery rung dragged ch0 down to 60% and left the fresh
-        // anchor to show up on the following normal tick. D1-j removed that drag,
-        // so ch0 reaches its curve value one tick earlier and the final write on
-        // the link is now some other channel's floor. The property under test is
-        // unchanged; where it lands is not.
+        // `set_pwm_cmds.last()`, a positional proxy that only held while the
+        // recovery rung dragged ch0 down to 60%. D1-j removed that drag and
+        // DEC-386 the rung itself; the property under test is unchanged, where it
+        // lands is not.
         let ch0: Vec<&str> = set_pwm_cmds
             .iter()
             .filter(|c| c.starts_with(">0200"))
@@ -7350,32 +7390,28 @@ mod tests {
         );
     }
 
-    /// [SAFETY] D1-j / DEC-307: the recovery rung is a FLOOR, and must never
-    /// lower a control below what its curve is asking for.
+    /// [SAFETY] Release hands every channel back: a controlled one to its curve,
+    /// one no profile controls to its pre-emergency duty (DEC-382).
     ///
-    /// This is the defect in its most direct form. The 60% recovery step fires
-    /// on the tick a CPU crosses back down through the release point — still
-    /// hot, seconds after a 105 °C excursion — and before DEC-307 it *replaced*
-    /// the profile's output rather than flooring it. At 70 °C this curve asks
-    /// for 84%; the old code drove the fan to 60% instead, a 24-point reduction
-    /// in cooling caused by the safety ladder itself.
+    /// This began as D1-j's test that the old 60% recovery rung FLOORED a curve
+    /// rather than replacing it (at 70 °C this curve asks for 84%, and before
+    /// DEC-307 the rung drove the fan to 60%). DEC-386 removed the rung, so the
+    /// release tick is an ordinary one; what is asserted is where each channel
+    /// ends up, which is unchanged. The discriminating test for the removal is
+    /// `release_returns_the_fans_to_their_curve_at_once`.
     ///
     ///   t0: ch3 (no profile controls it) is at 35%, set before the loop runs
     ///   t1: trigger+1 °C → emergency, EVERY channel → 100% (the full reach)
-    ///   t2: 70 °C → release + recovery.
-    ///       ch0 (controlled, curve = 84%) → max(84, 60) = 84%
+    ///   t2: 70 °C → release.
+    ///       ch0 (controlled, curve = 84%) → 84%
     ///       ch3 (not controlled)          → its pre-emergency 35% back
     ///       ch1,2,4-9 (never set)         → left at the forced 100%
     ///
-    /// DEC-382 replaced the second half. The 60% rung used to write a bare 60%
-    /// to every channel no profile controls, and then nothing ever gave those
-    /// channels back. Now a sub-100 rung reaches only the profile's channels,
-    /// and the end of the 100% phase gives every other channel the duty it had
-    /// before the emergency; a channel this daemon never set has no such duty
-    /// and is not guessed down. The full reach at 100% is unchanged and still
-    /// asserted here (t1), which is what guards the v2.38.0 P1 shape.
+    /// A channel this daemon never set has no pre-emergency duty and is not
+    /// guessed down. The full reach at 100% is still asserted here (t1), which is
+    /// what guards the v2.38.0 P1 shape.
     #[tokio::test(start_paused = true)]
-    async fn the_recovery_rung_floors_a_curve_it_used_to_replace() {
+    async fn release_hands_each_channel_back_to_its_curve_or_its_pre_emergency_duty() {
         let cache = make_cache_with_sensor("cpu", TRIGGER + 1.0);
         // step_up/step_down are 100%/cycle in this fixture, so nothing rate-limits
         // the descent and the value observed at t2 is the curve's own.
@@ -7408,7 +7444,7 @@ mod tests {
 
         // t1 @1.0s: emergency latches, all ten channels forced to 100%.
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-        // t2 @2.0s: fall to the release point → recovery rung.
+        // t2 @2.0s: fall to the release point → control returns.
         cache.update_sensors(vec![cpu_reading("cpu", 70.0, Instant::now())]);
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
@@ -7429,8 +7465,8 @@ mod tests {
         assert_eq!(
             values_for(0),
             vec![hex(100), hex(84)],
-            "the controlled channel must hold its own curve value (84%) through \
-             the recovery rung, not be replaced by the 60% floor; commands: {:?}",
+            "the controlled channel must go straight to its own curve value (84%) on \
+             release; commands: {:?}",
             cmds.iter()
                 .filter(|c| c.starts_with(">02"))
                 .collect::<Vec<_>>()
@@ -7439,17 +7475,112 @@ mod tests {
             values_for(3),
             vec![hex(35), hex(100), hex(35)],
             "a channel no profile controls must be forced to 100% by the emergency \
-             and then get its own pre-emergency duty back — never the 60% floor"
+             and then get its own pre-emergency duty back"
         );
         for ch in (1..crate::serial::protocol::NUM_CHANNELS).filter(|&ch| ch != 3) {
             assert_eq!(
                 values_for(ch),
                 vec![hex(100)],
                 "channel {ch} was never set before the emergency, so it has no duty \
-                 to give back: the emergency must still reach it (100%), and the \
-                 sub-100 rung must not take it (no 60%)"
+                 to give back: the emergency must still reach it (100%), and \
+                 nothing may take it afterwards"
             );
         }
+    }
+
+    /// [SAFETY] DEC-386: release hands control straight back to the curve — no
+    /// recovery rung. Released at 40 °C, where this curve asks for 36 %: the old
+    /// ladder forced max(36, 60) = 60 % for two ticks first, so the first write
+    /// after release was 60 %. Now it is the curve's own 36 %.
+    #[tokio::test(start_paused = true)]
+    async fn release_returns_the_fans_to_their_curve_at_once() {
+        let cache = make_cache_with_sensor("cpu", TRIGGER + 1.0);
+        let profile_arc = Arc::new(Mutex::new(Some(make_profile("curve", "graph", 50.0))));
+        let (transport, written) = LoopTestTransport::new(30);
+        let fan_ctrl = crate::serial::controller::FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            std::time::Duration::from_millis(500),
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(profile_engine_loop(
+            cache.clone(),
+            profile_arc,
+            Arc::new(parking_lot::RwLock::new(Some(Arc::new(Mutex::new(
+                fan_ctrl,
+            ))))),
+            None,
+            vec![],
+            Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new())),
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
+            shutdown_rx,
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        cache.update_sensors(vec![cpu_reading("cpu", 40.0, Instant::now())]);
+        tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+        stop(handle, shutdown_tx).await;
+
+        let hex = |pct: u8| format!("{:02X}", crate::pwm::percent_to_raw(pct));
+        let ch0: Vec<String> = written
+            .lock()
+            .iter()
+            .filter(|c| c.starts_with(">0200"))
+            .map(|c| c[c.len() - 3..c.len() - 1].to_string())
+            .collect();
+        assert_eq!(
+            ch0,
+            vec![hex(100), hex(36)],
+            "emergency, then the curve at once — no 60% recovery floor in between"
+        );
+    }
+
+    /// [SAFETY] `TS-p` / DEC-386, end to end — the audit's scenario. A CPU curve
+    /// is running its fan at 92 % (75 °C) when every CPU reading fails: the sensor
+    /// is evicted, the control is skipped (its fan holds 92 %), and after the
+    /// debounce the no-sensor floor forces 40 % over the profile's members. Before
+    /// DEC-386 the skipped control's members were "uncommanded" to that force and
+    /// took a bare 40 % — the fans of a CPU the curve had been cooling at 92 %,
+    /// dropped to 40 % with nothing latched. Now they hold.
+    #[tokio::test(start_paused = true)]
+    async fn a_skipped_cpu_control_keeps_its_duty_through_the_no_sensor_floor() {
+        let cache = make_cache_with_sensor("cpu", 75.0);
+        let sysfs = LiveHwmonSysfs::default().with(EN1, "2").with(PWM1, "90");
+        let profile_arc = Arc::new(Mutex::new(Some(hwmon_profile(&[H1]))));
+        let (handle, shutdown_tx) = spawn_engine(
+            cache.clone(),
+            profile_arc,
+            &sysfs,
+            vec![writable_pwm_header(H1)],
+        );
+        let raw = |pct: u8| crate::pwm::percent_to_raw(pct).to_string();
+
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert_eq!(
+            sysfs.get(PWM1),
+            Some(raw(92)),
+            "precondition: the curve runs the fan at 92%"
+        );
+
+        // Every CPU reading fails: the sensor is evicted and the control skipped.
+        cache.retain_sensors(&HashSet::new());
+        tokio::time::sleep(std::time::Duration::from_millis(
+            (u64::from(constants::NO_SENSOR_CYCLE_THRESHOLD) + 2) * 1000,
+        ))
+        .await;
+        assert_eq!(
+            cache.snapshot().thermal_override_state.as_deref(),
+            Some("no_sensor_fallback"),
+            "precondition: the no-sensor floor ran"
+        );
+        stop(handle, shutdown_tx).await;
+
+        assert_eq!(
+            sysfs.get(PWM1),
+            Some(raw(92)),
+            "the skipped control's fan must hold its duty under the 40% floor, not drop to it"
+        );
     }
 
     /// [SAFETY] DEC-307 review, finding 1: a sustained forced hold must not keep
@@ -7785,61 +7916,30 @@ mod tests {
         );
     }
 
-    /// DEC-135: the extracted safety step must walk the full trigger/release/recovery
-    /// ladder — trigger, hold, release-with-recovery, one extra recovery
-    /// cycle, then normal.
+    /// DEC-135: the extracted safety step must walk the ladder — trigger, hold,
+    /// release straight back to the profile (DEC-386: no recovery rung), normal.
     #[test]
-    fn safety_tick_emergency_recovery_ladder() {
+    fn safety_tick_emergency_ladder() {
         let mut rule = crate::safety::ThermalSafetyRule::new();
         let mut cycles = 0u32;
+        let emergency = SafetyDecision {
+            thermal_state: "emergency",
+            forced_pct: Some(100),
+        };
+        let normal = SafetyDecision {
+            thermal_state: "normal",
+            forced_pct: None,
+        };
 
-        let d = evaluate_safety_tick(CpuReading::Fresh(TRIGGER + 1.0), &mut cycles, &mut rule);
-        assert_eq!(
-            d,
-            SafetyDecision {
-                thermal_state: "emergency",
-                forced_pct: Some(100)
-            }
-        );
-
-        // Still above release threshold — hold at 100%.
-        let d = evaluate_safety_tick(CpuReading::Fresh(90.0), &mut cycles, &mut rule);
-        assert_eq!(
-            d,
-            SafetyDecision {
-                thermal_state: "emergency",
-                forced_pct: Some(100)
-            }
-        );
-
-        // Release at ≤80°C → recovery floor.
-        let d = evaluate_safety_tick(CpuReading::Fresh(60.0), &mut cycles, &mut rule);
-        assert_eq!(
-            d,
-            SafetyDecision {
-                thermal_state: "recovery",
-                forced_pct: Some(60)
-            }
-        );
-
-        // One extra recovery cycle.
-        let d = evaluate_safety_tick(CpuReading::Fresh(60.0), &mut cycles, &mut rule);
-        assert_eq!(
-            d,
-            SafetyDecision {
-                thermal_state: "recovery",
-                forced_pct: Some(60)
-            }
-        );
-
-        let d = evaluate_safety_tick(CpuReading::Fresh(60.0), &mut cycles, &mut rule);
-        assert_eq!(
-            d,
-            SafetyDecision {
-                thermal_state: "normal",
-                forced_pct: None
-            }
-        );
+        for (reading, expected, why) in [
+            (TRIGGER + 1.0, emergency, "trigger"),
+            (90.0, emergency, "still above release — hold at 100%"),
+            (60.0, normal, "release — control returns at once"),
+            (60.0, normal, "and nothing is owed after it"),
+        ] {
+            let d = evaluate_safety_tick(CpuReading::Fresh(reading), &mut cycles, &mut rule);
+            assert_eq!(d, expected, "{why}");
+        }
     }
 
     /// P0-R1 + DEC-132: the no-CPU-sensor fallback forces the safe minimum
@@ -7929,30 +8029,25 @@ mod tests {
     }
 
     #[test]
-    fn safety_tick_forces_floor_on_sensor_dropout_during_latched_emergency() {
-        // DEC-190: once a thermal emergency is latched, a CPU-sensor dropout must
-        // force the no-sensor safe floor IMMEDIATELY — not fall to profile
-        // control for cycles 1-4 (the pre-fix bug) — and report a coherent state
-        // rather than a stale "emergency" with no force.
+    fn safety_tick_holds_the_emergency_on_sensor_dropout() {
+        // DEC-190 fixed a dropout that let fans fall to profile control for cycles
+        // 1–4 of a latched emergency, by forcing the 40 % floor at once. DEC-386
+        // keeps the "at once" and replaces the 40 %: the emergency itself is held.
         let mut rule = crate::safety::ThermalSafetyRule::new();
         let mut cycles = 0u32;
 
-        // Latch the emergency with a real over-limit reading.
         let d = evaluate_safety_tick(CpuReading::Fresh(TRIGGER + 1.0), &mut cycles, &mut rule);
-        assert_eq!(d.thermal_state, "emergency");
-        assert_eq!(d.forced_pct, Some(100));
+        assert_eq!((d.thermal_state, d.forced_pct), ("emergency", Some(100)));
 
-        // Sensor vanishes the very next tick (cycle 1 of the dropout): force the
-        // no-sensor floor NOW, do not drop to profile control.
+        // The sensor vanishes on the very next tick: still the emergency.
         let d = evaluate_safety_tick(CpuReading::Absent, &mut cycles, &mut rule);
         assert_eq!(
             d,
             SafetyDecision {
-                thermal_state: "no_sensor_fallback",
-                forced_pct: Some(constants::NO_SENSOR_SAFE_PCT),
+                thermal_state: "emergency",
+                forced_pct: Some(100),
             },
-            "a dropout mid-emergency must force the no-sensor floor immediately, \
-             coherent with the reported state"
+            "a dropout mid-emergency must hold the emergency, not fall to a floor"
         );
     }
 
@@ -7980,10 +8075,9 @@ mod tests {
 
     #[test]
     fn safety_tick_dropout_during_emergency_stays_forced_past_the_no_sensor_threshold() {
-        // DEC-190: a dropout during a latched emergency forces 40% from cycle 1
-        // AND keeps forcing 40% once the generic 5-cycle no-sensor fallback ALSO
-        // trips (both branches of `force_no_sensor` true) — no flip-flop at the
-        // threshold boundary.
+        // DEC-386: a dropout during a latched emergency holds 100% from cycle 1
+        // AND keeps holding it once the generic 5-cycle no-sensor debounce is also
+        // satisfied — no flip to the 40% floor at the threshold boundary.
         let mut rule = crate::safety::ThermalSafetyRule::new();
         let mut cycles = 0u32;
         evaluate_safety_tick(CpuReading::Fresh(TRIGGER + 1.0), &mut cycles, &mut rule); // latch emergency
@@ -7993,10 +8087,10 @@ mod tests {
             assert_eq!(
                 d,
                 SafetyDecision {
-                    thermal_state: "no_sensor_fallback",
-                    forced_pct: Some(constants::NO_SENSOR_SAFE_PCT),
+                    thermal_state: "emergency",
+                    forced_pct: Some(100),
                 },
-                "cycle {cycle} of a mid-emergency dropout must hold the 40% floor"
+                "cycle {cycle} of a mid-emergency dropout must hold the emergency"
             );
         }
     }

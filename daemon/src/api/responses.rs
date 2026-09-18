@@ -19,8 +19,10 @@ pub struct StatusResponse {
     /// Seconds since daemon process started.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uptime_seconds: Option<u64>,
-    /// Thermal safety override state: `"normal"` | `"recovery"` | `"emergency"`
-    /// | `"no_sensor_fallback"` (forced 40% when no CPU sensor is reachable).
+    /// Thermal safety override state: `"normal"` | `"emergency"` |
+    /// `"no_sensor_fallback"` (forced 40% when no CPU sensor is reachable and
+    /// nothing is latched). `"recovery"` was emitted before DEC-386 removed the
+    /// recovery rung; clients still render it for older daemons.
     /// Mirrors the value the profile engine reports each tick (the same string
     /// `/diagnostics/hardware` exposes) so the GUI can surface a thermal-safety
     /// banner while the daemon is forcing safety PWM (DEC-132; the DEC-165

@@ -2114,7 +2114,7 @@ mod tests {
             !snap.sensors.values().any(|s| s.chip_name == "k10temp"),
             "an implausible reading must never be served as a live CPU temperature — \
              serving it resets no_cpu_sensor_cycles and silently suppresses the \
-             DEC-190 absent-sensor floor, which is the whole fault 294-c exists to fix"
+             no-sensor floor, which is the whole fault 294-c exists to fix"
         );
         assert!(
             snap.sensors.values().any(|s| s.chip_name == "nct6776"),
@@ -2129,7 +2129,7 @@ mod tests {
     ///
     /// A filter that could strand a CPU sensor out of service permanently would
     /// be a worse fault than the one it fixes — the machine would run with no CPU
-    /// temperature and sit on DEC-190's 40% floor forever. Recovery works by
+    /// temperature and sit on the no-sensor 40% floor forever. Recovery works by
     /// construction (a quarantined sensor keeps its descriptor, so it is still
     /// read every tick, and a plausible reading simply never enters `failures`),
     /// but "by construction" is a claim, and this asserts it.
