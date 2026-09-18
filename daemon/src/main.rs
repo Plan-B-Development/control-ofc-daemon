@@ -302,7 +302,7 @@ use control_ofc_daemon::hwmon::pwm_discovery::discover_pwm_headers;
 use control_ofc_daemon::hwmon::HWMON_SYSFS_ROOT;
 use control_ofc_daemon::profile::{self, DaemonProfile};
 use control_ofc_daemon::runtime_config::{
-    LoadPhase, RuntimeConfig, RuntimeConfigDegraded, RUNTIME_CONFIG_FILE,
+    record_degraded, LoadPhase, RuntimeConfig, RuntimeConfigDegraded, RUNTIME_CONFIG_FILE,
 };
 use control_ofc_daemon::safety::ThermalSafetyRule;
 use control_ofc_daemon::serial::controller::FanController;
@@ -648,19 +648,17 @@ fn apply_config_reload(
     // `runtime.toml` and sending SIGHUP. GUI v2.58.0 works around it by never
     // reassuring on `reload`; this fixes it at source.
     //
-    // A startup record therefore stands. Latest-wins is kept *within* the reload
-    // phase, so a second failed reload still refreshes `detail` with the current
-    // error rather than serving a stale one.
+    // A startup record therefore stands — and since `TS-r` so does an `update`
+    // record, which says a setter replaced the file. Latest-wins is kept
+    // *within* a phase, so a second failed reload still refreshes `detail` with
+    // the current error rather than serving a stale one. The rule itself is
+    // `runtime_config::record_degraded`.
     let (new_runtime, problem) =
         RuntimeConfig::load_from_reporting(runtime_config_path, LoadPhase::Reload);
     if let Some(problem) = problem {
-        let mut slot = degraded.write();
-        let startup_record_stands = slot
-            .as_ref()
-            .is_some_and(|existing| existing.phase == LoadPhase::Startup.as_str());
-        if !startup_record_stands {
-            *slot = Some(problem);
-        }
+        // Since `TS-r` the rule has a third phase (`update`, which also stands
+        // against a reload) and a second writer, so it lives in one function.
+        record_degraded(degraded, problem);
     }
     apply_runtime_overlay(&mut new_config, &new_runtime, config_path);
     let new_dirs = with_store_dir(
@@ -2060,8 +2058,9 @@ async fn async_main() {
         // this poll mirror in lockstep with the full snapshot).
         readiness_rollup: readiness_rollup.clone(),
         config_write: Default::default(),
-        // `AUD3-m`: seeded from the boot load above, and updated by the SIGHUP
-        // reload path. Never cleared — see the field's doc.
+        // `AUD3-m`: seeded from the boot load above; after that written only
+        // through `runtime_config::record_degraded`, by the SIGHUP reload path and
+        // the `/config/*` setters (`TS-r`). Never cleared — see the field's doc.
         runtime_config_degraded: Arc::new(parking_lot::RwLock::new(runtime_cfg_degraded)),
         assessment: Arc::new(control_ofc_daemon::api::handlers::AssessmentCache::new(
             readiness_rollup,

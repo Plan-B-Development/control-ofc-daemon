@@ -2661,6 +2661,129 @@ async fn status_reports_a_runtime_config_that_failed_to_load() {
 }
 
 #[tokio::test]
+async fn a_role_set_over_an_unreadable_runtime_config_keeps_every_other_role() {
+    // [SAFETY] `TS-r`, driven through the real route. `POST /config/header-role`
+    // commits memory by REBUILDING the engine's role map from the config it just
+    // loaded. When `runtime.toml` has gone bad since boot, that load moves the file
+    // aside, and it used to hand back bare defaults — so assigning ONE role dropped
+    // every other assigned role from the engine's floor union on the next tick,
+    // with nothing on `/status`. On a header with no pump label, the role is the
+    // only thing giving it the 30% floor.
+    let (state, tmp) = config_test_state_with_hwmon();
+    let rc = state.runtime_config_path.clone();
+    let roles = state.header_roles.clone();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_post(
+        &path,
+        "/config/header-role",
+        &serde_json::json!({"header_id": "h1", "role": "pump"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{json}");
+    // Precondition: the role really is live, or its survival below proves nothing.
+    assert_eq!(
+        roles.read().get("h1"),
+        Some(&control_ofc_daemon::hwmon::roles::HeaderRole::Pump)
+    );
+
+    // The file breaks after boot — a bad hand-edit, the realistic cause.
+    std::fs::write(&rc, "[hardware\nheader_roles = {").unwrap();
+
+    let (status, json) = uds_post(
+        &path,
+        "/config/header-role",
+        &serde_json::json!({"header_id": "h2", "role": "radiator_fan"}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a quarantine must not dead-end the setter: {json}"
+    );
+
+    // THE ASSERTION — on the map the engine reads every tick, not on the file.
+    let live = roles.read().clone();
+    assert_eq!(
+        live.get("h1"),
+        Some(&control_ofc_daemon::hwmon::roles::HeaderRole::Pump),
+        "setting h2 dropped h1's pump role from the live map: {live:?}"
+    );
+    assert_eq!(
+        live.get("h2"),
+        Some(&control_ofc_daemon::hwmon::roles::HeaderRole::RadiatorFan),
+        "the role actually requested must land too"
+    );
+
+    // ...and it reached the new file, so the next boot keeps it as well.
+    let written = std::fs::read_to_string(&rc).unwrap();
+    assert!(
+        written.contains("h1") && written.contains("pump"),
+        "{written}"
+    );
+
+    // ...and the quarantine is reported rather than left in the journal.
+    let (status, json) = uds_get(&path, "/status").await;
+    assert_eq!(status, 200);
+    let d = &json["runtime_config_degraded"];
+    assert_eq!(d["phase"], "update", "{json}");
+    assert_eq!(d["reason"], "malformed", "{json}");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+    drop(tmp);
+}
+
+#[tokio::test]
+async fn a_refused_setter_over_an_unreadable_runtime_config_still_leaves_every_role_on_disk() {
+    // [SAFETY] `TS-r`, the review's P1. A setter can be refused AFTER it has set
+    // the unreadable file aside — here a delete naming no device (404). When the
+    // quarantine was a rename, that left NO runtime.toml, and the next boot read
+    // it as a first boot: defaults, nothing reported, every assigned pump role
+    // gone. Assert what the next boot would load.
+    let (state, tmp) = config_test_state_with_hwmon();
+    let rc = state.runtime_config_path.clone();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_post(
+        &path,
+        "/config/header-role",
+        &serde_json::json!({"header_id": "h1", "role": "pump"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{json}");
+
+    std::fs::write(&rc, "[hardware\nheader_roles = {").unwrap();
+
+    let (status, json) = uds_delete(&path, "/config/cooling-device/no-such-device").await;
+    // Precondition: the setter really was refused after loading, or this is the
+    // other test over again.
+    assert_eq!(status, 404, "{json}");
+
+    let (at_next_boot, problem) =
+        control_ofc_daemon::runtime_config::RuntimeConfig::load_from_reporting(
+            &rc,
+            control_ofc_daemon::runtime_config::LoadPhase::Startup,
+        );
+    assert!(
+        problem.is_none(),
+        "the next boot must find a readable file, not a missing one"
+    );
+    assert_eq!(
+        at_next_boot.header_roles_parsed().get("h1"),
+        Some(&control_ofc_daemon::hwmon::roles::HeaderRole::Pump),
+        "a refused setter left no runtime.toml carrying h1's pump role"
+    );
+
+    let (status, json) = uds_get(&path, "/status").await;
+    assert_eq!(status, 200);
+    assert_eq!(json["runtime_config_degraded"]["phase"], "update", "{json}");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+    drop(tmp);
+}
+
+#[tokio::test]
 async fn status_omits_runtime_config_degraded_when_the_config_is_healthy() {
     // The field is additive and absent-means-fine, so an older daemon's omission
     // reads exactly as today's behaviour (no warning) rather than as a warning

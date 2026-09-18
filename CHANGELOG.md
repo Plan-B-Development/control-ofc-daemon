@@ -1,5 +1,26 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+**Saving a setting while `runtime.toml` is unreadable no longer removes your other
+fan header roles** (`TS-r`, DEC-391). If the daemon's settings file had become
+unreadable since startup — usually a hand-edit with a mistake in it — the next
+setting you saved moved the file aside and started a new one from defaults.
+Assigning a role to one header then also removed the role you had given every
+other header, immediately: a pump known only by its assigned role lost its 30 %
+minimum and could be stopped by fan identify, and nothing on `/status` said so.
+The new file now starts from the header roles and cooling devices the daemon is
+running with, and it is written before the save does anything else — so a save
+that is then refused, or that fails to write, no longer leaves no settings file at
+all, which made the next restart drop every role without a word. `/status` and
+`/poll` report it as `runtime_config_degraded` with the new phase `update`. Any
+other setting that was only in the old file (kept as
+`runtime.toml.invalid-<timestamp>`) still needs copying back. A settings file that
+has been deleted by hand is treated the same way: the next save keeps the roles
+the daemon is running with.
+
 ## [2.50.0] — 2026-09-18
 
 ### Added

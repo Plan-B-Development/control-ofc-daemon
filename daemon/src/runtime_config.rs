@@ -216,6 +216,13 @@ pub enum LoadPhase {
     /// A `SIGHUP` reload. Narrower: it re-applies the overlay but only commits
     /// `profile_search_dirs`, so header roles keep whatever boot established.
     Reload,
+    /// A `POST /config/*` setter found the file unreadable, kept the original
+    /// as `runtime.toml.invalid-<unix-ts>` and replaced it
+    /// ([`RuntimeConfig::load_for_update`], `TS-r`). The replacement carries the
+    /// header roles and cooling devices the daemon is running with, so no role is
+    /// lost; every other key that existed only in the original is not, and is
+    /// gone from the next boot.
+    Update,
 }
 
 impl LoadPhase {
@@ -223,8 +230,58 @@ impl LoadPhase {
         match self {
             LoadPhase::Startup => "startup",
             LoadPhase::Reload => "reload",
+            LoadPhase::Update => "update",
         }
     }
+
+    /// How much a degradation in this phase costs, for [`record_degraded`]'s
+    /// most-severe-wins rule. `startup` drops every header role; `update`
+    /// replaced the file, so settings that were only in it are gone from the
+    /// next boot; `reload` drops nothing.
+    fn severity(phase: &str) -> u8 {
+        match phase {
+            "startup" => 3,
+            "update" => 2,
+            _ => 1,
+        }
+    }
+}
+
+/// Put `problem` into the sticky `runtime_config_degraded` slot, keeping the more
+/// severe record (`WIRE-ao`, `TS-r`).
+///
+/// [SAFETY] **Most-severe wins, not latest-wins.** A `startup` record survives
+/// every later failure, because it is the one that says header roles — and with
+/// them a hand-assigned pump's 30% floor — are not in force; letting a cheaper
+/// record overwrite it would make `phase` under-report. An `update` record
+/// survives a later failed `reload` for the same reason one step down: it says
+/// the file was replaced. Latest-wins is kept *within* a phase, so a repeat
+/// failure still refreshes `detail`.
+///
+/// The one place this rule lives. `apply_config_reload` and the `/config/*`
+/// setters both write the slot through here.
+pub fn record_degraded(
+    slot: &parking_lot::RwLock<Option<RuntimeConfigDegraded>>,
+    problem: RuntimeConfigDegraded,
+) {
+    let mut slot = slot.write();
+    let existing_is_worse = slot.as_ref().is_some_and(|existing| {
+        LoadPhase::severity(&existing.phase) > LoadPhase::severity(&problem.phase)
+    });
+    if !existing_is_worse {
+        *slot = Some(problem);
+    }
+}
+
+/// The assignments a running daemon holds live, handed to
+/// [`RuntimeConfig::load_for_update`] so a quarantine cannot lose them (`TS-r`).
+///
+/// A required argument rather than something the caller patches in afterwards:
+/// the setter that forgot to would drop every user-assigned pump role from the
+/// engine's floor on the next tick, silently.
+pub struct LiveAssignments<'a> {
+    pub header_roles: &'a HashMap<String, crate::hwmon::roles::HeaderRole>,
+    pub cooling_devices: &'a [crate::hwmon::cooling_device::CoolingDeviceConfig],
 }
 
 /// A runtime-config load that fell back to defaults, surfaced on `/status`
@@ -246,8 +303,9 @@ pub struct RuntimeConfigDegraded {
     pub path: String,
     /// The underlying I/O or TOML error, verbatim.
     pub detail: String,
-    /// `"startup"` or `"reload"` — see [`LoadPhase`], which documents what each
-    /// one costs. A `startup` degradation is the one that drops header roles.
+    /// `"startup"`, `"reload"` or `"update"` — see [`LoadPhase`], which documents
+    /// what each one costs. A `startup` degradation is the one that drops header
+    /// roles.
     pub phase: String,
 }
 
@@ -337,37 +395,128 @@ impl RuntimeConfig {
     /// and not settable, with no documented way out.
     ///
     /// Quarantine keeps the property that matters — the user's bytes are never
-    /// destroyed, just moved to `runtime.toml.invalid-<unix-ts>` — while letting
-    /// the daemon carry on. `Err` is now reserved for the case where even the
-    /// rename fails, because then we genuinely cannot write without erasing.
+    /// destroyed, just kept as `runtime.toml.invalid-<unix-ts>` — while letting
+    /// the daemon carry on. `Err` is reserved for the two cases that cannot be
+    /// done safely — the original could not be kept, or its replacement could
+    /// not be written — and in both `path` is left exactly as it was.
     ///
     /// A *missing* file is not an error: that is the first-write case.
-    pub fn load_for_update(path: &Path) -> Result<Self, String> {
-        let problem = match crate::atomic_io::read_to_string_capped(path) {
-            Ok(content) => match toml::from_str::<RuntimeConfig>(&content) {
-                Ok(cfg) => return Ok(cfg),
-                Err(e) => format!("malformed ({e})"),
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(e) => format!("unreadable ({e})"),
-        };
+    ///
+    /// [SAFETY] **A quarantine — or a missing file — starts from `live`, not from
+    /// bare defaults (`TS-r`).** `POST /config/header-role` and the cooling-device setters
+    /// commit memory by *rebuilding* it from the config returned here, so
+    /// returning `Self::default()` plus the one key being set replaced the
+    /// engine's whole role map: one role assignment while the file was
+    /// unreadable dropped every other assigned pump role — and on a header with
+    /// no pump label, its 30% floor and its stop exemption — on the next tick,
+    /// with nothing on `/status`. The running daemon's own maps are the last good
+    /// copy of those assignments, so they are carried in. Every other key starts
+    /// at its default, because the in-memory value may have come from
+    /// `daemon.toml` rather than from this file and cannot be told apart.
+    ///
+    /// A missing file takes the same path, because it is the same hazard one step
+    /// on: a quarantine whose write then failed leaves no file at all, and so does
+    /// a hand-deleted one — and the next setter would rebuild the role map from
+    /// defaults exactly as above. On a genuine first write nothing is live yet
+    /// (both maps come only from this file), so carrying `live` there changes
+    /// nothing. A missing file is still not a degradation and publishes nothing.
+    ///
+    /// **The replacement is written HERE, before the caller runs.** A setter can
+    /// return without writing after this call — a rejected request (the
+    /// cooling-device cap, an unknown id, a bad search dir) or a failed write —
+    /// and when the quarantine *renamed* the file away, such a return left no
+    /// `runtime.toml` at all: the next boot read "missing" as a first boot, with
+    /// defaults, no report and every assigned pump role gone. So the original is
+    /// hard-linked aside (atomic, and it needs no free space) and the carried
+    /// config replaces it atomically through `save_to`. `path` is never empty,
+    /// and an `update` record always means a readable file holding the live
+    /// assignments is on disk. A filesystem without hard links refuses instead,
+    /// as every setter did before DEC-255.
+    ///
+    /// The second element is the degradation to publish (`phase: "update"`), so
+    /// the caller can put it on `/status` through [`record_degraded`]. It is
+    /// `None` whenever nothing was set aside.
+    ///
+    /// Blocking file I/O with fsyncs: call it off the async runtime (DEC-252).
+    pub fn load_for_update(
+        path: &Path,
+        live: LiveAssignments<'_>,
+    ) -> Result<(Self, Option<RuntimeConfigDegraded>), String> {
+        Self::load_for_update_with(path, live, |cfg, p| cfg.save_to(p))
+    }
 
+    /// [`Self::load_for_update`] with the replacement's writer passed in, so a
+    /// test can make it fail. Production always passes [`Self::save_to`].
+    fn load_for_update_with(
+        path: &Path,
+        live: LiveAssignments<'_>,
+        write: impl FnOnce(&Self, &Path) -> Result<(), String>,
+    ) -> Result<(Self, Option<RuntimeConfigDegraded>), String> {
+        let (reason, detail) = match crate::atomic_io::read_to_string_capped(path) {
+            Ok(content) => match toml::from_str::<RuntimeConfig>(&content) {
+                Ok(cfg) => return Ok((cfg, None)),
+                Err(e) => ("malformed", e.to_string()),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((Self::carrying(live), None));
+            }
+            Err(e) => ("unreadable", e.to_string()),
+        };
+        let problem = format!("{reason} ({detail})");
+
+        // Keep the original first, without ever removing `path`. A link to an
+        // existing name fails rather than replacing it, so an earlier copy from
+        // the same second is never overwritten.
         let quarantined = quarantine_path(path);
-        std::fs::rename(path, &quarantined).map_err(|e| {
+        std::fs::hard_link(path, &quarantined).map_err(|e| {
             format!(
-                "existing runtime config at {} is {problem} and could not be moved \
-                 aside ({e}); refusing to overwrite it",
-                path.display()
+                "existing runtime config at {} is {problem} and could not be kept as \
+                 {} ({e}); refusing to overwrite it",
+                path.display(),
+                quarantined.display()
             )
         })?;
+
+        let cfg = Self::carrying(live);
+        if let Err(e) = write(&cfg, path) {
+            // `save_to` replaces atomically, so `path` still holds the original.
+            // Drop the link too, so nothing on disk changed.
+            let _ = std::fs::remove_file(&quarantined);
+            return Err(format!(
+                "existing runtime config at {} is {problem} and its replacement \
+                 could not be written ({e}); left it untouched",
+                path.display()
+            ));
+        }
         log::error!(
-            "Runtime config at {} is {problem}; moved to {} and continuing with \
-             defaults. Settings in that file are NOT applied — copy anything you \
-             need back and restart.",
+            "Runtime config at {} is {problem}; the original is kept as {} and was \
+             replaced with the header roles and cooling devices the daemon is \
+             running with. Every other setting that was only in the original is \
+             NOT carried — copy anything you need back and restart.",
             path.display(),
             quarantined.display()
         );
-        Ok(Self::default())
+
+        Ok((
+            cfg,
+            Some(RuntimeConfigDegraded {
+                reason: reason.to_string(),
+                path: path.display().to_string(),
+                detail,
+                phase: LoadPhase::Update.as_str().to_string(),
+            }),
+        ))
+    }
+
+    /// Defaults, plus the assignments the running daemon holds — the starting
+    /// point [`Self::load_for_update`] uses when there is no file it can trust.
+    fn carrying(live: LiveAssignments<'_>) -> Self {
+        let mut cfg = Self::default();
+        for (id, role) in live.header_roles {
+            cfg.set_header_role(id, Some(*role));
+        }
+        cfg.cooling_devices = live.cooling_devices.to_vec();
+        cfg
     }
 
     /// Atomically persist runtime.toml. Creates the parent directory if needed.
@@ -1132,11 +1281,22 @@ mod tests {
         let original = "[polling]\npoll_interval_ms = 900\n[garbage\n";
         std::fs::write(&path, original).unwrap();
 
-        let loaded = RuntimeConfig::load_for_update(&path).expect("must not dead-end");
+        let (loaded, degraded) =
+            RuntimeConfig::load_for_update(&path, nothing_live()).expect("must not dead-end");
         assert!(loaded.polling.is_none(), "proceeds on defaults");
+        let degraded = degraded.expect("a quarantine is published, never silent (TS-r)");
+        assert_eq!(
+            (degraded.reason.as_str(), degraded.phase.as_str()),
+            ("malformed", "update")
+        );
+        assert_eq!(degraded.path, path.display().to_string());
+        // `TS-r`: the path is REPLACED, never vacated — a readable file is there
+        // before the caller does anything else.
+        let (replacement, problem) = RuntimeConfig::load_from_reporting(&path, LoadPhase::Startup);
+        assert!(problem.is_none(), "the replacement must load cleanly");
         assert!(
-            !path.exists(),
-            "the unparseable file is moved out of the way"
+            replacement.polling.is_none(),
+            "and carry none of the original's keys"
         );
 
         let quarantined: Vec<_> = std::fs::read_dir(dir.path())
@@ -1165,13 +1325,14 @@ mod tests {
         let path = dir.path().join("runtime.toml");
         std::fs::write(&path, "not = valid = toml [[[").unwrap();
 
-        let mut cfg = RuntimeConfig::load_for_update(&path).unwrap();
+        let (mut cfg, _) = RuntimeConfig::load_for_update(&path, nothing_live()).unwrap();
         cfg.set_poll_interval_ms(Some(1000));
         cfg.save_to(&path)
             .expect("the setter must be able to write");
 
-        let reloaded = RuntimeConfig::load_for_update(&path).unwrap();
+        let (reloaded, degraded) = RuntimeConfig::load_for_update(&path, nothing_live()).unwrap();
         assert_eq!(reloaded.polling.map(|p| p.poll_interval_ms), Some(1000));
+        assert!(degraded.is_none(), "the rewritten file is healthy again");
     }
 
     #[test]
@@ -1180,7 +1341,8 @@ mod tests {
         // the very first setter call impossible.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("runtime.toml");
-        assert!(RuntimeConfig::load_for_update(&path).is_ok());
+        let (_, degraded) = RuntimeConfig::load_for_update(&path, nothing_live()).unwrap();
+        assert!(degraded.is_none(), "first write is not a degradation");
     }
 
     #[test]
@@ -1189,10 +1351,219 @@ mod tests {
         let path = dir.path().join("runtime.toml");
         std::fs::write(&path, "[polling]\npoll_interval_ms = 750\n").unwrap();
 
-        let cfg = RuntimeConfig::load_for_update(&path).unwrap();
+        let (cfg, degraded) = RuntimeConfig::load_for_update(&path, nothing_live()).unwrap();
         assert_eq!(cfg.polling.map(|p| p.poll_interval_ms), Some(750));
+        assert!(degraded.is_none());
         assert!(path.exists(), "a file we understood must be left alone");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// No live assignments — the shape of a daemon that holds no roles.
+    fn nothing_live() -> LiveAssignments<'static> {
+        static ROLES: std::sync::LazyLock<HashMap<String, crate::hwmon::roles::HeaderRole>> =
+            std::sync::LazyLock::new(HashMap::new);
+        LiveAssignments {
+            header_roles: &ROLES,
+            cooling_devices: &[],
+        }
+    }
+
+    // ── TS-r: a quarantine must not cost the roles the daemon is running with ──
+
+    #[test]
+    fn a_quarantine_carries_the_live_roles_and_devices_into_the_new_config() {
+        // [SAFETY] `TS-r`. The header-role setter rebuilds the engine's role map
+        // from what this returns, so bare defaults here dropped every OTHER
+        // assigned pump role on the next tick. Two roles, so the one a setter
+        // is about to change is never the only one carried.
+        use crate::hwmon::roles::HeaderRole;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.toml");
+        std::fs::write(&path, "[hardware]\nheader_roles = { broken").unwrap();
+
+        let roles: HashMap<String, HeaderRole> = [
+            ("hwmon:it8696:isa:pwm2:pwm2".to_string(), HeaderRole::Pump),
+            (
+                "hwmon:it8696:isa:pwm3:pwm3".to_string(),
+                HeaderRole::RadiatorFan,
+            ),
+        ]
+        .into();
+        let devices = vec![aio_device()];
+        let (cfg, degraded) = RuntimeConfig::load_for_update(
+            &path,
+            LiveAssignments {
+                header_roles: &roles,
+                cooling_devices: &devices,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.header_roles_parsed(),
+            roles,
+            "every live role is carried"
+        );
+        assert_eq!(cfg.cooling_devices, devices, "the live topology is carried");
+        assert_eq!(degraded.map(|d| d.phase), Some("update".to_string()));
+        // Only those two: a key the daemon may hold from `daemon.toml` must not be
+        // written into runtime.toml as though the user had set it here.
+        assert!(cfg.polling.is_none() && cfg.profiles.is_none() && cfg.shutdown.is_none());
+    }
+
+    #[test]
+    fn a_quarantine_leaves_the_live_roles_on_disk_even_if_the_caller_never_writes() {
+        // [SAFETY] `TS-r`, the review's P1. A setter can return after this call
+        // without writing (a rejected request, a failed write). When the
+        // quarantine renamed the file away, that left NO runtime.toml, and the
+        // next boot read it as a first boot: defaults, no report, every assigned
+        // pump role gone. Assert what that boot would see.
+        use crate::hwmon::roles::HeaderRole;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.toml");
+        std::fs::write(&path, "[hardware\n").unwrap();
+
+        let roles: HashMap<String, HeaderRole> = [("h1".to_string(), HeaderRole::Pump)].into();
+        let _ = RuntimeConfig::load_for_update(
+            &path,
+            LiveAssignments {
+                header_roles: &roles,
+                cooling_devices: &[],
+            },
+        )
+        .unwrap();
+        // ...and the caller writes nothing.
+
+        let (at_next_boot, problem) = RuntimeConfig::load_from_reporting(&path, LoadPhase::Startup);
+        assert!(problem.is_none(), "the next boot finds a readable file");
+        assert_eq!(
+            at_next_boot.header_roles_parsed(),
+            roles,
+            "carrying the live roles"
+        );
+    }
+
+    #[test]
+    fn a_replacement_that_cannot_be_written_leaves_the_file_untouched() {
+        // The refusal arm: nothing on disk may change. `save_to` replaces
+        // atomically, so the original is still at `path`; the kept copy is
+        // removed so no `.invalid-` file suggests a loss that did not happen.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.toml");
+        let original = "[polling]\npoll_interval_ms = 900\n[garbage\n";
+        std::fs::write(&path, original).unwrap();
+
+        let result = RuntimeConfig::load_for_update_with(&path, nothing_live(), |_, _| {
+            Err("disk full".to_string())
+        });
+
+        assert!(result.is_err(), "a replacement that failed must be refused");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "no kept copy may be left behind"
+        );
+    }
+
+    #[test]
+    fn a_missing_file_carries_the_live_roles_and_publishes_nothing() {
+        // [SAFETY] `TS-r`, the same hazard one step on. A quarantine whose write
+        // then failed leaves NO file, and the next setter used to rebuild the
+        // role map from bare defaults. Nothing is degraded — first-write
+        // semantics — but no live role may be dropped.
+        use crate::hwmon::roles::HeaderRole;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.toml");
+
+        let roles: HashMap<String, HeaderRole> = [("h1".to_string(), HeaderRole::Pump)].into();
+        let (cfg, degraded) = RuntimeConfig::load_for_update(
+            &path,
+            LiveAssignments {
+                header_roles: &roles,
+                cooling_devices: &[],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(cfg.header_roles_parsed(), roles);
+        assert!(degraded.is_none(), "a missing file is never a degradation");
+        assert!(!path.exists(), "loading must not create the file");
+    }
+
+    #[test]
+    fn a_readable_file_wins_over_the_live_maps() {
+        // The carry-over is for a quarantine ONLY. On a healthy file the file is
+        // the record, and a live map must never be written over it — otherwise a
+        // hand-edit that removed a role and was not yet reloaded would be undone.
+        use crate::hwmon::roles::HeaderRole;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.toml");
+        std::fs::write(&path, "[hardware.header_roles]\n\"h1\" = \"cpu_fan\"\n").unwrap();
+
+        let roles: HashMap<String, HeaderRole> = [("h2".to_string(), HeaderRole::Pump)].into();
+        let (cfg, degraded) = RuntimeConfig::load_for_update(
+            &path,
+            LiveAssignments {
+                header_roles: &roles,
+                cooling_devices: &[],
+            },
+        )
+        .unwrap();
+
+        // Presence first: the file really was read, or the absence below is vacuous.
+        assert_eq!(
+            cfg.header_roles_parsed().get("h1"),
+            Some(&HeaderRole::CpuFan)
+        );
+        assert!(!cfg.header_roles_parsed().contains_key("h2"));
+        assert!(degraded.is_none());
+    }
+
+    fn degraded(phase: &str, detail: &str) -> RuntimeConfigDegraded {
+        RuntimeConfigDegraded {
+            reason: "malformed".into(),
+            path: "/x/runtime.toml".into(),
+            detail: detail.into(),
+            phase: phase.into(),
+        }
+    }
+
+    #[test]
+    fn the_more_severe_degradation_record_stands() {
+        // [SAFETY] `WIRE-ao` extended by `TS-r`: startup > update > reload, and
+        // latest-wins within a phase. Each pair is asserted in BOTH orders, so a
+        // rule that happened to keep whichever came first would fail.
+        let order = ["reload", "update", "startup"];
+        for (i, lower) in order.iter().enumerate() {
+            for higher in &order[i + 1..] {
+                let slot = parking_lot::RwLock::new(None);
+                record_degraded(&slot, degraded(higher, "first"));
+                record_degraded(&slot, degraded(lower, "second"));
+                assert_eq!(
+                    slot.read().as_ref().map(|d| d.phase.clone()),
+                    Some(higher.to_string()),
+                    "a later `{lower}` must not overwrite `{higher}`"
+                );
+
+                let slot = parking_lot::RwLock::new(None);
+                record_degraded(&slot, degraded(lower, "first"));
+                record_degraded(&slot, degraded(higher, "second"));
+                assert_eq!(
+                    slot.read().as_ref().map(|d| d.phase.clone()),
+                    Some(higher.to_string()),
+                    "a later `{higher}` must replace `{lower}`"
+                );
+            }
+            let slot = parking_lot::RwLock::new(None);
+            record_degraded(&slot, degraded(lower, "old"));
+            record_degraded(&slot, degraded(lower, "new"));
+            assert_eq!(
+                slot.read().as_ref().map(|d| d.detail.clone()),
+                Some("new".to_string()),
+                "a repeat `{lower}` failure refreshes `detail`"
+            );
+        }
     }
 
     // ── AIO-MB Phase 4 (DEC-316): cooling-device topology ────────────────────

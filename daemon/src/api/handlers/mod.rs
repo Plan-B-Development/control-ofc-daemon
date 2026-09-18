@@ -540,9 +540,11 @@ pub struct AppState {
     /// record survives any number of later failed reloads: a startup failure
     /// drops every `header_roles` assignment while a reload failure drops
     /// nothing, so letting the cheaper record overwrite the expensive one made
-    /// `phase` under-report. Latest-wins is kept *within* the reload phase, so a
-    /// second failed reload still refreshes `detail`. Written by
-    /// `main.rs::apply_config_reload`, which owns the rule.
+    /// `phase` under-report. An `update` record — a `/config/*` setter moved
+    /// the unreadable file aside (`TS-r`) — likewise survives a later failed
+    /// reload. Latest-wins is kept *within* a phase, so a second failed reload
+    /// still refreshes `detail`. After construction, written only through
+    /// `runtime_config::record_degraded`, which owns the rule.
     pub runtime_config_degraded:
         Arc<parking_lot::RwLock<Option<crate::runtime_config::RuntimeConfigDegraded>>>,
     /// Set by `POST /hwmon/rescan` to ask the sensor polling loop to refresh

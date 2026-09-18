@@ -715,9 +715,21 @@ its pump-safe identify, and until this field the entire notification was one
 `warn!` in the journal: no endpoint reported it. `/status` + `/poll` now carry
 `runtime_config_degraded = {reason, path, detail, phase}` — `reason` is
 `unreadable` (I/O error, or over the 4 MiB read cap) or `malformed` (read, but
-not valid TOML for this daemon version); `phase` is `startup` or `reload` and
-says what the degradation cost, since a startup load seeds every key while a
-SIGHUP reload commits only `profile_search_dirs`. Additive and **omitted when
+not valid TOML for this daemon version); `phase` is `startup`, `reload` or
+`update` and says what the degradation cost, since a startup load seeds every
+key while a SIGHUP reload commits only `profile_search_dirs`. `update` (2.51.0,
+`TS-r`) is a `/config/*` setter that found the file unreadable:
+`RuntimeConfig::load_for_update` hard-links the original to
+`runtime.toml.invalid-<unix-ts>` and atomically replaces it with the header roles
+and cooling devices the daemon is running with (`LiveAssignments`), **before the
+setter runs** — so a setter that is then refused, or fails to write, still leaves
+a readable file carrying every role, and the setters that rebuild those maps from
+the file cannot drop one. Only keys that existed solely in the original are lost.
+If the replacement cannot be written nothing on disk changes and the setter
+answers `503`. A setter that finds no file at all starts from the same live maps
+and publishes nothing. When several
+phases fail the more severe record stands — `startup` > `update` > `reload` —
+through the one function `runtime_config::record_degraded`. Additive and **omitted when
 the config loaded cleanly**, so an older daemon's omission reads exactly as
 "fine" — which is the same (absent) warning such a daemon shows today. A
 *missing* file is not a degradation: that is first boot. The field is sticky for

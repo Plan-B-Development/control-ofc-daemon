@@ -940,7 +940,34 @@ async fn runtime_for_update(
 ) -> Result<(tokio::sync::MutexGuard<'_, ()>, RuntimeConfig), (StatusCode, Json<serde_json::Value>)>
 {
     let guard = state.config_write.lock().await;
-    let cfg = RuntimeConfig::load_for_update(&state.runtime_config_path).map_err(|e| {
+    // [SAFETY] `TS-r`: the live maps go in so a quarantine carries them into the
+    // file that replaces the unreadable one — and into the maps this setter
+    // rebuilds from it. Read under `config_write`, the lock every writer of these
+    // two maps holds. Off the runtime, because a quarantine now writes and fsyncs
+    // (DEC-252).
+    let header_roles = state.header_roles();
+    let cooling_devices = Arc::clone(&state.cooling_devices.read());
+    let path = state.runtime_config_path.clone();
+    let slot = Arc::clone(&state.runtime_config_degraded);
+    let loaded = super::persist_off_runtime(move || {
+        let (cfg, quarantined) = RuntimeConfig::load_for_update(
+            &path,
+            crate::runtime_config::LiveAssignments {
+                header_roles: &header_roles,
+                cooling_devices: &cooling_devices,
+            },
+        )?;
+        // Published inside the blocking task, which a dropped request cannot
+        // cancel: the unreadable file has been kept aside and replaced whether
+        // or not this handler lives to see it, and whether or not the setter
+        // goes on to write. That is the fact `/status` must carry.
+        if let Some(problem) = quarantined {
+            crate::runtime_config::record_degraded(&slot, problem);
+        }
+        Ok(cfg)
+    })
+    .await;
+    let cfg = loaded.map_err(|e| {
         log::error!("{e}");
         error_response(
             StatusCode::SERVICE_UNAVAILABLE,
