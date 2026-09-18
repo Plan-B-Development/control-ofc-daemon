@@ -1794,36 +1794,58 @@ fn preflight_blocks_every_unsafe_condition() {
 
 /// §7: "stale required temperature blocks/aborts appropriately."
 ///
-/// **Both branches**, because the rule is per-diagnostic: it BLOCKS the new
-/// diagnostic and only WARNS for the two that shipped without a staleness gate.
-/// A test on one branch alone would pass with the distinction deleted.
+/// **Every diagnostic blocks, since DEC-385 (`TS-q`).** Until then verify and
+/// characterisation only WARNED, and this test pinned that split; the thermal
+/// audit showed a wedged poll blinds the ladder while those two drive a fan, so
+/// their handlers now refuse and the report says so. Both arms are asserted: a
+/// stale source blocks all three, a fresh one blocks none — a rule stuck at
+/// "always block" fails the second.
 #[test]
-fn a_stale_temperature_source_blocks_discovery_and_warns_the_others() {
+fn a_stale_temperature_source_blocks_every_diagnostic() {
     let stale = pf::TemperatureFreshness {
         total: 2,
         fresh: 0,
         newest_age_ms: Some(45_000),
         newest_id: Some("cpu".into()),
     };
+    let fresh = pf::TemperatureFreshness {
+        total: 2,
+        fresh: 2,
+        newest_age_ms: Some(500),
+        newest_id: Some("cpu".into()),
+    };
 
-    let mut inputs = ok_inputs(pf::Diagnostic::ControlPathDiscovery);
-    inputs.temperature = stale.clone();
-    let r = pf::build_report(&inputs);
-    assert_eq!(r.verdict, pf::VERDICT_BLOCKED);
-    assert_eq!(check(&r, pf::CHECK_TEMPERATURE).state, pf::CHECK_FAIL);
-
-    for diag in [pf::Diagnostic::Verify, pf::Diagnostic::Characterization] {
+    for diag in [
+        pf::Diagnostic::ControlPathDiscovery,
+        pf::Diagnostic::Verify,
+        pf::Diagnostic::Characterization,
+    ] {
         let mut inputs = ok_inputs(diag);
         inputs.temperature = stale.clone();
         let r = pf::build_report(&inputs);
         assert_eq!(
             check(&r, pf::CHECK_TEMPERATURE).state,
-            pf::CHECK_WARN,
-            "{} must not gain a refusal it does not perform",
+            pf::CHECK_FAIL,
+            "{}: a stale source must block",
             diag.token()
         );
-        assert_eq!(r.verdict, pf::VERDICT_WARN);
-        assert!(r.blocking.is_empty());
+        assert_eq!(r.verdict, pf::VERDICT_BLOCKED, "{}", diag.token());
+        assert!(
+            r.blocking.iter().any(|b| b == pf::CHECK_TEMPERATURE),
+            "{}: {:?}",
+            diag.token(),
+            r.blocking
+        );
+
+        let mut inputs = ok_inputs(diag);
+        inputs.temperature = fresh.clone();
+        let r = pf::build_report(&inputs);
+        assert_eq!(
+            check(&r, pf::CHECK_TEMPERATURE).state,
+            pf::CHECK_PASS,
+            "{}: a fresh source must not block",
+            diag.token()
+        );
     }
 }
 
@@ -2058,13 +2080,12 @@ fn ingest_truncation_does_not_split_a_codepoint() {
 /// [SAFETY] The refusal rule, asserted as the RELATIONSHIP it is derived from.
 ///
 /// `blocks_on_stale_temperature()` is what `build_report` keys the `blocked`
-/// verdict on, so the enforcement must key on the same thing. Asserting
-/// `is_some()` for discovery and `is_none()` for the other two against literals
-/// would pass for an implementation that hardcoded `matches!(d,
-/// ControlPathDiscovery)` — the exact second copy that could later disagree with
-/// the published verdict. The right-hand side is therefore the predicate itself,
-/// evaluated per diagnostic, and BOTH branches are exercised (a rule stuck at
-/// `true` fails the verify/characterisation arms).
+/// verdict on, so the enforcement must key on the same thing — the right-hand
+/// side is the predicate itself, evaluated per diagnostic, never a literal copy
+/// of the rule. Since DEC-385 every diagnostic blocks, so the loop also asserts
+/// that all three do (a predicate and a refusal stuck together at "never"
+/// would satisfy the relationship alone), and the fresh arm fails a rule stuck
+/// at "always refuse".
 #[test]
 fn stale_temperature_refusal_tracks_the_predicate_the_verdict_is_published_from() {
     let stale = cache_aged(
@@ -2073,8 +2094,7 @@ fn stale_temperature_refusal_tracks_the_predicate_the_verdict_is_published_from(
     );
     let fresh = cache_aged(40.0, Duration::from_millis(0));
 
-    let mut blocked_any = false;
-    let mut warned_any = false;
+    let mut blocked_all = true;
     for d in [
         pf::Diagnostic::Verify,
         pf::Diagnostic::Characterization,
@@ -2088,8 +2108,7 @@ fn stale_temperature_refusal_tracks_the_predicate_the_verdict_is_published_from(
             d.token(),
             d.blocks_on_stale_temperature()
         );
-        blocked_any |= d.blocks_on_stale_temperature();
-        warned_any |= !d.blocks_on_stale_temperature();
+        blocked_all &= d.blocks_on_stale_temperature();
 
         // A fresh cache never refuses, for any diagnostic. Without this the
         // predicate could be stuck at "always refuse" and still pass above.
@@ -2099,9 +2118,14 @@ fn stale_temperature_refusal_tracks_the_predicate_the_verdict_is_published_from(
             d.token()
         );
     }
-    // Precondition: both branches were actually observed, or the loop asserted
-    // nothing about the distinction it exists to prove.
-    assert!(blocked_any && warned_any);
+    // DEC-385: every diagnostic blocks now, so the relationship above is only
+    // half the proof — the refusal must actually fire for all three (a rule
+    // stuck at "never refuse" would satisfy `refused == predicate` with the
+    // predicate stuck too). The fresh arm inside the loop is the other half.
+    assert!(
+        blocked_all,
+        "every diagnostic must block on a stale source (DEC-385)"
+    );
 
     // An empty cache is distinguishable from a stale one, and both refuse.
     let empty = StateCache::new();
@@ -2717,13 +2741,18 @@ async fn a_stale_cache_blocks_discovery_through_the_call_site() {
     assert_eq!(check(&r, pf::CHECK_TEMPERATURE).state, pf::CHECK_FAIL);
     assert_eq!(r.verdict, pf::VERDICT_BLOCKED, "{:?}", r.checks);
 
-    // The other half of the DEC-336 asymmetry: the same stale cache does NOT
-    // block verify, which has shipped without a staleness gate since 2.32.0.
-    // Asserting only the FAIL above would pass with the diagnostic discriminator
-    // deleted and every diagnostic blocked.
-    let verify = run_preflight(&state, "pwm_verify").await;
-    assert_eq!(check(&verify, pf::CHECK_TEMPERATURE).state, pf::CHECK_WARN);
-    assert_ne!(verify.verdict, pf::VERDICT_BLOCKED, "{:?}", verify.checks);
+    // DEC-385: the same stale cache now blocks verify and characterisation too —
+    // DEC-336's asymmetry, which this test used to pin, is gone on purpose.
+    for diagnostic in ["pwm_verify", "pwm_characterization"] {
+        let other = run_preflight(&state, diagnostic).await;
+        assert_eq!(
+            check(&other, pf::CHECK_TEMPERATURE).state,
+            pf::CHECK_FAIL,
+            "{diagnostic}: {:?}",
+            other.checks
+        );
+        assert_eq!(other.verdict, pf::VERDICT_BLOCKED, "{diagnostic}");
+    }
 }
 
 /// `P8-ab`: the single-flight slot, read live rather than passed in.

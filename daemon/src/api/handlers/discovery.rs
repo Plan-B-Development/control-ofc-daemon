@@ -18,13 +18,12 @@
 //! this is a fourth consumer of one implementation rather than a fourth copy of
 //! a sequence.
 //!
-//! The one step that is **not** shared is the staleness refusal (DEC-336,
-//! `P8-p`), and that asymmetry is the point: `Diagnostic::blocks_on_stale_temperature`
-//! blocks for this diagnostic alone, because verify and characterisation have
-//! shipped without a staleness gate since 2.32.0 and silently widening what they
-//! refuse is not this change's to make. The guard is therefore keyed on that
-//! predicate rather than written out here, so this handler cannot end up
-//! refusing on a rule different from the one the preflight published.
+//! The staleness refusal (DEC-336, `P8-p`) was the one step discovery did not
+//! share; since DEC-385 verify and characterisation refuse on it too, through
+//! the same `stale_temperature_guard`. It is keyed on
+//! `Diagnostic::blocks_on_stale_temperature` rather than written out here, so
+//! this handler cannot end up refusing on a rule different from the one the
+//! preflight published.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -355,24 +354,12 @@ pub async fn discover_control_path_handler(
     // statement is that the daemon cannot tell — the same shape, and the same
     // client-side "soft refusal" taxonomy, as the forcing branch of
     // `verify_thermal_guard`.
-    if let Some(reason) =
-        crate::api::calibration::stale_temperature_refusal(&state.cache, disc::DISCOVERY_DIAGNOSTIC)
-    {
-        return error_response(
-            StatusCode::CONFLICT,
-            &ErrorEnvelope {
-                error: crate::api::responses::ErrorBody {
-                    code: "validation_error".into(),
-                    message: format!(
-                        "control-path discovery cannot run: {reason}. Retry once \
-                         sensor polling recovers."
-                    ),
-                    retryable: true,
-                    source: "validation".into(),
-                    details: None,
-                },
-            },
-        );
+    if let Some(resp) = super::stale_temperature_guard(
+        &state.cache,
+        disc::DISCOVERY_DIAGNOSTIC,
+        "control-path discovery",
+    ) {
+        return resp;
     }
     let Some(controller) = state.hwmon_controller.as_ref() else {
         return error_response(

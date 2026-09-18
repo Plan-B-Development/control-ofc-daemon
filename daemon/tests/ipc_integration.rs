@@ -1480,6 +1480,30 @@ fn test_app_state_with_hwmon() -> Arc<AppState> {
 /// and abort for a reason that has nothing to do with what the test asserts.
 fn test_app_state_with_headers(headers: Vec<PwmHeaderDescriptor>) -> Arc<AppState> {
     let cache = Arc::new(StateCache::new());
+    // One cool CPU reading that stays fresh for the whole test. Since DEC-385 a
+    // verify or characterisation refuses — and a sweep aborts part way — once the
+    // temperatures are older than the diagnostic budget, and several sweeps here
+    // run for real seconds, so a reading stamped `now` could age out mid-run and
+    // fail a test for a reason it is not about. Stamped an hour AHEAD instead:
+    // every age in the daemon is `saturating_duration_since`, so it reads as 0 ms.
+    // The SAME id every other CPU reading in this file uses: `update_sensors`
+    // upserts by id and freshness needs only one fresh reading, so a staleness
+    // test that ages the usual id (`age_the_cpu_reading`) must replace this one,
+    // never sit beside it and pass on it.
+    cache.update_sensors(vec![CachedSensorReading {
+        id: "hwmon:k10temp:0000:00:18.3:Tctl".into(),
+        kind: SensorKind::CpuTemp,
+        label: "Tctl".into(),
+        value_c: 40.0,
+        source: DeviceLabel::Hwmon,
+        updated_at: Instant::now() + std::time::Duration::from_secs(3600),
+        rate_c_per_s: None,
+        session_min_c: None,
+        session_max_c: None,
+        chip_name: "k10temp".into(),
+        temp_type: None,
+        thresholds: None,
+    }]);
     let lease_mgr = LeaseManager::new();
     let ctrl =
         HwmonPwmController::new(headers, lease_mgr, Box::new(HwmonMockWriter), cache.clone());
@@ -7148,7 +7172,8 @@ fn age_the_cpu_reading(state: &Arc<AppState>, age: std::time::Duration) {
 /// (register row `P8-p`).
 ///
 /// This is a **call-site** test, and deliberately so: `build_report`'s verdict
-/// was already pinned by `discovery_phase8::a_stale_temperature_source_blocks_discovery_and_warns_the_others`,
+/// was already pinned by `discovery_phase8::a_stale_temperature_source_blocks_every_diagnostic`
+/// (named for the pre-DEC-385 split it pinned then),
 /// and that test passed throughout the entire period the handler ignored the
 /// rule. What is asserted here is the realised HTTP status of the real route,
 /// through the real router, over the real socket.

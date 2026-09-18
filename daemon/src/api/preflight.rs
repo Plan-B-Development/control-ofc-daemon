@@ -49,15 +49,19 @@
 //! The runtime half now lives in
 //! [`calibration::stale_temperature_refusal`](crate::api::calibration::stale_temperature_refusal),
 //! which keys on [`Diagnostic::blocks_on_stale_temperature`] rather than
-//! restating the rule, and is called by `POST
-//! /hwmon/{id}/discover-control-path` and by every cycle of the sweep it starts.
+//! restating the rule, and is called by every diagnostic's POST and by every
+//! step of the sweeps they start.
 //!
-//! **It does not change what the existing diagnostics do.** A stale temperature
-//! source *blocks* `control_path_discovery` (the new diagnostic, whose abort
-//! triggers this batch defines) and *warns* for verify and characterisation,
-//! because those two handlers do not refuse on it and a preflight that claimed
-//! otherwise would be lying about the daemon's own behaviour — which §6.1
-//! forbids in exactly those words: the GUI "reflects daemon decisions".
+//! **Since DEC-385 a stale temperature source blocks every diagnostic.** Until
+//! then it blocked `control_path_discovery` only and *warned* for verify and
+//! characterisation, because those two handlers did not refuse on it and a
+//! preflight claiming otherwise would have lied about the daemon's own
+//! behaviour — §6.1: the GUI "reflects daemon decisions". `TS-q` showed the
+//! warning was not enough: with the poll wedged on a hot reading the thermal
+//! ladder cannot fire (stale-and-hot reports `normal`), and a verify or a sweep
+//! started then drives a fan on frozen numbers. Both halves moved together — the
+//! predicate below and the handlers' refusals — so the report still says exactly
+//! what the daemon does.
 
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
@@ -94,8 +98,9 @@ pub const CHECK_SUPPORTING: &str = "supporting_cooling";
 
 /// The diagnostics a preflight can be requested for.
 ///
-/// The distinction matters for exactly one check — see
-/// [`Diagnostic::blocks_on_stale_temperature`] — and is otherwise presentational.
+/// Presentational since DEC-385, when every diagnostic began to block on a stale
+/// temperature source; [`Diagnostic::blocks_on_stale_temperature`] stays the one
+/// place that rule is stated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Diagnostic {
     Verify,
@@ -124,22 +129,25 @@ impl Diagnostic {
     /// [SAFETY] Does a stale temperature source *block* this diagnostic, or only
     /// warn about it?
     ///
-    /// Only the new diagnostic blocks. `pwm_verify` and `pwm_characterization`
-    /// have shipped since 2.32.0 without a staleness gate, and adding one here
-    /// would change what those endpoints do from a change scoped to *reporting*
-    /// — the Q3 constraint. Reporting it as a warning is the honest middle: the
-    /// operator sees the risk, and the preflight does not promise a refusal the
-    /// daemon will not perform.
+    /// **Every diagnostic blocks, since DEC-385 (`TS-q`).** Until then only
+    /// `control_path_discovery` did: `pwm_verify` and `pwm_characterization`
+    /// had shipped without a staleness gate, and DEC-333 would not change what
+    /// they did from a change scoped to reporting, so they only warned. The
+    /// thermal-safety audit showed why that was not enough — a wedged poll
+    /// freezes a hot reading, stale-and-hot stops the ladder from forcing, and a
+    /// diagnostic started then drives a fan on numbers nothing is measuring.
     ///
-    /// That last sentence was **false for the one diagnostic that blocks** from
-    /// DEC-333 to DEC-336 — nothing on the write path read this predicate. It
-    /// is now the single source both the report and the refusal are derived
-    /// from (see
+    /// Still the single source both the report and the refusal are derived from
+    /// (see
     /// [`calibration::stale_temperature_refusal`](crate::api::calibration::stale_temperature_refusal)),
-    /// which is what makes the two incapable of disagreeing. **Do not add a
-    /// `matches!` copy of this rule at a call site.**
+    /// which is what makes the two incapable of disagreeing. An exhaustive
+    /// `match` rather than a constant `true`, so a new diagnostic is a compile
+    /// error here until someone decides. **Do not add a `matches!` copy of this
+    /// rule at a call site.**
     pub fn blocks_on_stale_temperature(self) -> bool {
-        matches!(self, Self::ControlPathDiscovery)
+        match self {
+            Self::Verify | Self::Characterization | Self::ControlPathDiscovery => true,
+        }
     }
 }
 
@@ -457,8 +465,8 @@ pub fn build_report(inputs: &PreflightInputs) -> PreflightReport {
         ),
     ));
 
-    // 8. [SAFETY] Temperature source freshness — the new predicate. Blocking for
-    //    the new diagnostic only; see `Diagnostic::blocks_on_stale_temperature`.
+    // 8. [SAFETY] Temperature source freshness. Blocking for every diagnostic
+    //    since DEC-385; see `Diagnostic::blocks_on_stale_temperature`.
     let stale_state = if inputs.diagnostic.blocks_on_stale_temperature() {
         CHECK_FAIL
     } else {

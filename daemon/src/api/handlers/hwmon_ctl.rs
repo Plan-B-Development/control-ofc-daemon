@@ -369,6 +369,15 @@ pub async fn hwmon_verify_handler(
     if let Some(resp) = super::verify_thermal_guard(&state.cache) {
         return resp;
     }
+    // [SAFETY] DEC-385 (`TS-q`): and while the temperatures are too old to
+    // trust, which the two guards above cannot see.
+    if let Some(resp) = super::stale_temperature_guard(
+        &state.cache,
+        crate::api::preflight::Diagnostic::Verify,
+        "a fan verify",
+    ) {
+        return resp;
+    }
     let controller = match &state.hwmon_controller {
         Some(c) => c,
         None => {
@@ -802,10 +811,18 @@ pub async fn hwmon_characterize_handler(
     }
     use crate::api::characterization as ch;
 
-    // Same two refusals as a verify, for the same reason: a sweep drives the
+    // Same three refusals as a verify, for the same reason: a sweep drives the
     // header away from its commanded duty, which must not happen while the
-    // system is hot or while the ladder is forcing (DEC-297).
+    // system is hot, while the ladder is forcing (DEC-297), or while the
+    // temperatures are too old to trust (DEC-385).
     if let Some(resp) = super::verify_thermal_guard(&state.cache) {
+        return resp;
+    }
+    if let Some(resp) = super::stale_temperature_guard(
+        &state.cache,
+        ch::CHARACTERIZATION_DIAGNOSTIC,
+        "PWM characterisation",
+    ) {
         return resp;
     }
     let Some(controller) = state.hwmon_controller.as_ref() else {
@@ -1470,6 +1487,59 @@ mod tests {
         );
     }
 
+    // ── TS-q / DEC-385: a stale temperature source refuses the verify family ──
+
+    /// [SAFETY] TS-q at the CALL SITES of both verify-family POSTs: with the poll
+    /// wedged on a reading just under the 85 °C limit, `verify_thermal_guard`'s
+    /// two checks pass (84 < 85, nothing forcing — stale-and-hot reports
+    /// `normal`) and only the staleness guard can refuse. Asserts the `409
+    /// validation_error` and that no PWM value was written.
+    ///
+    /// The opposite arm — the same fixture fresh, which verifies and
+    /// characterises — is every other test in this module: since DEC-385 the
+    /// fixture carries a fresh reading, and all of them write.
+    #[tokio::test]
+    async fn verify_and_characterise_refuse_a_stale_temperature_source() {
+        let (state, writes, _tx, _tmp) =
+            verify_test_state_at_duty(230, crate::hwmon::roles::HeaderRole::ChassisFan);
+        let stale = crate::api::calibration::diagnostic_temp_max_age(&state.cache)
+            + std::time::Duration::from_secs(5);
+        state.cache.update_sensors(vec![cpu_reading(84.0, stale)]);
+        assert!(
+            super::super::verify_thermal_guard(&state.cache).is_none(),
+            "precondition: only the staleness guard can refuse this"
+        );
+
+        let (status, Json(verify)) = hwmon_verify_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("hwmon:test:dev:pwm1".to_string()),
+        )
+        .await;
+        let (char_status, Json(characterise)) = hwmon_characterize_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("hwmon:test:dev:pwm1".to_string()),
+            Json(
+                serde_json::from_value(serde_json::json!({"points_pct": [40, 60]}))
+                    .expect("request"),
+            ),
+        )
+        .await;
+
+        for (name, status, body) in [
+            ("verify", status, &verify),
+            ("characterise", char_status, &characterise),
+        ] {
+            assert_eq!(status, StatusCode::CONFLICT, "{name}: {body}");
+            assert_eq!(body["error"]["code"], "validation_error", "{name}: {body}");
+            assert_eq!(body["error"]["retryable"], true, "{name}: {body}");
+        }
+        assert!(
+            pwm_duties(&writes).is_empty(),
+            "a refused diagnostic wrote a duty: {:?}",
+            pwm_duties(&writes)
+        );
+    }
+
     // ── TS-h / DEC-384: the profile's pump label reaches identify ─────────────
 
     const PROFILED: &str = "hwmon:test:dev:pwm1";
@@ -1695,6 +1765,31 @@ mod tests {
         (state, writes, tx, tmp.expect("a duty was requested"))
     }
 
+    /// A CPU reading aged `age` — `Duration::ZERO` for a fresh one.
+    fn cpu_reading(
+        temp_c: f64,
+        age: std::time::Duration,
+    ) -> crate::health::state::CachedSensorReading {
+        crate::health::state::CachedSensorReading {
+            id: "cpu".into(),
+            kind: crate::hwmon::types::SensorKind::CpuTemp,
+            label: "Tctl".into(),
+            value_c: temp_c,
+            source: crate::health::state::DeviceLabel::Hwmon,
+            updated_at: std::time::Instant::now() - age,
+            rate_c_per_s: None,
+            session_min_c: None,
+            session_max_c: None,
+            chip_name: "k10temp".into(),
+            temp_type: None,
+            thresholds: None,
+        }
+    }
+
+    fn fresh_cpu(temp_c: f64) -> crate::health::state::CachedSensorReading {
+        cpu_reading(temp_c, std::time::Duration::ZERO)
+    }
+
     fn build_verify_state(
         initial_raw: Option<u8>,
         role: crate::hwmon::roles::HeaderRole,
@@ -1755,6 +1850,10 @@ mod tests {
             ..Default::default()
         };
         let cache = Arc::new(crate::health::cache::StateCache::new());
+        // One fresh, cool CPU reading: since DEC-385 a verify or characterisation
+        // with no usable temperature is refused before it writes, so a fixture
+        // with an empty sensor map would test nothing but that refusal.
+        cache.update_sensors(vec![fresh_cpu(40.0)]);
         let writes: WriteLog = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let ctrl = crate::hwmon::pwm_control::HwmonPwmController::new(
             vec![header],

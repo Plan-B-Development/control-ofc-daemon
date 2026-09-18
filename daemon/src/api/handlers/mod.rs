@@ -941,6 +941,42 @@ pub(crate) fn verify_thermal_guard(
     None
 }
 
+/// [SAFETY] Refuse a diagnostic whose temperature telemetry is too old to trust
+/// (DEC-336 for discovery; every diagnostic since DEC-385, `TS-q`).
+///
+/// The third thermal gate, beside [`verify_thermal_guard`]'s two. Those compare
+/// `value_c` and cannot see age, so a wedged poll presents its last reading
+/// forever and both pass — while the ladder, which DOES see the age, treats a
+/// hot stale reading as unusable and cannot force. Keyed on `diagnostic` through
+/// [`crate::api::calibration::stale_temperature_refusal`], the same predicate the
+/// published preflight verdict is derived from, so the two cannot disagree.
+///
+/// `409 validation_error`, `retryable: true`, deliberately not `thermal_abort`:
+/// the machine may be perfectly cool, and the honest statement is that the
+/// daemon cannot tell — the shape of `verify_thermal_guard`'s forcing branch.
+/// `what` names the operation in the message.
+pub(crate) fn stale_temperature_guard(
+    cache: &crate::health::cache::StateCache,
+    diagnostic: crate::api::preflight::Diagnostic,
+    what: &str,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let reason = crate::api::calibration::stale_temperature_refusal(cache, diagnostic)?;
+    Some(error_response(
+        StatusCode::CONFLICT,
+        &ErrorEnvelope {
+            error: ErrorBody {
+                code: "validation_error".into(),
+                message: format!(
+                    "{what} cannot run: {reason}. Retry once sensor polling recovers."
+                ),
+                retryable: true,
+                source: "validation".into(),
+                details: None,
+            },
+        },
+    ))
+}
+
 /// Run a blocking, fsync-ing persistence call off the async worker threads
 /// (DEC-252).
 ///

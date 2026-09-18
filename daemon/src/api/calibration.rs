@@ -65,6 +65,14 @@ pub enum CalibrationError {
     /// sensor at all. Carries the state so the message can name it.
     #[error("thermal safety is forcing fan output ({state}); calibration cannot run")]
     ThermalForceActive { state: String },
+    /// The temperatures every other guard reads are too old to trust (DEC-385,
+    /// `TS-q`). Deliberately NOT `ThermalAbort` either: the machine may be cool,
+    /// and the honest statement is that the daemon cannot tell. With the poll
+    /// wedged on a hot reading the ladder cannot fire — stale-and-hot reports
+    /// `normal` — so a sweep that started, or kept going, would drive this
+    /// channel from 0 % on numbers nothing is measuring.
+    #[error("calibration cannot run: {reason}")]
+    StaleTemperature { reason: String },
     #[error("validation: {0}")]
     Validation(String),
     #[error("hardware: {0}")]
@@ -200,9 +208,9 @@ pub fn diagnostic_temp_max_age(cache: &StateCache) -> std::time::Duration {
 /// [SAFETY] The refusal the preflight publishes, performed (DEC-336, `P8-p`).
 ///
 /// `Some(message)` when `diagnostic` blocks on a stale temperature source AND
-/// the cache holds no usable reading. `None` otherwise — including for the two
-/// diagnostics that only *warn*, so this cannot silently widen what verify and
-/// characterisation refuse.
+/// the cache holds no usable reading ([`temperature_refusal`]). `None` otherwise.
+/// Since DEC-385 every diagnostic blocks; the predicate is still consulted so the
+/// published verdict and this refusal cannot come apart.
 ///
 /// # Why this exists
 ///
@@ -229,6 +237,17 @@ pub fn stale_temperature_refusal(
     if !diagnostic.blocks_on_stale_temperature() {
         return None;
     }
+    temperature_refusal(cache)
+}
+
+/// [SAFETY] Why the thermal guards cannot be evaluated right now, or `None` when
+/// at least one usable temperature reading exists ([`cache_temperature_freshness`]).
+///
+/// The unconditional half of [`stale_temperature_refusal`], for an operation that
+/// publishes no preflight verdict to stay consistent with — the OpenFan
+/// calibration sweep (DEC-385). A diagnostic that has a preflight entry must go
+/// through [`stale_temperature_refusal`] instead.
+pub fn temperature_refusal(cache: &StateCache) -> Option<String> {
     let freshness = cache_temperature_freshness(cache);
     if freshness.is_usable() {
         return None;
@@ -385,6 +404,16 @@ pub async fn calibrate_openfan_channel(
             // sweep with holes in it produces a wrong curve, not a partial one.
             if let Some(state) = thermal_force_state(&cache) {
                 return Err(CalibrationError::ThermalForceActive { state });
+            }
+
+            // [SAFETY] DEC-385 (`TS-q`): the two checks above read `value_c` with
+            // no age term, so a wedged poll presents its last hot reading forever
+            // and both pass while the ladder — which treats that reading as stale
+            // and so cannot force — is blind. Before every step, not just the
+            // first: a sweep runs up to steps x hold_seconds, and a poll that
+            // wedges part way through must stop it.
+            if let Some(reason) = temperature_refusal(&cache) {
+                return Err(CalibrationError::StaleTemperature { reason });
             }
 
             // Set PWM
@@ -655,6 +684,111 @@ mod tests {
             w.as_slice(),
             &[(0u8, 0u8), (0u8, 33u8)],
             "no step beyond the latch may be written, and no restore; got {w:?}"
+        );
+    }
+
+    /// A CPU reading aged `age`. Aged BY CONSTRUCTION: paused time does not
+    /// advance `std::time::Instant`, so a test that slept would age it by ~0 ms.
+    fn aged_cpu(temp_c: f64, age: Duration) -> CachedSensorReading {
+        CachedSensorReading {
+            id: "cpu".into(),
+            kind: SensorKind::CpuTemp,
+            label: "Tctl".into(),
+            value_c: temp_c,
+            source: DeviceLabel::Hwmon,
+            updated_at: Instant::now() - age,
+            rate_c_per_s: None,
+            session_min_c: None,
+            session_max_c: None,
+            chip_name: "k10temp".into(),
+            temp_type: None,
+            thresholds: None,
+        }
+    }
+
+    /// Older than the budget this cache applies — derived, so a slow configured
+    /// poll cannot quietly make the fixture fresh.
+    fn stale_age(cache: &StateCache) -> Duration {
+        diagnostic_temp_max_age(cache) + Duration::from_secs(5)
+    }
+
+    /// [SAFETY] TS-q / DEC-385 — the audit's scenario. The poll has wedged on a
+    /// reading just under the 85 °C calibration limit: the temperature check
+    /// passes (84 < 85) and the ladder is not forcing, because stale-and-hot
+    /// reports `normal`. Before DEC-385 nothing else looked, so the sweep drove
+    /// this channel from 0 % on a number nothing was measuring.
+    ///
+    /// Both arms: the same 84 °C, fresh, calibrates — so the refusal is the age.
+    #[tokio::test(start_paused = true)]
+    async fn calibration_refuses_a_stale_reading_the_ladder_cannot_act_on() {
+        let cache = make_cache(84.0, 0, 800);
+        let stale = stale_age(&cache);
+        cache.update_sensors(vec![aged_cpu(84.0, stale)]);
+        assert!(
+            check_thermal_safety(&cache).is_ok(),
+            "precondition: 84 °C passes"
+        );
+        assert!(
+            thermal_force_state(&cache).is_none(),
+            "precondition: nothing forcing"
+        );
+        let (write_fn, writes) = recording_write_fn(None);
+
+        let result = calibrate_openfan_channel(cache, 0, 3, 0, write_fn).await;
+
+        assert!(
+            matches!(
+                result.as_ref().unwrap_err(),
+                CalibrationError::StaleTemperature { .. }
+            ),
+            "{result:?}"
+        );
+        assert_eq!(
+            writes.lock().unwrap().as_slice(),
+            &[(0u8, 50u8)],
+            "no sweep step may be written — only the restore of the pre-calibration duty"
+        );
+
+        let cache = make_cache(84.0, 0, 800);
+        let (write_fn, writes) = recording_write_fn(None);
+        calibrate_openfan_channel(cache, 0, 3, 0, write_fn)
+            .await
+            .expect("a FRESH 84 °C reading must calibrate");
+        assert!(writes.lock().unwrap().contains(&(0u8, 0u8)));
+    }
+
+    /// DEC-385: the staleness check runs before EVERY step, like the two thermal
+    /// checks beside it. A sweep runs for up to steps x hold_seconds, and a poll
+    /// that wedges part way through must stop it at the next step — the case a
+    /// check hoisted out of the loop would miss.
+    #[tokio::test(start_paused = true)]
+    async fn calibration_aborts_mid_sweep_when_the_readings_go_stale() {
+        let cache = make_cache(50.0, 0, 800);
+        let stale = stale_age(&cache);
+        let log: WriteLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (log2, cache2) = (log.clone(), cache.clone());
+        // 3 steps -> 0, 33, 67, 100. The poll wedges during the 33 % hold.
+        let write_fn = move |ch: u8, pwm: u8| -> Result<(), CalibrationError> {
+            log2.lock().unwrap().push((ch, pwm));
+            if pwm == 33 {
+                cache2.update_sensors(vec![aged_cpu(50.0, stale)]);
+            }
+            Ok(())
+        };
+
+        let result = calibrate_openfan_channel(cache, 0, 3, 0, write_fn).await;
+
+        assert!(
+            matches!(
+                result.as_ref().unwrap_err(),
+                CalibrationError::StaleTemperature { .. }
+            ),
+            "{result:?}"
+        );
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            &[(0u8, 0u8), (0u8, 33u8), (0u8, 50u8)],
+            "no step past the wedge; then the restore"
         );
     }
 

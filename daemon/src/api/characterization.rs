@@ -68,10 +68,19 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::calibration::{check_thermal_safety, thermal_force_state};
+use crate::api::calibration::{
+    check_thermal_safety, stale_temperature_refusal, thermal_force_state,
+};
 use crate::api::responses::HwmonVerifyState;
 use crate::constants;
 use crate::health::cache::StateCache;
+
+/// The diagnostic this module IS, named once (DEC-385) — the per-point staleness
+/// refusals key on it, as the POST handler's does, so none of them can be gated
+/// on a different diagnostic than the preflight the operator was shown. The
+/// twin of `discovery::DISCOVERY_DIAGNOSTIC`.
+pub const CHARACTERIZATION_DIAGNOSTIC: crate::api::preflight::Diagnostic =
+    crate::api::preflight::Diagnostic::Characterization;
 
 // ── Wire types ───────────────────────────────────────────────────────
 
@@ -1355,6 +1364,16 @@ where
                 points: measured,
             };
         }
+        // [SAFETY] DEC-385 (`TS-q`): the two checks above cannot see age, and a
+        // poll that wedges part way through a sweep leaves them passing on its
+        // last reading while the ladder, blind to it, cannot force.
+        if let Some(reason) = stale_temperature_refusal(cache, CHARACTERIZATION_DIAGNOSTIC) {
+            return SweepOutcome {
+                state: STATE_ABORTED,
+                detail: Some(format!("characterisation cannot write: {reason}")),
+                points: measured,
+            };
+        }
         // DEC-296: prove liveness once per point so the deadman measures that
         // rather than the sweep's total duration.
         if !keepalive() {
@@ -1488,6 +1507,16 @@ where
                             "thermal safety is forcing fan output ({state}); \
                              characterisation cannot continue"
                         )),
+                        points: measured,
+                    };
+                }
+                // DEC-385: on the same cadence, for the same reason as the
+                // per-point check — a wedge inside one long dwell must stop it.
+                if let Some(reason) = stale_temperature_refusal(cache, CHARACTERIZATION_DIAGNOSTIC)
+                {
+                    return SweepOutcome {
+                        state: STATE_ABORTED,
+                        detail: Some(format!("characterisation cannot continue: {reason}")),
                         points: measured,
                     };
                 }
@@ -2093,7 +2122,10 @@ mod tests {
     /// Asserts the REALISED write log, not a re-derivation of the clamp.
     #[tokio::test]
     async fn a_pump_sweep_never_restores_to_a_stop() {
-        let cache = StateCache::new();
+        // A fresh, cool reading — not an empty cache. Since DEC-385 a sweep with
+        // no usable temperature refuses at its first point, so an empty cache
+        // would test nothing but the refusal.
+        let cache = cache_at(40.0, None);
         let rig = Rig::new();
         let writes = rig.writes.clone();
         let floor = crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8;
@@ -2122,6 +2154,12 @@ mod tests {
 
         let log = writes.lock().unwrap().clone();
         assert!(!log.is_empty(), "the sweep must have written something");
+        // Precondition: the sweep itself ran, not only its restore — the restore
+        // alone would satisfy every assertion below.
+        assert!(
+            log.contains(&50),
+            "precondition: the sweep reached 50%: {log:?}"
+        );
         for (i, &w) in log.iter().enumerate() {
             assert!(
                 w >= floor,
@@ -3134,7 +3172,7 @@ mod tests {
         /// this while proving nothing (DEC-314).
         #[tokio::test(start_paused = true)]
         async fn the_longest_dwell_never_lets_a_renewal_gap_reach_the_deadman() {
-            let cache = StateCache::new();
+            let cache = cache_at(40.0, None);
             let cancel = AtomicBool::new(false);
             let report = RestoreReport::new();
             let stamps: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::new()));
@@ -3203,7 +3241,7 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn a_completed_two_direction_sweep_restores_the_original_duty_last() {
             let rig = Rig::new();
-            let cache = StateCache::new();
+            let cache = cache_at(40.0, None);
             let out = sweep_bidi(&rig, &cache, &[30, 50, 100], 42, |p| {
                 Some(500 + u16::from(p) * 20)
             })
@@ -3222,7 +3260,7 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn cancelling_between_the_two_legs_still_restores() {
             let rig = Rig::new();
-            let cache = StateCache::new();
+            let cache = cache_at(40.0, None);
             let cancel_after = Arc::new(Mutex::new(0usize));
             let seen = cancel_after.clone();
             let flag = &rig.cancel;
@@ -3288,7 +3326,7 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn a_bidirectional_pump_sweep_never_writes_below_its_floor() {
             let rig = Rig::new();
-            let cache = StateCache::new();
+            let cache = cache_at(40.0, None);
             let floor = crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8;
             let points = resolve_points(Some(&[0, 5, 10, 50, 100]), floor);
             let plan = resolve_sweep_plan(&points, true, None);
@@ -3313,6 +3351,13 @@ mod tests {
                 |_| {},
             )
             .await;
+            // Precondition: the sweep ran to its top point. Without it, a sweep
+            // refused at its first point passes the loop below on the restore alone.
+            assert!(
+                rig.written().contains(&100),
+                "precondition: the sweep reached 100%: {:?}",
+                rig.written()
+            );
             // Asserts the REALISED write log, not a re-derivation of the clamp.
             for w in rig.written() {
                 assert!(
@@ -3337,7 +3382,7 @@ mod tests {
         /// Deleting `step.dwell.is_some() &&` from the guard makes this fail.
         #[tokio::test(start_paused = true)]
         async fn a_cancel_during_a_plain_settle_still_records_the_point() {
-            let cache = StateCache::new();
+            let cache = cache_at(40.0, None);
             let cancel = AtomicBool::new(false);
             let report = RestoreReport::new();
             let plan = plan_of(&[50, 80]);
@@ -3401,7 +3446,7 @@ mod tests {
         /// pre-existing entry check cannot be what catches it.
         #[tokio::test(start_paused = true)]
         async fn a_sensor_that_goes_hot_during_a_dwell_aborts_before_the_hold_ends() {
-            let cache = StateCache::new();
+            let cache = cache_at(40.0, None);
             let cancel = AtomicBool::new(false);
             let report = RestoreReport::new();
             let dwell = Duration::from_secs(constants::STABILITY_MAX_S);
@@ -3440,6 +3485,16 @@ mod tests {
             )
             .await;
             assert_eq!(out.state, STATE_ABORTED, "detail: {:?}", out.detail);
+            // The HOT reading must be what aborted it. With no usable reading at
+            // the start, the DEC-385 staleness refusal aborts first and this test
+            // passes without ever reaching the dwell.
+            assert!(
+                out.detail
+                    .as_deref()
+                    .is_some_and(|d| d.contains("thermal abort")),
+                "aborted for the wrong reason: {:?}",
+                out.detail
+            );
             // The REALISED bound, not a re-derivation: the abort must land inside a
             // renewal interval plus a sample, not at the end of the 60 s dwell.
             let observed = *reads.lock().unwrap() as u64;
@@ -3452,6 +3507,117 @@ mod tests {
              {worst_ticks}, and the whole dwell would be {}",
                 dwell.as_millis() as u64
                     / constants::CHARACTERIZATION_SAMPLE_INTERVAL.as_millis() as u64
+            );
+        }
+
+        /// A CPU reading older than every budget the cache can apply — aged by
+        /// construction, since paused time does not advance `Instant`.
+        fn stale_cpu(cache: &StateCache) -> CachedSensorReading {
+            let mut r = hot_cpu(40.0);
+            r.updated_at = std::time::Instant::now()
+                - (crate::api::calibration::diagnostic_temp_max_age(cache)
+                    + Duration::from_secs(5));
+            r
+        }
+
+        /// [SAFETY] TS-q / DEC-385, per POINT: a poll that wedges after the first
+        /// point stops the sweep at the next one, with the staleness named as the
+        /// reason — the checks beside it read `value_c` and would carry on.
+        #[tokio::test(start_paused = true)]
+        async fn a_poll_that_wedges_between_points_aborts_the_sweep() {
+            let rig = Rig::new();
+            let cache = cache_at(40.0, None);
+            let cache_w = &cache;
+            let writes = rig.writes.clone();
+            let out = run_sweep_uni(
+                &cache,
+                "hwmon:test:pwm1",
+                &[40, 60, 80],
+                0,
+                Duration::from_millis(1),
+                move |p: u8| {
+                    writes.lock().unwrap().push(p);
+                    if p == 40 {
+                        cache_w.update_sensors(vec![stale_cpu(cache_w)]);
+                    }
+                    Ok(())
+                },
+                || sample(Some(40), Some(1), Some(900)),
+                &rig.cancel,
+                || false,
+                || true,
+                &rig.report,
+                |_| {},
+            )
+            .await;
+            assert_eq!(out.state, STATE_ABORTED, "detail: {:?}", out.detail);
+            assert!(
+                out.detail.as_deref().is_some_and(|d| d.contains("stale")),
+                "aborted for the wrong reason: {:?}",
+                out.detail
+            );
+            assert!(
+                !rig.written().contains(&60),
+                "a point past the wedge was written: {:?}",
+                rig.written()
+            );
+        }
+
+        /// DEC-385, within a DWELL: the renewal-cadence check sees a wedge inside
+        /// one long hold, as it sees a hot reading — without it the hold would run
+        /// to its end on frozen numbers.
+        #[tokio::test(start_paused = true)]
+        async fn a_poll_that_wedges_during_a_dwell_aborts_before_the_hold_ends() {
+            let cache = cache_at(40.0, None);
+            let cancel = AtomicBool::new(false);
+            let report = RestoreReport::new();
+            let dwell = Duration::from_secs(constants::STABILITY_MAX_S);
+            let settle = Duration::from_secs(constants::CHARACTERIZATION_SETTLE_MIN_S);
+            let plan = vec![SweepStep {
+                pct: 50,
+                direction: Direction::Ramp,
+                dwell: Some(dwell),
+            }];
+            let reads = Arc::new(Mutex::new(0usize));
+            let reads_r = reads.clone();
+            let cache_w = &cache;
+            let out = run_sweep(
+                &cache,
+                "hwmon:test:pwm1",
+                &plan,
+                0,
+                settle,
+                None,
+                |_p: u8| Ok(()),
+                move || {
+                    let mut n = reads_r.lock().unwrap();
+                    *n += 1;
+                    if *n == 2 {
+                        cache_w.update_sensors(vec![stale_cpu(cache_w)]);
+                    }
+                    sample(Some(50), Some(1), Some(1200))
+                },
+                &cancel,
+                || false,
+                || true,
+                &report,
+                |_| {},
+            )
+            .await;
+            assert_eq!(out.state, STATE_ABORTED, "detail: {:?}", out.detail);
+            assert!(
+                out.detail.as_deref().is_some_and(|d| d.contains("stale")),
+                "aborted for the wrong reason: {:?}",
+                out.detail
+            );
+            let observed = *reads.lock().unwrap() as u64;
+            let worst_ticks = (constants::STABILITY_RENEW_INTERVAL_S * 1000
+                / constants::CHARACTERIZATION_SAMPLE_INTERVAL.as_millis() as u64)
+                + 2;
+            assert!(
+                observed <= worst_ticks,
+                "aborted after {observed} samples; the renewal-cadence check bounds it at \
+                 {worst_ticks}"
             );
         }
 
@@ -3532,7 +3698,7 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn the_summary_publishes_the_resolution_its_timings_were_measured_at() {
             let rig = Rig::new();
-            let cache = StateCache::new();
+            let cache = cache_at(40.0, None);
             let out = sweep_bidi(&rig, &cache, &[30, 100], 42, |p| {
                 Some(500 + u16::from(p) * 20)
             })

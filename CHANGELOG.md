@@ -47,6 +47,18 @@ and `/inventory/hwmon` now follow the active profile too. A CPU fan and a
 liquid cooler's radiator fans are still stopped, as before. Assigning the pump
 role is still what protects a pump whatever profile is active.
 
+**A fan diagnostic no longer runs on temperatures nothing is measuring**
+(`TS-q`, DEC-385). If sensor polling stalls, the last temperatures stay in the
+daemon's cache. The thermal emergency correctly stops trusting a stale CPU
+reading — but the checks that guard a Test PWM Control, a PWM characterisation
+and an OpenFan calibration compared the numbers without asking how old they were.
+A stalled poll that last read 84 °C therefore let a calibration sweep drive a fan
+from 0 % for up to five minutes while the emergency could not fire. All three now
+refuse to start (`409`, retryable, "Retry once sensor polling recovers") when no
+temperature reading is fresh, and a sweep already running stops at its next step.
+The safety preflight now reports this as blocking for verify and characterisation
+too, where it used to be only a warning.
+
 ### Changed
 
 **The 60 % recovery floor and the 40 % no-CPU-sensor floor now apply only to the

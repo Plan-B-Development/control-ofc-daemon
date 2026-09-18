@@ -601,6 +601,21 @@ pub async fn calibrate_openfan_handler(
                 },
             },
         ),
+        // DEC-385 (`TS-q`): the same 409 shape as the verify-family's
+        // `stale_temperature_guard` — the machine may be cool, and the daemon
+        // cannot tell; the condition clears once the poll recovers.
+        Err(e @ CalibrationError::StaleTemperature { .. }) => error_response(
+            StatusCode::CONFLICT,
+            &ErrorEnvelope {
+                error: ErrorBody {
+                    code: "validation_error".into(),
+                    message: format!("{e}. Retry once sensor polling recovers."),
+                    retryable: true,
+                    source: "validation".into(),
+                    details: None,
+                },
+            },
+        ),
         Err(CalibrationError::Validation(msg)) => {
             error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(msg))
         }
@@ -1474,6 +1489,94 @@ mod tests {
             calibration_pause_window(99, 99),
             calibration_pause_window(20, 15)
         );
+    }
+
+    // ── `TS-q` / DEC-385: calibration refuses a stale temperature source ─────
+
+    /// Records every frame written, answers nothing — a controller that would
+    /// show any write the handler made.
+    struct RecordingTransport(Arc<parking_lot::Mutex<Vec<String>>>);
+    impl crate::serial::transport::SerialTransport for RecordingTransport {
+        fn write_line(&mut self, data: &str) -> Result<(), crate::error::SerialError> {
+            self.0.lock().push(data.to_string());
+            Ok(())
+        }
+        fn read_line(&mut self, _timeout: Duration) -> Result<String, crate::error::SerialError> {
+            Err(crate::error::SerialError::Timeout { timeout_ms: 1 })
+        }
+    }
+
+    /// [SAFETY] TS-q at the CALL SITE: `POST /fans/openfan/{ch}/calibrate` with
+    /// the poll wedged on a hot reading answers the verify family's `409
+    /// validation_error` (retryable) and writes NOTHING to the controller. The
+    /// sweep's own tests prove the check exists; only this proves the endpoint
+    /// maps it — a missing arm would be a 500 or a 503.
+    ///
+    /// Opposite arm: the same reading fresh reaches the wire, so the refusal is
+    /// the reading's age and nothing else about the fixture.
+    #[tokio::test]
+    async fn calibrate_refuses_a_stale_temperature_source_before_any_frame() {
+        let stale = crate::constants::DIAGNOSTIC_TEMP_MAX_AGE + Duration::from_secs(60);
+        for (age, refused) in [(stale, true), (Duration::ZERO, false)] {
+            let (_tx, rx) = tokio::sync::watch::channel(false);
+            let state = adoption_state(rx);
+            let frames = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let transport: Box<dyn crate::serial::transport::SerialTransport + Send> =
+                Box::new(RecordingTransport(frames.clone()));
+            let ctrl = crate::serial::controller::FanController::new_shared(
+                Arc::new(parking_lot::Mutex::new(transport)),
+                state.cache.clone(),
+                Duration::from_millis(1),
+            );
+            *state.fan_controller.write() = Some(Arc::new(parking_lot::Mutex::new(ctrl)));
+            state
+                .cache
+                .update_sensors(vec![crate::health::state::CachedSensorReading {
+                    id: "cpu".into(),
+                    kind: crate::hwmon::types::SensorKind::CpuTemp,
+                    label: "Tctl".into(),
+                    value_c: 84.0,
+                    source: crate::health::state::DeviceLabel::Hwmon,
+                    updated_at: std::time::Instant::now() - age,
+                    rate_c_per_s: None,
+                    session_min_c: None,
+                    session_max_c: None,
+                    chip_name: "k10temp".into(),
+                    temp_type: None,
+                    thresholds: None,
+                }]);
+
+            let (status, Json(body)) = calibrate_openfan_handler(
+                State(state.clone()),
+                Path(0),
+                Json(crate::api::calibration::CalibrationRequest {
+                    steps: 2,
+                    hold_seconds: 2,
+                }),
+            )
+            .await;
+
+            if refused {
+                assert_eq!(status, StatusCode::CONFLICT, "{body}");
+                assert_eq!(body["error"]["code"], "validation_error", "{body}");
+                assert_eq!(body["error"]["retryable"], true, "{body}");
+                assert!(
+                    frames.lock().is_empty(),
+                    "a refused calibration wrote to the controller: {:?}",
+                    frames.lock()
+                );
+            } else {
+                assert_ne!(
+                    status,
+                    StatusCode::CONFLICT,
+                    "a FRESH reading was refused: {body}"
+                );
+                assert!(
+                    !frames.lock().is_empty(),
+                    "precondition: with a fresh reading the sweep reaches the wire"
+                );
+            }
+        }
     }
 
     // ── `OFN-t`: adoption racing shutdown ────────────────────────────────────
