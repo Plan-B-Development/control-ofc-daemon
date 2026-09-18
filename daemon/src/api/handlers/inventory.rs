@@ -80,24 +80,10 @@ fn build_hwmon_inventory(state: &AppState) -> (StatusCode, Json<serde_json::Valu
     // `/hwmon/headers`. Empty when no controller was constructed at startup.
     let pwm_controls: Vec<PwmHeaderEntry> = match &state.hwmon_controller {
         Some(controller) => {
+            // DEC-384: before the controller lock — `active_profile` is never held with it.
+            let profile_pumps = state.profile_pump_header_ids();
             let ctrl = controller.lock();
-            let assigned = state.header_roles();
-            // Snapshot before the loop: the controller lock is held here, and
-            // `header_is_pump_protected` would re-take it (see
-            // `roles::is_pump_protected`).
-            let devices = state.cooling_devices();
-            ctrl.headers()
-                .into_iter()
-                .map(|h| {
-                    let assign = assigned.get(&h.id).copied();
-                    PwmHeaderEntry::from_descriptor(
-                        h,
-                        assign,
-                        crate::hwmon::roles::is_pump_protected(assign, (h.role, h.role_source)),
-                        devices.iter().find(|d| d.claims(&h.id)),
-                    )
-                })
-                .collect()
+            super::hwmon_ctl::published_header_entries(state, ctrl.headers(), &profile_pumps)
         }
         None => Vec::new(),
     };

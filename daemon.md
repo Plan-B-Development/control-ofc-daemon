@@ -64,7 +64,8 @@ daemon/src/
     lease.rs           — LeaseManager (exclusive write access)
     aio.rs             — liquid-cooler (AIO/custom-loop) recognition: coolant-sensor + is_aio flag + aio_hwmon cap (DEC-156)
     roles.rs           — per-channel header role inference + resolution, and THE
-                          pump-protection union `is_pump_protected` (DEC-311/312/316).
+                          pump-protection union `is_pump_protected` (DEC-311/312/316;
+                          the active profile's pump-labelled members joined it in DEC-384).
                           `AppState::header_is_pump_protected` is the lookup wrapper
                           around it; callers holding the controller lock must use the
                           function directly or they deadlock
@@ -720,7 +721,7 @@ subsystem — DEC-102 / DEC-130).
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST | `/fans/openfan/{channel}/calibrate` | PWM→RPM sweep (long-running, thermal-aborting; pauses the engine write phase for the sweep so an active profile cannot corrupt the readback — DEC-191) |
-| POST | `/fans/{fan_id}/identify` | Per-fan identify hold/restore — 0 for an ordinary fan (floor-exempt), a floored perturbation for a `role: pump` header (DEC-311); deadman auto-restore (DEC-166) |
+| POST | `/fans/{fan_id}/identify` | Per-fan identify hold/restore — 0 for an ordinary fan (floor-exempt), a floored perturbation for a pump-protected header (DEC-311/312/384); deadman auto-restore (DEC-166) |
 | POST | `/config/header-role` | Assign or clear one PWM header's role (DEC-311). `{"header_id","role"}`; `role: null` clears |
 | POST | `/config/cooling-device` | Create or replace one cooling device by id (DEC-316). Safety numbers are **not** settable — a policy is chosen with `device_policy_id` and `minimum_safe_pwm` & siblings are rejected by name |
 | DELETE | `/config/cooling-device/{id}` | Remove one cooling device (DEC-316). `404` when no device has that id |
@@ -730,9 +731,11 @@ user hold any fan at its identify duty by re-issuing `stop` inside the
 deadman window. **A header the daemon knows to be a pump can no longer be held at 0** (DEC-311)
 — the daemon substitutes a floored perturbation regardless of what the client asks
 for. "Knows to be a pump" is a union of the header's own evidence (a `PUMP`-ish
-label, or a liquid-cooler chip) and the user's `POST /config/header-role`
-assignment, so an assignment can add that protection but not remove it. A header
-with no evidence and no assignment is treated as an ordinary fan and stopped. **Accepted, bounded risk** (2026-07-21 audit: accept + document): identification
+label, or channel 1 of a liquid-cooler chip), the user's `POST /config/header-role`
+assignment, and — since DEC-384 — a member of the active profile bound to the
+header whose label names a pump (`pump`/`aio`, the evidence the 30 % floor already
+acts on), so an assignment or a profile can add that protection but not remove it.
+A header with none of these is treated as an ordinary fan and stopped. **Accepted, bounded risk** (2026-07-21 audit: accept + document): identification
 requires stopping any fan by design (DEC-166); the deadman auto-restore limits an abandoned stop
 to one TTL; and a thermal emergency outranks the identify overlay entirely — the engine's
 `force_all_with_floor` path drives every OpenFan channel + writable hwmon header the machine has to **at

@@ -617,6 +617,44 @@ pub(crate) fn member_needs_hard_floor(member: &ControlMember) -> bool {
     })
 }
 
+/// The pump half of [`CPU_PUMP_LABEL_HINTS`]: every hint except `"cpu"`. Kept as
+/// its own list because one consumer needs the pump question without the CPU
+/// one; `pump_label_hints_are_the_floor_hints_minus_cpu` pins it to the parent
+/// list so the two cannot drift.
+const PUMP_LABEL_HINTS: &[&str] = &["pump", "aio"];
+
+/// Whether a member's label — the client's `member_label`, or the daemon's own,
+/// read back out of the id — names a pump: the pump arm of
+/// [`member_needs_hard_floor`].
+///
+/// [SAFETY] TS-h / DEC-384. The engine floors a member on either label, but
+/// identify and every diagnostic consulted only the header's role union, which
+/// never sees `member_label`. On a chip that publishes no label files — where the
+/// daemon's label is a synthetic `pwmN` and the profile's `member_label` is the
+/// only evidence — one header was held at 30 % by every tick and driven to 0 by
+/// identify: DEC-312's "two contradictory beliefs about one header", through a
+/// term DEC-312 did not reach. `AppState::header_is_pump_protected` unions this
+/// for every member of the active profile.
+///
+/// Two arms of the floor are deliberately left out, because identify decides
+/// them the other way on purpose (DEC-311):
+/// - `"cpu"` — a CPU fan carries the same 30 % floor and is still stoppable;
+///   stopping it briefly is how you find it.
+/// - the liquid-cooler chip — the floor takes every channel of a cooler, but
+///   only channel 1 is its pump, which `classify_header_role` already maps; the
+///   other channels are radiator fans, and a radiator fan is a fan.
+pub(crate) fn member_label_names_pump(member: &ControlMember) -> bool {
+    if member.source != "hwmon" {
+        return false;
+    }
+    let names_pump = |label: &str| {
+        let lower = label.to_lowercase();
+        PUMP_LABEL_HINTS.iter().any(|hint| lower.contains(hint))
+    };
+    names_pump(&member.member_label)
+        || daemon_label_from_member_id(&member.member_id).is_some_and(names_pump)
+}
+
 /// Whether the **user** has explicitly assigned this member's header the pump
 /// role (DEC-311, AIO-MB Phase 1).
 ///
@@ -1785,6 +1823,78 @@ mod tests {
             minimum_pct: min_pct,
             start_pct: 0.0,
             stop_pct: 0.0,
+        }
+    }
+
+    // ───────────────── TS-h / DEC-384: the floor's pump arm ─────────────────
+
+    /// The pump hints are the floor's hints minus `"cpu"` — derived, not
+    /// restated, so a hint added to the floor that names a pump cannot be
+    /// forgotten here (and the reverse).
+    #[test]
+    fn pump_label_hints_are_the_floor_hints_minus_cpu() {
+        let floor: HashSet<&str> = CPU_PUMP_LABEL_HINTS.iter().copied().collect();
+        let pump: HashSet<&str> = PUMP_LABEL_HINTS.iter().copied().collect();
+        assert!(!pump.contains("cpu"), "a CPU fan stays stoppable (DEC-311)");
+        let mut rebuilt = pump.clone();
+        rebuilt.insert("cpu");
+        assert_eq!(rebuilt, floor);
+    }
+
+    /// Both label sources, and the two arms of the floor left out on purpose.
+    #[test]
+    fn member_label_names_pump_reads_both_labels_and_nothing_else() {
+        // The client's label is the only evidence on an unlabelled chip.
+        let unlabelled = "hwmon:it8696:it87.2624:pwm2";
+        assert!(member_label_names_pump(&member(
+            "hwmon", unlabelled, "Pump"
+        )));
+        assert!(member_label_names_pump(&member(
+            "hwmon", unlabelled, "My AIO"
+        )));
+        // The daemon's label, read back out of the id, with no client label.
+        assert!(member_label_names_pump(&member(
+            "hwmon",
+            "hwmon:nct6798:dev:pwm2:AIO_PUMP",
+            ""
+        )));
+        assert!(!member_label_names_pump(&member(
+            "hwmon", unlabelled, "Rear Fan"
+        )));
+        // Floored, and deliberately NOT a pump: a CPU fan (DEC-311)…
+        let cpu = member("hwmon", unlabelled, "CPU Fan");
+        assert!(member_needs_hard_floor(&cpu));
+        assert!(!member_label_names_pump(&cpu));
+        // …and a liquid cooler's radiator channel — the floor takes every channel
+        // of a cooler chip, identify only its pump.
+        let radiator = member("hwmon", "hwmon:x53:usb:pwm2", "");
+        assert!(member_needs_hard_floor(&radiator));
+        assert!(!member_label_names_pump(&radiator));
+        // Only hwmon headers are pumps.
+        assert!(!member_label_names_pump(&member(
+            "openfan",
+            "openfan:ch00",
+            "Pump"
+        )));
+    }
+
+    /// Identify protects nothing the engine does not already floor: the pump arm
+    /// is a subset of `member_needs_hard_floor`, over every label shape above.
+    #[test]
+    fn a_member_named_as_a_pump_is_always_floored() {
+        for (id, label) in [
+            ("hwmon:it8696:it87.2624:pwm2", "Pump"),
+            ("hwmon:it8696:it87.2624:pwm2", "aio"),
+            ("hwmon:nct6798:dev:pwm2:AIO_PUMP", ""),
+            ("hwmon:nct6798:dev:pwm3:W_PUMP+", "Loop"),
+            ("hwmon:x53:usb:pwm1", "Kraken pump"),
+        ] {
+            let m = member("hwmon", id, label);
+            assert!(member_label_names_pump(&m), "precondition: {id} / {label}");
+            assert!(
+                member_needs_hard_floor(&m),
+                "{id} / {label} would be protected from identify but not floored"
+            );
         }
     }
 

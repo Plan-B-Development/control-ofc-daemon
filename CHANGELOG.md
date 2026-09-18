@@ -35,6 +35,18 @@ the stale record and was skipped as a duplicate, while `/status` reported 100 %.
 A failed reply now leaves the channel's speed unknown, so the next command is
 always sent.
 
+**Identifying fans no longer stops a pump that your profile holds at 30 %**
+(`TS-h`, DEC-384). Many motherboards publish no fan names, so on those the only
+thing telling the daemon a header drives a pump can be the name your profile
+gives that fan. The daemon already used that name to keep the fan at no less than
+30 %, but identify ignored it and stopped the fan for the length of the test. A
+fan the active profile calls a pump or an AIO is now shifted instead of stopped —
+the same rule as a header labelled `PUMP` — and so is the diagnostic test duty.
+`stop_permitted` and `effective_min_pwm_pct` on `/hwmon/headers`, `/hwmon/rescan`
+and `/inventory/hwmon` now follow the active profile too. A CPU fan and a
+liquid cooler's radiator fans are still stopped, as before. Assigning the pump
+role is still what protects a pump whatever profile is active.
+
 ### Changed
 
 **The 60 % recovery floor and the 40 % no-CPU-sensor floor now apply only to the

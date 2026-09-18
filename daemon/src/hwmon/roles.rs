@@ -245,11 +245,20 @@ pub fn resolve_role(
 
 /// The pump-protection union, computed from parts the caller already holds.
 ///
-/// `inferred.0.is_pump() || resolve_role(assigned, inferred).0.is_pump()` — an
-/// inferred pump OR a resolved one. It is a **union**, so a user assignment can
-/// only ever *add* protection: assigning `chassis_fan` to a header the hardware
-/// labels `PUMP` changes the display role and changes nothing about whether the
-/// daemon will stop it (DEC-312).
+/// An inferred pump, OR a resolved one, OR a header the active profile names as
+/// a pump (`profile_names_pump`). It is a **union**, so neither a user
+/// assignment nor a profile can remove protection: assigning `chassis_fan` to a
+/// header the hardware labels `PUMP` changes the display role and changes
+/// nothing about whether the daemon will stop it (DEC-312).
+///
+/// `profile_names_pump` is true when a member of the active profile bound to this
+/// header satisfies [`crate::profile::member_label_names_pump`] (TS-h, DEC-384):
+/// the evidence the engine's floor already acts on, so identify and the floor
+/// agree about one header. It is an argument rather than a lookup because the
+/// callers that hold the controller lock must collect it BEFORE taking that lock
+/// — `active_profile` is never held together with the controller — and a
+/// required `bool` makes every caller decide, where a default would let one
+/// forget.
 ///
 /// This is the single definition of the predicate.
 /// [`crate::api::handlers::AppState::header_is_pump_protected`] is the lookup
@@ -259,8 +268,12 @@ pub fn resolve_role(
 /// lock, so calling it while holding the controller lock would deadlock on a
 /// non-reentrant `parking_lot::Mutex`. Two copies of the rule would be worse
 /// still — a floor that disagreed with itself between two endpoints.
-pub fn is_pump_protected(assigned: Option<HeaderRole>, inferred: (HeaderRole, RoleSource)) -> bool {
-    inferred.0.is_pump() || resolve_role(assigned, inferred).0.is_pump()
+pub fn is_pump_protected(
+    assigned: Option<HeaderRole>,
+    inferred: (HeaderRole, RoleSource),
+    profile_names_pump: bool,
+) -> bool {
+    profile_names_pump || inferred.0.is_pump() || resolve_role(assigned, inferred).0.is_pump()
 }
 
 #[cfg(test)]
@@ -310,8 +323,11 @@ mod tests {
                 case["role"].as_str().unwrap(),
                 "role[{name}]"
             );
+            // No profile term: this oracle pins the LABEL classifier both repos
+            // mirror, and the GUI never reconstructs the profile term (it reads
+            // `stop_permitted`, which carries it).
             assert_eq!(
-                is_pump_protected(None, inferred),
+                is_pump_protected(None, inferred, false),
                 case["pump_protected"].as_bool().unwrap(),
                 "pump_protected[{name}] — this is the value that decides whether \
                  a client may offer to stop the header"

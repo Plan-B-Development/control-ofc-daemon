@@ -1263,7 +1263,8 @@ fn member_list_field(body: &serde_json::Value, field: &str) -> Result<Vec<String
 /// **No follow-on safety action, deliberately.** `update_header_role_handler`
 /// releases a live identify hold when a header becomes a pump, because that call
 /// changes `header_is_pump_protected`. This one cannot: the pump-protection union
-/// is role + label + liquid-cooler channel, and reads no cooling device. Naming a
+/// is role + label + liquid-cooler channel + the active profile's pump-named
+/// members (DEC-384), and reads no cooling device. Naming a
 /// header as a device's `pump_member` is a *description*, not a protection
 /// grant — a client that wants the floor assigns the role, and the GUI's
 /// Configure-AIO flow already posts `/config/header-role` before it posts here.

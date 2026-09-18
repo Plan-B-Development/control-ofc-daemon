@@ -769,29 +769,69 @@ impl AppState {
         (assigned, inferred)
     }
 
-    /// [SAFETY] Whether this header must never be stopped or driven below the
-    /// pump floor — the predicate behind pump-safe identify (DEC-311) and the
-    /// role-aware verify duty (`AIO1-a`).
+    /// Header ids the active profile names as pumps: every member whose label
+    /// satisfies [`crate::profile::member_label_names_pump`] (TS-h, DEC-384).
     ///
-    /// A **union**, exactly like [`crate::profile_engine::tuning`]'s floor: the
-    /// header is protected if the role in force is `Pump` **or** if the daemon's
-    /// own discovery evidence (a `PUMP`-ish label, or a known liquid-cooler
-    /// chip) says pump. A user assignment can therefore ADD protection — which
-    /// is the entire point on a board that publishes no labels — but it cannot
-    /// REMOVE protection the hardware's own evidence established.
+    /// Collected under the `active_profile` lock alone and returned owned, so no
+    /// caller holds that lock while taking another. A caller that needs the hwmon
+    /// controller lock must call this BEFORE taking it: the two are never held
+    /// together, in either order. The engine holds the controller across
+    /// blocking sysfs writes, so waiting for it with `active_profile` held would
+    /// stall everything else that takes `active_profile` — the engine tick and
+    /// `/poll`'s status build — behind one wedged header.
+    pub fn profile_pump_header_ids(&self) -> std::collections::HashSet<String> {
+        self.active_profile
+            .lock()
+            .as_ref()
+            .map(|p| {
+                p.controls
+                    .iter()
+                    .flat_map(|c| &c.members)
+                    .filter(|m| crate::profile::member_label_names_pump(m))
+                    .map(|m| m.member_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// [SAFETY] Whether this header must never be stopped or driven below the
+    /// pump floor — the predicate behind pump-safe identify (DEC-311), the
+    /// role-aware verify duty (`AIO1-a`) and the published `stop_permitted`.
+    ///
+    /// A **union** of three pieces of evidence: the role in force is `Pump`; the
+    /// daemon's own discovery evidence (a `PUMP` label, or channel 1 of a known
+    /// liquid cooler) says pump; or a member of the active profile bound to this
+    /// header has a label naming a pump (DEC-384). A user assignment can
+    /// therefore ADD protection — the entire point on a board that publishes no
+    /// labels — but cannot REMOVE protection the hardware's own evidence
+    /// established.
     ///
     /// Without the second term the daemon held two contradictory beliefs about
     /// the same header: `member_effective_floor` unions with
     /// `member_needs_hard_floor` and so kept a label-derived pump at its 30%
     /// floor, while identify consulted the fully-substituted role and would
     /// happily drive that same pump to 0. `POST /config/header-role
-    /// {"role": "chassis_fan"}` on an `AIO_PUMP` header was all it took.
+    /// {"role": "chassis_fan"}` on an `AIO_PUMP` header was all it took. The
+    /// third term closes the same contradiction for the floor's other input, the
+    /// profile's `member_label` — the only evidence on a chip with no label files.
+    ///
+    /// **It is not the engine's floor predicate, and the difference is
+    /// deliberate.** The floor also takes CPU-labelled members and every channel
+    /// of a liquid cooler; identify stops a CPU fan and a radiator fan on
+    /// purpose (DEC-311). This docstring used to say "exactly like the floor",
+    /// which was never true and hid the `member_label` gap (TS-h).
+    ///
+    /// The profile term makes the answer — and the published `stop_permitted` /
+    /// `effective_min_pwm_pct` — change when the active profile does.
     pub fn header_is_pump_protected(&self, header_id: &str) -> bool {
+        // The profile term first, its lock already released: `header_role_parts`
+        // takes the controller, and the two are never held together.
+        let profile_names_pump = self.profile_pump_header_ids().contains(header_id);
         let (assigned, inferred) = self.header_role_parts(header_id);
         // One definition of the union, in `roles`. This wrapper only adds the
-        // lookup — see `roles::is_pump_protected` for why a caller already
+        // lookups — see `roles::is_pump_protected` for why a caller already
         // holding the controller lock must call that directly instead.
-        crate::hwmon::roles::is_pump_protected(assigned, inferred)
+        crate::hwmon::roles::is_pump_protected(assigned, inferred, profile_names_pump)
     }
 }
 

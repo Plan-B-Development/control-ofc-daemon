@@ -28,30 +28,11 @@ pub async fn hwmon_headers_handler(
         );
     };
 
+    // DEC-384: the profile's pump members, collected (and that lock released)
+    // BEFORE the controller lock — the two are never held together.
+    let profile_pumps = state.profile_pump_header_ids();
     let ctrl = controller.lock();
-
-    // DEC-146 P3-12: single mapping source — `PwmHeaderEntry::from_descriptor`.
-    // DEC-311: the user's role assignment is overlaid here; the descriptor
-    // carries only what discovery could infer.
-    let assigned = state.header_roles();
-    // AIO-MB Phase 4: snapshot the topology once. `state.header_is_pump_protected`
-    // must NOT be called in this loop — it re-takes the controller lock this
-    // scope already holds, which would deadlock; the pure union takes the parts
-    // we have.
-    let devices = state.cooling_devices();
-    let headers = ctrl
-        .headers()
-        .into_iter()
-        .map(|h| {
-            let assign = assigned.get(&h.id).copied();
-            PwmHeaderEntry::from_descriptor(
-                h,
-                assign,
-                crate::hwmon::roles::is_pump_protected(assign, (h.role, h.role_source)),
-                devices.iter().find(|d| d.claims(&h.id)),
-            )
-        })
-        .collect();
+    let headers = published_header_entries(&state, ctrl.headers(), &profile_pumps);
 
     json_ok(
         StatusCode::OK,
@@ -60,6 +41,49 @@ pub async fn hwmon_headers_handler(
             headers,
         },
     )
+}
+
+/// The wire entries for `headers` — the one mapping `/hwmon/headers`,
+/// `/hwmon/rescan` and `/inventory/hwmon` share (DEC-146 P3-12).
+///
+/// [SAFETY] DEC-384. Every input of the pump-protection union is applied here,
+/// so `stop_permitted` and `effective_min_pwm_pct` cannot differ between the
+/// three endpoints. Each used to carry its own copy of this closure, so a new
+/// union term had to be threaded through three sites by hand — the shape
+/// DEC-379 records, where the call sites that can quietly take a default are
+/// the ones that get missed.
+///
+/// `profile_pumps` is [`AppState::profile_pump_header_ids`], collected by the
+/// caller BEFORE it takes the controller lock, because `active_profile` is never
+/// held together with it. The user's role assignments and the cooling-device
+/// topology are read here instead: each clones an `Arc` under a momentary read
+/// guard and takes no other lock, so both are safe under the controller lock —
+/// which `header_is_pump_protected` is not, since it takes that lock itself.
+pub(crate) fn published_header_entries<'a>(
+    state: &AppState,
+    headers: impl IntoIterator<Item = &'a crate::hwmon::pwm_discovery::PwmHeaderDescriptor>,
+    profile_pumps: &std::collections::HashSet<String>,
+) -> Vec<PwmHeaderEntry> {
+    // DEC-311: the user's assignment is overlaid here; the descriptor carries
+    // only what discovery could infer.
+    let assigned = state.header_roles();
+    let devices = state.cooling_devices();
+    headers
+        .into_iter()
+        .map(|h| {
+            let assign = assigned.get(&h.id).copied();
+            PwmHeaderEntry::from_descriptor(
+                h,
+                assign,
+                crate::hwmon::roles::is_pump_protected(
+                    assign,
+                    (h.role, h.role_source),
+                    profile_pumps.contains(&h.id),
+                ),
+                devices.iter().find(|d| d.claims(&h.id)),
+            )
+        })
+        .collect()
 }
 
 /// Map a `HwmonControlError` to an HTTP error response.
@@ -125,22 +149,11 @@ pub async fn hwmon_rescan_handler(
     let hwmon_root = std::path::Path::new(HWMON_SYSFS_ROOT);
     match discover_pwm_headers(hwmon_root) {
         Ok(headers) => {
-            // DEC-146 P3-12: single mapping source — `from_descriptor` (DEC-311
-            // overlays the user's role assignment).
-            let assigned = state.header_roles();
-            let devices = state.cooling_devices();
-            let entries: Vec<PwmHeaderEntry> = headers
-                .iter()
-                .map(|h| {
-                    let assign = assigned.get(&h.id).copied();
-                    PwmHeaderEntry::from_descriptor(
-                        h,
-                        assign,
-                        crate::hwmon::roles::is_pump_protected(assign, (h.role, h.role_source)),
-                        devices.iter().find(|d| d.claims(&h.id)),
-                    )
-                })
-                .collect();
+            // DEC-146 P3-12 / DEC-384: the one mapping `/hwmon/headers` and
+            // `/inventory/hwmon` use too. No controller lock is held here, but the
+            // profile term is still collected up front, as the other two must.
+            let profile_pumps = state.profile_pump_header_ids();
+            let entries = published_header_entries(&state, &headers, &profile_pumps);
             log::info!("Hwmon rescan: found {} PWM header(s)", entries.len());
             let count = entries.len();
             json_ok(
@@ -1455,6 +1468,192 @@ mod tests {
             Some(&0),
             "a non-pump assignment must not cancel an identify in progress"
         );
+    }
+
+    // ── TS-h / DEC-384: the profile's pump label reaches identify ─────────────
+
+    const PROFILED: &str = "hwmon:test:dev:pwm1";
+
+    /// A header with no pump evidence of its own (`role: unknown`, and an id
+    /// that carries no daemon label) — the no-label-files chip TS-h is about —
+    /// seen by the poll, so identify accepts its id.
+    fn unlabelled_header_state() -> (Arc<AppState>, WriteLog, tokio::sync::watch::Sender<bool>) {
+        let (state, writes, tx, _) =
+            build_verify_state(None, crate::hwmon::roles::HeaderRole::Unknown);
+        state
+            .cache
+            .update_hwmon_fans(vec![crate::health::state::HwmonFanState {
+                id: PROFILED.into(),
+                rpm: Some(900),
+                last_commanded_pwm: Some(60),
+                pwm_readback_pct: None,
+                pwm_commanded_pct: None,
+                updated_at: std::time::Instant::now(),
+                alarm: None,
+                pwm_enable_mode: None,
+            }]);
+        (state, writes, tx)
+    }
+
+    /// A profile whose one control drives `PROFILED` under `member_label`.
+    fn profile_naming(member_label: &str) -> crate::profile::DaemonProfile {
+        crate::profile::DaemonProfile {
+            id: "p".into(),
+            name: "p".into(),
+            version: 7,
+            description: String::new(),
+            controls: vec![crate::profile::LogicalControl {
+                id: "ctl".into(),
+                name: "ctl".into(),
+                mode: "manual".into(),
+                curve_id: String::new(),
+                manual_output_pct: 50.0,
+                members: vec![crate::profile::ControlMember {
+                    source: "hwmon".into(),
+                    member_id: PROFILED.into(),
+                    member_label: member_label.into(),
+                    fan_zero_rpm: false,
+                }],
+                step_up_pct: 100.0,
+                step_down_pct: 100.0,
+                offset_pct: 0.0,
+                minimum_pct: 20.0,
+                start_pct: 0.0,
+                stop_pct: 0.0,
+            }],
+            curves: vec![],
+        }
+    }
+
+    async fn identify_stop(state: &Arc<AppState>) -> serde_json::Value {
+        let (status, Json(body)) = crate::api::handlers::fan_identify_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(PROFILED.to_string()),
+            Json(IdentifyRequest {
+                action: "stop".into(),
+                ttl_secs: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+
+    /// [SAFETY] TS-h: identify must refuse to stop exactly the headers the
+    /// engine's floor holds as pumps — a RELATIONSHIP against the engine's own
+    /// predicate, never a literal (DEC-324), and through the handler, not the
+    /// helper. The header has no evidence of its own, so the profile's
+    /// `member_label` is the only thing either side can act on: before DEC-384 the
+    /// engine held a "Pump" member at 30 % while identify stopped it.
+    ///
+    /// `CPU Fan` is the one deliberate disagreement (DEC-311): floored, and still
+    /// stoppable. Asserting it keeps a predicate stuck at "protect everything the
+    /// floor takes" from passing.
+    #[tokio::test]
+    async fn identify_refuses_to_stop_a_header_the_profile_floors_as_a_pump() {
+        let floor = crate::profile::HARD_PUMP_CPU_FLOOR_PCT;
+        for (label, cpu_exception) in [
+            ("Pump", false),
+            ("AIO", false),
+            ("Rear Fan", false),
+            ("CPU Fan", true),
+        ] {
+            let (state, _writes, _tx) = unlabelled_header_state();
+            let profile = profile_naming(label);
+            let floored = crate::profile_engine::member_effective_floor(
+                &profile.controls[0],
+                &profile.controls[0].members[0],
+                &std::collections::HashMap::new(),
+            ) >= floor;
+            *state.active_profile.lock() = Some(profile);
+
+            let body = identify_stop(&state).await;
+            let perturbed = body["mode"] == "pump_perturb";
+            if cpu_exception {
+                assert!(floored, "precondition: the engine floors a {label} member");
+                assert!(
+                    !perturbed,
+                    "a {label} member stays stoppable (DEC-311): {body}"
+                );
+            } else {
+                assert_eq!(
+                    perturbed, floored,
+                    "identify and the engine floor disagree about a {label} member: \
+                     floored={floored}, identify={body}"
+                );
+            }
+            if perturbed {
+                let held = state.override_table.lock().snapshot().identify[PROFILED];
+                assert!(
+                    f64::from(held) >= floor,
+                    "a perturbed pump is held at {held}%, below the {floor}% floor"
+                );
+            }
+        }
+    }
+
+    /// The opposite branch, and why the term is read at call time: the evidence
+    /// lives in the active profile, so it goes with it. The same header is
+    /// perturbed while the profile is active and stopped once none is — which is
+    /// also when the engine stops flooring it.
+    #[tokio::test]
+    async fn the_profile_term_goes_with_the_profile() {
+        let (state, _writes, _tx) = unlabelled_header_state();
+        *state.active_profile.lock() = Some(profile_naming("Pump"));
+        assert_eq!(identify_stop(&state).await["mode"], "pump_perturb");
+
+        *state.active_profile.lock() = None;
+        let body = identify_stop(&state).await;
+        assert_eq!(body["mode"], "stop", "{body}");
+        assert_eq!(body["identify_pwm_percent"], 0);
+    }
+
+    /// [SAFETY] DEC-322's invariant with the new term: every endpoint that
+    /// publishes a header publishes `stop_permitted == !header_is_pump_protected`
+    /// — for `/hwmon/headers` and `/inventory/hwmon` both, which hold the
+    /// controller lock and so compute the union from parts rather than calling
+    /// the wrapper. Before DEC-384's shared mapping each had its own copy.
+    ///
+    /// Presence before absence: the protected state is asserted first, so the
+    /// check cannot pass on a header that was never protected.
+    #[tokio::test]
+    async fn every_published_header_carries_the_profile_term() {
+        let (state, _writes, _tx) = unlabelled_header_state();
+        let floor = crate::profile::HARD_PUMP_CPU_FLOOR_PCT.round() as u64;
+
+        for profile in [Some(profile_naming("Pump")), None] {
+            let named = profile.is_some();
+            *state.active_profile.lock() = profile;
+            let protected = state.header_is_pump_protected(PROFILED);
+            assert_eq!(
+                protected, named,
+                "precondition: the wrapper follows the profile"
+            );
+
+            let (_, Json(headers)) =
+                hwmon_headers_handler(axum::extract::State(state.clone())).await;
+            let (_, Json(inventory)) =
+                crate::api::handlers::hwmon_inventory_handler(axum::extract::State(state.clone()))
+                    .await;
+            for (endpoint, entries) in [
+                ("/hwmon/headers", &headers["headers"]),
+                ("/inventory/hwmon", &inventory["pwm_controls"]),
+            ] {
+                let entry = entries
+                    .as_array()
+                    .and_then(|a| a.iter().find(|e| e["id"] == PROFILED))
+                    .unwrap_or_else(|| panic!("{endpoint} omits the header: {entries}"));
+                assert_eq!(
+                    entry["stop_permitted"], !protected,
+                    "{endpoint} publishes a stoppability identify does not obey: {entry}"
+                );
+                assert_eq!(
+                    entry["effective_min_pwm_pct"],
+                    if protected { floor } else { 0 },
+                    "{endpoint}: {entry}"
+                );
+            }
+        }
     }
 
     /// Every PWM percentage this verify commanded.
