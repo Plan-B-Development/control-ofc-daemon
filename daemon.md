@@ -323,7 +323,9 @@ gating each have their own register rows and regression tests.
      junction temperature, independently of OS fan control. It does not ramp a
      fan past a curve the daemon has committed (`TS-i`), so while the daemon
      drives a GPU fan, throttling is the GPU's protection; the curve returns to
-     firmware when the daemon exits
+     firmware when the daemon exits. Excluded from the force, not from control:
+     a GPU-bound member keeps following its own curve on every forced tick,
+     never the forced duty (DEC-399 — until then a forced tick wrote no GPU fan)
    - Holds until CpuTemp <= 80C. The release threshold is a genuine constant
      (THERMAL_EMERGENCY_RELEASE_C), but the hysteresis SPAN is not — it follows
      the per-machine trip point: 25C at the 105 floor, 35C at the 115 cap. Do

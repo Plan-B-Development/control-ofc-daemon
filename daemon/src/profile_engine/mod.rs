@@ -340,7 +340,8 @@ impl ProfileEngineState {
         // bypasses every control (it no longer does), but because no single
         // control-wide number is true during one: a control's OpenFan and hwmon
         // members sit at `max(commanded, forced)` while its GPU members sit at
-        // whatever they last held, GPU being excluded from the force (DEC-130).
+        // the curve's own value, GPU being excluded from the force (DEC-130,
+        // `TS-t`).
         self.tick_outputs.clear();
         // EFF-3: drop the cached eval plan so a re-anchor (epoch bump, thermal
         // force, or no-profile) rebuilds it against whatever activates next.
@@ -381,8 +382,8 @@ impl ProfileEngineState {
         // not because the force bypasses every control (it no longer does), but
         // because no single control-wide number is true during one: a control's
         // OpenFan and hwmon members sit at `max(commanded, forced)` while its GPU
-        // members sit at whatever they last held, GPU being excluded from the
-        // force (DEC-130).
+        // members sit at the curve's own value, GPU being excluded from the
+        // force (DEC-130, `TS-t`).
         self.tick_outputs.clear();
     }
 
@@ -1547,12 +1548,34 @@ pub async fn profile_engine_loop(
             // control, so there is no control-wide output") is no longer true.
             // The reason now is that no single control-wide number is true during
             // a forced tick: a control's OpenFan and hwmon members sit at
-            // `max(commanded, forced_pct)` while its GPU members sit at whatever
-            // they last held, because GPU is excluded from the force (DEC-130).
-            // Publishing the curve value alone would understate the first set;
-            // publishing the floored value would overstate the second. An empty
-            // list — a card showing "—" — remains the only honest answer, and
-            // `reset_for_forced_tick` has already cleared them.
+            // `max(commanded, forced_pct)` while its GPU members sit at the
+            // curve's own value (written just below), because GPU is excluded
+            // from the force (DEC-130). Publishing the curve value alone would
+            // understate the first set; publishing the floored value would
+            // overstate the second. An empty list — a card showing "—" — remains
+            // the only honest answer, and `reset_for_forced_tick` has already
+            // cleared them.
+            //
+            // `TS-t`, DEC-399: GPU-bound members keep following their own curves
+            // through a forced tick, as the OpenFan and hwmon members keep
+            // following theirs under the floor. Until this, a forced tick wrote
+            // no GPU fan at all, so each held the duty it had when the force
+            // began — for the whole of a no-sensor floor, which on a CPU with no
+            // temperature driver is every tick after the fifth. They stay outside
+            // the force itself (DEC-130: `GpuBackend` is not a
+            // `SafetyWriteBackend`), so this is their ordinary write, under the
+            // write phase's own gates below: not once shutdown is signalled,
+            // where it would race the GPU restore, and not while a verify holds
+            // the write-pause (defence in depth — `GpuBackend::apply` re-checks
+            // it per fan). It runs after the force, so a GPU's bounded lock wait
+            // and join never delay the safety writes, and a forced tick is then
+            // no slower than a normal one, which the watchdog budget already
+            // covers (`the_systemd_watchdog_outlasts_the_slowest_healthy_tick`).
+            if let Some(commands) = profile_commands.as_deref() {
+                if !*shutdown.borrow() && !cache.verify_active() {
+                    gpu_be.apply(commands).await;
+                }
+            }
             continue;
         } else if let Some(ticks) = force_log.on_normal_tick() {
             // DEC-372 (`OFN-af`): the recovery edge of DEC-199's three-part
@@ -2997,7 +3020,7 @@ mod tests {
     ///
     /// No single control-wide number is true during a forced tick: OpenFan and
     /// hwmon members sit at `max(commanded, forced)` while GPU members sit at
-    /// whatever they last held (DEC-130/DEC-307). Publishing either figure — or
+    /// the curve's own value (DEC-130/DEC-307, `TS-t`). Publishing either figure — or
     /// the pre-emergency value — would have a card confidently display a duty
     /// nothing is applying.
     ///
@@ -3075,7 +3098,7 @@ mod tests {
             cache.read_with(|s| s.control_outputs.is_empty()),
             "a forced tick has no single control-wide output that is TRUE — its \
              OpenFan/hwmon members sit at max(commanded, forced) and its GPU \
-             members at whatever they last held (DEC-130/DEC-307) — so it must \
+             members at the curve's own value (DEC-130/DEC-307) — so it must \
              report none; republishing either figure would be a card lying about \
              what the fans are doing"
         );
@@ -6563,9 +6586,16 @@ mod tests {
     /// DEC-130: the thermal force drives OpenFan + writable hwmon to
     /// 100 %, but GPU fans are EXCLUDED — AMD PMFW firmware owns GPU thermal
     /// protection and `GpuBackend` deliberately does not implement
-    /// `SafetyWriteBackend`. This pins the exclusion behaviourally: with a GPU
-    /// member in the active profile and a fake GPU registered, a sustained
-    /// emergency must force OpenFan yet leave the GPU's `fan_curve` untouched.
+    /// `SafetyWriteBackend`. `TS-t` (DEC-399): excluded from the FORCE, not from
+    /// control — the GPU keeps following its own curve through the emergency.
+    ///
+    /// Both halves pinned behaviourally, with a GPU member in the active
+    /// profile and a fake GPU registered: a sustained emergency forces OpenFan
+    /// to 100 % while the GPU is written at its curve's 50 %, never 100 %. The
+    /// sensor is hot from the first tick, so every tick is forced and any GPU
+    /// write this run makes is a forced tick's. The curve is flat on purpose: a
+    /// graph curve reads 100 % at the trip temperature, which would make "on its
+    /// curve" and "forced" the same number.
     #[tokio::test(start_paused = true)]
     async fn loop_thermal_force_excludes_gpu() {
         let dir = tempfile::tempdir().unwrap();
@@ -6576,7 +6606,7 @@ mod tests {
 
         // A profile that controls the GPU, so absent the DEC-130 exclusion the
         // engine would have a GPU member it could force.
-        let profile = make_gpu_profile("curve", "graph", 50.0);
+        let profile = make_gpu_profile("curve", "flat", 50.0);
         let profile_arc = Arc::new(Mutex::new(Some(profile)));
         let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
 
@@ -6591,7 +6621,7 @@ mod tests {
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let handle = tokio::spawn(profile_engine_loop(
-            cache,
+            cache.clone(),
             profile_arc,
             Arc::new(parking_lot::RwLock::new(fan_ctrl)),
             None,
@@ -6607,19 +6637,122 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         let _ = handle.await;
 
-        // The GPU was NOT forced — its PMFW curve file is still empty (DEC-130).
-        let content = std::fs::read_to_string(&curve_path).unwrap();
-        assert!(
-            content.is_empty(),
-            "GPU must be excluded from the thermal force (DEC-130); \
-             fan_curve received: {content:?}"
-        );
-        // ...but the force path DID run: OpenFan channels were forced to 100 %.
+        // The force path DID run: OpenFan channels were forced to 100 %.
         let cmds = written.lock();
         assert!(
             cmds.iter().any(|c| c.starts_with(">02")),
             "thermal force must drive OpenFan (proves the force ran); got: {cmds:?}"
         );
+        assert_eq!(
+            cache.read_with(|s| s.thermal_override_state.clone()),
+            Some("emergency".to_string()),
+            "precondition: the run must have been in the emergency"
+        );
+        // `TS-t`: the GPU kept following its curve through the force...
+        let content = std::fs::read_to_string(&curve_path).unwrap();
+        assert!(
+            !content.is_empty(),
+            "a forced tick must still write the GPU's own curve (TS-t); \
+             fan_curve was never written"
+        );
+        // ...at the curve's value, never the forced duty (DEC-130).
+        assert_eq!(
+            cache
+                .gpu_fans_snapshot()
+                .get("amd_gpu:0000:03:00.0")
+                .and_then(|f| f.last_commanded_pct),
+            Some(50),
+            "the GPU follows its own curve during a force and is never forced \
+             (DEC-130)"
+        );
+    }
+
+    /// `TS-t` (DEC-399), where it mattered most. With no CPU temperature at all
+    /// — a CPU no temperature driver binds — every tick after the fifth is a
+    /// no-sensor forced tick, for the whole session. Before this, a forced tick
+    /// wrote no GPU fan, so a GPU curve stopped at whatever it had reached by
+    /// the fifth tick and never moved again.
+    ///
+    /// Driven as a transition: the GPU is at its curve's 36 % (40 °C) once the
+    /// floor is in force, then its sensor rises to 70 °C and the curve must
+    /// follow to 84 % while the floor still holds. A test that only sampled the
+    /// end could be satisfied by the ticks before the floor began.
+    #[tokio::test(start_paused = true)]
+    async fn a_gpu_curve_keeps_running_under_the_no_sensor_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let (gpu, _curve_path) = make_fake_gpu(&dir);
+        let gpu_sensor = |temp_c: f64| CachedSensorReading {
+            id: "gpu_edge".into(),
+            kind: SensorKind::GpuTemp,
+            label: "edge".into(),
+            value_c: temp_c,
+            source: DeviceLabel::Hwmon,
+            updated_at: Instant::now(),
+            rate_c_per_s: None,
+            session_min_c: None,
+            session_max_c: None,
+            chip_name: "amdgpu".into(),
+            temp_type: None,
+            thresholds: None,
+        };
+        // No CpuTemp sensor at all: the ladder reads Absent from the first tick.
+        let cache = Arc::new(StateCache::new());
+        cache.update_sensors(vec![gpu_sensor(40.0)]);
+
+        // Graph 30 °C → 20 %, 80 °C → 100 %: 36 % at 40 °C, 84 % at 70 °C.
+        let mut profile = make_gpu_profile("curve", "graph", 50.0);
+        profile.curves[0].sensor_id = "gpu_edge".into();
+        let profile_arc = Arc::new(Mutex::new(Some(profile)));
+        let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(profile_engine_loop(
+            cache.clone(),
+            profile_arc,
+            Arc::new(parking_lot::RwLock::new(None)), // no openfan
+            None,                                     // no hwmon
+            vec![gpu],
+            safety,
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
+            shutdown_rx,
+        ));
+        let gpu_duty = |c: &StateCache| {
+            c.gpu_fans_snapshot()
+                .get("amd_gpu:0000:03:00.0")
+                .and_then(|f| f.last_commanded_pct)
+        };
+
+        // Past the debounce: the floor is in force.
+        tokio::time::sleep(std::time::Duration::from_millis(8500)).await;
+        assert_eq!(
+            cache.read_with(|s| s.thermal_override_state.clone()),
+            Some("no_sensor_fallback".to_string()),
+            "precondition: the no-sensor floor must be in force"
+        );
+        assert_eq!(
+            gpu_duty(&cache),
+            Some(36),
+            "precondition: the GPU is on its curve before the temperature moves"
+        );
+
+        cache.update_sensors(vec![gpu_sensor(70.0)]);
+        tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+
+        assert_eq!(
+            cache.read_with(|s| s.thermal_override_state.clone()),
+            Some("no_sensor_fallback".to_string()),
+            "precondition: the floor must still be in force when the curve moves"
+        );
+        assert_eq!(
+            gpu_duty(&cache),
+            Some(84),
+            "a GPU curve must keep running under the no-sensor floor (TS-t)"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let _ = handle.await;
     }
 
     // ── P1-1: thermal-force hwmon leg ────────────────────────────────

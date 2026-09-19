@@ -4,6 +4,20 @@
 
 ### Fixed
 
+**GPU fans keep following their own curves during a thermal event** (`TS-t`,
+DEC-399). While the daemon holds motherboard and OpenFan fans up — in a thermal
+emergency, or when it cannot read any CPU temperature — it stopped writing GPU
+fans at all, so each one stayed at the speed it had when the event began. On a
+machine where no CPU temperature can be read at all, that state lasts the whole
+session, so a GPU fan curve stopped following its temperature a few seconds after
+the daemon started. GPU fans are still never forced to a safety speed, because the
+card's own firmware protects it. Their curves now keep running through the event,
+like the curves of the other fans in the same profile. During the event a curve
+runs without its step limits and without its Start % kickstart, for GPU fans as
+for the rest; the card's firmware still applies its own minimum fan speed. A
+manual override or an identify on a GPU fan now takes effect during the event as
+well, where before it did nothing until the event ended.
+
 **Dell fans go back to BIOS control when the daemon lets go of them** (`TS-ab`,
 DEC-398). On many Dell machines the `dell_smm` driver has one switch that turns
 the BIOS's fan control on or off for every fan at once. The switch sits on the
