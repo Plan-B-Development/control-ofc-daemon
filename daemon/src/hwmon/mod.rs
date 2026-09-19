@@ -290,13 +290,17 @@ mod tests {
     /// genuinely capable of latching the ladder, so the ASUS half asserts a real
     /// absence rather than passing vacuously — `CLAUDE.md § Hard-won lessons`,
     /// "a test asserting an absence must first assert the presence".
+    ///
+    /// Run for `nct6776`, DEC-294's chip, and for `nct6798`, an `AUD-x` sibling.
+    /// Until `DOC-w` (DEC-397) the sibling's `PECI Agent 0` was classified
+    /// `MbTemp`, so the ASUS half found no CPU reading at all.
     #[test]
     fn a_bogus_asus_cputin_never_reaches_the_thermal_ladder() {
-        fn ladder_verdict(vendor: &str) -> (Vec<SensorDescriptor>, Option<u8>) {
+        fn ladder_verdict(chip: &str, vendor: &str) -> (Vec<SensorDescriptor>, Option<u8>) {
             let tmp = tempfile::tempdir().unwrap();
             let hwmon0 = tmp.path().join("hwmon0");
             fs::create_dir_all(&hwmon0).unwrap();
-            fs::write(hwmon0.join("name"), "nct6776\n").unwrap();
+            fs::write(hwmon0.join("name"), format!("{chip}\n")).unwrap();
             // The documented-bogus pin: a constant, plausible, wrong 115°C.
             fs::write(hwmon0.join("temp1_input"), "115000\n").unwrap();
             fs::write(hwmon0.join("temp1_label"), "CPUTIN\n").unwrap();
@@ -349,47 +353,49 @@ mod tests {
             );
             let tctl = match reading {
                 crate::profile_engine::CpuReading::Fresh(c) => c,
-                other => panic!("expected a fresh CPU reading, got {other:?}"),
+                other => panic!("{chip}/{vendor}: expected a fresh CPU reading, got {other:?}"),
             };
             let mut rule = crate::safety::ThermalSafetyRule::new();
             (descriptors, rule.evaluate(tctl))
         }
 
-        // ── Presence: the fixture CAN latch the ladder. ──
-        // Same bytes, non-ASUS board, where the pin is wired normally. CPUTIN is
-        // a CpuTemp, outranks the healthy 45°C by `max`, and trips the emergency.
-        let (descs, verdict) = ladder_verdict("Gigabyte Technology Co., Ltd.");
-        assert!(
+        for chip in ["nct6776", "nct6798"] {
+            // ── Presence: the fixture CAN latch the ladder. ──
+            // Same bytes, non-ASUS board, where the pin is wired normally. CPUTIN is
+            // a CpuTemp, outranks the healthy 45°C by `max`, and trips the emergency.
+            let (descs, verdict) = ladder_verdict(chip, "Gigabyte Technology Co., Ltd.");
+            assert!(
             descs
                 .iter()
                 .any(|d| d.label == "CPUTIN" && d.kind == SensorKind::CpuTemp),
             "fixture must classify CPUTIN as CpuTemp off-ASUS, or the absence below proves nothing"
         );
-        assert_eq!(
-            verdict,
-            Some(100),
-            "the fixture must be capable of latching a 100% emergency"
-        );
+            assert_eq!(
+                verdict,
+                Some(100),
+                "the fixture must be capable of latching a 100% emergency"
+            );
 
-        // ── Absence: on the documented-bogus board it does not. ──
-        let (descs, verdict) = ladder_verdict("ASUSTeK COMPUTER INC.");
-        assert!(
-            descs
-                .iter()
-                .any(|d| d.label == "CPUTIN" && d.kind == SensorKind::MbTemp),
-            "the bogus pin must be demoted out of CpuTemp"
-        );
-        assert!(
-            descs
-                .iter()
-                .any(|d| d.label == "PECI Agent 0" && d.kind == SensorKind::CpuTemp),
-            "the preferred pin must still BE a CPU sensor — demoting the bogus one \
+            // ── Absence: on the documented-bogus board it does not. ──
+            let (descs, verdict) = ladder_verdict(chip, "ASUSTeK COMPUTER INC.");
+            assert!(
+                descs
+                    .iter()
+                    .any(|d| d.label == "CPUTIN" && d.kind == SensorKind::MbTemp),
+                "the bogus pin must be demoted out of CpuTemp"
+            );
+            assert!(
+                descs
+                    .iter()
+                    .any(|d| d.label == "PECI Agent 0" && d.kind == SensorKind::CpuTemp),
+                "the preferred pin must still BE a CPU sensor — demoting the bogus one \
              is worthless if it leaves the board with no CPU temperature at all"
-        );
-        assert_eq!(
-            verdict, None,
-            "a cold CPU reading 45°C on its good sensor must not latch an emergency"
-        );
+            );
+            assert_eq!(
+                verdict, None,
+                "a cold CPU reading 45°C on its good sensor must not latch an emergency"
+            );
+        }
     }
 
     #[test]

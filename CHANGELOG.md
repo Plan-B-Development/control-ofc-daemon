@@ -4,6 +4,18 @@
 
 ### Fixed
 
+**CPU temperature via PECI/TSI is now read on every Nuvoton nct67xx chip**
+(`DOC-w`, DEC-397). On `nct6779`, `nct6791`–`nct6793` and `nct6795`–`nct6799`, a
+`PECI Agent` or `TSI` temperature channel is the CPU temperature the kernel says to
+read. The daemon reported it as a motherboard sensor, because only five Nuvoton
+chips were recognised. On an ASUS board with one of these chips, the unreliable
+`CPUTIN` pin is already set aside. That left the chip with no CPU temperature at
+all, so a newer CPU without its own kernel sensor driver could not be protected by
+the thermal-emergency rule. These channels now report `kind: "cpu"`. They appear
+as CPU sensors in the GUI's sensor table and curve sensor picker, matching how the
+GUI already described them. They also count toward the thermal emergency, which
+acts on the hottest CPU reading.
+
 **A slow resume from suspend no longer restarts the daemon** (`TS-ao`, DEC-396).
 The service watchdog keeps counting while the machine's devices suspend and
 resume, a stretch in which the daemon is frozen and cannot check in. On hardware

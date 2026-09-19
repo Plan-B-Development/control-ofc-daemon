@@ -182,6 +182,27 @@ const ASUS_CPUTIN_BOGUS_CHIPS: &[&str] = &[
     "nct6797", "nct6798", "nct6799",
 ];
 
+/// Nuvoton chips whose `PECI`/`TSI` temperature channels are promoted to
+/// `CpuTemp` (`DOC-w`, DEC-397): the whole nct6775-driver family, plus the
+/// `nct6683`/`nct6686`/`nct6687` family.
+///
+/// **Must contain every chip in [`ASUS_CPUTIN_BOGUS_CHIPS`].** On an ASUS board
+/// that list demotes `CPUTIN`, and the kernel's remedy is to read the CPU from
+/// `PECI 0` or `TSI 0` instead. A chip in that list but missing from this one
+/// loses its CPU input entirely: `CPUTIN` is demoted, and `PECI`/`TSI` fall to
+/// `classify_chip`'s `_ =>` arm, which does not match them. AUD-x widened that
+/// list from one chip to eleven and left this arm at five, and
+/// `every_chip_that_can_demote_cputin_can_promote_peci_and_tsi` now holds the
+/// two lists together.
+///
+/// **Not vendor-gated, unlike that list, and the difference is deliberate.**
+/// `PECI`/`TSI` is a CPU source on any board that wires it; only the claim that
+/// `CPUTIN` is disconnected is ASUS-specific. Do not unify the two lists.
+const NUVOTON_PECI_TSI_CHIPS: &[&str] = &[
+    "nct6775", "nct6776", "nct6779", "nct6791", "nct6792", "nct6793", "nct6795", "nct6796",
+    "nct6797", "nct6798", "nct6799", "nct6683", "nct6686", "nct6687",
+];
+
 /// True for a sensor the kernel documents as reporting a bogus temperature on
 /// this board, which must therefore never be treated as a CPU temperature
 /// (DEC-294).
@@ -239,7 +260,7 @@ pub(crate) fn classify_chip(chip_name: &str, label: &str, board_vendor: &str) ->
         "sbtsi_temp" => SensorKind::CpuTemp,
         _ if chip_name.starts_with("it87") => SensorKind::MbTemp,
         // Nuvoton Super I/O families: default MbTemp, but TSI/PECI labels indicate CPU
-        "nct6775" | "nct6776" | "nct6683" | "nct6686" | "nct6687" => {
+        c if NUVOTON_PECI_TSI_CHIPS.contains(&c) => {
             if lower.contains("amd tsi")
                 || lower.contains("tsi")
                 || lower.contains("peci")
@@ -1215,6 +1236,19 @@ mod tests {
             ("nct6686", "PECI Agent 0", SensorKind::CpuTemp),     // peci keyword
             ("nct6687", "CPU", SensorKind::CpuTemp),              // cpu keyword
             ("nct6775", "cpu temp", SensorKind::CpuTemp),         // case-insensitive
+            // DOC-w: the nct6779..nct6799 siblings reach the same arm. Before,
+            // these fell to the `_ =>` arm, which has no peci/tsi keyword.
+            ("nct6798", "PECI Agent 0", SensorKind::CpuTemp),
+            ("nct6798", "TSI0_TEMP", SensorKind::CpuTemp),
+            ("nct6798", "PECI Agent 0 Calibration", SensorKind::CpuTemp),
+            (
+                "nct6799",
+                "PECI/TSI Agent 0 Calibration",
+                SensorKind::CpuTemp,
+            ),
+            ("nct6779", "PECI Agent 0", SensorKind::CpuTemp),
+            ("nct6798", "SYSTIN", SensorKind::MbTemp), // no keyword → MB, as before
+            ("nct6798", "AUXTIN0", SensorKind::MbTemp),
             // ── ASUS EC / WMI arms ──
             ("asus_ec_sensors", "CPU", SensorKind::CpuTemp),
             ("asus_ec_sensors", "GPU", SensorKind::GpuTemp),
@@ -1244,6 +1278,33 @@ mod tests {
                 got, *expected,
                 "classify_chip({chip:?}, {label:?}) expected {expected:?}, got {got:?}",
             );
+        }
+    }
+
+    /// [SAFETY] `DOC-w`: every chip whose `CPUTIN` the DEC-294 rule can demote
+    /// must be able to promote `PECI`/`TSI`, the sources the kernel says to read
+    /// instead. Otherwise an ASUS board with that chip has no Nuvoton CPU input
+    /// at all. Asserted per chip against the real classifier, not by comparing
+    /// the two lists. Presence first: `CPUTIN` really is demoted, so a pass is not
+    /// merely a chip the demotion never touches.
+    #[test]
+    fn every_chip_that_can_demote_cputin_can_promote_peci_and_tsi() {
+        let asus = "ASUSTeK COMPUTER INC.";
+        for chip in ASUS_CPUTIN_BOGUS_CHIPS {
+            assert_eq!(
+                classify_chip(chip, "CPUTIN", asus),
+                SensorKind::MbTemp,
+                "precondition: {chip} CPUTIN is demoted on ASUS"
+            );
+            for label in ["PECI Agent 0", "TSI0_TEMP"] {
+                for vendor in [asus, "Gigabyte Technology Co., Ltd.", ""] {
+                    assert_eq!(
+                        classify_chip(chip, label, vendor),
+                        SensorKind::CpuTemp,
+                        "{chip} {label:?} on {vendor:?} must be a CPU source"
+                    );
+                }
+            }
         }
     }
 
