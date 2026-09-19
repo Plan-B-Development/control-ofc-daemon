@@ -204,6 +204,9 @@ pub struct TemperatureFreshness {
     pub newest_age_ms: Option<u64>,
     /// Id of the freshest reading, for the detail line.
     pub newest_id: Option<String>,
+    /// The age bound these counts were taken against, so the detail line names
+    /// the limit actually applied — it follows the poll cadence (DEC-395).
+    pub max_age_ms: u64,
 }
 
 impl TemperatureFreshness {
@@ -356,6 +359,7 @@ pub fn temperature_freshness(
         fresh,
         newest_age_ms: newest.as_ref().map(|(_, age)| age.as_millis() as u64),
         newest_id: newest.map(|(id, _)| id),
+        max_age_ms: max_age.as_millis() as u64,
     }
 }
 
@@ -498,7 +502,7 @@ pub fn build_report(inputs: &PreflightInputs) -> PreflightReport {
                 Some(age) => format!(
                     "Every temperature reading is stale — freshest is {age} ms old, \
                      limit {} ms",
-                    constants::DIAGNOSTIC_TEMP_MAX_AGE.as_millis()
+                    inputs.temperature.max_age_ms
                 ),
                 None => "Every temperature reading is stale".to_string(),
             },

@@ -136,10 +136,10 @@ pub fn thermal_force_state(cache: &StateCache) -> Option<String> {
 ///
 /// # The budget is derived, not fixed
 ///
-/// [`diagnostic_temp_max_age`] widens the flat
-/// [`constants::DIAGNOSTIC_TEMP_MAX_AGE`] to the cache's own trust window when
-/// the operator has configured a slow poll. **Never refuse on a reading the
-/// thermal ladder itself is still acting on** — see that function.
+/// [`diagnostic_temp_max_age`] is the thermal ladder's own trust window, so a
+/// diagnostic refuses on a reading exactly when the ladder has stopped acting on
+/// it — never while the ladder still trusts it, and never after — see that
+/// function.
 pub fn cache_temperature_freshness(cache: &StateCache) -> TemperatureFreshness {
     // Snapshot FIRST, then stamp `now`. Reversed, any time spent waiting on the
     // read lock behind the 1 Hz `update_sensors` writer is silently subtracted
@@ -175,34 +175,38 @@ pub fn cache_temperature_freshness(cache: &StateCache) -> TemperatureFreshness {
 }
 
 /// [SAFETY] How old a temperature reading may be before a diagnostic treats it
-/// as unusable (DEC-336).
+/// as unusable (DEC-336, narrowed to equality by DEC-395).
 ///
-/// `max(DIAGNOSTIC_TEMP_MAX_AGE, cache.cpu_temp_stale_after())`.
+/// **Exactly** [`StateCache::cpu_temp_stale_after`] — the thermal ladder's own
+/// trust window, at every poll cadence.
 ///
-/// # Why this is not just the constant
+/// # Why it is that window, in both directions
 ///
-/// The flat 10 s was chosen in DEC-333 as "ten poll intervals", on the stated
-/// assumption that the sensor poll runs at 1 s — and while this predicate was
-/// only ever *reported*, an over-strict budget cost a warning line. DEC-336
-/// made it **refuse**, and an over-strict budget now aborts a diagnostic.
+/// **Never wider (DEC-395, register row `TS-aj`).** DEC-336 floored this at a
+/// flat 10 s so discovery "behaves exactly as before" at the default 1 s
+/// cadence, whose ladder window is 5 s. That left a band — ages 5 s to 10 s —
+/// in which the ladder had already stopped trusting the CPU reading, and so
+/// could not force on it however hot it read, while every diagnostic still
+/// passed its staleness gate and went on to drive a header. Readings refresh
+/// every poll, so a reading that old means reads are failing, which is exactly
+/// the case the gate exists for. The floor protected discovery's pre-DEC-336
+/// behaviour, a reason that never applied to the verify, characterisation and
+/// calibration gates DEC-385 added on the same budget.
 ///
-/// `polling.poll_interval_ms` in `daemon.toml` has no upper bound in
-/// `DaemonConfig::validate`; the overlay clamps it down to
-/// `MAX_SUPERVISABLE_POLL_INTERVAL_MS` (6 s), which is a supported cadence, not
-/// a typo. At 6 s, ordinary reading ages reach 6 s and one missed poll passes
-/// 10 s — so a fixed budget would refuse discovery on a perfectly healthy
-/// machine, with nothing the operator could set to stop it. Worse, the daemon's
-/// own trust window at that cadence is 30 s, so the thermal ladder would still
-/// be acting on a reading this gate had declared unusable.
+/// **Never narrower (DEC-336).** `polling.poll_interval_ms` has no upper bound
+/// in `DaemonConfig::validate`; the overlay clamps it to
+/// `MAX_SUPERVISABLE_POLL_INTERVAL_MS` (6 s), a supported cadence whose ladder
+/// window is 30 s. A fixed budget below that would refuse a diagnostic on a
+/// reading the ladder is still acting on, on a perfectly healthy machine.
 ///
-/// **That is the invariant, and it is a relationship rather than a number: a
-/// diagnostic must never refuse on a reading the ladder is still acting on.**
-/// `cpu_temp_stale_after` is the one place that window is defined, so this
-/// consumes it rather than restating it — and the flat constant is kept as a
-/// FLOOR so the default 1 s cadence (whose window is 5 s) behaves exactly as it
-/// did before.
+/// **So the invariant is a relationship rather than a number: a diagnostic
+/// refuses on a reading exactly when the ladder has stopped acting on it.**
+/// Both sides compare `age <= window` (`preflight::temperature_freshness` and
+/// `profile_engine::hottest_cpu_reading`), so equality of the window is
+/// equality of the verdict. `cpu_temp_stale_after` is the one place that window
+/// is defined, and this consumes it rather than restating it.
 pub fn diagnostic_temp_max_age(cache: &StateCache) -> std::time::Duration {
-    constants::DIAGNOSTIC_TEMP_MAX_AGE.max(cache.cpu_temp_stale_after())
+    cache.cpu_temp_stale_after()
 }
 
 /// [SAFETY] The refusal the preflight publishes, performed (DEC-336, `P8-p`).
@@ -259,9 +263,9 @@ pub fn temperature_refusal(cache: &StateCache) -> Option<String> {
         (_, Some(age)) => format!(
             "every temperature reading is stale — freshest is {age} ms old, limit \
              {} ms; the thermal guards cannot be evaluated",
-            // The budget actually applied, not the bare constant: on a slow poll
-            // cadence they differ, and a message naming a limit the daemon did
-            // not use sends the operator looking for the wrong fault.
+            // The budget actually applied: it follows the poll cadence, and a
+            // message naming a limit the daemon did not use sends the operator
+            // looking for the wrong fault.
             diagnostic_temp_max_age(cache).as_millis()
         ),
         _ => "every temperature reading is stale, so the thermal guards cannot be \
@@ -710,6 +714,54 @@ mod tests {
     /// poll cannot quietly make the fixture fresh.
     fn stale_age(cache: &StateCache) -> Duration {
         diagnostic_temp_max_age(cache) + Duration::from_secs(5)
+    }
+
+    /// [SAFETY] TS-aj / DEC-395 — the gate refuses a reading exactly when the
+    /// ladder has stopped acting on it, judged by the LADDER'S OWN classifier.
+    ///
+    /// The right-hand side is `profile_engine::hottest_cpu_reading` — the
+    /// function the safety tick actually calls — never a re-derivation of the
+    /// window, so the test cannot share the budget's arithmetic. The ages walk
+    /// the band DEC-336's 10 s floor opened at a 1 s poll (5–10 s: stale to the
+    /// ladder, fresh to the gate) and its 2 s-poll neighbour, on both sides of
+    /// each boundary. Precondition: both arms were observed, and the band itself
+    /// was — a sample set that never entered it would pass with the floor back.
+    #[test]
+    fn the_gate_refuses_exactly_where_the_ladder_stops_trusting_the_reading() {
+        let mut saw_refused = false;
+        let mut saw_allowed = false;
+        let mut saw_old_band = false;
+        for (interval_ms, ages_ms) in [
+            (1000u64, [4_000u64, 4_900, 5_100, 7_000, 9_900]),
+            (2000, [9_000, 9_900, 10_100, 12_000, 15_000]),
+        ] {
+            for age_ms in ages_ms {
+                let cache = StateCache::new();
+                cache.set_hwmon_poll_interval_ms(interval_ms);
+                cache.update_sensors(vec![aged_cpu(84.0, Duration::from_millis(age_ms))]);
+
+                let ladder = crate::profile_engine::hottest_cpu_reading(
+                    &cache.sensors_snapshot(),
+                    Instant::now(),
+                    cache.cpu_temp_stale_after(),
+                );
+                let ladder_stale = !matches!(ladder, crate::profile_engine::CpuReading::Fresh(_));
+                let refused = temperature_refusal(&cache).is_some();
+                assert_eq!(
+                    refused, ladder_stale,
+                    "poll {interval_ms} ms, reading {age_ms} ms old: the gate \
+                     refused = {refused} while the ladder reads it as {ladder:?}"
+                );
+                saw_refused |= refused;
+                saw_allowed |= !refused;
+                saw_old_band |= ladder_stale && age_ms <= 10_000;
+            }
+        }
+        assert!(saw_refused && saw_allowed, "both arms must be exercised");
+        assert!(
+            saw_old_band,
+            "no sample fell in the band the 10 s floor left open"
+        );
     }
 
     /// [SAFETY] TS-q / DEC-385 — the audit's scenario. The poll has wedged on a

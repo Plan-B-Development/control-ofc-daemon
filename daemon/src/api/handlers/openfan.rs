@@ -1516,7 +1516,9 @@ mod tests {
     /// the reading's age and nothing else about the fixture.
     #[tokio::test]
     async fn calibrate_refuses_a_stale_temperature_source_before_any_frame() {
-        let stale = crate::constants::DIAGNOSTIC_TEMP_MAX_AGE + Duration::from_secs(60);
+        let stale = crate::api::calibration::diagnostic_temp_max_age(
+            &crate::health::cache::StateCache::new(),
+        ) + Duration::from_secs(60);
         for (age, refused) in [(stale, true), (Duration::ZERO, false)] {
             let (_tx, rx) = tokio::sync::watch::channel(false);
             let state = adoption_state(rx);

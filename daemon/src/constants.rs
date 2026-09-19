@@ -1014,20 +1014,13 @@ pub const DISCOVERY_TARGET_OVER_NOISE: u16 = 3;
 /// zero noise floor, making any single-RPM flicker a "response".
 pub const DISCOVERY_MIN_NOISE_FLOOR_RPM: u16 = 50;
 
-/// Maximum age of a temperature reading before a diagnostic treats its
-/// temperature source as stale.
-///
-/// [SAFETY] `AIO-Phase7-Batch1` §1 requires "required temperature source becomes
-/// stale/unavailable" as both a preflight check and a runtime abort trigger, and
-/// nothing in this daemon previously expressed it: `check_thermal_safety`
-/// iterates whatever the cache holds, with no view of how old it is, so a poll
-/// loop wedged on an unresponsive chip presents its last-known-good temperatures
-/// forever and every thermal gate passes on them.
-///
-/// 10 s is ten poll intervals ([`crate::constants::VALIDATION_SAMPLE_INTERVAL`]
-/// is 1 s and the sensor poll matches it), so a healthy machine never trips it
-/// and a genuinely wedged reader trips it inside one settle window.
-pub const DIAGNOSTIC_TEMP_MAX_AGE: Duration = Duration::from_secs(10);
+// `DIAGNOSTIC_TEMP_MAX_AGE` (a flat 10 s staleness budget for diagnostics) was
+// deleted by DEC-395: the budget is now exactly the thermal ladder's own trust
+// window, `StateCache::cpu_temp_stale_after`, read through
+// `api::calibration::diagnostic_temp_max_age`. A flat floor wider than that
+// window let a diagnostic run on a reading the ladder had stopped acting on
+// (`TS-aj`). Do not reintroduce a constant here — a second definition of the
+// window is how the two drifted apart.
 
 /// Retained control-path records. Keyed by header id, so this is a ceiling on
 /// distinct headers ever discovered rather than on runs.

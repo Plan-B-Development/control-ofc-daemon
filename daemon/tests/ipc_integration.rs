@@ -7428,7 +7428,8 @@ async fn discovery_post_refuses_a_stale_temperature_source() {
     // Stale: refused before anything is claimed or written.
     age_the_cpu_reading(
         &state,
-        control_ofc_daemon::constants::DIAGNOSTIC_TEMP_MAX_AGE + std::time::Duration::from_secs(5),
+        control_ofc_daemon::api::calibration::diagnostic_temp_max_age(&state.cache)
+            + std::time::Duration::from_secs(5),
     );
     let (stale_status, stale_json) = uds_post(
         &path,
@@ -7470,7 +7471,8 @@ async fn a_blocked_preflight_and_a_refused_post_agree_on_one_cache() {
     let state = test_app_state();
     age_the_cpu_reading(
         &state,
-        control_ofc_daemon::constants::DIAGNOSTIC_TEMP_MAX_AGE + std::time::Duration::from_secs(5),
+        control_ofc_daemon::api::calibration::diagnostic_temp_max_age(&state.cache)
+            + std::time::Duration::from_secs(5),
     );
     let (path, shutdown, _dir) = start_test_server(state).await;
 

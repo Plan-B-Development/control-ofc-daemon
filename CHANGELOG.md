@@ -1,5 +1,22 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+**A fan diagnostic now refuses on the same stale temperature the thermal
+safety rule stops trusting** (`TS-aj`, DEC-395). The hwmon verify, PWM
+characterisation, control-path discovery and OpenFan calibration refuse to start
+— and a sweep in progress stops — when no temperature reading is fresh. Until now
+"fresh" meant up to 10 s old, while the thermal safety rule stops acting on a CPU
+reading after 5 poll intervals (5 s at the default 1 s poll). For those 5 seconds a
+diagnostic could drive a fan on a temperature the safety rule had already set aside,
+so it could not force full speed on it however hot it read. Readings refresh every
+poll, so a reading that old means sensor reads are failing. The two limits are now
+the same at every poll interval. At the default poll a diagnostic therefore refuses
+a few seconds sooner when reads fail, and the preflight's `temperature_source` line
+names the limit actually applied.
+
 ## [2.51.1] — 2026-09-19
 
 ### Fixed

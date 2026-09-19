@@ -1705,6 +1705,7 @@ fn ok_inputs(diagnostic: pf::Diagnostic) -> pf::PreflightInputs {
             fresh: 2,
             newest_age_ms: Some(300),
             newest_id: Some("cpu".into()),
+            max_age_ms: 5_000,
         },
         thermal_forcing: None,
         too_hot: None,
@@ -1807,12 +1808,14 @@ fn a_stale_temperature_source_blocks_every_diagnostic() {
         fresh: 0,
         newest_age_ms: Some(45_000),
         newest_id: Some("cpu".into()),
+        max_age_ms: 5_000,
     };
     let fresh = pf::TemperatureFreshness {
         total: 2,
         fresh: 2,
         newest_age_ms: Some(500),
         newest_id: Some("cpu".into()),
+        max_age_ms: 5_000,
     };
 
     for diag in [
@@ -1854,7 +1857,7 @@ fn a_stale_temperature_source_blocks_every_diagnostic() {
 #[test]
 fn temperature_freshness_counts_only_readings_inside_the_age_bound() {
     let now = Instant::now();
-    let max = constants::DIAGNOSTIC_TEMP_MAX_AGE;
+    let max = default_budget();
     let readings = vec![
         ("fresh".to_string(), now - Duration::from_millis(500)),
         ("stale".to_string(), now - (max + Duration::from_secs(5))),
@@ -2088,10 +2091,7 @@ fn ingest_truncation_does_not_split_a_codepoint() {
 /// at "always refuse".
 #[test]
 fn stale_temperature_refusal_tracks_the_predicate_the_verdict_is_published_from() {
-    let stale = cache_aged(
-        40.0,
-        constants::DIAGNOSTIC_TEMP_MAX_AGE + Duration::from_secs(5),
-    );
+    let stale = cache_aged(40.0, default_budget() + Duration::from_secs(5));
     let fresh = cache_aged(40.0, Duration::from_millis(0));
 
     let mut blocked_all = true;
@@ -2145,10 +2145,7 @@ fn stale_temperature_refusal_tracks_the_predicate_the_verdict_is_published_from(
 /// that perturbed the header and *then* reported `aborted`.
 #[tokio::test]
 async fn a_stale_temperature_source_aborts_the_sweep_before_it_writes() {
-    let cache = Arc::new(cache_aged(
-        40.0,
-        constants::DIAGNOSTIC_TEMP_MAX_AGE + Duration::from_secs(5),
-    ));
+    let cache = Arc::new(cache_aged(40.0, default_budget() + Duration::from_secs(5)));
     let rig = Rig::new(30);
     let cancel = AtomicBool::new(false);
     let report = RestoreReport::default();
@@ -2218,55 +2215,40 @@ async fn a_stale_temperature_source_aborts_the_sweep_before_it_writes() {
     );
 }
 
-/// [SAFETY] **A diagnostic never refuses on a reading the thermal ladder is
-/// still acting on** (DEC-336, the concurrency review's finding 2).
+/// The diagnostic staleness budget at the default poll cadence, taken from a
+/// fresh cache rather than restated — so a stale fixture here is stale by the
+/// same rule production applies (DEC-395 deleted the flat constant this used).
+fn default_budget() -> Duration {
+    cal::diagnostic_temp_max_age(&StateCache::new())
+}
+
+/// [SAFETY] **A diagnostic refuses on a reading exactly when the thermal ladder
+/// has stopped acting on it** (DEC-336, then DEC-395 / `TS-aj`).
 ///
 /// Asserted as that RELATIONSHIP across the supported cadence range, not as a
-/// number: `diagnostic_temp_max_age` must be `>= cache.cpu_temp_stale_after()`
-/// at every poll interval the daemon accepts, and never below the flat constant
-/// at the default. A literal `10_000` would be satisfied by the fixed budget
-/// this test exists to reject.
+/// number: `diagnostic_temp_max_age` must EQUAL `cache.cpu_temp_stale_after()`
+/// at every poll interval the daemon accepts.
 ///
-/// The interesting cadence is the slow end. `DaemonConfig::validate` bounds
-/// `polling.poll_interval_ms` only from BELOW (>= 100 ms), and the runtime
-/// overlay clamps it down to `MAX_SUPERVISABLE_POLL_INTERVAL_MS` — so 6 s is a
-/// supported configuration, not a typo, and at 6 s the ladder trusts a reading
-/// for 30 s while a flat 10 s budget would have aborted a healthy run.
+/// Both directions are defects. Narrower (DEC-336): at the slow end the ladder
+/// trusts a reading for 30 s, and a flat budget below that aborts a healthy
+/// run. Wider (DEC-395): DEC-336 floored the budget at 10 s, so at the default
+/// 1 s cadence a reading 5–10 s old was stale to the ladder — which therefore
+/// could not force on it — while every diagnostic still passed its gate and
+/// drove a header. `>=` was the old assertion and is what let that band ship.
 #[test]
-fn the_diagnostic_budget_never_undercuts_the_ladders_own_trust_window() {
-    let mut saw_widened = false;
-    let mut saw_floor = false;
+fn the_diagnostic_budget_is_exactly_the_ladders_own_trust_window() {
     for interval_ms in [1000u64, 2000, 4000, 6000] {
         let cache = cache_aged(40.0, Duration::from_millis(0));
         cache.set_hwmon_poll_interval_ms(interval_ms);
         let budget = cal::diagnostic_temp_max_age(&cache);
         let ladder = cache.cpu_temp_stale_after();
 
-        assert!(
-            budget >= ladder,
-            "at {interval_ms} ms the diagnostic would refuse at {budget:?} while the \
-             ladder still acts on a reading up to {ladder:?} old"
+        assert_eq!(
+            budget, ladder,
+            "at {interval_ms} ms the diagnostic refuses at {budget:?} while the \
+             ladder stops acting on a reading at {ladder:?}"
         );
-        assert!(
-            budget >= constants::DIAGNOSTIC_TEMP_MAX_AGE,
-            "at {interval_ms} ms the budget fell below the flat floor"
-        );
-        saw_widened |= budget > constants::DIAGNOSTIC_TEMP_MAX_AGE;
-        saw_floor |= budget == constants::DIAGNOSTIC_TEMP_MAX_AGE;
     }
-    // Preconditions: both regimes were actually observed. Without these the loop
-    // passes for a budget that is always the constant (the defect) or always the
-    // ladder window (which would silently move the default cadence's behaviour).
-    assert!(saw_floor, "no cadence exercised the flat-floor regime");
-    assert!(saw_widened, "no cadence exercised the widened regime");
-
-    // And the default cadence is unchanged, which is what lets every other test
-    // in this file keep asserting against the flat constant.
-    let cache = cache_aged(40.0, Duration::from_millis(0));
-    assert_eq!(
-        cal::diagnostic_temp_max_age(&cache),
-        constants::DIAGNOSTIC_TEMP_MAX_AGE
-    );
 }
 
 // ── §1/§6.1: the preflight CALL SITE (register rows `P8-t`, `P8-ab`) ──
@@ -2733,13 +2715,21 @@ async fn a_hot_cache_blocks_through_the_call_site() {
 /// paused runtime, so a sleeping test would age by ~0 ms and pass vacuously.
 #[tokio::test]
 async fn a_stale_cache_blocks_discovery_through_the_call_site() {
-    let stale = constants::DIAGNOSTIC_TEMP_MAX_AGE + Duration::from_secs(5);
+    let stale = default_budget() + Duration::from_secs(5);
     let (state, _device, _tmp) = preflight_state(cache_aged(45.0, stale));
     seed_spinning_siblings(&state);
     let r = run_preflight(&state, "control_path_discovery").await;
 
     assert_eq!(check(&r, pf::CHECK_TEMPERATURE).state, pf::CHECK_FAIL);
     assert_eq!(r.verdict, pf::VERDICT_BLOCKED, "{:?}", r.checks);
+    // DEC-395: the detail line names the budget the gatherer applied, taken
+    // from this state's own cache — not the deleted flat 10 s constant.
+    let limit = format!(
+        "limit {} ms",
+        cal::diagnostic_temp_max_age(&state.cache).as_millis()
+    );
+    let detail = &check(&r, pf::CHECK_TEMPERATURE).detail;
+    assert!(detail.contains(&limit), "{detail:?} should name {limit:?}");
 
     // DEC-385: the same stale cache now blocks verify and characterisation too —
     // DEC-336's asymmetry, which this test used to pin, is gone on purpose.
