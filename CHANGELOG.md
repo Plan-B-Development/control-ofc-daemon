@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.51.3] — 2026-09-19
+
 ### Changed
 
 **An OpenFan fan whose speed was lost to a reconnect or resume goes to full speed
