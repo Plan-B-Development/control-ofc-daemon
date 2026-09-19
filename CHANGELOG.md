@@ -18,6 +18,27 @@ does one whose last command went unanswered, unless the controller has reconnect
 since. Motherboard fans are unaffected: the daemon keeps
 their last speed across a resume.
 
+### Fixed
+
+**A missed stop notice is sent again sooner** (`TS-ay`, DEC-402). When systemd is
+too busy to take the daemon's stop notice, 2.51.2 sends it again just before the
+fan hand-back. In one rare case that was too late: several parts of the shutdown
+each ran out their full time limit, and systemd's watchdog could interrupt the
+hand-back first. The daemon now also sends the notice as soon as it has stopped
+taking requests, before it waits for those parts, and still sends it before the
+hand-back if that attempt fails as well. This makes the rare case rarer, not
+impossible: if systemd stays busy for a moment longer, the notice can still arrive
+too late.
+
+**The sleep hook's two signals are handled in the safer order when both are
+waiting** (`TS-az`, DEC-402). If the daemon receives the "going to sleep" and
+"woke up" signals together, it cannot tell which came first. It used to pick
+either order at random. One wrong order could leave the watchdog at its normal
+15 seconds across the next sleep, so a machine that is slow to resume could see
+the daemon restarted as it woke. The daemon now always handles "woke up" first.
+When that guess is wrong, the watchdog stays at 120 seconds for up to two minutes,
+which only delays the detection of a hung daemon.
+
 ## [2.51.2] — 2026-09-19
 
 ### Fixed

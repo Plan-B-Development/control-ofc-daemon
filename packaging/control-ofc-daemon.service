@@ -58,8 +58,9 @@ NotifyAccess=main
 # WATCHDOG_USEC=0 — because systemd re-arms it on any keep-alive whatever the
 # unit's state, and a late tick would otherwise arm a fresh 15 s over the
 # hardware restore below. A disarm that systemd's full queue refused is sent
-# again just before that restore (TS-ap, DEC-396), and no sleep-window widen is
-# ever sent after it.
+# again once the IPC server has stopped, before the task drains (TS-ay,
+# DEC-402), and once more just before that restore (TS-ap, DEC-396); no
+# sleep-window widen is ever sent after it.
 WatchdogSec=15
 # DEC-388 (TS-al, the user's choice): a watchdog timeout asks for a GRACEFUL stop
 # rather than aborting. Only the in-process stop can apply the exit floor to the

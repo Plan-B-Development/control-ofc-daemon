@@ -332,18 +332,20 @@ impl Notifier {
             Ok(()) => self.disarmed.store(true, Ordering::Release),
             Err(e) => log::warn!(
                 "could not tell systemd the daemon is stopping ({e}); its watchdog may \
-                 still be armed — trying again just before the hardware restore"
+                 still be armed — trying again after the IPC server stops and before \
+                 the hardware restore"
             ),
         }
     }
 
-    /// `TS-ap`: send the stop's disarm a second time if the first never reached
-    /// systemd. `finish_shutdown` calls it immediately before the hardware
-    /// restore: the task drains in between take up to several seconds, so a
-    /// queue that was full for the first attempt has usually been read by now,
-    /// and without it the LAST keep-alive's deadline stays armed over a restore
-    /// that can outlast it. A no-op when the first attempt landed, or before
-    /// [`Self::stopping`] has run.
+    /// `TS-ap`: send the stop's disarm again if no attempt has reached systemd
+    /// yet. `finish_shutdown` calls it twice: once the IPC server has stopped,
+    /// before the task drains (`TS-ay`, DEC-402), because those drains can
+    /// together outlast what is left of the last keep-alive's deadline; and
+    /// immediately before the hardware restore, after the drains have given a
+    /// full queue more time to be read. Without it that deadline stays armed over
+    /// a restore that can outlast it. A no-op once an attempt has landed, or
+    /// before [`Self::stopping`] has run.
     pub fn resend_disarm_if_lost(&self) {
         let _serial = self.watchdog_usec_lock();
         if !self.stopping.load(Ordering::Acquire) || self.disarmed.load(Ordering::Acquire) {
@@ -352,12 +354,13 @@ impl Notifier {
         match self.send_once(STOP_MESSAGE) {
             Ok(()) => {
                 self.disarmed.store(true, Ordering::Release);
-                log::info!("told systemd the daemon is stopping on the second attempt");
+                log::info!("told systemd the daemon is stopping on a retry");
             }
             Err(e) => log::warn!(
-                "could not tell systemd the daemon is stopping on the second attempt \
-                 either ({e}); a restore slower than the watchdog may be cut short, and \
-                 ExecStopPost repeats the hwmon and GPU steps"
+                "could not tell systemd the daemon is stopping on a retry either ({e}); \
+                 if no attempt lands before the hardware restore, a restore slower than \
+                 the watchdog may be cut short, and ExecStopPost repeats the hwmon and \
+                 GPU steps"
             ),
         }
     }
@@ -405,9 +408,11 @@ impl Notifier {
     /// second; these cannot. A lost `READY=1` costs a restart when
     /// `TimeoutStartSec=` expires, and a lost stop leaves the watchdog armed over
     /// the hardware restore — the hazard it exists to remove. So a full receive
-    /// queue is retried briefly, and the wait is still bounded (at most
+    /// queue is retried briefly, and each wait is still bounded (at most
     /// [`ONE_SHOT_RETRIES`] x [`ONE_SHOT_RETRY_GAP`], ~100 ms) because the stop is
-    /// sent ahead of the restore and must not delay it by more than that. Called
+    /// sent ahead of the restore and must not delay it by more than that. A stop
+    /// makes at most three attempts (DEC-402), so ~300 ms in all, and only while
+    /// systemd's queue stays full. Called
     /// only from `main`'s thread and from [`watch_sleep`]'s blocking task — never
     /// from the engine, whose tick must not wait.
     fn send_once(&self, message: &str) -> io::Result<()> {

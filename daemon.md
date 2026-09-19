@@ -494,8 +494,9 @@ gating each have their own register rows and regression tests.
     `STOPPING=1` with `WATCHDOG_USEC=0` opens every shutdown, because systemd
     re-arms its watchdog on any keep-alive whatever the unit's state, and a late
     tick would otherwise arm a fresh timer over the hardware restore; if systemd's
-    queue refused that disarm, it is sent again just before the restore (`TS-ap`,
-    DEC-396). System sleep (`TS-ao`, DEC-396): user space is frozen while devices
+    queue refused that disarm, it is sent again once the IPC server has stopped,
+    before the task drains (`TS-ay`, DEC-402), and once more just before the
+    restore (`TS-ap`, DEC-396). System sleep (`TS-ao`, DEC-396): user space is frozen while devices
     suspend and resume, and that stretch counts against the watchdog, so the
     package's `system-sleep` hook sends `SIGUSR1` before a sleep and `SIGUSR2`
     after it. The daemon answers the first with `WATCHDOG_USEC=` widened to

@@ -1314,7 +1314,8 @@ fn start_sleep_watch(notifier: &Arc<control_ofc_daemon::sd_notify::Notifier>) {
     }
 }
 
-/// Turn the sleep hook's two signals into transitions, in arrival order. Ends
+/// Turn the sleep hook's two signals into transitions — in arrival order, except
+/// that when both are pending at once the resume goes first (`TS-az`). Ends
 /// when `watch_sleep` has gone, or when both signal streams have.
 async fn forward_sleep_signals(
     mut usr1: tokio::signal::unix::Signal,
@@ -1323,9 +1324,19 @@ async fn forward_sleep_signals(
 ) {
     use control_ofc_daemon::sd_notify::SleepTransition;
     loop {
+        // `TS-az`, DEC-402: `biased;`, resume arm FIRST. When both signals are
+        // pending, the daemon cannot tell which came first: tokio merges repeats
+        // and keeps no order across signals. A pre and a post from one sleep are
+        // then applied post-then-pre, which leaves the watchdog wide until
+        // `watch_sleep`'s fallback narrows it (bounded, it only delays hang
+        // detection). A post followed by the NEXT sleep's pre is applied in its
+        // true order and stays wide across that sleep. Sleep-first would get the
+        // first case right and leave the watchdog narrow across the next sleep
+        // in the second — `TS-ao`'s failure, which the hook exists to prevent.
         let transition = tokio::select! {
-            Some(()) = usr1.recv() => SleepTransition::Entering,
+            biased;
             Some(()) = usr2.recv() => SleepTransition::Resumed,
+            Some(()) = usr1.recv() => SleepTransition::Entering,
             else => return,
         };
         if tx.send(transition).await.is_err() {
@@ -1418,7 +1429,8 @@ fn hand_back_hwmon(
 /// Ordered graceful shutdown (DEC-146 P3-9 + audit P1-A).
 ///
 /// Stops accepting IPC connections and drains in-flight requests FIRST, then
-/// drains the poll/engine tasks, then gives the hardware back — so
+/// runs `after_server_stop` (DEC-402), then drains the poll/engine tasks, then
+/// gives the hardware back — so
 /// neither a late client write (via the IPC server) nor an in-flight engine
 /// write can land after the restore and leave fans stuck in manual mode. Every
 /// await is bounded by `task_timeout` so a hung task or a lingering connection
@@ -1453,14 +1465,16 @@ fn hand_back_hwmon(
 /// so a restore that never returned would hold it off for good — which is what
 /// the two bounded steps above prevent. Since DEC-387 a self-stop also sends
 /// `STOPPING=1`, so systemd's `TimeoutStopSec=` bounds that path as well.
-async fn shutdown_sequence<F>(
+async fn shutdown_sequence<G, F>(
     poll_shutdown_tx: &tokio::sync::watch::Sender<bool>,
     server_shutdown_tx: tokio::sync::oneshot::Sender<()>,
     server_handle: tokio::task::JoinHandle<()>,
     task_handles: Vec<(&'static str, tokio::task::JoinHandle<()>)>,
     task_timeout: Duration,
+    after_server_stop: G,
     restore_hardware: F,
 ) where
+    G: FnOnce(),
     F: FnOnce(),
 {
     // Tell the poll/engine tasks to stop.
@@ -1480,6 +1494,11 @@ async fn shutdown_sequence<F>(
             task_timeout.as_secs()
         );
     }
+
+    // After the server, before the drains (DEC-402, `TS-ay`): the drains can run
+    // out several task timeouts between them, so anything that must not wait
+    // for them goes here.
+    after_server_stop();
 
     // Drain the poll/engine tasks (DEC-146 P3-9) so an in-flight engine
     // spawn_blocking write cannot land after the restore — in the UNCONTENDED
@@ -1549,11 +1568,24 @@ async fn finish_shutdown<F>(
         task_handles,
         task_timeout,
         move || {
-            // [SAFETY] `TS-ap`: if the disarm above never reached systemd, the
-            // last keep-alive's deadline is still armed — send it again now, as
-            // late as possible before the restore it protects. The drains in
-            // between give a briefly full queue time to be read. A no-op when the
-            // first one landed.
+            // [SAFETY] `TS-ay`, DEC-402: if the disarm above never reached
+            // systemd, the last keep-alive's deadline is still armed, and the
+            // task drains that follow can run out several `task_timeout`s
+            // between them — together longer than what is left of that deadline.
+            // Send it again now, before any of them. It lands if systemd has read
+            // its queue since the first attempt. On a normal stop the server
+            // stops within milliseconds, so this is only ~100 ms later: it
+            // narrows the window rather than closing it (`TS-bd`). A no-op once
+            // it has landed.
+            if let Some(n) = notifier {
+                n.resend_disarm_if_lost();
+            }
+        },
+        move || {
+            // [SAFETY] `TS-ap`: and once more as late as possible before the
+            // restore it protects, in case the queue was still full just now.
+            // The drains give it more time to be read. A no-op when an earlier
+            // attempt landed.
             if let Some(n) = notifier {
                 n.resend_disarm_if_lost();
             }
@@ -3664,6 +3696,7 @@ mod tests {
             order_srv.lock().unwrap().push("server_stopped");
         });
 
+        let order_after = order.clone();
         let order_restore = order.clone();
         shutdown_sequence(
             &poll_tx,
@@ -3671,13 +3704,14 @@ mod tests {
             server_handle,
             vec![],
             Duration::from_secs(3),
+            move || order_after.lock().unwrap().push("after_server_stop"),
             move || order_restore.lock().unwrap().push("hardware_restored"),
         )
         .await;
 
         assert_eq!(
             *order.lock().unwrap(),
-            vec!["server_stopped", "hardware_restored"],
+            vec!["server_stopped", "after_server_stop", "hardware_restored"],
             "the IPC server must stop before hardware is restored to auto"
         );
     }
@@ -3704,6 +3738,7 @@ mod tests {
             server_handle,
             vec![],
             Duration::from_millis(50),
+            || {},
             move || *restored_c.lock().unwrap() = true,
         )
         .await;
@@ -3768,14 +3803,14 @@ mod tests {
         );
     }
 
-    /// [SAFETY] `TS-ap`, at the call site: a disarm lost to a queue that was full
-    /// when the stop began is delivered before the restore runs. The queue is
-    /// read by a task that waits for the shutdown watch — which `shutdown_sequence`
-    /// sets AFTER `stopping` — so it is full across the first attempt only, and
-    /// only the resend inside `finish_shutdown` can land the disarm in time.
-    #[tokio::test]
-    async fn a_lost_disarm_is_resent_before_the_hardware_restore() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    /// A notifier whose queue is FULL: the fake socket is never read, so every
+    /// one-shot send after this finds no room until a test task reads it.
+    fn notifier_with_a_full_queue(
+        dir: &tempfile::TempDir,
+    ) -> (
+        control_ofc_daemon::sd_notify::Notifier,
+        Arc<std::os::unix::net::UnixDatagram>,
+    ) {
         let path = dir.path().join("notify");
         let rx = std::os::unix::net::UnixDatagram::bind(&path).expect("bind the fake socket");
         rx.set_nonblocking(true).expect("nonblocking receiver");
@@ -3787,29 +3822,105 @@ mod tests {
         for _ in 0..5_000 {
             notifier.watchdog_tick();
         }
+        (notifier, Arc::new(rx))
+    }
 
-        let (poll_tx, mut poll_rx) = tokio::sync::watch::channel(false);
+    /// Everything queued on `rx` right now.
+    fn read_queue(rx: &std::os::unix::net::UnixDatagram) -> Vec<String> {
+        let mut buf = [0u8; 64];
+        let mut got = Vec::new();
+        while let Ok(n) = rx.recv(&mut buf) {
+            got.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+        }
+        got
+    }
+
+    /// A task for the drain list that reads the queue once, IN the drain phase.
+    /// Time is paused, so its sleep can only elapse when the runtime is idle —
+    /// which first happens while `shutdown_sequence` awaits this task. It never
+    /// runs while the IPC server is being awaited, however the scheduler orders
+    /// the ready tasks.
+    fn read_in_the_drain_phase(
+        mut poll_rx: tokio::sync::watch::Receiver<bool>,
+        rx: Arc<std::os::unix::net::UnixDatagram>,
+        seen: Arc<Mutex<Vec<String>>>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let _ = poll_rx.wait_for(|stop| *stop).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            seen.lock().unwrap().extend(read_queue(&rx));
+        })
+    }
+
+    /// [SAFETY] `TS-ay`, DEC-402, at the call site: a disarm lost when the stop
+    /// began is sent again once the IPC server has stopped, BEFORE the task
+    /// drains, which can run out several task timeouts between them. The queue
+    /// is read only by the fake server as it stops, so the first attempt finds
+    /// it full and the resend finds room. The drain-phase reader must already
+    /// see the disarm; the resend before the restore comes after it and cannot
+    /// satisfy this.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_disarm_is_resent_before_the_task_drains() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (notifier, rx) = notifier_with_a_full_queue(&dir);
+
+        let (poll_tx, poll_rx) = tokio::sync::watch::channel(false);
+        let (server_tx, server_rx) = tokio::sync::oneshot::channel::<()>();
+        let at_server_stop: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let server_handle = {
+            let rx = Arc::clone(&rx);
+            let at_server_stop = Arc::clone(&at_server_stop);
+            tokio::spawn(async move {
+                let _ = server_rx.await;
+                at_server_stop.lock().unwrap().extend(read_queue(&rx));
+            })
+        };
+        let in_drains: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let reader = read_in_the_drain_phase(poll_rx, Arc::clone(&rx), Arc::clone(&in_drains));
+        finish_shutdown(
+            Some(&notifier),
+            &poll_tx,
+            server_tx,
+            server_handle,
+            vec![("reader", reader)],
+            Duration::from_secs(3),
+            false,
+            || {},
+        )
+        .await;
+
+        let at_server_stop = at_server_stop.lock().unwrap();
+        assert!(
+            !at_server_stop.is_empty() && !at_server_stop.iter().any(|m| m.starts_with("STOPPING")),
+            "precondition: the queue was full and the first disarm was lost; \
+             read at the server stop: {} message(s)",
+            at_server_stop.len()
+        );
+        assert_eq!(
+            in_drains.lock().unwrap().as_slice(),
+            ["STOPPING=1\nWATCHDOG_USEC=0"],
+            "the disarm must be sent again after the server stop and land before the drains"
+        );
+    }
+
+    /// [SAFETY] `TS-ap`, at the call site: a disarm lost to a queue that stays
+    /// full through BOTH earlier attempts — the stop's own and the one after the
+    /// server stop (DEC-402) — is delivered before the restore runs. The queue is
+    /// read only in the drain phase, so only the resend inside the restore
+    /// closure can land the disarm in time.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_disarm_is_resent_before_the_hardware_restore() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (notifier, rx) = notifier_with_a_full_queue(&dir);
+
+        let (poll_tx, poll_rx) = tokio::sync::watch::channel(false);
         let (server_tx, server_rx) = tokio::sync::oneshot::channel::<()>();
         let server_handle = tokio::spawn(async move {
             let _ = server_rx.await;
         });
-        let rx = Arc::new(rx);
         let drained: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let drainer = {
-            let rx = Arc::clone(&rx);
-            let drained = Arc::clone(&drained);
-            tokio::spawn(async move {
-                let _ = poll_rx.wait_for(|stop| *stop).await;
-                let mut buf = [0u8; 64];
-                while let Ok(n) = rx.recv(&mut buf) {
-                    drained
-                        .lock()
-                        .unwrap()
-                        .push(String::from_utf8_lossy(&buf[..n]).into_owned());
-                }
-            })
-        };
-        let at_restore: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let drainer = read_in_the_drain_phase(poll_rx, Arc::clone(&rx), Arc::clone(&drained));
+        let at_restore: Arc<Mutex<Option<Vec<String>>>> = Arc::new(Mutex::new(None));
         let seen = at_restore.clone();
         finish_shutdown(
             Some(&notifier),
@@ -3819,31 +3930,30 @@ mod tests {
             vec![("drainer", drainer)],
             Duration::from_secs(3),
             false,
-            move || {
-                let mut buf = [0u8; 64];
-                let got = rx.recv(&mut buf).map_or_else(
-                    |e| format!("<nothing: {e}>"),
-                    |n| String::from_utf8_lossy(&buf[..n]).into_owned(),
-                );
-                *seen.lock().unwrap() = Some(got);
-            },
+            move || *seen.lock().unwrap() = Some(read_queue(&rx)),
         )
         .await;
 
+        let drained = drained.lock().unwrap();
         assert!(
-            !drained
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|m| m.starts_with("STOPPING")),
-            "precondition: the first disarm was lost to the full queue"
+            !drained.is_empty() && !drained.iter().any(|m| m.starts_with("STOPPING")),
+            "precondition: the first two disarms were lost to the full queue; \
+             drained {} message(s)",
+            drained.len()
         );
         assert_eq!(
             at_restore.lock().unwrap().as_deref(),
-            Some("STOPPING=1\nWATCHDOG_USEC=0"),
+            Some(["STOPPING=1\nWATCHDOG_USEC=0".to_string()].as_slice()),
             "the disarm must be sent again, and land, before the restore runs"
         );
     }
+
+    /// Held by every test that raises SIGUSR1 or SIGUSR2. A signal is delivered
+    /// to the whole process, and tokio hands it to every stream registered for
+    /// it, whichever test's runtime owns the stream — so two of these tests
+    /// running at once would each see the other's signals. Taken BEFORE the
+    /// streams are registered, since a stream only sees signals raised after it.
+    static SLEEP_SIGNALS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// `TS-ao`: the hook's two signals reach `watch_sleep` as the two transitions.
     /// Raised for real, so a swapped or dropped arm fails here.
@@ -3851,6 +3961,7 @@ mod tests {
     async fn the_sleep_hook_signals_become_sleep_transitions() {
         use control_ofc_daemon::sd_notify::SleepTransition;
         use tokio::signal::unix::{signal, SignalKind};
+        let _only_us = SLEEP_SIGNALS.lock().await;
         let usr1 = signal(SignalKind::user_defined1()).expect("SIGUSR1 must be registerable");
         let usr2 = signal(SignalKind::user_defined2()).expect("SIGUSR2 must be registerable");
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
@@ -3868,6 +3979,51 @@ mod tests {
             assert_eq!(got, Some(want));
         }
         task.abort();
+    }
+
+    /// `TS-az`, DEC-402: when a sleep signal and a resume signal are BOTH pending,
+    /// the resume is forwarded first. The daemon cannot tell which arrived first
+    /// (tokio keeps no order across signals), and resume-first is the order whose
+    /// wrong guess is bounded: a pre and a post from one sleep end wide until
+    /// `watch_sleep`'s fallback narrows it, whereas sleep-first would leave the
+    /// watchdog narrow across the next sleep when a post and the next pre meet.
+    ///
+    /// Raised pre-then-post, the order of one sleep, and the forwarder is only
+    /// spawned after a sleep that parks this runtime, so its driver has handed
+    /// both signals to the streams first. The select then sees both at once, and
+    /// only the arm order decides.
+    #[tokio::test]
+    async fn a_pending_resume_is_forwarded_before_a_pending_sleep() {
+        use control_ofc_daemon::sd_notify::SleepTransition;
+        use tokio::signal::unix::{signal, SignalKind};
+        let _only_us = SLEEP_SIGNALS.lock().await;
+        let usr1 = signal(SignalKind::user_defined1()).expect("SIGUSR1 must be registerable");
+        let usr2 = signal(SignalKind::user_defined2()).expect("SIGUSR2 must be registerable");
+        // SAFETY: raising signals whose handlers tokio installed above.
+        unsafe {
+            libc::raise(libc::SIGUSR1);
+            libc::raise(libc::SIGUSR2);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let task = tokio::spawn(forward_sleep_signals(usr1, usr2, tx));
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            got.push(
+                tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .expect("a transition within 5 s"),
+            );
+        }
+        task.abort();
+        assert_eq!(
+            got,
+            [
+                Some(SleepTransition::Resumed),
+                Some(SleepTransition::Entering)
+            ]
+        );
     }
 
     /// The CALL SITES of both DEC-387 start-up rules, which no in-process test
