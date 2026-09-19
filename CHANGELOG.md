@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.51.2] — 2026-09-19
+
 ### Fixed
 
 **GPU fans keep following their own curves during a thermal event** (`TS-t`,
