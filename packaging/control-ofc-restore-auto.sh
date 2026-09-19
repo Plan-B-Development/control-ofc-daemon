@@ -10,8 +10,10 @@
 # runtime directory, and this script replays that record: each header gets its
 # recorded pwmN_enable back (and its duty, if it was already in manual mode),
 # confirmed by reading it back, with lm-sensors fancontrol's fallback —
-# pwmN_enable=0 (full speed), else manual at 255 — where that fails. A header the
-# daemon never took is not touched. This replaces a loop that wrote
+# pwmN_enable=0 (full speed), else manual at 255 — where that fails. A switch the
+# driver makes write-only (dell_smm's, DEC-398) cannot be read back, so there the
+# write succeeding is the confirmation. A header the daemon never took is not
+# touched. This replaces a loop that wrote
 # pwm_enable=2 to EVERY header on the machine: 2 is automatic only on it87. It is
 # Thermal Cruise on nct6775, and on an NZXT Kraken (nzxt-kraken3) it uploads a
 # curve buffer that is all zero unless something wrote it — a 0% pump curve.
@@ -65,6 +67,14 @@ hand_back() {
                 return 0
             fi
             ;;
+        write-only)
+            # Nothing can read this switch back, so the write succeeding is the
+            # only confirmation there is. Falling back after it would take back
+            # the mode just given: the fallback's 1 is manual mode on dell_smm.
+            if echo "$value" > "$enable" 2>/dev/null; then
+                return 0
+            fi
+            ;;
         manual)
             if echo 1 > "$enable" 2>/dev/null && echo "$value" > "$pwm" 2>/dev/null; then
                 mode=$(read_value "$enable")
@@ -89,7 +99,7 @@ if [ -r "$record" ]; then
         [ "$enable" = "${pwm}_enable" ] || continue
         [[ "$pwm" =~ /pwm[0-9]+$ ]] || continue
         case "$kind" in
-            mode | manual)
+            mode | write-only | manual)
                 # Anything but a small integer is unrecorded: fall back.
                 [[ "$value" =~ ^[0-9]{1,3}$ ]] && [ "$value" -le 255 ] || kind=full
                 ;;

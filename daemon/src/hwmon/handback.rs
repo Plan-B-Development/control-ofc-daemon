@@ -12,7 +12,8 @@
 //! The rule here is the one `fancontrol` (`PWM_ENABLE_ORIG_STATE`) and `fan2go`
 //! (`onExit: restore`) both follow: read what a header was doing just before the
 //! daemon first took it, and give back exactly that. Where that is impossible or
-//! known to be unsafe, fall back to full speed, as `fancontrol` does.
+//! known to be unsafe, fall back to full speed, as `fancontrol` does — unless the
+//! driver's own semantics say what to give back instead ([`driver_rule`]).
 //!
 //! # The record
 //!
@@ -28,9 +29,10 @@
 //! One line per header the daemon holds right now, tab-separated:
 //!
 //! ```text
-//! <pwmN_enable path>  <pwmN path>  mode    <value>   write pwm_enable = value
-//! <pwmN_enable path>  <pwmN path>  manual  <raw>     write pwm_enable = 1, pwm = raw
-//! <pwmN_enable path>  <pwmN path>  full    -         fancontrol's fallback
+//! <pwmN_enable path>  <pwmN path>  mode        <value>  write pwm_enable = value
+//! <pwmN_enable path>  <pwmN path>  write-only  <value>  the same, confirmed by the write alone
+//! <pwmN_enable path>  <pwmN path>  manual      <raw>    write pwm_enable = 1, pwm = raw
+//! <pwmN_enable path>  <pwmN path>  full        -        fancontrol's fallback
 //! ```
 
 use std::collections::HashMap;
@@ -51,6 +53,13 @@ const RECORD_HEADER: &str =
      from firmware. Written by control-ofc-daemon, replayed by control-ofc-restore-auto \
      (ExecStopPost). Do not edit.";
 
+/// The hwmon `name` of `dell-smm-hwmon`, the driver for Dell's SMM fan interface.
+const DELL_SMM_CHIP: &str = "dell_smm";
+
+/// The `pwmN_enable` value that gives `dell_smm`'s fans to the BIOS. The driver
+/// accepts only this and `1` (manual).
+const DELL_SMM_BIOS_CONTROL: u8 = 2;
+
 /// Raw duty at or above which a full-speed fallback counts as having landed.
 ///
 /// `fancontrol`'s own threshold (`pwmdisable`, `-ge 190`): some chips cap or round
@@ -64,6 +73,11 @@ pub enum HandBack {
     /// Write this `pwmN_enable` value back. Never `1`: a header found in manual
     /// mode is [`HandBack::Manual`], because its duty has to come back with it.
     Mode(u8),
+    /// Write this `pwmN_enable` value to a switch the driver makes write-only.
+    /// Nothing can read it back, so the write succeeding is the only
+    /// confirmation there is. Only [`driver_rule`] chooses it (`dell_smm`), never
+    /// a reading.
+    WriteOnlyMode(u8),
     /// The header was already in manual mode, at this raw duty. Give back both.
     Manual(u8),
     /// The original could not be read, or writing it back is known to be unsafe:
@@ -76,21 +90,19 @@ impl HandBack {
     /// What a header gets back, from what it reported just before the daemon
     /// first took it.
     ///
+    /// * A driver whose `pwmN_enable` does not mean what the hwmon ABI says gets
+    ///   its own answer ([`driver_rule`]).
     /// * An unreadable `pwmN_enable` is an unrecorded mode → [`Self::FullSpeed`].
     /// * `1` means something — a user, another tool, or a daemon that died
     ///   without its `ExecStopPost` running — already had it in manual mode. The
     ///   duty is part of that state, so an unreadable duty is unrecorded too.
-    /// * `2` on an `nzxt-kraken3` device is never written back: that write
-    ///   uploads a curve buffer that is all zero unless something wrote it
-    ///   ([`crate::hwmon::aio::is_nzxt_kraken3_chip`]). A Kraken reports `0` after
-    ///   probe, and `0` gives back fixed 100 %, so a Kraken reporting `2` is one
-    ///   some other writer put there — an earlier daemon's hardcoded restore among
-    ///   them — and replaying it is exactly the defect this module removes.
     pub fn from_reading(chip_name: &str, enable: Option<u8>, raw_pwm: Option<u8>) -> Self {
+        if let Some(action) = driver_rule(chip_name, enable) {
+            return action;
+        }
         match enable {
             None => Self::FullSpeed,
             Some(1) => raw_pwm.map_or(Self::FullSpeed, Self::Manual),
-            Some(2) if crate::hwmon::aio::is_nzxt_kraken3_chip(chip_name) => Self::FullSpeed,
             Some(mode) => Self::Mode(mode),
         }
     }
@@ -99,16 +111,48 @@ impl HandBack {
     fn record_columns(self) -> (&'static str, String) {
         match self {
             Self::Mode(mode) => ("mode", mode.to_string()),
+            Self::WriteOnlyMode(mode) => ("write-only", mode.to_string()),
             Self::Manual(raw) => ("manual", raw.to_string()),
             Self::FullSpeed => ("full", "-".to_string()),
         }
     }
 }
 
+/// What a driver whose `pwmN_enable` does not mean what the hwmon ABI says
+/// gets back instead of the generic reading. `None` for every other driver,
+/// and for every other reading on these two.
+///
+/// * `nzxt-kraken3` reporting `2` → [`HandBack::FullSpeed`]. Writing `2` there
+///   uploads a curve buffer that is all zero unless something wrote it
+///   ([`crate::hwmon::aio::is_nzxt_kraken3_chip`]). A Kraken reports `0` after
+///   probe, and `0` gives back fixed 100 %, so a Kraken reporting `2` is one
+///   some other writer put there — an earlier daemon's hardcoded restore among
+///   them — and replaying it is exactly the defect this module removes.
+/// * `dell_smm` with an unreadable mode → [`HandBack::WriteOnlyMode`]`(2)`
+///   (`TS-ab`, DEC-398). Where the driver uses the BIOS's global fan-control
+///   commands (its `auto_fan` whitelist), `pwm1_enable` is ONE switch for every
+///   fan and is write-only (`0200`), because SMM has no command that reads it.
+///   `2` gives the fans to the BIOS, where the machine boots them. Without this
+///   rule every hand-back there ends with that header at full speed and the BIOS
+///   off for every fan, which outlives the daemon until the next boot. Because
+///   the switch is global, giving it back also hands the BIOS any fan a profile
+///   still names (`TS-bb`). The driver's per-fan switch reads back,
+///   so it reaches this arm only on a failed read — and `2` is BIOS control
+///   there too.
+fn driver_rule(chip_name: &str, enable: Option<u8>) -> Option<HandBack> {
+    match enable {
+        Some(2) if crate::hwmon::aio::is_nzxt_kraken3_chip(chip_name) => Some(HandBack::FullSpeed),
+        None if chip_name == DELL_SMM_CHIP => Some(HandBack::WriteOnlyMode(DELL_SMM_BIOS_CONTROL)),
+        _ => None,
+    }
+}
+
 /// What one hand-back achieved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandBackOutcome {
-    /// The recorded state is back, and reading it back confirmed it.
+    /// The recorded state is back, and reading it back confirmed it — or, for a
+    /// [`HandBack::WriteOnlyMode`], the write succeeded, which is all such a
+    /// switch can report.
     Restored,
     /// The recorded state could not be given back — or none was recorded — and
     /// the header runs at full speed instead.
@@ -131,6 +175,12 @@ impl HandBackOutcome {
 /// Every write is confirmed by reading it back, because a write syscall that
 /// succeeds is not a mode that took: a driver can accept a value and store
 /// something else. A hand-back that is not confirmed is not assumed.
+///
+/// The one exception is [`HandBack::WriteOnlyMode`], a switch nothing can read.
+/// There the write succeeding is the only confirmation the driver can give —
+/// `dell_smm` returns its SMM call's error from the write — and falling back
+/// after a write that succeeded would take back the very mode it just gave:
+/// the fallback's `1` is manual mode on that switch.
 pub fn hand_back(
     writer: &mut dyn SysfsWriter,
     enable_path: &str,
@@ -142,6 +192,7 @@ pub fn hand_back(
             writer.write_file(enable_path, &mode.to_string()).is_ok()
                 && read_u8(writer, enable_path) == Some(mode)
         }
+        HandBack::WriteOnlyMode(mode) => writer.write_file(enable_path, &mode.to_string()).is_ok(),
         HandBack::Manual(raw) => {
             writer.write_file(enable_path, "1").is_ok()
                 && writer.write_file(pwm_path, &raw.to_string()).is_ok()
@@ -473,12 +524,14 @@ mod tests {
     use crate::error::HwmonError;
 
     /// An in-memory sysfs that can refuse a write (`EINVAL`) or store something
-    /// other than what was written — the two ways a driver says "not that".
+    /// other than what was written — the two ways a driver says "not that" — or
+    /// refuse every read of a file, as sysfs does for a `0200` attribute.
     #[derive(Default)]
     struct FakeSysfs {
         files: HashMap<String, String>,
         refused: Vec<(String, String)>,
         remapped: Vec<(String, String, String)>,
+        write_only: Vec<String>,
         log: Vec<(String, String)>,
     }
 
@@ -494,6 +547,10 @@ mod tests {
         fn storing_instead(mut self, path: &str, written: &str, stored: &str) -> Self {
             self.remapped
                 .push((path.into(), written.into(), stored.into()));
+            self
+        }
+        fn write_only(mut self, path: &str) -> Self {
+            self.write_only.push(path.into());
             self
         }
         fn get(&self, path: &str) -> Option<&str> {
@@ -519,6 +576,12 @@ mod tests {
             Ok(())
         }
         fn read_file(&self, path: &str) -> Result<String, HwmonError> {
+            if self.write_only.iter().any(|p| p == path) {
+                return Err(HwmonError::ReadError {
+                    path: path.into(),
+                    message: "Permission denied (os error 13)".into(),
+                });
+            }
             self.files
                 .get(path)
                 .map(|v| format!("{v}\n"))
@@ -592,6 +655,77 @@ mod tests {
             HandBack::from_reading("it8696", Some(2), Some(128)),
             HandBack::Mode(2)
         );
+    }
+
+    /// [SAFETY] `TS-ab`: `dell_smm`'s global switch cannot be read, and `2` there
+    /// gives the fans to the BIOS. Both arms, so a stuck predicate fails one of
+    /// them: the unreadable switch gets `2`, a switch that reads back (the
+    /// driver's per-fan one) is taken as read, and the same unreadable reading
+    /// on any other chip still gets the fallback.
+    #[test]
+    fn dell_smm_gives_an_unreadable_switch_back_to_the_bios() {
+        for duty in [Some(128), None] {
+            assert_eq!(
+                HandBack::from_reading("dell_smm", None, duty),
+                HandBack::WriteOnlyMode(2),
+                "duty {duty:?}: the switch is what is given back, not the duty"
+            );
+        }
+        assert_eq!(
+            HandBack::from_reading("dell_smm", Some(2), None),
+            HandBack::Mode(2)
+        );
+        assert_eq!(
+            HandBack::from_reading("dell_smm", Some(1), Some(255)),
+            HandBack::Manual(255)
+        );
+        for chip in ["it8696", "nct6798", "x53"] {
+            assert_eq!(
+                HandBack::from_reading(chip, None, Some(128)),
+                HandBack::FullSpeed,
+                "{chip}: an unreadable mode is unrecorded"
+            );
+        }
+    }
+
+    /// [SAFETY] `TS-ab`: a switch nothing can read is confirmed by the write
+    /// alone, and nothing else is written. Through the read-back path the same
+    /// hand-back finds nothing to read, falls back, and writes `1` — manual mode
+    /// on `dell_smm`'s switch, taking back the `2` it had just given.
+    #[test]
+    fn a_write_only_switch_is_confirmed_by_the_write_alone() {
+        let mut sysfs = FakeSysfs::default()
+            .with(EN, "1")
+            .with(PWM, "80")
+            .write_only(EN);
+        let outcome = hand_back(&mut sysfs, EN, PWM, HandBack::WriteOnlyMode(2));
+        assert_eq!(outcome, HandBackOutcome::Restored);
+        assert_eq!(
+            sysfs.log,
+            vec![(EN.to_string(), "2".to_string())],
+            "exactly one write: the BIOS gets the fans back and nothing takes them away"
+        );
+        assert_eq!(sysfs.get(PWM), Some("80"), "no fallback touched the duty");
+    }
+
+    /// A write-only switch that refuses the write is not given back: `fancontrol`'s
+    /// fallback runs, and on `dell_smm` — which refuses `0` too — ends at manual 255.
+    #[test]
+    fn a_refused_write_only_switch_falls_back_to_full_speed() {
+        let mut sysfs = FakeSysfs::default()
+            .with(EN, "1")
+            .with(PWM, "80")
+            .write_only(EN)
+            .refusing(EN, "2")
+            .refusing(EN, "0");
+        let outcome = hand_back(&mut sysfs, EN, PWM, HandBack::WriteOnlyMode(2));
+        assert_eq!(outcome, HandBackOutcome::FullSpeed);
+        let written: Vec<(&str, &str)> = sysfs
+            .log
+            .iter()
+            .map(|(p, v)| (p.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(written, vec![(EN, "2"), (EN, "0"), (EN, "1"), (PWM, "255")]);
     }
 
     #[test]
@@ -779,6 +913,24 @@ mod tests {
         assert!(
             body.lines()
                 .any(|l| l == format!("{EN}\t/sys/class/hwmon/hwmon3/pwm2\tfull\t-")),
+            "got {body:?}"
+        );
+    }
+
+    /// `TS-ab`: the record must carry the write-only kind, not `mode`. The
+    /// ExecStopPost script confirms a `mode` line by reading it back, which on
+    /// `dell_smm` fails, so a crash would end at full speed after all.
+    #[test]
+    fn a_write_only_take_is_recorded_as_write_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join(RECORD_FILE_NAME);
+        let ledger = HandBackLedger::new(&[header("pwm2", Some(EN))]);
+        ledger.set_record_path(record.clone());
+        ledger.note_take("pwm2", Some(HandBack::WriteOnlyMode(2)));
+        let body = std::fs::read_to_string(&record).unwrap();
+        assert!(
+            body.lines()
+                .any(|l| l == format!("{EN}\t/sys/class/hwmon/hwmon3/pwm2\twrite-only\t2")),
             "got {body:?}"
         );
     }

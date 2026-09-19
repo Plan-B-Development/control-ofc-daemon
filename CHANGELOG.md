@@ -4,6 +4,24 @@
 
 ### Fixed
 
+**Dell fans go back to BIOS control when the daemon lets go of them** (`TS-ab`,
+DEC-398). On many Dell machines the `dell_smm` driver has one switch that turns
+the BIOS's fan control on or off for every fan at once. The switch sits on the
+first fan header, and it can be set but never read. Since 2.50.0 the daemon gives
+each header back exactly as it found it, and a setting it could not read got full
+speed instead. On those machines, whenever the daemon let go of the first header,
+that fan went to full speed and the BIOS stayed off. That happened when a thermal
+emergency ended, when a profile was deactivated or stopped naming the header, and
+when the daemon stopped. The other fans were left where they were, with nothing
+controlling them, until the next boot. The daemon now turns the BIOS's fan
+control back on, which is what the switch's `2` means and how the machine starts.
+The `ExecStopPost` cleanup does the same after a crash. If the switch refuses the
+write, the first fan still goes to full speed and the BIOS stays off. Because
+the switch covers every fan, handing it back also gives the BIOS any other fan a
+profile still controls, until something takes the switch again. On these
+machines a profile should therefore control all of the fans or none of them.
+Other drivers are unchanged.
+
 **CPU temperature via PECI/TSI is now read on every Nuvoton nct67xx chip**
 (`DOC-w`, DEC-397). On `nct6779`, `nct6791`–`nct6793` and `nct6795`–`nct6799`, a
 `PECI Agent` or `TSI` temperature channel is the CPU temperature the kernel says to

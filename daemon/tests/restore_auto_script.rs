@@ -63,6 +63,35 @@ impl Tree {
             .output()
             .expect("bash must be available to run the ExecStopPost script")
     }
+
+    /// Run the script with every read of `unreadable` refused, as sysfs refuses
+    /// a read-open of a `0200` attribute (`EACCES`) even to root. The script
+    /// reads through `cat`, so a `cat` earlier on `PATH` that fails for that one
+    /// path stands in for the kernel. A regular file with mode `0200` would not:
+    /// root can read it, and CI may run as root.
+    fn run_script_unable_to_read(&self, unreadable: &Path) -> std::process::Output {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = self.run.with_file_name("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let path = std::env::var("PATH").unwrap_or_default();
+        let shim = bin.join("cat");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/bash\n[ \"$1\" = '{}' ] && exit 1\nPATH='{path}' exec cat \"$@\"\n",
+                unreadable.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Command::new("bash")
+            .arg(script())
+            .env("RUNTIME_DIRECTORY", &self.run)
+            .env("CONTROL_OFC_SYSFS_ROOT", &self.sys)
+            .env("PATH", format!("{}:{path}", bin.display()))
+            .output()
+            .expect("bash must be available to run the ExecStopPost script")
+    }
 }
 
 fn line(enable: &Path, pwm: &Path, kind: &str, value: &str) -> String {
@@ -84,10 +113,12 @@ fn the_record_is_replayed_and_nothing_else_is_touched() {
     let (en2, pwm2) = t.header(2);
     let (en3, _) = t.header(3);
     let (en4, pwm4) = t.header(4);
+    let (en5, pwm5) = t.header(5);
     t.record(&[
         line(&en1, &pwm1, "mode", "5"),
         line(&en2, &pwm2, "manual", "77"),
         line(&en4, &pwm4, "full", "-"),
+        line(&en5, &pwm5, "write-only", "2"),
     ]);
 
     let out = t.run_script();
@@ -105,10 +136,58 @@ fn the_record_is_replayed_and_nothing_else_is_touched() {
         "an unrecorded mode gets fancontrol's full speed"
     );
     assert_eq!(
+        (read(&en5), read(&pwm5)),
+        ("2".to_string(), "150".to_string()),
+        "a write-only switch gets its recorded value, and its duty is not touched"
+    );
+    assert_eq!(
         read(&en3),
         "1",
         "a header no record line names is not touched"
     );
+}
+
+/// [SAFETY] DEC-398 (`TS-ab`): a `write-only` line is confirmed by the write
+/// alone. The switch here refuses every read, as `dell_smm`'s `0200`
+/// `pwm1_enable` does. Confirmed by reading it back instead, the refused read
+/// fails the confirmation, the fallback runs, and it leaves the switch at `1`
+/// and the duty at 255 — on `dell_smm` that `1` takes the fans back from the
+/// BIOS. The switch reading `2` afterwards is the presence half: a line the
+/// script skipped would also leave the duty alone.
+#[test]
+fn a_write_only_switch_is_confirmed_by_the_write_alone() {
+    let t = Tree::new();
+    let (en1, pwm1) = t.header(1);
+    t.record(&[line(&en1, &pwm1, "write-only", "2")]);
+
+    let out = t.run_script_unable_to_read(&en1);
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(read(&en1), "2", "the switch was written");
+    assert_eq!(read(&pwm1), "150", "and no fallback took it back");
+    assert!(out.stderr.is_empty(), "{out:?}");
+}
+
+/// A write-only switch that refuses the write is not reported given back: the
+/// fallback runs, and where nothing at all can be written the script says so.
+#[test]
+fn a_write_only_switch_that_takes_no_write_is_reported() {
+    let t = Tree::new();
+    let (en1, pwm1) = t.header(1);
+    std::fs::remove_file(&en1).unwrap();
+    // A directory: it exists, and every write to it fails.
+    std::fs::create_dir(&en1).unwrap();
+    t.record(&[line(&en1, &pwm1, "write-only", "2")]);
+
+    let out = t.run_script();
+
+    assert!(out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!("could not give {} back", en1.display())),
+        "{stderr}"
+    );
+    assert_eq!(read(&pwm1), "150");
 }
 
 /// A line is checked before anything is written to the path it names — the

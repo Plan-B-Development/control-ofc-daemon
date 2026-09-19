@@ -2384,9 +2384,13 @@ mod tests {
     /// play the firmware. `MockSysfsWriter` never updates what it reads back,
     /// which is exactly the property these tests need: a capture made AFTER the
     /// `pwm_enable=1` write reads `1` here, so they can tell "read before the
-    /// take" from "read after it".
+    /// take" from "read after it". Paths marked write-only refuse every read, as
+    /// sysfs does for a `0200` attribute, while still recording what is written.
     #[derive(Clone, Default)]
-    struct LiveSysfs(Arc<Mutex<StdHashMap<String, String>>>);
+    struct LiveSysfs(
+        Arc<Mutex<StdHashMap<String, String>>>,
+        Arc<Mutex<Vec<String>>>,
+    );
 
     impl LiveSysfs {
         fn set(&self, path: &str, value: &str) {
@@ -2394,6 +2398,9 @@ mod tests {
         }
         fn get(&self, path: &str) -> Option<String> {
             self.0.lock().get(path).cloned()
+        }
+        fn write_only(&self, path: &str) {
+            self.1.lock().push(path.into());
         }
     }
 
@@ -2403,6 +2410,12 @@ mod tests {
             Ok(())
         }
         fn read_file(&self, path: &str) -> Result<String, HwmonError> {
+            if self.1.lock().iter().any(|p| p == path) {
+                return Err(HwmonError::ReadError {
+                    path: path.into(),
+                    message: "Permission denied (os error 13)".into(),
+                });
+            }
             self.get(path)
                 .map(|v| format!("{v}\n"))
                 .ok_or(HwmonError::ReadError {
@@ -2506,6 +2519,67 @@ mod tests {
             "the next take re-asserts manual mode"
         );
         assert!(ctrl.handback().is_taken("h1"));
+    }
+
+    /// [SAFETY] `TS-ab` at the call site: `set_pwm` hands the reading the
+    /// header's own chip. A `dell_smm` switch that cannot be read is recorded as
+    /// BIOS control and given back as it; the same unreadable switch on another
+    /// chip keeps `fancontrol`'s full-speed fallback. The second arm is what
+    /// fails if the call site passed a fixed chip name instead of the header's.
+    #[test]
+    fn an_unreadable_dell_smm_switch_goes_back_to_the_bios() {
+        // (chip, recorded action, hand-back outcome, the switch afterwards: `2`
+        // is the BIOS; `1` is the fallback's manual mode at 255)
+        for (chip, action, restored, enable_after) in [
+            (
+                "dell_smm",
+                HandBack::WriteOnlyMode(2),
+                HandBackOutcome::Restored,
+                "2",
+            ),
+            (
+                "it8696",
+                HandBack::FullSpeed,
+                HandBackOutcome::FullSpeed,
+                "1",
+            ),
+        ] {
+            let sysfs = LiveSysfs::default();
+            sysfs.set(ENABLE, "2");
+            sysfs.set(PWM, "90");
+            sysfs.write_only(ENABLE);
+            let mut header = make_header("h1", "Processor Fan", 0);
+            header.chip_name = chip.into();
+            let mut ctrl = HwmonPwmController::new(
+                vec![header],
+                LeaseManager::new(),
+                Box::new(sysfs.clone()),
+                Arc::new(StateCache::new()),
+            );
+            let lease = ctrl
+                .lease_manager_mut()
+                .take_lease(HwmonWriter::Engine)
+                .unwrap()
+                .lease_id;
+
+            ctrl.set_pwm("h1", 60, &lease).unwrap();
+            assert_eq!(
+                sysfs.get(ENABLE).as_deref(),
+                Some("1"),
+                "{chip}: precondition: the take switched the header to manual"
+            );
+            assert_eq!(
+                ctrl.handback().taken_header("h1").map(|t| t.action),
+                Some(action),
+                "{chip}"
+            );
+            assert_eq!(
+                ctrl.hand_back("h1", &lease).unwrap(),
+                Some(restored),
+                "{chip}"
+            );
+            assert_eq!(sysfs.get(ENABLE).as_deref(), Some(enable_after), "{chip}");
+        }
     }
 
     #[test]
