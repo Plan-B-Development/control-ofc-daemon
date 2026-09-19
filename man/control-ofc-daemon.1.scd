@@ -90,6 +90,14 @@ _/run/control-ofc/control-ofc.sock_
 	changing it requires a restart. *GET /config* reports which keys have
 	a persisted value that is not yet in effect.
 
+*SIGUSR1*, *SIGUSR2*
+	Sent by the package's systemd-sleep hook
+	(/usr/lib/systemd/system-sleep/control-ofc-daemon) before and after a
+	system sleep. Under systemd, *SIGUSR1* widens the service watchdog to
+	120 seconds (never below *WatchdogSec*) so a slow device resume cannot
+	draw a watchdog restart, and *SIGUSR2* restores it; the daemon restores
+	it by itself if *SIGUSR2* never arrives. Not intended to be sent by hand.
+
 # AMD GPU SUPPORT
 
 The daemon controls AMD GPU fans via one of two sysfs interfaces:

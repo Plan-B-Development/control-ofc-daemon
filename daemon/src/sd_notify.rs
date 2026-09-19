@@ -19,6 +19,7 @@
 //! | `RESTART_RESET=1` | the same ping | once, after [`RESTART_RESET_AFTER_TICKS`] completed ticks |
 //! | `STOPPING=1` + `WATCHDOG_USEC=0` | `finish_shutdown` | the moment shutdown begins |
 //! | `EXTEND_TIMEOUT_USEC=` | `main` | before each boot-time serial probe |
+//! | `WATCHDOG_USEC=` (wide, then configured) | [`watch_sleep`] | around a system sleep, on the hook's signals |
 //!
 //! The ping lives in the tick's completion guard because "a tick completed" is
 //! the only liveness this watchdog should measure. A device write that is slow
@@ -51,11 +52,20 @@
 //! a probe that never returns stops extending it, which times the start out as
 //! before.
 //!
-//! **A limit worth knowing (`TS-ao`).** The watchdog's clock is `CLOCK_MONOTONIC`.
+//! **System sleep (`TS-ao`, DEC-396).** The watchdog's clock is `CLOCK_MONOTONIC`.
 //! It does not advance during the sleep itself, but user space — this daemon and
 //! PID 1 alike — is frozen while devices suspend and resume, and that stretch does
-//! count. A machine whose device suspend and resume together take more than about
-//! ten seconds can therefore see the daemon restarted as it resumes.
+//! count. A machine whose device suspend and resume together took more than about
+//! ten seconds could therefore see the daemon restarted as it resumed. So the
+//! package ships a `system-sleep` hook: it sends `SIGUSR1` before the sleep, and
+//! [`watch_sleep`] answers with `WATCHDOG_USEC=` widened to [`SLEEP_WATCHDOG`] (never
+//! narrowed below what the unit configured), then acknowledges in the runtime
+//! directory so the hook — and with it the sleep — waits until the wide value is
+//! queued to systemd. `SIGUSR2` after resume puts the configured value back. If no
+//! resume signal arrives, [`watch_sleep`] puts it back by itself once
+//! [`SLEEP_WATCHDOG`] has passed: a missing hook must never leave detection wide for
+//! the rest of the process's life. Neither is ever sent once [`Notifier::stopping`]
+//! has run, since any non-zero `WATCHDOG_USEC=` would re-arm what the stop disarmed.
 //!
 //! # No dependency
 //!
@@ -69,7 +79,9 @@
 use std::io;
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::net::{SocketAddr, UnixDatagram};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Completed ticks after which the daemon asks systemd to reset its restart
@@ -90,6 +102,58 @@ const ONE_SHOT_RETRIES: u32 = 50;
 /// The pause between those retries: 50 x 2 ms bounds the wait at ~100 ms.
 const ONE_SHOT_RETRY_GAP: Duration = Duration::from_millis(2);
 
+/// How wide the watchdog is opened across a system sleep (`TS-ao`, DEC-396), and
+/// how long [`watch_sleep`] waits for the resume signal before narrowing it again
+/// by itself.
+///
+/// Eight times the unit's 15 s, to cover device suspend plus resume on slow
+/// hardware — the stretch the frozen daemon cannot ping through. It is not a
+/// hang budget in normal running: it applies only between the hook's two calls,
+/// most of which the machine spends asleep with the clock stopped. A drop-in
+/// that already configures a wider watchdog keeps its own value.
+pub const SLEEP_WATCHDOG: Duration = Duration::from_secs(120);
+
+/// How soon a restore that could not be delivered after resume is tried again.
+const SLEEP_RESTORE_RETRY: Duration = Duration::from_secs(1);
+
+/// The file the daemon writes its PID to once the sleep signals are handled, so
+/// the hook signals only a daemon that understands them (`SIGUSR1`'s default
+/// action is to terminate). Lives in the unit's runtime directory, which systemd
+/// empties whenever the unit stops.
+pub const SLEEP_HOOK_PID_FILE: &str = "sleep-hook.pid";
+/// The acknowledgement the hook waits for before letting the sleep proceed.
+pub const SLEEP_HOOK_ACK_FILE: &str = "sleep-hook.ack";
+
+/// Which side of a system sleep a hook signal announced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SleepTransition {
+    /// `SIGUSR1`: the hook's `pre` call, just before the machine sleeps.
+    Entering,
+    /// `SIGUSR2`: the hook's `post` call, after it has resumed.
+    Resumed,
+}
+
+/// What [`Notifier::sleep_transition`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SleepOutcome {
+    /// The new `WATCHDOG_USEC=` reached systemd's queue.
+    Sent,
+    /// Nothing to send: no watchdog is configured, or the daemon is stopping.
+    Skipped,
+    /// It could not be sent, even after the one-shot retry.
+    Failed,
+}
+
+impl SleepOutcome {
+    fn as_ack(self) -> &'static str {
+        match self {
+            Self::Sent => "sent",
+            Self::Skipped => "skipped",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// The daemon's connection to systemd's notification socket.
 ///
 /// Built once in `main` from the environment systemd provides, and shared with
@@ -103,6 +167,16 @@ pub struct Notifier {
     /// Set by [`Self::stopping`]. No ping is sent after it, and systemd has been
     /// told to ignore any that are already in flight.
     stopping: AtomicBool,
+    /// Set only once the stop's `WATCHDOG_USEC=0` actually reached systemd's
+    /// queue — by [`Self::stopping`] or by [`Self::resend_disarm_if_lost`]
+    /// (`TS-ap`). `stopping` alone says the daemon *meant* to disarm.
+    disarmed: AtomicBool,
+    /// Serialises every message that sets `WATCHDOG_USEC=`: the stop's disarm and
+    /// the sleep hook's widen/restore. Without it a sleep transition that had
+    /// checked `stopping` could still send its non-zero value just AFTER the
+    /// disarm and re-arm the watchdog over the hardware restore. Never taken by
+    /// the engine's ping, which must not wait.
+    watchdog_usec: Mutex<()>,
     /// Completed ticks seen, for [`RESTART_RESET_AFTER_TICKS`] — counted whether
     /// or not their keep-alive could be sent. Only the engine calls in, so this
     /// never sees contention; it is atomic only so `Notifier` is `Sync`.
@@ -162,6 +236,8 @@ impl Notifier {
             addr,
             watchdog,
             stopping: AtomicBool::new(false),
+            disarmed: AtomicBool::new(false),
+            watchdog_usec: Mutex::new(()),
             ticks: AtomicU64::new(0),
             restart_reset_sent: AtomicBool::new(false),
             ping_failure_logged: AtomicBool::new(false),
@@ -250,13 +326,78 @@ impl Notifier {
     /// this process's life. See the module doc for why `WATCHDOG_USEC=0` is
     /// part of the same message.
     pub fn stopping(&self) {
+        let _serial = self.watchdog_usec_lock();
         self.stopping.store(true, Ordering::Release);
-        if let Err(e) = self.send_once("STOPPING=1\nWATCHDOG_USEC=0") {
-            log::warn!(
+        match self.send_once(STOP_MESSAGE) {
+            Ok(()) => self.disarmed.store(true, Ordering::Release),
+            Err(e) => log::warn!(
                 "could not tell systemd the daemon is stopping ({e}); its watchdog may \
-                 still be armed during the hardware restore"
-            );
+                 still be armed — trying again just before the hardware restore"
+            ),
         }
+    }
+
+    /// `TS-ap`: send the stop's disarm a second time if the first never reached
+    /// systemd. `finish_shutdown` calls it immediately before the hardware
+    /// restore: the task drains in between take up to several seconds, so a
+    /// queue that was full for the first attempt has usually been read by now,
+    /// and without it the LAST keep-alive's deadline stays armed over a restore
+    /// that can outlast it. A no-op when the first attempt landed, or before
+    /// [`Self::stopping`] has run.
+    pub fn resend_disarm_if_lost(&self) {
+        let _serial = self.watchdog_usec_lock();
+        if !self.stopping.load(Ordering::Acquire) || self.disarmed.load(Ordering::Acquire) {
+            return;
+        }
+        match self.send_once(STOP_MESSAGE) {
+            Ok(()) => {
+                self.disarmed.store(true, Ordering::Release);
+                log::info!("told systemd the daemon is stopping on the second attempt");
+            }
+            Err(e) => log::warn!(
+                "could not tell systemd the daemon is stopping on the second attempt \
+                 either ({e}); a restore slower than the watchdog may be cut short, and \
+                 ExecStopPost repeats the hwmon and GPU steps"
+            ),
+        }
+    }
+
+    /// Widen the watchdog for a system sleep, or put the configured value back
+    /// after one (`TS-ao`, DEC-396) — see the module doc. Blocks for at most the
+    /// one-shot retry budget, so [`watch_sleep`] calls it off the async workers.
+    ///
+    /// [SAFETY] Sends nothing when no watchdog is configured, because a non-zero
+    /// `WATCHDOG_USEC=` would ENABLE one the unit never asked for; and nothing
+    /// once [`Self::stopping`] has run, because it would re-arm the watchdog the
+    /// stop disarmed. The check and the send share the lock `stopping` takes, so
+    /// neither can slip in after the disarm.
+    pub fn sleep_transition(&self, transition: SleepTransition) -> SleepOutcome {
+        let _serial = self.watchdog_usec_lock();
+        let Some(configured) = self.watchdog else {
+            return SleepOutcome::Skipped;
+        };
+        if self.stopping.load(Ordering::Acquire) {
+            return SleepOutcome::Skipped;
+        }
+        let usec = match transition {
+            SleepTransition::Entering => configured.max(SLEEP_WATCHDOG),
+            SleepTransition::Resumed => configured,
+        };
+        match self.send_once(&format!("WATCHDOG_USEC={}", usec.as_micros())) {
+            Ok(()) => SleepOutcome::Sent,
+            Err(e) => {
+                log::warn!("could not change the systemd watchdog for {transition:?} ({e})");
+                SleepOutcome::Failed
+            }
+        }
+    }
+
+    /// The `WATCHDOG_USEC=` lock. Poisoning is ignored: it guards no data, only
+    /// the ordering of two sends, and a stop must never be refused over a panic.
+    fn watchdog_usec_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.watchdog_usec
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// [`Self::send`] for a message that has no second chance — `READY=1` and the
@@ -267,7 +408,8 @@ impl Notifier {
     /// queue is retried briefly, and the wait is still bounded (at most
     /// [`ONE_SHOT_RETRIES`] x [`ONE_SHOT_RETRY_GAP`], ~100 ms) because the stop is
     /// sent ahead of the restore and must not delay it by more than that. Called
-    /// only from `main`'s thread — never from the engine, whose tick must not wait.
+    /// only from `main`'s thread and from [`watch_sleep`]'s blocking task — never
+    /// from the engine, whose tick must not wait.
     fn send_once(&self, message: &str) -> io::Result<()> {
         let mut attempt = 0;
         loop {
@@ -293,6 +435,88 @@ impl Notifier {
                 format!("sent {sent} of {} bytes", message.len()),
             ))
         }
+    }
+}
+
+/// The stop announcement, with the disarm in the same datagram (see the module doc).
+const STOP_MESSAGE: &str = "STOPPING=1\nWATCHDOG_USEC=0";
+
+/// Act on the sleep hook's signals for the life of the process (`TS-ao`, DEC-396).
+///
+/// Each [`SleepTransition`] is applied through [`Notifier::sleep_transition`] and,
+/// when `ack_dir` is given, acknowledged in [`SLEEP_HOOK_ACK_FILE`] there — the
+/// hook deletes that file, signals, and holds the sleep until it reappears. After
+/// a widen, a resume signal that has not arrived within `fallback` is treated as
+/// having arrived; a restore that could not be delivered is retried every
+/// [`SLEEP_RESTORE_RETRY`]. Ends when `events` closes.
+pub async fn watch_sleep(
+    notifier: Arc<Notifier>,
+    mut events: tokio::sync::mpsc::Receiver<SleepTransition>,
+    fallback: Duration,
+    ack_dir: Option<PathBuf>,
+) {
+    let mut narrow_at: Option<tokio::time::Instant> = None;
+    loop {
+        let transition = match narrow_at {
+            Some(deadline) => tokio::select! {
+                event = events.recv() => event,
+                () = tokio::time::sleep_until(deadline) => Some(SleepTransition::Resumed),
+            },
+            None => events.recv().await,
+        };
+        let Some(transition) = transition else {
+            return;
+        };
+        let n = Arc::clone(&notifier);
+        let ack = ack_dir.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let outcome = n.sleep_transition(transition);
+            if let Some(dir) = ack {
+                write_sleep_ack(&dir, transition, outcome);
+            }
+            outcome
+        })
+        .await
+        .unwrap_or(SleepOutcome::Failed);
+        let now = tokio::time::Instant::now();
+        narrow_at = match (transition, outcome) {
+            (SleepTransition::Entering, SleepOutcome::Sent) => Some(now + fallback),
+            // A widen that did not land changed nothing at systemd, so whatever
+            // narrowing was already due — an earlier widen's fallback, or a
+            // restore retry — is still due. Dropping it could leave a watchdog
+            // that DID widen earlier wide for good.
+            (SleepTransition::Entering, SleepOutcome::Failed) => narrow_at,
+            (SleepTransition::Resumed, SleepOutcome::Failed) => Some(now + SLEEP_RESTORE_RETRY),
+            (SleepTransition::Resumed, SleepOutcome::Sent) | (_, SleepOutcome::Skipped) => None,
+        };
+        match (transition, outcome) {
+            (SleepTransition::Entering, SleepOutcome::Sent) => {
+                log::info!("system sleep: systemd watchdog widened for the suspend and resume")
+            }
+            (SleepTransition::Resumed, SleepOutcome::Sent) => {
+                log::info!("system sleep: systemd watchdog restored")
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `<transition> <outcome>`, written whole by rename so the hook never reads half
+/// of it. Failure is logged and ignored: the hook's wait is bounded, and the
+/// watchdog change itself has already been sent or not by the time this runs.
+fn write_sleep_ack(dir: &Path, transition: SleepTransition, outcome: SleepOutcome) {
+    let word = match transition {
+        SleepTransition::Entering => "pre",
+        SleepTransition::Resumed => "post",
+    };
+    let tmp = dir.join(format!("{SLEEP_HOOK_ACK_FILE}.tmp"));
+    let result = std::fs::write(&tmp, format!("{word} {}\n", outcome.as_ack()))
+        .and_then(|()| std::fs::rename(&tmp, dir.join(SLEEP_HOOK_ACK_FILE)));
+    if let Err(e) = result {
+        log::warn!(
+            "could not acknowledge the sleep hook in {} ({e})",
+            dir.display()
+        );
     }
 }
 
@@ -558,6 +782,287 @@ mod tests {
             (ONE_SHOT_RETRIES, ONE_SHOT_RETRY_GAP)
         );
         assert!(ONE_SHOT_RETRY_GAP * ONE_SHOT_RETRIES <= Duration::from_millis(100));
+    }
+
+    /// [SAFETY] `TS-ap`: a stop that could not be delivered is sent again before
+    /// the restore. The queue is full across the FIRST attempt only — filled with
+    /// pings, which never wait, then read — so only a second attempt can land it.
+    #[test]
+    fn a_lost_disarm_is_sent_again_before_the_restore() {
+        let m = Manager::new();
+        // No retries, so the first attempt fails on the full queue at once; the
+        // production budget would only make the test slower.
+        let n = m.notifier(WATCHDOG).with_one_shot_budget(0, Duration::ZERO);
+        for _ in 0..5_000 {
+            n.watchdog_tick();
+        }
+        assert!(
+            n.ping_failure_logged.load(Ordering::Relaxed),
+            "precondition: the queue really is full"
+        );
+        n.stopping();
+        assert!(
+            !n.disarmed.load(Ordering::Acquire),
+            "precondition: the first disarm was lost to the full queue"
+        );
+        let before = m.drain();
+        assert!(
+            !before.iter().any(|m| m.starts_with("STOPPING")),
+            "precondition: the stop never reached the queue"
+        );
+
+        n.resend_disarm_if_lost();
+        assert_eq!(m.drain(), [STOP_MESSAGE], "the second attempt must land");
+        assert!(n.disarmed.load(Ordering::Acquire));
+
+        n.resend_disarm_if_lost();
+        assert!(m.drain().is_empty(), "a landed disarm is never repeated");
+    }
+
+    /// The retry is a no-op when the first attempt landed, and before any stop.
+    #[test]
+    fn a_disarm_that_landed_is_not_sent_again() {
+        let m = Manager::new();
+        let n = m.notifier(WATCHDOG);
+        n.resend_disarm_if_lost();
+        assert!(m.drain().is_empty(), "nothing to resend before a stop");
+        n.stopping();
+        n.resend_disarm_if_lost();
+        assert_eq!(m.drain(), [STOP_MESSAGE]);
+    }
+
+    /// `TS-ao`: widened to [`SLEEP_WATCHDOG`] for the sleep, back to the unit's own
+    /// value after it.
+    #[test]
+    fn a_sleep_widens_the_watchdog_and_resume_restores_it() {
+        let m = Manager::new();
+        let n = m.notifier(WATCHDOG);
+        assert_eq!(
+            n.sleep_transition(SleepTransition::Entering),
+            SleepOutcome::Sent
+        );
+        assert_eq!(
+            n.sleep_transition(SleepTransition::Resumed),
+            SleepOutcome::Sent
+        );
+        assert_eq!(
+            m.drain(),
+            [
+                format!("WATCHDOG_USEC={}", SLEEP_WATCHDOG.as_micros()),
+                "WATCHDOG_USEC=15000000".to_owned(),
+            ]
+        );
+        assert!(SLEEP_WATCHDOG > WATCHDOG.unwrap());
+    }
+
+    /// A drop-in that already configured a wider watchdog is never narrowed by a
+    /// sleep.
+    #[test]
+    fn a_sleep_never_narrows_a_wider_configured_watchdog() {
+        let m = Manager::new();
+        let wide = SLEEP_WATCHDOG * 3;
+        let n = m.notifier(Some(wide));
+        n.sleep_transition(SleepTransition::Entering);
+        assert_eq!(m.drain(), [format!("WATCHDOG_USEC={}", wide.as_micros())]);
+    }
+
+    /// [SAFETY] Without a configured watchdog a non-zero `WATCHDOG_USEC=` would
+    /// ENABLE one, so nothing is sent.
+    #[test]
+    fn a_sleep_never_enables_a_watchdog_the_unit_did_not_configure() {
+        let m = Manager::new();
+        let n = m.notifier(None);
+        for t in [SleepTransition::Entering, SleepTransition::Resumed] {
+            assert_eq!(n.sleep_transition(t), SleepOutcome::Skipped);
+        }
+        assert!(m.drain().is_empty());
+    }
+
+    /// [SAFETY] Once the stop has disarmed the watchdog, a sleep transition must
+    /// not re-arm it over the hardware restore.
+    #[test]
+    fn a_sleep_after_the_stop_does_not_re_arm_the_watchdog() {
+        let m = Manager::new();
+        let n = m.notifier(WATCHDOG);
+        n.sleep_transition(SleepTransition::Entering);
+        assert_eq!(m.drain().len(), 1, "precondition: transitions are sent");
+        n.stopping();
+        for t in [SleepTransition::Entering, SleepTransition::Resumed] {
+            assert_eq!(n.sleep_transition(t), SleepOutcome::Skipped);
+        }
+        assert_eq!(m.drain(), [STOP_MESSAGE]);
+    }
+
+    /// Poll `m` until `want` has arrived, or fail after 5 s. Returns everything
+    /// read, in order.
+    async fn recv_until(m: &Manager, want: &str) -> Vec<String> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut got = Vec::new();
+        while std::time::Instant::now() < deadline {
+            got.extend(m.drain());
+            if got.iter().any(|g| g == want) {
+                return got;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{want:?} never arrived; got {got:?}");
+    }
+
+    /// Poll the ack file until it reads `want` (it is written just after the
+    /// send), or fail after 5 s.
+    async fn wait_for_ack(ack: &Path, want: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let got = std::fs::read_to_string(ack).unwrap_or_default();
+            if got == want {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ack never read {want:?}; last read {got:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The hook's round trip: each signal is applied and acknowledged in the
+    /// runtime directory, which is what the `pre` hook waits for.
+    #[tokio::test]
+    async fn watch_sleep_applies_and_acknowledges_each_transition() {
+        let m = Manager::new();
+        let ack_dir = tempfile::tempdir().expect("ack dir");
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let task = tokio::spawn(watch_sleep(
+            Arc::new(m.notifier(WATCHDOG)),
+            rx,
+            SLEEP_WATCHDOG,
+            Some(ack_dir.path().to_owned()),
+        ));
+        let ack = ack_dir.path().join(SLEEP_HOOK_ACK_FILE);
+
+        tx.send(SleepTransition::Entering).await.expect("send");
+        recv_until(&m, &format!("WATCHDOG_USEC={}", SLEEP_WATCHDOG.as_micros())).await;
+        wait_for_ack(&ack, "pre sent\n").await;
+
+        tx.send(SleepTransition::Resumed).await.expect("send");
+        recv_until(&m, "WATCHDOG_USEC=15000000").await;
+        wait_for_ack(&ack, "post sent\n").await;
+
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("watch_sleep ends when its channel closes")
+            .expect("task");
+    }
+
+    /// [SAFETY] A widen whose resume signal never comes is narrowed by the daemon
+    /// itself: a missing `post` must not leave detection wide for good.
+    #[tokio::test]
+    async fn a_widen_with_no_resume_is_narrowed_after_the_fallback() {
+        let m = Manager::new();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let _task = tokio::spawn(watch_sleep(
+            Arc::new(m.notifier(WATCHDOG)),
+            rx,
+            Duration::from_millis(100),
+            None,
+        ));
+        tx.send(SleepTransition::Entering).await.expect("send");
+        let got = recv_until(&m, "WATCHDOG_USEC=15000000").await;
+        assert_eq!(
+            got,
+            [
+                format!("WATCHDOG_USEC={}", SLEEP_WATCHDOG.as_micros()),
+                "WATCHDOG_USEC=15000000".to_owned(),
+            ],
+            "widened, then narrowed with no Resumed ever sent"
+        );
+    }
+
+    /// [SAFETY] A widen that fails to send must not cancel the narrowing an
+    /// earlier widen that DID land is owed — or systemd keeps the wide value for
+    /// good. The first widen lands; the second is refused (nothing listening);
+    /// the first one's fallback must still narrow.
+    #[tokio::test]
+    async fn a_failed_widen_keeps_the_narrowing_already_due() {
+        let m = Manager::new();
+        let ack_dir = tempfile::tempdir().expect("ack dir");
+        let ack = ack_dir.path().join(SLEEP_HOOK_ACK_FILE);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let _task = tokio::spawn(watch_sleep(
+            Arc::new(m.notifier(WATCHDOG)),
+            rx,
+            Duration::from_secs(1),
+            Some(ack_dir.path().to_owned()),
+        ));
+        tx.send(SleepTransition::Entering).await.expect("send");
+        recv_until(&m, &format!("WATCHDOG_USEC={}", SLEEP_WATCHDOG.as_micros())).await;
+
+        std::fs::remove_file(&m.path).expect("unbind");
+        tx.send(SleepTransition::Entering).await.expect("send");
+        wait_for_ack(&ack, "pre failed\n").await;
+        let rx2 = UnixDatagram::bind(&m.path).expect("rebind");
+        rx2.set_nonblocking(true).expect("nonblocking");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut buf = [0u8; 64];
+        loop {
+            match rx2.recv(&mut buf) {
+                Ok(k) => {
+                    assert_eq!(&buf[..k], b"WATCHDOG_USEC=15000000");
+                    break;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the failed widen cancelled the narrowing the first one was owed"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => panic!("recv: {e}"),
+            }
+        }
+    }
+
+    /// A restore that could not be delivered is retried until it lands.
+    #[tokio::test]
+    async fn a_lost_restore_is_retried() {
+        let m = Manager::new();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let _task = tokio::spawn(watch_sleep(
+            Arc::new(m.notifier(WATCHDOG)),
+            rx,
+            SLEEP_WATCHDOG,
+            None,
+        ));
+        tx.send(SleepTransition::Entering).await.expect("send");
+        recv_until(&m, &format!("WATCHDOG_USEC={}", SLEEP_WATCHDOG.as_micros())).await;
+
+        // Nothing listening: the restore fails at once rather than waiting.
+        std::fs::remove_file(&m.path).expect("unbind");
+        tx.send(SleepTransition::Resumed).await.expect("send");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let rx2 = UnixDatagram::bind(&m.path).expect("rebind");
+        rx2.set_nonblocking(true).expect("nonblocking");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut buf = [0u8; 64];
+        loop {
+            match rx2.recv(&mut buf) {
+                Ok(k) => {
+                    assert_eq!(&buf[..k], b"WATCHDOG_USEC=15000000");
+                    break;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the lost restore was never retried"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => panic!("recv: {e}"),
+            }
+        }
     }
 
     #[test]

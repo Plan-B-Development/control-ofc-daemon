@@ -4,6 +4,27 @@
 
 ### Fixed
 
+**A slow resume from suspend no longer restarts the daemon** (`TS-ao`, DEC-396).
+The service watchdog keeps counting while the machine's devices suspend and
+resume, a stretch in which the daemon is frozen and cannot check in. On hardware
+where that took more than about ten seconds, systemd could restart the daemon
+just as the machine woke. The package now installs a systemd sleep hook,
+`/usr/lib/systemd/system-sleep/control-ofc-daemon`. Before each suspend or
+hibernate it asks the daemon to widen its watchdog to 120 seconds, and after resume
+it puts the normal 15 seconds back. If the resume call never comes, the daemon
+narrows the watchdog again by itself after 120 seconds. The hook only ever signals
+the running daemon, and never stops the machine from sleeping. A `WatchdogSec`
+drop-in is no longer needed for this, and a wider one you already set is kept.
+
+**A missed stop notice is sent again before the shutdown restore** (`TS-ap`,
+DEC-396). When the daemon stops, it tells systemd to stand its watchdog down so the
+fan hand-back can take as long as it needs. If systemd was too busy to take that
+message, the watchdog stayed armed, and a slow hand-back could be interrupted
+part-way through. The daemon now sends the message a second time just before the
+hand-back, after the rest of the shutdown has given systemd time to catch up. It
+can still be too late in one rare case: systemd was busy when the stop began, and
+several parts of the shutdown each ran out their full time limit.
+
 **A fan diagnostic now refuses on the same stale temperature the thermal
 safety rule stops trusting** (`TS-aj`, DEC-395). The hwmon verify, PWM
 characterisation, control-path discovery and OpenFan calibration refuse to start

@@ -46,14 +46,20 @@ NotifyAccess=main
 # 15 s is three times that. (DEC-259's ~10 s figure is how long a degraded serial
 # WRITE can take; the tick no longer waits for it.) Suspend is not entirely free:
 # the clock is CLOCK_MONOTONIC, which does not advance during the sleep itself, but
-# user space is frozen while devices suspend and resume and that stretch DOES count
-# — so a machine whose device suspend + resume exceeds ~10 s can have the daemon
-# restarted as it resumes (TS-ao; widen WatchdogSec in a drop-in on such a box).
+# user space is frozen while devices suspend and resume and that stretch DOES count.
+# So the package's system-sleep hook (/usr/lib/systemd/system-sleep/
+# control-ofc-daemon, DEC-396, TS-ao) signals the daemon before each sleep, and the
+# daemon widens this watchdog to 120 s (WATCHDOG_USEC=) until the hook's resume
+# call — or until 120 s have passed without one — then puts 15 s back. A machine
+# whose device suspend + resume exceeds even that can still widen WatchdogSec in a
+# drop-in; the sleep window never narrows a wider configured value.
 #
 # While stopping, the daemon disarms the watchdog itself — STOPPING=1 with
 # WATCHDOG_USEC=0 — because systemd re-arms it on any keep-alive whatever the
 # unit's state, and a late tick would otherwise arm a fresh 15 s over the
-# hardware restore below.
+# hardware restore below. A disarm that systemd's full queue refused is sent
+# again just before that restore (TS-ap, DEC-396), and no sleep-window widen is
+# ever sent after it.
 WatchdogSec=15
 # DEC-388 (TS-al, the user's choice): a watchdog timeout asks for a GRACEFUL stop
 # rather than aborting. Only the in-process stop can apply the exit floor to the

@@ -483,10 +483,19 @@ gating each have their own register rows and regression tests.
     by progress rather than by how many serial devices the machine has.
     `STOPPING=1` with `WATCHDOG_USEC=0` opens every shutdown, because systemd
     re-arms its watchdog on any keep-alive whatever the unit's state, and a late
-    tick would otherwise arm a fresh timer over the hardware restore. One limit:
-    user space is frozen while devices suspend and resume, and that stretch counts
-    against the watchdog, so hardware whose device suspend and resume exceed ~10 s
-    can see the daemon restarted at resume (`TS-ao`).
+    tick would otherwise arm a fresh timer over the hardware restore; if systemd's
+    queue refused that disarm, it is sent again just before the restore (`TS-ap`,
+    DEC-396). System sleep (`TS-ao`, DEC-396): user space is frozen while devices
+    suspend and resume, and that stretch counts against the watchdog, so the
+    package's `system-sleep` hook sends `SIGUSR1` before a sleep and `SIGUSR2`
+    after it. The daemon answers the first with `WATCHDOG_USEC=` widened to
+    `max(configured, 120 s)` and acknowledges in `/run/control-ofc/sleep-hook.ack`
+    (the hook holds the sleep until it does, for at most 2 s), and the second by
+    putting the configured value back — or does that itself 120 s after the widen
+    if no resume signal arrives. The hook signals only the PID the daemon wrote to
+    `/run/control-ofc/sleep-hook.pid` once its handlers were live, and only while
+    systemd reports it as the unit's MainPID, because `SIGUSR1`'s default action
+    would kill a daemon that cannot handle it. No widen is sent once stopping.
 
 11. **Exit floor** (`main.rs::apply_exit_floor`, DEC-388, `TS-j`/`TS-y`): on a
     clean stop, every output the daemon cannot give back to firmware is left at

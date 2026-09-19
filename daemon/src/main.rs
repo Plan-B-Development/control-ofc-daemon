@@ -1244,14 +1244,7 @@ fn restore_panic_targets(targets: &'static PanicRestoreTargets, timeout: Duratio
 /// daemon still gives headers back itself on every exit it survives — only the
 /// crash backstop is lost, and the log says so once, here.
 fn keep_handback_record(ledger: &Arc<HandBackLedger>) {
-    let dir = std::env::var_os("RUNTIME_DIRECTORY")
-        .and_then(|v| {
-            // systemd separates several directories with ':'; this unit has one.
-            v.to_str()
-                .and_then(|s| s.split(':').next())
-                .map(PathBuf::from)
-        })
-        .unwrap_or_else(|| PathBuf::from("/run/control-ofc"));
+    let dir = runtime_dir();
     if dir.is_dir() {
         ledger.set_record_path(dir.join(handback::RECORD_FILE_NAME));
     } else {
@@ -1260,6 +1253,84 @@ fn keep_handback_record(ledger: &Arc<HandBackLedger>) {
              after a crash ExecStopPost cannot give back the headers the daemon holds",
             dir.display()
         );
+    }
+}
+
+/// The unit's runtime directory: `$RUNTIME_DIRECTORY`, which systemd sets for
+/// `RuntimeDirectory=control-ofc`, or the same literal for a daemon run by hand.
+fn runtime_dir() -> PathBuf {
+    std::env::var_os("RUNTIME_DIRECTORY")
+        .and_then(|v| {
+            // systemd separates several directories with ':'; this unit has one.
+            v.to_str()
+                .and_then(|s| s.split(':').next())
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(|| PathBuf::from("/run/control-ofc"))
+}
+
+/// Answer the `system-sleep` hook (`TS-ao`, DEC-396): `SIGUSR1` before a sleep,
+/// `SIGUSR2` after it, each turned into a [`SleepTransition`] for
+/// `sd_notify::watch_sleep`, which widens and restores the watchdog.
+///
+/// Only once both handlers are registered is the PID file written, and the hook
+/// signals only a PID that file names — `SIGUSR1`'s default action terminates the
+/// process, so a daemon that cannot handle it (an older one still running after
+/// an upgrade, or this one mid-start) must never receive it. Registration is
+/// fail-soft like SIGHUP's: without it the hook finds no file and does nothing,
+/// which is the pre-DEC-396 behaviour.
+fn start_sleep_watch(notifier: &Arc<control_ofc_daemon::sd_notify::Notifier>) {
+    use control_ofc_daemon::sd_notify::{self, SleepTransition};
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let (usr1, usr2) = match (
+        signal(SignalKind::user_defined1()),
+        signal(SignalKind::user_defined2()),
+    ) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => {
+            log::warn!(
+                "could not register the sleep hook's signals ({e}); the watchdog will not \
+                 be widened across a system sleep"
+            );
+            return;
+        }
+    };
+    let dir = runtime_dir();
+    let (tx, rx) = tokio::sync::mpsc::channel::<SleepTransition>(4);
+    tokio::spawn(forward_sleep_signals(usr1, usr2, tx));
+    tokio::spawn(sd_notify::watch_sleep(
+        Arc::clone(notifier),
+        rx,
+        sd_notify::SLEEP_WATCHDOG,
+        Some(dir.clone()),
+    ));
+    let pid_file = dir.join(sd_notify::SLEEP_HOOK_PID_FILE);
+    if let Err(e) = std::fs::write(&pid_file, format!("{}\n", std::process::id())) {
+        log::warn!(
+            "could not write {} ({e}); the sleep hook will not widen the watchdog",
+            pid_file.display()
+        );
+    }
+}
+
+/// Turn the sleep hook's two signals into transitions, in arrival order. Ends
+/// when `watch_sleep` has gone, or when both signal streams have.
+async fn forward_sleep_signals(
+    mut usr1: tokio::signal::unix::Signal,
+    mut usr2: tokio::signal::unix::Signal,
+    tx: tokio::sync::mpsc::Sender<control_ofc_daemon::sd_notify::SleepTransition>,
+) {
+    use control_ofc_daemon::sd_notify::SleepTransition;
+    loop {
+        let transition = tokio::select! {
+            Some(()) = usr1.recv() => SleepTransition::Entering,
+            Some(()) = usr2.recv() => SleepTransition::Resumed,
+            else => return,
+        };
+        if tx.send(transition).await.is_err() {
+            return;
+        }
     }
 }
 
@@ -1477,7 +1548,17 @@ async fn finish_shutdown<F>(
         server_handle,
         task_handles,
         task_timeout,
-        restore_hardware,
+        move || {
+            // [SAFETY] `TS-ap`: if the disarm above never reached systemd, the
+            // last keep-alive's deadline is still armed — send it again now, as
+            // late as possible before the restore it protects. The drains in
+            // between give a briefly full queue time to be read. A no-op when the
+            // first one landed.
+            if let Some(n) = notifier {
+                n.resend_disarm_if_lost();
+            }
+            restore_hardware();
+        },
     )
     .await;
 
@@ -2445,6 +2526,13 @@ async fn async_main() {
                 None
             }
         };
+
+        // TS-ao (DEC-396): the sleep hook's signals, before READY=1 so an active
+        // unit always answers them. Only under systemd — the hook reaches the
+        // daemon through the unit's MainPID and runtime directory.
+        if let Some(n) = &notifier {
+            start_sleep_watch(n);
+        }
 
         // DEC-387 (`TS-d`): start-up is complete — the engine is ticking, the API
         // is serving, and SIGTERM now reaches the graceful path. systemd holds
@@ -3680,6 +3768,108 @@ mod tests {
         );
     }
 
+    /// [SAFETY] `TS-ap`, at the call site: a disarm lost to a queue that was full
+    /// when the stop began is delivered before the restore runs. The queue is
+    /// read by a task that waits for the shutdown watch — which `shutdown_sequence`
+    /// sets AFTER `stopping` — so it is full across the first attempt only, and
+    /// only the resend inside `finish_shutdown` can land the disarm in time.
+    #[tokio::test]
+    async fn a_lost_disarm_is_resent_before_the_hardware_restore() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("notify");
+        let rx = std::os::unix::net::UnixDatagram::bind(&path).expect("bind the fake socket");
+        rx.set_nonblocking(true).expect("nonblocking receiver");
+        let notifier = control_ofc_daemon::sd_notify::Notifier::new(
+            path.to_str().expect("utf-8 path"),
+            Some(Duration::from_secs(15)),
+        )
+        .expect("notifier");
+        for _ in 0..5_000 {
+            notifier.watchdog_tick();
+        }
+
+        let (poll_tx, mut poll_rx) = tokio::sync::watch::channel(false);
+        let (server_tx, server_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_handle = tokio::spawn(async move {
+            let _ = server_rx.await;
+        });
+        let rx = Arc::new(rx);
+        let drained: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let drainer = {
+            let rx = Arc::clone(&rx);
+            let drained = Arc::clone(&drained);
+            tokio::spawn(async move {
+                let _ = poll_rx.wait_for(|stop| *stop).await;
+                let mut buf = [0u8; 64];
+                while let Ok(n) = rx.recv(&mut buf) {
+                    drained
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                }
+            })
+        };
+        let at_restore: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let seen = at_restore.clone();
+        finish_shutdown(
+            Some(&notifier),
+            &poll_tx,
+            server_tx,
+            server_handle,
+            vec![("drainer", drainer)],
+            Duration::from_secs(3),
+            false,
+            move || {
+                let mut buf = [0u8; 64];
+                let got = rx.recv(&mut buf).map_or_else(
+                    |e| format!("<nothing: {e}>"),
+                    |n| String::from_utf8_lossy(&buf[..n]).into_owned(),
+                );
+                *seen.lock().unwrap() = Some(got);
+            },
+        )
+        .await;
+
+        assert!(
+            !drained
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| m.starts_with("STOPPING")),
+            "precondition: the first disarm was lost to the full queue"
+        );
+        assert_eq!(
+            at_restore.lock().unwrap().as_deref(),
+            Some("STOPPING=1\nWATCHDOG_USEC=0"),
+            "the disarm must be sent again, and land, before the restore runs"
+        );
+    }
+
+    /// `TS-ao`: the hook's two signals reach `watch_sleep` as the two transitions.
+    /// Raised for real, so a swapped or dropped arm fails here.
+    #[tokio::test]
+    async fn the_sleep_hook_signals_become_sleep_transitions() {
+        use control_ofc_daemon::sd_notify::SleepTransition;
+        use tokio::signal::unix::{signal, SignalKind};
+        let usr1 = signal(SignalKind::user_defined1()).expect("SIGUSR1 must be registerable");
+        let usr2 = signal(SignalKind::user_defined2()).expect("SIGUSR2 must be registerable");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let task = tokio::spawn(forward_sleep_signals(usr1, usr2, tx));
+
+        for (sig, want) in [
+            (libc::SIGUSR1, SleepTransition::Entering),
+            (libc::SIGUSR2, SleepTransition::Resumed),
+        ] {
+            // SAFETY: raising a signal whose handler tokio installed above.
+            unsafe { libc::raise(sig) };
+            let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a transition within 5 s");
+            assert_eq!(got, Some(want));
+        }
+        task.abort();
+    }
+
     /// The CALL SITES of both DEC-387 start-up rules, which no in-process test
     /// can reach: `async_main` is never run by the suite. Same tool and reasoning
     /// as `the_shutdown_restore_goes_through_the_bounded_helper`.
@@ -3711,6 +3901,7 @@ mod tests {
             "profile_engine::profile_engine_loop(",
             "server::serve(",
             "SignalKind::terminate()",
+            "start_sleep_watch(n);",
         ] {
             assert!(
                 at(before) < ready,
