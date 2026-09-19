@@ -314,6 +314,8 @@ impl OverrideTable {
     /// *physical fan* (`openfan:ch00`, `hwmon:…`, `amd_gpu:…`) and
     /// profile-independent — it must survive a profile switch and auto-restore
     /// on its own deadman.
+    /// The one exception is [`Self::release_identify_stops`], which activation
+    /// calls for a stop on a header the new profile names a pump (DEC-394).
     pub fn clear_all_overrides(&mut self) {
         self.controls.clear();
     }
@@ -348,6 +350,37 @@ impl OverrideTable {
     /// Restore a fan immediately (remove the identify hold). Idempotent.
     pub fn identify_restore(&mut self, fan_id: &str) {
         self.identify.remove(fan_id);
+    }
+
+    /// [SAFETY] TS-af / DEC-394: release every live identify **stop** on a fan in
+    /// `fan_ids`, returning the released ids.
+    ///
+    /// Called by profile activation with the new profile's pump-named members.
+    /// A stop's `0` was chosen from the evidence in force when it was taken, so
+    /// a header stopped while no profile named it a pump would otherwise stay at
+    /// `0` after one began protecting it, until the deadman fired — the
+    /// activation twin of the case `update_header_role_handler` closes for a
+    /// `pump` assignment (DEC-311). Releasing restores curve control on the
+    /// engine's next tick.
+    ///
+    /// A [`IdentifyMode::PumpPerturb`] hold is left alone: its target is
+    /// already at or above the pump floor, so it protects the header, and
+    /// dropping it would cancel an identify the user is listening to for no
+    /// safety gain.
+    pub fn release_identify_stops(
+        &mut self,
+        fan_ids: &std::collections::HashSet<String>,
+    ) -> Vec<String> {
+        let mut released = Vec::new();
+        self.identify.retain(|id, e| {
+            let release = e.mode == IdentifyMode::Stop && fan_ids.contains(id);
+            if release {
+                released.push(id.clone());
+            }
+            !release
+        });
+        released.sort();
+        released
     }
 
     /// Drop every entry whose deadman has fired, judged on the daemon's clock.
@@ -456,6 +489,28 @@ mod tests {
 
     fn ttl() -> Duration {
         Duration::from_secs(15)
+    }
+
+    /// TS-af / DEC-394: only a STOP on a listed fan is released. A perturbation
+    /// on a listed fan and a stop on an unlisted one both survive — without
+    /// either arm a predicate stuck at "release everything" would pass.
+    #[test]
+    fn release_identify_stops_takes_only_listed_stops() {
+        let mut t = OverrideTable::new();
+        t.identify_hold("pump-stopped", 0, IdentifyMode::Stop, ttl());
+        t.identify_hold("pump-perturbed", 85, IdentifyMode::PumpPerturb, ttl());
+        t.identify_hold("fan-stopped", 0, IdentifyMode::Stop, ttl());
+        let listed: std::collections::HashSet<String> = ["pump-stopped", "pump-perturbed"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        assert_eq!(t.release_identify_stops(&listed), vec!["pump-stopped"]);
+        let held = t.snapshot().identify;
+        assert!(!held.contains_key("pump-stopped"));
+        assert_eq!(held.get("pump-perturbed"), Some(&85));
+        assert_eq!(held.get("fan-stopped"), Some(&0));
+        assert!(t.release_identify_stops(&listed).is_empty(), "idempotent");
     }
 
     #[test]

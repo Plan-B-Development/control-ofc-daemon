@@ -26,6 +26,16 @@ the old duty while every other skipped channel already dropped to the floor. All
 them now get the floor, which for that one channel can be lower than before, and it
 stays there while the control is skipped.
 
+**Activating a profile that treats a header as a pump now ends an identify stop
+on it** (`TS-af`, DEC-394). If you had stopped a fan with identify while no
+profile called it a pump, and then activated a profile that does — for example
+one whose member for that header is labelled "Pump" — the header stayed stopped
+until identify timed out (up to 15 s). It now resumes under the new profile at
+once, the same as when you assign the header the pump role. An identify that is
+nudging a pump rather than stopping it is left running. A narrow timing window
+in which an identify arriving at the same moment as an activation could still
+stop the newly-protected pump is closed too.
+
 ## [2.51.0] — 2026-09-19
 
 ### Fixed

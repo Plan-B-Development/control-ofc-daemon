@@ -1678,6 +1678,187 @@ mod tests {
         assert_eq!(body["identify_pwm_percent"], 0);
     }
 
+    // ── TS-af / DEC-394: activation releases a stop the new profile protects ──
+
+    /// Point the process-wide state dir at a temp dir. Activation persists
+    /// `daemon_state.json` there, and the default is `/var/lib/control-ofc` —
+    /// the installed daemon's own file, which a root `cargo test` would
+    /// otherwise overwrite with a profile id from a deleted temp dir.
+    /// `init_state_dir` is a `OnceLock`, so the first caller wins; the
+    /// integration binaries redirect it the same way (`ipc_temp_state_dir`).
+    fn temp_state_dir() {
+        static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        DIR.get_or_init(|| {
+            let d = tempfile::tempdir().unwrap();
+            crate::daemon_state::init_state_dir(d.path().to_str().unwrap());
+            d
+        });
+    }
+
+    /// Activate `profile` through the real handler, from a search dir holding
+    /// only it. Returns the dir so it outlives the call.
+    async fn activate(
+        state: &Arc<AppState>,
+        mut profile: crate::profile::DaemonProfile,
+    ) -> tempfile::TempDir {
+        temp_state_dir();
+        // A pump-named member must carry the pump floor, or `validate()`
+        // rejects the profile with FLOOR_TOO_LOW before the swap is reached.
+        profile.controls[0].minimum_pct = crate::profile::HARD_PUMP_CPU_FLOOR_PCT;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("p.json"),
+            serde_json::to_string(&profile).unwrap(),
+        )
+        .unwrap();
+        *state.profile_search_dirs.write() = vec![dir.path().to_path_buf()];
+        let (status, Json(body)) = crate::api::handlers::activate_profile_handler(
+            axum::extract::State(state.clone()),
+            Json(serde_json::json!({ "profile_id": "p" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        dir
+    }
+
+    /// [SAFETY] TS-af: a header stopped while no profile named it a pump is
+    /// released when a profile that names it one is activated — through the
+    /// handler, so the WIRING is tested and not just `release_identify_stops`.
+    ///
+    /// Presence before absence: the stop is asserted live at 0 first, and the
+    /// released header is asserted protected afterwards, so the check cannot
+    /// pass on a hold that never existed or a profile that never named it.
+    #[tokio::test]
+    async fn activating_a_profile_that_names_a_pump_releases_its_identify_stop() {
+        let (state, _writes, _tx) = unlabelled_header_state();
+        let body = identify_stop(&state).await;
+        assert_eq!(
+            body["mode"], "stop",
+            "precondition: no evidence yet: {body}"
+        );
+        assert_eq!(
+            state
+                .override_table
+                .lock()
+                .snapshot()
+                .identify
+                .get(PROFILED),
+            Some(&0),
+            "precondition: the header must actually be held at 0"
+        );
+
+        let _dir = activate(&state, profile_naming("Pump")).await;
+
+        assert!(
+            state.header_is_pump_protected(PROFILED),
+            "precondition: the activated profile protects the header"
+        );
+        assert!(
+            !state
+                .override_table
+                .lock()
+                .snapshot()
+                .identify
+                .contains_key(PROFILED),
+            "activation left a now-protected pump pinned at 0 by an identify stop"
+        );
+    }
+
+    /// The opposite branches: a profile that does NOT name the header leaves the
+    /// stop alone (identify stays profile-independent, DEC-189), and a pump
+    /// PERTURBATION survives an activation that names it — it already sits at
+    /// or above the floor, so releasing it would only cancel the identify.
+    #[tokio::test]
+    async fn activation_keeps_holds_it_has_no_reason_to_release() {
+        let (state, _writes, _tx) = unlabelled_header_state();
+        identify_stop(&state).await;
+        let _dir = activate(&state, profile_naming("Rear Fan")).await;
+        assert_eq!(
+            state
+                .override_table
+                .lock()
+                .snapshot()
+                .identify
+                .get(PROFILED),
+            Some(&0),
+            "a profile with no pump claim on the header released its stop"
+        );
+
+        let (state, _writes, _tx) = unlabelled_header_state();
+        *state.active_profile.lock() = Some(profile_naming("Pump"));
+        let body = identify_stop(&state).await;
+        assert_eq!(body["mode"], "pump_perturb", "precondition: {body}");
+        let held = body["identify_pwm_percent"].as_u64().unwrap() as u8;
+        let _dir = activate(&state, profile_naming("Pump")).await;
+        assert_eq!(
+            state
+                .override_table
+                .lock()
+                .snapshot()
+                .identify
+                .get(PROFILED),
+            Some(&held),
+            "activation cancelled a pump perturbation it had no reason to touch"
+        );
+    }
+
+    /// [SAFETY] TS-af: identify decides AND inserts under one `active_profile`
+    /// guard. Releasing on activation is only sound if this holds — otherwise an
+    /// activation between identify's profile read and its insert finds no hold
+    /// to release, and the insert then pins a now-protected pump at 0.
+    ///
+    /// The observable: with the test holding `override_table`, an identify parks
+    /// on it at the insert — and must be holding `active_profile` while it does.
+    /// Pre-fix it read the profile in a critical section of its own and parked
+    /// with nothing held, which goes red by one of two routes, and both name the
+    /// defect: the guard is never seen held before the deadline, or it is seen
+    /// only in passing and `try_lock_for` then takes it. Which route fires
+    /// depends on catching a hold that lasts microseconds, so neither message
+    /// may blame the harness (DEC-348). A genuine fixture fault — identify
+    /// returning before it reaches the insert, e.g. a 404 — has its own
+    /// message, because it cannot park at all.
+    #[test]
+    fn identify_holds_the_profile_guard_across_its_insert() {
+        let (state, _writes, _tx) = unlabelled_header_state();
+        let table = state.override_table.lock();
+
+        let st = state.clone();
+        let identify = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(identify_stop(&st))
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut seen_held = false;
+        while std::time::Instant::now() < deadline {
+            if state.active_profile.is_locked() {
+                seen_held = true;
+                break;
+            }
+            assert!(
+                !identify.is_finished(),
+                "fixture fault: identify returned before reaching its insert"
+            );
+            std::thread::yield_now();
+        }
+        let raced = !seen_held
+            || state
+                .active_profile
+                .try_lock_for(std::time::Duration::from_secs(2))
+                .is_some();
+        drop(table);
+        let body = identify.join().unwrap();
+        assert!(
+            !raced,
+            "identify waits on its insert without holding `active_profile` \
+             (seen held: {seen_held}) — an activation can land between the pump \
+             decision and the hold"
+        );
+        assert_eq!(body["mode"], "stop", "{body}");
+    }
+
     /// [SAFETY] DEC-322's invariant with the new term: every endpoint that
     /// publishes a header publishes `stop_permitted == !header_is_pump_protected`
     /// — for `/hwmon/headers` and `/inventory/hwmon` both, which hold the

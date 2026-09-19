@@ -899,7 +899,7 @@ that run. Thermal safety never depended on this — the forced-duty branch runs 
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST/PUT/DELETE | `/profiles`, `/profiles/{id}` | Profile CRUD + `?validate_only` — daemon is the store of record (DEC-160) |
-| POST | `/profile/activate` | Switch active profile by id or path; clears all active control-overrides, not identify holds (DEC-189) |
+| POST | `/profile/activate` | Switch active profile by id or path; clears all active control-overrides, not identify holds (DEC-189) — except an identify stop on a header the new profile names a pump, which is released (DEC-394) |
 | POST | `/profile/deactivate` | Clear active profile (DEC-097); also clears all active control-overrides, not identify holds (DEC-218, ≥ 2.12.0); idempotent |
 | POST | `/control/{control_id}/override` (+`/override/renew`, `DELETE`) | Expiring manual override — floor-clamped, deadman, monotonic fencing (DEC-163); cleared on profile activation/deactivation (DEC-189/DEC-218) |
 | POST | `/config/profile-search-dirs` | Edit the profile search path: `{"add": [...]}` and/or `{"remove": [...]}`, at least one required. Removals apply before additions, so `add`+`remove` is one atomic "move" (DEC-285, `remove` is ≥ 2.23.0 and gated by `control.profile_search_dir_remove`). `/etc/control-ofc/profiles` and the last remaining entry cannot be removed. Applies live; persists to `runtime.toml`; 503 `persistence_failed` on write error |

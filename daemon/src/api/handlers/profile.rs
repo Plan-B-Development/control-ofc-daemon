@@ -134,6 +134,9 @@ pub async fn activate_profile_handler(
 
     let profile_name = profile.name.clone();
     let profile_id = profile.id.clone();
+    // TS-af / DEC-394: the headers this profile names as pumps, computed from the
+    // owned profile before the swap moves it — a pure read, no lock needed.
+    let pump_ids = super::pump_header_ids(&profile);
 
     // Apply. Everything in this block runs under the `active_profile` lock so
     // the swap and the dependent state resets are observed atomically by the
@@ -142,7 +145,7 @@ pub async fn activate_profile_handler(
     // engine never holds those inner locks while waiting on `active_profile`
     // (it releases `override_table` before `profile.lock()`), so there is no
     // inversion (DEC-189).
-    {
+    let released_stops = {
         let mut guard = state.active_profile.lock();
         *guard = Some(profile);
         // DEC-188: re-anchor the engine even on a same-id re-activation (the
@@ -163,13 +166,35 @@ pub async fn activate_profile_handler(
         // profile-independent, so they are left intact. The engine resets the
         // cleared controls' cross-tick state on its next tick via the epoch
         // path above.
-        state.override_table.lock().clear_all_overrides();
+        //
+        // [SAFETY] TS-af / DEC-394 — the one exception. An identify STOP on a
+        // header this profile names as a pump is released: the stop's 0 was
+        // chosen before the profile existed to protect it, and would otherwise
+        // hold a now-protected pump stopped until its deadman fired. This is the
+        // activation twin of the release `update_header_role_handler` performs
+        // for a `pump` assignment (DEC-311). Done under this guard because
+        // `fan_identify_handler` decides and inserts under it too, so an identify
+        // serialises fully before this release — and is released — or fully
+        // after — and sees this profile's pump term. A pump perturbation is kept:
+        // it is already at or above the floor.
+        let released = {
+            let mut table = state.override_table.lock();
+            table.clear_all_overrides();
+            table.release_identify_stops(&pump_ids)
+        };
         // DEC-165 / audit P3-4: a freshly-activated profile takes control of
         // all its members, so clear any GPU fans previously relinquished to
         // firmware-auto via reset. Done inside the `active_profile` lock so the
         // engine cannot evaluate the new profile and skip a still-relinquished
         // GPU fan for one tick (the clear used to run after the lock dropped).
         state.cache.clear_relinquished_gpu_fans();
+        released
+    };
+    // Logged after the guard drops — nothing but the swap runs under it.
+    for fan_id in &released_stops {
+        log::info!(
+            "Fan identify: released the stop on {fan_id} — the activated profile names it a pump"
+        );
     }
 
     // Persist

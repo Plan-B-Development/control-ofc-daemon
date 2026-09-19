@@ -746,7 +746,7 @@ impl AppState {
     /// and the inventory handler take those two in the opposite order, so
     /// holding both here would complete an ABBA cycle with the 1 Hz engine in
     /// the middle of it.
-    fn header_role_parts(
+    pub(crate) fn header_role_parts(
         &self,
         header_id: &str,
     ) -> (
@@ -785,14 +785,7 @@ impl AppState {
         self.active_profile
             .lock()
             .as_ref()
-            .map(|p| {
-                p.controls
-                    .iter()
-                    .flat_map(|c| &c.members)
-                    .filter(|m| crate::profile::member_label_names_pump(m))
-                    .map(|m| m.member_id.clone())
-                    .collect()
-            })
+            .map(pump_header_ids)
             .unwrap_or_default()
     }
 
@@ -835,6 +828,26 @@ impl AppState {
         // holding the controller lock must call that directly instead.
         crate::hwmon::roles::is_pump_protected(assigned, inferred, profile_names_pump)
     }
+}
+
+/// Header ids `profile` names as pumps: every member whose label satisfies
+/// [`crate::profile::member_label_names_pump`] (TS-h, DEC-384).
+///
+/// The one definition of the profile term of the pump union, over a profile the
+/// caller already holds. [`AppState::profile_pump_header_ids`] wraps it for a
+/// caller that holds nothing; `fan_identify_handler` and activation call it
+/// directly, because each needs the answer and its own write under ONE
+/// `active_profile` guard (TS-af, DEC-394).
+pub(crate) fn pump_header_ids(
+    profile: &crate::profile::DaemonProfile,
+) -> std::collections::HashSet<String> {
+    profile
+        .controls
+        .iter()
+        .flat_map(|c| &c.members)
+        .filter(|m| crate::profile::member_label_names_pump(m))
+        .map(|m| m.member_id.clone())
+        .collect()
 }
 
 /// RAII guard that clears the profile engine's verify pause on drop (DEC-165),
