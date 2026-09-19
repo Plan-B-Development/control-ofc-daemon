@@ -42,10 +42,13 @@ const PLAUSIBLE_MIN_C: f64 = -50.0;
 /// reachable — an ASUS NCT6776F `CPUTIN`, which is frequently unconnected and
 /// reports a plausible-looking constant — but it did so **at classification,
 /// not here**: that sensor is no longer a `CpuTemp`, so it never reaches the
-/// ladder. The general class is untouched and remains `AUD-x` in
-/// `DECISIONS_OPEN_ITEMS.md`; closing it needs a change to the ladder itself
-/// (bounding how long a latch may persist without a release-eligible reading),
-/// which was considered and deliberately deferred.
+/// ladder. The general class is an accepted posture, not an open gap (`TS-s`,
+/// DEC-400, the user's decision). The ladder does not bound its latch: it has
+/// no plausibility gate, no maximum latch time and no sibling cross-check,
+/// because a safety function that has tripped stays tripped until its reset
+/// (IEC 61511-1 11.2.7). Here the reset is a fresh reading at or below release.
+/// A stuck reading therefore fails loud, at 100 %. The remedy for a sensor
+/// known to do that is at classification, as DEC-294's was.
 const PLAUSIBLE_MAX_C: f64 = 250.0;
 
 /// Read a temperature value from a `temp*_input` sysfs file.

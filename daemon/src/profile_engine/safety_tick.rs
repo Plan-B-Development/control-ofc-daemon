@@ -27,9 +27,11 @@
 //! dropped it to the 40 % no-sensor floor; a stale sensor already held), and
 //! release hands control straight back — the two-tick 60 % recovery rung is gone.
 //!
-//! `TS-s` stays a row of this table rather than a problem it solves: a latched
-//! emergency releases only on a fresh reading at or below release, however long
-//! it is held, and a spurious reading above the trigger keeps it latched.
+//! `TS-s` is a row of this table by decision, not an omission (DEC-400): a
+//! latched emergency releases only on a fresh reading at or below release,
+//! however long it is held, and a spurious reading above the trigger keeps it
+//! latched. The user chose that over a bounded latch, following IEC 61511-1
+//! 11.2.7: a safety function that has tripped stays tripped until its reset.
 
 use super::*;
 

@@ -335,6 +335,13 @@ gating each have their own register rows and regression tests.
      for two 1 Hz ticks, which was thermally meaningless). Every other output the
      emergency took is given back at the release — an hwmon header to its
      recorded mode, an OpenFan channel to its pre-emergency duty (DEC-382)
+   - One fresh reading at or above the trip point is enough to latch, and a
+     sensor stuck in [trip point, 250C] keeps the latch for as long as it keeps
+     reporting that. There is no plausibility gate, maximum latch time or sibling
+     cross-check, by decision (`TS-s`, DEC-400): a safety function that has
+     tripped stays tripped until its reset (IEC 61511-1 11.2.7). A stuck sensor
+     fails loud, at 100%; the remedy for a known one is at classification, as
+     DEC-294's vendor-gated CPUTIN demotion is
    - A latched emergency whose CPU sensor goes stale OR vanishes holds 100%
      until that fresh reading — losing sight of a sensor must never lower an
      already-forced safety output (DEC-269; DEC-386 retired DEC-190's 40% for a

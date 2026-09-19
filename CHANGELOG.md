@@ -82,6 +82,16 @@ the same at every poll interval. At the default poll a diagnostic therefore refu
 a few seconds sooner when reads fail, and the preflight's `temperature_source` line
 names the limit actually applied.
 
+### Documentation
+
+**A faulty CPU sensor stuck at or above the emergency limit keeps the emergency
+on, by design** (`TS-s`, DEC-400). One reading at the limit starts it, and it
+holds until that sensor reads a fresh value at or below 80°C. The daemon never
+decides afterwards that the reading was wrong, following the industrial safety
+standard IEC 61511 (a safety action that has fired stays in force until its
+reset). The user guide now says so, and says what to do when fans stay at full
+speed on a cool machine. Nothing about the behaviour changed.
+
 ## [2.51.1] — 2026-09-19
 
 ### Fixed
