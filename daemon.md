@@ -352,7 +352,8 @@ gating each have their own register rows and regression tests.
      firmware, and with no profile nothing is forced) — unless the last stale
      reading was at or above release, when curves keep running on it (DEC-269). A
      control skipped that tick keeps its fans at their last duty under the floor
-     (DEC-386, `TS-p`)
+     (DEC-386, `TS-p`); an OpenFan channel whose duty a reconnect or resume lost
+     goes to 100% instead, and any other unknown duty gets the bare floor (DEC-401)
    - Override state is surfaced as `thermal_state` in `GET /status`
      (`normal` | `emergency` | `no_sensor_fallback`, DEC-132; `recovery` was
      emitted before DEC-386)

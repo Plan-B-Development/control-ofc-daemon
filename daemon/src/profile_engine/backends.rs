@@ -471,7 +471,8 @@ pub(crate) enum ForceReach<'a> {
         /// its control skipped, and the no-sensor floor then wrote a bare 40 % to
         /// fans the curve had been running at, say, 85 %. A member whose last
         /// duty is unknown (never written, handed back, a failed reply) gets the
-        /// bare floor, as before.
+        /// bare floor, as before — except an OpenFan channel whose duty a
+        /// reconnect or resume lost, which gets full speed (DEC-401).
         held: &'a HeldMembers,
     },
 }
@@ -1230,10 +1231,11 @@ impl SafetyWriteBackend for OpenFanBackend {
         };
         // `TS-p`: the channels of controls skipped this tick hold their last
         // duty under the floor. Read per channel under the lock the write takes.
-        // A channel whose duty is unknown — never written, a failed reply, or
-        // lost to a reconnect or resume (`TS-ak`) — gets the bare floor
-        // (DEC-386 decision 4); whether it should get full speed instead is
-        // `TS-av`.
+        // [SAFETY] DEC-401 (`TS-av`): a channel whose duty a reconnect or resume
+        // lost (`TS-ak`) gets full speed, as the exit floor gives a lost duty
+        // (DEC-388) — the device may have come back at its power-on default and
+        // the floor could lower it. Any other unknown — never written, or a
+        // failed reply — still gets the bare floor (DEC-386 decision 4).
         let held: HashSet<u8> = match reach {
             ForceReach::ProfileMembers { held, .. } => held.0.openfan.clone(),
             ForceReach::All => HashSet::new(),
@@ -1271,7 +1273,11 @@ impl SafetyWriteBackend for OpenFanBackend {
                     let mut guard = ctrl.lock();
                     let held_duty = held
                         .contains(&ch)
-                        .then(|| guard.last_commanded_pct(ch))
+                        .then(|| {
+                            guard
+                                .last_commanded_pct(ch)
+                                .or_else(|| guard.duty_lost_to_reconnect(ch).then_some(100))
+                        })
                         .flatten();
                     let duty = floors
                         .get(&ch)
@@ -4009,12 +4015,13 @@ mod tests {
         }
     }
 
-    /// [SAFETY] `TS-ak`: after a reconnect or resume the held channel's last
-    /// duty is unknown, so it is floored at the bare floor — not at the duty it
-    /// held before the device may have lost it. Channel 0 is the force's first
-    /// target, so no `set_pwm` has observed the bump when it is read.
+    /// [SAFETY] `TS-ak` + DEC-401 (`TS-av`): after a reconnect or resume the
+    /// held channel's last duty is unknown — never the duty it held before the
+    /// device may have lost it — and a duty lost that way gets full speed, not
+    /// the bare floor. Channel 0 is the force's first target, so no `set_pwm` has
+    /// observed the bump when it is read.
     #[tokio::test]
-    async fn a_held_openfan_channel_whose_duty_was_lost_gets_the_bare_floor() {
+    async fn a_held_openfan_channel_whose_duty_was_lost_gets_full_speed() {
         let (mut be, written, cache) = openfan_backend();
         be.ctrl.lock().set_pwm(0, 85).unwrap();
         cache.invalidate_openfan_writes();
@@ -4037,14 +4044,138 @@ mod tests {
         .await;
 
         let w = written.lock();
-        let frame_40 = format!(">0200{:02X}", crate::pwm::percent_to_raw(40));
         assert_eq!(
             w[before..]
                 .iter()
                 .map(|f| f.trim_end().to_string())
                 .collect::<Vec<_>>(),
-            [frame_40],
-            "one frame, at the floor rather than the pre-reconnect 85 %"
+            [">0200FF"],
+            "one frame, at full speed — neither the pre-reconnect 85 % nor the 40 % floor"
+        );
+    }
+
+    /// Answers every write the way the firmware does — same opcode, same channel
+    /// (DEC-301) — unless `fail` is set, when the reply times out (DEC-383).
+    struct EchoSerial {
+        written: Arc<Mutex<Vec<String>>>,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::serial::transport::SerialTransport for EchoSerial {
+        fn write_line(&mut self, data: &str) -> Result<(), crate::error::SerialError> {
+            self.written.lock().push(data.to_string());
+            Ok(())
+        }
+        fn read_line(
+            &mut self,
+            _timeout: std::time::Duration,
+        ) -> Result<String, crate::error::SerialError> {
+            let last = self.written.lock().last().cloned();
+            match last {
+                Some(cmd) if !self.fail.load(std::sync::atomic::Ordering::Relaxed) => {
+                    Ok(crate::serial::protocol::firmware_echo_for(&cmd))
+                }
+                _ => Err(crate::error::SerialError::Timeout { timeout_ms: 100 }),
+            }
+        }
+    }
+
+    type EchoBackend = (
+        OpenFanBackend,
+        Arc<Mutex<Vec<String>>>,
+        Arc<StateCache>,
+        Arc<std::sync::atomic::AtomicBool>,
+    );
+
+    fn echo_openfan_backend() -> EchoBackend {
+        let written: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cache = Arc::new(StateCache::new());
+        let ctrl = crate::serial::controller::FanController::new(
+            Box::new(EchoSerial {
+                written: written.clone(),
+                fail: fail.clone(),
+            }),
+            cache.clone(),
+            std::time::Duration::from_millis(100),
+        );
+        (
+            OpenFanBackend::new(Arc::new(Mutex::new(ctrl)), cache.clone()),
+            written,
+            cache,
+            fail,
+        )
+    }
+
+    async fn force_held_openfan(be: &mut OpenFanBackend, channels: &[u8], pct: u8) {
+        let members = ProfileMembers {
+            openfan: channels.iter().copied().collect(),
+            ..ProfileMembers::default()
+        };
+        let held = HeldMembers(members.clone());
+        be.force_all_with_floor(
+            pct,
+            &[],
+            ForceReach::ProfileMembers {
+                members: &members,
+                give_back: true,
+                held: &held,
+            },
+        )
+        .await;
+    }
+
+    /// [SAFETY] DEC-401: EVERY held channel whose duty a reconnect lost gets
+    /// full speed — not only the force's first target. Channel 0's own write
+    /// observes the bump and clears every channel's duty, so channel 2 is read
+    /// after that, through the controller's record rather than the pending
+    /// generation. The landed 100 % is then the channel's last duty, so the next
+    /// forced tick holds it and sends nothing.
+    #[tokio::test]
+    async fn every_held_channel_whose_duty_was_lost_gets_full_speed() {
+        let (mut be, written, cache, _fail) = echo_openfan_backend();
+        be.ctrl.lock().set_pwm(0, 85).unwrap();
+        be.ctrl.lock().set_pwm(2, 50).unwrap();
+        cache.invalidate_openfan_writes();
+        let before = written.lock().len();
+
+        force_held_openfan(&mut be, &[0, 2], 40).await;
+        let frames: Vec<String> = written.lock()[before..]
+            .iter()
+            .map(|f| f.trim_end().to_string())
+            .collect();
+        assert_eq!(frames, [">0200FF", ">0202FF"]);
+
+        let before = written.lock().len();
+        force_held_openfan(&mut be, &[0, 2], 40).await;
+        assert_eq!(
+            written.lock().len(),
+            before,
+            "the next forced tick holds the landed 100 % and writes nothing"
+        );
+    }
+
+    /// [SAFETY] DEC-401 keeps DEC-386 decision 4 for every OTHER unknown: a held
+    /// channel never written, and one whose last reply failed, get the bare
+    /// floor — the user chose full speed for the reconnect/resume case only.
+    #[tokio::test]
+    async fn a_held_channel_never_written_or_whose_reply_failed_keeps_the_bare_floor() {
+        let (mut be, written, _cache, fail) = echo_openfan_backend();
+        fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(be.ctrl.lock().set_pwm(1, 85).is_err(), "precondition");
+        fail.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(be.ctrl.lock().last_commanded_pct(1), None, "precondition");
+        let before = written.lock().len();
+
+        force_held_openfan(&mut be, &[0, 1], 40).await;
+        let raw_40 = crate::pwm::percent_to_raw(40);
+        let frames: Vec<String> = written.lock()[before..]
+            .iter()
+            .map(|f| f.trim_end().to_string())
+            .collect();
+        assert_eq!(
+            frames,
+            [format!(">0200{raw_40:02X}"), format!(">0201{raw_40:02X}")]
         );
     }
 

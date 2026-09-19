@@ -32,6 +32,13 @@ struct ChannelControl {
     /// daemon never wrote is left alone, one whose duty it lost goes to full
     /// speed.
     written: bool,
+    /// Whether this channel's duty is unknown because a reconnect or resume
+    /// lost it (DEC-401, `TS-av`) — as opposed to never written, or a reply
+    /// that failed. Set on every written channel when
+    /// [`FanController::observe_write_generation`] sees a bump, cleared by the
+    /// next write that lands. A failed reply leaves it as it was: the device
+    /// may still be at its power-on default.
+    lost_to_reconnect: bool,
     /// The lowest duty this channel may be written at from now on (DEC-388):
     /// latched by [`FanController::apply_exit_floor`] and never cleared.
     ///
@@ -177,6 +184,26 @@ impl FanController {
             .collect()
     }
 
+    /// Whether `channel`'s duty is unknown because a reconnect or resume lost it
+    /// (DEC-401, `TS-av`): the daemon had written the channel, and the device
+    /// has since re-enumerated or the host resumed, with no write landing since.
+    /// `false` for a channel never written and for one whose only unknown is a
+    /// failed reply (DEC-383).
+    ///
+    /// [SAFETY] Read by the no-sensor floor's held arm, which gives such a
+    /// channel full speed rather than the bare floor. Like
+    /// [`Self::last_commanded_pct`] it honours a bump no write has observed yet,
+    /// because the force reads it before its first write of a tick.
+    pub fn duty_lost_to_reconnect(&self, channel: u8) -> bool {
+        let Some(c) = self.channels.get(channel as usize) else {
+            return false;
+        };
+        if self.cache.openfan_write_generation() != self.last_write_generation {
+            return c.written;
+        }
+        c.lost_to_reconnect
+    }
+
     /// Forget every channel's duty if the device may have lost it (DEC-256).
     ///
     /// Called at the top of [`Self::set_pwm`] and of [`Self::apply_exit_floor`],
@@ -198,6 +225,7 @@ impl FanController {
             self.last_write_generation = generation;
             for ch in &mut self.channels {
                 ch.last_commanded_pct = None;
+                ch.lost_to_reconnect = ch.written;
                 // The stop clock MUST be reset with it. `apply_safety`'s own
                 // doc note says the expired-timer branch is unreachable because
                 // "any non-zero write clears the timer; a repeat 0% coalesces"
@@ -314,6 +342,7 @@ impl FanController {
 
         // Update tracking state
         self.channels[channel as usize].last_commanded_pct = Some(effective_pct);
+        self.channels[channel as usize].lost_to_reconnect = false;
         if effective_pct == 0 {
             if self.channels[channel as usize].stop_started_at.is_none() {
                 self.channels[channel as usize].stop_started_at = Some(Instant::now());
@@ -817,6 +846,63 @@ mod tests {
         ctrl.set_pwm(0, 60).unwrap();
         assert_eq!(ctrl.last_commanded_pct(0), Some(60));
         assert_eq!(ctrl.last_commanded_pct(1), None);
+    }
+
+    /// [SAFETY] DEC-401 (`TS-av`): a reconnect or resume marks every channel the
+    /// daemon had written as lost — before any write observes the bump, and after
+    /// one has — and a never-written channel as not. A landed write clears it.
+    #[test]
+    fn a_reconnect_marks_every_written_channel_lost_until_a_write_lands() {
+        let (transport, _written) = MockTransport::with_ok_responses(3);
+        let cache = Arc::new(StateCache::new());
+        let mut ctrl = FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            Duration::from_millis(500),
+        );
+        ctrl.set_pwm(0, 85).unwrap();
+        ctrl.set_pwm(1, 40).unwrap();
+        assert!(!ctrl.duty_lost_to_reconnect(0), "precondition: known duty");
+
+        cache.invalidate_openfan_writes();
+
+        // Pending: no write has observed the bump yet.
+        assert!(ctrl.duty_lost_to_reconnect(0));
+        assert!(ctrl.duty_lost_to_reconnect(1));
+        assert!(!ctrl.duty_lost_to_reconnect(2), "never written is not lost");
+
+        // Observed: channel 0's write lands and clears only channel 0.
+        ctrl.set_pwm(0, 60).unwrap();
+        assert!(!ctrl.duty_lost_to_reconnect(0));
+        assert!(ctrl.duty_lost_to_reconnect(1));
+        assert!(!ctrl.duty_lost_to_reconnect(2));
+        assert!(!ctrl.duty_lost_to_reconnect(NUM_CHANNELS), "out of range");
+    }
+
+    /// [SAFETY] DEC-401: a failed reply on its own is an unknown duty but not a
+    /// lost one (the user chose full speed for the reconnect/resume case only).
+    /// A reconnect after it makes it lost, and a failed reply after the
+    /// reconnect does not clear that — the device may still be at its power-on
+    /// default.
+    #[test]
+    fn a_failed_reply_alone_is_not_a_duty_lost_to_a_reconnect() {
+        let (transport, _written) = MockTransport::with_ok_responses(1);
+        let cache = Arc::new(StateCache::new());
+        let mut ctrl = FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            Duration::from_millis(500),
+        );
+        ctrl.set_pwm(0, 60).unwrap();
+        assert!(ctrl.set_pwm(0, 70).is_err(), "precondition: reply fails");
+        assert_eq!(ctrl.last_commanded_pct(0), None, "precondition: unknown");
+        assert!(!ctrl.duty_lost_to_reconnect(0));
+
+        cache.invalidate_openfan_writes();
+        assert!(ctrl.duty_lost_to_reconnect(0));
+
+        assert!(ctrl.set_pwm(0, 80).is_err(), "the reply fails again");
+        assert!(ctrl.duty_lost_to_reconnect(0));
     }
 
     #[test]

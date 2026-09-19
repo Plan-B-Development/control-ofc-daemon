@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Changed
+
+**An OpenFan fan whose speed was lost to a reconnect or resume goes to full speed
+when no CPU temperature can be read** (`TS-av`, DEC-401). When the daemon cannot
+read any CPU temperature it holds the active profile's fans at 40 % or more, and a
+fan whose curve has also lost its sensor stays at the speed it had. After the
+OpenFan controller reconnects, or the computer wakes from sleep, the daemon no
+longer knows that speed, because the controller may have come back at its
+power-on default. Such a fan used to get the bare 40 %, which could be lower than
+it was running, and it then stayed there. It now goes to full speed and stays
+there until its curve can run again, which is what the daemon already does with a
+lost speed when it stops. A fan the daemon has never set still gets 40 %, and so
+does one whose last command went unanswered, unless the controller has reconnected
+since. Motherboard fans are unaffected: the daemon keeps
+their last speed across a resume.
+
 ## [2.51.2] — 2026-09-19
 
 ### Fixed
