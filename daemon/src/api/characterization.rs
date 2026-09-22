@@ -68,9 +68,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::calibration::{
-    check_thermal_safety, stale_temperature_refusal, thermal_force_state,
-};
+use crate::api::calibration::thermal_force_state;
+use crate::api::diagnostic_gates::{step_gate, thermal_gate, GateStop};
 use crate::api::responses::HwmonVerifyState;
 use crate::constants;
 use crate::health::cache::StateCache;
@@ -1404,53 +1403,40 @@ where
         // re-assert `pwm_enable=1` at the swept duty — a header latched in manual
         // with no writer left. That is the DEC-290 / 277-c hazard, and checking
         // only in `Drop` does not close it.
-        if shutting_down() {
-            return SweepOutcome {
-                state: STATE_ABORTED,
-                detail: Some("the daemon is shutting down".into()),
-                points: measured,
-            };
-        }
-        if cancel.load(Ordering::SeqCst) {
-            return SweepOutcome {
-                state: STATE_CANCELLED,
-                detail: Some(format!("cancelled after {idx} of {} steps", plan.len())),
-                points: measured,
-            };
-        }
-        if let Err(e) = check_thermal_safety(cache) {
-            return SweepOutcome {
-                state: STATE_ABORTED,
-                detail: Some(e.to_string()),
-                points: measured,
-            };
-        }
-        if let Some(state) = thermal_force_state(cache) {
-            return SweepOutcome {
-                state: STATE_ABORTED,
-                detail: Some(format!(
-                    "thermal safety is forcing fan output ({state}); \
-                     characterisation cannot write"
-                )),
-                points: measured,
-            };
-        }
-        // [SAFETY] DEC-385 (`TS-q`): the two checks above cannot see age, and a
+        //
+        // Then cancel, the three thermal gates — including DEC-385's staleness
+        // refusal (`TS-q`), because the two `value_c` checks cannot see age and a
         // poll that wedges part way through a sweep leaves them passing on its
-        // last reading while the ladder, blind to it, cannot force.
-        if let Some(reason) = stale_temperature_refusal(cache, CHARACTERIZATION_DIAGNOSTIC) {
-            return SweepOutcome {
-                state: STATE_ABORTED,
-                detail: Some(format!("characterisation cannot write: {reason}")),
-                points: measured,
+        // last reading while the ladder, blind to it, cannot force — and finally
+        // DEC-296's keepalive, proving liveness once per point so the deadman
+        // measures that rather than the sweep's total duration. One definition,
+        // shared with the stall probe (DEC-407): `diagnostic_gates::step_gate`.
+        if let Err(stop) = step_gate(
+            cache,
+            CHARACTERIZATION_DIAGNOSTIC,
+            "characterisation",
+            "cannot write",
+            &shutting_down,
+            cancel,
+            &keepalive,
+        ) {
+            let (state, detail) = match stop {
+                GateStop::ShuttingDown => {
+                    (STATE_ABORTED, "the daemon is shutting down".to_string())
+                }
+                GateStop::Cancelled => (
+                    STATE_CANCELLED,
+                    format!("cancelled after {idx} of {} steps", plan.len()),
+                ),
+                GateStop::Thermal(_, detail) => (STATE_ABORTED, detail),
+                GateStop::Superseded => (
+                    STATE_ABORTED,
+                    "superseded by a later diagnostic; this run's lease is gone".to_string(),
+                ),
             };
-        }
-        // DEC-296: prove liveness once per point so the deadman measures that
-        // rather than the sweep's total duration.
-        if !keepalive() {
             return SweepOutcome {
-                state: STATE_ABORTED,
-                detail: Some("superseded by a later diagnostic; this run's lease is gone".into()),
+                state,
+                detail: Some(detail),
                 points: measured,
             };
         }
@@ -1564,30 +1550,21 @@ where
                 // bounds the latency at ~5.5 s, which is *better* than the 15 s
                 // this path allowed before the dwell existed, without paying for
                 // a cache snapshot twice a second.
-                if let Err(e) = check_thermal_safety(cache) {
+                //
+                // DEC-385's staleness refusal runs on the same cadence, for the
+                // same reason as the per-point check — a wedge inside one long
+                // dwell must stop it. The three gates are the shared definition
+                // (DEC-407); shutdown and cancel keep their in-hold rules above
+                // and below, which is why this is not `step_gate`.
+                if let Some(detail) = thermal_gate(
+                    cache,
+                    CHARACTERIZATION_DIAGNOSTIC,
+                    "characterisation",
+                    "cannot continue",
+                ) {
                     return SweepOutcome {
                         state: STATE_ABORTED,
-                        detail: Some(e.to_string()),
-                        points: measured,
-                    };
-                }
-                if let Some(state) = thermal_force_state(cache) {
-                    return SweepOutcome {
-                        state: STATE_ABORTED,
-                        detail: Some(format!(
-                            "thermal safety is forcing fan output ({state}); \
-                             characterisation cannot continue"
-                        )),
-                        points: measured,
-                    };
-                }
-                // DEC-385: on the same cadence, for the same reason as the
-                // per-point check — a wedge inside one long dwell must stop it.
-                if let Some(reason) = stale_temperature_refusal(cache, CHARACTERIZATION_DIAGNOSTIC)
-                {
-                    return SweepOutcome {
-                        state: STATE_ABORTED,
-                        detail: Some(format!("characterisation cannot continue: {reason}")),
+                        detail: Some(detail),
                         points: measured,
                     };
                 }
