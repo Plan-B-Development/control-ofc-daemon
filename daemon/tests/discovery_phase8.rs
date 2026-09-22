@@ -132,6 +132,20 @@ struct Rig {
     /// When `Some(n)`, the n-th keepalive (0-based) refuses — modelling this run
     /// having been superseded by a later diagnostic.
     keepalive_fails_at: Option<usize>,
+    /// DEC-405: when `Some((n, action))`, the n-th keepalive (0-based) performs
+    /// `action` before answering. Keyed on the RENEWAL, not on a duty or a read
+    /// index, so a trip or a cancel lands in exactly the window that renewal
+    /// opens: a keepalive runs after its site's thermal gate, so whatever it
+    /// engages is first seen by the NEXT gate site. A duty-keyed trip cannot
+    /// target the baseline window once a settle-wait precedes it.
+    at_keepalive: Option<(usize, AtKeepalive)>,
+}
+
+/// What [`Rig::at_keepalive`] does.
+#[derive(Clone, Copy)]
+enum AtKeepalive {
+    Trip(TripKind),
+    Cancel,
 }
 
 impl Rig {
@@ -143,6 +157,7 @@ impl Rig {
             reads: Arc::new(AtomicUsize::new(0)),
             keepalives: Arc::new(AtomicUsize::new(0)),
             keepalive_fails_at: None,
+            at_keepalive: None,
         }
     }
     fn keepalive_count(&self) -> usize {
@@ -190,6 +205,35 @@ enum TripKind {
     Sensor(f64),
 }
 
+/// Engage one thermal limb in `cache`, exactly as production would see it.
+fn engage(cache: &StateCache, kind: TripKind) {
+    match kind {
+        TripKind::Ladder(state) => {
+            cache.record_engine_tick(state, constants::THERMAL_EMERGENCY_TRIGGER_C);
+        }
+        // Re-publishing the reading is what `update_sensors` does on the real
+        // 1 Hz path, so the gate sees a FRESH hot reading rather than a stale
+        // one — otherwise the freshness refusal would fire first and the test
+        // would prove the wrong limb.
+        TripKind::Sensor(temp_c) => {
+            cache.update_sensors(vec![CachedSensorReading {
+                id: "cpu".into(),
+                kind: SensorKind::CpuTemp,
+                label: "Tctl".into(),
+                value_c: temp_c,
+                source: DeviceLabel::Hwmon,
+                updated_at: Instant::now(),
+                rate_c_per_s: None,
+                session_min_c: None,
+                session_max_c: None,
+                chip_name: "k10temp".into(),
+                temp_type: None,
+                thresholds: None,
+            }]);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn sweep(
     rig: &Rig,
@@ -223,8 +267,15 @@ async fn sweep(
     };
     let keepalives = rig.keepalives.clone();
     let fails_at = rig.keepalive_fails_at;
+    let at_keepalive = rig.at_keepalive;
+    let keepalive_cache = cache.clone();
     let keepalive = move || {
         let n = keepalives.fetch_add(1, Ordering::SeqCst);
+        match at_keepalive {
+            Some((k, AtKeepalive::Trip(kind))) if k == n => engage(&keepalive_cache, kind),
+            Some((k, AtKeepalive::Cancel)) if k == n => cancel.store(true, Ordering::SeqCst),
+            _ => {}
+        }
         fails_at != Some(n)
     };
 
@@ -239,32 +290,7 @@ async fn sweep(
         let d = *duty_r.lock().unwrap();
         if let Some(t) = &trip {
             if d == t.once_duty_is {
-                match t.kind {
-                    TripKind::Ladder(state) => {
-                        trip_cache
-                            .record_engine_tick(state, constants::THERMAL_EMERGENCY_TRIGGER_C);
-                    }
-                    // Re-publishing the reading is what `update_sensors` does on
-                    // the real 1 Hz path, so the gate sees a FRESH hot reading
-                    // rather than a stale one — otherwise the freshness refusal
-                    // would fire first and the test would prove the wrong limb.
-                    TripKind::Sensor(temp_c) => {
-                        trip_cache.update_sensors(vec![CachedSensorReading {
-                            id: "cpu".into(),
-                            kind: SensorKind::CpuTemp,
-                            label: "Tctl".into(),
-                            value_c: temp_c,
-                            source: DeviceLabel::Hwmon,
-                            updated_at: Instant::now(),
-                            rate_c_per_s: None,
-                            session_min_c: None,
-                            session_max_c: None,
-                            chip_name: "k10temp".into(),
-                            temp_type: None,
-                            thresholds: None,
-                        }]);
-                    }
-                }
+                engage(&trip_cache, t.kind);
             }
         }
         std::future::ready(disc::DiscoverySample {
@@ -292,6 +318,7 @@ async fn sweep(
         cycles,
         restore_floor,
         pump_protected,
+        Duration::from_millis(20),
         Duration::from_millis(20),
         write_fn,
         read_fn,
@@ -619,7 +646,7 @@ async fn a_forcing_ladder_aborts_and_the_restore_stands_down() {
 /// during the baseline window.** This is register row `P8-u`.
 ///
 /// The shape that makes this a real defect rather than a late abort: the
-/// perturbation here moves the header DOWN (60 → 45 → 20), so the write under
+/// perturbation here moves the header DOWN (45 → 20), so the write under
 /// test actively reduces cooling on a machine the daemon already knows is being
 /// force-cooled. Before DEC-339 the three thermal predicates ran once at the top
 /// of the cycle and a cycle issues two writes, so the gate had last looked a
@@ -630,11 +657,17 @@ async fn a_forcing_ladder_aborts_and_the_restore_stands_down() {
 /// reports `STATE_ABORTED`, and that is precisely the pre-fix behaviour, so an
 /// assertion on the state alone passes with the fix deleted.
 ///
-/// The trip duty (45) differs from the rig's starting duty (60) on purpose; see
-/// `ThermalTrip::once_duty_is`.
+/// **Keyed on the cycle-top renewal, not on a duty (DEC-405).** The rig starts
+/// at the baseline duty, so cycle 1 has no settle-wait and the renewal at index
+/// 0 is the last thing before the baseline window: the trip engages after the
+/// cycle-top gate passed, and the first gate that can see it is the one before
+/// the perturbed write. A duty-keyed trip used to do this, and stopped reaching
+/// that gate once a settle-wait preceded the baseline window — every test here
+/// then stayed green with the gate deleted (`ofc:concurrency-reviewer` F1).
 #[tokio::test]
 async fn the_perturbed_duty_is_not_written_after_a_mid_window_ladder_trip() {
-    let rig = Rig::new(60);
+    let mut rig = Rig::new(45);
+    rig.at_keepalive = Some((0, AtKeepalive::Trip(TripKind::Ladder("emergency"))));
     let cache = Arc::new(cache_at(40.0, Some("normal")));
     let chans = channels(&[("pump", true)]);
     let report = RestoreReport::new();
@@ -651,12 +684,7 @@ async fn the_perturbed_duty_is_not_written_after_a_mid_window_ladder_trip() {
         false,
         |_, duty| Some(u16::from(duty) * 20),
         None,
-        // Fires while the BASELINE duty is being held — i.e. after the cycle-top
-        // gate has already passed, which is the whole window the row is about.
-        Some(ThermalTrip {
-            once_duty_is: 45,
-            kind: TripKind::Ladder("emergency"),
-        }),
+        None,
         &cancel,
         &report,
     )
@@ -672,6 +700,11 @@ async fn the_perturbed_duty_is_not_written_after_a_mid_window_ladder_trip() {
         "the lower perturbed duty was commanded after the ladder engaged"
     );
     assert_eq!(report.get(), RestoreOutcome::SkippedThermalForce);
+    assert_eq!(
+        rig.keepalive_count(),
+        1,
+        "the perturbed window's renewal was reached"
+    );
 }
 
 /// [SAFETY] The other limb (DEC-297): a sensor crossing
@@ -685,7 +718,12 @@ async fn the_perturbed_duty_is_not_written_after_a_mid_window_ladder_trip() {
 /// asserts.
 #[tokio::test]
 async fn the_perturbed_duty_is_not_written_after_a_mid_window_sensor_trip() {
-    let rig = Rig::new(60);
+    // Keyed on the cycle-top renewal for the reason the ladder test gives.
+    let mut rig = Rig::new(45);
+    rig.at_keepalive = Some((
+        0,
+        AtKeepalive::Trip(TripKind::Sensor(constants::CALIBRATION_MAX_TEMP_C + 1.0)),
+    ));
     let cache = Arc::new(cache_at(40.0, Some("normal")));
     let chans = channels(&[("pump", true)]);
     let report = RestoreReport::new();
@@ -702,29 +740,27 @@ async fn the_perturbed_duty_is_not_written_after_a_mid_window_sensor_trip() {
         false,
         |_, duty| Some(u16::from(duty) * 20),
         None,
-        Some(ThermalTrip {
-            once_duty_is: 45,
-            kind: TripKind::Sensor(constants::CALIBRATION_MAX_TEMP_C + 1.0),
-        }),
+        None,
         &cancel,
         &report,
     )
     .await;
 
     assert_eq!(outcome.state, disc::STATE_ABORTED);
-    assert!(
-        rig.writes().contains(&45),
-        "precondition: the run must reach the baseline write, else nothing is proven"
+    // The baseline write, then the restore to the captured 45 — and no 20
+    // between them. No force is active, so the restore is NOT skipped: this is
+    // what separates the two limbs.
+    assert_eq!(
+        rig.writes(),
+        vec![45, 45],
+        "the lower perturbed duty was commanded after the sensor passed the limit"
     );
-    assert!(
-        !rig.writes().contains(&20),
-        "the lower perturbed duty was commanded after the sensor passed the limit: {:?}",
-        rig.writes()
-    );
-    // No force is active, so the restore is NOT skipped — it puts the header
-    // back at the duty the run captured. This is what separates the two limbs.
     assert_eq!(report.get(), RestoreOutcome::Restored);
-    assert_eq!(rig.writes().last().copied(), Some(60));
+    assert_eq!(
+        rig.keepalive_count(),
+        1,
+        "the perturbed window's renewal was reached"
+    );
 }
 
 /// [SAFETY] **A force landing in the FINAL window aborts the run, so its
@@ -818,11 +854,14 @@ async fn a_force_in_the_final_window_aborts_rather_than_persisting_the_run() {
 /// Modelled by tripping the ladder during the baseline window *and* failing the
 /// perturbed window's renewal (`keepalive` index 1), which is what production
 /// does. Every other test in this group uses an always-succeeding keepalive and
-/// therefore cannot distinguish the two orderings at all.
+/// therefore cannot distinguish the two orderings at all. The trip is keyed on
+/// the cycle-top renewal and the rig starts at the baseline duty, so no
+/// settle-wait precedes the baseline window (DEC-405; see the ladder test).
 #[tokio::test]
 async fn a_thermal_trip_that_also_kills_the_lease_is_reported_as_thermal() {
-    let mut rig = Rig::new(60);
+    let mut rig = Rig::new(45);
     rig.keepalive_fails_at = Some(1);
+    rig.at_keepalive = Some((0, AtKeepalive::Trip(TripKind::Ladder("emergency"))));
     let cache = Arc::new(cache_at(40.0, Some("normal")));
     let chans = channels(&[("pump", true)]);
     let report = RestoreReport::new();
@@ -839,10 +878,7 @@ async fn a_thermal_trip_that_also_kills_the_lease_is_reported_as_thermal() {
         false,
         |_, duty| Some(u16::from(duty) * 20),
         None,
-        Some(ThermalTrip {
-            once_duty_is: 45,
-            kind: TripKind::Ladder("emergency"),
-        }),
+        None,
         &cancel,
         &report,
     )
@@ -1211,11 +1247,67 @@ async fn liveness_is_proved_before_every_observation_window() {
         .await;
 
         assert_eq!(outcome.state, disc::STATE_COMPLETE);
+        // DEC-405: a settle-wait is a window too, and renews before the
+        // baseline window that follows it. Counted from the cycles that
+        // actually waited, never assumed — and pinned: here the header starts
+        // at the baseline duty, so cycle 1 does not wait and every later one
+        // does (S1-11).
+        let waits = outcome
+            .cycles
+            .iter()
+            .filter(|c| c.baseline_settled.is_some())
+            .count();
+        assert_eq!(
+            waits,
+            usize::from(cycles) - 1,
+            "precondition: which cycles waited"
+        );
         assert_eq!(
             rig.keepalive_count(),
-            usize::from(cycles) * 2,
+            usize::from(cycles) * 2 + waits,
             "a cycle holds two windows, so it must renew twice — renewing once \
-             per cycle doubles the interval past the deadman"
+             per cycle doubles the interval past the deadman — and a settle-wait \
+             is a third window that must renew again before the baseline"
+        );
+    }
+}
+
+/// DEC-405 S1-11: cycle 1 waits too when its baseline write MOVED the duty (a
+/// header found below the discovery floor), because its baseline window then
+/// opens on a ramp exactly as a later cycle's does.
+#[tokio::test]
+async fn cycle_one_waits_only_when_its_baseline_write_moved_the_duty() {
+    for (initial, expect_wait) in [(45u8, false), (10u8, true)] {
+        let rig = Rig::new(initial);
+        let cache = Arc::new(cache_at(40.0, Some("normal")));
+        let chans = channels(&[("pump", true)]);
+        let report = RestoreReport::new();
+        let cancel = AtomicBool::new(false);
+        let outcome = sweep(
+            &rig,
+            &cache,
+            &chans,
+            45,
+            70,
+            2,
+            0,
+            false,
+            |_, duty| Some(u16::from(duty) * 20),
+            None,
+            None,
+            &cancel,
+            &report,
+        )
+        .await;
+        assert_eq!(outcome.state, disc::STATE_COMPLETE, "{:?}", outcome.detail);
+        assert_eq!(
+            outcome.cycles[0].baseline_settled.is_some(),
+            expect_wait,
+            "initial duty {initial}%"
+        );
+        assert!(
+            outcome.cycles[1].baseline_settled.is_some(),
+            "cycle 2 always waits"
         );
     }
 }
@@ -1530,6 +1622,7 @@ async fn an_inconsistent_responder_is_ambiguous_not_confirmed() {
                 delta_rpm: Some(if responded { 500 } else { 5 }),
                 noise_floor_rpm: 50,
                 responded,
+                noise_floor_from_cycle_1: false,
             },
             disc::TachObservation {
                 tach_id: "fan2".into(),
@@ -1538,8 +1631,11 @@ async fn an_inconsistent_responder_is_ambiguous_not_confirmed() {
                 delta_rpm: Some(0),
                 noise_floor_rpm: 50,
                 responded: false,
+                noise_floor_from_cycle_1: false,
             },
         ],
+        baseline_settled: None,
+        settle_wait_ms: 0,
     };
     let cycles = vec![mk(1, true), mk(2, false)];
     let sum = disc::summarise(&chans, &cycles, None, None, 8);
@@ -1653,7 +1749,10 @@ fn a_run_round_trips_through_json_with_its_confidence_intact() {
             delta_rpm: Some(500),
             noise_floor_rpm: 50,
             responded: true,
+            noise_floor_from_cycle_1: false,
         }],
+        baseline_settled: None,
+        settle_wait_ms: 0,
     }];
     let summary = disc::summarise(&chans, &cycles, Some(1000), None, 8);
     let run = disc::ControlPathRun {
@@ -2986,4 +3085,381 @@ fn the_preflight_handler_answers_only_200_or_400() {
          which is only sound while a 404 can come from the route fallback alone. \
          `preflight_handler` now writes: {codes:?}"
     );
+}
+
+// ── DEC-405 (`PTR-c`, D7): settled baselines ─────────────────────────
+
+/// A pump that approaches each duty first-order with τ = 4.8 s (t90 ≈ 11 s, the
+/// 2026-09-08 pump), read through a tach register that refreshes every 2 s with
+/// ±30 rpm of deterministic jitter. Time is tokio's paused clock.
+struct SlowPump {
+    started: tokio::time::Instant,
+    /// (write instant, rpm at that instant, target rpm)
+    segments: Vec<(tokio::time::Instant, f64, f64)>,
+    duty: u8,
+    /// A hunting pump: ± this much on alternate refreshes, so its reading never
+    /// holds inside the settling band. `0` for a well-behaved one.
+    hunt_rpm: f64,
+}
+
+impl SlowPump {
+    const TAU_S: f64 = 4.8;
+    const REFRESH_MS: u64 = 2000;
+    /// An unrelated fan on a faster chip: 1500 rpm ± 30, refreshing every 1 s.
+    const NEIGHBOUR_REFRESH_MS: u64 = 1000;
+    fn neighbour(&self) -> u16 {
+        let k = tokio::time::Instant::now()
+            .duration_since(self.started)
+            .as_millis() as u64
+            / Self::NEIGHBOUR_REFRESH_MS;
+        (1500.0 + ((k * 104_729) % 61) as f64 - 30.0).round() as u16
+    }
+    fn target(duty: u8) -> f64 {
+        1200.0 + f64::from(duty) * 20.0
+    }
+    fn speed_at(&self, at: tokio::time::Instant) -> f64 {
+        match self.segments.iter().rev().find(|(t, _, _)| *t <= at) {
+            Some(&(t, from, to)) => {
+                to + (from - to) * (-at.duration_since(t).as_secs_f64() / Self::TAU_S).exp()
+            }
+            None => Self::target(self.duty),
+        }
+    }
+    fn register(&self) -> u16 {
+        let k = tokio::time::Instant::now()
+            .duration_since(self.started)
+            .as_millis() as u64
+            / Self::REFRESH_MS;
+        let refreshed = self.started + Duration::from_millis(k * Self::REFRESH_MS);
+        let jitter = ((k * 7919) % 61) as f64 - 30.0;
+        let hunt = if k.is_multiple_of(2) {
+            self.hunt_rpm
+        } else {
+            -self.hunt_rpm
+        };
+        (self.speed_at(refreshed) + jitter + hunt).round() as u16
+    }
+}
+
+/// Run the real `run_discovery` over a [`SlowPump`] starting at `initial_duty`,
+/// at production window and wait lengths, and summarise it.
+async fn discover_slow_pump(initial_duty: u8) -> (disc::DiscoveryOutcome, disc::DiscoverySummary) {
+    discover_pump_with(initial_duty, 0.0, false).await
+}
+
+async fn discover_pump_with(
+    initial_duty: u8,
+    hunt_rpm: f64,
+    with_neighbour: bool,
+) -> (disc::DiscoveryOutcome, disc::DiscoverySummary) {
+    let cache = cache_at(40.0, Some("normal"));
+    let chans = if with_neighbour {
+        channels(&[("pump", true), ("fan_other", false)])
+    } else {
+        channels(&[("pump", true)])
+    };
+    let report = RestoreReport::new();
+    let cancel = AtomicBool::new(false);
+    let pump = Arc::new(Mutex::new(SlowPump {
+        started: tokio::time::Instant::now(),
+        segments: Vec::new(),
+        duty: initial_duty,
+        hunt_rpm,
+    }));
+    let (pw, pr) = (pump.clone(), pump.clone());
+    let outcome = disc::run_discovery(
+        &cache,
+        "hwmon:nct6798:isa:pwm2:AIO_PUMP",
+        &chans,
+        40,
+        65,
+        "up",
+        2,
+        0,
+        false,
+        Duration::from_secs(constants::CHARACTERIZATION_DEFAULT_SETTLE_S),
+        constants::DISCOVERY_SETTLE_WAIT_MAX,
+        move |pct: u8| {
+            let mut p = pw.lock().unwrap();
+            let now = tokio::time::Instant::now();
+            let from = p.speed_at(now);
+            p.segments.push((now, from, SlowPump::target(pct)));
+            p.duty = pct;
+            Ok(())
+        },
+        move || {
+            let p = pr.lock().unwrap();
+            let rpm = Some(p.register());
+            std::future::ready(disc::DiscoverySample {
+                header: HwmonVerifyState {
+                    pwm_enable: Some(1),
+                    pwm_raw: Some(((u16::from(p.duty) * 255) / 100) as u8),
+                    pwm_percent: Some(p.duty),
+                    rpm,
+                },
+                tachs: if with_neighbour {
+                    vec![rpm, Some(p.neighbour())]
+                } else {
+                    vec![rpm]
+                },
+            })
+        },
+        &cancel,
+        || false,
+        || true,
+        &report,
+        |_| {},
+    )
+    .await;
+    assert_eq!(outcome.state, disc::STATE_COMPLETE, "{:?}", outcome.detail);
+    let summary = disc::summarise(
+        &chans,
+        &outcome.cycles,
+        None,
+        outcome.observed_resolution_ms,
+        0,
+    );
+    (outcome, summary)
+}
+
+/// The D7 outcome, asserted BEFORE anything that names the fix, so a fix-out
+/// run fails here — on the defect — rather than on a precondition (DEC-348).
+fn assert_both_cycles_respond_on_settled_floors(
+    outcome: &disc::DiscoveryOutcome,
+    summary: &disc::DiscoverySummary,
+) {
+    assert_both_cycles_respond_on_settled_floors_for(outcome, summary, 0);
+    assert_eq!(
+        summary.measurement_resolution_ms,
+        Some(SlowPump::REFRESH_MS)
+    );
+}
+
+fn assert_both_cycles_respond_on_settled_floors_for(
+    outcome: &disc::DiscoveryOutcome,
+    summary: &disc::DiscoverySummary,
+    idx: usize,
+) {
+    for c in &outcome.cycles {
+        let o = &c.observations[idx];
+        let delta = o.delta_rpm.expect("readable").unsigned_abs();
+        assert!(
+            o.responded,
+            "cycle {}: a {delta} rpm response did not clear a {} rpm floor",
+            c.cycle, o.noise_floor_rpm
+        );
+        // A recovery ramp is not noise: every floor sits far below the response.
+        assert!(
+            delta >= u32::from(o.noise_floor_rpm) * 3,
+            "cycle {}: response {delta} vs floor {}",
+            c.cycle,
+            o.noise_floor_rpm
+        );
+        assert!(!o.noise_floor_from_cycle_1);
+    }
+    assert_eq!(
+        summary.relationship,
+        disc::REL_CONFIRMED,
+        "{:?}",
+        summary.confidence_notes
+    );
+}
+
+/// D7, the defect: a later cycle's baseline window opened as the previous
+/// perturbation was reversed, so the pump's recovery ramp became its "noise"
+/// floor and a real response failed to clear it — on 2026-09-08 a +796 rpm
+/// response against an 804 rpm cycle-2 floor, graded `ambiguous`. With the
+/// settle-wait the second baseline is measured on a settled pump, both cycles
+/// respond, and the mapping is `confirmed`.
+#[tokio::test(start_paused = true)]
+async fn a_slow_pump_is_confirmed_because_its_later_baseline_settles_first() {
+    let (outcome, summary) = discover_slow_pump(40).await;
+    assert_both_cycles_respond_on_settled_floors(&outcome, &summary);
+    // Which cycles waited: cycle 1 started at its baseline duty (S1-11).
+    assert_eq!(outcome.cycles[0].baseline_settled, None);
+    assert_eq!(outcome.cycles[1].baseline_settled, Some(true));
+    assert!(outcome.cycles[1].settle_wait_ms > 0);
+}
+
+/// S1-11 and the unchanged-span guard. A header found at 10 % is moved to the
+/// 40 % baseline, so cycle 1 waits too — and for the first two seconds its
+/// register still shows the OLD speed. "Unchanged" must not release it then:
+/// that is `PTR-b`'s slow register, arriving through the online wait.
+#[tokio::test(start_paused = true)]
+async fn a_moved_cycle_one_baseline_waits_through_a_register_that_has_not_refreshed() {
+    let (outcome, summary) = discover_slow_pump(10).await;
+    assert_both_cycles_respond_on_settled_floors(&outcome, &summary);
+    assert_eq!(outcome.cycles[0].baseline_settled, Some(true));
+    assert!(
+        outcome.cycles[0].settle_wait_ms >= SlowPump::REFRESH_MS,
+        "the wait ended before the register had refreshed once"
+    );
+}
+
+/// The fallback. A hunting pump (± 150 rpm on alternate refreshes, beyond the
+/// 5 % band) never settles inside the 15 s bound, so cycle 2 keeps its recovery
+/// ramp out of its noise floor by borrowing cycle 1's, flags that it did, and
+/// says so in `confidence_notes`.
+///
+/// (A merely SLOW pump is not this case: τ = 20 s falls ~110 rpm across four
+/// refreshes, inside the band, so it settles — the band's resolution, measured
+/// while writing this test, and still a floor far below the unsettled ramp's.)
+#[tokio::test(start_paused = true)]
+async fn a_baseline_that_cannot_settle_borrows_cycle_one_noise_and_says_so() {
+    let (outcome, summary) = discover_pump_with(40, 150.0, false).await;
+    let (c1, c2) = (&outcome.cycles[0], &outcome.cycles[1]);
+    assert_eq!(
+        c2.observations[0].noise_floor_rpm,
+        c1.observations[0].noise_floor_rpm
+    );
+    assert!(c2.observations[0].noise_floor_from_cycle_1);
+    assert!(
+        !c1.observations[0].noise_floor_from_cycle_1,
+        "cycle 1 has nothing to borrow"
+    );
+    assert_eq!(c2.baseline_settled, Some(false));
+    assert_eq!(
+        c2.settle_wait_ms,
+        constants::DISCOVERY_SETTLE_WAIT_MAX.as_millis() as u64
+    );
+    assert!(
+        summary
+            .confidence_notes
+            .iter()
+            .any(|n| n.contains("had not all settled") && n.contains("cycle 1's noise floor")),
+        "{:?}",
+        summary.confidence_notes
+    );
+}
+
+/// S1-12: the run's resolution is the header's own tach's cadence, not the
+/// fastest channel's. The neighbour refreshes every 1 s; the pump's chip every
+/// 2 s, and the pump is what the timings describe.
+#[tokio::test(start_paused = true)]
+async fn the_run_resolution_is_the_target_tachs_not_the_fastest_neighbours() {
+    let (outcome, summary) = discover_pump_with(40, 0.0, true).await;
+    assert_eq!(
+        outcome.cycles[0].observations.len(),
+        2,
+        "precondition: two channels watched"
+    );
+    assert_both_cycles_respond_on_settled_floors_for(&outcome, &summary, 0);
+    assert_eq!(
+        summary.measurement_resolution_ms,
+        Some(SlowPump::REFRESH_MS)
+    );
+}
+
+// ── DEC-405: the settle-wait's own boundary ─────────────────────────
+
+/// A 60 % rig moved to the 45 % baseline, so cycle 1 waits (S1-11): the
+/// renewal at index 0 is the cycle top, and the next gate site is the one after
+/// the wait. `n` cycles, the pump-safe down perturbation to 20.
+async fn sweep_through_a_wait(
+    rig: &Rig,
+    pump: bool,
+    rpm_for: fn(usize, u8) -> Option<u16>,
+) -> (disc::DiscoveryOutcome, RestoreReport) {
+    let cache = Arc::new(cache_at(40.0, Some("normal")));
+    let chans = channels(&[("pump", true)]);
+    let report = RestoreReport::new();
+    let cancel = AtomicBool::new(false);
+    let floor = if pump { pump_floor() } else { 0 };
+    let outcome = sweep(
+        rig, &cache, &chans, 45, 20, 2, floor, pump, rpm_for, None, None, &cancel, &report,
+    )
+    .await;
+    (outcome, report)
+}
+
+/// [SAFETY] The post-wait gate: a force that engaged during the settle-wait is
+/// caught at the wait's end — before the baseline window, and before the
+/// renewal, so the operator is told it was the heat (the DEC-339 ordering
+/// rule at the new site). The renewal at index 1 is armed to fail, so a gate
+/// deleted or placed after the keepalive reports "superseded" instead.
+#[tokio::test]
+async fn a_force_during_the_settle_wait_is_caught_before_the_baseline_window() {
+    let mut rig = Rig::new(60);
+    rig.keepalive_fails_at = Some(1);
+    rig.at_keepalive = Some((0, AtKeepalive::Trip(TripKind::Ladder("emergency"))));
+    let (outcome, report) = sweep_through_a_wait(&rig, false, |_, d| Some(u16::from(d) * 20)).await;
+    assert_eq!(outcome.state, disc::STATE_ABORTED);
+    let detail = outcome.detail.as_deref().unwrap_or_default();
+    assert!(detail.contains("thermal safety"), "detail was {detail:?}");
+    assert_eq!(
+        rig.keepalive_count(),
+        1,
+        "the post-wait renewal ran before the gate"
+    );
+    assert!(
+        outcome.cycles.is_empty(),
+        "a baseline window was observed after the force"
+    );
+    assert_eq!(rig.writes(), vec![45]);
+    assert_eq!(report.get(), RestoreOutcome::SkippedThermalForce);
+}
+
+/// F2: a cancel pressed during the settle-wait lands when the wait ends — not
+/// after the baseline and perturbed windows as well. Set by the cycle-top
+/// renewal, i.e. after that site's own cancel check had passed.
+#[tokio::test]
+async fn a_cancel_during_the_settle_wait_lands_when_the_wait_ends() {
+    let mut rig = Rig::new(60);
+    rig.at_keepalive = Some((0, AtKeepalive::Cancel));
+    let (outcome, report) = sweep_through_a_wait(&rig, false, |_, d| Some(u16::from(d) * 20)).await;
+    assert_eq!(outcome.state, disc::STATE_CANCELLED, "{:?}", outcome.detail);
+    assert_eq!(
+        rig.keepalive_count(),
+        1,
+        "the cancel waited past the post-wait renewal"
+    );
+    assert!(outcome.cycles.is_empty());
+    // Baseline, then the restore to the captured 60 — never the perturbed 20.
+    assert_eq!(rig.writes(), vec![45, 60]);
+    assert_eq!(report.get(), RestoreOutcome::Restored);
+}
+
+/// F2, the other new boundary: a cancel pressed during the baseline window
+/// lands before the perturbed write, not a perturbed window later.
+#[tokio::test]
+async fn a_cancel_during_the_baseline_window_lands_before_the_perturbed_write() {
+    let mut rig = Rig::new(45); // no settle-wait: index 0 opens the baseline window
+    rig.at_keepalive = Some((0, AtKeepalive::Cancel));
+    let (outcome, _report) =
+        sweep_through_a_wait(&rig, false, |_, d| Some(u16::from(d) * 20)).await;
+    assert_eq!(outcome.state, disc::STATE_CANCELLED, "{:?}", outcome.detail);
+    assert_eq!(rig.keepalive_count(), 1);
+    assert!(
+        !rig.writes().contains(&20),
+        "the perturbed duty was written: {:?}",
+        rig.writes()
+    );
+}
+
+/// [SAFETY] SR-1: a pump whose tach vanishes during the settle-wait aborts at
+/// the wait's end — the check every window's last reading gets — rather than
+/// after a further baseline window at the same duty.
+#[tokio::test]
+async fn a_pump_tach_lost_during_the_settle_wait_aborts_at_the_wait_end() {
+    let rig = Rig::new(60);
+    // Readable at the starting 60 %, gone at the 45 % baseline.
+    let (outcome, _report) =
+        sweep_through_a_wait(&rig, true, |_, d| if d == 45 { None } else { Some(1200) }).await;
+    assert_eq!(outcome.state, disc::STATE_ABORTED);
+    assert!(
+        outcome
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("tachometer"),
+        "detail was {:?}",
+        outcome.detail
+    );
+    assert_eq!(
+        rig.keepalive_count(),
+        1,
+        "a baseline window ran on a lost pump tach"
+    );
+    assert!(outcome.cycles.is_empty());
+    assert_eq!(rig.writes().last().copied(), Some(60), "not restored");
 }

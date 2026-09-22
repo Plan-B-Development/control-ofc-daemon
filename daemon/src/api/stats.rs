@@ -36,6 +36,10 @@ pub const STABILITY_INSUFFICIENT: &str = "insufficient_data";
 /// vocabulary asks that lack of evidence never become a PASS, and this keeps the
 /// two lacks distinguishable.
 pub const STABILITY_UNAVAILABLE: &str = "unavailable";
+/// DEC-405 (`PTR-a`): the window never settled within its hold, so its figures
+/// describe a transient, not a steady state. Distinct from `insufficient_data`
+/// (too few readings): here there were enough readings and they kept moving.
+pub const STABILITY_NOT_SETTLED: &str = "not_settled";
 
 // ── Hysteresis tokens ────────────────────────────────────────────────
 
@@ -251,50 +255,190 @@ fn median_of_sorted(sorted: &[u16]) -> u16 {
     }
 }
 
-/// `§5`'s settling criterion, as the spec words it: the first sample from which
-/// reported RPM stays within [`constants::SETTLING_BAND_PCT`] of the rolling
-/// median for [`constants::SETTLING_HOLD_SAMPLES`] consecutive readings.
+/// `§5`'s settling criterion, judged on **register updates** (DEC-405, `PTR-b`).
 ///
-/// Returns that sample's `at_ms`, or `None` when the window never settled or
+/// A tach register refreshes on the driver's cadence, not the sampler's: it87
+/// refreshes about every 2 s, so four consecutive 500 ms samples can all be one
+/// stale value. The rule this function used to apply ("four consecutive
+/// *samples* in band") therefore reported a settle point before the fan had
+/// moved at all — on 2026-09-08 `settled_ms` preceded `first_change_ms` on 24 of
+/// 32 points. So the samples are collapsed to the readings at which the value
+/// actually changed, and the rule is applied to those:
+///
+/// - a point settles at the first of [`constants::SETTLING_HOLD_SAMPLES`]
+///   consecutive **updates** that all sit within [`constants::SETTLING_BAND_PCT`]
+///   of their median;
+/// - a point can never settle before its first update. `reference` is the
+///   reading taken before the write; a first sample equal to it is not an
+///   update. With no reference the first usable sample is the reference;
+/// - a window whose readings never change at all — a stopped fan's 0 is the
+///   common case — is steady, and settles at its first sample. There is no
+///   transient to wait out, and no update to count.
+///
+/// Returns that reading's `at_ms`, or `None` when the window never settled or
 /// held too few usable readings to judge. **`None` is not "settled instantly"**
 /// — the same distinction `first_change_ms` already carries.
-pub fn settling_ms(samples: &[RpmSample]) -> Option<u64> {
-    let usable: Vec<&RpmSample> = samples.iter().filter(|s| s.rpm.is_some()).collect();
+pub fn settling_ms(samples: &[RpmSample], reference: Option<u16>) -> Option<u64> {
+    let usable: Vec<(u64, u16)> = samples
+        .iter()
+        .filter_map(|s| s.rpm.map(|v| (s.at_ms, v)))
+        .collect();
     let hold = constants::SETTLING_HOLD_SAMPLES;
     if usable.len() < hold {
         return None;
     }
-    for start in 0..=(usable.len() - hold) {
-        // A WINDOW of `hold` readings, not the whole remaining tail.
-        //
-        // The first draft took `&usable[start..]`, which made the constant a
-        // minimum tail length rather than the observation period both its own
-        // doc and `constants::SETTLING_HOLD_SAMPLES` describe — and tuning it
-        // changed nothing. Worse, one late tach spike then disqualified every
-        // start index, so a window that plainly settled reported `None`
-        // ("never settled"); DEC-334 §7 expects occasional outliers at these
-        // sample counts, so that case is normal rather than exotic.
-        let window = &usable[start..start + hold];
-        let mut vals: Vec<u16> = window.iter().filter_map(|s| s.rpm).collect();
+    if usable.iter().all(|&(_, v)| v == usable[0].1) {
+        return Some(usable[0].0);
+    }
+    settled_on_updates(samples, reference)
+}
+
+/// [`settling_ms`] without its constant-window rule: a settle proved by
+/// register updates, or `None`.
+///
+/// This is the half a caller judging a window **while it is still open** must
+/// use. Online, "the reading never changed" is also exactly what a slow register
+/// looks like before its first refresh — two seconds of identical samples on
+/// it87 — so the constant rule, applied mid-window, reintroduces `PTR-b`. It is
+/// only sound over a window that has closed.
+pub fn settled_on_updates(samples: &[RpmSample], reference: Option<u16>) -> Option<u64> {
+    let usable: Vec<(u64, u16)> = samples
+        .iter()
+        .filter_map(|s| s.rpm.map(|v| (s.at_ms, v)))
+        .collect();
+    let hold = constants::SETTLING_HOLD_SAMPLES;
+    let updates = register_updates(&usable, reference);
+    if updates.len() < hold {
+        return None;
+    }
+    for start in 0..=(updates.len() - hold) {
+        // A WINDOW of `hold` updates, not the whole remaining tail: one late
+        // tach spike must not erase an earlier settled window (DEC-334 §7
+        // expects occasional outliers at these counts).
+        let window = &updates[start..start + hold];
+        let mut vals: Vec<u16> = window.iter().map(|&(_, v)| v).collect();
         vals.sort_unstable();
         let med = f64::from(median_of_sorted(&vals));
-        // A zero median means the fan read as stopped for the rest of the
-        // window; a percentage band around zero admits nothing, so treat an
-        // all-zero tail as settled rather than never-settling.
+        // A zero median admits nothing through a percentage band; a window of
+        // zeros is exactly settled, and a band of 0 says so.
         let band = if med > 0.0 {
             med * constants::SETTLING_BAND_PCT / 100.0
         } else {
             0.0
         };
-        let settled = window
+        if window
             .iter()
-            .filter_map(|s| s.rpm)
-            .all(|v| (f64::from(v) - med).abs() <= band);
-        if settled {
-            return Some(window[0].at_ms);
+            .all(|&(_, v)| (f64::from(v) - med).abs() <= band)
+        {
+            return Some(window[0].0);
         }
     }
     None
+}
+
+/// The readings at which the value changed, in order. The first usable reading
+/// counts only if it differs from `reference`; with no reference it IS the
+/// reference, because nothing says it was not already the value before the
+/// write.
+fn register_updates(usable: &[(u64, u16)], reference: Option<u16>) -> Vec<(u64, u16)> {
+    let (mut prev, rest) = match reference {
+        Some(r) => (r, usable),
+        None => match usable.split_first() {
+            Some((first, rest)) => (first.1, rest),
+            None => return Vec::new(),
+        },
+    };
+    let mut out = Vec::new();
+    for &(at, v) in rest {
+        if v != prev {
+            out.push((at, v));
+            prev = v;
+        }
+    }
+    out
+}
+
+/// The tach register's refresh interval as observed: the **median** gap between
+/// consecutive changes of value (DEC-405, `PTR-b`). The one rule for both
+/// characterisation and control-path discovery.
+///
+/// §4: "Do not report sub-second timing precision if the underlying hwmon value
+/// updates every ~1–2 seconds." The median, not the smallest gap: sampling a 2 s
+/// register every 500 ms puts consecutive changes 1.5, 2 or 2.5 s apart, and the
+/// smallest of those under-reports the cadence — the false precision §4 exists
+/// to prevent. A driver's own `update_interval` outranks this where published;
+/// that choice is the caller's.
+///
+/// The gap before the first change is never counted: it measures when sampling
+/// began, not how often the driver refreshes. So two changes are required, and
+/// `None` — UNKNOWN, never a guess — is returned with fewer.
+pub fn update_interval_ms(samples: &[(u64, Option<u16>)]) -> Option<u64> {
+    let mut last_value: Option<u16> = None;
+    let mut prev_change_at: Option<u64> = None;
+    let mut gaps: Vec<u64> = Vec::new();
+    for (at_ms, value) in samples {
+        let Some(v) = value else { continue };
+        match last_value {
+            None => last_value = Some(*v),
+            Some(prev) if prev != *v => {
+                if let Some(prev_ms) = prev_change_at {
+                    let gap = at_ms.saturating_sub(prev_ms);
+                    if gap > 0 {
+                        gaps.push(gap);
+                    }
+                }
+                prev_change_at = Some(*at_ms);
+                last_value = Some(*v);
+            }
+            Some(_) => {}
+        }
+    }
+    if gaps.is_empty() {
+        return None;
+    }
+    gaps.sort_unstable();
+    Some(gaps[gaps.len() / 2])
+}
+
+/// `§4` statistics over the part of a window that describes a steady state
+/// (DEC-405, `PTR-a`).
+///
+/// Deleting the initial transient before computing steady-state statistics is
+/// the standard treatment (the MSER literature); the truncation point here is
+/// the daemon's own settle detector, [`settling_ms`]. Before this, a point's CV
+/// was computed from the moment of the write, so the settling ramp itself read
+/// as instability — 14.1 % at a pump duty whose steady spread was 0.81 %.
+///
+/// Returns the statistics and the `at_ms` the window opened at. A window that
+/// never settled keeps its figures over the WHOLE hold (opening at 0) so the
+/// evidence stays visible, and its verdict says it is not steady state:
+/// [`STABILITY_NOT_SETTLED`], unless it is already `unavailable` or
+/// `insufficient_data`, which are the stronger statements.
+///
+/// **`samples` and `dropouts` always describe the whole hold.** They are raw
+/// evidence, counted and never removed (`§9`): a tach that dropped out during
+/// the transient dropped out, and cutting the transient from the *statistics*
+/// must not cut it from the record. Everything else — `usable`, the
+/// distribution, `outliers`, `verdict` — describes the window, so `usable` can
+/// be less than `samples - dropouts` by exactly the transient's readings.
+pub fn settled_rpm_stats(samples: &[RpmSample], settled_ms: Option<u64>) -> (RpmStats, u64) {
+    match settled_ms {
+        Some(t) => {
+            let tail: Vec<RpmSample> = samples.iter().copied().filter(|s| s.at_ms >= t).collect();
+            let whole = rpm_stats(samples);
+            let mut st = rpm_stats(&tail);
+            st.samples = whole.samples;
+            st.dropouts = whole.dropouts;
+            (st, t)
+        }
+        None => {
+            let mut st = rpm_stats(samples);
+            if st.verdict != STABILITY_UNAVAILABLE && st.verdict != STABILITY_INSUFFICIENT {
+                st.verdict = STABILITY_NOT_SETTLED;
+            }
+            (st, 0)
+        }
+    }
 }
 
 /// A measured duty and the RPM observed at it, for the shape analyses below.
@@ -1004,18 +1148,31 @@ mod tests {
 
     // ── settling_ms ──────────────────────────────────────────────────
 
-    #[test]
-    fn a_window_that_never_settles_reports_none_not_zero() {
-        // Monotonically climbing: no tail ever sits inside the band.
-        let v: Vec<RpmSample> = (0..12)
-            .map(|i| s(i * 500, 500 + (i as u16) * 300))
-            .collect();
-        assert_eq!(settling_ms(&v), None);
+    /// A register that refreshes every `refresh_ms`, sampled every 500 ms: each
+    /// value in `values` is held for one refresh, so it appears in several
+    /// consecutive samples.
+    fn refreshing(values: &[u16], refresh_ms: u64, hold_ms: u64) -> Vec<RpmSample> {
+        (0..hold_ms / 500)
+            .map(|i| {
+                let at = i * 500;
+                let idx = ((at / refresh_ms) as usize).min(values.len() - 1);
+                s(at, values[idx])
+            })
+            .collect()
     }
 
     #[test]
-    fn settling_reports_the_first_sample_of_the_settled_tail() {
-        // Four noisy readings, then a flat tail starting at 2000 ms.
+    fn a_window_that_never_settles_reports_none_not_zero() {
+        // Monotonically climbing: no window of updates ever sits in the band.
+        let v: Vec<RpmSample> = (0..12)
+            .map(|i| s(i * 500, 500 + (i as u16) * 300))
+            .collect();
+        assert_eq!(settling_ms(&v, Some(200)), None);
+    }
+
+    #[test]
+    fn settling_reports_the_first_update_of_the_settled_window() {
+        // A 500 ms register: every sample is an update. Noisy, then flat from 2000.
         let v = vec![
             s(0, 400),
             s(500, 1200),
@@ -1026,48 +1183,99 @@ mod tests {
             s(3000, 998),
             s(3500, 1002),
         ];
-        assert_eq!(settling_ms(&v), Some(2000));
+        assert_eq!(settling_ms(&v, Some(300)), Some(2000));
+    }
+
+    /// `PTR-b`, the defect this rule exists for. A 2 s register sampled every
+    /// 500 ms reads four identical samples before it has refreshed once; the
+    /// old sample-counting rule called that settled at t = 0, before the fan had
+    /// moved. The pre-write reading is 2922; the first refresh (2000 ms) is the
+    /// first update, and nothing may settle before it.
+    #[test]
+    fn a_slow_register_cannot_settle_before_its_first_update() {
+        let v = refreshing(
+            &[2922, 2500, 2100, 1850, 1800, 1805, 1798, 1802],
+            2000,
+            16_000,
+        );
+        // Precondition: the samples before the first refresh are exactly the
+        // run of identical readings the old rule mistook for a settle.
+        assert!(v[..4].iter().all(|x| x.rpm == Some(2922)));
+        let settled = settling_ms(&v, Some(2922)).expect("the tail is flat and long enough");
+        assert!(
+            settled >= 2000,
+            "settled at {settled} ms, before the register's first refresh at 2000 ms"
+        );
+        // And the answer is the first update of the in-band run: 1850 at 6000.
+        assert_eq!(settled, 6000);
+    }
+
+    /// The same trace with the fan never changing its reading after one step
+    /// has too few UPDATES to settle, however many samples it has — this is the
+    /// "four identical samples are one observation" half of `PTR-b`.
+    #[test]
+    fn repeated_samples_of_one_value_are_one_update_not_many() {
+        // One refresh to a new value at 2000 ms, then three more refreshes.
+        let v = refreshing(&[1000, 1200, 1201, 1200, 1202], 2000, 10_000);
+        assert!(v.len() >= 4 * constants::SETTLING_HOLD_SAMPLES);
+        assert_eq!(
+            settling_ms(&v, Some(1000)),
+            Some(2000),
+            "four updates (1200, 1201, 1200, 1202) are needed and present"
+        );
+        let short = refreshing(&[1000, 1200, 1201], 2000, 6_000);
+        assert_eq!(
+            settling_ms(&short, Some(1000)),
+            None,
+            "two updates in twelve samples are two observations, not twelve"
+        );
+    }
+
+    /// A window whose reading never changes has no transient: a stopped fan's
+    /// zero, or a register that simply held one value. It settles at its first
+    /// sample (DEC-405 S1-10), the rule the all-zero case always had.
+    #[test]
+    fn a_window_that_never_changes_is_steady_from_its_first_sample() {
+        let zeros: Vec<RpmSample> = (0..12).map(|i| s(i * 500, 0)).collect();
+        assert_eq!(settling_ms(&zeros, Some(900)), Some(0));
+        let flat: Vec<RpmSample> = (0..12).map(|i| s(500 + i * 500, 1500)).collect();
+        assert_eq!(settling_ms(&flat, None), Some(500));
     }
 
     /// A settled window followed by one late spike still reports a settling
-    /// time.
-    ///
-    /// The first draft matched the whole remaining tail rather than a window of
-    /// `SETTLING_HOLD_SAMPLES`, so a single late outlier disqualified every
-    /// start index and the window read as "never settled". DEC-334 §7 expects
-    /// occasional outliers at these sample counts, so that is the normal case,
-    /// not an exotic one — and it also made the constant a minimum tail length
-    /// rather than the observation period its own doc describes.
+    /// time: the criterion is a window of `SETTLING_HOLD_SAMPLES` updates, not
+    /// the whole remaining tail (DEC-334 §7 expects occasional outliers).
     #[test]
     fn a_late_spike_does_not_erase_an_earlier_settled_window() {
         let hold = constants::SETTLING_HOLD_SAMPLES;
-        // `hold` steady readings from t=0, then one wild one.
-        let mut v: Vec<RpmSample> = (0..hold).map(|i| s(i as u64 * 500, 1000)).collect();
+        // `hold` in-band updates from t=0, then one wild one.
+        let mut v: Vec<RpmSample> = (0..hold)
+            .map(|i| s(i as u64 * 500, 1000 + i as u16))
+            .collect();
         v.push(s(hold as u64 * 500, 4000));
         assert_eq!(
-            settling_ms(&v),
+            settling_ms(&v, Some(700)),
             Some(0),
-            "a window of {hold} steady readings settled at t=0 regardless of what \
+            "a window of {hold} in-band updates settled at t=0 regardless of what \
              happened afterwards"
         );
     }
 
-    /// The other direction: the criterion is still a real one, and noise inside
-    /// the window disqualifies it.
+    /// The other direction: noise inside the window disqualifies it.
     #[test]
     fn noise_inside_the_window_still_prevents_a_settling_claim() {
         let hold = constants::SETTLING_HOLD_SAMPLES;
         let v: Vec<RpmSample> = (0..hold * 2)
             .map(|i| s(i as u64 * 500, if i % 2 == 0 { 500 } else { 3000 }))
             .collect();
-        assert_eq!(settling_ms(&v), None);
+        assert_eq!(settling_ms(&v, None), None);
     }
 
     #[test]
     fn too_few_usable_samples_cannot_claim_a_settling_time() {
         let v = vec![s(0, 1000), gap(500), s(1000, 1000)];
         assert!(v.len() >= constants::SETTLING_HOLD_SAMPLES.saturating_sub(1));
-        assert_eq!(settling_ms(&v), None);
+        assert_eq!(settling_ms(&v, None), None);
     }
 
     #[test]
@@ -1079,11 +1287,127 @@ mod tests {
             gap(1500),
             s(2000, 999),
             s(2500, 1001),
+            gap(3000),
+            s(3500, 1003),
         ];
         assert_eq!(
-            settling_ms(&v),
+            settling_ms(&v, Some(900)),
             Some(0),
             "an unreadable sample is missing data, not a departure from the band"
+        );
+    }
+
+    // ── update_interval_ms ───────────────────────────────────────────
+
+    /// §4 / DEC-405: the MEDIAN gap. A 2 s register sampled at 500 ms shows
+    /// changes 1.5, 2 and 2.5 s apart; the smallest (1.5 s) under-reports it.
+    #[test]
+    fn the_update_interval_is_the_median_gap_not_the_smallest() {
+        let changes = [
+            (0u64, 1000u16),
+            (1500, 1010),
+            (3500, 1020),
+            (6000, 1030),
+            (8000, 1040),
+        ];
+        let mut samples: Vec<(u64, Option<u16>)> = Vec::new();
+        let mut current = 1000;
+        for t in (0..=8000).step_by(500) {
+            if let Some(&(_, v)) = changes.iter().find(|(at, _)| *at == t) {
+                current = v;
+            }
+            samples.push((t, Some(current)));
+        }
+        // Gaps between changes: 2000, 2500, 2000 → median 2000; smallest 2000
+        // too, so add the sampling-jitter case that separates them:
+        assert_eq!(update_interval_ms(&samples), Some(2000));
+        let jittery = [
+            (0u64, Some(1u16)),
+            (1000, Some(2)),
+            (2500, Some(3)),
+            (4500, Some(4)),
+            (7000, Some(5)),
+            (9000, Some(6)),
+        ];
+        // Gaps 1500, 2000, 2500, 2000 → median 2000, while the old rule said 1500.
+        assert_eq!(update_interval_ms(&jittery), Some(2000));
+    }
+
+    #[test]
+    fn one_change_or_none_is_an_unknown_interval() {
+        assert_eq!(update_interval_ms(&[(0, Some(5)), (500, Some(5))]), None);
+        assert_eq!(update_interval_ms(&[(0, Some(5)), (500, Some(6))]), None);
+    }
+
+    // ── settled_rpm_stats ────────────────────────────────────────────
+
+    /// `PTR-a` (D6). A step response whose ramp sits inside the window: the
+    /// statistics must describe the settled tail, not the transient. Asserted on
+    /// the realised output against a figure computed independently from the
+    /// tail values, never by re-running the same arithmetic (DEC-320).
+    #[test]
+    fn stability_is_computed_over_the_settled_tail_only() {
+        let v = refreshing(
+            &[2922, 2400, 1900, 1500, 1200, 1180, 1190, 1185, 1182],
+            1000,
+            9_000,
+        );
+        let settled = settling_ms(&v, Some(2922)).expect("settles");
+        let (st, opened) = settled_rpm_stats(&v, Some(settled));
+        assert_eq!(opened, settled);
+        assert_eq!(st.min, Some(1180), "no ramp reading survives into the tail");
+        assert!(st.cv_pct.expect("cv") < 1.0, "tail CV {:?}", st.cv_pct);
+        // The whole-window figure the old code published, for contrast.
+        let whole = rpm_stats(&v);
+        assert!(whole.cv_pct.expect("cv") > 20.0);
+    }
+
+    /// SR-2: trimming the transient from the statistics must not trim it from
+    /// the record — a tach dropout during the ramp is still counted, and
+    /// `samples` is still every retained reading.
+    #[test]
+    fn a_dropout_in_the_transient_is_still_counted() {
+        let mut v = refreshing(
+            &[2922, 2400, 1900, 1500, 1200, 1180, 1190, 1185, 1182],
+            1000,
+            9_000,
+        );
+        v[3] = gap(v[3].at_ms); // unreadable during the ramp (1500 ms)
+        let settled = settling_ms(&v, Some(2922)).expect("settles");
+        assert!(
+            settled > 1500,
+            "precondition: the dropout sits in the transient"
+        );
+        let (st, _) = settled_rpm_stats(&v, Some(settled));
+        assert_eq!(
+            st.dropouts, 1,
+            "the transient's dropout vanished from the record"
+        );
+        assert_eq!(
+            st.samples as usize,
+            v.len(),
+            "samples is every retained reading"
+        );
+        assert!(
+            st.usable < st.samples - st.dropouts,
+            "the statistics still cover the tail only"
+        );
+    }
+
+    #[test]
+    fn a_window_that_never_settles_keeps_its_figures_and_says_not_settled() {
+        let v: Vec<RpmSample> = (0..12)
+            .map(|i| s(i * 500, 500 + (i as u16) * 300))
+            .collect();
+        let (st, opened) = settled_rpm_stats(&v, settling_ms(&v, None));
+        assert_eq!(opened, 0);
+        assert_eq!(st.verdict, STABILITY_NOT_SETTLED);
+        assert_eq!(st.usable, 12, "the figures cover the whole hold");
+        // Too few readings stays the stronger statement.
+        let few: Vec<RpmSample> = (0..3).map(|i| s(i * 500, 500 + i as u16 * 900)).collect();
+        assert_eq!(
+            settled_rpm_stats(&few, None).0.verdict,
+            STABILITY_INSUFFICIENT
         );
     }
 

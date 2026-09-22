@@ -1469,6 +1469,11 @@ pub struct HardwareDiagnosticsResponse {
     pub kernel_modules: Vec<KernelModuleInfo>,
     pub acpi_conflicts: Vec<AcpiConflictInfo>,
     pub board: BoardInfo,
+    /// DEC-405 (`PTR-f`). The running kernel's release
+    /// (`/proc/sys/kernel/osrelease`), the one fact that separates a kernel
+    /// update from a hardware change when two reports differ. `None` when
+    /// unreadable. Length-capped.
+    pub kernel_release: Option<String>,
     /// Chip names this DMI board is *expected* to expose, sourced from a
     /// curated dual-chip board lookup (`it87.c` DMI table + community
     /// reports). Empty when the board is not in the lookup. The GUI
@@ -1777,6 +1782,18 @@ pub struct KernelModuleInfo {
     pub name: String,
     pub loaded: bool,
     pub in_mainline: bool,
+    /// DEC-405 (`PTR-f`). `/sys/module/<name>/version` — present only for a
+    /// loaded module built with `MODULE_VERSION`, so `None` is common and means
+    /// "not published", never "unknown version". Length-capped.
+    pub version: Option<String>,
+    /// DEC-405. `/sys/module/<name>/srcversion`, the checksum of the module's
+    /// source — what tells two builds of one version apart (a DKMS rebuild, a
+    /// kernel update). `None` when not loaded or not published.
+    pub srcversion: Option<String>,
+    /// DEC-405. The kernel's `O` taint flag on the loaded module: built outside
+    /// the kernel tree (a DKMS or hand build). `None` when the module is not
+    /// loaded or its taint could not be read — never a guessed `false`.
+    pub out_of_tree: Option<bool>,
 }
 
 /// Detected ACPI I/O port conflict.
@@ -1822,6 +1839,10 @@ pub struct BoardInfo {
     pub vendor: String,
     pub name: String,
     pub bios_version: String,
+    /// DEC-405 (`PTR-f`). DMI `bios_date` as the firmware reports it (commonly
+    /// `MM/DD/YYYY`; passed through, not parsed). `None` when absent — unlike
+    /// the three fields above, which predate the rule and read `""`.
+    pub bios_date: Option<String>,
 }
 
 // ── PWM verification ──────────────────────────────────────────────
@@ -2596,6 +2617,7 @@ mod tests {
             delta_rpm: Some(360),
             noise_floor_rpm: 30,
             responded: true,
+            noise_floor_from_cycle_1: false,
         };
         expect(
             &serde_json::to_value(&observation).unwrap(),
@@ -2616,6 +2638,8 @@ mod tests {
             perturbed_pct: 70,
             direction: "up".into(),
             observations: vec![observation],
+            baseline_settled: Some(true),
+            settle_wait_ms: 8_000,
         };
         expect(&serde_json::to_value(&cycle).unwrap(), "DiscoveryCycle");
 
@@ -2697,6 +2721,8 @@ mod tests {
             verdict: "stable".into(),
             sample_interval_ms: 500,
             dwell_ms: 12_000,
+            window_start_ms: 5_400,
+            update_interval_ms: Some(2_000),
         };
         expect(&serde_json::to_value(&stability).unwrap(), "PointStability");
 
@@ -2745,6 +2771,8 @@ mod tests {
             min_rpm: Some(640),
             max_rpm: Some(1900),
             monotonic: Some(true),
+            monotonic_falling: Some(true),
+            monotonic_rising: Some(true),
             dead_zone_upper_pct: Some(15),
             clamp_pct: None,
             possible_device_override: false,
@@ -2800,6 +2828,24 @@ mod tests {
         expect(
             &serde_json::to_value(&fingerprint).unwrap(),
             "StartupFingerprint",
+        );
+
+        // DEC-405 (`PTR-e`): a session's verify evidence, enrolled when the GUI
+        // started reading it — the struct whose fields were always `None`.
+        let verify_evidence = crate::validation::session::VerifyEvidence {
+            header_id: "hwmon:it87:isa-0a30:pwm2:PUMP".into(),
+            write_ok: true,
+            readback_pct: Some(80),
+            requested_pct: Some(80),
+            rpm_before: Some(1200),
+            rpm_after: Some(1932),
+            detail: Some("x".into()),
+            result: Some("effective".into()),
+            restore_failed: false,
+        };
+        expect(
+            &serde_json::to_value(&verify_evidence).unwrap(),
+            "VerifyEvidence",
         );
 
         // **Both directions, and this is what makes the oracle an interlock
@@ -2863,7 +2909,9 @@ mod tests {
                     vendor: "Gigabyte".into(),
                     name: "X870E AORUS MASTER".into(),
                     bios_version: "F14c".into(),
+                    bios_date: Some("08/14/2025".into()),
                 },
+                kernel_release: Some("6.18.2-1-cachyos".into()),
                 expected_chips: Vec::new(),
                 board_firmware_counts: None,
                 kernel_detected_chips: Vec::new(),

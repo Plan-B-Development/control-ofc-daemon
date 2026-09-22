@@ -242,11 +242,41 @@ pub fn is_known_superio_chip(chip_name: &str) -> bool {
 
 /// Detect which known hwmon kernel modules are currently loaded.
 pub fn detect_loaded_modules() -> Vec<KernelModuleInfo> {
-    detect_loaded_modules_from(Path::new("/proc/modules"))
+    detect_loaded_modules_from(Path::new("/proc/modules"), Path::new("/sys/module"))
 }
 
-/// Testable variant with injectable path.
-pub fn detect_loaded_modules_from(proc_modules: &Path) -> Vec<KernelModuleInfo> {
+/// DEC-405 (`PTR-f`): the cap on any one environment fact the daemon passes
+/// through from sysfs/DMI. These are firmware- and build-supplied strings of a
+/// few dozen bytes; the cap only stops a malformed one being copied into every
+/// report and export verbatim.
+pub const ENV_FACT_MAX_BYTES: usize = 128;
+
+/// Trim, drop an empty value (absent is `None`, never `""`), and cap at
+/// [`ENV_FACT_MAX_BYTES`] on a character boundary.
+pub fn cap_env_fact(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let mut end = t.len().min(ENV_FACT_MAX_BYTES);
+    while !t.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(t[..end].to_string())
+}
+
+/// Read one environment fact: `None` when the file is absent, unreadable or
+/// empty.
+fn read_env_fact(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .as_deref()
+        .and_then(cap_env_fact)
+}
+
+/// Testable variant with injectable paths. `sys_module` is `/sys/module`, read
+/// only for modules `/proc/modules` lists as loaded.
+pub fn detect_loaded_modules_from(proc_modules: &Path, sys_module: &Path) -> Vec<KernelModuleInfo> {
     let content = match std::fs::read_to_string(proc_modules) {
         Ok(c) => c,
         Err(e) => {
@@ -257,6 +287,9 @@ pub fn detect_loaded_modules_from(proc_modules: &Path) -> Vec<KernelModuleInfo> 
                     name: name.to_string(),
                     loaded: false,
                     in_mainline: *mainline,
+                    version: None,
+                    srcversion: None,
+                    out_of_tree: None,
                 })
                 .collect();
         }
@@ -270,10 +303,26 @@ pub fn detect_loaded_modules_from(proc_modules: &Path) -> Vec<KernelModuleInfo> 
 
     KNOWN_MODULES
         .iter()
-        .map(|(name, mainline)| KernelModuleInfo {
-            name: name.to_string(),
-            loaded: loaded.contains_key(name),
-            in_mainline: *mainline,
+        .map(|(name, mainline)| {
+            let is_loaded = loaded.contains_key(name);
+            // DEC-405: the build facts, only for a module that is loaded — an
+            // unloaded one's `/sys/module` entry, if any, describes nothing
+            // that is running.
+            let dir = sys_module.join(name);
+            let fact = |f: &str| is_loaded.then(|| read_env_fact(&dir.join(f))).flatten();
+            KernelModuleInfo {
+                name: name.to_string(),
+                loaded: is_loaded,
+                in_mainline: *mainline,
+                version: fact("version"),
+                srcversion: fact("srcversion"),
+                // `taint` exists (often empty) for every loaded module, so an
+                // unreadable one is `None`, not "in-tree".
+                out_of_tree: is_loaded
+                    .then(|| std::fs::read_to_string(dir.join("taint")).ok())
+                    .flatten()
+                    .map(|t| t.contains('O')),
+            }
         })
         .collect()
 }
@@ -555,6 +604,7 @@ pub fn read_board_info_from(dmi_dir: &Path) -> BoardInfo {
         vendor: read_field("board_vendor"),
         name: read_field("board_name"),
         bios_version: read_field("bios_version"),
+        bios_date: read_env_fact(&dmi_dir.join("bios_date")),
     }
 }
 
@@ -1208,7 +1258,7 @@ mod tests {
         )
         .unwrap();
 
-        let modules = detect_loaded_modules_from(&modules_path);
+        let modules = detect_loaded_modules_from(&modules_path, &tmp.path().join("no-sys-module"));
         let nct = modules.iter().find(|m| m.name == "nct6775").unwrap();
         assert!(nct.loaded);
         assert!(nct.in_mainline);
@@ -1287,10 +1337,64 @@ mod tests {
         fs::write(tmp.path().join("board_name"), "X870E AORUS MASTER\n").unwrap();
         fs::write(tmp.path().join("bios_version"), "F13a\n").unwrap();
 
+        fs::write(tmp.path().join("bios_date"), "08/14/2025\n").unwrap();
+
         let info = read_board_info_from(tmp.path());
         assert_eq!(info.vendor, "Gigabyte Technology Co., Ltd.");
         assert_eq!(info.name, "X870E AORUS MASTER");
         assert_eq!(info.bios_version, "F13a");
+        assert_eq!(info.bios_date.as_deref(), Some("08/14/2025"));
+    }
+
+    /// DEC-405 (`PTR-f`): the build facts come from `/sys/module` for a LOADED
+    /// module only; an absent file is `None`, never `""`; an empty `taint` is
+    /// an in-tree module (`Some(false)`), an `O` taint an out-of-tree one.
+    #[test]
+    fn loaded_modules_publish_their_build_facts_and_absent_ones_are_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_modules = tmp.path().join("modules");
+        fs::write(
+            &proc_modules,
+            "it87 90112 0 - Live 0x0 (OE)\nnct6775 28672 0 - Live 0x0\n",
+        )
+        .unwrap();
+        let sys = tmp.path().join("sys-module");
+        let it87 = sys.join("it87");
+        fs::create_dir_all(&it87).unwrap();
+        fs::write(it87.join("version"), "v1.0-202509\n").unwrap();
+        fs::write(it87.join("srcversion"), "A1B2C3D4E5F6A7B8C9D0E1F\n").unwrap();
+        fs::write(it87.join("taint"), "OE\n").unwrap();
+        let nct = sys.join("nct6775");
+        fs::create_dir_all(&nct).unwrap();
+        fs::write(nct.join("taint"), "\n").unwrap(); // in-tree: empty, no version
+                                                     // An unloaded module whose directory lingers must not be reported.
+        let stale = sys.join("nct6687");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("version"), "stale\n").unwrap();
+
+        let mods = detect_loaded_modules_from(&proc_modules, &sys);
+        let get = |n: &str| mods.iter().find(|m| m.name == n).unwrap().clone();
+        let a = get("it87");
+        assert_eq!(a.version.as_deref(), Some("v1.0-202509"));
+        assert_eq!(a.srcversion.as_deref(), Some("A1B2C3D4E5F6A7B8C9D0E1F"));
+        assert_eq!(a.out_of_tree, Some(true));
+        let b = get("nct6775");
+        assert_eq!(
+            (b.version, b.srcversion, b.out_of_tree),
+            (None, None, Some(false))
+        );
+        let c = get("nct6687");
+        assert!(!c.loaded);
+        assert_eq!((c.version, c.srcversion, c.out_of_tree), (None, None, None));
+    }
+
+    #[test]
+    fn an_environment_fact_is_capped_on_a_char_boundary_and_empty_is_none() {
+        assert_eq!(cap_env_fact("  \n"), None);
+        let long = "é".repeat(ENV_FACT_MAX_BYTES); // two bytes each
+        let capped = cap_env_fact(&long).unwrap();
+        assert!(capped.len() <= ENV_FACT_MAX_BYTES);
+        assert!(capped.chars().all(|c| c == 'é'));
     }
 
     #[test]
@@ -1300,6 +1404,10 @@ mod tests {
         assert_eq!(info.vendor, "");
         assert_eq!(info.name, "");
         assert_eq!(info.bios_version, "");
+        assert_eq!(
+            info.bios_date, None,
+            "absent is None, never an empty string"
+        );
     }
 
     // ── DEC-101: dual-chip board lookup ────────────────────────

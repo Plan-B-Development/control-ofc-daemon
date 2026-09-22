@@ -137,6 +137,11 @@ pub struct TachObservation {
     /// Did this channel move beyond both its own noise floor and the relative
     /// threshold?
     pub responded: bool,
+    /// DEC-405 (`PTR-c`). True when this channel had not settled before this
+    /// cycle's baseline window, so `noise_floor_rpm` is cycle 1's measurement
+    /// for it rather than this window's — a recovery ramp is not noise.
+    #[serde(default)]
+    pub noise_floor_from_cycle_1: bool,
 }
 
 /// One perturbation cycle.
@@ -149,6 +154,15 @@ pub struct DiscoveryCycle {
     /// `up` | `down` — which way [`perturbation_target`] went.
     pub direction: String,
     pub observations: Vec<TachObservation>,
+    /// DEC-405 (`PTR-c`). Whether every channel that could move had settled
+    /// before the baseline window opened. `None` when no wait ran, because the
+    /// baseline write did not move the duty (cycle 1 at the header's own duty).
+    #[serde(default)]
+    pub baseline_settled: Option<bool>,
+    /// DEC-405. How long this cycle waited for that settle, bounded by
+    /// [`constants::DISCOVERY_SETTLE_WAIT_MAX`]. `0` when no wait ran.
+    #[serde(default)]
+    pub settle_wait_ms: u64,
 }
 
 /// A candidate PWM → tach relationship.
@@ -180,8 +194,9 @@ pub struct DiscoverySummary {
     pub confidence: String,
     pub candidates: Vec<ControlPathCandidate>,
     /// Effective telemetry update cadence, when it could be established: the
-    /// driver's own `update_interval` if it publishes one, else the smallest
-    /// interval between two *differing* samples this run actually observed.
+    /// driver's own `update_interval` if it publishes one, else the **median**
+    /// interval between changes this run observed (DEC-405) — on the header's
+    /// own tach where it has one, else the fastest channel.
     /// `None` means UNKNOWN, which §4 requires in preference to a guess.
     pub measurement_resolution_ms: Option<u64>,
     /// How this run sub-sampled.
@@ -354,47 +369,15 @@ pub fn responded(baseline: Option<u16>, perturbed: Option<u16>, noise: u16) -> b
     delta >= noise && delta >= relative
 }
 
-/// Smallest interval between two consecutive samples whose value differed.
+/// The tach refresh interval one channel's samples show: the median gap between
+/// changes of value. The rule lives in [`crate::api::stats::update_interval_ms`]
+/// so characterisation and discovery cannot disagree about it (DEC-405); this
+/// name is kept for the callers and tests that already use it.
 ///
-/// §4: "Do not report sub-second timing precision if the underlying hwmon value
-/// updates every ~1–2 seconds." This derives the cadence from samples the run
-/// **already took**, which is why there is no second, faster polling loop: a
-/// driver that only refreshes every 2 s produces runs of identical readings, and
-/// the gap between changes is exactly the quantity §4 asks for.
-///
-/// `None` when nothing ever changed — reported as UNKNOWN rather than guessed.
+/// `None` when fewer than two changes were seen — reported as UNKNOWN rather
+/// than guessed.
 pub fn measurement_resolution_ms(samples: &[(u64, Option<u16>)]) -> Option<u64> {
-    let mut last_value: Option<u16> = None;
-    // The timestamp of the previous OBSERVED CHANGE, not of the previous sample.
-    //
-    // The distinction is the whole correctness of this function. The first change
-    // in a series has no known start: the value was already whatever it was when
-    // sampling began, so the gap between sample 0 and the first change is a
-    // measure of when we started looking, not of how often the driver updates.
-    // Counting it under-reports the cadence — a 2 s driver first sampled 1 s
-    // before its first refresh would be reported as 1 s, which is exactly the
-    // false precision §4 exists to prevent. Two changes are therefore required
-    // before any interval is reported, and one change alone yields UNKNOWN.
-    let mut prev_change_at: Option<u64> = None;
-    let mut smallest: Option<u64> = None;
-    for (at_ms, value) in samples {
-        let Some(v) = value else { continue };
-        match last_value {
-            None => last_value = Some(*v),
-            Some(prev) if prev != *v => {
-                if let Some(prev_ms) = prev_change_at {
-                    let interval = at_ms.saturating_sub(prev_ms);
-                    if interval > 0 {
-                        smallest = Some(smallest.map_or(interval, |s: u64| s.min(interval)));
-                    }
-                }
-                prev_change_at = Some(*at_ms);
-                last_value = Some(*v);
-            }
-            Some(_) => {}
-        }
-    }
-    smallest
+    crate::api::stats::update_interval_ms(samples)
 }
 
 /// Derive the whole result from the measured cycles. Pure — the handler must
@@ -552,6 +535,29 @@ pub fn summarise(
         CONF_LOW
     };
 
+    // DEC-405 (`PTR-c`): say when a baseline could not settle, and which noise
+    // floors it therefore borrowed, so a verdict never silently rests on a
+    // window that was still recovering.
+    let unsettled: Vec<String> = cycles
+        .iter()
+        .filter(|c| c.baseline_settled == Some(false))
+        .map(|c| c.cycle.to_string())
+        .collect();
+    if !unsettled.is_empty() {
+        let borrowed = cycles
+            .iter()
+            .flat_map(|c| c.observations.iter())
+            .filter(|o| o.noise_floor_from_cycle_1)
+            .count();
+        notes.push(format!(
+            "The tachs had not all settled within {} s before the baseline of cycle(s) {}. \
+             {borrowed} channel reading(s) used cycle 1's noise floor instead of one \
+             measured while the fan was still recovering.",
+            constants::DISCOVERY_SETTLE_WAIT_MAX.as_secs(),
+            unsettled.join(", ")
+        ));
+    }
+
     // §4: prefer the driver's own declared cadence; fall back to what this run
     // observed; report UNKNOWN rather than guessing.
     let measurement_resolution_ms = driver_update_interval_ms.or(observed_resolution_ms);
@@ -638,6 +644,10 @@ pub async fn run_discovery<W, R, Fut, P, S, K>(
     restore_floor: u8,
     pump_protected: bool,
     window: Duration,
+    // DEC-405: the bound on each settle-wait. Production passes
+    // `constants::DISCOVERY_SETTLE_WAIT_MAX`; a parameter, like `window`, so a
+    // harness's own clock decides how long "bounded" is.
+    settle_wait_max: Duration,
     write_fn: W,
     // One observation, resolved as a **future** so the caller can put the
     // blocking `std::fs` reads it performs on the blocking pool (`P8-am`).
@@ -667,6 +677,13 @@ where
         .is_some();
 
     let mut measured: Vec<DiscoveryCycle> = Vec::with_capacity(cycle_count as usize);
+    // DEC-405: each channel's reading just before the current window, the
+    // reference a settle is judged against — a first sample still equal to it is
+    // a register that has not refreshed, never a settle.
+    let mut previous_tachs: Vec<Option<u16>> = first.tachs.clone();
+    // Cycle 1's per-channel noise floor, and whether it was measured on a
+    // settled baseline — the fallback when a later baseline cannot settle.
+    let mut cycle_1_noise: Vec<Option<u16>> = vec![None; channels.len()];
     let mut sample_count: u32 = 0;
     let mut resolution_samples: Vec<Vec<(u64, Option<u16>)>> = vec![Vec::new(); channels.len()];
     let wrote_any = AtomicBool::new(false);
@@ -714,7 +731,7 @@ where
                 detail: Some($detail),
                 cycles: measured,
                 sample_count,
-                observed_resolution_ms: fold_resolution(&resolution_samples),
+                observed_resolution_ms: fold_resolution(&resolution_samples, target_idx),
             }
         };
     }
@@ -805,6 +822,75 @@ where
                 format!("PWM write of {baseline_pct}% failed: {e}")
             );
         }
+        // ── Settle-wait (DEC-405, `PTR-c`) ──
+        // A baseline window that opens as the previous perturbation is reversed
+        // measures the recovery ramp, and `noise_floor` then calls that ramp
+        // noise: on 2026-09-08 a +796 rpm pump response was graded `ambiguous`
+        // against an 804 rpm cycle-2 floor. So wait, bounded, for every channel
+        // that can move to settle — before any baseline whose write moved the
+        // duty, which is every later cycle and cycle 1 only when the header was
+        // below the discovery floor.
+        let needs_wait = cycle > 1 || original_pct != Some(baseline_pct);
+        let (baseline_settled, settle_wait_ms, channel_settled) = if needs_wait {
+            let waited = match settle_wait(
+                &read_fn,
+                settle_wait_max,
+                &shutting_down,
+                run_started,
+                &mut resolution_samples,
+                &mut sample_count,
+                &previous_tachs,
+            )
+            .await
+            {
+                Some(w) => w,
+                None => bail!(STATE_ABORTED, "the daemon is shutting down".into()),
+            };
+            // [SAFETY] The wait held the baseline duty for up to a window, so its
+            // last reading gets the same reclaim / lost-pump-tach check every
+            // observation window's does. Without it a pump whose tach vanished
+            // during the wait would be noticed only after the baseline window
+            // too — two windows at the baseline duty instead of one.
+            if let Some(reason) = reclaim_or_lost_pump(
+                &waited.last,
+                baseline_pct,
+                pump_protected,
+                had_target_tach,
+                target_idx.and_then(|i| waited.last.tachs.get(i).copied().flatten()),
+            ) {
+                bail!(STATE_ABORTED, reason);
+            }
+            // DEC-405 (F2): a cancel is honoured at every window boundary, so it
+            // lands when the window being held ends — the wait included, which
+            // would otherwise add up to `DISCOVERY_SETTLE_WAIT_MAX` to it.
+            if cancel.load(Ordering::SeqCst) {
+                bail!(
+                    STATE_CANCELLED,
+                    format!("cancelled after {} of {cycle_count} cycles", cycle - 1)
+                );
+            }
+            // [SAFETY] The wait is an observation window in its own right, so
+            // the one-window renewal cadence (DEC-296) and the thermal gates
+            // beside it (DEC-339) are applied again before the baseline window.
+            // Without this the baseline window would run up to
+            // `DISCOVERY_SETTLE_WAIT_MAX + window` (30 s) past the last renewal —
+            // exactly the deadman — and a thermal condition that arose during
+            // the wait would go unexamined for two windows. Same order as every
+            // other gate site in this function: thermal, then keepalive.
+            if let Some(reason) = thermal_gate() {
+                bail!(STATE_ABORTED, reason);
+            }
+            if !keepalive() {
+                bail!(
+                    STATE_ABORTED,
+                    "superseded by a later diagnostic; this run's lease is gone".into()
+                );
+            }
+            let all = waited.settled.iter().all(|s| *s);
+            (Some(all), waited.elapsed_ms, waited.settled)
+        } else {
+            (None, 0, vec![true; channels.len()])
+        };
         let base = match observe(
             &read_fn,
             window,
@@ -855,6 +941,15 @@ where
         // return one read after a shutdown began and a write landing after
         // `hand_back_hwmon` would re-assert `pwm_enable=1` on a header the
         // firmware has been handed back (the DEC-290 / 277-c hazard).
+        //
+        // DEC-405 (F2): a cancel pressed during the baseline window lands here,
+        // when that window ends, rather than a whole perturbed window later.
+        if cancel.load(Ordering::SeqCst) {
+            bail!(
+                STATE_CANCELLED,
+                format!("cancelled after {} of {cycle_count} cycles", cycle - 1)
+            );
+        }
         if let Some(reason) = thermal_gate() {
             bail!(STATE_ABORTED, reason);
         }
@@ -903,7 +998,20 @@ where
             .map(|(i, ch)| {
                 let baseline_rpm = base.last.tachs.get(i).copied().flatten();
                 let perturbed_rpm = pert.last.tachs.get(i).copied().flatten();
-                let noise = noise_floor(&base.per_channel[i]);
+                let own_noise = noise_floor(&base.per_channel[i]);
+                // DEC-405: a channel that settled measured its noise on a steady
+                // baseline. One that did not falls back to cycle 1's floor for it
+                // when there is one; cycle 1 itself has nothing earlier to use,
+                // and its `baseline_settled` says so.
+                let fallback = if channel_settled[i] {
+                    None
+                } else {
+                    cycle_1_noise[i]
+                };
+                let noise = fallback.unwrap_or(own_noise);
+                if cycle == 1 {
+                    cycle_1_noise[i] = channel_settled[i].then_some(own_noise);
+                }
                 TachObservation {
                     tach_id: ch.tach_id.clone(),
                     baseline_rpm,
@@ -913,6 +1021,7 @@ where
                         .map(|(b, p)| i32::from(p) - i32::from(b)),
                     noise_floor_rpm: noise,
                     responded: responded(baseline_rpm, perturbed_rpm, noise),
+                    noise_floor_from_cycle_1: fallback.is_some(),
                 }
             })
             .collect();
@@ -923,7 +1032,10 @@ where
             perturbed_pct,
             direction: direction.to_string(),
             observations,
+            baseline_settled,
+            settle_wait_ms,
         };
+        previous_tachs = pert.last.tachs.clone();
         measured.push(done.clone());
         publish(done);
     }
@@ -993,7 +1105,7 @@ where
         detail: None,
         cycles: measured,
         sample_count,
-        observed_resolution_ms: fold_resolution(&resolution_samples),
+        observed_resolution_ms: fold_resolution(&resolution_samples, target_idx),
     }
 }
 
@@ -1095,12 +1207,124 @@ where
     Some(Observed { last, per_channel })
 }
 
-/// Smallest observed update interval across every channel.
-fn fold_resolution(per_channel: &[Vec<(u64, Option<u16>)>]) -> Option<u64> {
-    per_channel
-        .iter()
-        .filter_map(|s| measurement_resolution_ms(s))
-        .min()
+/// The run's observed update interval (DEC-405): the header's own tach's, when
+/// it has one that established a cadence — that is the chip the timings are
+/// about — else the fastest channel's, as before.
+fn fold_resolution(
+    per_channel: &[Vec<(u64, Option<u16>)>],
+    target_idx: Option<usize>,
+) -> Option<u64> {
+    target_idx
+        .and_then(|i| per_channel.get(i))
+        .and_then(|s| measurement_resolution_ms(s))
+        .or_else(|| {
+            per_channel
+                .iter()
+                .filter_map(|s| measurement_resolution_ms(s))
+                .min()
+        })
+}
+
+/// What a settle-wait established.
+struct SettleWait {
+    /// Per channel: settled, or had nothing to settle.
+    settled: Vec<bool>,
+    elapsed_ms: u64,
+    /// The wait's final reading, for the reclaim / lost-pump-tach check every
+    /// window's last reading gets.
+    last: DiscoverySample,
+}
+
+/// Can this channel be released from a settle-wait without settling on updates?
+///
+/// Only when it has produced nothing that could be settling: every readable
+/// value it has shown this run — `reference` included — is the same, over at
+/// least [`constants::DISCOVERY_UNCHANGED_SPAN`] of observation, or it has never
+/// been readable at all. The span is the point: two seconds of one value is
+/// what a slow register looks like before it refreshes.
+fn nothing_to_settle(history: &[(u64, Option<u16>)], reference: Option<u16>) -> bool {
+    let mut readable = history.iter().filter_map(|(at, v)| v.map(|v| (*at, v)));
+    let Some((first_at, first_v)) = readable.next() else {
+        return reference.is_none();
+    };
+    if reference.is_some_and(|r| r != first_v) {
+        return false;
+    }
+    let mut last_at = first_at;
+    for (at, v) in readable {
+        if v != first_v {
+            return false;
+        }
+        last_at = at;
+    }
+    last_at.saturating_sub(first_at) >= constants::DISCOVERY_UNCHANGED_SPAN.as_millis() as u64
+}
+
+/// DEC-405 (`PTR-c`): hold the just-written duty until every channel that can
+/// move has settled, or `bound` elapses. `None` means shutdown began.
+///
+/// Settling is judged with [`stats::settled_on_updates`] while the wait is open
+/// and only with the full [`stats::settling_ms`] once it has closed: online, the
+/// constant-window rule would release a slow register before its first refresh.
+/// Samples are appended to `resolution`, so the wait also informs the cadence.
+async fn settle_wait<R, Fut, S>(
+    read_fn: &R,
+    bound: Duration,
+    shutting_down: &S,
+    run_started: tokio::time::Instant,
+    resolution: &mut [Vec<(u64, Option<u16>)>],
+    sample_count: &mut u32,
+    reference: &[Option<u16>],
+) -> Option<SettleWait>
+where
+    R: Fn() -> Fut,
+    Fut: std::future::Future<Output = DiscoverySample>,
+    S: Fn() -> bool,
+{
+    use crate::api::stats::{self, RpmSample};
+    // `tokio::time::Instant` for the same reason as `observe` (tokio trap 1).
+    let started = tokio::time::Instant::now();
+    let n = resolution.len();
+    let mut per_channel: Vec<Vec<RpmSample>> = vec![Vec::new(); n];
+    let reference_of = |i: usize| reference.get(i).copied().flatten();
+    let mut last;
+    loop {
+        if shutting_down() {
+            return None;
+        }
+        let sample = read_fn().await;
+        *sample_count = sample_count.saturating_add(1);
+        let at_run = run_started.elapsed().as_millis() as u64;
+        let at = started.elapsed().as_millis() as u64;
+        for (i, slot) in per_channel.iter_mut().enumerate() {
+            let v = sample.tachs.get(i).copied().flatten();
+            slot.push(RpmSample { at_ms: at, rpm: v });
+            if let Some(res) = resolution.get_mut(i) {
+                res.push((at_run, v));
+            }
+        }
+        last = sample;
+        let open_done = (0..n).all(|i| {
+            nothing_to_settle(&resolution[i], reference_of(i))
+                || stats::settled_on_updates(&per_channel[i], reference_of(i)).is_some()
+        });
+        if open_done || started.elapsed() >= bound {
+            break;
+        }
+        let remaining = bound.saturating_sub(started.elapsed());
+        tokio::time::sleep(remaining.min(constants::DISCOVERY_SAMPLE_INTERVAL)).await;
+    }
+    let settled = (0..n)
+        .map(|i| {
+            nothing_to_settle(&resolution[i], reference_of(i))
+                || stats::settling_ms(&per_channel[i], reference_of(i)).is_some()
+        })
+        .collect();
+    Some(SettleWait {
+        settled,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        last,
+    })
 }
 
 /// A monotonically increasing run id. Opaque to clients; only used so a polling

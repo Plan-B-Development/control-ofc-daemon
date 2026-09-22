@@ -1141,6 +1141,7 @@ mod tests {
             vendor: vendor.to_string(),
             name: name.to_string(),
             bios_version: String::new(),
+            bios_date: None,
         }
     }
 

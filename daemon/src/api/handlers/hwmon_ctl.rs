@@ -553,13 +553,16 @@ pub async fn hwmon_verify_handler(
         // The mode is the part that makes it dangerous: 0 under firmware control
         // is the firmware's business, 0 under `pwm_enable=1` is a stopped pump.
         //
-        // **This clamps the duty; it does NOT restore the mode** — neither
-        // diagnostic writes the captured `pwm_enable` back, so a header taken
-        // from firmware control stays in manual for the daemon's lifetime
-        // whatever duty it lands on. Pre-existing, wider than this change, and
-        // recorded as `322-c` rather than fixed here (`CLAUDE.md § Review blast
-        // radius`). Named because the argument above is a mode argument, and it
-        // would be dishonest to borrow it and imply the mode were handled.
+        // **This clamps the duty; the MODE is restored elsewhere.** Neither
+        // diagnostic writes the captured `pwm_enable` back itself. Since DEC-382
+        // (`hwmon::handback`, `TS-c`) the engine's next tick after the diagnostic
+        // ends gives back every header the daemon holds that no active-profile
+        // control names, exactly as it was found — so a header taken from
+        // firmware control returns to firmware. A header the profile does name
+        // stays in manual, because the engine is its writer. (This paragraph
+        // used to say the header stayed in manual "for the daemon's lifetime",
+        // recorded as `322-c`; that was true before DEC-382 and misled a planning
+        // pass afterwards — `PTR-j`, corrected by DEC-405.)
         //
         // Newly reachable rather than merely old: Phase 5's orchestrator aims
         // both diagnostics at `device.pump_member` by default.
@@ -1046,6 +1049,10 @@ pub async fn hwmon_characterize_handler(
                 }
             };
 
+            // §4 / DEC-405: the chip's declared tach cadence outranks the one
+            // the holds observe. Read once, before the sweep: it is a chip
+            // attribute and does not change mid-run.
+            let driver_interval = super::discovery::read_update_interval(&pwm_path);
             let outcome = ch::run_sweep(
                 &cache,
                 &hid,
@@ -1082,7 +1089,7 @@ pub async fn hwmon_characterize_handler(
             if let Some(r) = slot.lock().as_mut() {
                 if r.run_id == my_run_id {
                     r.points = outcome.points;
-                    r.summary = Some(ch::summarise(&r.points, &learned));
+                    r.summary = Some(ch::summarise(&r.points, &learned, driver_interval));
                     r.state = outcome.state.to_string();
                     r.detail = outcome.detail;
                     // ONE source of truth for both fields (`AUD2-c`): the boolean
@@ -1247,7 +1254,7 @@ pub async fn characterization_cancel_handler(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::hwmon::lease::LeaseError;
     use crate::hwmon::pwm_control::HwmonControlError;
@@ -1967,13 +1974,74 @@ mod tests {
         }
     }
 
-    fn fresh_cpu(temp_c: f64) -> crate::health::state::CachedSensorReading {
+    pub(crate) fn fresh_cpu(temp_c: f64) -> crate::health::state::CachedSensorReading {
         cpu_reading(temp_c, std::time::Duration::ZERO)
+    }
+
+    /// Writes through to the fake sysfs tree and moves the tach with the duty,
+    /// the way a fan on the header would (DEC-405): `fan1_input` becomes
+    /// `rpm_at(raw)` on every `pwm1` write. Every write is also logged.
+    struct TreeWriter {
+        log: WriteLog,
+        rpm_path: Option<std::path::PathBuf>,
+        rpm_at: fn(u32) -> u32,
+    }
+    impl crate::hwmon::pwm_control::SysfsWriter for TreeWriter {
+        fn write_file(&mut self, p: &str, v: &str) -> Result<(), crate::error::HwmonError> {
+            self.log.lock().push((p.to_string(), v.to_string()));
+            std::fs::write(p, format!("{}\n", v.trim())).map_err(|e| {
+                crate::error::HwmonError::WriteError {
+                    path: p.to_string(),
+                    message: e.to_string(),
+                }
+            })?;
+            if let (true, Some(rpm)) = (p.ends_with("pwm1"), &self.rpm_path) {
+                let raw: u32 = v.trim().parse().unwrap_or(0);
+                std::fs::write(rpm, format!("{}\n", (self.rpm_at)(raw))).unwrap();
+            }
+            Ok(())
+        }
+        fn read_file(&self, p: &str) -> Result<String, crate::error::HwmonError> {
+            std::fs::read_to_string(p).map_err(|e| crate::error::HwmonError::ReadError {
+                path: p.to_string(),
+                message: e.to_string(),
+            })
+        }
+    }
+
+    /// DEC-405 (`PTR-e`): a verify-ready state over a fake sysfs tree whose
+    /// `pwm1`, `pwm1_enable` and `fan1_input` are real files the verify handler
+    /// reads and writes. `rpm_at` maps the written raw duty to the tach reading.
+    /// For callers outside this module that must drive the REAL handler rather
+    /// than hand-build its response (DEC-340).
+    pub(crate) fn verify_state_on_tree(
+        initial_raw: u8,
+        rpm_at: fn(u32) -> u32,
+    ) -> (Arc<AppState>, tempfile::TempDir) {
+        let (state, _writes, _tx, tmp) = build_verify_state_with(
+            Some(initial_raw),
+            crate::hwmon::roles::HeaderRole::ChassisFan,
+            Some(rpm_at),
+        );
+        (state, tmp.expect("a duty was requested"))
     }
 
     fn build_verify_state(
         initial_raw: Option<u8>,
         role: crate::hwmon::roles::HeaderRole,
+    ) -> (
+        Arc<AppState>,
+        WriteLog,
+        tokio::sync::watch::Sender<bool>,
+        Option<tempfile::TempDir>,
+    ) {
+        build_verify_state_with(initial_raw, role, None)
+    }
+
+    fn build_verify_state_with(
+        initial_raw: Option<u8>,
+        role: crate::hwmon::roles::HeaderRole,
+        fan: Option<fn(u32) -> u32>,
     ) -> (
         Arc<AppState>,
         WriteLog,
@@ -2001,6 +2069,15 @@ mod tests {
                 None,
             ),
         };
+        // A tach only when the caller asked for a fan on the header.
+        let rpm_path: Option<String> = match (&tmp, fan, initial_raw) {
+            (Some(dir), Some(rpm_at), Some(raw)) => {
+                let r = dir.path().join("fan1_input");
+                std::fs::write(&r, format!("{}\n", rpm_at(u32::from(raw)))).unwrap();
+                Some(r.display().to_string())
+            }
+            _ => None,
+        };
         let header = crate::hwmon::pwm_discovery::PwmHeaderDescriptor {
             id: "hwmon:test:dev:pwm1".into(),
             label: if role.is_pump() {
@@ -2015,8 +2092,8 @@ mod tests {
             supports_enable: true,
             pwm_path,
             enable_path,
-            rpm_available: false,
-            rpm_path: None,
+            rpm_available: rpm_path.is_some(),
+            rpm_path: rpm_path.clone(),
             min_pwm_percent: 0,
             max_pwm_percent: 100,
             is_writable: true,
@@ -2036,10 +2113,18 @@ mod tests {
         // with an empty sensor map would test nothing but that refusal.
         cache.update_sensors(vec![fresh_cpu(40.0)]);
         let writes: WriteLog = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let writer: Box<dyn crate::hwmon::pwm_control::SysfsWriter> = match (fan, &rpm_path) {
+            (Some(rpm_at), Some(r)) => Box::new(TreeWriter {
+                log: writes.clone(),
+                rpm_path: Some(std::path::PathBuf::from(r)),
+                rpm_at,
+            }),
+            _ => Box::new(RecordingWriter(writes.clone())),
+        };
         let ctrl = crate::hwmon::pwm_control::HwmonPwmController::new(
             vec![header],
             crate::hwmon::lease::LeaseManager::new(),
-            Box::new(RecordingWriter(writes.clone())),
+            writer,
             cache.clone(),
         );
         let readiness_rollup = Arc::new(parking_lot::Mutex::new(None));

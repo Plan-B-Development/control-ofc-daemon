@@ -129,7 +129,8 @@ pub struct PointStability {
     pub stddev_rpm: Option<f64>,
     /// `None` when the mean is zero; a stopped fan has no relative spread.
     pub cv_pct: Option<f64>,
-    /// `stable` | `variable` | `unstable` | `insufficient_data` | `unavailable`.
+    /// `stable` | `variable` | `unstable` | `insufficient_data` | `unavailable`
+    /// | `not_settled` (DEC-405, daemon >= 2.52.0).
     /// An opaque token: render an unrecognised one, never drop it (273-i).
     pub verdict: String,
     /// The cadence these readings were actually taken at. Published so no client
@@ -138,6 +139,19 @@ pub struct PointStability {
     /// How much of the hold was dwell rather than settle. `0` for a step the
     /// daemon did not select.
     pub dwell_ms: u64,
+    /// DEC-405 (`PTR-a`). Where, measured from the write, the window these
+    /// figures describe opened: the point's `settled_ms` when it settled, so the
+    /// settling transient is excluded, and `0` when it never settled — the
+    /// figures then cover the whole hold and `verdict` is `not_settled`.
+    /// `samples` and `dropouts` always cover the whole hold — raw evidence is
+    /// never trimmed (`§9`).
+    #[serde(default)]
+    pub window_start_ms: u64,
+    /// DEC-405 (`PTR-b`). The tach register's refresh interval as this hold
+    /// observed it — the median gap between changes of value. `None` when the
+    /// value changed fewer than twice, which is UNKNOWN, not fast.
+    #[serde(default)]
+    pub update_interval_ms: Option<u64>,
 }
 
 /// `§7`: a value the daemon derived from a *trusted* correction factor, carried
@@ -158,9 +172,15 @@ pub struct EstimatedRpm {
     pub correction_source: String,
 }
 
-/// Project one window's [`crate::api::stats::RpmStats`] onto the wire.
-fn point_stability(samples: &[crate::api::stats::RpmSample], dwell: Duration) -> PointStability {
-    let st = crate::api::stats::rpm_stats(samples);
+/// Project one hold's statistics onto the wire, over its settled tail
+/// (DEC-405): `settled_ms` is the same value the point publishes.
+fn point_stability(
+    samples: &[crate::api::stats::RpmSample],
+    dwell: Duration,
+    settled_ms: Option<u64>,
+) -> PointStability {
+    let (st, window_start_ms) = crate::api::stats::settled_rpm_stats(samples, settled_ms);
+    let observed: Vec<(u64, Option<u16>)> = samples.iter().map(|s| (s.at_ms, s.rpm)).collect();
     PointStability {
         samples: st.samples,
         usable: st.usable,
@@ -175,6 +195,8 @@ fn point_stability(samples: &[crate::api::stats::RpmSample], dwell: Duration) ->
         verdict: st.verdict.to_string(),
         sample_interval_ms: constants::CHARACTERIZATION_SAMPLE_INTERVAL.as_millis() as u64,
         dwell_ms: dwell.as_millis() as u64,
+        window_start_ms,
+        update_interval_ms: crate::api::stats::update_interval_ms(&observed),
     }
 }
 
@@ -291,7 +313,20 @@ pub struct CharSummary {
     pub min_rpm: Option<u16>,
     pub max_rpm: Option<u16>,
     /// `None` when fewer than two points carried a usable tach reading.
+    ///
+    /// DEC-405 (`PTR-d`): in a bidirectional run this is judged per leg, each
+    /// sorted by duty — `false` if any judged leg is, `true` if at least one leg
+    /// was judged and none is `false`, `None` if no leg could be. Before, it was
+    /// judged in walk order, and a walk that descends then climbs is `false` for
+    /// every working fan. Unidirectional runs are judged in walk order, as ever.
     pub monotonic: Option<bool>,
+    /// DEC-405. The falling leg alone, by duty. `None` for a unidirectional run
+    /// or a leg with fewer than two usable readings.
+    #[serde(default)]
+    pub monotonic_falling: Option<bool>,
+    /// DEC-405. The rising leg alone, by duty. Same `None` rule.
+    #[serde(default)]
+    pub monotonic_rising: Option<bool>,
     /// Top of a flat region at the bottom of the sweep, if one was measured.
     pub dead_zone_upper_pct: Option<u8>,
     /// The readback value the hardware appears to pin at, when clamping was seen.
@@ -772,7 +807,14 @@ fn rpm_verdict(before: Option<u16>, after: Option<u16>) -> String {
 
 /// Derive the whole-sweep diagnostics. Pure, total, and the only place these
 /// rules live — the handler calls this rather than deriving anything inline.
-pub fn summarise(points: &[CharPoint], learned: &[LearnedPoint]) -> CharSummary {
+///
+/// `driver_update_interval_ms` is the chip's own `update_interval`, when it
+/// publishes one; it outranks the interval the holds observed (§4, DEC-405).
+pub fn summarise(
+    points: &[CharPoint],
+    learned: &[LearnedPoint],
+    driver_update_interval_ms: Option<u64>,
+) -> CharSummary {
     let accepted = points.iter().filter(|p| p.command_accepted).count();
     let command_acceptance = if points.is_empty() || accepted == 0 {
         "fail"
@@ -841,19 +883,14 @@ pub fn summarise(points: &[CharPoint], learned: &[LearnedPoint]) -> CharSummary 
     // Monotonic within tolerance: no reading may fall meaningfully below the one
     // before it. `AIO-Phase3.md` is explicit that a non-monotonic result is not
     // by itself a fault, so this is reported, never acted on.
-    let monotonic = if rpms.len() < 2 {
-        None
-    } else {
-        let mut ok = true;
-        for w in rpms.windows(2) {
-            let (prev, next) = (w[0].1, w[1].1);
-            let tolerance = constants::CHARACTERIZATION_RPM_NOISE_FLOOR.max(prev / 33);
-            if next + tolerance < prev {
-                ok = false;
-                break;
-            }
+    let non_decreasing = |seq: &[u16]| -> Option<bool> {
+        if seq.len() < 2 {
+            return None;
         }
-        Some(ok)
+        Some(seq.windows(2).all(|w| {
+            let tolerance = constants::CHARACTERIZATION_RPM_NOISE_FLOOR.max(w[0] / 33);
+            w[1] + tolerance >= w[0]
+        }))
     };
 
     // Dead zone: a flat region at the BOTTOM of the sweep that something above it
@@ -902,6 +939,27 @@ pub fn summarise(points: &[CharPoint], learned: &[LearnedPoint]) -> CharSummary 
 
     let hyst = stats::hysteresis(&rising, &falling, bidirectional);
 
+    // DEC-405 (`PTR-d`): a bidirectional walk descends and then climbs, so walk
+    // order is not duty order. Each leg is judged on its own, by duty — the same
+    // two series the hysteresis comparison uses, `ramp` excluded for the same
+    // reason (its approach direction is unknown).
+    let leg = |series: &[stats::DutyRpm]| -> Option<bool> {
+        let seq: Vec<u16> = series.iter().map(|p| p.rpm).collect();
+        non_decreasing(&seq)
+    };
+    let (monotonic, monotonic_falling, monotonic_rising) = if bidirectional {
+        let (f, r) = (leg(&falling), leg(&rising));
+        let overall = match (f, r) {
+            (Some(false), _) | (_, Some(false)) => Some(false),
+            (None, None) => None,
+            _ => Some(true),
+        };
+        (overall, f, r)
+    } else {
+        let seq: Vec<u16> = rpms.iter().map(|(_, r)| *r).collect();
+        (non_decreasing(&seq), None, None)
+    };
+
     // Shape analysis runs over every usable reading regardless of leg — the
     // effective range is a property of the header, not of one direction.
     let all_points = stats::fold_direction(points.iter().filter_map(|p| {
@@ -923,9 +981,13 @@ pub fn summarise(points: &[CharPoint], learned: &[LearnedPoint]) -> CharSummary 
 
     // `§4`: the WORST per-point classification, never an average — one unstable
     // duty is the finding, and averaging would bury it.
+    // `not_settled` (DEC-405) ranks above `insufficient_data`: there were
+    // enough readings, and they were still moving — a stronger observation than
+    // too few readings, and weaker than a settled window that varied.
     let rank = |v: &str| match v {
-        stats::STABILITY_UNSTABLE => 4,
-        stats::STABILITY_VARIABLE => 3,
+        stats::STABILITY_UNSTABLE => 5,
+        stats::STABILITY_VARIABLE => 4,
+        stats::STABILITY_NOT_SETTLED => 3,
         stats::STABILITY_INSUFFICIENT => 2,
         stats::STABILITY_STABLE => 1,
         _ => 0,
@@ -955,14 +1017,6 @@ pub fn summarise(points: &[CharPoint], learned: &[LearnedPoint]) -> CharSummary 
         .map(|st| st.outliers)
         .sum();
 
-    // `§5`: publish the cadence the timings were measured at, so no client has
-    // to assume milliseconds. Taken from the samples actually retained rather
-    // than restated as a constant.
-    let measurement_resolution_ms = points
-        .iter()
-        .filter_map(|p| p.stability.as_ref())
-        .map(|st| st.sample_interval_ms)
-        .max();
     let median_u64 = |mut v: Vec<u64>| -> Option<u64> {
         if v.is_empty() {
             return None;
@@ -970,6 +1024,21 @@ pub fn summarise(points: &[CharPoint], learned: &[LearnedPoint]) -> CharSummary 
         v.sort_unstable();
         Some(v[v.len() / 2])
     };
+    // `§5`: publish the cadence the timings were measured at, so no client has
+    // to assume milliseconds. DEC-405 (`PTR-b`): that is the tach REGISTER's
+    // refresh, not the sampler's — the chip's own `update_interval` where it
+    // publishes one, else the median of what the holds observed, else UNKNOWN.
+    // This used to report the 500 ms sample interval, against a measured ~2 s
+    // refresh on it87.
+    let measurement_resolution_ms = driver_update_interval_ms.or_else(|| {
+        median_u64(
+            points
+                .iter()
+                .filter_map(|p| p.stability.as_ref())
+                .filter_map(|st| st.update_interval_ms)
+                .collect(),
+        )
+    });
     let typical_response_ms = median_u64(points.iter().filter_map(|p| p.first_change_ms).collect());
     let typical_settling_ms = median_u64(points.iter().filter_map(|p| p.settled_ms).collect());
 
@@ -1019,6 +1088,8 @@ pub fn summarise(points: &[CharPoint], learned: &[LearnedPoint]) -> CharSummary 
         min_rpm,
         max_rpm,
         monotonic,
+        monotonic_falling,
+        monotonic_rising,
         dead_zone_upper_pct,
         clamp_pct,
         interference_detected,
@@ -1572,6 +1643,11 @@ where
         }
 
         let after = read_fn();
+        // DEC-405: one settle point, used for both the published `settled_ms`
+        // and the window the statistics describe, so the two cannot disagree.
+        // The pre-write reading is the reference: a first sample still showing
+        // it is the register not having refreshed yet, never a settle.
+        let settled_ms = crate::api::stats::settling_ms(&samples, rpm_before);
         let point = CharPoint {
             requested_pct: pct,
             command_accepted,
@@ -1586,8 +1662,8 @@ where
             rpm_verdict: rpm_verdict(rpm_before, after.rpm),
             direction: step.direction.token().into(),
             step_index: idx as u16,
-            settled_ms: crate::api::stats::settling_ms(&samples),
-            stability: Some(point_stability(&samples, dwell)),
+            settled_ms,
+            stability: Some(point_stability(&samples, dwell, settled_ms)),
             estimated_physical_rpm: estimate_physical_rpm(after.rpm, correction),
         };
         // The abort predicate gets the same exemption (DEC-326 / `HOST-a`).
@@ -1673,6 +1749,10 @@ pub fn provenance_legend() -> BTreeMap<String, String> {
         "pwm_readback",
         "rpm_response",
         "monotonic",
+        "monotonic_falling",
+        "monotonic_rising",
+        "window_start_ms",
+        "update_interval_ms",
         "dead_zone_upper_pct",
         "clamp_pct",
         "possible_device_override",
@@ -1720,7 +1800,7 @@ mod tests {
     /// `summarise` with no learned band — the pre-DEC-334 behaviour, which is
     /// what every test written before §6 existed is asserting about.
     fn sum(points: &[CharPoint]) -> CharSummary {
-        summarise(points, &[])
+        summarise(points, &[], None)
     }
 
     /// A unidirectional plan over `points`, i.e. exactly the walk these tests
@@ -3693,21 +3773,207 @@ mod tests {
 
         // ── §5 / §6 summary derivations ──────────────────────────────────
 
-        /// §5: "Do not publish unrealistic millisecond precision." The summary must
-        /// name the resolution its timings were measured at.
+        /// A tach register that refreshes every [`SLOW_REFRESH_MS`] and a fan that
+        /// approaches each commanded duty first-order (τ = 1.5 s) — the it87 shape
+        /// behind `PTR-a`/`PTR-b`, driven through the real `run_sweep` so the call
+        /// site, not only the pure helpers, is what is under test (DEC-324).
+        const SLOW_REFRESH_MS: u64 = 2000;
+
+        struct SlowTach {
+            started: tokio::time::Instant,
+            /// (write instant, rpm at that instant, target rpm)
+            segments: Vec<(tokio::time::Instant, f64, f64)>,
+            last_pct: u8,
+        }
+
+        impl SlowTach {
+            fn target(pct: u8) -> f64 {
+                500.0 + f64::from(pct) * 20.0
+            }
+            fn continuous(&self, at: tokio::time::Instant) -> f64 {
+                let seg = self
+                    .segments
+                    .iter()
+                    .rev()
+                    .find(|(t, _, _)| *t <= at)
+                    .copied();
+                match seg {
+                    Some((t, from, to)) => {
+                        let dt = at.duration_since(t).as_secs_f64();
+                        to + (from - to) * (-dt / 1.5).exp()
+                    }
+                    None => Self::target(self.last_pct),
+                }
+            }
+            /// The value the register holds now: the fan's speed at the latest
+            /// refresh, plus a deterministic ±2 so every refresh is an update.
+            fn register(&self) -> u16 {
+                let since = tokio::time::Instant::now().duration_since(self.started);
+                let k = since.as_millis() as u64 / SLOW_REFRESH_MS;
+                let refreshed = self.started + Duration::from_millis(k * SLOW_REFRESH_MS);
+                let jitter = [0.0, 2.0, -2.0][(k % 3) as usize];
+                (self.continuous(refreshed) + jitter).round() as u16
+            }
+        }
+
+        async fn sweep_slow_tach(rig: &Rig, cache: &StateCache, settle: Duration) -> SweepOutcome {
+            let plan = resolve_sweep_plan(&[30, 60, 100], true, None);
+            let writes = rig.writes.clone();
+            let tach = Arc::new(Mutex::new(SlowTach {
+                started: tokio::time::Instant::now(),
+                segments: Vec::new(),
+                last_pct: 42,
+            }));
+            let tach_w = tach.clone();
+            run_sweep(
+                cache,
+                "hwmon:test:pwm1",
+                &plan,
+                0,
+                settle,
+                None,
+                move |pct: u8| {
+                    writes.lock().unwrap().push(pct);
+                    let mut t = tach_w.lock().unwrap();
+                    let now = tokio::time::Instant::now();
+                    let from = t.continuous(now);
+                    t.segments.push((now, from, SlowTach::target(pct)));
+                    t.last_pct = pct;
+                    Ok(())
+                },
+                move || {
+                    let t = tach.lock().unwrap();
+                    sample(Some(t.last_pct), Some(1), Some(t.register()))
+                },
+                &rig.cancel,
+                || false,
+                || true,
+                &rig.report,
+                |_| {},
+            )
+            .await
+        }
+
+        /// DEC-405 through the real sweep: `PTR-b` (no settle before the
+        /// register's first refresh), `PTR-a` (statistics over the settled tail
+        /// only), `PTR-b` again (the published resolution is the register's
+        /// cadence, not the sampler's) and `PTR-d` (per-leg monotonic).
         #[tokio::test(start_paused = true)]
-        async fn the_summary_publishes_the_resolution_its_timings_were_measured_at() {
+        async fn a_slow_tach_sweep_reports_settling_stability_and_resolution_honestly() {
+            let rig = Rig::new();
+            let cache = cache_at(40.0, None);
+            let out = sweep_slow_tach(
+                &rig,
+                &cache,
+                Duration::from_secs(constants::CHARACTERIZATION_DEFAULT_SETTLE_S),
+            )
+            .await;
+            assert_eq!(out.state, STATE_COMPLETE, "{:?}", out.detail);
+            assert_eq!(
+                out.points.len(),
+                5,
+                "100 ramp, 60/30 falling, 60/100 rising"
+            );
+
+            let mut settled_points = 0;
+            for p in &out.points {
+                let st = p.stability.as_ref().expect("every held point has stats");
+                let (before, after) = (p.rpm_before.unwrap(), p.rpm_after.unwrap());
+                if before.abs_diff(after) < 100 {
+                    continue; // the fan barely moved; nothing to wait out
+                }
+                let settled = p.settled_ms.unwrap_or_else(|| {
+                    panic!("{}% should settle inside a 12 s hold", p.requested_pct)
+                });
+                settled_points += 1;
+                // PTR-b: the first register refresh after each write is 2000 ms
+                // later (steps start on refresh boundaries), so nothing earlier
+                // can be a settle. The old sample-counting rule said 500.
+                assert!(
+                    settled >= SLOW_REFRESH_MS,
+                    "{}% settled at {settled} ms, before the first refresh",
+                    p.requested_pct
+                );
+                // PTR-a: the window the figures describe opens at the settle, and
+                // no reading from the ramp before it survives into them.
+                assert_eq!(st.window_start_ms, settled);
+                let band = f64::from(after) * constants::SETTLING_BAND_PCT / 100.0;
+                for extreme in [st.min_rpm.unwrap(), st.max_rpm.unwrap()] {
+                    assert!(
+                        f64::from(extreme.abs_diff(after)) <= band,
+                        "{}%: {extreme} rpm is a transient reading inside the window",
+                        p.requested_pct
+                    );
+                }
+                assert_eq!(st.verdict, crate::api::stats::STABILITY_STABLE);
+                assert_eq!(st.update_interval_ms, Some(SLOW_REFRESH_MS));
+            }
+            assert!(
+                settled_points >= 3,
+                "precondition: the sweep really moved the fan"
+            );
+
+            let s = summarise(&out.points, &[], None);
+            assert_eq!(
+                s.measurement_resolution_ms,
+                Some(SLOW_REFRESH_MS),
+                "the register's cadence, never the 500 ms sampler's"
+            );
+            assert_eq!(s.stability_verdict, crate::api::stats::STABILITY_STABLE);
+            // PTR-d: a working fan walked down then up is monotonic on each leg.
+            assert_eq!(s.monotonic_falling, Some(true));
+            assert_eq!(s.monotonic_rising, Some(true));
+            assert_eq!(s.monotonic, Some(true));
+            // A declared driver cadence outranks the observed one.
+            assert_eq!(
+                summarise(&out.points, &[], Some(1000)).measurement_resolution_ms,
+                Some(1000)
+            );
+        }
+
+        /// A tach that never changes value establishes no cadence: UNKNOWN, not
+        /// the sampler's 500 ms (§5 — the figure this used to publish).
+        #[tokio::test(start_paused = true)]
+        async fn a_tach_that_never_changes_publishes_no_resolution() {
             let rig = Rig::new();
             let cache = cache_at(40.0, None);
             let out = sweep_bidi(&rig, &cache, &[30, 100], 42, |p| {
                 Some(500 + u16::from(p) * 20)
             })
             .await;
-            let s = summarise(&out.points, &[]);
+            assert!(!out.points.is_empty());
             assert_eq!(
-                s.measurement_resolution_ms,
-                Some(constants::CHARACTERIZATION_SAMPLE_INTERVAL.as_millis() as u64),
-                "the timings can only be multiples of the sub-sample cadence"
+                summarise(&out.points, &[], None).measurement_resolution_ms,
+                None
+            );
+        }
+
+        /// PTR-d, the other arm: a genuinely non-monotonic LEG is still `false`,
+        /// and says which leg.
+        #[test]
+        fn a_non_monotonic_leg_is_reported_and_named() {
+            let pts = vec![
+                point_dir(100, Some(100), Some(1), Some(2500), "ramp"),
+                point_dir(60, Some(60), Some(1), Some(1700), "falling"),
+                point_dir(30, Some(30), Some(1), Some(1100), "falling"),
+                // Rising leg: 60% reads FASTER than 100% — a real dip at the top.
+                point_dir(60, Some(60), Some(1), Some(1700), "rising"),
+                point_dir(100, Some(100), Some(1), Some(1200), "rising"),
+            ];
+            let s = summarise(&pts, &[], None);
+            assert_eq!(s.monotonic_falling, Some(true));
+            assert_eq!(s.monotonic_rising, Some(false));
+            assert_eq!(s.monotonic, Some(false));
+            // And a unidirectional walk is still judged in walk order.
+            let uni = vec![
+                point_dir(30, Some(30), Some(1), Some(900), "ramp"),
+                point_dir(60, Some(60), Some(1), Some(1500), "rising"),
+                point_dir(100, Some(100), Some(1), Some(2400), "rising"),
+            ];
+            let u = summarise(&uni, &[], None);
+            assert_eq!(
+                (u.monotonic, u.monotonic_falling, u.monotonic_rising),
+                (Some(true), None, None)
             );
         }
 
@@ -3720,7 +3986,7 @@ mod tests {
                 point_dir(50, Some(50), Some(1), Some(1500), "rising"),
             ];
             assert_eq!(
-                summarise(&uni, &[]).hysteresis_verdict,
+                summarise(&uni, &[], None).hysteresis_verdict,
                 crate::api::stats::HYSTERESIS_NOT_TESTED
             );
         }
@@ -3734,7 +4000,7 @@ mod tests {
                 point_dir(50, Some(50), Some(1), Some(1200), "rising"),
                 point_dir(100, Some(100), Some(1), Some(3000), "rising"),
             ];
-            let s = summarise(&pts, &[]);
+            let s = summarise(&pts, &[], None);
             assert_eq!(s.hysteresis_compared_points, 1, "only 50% has both legs");
             assert_eq!(s.hysteresis_worst_duty_pct, Some(50));
             assert_eq!(s.hysteresis_worst_delta_rpm, Some(800));
@@ -3746,7 +4012,7 @@ mod tests {
         #[test]
         fn an_unlearned_header_reports_no_comparison_rather_than_agreement() {
             let pts = vec![point_dir(50, Some(50), Some(1), Some(2000), "rising")];
-            assert_eq!(summarise(&pts, &[]).outside_learned_range, None);
+            assert_eq!(summarise(&pts, &[], None).outside_learned_range, None);
         }
 
         #[test]
@@ -3757,7 +4023,10 @@ mod tests {
                 rpm_min: 1900,
                 rpm_max: 2100,
             }];
-            assert_eq!(summarise(&pts, &learned).outside_learned_range, Some(false));
+            assert_eq!(
+                summarise(&pts, &learned, None).outside_learned_range,
+                Some(false)
+            );
         }
 
         /// §6's worked example, and §8.5's rule that this must never render as a
@@ -3770,7 +4039,7 @@ mod tests {
                 rpm_min: 900,
                 rpm_max: 1150,
             }];
-            let s = summarise(&pts, &learned);
+            let s = summarise(&pts, &learned, None);
             assert_eq!(s.outside_learned_range, Some(true));
             assert!(
                 s.learned_range_note
@@ -3799,7 +4068,7 @@ mod tests {
                 rpm_min: 900,
                 rpm_max: 1150,
             }];
-            let s = summarise(&[p], &learned);
+            let s = summarise(&[p], &learned, None);
             assert!(
                 !s.interpretation_states
                     .iter()

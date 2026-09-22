@@ -2,6 +2,63 @@
 
 ## [Unreleased]
 
+## [2.52.0] — 2026-09-22
+
+### Fixed
+
+**Diagnostic settling times and stability figures describe the fan, not the
+tach's refresh rate** (`PTR-a`, `PTR-b`, DEC-405). Many motherboard chips update
+their fan-speed reading only every couple of seconds, while the characterisation
+sweep reads it twice a second. The sweep saw four identical readings, a single
+stale value, and called the fan settled before it had moved. It then worked out
+the fan's steadiness from the moment of the write, so the fan speeding up or
+slowing down counted as unsteadiness: 14 % variation was reported for a pump that
+varies by under 1 %. Settling now counts real updates of the reading, and can't
+happen before the first one. Steadiness is measured only after the fan has
+settled, while tach dropouts are still counted across the whole step. A point
+that never settles says "not settled" instead of showing a figure. The reported measurement resolution is now how often the chip refreshes
+(the median gap between updates, or the chip's own figure where it publishes
+one), not 500 ms. A sweep now holds each point for 12 s by default instead of
+6 s, so a default sweep takes about twice as long.
+
+**A sweep that walks down and back up no longer reports every fan as
+"non-monotonic"** (`PTR-d`, DEC-405). The check read the readings in the order
+they were taken, so the step from the lowest duty back up always looked like a
+drop. Each direction is now judged on its own, by duty. The result says which
+direction, if either, did not rise steadily.
+
+**Control-path discovery no longer mistakes a slow pump's recovery for noise**
+(`PTR-c`, DEC-405). Each later cycle started measuring right after the previous
+change was undone, while the pump was still returning to speed. That recovery was
+counted as noise, so a real response could fail to clear it: on 2026-09-08 a
++796 rpm response was graded "ambiguous". The run now waits, for up to 15 s, for
+the fans to settle first. A channel that doesn't settle in time uses the noise
+level from the first cycle, and the result says so. The reported measurement
+resolution is now the header's own tach, not the fastest fan on the machine. Each
+measurement window defaults to 12 s instead of 6 s. Cancelling a discovery now
+takes effect when the current measurement window ends. It used to wait for the
+end of the whole cycle, up to two windows. A pump whose speed reading disappears
+while the run waits stops the run at the end of that wait.
+
+**A validation session records what its PWM verify actually found** (`PTR-e`,
+DEC-405). The session read the verify's readback and before/after speeds from the
+wrong places, so they were always empty. Every verify that ran was recorded as
+"observed", including one where the fan did not respond at all. The session now
+keeps the real readings, the verify's result and whether the fan was put back
+where it was. It records a working result as passed, and a result that says
+something about the hardware as observed. A verify the daemon refused, for
+example because of heat or another test running, is now recorded as unavailable.
+It used to count as a failed "PWM header control" finding.
+
+### Added
+
+**The hardware report names the kernel, BIOS date and driver builds**
+(`PTR-f`, DEC-405). `GET /diagnostics/hardware` now includes the running kernel
+version, the BIOS date, and each loaded fan driver's version, build checksum, and
+whether it was built outside the kernel (a DKMS driver, for example). With these,
+two reports can show whether a driver, kernel or BIOS update is what changed.
+Each is left empty when the system doesn't provide it.
+
 ## [2.51.3] — 2026-09-19
 
 ### Changed

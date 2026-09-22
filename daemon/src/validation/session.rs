@@ -581,6 +581,16 @@ pub struct VerifyEvidence {
     pub rpm_after: Option<u16>,
     #[serde(default)]
     pub detail: Option<String>,
+    /// DEC-405 (`PTR-e`). Verify's own `result` token — `effective`,
+    /// `no_rpm_effect`, … — exactly as the verify handler returned it. `None` for
+    /// a refused verify (no body to read it from) and for evidence recorded by a
+    /// daemon before 2.52.0, which never stored it.
+    #[serde(default)]
+    pub result: Option<String>,
+    /// DEC-405. The verify's restore-to-original write failed, so the header
+    /// was left at the test duty.
+    #[serde(default)]
+    pub restore_failed: bool,
 }
 
 // ── External measurements (§14) ─────────────────────────────────────────────

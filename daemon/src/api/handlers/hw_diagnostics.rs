@@ -337,6 +337,11 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
             kernel_modules,
             acpi_conflicts,
             board,
+            // DEC-405: the same read the GPU advisories above use, now also
+            // published — capped like every other environment fact.
+            kernel_release: kernel_release
+                .as_deref()
+                .and_then(crate::hwmon::chip_db::cap_env_fact),
             expected_chips,
             board_firmware_counts,
             kernel_detected_chips,

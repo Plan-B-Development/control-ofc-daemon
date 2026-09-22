@@ -386,15 +386,21 @@ pub const CHARACTERIZATION_MAX_POINTS: usize = 20;
 // shaped unbounded copy with nothing to catch it. Found in review of DEC-344.
 const _: () = assert!(CHARACTERIZATION_MAX_POINTS >= 2);
 
-/// Settle window per point, and its clamp. Default matches
-/// [`VERIFY_WAIT_SECONDS`] — raised to 6 s for exactly this reason (DEC-101):
-/// slow-spinning pumps need >3 s or they report a false `no_response`.
+/// Settle window per point, and its clamp.
+///
+/// **12 s since DEC-405, and no longer tied to [`VERIFY_WAIT_SECONDS`].** It
+/// used to match verify's 6 s (DEC-101: slow pumps need >3 s or report a false
+/// `no_response`). DEC-405 made settling count tach-register *updates* rather
+/// than 500 ms samples, and it87 refreshes about every 2 s — so a point needs its
+/// first refresh, the fan's own response, and four in-band updates (~8 s) before
+/// it can settle, which 6 s can almost never hold. Verify keeps its 6 s: it
+/// judges one before/after pair, not a settle.
 ///
 /// The maximum is load-bearing for DEC-296: the pause deadman is renewed once
 /// per point, so the renewal interval is `settle + I/O`. At 15 s that leaves
 /// ample margin inside [`VERIFY_PAUSE_DEADMAN`] (30 s); raising it past ~28 s
 /// would let a healthy sweep time its own pause out.
-pub const CHARACTERIZATION_DEFAULT_SETTLE_S: u64 = VERIFY_WAIT_SECONDS as u64;
+pub const CHARACTERIZATION_DEFAULT_SETTLE_S: u64 = 12;
 pub const CHARACTERIZATION_SETTLE_MIN_S: u64 = 2;
 pub const CHARACTERIZATION_SETTLE_MAX_S: u64 = 15;
 
@@ -1114,6 +1120,27 @@ const _: () = assert!(DISCOVERY_TARGET_OVER_NOISE > 1);
 // because it constrains only the deadman. Anyone loosening the cadence has two
 // invariants to re-argue, not one.
 const _: () = assert!(CHARACTERIZATION_SETTLE_MAX_S * 2 <= VERIFY_PAUSE_DEADMAN.as_secs());
+
+/// DEC-405 (`PTR-c`): the longest a discovery run waits, after a write that moved
+/// the duty, for the tachs to settle before its baseline window opens. Equal to
+/// the observation window's own maximum. The wait is a window in its own right,
+/// so the deadman and the thermal gates are renewed before it AND before the
+/// baseline window after it — the one-window renewal interval the assertion
+/// above is the tripwire on is kept, and this is its twin for the wait.
+pub const DISCOVERY_SETTLE_WAIT_MAX: Duration = Duration::from_secs(CHARACTERIZATION_SETTLE_MAX_S);
+const _: () = assert!(DISCOVERY_SETTLE_WAIT_MAX.as_secs() * 2 <= VERIFY_PAUSE_DEADMAN.as_secs());
+
+/// DEC-405: how long a channel's reading must have stayed unchanged — across the
+/// run so far — before a settle-wait stops waiting on it.
+///
+/// A tach register that has not refreshed yet is indistinguishable from one
+/// with nothing to report (an empty header's steady 0), so "unchanged" alone
+/// cannot release a channel: that is `PTR-b` in the online wait. Three refreshes
+/// of the ~2 s register it87 was measured at on 2026-09-08, the slowest cadence
+/// this project has hardware evidence for. A channel that never changes still
+/// cannot hold the wait past [`DISCOVERY_SETTLE_WAIT_MAX`].
+pub const DISCOVERY_UNCHANGED_SPAN: Duration = Duration::from_secs(6);
+const _: () = assert!(DISCOVERY_UNCHANGED_SPAN.as_secs() < DISCOVERY_SETTLE_WAIT_MAX.as_secs());
 const _: () = assert!(CONTROL_PATHS_MAX_ENTRIES > 0);
 const _: () = assert!(CONTROL_PATH_MAX_TEXT_BYTES > 0);
 const _: () = assert!(CONTROL_PATH_MAX_TACH_REFS > 0);

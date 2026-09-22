@@ -133,7 +133,11 @@ fn pwm_header_control(session: &ValidationSession, interrupted: bool) -> Validat
     }
     for ev in verifies(session) {
         if let Some(v) = &ev.verify {
-            let state = if v.write_ok { RESULT_PASS } else { RESULT_FAIL };
+            // DEC-405 (`PTR-e`): through the one verify mapping. This used to be
+            // `write_ok → pass, else fail`, and `write_ok` is merely "the handler
+            // answered 200" — so a thermal refusal or a busy slot filed
+            // "PWM header control: fail", which DEC-317 §7 forbids.
+            let state = verify_outcome(v);
             let mut f = finding(F_PWM_HEADER_CONTROL, state);
             f.member_id = Some(ev.member_id.clone());
             f.evidence_kind = Some(DIAG_VERIFY.to_string());
@@ -141,6 +145,29 @@ fn pwm_header_control(session: &ValidationSession, interrupted: bool) -> Validat
         }
     }
     finding(F_PWM_HEADER_CONTROL, absent_state(interrupted))
+}
+
+/// A verify's session outcome (DEC-405, `PTR-e`). **Never `fail`** (DEC-317 §7):
+/// a verify tests one duty for a few seconds, and none of its results is
+/// evidence that the header cannot be controlled.
+///
+/// | verify | outcome |
+/// |---|---|
+/// | refused (non-200) | `unavailable` — a thermal refusal or a busy slot is not a hardware result |
+/// | `effective` | `pass` |
+/// | `no_rpm_effect`, `pwm_enable_reverted`, `pwm_value_clamped` | `observed` — true of the device, not a failed test |
+/// | `rpm_unavailable`, `pwm_readback_unavailable` | `unavailable` |
+/// | anything else, or no token (a pre-2.52.0 record) | `unknown` — rendered, never dropped |
+pub fn verify_outcome(v: &VerifyEvidence) -> &'static str {
+    if !v.write_ok {
+        return RESULT_UNAVAILABLE;
+    }
+    match v.result.as_deref() {
+        Some("effective") => RESULT_PASS,
+        Some("no_rpm_effect" | "pwm_enable_reverted" | "pwm_value_clamped") => RESULT_OBSERVED,
+        Some("rpm_unavailable" | "pwm_readback_unavailable") => RESULT_UNAVAILABLE,
+        _ => RESULT_UNKNOWN,
+    }
 }
 
 /// Did the written duty read back?
@@ -372,6 +399,10 @@ fn stability_finding(session: &ValidationSession, interrupted: bool) -> Validati
         let state = match sum.stability_verdict.as_str() {
             stats::STABILITY_UNAVAILABLE => RESULT_UNAVAILABLE,
             stats::STABILITY_INSUFFICIENT => RESULT_UNKNOWN,
+            // DEC-405: the worst point never settled, so no steady-state figure
+            // exists to call stable or variable — no evidence, like too few
+            // readings, never an observation of variability.
+            stats::STABILITY_NOT_SETTLED => RESULT_UNKNOWN,
             // `variable` and `unstable` are OBSERVED, never FAIL. §4: "Do not
             // claim cavitation, electrical failure or bubbles purely from tach
             // variability."

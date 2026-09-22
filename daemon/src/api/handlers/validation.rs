@@ -1101,40 +1101,8 @@ async fn run_verify(state: &Arc<AppState>, session_id: &str, member: &str) {
     )
     .await;
 
-    let ok = status == StatusCode::OK;
-    let outcome = if ok {
-        RESULT_OBSERVED
-    } else {
-        // A refusal is not a hardware failure: the thermal ladder was forcing,
-        // another diagnostic held the slot, or the daemon is going down.
-        // `unavailable`, never `fail` (§7).
-        RESULT_UNAVAILABLE
-    };
-    let evidence = VerifyEvidence {
-        header_id: member.to_string(),
-        write_ok: ok,
-        readback_pct: body
-            .get("readback_pct")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u8),
-        requested_pct: body
-            .get("test_pwm_percent")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u8),
-        rpm_before: body
-            .get("rpm_before")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u16),
-        rpm_after: body
-            .get("rpm_after")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u16),
-        detail: body
-            .get("error")
-            .and_then(|e| e.get("message"))
-            .and_then(|m| m.as_str())
-            .map(str::to_string),
-    };
+    let evidence = verify_evidence(member, status, &body);
+    let outcome = crate::validation::summary::verify_outcome(&evidence);
     state.validation.attach_evidence_for(
         session_id,
         EvidenceRef {
@@ -1156,6 +1124,35 @@ async fn run_verify(state: &Arc<AppState>, session_id: &str, member: &str) {
         Some(outcome.to_string()),
         Some(member.to_string()),
     );
+}
+
+/// Read a verify handler's response into session evidence (DEC-405, `PTR-e`).
+///
+/// **The field paths are `HwmonVerifyResponse`'s, and they are nested.** The
+/// code this replaced read `readback_pct`, `rpm_before` and `rpm_after` from the
+/// top level of a body that has none of them — they live under `initial_state`
+/// and `final_state` — so all three were always `None`, the `result` token was
+/// never kept, and every 200 (a `no_rpm_effect` included) filed `observed`. It
+/// survived because every test handed the orchestrator a hand-built body that
+/// shared the mistake (DEC-340); the tests for this read the real handler's.
+fn verify_evidence(member: &str, status: StatusCode, body: &serde_json::Value) -> VerifyEvidence {
+    let at = |path: &[&str]| path.iter().try_fold(body, |v, k| v.get(*k));
+    let u64_at = |path: &[&str]| at(path).and_then(|v| v.as_u64());
+    VerifyEvidence {
+        header_id: member.to_string(),
+        write_ok: status == StatusCode::OK,
+        readback_pct: u64_at(&["final_state", "pwm_percent"]).map(|v| v as u8),
+        requested_pct: u64_at(&["test_pwm_percent"]).map(|v| v as u8),
+        rpm_before: u64_at(&["initial_state", "rpm"]).map(|v| v as u16),
+        rpm_after: u64_at(&["final_state", "rpm"]).map(|v| v as u16),
+        detail: at(&["error", "message"])
+            .and_then(|m| m.as_str())
+            .map(str::to_string),
+        result: at(&["result"]).and_then(|r| r.as_str()).map(str::to_string),
+        restore_failed: at(&["restore_failed"])
+            .and_then(|r| r.as_bool())
+            .unwrap_or(false),
+    }
 }
 
 /// Ask the characterisation sweep to stop, **fenced on the run this session
@@ -1495,14 +1492,15 @@ async fn run_discovery(state: &Arc<AppState>, session_id: &str, member: &str) {
         .map(str::to_string);
 
     // Bounded by the sweep's own worst case: every cycle holding the maximum
-    // settle at BOTH the baseline and the perturbed duty, plus slack. A bare
+    // settle at BOTH the baseline and the perturbed duty, plus — since DEC-405 —
+    // its bounded settle-wait before the baseline, doubled for slack. A bare
     // `sleep` would be the tokio trap this project has recorded — every wait
     // here is a bounded poll against a deadline.
     let deadline = tokio::time::Instant::now()
         + std::time::Duration::from_secs(
             constants::DISCOVERY_MAX_CYCLES as u64
-                * 2
-                * constants::CHARACTERIZATION_SETTLE_MAX_S
+                * (2 * constants::CHARACTERIZATION_SETTLE_MAX_S
+                    + constants::DISCOVERY_SETTLE_WAIT_MAX.as_secs())
                 * 2
                 + 60,
         );
@@ -1559,6 +1557,128 @@ mod tests {
     use super::*;
     use crate::api::characterization as ch;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    // ── DEC-405 (`PTR-e`): verify evidence from the REAL handler ────────────
+
+    /// The real verify handler, over a fake sysfs tree, read by the real
+    /// gatherer. Never a hand-built body: the defect this pins was a body shape
+    /// the orchestrator's own tests shared with it (DEC-340).
+    async fn real_verify(rpm_at: fn(u32) -> u32, temp_c: f64) -> VerifyEvidence {
+        let (state, _tmp) = super::super::hwmon_ctl::tests::verify_state_on_tree(128, rpm_at);
+        state
+            .cache
+            .update_sensors(vec![super::super::hwmon_ctl::tests::fresh_cpu(temp_c)]);
+        let member = "hwmon:test:dev:pwm1";
+        let (status, axum::Json(body)) = super::super::hwmon_ctl::hwmon_verify_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(member.to_string()),
+        )
+        .await;
+        verify_evidence(member, status, &body)
+    }
+
+    #[tokio::test]
+    async fn an_effective_verify_is_filed_as_pass_with_its_readings() {
+        // A fan whose tach follows the duty: 128 raw -> 1324 rpm, 204 -> 1932.
+        let ev = real_verify(|raw| 300 + raw * 8, 40.0).await;
+        assert_eq!(ev.result.as_deref(), Some("effective"), "{ev:?}");
+        // The three fields that were always None before the fix.
+        assert_eq!(ev.rpm_before, Some(1324));
+        assert_eq!(ev.rpm_after, Some(300 + 204 * 8));
+        assert_eq!(
+            ev.readback_pct, ev.requested_pct,
+            "the header held the test duty"
+        );
+        assert!(ev.readback_pct.is_some());
+        assert_eq!(crate::validation::summary::verify_outcome(&ev), RESULT_PASS);
+    }
+
+    #[tokio::test]
+    async fn a_verify_with_no_rpm_effect_is_observed_never_pass() {
+        let ev = real_verify(|_| 1200, 40.0).await;
+        assert_eq!(ev.result.as_deref(), Some("no_rpm_effect"), "{ev:?}");
+        assert_eq!((ev.rpm_before, ev.rpm_after), (Some(1200), Some(1200)));
+        assert_eq!(
+            crate::validation::summary::verify_outcome(&ev),
+            RESULT_OBSERVED
+        );
+    }
+
+    /// DEC-405 S1-6: a refused verify is `unavailable` — in the evidence AND in
+    /// the `pwm_header_control` finding, which used to read `write_ok` alone and
+    /// file "fail" for a thermal refusal.
+    #[tokio::test]
+    async fn a_refused_verify_is_unavailable_never_fail() {
+        let ev = real_verify(|raw| 300 + raw * 8, 95.0).await;
+        assert!(
+            !ev.write_ok,
+            "precondition: 95 °C must refuse the verify: {ev:?}"
+        );
+        assert_eq!(
+            crate::validation::summary::verify_outcome(&ev),
+            RESULT_UNAVAILABLE
+        );
+
+        let mut session = finalised_session();
+        session.evidence = vec![EvidenceRef {
+            kind: DIAG_VERIFY.to_string(),
+            member_id: ev.header_id.clone(),
+            run_id: None,
+            started_unix_ms: 1,
+            completed_unix_ms: Some(2),
+            outcome: RESULT_UNAVAILABLE.to_string(),
+            detail: ev.detail.clone(),
+            characterization: None,
+            verify: Some(ev),
+            control_path: None,
+        }];
+        let findings = crate::validation::summary::summarise(&session);
+        let control = findings
+            .iter()
+            .find(|f| f.id == crate::validation::session::F_PWM_HEADER_CONTROL)
+            .expect("the finding is always present");
+        assert_eq!(control.state, RESULT_UNAVAILABLE);
+    }
+
+    /// DEC-405: a sweep whose worst point never settled has no steady-state
+    /// figure, so the stability finding is `unknown` — and a settled one that
+    /// varied stays `observed` (the opposite arm, or a stuck mapping passes).
+    #[test]
+    fn a_not_settled_stability_verdict_is_unknown_never_observed() {
+        let finding_for = |verdict: &str| {
+            let mut session = finalised_session();
+            let mut r = run("char-405", ch::STATE_COMPLETE);
+            r.summary = Some(ch::CharSummary {
+                stability_verdict: verdict.to_string(),
+                ..Default::default()
+            });
+            session.evidence = vec![EvidenceRef {
+                kind: DIAG_CHARACTERIZATION.to_string(),
+                member_id: "hwmon:it87:isa-0a30:pwm2:PUMP".into(),
+                run_id: Some("char-405".into()),
+                started_unix_ms: 1,
+                completed_unix_ms: Some(2),
+                outcome: RESULT_OBSERVED.to_string(),
+                detail: None,
+                characterization: Some(r),
+                verify: None,
+                control_path: None,
+            }];
+            crate::validation::summary::summarise(&session)
+                .into_iter()
+                .find(|f| f.id == crate::validation::session::F_RPM_STABILITY)
+                .expect("present")
+                .state
+        };
+        assert_eq!(
+            finding_for(crate::api::stats::STABILITY_NOT_SETTLED),
+            RESULT_UNKNOWN
+        );
+        assert_eq!(
+            finding_for(crate::api::stats::STABILITY_VARIABLE),
+            RESULT_OBSERVED
+        );
+    }
 
     /// The smallest `ValidationSession` the response mapper can be handed. Built
     /// literally because `SessionMetadata` has no `Default` — every field of it is
@@ -1800,7 +1920,7 @@ mod tests {
             direction: "rising".into(),
             ..Default::default()
         }];
-        r.summary = Some(ch::summarise(&r.points, &[]));
+        r.summary = Some(ch::summarise(&r.points, &[], None));
 
         let findings_for = |kind: &str| {
             let mut session = finalised_session();

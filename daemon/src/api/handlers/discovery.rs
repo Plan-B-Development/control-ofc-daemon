@@ -603,6 +603,7 @@ pub async fn discover_control_path_handler(
                 floor,
                 pump_protected,
                 window,
+                crate::constants::DISCOVERY_SETTLE_WAIT_MAX,
                 write_fn,
                 read_fn,
                 &cancel,
@@ -844,8 +845,9 @@ impl SamplePaths {
 /// hwmon's `update_interval` is a chip-level attribute beside the `pwmN` files.
 /// Absent on most Super-I/O drivers, which is exactly why §4 requires UNKNOWN
 /// rather than a guess — this returns `None` and the summary falls back to what
-/// the run actually observed.
-fn read_update_interval(pwm_path: &str) -> Option<u64> {
+/// the run actually observed. Shared with the characterisation handler
+/// (DEC-405), so both diagnostics read the one declared cadence the same way.
+pub(super) fn read_update_interval(pwm_path: &str) -> Option<u64> {
     let dir = std::path::Path::new(pwm_path).parent()?;
     std::fs::read_to_string(dir.join("update_interval"))
         .ok()?

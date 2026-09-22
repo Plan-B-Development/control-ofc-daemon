@@ -1919,6 +1919,8 @@ fn widest_characterization_run() -> control_ofc_daemon::api::characterization::C
                     verdict: text_at(tok),
                     sample_interval_ms: u64::MAX,
                     dwell_ms: u64::MAX,
+                    window_start_ms: u64::MAX,
+                    update_interval_ms: Some(u64::MAX),
                 }),
                 estimated_physical_rpm: Some(ch::EstimatedRpm {
                     value: u16::MAX,
@@ -1937,6 +1939,8 @@ fn widest_characterization_run() -> control_ofc_daemon::api::characterization::C
             min_rpm: Some(u16::MAX),
             max_rpm: Some(u16::MAX),
             monotonic: Some(true),
+            monotonic_falling: Some(true),
+            monotonic_rising: Some(true),
             dead_zone_upper_pct: Some(u8::MAX),
             clamp_pct: Some(u8::MAX),
             possible_device_override: true,
@@ -2372,6 +2376,8 @@ fn evidence_with_detail_everywhere(detail: &str) -> EvidenceRef {
             rpm_before: Some(900),
             rpm_after: Some(1400),
             detail: Some(detail.to_string()),
+            result: Some("no_rpm_effect".into()),
+            restore_failed: false,
         }),
         control_path: Some(control_path_run(detail)),
     }
