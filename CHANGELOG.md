@@ -4,6 +4,12 @@
 
 ## [2.53.0] — 2026-09-22
 
+This release also carries **2.52.0**, which was never published on its own —
+its changes (DEC-405: more accurate fan-diagnostic settling and resolution
+figures) are listed under
+[2.52.0](https://github.com/Plan-B-Development/control-ofc-daemon/blob/v2.53.0/CHANGELOG.md#2520--2026-09-22)
+below.
+
 ### Fixed
 
 **A fan speed set by another program no longer sticks while your profile's
