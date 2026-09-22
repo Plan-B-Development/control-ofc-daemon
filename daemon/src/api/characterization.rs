@@ -783,7 +783,7 @@ fn readback_verdict(requested_pct: u8, readback_pct: Option<u8>, pwm_enable: Opt
     match readback_pct {
         None => "unavailable".into(),
         Some(got) => {
-            if got.abs_diff(requested_pct) <= constants::CHARACTERIZATION_READBACK_TOLERANCE_PCT {
+            if got.abs_diff(requested_pct) <= constants::READBACK_TOLERANCE_PCT {
                 "match".into()
             } else {
                 "clamped".into()

@@ -412,7 +412,22 @@ pub const CHARACTERIZATION_SAMPLE_INTERVAL: Duration = Duration::from_millis(500
 /// Readback tolerance in percentage points. A duty is stored as a 0-255 raw
 /// value, so a round-trip through `percent -> raw -> percent` can legitimately
 /// land one point away; 2 absorbs that without hiding a real clamp.
-pub const CHARACTERIZATION_READBACK_TOLERANCE_PCT: u8 = 2;
+///
+/// ONE tolerance with two readers (DEC-406): characterisation's
+/// `readback_verdict`, and the engine's duty reconciliation in
+/// `HwmonPwmController::set_pwm`, which rewrites a coalesced duty whose
+/// readback is further than this from the command. Renamed from
+/// `CHARACTERIZATION_READBACK_TOLERANCE_PCT` when the second reader arrived, so
+/// the two cannot drift into two different ideas of "the duty held".
+pub const READBACK_TOLERANCE_PCT: u8 = 2;
+
+/// How many consecutive duty corrections that do not hold the engine writes
+/// before it stops correcting a header and flags it `duty_not_holding`
+/// (DEC-406). A correction "does not hold" when the NEXT tick's coalesced
+/// readback still disagrees beyond [`READBACK_TOLERANCE_PCT`] — so this bounds
+/// how long the daemon fights a second writer, or a chip that clamps, to this
+/// many ticks per episode.
+pub const DUTY_CORRECTION_ATTEMPTS: u8 = 3;
 
 /// Absolute RPM noise floor for "did this reading move?". Below this, tach
 /// jitter on a healthy fan would read as a response.

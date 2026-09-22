@@ -173,12 +173,19 @@ pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntr
             pwm_enable_mode: None,
             pwm_readback_pct: None,
             pwm_commanded_pct: None,
+            duty_corrections: None,
+            duty_not_holding: None,
         });
     }
 
     // Hwmon fans
     for (id, fan) in &snap.hwmon_fans {
         let age_ms = now.duration_since(fan.updated_at).as_millis() as u64;
+        let reconciliation = snap
+            .hwmon_duty_reconciliation
+            .get(id)
+            .copied()
+            .unwrap_or_default();
         let stall = match (fan.rpm, fan.last_commanded_pwm) {
             (Some(rpm), Some(pwm)) => Some(rpm == 0 && pwm > constants::STALL_PWM_THRESHOLD),
             _ => None,
@@ -195,6 +202,9 @@ pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntr
             pwm_enable_mode: fan.pwm_enable_mode,
             pwm_readback_pct: fan.pwm_readback_pct,
             pwm_commanded_pct: fan.pwm_commanded_pct,
+            // DEC-406: on every hwmon entry; a header never corrected reads 0.
+            duty_corrections: Some(reconciliation.corrections),
+            duty_not_holding: Some(reconciliation.not_holding),
         });
     }
 
@@ -222,6 +232,8 @@ pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntr
             pwm_enable_mode: None,
             pwm_readback_pct: None,
             pwm_commanded_pct: None,
+            duty_corrections: None,
+            duty_not_holding: None,
         });
     }
 

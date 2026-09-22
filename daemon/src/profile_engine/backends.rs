@@ -3442,6 +3442,76 @@ mod tests {
         );
     }
 
+    /// A sysfs whose duty register keeps what was written, so a test can play a
+    /// second writer between two engine ticks (DEC-406).
+    #[derive(Clone, Default)]
+    struct DutyHoldingWriter {
+        files: Arc<Mutex<HashMap<String, String>>>,
+        writes: WriteLog,
+    }
+
+    impl SysfsWriter for DutyHoldingWriter {
+        fn write_file(&mut self, path: &str, value: &str) -> Result<(), HwmonError> {
+            self.writes.lock().push((path.into(), value.into()));
+            self.files.lock().insert(path.into(), value.trim().into());
+            Ok(())
+        }
+        fn read_file(&self, path: &str) -> Result<String, HwmonError> {
+            self.files
+                .lock()
+                .get(path)
+                .map(|v| format!("{v}\n"))
+                .ok_or(HwmonError::ReadError {
+                    path: path.into(),
+                    message: "not found".into(),
+                })
+        }
+    }
+
+    /// [SAFETY] DEC-406 (`PTR-g`) at the call site, through the engine's own
+    /// write path: a steady command whose duty a second writer changed between
+    /// ticks is written again on the next tick and published for `/poll`.
+    /// Before DEC-406 the second `apply` coalesced and the 60 % stood — the
+    /// 2026-09-08 D3 finding, 55 s against a commanded 46 %/40 %.
+    #[tokio::test]
+    async fn the_engine_rewrites_a_duty_a_second_writer_changed() {
+        let id = "hwmon:it8696:pwm1";
+        let pwm = "/sys/class/hwmon/hwmon0/pwm1";
+        let writer = DutyHoldingWriter::default();
+        let files = writer.files.clone();
+        let writes = writer.writes.clone();
+        let cache = Arc::new(StateCache::new());
+        let ctrl = HwmonPwmController::new(
+            vec![make_header(id)],
+            LeaseManager::new(),
+            Box::new(writer),
+            cache.clone(),
+        );
+        let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl))).expect("writable header");
+
+        be.apply(&[cmd(id, "hwmon", 40)]).await;
+        let duty_writes = || writes.lock().iter().filter(|(p, _)| p == pwm).count();
+        assert_eq!(duty_writes(), 1, "precondition: the first tick writes");
+        be.apply(&[cmd(id, "hwmon", 40)]).await;
+        assert_eq!(duty_writes(), 1, "precondition: a holding duty coalesces");
+
+        files
+            .lock()
+            .insert(pwm.into(), crate::pwm::percent_to_raw(60).to_string());
+        be.apply(&[cmd(id, "hwmon", 40)]).await;
+
+        assert_eq!(duty_writes(), 2, "the drifted duty must be written again");
+        assert_eq!(
+            files.lock().get(pwm).cloned(),
+            Some(crate::pwm::percent_to_raw(40).to_string())
+        );
+        let entries =
+            crate::api::handlers::build_fan_entries(&cache.snapshot(), std::time::Instant::now());
+        let entry = entries.iter().find(|e| e.id == id);
+        assert_eq!(entry.and_then(|e| e.duty_corrections), Some(1));
+        assert_eq!(entry.and_then(|e| e.duty_not_holding), Some(false));
+    }
+
     #[tokio::test]
     async fn force_all_reasserts_manual_mode_after_engine_write() {
         // Engine controls a header first (manual_mode_set = true), then thermal

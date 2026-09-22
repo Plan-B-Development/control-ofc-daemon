@@ -387,6 +387,30 @@ impl StateCache {
         }
     }
 
+    /// Publish hwmon header `id`'s duty-reconciliation record (DEC-406). The
+    /// write path is its only producer.
+    pub fn set_hwmon_duty_reconciliation(&self, id: &str, record: DutyReconciliation) {
+        self.inner
+            .write()
+            .hwmon_duty_reconciliation
+            .insert(id.to_string(), record);
+    }
+
+    /// Clear the `not_holding` flag on every header in `ids` (DEC-406), keeping
+    /// each header's correction count, which is since boot.
+    ///
+    /// Called where the controller forgets a header's write state — a hand-back,
+    /// a profile deactivation — because the flag describes a header the engine
+    /// is commanding, and after either of those it is not.
+    pub fn clear_hwmon_duty_not_holding<'a>(&self, ids: impl IntoIterator<Item = &'a str>) {
+        let mut state = self.inner.write();
+        for id in ids {
+            if let Some(r) = state.hwmon_duty_reconciliation.get_mut(id) {
+                r.not_holding = false;
+            }
+        }
+    }
+
     pub fn update_hwmon_fans(&self, fans: Vec<HwmonFanState>) {
         let now = Instant::now();
         let mut state = self.inner.write();

@@ -429,6 +429,28 @@ pub struct DaemonState {
     /// Empty whenever no profile is evaluating, including for the duration of a
     /// thermal force (which drives fans directly, bypassing every control).
     pub control_outputs: Vec<ControlOutput>,
+    /// The engine's duty reconciliation per hwmon header (DEC-406), published by
+    /// `HwmonPwmController::set_pwm` so `/fans` and `/poll` can report it without
+    /// taking the hwmon lock (the DEC-278 shape, like `pwm_commanded_pct`).
+    ///
+    /// Kept apart from `hwmon_fans` on purpose: the poll rebuilds those entries
+    /// every second and has no knowledge of the controller, and a separate map
+    /// with one producer needs no carry-forward rule. A header absent here has
+    /// never been corrected and is not flagged — the wire reports 0 / false.
+    pub hwmon_duty_reconciliation: HashMap<String, DutyReconciliation>,
+}
+
+/// One hwmon header's duty-reconciliation record (DEC-406).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DutyReconciliation {
+    /// Corrections the engine has written since the daemon started: coalesced
+    /// ticks whose `pwmN` readback disagreed with the command beyond
+    /// `constants::READBACK_TOLERANCE_PCT`, so the duty was rewritten.
+    pub corrections: u32,
+    /// The engine gave up: `constants::DUTY_CORRECTION_ATTEMPTS` corrections in a
+    /// row did not hold, so it no longer rewrites this header until the command
+    /// changes or the readback agrees again.
+    pub not_holding: bool,
 }
 
 impl DaemonState {
@@ -476,6 +498,7 @@ impl Default for DaemonState {
             unavailable_sensors: Vec::new(),
             skipped_controls: Vec::new(),
             control_outputs: Vec::new(),
+            hwmon_duty_reconciliation: HashMap::new(),
         }
     }
 }

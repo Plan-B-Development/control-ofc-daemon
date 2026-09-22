@@ -60,7 +60,7 @@ daemon/src/
     classify.rs        — refines each temp sensor's CPU/motherboard classification for the inventory (DEC-200)
     readiness.rs       — turns the inventory into an actionable hardware-readiness list (DEC-200)
     pwm_discovery.rs   — PWM header discovery (fan outputs)
-    pwm_control.rs     — HwmonPwmController + SysfsWriter trait
+    pwm_control.rs     — HwmonPwmController + SysfsWriter trait; write coalescing with engine duty reconciliation (DEC-073/DEC-406)
     lease.rs           — LeaseManager (exclusive write access)
     aio.rs             — liquid-cooler (AIO/custom-loop) recognition: coolant-sensor + is_aio flag + aio_hwmon cap (DEC-156)
     roles.rs           — per-channel header role inference + resolution, and THE
@@ -210,6 +210,31 @@ counter on `StateCache`, bumped and read under the `active_profile` lock so the
 swap and the bump are observed together), and the deadband self-releases for one
 tick after `DEADBAND_MAX_HOLD_CYCLES` (~30 s) so a temperature that settles just
 inside the band cannot pin the pre-settle fan speed indefinitely.
+
+**hwmon writes coalesce, and a coalesced engine write checks its readback
+(DEC-073, DEC-406).** `HwmonPwmController::set_pwm` skips a write whose duty
+equals the header's last command while manual mode is still set. Since DEC-406 an
+*engine* write that would coalesce first reads `pwmN` back; if it is further than
+`READBACK_TOLERANCE_PCT` (2 points, the same tolerance characterisation uses) from
+the duty the header **took** — what `pwmN` read immediately after the daemon's last
+write, or the command where that read failed — the duty is written again: a
+*correction*, counted per header since boot. Comparing with what the header took
+rather than with the command is what keeps a coarse driver (`dell_smm`'s three
+levels, `thinkpad_acpi`'s eight) or a clamping chip from reading as drift after
+every write; a clamp stays visible through `verify_mismatch_counts`. A correction
+"did not hold" when the next tick still disagrees (one whose write failed did not
+land and is not counted); after `DUTY_CORRECTION_ATTEMPTS` (3) of those in a row the engine stops rewriting that
+header and flags it `duty_not_holding`, so it cannot fight a persistent second
+writer indefinitely. It resumes when the command changes, and the flag
+clears when a coalesced readback agrees again (or the header is handed back or the
+profile deactivated). One drift episode logs at most one WARN for its first
+correction, one WARN for the give-up and one INFO for the recovery. An unreadable
+duty is unknown, never a mismatch. Scope: writes under a `Verify` lease (verify,
+characterise, discover) are never reconciled — a diagnostic gets exactly the duty
+it asked for — and the thermal force is unaffected, because it clears
+`manual_mode_set` first (`forget_manual_mode`) and so never coalesces. Both
+figures are published through the cache on every hwmon `/fans` and `/poll` entry
+(`duty_corrections`, `duty_not_holding`), gated by `control.duty_reconciliation`.
 
 ## Startup Sequence — OpenFan adoption (DEC-291 / DEC-361)
 

@@ -15,9 +15,9 @@ const WATCHDOG_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
 
 use crate::error::HwmonError;
 use crate::health::cache::StateCache;
-use crate::health::state::HwmonFanState;
+use crate::health::state::{DutyReconciliation, HwmonFanState};
 use crate::hwmon::handback::{HandBack, HandBackLedger, HandBackOutcome};
-use crate::hwmon::lease::{LeaseError, LeaseManager};
+use crate::hwmon::lease::{HwmonWriter, LeaseError, LeaseManager};
 use crate::hwmon::pwm_discovery::PwmHeaderDescriptor;
 
 /// PWM enable mode: manual (1) allows direct PWM writes.
@@ -97,6 +97,125 @@ struct HeaderWriteState {
     last_commanded_pct: Option<u8>,
     /// Whether manual mode (pwm_enable=1) has been written during the current lease.
     manual_mode_set: bool,
+    /// What `pwmN` read immediately after the last successful write to this
+    /// header, as a percent — the duty the header actually took (DEC-406, S2-5).
+    /// `None` when that read failed, or after a write that did not read back.
+    ///
+    /// The drift check compares against THIS, not the command, because a driver
+    /// may legitimately hold a different value: `dell_smm` has three duty levels
+    /// (a write of 40 % reads back 50 %), `thinkpad_acpi` eight, and a clamping
+    /// chip raises a low duty. Against the command every such header would be
+    /// "drifting" after every write; against what it took, only a change made
+    /// after the write is.
+    held_pct: Option<u8>,
+    /// The engine's duty-drift episode for this header (DEC-406).
+    drift: DriftState,
+}
+
+/// One header's duty-drift episode (DEC-406, `PTR-g`).
+///
+/// An EPISODE opens when a coalesced tick reads `pwmN` back further than
+/// `READBACK_TOLERANCE_PCT` from the duty the header took after the daemon's
+/// last write (`HeaderWriteState::held_pct`, or the command where that read
+/// failed), and closes when a coalesced tick reads it back within tolerance. Inside one episode the daemon logs at
+/// most one WARN for the first correction and one for giving up, however many
+/// times a changed command restarts the corrections.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DriftState {
+    /// Corrections written at the current command that the next tick found had
+    /// not held. Reset by any other write (a changed command, a re-take).
+    corrections: u8,
+    /// Gave up: `DUTY_CORRECTION_ATTEMPTS` corrections in a row did not hold.
+    not_holding: bool,
+    /// An episode is open.
+    in_episode: bool,
+    /// The give-up WARN has been logged in this episode.
+    give_up_logged: bool,
+}
+
+impl DriftState {
+    /// A write that is not a correction — a changed command, a re-take after a
+    /// reclaim, resume or thermal force. It is a fresh attempt at a fresh duty,
+    /// so the give-up is left and the correction count restarts; the episode
+    /// (and so its log lines) is not closed, because nothing has yet read the
+    /// duty back and found it holding.
+    fn after_plain_write(self) -> Self {
+        Self {
+            corrections: 0,
+            not_holding: false,
+            ..self
+        }
+    }
+}
+
+/// What a coalesced engine tick does about its readback (DEC-406).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriftAction {
+    /// The duty holds, or could not be read: skip the write, as before DEC-406.
+    Coalesce,
+    /// The duty holds again after an episode: skip the write; the episode ends.
+    Recovered { was_not_holding: bool },
+    /// Rewrite the duty. `first` = the episode's first correction (WARN).
+    Correct { first: bool },
+    /// Stop correcting: skip the write and flag the header. `log` = the
+    /// episode's first give-up (WARN).
+    GiveUp { log: bool },
+    /// Already given up and still disagreeing: skip the write.
+    Hold,
+}
+
+/// Decide a coalesced tick from its readback (DEC-406). Pure, so the state
+/// machine is tested on its own; `set_pwm` is its one caller and is tested
+/// through the engine as well.
+///
+/// `expected_pct` is the duty the header took after the daemon's last write
+/// (S2-5), not necessarily the command. `readback_pct` of `None` is UNKNOWN,
+/// never a mismatch: nothing is written, counted or changed. The comparison is
+/// the same tolerance characterisation uses.
+fn reconcile_decision(
+    expected_pct: u8,
+    readback_pct: Option<u8>,
+    state: DriftState,
+) -> (DriftAction, DriftState) {
+    let Some(read) = readback_pct else {
+        return (DriftAction::Coalesce, state);
+    };
+    if read.abs_diff(expected_pct) <= crate::constants::READBACK_TOLERANCE_PCT {
+        if state.in_episode {
+            return (
+                DriftAction::Recovered {
+                    was_not_holding: state.not_holding || state.give_up_logged,
+                },
+                DriftState::default(),
+            );
+        }
+        return (DriftAction::Coalesce, state);
+    }
+    if state.not_holding {
+        return (DriftAction::Hold, state);
+    }
+    if state.corrections >= crate::constants::DUTY_CORRECTION_ATTEMPTS {
+        return (
+            DriftAction::GiveUp {
+                log: !state.give_up_logged,
+            },
+            DriftState {
+                not_holding: true,
+                give_up_logged: true,
+                ..state
+            },
+        );
+    }
+    (
+        DriftAction::Correct {
+            first: !state.in_episode,
+        },
+        DriftState {
+            corrections: state.corrections + 1,
+            in_episode: true,
+            ..state
+        },
+    )
 }
 
 /// Per-header throttle state for the pwm_enable watchdog log.
@@ -200,6 +319,11 @@ pub struct HwmonPwmController {
     /// PWM=N but read back PWM≠N — a strong signal of BIOS/EC interference,
     /// clamping, or a concurrent in-process writer.
     verify_mismatch_counts: HashMap<String, u64>,
+    /// Duty corrections the engine has written per header since the daemon
+    /// started (DEC-406): coalesced ticks whose readback disagreed with the
+    /// command, so the duty was rewritten. Persists across leases, like
+    /// `verify_mismatch_counts`, and is published on `/fans` and `/poll`.
+    duty_corrections: HashMap<String, u32>,
     /// Which headers this controller has taken from firmware, and what each one
     /// gets back (DEC-382). Shared, not owned: the shutdown restore and the panic
     /// hook read it without this controller's mutex, which a wedged sysfs write
@@ -262,6 +386,7 @@ impl HwmonPwmController {
             enable_revert_last_at: HashMap::new(),
             watchdog_log_state: HashMap::new(),
             verify_mismatch_counts: HashMap::new(),
+            duty_corrections: HashMap::new(),
             handback,
             exit_record: HashMap::new(),
             exit_min: HashMap::new(),
@@ -318,6 +443,9 @@ impl HwmonPwmController {
                 if written.is_ok() {
                     if let Some(ws) = self.write_state.get_mut(&header_id) {
                         ws.last_commanded_pct = Some(target_pct);
+                        // DEC-406: this write was not read back, so the drift
+                        // check falls back to comparing with the floor's duty.
+                        ws.held_pct = None;
                     }
                 }
                 Some(written)
@@ -370,6 +498,8 @@ impl HwmonPwmController {
             // take re-assert `pwm_enable=1` from a clean slate.
             self.write_state.remove(header_id);
             self.cache.clear_hwmon_commanded(header_id);
+            // DEC-406: a header nothing commands is not "not holding" anything.
+            self.cache.clear_hwmon_duty_not_holding([header_id]);
         }
         Ok(Some(outcome))
     }
@@ -488,6 +618,16 @@ impl HwmonPwmController {
         self.lease_manager
             .validate_lease(lease_id)
             .map_err(HwmonControlError::Lease)?;
+        // DEC-406: only the ENGINE's writes are reconciled — profile curves and
+        // overrides, including under a thermal-safety lease the engine adopted.
+        // A diagnostic writes under a `Verify` lease and must get exactly the
+        // duty it asked for, with no correction counted against the header.
+        // Derived from the lease this call was validated against, not from a
+        // parameter a caller could forget to pass.
+        let reconciles = self
+            .lease_manager
+            .active_lease()
+            .is_some_and(|l| l.lease_id == lease_id && l.owner != HwmonWriter::Verify);
 
         // Check for system resume — reset all manual mode flags
         if self.cache.take_resume_flag() {
@@ -642,8 +782,15 @@ impl HwmonPwmController {
             ws.manual_mode_set = false;
         }
 
-        // Coalesce: skip if same as last commanded value and mode still set.
-        if ws.manual_mode_set && ws.last_commanded_pct == Some(effective_pct) {
+        // Coalesce: skip if same as last commanded value and mode still set —
+        // unless the readback says the duty did not hold (DEC-406), in which
+        // case this falls through and writes it again as a correction.
+        let mode_set = ws.manual_mode_set;
+        let coalescible = mode_set && ws.last_commanded_pct == Some(effective_pct);
+        let correcting = coalescible
+            && reconciles
+            && self.duty_drift_rewrite(header_id, effective_pct, &pwm_path);
+        if coalescible && !correcting {
             let now = Instant::now();
             let rpm = rpm_path.as_ref().and_then(|p| {
                 self.writer
@@ -671,7 +818,7 @@ impl HwmonPwmController {
         }
 
         // Write pwm_enable if not yet set (or if BIOS reclaimed it).
-        if !ws.manual_mode_set && supports_enable {
+        if !mode_set && supports_enable {
             if let Some(ref ep) = enable_path {
                 // [SAFETY] DEC-382: this write is the TAKE. Read what the header
                 // was doing BEFORE it — on the first take only; every later one
@@ -703,9 +850,20 @@ impl HwmonPwmController {
             // success — and confirmed below once it has.
             self.exit_record.insert(header_id.to_string(), None);
         }
-        self.writer
-            .write_file(&pwm_path, &raw.to_string())
-            .map_err(HwmonControlError::Hardware)?;
+        if let Err(e) = self.writer.write_file(&pwm_path, &raw.to_string()) {
+            // DEC-406: a correction that never landed is not one that "did not
+            // hold", so it must not count toward the give-up — or three EIOs would
+            // publish `duty_not_holding` beside `duty_corrections: 0`. The episode
+            // stays open (no repeat WARN); the failure reaches the engine's own
+            // throttled write-failure log, and the next tick tries again, as it
+            // does for any failed write.
+            if correcting {
+                if let Some(ws) = self.write_state.get_mut(header_id) {
+                    ws.drift.corrections = ws.drift.corrections.saturating_sub(1);
+                }
+            }
+            return Err(HwmonControlError::Hardware(e));
+        }
         if !supports_enable {
             self.exit_record
                 .insert(header_id.to_string(), Some(effective_pct));
@@ -714,9 +872,11 @@ impl HwmonPwmController {
         // Verify write: read back and compare (best-effort). On mismatch,
         // increment a per-header counter so the discrepancy is observable
         // beyond the log line (DEC log signal can be lost under throttling).
+        let mut held_pct = None;
         match self.writer.read_file(&pwm_path) {
             Ok(raw_str) => {
                 if let Ok(actual_raw) = raw_str.trim().parse::<u8>() {
+                    held_pct = Some(raw_to_percent(actual_raw));
                     if actual_raw != raw {
                         *self
                             .verify_mismatch_counts
@@ -742,6 +902,21 @@ impl HwmonPwmController {
         let ws = self.write_state.entry(header_id.to_string()).or_default();
         ws.last_commanded_pct = Some(effective_pct);
         ws.manual_mode_set = true;
+        ws.held_pct = held_pct;
+        // DEC-406: a correction is counted once it has been written; any other
+        // engine write restarts the corrections (`DriftState::after_plain_write`).
+        // A diagnostic's write touches neither.
+        if correcting {
+            *self
+                .duty_corrections
+                .entry(header_id.to_string())
+                .or_insert(0) += 1;
+        } else if reconciles {
+            ws.drift = ws.drift.after_plain_write();
+        }
+        if reconciles {
+            self.publish_duty_reconciliation(header_id);
+        }
 
         // Update cache with commanded value
         let now = Instant::now();
@@ -775,7 +950,101 @@ impl HwmonPwmController {
     /// Called when a lease is released. Resets coalescing state so the next
     /// lease holder gets a fresh pwm_enable write on their first set_pwm().
     pub fn on_lease_released(&mut self) {
+        // DEC-406: the drift episodes go with the write state; their flags must
+        // not outlive it on the wire. The correction counts are since boot.
+        self.cache
+            .clear_hwmon_duty_not_holding(self.write_state.keys().map(String::as_str));
         self.write_state.clear();
+    }
+
+    /// Duty corrections the engine has written per header since the daemon
+    /// started (DEC-406).
+    pub fn duty_corrections(&self) -> &HashMap<String, u32> {
+        &self.duty_corrections
+    }
+
+    /// Whether the engine has given up correcting `header_id`'s duty (DEC-406).
+    pub fn duty_not_holding(&self, header_id: &str) -> bool {
+        self.write_state
+            .get(header_id)
+            .is_some_and(|ws| ws.drift.not_holding)
+    }
+
+    /// Read `pwm_path` back on a coalesced engine tick and decide whether to
+    /// write the duty again (DEC-406, `PTR-g`). `true` = write it: the caller
+    /// falls through to the normal write path, which counts it.
+    ///
+    /// Before DEC-406 a coalesced tick skipped the write without looking, so a
+    /// second writer's duty stood for as long as the curve output was steady —
+    /// 55 s against a commanded 46 %/40 % on 2026-09-08, and that header could
+    /// be a pump. The thermal force is unaffected either way: it clears
+    /// `manual_mode_set` first (`forget_manual_mode`), so it never coalesces.
+    ///
+    /// The read is direct, under the lock `set_pwm` already holds, beside the
+    /// `fanN_input` read the coalesce refresh already makes — not the poll's
+    /// cached readback, which can be up to a poll interval older than the write
+    /// it would be judging.
+    fn duty_drift_rewrite(&mut self, header_id: &str, commanded_pct: u8, pwm_path: &str) -> bool {
+        let readback_pct = self
+            .writer
+            .read_file(pwm_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u8>().ok())
+            .map(raw_to_percent);
+        let Some(ws) = self.write_state.get_mut(header_id) else {
+            return false;
+        };
+        let expected_pct = ws.held_pct.unwrap_or(commanded_pct);
+        let (action, next) = reconcile_decision(expected_pct, readback_pct, ws.drift);
+        let changed = next != ws.drift;
+        ws.drift = next;
+        let read = readback_pct.map_or_else(|| "?".to_string(), |p| p.to_string());
+        let attempts = crate::constants::DUTY_CORRECTION_ATTEMPTS;
+        match action {
+            DriftAction::Coalesce | DriftAction::Hold => {}
+            DriftAction::Correct { first: true } => log::warn!(
+                "hwmon {header_id}: duty reads {read} % but held {expected_pct} % after the \
+                 engine's last write (commanded {commanded_pct} %) — rewriting it. Something \
+                 else may be writing this header \
+                 (a vendor tool, a script, firmware); further corrections are logged at DEBUG"
+            ),
+            DriftAction::Correct { first: false } => log::debug!(
+                "hwmon {header_id}: duty reads {read} %, held {expected_pct} % — rewriting"
+            ),
+            DriftAction::GiveUp { log: true } => log::warn!(
+                "hwmon {header_id}: {attempts} duty corrections in a row did not hold (reads \
+                 {read} %, held {expected_pct} % after a write; commanded {commanded_pct} %) — \
+                 no longer rewriting it until the \
+                 command changes or the duty holds again (duty_not_holding)"
+            ),
+            DriftAction::GiveUp { log: false } => log::debug!(
+                "hwmon {header_id}: duty still not holding at {commanded_pct} % (reads {read} %)"
+            ),
+            DriftAction::Recovered {
+                was_not_holding: true,
+            } => log::info!(
+                "hwmon {header_id}: duty holds at {read} % again — the episode that set \
+                 duty_not_holding is over"
+            ),
+            DriftAction::Recovered {
+                was_not_holding: false,
+            } => log::debug!("hwmon {header_id}: corrected duty holds at {read} %"),
+        }
+        if changed {
+            self.publish_duty_reconciliation(header_id);
+        }
+        matches!(action, DriftAction::Correct { .. })
+    }
+
+    /// Publish `header_id`'s reconciliation record to the cache (DEC-406).
+    fn publish_duty_reconciliation(&self, header_id: &str) {
+        self.cache.set_hwmon_duty_reconciliation(
+            header_id,
+            DutyReconciliation {
+                corrections: self.duty_corrections.get(header_id).copied().unwrap_or(0),
+                not_holding: self.duty_not_holding(header_id),
+            },
+        );
     }
 
     /// Reset every header's `manual_mode_set` — and ONLY that — so the next write
@@ -2609,5 +2878,544 @@ mod tests {
         assert_eq!(commanded(&cache), Some(60), "precondition");
         ctrl.hand_back("h1", &lease).unwrap();
         assert_eq!(commanded(&cache), None);
+    }
+
+    // ── DEC-406 (`PTR-g`): the engine reconciles a coalesced duty ─────────
+
+    /// `LiveSysfs` plus a log of every duty write and an optional clamp, so a
+    /// test can play a second writer (set `PWM` between ticks), a chip that will
+    /// not go below a duty, or an unreadable duty register.
+    #[derive(Clone, Default)]
+    struct DriftSysfs {
+        live: LiveSysfs,
+        pwm_writes: Arc<Mutex<Vec<String>>>,
+        clamp_raw_min: Arc<Mutex<Option<u8>>>,
+        /// A coarse driver: every write lands on the nearest of these raw levels
+        /// (`dell_smm` is 0/128/255).
+        levels: Arc<Mutex<Option<Vec<u8>>>>,
+        /// Fail every duty write (EIO), leaving the register as it was.
+        fail_pwm_writes: Arc<Mutex<bool>>,
+    }
+
+    impl DriftSysfs {
+        fn duty_writes(&self) -> usize {
+            self.pwm_writes.lock().len()
+        }
+        fn external_write(&self, pct: u8) {
+            self.live.set(PWM, &percent_to_raw(pct).to_string());
+        }
+    }
+
+    impl SysfsWriter for DriftSysfs {
+        fn write_file(&mut self, path: &str, value: &str) -> Result<(), HwmonError> {
+            let mut value = value.trim().to_string();
+            if path == PWM && *self.fail_pwm_writes.lock() {
+                return Err(HwmonError::WriteError {
+                    path: path.into(),
+                    message: "Input/output error (os error 5)".into(),
+                });
+            }
+            if path == PWM {
+                self.pwm_writes.lock().push(value.clone());
+                if let (Some(min), Ok(raw)) = (*self.clamp_raw_min.lock(), value.parse::<u8>()) {
+                    value = raw.max(min).to_string();
+                }
+                if let (Some(levels), Ok(raw)) = (self.levels.lock().as_ref(), value.parse::<u8>())
+                {
+                    let nearest = levels.iter().min_by_key(|l| l.abs_diff(raw)).copied();
+                    value = nearest.unwrap_or(raw).to_string();
+                }
+            }
+            self.live.set(path, &value);
+            Ok(())
+        }
+        fn read_file(&self, path: &str) -> Result<String, HwmonError> {
+            self.live.read_file(path)
+        }
+    }
+
+    fn drift_controller(
+        owner: HwmonWriter,
+    ) -> (HwmonPwmController, DriftSysfs, Arc<StateCache>, String) {
+        let sysfs = DriftSysfs::default();
+        sysfs.live.set(ENABLE, "2");
+        sysfs.live.set(PWM, "0");
+        let cache = Arc::new(StateCache::new());
+        let mut ctrl = HwmonPwmController::new(
+            vec![make_header("h1", "CHA_FAN1", 0)],
+            LeaseManager::new(),
+            Box::new(sysfs.clone()),
+            cache.clone(),
+        );
+        let lease = ctrl.lease_manager_mut().take_lease(owner).unwrap().lease_id;
+        (ctrl, sysfs, cache, lease)
+    }
+
+    fn published(cache: &StateCache) -> DutyReconciliation {
+        cache
+            .snapshot()
+            .hwmon_duty_reconciliation
+            .get("h1")
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// The state machine over one whole episode: three corrections, one give-up,
+    /// holds, then recovery — with exactly one WARN-level action for the first
+    /// correction and one for the give-up. The log lines in `duty_drift_rewrite`
+    /// are a 1:1 match on these actions, so this is where "logs once" is pinned.
+    #[test]
+    fn a_drift_episode_corrects_three_times_then_gives_up_once() {
+        let mut st = DriftState::default();
+        let mut actions = Vec::new();
+        for _ in 0..6 {
+            let (a, next) = reconcile_decision(40, Some(60), st);
+            actions.push(a);
+            st = next;
+        }
+        assert_eq!(
+            actions,
+            vec![
+                DriftAction::Correct { first: true },
+                DriftAction::Correct { first: false },
+                DriftAction::Correct { first: false },
+                DriftAction::GiveUp { log: true },
+                DriftAction::Hold,
+                DriftAction::Hold,
+            ]
+        );
+        assert!(st.not_holding);
+
+        // A changed command restarts the corrections but keeps the episode, so
+        // neither WARN repeats however often the curve moves under a second writer.
+        st = st.after_plain_write();
+        assert!(!st.not_holding && st.corrections == 0 && st.in_episode);
+        let mut again = Vec::new();
+        for _ in 0..4 {
+            let (a, next) = reconcile_decision(41, Some(60), st);
+            again.push(a);
+            st = next;
+        }
+        assert_eq!(
+            again,
+            vec![
+                DriftAction::Correct { first: false },
+                DriftAction::Correct { first: false },
+                DriftAction::Correct { first: false },
+                DriftAction::GiveUp { log: false },
+            ]
+        );
+
+        let (a, st) = reconcile_decision(41, Some(41), st);
+        assert_eq!(
+            a,
+            DriftAction::Recovered {
+                was_not_holding: true
+            }
+        );
+        assert_eq!(st, DriftState::default(), "the episode is over");
+    }
+
+    /// Within the tolerance is agreement (quantised duty), `None` is unknown, and
+    /// neither opens an episode or changes anything.
+    #[test]
+    fn within_tolerance_or_unreadable_is_not_a_mismatch() {
+        let st = DriftState::default();
+        let tol = crate::constants::READBACK_TOLERANCE_PCT;
+        assert_eq!(
+            reconcile_decision(40, Some(40 + tol), st),
+            (DriftAction::Coalesce, st)
+        );
+        assert_eq!(
+            reconcile_decision(40, Some(40 - tol), st),
+            (DriftAction::Coalesce, st)
+        );
+        assert_eq!(
+            reconcile_decision(40, None, st),
+            (DriftAction::Coalesce, st)
+        );
+        let open = DriftState {
+            corrections: 2,
+            in_episode: true,
+            ..st
+        };
+        assert_eq!(
+            reconcile_decision(40, None, open),
+            (DriftAction::Coalesce, open),
+            "an unreadable duty neither ends an episode nor counts toward the give-up"
+        );
+        assert!(matches!(
+            reconcile_decision(40, Some(40 + tol + 1), st).0,
+            DriftAction::Correct { first: true }
+        ));
+    }
+
+    /// [SAFETY] `PTR-g`, at the call site: a second writer's duty between two
+    /// engine ticks is written back on the next tick, counted, and published.
+    #[test]
+    fn an_external_duty_write_is_corrected_on_the_next_tick() {
+        let (mut ctrl, sysfs, cache, lease) = drift_controller(HwmonWriter::Engine);
+        ctrl.set_pwm("h1", 40, &lease).unwrap();
+        let before = sysfs.duty_writes();
+
+        sysfs.external_write(60);
+        ctrl.set_pwm("h1", 40, &lease).unwrap();
+
+        assert_eq!(
+            sysfs.duty_writes(),
+            before + 1,
+            "the coalesced tick must write"
+        );
+        assert_eq!(
+            sysfs.live.get(PWM).as_deref(),
+            Some(percent_to_raw(40).to_string().as_str())
+        );
+        assert_eq!(ctrl.duty_corrections().get("h1"), Some(&1));
+        assert_eq!(
+            published(&cache),
+            DutyReconciliation {
+                corrections: 1,
+                not_holding: false
+            }
+        );
+
+        // The correction held: the next tick writes nothing and counts nothing.
+        ctrl.set_pwm("h1", 40, &lease).unwrap();
+        assert_eq!(sysfs.duty_writes(), before + 1);
+        assert_eq!(ctrl.duty_corrections().get("h1"), Some(&1));
+    }
+
+    /// Readback within the tolerance is left alone: no write, no count.
+    #[test]
+    fn a_readback_within_tolerance_writes_nothing() {
+        let (mut ctrl, sysfs, cache, lease) = drift_controller(HwmonWriter::Engine);
+        ctrl.set_pwm("h1", 40, &lease).unwrap();
+        let before = sysfs.duty_writes();
+        sysfs.external_write(40 + crate::constants::READBACK_TOLERANCE_PCT);
+        ctrl.set_pwm("h1", 40, &lease).unwrap();
+        assert_eq!(sysfs.duty_writes(), before);
+        assert_eq!(published(&cache).corrections, 0);
+    }
+
+    /// [SAFETY] Three corrections a persistent second writer undoes flag the
+    /// header and stop the writes: the daemon stops fighting it.
+    #[test]
+    fn three_corrections_that_do_not_hold_flag_the_header_and_stop_writing() {
+        let (mut ctrl, sysfs, cache, lease) = drift_controller(HwmonWriter::Engine);
+        ctrl.set_pwm("h1", 20, &lease).unwrap();
+        let before = sysfs.duty_writes();
+
+        for tick in 1..=3 {
+            sysfs.external_write(60);
+            ctrl.set_pwm("h1", 20, &lease).unwrap();
+            assert_eq!(sysfs.duty_writes(), before + tick, "correction {tick}");
+            assert!(!ctrl.duty_not_holding("h1"));
+        }
+        sysfs.external_write(60);
+        ctrl.set_pwm("h1", 20, &lease).unwrap();
+        assert!(
+            ctrl.duty_not_holding("h1"),
+            "the fourth disagreement gives up"
+        );
+        for _ in 0..5 {
+            sysfs.external_write(60);
+            ctrl.set_pwm("h1", 20, &lease).unwrap();
+        }
+        assert_eq!(
+            sysfs.duty_writes(),
+            before + 3,
+            "no writes after the give-up"
+        );
+        assert_eq!(
+            published(&cache),
+            DutyReconciliation {
+                corrections: 3,
+                not_holding: true
+            }
+        );
+    }
+
+    /// A changed command leaves `duty_not_holding` and corrections resume; the
+    /// readback agreeing again also leaves it.
+    #[test]
+    fn a_changed_command_or_agreement_leaves_not_holding() {
+        let (mut ctrl, sysfs, cache, lease) = drift_controller(HwmonWriter::Engine);
+        ctrl.set_pwm("h1", 20, &lease).unwrap();
+        for _ in 0..4 {
+            sysfs.external_write(60);
+            ctrl.set_pwm("h1", 20, &lease).unwrap();
+        }
+        assert!(ctrl.duty_not_holding("h1"), "precondition");
+
+        ctrl.set_pwm("h1", 22, &lease).unwrap();
+        assert!(!ctrl.duty_not_holding("h1"));
+        assert!(!published(&cache).not_holding, "the wire follows");
+        sysfs.external_write(60);
+        let before = sysfs.duty_writes();
+        ctrl.set_pwm("h1", 22, &lease).unwrap();
+        assert_eq!(sysfs.duty_writes(), before + 1, "correction resumes");
+
+        for _ in 0..3 {
+            sysfs.external_write(60);
+            ctrl.set_pwm("h1", 22, &lease).unwrap();
+        }
+        assert!(ctrl.duty_not_holding("h1"), "precondition: flagged again");
+        sysfs.external_write(22);
+        ctrl.set_pwm("h1", 22, &lease).unwrap();
+        assert!(!ctrl.duty_not_holding("h1"), "agreement leaves the flag");
+        assert!(!published(&cache).not_holding);
+    }
+
+    /// S2-5: a coarse driver holds a different duty from the one written
+    /// (`dell_smm`: 40 % lands on 128 = 50 %). That is what the header TOOK, so
+    /// it is not drift: no correction, however many ticks — and a second writer
+    /// on the same header is still corrected, back to the level it took.
+    #[test]
+    fn a_coarse_driver_is_not_drift_but_a_second_writer_on_it_is() {
+        let (mut ctrl, sysfs, cache, lease) = drift_controller(HwmonWriter::Engine);
+        *sysfs.levels.lock() = Some(vec![0, 128, 255]);
+        ctrl.set_pwm("h1", 40, &lease).unwrap();
+        assert_eq!(sysfs.live.get(PWM).as_deref(), Some("128"), "precondition");
+        let before = sysfs.duty_writes();
+        for _ in 0..6 {
+            ctrl.set_pwm("h1", 40, &lease).unwrap();
+        }
+        assert_eq!(sysfs.duty_writes(), before, "quantisation is not drift");
+        assert_eq!(published(&cache), DutyReconciliation::default());
+
+        sysfs.live.set(PWM, "255");
+        ctrl.set_pwm("h1", 40, &lease).unwrap();
+        assert_eq!(sysfs.duty_writes(), before + 1, "a second writer is");
+        assert_eq!(sysfs.live.get(PWM).as_deref(), Some("128"));
+        assert_eq!(published(&cache).corrections, 1);
+    }
+
+    /// S2-5: a chip that clamps a low duty is never corrected — the clamp is
+    /// what it took — and stays visible through the write-verify counter.
+    #[test]
+    fn a_clamping_chip_is_not_corrected_but_is_counted_by_write_verify() {
+        let (mut ctrl, sysfs, cache, lease) = drift_controller(HwmonWriter::Engine);
+        *sysfs.clamp_raw_min.lock() = Some(percent_to_raw(35));
+        ctrl.set_pwm("h1", 20, &lease).unwrap();
+        let before = sysfs.duty_writes();
+        for _ in 0..6 {
+            ctrl.set_pwm("h1", 20, &lease).unwrap();
+        }
+        assert_eq!(sysfs.duty_writes(), before);
+        assert_eq!(published(&cache), DutyReconciliation::default());
+        assert_eq!(ctrl.verify_mismatch_counts().get("h1"), Some(&1));
+    }
+
+    /// An unreadable duty register produces no correction and no count.
+    #[test]
+    fn an_unreadable_duty_is_never_corrected() {
+        let (mut ctrl, sysfs, cache, lease) = drift_controller(HwmonWriter::Engine);
+        ctrl.set_pwm("h1", 40, &lease).unwrap();
+        sysfs.external_write(60);
+        sysfs.live.write_only(PWM);
+        let before = sysfs.duty_writes();
+        for _ in 0..5 {
+            ctrl.set_pwm("h1", 40, &lease).unwrap();
+        }
+        assert_eq!(sysfs.duty_writes(), before);
+        assert_eq!(published(&cache), DutyReconciliation::default());
+    }
+
+    /// A diagnostic's `Verify` lease is never reconciled: it gets exactly the duty
+    /// it asked for, and nothing is counted against the header (S2-2).
+    #[test]
+    fn a_verify_lease_write_is_never_reconciled() {
+        let (mut ctrl, sysfs, cache, lease) = drift_controller(HwmonWriter::Verify);
+        ctrl.set_pwm("h1", 40, &lease).unwrap();
+        sysfs.external_write(60);
+        let before = sysfs.duty_writes();
+        ctrl.set_pwm("h1", 40, &lease).unwrap();
+        assert_eq!(sysfs.duty_writes(), before);
+        assert_eq!(published(&cache), DutyReconciliation::default());
+
+        // Positive control: the same sequence under the engine's lease corrects.
+        let (mut ctrl, sysfs, _cache, lease) = drift_controller(HwmonWriter::Engine);
+        ctrl.set_pwm("h1", 40, &lease).unwrap();
+        sysfs.external_write(60);
+        let before = sysfs.duty_writes();
+        ctrl.set_pwm("h1", 40, &lease).unwrap();
+        assert_eq!(sysfs.duty_writes(), before + 1);
+    }
+
+    /// A header a diagnostic restored to the engine's last command agrees with it,
+    /// so the engine's next tick writes and counts nothing.
+    #[test]
+    fn a_header_restored_by_a_diagnostic_is_not_corrected() {
+        let (mut ctrl, sysfs, cache, engine) = drift_controller(HwmonWriter::Engine);
+        ctrl.set_pwm("h1", 40, &engine).unwrap();
+        let verify = ctrl
+            .lease_manager_mut()
+            .force_take_lease(HwmonWriter::Verify)
+            .lease_id;
+        ctrl.set_pwm("h1", 70, &verify).unwrap();
+        ctrl.set_pwm("h1", 40, &verify).unwrap();
+        ctrl.lease_manager_mut().release_lease(&verify).unwrap();
+        let engine = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap()
+            .lease_id;
+        let before = sysfs.duty_writes();
+        ctrl.set_pwm("h1", 40, &engine).unwrap();
+        assert_eq!(sysfs.duty_writes(), before);
+        assert_eq!(published(&cache).corrections, 0);
+    }
+
+    /// [SAFETY] A forced tick still writes (the force clears `manual_mode_set`
+    /// first), and a forced write is not a correction.
+    #[test]
+    fn a_forced_write_still_writes_and_is_not_counted() {
+        let (mut ctrl, sysfs, cache, lease) = drift_controller(HwmonWriter::ThermalSafety);
+        ctrl.set_pwm("h1", 100, &lease).unwrap();
+        let before = sysfs.duty_writes();
+        ctrl.forget_manual_mode();
+        ctrl.set_pwm("h1", 100, &lease).unwrap();
+        assert_eq!(sysfs.duty_writes(), before + 1, "the forced tick writes");
+        assert_eq!(published(&cache).corrections, 0);
+    }
+
+    /// it87's full-speed alias: at 100 % the chip reports mode 0 and a duty of
+    /// 255. That is agreement, not drift and not a reclaim — no write, no flag.
+    #[test]
+    fn the_full_speed_alias_is_not_flagged() {
+        let (mut ctrl, sysfs, cache, lease) = drift_controller(HwmonWriter::Engine);
+        ctrl.set_pwm("h1", 100, &lease).unwrap();
+        sysfs.live.set(ENABLE, "0");
+        sysfs.live.set(PWM, "255");
+        let before = sysfs.duty_writes();
+        for _ in 0..5 {
+            ctrl.set_pwm("h1", 100, &lease).unwrap();
+        }
+        assert_eq!(sysfs.duty_writes(), before);
+        assert!(!ctrl.duty_not_holding("h1"));
+        assert_eq!(published(&cache), DutyReconciliation::default());
+    }
+
+    /// A BIOS reclaim still takes the full re-take path — the watchdog, not the
+    /// drift check — and a re-take is not a correction.
+    #[test]
+    fn a_bios_reclaim_is_a_retake_not_a_correction() {
+        let (mut ctrl, sysfs, cache, lease) = drift_controller(HwmonWriter::Engine);
+        ctrl.set_pwm("h1", 40, &lease).unwrap();
+        sysfs.live.set(ENABLE, "2");
+        sysfs.external_write(80);
+        ctrl.set_pwm("h1", 40, &lease).unwrap();
+        assert_eq!(sysfs.live.get(ENABLE).as_deref(), Some("1"), "re-taken");
+        assert_eq!(
+            sysfs.live.get(PWM).as_deref(),
+            Some(percent_to_raw(40).to_string().as_str())
+        );
+        assert_eq!(ctrl.enable_revert_counts().get("h1"), Some(&1));
+        assert_eq!(published(&cache).corrections, 0);
+    }
+
+    /// The flag describes a header the engine commands, so a hand-back or a
+    /// profile deactivation clears it on the wire; the count is since boot.
+    #[test]
+    fn deactivation_and_hand_back_clear_the_flag_but_keep_the_count() {
+        for hand_back in [false, true] {
+            let (mut ctrl, sysfs, cache, lease) = drift_controller(HwmonWriter::Engine);
+            ctrl.set_pwm("h1", 20, &lease).unwrap();
+            for _ in 0..4 {
+                sysfs.external_write(60);
+                ctrl.set_pwm("h1", 20, &lease).unwrap();
+            }
+            assert!(published(&cache).not_holding, "precondition");
+            if hand_back {
+                ctrl.hand_back("h1", &lease).unwrap();
+            } else {
+                ctrl.on_lease_released();
+            }
+            assert_eq!(
+                published(&cache),
+                DutyReconciliation {
+                    corrections: 3,
+                    not_holding: false
+                },
+                "hand_back = {hand_back}"
+            );
+        }
+    }
+
+    /// [SAFETY] The exit floor is unchanged: once it has latched, a correction
+    /// rewrites the RAISED duty, so drift can never take a header with no mode
+    /// switch below the duty the stop left it at (DEC-392).
+    #[test]
+    fn a_correction_after_the_exit_floor_rewrites_the_raised_duty() {
+        let sysfs = DriftSysfs::default();
+        sysfs.live.set(PWM, "0");
+        let cache = Arc::new(StateCache::new());
+        let mut ctrl = HwmonPwmController::new(
+            vec![no_mode_header("h1", 1)],
+            LeaseManager::new(),
+            Box::new(sysfs.clone()),
+            cache.clone(),
+        );
+        let lease = engine_lease(&mut ctrl);
+        ctrl.set_pwm("h1", 30, &lease).unwrap();
+        ctrl.apply_exit_floor(50);
+        assert_eq!(ctrl.set_pwm("h1", 30, &lease).unwrap().pwm_percent, 50);
+
+        sysfs.external_write(20);
+        ctrl.set_pwm("h1", 30, &lease).unwrap();
+        assert_eq!(
+            sysfs.live.get(PWM).as_deref(),
+            Some(percent_to_raw(50).to_string().as_str()),
+            "the correction restores the exit duty, never the lower command"
+        );
+        assert_eq!(published(&cache).corrections, 1);
+    }
+
+    /// A correction whose write fails did not land, so it is not one that "did
+    /// not hold": however many fail, the header is never flagged, the episode's
+    /// first WARN is not repeated, and the next landed correction is counted.
+    #[test]
+    fn a_failed_correction_write_does_not_count_toward_the_give_up() {
+        let (mut ctrl, sysfs, cache, lease) = drift_controller(HwmonWriter::Engine);
+        ctrl.set_pwm("h1", 40, &lease).unwrap();
+        *sysfs.fail_pwm_writes.lock() = true;
+        for tick in 1..=5 {
+            sysfs.external_write(60);
+            assert!(
+                ctrl.set_pwm("h1", 40, &lease).is_err(),
+                "precondition: the correction write fails (tick {tick})"
+            );
+            assert!(!ctrl.duty_not_holding("h1"), "tick {tick}");
+            let drift = ctrl.write_state["h1"].drift;
+            assert_eq!(drift.corrections, 0, "tick {tick}");
+            assert!(
+                drift.in_episode,
+                "the episode stays open, so no repeat WARN"
+            );
+        }
+        assert_eq!(published(&cache), DutyReconciliation::default());
+
+        *sysfs.fail_pwm_writes.lock() = false;
+        ctrl.set_pwm("h1", 40, &lease).unwrap();
+        assert_eq!(
+            sysfs.live.get(PWM).as_deref(),
+            Some(percent_to_raw(40).to_string().as_str())
+        );
+        assert_eq!(published(&cache).corrections, 1);
+    }
+
+    /// S2-2: after an emergency the engine adopts the thermal-safety lease and
+    /// keeps renewing it (`backends.rs`), so its writes under THAT lease must be
+    /// reconciled too — or drift correction would silently stop for the rest of
+    /// the session after the first emergency.
+    #[test]
+    fn a_coalesced_write_under_an_adopted_thermal_safety_lease_is_reconciled() {
+        let (mut ctrl, sysfs, cache, lease) = drift_controller(HwmonWriter::ThermalSafety);
+        ctrl.set_pwm("h1", 40, &lease).unwrap();
+        let before = sysfs.duty_writes();
+        sysfs.external_write(60);
+        ctrl.set_pwm("h1", 40, &lease).unwrap();
+        assert_eq!(sysfs.duty_writes(), before + 1);
+        assert_eq!(published(&cache).corrections, 1);
     }
 }

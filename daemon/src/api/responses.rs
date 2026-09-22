@@ -420,6 +420,23 @@ pub struct FanEntry {
     /// duplicating it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pwm_commanded_pct: Option<u8>,
+    /// Duty corrections the engine has written to this hwmon header since the
+    /// daemon started (DEC-406): coalesced ticks whose `pwmN` readback disagreed
+    /// with the command beyond the readback tolerance, so the duty was written
+    /// again. A correction is evidence that something else wrote the header, or
+    /// that it does not hold the duty it is given.
+    ///
+    /// hwmon only, and present on EVERY hwmon entry from a daemon with
+    /// `control.duty_reconciliation` — `0` for a header never corrected. Absent
+    /// means an older daemon, or an OpenFan/GPU entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duty_corrections: Option<u32>,
+    /// The engine has stopped correcting this hwmon header's duty (DEC-406):
+    /// several corrections in a row did not hold. Cleared when the command
+    /// changes, the readback agrees again, or the engine stops commanding the
+    /// header. Same presence rule as `duty_corrections`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duty_not_holding: Option<bool>,
 }
 
 /// A validation session's progress, for the poll surface (AIO-MB Phase 5).
@@ -1131,6 +1148,16 @@ pub struct ControlCapability {
     /// since 2.16.0 (DEC-243).
     #[serde(default)]
     pub daemon_config_report: bool,
+    /// The engine checks a coalesced hwmon write's readback and rewrites a duty
+    /// that did not hold, and publishes `duty_corrections` / `duty_not_holding`
+    /// on every hwmon `/fans` and `/poll` entry. True since 2.53.0 (DEC-406).
+    ///
+    /// A client gates on this, not on the fields' presence, to say whether this
+    /// daemon corrects drift at all: an older daemon omits both fields and
+    /// leaves a second writer's duty standing for as long as the curve is
+    /// steady, which is a claim the client must not make on its behalf.
+    #[serde(default)]
+    pub duty_reconciliation: bool,
 }
 
 /// Per-device-group capability info.
@@ -2424,6 +2451,8 @@ mod tests {
             fan_alarm: Some(false),
             pwm_readback_pct: Some(40),
             pwm_commanded_pct: Some(40),
+            duty_corrections: Some(2),
+            duty_not_holding: Some(false),
         };
         expect(&serde_json::to_value(&fan).unwrap(), "FanEntry");
 
@@ -3641,6 +3670,8 @@ mod tests {
             stall_detected: None,
             fan_alarm: None,
             pwm_enable_mode: None,
+            duty_corrections: None,
+            duty_not_holding: None,
         };
         let json = serde_json::to_value(&entry).unwrap();
         assert_eq!(json["rpm"], 1200);
@@ -3661,6 +3692,8 @@ mod tests {
             stall_detected: None,
             fan_alarm: None,
             pwm_enable_mode: None,
+            duty_corrections: None,
+            duty_not_holding: None,
         };
         let json = serde_json::to_value(&nvidia).unwrap();
         assert_eq!(json["duty_pct"], 47);

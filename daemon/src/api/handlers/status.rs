@@ -415,6 +415,8 @@ pub async fn capabilities_handler(
             superio_port_probe: true,
             preferred_sensors: true,
             daemon_config_report: true,
+            // DEC-406: coalesced hwmon writes are reconciled against readback.
+            duty_reconciliation: true,
         },
     })
 }

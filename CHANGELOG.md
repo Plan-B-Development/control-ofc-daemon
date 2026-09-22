@@ -2,6 +2,40 @@
 
 ## [Unreleased]
 
+## [2.53.0] — 2026-09-22
+
+### Fixed
+
+**A fan speed set by another program no longer sticks while your profile's
+curve is steady** (`PTR-g`, DEC-406). The daemon skips rewriting a motherboard
+fan header when the speed it wants hasn't changed, and before this release it
+skipped without checking whether the header still held that speed. So if a
+vendor tool, a script or the firmware set a different speed, it stayed until the
+curve moved. On one machine a header stayed at 60 % for 55 seconds while the
+daemon was asking for 46 % and then 40 %. That header can be a pump. The daemon
+now reads the speed back each time it would skip. If the reading has moved more
+than 2 points from what the header held right after the daemon's own write, it
+writes the speed again. (It compares with what the header held, not with what
+was asked for, so a fan controller with only a few speed steps, like Dell and
+ThinkPad laptops, or a chip that won't go below some speed, doesn't look like
+drift.) If three of those rewrites in a row don't stick because another program
+keeps writing, it stops rewriting that header until the speed it wants changes
+or the header holds again. It doesn't keep fighting. Each episode logs one warning when the
+first rewrite happens, one when it gives up, and one line when the header holds
+again.
+
+This covers the daemon's own control (profile curves and manual overrides).
+Diagnostics (verify, characterise, control-path discovery) still get exactly the
+speed they ask for. The thermal emergency always writes, as it already did.
+
+### Added
+
+**`duty_corrections` and `duty_not_holding` on every motherboard-header entry
+of `/fans` and `/poll`** (DEC-406): how many times the daemon has rewritten the
+header's speed since it started, and whether it has currently stopped trying. A
+new capability, `control.duty_reconciliation`, tells a client this daemon does
+both.
+
 ## [2.52.0] — 2026-09-22
 
 ### Fixed

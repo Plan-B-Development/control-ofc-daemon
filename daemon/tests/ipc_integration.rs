@@ -15,7 +15,8 @@ use control_ofc_daemon::health::cache::StateCache;
 use control_ofc_daemon::health::history::HistoryRing;
 use control_ofc_daemon::health::staleness::StalenessConfig;
 use control_ofc_daemon::health::state::{
-    AmdGpuFanState, CachedSensorReading, DeviceLabel, OpenFanState,
+    AmdGpuFanState, CachedSensorReading, DeviceLabel, DutyReconciliation, HwmonFanState,
+    OpenFanState,
 };
 use control_ofc_daemon::hwmon::lease::{HwmonWriter, LeaseManager};
 use control_ofc_daemon::hwmon::pwm_control::{HwmonPwmController, SysfsWriter};
@@ -7823,6 +7824,79 @@ async fn auto_stop_is_refused_when_the_resolved_sweep_is_empty() {
     );
 
     let _ = uds_delete(&path, "/validation/session").await;
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// DEC-406 (S2-4): every hwmon entry on `/fans` and `/poll` carries the
+/// engine's duty reconciliation — `0` / `false` for a header never corrected —
+/// OpenFan and GPU entries carry neither, and the build that publishes them
+/// advertises `control.duty_reconciliation`, which is what a client gates on.
+#[tokio::test]
+async fn duty_reconciliation_is_on_every_hwmon_entry_and_advertised() {
+    let state = test_app_state();
+    let cache = state.cache.clone();
+    let fan = |id: &str| HwmonFanState {
+        id: id.into(),
+        rpm: Some(900),
+        last_commanded_pwm: Some(40),
+        pwm_readback_pct: Some(40),
+        pwm_commanded_pct: Some(40),
+        updated_at: Instant::now(),
+        alarm: None,
+        pwm_enable_mode: Some(1),
+    };
+    cache.update_hwmon_fans(vec![
+        fan("hwmon:it8696:pci0:pwm1"),
+        fan("hwmon:it8696:pci0:pwm2"),
+    ]);
+    cache.set_hwmon_duty_reconciliation(
+        "hwmon:it8696:pci0:pwm2",
+        DutyReconciliation {
+            corrections: 3,
+            not_holding: true,
+        },
+    );
+    cache.update_openfan_fans(vec![OpenFanState {
+        channel: 0,
+        rpm: 1000,
+        last_commanded_pwm: Some(40),
+        updated_at: Instant::now(),
+        rpm_polled: true,
+    }]);
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (_, caps) = uds_get(&path, "/capabilities").await;
+    assert_eq!(
+        caps["control"]["duty_reconciliation"], true,
+        "this daemon publishes duty_corrections but does not advertise it: {caps}"
+    );
+    let (_, fans) = uds_get(&path, "/fans").await;
+    let (_, poll) = uds_get(&path, "/poll").await;
+    for (surface, list) in [("/fans", &fans["fans"]), ("/poll", &poll["fans"])] {
+        let list = list
+            .as_array()
+            .unwrap_or_else(|| panic!("{surface}: no fans array"));
+        let by_id = |id: &str| {
+            list.iter()
+                .find(|f| f["id"] == id)
+                .unwrap_or_else(|| panic!("{surface}: {id} missing"))
+                .clone()
+        };
+        let never = by_id("hwmon:it8696:pci0:pwm1");
+        assert_eq!(never["duty_corrections"], 0, "{surface}");
+        assert_eq!(never["duty_not_holding"], false, "{surface}");
+        let flagged = by_id("hwmon:it8696:pci0:pwm2");
+        assert_eq!(flagged["duty_corrections"], 3, "{surface}");
+        assert_eq!(flagged["duty_not_holding"], true, "{surface}");
+        let openfan = list
+            .iter()
+            .find(|f| f["source"] == "openfan")
+            .unwrap_or_else(|| panic!("{surface}: precondition: an OpenFan entry"));
+        assert!(openfan.get("duty_corrections").is_none(), "{surface}");
+        assert!(openfan.get("duty_not_holding").is_none(), "{surface}");
+    }
+
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
 }
