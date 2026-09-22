@@ -1158,6 +1158,13 @@ pub struct ControlCapability {
     /// steady, which is a claim the client must not make on its behalf.
     #[serde(default)]
     pub duty_reconciliation: bool,
+    /// Daemon exposes `POST /hwmon/{id}/stall-probe` plus the
+    /// `GET`/`DELETE /diagnostics/stall-probe` pair and the `pwm_stall_probe`
+    /// preflight — the opt-in stall/restart probe below 20 %. True since 2.54.0
+    /// (DEC-407). An older daemon 404s these routes and answers the preflight
+    /// token with a 400.
+    #[serde(default)]
+    pub stall_probe: bool,
 }
 
 /// Per-device-group capability info.

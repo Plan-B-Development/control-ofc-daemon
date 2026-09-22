@@ -790,6 +790,8 @@ mod tests {
             characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             control_path: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             control_path_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stall_probe: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            stall_probe_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
             pwm_baselines: Default::default(),
             openfan_rescanning: std::sync::atomic::AtomicBool::new(false),

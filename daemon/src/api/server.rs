@@ -111,6 +111,19 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(handlers::discovery::control_path_status_handler)
                 .delete(handlers::discovery::control_path_cancel_handler),
         )
+        // DEC-407 (DEC-404 Stage 3): the stall/restart probe, the one diagnostic
+        // that writes below 20 % on purpose. 202 + detached, like characterise,
+        // on the SAME single verify slot. Capability-gated on
+        // `control.stall_probe`.
+        .route(
+            "/hwmon/{header_id}/stall-probe",
+            post(handlers::stall_probe::stall_probe_handler),
+        )
+        .route(
+            "/diagnostics/stall-probe",
+            get(handlers::stall_probe::stall_probe_status_handler)
+                .delete(handlers::stall_probe::stall_probe_cancel_handler),
+        )
         // AIO-MB Phase 5: validation sessions. A session RECORDS what an
         // already-configured cooler did, and may ORCHESTRATE the two diagnostics
         // above — it never writes a duty itself, so it adds no second PWM

@@ -417,6 +417,8 @@ pub async fn capabilities_handler(
             daemon_config_report: true,
             // DEC-406: coalesced hwmon writes are reconciled against readback.
             duty_reconciliation: true,
+            // DEC-407: the stall/restart probe below 20 %.
+            stall_probe: true,
         },
     })
 }

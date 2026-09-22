@@ -2134,6 +2134,8 @@ async fn async_main() {
         // this is a fourth claimant rather than a fourth concurrent writer.
         control_path: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         control_path_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        stall_probe: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        stall_probe_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         // Persisted PWM to tach relationships, pruned at boot to whatever
         // discovery can still see. The header id embeds chip, device, pwmN and
         // label, so a board or driver change invalidates a stale record by

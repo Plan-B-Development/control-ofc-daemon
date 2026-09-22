@@ -110,6 +110,8 @@ fn test_app_state_inner(engine_ticked: bool, runtime_cfg: std::path::PathBuf) ->
         characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         control_path: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         control_path_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        stall_probe: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        stall_probe_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
         pwm_baselines: Default::default(),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
@@ -896,6 +898,8 @@ async fn fans_endpoint_tags_intel_gpu_source_by_id_prefix() {
         characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         control_path: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         control_path_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        stall_probe: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        stall_probe_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
         pwm_baselines: Default::default(),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
@@ -1178,6 +1182,8 @@ fn test_app_state_with_nvidia_gpu(
         characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         control_path: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         control_path_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        stall_probe: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        stall_probe_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
         pwm_baselines: Default::default(),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
@@ -1530,6 +1536,8 @@ fn test_app_state_with_headers(headers: Vec<PwmHeaderDescriptor>) -> Arc<AppStat
         characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         control_path: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         control_path_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        stall_probe: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        stall_probe_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
         pwm_baselines: Default::default(),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
@@ -1944,6 +1952,8 @@ fn test_app_state_with_unsupported_gpu(pci_bdf: &str) -> Arc<AppState> {
         characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         control_path: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         control_path_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        stall_probe: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        stall_probe_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
         pwm_baselines: Default::default(),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
@@ -2042,6 +2052,8 @@ fn test_app_state_with_read_only_gpu(pci_bdf: &str, pci_device_id: u16) -> Arc<A
         characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         control_path: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         control_path_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        stall_probe: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        stall_probe_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
         pwm_baselines: Default::default(),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
@@ -2130,6 +2142,8 @@ fn test_app_state_with_amd_gpu(
         characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         control_path: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         control_path_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        stall_probe: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        stall_probe_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
         pwm_baselines: Default::default(),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
@@ -3135,6 +3149,8 @@ async fn deactivate_profile_resets_hwmon_coalescing() {
         characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         control_path: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         control_path_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        stall_probe: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        stall_probe_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
         pwm_baselines: Default::default(),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
@@ -3274,6 +3290,8 @@ fn test_app_state_with_writable_pmfw_gpu(pci_bdf: &str) -> (Arc<AppState>, tempf
         characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         control_path: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         control_path_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        stall_probe: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        stall_probe_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
         pwm_baselines: Default::default(),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
@@ -3469,6 +3487,8 @@ async fn hwmon_discovery_excludes_amdgpu_end_to_end_via_ipc() {
         characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         control_path: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         control_path_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        stall_probe: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        stall_probe_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
         pwm_baselines: Default::default(),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
@@ -3555,6 +3575,8 @@ fn test_app_state_with_profile_dirs(dirs: Vec<std::path::PathBuf>) -> Arc<AppSta
         characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         control_path: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         control_path_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        stall_probe: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        stall_probe_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
         pwm_baselines: Default::default(),
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
@@ -7896,6 +7918,75 @@ async fn duty_reconciliation_is_on_every_hwmon_entry_and_advertised() {
         assert!(openfan.get("duty_corrections").is_none(), "{surface}");
         assert!(openfan.get("duty_not_holding").is_none(), "{surface}");
     }
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// DEC-407: the stall probe is advertised and routed. Over the real socket —
+/// the capability a client gates on, the two routes answering with the error
+/// envelope (a missing route would be an empty 404), the acknowledgement
+/// refusal before anything else, the eligibility refusal naming its reason, and
+/// the `pwm_stall_probe` preflight carrying its own row.
+#[tokio::test]
+async fn stall_probe_is_advertised_routed_and_refuses_without_acknowledgement() {
+    let state = test_app_state_with_hwmon();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (_, caps) = uds_get(&path, "/capabilities").await;
+    assert_eq!(caps["control"]["stall_probe"], true, "{caps}");
+
+    let (status, body) = uds_get(&path, "/diagnostics/stall-probe").await;
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(body["error"]["code"], "not_found", "{body}");
+    let (status, _) = uds_delete(&path, "/diagnostics/stall-probe").await;
+    assert_eq!(status, 409);
+
+    let (status, body) = uds_post(&path, "/hwmon/h1/stall-probe", &serde_json::json!({})).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("acknowledge_below_floor"),
+        "{body}"
+    );
+    // `h1` carries no role evidence, so it is refused as `role_unknown`.
+    let (status, body) = uds_post(
+        &path,
+        "/hwmon/h1/stall-probe",
+        &serde_json::json!({ "acknowledge_below_floor": true }),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"]["details"]["reason"], "role_unknown", "{body}");
+    // No tunables: a body naming one is rejected by the typed extractor — axum's
+    // plain-text 422, deliberately not the envelope (see the note above
+    // `profile_create_missing_id_returns_validation_envelope`).
+    let (status, _) = uds_send(
+        &path,
+        "POST",
+        "/hwmon/h1/stall-probe",
+        Some(&serde_json::json!({ "acknowledge_below_floor": true, "points_pct": [0] })),
+    )
+    .await;
+    assert_eq!(status, 422);
+
+    let (status, report) = uds_get(
+        &path,
+        "/diagnostics/preflight?header=h1&diagnostic=pwm_stall_probe",
+    )
+    .await;
+    assert_eq!(status, 200, "{report}");
+    assert_eq!(report["diagnostic"], "pwm_stall_probe");
+    let row = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["check_id"] == "stall_probe_eligible")
+        .unwrap_or_else(|| panic!("no stall_probe_eligible row: {report}"));
+    assert_eq!(row["state"], "fail", "{report}");
+    assert_eq!(report["verdict"], "blocked");
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);

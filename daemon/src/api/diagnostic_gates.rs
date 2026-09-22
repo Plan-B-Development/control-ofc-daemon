@@ -40,9 +40,9 @@ pub(crate) enum GateStop {
     Superseded,
 }
 
-/// Which of the three thermal gates refused — so a caller that publishes a
-/// reason never re-parses the detail text or re-evaluates a gate whose answer
-/// may have moved.
+/// Which of the three thermal gates refused, as a stable token — so a caller
+/// that publishes a reason (the stall probe's `abort_reason`) never re-parses
+/// the detail text or re-evaluates a gate whose answer may have moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ThermalRefusal {
     /// A sensor is over `CALIBRATION_MAX_TEMP_C`.
@@ -53,6 +53,15 @@ pub(crate) enum ThermalRefusal {
     Stale,
 }
 
+impl ThermalRefusal {
+    pub(crate) fn token(self) -> &'static str {
+        match self {
+            ThermalRefusal::TooHot => "thermal_limit",
+            ThermalRefusal::Forcing => "thermal_force",
+            ThermalRefusal::Stale => "stale_temperature",
+        }
+    }
+}
 
 /// [SAFETY] The three thermal gates, in their established order: the two cheap
 /// `value_c` comparisons (a sensor over `CALIBRATION_MAX_TEMP_C`, the ladder

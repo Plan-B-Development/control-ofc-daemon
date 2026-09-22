@@ -367,9 +367,11 @@ pub const CHARACTERIZATION_DEFAULT_POINTS: [u8; 8] = [30, 40, 50, 60, 70, 80, 90
 /// command. Until DEC-322 the restore had no floor at all, and this sentence
 /// was read as covering it.
 ///
-/// The cost (no chassis-fan stall/start-point discovery) is accepted and
-/// recorded as `AIO3-c` in `DECISIONS_OPEN_ITEMS.md`. Do not "fix" it by
-/// branching here; the reserved route is a per-device policy table.
+/// Stall/start-point discovery, which this clamp makes impossible here, is the
+/// job of a SEPARATE diagnostic with its own envelope: the stall/restart probe
+/// (DEC-407, `api::stall_probe`), which superseded `AIO3-c`'s accepted cost. Do
+/// not "fix" this clamp by branching on role — it stays flat and still governs
+/// every characterisation point.
 pub const CHARACTERIZATION_MIN_PCT: u8 = 20;
 
 /// Cap on caller-supplied sweep points. Mirrors the calibrate sweep's
@@ -1168,3 +1170,68 @@ const _: () = assert!(CONTROL_PATH_MAX_TACH_REFS <= DISCOVERY_MAX_TACH_CHANNELS)
 const _: () = assert!(
     CONTROL_PATHS_MAX_ENTRIES * CONTROL_PATH_RECORD_MAX_BYTES < CONTROL_PATHS_MAX_BYTES as usize
 );
+
+// ── Stall/restart probe (DEC-407, DEC-404 Stage 3) ───────────────────
+
+/// [SAFETY] The duty the stall/restart probe starts from and never goes above
+/// while probing, and the line below which its time is budgeted. It is
+/// [`CHARACTERIZATION_MIN_PCT`] on purpose: the probe exists to measure exactly
+/// the band the characterisation clamp refuses, and nothing else.
+pub const STALL_PROBE_START_PCT: u8 = CHARACTERIZATION_MIN_PCT;
+
+/// Points between probe steps, on the way down and on the way back up.
+pub const STALL_PROBE_STEP_PCT: u8 = 2;
+
+/// The shortest a probe step is held: `max(this, 3 × the header's tach
+/// refresh)`. Six seconds is three refreshes of the ~2 s it87 register measured
+/// on 2026-09-08, the slowest cadence this project has hardware evidence for.
+pub const STALL_PROBE_MIN_DWELL: Duration = Duration::from_secs(6);
+
+/// How many tach refreshes a step is held for, when that is longer than
+/// [`STALL_PROBE_MIN_DWELL`].
+pub const STALL_PROBE_DWELL_REFRESHES: u32 = 3;
+
+/// [SAFETY] The hard ceiling on a probe's time below
+/// [`STALL_PROBE_START_PCT`]. The budget itself is derived per header from its
+/// refresh (`stall_probe::derive_timing`) and a header whose derived budget
+/// exceeds this is refused before any sub-floor duty is written.
+pub const STALL_PROBE_BUDGET_CAP: Duration = Duration::from_secs(180);
+
+/// [SAFETY] The duty of the recovery kick every abort and cancel ends with.
+pub const STALL_PROBE_KICK_PCT: u8 = 100;
+
+/// [SAFETY] The longest the recovery kick is held while waiting for two
+/// refreshes of a spinning fan. Its window is `max(STALL_PROBE_MIN_DWELL,
+/// 3 × refresh)` clamped to this.
+pub const STALL_PROBE_KICK_MAX: Duration = Duration::from_secs(15);
+
+/// [SAFETY] How far the hottest fresh CPU reading may rise above its value at
+/// probe start before the probe aborts. Checked on every sample.
+pub const STALL_PROBE_RISE_LIMIT_C: f64 = 5.0;
+
+/// [SAFETY] The longest one probe read of the header (`pwmN`, `pwmN_enable`,
+/// `fanN_input`) may take before it counts as wedged (S3-R4). A healthy read
+/// takes microseconds; this is about one it87 refresh. While a read is
+/// outstanding no per-sample gate runs, so this bounds how long the gates can be
+/// blind with the header possibly at 0 %. A wedge ends the run as
+/// `tach_unreadable`; `spawn_blocking` cannot be cancelled, so the probe then
+/// stops reading that header altogether (DEC-289's lesson).
+pub const STALL_PROBE_READ_BUDGET: Duration = Duration::from_secs(2);
+
+// The descent must land exactly on 0 %, so the start must be a whole number of
+// steps; and the probe must never start above the characterisation clamp.
+const _: () = assert!(STALL_PROBE_STEP_PCT > 0);
+const _: () = assert!(STALL_PROBE_START_PCT.is_multiple_of(STALL_PROBE_STEP_PCT));
+const _: () = assert!(STALL_PROBE_START_PCT <= CHARACTERIZATION_MIN_PCT);
+// The kick must be above the probed band, or it is not a recovery.
+const _: () = assert!(STALL_PROBE_KICK_PCT > STALL_PROBE_START_PCT);
+const _: () = assert!(STALL_PROBE_MIN_DWELL.as_secs() <= STALL_PROBE_KICK_MAX.as_secs());
+// A wedged read must be detected well inside one renewal interval, so a wedge
+// cannot outlast the engine-pause deadman before the probe notices it.
+const _: () = assert!(STALL_PROBE_READ_BUDGET.as_secs() < STABILITY_RENEW_INTERVAL_S);
+// Every probe hold renews the lease and the engine pause on the
+// `STABILITY_RENEW_INTERVAL_S` cadence (DEC-334's rule), so no hold length can
+// outrun either deadline; the renewal interval is what must fit, and does:
+// `STABILITY_RENEW_INTERVAL_S * 2 <= VERIFY_PAUSE_DEADMAN` is asserted above.
+// The 20 % baseline hold is one settle window, bounded like every other.
+const _: () = assert!(CHARACTERIZATION_SETTLE_MAX_S * 2 <= VERIFY_PAUSE_DEADMAN.as_secs());

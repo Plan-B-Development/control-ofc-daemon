@@ -152,6 +152,13 @@ daemon/src/
     preflight.rs       — the shared diagnostic safety predicates + typed report (DEC-333).
                          CONSUMES the existing guards rather than restating them, which is
                          why the three older diagnostics needed no edit
+    diagnostic_gates.rs — [SAFETY] the per-step write gates (shutdown, cancel, the three
+                         thermal gates, keepalive), defined once (DEC-407) and called by
+                         characterisation and the stall probe
+    stall_probe.rs     — [SAFETY] the stall/restart probe (DEC-407): the ONLY diagnostic
+                         that writes below 20 %. Pure eligibility + timing rules, and the
+                         adaptive loop (baseline → descent → ascent → kick) over the shared
+                         gates and RestoreOnDrop
 
   validation/            — AIO-MB Phase 5 (DEC-317). Split by who may have side effects.
     mod.rs             — subsystem re-exports + the safety posture, stated once
@@ -550,6 +557,19 @@ gating each have their own register rows and regression tests.
     cannot repeat it — serial is out of its reach — so after a crash or SIGKILL
     those outputs keep their last duty.
 
+12. **The stall/restart probe is the one diagnostic below 20 %** (`api::stall_probe`,
+    DEC-407). Every other diagnostic clamps to `max(20, header floor)`, and still does.
+    The probe is opt-in per header, takes no tunables and needs an explicit
+    acknowledgement; it refuses a pump-protected header (the full union, checked before
+    the display role), `cpu_fan` and `unknown` roles, and a machine with no fresh CPU
+    temperature. Eligibility is re-checked before **every** write and on every sample,
+    and a pump answer at any point raises the restore to the pump floor. Every sample
+    runs the diagnostic gates plus a 5 °C rise gate on the hottest fresh CPU reading,
+    each read is bounded at 2 s, an unreadable sample ends the run, and the time below
+    20 % is budgeted from the header's own tach refresh (capped at 180 s). Every abort
+    and cancel ends with a 100 % recovery kick — never while shutting down, when a
+    write after the hand-back would re-take the header — and then the shared restore.
+
 ## Running
 
 **Always start the daemon via systemd.** The binary under `/usr/bin/control-ofc-daemon`
@@ -648,7 +668,7 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 | GET | `/profile/active` | Current active profile or `{"active": false}` |
 | GET | `/diagnostics/hardware` | Hardware readiness report (hwmon chips, GPU, thermal safety, kernel modules, ACPI conflicts, board info, and `board_firmware_counts` — the board's own firmware-declared fan/temp/volt counts where `it87` publishes the Gigabyte SIV, `X87-d`; a measurement beside `expected_chips`' DMI-table inference; compare against `hwmon.total_headers`, which is `pwmN`-capable headers only — monitor-only tachometers are disjoint and live on `/inventory/hwmon`). **DEC-405 (2.52.0):** also `kernel_release`, `board.bios_date` and per-module `version`/`srcversion`/`out_of_tree` (loaded modules only) — each `null` when absent, capped at 128 bytes |
 | GET | `/inventory/hwmon` | Read-only structured inventory: temp sensors (each with a fine `classification`/`confidence`/`rationale` + an advisory `default_cpu`), controllable PWM headers, and monitor-only fan tachometers (`fanN_input` with no matching `pwmN`) |
-| GET | `/diagnostics/preflight?header=&diagnostic=` | The daemon's own safety verdict for one header and one diagnostic, **before anything is driven** (DEC-333, 2.39.0+, `control.diagnostic_preflight`). Read-only: no lease, no slot, nothing reserved — a `ready` verdict describes *now*, and the diagnostic's own POST still runs its own guards. Returns `{verdict, checks[], blocking[]}` with `verdict` in `ready`\|`warn`\|`blocked`. A stale temperature source **blocks** every diagnostic since DEC-385 (`TS-q`), and each POST refuses on it from the same predicate — until then it only warned for verify and characterisation, whose handlers did not refuse. "Stale" is exactly the thermal ladder's own CPU trust window (5 poll intervals; DEC-395 removed the flat 10 s floor that let a diagnostic run on a reading the ladder had stopped acting on) |
+| GET | `/diagnostics/preflight?header=&diagnostic=` | The daemon's own safety verdict for one header and one diagnostic, **before anything is driven** (DEC-333, 2.39.0+, `control.diagnostic_preflight`). Read-only: no lease, no slot, nothing reserved — a `ready` verdict describes *now*, and the diagnostic's own POST still runs its own guards. Returns `{verdict, checks[], blocking[]}` with `verdict` in `ready`\|`warn`\|`blocked`. A stale temperature source **blocks** every diagnostic since DEC-385 (`TS-q`), and each POST refuses on it from the same predicate — until then it only warned for verify and characterisation, whose handlers did not refuse. "Stale" is exactly the thermal ladder's own CPU trust window (5 poll intervals; DEC-395 removed the flat 10 s floor that let a diagnostic run on a reading the ladder had stopped acting on). `diagnostic=pwm_stall_probe` (DEC-407, 2.54.0+) adds a `stall_probe_eligible` row — the same eligibility rule the probe's POST refuses on — and only for that diagnostic |
 | GET | `/inventory/cooling-devices` | Configured cooling-device topology + every device policy the daemon ships (DEC-316). Metadata — the profile engine never reads a device |
 | GET | `/validation/session` | The current or most recent validation session in full — metadata, samples, event timeline, referenced diagnostics, findings (DEC-317). `404` when none has ever run. **DEC-405 (2.52.0):** verify evidence carries its real readings, its `result` token and `restore_failed`, and never maps to `fail` — a refused verify is `unavailable` |
 | GET | `/validation/sessions`, `/validation/sessions/{id}` | The retained session index (last 5, newest first) and one session in full (DEC-317) |
@@ -873,6 +893,9 @@ commands still gets the forced duty, which is what keeps the reach above true.
 | POST | `/hwmon/{header_id}/discover-control-path` | Establish which tach channel(s) this PWM output actually drives, **by measurement rather than by sysfs numbering** (AIO Phase 8 Batch 1, DEC-333, 2.39.0+, `control.control_path_discovery`). Returns `202` and runs detached; poll `GET /diagnostics/control-path`. Optional `{"delta_pct", "cycles", "window_seconds"}`, all clamped server-side. Deliberately **not** `pwmconfig`'s stop-the-fan model: the perturbation moves away from the nearer rail so there is always headroom, every commanded duty is clamped into `[max(20, header floor)..100]` — **0% is unreachable for any header** — and a pump-protected header never crosses its 30% floor. Claims the **same** single-flight verify slot as verify/calibrate/characterize, so at most one of the four ever drives hardware. **DEC-336 (2.42.0):** refuses with `409 validation_error` and aborts a run in flight when every temperature reading is stale — the refusal `GET /diagnostics/preflight` publishes, built from the same predicate. **DEC-339 (2.43.1):** that gate and the two beside it (85 °C voluntary abort, thermal-ladder force) run before **every** PWM write rather than once per cycle — a cycle issues two writes, so the second one used to be made on a reading up to one observation window old; the thermal cadence is now exactly the keepalive cadence. The end-of-run return-to-baseline write also obeys the force skip, so it can no longer move a header off a duty the ladder is holding **DEC-405 (2.52.0):** before any baseline window whose write moved the duty the run waits, bounded at 15 s, for every channel that can move to settle, as its own gated window (renewal + thermal gates again before the baseline) — so a recovery ramp is no longer measured as noise (`baseline_settled`, `settle_wait_ms`, `noise_floor_from_cycle_1` when a channel could not settle and borrowed cycle 1's floor); the wait's last reading gets the reclaim / lost-pump-tach check, and a cancel is honoured at every window boundary. Resolution is the header's own tach's median update interval; the default window is 12 s |
 | GET | `/diagnostics/control-path` | Current or most recent discovery run, **plus every persisted relationship**. Records survive a restart, are keyed by the header's stable id — so a board or driver change invalidates one by construction — and are pruned at boot to whatever discovery still sees. `no_tach_response` is a legitimate result and **not** a fault: the header may drive no tach-reporting device, or one running under its own internal control |
 | DELETE | `/diagnostics/control-path` | Ask a running discovery to stop. Same cooperative-cancel and restore semantics, and the same two deliberate skips, as the characterisation sweep above |
+| POST | `/hwmon/{header_id}/stall-probe` | **`[SAFETY]` The only diagnostic that writes below 20 %** (DEC-407, 2.54.0+, `control.stall_probe`): finds a fan's stall and restart duties. Body must be exactly `{"acknowledge_below_floor": true}` — no tunables. Refuses a pump-protected header (the full union), `cpu_fan`, an `unknown` role, read-only, no tach, or no fresh CPU temperature, and re-checks eligibility before every write and on every sample. 20 % baseline (measures the tach refresh; a fan spinning before that reads 0 there is `stalled_at_or_above_20`), then 18 → 0 % in 2-point steps to a stall, then up to 20 % to a restart; dwell and budget derived from the refresh, budget capped at 180 s. Aborts on the diagnostic gates, a 5 °C CPU rise, lost eligibility, the budget, a reclaim, an unreadable tach sample, a read that does not return within 2 s, or a cancel — each ending with a 100 % recovery kick (never while shutting down), then the restore. Same single-flight slot. See `api::stall_probe` |
+| GET | `/diagnostics/stall-probe` | Current or most recent probe run, in memory only: `outcome`, `abort_reason`, stall/restart duties, the derived timing, every held point, and the restore tokens |
+| DELETE | `/diagnostics/stall-probe` | Ask a running probe to stop — honoured on the next sample, then the kick and the restore |
 | POST | `/hwmon/rescan` | Re-enumerate hwmon devices and return fresh header list |
 | POST | `/fans/openfan/rescan` | Look for an OpenFanController and adopt it without a restart (DEC-265) |
 

@@ -1815,6 +1815,8 @@ fn ok_inputs(diagnostic: pf::Diagnostic) -> pf::PreflightInputs {
             siblings_running: 2,
             siblings_unknown: 0,
         },
+        stall_probe_ineligible: None,
+        cpu_temperature_fresh: true,
     }
 }
 
@@ -2492,6 +2494,8 @@ fn preflight_state_with_members(
         characterization_cancel: Arc::new(AtomicBool::new(false)),
         control_path: Arc::new(parking_lot::Mutex::new(None)),
         control_path_cancel: Arc::new(AtomicBool::new(false)),
+        stall_probe: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        stall_probe_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         control_paths: Arc::new(parking_lot::RwLock::new(Default::default())),
         pwm_baselines: Default::default(),
         openfan_rescanning: AtomicBool::new(false),
@@ -3462,4 +3466,66 @@ async fn a_pump_tach_lost_during_the_settle_wait_aborts_at_the_wait_end() {
     );
     assert!(outcome.cycles.is_empty());
     assert_eq!(rig.writes().last().copied(), Some(60), "not restored");
+}
+
+/// DEC-407: the `pwm_stall_probe` preflight row, pure. `pass` needs both an
+/// eligible header and a fresh CPU temperature; either missing blocks; and no
+/// other diagnostic's report gains the row, so their shape is unchanged.
+#[test]
+fn the_stall_probe_row_blocks_on_ineligibility_and_on_no_cpu_temperature() {
+    let mut inputs = ok_inputs(pf::Diagnostic::StallProbe);
+    inputs.pump_protected = false;
+    inputs.role = "chassis_fan".into();
+    let ready = pf::build_report(&inputs);
+    assert_eq!(
+        check(&ready, pf::CHECK_STALL_PROBE_ELIGIBLE).state,
+        pf::CHECK_PASS
+    );
+    assert!(
+        check(&ready, pf::CHECK_SAFE_MINIMUM).detail.contains("0%"),
+        "the report must not claim a 20 % clamp for the probe: {:?}",
+        check(&ready, pf::CHECK_SAFE_MINIMUM)
+    );
+
+    let mut pump = inputs.clone();
+    pump.stall_probe_ineligible = Some("pump_protected".into());
+    let blocked = pf::build_report(&pump);
+    assert_eq!(
+        check(&blocked, pf::CHECK_STALL_PROBE_ELIGIBLE).state,
+        pf::CHECK_FAIL
+    );
+    assert_eq!(blocked.verdict, pf::VERDICT_BLOCKED);
+    assert!(blocked
+        .blocking
+        .contains(&pf::CHECK_STALL_PROBE_ELIGIBLE.to_string()));
+
+    let mut no_cpu = inputs.clone();
+    no_cpu.cpu_temperature_fresh = false;
+    let blocked = pf::build_report(&no_cpu);
+    assert_eq!(
+        check(&blocked, pf::CHECK_STALL_PROBE_ELIGIBLE).state,
+        pf::CHECK_FAIL
+    );
+
+    for d in [
+        pf::Diagnostic::Verify,
+        pf::Diagnostic::Characterization,
+        pf::Diagnostic::ControlPathDiscovery,
+    ] {
+        let r = pf::build_report(&ok_inputs(d));
+        assert!(
+            r.checks
+                .iter()
+                .all(|c| c.check_id != pf::CHECK_STALL_PROBE_ELIGIBLE),
+            "{d:?} gained the probe's row"
+        );
+        assert!(check(&r, pf::CHECK_SAFE_MINIMUM)
+            .detail
+            .starts_with("Commands clamped"));
+    }
+    assert_eq!(
+        pf::Diagnostic::from_token("pwm_stall_probe"),
+        Some(pf::Diagnostic::StallProbe)
+    );
+    assert!(pf::Diagnostic::StallProbe.blocks_on_stale_temperature());
 }

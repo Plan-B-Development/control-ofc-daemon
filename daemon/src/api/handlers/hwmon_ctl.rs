@@ -1259,7 +1259,7 @@ pub(crate) mod tests {
     use crate::hwmon::lease::LeaseError;
     use crate::hwmon::pwm_control::HwmonControlError;
 
-    type WriteLog = Arc<parking_lot::Mutex<Vec<(String, String)>>>;
+    pub(crate) type WriteLog = Arc<parking_lot::Mutex<Vec<(String, String)>>>;
 
     /// Records every sysfs write so a test can see whether the restore landed.
     struct RecordingWriter(WriteLog);
@@ -1915,7 +1915,7 @@ pub(crate) mod tests {
     }
 
     /// Every PWM percentage this verify commanded.
-    fn pwm_duties(writes: &WriteLog) -> Vec<u8> {
+    pub(crate) fn pwm_duties(writes: &WriteLog) -> Vec<u8> {
         writes
             .lock()
             .iter()
@@ -2038,7 +2038,7 @@ pub(crate) mod tests {
         build_verify_state_with(initial_raw, role, None)
     }
 
-    fn build_verify_state_with(
+    pub(crate) fn build_verify_state_with(
         initial_raw: Option<u8>,
         role: crate::hwmon::roles::HeaderRole,
         fan: Option<fn(u32) -> u32>,
@@ -2149,6 +2149,8 @@ pub(crate) mod tests {
             characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             control_path: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             control_path_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stall_probe: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            stall_probe_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
             pwm_baselines: Default::default(),
             openfan_rescanning: std::sync::atomic::AtomicBool::new(false),

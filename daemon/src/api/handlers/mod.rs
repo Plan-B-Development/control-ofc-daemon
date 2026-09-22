@@ -14,6 +14,7 @@ mod inventory;
 mod openfan;
 mod path_confine;
 mod profile;
+pub mod stall_probe;
 mod status;
 pub mod validation;
 
@@ -426,6 +427,15 @@ pub struct AppState {
     /// concurrent writer.
     pub control_path: crate::api::discovery::ControlPathSlot,
     pub control_path_cancel: Arc<AtomicBool>,
+    /// The current or most recent stall/restart probe run (DEC-407), and the
+    /// flag `DELETE /diagnostics/stall-probe` sets to ask it to stop.
+    ///
+    /// Same shape and the same detached-task caveat as `characterization`: its
+    /// safety at shutdown comes from the shared `RestoreOnDrop` plus the probe's
+    /// own per-sample shutdown check. It claims the SAME single verify slot, so
+    /// it is a fifth claimant, never a fifth concurrent writer.
+    pub stall_probe: crate::api::stall_probe::StallProbeSlot,
+    pub stall_probe_cancel: Arc<AtomicBool>,
     /// Persisted PWM to tach relationships, keyed by header id (§6.3).
     ///
     /// An `Arc` swapped under a write lock, exactly like `header_roles` and

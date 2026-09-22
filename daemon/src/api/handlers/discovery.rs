@@ -71,7 +71,7 @@ pub async fn preflight_handler(
             StatusCode::BAD_REQUEST,
             &ErrorEnvelope::validation(format!(
                 "unknown diagnostic '{diagnostic_token}'; expected one of pwm_verify, \
-                 pwm_characterization, control_path_discovery"
+                 pwm_characterization, control_path_discovery, pwm_stall_probe"
             )),
         );
     };
@@ -90,7 +90,8 @@ fn gather_preflight(
     diagnostic: pf::Diagnostic,
 ) -> pf::PreflightInputs {
     let pump_protected = state.header_is_pump_protected(header_id);
-    let role = state.resolved_header_role(header_id).as_str().to_string();
+    let resolved_role = state.resolved_header_role(header_id);
+    let role = resolved_role.as_str().to_string();
 
     // One controller lock, released before anything else is done with the result
     // — the same discipline `header_role_parts` documents for the ABBA hazard.
@@ -112,12 +113,13 @@ fn gather_preflight(
         })
     });
 
-    let (header_known, is_writable, live, enable_revert_count) = match header_bits {
+    let (header_known, is_writable, has_tach, live, enable_revert_count) = match header_bits {
         Some((writable, pwm, en, rpm, reverts)) => {
+            let has_tach = rpm.is_some();
             let live = super::hwmon_ctl::read_header_state(&pwm, &en, &rpm);
-            (true, writable, Some(live), reverts)
+            (true, writable, has_tach, Some(live), reverts)
         }
-        None => (false, false, None, 0),
+        None => (false, false, false, None, 0),
     };
 
     let effective_floor_pct = if pump_protected {
@@ -157,6 +159,23 @@ fn gather_preflight(
         thermal_forcing: crate::api::calibration::thermal_force_state(&state.cache),
         too_hot,
         supporting: supporting_cooling(state, header_id),
+        // [SAFETY] DEC-407: the one eligibility rule, evaluated for the probe
+        // only, on the SAME role and union values the rows above report — no
+        // second lookup that could disagree with them. Not evaluated for a
+        // header discovery cannot see: the row defers to `target_discoverable`
+        // rather than inventing a reason (an unknown header is not `read_only`).
+        stall_probe_ineligible: (diagnostic == pf::Diagnostic::StallProbe && header_known)
+            .then(|| {
+                crate::api::stall_probe::ineligibility(
+                    resolved_role,
+                    pump_protected,
+                    is_writable,
+                    has_tach,
+                )
+            })
+            .flatten()
+            .map(str::to_string),
+        cpu_temperature_fresh: crate::api::stall_probe::hottest_fresh_cpu_c(&state.cache).is_some(),
     }
 }
 

@@ -2,6 +2,45 @@
 
 ## [Unreleased]
 
+## [2.54.0] — 2026-09-22
+
+### Added
+
+**A stall/restart probe: find where a fan stops, and where it starts again**
+(`PTR-h`, DEC-407). `POST /hwmon/{header}/stall-probe` is the one diagnostic
+that drives a fan below 20 %, down to 0 %. It finds the **stall duty** (where
+the fan stops as the speed falls) and the **restart duty** (where it starts
+again as the speed rises). A profile that asks for a speed between the two can
+stop a fan that it can't then restart. On one machine a radiator fan stopped at
+6 % and only restarted at 10 %.
+
+It is opt-in and runs on one header at a time. It refuses anything that could
+be a pump (the label, your role assignment, or a profile that names it a pump),
+a `cpu_fan` header, and a header whose role is still `unknown`. Assign
+`chassis_fan` or `radiator_fan` first. It keeps checking this while it runs, and
+stops within half a second if you assign a pump to that header. It also needs a
+fresh CPU temperature, and stops if that rises more than 5 °C. It stops if it
+can't read the fan's speed, rather than guess. A fan that stops as soon as it
+gets to 20 % is reported as stopping at 20 % or above, and is given the 100 %
+kick before it gets its previous speed back. There is nothing to tune: the request is exactly
+`{"acknowledge_below_floor": true}`, and the daemon works out the step length
+and time budget from how often the fan's speed reading updates (at most three
+minutes below 20 %). A chip that updates too slowly is refused, with the
+reason. If the probe stops early or you cancel it, the fan runs at 100 % until
+it is seen spinning, then gets its previous speed back. (If the daemon itself is
+shutting down it doesn't; the shutdown puts every fan back on its own.)
+`GET /diagnostics/stall-probe` returns the result;
+`DELETE /diagnostics/stall-probe` cancels it. Capability `control.stall_probe`;
+preflight `diagnostic=pwm_stall_probe`. Characterisation is unchanged and still
+never goes below 20 %.
+
+### Changed
+
+Characterisation's safety checks before each write (shutdown, cancel, the
+temperature checks, and the check that its claim on the fan is still held) now
+come from one shared definition, which the stall probe also uses. There is no
+behaviour change.
+
 ## [2.53.0] — 2026-09-22
 
 This release also carries **2.52.0**, which was never published on its own —

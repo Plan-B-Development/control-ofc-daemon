@@ -95,6 +95,9 @@ pub const CHECK_THERMAL: &str = "thermal_state";
 pub const CHECK_RECLAIM: &str = "reclaim_state";
 pub const CHECK_ORIGINAL_STATE: &str = "original_state";
 pub const CHECK_SUPPORTING: &str = "supporting_cooling";
+/// The stall probe's own envelope (DEC-407). Emitted for `pwm_stall_probe`
+/// only, so no other diagnostic's report changes shape.
+pub const CHECK_STALL_PROBE_ELIGIBLE: &str = "stall_probe_eligible";
 
 /// The diagnostics a preflight can be requested for.
 ///
@@ -106,6 +109,8 @@ pub enum Diagnostic {
     Verify,
     Characterization,
     ControlPathDiscovery,
+    /// DEC-407: the stall/restart probe, the one diagnostic that writes below 20 %.
+    StallProbe,
 }
 
 impl Diagnostic {
@@ -114,6 +119,7 @@ impl Diagnostic {
             "pwm_verify" => Some(Self::Verify),
             "pwm_characterization" => Some(Self::Characterization),
             "control_path_discovery" => Some(Self::ControlPathDiscovery),
+            "pwm_stall_probe" => Some(Self::StallProbe),
             _ => None,
         }
     }
@@ -123,6 +129,7 @@ impl Diagnostic {
             Self::Verify => "pwm_verify",
             Self::Characterization => "pwm_characterization",
             Self::ControlPathDiscovery => "control_path_discovery",
+            Self::StallProbe => "pwm_stall_probe",
         }
     }
 
@@ -146,7 +153,10 @@ impl Diagnostic {
     /// rule at a call site.**
     pub fn blocks_on_stale_temperature(self) -> bool {
         match self {
-            Self::Verify | Self::Characterization | Self::ControlPathDiscovery => true,
+            Self::Verify
+            | Self::Characterization
+            | Self::ControlPathDiscovery
+            | Self::StallProbe => true,
         }
     }
 }
@@ -325,6 +335,14 @@ pub struct PreflightInputs {
     /// diagnostic temperature limit.
     pub too_hot: Option<(String, f64, f64)>,
     pub supporting: SupportingCooling,
+    /// [SAFETY] DEC-407: why the stall probe may not run on this header — a
+    /// `stall_probe::INELIGIBLE_*` token from `stall_probe::ineligibility`, the
+    /// same rule the POST and the mid-run re-check apply — or `None` when it may.
+    /// Read only for [`Diagnostic::StallProbe`].
+    pub stall_probe_ineligible: Option<String>,
+    /// Whether a fresh CPU temperature exists for the probe's rise gate. Read
+    /// only for [`Diagnostic::StallProbe`].
+    pub cpu_temperature_fresh: bool,
 }
 
 // ── The one new predicate (pure) ─────────────────────────────────────
@@ -459,15 +477,30 @@ pub fn build_report(inputs: &PreflightInputs) -> PreflightReport {
         )
     });
 
-    // 7. Safe minimum known.
-    checks.push(PreflightCheck::new(
-        CHECK_SAFE_MINIMUM,
-        CHECK_PASS,
-        format!(
-            "Commands clamped to {}%–100%",
-            inputs.effective_floor_pct.max(constants::DISCOVERY_MIN_PCT)
-        ),
-    ));
+    // 7. Safe minimum known. The stall probe is the one diagnostic whose
+    //    commands are not clamped to the diagnostic floor, and saying otherwise
+    //    would be the report lying about what the daemon is about to do.
+    checks.push(if inputs.diagnostic == Diagnostic::StallProbe {
+        PreflightCheck::new(
+            CHECK_SAFE_MINIMUM,
+            CHECK_PASS,
+            format!(
+                "Descends from {start}% to 0% by design, then back up to {start}%; any \
+                 abort ends with a {kick}% recovery kick",
+                start = constants::STALL_PROBE_START_PCT,
+                kick = constants::STALL_PROBE_KICK_PCT
+            ),
+        )
+    } else {
+        PreflightCheck::new(
+            CHECK_SAFE_MINIMUM,
+            CHECK_PASS,
+            format!(
+                "Commands clamped to {}%–100%",
+                inputs.effective_floor_pct.max(constants::DISCOVERY_MIN_PCT)
+            ),
+        )
+    });
 
     // 8. [SAFETY] Temperature source freshness. Blocking for every diagnostic
     //    since DEC-385; see `Diagnostic::blocks_on_stale_temperature`.
@@ -608,6 +641,42 @@ pub fn build_report(inputs: &PreflightInputs) -> PreflightReport {
             ),
         )
     });
+
+    // 13. [SAFETY] DEC-407: the stall probe's envelope. The token comes from
+    //     `stall_probe::ineligibility`, which the POST and the mid-run re-check
+    //     also call, so the published verdict cannot disagree with the refusal.
+    if inputs.diagnostic == Diagnostic::StallProbe {
+        checks.push(
+            match (&inputs.stall_probe_ineligible, inputs.cpu_temperature_fresh) {
+                // No header to assess: `target_discoverable` already fails and
+                // blocks, and a reason invented for a header nobody can see
+                // would contradict the POST's 404.
+                _ if !inputs.header_known => PreflightCheck::new(
+                    CHECK_STALL_PROBE_ELIGIBLE,
+                    CHECK_NOT_APPLICABLE,
+                    "No header to assess — see target_discoverable",
+                ),
+                (Some(token), _) => PreflightCheck::new(
+                    CHECK_STALL_PROBE_ELIGIBLE,
+                    CHECK_FAIL,
+                    format!(
+                        "Not eligible ({token}): {}",
+                        crate::api::stall_probe::ineligibility_detail(token)
+                    ),
+                ),
+                (None, false) => PreflightCheck::new(
+                    CHECK_STALL_PROBE_ELIGIBLE,
+                    CHECK_FAIL,
+                    "No fresh CPU temperature, so the probe's rise gate cannot be evaluated",
+                ),
+                (None, true) => PreflightCheck::new(
+                    CHECK_STALL_PROBE_ELIGIBLE,
+                    CHECK_PASS,
+                    "Eligible: a chassis or radiator fan, not pump-protected, with a tach",
+                ),
+            },
+        );
+    }
 
     let verdict = verdict_for(&checks);
     let blocking = checks
