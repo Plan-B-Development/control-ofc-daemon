@@ -2884,6 +2884,153 @@ mod tests {
             "VerifyEvidence",
         );
 
+        // DEC-404 Stage 4 (`PTR-r`): `GET /diagnostics/hardware`, enrolled when the
+        // GUI's PWM Test Report became the first reader of DEC-405's environment
+        // facts. Every optional top-level field is populated, so every declared
+        // key serialises; the nested structs are pinned at this level only.
+        let board = BoardInfo {
+            vendor: "Gigabyte".into(),
+            name: "X870E AORUS MASTER".into(),
+            bios_version: "F14c".into(),
+            bios_date: Some("08/14/2025".into()),
+        };
+        expect(&serde_json::to_value(&board).unwrap(), "BoardInfo");
+        let kernel_module = KernelModuleInfo {
+            name: "it87".into(),
+            loaded: true,
+            in_mainline: false,
+            version: Some("v1.0-160".into()),
+            srcversion: Some("0123456789ABCDEF01234567".into()),
+            out_of_tree: Some(true),
+        };
+        expect(
+            &serde_json::to_value(&kernel_module).unwrap(),
+            "KernelModuleInfo",
+        );
+        let hardware = HardwareDiagnosticsResponse {
+            api_version: API_VERSION,
+            hwmon: HwmonDiagnostics {
+                chips_detected: Vec::new(),
+                total_headers: 8,
+                writable_headers: 8,
+                enable_revert_counts: HashMap::new(),
+                enable_revert_last_seen_ms: HashMap::new(),
+            },
+            gpu: Some(GpuDiagnostics {
+                pci_bdf: "0000:03:00.0".into(),
+                pci_id: "1002:744c".into(),
+                pci_device_id: 0x744c,
+                pci_revision: 0xc8,
+                model_name: Some("Radeon RX 7900 XTX".into()),
+                fan_control_method: "pmfw_curve".into(),
+                overdrive_enabled: true,
+                ppfeaturemask: Some("0xffffffff".into()),
+                ppfeaturemask_bit14_set: true,
+                zero_rpm_available: true,
+                fan_speed_min_pct: Some(15),
+                fan_speed_max_pct: Some(100),
+                fan_minimum_pwm: Some(15),
+                amdgpu_driver_bound: true,
+                kernel_warnings: Vec::new(),
+            }),
+            intel_gpu: Some(IntelGpuDiagnostics {
+                pci_bdf: "0000:04:00.0".into(),
+                pci_id: "8086:56a0".into(),
+                pci_device_id: 0x56a0,
+                pci_revision: 0x08,
+                model_name: Some("Arc A770".into()),
+                driver: "xe".into(),
+                fan_control_method: "read_only".into(),
+                fan_rpm_available: true,
+                fan_control_note: "x".into(),
+            }),
+            nvidia_gpu: Some(NvidiaGpuDiagnostics {
+                pci_bdf: "0000:05:00.0".into(),
+                pci_id: "10de:2684".into(),
+                model_name: Some("RTX 4090".into()),
+                driver: "nvidia".into(),
+                driver_version: Some("580.95".into()),
+                fan_control_method: "read_only".into(),
+                fan_rpm_available: true,
+                fan_control_note: "x".into(),
+            }),
+            thermal_safety: ThermalSafetyInfo {
+                state: "normal".into(),
+                cpu_sensor_found: true,
+                emergency_threshold_c: 110.0,
+                release_threshold_c: 80.0,
+            },
+            kernel_modules: vec![kernel_module],
+            acpi_conflicts: Vec::new(),
+            board,
+            kernel_release: Some("6.18.2-1-cachyos".into()),
+            expected_chips: vec!["it8696".into()],
+            board_firmware_counts: Some(crate::hwmon::gigabyte_siv::GigabyteSiv {
+                platform: 1,
+                special: 0,
+                fan_count: 8,
+                temp_count: 6,
+                volt_count: 10,
+            }),
+            kernel_detected_chips: vec!["it8696".into()],
+            module_collisions: vec![ModuleCollisionInfo {
+                module_a: "nct6687".into(),
+                module_b: "nct6775".into(),
+                severity: "critical".into(),
+                summary: "x".into(),
+                remediation: "y".into(),
+            }],
+            cpu_vendor: "AMD".into(),
+            amd_pci_devices: vec![AmdPciDeviceInfo {
+                pci_bdf: "0000:03:00.0".into(),
+                pci_device_id: 0x744c,
+                driver: Some("amdgpu".into()),
+                amdgpu_bound: true,
+                hwmon_present: true,
+            }],
+            amdgpu_module_loaded: true,
+            voltages: vec![VoltageEntry {
+                id: "hwmon:it8696:pci0:in0".into(),
+                chip_name: "it8696".into(),
+                channel: 0,
+                label: "in0".into(),
+                value_v: 1.236,
+                identified: false,
+            }],
+        };
+        expect(
+            &serde_json::to_value(&hardware).unwrap(),
+            "HardwareDiagnosticsResponse",
+        );
+
+        // DEC-404 Stage 4 (`PTR-u`): the DEC-407 stall probe, enrolled when the
+        // GUI's PWM Test Report modelled and read it.
+        let probe_point = crate::api::stall_probe::ProbePoint {
+            phase: "descent".into(),
+            step_index: 3,
+            commanded_pct: 8,
+            command_accepted: true,
+            readback_pct: Some(8),
+            pwm_enable: Some(1),
+            rpm_before: Some(420),
+            rpm_after: Some(0),
+            held_ms: 6_000,
+            confirmed_at_ms: Some(4_000),
+            samples: 12,
+            zero_samples: 8,
+            observation: "stalled".into(),
+        };
+        expect(&serde_json::to_value(&probe_point).unwrap(), "ProbePoint");
+        let probe_run = crate::api::stall_probe::StallProbeRun {
+            run_id: "probe-1".into(),
+            header_id: "hwmon:it8696:it87.2624:pwm2:SYS_FAN1".into(),
+            state: "complete".into(),
+            outcome: Some("stall_and_restart_found".into()),
+            points: vec![probe_point],
+            ..Default::default()
+        };
+        expect(&serde_json::to_value(&probe_run).unwrap(), "StallProbeRun");
+
         // **Both directions, and this is what makes the oracle an interlock
         // rather than a workflow (`P8-cb`).** A struct declared in the fixture
         // with no arm here is the `P8-ca` gap — sixteen entries the GUI checked
