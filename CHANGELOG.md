@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.55.0] — 2026-09-23
+
 ### Added
 
 **Long diagnostics say what they are doing between results** (`P8-bg`, DEC-411). A
