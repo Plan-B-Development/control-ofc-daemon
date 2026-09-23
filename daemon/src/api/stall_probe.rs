@@ -183,7 +183,8 @@ pub struct ProbePoint {
     pub samples: u32,
     pub zero_samples: u32,
     /// `spinning` | `stalled` | `restarted` | `stopped` | `no_fan` |
-    /// `unreadable` | `interrupted`.
+    /// `unreadable` | `interrupted` | `unconfirmed`. An opaque token: render an
+    /// unrecognised one, never drop it (273-i).
     pub observation: String,
 }
 

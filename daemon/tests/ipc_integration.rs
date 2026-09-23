@@ -5869,6 +5869,28 @@ async fn advertised_stop_timeout_tracks_the_constant() {
 }
 
 #[tokio::test]
+async fn advertised_diagnostic_temperature_limit_tracks_the_constant() {
+    // `PTA-i`: the PWM Test Report's consent page told the user a test stops
+    // "if a temperature passes 85 °C" — a figure the wire did not carry, so the
+    // promise would have gone stale the moment the constant moved. The GUI now
+    // interpolates this field, so it must be the constant every diagnostic's
+    // thermal gate compares against, never a restatement of it.
+    let state = test_app_state();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/capabilities").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        json["limits"]["diagnostic_max_temp_c"].as_f64().unwrap(),
+        control_ofc_daemon::constants::CALIBRATION_MAX_TEMP_C,
+        "advertised diagnostic limit must be derived from CALIBRATION_MAX_TEMP_C"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
 async fn live_applied_key_does_not_claim_a_restart_is_owed() {
     // REGRESSION (DEC-243 review): `profiles.search_dirs` was declared
     // requires_restart=true, but its POST handler applies the change live
@@ -6216,6 +6238,64 @@ async fn await_characterization(path: &str) -> serde_json::Value {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     panic!("characterisation run never reached a terminal state");
+}
+
+/// `P8-bg` **at the call site**: the handler's `announce` closure is what puts
+/// `current_step` on `GET /diagnostics/characterization`. `run_sweep`'s own test
+/// proves it announces; this proves the handler publishes what it is told, and
+/// clears it at the terminal write — a no-op closure would pass the unit test.
+#[tokio::test]
+async fn a_running_characterisation_publishes_its_current_step_and_clears_it() {
+    let state = test_app_state_with_hwmon();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+    let (status, json) = uds_post(
+        &path,
+        "/hwmon/h1/characterize",
+        &serde_json::json!({"points_pct": [40, 60], "settle_seconds": 2}),
+    )
+    .await;
+    assert_eq!(status, 202, "{json}");
+    let run_id = json["run_id"].as_str().unwrap().to_string();
+
+    // Every distinct (index, duty) the live run reported while it was running.
+    let mut seen: Vec<(u64, u64)> = Vec::new();
+    let mut terminal: Option<serde_json::Value> = None;
+    for _ in 0..200 {
+        let (st, snap) = uds_get(&path, "/diagnostics/characterization").await;
+        assert_eq!(st, 200);
+        assert_eq!(snap["run_id"], run_id.as_str());
+        if snap["state"] != "running" {
+            terminal = Some(snap);
+            break;
+        }
+        let step = &snap["current_step"];
+        if step.is_object() {
+            assert_eq!(step["phase"], "settle", "{snap}");
+            assert_eq!(step["max_ms"], 2_000, "{snap}");
+            let key = (
+                step["index"].as_u64().unwrap(),
+                step["duty_pct"].as_u64().unwrap(),
+            );
+            if seen.last() != Some(&key) {
+                seen.push(key);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let done = terminal.expect("the sweep reached a terminal state");
+    assert_eq!(done["state"], "complete", "{done}");
+    assert_eq!(
+        seen,
+        vec![(0, 40), (1, 60)],
+        "each point's settle, in order, while it was being held"
+    );
+    assert!(
+        done["current_step"].is_null(),
+        "a terminal run holds nothing: {done}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
 }
 
 /// Build the hwmon fixture with a deliberately short hwmon lease TTL.

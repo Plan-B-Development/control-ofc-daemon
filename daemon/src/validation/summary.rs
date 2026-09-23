@@ -27,30 +27,30 @@ pub fn summarise(session: &ValidationSession) -> Vec<ValidationFinding> {
     let interrupted = session.state == STATE_INTERRUPTED;
     let mut out = Vec::new();
 
-    out.push(pwm_header_control(session, interrupted));
-    out.push(pwm_readback(session, interrupted));
+    out.extend(pwm_header_control(session, interrupted));
+    out.extend(pwm_readback(session, interrupted));
     out.extend(rpm_telemetry(session));
-    out.push(pwm_response(session, interrupted));
-    out.push(response_latency(session, interrupted));
+    out.extend(pwm_response(session, interrupted));
+    out.extend(response_latency(session, interrupted));
     // DEC-334 (AIO Phase 8 Batch 2). All four are OBSERVATIONAL by construction:
     // §2 forbids treating hysteresis as a fault, §3 forbids reinterpreting a
     // plateau as pump failure, §4 forbids inferring cavitation or an electrical
     // fault from tach variability, and §6 forbids labelling unexpected RPM as
     // hardware failure. None of them can produce RESULT_FAIL.
-    out.push(hysteresis_finding(session, interrupted));
-    out.push(stability_finding(session, interrupted));
-    out.push(effective_range_finding(session, interrupted));
-    out.push(learned_range_finding(session, interrupted));
+    out.extend(hysteresis_finding(session, interrupted));
+    out.extend(stability_finding(session, interrupted));
+    out.extend(effective_range_finding(session, interrupted));
+    out.extend(learned_range_finding(session, interrupted));
     out.push(startup_behaviour(session));
     // DEC-335 (Batch 3a §3). Observational like the four above: `not_established`
     // is a statement about the observation, never about the cooler.
     out.push(steady_state_finding(session));
     out.extend(divergence(session));
-    out.push(device_override(session, interrupted));
+    out.extend(device_override(session, interrupted));
     out.push(bios_reclaim(session));
     out.push(thermal_safety(session));
     out.push(control_restoration(session));
-    out.push(control_path(session, interrupted));
+    out.extend(control_path(session, interrupted));
     out.push(coolant_telemetry(session));
     out.push(daemon_restart_recovery(session));
 
@@ -106,45 +106,86 @@ fn verifies(session: &ValidationSession) -> impl Iterator<Item = &EvidenceRef> {
     session.evidence.iter().filter(|e| e.kind == DIAG_VERIFY)
 }
 
+/// One finding per member (`PTR-n`): the first piece of `evidence` for each
+/// member from which `derive` produces a finding, in evidence order.
+///
+/// Every finding below used to `return` on the first run it found, so a session
+/// that swept several members reported ONE member's verdict for the session —
+/// labelled with that member, silent about the others. The API takes up to
+/// eight sweep members; the GUI's start form happens to send one, which is the
+/// only reason nobody saw it. `divergence` and `rpm_telemetry` were already per
+/// member; this is the same shape for every run-derived finding, defined once
+/// so a new one cannot quietly regress to "first run wins".
+///
+/// `derive` returning `None` means "this run carries nothing for this finding"
+/// (no summary yet, an empty verdict), and the member's NEXT run is tried — the
+/// same fall-through the per-finding loops had. `member_id` is stamped here.
+fn per_member<'a>(
+    evidence: impl Iterator<Item = &'a EvidenceRef>,
+    mut derive: impl FnMut(&'a EvidenceRef) -> Option<ValidationFinding>,
+) -> Vec<ValidationFinding> {
+    let mut done: Vec<&'a str> = Vec::new();
+    let mut out = Vec::new();
+    for ev in evidence {
+        if done.contains(&ev.member_id.as_str()) {
+            continue;
+        }
+        if let Some(mut f) = derive(ev) {
+            f.member_id = Some(ev.member_id.clone());
+            done.push(ev.member_id.as_str());
+            out.push(f);
+        }
+    }
+    out
+}
+
+/// `out`, or — when no member produced anything — the one session-level
+/// finding saying why: `interrupted` or `not_tested`, never `pass` (§7).
+fn or_absent(out: Vec<ValidationFinding>, id: &str, interrupted: bool) -> Vec<ValidationFinding> {
+    if out.is_empty() {
+        vec![finding(id, absent_state(interrupted))]
+    } else {
+        out
+    }
+}
+
 // ── Individual findings ─────────────────────────────────────────────────────
 
 /// Did the header accept PWM commands at all?
-fn pwm_header_control(session: &ValidationSession, interrupted: bool) -> ValidationFinding {
+fn pwm_header_control(session: &ValidationSession, interrupted: bool) -> Vec<ValidationFinding> {
     // Prefer the sweep's own verdict — it tested many duties, verify tested one.
-    for ev in characterizations(session) {
-        if let Some(run) = &ev.characterization {
-            if let Some(sum) = &run.summary {
-                let state = match sum.command_acceptance.as_str() {
-                    "pass" => RESULT_PASS,
-                    "fail" => RESULT_FAIL,
-                    // `partial`, or a token a newer daemon added: real evidence,
-                    // but not a clean verdict. Rendered, never dropped.
-                    _ => RESULT_UNKNOWN,
-                };
-                let mut f = with_detail(
-                    finding(F_PWM_HEADER_CONTROL, state),
-                    format!("command acceptance: {}", sum.command_acceptance),
-                );
-                f.member_id = Some(ev.member_id.clone());
-                f.evidence_kind = Some(ev.kind.clone());
-                return f;
-            }
-        }
-    }
-    for ev in verifies(session) {
-        if let Some(v) = &ev.verify {
+    let mut out = per_member(characterizations(session), |ev| {
+        let sum = ev.characterization.as_ref()?.summary.as_ref()?;
+        let state = match sum.command_acceptance.as_str() {
+            "pass" => RESULT_PASS,
+            "fail" => RESULT_FAIL,
+            // `partial`, or a token a newer daemon added: real evidence,
+            // but not a clean verdict. Rendered, never dropped.
+            _ => RESULT_UNKNOWN,
+        };
+        let mut f = with_detail(
+            finding(F_PWM_HEADER_CONTROL, state),
+            format!("command acceptance: {}", sum.command_acceptance),
+        );
+        f.evidence_kind = Some(ev.kind.clone());
+        Some(f)
+    });
+    // A member no sweep covered falls back to its verify, per member.
+    let swept: Vec<String> = out.iter().filter_map(|f| f.member_id.clone()).collect();
+    out.extend(per_member(
+        verifies(session).filter(|ev| !swept.contains(&ev.member_id)),
+        |ev| {
+            let v = ev.verify.as_ref()?;
             // DEC-405 (`PTR-e`): through the one verify mapping. This used to be
             // `write_ok → pass, else fail`, and `write_ok` is merely "the handler
             // answered 200" — so a thermal refusal or a busy slot filed
             // "PWM header control: fail", which DEC-317 §7 forbids.
-            let state = verify_outcome(v);
-            let mut f = finding(F_PWM_HEADER_CONTROL, state);
-            f.member_id = Some(ev.member_id.clone());
+            let mut f = finding(F_PWM_HEADER_CONTROL, verify_outcome(v));
             f.evidence_kind = Some(DIAG_VERIFY.to_string());
-            return f;
-        }
-    }
-    finding(F_PWM_HEADER_CONTROL, absent_state(interrupted))
+            Some(f)
+        },
+    ));
+    or_absent(out, F_PWM_HEADER_CONTROL, interrupted)
 }
 
 /// A verify's session outcome (DEC-405, `PTR-e`). **Never `fail`** (DEC-317 §7):
@@ -171,27 +212,26 @@ pub fn verify_outcome(v: &VerifyEvidence) -> &'static str {
 }
 
 /// Did the written duty read back?
-fn pwm_readback(session: &ValidationSession, interrupted: bool) -> ValidationFinding {
-    for ev in characterizations(session) {
-        if let Some(run) = &ev.characterization {
-            if let Some(sum) = &run.summary {
-                let state = match sum.pwm_readback.as_str() {
-                    "pass" => RESULT_PASS,
-                    // A clamp or a BIOS reclaim is evidence about the device, not
-                    // a failed test of the daemon's write path.
-                    "clamped" | "reverted" => RESULT_OBSERVED,
-                    "unavailable" => RESULT_UNAVAILABLE,
-                    _ => RESULT_UNKNOWN,
-                };
-                let mut f = with_detail(
-                    finding(F_PWM_READBACK, state),
-                    format!("readback: {}", sum.pwm_readback),
-                );
-                f.member_id = Some(ev.member_id.clone());
-                f.evidence_kind = Some(ev.kind.clone());
-                return f;
-            }
-        }
+fn pwm_readback(session: &ValidationSession, interrupted: bool) -> Vec<ValidationFinding> {
+    let swept = per_member(characterizations(session), |ev| {
+        let sum = ev.characterization.as_ref()?.summary.as_ref()?;
+        let state = match sum.pwm_readback.as_str() {
+            "pass" => RESULT_PASS,
+            // A clamp or a BIOS reclaim is evidence about the device, not
+            // a failed test of the daemon's write path.
+            "clamped" | "reverted" => RESULT_OBSERVED,
+            "unavailable" => RESULT_UNAVAILABLE,
+            _ => RESULT_UNKNOWN,
+        };
+        let mut f = with_detail(
+            finding(F_PWM_READBACK, state),
+            format!("readback: {}", sum.pwm_readback),
+        );
+        f.evidence_kind = Some(ev.kind.clone());
+        Some(f)
+    });
+    if !swept.is_empty() {
+        return swept;
     }
     // Fall back to what the samples saw — a readback column that was never
     // populated is `unavailable`, not a failure.
@@ -199,7 +239,7 @@ fn pwm_readback(session: &ValidationSession, interrupted: bool) -> ValidationFin
         .samples
         .iter()
         .any(|s| s.members.iter().any(|m| m.readback_pct.is_some()));
-    if session.samples.is_empty() {
+    vec![if session.samples.is_empty() {
         finding(F_PWM_READBACK, absent_state(interrupted))
     } else if any_readback {
         with_detail(
@@ -211,7 +251,7 @@ fn pwm_readback(session: &ValidationSession, interrupted: bool) -> ValidationFin
             finding(F_PWM_READBACK, RESULT_UNAVAILABLE),
             "no PWM readback exposed",
         )
-    }
+    }]
 }
 
 /// One finding per member, so radiator identity survives (§3) rather than being
@@ -259,27 +299,23 @@ fn rpm_telemetry(session: &ValidationSession) -> Vec<ValidationFinding> {
 }
 
 /// Did RPM respond across the swept duty range?
-fn pwm_response(session: &ValidationSession, interrupted: bool) -> ValidationFinding {
-    for ev in characterizations(session) {
-        if let Some(run) = &ev.characterization {
-            if let Some(sum) = &run.summary {
-                let state = match sum.rpm_response.as_str() {
-                    "pass" => RESULT_PASS,
-                    "fail" => RESULT_FAIL,
-                    "unavailable" => RESULT_UNAVAILABLE,
-                    _ => RESULT_UNKNOWN,
-                };
-                let mut f = with_detail(
-                    finding(F_PWM_RESPONSE, state),
-                    format!("rpm response: {}", sum.rpm_response),
-                );
-                f.member_id = Some(ev.member_id.clone());
-                f.evidence_kind = Some(ev.kind.clone());
-                return f;
-            }
-        }
-    }
-    finding(F_PWM_RESPONSE, absent_state(interrupted))
+fn pwm_response(session: &ValidationSession, interrupted: bool) -> Vec<ValidationFinding> {
+    let out = per_member(characterizations(session), |ev| {
+        let sum = ev.characterization.as_ref()?.summary.as_ref()?;
+        let state = match sum.rpm_response.as_str() {
+            "pass" => RESULT_PASS,
+            "fail" => RESULT_FAIL,
+            "unavailable" => RESULT_UNAVAILABLE,
+            _ => RESULT_UNKNOWN,
+        };
+        let mut f = with_detail(
+            finding(F_PWM_RESPONSE, state),
+            format!("rpm response: {}", sum.rpm_response),
+        );
+        f.evidence_kind = Some(ev.kind.clone());
+        Some(f)
+    });
+    or_absent(out, F_PWM_RESPONSE, interrupted)
 }
 
 /// Which tach channel(s) does this header actually drive (AIO Phase 8 Batch 1)?
@@ -294,37 +330,32 @@ fn pwm_response(session: &ValidationSession, interrupted: bool) -> ValidationFin
 /// `ambiguous` maps to `unknown` rather than to a verdict, for the same reason:
 /// the run's own answer was "not repeatable enough to rely on", and promoting
 /// that to either pass or fail would be the report inventing evidence.
-fn control_path(session: &ValidationSession, interrupted: bool) -> ValidationFinding {
-    for ev in session
+fn control_path(session: &ValidationSession, interrupted: bool) -> Vec<ValidationFinding> {
+    let runs = session
         .evidence
         .iter()
-        .filter(|e| e.kind == DIAG_CONTROL_PATH)
-    {
-        if let Some(run) = &ev.control_path {
-            if let Some(sum) = &run.summary {
-                use crate::api::discovery as disc;
-                let state = match sum.relationship.as_str() {
-                    disc::REL_CONFIRMED | disc::REL_PROBABLE | disc::REL_MULTIPLE => {
-                        RESULT_OBSERVED
-                    }
-                    disc::REL_NO_RESPONSE => RESULT_NOT_OBSERVED,
-                    _ => RESULT_UNKNOWN,
-                };
-                let detail = match sum.candidates.first() {
-                    Some(best) => format!(
-                        "{} -> {} ({} confidence)",
-                        run.header_id, best.label, sum.confidence
-                    ),
-                    None => format!("{}: no tach channel responded", run.header_id),
-                };
-                let mut f = with_detail(finding(F_CONTROL_PATH, state), detail);
-                f.member_id = Some(ev.member_id.clone());
-                f.evidence_kind = Some(DIAG_CONTROL_PATH.to_string());
-                return f;
-            }
-        }
-    }
-    finding(F_CONTROL_PATH, absent_state(interrupted))
+        .filter(|e| e.kind == DIAG_CONTROL_PATH);
+    let out = per_member(runs, |ev| {
+        let run = ev.control_path.as_ref()?;
+        let sum = run.summary.as_ref()?;
+        use crate::api::discovery as disc;
+        let state = match sum.relationship.as_str() {
+            disc::REL_CONFIRMED | disc::REL_PROBABLE | disc::REL_MULTIPLE => RESULT_OBSERVED,
+            disc::REL_NO_RESPONSE => RESULT_NOT_OBSERVED,
+            _ => RESULT_UNKNOWN,
+        };
+        let detail = match sum.candidates.first() {
+            Some(best) => format!(
+                "{} -> {} ({} confidence)",
+                run.header_id, best.label, sum.confidence
+            ),
+            None => format!("{}: no tach channel responded", run.header_id),
+        };
+        let mut f = with_detail(finding(F_CONTROL_PATH, state), detail);
+        f.evidence_kind = Some(DIAG_CONTROL_PATH.to_string());
+        Some(f)
+    });
+    or_absent(out, F_CONTROL_PATH, interrupted)
 }
 
 /// §2. How far apart were the rising and falling curves?
@@ -332,16 +363,10 @@ fn control_path(session: &ValidationSession, interrupted: bool) -> ValidationFin
 /// `not_observed` when the walk was unidirectional — that is "we did not look",
 /// which is a different statement from "there is none", and the Overview is
 /// explicit that lack of evidence must not become a PASS.
-fn hysteresis_finding(session: &ValidationSession, interrupted: bool) -> ValidationFinding {
+fn hysteresis_finding(session: &ValidationSession, interrupted: bool) -> Vec<ValidationFinding> {
     use crate::api::stats;
-    for ev in characterizations(session) {
-        let Some(sum) = ev
-            .characterization
-            .as_ref()
-            .and_then(|r| r.summary.as_ref())
-        else {
-            continue;
-        };
+    let out = per_member(characterizations(session), |ev| {
+        let sum = ev.characterization.as_ref()?.summary.as_ref()?;
         let (state, detail) = match sum.hysteresis_verdict.as_str() {
             stats::HYSTERESIS_NOT_TESTED => (
                 RESULT_NOT_TESTED,
@@ -375,26 +400,19 @@ fn hysteresis_finding(session: &ValidationSession, interrupted: bool) -> Validat
             ),
         };
         let mut f = with_detail(finding(F_HYSTERESIS, state), detail);
-        f.member_id = Some(ev.member_id.clone());
         f.evidence_kind = ev.characterization.as_ref().map(|_| ev.kind.clone());
-        return f;
-    }
-    finding(F_HYSTERESIS, absent_state(interrupted))
+        Some(f)
+    });
+    or_absent(out, F_HYSTERESIS, interrupted)
 }
 
 /// §4. How steady was the tach at a held duty?
-fn stability_finding(session: &ValidationSession, interrupted: bool) -> ValidationFinding {
+fn stability_finding(session: &ValidationSession, interrupted: bool) -> Vec<ValidationFinding> {
     use crate::api::stats;
-    for ev in characterizations(session) {
-        let Some(sum) = ev
-            .characterization
-            .as_ref()
-            .and_then(|r| r.summary.as_ref())
-        else {
-            continue;
-        };
+    let out = per_member(characterizations(session), |ev| {
+        let sum = ev.characterization.as_ref()?.summary.as_ref()?;
         if sum.stability_verdict.is_empty() {
-            continue;
+            return None;
         }
         let state = match sum.stability_verdict.as_str() {
             stats::STABILITY_UNAVAILABLE => RESULT_UNAVAILABLE,
@@ -416,23 +434,19 @@ fn stability_finding(session: &ValidationSession, interrupted: bool) -> Validati
             detail.push_str(&format!(", {} tach dropout(s)", sum.total_dropouts));
         }
         let mut f = with_detail(finding(F_RPM_STABILITY, state), detail);
-        f.member_id = Some(ev.member_id.clone());
         f.evidence_kind = Some(ev.kind.clone());
-        return f;
-    }
-    finding(F_RPM_STABILITY, absent_state(interrupted))
+        Some(f)
+    });
+    or_absent(out, F_RPM_STABILITY, interrupted)
 }
 
 /// §3. Over what band does PWM actually move reported RPM?
-fn effective_range_finding(session: &ValidationSession, interrupted: bool) -> ValidationFinding {
-    for ev in characterizations(session) {
-        let Some(sum) = ev
-            .characterization
-            .as_ref()
-            .and_then(|r| r.summary.as_ref())
-        else {
-            continue;
-        };
+fn effective_range_finding(
+    session: &ValidationSession,
+    interrupted: bool,
+) -> Vec<ValidationFinding> {
+    let out = per_member(characterizations(session), |ev| {
+        let sum = ev.characterization.as_ref()?.summary.as_ref()?;
         let detail = match (sum.min_responsive_pct, sum.max_responsive_pct) {
             (Some(lo), Some(hi)) => {
                 let mut d = format!("effective control range {lo}-{hi}%");
@@ -455,23 +469,16 @@ fn effective_range_finding(session: &ValidationSession, interrupted: bool) -> Va
             RESULT_NOT_OBSERVED
         };
         let mut f = with_detail(finding(F_EFFECTIVE_RANGE, state), detail);
-        f.member_id = Some(ev.member_id.clone());
         f.evidence_kind = Some(ev.kind.clone());
-        return f;
-    }
-    finding(F_EFFECTIVE_RANGE, absent_state(interrupted))
+        Some(f)
+    });
+    or_absent(out, F_EFFECTIVE_RANGE, interrupted)
 }
 
 /// §6. Did this run agree with what previous runs learned?
-fn learned_range_finding(session: &ValidationSession, interrupted: bool) -> ValidationFinding {
-    for ev in characterizations(session) {
-        let Some(sum) = ev
-            .characterization
-            .as_ref()
-            .and_then(|r| r.summary.as_ref())
-        else {
-            continue;
-        };
+fn learned_range_finding(session: &ValidationSession, interrupted: bool) -> Vec<ValidationFinding> {
+    let out = per_member(characterizations(session), |ev| {
+        let sum = ev.characterization.as_ref()?.summary.as_ref()?;
         let (state, detail) = match sum.outside_learned_range {
             // Three states, and this is the one that matters: no model yet is
             // NOT a pass. §6 compares against a previously learned response, and
@@ -501,74 +508,78 @@ fn learned_range_finding(session: &ValidationSession, interrupted: bool) -> Vali
             }
         };
         let mut f = with_detail(finding(F_LEARNED_RANGE, state), detail);
-        f.member_id = Some(ev.member_id.clone());
         f.evidence_kind = Some(ev.kind.clone());
-        return f;
-    }
-    finding(F_LEARNED_RANGE, absent_state(interrupted))
+        Some(f)
+    });
+    or_absent(out, F_LEARNED_RANGE, interrupted)
 }
 
 /// How quickly did RPM begin to move after a duty change?
-fn response_latency(session: &ValidationSession, interrupted: bool) -> ValidationFinding {
-    for ev in characterizations(session) {
-        if let Some(run) = &ev.characterization {
-            let latencies: Vec<u64> = run
-                .points
-                .iter()
-                .filter_map(|p| p.first_change_ms)
-                .collect();
-            if latencies.is_empty() {
-                continue;
-            }
-            let min = latencies.iter().copied().min().unwrap_or(0);
-            let max = latencies.iter().copied().max().unwrap_or(0);
-            // [DEC-334, §5] "Do not publish unrealistic millisecond precision
-            // when the driver updates tach once per second or slower."
-            //
-            // This line used to read "first RPM change 500–3000 ms", which is
-            // millisecond wording over a figure that can only ever be a multiple
-            // of the sub-sample interval — the sweep detects a change by polling,
-            // so the timing's true resolution is that cadence and nothing finer.
-            // Report in the resolution that exists, and name it, exactly as
-            // discovery's `measurement_resolution_ms` already does.
-            let resolution_ms = run
-                .summary
-                .as_ref()
-                .and_then(|s| s.measurement_resolution_ms)
-                .unwrap_or_else(|| {
-                    crate::constants::CHARACTERIZATION_SAMPLE_INTERVAL.as_millis() as u64
-                })
-                .max(1);
-            let quantise = |ms: u64| (ms / resolution_ms) * resolution_ms;
-            let detail = if min == max {
-                format!(
-                    "first RPM change ~{} ms across {} points (resolution {resolution_ms} ms)",
-                    quantise(min),
-                    latencies.len()
-                )
-            } else {
-                format!(
-                    "first RPM change ~{}–{} ms across {} points (resolution {resolution_ms} ms)",
-                    quantise(min),
-                    quantise(max),
-                    latencies.len()
-                )
-            };
-            let mut f = with_detail(finding(F_RESPONSE_LATENCY, RESULT_OBSERVED), detail);
-            f.member_id = Some(ev.member_id.clone());
-            f.evidence_kind = Some(ev.kind.clone());
-            return f;
+fn response_latency(session: &ValidationSession, interrupted: bool) -> Vec<ValidationFinding> {
+    let mut out = per_member(characterizations(session), |ev| {
+        let run = ev.characterization.as_ref()?;
+        let latencies: Vec<u64> = run
+            .points
+            .iter()
+            .filter_map(|p| p.first_change_ms)
+            .collect();
+        if latencies.is_empty() {
+            return None;
         }
-    }
-    // A sweep that ran but saw no RPM movement has latency data that is
-    // unavailable, not untested.
-    if characterizations(session).any(|e| e.characterization.is_some()) {
-        return with_detail(
-            finding(F_RESPONSE_LATENCY, RESULT_UNAVAILABLE),
-            "no RPM change timing captured",
-        );
-    }
-    finding(F_RESPONSE_LATENCY, absent_state(interrupted))
+        let min = latencies.iter().copied().min().unwrap_or(0);
+        let max = latencies.iter().copied().max().unwrap_or(0);
+        // [DEC-334, §5] "Do not publish unrealistic millisecond precision
+        // when the driver updates tach once per second or slower."
+        //
+        // This line used to read "first RPM change 500–3000 ms", which is
+        // millisecond wording over a figure that can only ever be a multiple
+        // of the sub-sample interval — the sweep detects a change by polling,
+        // so the timing's true resolution is that cadence and nothing finer.
+        // Report in the resolution that exists, and name it, exactly as
+        // discovery's `measurement_resolution_ms` already does.
+        let resolution_ms = run
+            .summary
+            .as_ref()
+            .and_then(|s| s.measurement_resolution_ms)
+            .unwrap_or_else(|| {
+                crate::constants::CHARACTERIZATION_SAMPLE_INTERVAL.as_millis() as u64
+            })
+            .max(1);
+        let quantise = |ms: u64| (ms / resolution_ms) * resolution_ms;
+        let detail = if min == max {
+            format!(
+                "first RPM change ~{} ms across {} points (resolution {resolution_ms} ms)",
+                quantise(min),
+                latencies.len()
+            )
+        } else {
+            format!(
+                "first RPM change ~{}–{} ms across {} points (resolution {resolution_ms} ms)",
+                quantise(min),
+                quantise(max),
+                latencies.len()
+            )
+        };
+        let mut f = with_detail(finding(F_RESPONSE_LATENCY, RESULT_OBSERVED), detail);
+        f.evidence_kind = Some(ev.kind.clone());
+        Some(f)
+    });
+    // A member whose sweep ran but saw no RPM movement has latency data that is
+    // unavailable, not untested — per member, like the finding itself.
+    let timed: Vec<String> = out.iter().filter_map(|f| f.member_id.clone()).collect();
+    out.extend(per_member(
+        characterizations(session).filter(|ev| !timed.contains(&ev.member_id)),
+        |ev| {
+            ev.characterization.as_ref()?;
+            let mut f = with_detail(
+                finding(F_RESPONSE_LATENCY, RESULT_UNAVAILABLE),
+                "no RPM change timing captured",
+            );
+            f.evidence_kind = Some(ev.kind.clone());
+            Some(f)
+        },
+    ));
+    or_absent(out, F_RESPONSE_LATENCY, interrupted)
 }
 
 /// Derive the Batch 3a §1 and §3 analyses onto the session.
@@ -870,34 +881,30 @@ fn divergence(session: &ValidationSession) -> Vec<ValidationFinding> {
 }
 
 /// §10's classification, **preserved from Phase 3 and never recomputed**.
-fn device_override(session: &ValidationSession, interrupted: bool) -> ValidationFinding {
-    for ev in characterizations(session) {
-        if let Some(run) = &ev.characterization {
-            if let Some(sum) = &run.summary {
-                // Cautious semantics (§10): a possible device-side control is
-                // `observed` evidence, NEVER a failure. Misclassifying working
-                // motherboard PWM control as failed is the specific outcome §10
-                // exists to prevent.
-                let state = if sum.possible_device_override {
-                    RESULT_OBSERVED
-                } else {
-                    RESULT_NOT_OBSERVED
-                };
-                let mut f = with_detail(
-                    finding(F_DEVICE_OVERRIDE, state),
-                    if sum.possible_device_override {
-                        "PWM control/readback valid, physical response unexpected"
-                    } else {
-                        "physical response tracked PWM"
-                    },
-                );
-                f.member_id = Some(ev.member_id.clone());
-                f.evidence_kind = Some(ev.kind.clone());
-                return f;
-            }
-        }
-    }
-    finding(F_DEVICE_OVERRIDE, absent_state(interrupted))
+fn device_override(session: &ValidationSession, interrupted: bool) -> Vec<ValidationFinding> {
+    let out = per_member(characterizations(session), |ev| {
+        let sum = ev.characterization.as_ref()?.summary.as_ref()?;
+        // Cautious semantics (§10): a possible device-side control is
+        // `observed` evidence, NEVER a failure. Misclassifying working
+        // motherboard PWM control as failed is the specific outcome §10
+        // exists to prevent.
+        let state = if sum.possible_device_override {
+            RESULT_OBSERVED
+        } else {
+            RESULT_NOT_OBSERVED
+        };
+        let mut f = with_detail(
+            finding(F_DEVICE_OVERRIDE, state),
+            if sum.possible_device_override {
+                "PWM control/readback valid, physical response unexpected"
+            } else {
+                "physical response tracked PWM"
+            },
+        );
+        f.evidence_kind = Some(ev.kind.clone());
+        Some(f)
+    });
+    or_absent(out, F_DEVICE_OVERRIDE, interrupted)
 }
 
 /// Did anything take a header back off the daemon?

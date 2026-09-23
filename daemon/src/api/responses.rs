@@ -1429,6 +1429,13 @@ pub struct Limits {
     pub pwm_percent_min: u8,
     pub pwm_percent_max: u8,
     pub openfan_stop_timeout_s: u8,
+    /// `PTA-i` (daemon >= 2.55.0). The temperature, in °C, above which ANY
+    /// sensor makes a diagnostic refuse to start or stop mid-run — verify,
+    /// characterisation, control-path discovery, the stall probe and OpenFan
+    /// calibration all gate on it (`calibration::check_thermal_safety`).
+    /// Published so a client that tells the user where a test stops can
+    /// interpolate the figure rather than restate a constant that drifts.
+    pub diagnostic_max_temp_c: f64,
 }
 
 /// Response for `GET /sensors/history`.
@@ -2582,6 +2589,7 @@ mod tests {
             pwm_percent_min: 0,
             pwm_percent_max: 100,
             openfan_stop_timeout_s: 8,
+            diagnostic_max_temp_c: crate::constants::CALIBRATION_MAX_TEMP_C,
         };
         expect(&serde_json::to_value(&limits).unwrap(), "Limits");
 
@@ -2725,8 +2733,19 @@ mod tests {
             restore_outcome: "restored".into(),
             detail: Some("two cycles, one responder".into()),
             completed_unix_ms: Some(1_757_000_000_000),
+            current_step: Some(crate::api::characterization::RunStep {
+                phase: "perturbed".into(),
+                index: 2,
+                duty_pct: 70,
+                started_unix_ms: 1_756_999_990_000,
+                max_ms: 12_000,
+            }),
         };
         expect(&serde_json::to_value(&run).unwrap(), "ControlPathRun");
+        expect(
+            &serde_json::to_value(run.current_step.as_ref().unwrap()).unwrap(),
+            "RunStep",
+        );
 
         let record = ControlPathRecord {
             header_id: "hwmon:it8696:isa-0a40:pwm1:CPU_FAN".into(),
@@ -3652,6 +3671,7 @@ mod tests {
                 pwm_percent_min: 0,
                 pwm_percent_max: 100,
                 openfan_stop_timeout_s: 8,
+                diagnostic_max_temp_c: crate::constants::CALIBRATION_MAX_TEMP_C,
             },
             control: ControlCapability {
                 profile_storage: true,

@@ -515,6 +515,7 @@ pub async fn discover_control_path_handler(
             .to_string(),
         detail: None,
         completed_unix_ms: None,
+        current_step: None,
     };
     // Cancel flag cleared and run installed under ONE lock, and the cancel
     // handler takes the same lock across its check-and-set — without that
@@ -606,6 +607,14 @@ pub async fn discover_control_path_handler(
                     }
                 }
             };
+            // `P8-bg`: the phase being held, under the same fence.
+            let announce = |step: crate::api::characterization::RunStep| {
+                if let Some(r) = slot.lock().as_mut() {
+                    if r.run_id == my_run_id && r.state == disc::STATE_RUNNING {
+                        r.current_step = Some(step);
+                    }
+                }
+            };
 
             let outcome = disc::run_discovery(
                 &cache,
@@ -630,6 +639,7 @@ pub async fn discover_control_path_handler(
                 keepalive,
                 &report,
                 publish,
+                announce,
             )
             .await;
 
@@ -653,6 +663,8 @@ pub async fn discover_control_path_handler(
                     r.state = outcome.state.to_string();
                     r.detail = outcome.detail;
                     r.completed_unix_ms = Some(completed);
+                    // Nothing is being held any more.
+                    r.current_step = None;
                     // ONE source of truth for both fields (`AUD2-c`).
                     let restore = report.get();
                     r.restore_failed = restore.header_left_moved();

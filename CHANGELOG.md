@@ -2,6 +2,44 @@
 
 ## [Unreleased]
 
+### Added
+
+**Long diagnostics say what they are doing between results** (`P8-bg`, DEC-411). A
+characterisation sweep publishes a point only when its hold ends, and control-path discovery
+publishes a cycle only after both of its windows, so a healthy run could be silent for up to 26 s.
+`CharacterizationRun` and `ControlPathRun` now carry `current_step`: the phase being held (`settle`
+or `dwell` for a sweep; `settle_wait`, `baseline` or `perturbed` for discovery), the step or cycle,
+the duty, when the phase started and its upper bound. It changes at every phase boundary and is
+`null` before the first write and once the run has finished.
+
+**`GET /capabilities` publishes the diagnostic temperature limit** (`PTA-i`, DEC-411).
+`limits.diagnostic_max_temp_c` is the temperature above which any sensor stops a verify, a
+characterisation, control-path discovery, the stall probe or an OpenFan calibration. Clients that
+tell the user where a test stops can now show the real figure.
+
+### Changed
+
+**A slow ramp is no longer called settled** (`PTR-q`, DEC-411). A point settled when four
+consecutive tach updates sat within 5 % of their median. A slowly moving pump could pass that while
+still ramping, so a report called a moving reading steady. The four updates must now also not all
+move the same way by more than 2.5 % of their median. Slow devices on slow tach registers now settle
+later, or report that they did not settle (`settled_ms: null`, stability `not_settled`, discovery
+`baseline_settled: false`), where they used to report a settle that had not happened.
+
+**A point's `rpm_verdict` is judged against its own measured noise** (`PTR-m`, DEC-411). A reading
+counted as `changed` only if it moved by more than a tenth of itself, so a smooth, fast fan's
+genuine ~265 rpm steps read `unchanged`. A point that settled is now `changed` when it moved by more
+than three of its own standard deviations (never less than 50 rpm). A point that did not settle, or
+had too few readings, keeps the old rule.
+
+### Fixed
+
+**A validation session that tests several members reports each one** (`PTR-n`, DEC-411). Every
+finding derived from a characterisation, verify or control-path run reported only the first run it
+found, so a session sweeping several members showed one member's verdict and said nothing about
+the others. Each finding is now reported once per member. The GUI's start form sends one sweep
+member, so this was only reachable through the API.
+
 ## [2.54.0] — 2026-09-22
 
 ### Added

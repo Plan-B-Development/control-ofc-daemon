@@ -1984,6 +1984,15 @@ fn widest_characterization_run() -> control_ofc_daemon::api::characterization::C
         provenance: (0..n)
             .map(|i| (format!("{i:02}{}", text_at(tok - 2)), text_at(tok)))
             .collect(),
+        // `P8-bg`: present at its widest, per this function's rule — a run
+        // snapshotted mid-hold carries one.
+        current_step: Some(ch::RunStep {
+            phase: text_at(tok),
+            index: u16::MAX,
+            duty_pct: u8::MAX,
+            started_unix_ms: u64::MAX,
+            max_ms: u64::MAX,
+        }),
     }
 }
 
@@ -2348,6 +2357,7 @@ fn control_path_run(detail: &str) -> control_ofc_daemon::api::discovery::Control
         restore_outcome: "restored".into(),
         detail: Some(detail.to_string()),
         completed_unix_ms: Some(2),
+        current_step: None,
     }
 }
 

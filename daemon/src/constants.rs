@@ -435,6 +435,16 @@ pub const DUTY_CORRECTION_ATTEMPTS: u8 = 3;
 /// jitter on a healthy fan would read as a response.
 pub const CHARACTERIZATION_RPM_NOISE_FLOOR: u16 = 50;
 
+/// `PTR-m`: a point's `rpm_verdict` is `changed` when its reading moved by more
+/// than this many of the point's OWN settled standard deviations (never less
+/// than [`CHARACTERIZATION_RPM_NOISE_FLOOR`]). Three, because `before` and
+/// `after` are single readings from two noisy distributions: their difference
+/// has √2 of one reading's spread, so 3σ is ~2.1σ of the difference — a few
+/// per cent of steady points mis-read as moved, against the proportional rule
+/// this replaced, which called a smooth high-RPM device's genuine ~265 rpm step
+/// `unchanged` because it was under a tenth of the reading.
+pub const CHARACTERIZATION_RPM_VERDICT_SIGMA: f64 = 3.0;
+
 /// Minimum absolute RPM spread across the whole sweep before it is called
 /// `responsive`. Paired with a >20% relative test (the same rule
 /// `classify_verify_result` uses) so a slow pump is not a false negative:
@@ -518,10 +528,24 @@ pub const STABILITY_VARIABLE_MAX_CV_PCT: f64 = 10.0;
 /// pins exactly that, because a bound you cannot reach is not a bound (DEC-320).
 pub const STABILITY_OUTLIER_MODIFIED_Z: f64 = 3.5;
 
-/// `§5` settling criterion: reported RPM must stay within this band of the
-/// rolling median for [`SETTLING_HOLD_SAMPLES`] consecutive samples.
+/// `§5` settling criterion: [`SETTLING_HOLD_SAMPLES`] consecutive tach-register
+/// UPDATES (DEC-405, not samples) must sit within this band of their median, and
+/// must not be a ramp ([`SETTLING_TREND_PCT`], DEC-411). See
+/// `api::stats::settling_ms`.
 pub const SETTLING_BAND_PCT: f64 = 5.0;
 pub const SETTLING_HOLD_SAMPLES: usize = 4;
+
+/// `PTR-q`: the trend term of the settling criterion. A window of
+/// [`SETTLING_HOLD_SAMPLES`] updates that moves the SAME way at every step, by
+/// more than this share of its median end to end, is a ramp still in progress —
+/// not a settle — however tightly it sits inside [`SETTLING_BAND_PCT`].
+///
+/// Half the band, because the band alone is what let the ramp through: a
+/// τ = 20 s pump falls ~110 rpm across four 2 s refreshes at ~2400 rpm, inside
+/// the 120 rpm band, and "settled" while still moving. A settled tach jitters,
+/// so its consecutive updates change direction; three same-sign steps whose net
+/// drift also clears 2.5 % of the median are a slope, not jitter.
+pub const SETTLING_TREND_PCT: f64 = SETTLING_BAND_PCT / 2.0;
 
 /// `§2` hysteresis: the rising/falling gap at a shared duty, as a percentage of
 /// the sweep's observed RPM span, below which the difference is reported as

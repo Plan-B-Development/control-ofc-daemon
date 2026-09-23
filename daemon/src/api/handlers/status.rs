@@ -357,6 +357,9 @@ pub async fn capabilities_handler(
             // future STOP_TIMEOUT above 255 s into a tiny advertised value.
             openfan_stop_timeout_s: u8::try_from(crate::constants::STOP_TIMEOUT.as_secs())
                 .unwrap_or(u8::MAX),
+            // The constant every diagnostic's thermal gate compares against,
+            // never a literal (`PTA-i`).
+            diagnostic_max_temp_c: crate::constants::CALIBRATION_MAX_TEMP_C,
         },
         // Control-execution capability (DEC-159/160). 1.20.0 delivered daemon-
         // owned profile storage; 1.21.0 added the manual-override (DEC-163) and

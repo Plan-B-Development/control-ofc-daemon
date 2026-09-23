@@ -1895,6 +1895,129 @@ mod tests {
         );
     }
 
+    /// `PTR-n`: every run-derived finding is reported PER MEMBER. They used to
+    /// `return` on the first run found, so a session sweeping two members
+    /// reported the first one's verdict and said nothing about the second.
+    ///
+    /// Asserts a RELATIONSHIP: a member's finding in the mixed session equals
+    /// the finding a session holding ONLY that member's evidence produces — a
+    /// reference the pre-fix code also computed correctly. Plus the
+    /// precondition that the members' verdicts genuinely differ, or "each
+    /// matches its solo session" could be two identical findings agreeing.
+    #[test]
+    fn every_run_derived_finding_is_reported_for_each_member() {
+        use crate::validation::session::*;
+        let sweep = |rpms: [u16; 3]| {
+            let mut r = run("char-m", ch::STATE_COMPLETE);
+            r.points = [30u8, 60, 100]
+                .iter()
+                .zip(rpms)
+                .enumerate()
+                .map(|(i, (&pct, rpm))| ch::CharPoint {
+                    requested_pct: pct,
+                    command_accepted: true,
+                    readback_pct: Some(pct),
+                    pwm_enable: Some(1),
+                    rpm_before: Some(if i == 0 { rpm } else { rpms[i - 1] }),
+                    rpm_after: Some(rpm),
+                    first_change_ms: (i > 0 && rpms[i - 1] != rpm).then_some(1500),
+                    readback_verdict: "match".into(),
+                    step_index: i as u16,
+                    direction: "rising".into(),
+                    ..Default::default()
+                })
+                .collect();
+            r.summary = Some(ch::summarise(&r.points, &[], None));
+            r
+        };
+        let evidence =
+            |member: &str, kind: &str, char_run: Option<ch::CharacterizationRun>| EvidenceRef {
+                kind: kind.to_string(),
+                member_id: member.into(),
+                run_id: Some("r".into()),
+                started_unix_ms: 1,
+                completed_unix_ms: Some(2),
+                outcome: RESULT_OBSERVED.to_string(),
+                detail: None,
+                verify: (kind == DIAG_VERIFY).then(|| VerifyEvidence {
+                    header_id: member.into(),
+                    write_ok: true,
+                    readback_pct: Some(60),
+                    requested_pct: Some(60),
+                    rpm_before: Some(900),
+                    rpm_after: Some(1400),
+                    detail: None,
+                    result: Some("effective".into()),
+                    restore_failed: false,
+                }),
+                characterization: char_run,
+                control_path: None,
+            };
+        let (pump, fan, verified) = ("hwmon:a:pwm1:PUMP", "hwmon:a:pwm2:FAN", "hwmon:a:pwm3:FAN");
+        // The pump responds across the sweep; the fan never moves.
+        let pump_ev = evidence(pump, DIAG_CHARACTERIZATION, Some(sweep([900, 1500, 2100])));
+        let fan_ev = evidence(fan, DIAG_BEHAVIOUR, Some(sweep([1200, 1200, 1200])));
+        let verify_ev = evidence(verified, DIAG_VERIFY, None);
+        let findings = |ev: Vec<EvidenceRef>| {
+            let mut session = finalised_session();
+            session.evidence = ev;
+            crate::validation::summary::summarise(&session)
+        };
+        let mixed = findings(vec![pump_ev.clone(), fan_ev.clone(), verify_ev.clone()]);
+        let solo_pump = findings(vec![pump_ev]);
+        let solo_fan = findings(vec![fan_ev]);
+        let solo_verified = findings(vec![verify_ev]);
+        let for_member = |fs: &[ValidationFinding], id: &str, m: &str| -> Vec<ValidationFinding> {
+            fs.iter()
+                .filter(|f| f.id == id && f.member_id.as_deref() == Some(m))
+                .cloned()
+                .collect()
+        };
+
+        let swept_ids = [
+            F_PWM_HEADER_CONTROL,
+            F_PWM_READBACK,
+            F_PWM_RESPONSE,
+            F_RESPONSE_LATENCY,
+            F_HYSTERESIS,
+            F_RPM_STABILITY,
+            F_EFFECTIVE_RANGE,
+            F_LEARNED_RANGE,
+            F_DEVICE_OVERRIDE,
+        ];
+        let mut differs = false;
+        for id in swept_ids {
+            let p = for_member(&mixed, id, pump);
+            let f = for_member(&mixed, id, fan);
+            assert_eq!(
+                p.len(),
+                1,
+                "{id}: exactly one finding for the pump: {mixed:#?}"
+            );
+            assert_eq!(
+                f.len(),
+                1,
+                "{id}: exactly one finding for the fan: {mixed:#?}"
+            );
+            assert_eq!(p, for_member(&solo_pump, id, pump), "{id} (pump)");
+            assert_eq!(f, for_member(&solo_fan, id, fan), "{id} (fan)");
+            differs |= p[0].state != f[0].state;
+        }
+        assert!(
+            differs,
+            "precondition: the two members' verdicts must differ somewhere, or the \
+             per-member comparison cannot tell them apart"
+        );
+        // A member no sweep covered falls back to its own verify, not to
+        // nothing and not to another member's sweep.
+        let v = for_member(&mixed, F_PWM_HEADER_CONTROL, verified);
+        assert_eq!(
+            v,
+            for_member(&solo_verified, F_PWM_HEADER_CONTROL, verified)
+        );
+        assert_eq!(v[0].state, RESULT_PASS);
+    }
+
     /// [DEC-334 Q15] The load-bearing half of "behaviour supersedes": if the
     /// findings only looked at `pwm_characterization` evidence, a session that
     /// asked for the richer sweep would report `not_tested` for every basic

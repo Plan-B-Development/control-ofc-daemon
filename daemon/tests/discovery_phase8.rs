@@ -139,6 +139,8 @@ struct Rig {
     /// engages is first seen by the NEXT gate site. A duty-keyed trip cannot
     /// target the baseline window once a settle-wait precedes it.
     at_keepalive: Option<(usize, AtKeepalive)>,
+    /// `P8-bg`: every phase the run announced, in order.
+    steps: Arc<Mutex<Vec<control_ofc_daemon::api::characterization::RunStep>>>,
 }
 
 /// What [`Rig::at_keepalive`] does.
@@ -158,6 +160,7 @@ impl Rig {
             keepalives: Arc::new(AtomicUsize::new(0)),
             keepalive_fails_at: None,
             at_keepalive: None,
+            steps: Arc::default(),
         }
     }
     fn keepalive_count(&self) -> usize {
@@ -327,6 +330,10 @@ async fn sweep(
         keepalive,
         report,
         |_| {},
+        {
+            let steps = rig.steps.clone();
+            move |st| steps.lock().unwrap().push(st)
+        },
     )
     .await
 }
@@ -952,6 +959,64 @@ async fn a_healthy_run_is_not_refused_and_writes_both_duties_every_cycle() {
         "the perturbed duty must be written once per cycle"
     );
     assert_eq!(report.get(), RestoreOutcome::Restored);
+}
+
+/// `P8-bg`: discovery announces every window it holds — a settle-wait wherever
+/// the baseline write moved the duty (cycle 1 only when the header started off
+/// its baseline; every later cycle), then the baseline, then the perturbed
+/// window — each naming its cycle and the duty being held. Derived from the
+/// run's own inputs, and cross-checked against what it published.
+#[tokio::test]
+async fn every_window_is_announced_with_its_cycle_and_duty() {
+    let rig = Rig::new(60);
+    let cache = Arc::new(cache_at(40.0, Some("normal")));
+    let chans = channels(&[("pump", true)]);
+    let report = RestoreReport::new();
+    let cancel = AtomicBool::new(false);
+    let (baseline, perturbed, cycles) = (45u8, 20u8, 2u8);
+    let outcome = sweep(
+        &rig,
+        &cache,
+        &chans,
+        baseline,
+        perturbed,
+        cycles,
+        0,
+        false,
+        |_, duty| Some(u16::from(duty) * 20),
+        None,
+        None,
+        &cancel,
+        &report,
+    )
+    .await;
+    assert_eq!(outcome.state, disc::STATE_COMPLETE, "{:?}", outcome.detail);
+
+    // Precondition: the header started off its baseline, so cycle 1 waits too.
+    assert_ne!(60, baseline);
+    let mut expected: Vec<(&str, u16, u8)> = Vec::new();
+    for cycle in 1..=u16::from(cycles) {
+        expected.push((disc::STEP_PHASE_SETTLE_WAIT, cycle, baseline));
+        expected.push((disc::STEP_PHASE_BASELINE, cycle, baseline));
+        expected.push((disc::STEP_PHASE_PERTURBED, cycle, perturbed));
+    }
+    let steps = rig.steps.lock().unwrap().clone();
+    let got: Vec<(&str, u16, u8)> = steps
+        .iter()
+        .map(|s| (s.phase.as_str(), s.index, s.duty_pct))
+        .collect();
+    assert_eq!(got, expected);
+    // The announced cycle numbering is the published one.
+    let published: Vec<u16> = outcome.cycles.iter().map(|c| u16::from(c.cycle)).collect();
+    let announced: Vec<u16> = steps
+        .iter()
+        .filter(|s| s.phase == disc::STEP_PHASE_PERTURBED)
+        .map(|s| s.index)
+        .collect();
+    assert_eq!(announced, published);
+    for s in &steps {
+        assert!(s.max_ms > 0 && s.started_unix_ms > 0, "{s:?}");
+    }
 }
 
 /// The ladder forcing at ENTRY refuses before writing anything, and the guard
@@ -1773,6 +1838,7 @@ fn a_run_round_trips_through_json_with_its_confidence_intact() {
         restore_outcome: "restored".into(),
         detail: None,
         completed_unix_ms: Some(1_700_000_000_000),
+        current_step: None,
     };
     let json = serde_json::to_string(&run).expect("serialise");
     let back: disc::ControlPathRun = serde_json::from_str(&json).expect("deserialise");
@@ -3213,6 +3279,7 @@ async fn discover_pump_with(
         || true,
         &report,
         |_| {},
+        |_| {},
     )
     .await;
     assert_eq!(outcome.state, disc::STATE_COMPLETE, "{:?}", outcome.detail);
@@ -3293,11 +3360,53 @@ async fn a_slow_pump_is_confirmed_because_its_later_baseline_settles_first() {
 async fn a_moved_cycle_one_baseline_waits_through_a_register_that_has_not_refreshed() {
     let (outcome, summary) = discover_slow_pump(10).await;
     assert_both_cycles_respond_on_settled_floors(&outcome, &summary);
-    assert_eq!(outcome.cycles[0].baseline_settled, Some(true));
+    assert!(
+        outcome.cycles[0].baseline_settled.is_some(),
+        "cycle 1 was moved to its baseline, so it waited"
+    );
     assert!(
         outcome.cycles[0].settle_wait_ms >= SlowPump::REFRESH_MS,
         "the wait ended before the register had refreshed once"
     );
+}
+
+/// `PTR-q` through discovery's online settle-wait. The same 10 % → 40 % move is
+/// 600 rpm on a τ = 4.8 s pump: at 6 s it is still ~170 rpm short of its
+/// target and climbing every refresh, yet four of those rising updates fit the
+/// 5 % band — so the band-only rule released the wait there and measured the
+/// baseline on the ramp. With the trend term the wait holds until the climb has
+/// flattened into jitter, or runs to its bound and says it did not settle.
+#[tokio::test(start_paused = true)]
+async fn a_rising_baseline_is_not_released_while_it_is_still_climbing() {
+    let (outcome, _summary) = discover_slow_pump(10).await;
+    let c1 = &outcome.cycles[0];
+    // When does the climb stop being a slope? Its remaining distance,
+    // 600 rpm × e^(-t/τ), falls under the trend term's share of the target only
+    // at t = τ·ln(600 / that share) — about 11.9 s for this pump.
+    let target = SlowPump::target(40);
+    let moved = target - SlowPump::target(10);
+    let trend_rpm = target * constants::SETTLING_TREND_PCT / 100.0;
+    let flat_from_ms = (SlowPump::TAU_S * (moved / trend_rpm).ln() * 1000.0) as u64;
+    // A settle is a window of `SETTLING_HOLD_SAMPLES` updates, so the earliest
+    // honest one is confirmed `hold - 1` refreshes after the climb flattens.
+    let earliest_honest_ms =
+        flat_from_ms + (constants::SETTLING_HOLD_SAMPLES as u64 - 1) * SlowPump::REFRESH_MS;
+    let bound_ms = constants::DISCOVERY_SETTLE_WAIT_MAX.as_millis() as u64;
+    assert!(
+        earliest_honest_ms > bound_ms,
+        "precondition: this pump cannot honestly settle inside the wait \
+         ({earliest_honest_ms} ms needed, {bound_ms} ms allowed)"
+    );
+    // So the only truthful answer is "did not settle". The band-only rule said
+    // `Some(true)` here, released at 12 s on a window that opened at 6 s with
+    // the pump ~170 rpm short of its target.
+    assert_eq!(
+        c1.baseline_settled,
+        Some(false),
+        "cycle 1's wait released at {} ms while the pump was still climbing",
+        c1.settle_wait_ms
+    );
+    assert_eq!(c1.settle_wait_ms, bound_ms, "it ran to its bound");
 }
 
 /// The fallback. A hunting pump (± 150 rpm on alternate refreshes, beyond the

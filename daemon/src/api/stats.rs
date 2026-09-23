@@ -267,7 +267,9 @@ fn median_of_sorted(sorted: &[u16]) -> u16 {
 ///
 /// - a point settles at the first of [`constants::SETTLING_HOLD_SAMPLES`]
 ///   consecutive **updates** that all sit within [`constants::SETTLING_BAND_PCT`]
-///   of their median;
+///   of their median **and are not a ramp** — a window whose every step moves
+///   the same way, by more than [`constants::SETTLING_TREND_PCT`] of the median
+///   end to end, is still moving (`PTR-q`);
 /// - a point can never settle before its first update. `reference` is the
 ///   reading taken before the write; a first sample equal to it is not an
 ///   update. With no reference the first usable sample is the reference;
@@ -329,11 +331,40 @@ pub fn settled_on_updates(samples: &[RpmSample], reference: Option<u16>) -> Opti
         if window
             .iter()
             .all(|&(_, v)| (f64::from(v) - med).abs() <= band)
+            && !is_ramp(window, med)
         {
             return Some(window[0].0);
         }
     }
     None
+}
+
+/// `PTR-q`: does this window of updates move one way throughout, far enough
+/// end to end to be a slope rather than jitter?
+///
+/// The band test alone cannot see this. A slow ramp's four updates can all sit
+/// inside 5 % of their median while every one of them is lower than the last —
+/// the 2026-09-08 τ = 20 s pump did exactly that, "settled" still moving, and
+/// discovery then measured a ~110 rpm noise floor where a settled one reads ~60.
+/// Consecutive updates always differ (that is what makes them updates), so the
+/// sign of each step is defined; a settled tach's steps change sign, a ramp's
+/// do not. The magnitude term keeps three same-sign quantisation steps on a
+/// steady fan — a one-in-four coincidence at this window length — from reading
+/// as a ramp.
+fn is_ramp(window: &[(u64, u16)], median: f64) -> bool {
+    let steps: Vec<i32> = window
+        .windows(2)
+        .map(|w| i32::from(w[1].1) - i32::from(w[0].1))
+        .collect();
+    let one_way = steps.iter().all(|&d| d > 0) || steps.iter().all(|&d| d < 0);
+    if !one_way {
+        return false;
+    }
+    let (Some(first), Some(last)) = (window.first(), window.last()) else {
+        return false;
+    };
+    let drift = f64::from(first.1.abs_diff(last.1));
+    drift > median * constants::SETTLING_TREND_PCT / 100.0
 }
 
 /// The readings at which the value changed, in order. The first usable reading
@@ -1269,6 +1300,52 @@ mod tests {
             .map(|i| s(i as u64 * 500, if i % 2 == 0 { 500 } else { 3000 }))
             .collect();
         assert_eq!(settling_ms(&v, None), None);
+    }
+
+    /// `PTR-q`, the case the band alone let through. A τ ≈ 20 s pump falling
+    /// ~110 rpm across four 2 s refreshes at ~2400 rpm: every update sits inside
+    /// 5 % of the window's median (120 rpm), and every step is downward.
+    #[test]
+    fn a_slow_ramp_inside_the_band_is_not_settled() {
+        let ramp = [2400, 2362, 2327, 2300, 2272, 2250];
+        let v = refreshing(&ramp, 2000, 12_000);
+        // Precondition: the old band-only rule WOULD have settled this, at the
+        // first update — so a None below is the trend term, not the band.
+        let window = &ramp[1..=constants::SETTLING_HOLD_SAMPLES];
+        let mut sorted = window.to_vec();
+        sorted.sort_unstable();
+        let med = f64::from(median_of_sorted(&sorted));
+        let band = med * constants::SETTLING_BAND_PCT / 100.0;
+        assert!(
+            window.iter().all(|&x| (f64::from(x) - med).abs() <= band),
+            "precondition: the ramp's first window sits inside the band"
+        );
+        assert_eq!(settling_ms(&v, Some(2400)), None);
+    }
+
+    /// The same ramp, finishing into ordinary jitter, settles — at the first
+    /// window whose steps change direction, not at the ramp's start.
+    #[test]
+    fn a_ramp_that_levels_off_settles_where_the_jitter_begins() {
+        let trace = [2400, 2362, 2327, 2300, 2290, 2296, 2291, 2295, 2292];
+        let v = refreshing(&trace, 2000, 18_000);
+        let settled = settling_ms(&v, Some(2400)).expect("the tail is jitter");
+        assert!(
+            settled > 2000,
+            "settled at {settled} ms, on the ramp's first update — the trend \
+             term did not fire"
+        );
+        // Windows: [2362,2327,2300,2290] ramps; [2327,2300,2290,2296] turns.
+        assert_eq!(settled, 4000);
+    }
+
+    /// Three same-sign quantisation steps on a steady fan are not a ramp: the
+    /// drift has to clear `SETTLING_TREND_PCT` of the median as well.
+    #[test]
+    fn a_tiny_one_way_drift_on_a_steady_fan_still_settles() {
+        let trace = [1500, 2400, 2401, 2403, 2405];
+        let v = refreshing(&trace, 2000, 10_000);
+        assert_eq!(settling_ms(&v, Some(1500)), Some(2000));
     }
 
     #[test]

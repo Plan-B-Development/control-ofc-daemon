@@ -388,6 +388,49 @@ pub struct CharSummary {
     pub interpretation_states: Vec<String>,
 }
 
+/// What a running diagnostic is doing **right now** (`P8-bg`, daemon >= 2.55.0).
+///
+/// Shared by [`CharacterizationRun`] and
+/// [`ControlPathRun`](crate::api::discovery::ControlPathRun). Both publish a
+/// result only when a hold ENDS — a point after its settle and any dwell, a
+/// cycle after two windows — so without this a healthy run was silent for up
+/// to 26 s at a time, and indistinguishable from a wedged one. It changes at
+/// every phase boundary, and is `None` before the first write and once the run
+/// is terminal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RunStep {
+    /// Characterisation: `settle` | `dwell`. Discovery: `settle_wait` |
+    /// `baseline` | `perturbed`. An opaque token: render an unrecognised one,
+    /// never drop it (273-i).
+    pub phase: String,
+    /// Characterisation: the 0-based `step_index` the held point will carry.
+    /// Discovery: the 1-based cycle, as `DiscoveryCycle::cycle` numbers it.
+    pub index: u16,
+    /// The duty being held during this phase.
+    pub duty_pct: u8,
+    /// When this phase began, on the wall clock `completed_unix_ms` uses — so a
+    /// client on the same host can show how long it has been held.
+    pub started_unix_ms: u64,
+    /// The phase's upper bound. A phase can end sooner (a settle-wait that
+    /// settles, a cancel, an abort) but never later, save I/O overhead.
+    pub max_ms: u64,
+}
+
+impl RunStep {
+    pub fn now(phase: &str, index: u16, duty_pct: u8, max: Duration) -> Self {
+        Self {
+            phase: phase.to_string(),
+            index,
+            duty_pct,
+            started_unix_ms: crate::control_paths::unix_ms(),
+            max_ms: max.as_millis() as u64,
+        }
+    }
+}
+
+pub const STEP_PHASE_SETTLE: &str = "settle";
+pub const STEP_PHASE_DWELL: &str = "dwell";
+
 /// A characterisation run, and the body of `GET /diagnostics/characterization`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct CharacterizationRun {
@@ -439,6 +482,11 @@ pub struct CharacterizationRun {
     /// token. A **sidecar**, so the export needs no per-field wrapping and the
     /// fields whose provenance never varies stay bare on the wire.
     pub provenance: BTreeMap<String, String>,
+    /// `P8-bg`: the phase being held right now. `None` before the first write
+    /// and once terminal. `serde(default)` so a run persisted by an older
+    /// daemon inside a validation session still loads.
+    #[serde(default)]
+    pub current_step: Option<RunStep>,
 }
 
 impl CharacterizationRun {
@@ -791,16 +839,50 @@ fn readback_verdict(requested_pct: u8, readback_pct: Option<u8>, pwm_enable: Opt
     }
 }
 
-fn rpm_verdict(before: Option<u16>, after: Option<u16>) -> String {
-    match (before, after) {
-        (Some(b), Some(a)) => {
-            if rpm_moved(b, a) {
-                "changed".into()
-            } else {
-                "unchanged".into()
-            }
+/// Did this point's fan physically respond? `changed` | `unchanged` |
+/// `unavailable`.
+///
+/// `PTR-m`: judged against the point's own measured noise where it has one —
+/// `stddev_rpm` over a window that SETTLED — rather than the proportional
+/// `before / 10` of [`rpm_moved`]. The proportional rule scales with the
+/// reading, not with the tach's spread, so a smooth high-RPM device's genuine
+/// ~265 rpm steps read `unchanged` while the sweep-level `rpm_response` passed.
+///
+/// Falls back to [`rpm_moved`] when no trustworthy settled spread exists: a
+/// point that did not settle computed its σ over its own step transient, and
+/// using that would grade the step by itself — the bigger the response, the
+/// larger the "noise". Too few readings, or none, is no spread at all.
+fn rpm_verdict(
+    before: Option<u16>,
+    after: Option<u16>,
+    stability: Option<&PointStability>,
+) -> String {
+    let (Some(b), Some(a)) = (before, after) else {
+        return "unavailable".into();
+    };
+    use crate::api::stats::{STABILITY_INSUFFICIENT, STABILITY_NOT_SETTLED, STABILITY_UNAVAILABLE};
+    let settled_sigma = stability
+        .filter(|st| {
+            ![
+                STABILITY_NOT_SETTLED,
+                STABILITY_INSUFFICIENT,
+                STABILITY_UNAVAILABLE,
+            ]
+            .contains(&st.verdict.as_str())
+        })
+        .and_then(|st| st.stddev_rpm);
+    let moved = match settled_sigma {
+        Some(sigma) => {
+            let threshold = (sigma * constants::CHARACTERIZATION_RPM_VERDICT_SIGMA)
+                .max(f64::from(constants::CHARACTERIZATION_RPM_NOISE_FLOOR));
+            f64::from(b.abs_diff(a)) > threshold
         }
-        _ => "unavailable".into(),
+        None => rpm_moved(b, a),
+    };
+    if moved {
+        "changed".into()
+    } else {
+        "unchanged".into()
     }
 }
 
@@ -1344,7 +1426,7 @@ pub struct SweepOutcome {
 /// (→ `failed`), `pwm_enable != 1` (→ `aborted`, reclaim), a sensor over the
 /// calibrate/verify limit or the ladder forcing (→ `aborted`).
 #[allow(clippy::too_many_arguments)]
-pub async fn run_sweep<W, R, P, S, K>(
+pub async fn run_sweep<W, R, P, A, S, K>(
     cache: &StateCache,
     header_id: &str,
     plan: &[SweepStep],
@@ -1365,11 +1447,16 @@ pub async fn run_sweep<W, R, P, S, K>(
     keepalive: K,
     report: &RestoreReport,
     mut publish: P,
+    // `P8-bg`: told the phase at every boundary — each step's settle, then its
+    // dwell when it has one. Separate from `publish`, which fires only when a
+    // hold completes and is therefore exactly the silence this exists to fill.
+    mut announce: A,
 ) -> SweepOutcome
 where
     W: Fn(u8) -> Result<(), String>,
     R: Fn() -> HwmonVerifyState,
     P: FnMut(CharPoint),
+    A: FnMut(RunStep),
     S: Fn() -> bool,
     K: Fn() -> bool,
 {
@@ -1502,6 +1589,8 @@ where
         let hold = settle + dwell;
         let renew_every = Duration::from_secs(constants::STABILITY_RENEW_INTERVAL_S);
         let started = tokio::time::Instant::now();
+        announce(RunStep::now(STEP_PHASE_SETTLE, idx as u16, pct, settle));
+        let mut dwell_announced = dwell.is_zero();
         let mut first_change_ms: Option<u64> = None;
         let mut samples: Vec<crate::api::stats::RpmSample> = Vec::new();
         let mut last_renew = tokio::time::Instant::now();
@@ -1604,6 +1693,15 @@ where
                     points: measured,
                 };
             }
+            if !dwell_announced && started.elapsed() >= settle {
+                dwell_announced = true;
+                announce(RunStep::now(
+                    STEP_PHASE_DWELL,
+                    idx as u16,
+                    pct,
+                    hold.saturating_sub(started.elapsed()),
+                ));
+            }
             let at_ms = started.elapsed().as_millis() as u64;
             let sampled = read_fn().rpm;
             samples.push(crate::api::stats::RpmSample {
@@ -1625,6 +1723,7 @@ where
         // The pre-write reading is the reference: a first sample still showing
         // it is the register not having refreshed yet, never a settle.
         let settled_ms = crate::api::stats::settling_ms(&samples, rpm_before);
+        let stability = point_stability(&samples, dwell, settled_ms);
         let point = CharPoint {
             requested_pct: pct,
             command_accepted,
@@ -1636,11 +1735,11 @@ where
             settle_ms: started.elapsed().as_millis() as u64,
             first_change_ms,
             readback_verdict: readback_verdict(pct, after.pwm_percent, after.pwm_enable),
-            rpm_verdict: rpm_verdict(rpm_before, after.rpm),
+            rpm_verdict: rpm_verdict(rpm_before, after.rpm, Some(&stability)),
             direction: step.direction.token().into(),
             step_index: idx as u16,
             settled_ms,
-            stability: Some(point_stability(&samples, dwell, settled_ms)),
+            stability: Some(stability),
             estimated_physical_rpm: estimate_physical_rpm(after.rpm, correction),
         };
         // The abort predicate gets the same exemption (DEC-326 / `HOST-a`).
@@ -1826,6 +1925,7 @@ mod tests {
             keepalive,
             report,
             publish,
+            |_| {},
         )
         .await
     }
@@ -1897,9 +1997,71 @@ mod tests {
             settle_ms: 6000,
             first_change_ms: None,
             readback_verdict: readback_verdict(pct, readback, enable),
-            rpm_verdict: rpm_verdict(Some(0), rpm),
+            rpm_verdict: rpm_verdict(Some(0), rpm, None),
             ..Default::default()
         }
+    }
+
+    // ── rpm_verdict (`PTR-m`) ─────────────────────────────────────────
+
+    fn stab(verdict: &str, stddev: Option<f64>) -> PointStability {
+        PointStability {
+            verdict: verdict.into(),
+            stddev_rpm: stddev,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_step_beyond_three_settled_sigmas_is_changed_and_one_inside_is_not() {
+        let quiet = stab(crate::api::stats::STABILITY_STABLE, Some(20.0));
+        // 3σ = 60, above the 50 floor: 61 moved, 60 did not.
+        assert_eq!(rpm_verdict(Some(3000), Some(3061), Some(&quiet)), "changed");
+        assert_eq!(
+            rpm_verdict(Some(3000), Some(3060), Some(&quiet)),
+            "unchanged"
+        );
+        // A noisy point needs a proportionally bigger move.
+        let noisy = stab(crate::api::stats::STABILITY_VARIABLE, Some(100.0));
+        assert_eq!(
+            rpm_verdict(Some(1000), Some(1250), Some(&noisy)),
+            "unchanged"
+        );
+    }
+
+    #[test]
+    fn the_absolute_noise_floor_still_applies_to_a_perfectly_steady_point() {
+        let dead_steady = stab(crate::api::stats::STABILITY_STABLE, Some(0.0));
+        assert_eq!(
+            rpm_verdict(Some(800), Some(850), Some(&dead_steady)),
+            "unchanged"
+        );
+        assert_eq!(
+            rpm_verdict(Some(800), Some(851), Some(&dead_steady)),
+            "changed"
+        );
+    }
+
+    /// A point that never settled has a σ inflated by its own step transient —
+    /// grading the step against that would make a bigger response look like
+    /// bigger noise. It keeps the proportional rule, as do too few readings.
+    #[test]
+    fn an_unsettled_or_thin_point_keeps_the_proportional_rule() {
+        for verdict in [
+            crate::api::stats::STABILITY_NOT_SETTLED,
+            crate::api::stats::STABILITY_INSUFFICIENT,
+            crate::api::stats::STABILITY_UNAVAILABLE,
+        ] {
+            let st = stab(verdict, Some(5.0));
+            // 3σ would say changed; the proportional rule (300) says not.
+            assert_eq!(
+                rpm_verdict(Some(3000), Some(3200), Some(&st)),
+                "unchanged",
+                "{verdict}"
+            );
+        }
+        assert_eq!(rpm_verdict(Some(3000), Some(3200), None), "unchanged");
+        assert_eq!(rpm_verdict(None, Some(3200), None), "unavailable");
     }
 
     // ── resolve_points: the central safety invariant ─────────────────
@@ -3046,6 +3208,7 @@ mod tests {
                 || true,
                 &rig.report,
                 |_| {},
+                |_| {},
             )
             .await
         }
@@ -3269,6 +3432,7 @@ mod tests {
                 },
                 &report,
                 |_| {},
+                |_| {},
             )
             .await;
 
@@ -3363,6 +3527,7 @@ mod tests {
                         }
                     }
                 },
+                |_| {},
             )
             .await;
             assert_eq!(out.state, STATE_CANCELLED);
@@ -3405,6 +3570,7 @@ mod tests {
                 || false,
                 || true,
                 &report,
+                |_| {},
                 |_| {},
             )
             .await;
@@ -3472,6 +3638,7 @@ mod tests {
                 || true,
                 &report,
                 |_| {},
+                |_| {},
             )
             .await;
             assert_eq!(out.state, STATE_CANCELLED);
@@ -3538,6 +3705,7 @@ mod tests {
                 || false,
                 || true,
                 &report,
+                |_| {},
                 |_| {},
             )
             .await;
@@ -3658,6 +3826,7 @@ mod tests {
                 || false,
                 || true,
                 &report,
+                |_| {},
                 |_| {},
             )
             .await;
@@ -3827,6 +3996,7 @@ mod tests {
                 || true,
                 &rig.report,
                 |_| {},
+                |_| {},
             )
             .await
         }
@@ -3906,6 +4076,158 @@ mod tests {
                 summarise(&out.points, &[], Some(1000)).measurement_resolution_ms,
                 Some(1000)
             );
+        }
+
+        /// `P8-bg`: every step announces its settle before the hold, and a
+        /// dwell step announces the dwell once the settle has elapsed — each
+        /// naming the step index and duty the point it becomes will carry.
+        /// Asserted against the plan and the published points, not a list.
+        #[tokio::test(start_paused = true)]
+        async fn every_phase_is_announced_with_the_point_it_becomes() {
+            let rig = Rig::new();
+            let cache = cache_at(40.0, None);
+            let settle = Duration::from_secs(2);
+            let dwell = Duration::from_secs(6);
+            let plan = resolve_sweep_plan(&[30, 60, 100], true, Some(dwell));
+            // Precondition: the plan really has dwell and non-dwell steps.
+            assert!(plan.iter().any(|s| s.dwell.is_some()));
+            assert!(plan.iter().any(|s| s.dwell.is_none()));
+            let writes = rig.writes.clone();
+            let last = Arc::new(Mutex::new(42u8));
+            let last_w = last.clone();
+            let steps: Arc<Mutex<Vec<RunStep>>> = Arc::default();
+            let steps_a = steps.clone();
+            let published: Arc<Mutex<Vec<(u16, u8, usize)>>> = Arc::default();
+            let published_p = published.clone();
+            let out = run_sweep(
+                &cache,
+                "hwmon:test:pwm1",
+                &plan,
+                0,
+                settle,
+                None,
+                move |pct: u8| {
+                    writes.lock().unwrap().push(pct);
+                    *last_w.lock().unwrap() = pct;
+                    Ok(())
+                },
+                move || {
+                    let p = *last.lock().unwrap();
+                    sample(Some(p), Some(1), Some(600 + u16::from(p) * 10))
+                },
+                &rig.cancel,
+                || false,
+                || true,
+                &rig.report,
+                // Record how many phases had been announced when each point
+                // landed, so the order is asserted, not just the contents.
+                move |pt: CharPoint| {
+                    let n = steps_a.lock().unwrap().len();
+                    published_p
+                        .lock()
+                        .unwrap()
+                        .push((pt.step_index, pt.requested_pct, n));
+                },
+                {
+                    let steps = steps.clone();
+                    move |st: RunStep| steps.lock().unwrap().push(st)
+                },
+            )
+            .await;
+            assert_eq!(out.state, STATE_COMPLETE, "{:?}", out.detail);
+            let steps = steps.lock().unwrap().clone();
+
+            let mut expected: Vec<(&str, u16, u8)> = Vec::new();
+            for (idx, step) in plan.iter().enumerate() {
+                expected.push((STEP_PHASE_SETTLE, idx as u16, step.pct));
+                if step.dwell.is_some() {
+                    expected.push((STEP_PHASE_DWELL, idx as u16, step.pct));
+                }
+            }
+            let got: Vec<(&str, u16, u8)> = steps
+                .iter()
+                .map(|s| (s.phase.as_str(), s.index, s.duty_pct))
+                .collect();
+            assert_eq!(got, expected);
+            for s in &steps {
+                let bound = if s.phase == STEP_PHASE_SETTLE {
+                    settle
+                } else {
+                    dwell
+                };
+                assert!(
+                    s.max_ms > 0 && s.max_ms <= bound.as_millis() as u64,
+                    "{s:?} against a bound of {bound:?}"
+                );
+                assert!(s.started_unix_ms > 0);
+            }
+            // Each point lands after its own phases were announced and before
+            // the next step's.
+            for (step_index, pct, announced) in published.lock().unwrap().iter() {
+                let last = &steps[announced - 1];
+                assert_eq!((last.index, last.duty_pct), (*step_index, *pct));
+            }
+        }
+
+        /// `PTR-m` through the real sweep. A smooth high-RPM device — a few rpm
+        /// of jitter at ~2700 — steps 125 rpm per point. The proportional rule
+        /// needed more than a tenth of the reading (~265 rpm here) and called
+        /// every one of those genuine responses `unchanged`; judged against the
+        /// point's own settled spread they are unmistakable.
+        #[tokio::test(start_paused = true)]
+        async fn a_smooth_high_rpm_step_is_changed_against_its_own_noise() {
+            let rig = Rig::new();
+            let cache = cache_at(40.0, None);
+            let writes = rig.writes.clone();
+            let level = Arc::new(Mutex::new(90u8));
+            let level_w = level.clone();
+            let reads = Arc::new(Mutex::new(0u32));
+            let rpm_for = |pct: u8| 2650 + (u16::from(pct) - 90) * 25;
+            let out = run_sweep_uni(
+                &cache,
+                "hwmon:test:pwm1",
+                &[95, 100],
+                0,
+                Duration::from_secs(constants::CHARACTERIZATION_DEFAULT_SETTLE_S),
+                move |pct: u8| {
+                    writes.lock().unwrap().push(pct);
+                    *level_w.lock().unwrap() = pct;
+                    Ok(())
+                },
+                move || {
+                    let mut n = reads.lock().unwrap();
+                    *n += 1;
+                    // Changes direction every read, so it settles at once.
+                    let jitter: i32 = [0, 3, -2, 1][(*n % 4) as usize];
+                    let p = *level.lock().unwrap();
+                    let rpm = (i32::from(rpm_for(p)) + jitter) as u16;
+                    sample(Some(p), Some(1), Some(rpm))
+                },
+                &rig.cancel,
+                || false,
+                || true,
+                &rig.report,
+                |_| {},
+            )
+            .await;
+            assert_eq!(out.state, STATE_COMPLETE, "{:?}", out.detail);
+            assert_eq!(out.points.len(), 2);
+            for p in &out.points {
+                let (before, after) = (p.rpm_before.unwrap(), p.rpm_after.unwrap());
+                // Precondition: the old proportional rule really did call this
+                // step unchanged, so a `changed` below is the new rule's doing.
+                assert!(
+                    !rpm_moved(before, after),
+                    "precondition: {before} -> {after} is under the proportional threshold"
+                );
+                let st = p.stability.as_ref().unwrap();
+                assert_eq!(st.verdict, crate::api::stats::STABILITY_STABLE);
+                assert_eq!(
+                    p.rpm_verdict, "changed",
+                    "{}%: {before} -> {after} rpm against a σ of {:?}",
+                    p.requested_pct, st.stddev_rpm
+                );
+            }
         }
 
         /// A tach that never changes value establishes no cadence: UNKNOWN, not

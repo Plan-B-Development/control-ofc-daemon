@@ -957,6 +957,7 @@ pub async fn hwmon_characterize_handler(
         stability_seconds: dwell.map(|d| d.as_secs()).unwrap_or(0),
         completed_unix_ms: None,
         provenance: ch::provenance_legend(),
+        current_step: None,
     };
     // The cancel flag is cleared and the run installed under ONE lock, and the
     // cancel handler takes the same lock across its check-and-set. Without that
@@ -1048,6 +1049,16 @@ pub async fn hwmon_characterize_handler(
                     }
                 }
             };
+            // `P8-bg`: the phase being held, under the same `run_id` fence and
+            // for the same reason — a superseded run must not describe itself
+            // over the run that replaced it.
+            let announce = |step: ch::RunStep| {
+                if let Some(r) = slot.lock().as_mut() {
+                    if r.run_id == my_run_id && r.state == ch::STATE_RUNNING {
+                        r.current_step = Some(step);
+                    }
+                }
+            };
 
             // §4 / DEC-405: the chip's declared tach cadence outranks the one
             // the holds observe. Read once, before the sweep: it is a chip
@@ -1072,6 +1083,7 @@ pub async fn hwmon_characterize_handler(
                 keepalive,
                 &report,
                 publish,
+                announce,
             )
             .await;
 
@@ -1099,6 +1111,8 @@ pub async fn hwmon_characterize_handler(
                     r.restore_failed = restore.header_left_moved();
                     r.restore_outcome = restore.token().to_string();
                     r.completed_unix_ms = Some(crate::control_paths::unix_ms());
+                    // Nothing is being held any more.
+                    r.current_step = None;
                     terminal = Some(r.clone());
                 }
             }

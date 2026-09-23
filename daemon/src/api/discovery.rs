@@ -57,7 +57,7 @@ use std::time::Duration;
 use crate::api::calibration::{
     check_thermal_safety, stale_temperature_refusal, thermal_force_state,
 };
-use crate::api::characterization::{RestoreOnDrop, RestoreReport};
+use crate::api::characterization::{RestoreOnDrop, RestoreReport, RunStep};
 use crate::api::responses::HwmonVerifyState;
 use crate::constants;
 use crate::health::cache::StateCache;
@@ -244,7 +244,18 @@ pub struct ControlPathRun {
     pub detail: Option<String>,
     /// Wall-clock completion stamp, for §6.3's "Last validated" row.
     pub completed_unix_ms: Option<u64>,
+    /// `P8-bg` (daemon >= 2.55.0): the phase being held right now —
+    /// `settle_wait`, `baseline` or `perturbed` — which cycle, at what duty,
+    /// and for how long at most. A cycle is published only after both of its
+    /// windows, so before this a client saw one intermediate update in a whole
+    /// default run. `None` before the first write and once terminal.
+    #[serde(default)]
+    pub current_step: Option<RunStep>,
 }
+
+pub const STEP_PHASE_SETTLE_WAIT: &str = "settle_wait";
+pub const STEP_PHASE_BASELINE: &str = "baseline";
+pub const STEP_PHASE_PERTURBED: &str = "perturbed";
 
 impl ControlPathRun {
     pub fn is_running(&self) -> bool {
@@ -628,7 +639,7 @@ pub struct DiscoveryOutcome {
 /// down (→ `aborted`), and **a pump-protected header whose tach disappears**
 /// (→ `aborted`).
 #[allow(clippy::too_many_arguments)]
-pub async fn run_discovery<W, R, Fut, P, S, K>(
+pub async fn run_discovery<W, R, Fut, P, A, S, K>(
     cache: &StateCache,
     header_id: &str,
     channels: &[TachChannel],
@@ -658,12 +669,16 @@ pub async fn run_discovery<W, R, Fut, P, S, K>(
     keepalive: K,
     report: &RestoreReport,
     mut publish: P,
+    // `P8-bg`: told the phase at every window boundary. `publish` fires once
+    // per cycle, after both windows, which is the silence this fills.
+    mut announce: A,
 ) -> DiscoveryOutcome
 where
     W: Fn(u8) -> Result<(), String>,
     R: Fn() -> Fut,
     Fut: std::future::Future<Output = DiscoverySample>,
     P: FnMut(DiscoveryCycle),
+    A: FnMut(RunStep),
     S: Fn() -> bool,
     K: Fn() -> bool,
 {
@@ -832,6 +847,12 @@ where
         // below the discovery floor.
         let needs_wait = cycle > 1 || original_pct != Some(baseline_pct);
         let (baseline_settled, settle_wait_ms, channel_settled) = if needs_wait {
+            announce(RunStep::now(
+                STEP_PHASE_SETTLE_WAIT,
+                u16::from(cycle),
+                baseline_pct,
+                settle_wait_max,
+            ));
             let waited = match settle_wait(
                 &read_fn,
                 settle_wait_max,
@@ -891,6 +912,12 @@ where
         } else {
             (None, 0, vec![true; channels.len()])
         };
+        announce(RunStep::now(
+            STEP_PHASE_BASELINE,
+            u16::from(cycle),
+            baseline_pct,
+            window,
+        ));
         let base = match observe(
             &read_fn,
             window,
@@ -969,6 +996,12 @@ where
                 format!("PWM write of {perturbed_pct}% failed: {e}")
             );
         }
+        announce(RunStep::now(
+            STEP_PHASE_PERTURBED,
+            u16::from(cycle),
+            perturbed_pct,
+            window,
+        ));
         let pert = match observe(
             &read_fn,
             window,
