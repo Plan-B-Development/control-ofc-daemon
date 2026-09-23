@@ -57,6 +57,13 @@ cancelled in its first steps left the fan at 0 %. The channel now goes to 100 % 
 calibration that is refused before it starts (too hot, the thermal emergency still active, or
 temperature readings too old) no longer writes anything to the channel, not even a restore.
 
+**A calibration that starts just as a thermal emergency ends keeps its test speeds** (`TS-z`,
+DEC-413). After an emergency, the daemon returns each OpenFan fan that no profile controls to its
+speed from before the emergency. It checked for a running calibration once, before setting up to ten
+channels. A calibration that started partway through could then have a test speed overwritten,
+which corrupted that step's reading. Each channel is now checked before it is written, and the
+channels not yet returned wait until the calibration ends.
+
 **A config reload can no longer undo an exit-minimum change made at the same moment** (`TS-aq`,
 DEC-412). A `SIGHUP` / `systemctl reload` that read the config files just before
 `POST /config/exit-floor` saved a new value could then apply the old one. The file and the running

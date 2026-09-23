@@ -1143,6 +1143,13 @@ fn record_pre_emergency(
 ///
 /// Skipped while the engine write-pause is held: an OpenFan calibration owns
 /// the channels then, and the snapshot is kept for the first tick after it.
+///
+/// The pause is re-checked for every channel while holding the controller lock
+/// (DEC-413, `TS-z`), as `write` does (DEC-191): a calibration can claim it
+/// between two of these writes, and its test writes take the same lock. On a
+/// skip the WHOLE snapshot goes back, not only the channels still to come — the
+/// ones already returned coalesce to no wire write next time, and a second
+/// emergency before then still records their duty from before the first.
 fn give_back_pre_emergency(
     ctrl: &Mutex<crate::serial::controller::FanController>,
     cache: &StateCache,
@@ -1155,18 +1162,37 @@ fn give_back_pre_emergency(
     let Some(duties) = pre_emergency.lock().take() else {
         return Vec::new();
     };
+    // A member is the profile's to drive, and an unknown duty is not guessed:
+    // that channel stays at the forced duty.
+    let returnable = |ch: u8, duty: Option<u8>| duty.filter(|_| !members.contains(&ch));
     let mut results = Vec::new();
-    for (ch, duty) in (0..NUM_CHANNELS).zip(duties) {
-        // A member is the profile's to drive, and an unknown duty is not
-        // guessed: that channel stays at the forced duty.
-        let Some(duty) = duty.filter(|_| !members.contains(&ch)) else {
+    for (ch, duty) in (0..NUM_CHANNELS).zip(duties.iter().copied()) {
+        let Some(duty) = returnable(ch, duty) else {
             continue;
         };
-        let res = ctrl
-            .lock()
+        let mut guard = ctrl.lock();
+        if cache.verify_active() {
+            // Never hold the controller and the snapshot slot together.
+            drop(guard);
+            let pending = (ch..NUM_CHANNELS)
+                .zip(duties[ch as usize..].iter().copied())
+                .filter(|&(c, d)| returnable(c, d).is_some())
+                .count();
+            let mut slot = pre_emergency.lock();
+            if slot.is_none() {
+                *slot = Some(duties);
+            }
+            log::info!(
+                "Thermal emergency over: a hardware diagnostic holds the engine write-pause — \
+                 {pending} channel(s) get their pre-emergency duty back once it ends"
+            );
+            return results;
+        }
+        let res = guard
             .set_pwm(ch, duty)
             .map(|_| ())
             .map_err(|e| e.to_string());
+        drop(guard);
         match &res {
             Ok(()) => log::info!(
                 "Thermal emergency over: OpenFan ch{ch} (no profile controls it) returned \
@@ -4933,6 +4959,121 @@ mod tests {
         assert!(
             written.lock().iter().any(|c| c.starts_with(">02")),
             "writes resume once the pause clears"
+        );
+    }
+
+    /// A serial mock that claims the engine write-pause while one frame is on
+    /// the wire, as a calibration on another thread would between two writes.
+    struct PauseClaimingSerial {
+        written: Arc<Mutex<Vec<String>>>,
+        cache: Arc<StateCache>,
+        claim_on_prefix: &'static str,
+        epoch: Arc<Mutex<Option<u64>>>,
+        /// The channel of the last frame, so the ACK names it (DEC-301's
+        /// `matches_reply` rejects a reply for another channel as a failure).
+        last_channel: String,
+    }
+
+    impl crate::serial::transport::SerialTransport for PauseClaimingSerial {
+        fn write_line(&mut self, data: &str) -> Result<(), crate::error::SerialError> {
+            self.written.lock().push(data.to_string());
+            self.last_channel = data.get(3..5).unwrap_or("00").to_string();
+            if data.starts_with(self.claim_on_prefix) {
+                *self.epoch.lock() = self
+                    .cache
+                    .try_begin_verify(std::time::Duration::from_secs(30));
+            }
+            Ok(())
+        }
+        fn read_line(
+            &mut self,
+            _timeout: std::time::Duration,
+        ) -> Result<String, crate::error::SerialError> {
+            Ok(format!("<02|{}:0000;>", self.last_channel))
+        }
+    }
+
+    #[tokio::test]
+    async fn give_back_rechecks_the_pause_per_channel_and_keeps_the_rest() {
+        // DEC-413 (`TS-z`): the pre-emergency give-back checked the write-pause
+        // once, before a loop of up to ten serial writes, so a calibration that
+        // claimed it partway through had its test duty overwritten by the
+        // channels still to come. The pause is claimed while ch1's frame is on
+        // the wire: ch2 must not be written, and the snapshot must survive so
+        // the first tick after the calibration finishes the job.
+        let written: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let cache = Arc::new(StateCache::new());
+        let epoch = Arc::new(Mutex::new(None));
+        let transport = PauseClaimingSerial {
+            written: written.clone(),
+            cache: cache.clone(),
+            claim_on_prefix: ">0201",
+            epoch: epoch.clone(),
+            last_channel: String::new(),
+        };
+        let ctrl = crate::serial::controller::FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            std::time::Duration::from_millis(100),
+        );
+        let mut be = OpenFanBackend::new(Arc::new(Mutex::new(ctrl)), cache.clone());
+        let mut snapshot = vec![None; NUM_CHANNELS as usize];
+        snapshot[0] = Some(40);
+        snapshot[1] = Some(41);
+        snapshot[2] = Some(42);
+        *be.pre_emergency.lock() = Some(snapshot.clone());
+        let members = ProfileMembers::default();
+
+        be.apply_and_give_back(&[], &members).await;
+
+        let frames = |prefix: &str| {
+            written
+                .lock()
+                .iter()
+                .filter(|f| f.starts_with(prefix))
+                .count()
+        };
+        // Presence first: the give-back ran and reached the claiming write.
+        assert_eq!(frames(">0200"), 1, "ch0 is returned before the claim");
+        assert_eq!(
+            frames(">0201"),
+            1,
+            "ch1's write is the one the claim lands in"
+        );
+        let claimed = epoch.lock().take().expect("the mock claimed the pause");
+        assert_eq!(
+            (be.channel_failure_streak(0), be.channel_failure_streak(1)),
+            (0, 0),
+            "both writes were acknowledged — a failed reply leaves the duty unknown \
+             and would be re-sent, which is not what this test is about"
+        );
+        assert_eq!(
+            frames(">0202"),
+            0,
+            "ch2 was written after a calibration claimed the pause (TS-z)"
+        );
+        assert_eq!(
+            *be.pre_emergency.lock(),
+            Some(snapshot),
+            "a skip puts the whole snapshot back for the next tick"
+        );
+
+        cache.end_verify(claimed);
+        be.apply_and_give_back(&[], &members).await;
+
+        assert_eq!(
+            frames(">0202"),
+            1,
+            "ch2 gets its duty back once the pause ends"
+        );
+        assert_eq!(
+            (frames(">0200"), frames(">0201")),
+            (1, 1),
+            "channels already returned coalesce — no second wire write"
+        );
+        assert!(
+            be.pre_emergency.lock().is_none(),
+            "a completed give-back clears the snapshot"
         );
     }
 
