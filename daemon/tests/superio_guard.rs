@@ -179,3 +179,143 @@ fn superio_guard_board_list_matches_chip_db() {
          list between the GENERATED markers in the guard."
     );
 }
+
+// ── The modprobe.d `install` lines themselves (DEC-414, `PKG-g`) ─────────────
+
+const INSTALLED_GUARD: &str = "/usr/lib/control-ofc/control-ofc-superio-guard";
+
+/// Every `install <module> <command>` line in the shipped drop-in, as kmod
+/// reads it: the module, then the rest of the line verbatim.
+fn install_lines() -> Vec<(String, String)> {
+    let conf =
+        std::fs::read_to_string(repo_root().join("packaging/modprobe.d-control-ofc-superio.conf"))
+            .expect("read the modprobe.d drop-in");
+    conf.lines()
+        .filter_map(|l| l.strip_prefix("install "))
+        .map(|rest| {
+            let (module, cmd) = rest.split_once(' ').expect("install <module> <command>");
+            (module.to_string(), cmd.to_string())
+        })
+        .collect()
+}
+
+/// A unique scratch directory per call, for the same parallel-test reason as
+/// [`decide`].
+fn scratch(tag: &str) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "cofc-install-{tag}-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    dir
+}
+
+/// Run one install command the way kmod does (`sh -c`, `$CMDLINE_OPTS`
+/// substituted), with the guard's installed path pointed at `guard`, and a
+/// `modprobe` on PATH that records any call instead of loading anything.
+fn run_install(
+    cmd: &str,
+    guard: &std::path::Path,
+    dmi: Option<&std::path::Path>,
+) -> (std::process::Output, bool) {
+    let bin = scratch("bin");
+    let marker = bin.join("modprobe-was-called");
+    let fake = bin.join("modprobe");
+    std::fs::write(
+        &fake,
+        format!("#!/bin/sh\necho \"$@\" > '{}'\n", marker.display()),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let cmd = cmd
+        .replace(INSTALLED_GUARD, &guard.display().to_string())
+        .replace("$CMDLINE_OPTS", "");
+    let mut c = Command::new("sh");
+    c.arg("-c")
+        .arg(&cmd)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+    if let Some(dmi) = dmi {
+        c.env("CONTROL_OFC_DMI_DIR", dmi)
+            .env("CONTROL_OFC_GUARD_DRY_RUN", "1");
+    }
+    let out = c.output().expect("run the install command");
+    let called = marker.exists();
+    std::fs::remove_dir_all(&bin).ok();
+    (out, called)
+}
+
+#[test]
+fn both_modules_have_a_guarded_install_line() {
+    // Presence first: the tests below iterate over these lines, and an empty
+    // list would pass them all.
+    let lines = install_lines();
+    let modules: Vec<&str> = lines.iter().map(|(m, _)| m.as_str()).collect();
+    assert_eq!(modules, ["nct6775", "w83627ehf"]);
+    for (module, cmd) in &lines {
+        assert_eq!(
+            cmd.matches(INSTALLED_GUARD).count(),
+            2,
+            "{module}: the line must both check for the guard and exec it, at its \
+             installed path: {cmd}"
+        );
+    }
+}
+
+/// [SAFETY] DEC-414 (`PKG-g`): mkinitcpio's `modconf` copies the drop-in into
+/// every initramfs but not the guard it names. There, the line must load
+/// NOTHING — on an affected ITE board an unguarded load is the very probe the
+/// guard exists to stop — and must say why, and must not fail the boot.
+#[test]
+fn without_the_guard_nothing_is_loaded_and_the_line_says_why() {
+    let missing = scratch("noguard").join("control-ofc-superio-guard");
+    for (module, cmd) in install_lines() {
+        let (out, modprobe_called) = run_install(&cmd, &missing, None);
+        assert!(
+            out.status.success(),
+            "{module}: a missing guard must not fail the initramfs load: {out:?}"
+        );
+        assert!(
+            !modprobe_called,
+            "{module}: the line loaded the module without its guard — that is the \
+             destructive probe on an ITE board"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!("{module} is not loaded in the initramfs")),
+            "{module}: the line must say why nothing was loaded, got: {stderr:?}"
+        );
+    }
+}
+
+/// With the guard present — every real root — the line hands the decision to
+/// the guard, for the module the line names.
+#[test]
+fn with_the_guard_the_line_hands_the_decision_to_it() {
+    for (module, cmd) in install_lines() {
+        for (vendor, board, want) in [
+            (GIGABYTE, "X870E AORUS MASTER", "SUPPRESS"),
+            (
+                "ASUSTeK COMPUTER INC.",
+                "ROG STRIX X670E-E GAMING WIFI",
+                "LOAD",
+            ),
+        ] {
+            let dmi = scratch("dmi");
+            std::fs::write(dmi.join("board_vendor"), vendor).unwrap();
+            std::fs::write(dmi.join("board_name"), board).unwrap();
+            let (out, _) = run_install(&cmd, &guard_path(), Some(&dmi));
+            std::fs::remove_dir_all(&dmi).ok();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                stdout.trim().starts_with(&format!("{want} {module}")),
+                "{module} on {board}: expected {want} from the guard, got {stdout:?} \
+                 (stderr {:?})",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+}

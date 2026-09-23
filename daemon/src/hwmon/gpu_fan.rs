@@ -581,6 +581,104 @@ pub fn reset_legacy_to_auto(hwmon_path: &Path) -> Result<(), HwmonError> {
     Ok(())
 }
 
+// ── Crash backstop for the legacy verify (DEC-414, `TS-aa`) ──────────
+//
+// The legacy GPU verify is the one path that puts a pre-RDNA3 fan in manual
+// mode (`pwm1_enable=1`), and amdgpu is outside the hwmon hand-back ledger by
+// design. So before that write the verify records the fan here, in the
+// line format of the hwmon record (`handback.rs`), and `control-ofc-restore-auto`
+// — `ExecStopPost` — replays it after a crash. Only a GPU the daemon took is
+// named, so a card another tool put in manual mode is never touched.
+
+/// File name of the legacy GPU hand-back record in the unit's runtime directory.
+pub const GPU_RECORD_FILE_NAME: &str = "gpu-handback";
+
+const GPU_RECORD_HEADER: &str = "# control-ofc GPU hand-back record v1";
+
+/// amdgpu's automatic fan mode — what the verify's own restore writes
+/// ([`reset_legacy_to_auto`]), and so what a record gives back when the
+/// original mode could not be read (the user's choice, DEC-414).
+const AMDGPU_PWM_ENABLE_AUTO: u8 = 2;
+
+/// Record a legacy take in `record` BEFORE the `pwm1_enable=1` write: one line
+/// per fan, giving back `original` (or automatic, when it could not be read).
+///
+/// The FIRST take's line is kept, as the hwmon ledger keeps the first original
+/// (`needs_original`): a line still here means an earlier verify's restore
+/// failed, so the fan is in the daemon's manual mode now, and reading it again
+/// would record the daemon's own leftover as the fan's original.
+///
+/// A failure is logged and the verify goes on: the verify still restores the
+/// fan itself on every path it survives — only the crash backstop is lost.
+pub fn note_legacy_take(record: &Path, hwmon_path: &Path, original: Option<u8>) {
+    let enable = hwmon_path.join("pwm1_enable");
+    let pwm = hwmon_path.join("pwm1");
+    let value = original.unwrap_or(AMDGPU_PWM_ENABLE_AUTO);
+    let line = format!("{}\t{}\tmode\t{value}", enable.display(), pwm.display());
+    if line.matches('\t').count() != 3 || line.contains('\n') {
+        return; // a separator in a path could not be parsed back; never replay it wrong
+    }
+    let mut lines = other_gpu_lines(record, &enable);
+    if gpu_record_lines(record).len() != lines.len() {
+        return; // this fan already has a line: its first original stands
+    }
+    lines.push(line);
+    write_gpu_record(record, &lines);
+}
+
+/// Drop `hwmon_path`'s line from `record` once the verify has given the fan back,
+/// removing the file when no line is left.
+pub fn note_legacy_handed_back(record: &Path, hwmon_path: &Path) {
+    let lines = other_gpu_lines(record, &hwmon_path.join("pwm1_enable"));
+    if lines.is_empty() {
+        match std::fs::remove_file(record) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!(
+                "could not remove the GPU hand-back record {}: {e} — ExecStopPost will \
+                 give the fan back its original mode again, which is harmless",
+                record.display()
+            ),
+        }
+    } else {
+        write_gpu_record(record, &lines);
+    }
+}
+
+/// Every line of `record` — each a fan whose take has not been given back.
+fn gpu_record_lines(record: &Path) -> Vec<String> {
+    std::fs::read_to_string(record)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Every record line that is not `enable`'s — other fans' takes a failed restore left.
+fn other_gpu_lines(record: &Path, enable: &Path) -> Vec<String> {
+    let enable = enable.display().to_string();
+    gpu_record_lines(record)
+        .into_iter()
+        .filter(|l| l.split('\t').next() != Some(enable.as_str()))
+        .collect()
+}
+
+fn write_gpu_record(record: &Path, lines: &[String]) {
+    let mut body = format!("{GPU_RECORD_HEADER}\n");
+    for l in lines {
+        body.push_str(l);
+        body.push('\n');
+    }
+    if let Err(e) = crate::hwmon::handback::write_replacing(record, &body) {
+        log::warn!(
+            "could not write the GPU hand-back record {}: {e} — if the daemon crashes \
+             during this verify, ExecStopPost cannot take the GPU fan out of manual mode",
+            record.display()
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -989,6 +1087,73 @@ ZERO_RPM_ENABLE: 0 1
     fn set_legacy_pwm_missing_path_returns_error() {
         let result = set_legacy_pwm(Path::new("/nonexistent/hwmon99"), 50);
         assert!(result.is_err());
+    }
+
+    // ── DEC-414 (`TS-aa`): the legacy verify's crash record ──
+
+    fn record_lines(record: &Path) -> Vec<String> {
+        gpu_record_lines(record)
+    }
+
+    #[test]
+    fn a_take_records_the_original_mode_and_a_hand_back_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join(GPU_RECORD_FILE_NAME);
+        let card = dir.path().join("hwmon3");
+        note_legacy_take(&record, &card, Some(2));
+        assert_eq!(
+            record_lines(&record),
+            vec![format!(
+                "{}\t{}\tmode\t2",
+                card.join("pwm1_enable").display(),
+                card.join("pwm1").display()
+            )]
+        );
+        note_legacy_handed_back(&record, &card);
+        assert!(!record.exists(), "the last line going removes the file");
+    }
+
+    #[test]
+    fn an_unreadable_original_is_given_back_as_automatic() {
+        // The user's choice (DEC-414): amdgpu's automatic mode, which is what
+        // the verify's own restore writes.
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join(GPU_RECORD_FILE_NAME);
+        note_legacy_take(&record, &dir.path().join("hwmon3"), None);
+        let lines = record_lines(&record);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].ends_with("\tmode\t2"), "{lines:?}");
+    }
+
+    #[test]
+    fn the_first_take_of_a_card_keeps_its_original_mode() {
+        // A line still present means an earlier verify's restore failed, so the
+        // card is in the daemon's manual mode; the next verify reads that `1`,
+        // and must not record it as the card's original.
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join(GPU_RECORD_FILE_NAME);
+        let card = dir.path().join("hwmon3");
+        note_legacy_take(&record, &card, Some(2));
+        note_legacy_take(&record, &card, Some(1));
+        let lines = record_lines(&record);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].ends_with("\tmode\t2"),
+            "the first original stands: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_hand_back_leaves_other_cards_lines_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join(GPU_RECORD_FILE_NAME);
+        let (a, b) = (dir.path().join("hwmon3"), dir.path().join("hwmon4"));
+        note_legacy_take(&record, &a, Some(2));
+        note_legacy_take(&record, &b, Some(2));
+        note_legacy_handed_back(&record, &a);
+        let lines = record_lines(&record);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with(&b.join("pwm1_enable").display().to_string()));
     }
 
     #[test]

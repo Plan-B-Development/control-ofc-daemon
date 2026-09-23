@@ -47,6 +47,23 @@ use crate::hwmon::pwm_discovery::PwmHeaderDescriptor;
 /// File name of the record inside the unit's runtime directory.
 pub const RECORD_FILE_NAME: &str = "hwmon-handback";
 
+/// The unit's runtime directory: `$RUNTIME_DIRECTORY`, which systemd sets for
+/// `RuntimeDirectory=control-ofc`, or the same literal for a daemon run by hand.
+///
+/// Both hand-back records live here — this one and the legacy GPU verify's
+/// (`gpu_fan::GPU_RECORD_FILE_NAME`, DEC-414) — because `control-ofc-restore-auto`
+/// reads both from the same place.
+pub fn runtime_dir() -> PathBuf {
+    std::env::var_os("RUNTIME_DIRECTORY")
+        .and_then(|v| {
+            // systemd separates several directories with ':'; this unit has one.
+            v.to_str()
+                .and_then(|s| s.split(':').next())
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(|| PathBuf::from("/run/control-ofc"))
+}
+
 /// First line of every record. `control-ofc-restore-auto` skips `#` lines.
 const RECORD_HEADER: &str =
     "# control-ofc hwmon hand-back record v1: headers the daemon has taken \
@@ -510,7 +527,7 @@ fn render_record(entries: &HashMap<String, Entry>) -> String {
 
 /// Replace `path` in one step, so `ExecStopPost` can never read half a record.
 /// No `fsync`: the record lives on tmpfs and only has to outlive this process.
-fn write_replacing(path: &Path, body: &str) -> std::io::Result<()> {
+pub(crate) fn write_replacing(path: &Path, body: &str) -> std::io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);

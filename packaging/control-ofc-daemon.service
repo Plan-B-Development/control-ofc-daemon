@@ -168,7 +168,8 @@ RestartMaxDelaySec=60
 # ExecStopPost=control-ofc-restore-auto does and does NOT cover: the script
 # replays the daemon's hand-back record — each hwmon header the daemon holds goes
 # back to what it was doing before the daemon took it (DEC-382), and nothing else
-# is touched — and resets GPU `fan_curve`. OpenFan channels are USB-serial, out of
+# is touched — replays the legacy GPU verify's record (DEC-414), and resets GPU
+# `fan_curve`. OpenFan channels are USB-serial, out of
 # its reach, and have no firmware-auto to fall back to: a clean stop leaves them at
 # the exit floor first (DEC-388), but after a crash or SIGKILL they stay latched
 # at the last commanded duty until a daemon owns them again. Fans hold, never

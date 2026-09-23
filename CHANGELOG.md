@@ -57,6 +57,24 @@ cancelled in its first steps left the fan at 0 %. The channel now goes to 100 % 
 calibration that is refused before it starts (too hot, the thermal emergency still active, or
 temperature readings too old) no longer writes anything to the channel, not even a restore.
 
+**A crash during a GPU verify no longer leaves an older AMD card's fan stuck in manual mode**
+(`TS-aa`, DEC-414). On an RX 6000 or older card, the hardware verify puts the fan in manual mode
+at a test speed and restores it when done. If the daemon died in between, nothing gave the card
+back. The service's stop script used to reset every fan header, which covered this, until DEC-382
+limited it to headers the daemon had recorded. The verify now records the card's original fan mode
+before its test and removes that record when it restores the card. The stop script gives back any
+card still recorded. A card the daemon did not test, including one another tool controls, is not
+touched.
+
+**A Super-I/O module in the initramfs no longer fails to load with a missing-file error**
+(`PKG-g`, DEC-414). mkinitcpio copies the package's modprobe guard rule into the initramfs, but not
+the guard program it runs. So `nct6775` or `w83627ehf` in `MODULES=` failed there with a "not
+found" error on every board. The rule now checks for the guard first. Without it, nothing is loaded
+or probed in the initramfs, and a message explains why. The package's `modules-load.d` file then
+loads the module after boot, where the guard can check the board. The check needs a shell in the
+initramfs, which mkinitcpio's `base` hook provides. An image built without `base` fails the load
+as before, still without probing.
+
 **A calibration that starts just as a thermal emergency ends keeps its test speeds** (`TS-z`,
 DEC-413). After an emergency, the daemon returns each OpenFan fan that no profile controls to its
 speed from before the emergency. It checked for a running calibration once, before setting up to ten

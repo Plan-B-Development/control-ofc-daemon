@@ -245,3 +245,47 @@ fn no_record_writes_nothing() {
     assert!(out.status.success(), "{out:?}");
     assert_eq!(read(&en1), "1");
 }
+
+/// [SAFETY] DEC-414 (`TS-aa`): a pre-RDNA3 amdgpu fan that a legacy GPU verify
+/// left in manual mode — the daemon died mid-verify — gets its original mode
+/// back from the GPU record, and a card no line names is not touched, even in
+/// manual mode (another tool's). The record is written by the daemon's own
+/// writer, so the line format the script parses is the one production writes.
+#[test]
+fn a_gpu_record_is_replayed_and_an_unrecorded_card_is_untouched() {
+    use control_ofc_daemon::hwmon::gpu_fan::{note_legacy_take, GPU_RECORD_FILE_NAME};
+    let t = Tree::new();
+    let card = |n: u8| {
+        let dir = t.sys.join(format!("class/hwmon/hwmon{n}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("name"), "amdgpu\n").unwrap();
+        std::fs::write(dir.join("pwm1"), "200\n").unwrap();
+        std::fs::write(dir.join("pwm1_enable"), "1\n").unwrap();
+        dir
+    };
+    let verified = card(1);
+    let other = card(2);
+    let record = t.run.join(GPU_RECORD_FILE_NAME);
+    note_legacy_take(&record, &verified, Some(2));
+    // Presence first: the writer produced a line the script can see.
+    assert!(
+        std::fs::read_to_string(&record)
+            .unwrap()
+            .contains("\tmode\t2"),
+        "the verify's writer must have recorded the original mode"
+    );
+
+    let out = t.run_script();
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        read(&verified.join("pwm1_enable")),
+        "2",
+        "the recorded card must get its original (automatic) mode back"
+    );
+    assert_eq!(
+        read(&other.join("pwm1_enable")),
+        "1",
+        "a card no record line names must not be touched"
+    );
+}

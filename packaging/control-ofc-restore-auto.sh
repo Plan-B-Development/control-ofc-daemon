@@ -21,6 +21,14 @@
 # The hand-back rules below restate daemon/src/hwmon/handback.rs, which is the
 # canonical copy; daemon/tests/restore_auto_script.rs holds the two together.
 #
+# DEC-414 (TS-aa): a second record, gpu-handback, in the same line format. The
+# legacy (pre-RDNA3) GPU verify is the one path that puts an amdgpu fan in
+# manual mode (pwm1_enable=1), and amdgpu is outside the hwmon ledger by design,
+# so the verify records the card's original mode there before its write and
+# drops the line once it has restored the fan. A line still present here is a
+# verify that did not finish: its card gets its original mode back. A card no
+# line names -- including one another tool put in manual mode -- is not touched.
+#
 # DEC-199: the writes go through the /sys/class/hwmon and /sys/class/drm
 # *symlinks*, but the service sandbox grants write access via
 # ReadWritePaths=/sys/devices (the real backing path). A ReadWritePaths entry on
@@ -34,7 +42,7 @@ shopt -s nullglob
 # ':'-separated, and this unit has one entry. CONTROL_OFC_SYSFS_ROOT exists only
 # so the test suite can point this at a fake tree; the unit never sets it.
 runtime_dir="${RUNTIME_DIRECTORY:-/run/control-ofc}"
-record="${runtime_dir%%:*}/hwmon-handback"
+records=("${runtime_dir%%:*}/hwmon-handback" "${runtime_dir%%:*}/gpu-handback")
 sysfs_root="${CONTROL_OFC_SYSFS_ROOT:-/sys}"
 
 # The value of a sysfs attribute, whitespace stripped; fails if unreadable.
@@ -89,7 +97,8 @@ hand_back() {
     full_speed "$enable" "$pwm"
 }
 
-if [ -r "$record" ]; then
+for record in "${records[@]}"; do
+    [ -r "$record" ] || continue
     while IFS=$'\t' read -r enable pwm kind value; do
         case "$enable" in '' | '#'*) continue ;; esac
         # The record is root's, in a root-owned directory, but a line is still
@@ -110,7 +119,7 @@ if [ -r "$record" ]; then
         hand_back "$enable" "$pwm" "$kind" "$value" \
             || echo "control-ofc-restore-auto: could not give $enable back" >&2
     done < "$record"
-fi
+done
 
 # Also reset GPU fan curves to auto if the sysfs paths exist
 for fan_curve in "$sysfs_root"/class/drm/card*/device/gpu_od/fan_ctrl/fan_curve; do

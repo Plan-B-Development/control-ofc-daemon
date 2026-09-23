@@ -229,7 +229,7 @@ Every sensor/fan/header includes:
 - **hwmon PWM**: no daemon-enforced per-header floors (`min_pwm_percent: 0` for all). The role-aware pump/CPU floor is GUI-baked and **daemon-enforced** (validate-time reject + eval-time clamp, DEC-162); the thermal force is the absolute backstop.
 - **Pump-stop guard** (`profile.rs`, DEC-167): a control with a pump/CPU member may not be set to stop — a non-zero `stop_pct` is rejected at profile-validate time (`PUMP_STOP_FORBIDDEN` → `400 validation_error`), and the eval-time stop-snap is skipped for pump/CPU members on any un-validated profile. Distinct from the DEC-162 *floor* above: this forbids *stopping*, not merely clamps the minimum.
 - **PWM enable mode** (`pwmN_enable=1`) set on first write per lease, reset on release
-- **ExecStopPost**: replays the hwmon hand-back record — each header the daemon took goes back to what it was doing before (DEC-382, `hwmon::handback`) — and resets GPU fan curves on any service stop
+- **ExecStopPost**: replays the hwmon hand-back record — each header the daemon took goes back to what it was doing before (DEC-382, `hwmon::handback`) — and the legacy GPU verify's record (`gpu-handback`, DEC-414: a pre-RDNA3 card a crashed verify left in manual mode gets its original mode back), and resets GPU fan curves on any service stop
 - **GPU PMFW writes**: clamped to OD_RANGE from firmware PPTable (prevents EINVAL)
 
 ## Key design decisions

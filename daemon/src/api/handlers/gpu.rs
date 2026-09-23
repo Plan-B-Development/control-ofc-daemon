@@ -422,78 +422,28 @@ pub async fn gpu_verify_handler(
     } else {
         // ── Legacy hwmon pwm1 path (pre-RDNA3) ────────────────────────
         let hwmon_path = gpu.hwmon_path.clone();
+        // DEC-414 (`TS-aa`): where `control-ofc-restore-auto` looks for the crash
+        // backstop — the same runtime directory as the hwmon hand-back record.
+        let record =
+            crate::hwmon::handback::runtime_dir().join(crate::hwmon::gpu_fan::GPU_RECORD_FILE_NAME);
         tokio::task::spawn_blocking(move || {
             let verify_guard = verify_guard;
             let _gpu_write_guard = gpu_write_guard;
-            let read_rpm = |hwmon: &std::path::Path| -> Option<u16> {
-                std::fs::read_to_string(hwmon.join("fan1_input"))
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u16>().ok())
-            };
-            let read_pwm_pct = |hwmon: &std::path::Path| -> Option<u8> {
-                std::fs::read_to_string(hwmon.join("pwm1"))
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u8>().ok())
-                    .map(crate::pwm::raw_to_percent)
-            };
-            let read_enable = |hwmon: &std::path::Path| -> Option<u8> {
-                std::fs::read_to_string(hwmon.join("pwm1_enable"))
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u8>().ok())
-            };
-
-            let initial_state = GpuVerifyState {
-                applied_speed_pct: read_pwm_pct(&hwmon_path),
-                rpm: read_rpm(&hwmon_path),
-                pwm_enable: read_enable(&hwmon_path),
-                zero_rpm_enabled: None,
-            };
-
-            let test_speed =
-                select_gpu_test_speed(prior_pct.or(initial_state.applied_speed_pct), 0, 100);
-
-            if let Err(e) = crate::hwmon::gpu_fan::set_legacy_pwm(&hwmon_path, test_speed) {
-                let restore_failed = restore_legacy(prior_pct, &hwmon_path);
-                stamp_restored_pct(&task_cache, &task_fan_id, prior_pct, restore_failed);
-                return GpuVerifySequence::WriteFailed {
-                    initial: initial_state,
-                    final_state: GpuVerifyState {
-                        applied_speed_pct: read_pwm_pct(&hwmon_path),
-                        rpm: read_rpm(&hwmon_path),
-                        pwm_enable: read_enable(&hwmon_path),
-                        zero_rpm_enabled: None,
-                    },
-                    test_speed,
-                    restore_failed,
-                    details: format!(
-                        "The legacy pwm1 write was rejected: {e}. Manual fan control is not \
-                         functional in this state."
-                    ),
-                };
-            }
-            task_cache.set_gpu_fan_commanded_pct(&task_fan_id, test_speed);
-
-            std::thread::sleep(std::time::Duration::from_secs(
-                constants::VERIFY_WAIT_SECONDS as u64,
-            ));
-
-            let final_state = GpuVerifyState {
-                applied_speed_pct: read_pwm_pct(&hwmon_path),
-                rpm: read_rpm(&hwmon_path),
-                pwm_enable: read_enable(&hwmon_path),
-                zero_rpm_enabled: None,
-            };
-
-            let _ = verify_guard.renew(constants::VERIFY_PAUSE_DEADMAN);
-
-            let restore_failed = restore_legacy(prior_pct, &hwmon_path);
-            stamp_restored_pct(&task_cache, &task_fan_id, prior_pct, restore_failed);
-            GpuVerifySequence::Completed {
-                initial: initial_state,
-                final_state,
-                test_speed,
-                restore_failed,
-            }
+            legacy_verify_sequence(
+                &hwmon_path,
+                prior_pct,
+                &task_cache,
+                &task_fan_id,
+                &record,
+                || {
+                    std::thread::sleep(std::time::Duration::from_secs(
+                        constants::VERIFY_WAIT_SECONDS as u64,
+                    ))
+                },
+                || {
+                    let _ = verify_guard.renew(constants::VERIFY_PAUSE_DEADMAN);
+                },
+            )
         })
     };
 
@@ -607,17 +557,141 @@ fn restore_pmfw(
     result.is_err()
 }
 
-/// Restore the GPU to its pre-verify state on the legacy `pwm1` path.
-/// Returns `true` if the restore write failed.
-fn restore_legacy(prior_pct: Option<u8>, hwmon_path: &std::path::Path) -> bool {
-    let result = match prior_pct {
-        Some(p) if p > 0 => crate::hwmon::gpu_fan::set_legacy_pwm(hwmon_path, p),
-        _ => crate::hwmon::gpu_fan::reset_legacy_to_auto(hwmon_path),
+/// The legacy (pre-RDNA3) GPU verify: read, record, write manual mode, settle,
+/// read back, restore (DEC-297's uncancellable sequence).
+///
+/// A named function rather than the closure body so the crash backstop's
+/// placement can be tested: `note_legacy_take` must land before the
+/// `pwm1_enable=1` write, and the line must go only once the fan is back under
+/// firmware control (DEC-414, `TS-aa`). `settle` is the sleep and `renew` the deadman renewal,
+/// in the order the handler has always run them.
+fn legacy_verify_sequence(
+    hwmon_path: &std::path::Path,
+    prior_pct: Option<u8>,
+    task_cache: &crate::health::cache::StateCache,
+    task_fan_id: &str,
+    record: &std::path::Path,
+    settle: impl FnOnce(),
+    renew: impl FnOnce(),
+) -> GpuVerifySequence {
+    let read_rpm = |hwmon: &std::path::Path| -> Option<u16> {
+        std::fs::read_to_string(hwmon.join("fan1_input"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u16>().ok())
+    };
+    let read_pwm_pct = |hwmon: &std::path::Path| -> Option<u8> {
+        std::fs::read_to_string(hwmon.join("pwm1"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u8>().ok())
+            .map(crate::pwm::raw_to_percent)
+    };
+    let read_enable = |hwmon: &std::path::Path| -> Option<u8> {
+        std::fs::read_to_string(hwmon.join("pwm1_enable"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u8>().ok())
+    };
+
+    let initial_state = GpuVerifyState {
+        applied_speed_pct: read_pwm_pct(hwmon_path),
+        rpm: read_rpm(hwmon_path),
+        pwm_enable: read_enable(hwmon_path),
+        zero_rpm_enabled: None,
+    };
+
+    let test_speed = select_gpu_test_speed(prior_pct.or(initial_state.applied_speed_pct), 0, 100);
+
+    // DEC-414 (`TS-aa`): recorded BEFORE the manual-mode write, so a crash
+    // from here on is given back by ExecStopPost with the mode just read.
+    crate::hwmon::gpu_fan::note_legacy_take(record, hwmon_path, initial_state.pwm_enable);
+
+    if let Err(e) = crate::hwmon::gpu_fan::set_legacy_pwm(hwmon_path, test_speed) {
+        let restored = restore_legacy(prior_pct, hwmon_path);
+        let restore_failed = restored == LegacyRestore::Failed;
+        // DEC-414: only a card back under firmware control is given back; one
+        // restored to a prior static speed is still in the daemon's manual mode.
+        if restored == LegacyRestore::Automatic {
+            crate::hwmon::gpu_fan::note_legacy_handed_back(record, hwmon_path);
+        }
+        stamp_restored_pct(task_cache, task_fan_id, prior_pct, restore_failed);
+        return GpuVerifySequence::WriteFailed {
+            initial: initial_state,
+            final_state: GpuVerifyState {
+                applied_speed_pct: read_pwm_pct(hwmon_path),
+                rpm: read_rpm(hwmon_path),
+                pwm_enable: read_enable(hwmon_path),
+                zero_rpm_enabled: None,
+            },
+            test_speed,
+            restore_failed,
+            details: format!(
+                "The legacy pwm1 write was rejected: {e}. Manual fan control is not \
+                 functional in this state."
+            ),
+        };
+    }
+    task_cache.set_gpu_fan_commanded_pct(task_fan_id, test_speed);
+
+    settle();
+
+    let final_state = GpuVerifyState {
+        applied_speed_pct: read_pwm_pct(hwmon_path),
+        rpm: read_rpm(hwmon_path),
+        pwm_enable: read_enable(hwmon_path),
+        zero_rpm_enabled: None,
+    };
+
+    renew();
+
+    let restored = restore_legacy(prior_pct, hwmon_path);
+    let restore_failed = restored == LegacyRestore::Failed;
+    // DEC-414: only a card back under firmware control is given back; one
+    // restored to a prior static speed is still in the daemon's manual mode.
+    if restored == LegacyRestore::Automatic {
+        crate::hwmon::gpu_fan::note_legacy_handed_back(record, hwmon_path);
+    }
+    stamp_restored_pct(task_cache, task_fan_id, prior_pct, restore_failed);
+    GpuVerifySequence::Completed {
+        initial: initial_state,
+        final_state,
+        test_speed,
+        restore_failed,
+    }
+}
+
+/// What a legacy restore left the card in (DEC-414).
+///
+/// Not a `bool`, because the crash record needs the difference between the two
+/// successes: only [`LegacyRestore::Automatic`] gives the card back. A restore to
+/// a prior static speed leaves it in the daemon's manual mode, so its record line
+/// must stay for `ExecStopPost`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyRestore {
+    /// `pwm1_enable=2`: back under firmware control.
+    Automatic,
+    /// Manual mode at the prior static speed — still the daemon's.
+    Manual,
+    /// The restore write failed; the card is at the test speed.
+    Failed,
+}
+
+/// Restore the GPU to its pre-verify state on the legacy `pwm1` path, and say
+/// what that left the card in.
+fn restore_legacy(prior_pct: Option<u8>, hwmon_path: &std::path::Path) -> LegacyRestore {
+    let (result, restored) = match prior_pct {
+        Some(p) if p > 0 => (
+            crate::hwmon::gpu_fan::set_legacy_pwm(hwmon_path, p),
+            LegacyRestore::Manual,
+        ),
+        _ => (
+            crate::hwmon::gpu_fan::reset_legacy_to_auto(hwmon_path),
+            LegacyRestore::Automatic,
+        ),
     };
     if let Err(e) = &result {
         log::warn!("verify: GPU legacy restore failed (fan may be left at test speed): {e}");
+        return LegacyRestore::Failed;
     }
-    result.is_err()
+    restored
 }
 
 /// Classify the GPU fan verify outcome from the before/after state and the
@@ -747,6 +821,173 @@ fn unsupported_fan_control_message(gpu: &crate::hwmon::gpu_detect::AmdGpuInfo) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pre-RDNA3 amdgpu hwmon dir in automatic mode, and where its crash record goes.
+    fn legacy_card() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let hwmon = tmp.path().join("hwmon3");
+        std::fs::create_dir_all(&hwmon).unwrap();
+        std::fs::write(hwmon.join("pwm1_enable"), "2\n").unwrap();
+        std::fs::write(hwmon.join("pwm1"), "100\n").unwrap();
+        std::fs::write(hwmon.join("fan1_input"), "1200\n").unwrap();
+        let record = tmp.path().join(crate::hwmon::gpu_fan::GPU_RECORD_FILE_NAME);
+        (tmp, hwmon, record)
+    }
+
+    /// [SAFETY] DEC-414 (`TS-aa`): while the legacy verify holds the card in
+    /// manual mode — the window a crash leaves it stuck in — the record names
+    /// the card with the mode it had; once the verify has restored it, the line
+    /// is gone, so a later stop does not touch the card again.
+    #[test]
+    fn the_legacy_verify_records_its_take_for_the_whole_manual_window() {
+        let (_tmp, hwmon, record) = legacy_card();
+        let cache = crate::health::cache::StateCache::new();
+        let seen_mid_verify = std::cell::RefCell::new(None);
+        let sequence = legacy_verify_sequence(
+            &hwmon,
+            None,
+            &cache,
+            "amd_gpu:0000:03:00.0",
+            &record,
+            || {
+                *seen_mid_verify.borrow_mut() = Some((
+                    std::fs::read_to_string(hwmon.join("pwm1_enable")).unwrap(),
+                    std::fs::read_to_string(&record).ok(),
+                ));
+            },
+            || {},
+        );
+        let (mode, line) = seen_mid_verify.into_inner().expect("the settle hook ran");
+        assert_eq!(
+            mode.trim(),
+            "1",
+            "precondition: the card is in manual mode mid-verify"
+        );
+        let line = line.expect("the take must be recorded while the card is in manual mode");
+        assert!(
+            line.contains(&format!(
+                "{}\t{}\tmode\t2",
+                hwmon.join("pwm1_enable").display(),
+                hwmon.join("pwm1").display()
+            )),
+            "the record must give back the mode the card had (2): {line:?}"
+        );
+        assert!(
+            matches!(
+                sequence,
+                GpuVerifySequence::Completed {
+                    restore_failed: false,
+                    ..
+                }
+            ),
+            "precondition: the verify restored the card"
+        );
+        assert!(!record.exists(), "a restored card's line must be dropped");
+    }
+
+    /// DEC-414 review (`ofc:packaging-reviewer`, P2): a failed restore leaves the
+    /// test duty in the cache (DEC-297), so the NEXT verify's prior is that duty
+    /// and its restore puts the card back in manual mode at it. That restore
+    /// succeeds, and must still not drop the line — the card is the daemon's, in
+    /// manual, and the line is the only thing that will ever give it back.
+    #[test]
+    fn a_restore_that_leaves_the_card_in_manual_keeps_the_record() {
+        let (_tmp, hwmon, record) = legacy_card();
+        let cache = crate::health::cache::StateCache::new();
+        let fan_id = "amd_gpu:0000:03:00.0";
+        let enable = hwmon.join("pwm1_enable");
+        // Verify #1: its restore fails.
+        let first = legacy_verify_sequence(
+            &hwmon,
+            None,
+            &cache,
+            fan_id,
+            &record,
+            || {
+                std::fs::remove_file(&enable).unwrap();
+                std::fs::create_dir(&enable).unwrap();
+            },
+            || {},
+        );
+        assert!(matches!(
+            first,
+            GpuVerifySequence::Completed {
+                restore_failed: true,
+                ..
+            }
+        ));
+        // The card is still in manual, as the failed restore left it.
+        std::fs::remove_dir(&enable).unwrap();
+        std::fs::write(&enable, "1\n").unwrap();
+        // Verify #2 reads its prior exactly as the handler does.
+        let prior_pct = cache
+            .snapshot()
+            .gpu_fans
+            .get(fan_id)
+            .and_then(|f| f.last_commanded_pct);
+        assert!(
+            prior_pct.is_some_and(|p| p > 0),
+            "precondition: the failed restore left the test duty as the prior ({prior_pct:?})"
+        );
+        let second =
+            legacy_verify_sequence(&hwmon, prior_pct, &cache, fan_id, &record, || {}, || {});
+        assert!(
+            matches!(
+                second,
+                GpuVerifySequence::Completed {
+                    restore_failed: false,
+                    ..
+                }
+            ),
+            "precondition: verify #2's restore succeeded"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&enable).unwrap().trim(),
+            "1",
+            "precondition: that restore left the card in manual mode"
+        );
+        let body = std::fs::read_to_string(&record)
+            .expect("a card left in manual must keep its record line");
+        assert!(
+            body.contains("\tmode\t2"),
+            "the line must still give back the first take's original (2): {body:?}"
+        );
+    }
+
+    /// The line stays when the verify's own restore fails, so ExecStopPost —
+    /// which also runs after a clean stop — still gives the card back.
+    #[test]
+    fn a_failed_legacy_restore_keeps_the_record() {
+        let (_tmp, hwmon, record) = legacy_card();
+        let cache = crate::health::cache::StateCache::new();
+        let enable = hwmon.join("pwm1_enable");
+        let sequence = legacy_verify_sequence(
+            &hwmon,
+            None,
+            &cache,
+            "amd_gpu:0000:03:00.0",
+            &record,
+            || {
+                // The restore's write of `2` to pwm1_enable now fails.
+                std::fs::remove_file(&enable).unwrap();
+                std::fs::create_dir(&enable).unwrap();
+            },
+            || {},
+        );
+        assert!(
+            matches!(
+                sequence,
+                GpuVerifySequence::Completed {
+                    restore_failed: true,
+                    ..
+                }
+            ),
+            "precondition: the restore failed"
+        );
+        let body =
+            std::fs::read_to_string(&record).expect("the record must survive a failed restore");
+        assert!(body.contains("\tmode\t2"), "{body:?}");
+    }
 
     /// AppState carrying one PMFW GPU whose `fan_curve` is a real temp file, so
     /// the verify's writes and its restore are observable.

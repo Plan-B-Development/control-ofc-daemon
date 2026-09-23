@@ -1244,7 +1244,7 @@ fn restore_panic_targets(targets: &'static PanicRestoreTargets, timeout: Duratio
 /// daemon still gives headers back itself on every exit it survives — only the
 /// crash backstop is lost, and the log says so once, here.
 fn keep_handback_record(ledger: &Arc<HandBackLedger>) {
-    let dir = runtime_dir();
+    let dir = handback::runtime_dir();
     if dir.is_dir() {
         ledger.set_record_path(dir.join(handback::RECORD_FILE_NAME));
     } else {
@@ -1254,19 +1254,6 @@ fn keep_handback_record(ledger: &Arc<HandBackLedger>) {
             dir.display()
         );
     }
-}
-
-/// The unit's runtime directory: `$RUNTIME_DIRECTORY`, which systemd sets for
-/// `RuntimeDirectory=control-ofc`, or the same literal for a daemon run by hand.
-fn runtime_dir() -> PathBuf {
-    std::env::var_os("RUNTIME_DIRECTORY")
-        .and_then(|v| {
-            // systemd separates several directories with ':'; this unit has one.
-            v.to_str()
-                .and_then(|s| s.split(':').next())
-                .map(PathBuf::from)
-        })
-        .unwrap_or_else(|| PathBuf::from("/run/control-ofc"))
 }
 
 /// Answer the `system-sleep` hook (`TS-ao`, DEC-396): `SIGUSR1` before a sleep,
@@ -1296,7 +1283,7 @@ fn start_sleep_watch(notifier: &Arc<control_ofc_daemon::sd_notify::Notifier>) {
             return;
         }
     };
-    let dir = runtime_dir();
+    let dir = handback::runtime_dir();
     let (tx, rx) = tokio::sync::mpsc::channel::<SleepTransition>(4);
     tokio::spawn(forward_sleep_signals(usr1, usr2, tx));
     tokio::spawn(sd_notify::watch_sleep(
