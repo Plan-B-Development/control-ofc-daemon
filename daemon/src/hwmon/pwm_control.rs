@@ -500,6 +500,21 @@ impl HwmonPwmController {
             self.cache.clear_hwmon_commanded(header_id);
             // DEC-406: a header nothing commands is not "not holding" anything.
             self.cache.clear_hwmon_duty_not_holding([header_id]);
+        } else {
+            // `PTA-k`: a FAILED hand-back leaves the header taken, but nothing
+            // commands it any more either, so the same rule applies to its drift:
+            // the episode closes and the flag goes. Before this only the released
+            // arm obeyed it, so a header whose hand-back kept failing went on
+            // publishing `duty_not_holding` — blaming corrections for what was a
+            // failing hand-back — and a profile naming it again at the same duty
+            // met a stale give-up and held instead of correcting.
+            //
+            // `last_commanded_pct` and `manual_mode_set` stay: the next tick's
+            // retry of the hand-back and `TS-p`'s hold both read them.
+            if let Some(ws) = self.write_state.get_mut(header_id) {
+                ws.drift = DriftState::default();
+            }
+            self.cache.clear_hwmon_duty_not_holding([header_id]);
         }
         Ok(Some(outcome))
     }
@@ -517,10 +532,13 @@ impl HwmonPwmController {
     ///
     /// [SAFETY] `OFN-ad`, DEC-372; `OFN-ah`/`OFN-ak`, DEC-376. This is the ONE
     /// definition of "a hwmon output this daemon can drive", and it now has
-    /// three readers, all of which must agree or the daemon lies about itself:
+    /// four readers, all of which must agree or the daemon lies about itself:
     /// `HwmonBackend::force_all_with_floor` (the set it actually writes),
     /// `HwmonBackend::new` (which refuses to build a backend when this is empty,
-    /// so the engine's `hwmon_be.is_some()` means what its readers assume), and
+    /// so the engine's `hwmon_be.is_some()` means what its readers assume),
+    /// `HwmonBackend::delivery_targets` (the per-MEMBER deliverability that
+    /// lists a control bound only to headers outside this set, `OFN-al` — the
+    /// same set `new` measured, so it cannot disagree with the force), and
     /// `capabilities_handler` (`devices.hwmon.write_support` and
     /// `features.hwmon_write_supported`). Derived, never restated —
     /// DEC-334's "one flag, one gating shape".
@@ -785,8 +803,15 @@ impl HwmonPwmController {
         // Coalesce: skip if same as last commanded value and mode still set —
         // unless the readback says the duty did not hold (DEC-406), in which
         // case this falls through and writes it again as a correction.
+        //
+        // `PTA-j`: only the ENGINE's writes coalesce. A diagnostic's write is a
+        // measurement, and one that repeats the engine's last duty is exactly the
+        // one that finds a second writer holding the header elsewhere — skipping
+        // it recorded that writer's RPM under the duty the diagnostic asked for.
+        // It is written unconditionally, and (being non-reconciling) counts and
+        // publishes nothing below.
         let mode_set = ws.manual_mode_set;
-        let coalescible = mode_set && ws.last_commanded_pct == Some(effective_pct);
+        let coalescible = reconciles && mode_set && ws.last_commanded_pct == Some(effective_pct);
         let correcting = coalescible
             && reconciles
             && self.duty_drift_rewrite(header_id, effective_pct, &pwm_path);
@@ -2895,6 +2920,8 @@ mod tests {
         levels: Arc<Mutex<Option<Vec<u8>>>>,
         /// Fail every duty write (EIO), leaving the register as it was.
         fail_pwm_writes: Arc<Mutex<bool>>,
+        /// Fail every `pwm_enable` write, so a hand-back cannot write anything.
+        fail_enable_writes: Arc<Mutex<bool>>,
     }
 
     impl DriftSysfs {
@@ -2909,7 +2936,9 @@ mod tests {
     impl SysfsWriter for DriftSysfs {
         fn write_file(&mut self, path: &str, value: &str) -> Result<(), HwmonError> {
             let mut value = value.trim().to_string();
-            if path == PWM && *self.fail_pwm_writes.lock() {
+            if (path == PWM && *self.fail_pwm_writes.lock())
+                || (path == ENABLE && *self.fail_enable_writes.lock())
+            {
                 return Err(HwmonError::WriteError {
                     path: path.into(),
                     message: "Input/output error (os error 5)".into(),
@@ -3223,6 +3252,10 @@ mod tests {
 
     /// A diagnostic's `Verify` lease is never reconciled: it gets exactly the duty
     /// it asked for, and nothing is counted against the header (S2-2).
+    ///
+    /// `PTA-j`: "exactly the duty it asked for" includes a repeat. Until DEC-406's
+    /// residual was fixed this asserted the opposite — that the repeated 40 was
+    /// NOT written — so a second writer's 60 stood under a diagnostic's "40 %".
     #[test]
     fn a_verify_lease_write_is_never_reconciled() {
         let (mut ctrl, sysfs, cache, lease) = drift_controller(HwmonWriter::Verify);
@@ -3230,7 +3263,12 @@ mod tests {
         sysfs.external_write(60);
         let before = sysfs.duty_writes();
         ctrl.set_pwm("h1", 40, &lease).unwrap();
-        assert_eq!(sysfs.duty_writes(), before);
+        assert_eq!(sysfs.duty_writes(), before + 1, "the repeat is written");
+        assert_eq!(
+            sysfs.live.get(PWM).as_deref(),
+            Some(percent_to_raw(40).to_string().as_str()),
+            "the header holds the duty the diagnostic asked for"
+        );
         assert_eq!(published(&cache), DutyReconciliation::default());
 
         // Positive control: the same sequence under the engine's lease corrects.
@@ -3340,6 +3378,50 @@ mod tests {
                 "hand_back = {hand_back}"
             );
         }
+    }
+
+    /// `PTA-k`: a hand-back that FAILS leaves the header taken but uncommanded,
+    /// so the flag and the drift episode go exactly as on a released one — while
+    /// the retry state stays. The second half is what discriminates: with a
+    /// stale give-up, a profile naming the header again at the same duty HOLDS
+    /// instead of correcting a second writer.
+    #[test]
+    fn a_failed_hand_back_clears_the_flag_but_keeps_the_retry_state() {
+        let (mut ctrl, sysfs, cache, lease) = drift_controller(HwmonWriter::Engine);
+        ctrl.set_pwm("h1", 20, &lease).unwrap();
+        for _ in 0..4 {
+            sysfs.external_write(60);
+            ctrl.set_pwm("h1", 20, &lease).unwrap();
+        }
+        assert!(published(&cache).not_holding, "precondition");
+        assert!(ctrl.duty_not_holding("h1"), "precondition");
+
+        *sysfs.fail_enable_writes.lock() = true;
+        assert_eq!(
+            ctrl.hand_back("h1", &lease).unwrap(),
+            Some(HandBackOutcome::Failed),
+            "precondition: nothing could be written"
+        );
+
+        assert_eq!(
+            published(&cache),
+            DutyReconciliation {
+                corrections: 3,
+                not_holding: false
+            }
+        );
+        assert!(!ctrl.duty_not_holding("h1"));
+        assert_eq!(ctrl.last_commanded_pct("h1"), Some(20), "retry state kept");
+
+        *sysfs.fail_enable_writes.lock() = false;
+        sysfs.external_write(60);
+        let before = sysfs.duty_writes();
+        ctrl.set_pwm("h1", 20, &lease).unwrap();
+        assert_eq!(
+            sysfs.duty_writes(),
+            before + 1,
+            "a fresh episode corrects the second writer"
+        );
     }
 
     /// [SAFETY] The exit floor is unchanged: once it has latched, a correction

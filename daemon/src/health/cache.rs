@@ -780,10 +780,38 @@ impl StateCache {
         self.inner.read().relinquished_gpu_fans.contains(fan_id)
     }
 
-    /// Update the last commanded PWM for a single OpenFanController channel.
-    pub fn set_openfan_commanded_pwm(&self, channel: u8, pwm: u8) {
+    /// Forget OpenFan `channel`'s commanded duty (`TS-ad`): a write whose reply
+    /// failed may or may not have landed, so the daemon no longer knows it.
+    /// The OpenFan twin of [`Self::clear_hwmon_commanded`]. Like
+    /// [`Self::set_openfan_commanded_pwm`] it leaves `updated_at` alone — that
+    /// is when the RPM was last read (OFS-i).
+    pub fn clear_openfan_commanded_pwm(&self, channel: u8) {
+        if let Some(fan) = self.inner.write().openfan_fans.get_mut(&channel) {
+            fan.last_commanded_pwm = None;
+        }
+    }
+
+    /// Publish the duty an OpenFanController write landed, if the device has not
+    /// been invalidated since the writer observed `generation` — the value of
+    /// [`Self::openfan_write_generation`] its write was issued against. Returns
+    /// whether it published.
+    ///
+    /// `TS-ad`: the generation is compared UNDER the write guard, and that is the
+    /// whole point of taking it as a parameter. [`Self::invalidate_openfan_writes`]
+    /// bumps the counter and only then takes the guard to clear, so a writer
+    /// holding the guard either sees the bump and publishes nothing, or publishes
+    /// before the clear, which then removes it. A check made before taking the
+    /// guard (the first shape of this fix) left a window in which an invalidation
+    /// cleared the cache and the write then republished the duty the device may
+    /// have lost — on a channel nothing commands again, for the life of the
+    /// process. There is deliberately no unconditional setter, so no caller can
+    /// reintroduce that shape.
+    pub fn set_openfan_commanded_pwm(&self, channel: u8, pwm: u8, generation: u64) -> bool {
         let now = Instant::now();
         let mut state = self.inner.write();
+        if self.openfan_write_generation.load(Ordering::SeqCst) != generation {
+            return false;
+        }
         if let Some(fan) = state.openfan_fans.get_mut(&channel) {
             fan.last_commanded_pwm = Some(pwm);
             // OFS-i: deliberately does NOT touch `updated_at`. That field is when
@@ -809,6 +837,7 @@ impl StateCache {
             );
         }
         state.snapshot_at = now;
+        true
     }
 
     /// Update AMD GPU fan readings as a batch.
@@ -1100,8 +1129,19 @@ impl StateCache {
     /// Declare that the OpenFanController's device-side duty may no longer match
     /// what we last commanded, so the next write for each channel must actually
     /// reach the wire (DEC-256). Called on serial reconnect and on resume.
+    ///
+    /// `TS-ad`: the published `last_commanded_pwm` goes with it. The controller
+    /// forgets its duties on the generation bump; the wire must not go on
+    /// reporting them for the channels nothing commands again. The counter MUST
+    /// move before the guard is taken: [`Self::set_openfan_commanded_pwm`]
+    /// compares it under the guard, which is what stops a write that completes
+    /// across this call from republishing a duty it cleared.
     pub fn invalidate_openfan_writes(&self) {
         self.openfan_write_generation.fetch_add(1, Ordering::SeqCst);
+        let mut state = self.inner.write();
+        for fan in state.openfan_fans.values_mut() {
+            fan.last_commanded_pwm = None;
+        }
     }
 
     /// Read the resume counter (AIO-MB Phase 5). Non-consuming, unlike
@@ -2142,6 +2182,61 @@ mod tests {
         assert!(!cache.take_resume_flag(), "flag cleared after take");
     }
 
+    /// `TS-ad`: a duty written against a generation an invalidation has since
+    /// moved past is never published. The plain arm first — a stale generation
+    /// publishes nothing, the current one does (the opposite arm, so a setter
+    /// stuck at "never" fails too).
+    #[test]
+    fn a_duty_set_against_a_stale_generation_is_not_published() {
+        let cache = StateCache::new();
+        cache.update_openfan_fans(vec![make_openfan(4, 900)]);
+        let stale = cache.openfan_write_generation();
+        cache.invalidate_openfan_writes();
+
+        assert!(!cache.set_openfan_commanded_pwm(4, 60, stale));
+        assert_eq!(cache.snapshot().openfan_fans[&4].last_commanded_pwm, None);
+
+        let current = cache.openfan_write_generation();
+        assert!(cache.set_openfan_commanded_pwm(4, 60, current));
+        assert_eq!(
+            cache.snapshot().openfan_fans[&4].last_commanded_pwm,
+            Some(60)
+        );
+    }
+
+    /// `TS-ad`, the INTERLEAVING the plain arm above cannot see: the generation
+    /// must be compared under the write guard. This holds the guard, lets a
+    /// writer start, then does the invalidation's first step (the counter moves
+    /// before the guard is taken, as `invalidate_openfan_writes` does) and
+    /// releases. A setter that compares under the guard sees the bump whatever
+    /// the timing. One that compares BEFORE taking the guard — the first shape of
+    /// this fix — read the old generation while it waited, and republished the
+    /// duty the invalidation had just cleared. The sleep only gives that shape
+    /// the chance to show itself; the correct shape passes without it.
+    #[test]
+    fn the_generation_is_compared_under_the_guard() {
+        let cache = Arc::new(StateCache::new());
+        cache.update_openfan_fans(vec![make_openfan(4, 900)]);
+        let observed = cache.openfan_write_generation();
+
+        let guard = cache.inner.write();
+        let writer = {
+            let cache = Arc::clone(&cache);
+            std::thread::spawn(move || cache.set_openfan_commanded_pwm(4, 60, observed))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        cache
+            .openfan_write_generation
+            .fetch_add(1, Ordering::SeqCst);
+        drop(guard);
+
+        assert!(
+            !writer.join().expect("the writer thread did not panic"),
+            "a write issued before the invalidation published after it"
+        );
+        assert_eq!(cache.snapshot().openfan_fans[&4].last_commanded_pwm, None);
+    }
+
     /// OFS-i. `build_fan_entries` publishes `OpenFanState.updated_at` as the
     /// fan's telemetry `age_ms`, and `set_openfan_commanded_pwm` used to refresh
     /// it — so a *command* made a *reading* look fresh. The rpm stayed frozen at
@@ -2163,7 +2258,7 @@ mod tests {
         // The link stops answering RPM polls, but writes still ack — a ~10-byte
         // SetPwm completes on a degraded link where an ~80-byte ReadAllRpm does
         // not, which is why this is the reachable shape rather than a contrived one.
-        cache.set_openfan_commanded_pwm(3, 200);
+        assert!(cache.set_openfan_commanded_pwm(3, 200, cache.openfan_write_generation()));
 
         let snap = cache.snapshot();
         let after = snap.openfan_fans[&3].updated_at;
@@ -2239,7 +2334,7 @@ mod tests {
         let cache = StateCache::new();
         cache.update_openfan_fans(vec![make_openfan(0, 900), make_openfan(1, 900)]);
         // The thermal force writes a channel the controller never reports.
-        cache.set_openfan_commanded_pwm(9, 255);
+        assert!(cache.set_openfan_commanded_pwm(9, 255, cache.openfan_write_generation()));
         assert!(!cache.snapshot().openfan_fans[&9].rpm_polled);
 
         assert_eq!(

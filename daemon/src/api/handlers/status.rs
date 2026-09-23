@@ -147,7 +147,8 @@ pub async fn capabilities_handler(
     // (`AUD2-g`/DEC-325, inverted). Write support is the same "≥ 1 writable
     // header" predicate the profile engine gates its backend on
     // (`HwmonBackend::new`) and the thermal force filters to
-    // (`forced_target_ids`, DEC-295/DEC-372) — one definition, three readers.
+    // (`forced_target_ids`, DEC-295/DEC-372) — one definition, four readers
+    // since the engine's per-member deliverability joined them (`OFN-al`).
     //
     // These two values come from ONE lock acquisition rather than two. The
     // controller lock is held for the whole of an uncancellable blocking

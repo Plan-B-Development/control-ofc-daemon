@@ -1688,7 +1688,8 @@ mod tests {
         let parsed: Result<RuntimeConfig, _> = toml::from_str(with_unknown);
         assert!(
             parsed.is_err(),
-            "[hardware] must still reject unknown keys — if this passes,              deny_unknown_fields was removed and the downgrade argument is void"
+            "[hardware] must still reject unknown keys — if this passes, \
+             deny_unknown_fields was removed and the downgrade argument is void"
         );
     }
 

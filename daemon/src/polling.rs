@@ -764,15 +764,6 @@ fn read_nvml_states(backend: &dyn NvmlBackend) -> (Vec<SensorReading>, Vec<AmdGp
     (sensors, fans)
 }
 
-/// Run the OpenFanController RPM polling loop.
-///
-/// Sends `ReadAllRpm` every `interval` and pushes fan state into the cache.
-/// After 5 consecutive errors, enters reconnect mode: attempts `auto_detect_port`
-/// on a doubling backoff **capped at 30 poll intervals** until the device
-/// reappears. The backoff is a count of loop cycles, not of seconds
-/// (`attempts_reconnect_this_cycle`), so it reads as 1 s..30 s only at the
-/// default 1000 ms `polling.poll_interval_ms` and is proportionally shorter
-/// wherever that has been lowered (`OFN-aj`).
 /// Verify and adopt a re-opened OpenFan transport, or refuse it (DEC-260).
 ///
 /// Extracted from `openfan_poll_loop` for the same reason `first_openfan_port`
@@ -852,12 +843,17 @@ fn poll_attempt_failed<T>(
 /// Poll the OpenFanController for per-channel RPM at `interval`, reconnecting
 /// when the device stops answering.
 ///
+/// Sends `ReadAllRpm` every `interval` and pushes fan state into the cache.
 /// Runs until `shutdown` flips. Serial I/O is blocking, so each poll and each
 /// reconnect attempt runs on the blocking pool.
 ///
-/// Reconnect is not a separate task: after `reconnect_threshold` consecutive
+/// Reconnect is not a separate task: after [`RECONNECT_THRESHOLD`] consecutive
 /// failures the loop stops polling and starts attempting adoption instead, with
-/// exponential backoff capped at 30 cycles. A candidate must pass the DEC-250
+/// a doubling backoff capped at 30 cycles. The backoff is a count of loop
+/// cycles, not of seconds (`attempts_reconnect_this_cycle`), so it reads as
+/// 1 s..30 s only at the default 1000 ms `polling.poll_interval_ms` and is
+/// proportionally shorter wherever that has been lowered (`OFN-aj`). A
+/// candidate must pass the DEC-250
 /// identity probe before it is adopted — an openable port that is not an
 /// OpenFanController is worse than no port, because every subsequent write
 /// silently goes somewhere else.
@@ -870,11 +866,13 @@ fn poll_attempt_failed<T>(
 /// start a loop, and neither can replace a controller the engine is already
 /// writing through. Until *some* controller is
 /// adopted there is no OpenFan backend at all, which also costs the thermal
-/// thermal emergency its OpenFan leg.
+/// emergency its OpenFan leg.
 ///
 /// (This block was lost once in `419025d`, which moved the reconnect helper out
 /// and left the loop bare, and again in DEC-266, where it ended up attached to
-/// the constant below it and silently documented a `u32`. Keep it on the fn.)
+/// the constant below it and silently documented a `u32`. A third copy of its
+/// summary then sat on `adopt_reconnected_transport` until `OFN-an`. Keep it on
+/// the fn — `every_poll_loop_fn_carries_its_own_doc_summary` now checks.)
 pub async fn openfan_poll_loop(
     cache: Arc<StateCache>,
     transport: Arc<parking_lot::Mutex<Box<dyn SerialTransport + Send>>>,
@@ -1507,6 +1505,71 @@ mod tests {
              without the freshness bound it stays parked in the join and the daemon \
              can only be stopped by SIGKILL"
         );
+    }
+
+    /// `OFN-an`: each function's doc block opens with ITS OWN summary.
+    ///
+    /// `openfan_poll_loop`'s summary has now drifted onto a neighbour three
+    /// times — onto the constant below it (DEC-266), and onto
+    /// `adopt_reconnected_transport` (found at `OFN-aj`). Rustdoc attaches a
+    /// `///` run to whatever item follows it, so a block that lands above the
+    /// wrong `fn` compiles cleanly and documents the wrong thing. Prose asking the
+    /// next editor to keep it in place did not hold, so this checks it.
+    ///
+    /// Production source only, and each signature is matched in item position
+    /// (a line that STARTS with it), so the literals below cannot match
+    /// themselves and a doc comment naming a function is not mistaken for it.
+    #[test]
+    fn every_poll_loop_fn_carries_its_own_doc_summary() {
+        let whole = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/polling.rs"));
+        let src = whole
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .expect("polling.rs has a #[cfg(test)] module");
+        let lines: Vec<&str> = src.lines().collect();
+
+        let cases = [
+            (
+                "fn adopt_reconnected_transport<",
+                "/// Verify and adopt a re-opened OpenFan transport, or refuse it (DEC-260).",
+            ),
+            (
+                "pub async fn openfan_poll_loop(",
+                "/// Poll the OpenFanController for per-channel RPM at `interval`, reconnecting",
+            ),
+        ];
+        for (signature, summary) in cases {
+            let at = lines
+                .iter()
+                .position(|l| l.starts_with(signature))
+                .unwrap_or_else(|| panic!("`{signature}` not found in item position"));
+            // Walk up over attributes, then over the contiguous `///` run.
+            let mut first = at;
+            while first > 0 && lines[first - 1].starts_with("#[") {
+                first -= 1;
+            }
+            let block_end = first;
+            while first > 0 && lines[first - 1].starts_with("///") {
+                first -= 1;
+            }
+            assert!(first < block_end, "`{signature}` has no doc block at all");
+            assert_eq!(
+                lines[first], summary,
+                "the doc block on `{signature}` does not open with its own summary — \
+                 another item's documentation has drifted onto it"
+            );
+            // And no second summary further down the same run: a block whose
+            // first line is right can still carry an orphan appended below it.
+            let run = &lines[first..block_end];
+            for (other_sig, other_summary) in cases {
+                if other_sig != signature {
+                    assert!(
+                        !run.contains(&other_summary),
+                        "`{signature}`'s doc block also carries `{other_sig}`'s summary"
+                    );
+                }
+            }
+        }
     }
 
     /// [SAFETY] DEC-272 round 2 — the shutdown-first ORDERING, pinned deterministically.

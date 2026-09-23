@@ -1563,12 +1563,13 @@ pub(crate) mod tests {
 
     // ── TS-h / DEC-384: the profile's pump label reaches identify ─────────────
 
-    const PROFILED: &str = "hwmon:test:dev:pwm1";
+    pub(crate) const PROFILED: &str = "hwmon:test:dev:pwm1";
 
     /// A header with no pump evidence of its own (`role: unknown`, and an id
     /// that carries no daemon label) — the no-label-files chip TS-h is about —
     /// seen by the poll, so identify accepts its id.
-    fn unlabelled_header_state() -> (Arc<AppState>, WriteLog, tokio::sync::watch::Sender<bool>) {
+    pub(crate) fn unlabelled_header_state(
+    ) -> (Arc<AppState>, WriteLog, tokio::sync::watch::Sender<bool>) {
         let (state, writes, tx, _) =
             build_verify_state(None, crate::hwmon::roles::HeaderRole::Unknown);
         state
@@ -1587,7 +1588,7 @@ pub(crate) mod tests {
     }
 
     /// A profile whose one control drives `PROFILED` under `member_label`.
-    fn profile_naming(member_label: &str) -> crate::profile::DaemonProfile {
+    pub(crate) fn profile_naming(member_label: &str) -> crate::profile::DaemonProfile {
         crate::profile::DaemonProfile {
             id: "p".into(),
             name: "p".into(),

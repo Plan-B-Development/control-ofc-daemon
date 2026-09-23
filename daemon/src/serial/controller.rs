@@ -337,6 +337,11 @@ impl FanController {
             let ch = &mut self.channels[channel as usize];
             ch.last_commanded_pct = None;
             ch.stop_started_at = None;
+            // `TS-ad`: and so does the wire. The cache is written only on
+            // success, so without this `/status` went on reporting the previous
+            // duty — 100 % on a channel the controller no longer believed was
+            // at 100 %.
+            self.cache.clear_openfan_commanded_pwm(channel);
             return Err(FanControlError::Serial(e));
         }
 
@@ -351,8 +356,14 @@ impl FanController {
             self.channels[channel as usize].stop_started_at = None;
         }
 
-        // Update cache (store percent, not raw — GUI displays this as "%")
-        self.cache.set_openfan_commanded_pwm(channel, effective_pct);
+        // Update cache (store percent, not raw — GUI displays this as "%").
+        // `TS-ad`: against the generation this write was issued under, which the
+        // cache compares under its own guard — so a reconnect or resume that
+        // invalidated the device while this write was in flight is never undone
+        // by publishing its duty afterwards. The tracking above is forgotten by
+        // the next `observe_write_generation` in that case.
+        self.cache
+            .set_openfan_commanded_pwm(channel, effective_pct, self.last_write_generation);
 
         Ok(SetPwmResult {
             channel,
@@ -1040,6 +1051,112 @@ mod tests {
             "the next 0 % must reach the wire, not be rejected by a stale stop clock: {stop:?}"
         );
         assert_eq!(written.lock().len(), 2);
+    }
+
+    /// `TS-ad`: the published duty is forgotten with the controller's. The cache
+    /// is written only on success, so a failed reply used to leave `/status`
+    /// reporting the previous duty on a channel whose duty the daemon no longer
+    /// knows.
+    #[test]
+    fn a_failed_reply_clears_the_published_duty() {
+        let (transport, _written) = MockTransport::with_responses(vec![
+            Ok(ack(100)),
+            Err(SerialError::Timeout { timeout_ms: 500 }),
+        ]);
+        let cache = Arc::new(StateCache::new());
+        let mut ctrl = FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            Duration::from_millis(500),
+        );
+        ctrl.set_pwm(0, 100).unwrap();
+        assert_eq!(
+            cache.snapshot().openfan_fans[&0].last_commanded_pwm,
+            Some(100),
+            "precondition: the landed duty is published"
+        );
+
+        assert!(ctrl.set_pwm(0, 60).is_err(), "precondition: reply fails");
+
+        assert_eq!(cache.snapshot().openfan_fans[&0].last_commanded_pwm, None);
+    }
+
+    /// `TS-ad`, the reconnect/resume half: every channel's published duty goes
+    /// when the device may have been reset — including one nothing commands
+    /// again, which is the channel that would otherwise report it indefinitely.
+    #[test]
+    fn invalidation_clears_every_channel_s_published_duty() {
+        let (transport, _written) = MockTransport::with_ok_responses(2);
+        let cache = Arc::new(StateCache::new());
+        let mut ctrl = FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            Duration::from_millis(500),
+        );
+        ctrl.set_pwm(0, 40).unwrap();
+        ctrl.set_pwm(1, 70).unwrap();
+        let before = cache.snapshot();
+        assert_eq!(before.openfan_fans[&0].last_commanded_pwm, Some(40));
+        assert_eq!(before.openfan_fans[&1].last_commanded_pwm, Some(70));
+
+        cache.invalidate_openfan_writes();
+
+        let after = cache.snapshot();
+        assert_eq!(after.openfan_fans[&0].last_commanded_pwm, None);
+        assert_eq!(after.openfan_fans[&1].last_commanded_pwm, None);
+    }
+
+    /// Answers like `MockTransport`, but invalidates the device the moment a
+    /// frame is written — the reconnect landing while a write is in flight.
+    struct InvalidatingTransport {
+        inner: MockTransport,
+        cache: Arc<StateCache>,
+    }
+
+    impl SerialTransport for InvalidatingTransport {
+        fn write_line(&mut self, data: &str) -> Result<(), SerialError> {
+            self.cache.invalidate_openfan_writes();
+            self.inner.write_line(data)
+        }
+
+        fn read_line(&mut self, timeout: Duration) -> Result<String, SerialError> {
+            self.inner.read_line(timeout)
+        }
+    }
+
+    /// `TS-ad`: a write that succeeds AFTER an invalidation cleared the cache
+    /// must not republish its duty, or a channel nothing commands again would
+    /// report it on the wire for as long as the daemon runs.
+    #[test]
+    fn a_write_racing_an_invalidation_does_not_republish_its_duty() {
+        let (inner, _written) = MockTransport::with_ok_responses(1);
+        let cache = Arc::new(StateCache::new());
+        let mut ctrl = FanController::new(
+            Box::new(InvalidatingTransport {
+                inner,
+                cache: cache.clone(),
+            }),
+            cache.clone(),
+            Duration::from_millis(500),
+        );
+        let generation = cache.openfan_write_generation();
+
+        let r = ctrl.set_pwm(2, 55).unwrap();
+
+        assert!(!r.coalesced, "precondition: the frame was written");
+        assert_ne!(
+            cache.openfan_write_generation(),
+            generation,
+            "precondition: the invalidation landed during the write"
+        );
+        assert!(
+            cache
+                .snapshot()
+                .openfan_fans
+                .get(&2)
+                .is_none_or(|f| f.last_commanded_pwm.is_none()),
+            "a duty the device may have lost must not be published"
+        );
     }
 
     #[test]

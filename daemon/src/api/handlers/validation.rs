@@ -284,21 +284,50 @@ fn build_metadata(
         .map(|c| c.lock().headers().into_iter().cloned().collect())
         .unwrap_or_default();
 
+    // `TS-ag`: the profile is read ONCE, and its id, name and pump members all
+    // come from that read. Each member's union used to read the active profile
+    // on its own, and the id was read again after them, so an activation in
+    // between recorded one profile's id beside pump fields derived from another
+    // — or two members derived from different profiles. The lock is released
+    // before `header_role_parts` takes the controller: the two are never held
+    // together (`AppState::header_is_pump_protected`).
+    let (active_profile_id, active_profile_name, profile_pump_ids) = {
+        let guard = state.active_profile.lock();
+        match guard.as_ref() {
+            Some(p) => (
+                Some(p.id.clone()),
+                Some(p.name.clone()),
+                super::pump_header_ids(p),
+            ),
+            None => (None, None, std::collections::HashSet::new()),
+        }
+    };
+
     let mut members = Vec::new();
     let add = |id: &str, kind: &str, members: &mut Vec<MemberRoleSnapshot>| {
         let header = headers.iter().find(|h| h.id == id);
         // [SAFETY] The union predicate, never the display role (DEC-312): a user
         // may assign `chassis_fan` to a header the hardware labels `PUMP`, and
         // recording that as unprotected would be evidence that contradicts what
-        // the daemon will actually refuse to do.
-        let pump_protected = state.header_is_pump_protected(id);
+        // the daemon will actually refuse to do. Computed from its parts so the
+        // profile term is the snapshot above, and the display role from the
+        // same two facts.
+        let (assigned, inferred) = state.header_role_parts(id);
+        let pump_protected = crate::hwmon::roles::is_pump_protected(
+            assigned,
+            inferred,
+            profile_pump_ids.contains(id),
+        );
         let floor = crate::hwmon::device_policy::resolve_policy_floor(policy, pump_protected);
         members.push(MemberRoleSnapshot {
             member_id: id.to_string(),
             label: header
                 .map(|h| h.label.clone())
                 .unwrap_or_else(|| id.to_string()),
-            role: state.resolved_header_role(id).as_str().to_string(),
+            role: crate::hwmon::roles::resolve_role(assigned, inferred)
+                .0
+                .as_str()
+                .to_string(),
             member_kind: kind.to_string(),
             pump_protected,
             effective_min_pwm_pct: Some(floor.round() as u8),
@@ -316,14 +345,6 @@ fn build_metadata(
     for a in &device.auxiliary_members {
         add(a, MEMBER_AUXILIARY, &mut members);
     }
-
-    let (active_profile_id, active_profile_name) = {
-        let guard = state.active_profile.lock();
-        match guard.as_ref() {
-            Some(p) => (Some(p.id.clone()), Some(p.name.clone())),
-            None => (None, None),
-        }
-    };
 
     SessionMetadata {
         cooling_device_id: device.id.clone(),
@@ -1557,6 +1578,89 @@ mod tests {
     use super::*;
     use crate::api::characterization as ch;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    // ── `TS-ag`: one profile snapshot for the session's metadata ───────────────
+
+    /// [SAFETY] The member's recorded pump posture comes from the SAME profile
+    /// as the session's `active_profile_id`. The header has no pump evidence of
+    /// its own, so the profile's `member_label` is the only term that can make
+    /// it pump-protected — which is what makes this discriminate a call site
+    /// that drops the snapshot's profile term. Asserted as a relationship
+    /// against the daemon's live union (DEC-324), with the opposite arm, so a
+    /// predicate stuck at either answer fails.
+    #[test]
+    fn metadata_pump_fields_come_from_the_profile_it_names() {
+        use super::super::hwmon_ctl::tests::{profile_naming, unlabelled_header_state, PROFILED};
+        for (label, expect_pump) in [("Pump", true), ("Rear Fan", false)] {
+            let (state, _writes, _tx) = unlabelled_header_state();
+            *state.active_profile.lock() = Some(profile_naming(label));
+            let device = crate::hwmon::cooling_device::CoolingDeviceConfig {
+                id: "aio".into(),
+                pump_member: Some(PROFILED.into()),
+                ..Default::default()
+            };
+
+            let meta = build_metadata(&state, &device, Default::default());
+
+            assert_eq!(meta.active_profile_id.as_deref(), Some("p"));
+            let member = &meta.members[0];
+            assert_eq!(member.member_id, PROFILED);
+            assert_eq!(
+                member.pump_protected, expect_pump,
+                "precondition for the relationship below ({label})"
+            );
+            assert_eq!(
+                member.pump_protected,
+                state.header_is_pump_protected(PROFILED),
+                "{label}: the recorded posture must be the daemon's own union"
+            );
+            assert_eq!(
+                member.stop_permitted,
+                Some(crate::hwmon::device_policy::stop_permitted(
+                    member.pump_protected
+                ))
+            );
+        }
+    }
+
+    /// [SAFETY] `TS-ag`'s race is an activation landing between two reads of
+    /// the active profile, and no deterministic test can place one there. This
+    /// tripwire pins the shape that makes the race impossible instead:
+    /// `build_metadata` locks the profile ONCE and never reaches for a helper
+    /// that locks it again. **A tripwire, not a proof** — a helper added under a
+    /// new name would evade it — but it catches the likely edit, which is
+    /// reverting to `header_is_pump_protected` because it is shorter.
+    ///
+    /// Over the production half only, and within `build_metadata`'s body, so
+    /// this test's own literals cannot match.
+    #[test]
+    fn build_metadata_reads_the_active_profile_once() {
+        let src = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/api/handlers/validation.rs"
+        ));
+        let production = src.split("#[cfg(test)]").next().expect("production half");
+        let start = production
+            .find("\nfn build_metadata(")
+            .expect("build_metadata in item position");
+        let body = &production[start..];
+        let end = body[1..].find("\n}\n").expect("end of build_metadata") + 1;
+        let body = &body[..end];
+
+        assert_eq!(
+            body.matches("active_profile.lock()").count(),
+            1,
+            "build_metadata must read the active profile exactly once (`TS-ag`)"
+        );
+        for relock in ["header_is_pump_protected(", "profile_pump_header_ids("] {
+            assert!(
+                !body.contains(relock),
+                "build_metadata calls `{relock}`, which re-reads the active profile \
+                 per member — compute the union from the snapshot with \
+                 `roles::is_pump_protected` instead (`TS-ag`)"
+            );
+        }
+    }
 
     // ── DEC-405 (`PTR-e`): verify evidence from the REAL handler ────────────
 

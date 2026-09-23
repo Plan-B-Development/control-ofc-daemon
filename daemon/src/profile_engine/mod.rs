@@ -34,8 +34,8 @@ pub use crate::health::state::ControlOutput;
 pub(crate) use curve_eval::*;
 pub(crate) use safety_tick::*;
 pub use skipped::{
-    control_deliverability, source_is_deliverable, Deliverability, SkipEvent, SkipReason,
-    SkipRecord, SkippedControl, SkippedControlTracker, SKIP_DEBOUNCE_TICKS,
+    control_deliverability, member_is_deliverable, Deliverability, DeliveryTargets, HwmonTargets,
+    SkipEvent, SkipReason, SkipRecord, SkippedControl, SkippedControlTracker, SKIP_DEBOUNCE_TICKS,
 };
 pub(crate) use tuning::*;
 
@@ -182,8 +182,10 @@ impl ProfileEngineState {
 
     /// Record controls that resolved but can deliver to nothing (`OFN-j`).
     ///
-    /// Appends a `BackendUnavailable` record for every control whose members ALL
-    /// target an absent backend, and returns the ids of controls that are only
+    /// Appends a `BackendUnavailable` record for every control none of whose
+    /// members this daemon can write — each member resolved on its own against
+    /// `targets` (`OFN-al`), so on a board with writable headers a control bound
+    /// only to read-only ones is listed too — and returns the ids of controls that are only
     /// PARTIALLY deliverable and have not been reported yet — the caller logs
     /// those and does not list them, because a partly-live control is still
     /// commanding fans and `/status`'s contract for this list is that nothing is.
@@ -202,8 +204,7 @@ impl ProfileEngineState {
         &mut self,
         profile: &DaemonProfile,
         overrides: &OverrideSnapshot,
-        openfan_available: bool,
-        hwmon_available: bool,
+        targets: DeliveryTargets<'_>,
     ) -> Vec<String> {
         let mut partial_to_log = Vec::new();
         for control in &profile.controls {
@@ -215,7 +216,7 @@ impl ProfileEngineState {
             {
                 continue;
             }
-            match control_deliverability(control, openfan_available, hwmon_available) {
+            match control_deliverability(control, targets) {
                 Deliverability::None => {
                     self.skipped_this_tick.push(SkipRecord {
                         control_id: control.id.clone(),
@@ -1338,16 +1339,25 @@ pub async fn profile_engine_loop(
                     // commands were built, never delivered, never logged and never
                     // listed. A profile exported from a machine that HAS a
                     // controller imports cleanly onto one that does not.
+                    //
+                    // `OFN-al`: hwmon members are resolved one by one against the
+                    // backend's writable set, so a control bound only to read-only
+                    // headers is listed on a board that has writable ones too.
                     for id in engine_state.note_backend_unavailable(
                         active_profile,
                         &override_snapshot,
-                        openfan_be.is_some(),
-                        hwmon_be.is_some(),
+                        DeliveryTargets {
+                            openfan: openfan_be.is_some(),
+                            hwmon: hwmon_be
+                                .as_ref()
+                                .map_or(HwmonTargets::Absent, HwmonBackend::delivery_targets),
+                        },
                     ) {
                         log::info!(
                             "Control '{id}' has members this daemon cannot write (no backend for \
-                             their source) alongside members it can — the rest are still being \
-                             commanded, so it is not listed as uncommanded"
+                             their source, or a header it cannot write) alongside members it can \
+                             — the rest are still being commanded, so it is not listed as \
+                             uncommanded"
                         );
                     }
                     // `TS-p`: the skipped controls' members, from the same
@@ -1794,15 +1804,18 @@ mod tests {
         let partial = state.note_backend_unavailable(
             &profile,
             &OverrideSnapshot::default(),
-            false, // no OpenFan backend
-            true,
+            DeliveryTargets::backends(false, true), // no OpenFan backend
         );
         assert!(partial.is_empty(), "nothing is partial in this fixture");
 
         // The listing is debounced (SKIP_DEBOUNCE_TICKS), so drive enough ticks
         // for it to publish rather than asserting on an internal.
         for _ in 0..=SKIP_DEBOUNCE_TICKS {
-            state.note_backend_unavailable(&profile, &OverrideSnapshot::default(), false, true);
+            state.note_backend_unavailable(
+                &profile,
+                &OverrideSnapshot::default(),
+                DeliveryTargets::backends(false, true),
+            );
             state.commit_skips(std::time::Instant::now());
         }
         let snap = state.skipped_snapshot();
@@ -1819,7 +1832,11 @@ mod tests {
         let profile = one_openfan_control_profile();
         let mut state = ProfileEngineState::new();
         for _ in 0..=SKIP_DEBOUNCE_TICKS {
-            state.note_backend_unavailable(&profile, &OverrideSnapshot::default(), true, true);
+            state.note_backend_unavailable(
+                &profile,
+                &OverrideSnapshot::default(),
+                DeliveryTargets::backends(true, true),
+            );
             state.commit_skips(std::time::Instant::now());
         }
         assert!(
@@ -1847,7 +1864,11 @@ mod tests {
              otherwise the assertion below would hold vacuously"
         );
 
-        state.note_backend_unavailable(&profile, &OverrideSnapshot::default(), false, true);
+        state.note_backend_unavailable(
+            &profile,
+            &OverrideSnapshot::default(),
+            DeliveryTargets::backends(false, true),
+        );
 
         assert!(
             !state.outputs_snapshot().iter().any(|o| o.control_id == "c"),
@@ -1862,7 +1883,11 @@ mod tests {
         let cache = make_cache_with_sensors(&[("cpu".into(), 50.0)]);
         let mut state = ProfileEngineState::new();
         evaluate_profile(&profile, &cache.sensors_snapshot(), &mut state);
-        state.note_backend_unavailable(&profile, &OverrideSnapshot::default(), true, true);
+        state.note_backend_unavailable(
+            &profile,
+            &OverrideSnapshot::default(),
+            DeliveryTargets::backends(true, true),
+        );
         assert!(state.outputs_snapshot().iter().any(|o| o.control_id == "c"));
     }
 
@@ -1875,7 +1900,11 @@ mod tests {
         overrides.controls.insert("c".to_string(), 50);
         let mut state = ProfileEngineState::new();
         for _ in 0..=SKIP_DEBOUNCE_TICKS {
-            state.note_backend_unavailable(&profile, &overrides, false, true);
+            state.note_backend_unavailable(
+                &profile,
+                &overrides,
+                DeliveryTargets::backends(false, true),
+            );
             state.commit_skips(std::time::Instant::now());
         }
         assert!(state.skipped_snapshot().is_empty());
@@ -1898,8 +1927,8 @@ mod tests {
         let first = state.note_backend_unavailable(
             &profile,
             &OverrideSnapshot::default(),
-            false, // openfan member undeliverable
-            true,  // hwmon member deliverable
+            // The openfan member is undeliverable, the hwmon member deliverable.
+            DeliveryTargets::backends(false, true),
         );
         assert_eq!(
             first,
@@ -1907,12 +1936,19 @@ mod tests {
             "the partial case is reported once"
         );
 
-        let second =
-            state.note_backend_unavailable(&profile, &OverrideSnapshot::default(), false, true);
+        let second = state.note_backend_unavailable(
+            &profile,
+            &OverrideSnapshot::default(),
+            DeliveryTargets::backends(false, true),
+        );
         assert!(second.is_empty(), "and not again on the next tick");
 
         for _ in 0..=SKIP_DEBOUNCE_TICKS {
-            state.note_backend_unavailable(&profile, &OverrideSnapshot::default(), false, true);
+            state.note_backend_unavailable(
+                &profile,
+                &OverrideSnapshot::default(),
+                DeliveryTargets::backends(false, true),
+            );
             state.commit_skips(std::time::Instant::now());
         }
         assert!(
@@ -7151,6 +7187,85 @@ mod tests {
             outputs.iter().any(|o| o.control_id == "c"),
             "and the control must still publish its applied duty — got {outputs:?}"
         );
+    }
+
+    /// [SAFETY-adjacent] `OFN-al` — the CALL SITE on a MIXED board.
+    ///
+    /// One writable header and one read-only one, so the hwmon backend EXISTS
+    /// and a per-backend answer called every `hwmon:` member deliverable. The
+    /// discriminating controls are `ro` (bound only to the read-only header) and
+    /// `gone` (bound to a header this board never discovered, as an imported
+    /// profile would be): the backend is present for both, so only a per-member
+    /// resolution against the writable set can list them. `rw` and `mixed` are
+    /// the opposite arms — a gate stuck at "never deliverable" lists `rw`, and
+    /// one that lists on ANY undeliverable member lists `mixed`, which is still
+    /// commanding its writable fan (DEC-361: partial delivery is journal-only).
+    ///
+    /// Driven through the real loop, not `note_backend_unavailable` with a
+    /// hand-built set, for `OFN-ah`'s reason: the argument the tick body passes
+    /// is the thing most likely to be wrong.
+    #[tokio::test]
+    async fn loop_reports_read_only_and_unknown_hwmon_controls_on_a_mixed_board() {
+        let mut mixed = hwmon_control("mixed", "cv", "hwmon:it8696:pwm1");
+        mixed.members.push(ControlMember {
+            source: "hwmon".into(),
+            member_id: "hwmon:it8696:pwm2".into(),
+            member_label: String::new(),
+            fan_zero_rpm: false,
+        });
+        let profile = DaemonProfile {
+            id: "p".into(),
+            name: "P".into(),
+            version: 7,
+            description: String::new(),
+            controls: vec![
+                hwmon_control("rw", "cv", "hwmon:it8696:pwm1"),
+                hwmon_control("ro", "cv", "hwmon:it8696:pwm2"),
+                hwmon_control("gone", "cv", "hwmon:other:pwm9"),
+                mixed,
+            ],
+            curves: vec![linear_curve("cv", "cpu")],
+        };
+
+        let cache = run_loop_with_hwmon_headers(
+            profile,
+            vec![
+                writable_pwm_header("hwmon:it8696:pwm1"),
+                read_only_pwm_header("hwmon:it8696:pwm2"),
+            ],
+            |s| s.skipped_controls.len() >= 2,
+        )
+        .await;
+
+        let (skipped, outputs) =
+            cache.read_with(|s| (s.skipped_controls.clone(), s.control_outputs.clone()));
+        let mut listed: Vec<(&str, SkipReason)> = skipped
+            .iter()
+            .map(|c| (c.control_id.as_str(), c.reason))
+            .collect();
+        listed.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            listed,
+            vec![
+                ("gone", SkipReason::BackendUnavailable),
+                ("ro", SkipReason::BackendUnavailable),
+            ],
+            "exactly the controls none of whose members can be written"
+        );
+        let published: Vec<&str> = outputs.iter().map(|o| o.control_id.as_str()).collect();
+        for id in ["ro", "gone"] {
+            assert!(
+                !published.contains(&id),
+                "277-k: listed `{id}` must not also publish a duty — got {published:?}"
+            );
+        }
+        for id in ["rw", "mixed"] {
+            assert!(
+                published.contains(&id),
+                "`{id}` is commanding a writable header and must keep its duty — got \
+                 {published:?}"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]

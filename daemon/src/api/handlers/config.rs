@@ -979,6 +979,33 @@ async fn runtime_for_update(
     Ok((guard, cfg))
 }
 
+/// Run a SIGHUP configuration reload under `config_write` (`TS-aq`).
+///
+/// The reload reads `daemon.toml` and `runtime.toml` and then applies what it
+/// read to the running daemon — the search dirs and, since DEC-388, the exit
+/// floor. Without the lock a setter could land between the two: the reload
+/// read the old file, `POST /config/exit-floor` wrote the new value to the file
+/// and the cache, and the reload then overwrote the cache with the stale value
+/// it had read. The file and the process disagreed until the next reload or
+/// restart, with the older value the one a stop would use. Taking the lock
+/// every setter holds orders the reload wholly before or wholly after each one.
+///
+/// Called from a task of its own, never awaited by the signal loop: a setter
+/// holds this lock across an fsync, and a SIGTERM must not wait behind one.
+/// The reload itself runs off the async runtime, like every other config file
+/// read and write here (DEC-252). `reload` is the binary's
+/// `apply_config_reload`, passed in because it lives in `main.rs`.
+pub async fn reload_under_config_write<F>(state: Arc<AppState>, reload: F)
+where
+    F: FnOnce(&AppState) -> Result<(), String> + Send + 'static,
+{
+    let _guard = state.config_write.lock().await;
+    let owned = Arc::clone(&state);
+    if let Err(e) = super::persist_off_runtime(move || reload(&owned)).await {
+        log::error!("{e}");
+    }
+}
+
 /// Shared persist-and-report tail for the DEC-243 setters.
 async fn persist_runtime(
     state: &AppState,
@@ -1627,6 +1654,42 @@ pub async fn delete_cooling_device_handler(
 mod tests {
     use super::*;
     use crate::config::SYSTEM_PROFILE_DIR;
+
+    // ── `TS-aq`: a SIGHUP reload is serialised with the setters ─────────────
+
+    /// The reload must wait for a setter holding `config_write`, or it can read
+    /// the files before the setter writes them and apply that stale value after.
+    /// Asserted as "does not run while the lock is held", then "does run once it
+    /// is released" — the presence half, so a reload that never runs cannot pass.
+    #[tokio::test]
+    async fn a_config_reload_waits_for_a_setter_holding_config_write() {
+        let (state, _writes, _tx, _tmp) = super::super::hwmon_ctl::tests::build_verify_state_with(
+            None,
+            crate::hwmon::roles::HeaderRole::ChassisFan,
+            None,
+        );
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let setter = state.config_write.lock().await;
+
+        let flag = Arc::clone(&ran);
+        let mut reload = tokio::spawn(reload_under_config_write(state.clone(), move |_| {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }));
+
+        let early = tokio::time::timeout(std::time::Duration::from_millis(200), &mut reload).await;
+        assert!(
+            early.is_err() && !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the reload ran while a setter held config_write"
+        );
+
+        drop(setter);
+        tokio::time::timeout(std::time::Duration::from_secs(5), reload)
+            .await
+            .expect("the reload runs once the setter releases the lock")
+            .expect("the reload task did not panic");
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     fn v(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()

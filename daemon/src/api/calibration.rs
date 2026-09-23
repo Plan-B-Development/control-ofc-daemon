@@ -280,6 +280,14 @@ pub fn temperature_refusal(cache: &StateCache) -> Option<String> {
 /// the same change, because scope exit covers completion and cancellation alike.
 /// Kept as a named function rather than inlined into `Drop` so the thermal rule
 /// is readable and testable on its own.
+///
+/// An UNKNOWN pre-calibration duty is restored to full speed (DEC-412) — the
+/// exit floor's rule for a duty the daemon has lost track of (DEC-388), taken
+/// from the same `pwm::exit_duty` so the two cannot drift. It is unknown when
+/// the channel was never commanded, and since `TS-ad` also after a failed reply,
+/// a reconnect or a resume. Skipping the restore, as this did before, left a
+/// cancelled sweep's channel at its step — 0 % for the early ones — with only
+/// the 100 % emergency left to write it again.
 fn restore_pre_cal<F>(
     channel: u8,
     pre_cal_pwm: Option<u8>,
@@ -289,9 +297,13 @@ fn restore_pre_cal<F>(
 ) where
     F: Fn(u8, u8) -> Result<(), CalibrationError>,
 {
-    let Some(restore) = pre_cal_pwm else {
-        return;
-    };
+    let restore = crate::pwm::exit_duty(pre_cal_pwm, 0);
+    if pre_cal_pwm.is_none() {
+        log::info!(
+            "ch{channel}: the pre-calibration duty is unknown (never commanded, or lost \
+             to a failed reply, a reconnect or a resume) — restoring {restore}% ({why})"
+        );
+    }
     if let Some(state) = thermal_force_state(cache) {
         log::warn!(
             "ch{channel} left at the thermal-safety forced duty instead of restoring \
@@ -324,10 +336,24 @@ struct RestoreOnDrop<'a, F: Fn(u8, u8) -> Result<(), CalibrationError>> {
     pre_cal_pwm: Option<u8>,
     write_fn: &'a F,
     cache: &'a StateCache,
+    /// Set just before the sweep's first write is issued (DEC-412). A sweep
+    /// refused before any step — a hot, stale or forcing thermal state — never
+    /// touched the channel, so there is nothing to restore, and a refusal must
+    /// write nothing. Set BEFORE the write rather than after it succeeds: a
+    /// write whose reply fails may still have landed (`TS-o`).
+    touched: &'a std::sync::atomic::AtomicBool,
 }
 
 impl<F: Fn(u8, u8) -> Result<(), CalibrationError>> Drop for RestoreOnDrop<'_, F> {
     fn drop(&mut self) {
+        // Before DEC-412 this rule was implicit: a refused sweep on a channel
+        // with a known duty restored that duty, which the controller coalesced
+        // into no frame, and an unknown duty skipped the restore. Once an
+        // unknown duty restores full speed, a refusal would write 100 % — so the
+        // guard says outright what it restores: only what the sweep changed.
+        if !self.touched.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         restore_pre_cal(
             self.channel,
             self.pre_cal_pwm,
@@ -387,6 +413,7 @@ pub async fn calibrate_openfan_channel(
 
     let fan_id = crate::serial::openfan_member_id(channel);
     let step_size = 100.0 / steps as f64;
+    let touched = std::sync::atomic::AtomicBool::new(false);
 
     // Sweep from 0% to 100%. Runs as an inner block so every exit —
     // success, thermal abort, write failure — flows through the restore
@@ -420,7 +447,9 @@ pub async fn calibrate_openfan_channel(
                 return Err(CalibrationError::StaleTemperature { reason });
             }
 
-            // Set PWM
+            // Set PWM. Marked first: from here the channel may hold a sweep duty
+            // whether or not the write reports success, so the restore is owed.
+            touched.store(true, std::sync::atomic::Ordering::SeqCst);
             write_fn(channel, pwm)?;
 
             // Wait for fan to settle
@@ -449,6 +478,7 @@ pub async fn calibrate_openfan_channel(
         pre_cal_pwm,
         write_fn: &write_fn,
         cache: &cache,
+        touched: &touched,
     };
 
     let sweep_result = sweep.await;
@@ -599,10 +629,26 @@ mod tests {
     }
 
     /// DEC-134: a thermal abort must still restore the pre-calibration PWM.
+    ///
+    /// The machine heats past the limit after the sweep's first step, so the
+    /// abort lands on a channel the sweep HAS touched. Until DEC-412 this test
+    /// aborted before any write and asserted a lone restore; since DEC-412 a
+    /// sweep that touched nothing restores nothing
+    /// (`a_sweep_refused_before_its_first_step_writes_nothing`), so that shape
+    /// would no longer exercise the restore at all.
     #[tokio::test(start_paused = true)]
     async fn calibration_restores_pre_cal_pwm_on_thermal_abort() {
-        let cache = make_cache(90.0, 0, 800); // over limit — aborts before any sweep write
-        let (write_fn, writes) = recording_write_fn(None);
+        let cache = make_cache(50.0, 0, 800);
+        let writes: WriteLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let write_fn = {
+            let (cache, writes) = (cache.clone(), writes.clone());
+            move |ch: u8, pwm: u8| -> Result<(), CalibrationError> {
+                writes.lock().unwrap().push((ch, pwm));
+                // Too hot from the next step's check on.
+                cache.update_sensors(vec![aged_cpu(90.0, Duration::ZERO)]);
+                Ok(())
+            }
+        };
 
         let result = calibrate_openfan_channel(cache, 0, 3, 0, write_fn).await;
 
@@ -613,8 +659,8 @@ mod tests {
         let w = writes.lock().unwrap();
         assert_eq!(
             w.as_slice(),
-            &[(0u8, 50u8)],
-            "abort must restore (and nothing else was written)"
+            &[(0u8, 0u8), (0u8, 50u8)],
+            "the first step, then the abort's restore — and no second step"
         );
     }
 
@@ -797,8 +843,9 @@ mod tests {
         );
         assert_eq!(
             writes.lock().unwrap().as_slice(),
-            &[(0u8, 50u8)],
-            "no sweep step may be written — only the restore of the pre-calibration duty"
+            &[] as &[(u8, u8)],
+            "no sweep step may be written — and since DEC-412 no restore either, \
+             because a sweep refused before its first step never touched the channel"
         );
 
         let cache = make_cache(84.0, 0, 800);
@@ -880,6 +927,81 @@ mod tests {
         );
     }
 
+    /// DEC-412: the case that stranded a fan. A duty the daemon stopped knowing
+    /// (`TS-ad` — here withdrawn exactly as a failed reply withdraws it) left a
+    /// cancelled sweep's channel at its first step, 0 %, because the restore was
+    /// skipped when there was nothing to restore. It now goes to full speed.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_calibration_with_an_unknown_duty_restores_full_speed() {
+        let cache = make_cache(50.0, 0, 800);
+        cache.clear_openfan_commanded_pwm(0);
+        assert_eq!(
+            cache.snapshot().openfan_fans[&0].last_commanded_pwm,
+            None,
+            "precondition: the duty is unknown"
+        );
+        let (write_fn, writes) = recording_write_fn(None);
+        {
+            let fut = calibrate_openfan_channel(cache.clone(), 0, 3, 0, write_fn);
+            tokio::pin!(fut);
+            tokio::select! {
+                _ = &mut fut => panic!("the sweep completed too fast to model a cancellation"),
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+
+        let w = writes.lock().unwrap();
+        assert!(
+            w.contains(&(0u8, 0u8)),
+            "fixture check: the sweep must have written 0 % before the cancel; got {w:?}"
+        );
+        assert_eq!(
+            w.last(),
+            Some(&(0u8, 100u8)),
+            "an unknown duty is restored to full speed, never left at 0 %; got {w:?}"
+        );
+    }
+
+    /// DEC-412: a sweep refused before its first step never touched the channel,
+    /// so nothing is restored — above all not the full speed an UNKNOWN duty now
+    /// restores to, which would make a refusal write 100 %. Both refusal shapes
+    /// the sweep has before a write (too hot; a stale temperature source) and
+    /// both duty states, because the known-duty arm used to pass only by the
+    /// controller's coalescing, which this recording closure does not do.
+    #[tokio::test(start_paused = true)]
+    async fn a_sweep_refused_before_its_first_step_writes_nothing() {
+        for (temp, stale) in [(90.0, false), (50.0, true)] {
+            for unknown_duty in [true, false] {
+                let cache = make_cache(temp, 0, 800);
+                if unknown_duty {
+                    cache.clear_openfan_commanded_pwm(0);
+                }
+                if stale {
+                    let old = std::time::Instant::now()
+                        - diagnostic_temp_max_age(&cache)
+                        - Duration::from_secs(60);
+                    let mut reading = cache.snapshot().sensors["cpu"].clone();
+                    reading.updated_at = old;
+                    cache.update_sensors(vec![reading]);
+                }
+                let (write_fn, writes) = recording_write_fn(None);
+
+                let result = calibrate_openfan_channel(cache, 0, 3, 0, write_fn).await;
+
+                assert!(
+                    result.is_err(),
+                    "precondition: temp {temp}, stale {stale} must refuse the sweep"
+                );
+                assert!(
+                    writes.lock().unwrap().is_empty(),
+                    "a refused sweep wrote (temp {temp}, stale {stale}, unknown duty \
+                     {unknown_duty}): {:?}",
+                    writes.lock().unwrap()
+                );
+            }
+        }
+    }
+
     /// DEC-295: the restore guard in isolation.
     ///
     /// The test above aborts at the first step, so it never reaches the restore.
@@ -953,10 +1075,14 @@ mod tests {
         );
     }
 
-    /// No pre-calibration PWM in the cache → nothing to restore (the sweep's
-    /// own writes are the only ones issued).
+    /// DEC-412: no pre-calibration PWM in the cache → the duty is unknown, and
+    /// it is restored to FULL speed, the exit floor's rule for a duty the daemon
+    /// lost track of. Until DEC-412 this skipped the restore (the sweep's own
+    /// writes were the only ones issued). A completed sweep already ends at
+    /// 100 %, so the extra write is what discriminates here; the cancelled case
+    /// below is the one that mattered.
     #[tokio::test(start_paused = true)]
-    async fn calibration_skips_restore_without_pre_cal_pwm() {
+    async fn calibration_restores_full_speed_without_pre_cal_pwm() {
         let cache = Arc::new(StateCache::new());
         cache.update_sensors(vec![CachedSensorReading {
             id: "cpu".into(),
@@ -986,7 +1112,11 @@ mod tests {
             .unwrap();
 
         let w = writes.lock().unwrap();
-        assert_eq!(w.len(), 4, "sweep writes only — no restore; writes: {w:?}");
+        assert_eq!(
+            w.len(),
+            5,
+            "four sweep writes, then the restore; writes: {w:?}"
+        );
         assert_eq!(w.last(), Some(&(0u8, 100u8)));
     }
 }

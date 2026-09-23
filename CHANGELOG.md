@@ -32,7 +32,51 @@ genuine ~265 rpm steps read `unchanged`. A point that settled is now `changed` w
 than three of its own standard deviations (never less than 50 rpm). A point that did not settle, or
 had too few readings, keeps the old rule.
 
+**`backend_unavailable` now covers fans on headers the daemon cannot write** (`OFN-al`, DEC-412).
+A control none of whose fans the daemon can write is listed in `skipped_controls[]` as
+`backend_unavailable`. That used to be decided per backend: on a board with at least one writable
+header, a control bound only to read-only headers counted as deliverable. It published a duty, and
+the engine then dropped every write to it without logging anything. Each fan is now checked on its
+own, so such a control is listed and leaves `control_outputs`. The same applies to headers the
+board doesn't have at all, as in a profile imported from another machine. A control where some
+fans can be written and some can't is still only logged, not listed, as before.
+
 ### Fixed
+
+**`/status` no longer reports an OpenFan duty the daemon has stopped knowing** (`TS-ad`, DEC-412).
+After a write whose reply failed, and for every channel after a serial reconnect or a system resume,
+the daemon treats the channel's duty as unknown. `last_commanded_pwm` kept showing the previous
+value anyway, for as long as nothing wrote that channel again. It is now omitted until a write
+lands. That channel's `stall_detected` is omitted over the same period, because it is worked out from
+that duty.
+
+**A cancelled OpenFan calibration no longer leaves a fan stopped** (DEC-412). A calibration puts
+the channel back to its previous speed when it ends, even when cancelled. If that speed wasn't known
+(the channel had never been set, or its speed was lost as above), nothing was restored, so a sweep
+cancelled in its first steps left the fan at 0 %. The channel now goes to 100 % instead. A
+calibration that is refused before it starts (too hot, the thermal emergency still active, or
+temperature readings too old) no longer writes anything to the channel, not even a restore.
+
+**A config reload can no longer undo an exit-minimum change made at the same moment** (`TS-aq`,
+DEC-412). A `SIGHUP` / `systemctl reload` that read the config files just before
+`POST /config/exit-floor` saved a new value could then apply the old one. The file and the running
+daemon disagreed, and the next stop used the older minimum. A reload now waits for any config
+change in progress, and a SIGTERM never waits behind the reload.
+
+**A validation session records one profile's pump settings** (`TS-ag`, DEC-412). A session's
+metadata read the active profile once per member and again for its id. A profile activated in
+between could leave the recorded id beside pump fields worked out from a different profile. It is
+now read once.
+
+**A diagnostic always gets the duty it asks for** (`PTA-j`, DEC-412). A verify, characterisation or
+probe write that repeated the engine's last duty was skipped. If a second program was holding the
+header at another speed, the test recorded that program's RPM under the duty it asked for. It is
+now always written.
+
+**A failed hand-back no longer leaves "duty not holding" raised** (`PTA-k`, DEC-412). When a
+profile stopped naming a header and giving it back to firmware failed, the header kept reporting
+`duty_not_holding: true`. That blamed corrections for a failing hand-back. It could also stop a
+later profile from correcting a second writer on that header.
 
 **A validation session that tests several members reports each one** (`PTR-n`, DEC-411). Every
 finding derived from a characterisation, verify or control-path run reported only the first run it

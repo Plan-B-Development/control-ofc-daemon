@@ -1872,6 +1872,18 @@ impl HwmonBackend {
         })
     }
 
+    /// The headers this backend can deliver a write to, for the engine's
+    /// per-member deliverability (`OFN-al`) — the same measured set the forced
+    /// write's reach is judged against, so the two cannot disagree. `Unmeasured`
+    /// when the controller was locked at construction, where `new` already
+    /// assumes the backend can drive anything.
+    pub(crate) fn delivery_targets(&self) -> crate::profile_engine::skipped::HwmonTargets<'_> {
+        match &self.writable {
+            Some(ids) => crate::profile_engine::skipped::HwmonTargets::Writable(ids),
+            None => crate::profile_engine::skipped::HwmonTargets::Unmeasured,
+        }
+    }
+
     /// Would this tick give anything back? A non-blocking peek at the ledger,
     /// so a tick with nothing to command does not spawn a write task just to
     /// find out (DEC-298). A contended lock answers `true`: the task then

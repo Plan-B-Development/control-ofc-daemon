@@ -32,7 +32,7 @@
 //! The tracker holds no I/O and no clock of its own (the caller passes `now`),
 //! so it is a pure, deterministic state machine that is unit-tested directly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 // The two types that reach `/status` live with the rest of the state model
@@ -62,44 +62,98 @@ pub struct SkipRecord {
 /// How much of a control this daemon can actually write (`OFN-j`).
 ///
 /// Distinct from every other skip reason: the curve resolved and an output was
-/// computed: it is the *delivery* that has nowhere to go, because the backend
-/// for a member's source is absent.
+/// computed: it is the *delivery* that has nowhere to go, because no backend
+/// can write a member — its source's backend is absent, or (`OFN-al`) its
+/// header is one the daemon cannot write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Deliverability {
     /// No members at all. Not a fault — a member-less control still publishes a
     /// tick output for any Sync that mirrors it (DEC-151).
     NoMembers,
-    /// Every member's backend is present.
+    /// Every member can be written.
     All,
     /// Some members can be written and some cannot. The control IS commanding
     /// fans, so it must not be reported as uncommanded — see `BackendUnavailable`.
     Partial,
-    /// No member's backend is present: the control commands nothing at all.
+    /// No member can be written: the control commands nothing at all.
     None,
 }
 
-/// Whether a member `source` can be written on this daemon right now.
+/// What this daemon can deliver a hwmon write to (`OFN-al`).
+#[derive(Debug, Clone, Copy)]
+pub enum HwmonTargets<'a> {
+    /// No hwmon backend at all — no writable header was discovered (DEC-376).
+    Absent,
+    /// A backend whose writable set could not be read when it was built (a
+    /// contended controller lock at engine start). Every `hwmon:` member is
+    /// assumed deliverable — the same over-claim `HwmonBackend::new` already
+    /// makes in that case, in the direction that never hides a live control.
+    Unmeasured,
+    /// The ids of the headers the daemon can write — `forced_target_ids()`,
+    /// measured once when the backend was built.
+    Writable(&'a HashSet<String>),
+}
+
+/// The backends a control's members are resolved against (`OFN-j`, `OFN-al`).
+#[derive(Debug, Clone, Copy)]
+pub struct DeliveryTargets<'a> {
+    /// An OpenFanController has been adopted.
+    pub openfan: bool,
+    pub hwmon: HwmonTargets<'a>,
+}
+
+impl DeliveryTargets<'static> {
+    /// Backend presence alone, with every header of a present hwmon backend
+    /// taken as writable — the per-backend answer this replaced, for a caller
+    /// that has no writable set to consult.
+    pub fn backends(openfan: bool, hwmon: bool) -> Self {
+        Self {
+            openfan,
+            hwmon: if hwmon {
+                HwmonTargets::Unmeasured
+            } else {
+                HwmonTargets::Absent
+            },
+        }
+    }
+}
+
+/// Whether this daemon can write `member` right now.
+///
+/// Per MEMBER, not per backend (`OFN-al`): on a board with at least one
+/// writable header the hwmon backend exists, so a per-backend answer called a
+/// member bound to a read-only header deliverable — and `HwmonBackend::apply`'s
+/// DEC-102 backstop then dropped every one of its writes in silence. An
+/// `hwmon:` member is deliverable only if its header is in the writable set,
+/// which also covers an id this board never discovered (a profile imported
+/// from another machine): nothing can write that either.
 ///
 /// GPU sources are always deliverable: the GPU backend is not optional in the
 /// tick body (`gpu_be` is a value, not an `Option`), and a GPU with no writable
 /// fan path is rejected far earlier, at profile validation (DEC-102).
-pub fn source_is_deliverable(source: &str, openfan_available: bool, hwmon_available: bool) -> bool {
-    match source {
-        "openfan" => openfan_available,
-        "hwmon" => hwmon_available,
+pub fn member_is_deliverable(
+    member: &crate::profile::ControlMember,
+    targets: DeliveryTargets<'_>,
+) -> bool {
+    match member.source.as_str() {
+        "openfan" => targets.openfan,
+        "hwmon" => match targets.hwmon {
+            HwmonTargets::Absent => false,
+            HwmonTargets::Unmeasured => true,
+            HwmonTargets::Writable(ids) => ids.contains(&member.member_id),
+        },
         _ => true,
     }
 }
 
-/// Classify one control against the backends this daemon actually has.
+/// Classify one control against what this daemon can actually write.
 ///
 /// Pure, and deliberately clock-free and profile-shaped like its neighbours in
 /// this module, so the rule is testable without an engine, a serial device or a
 /// sysfs tree.
 pub fn control_deliverability(
     control: &crate::profile::LogicalControl,
-    openfan_available: bool,
-    hwmon_available: bool,
+    targets: DeliveryTargets<'_>,
 ) -> Deliverability {
     if control.members.is_empty() {
         return Deliverability::NoMembers;
@@ -108,7 +162,7 @@ pub fn control_deliverability(
     let live = control
         .members
         .iter()
-        .filter(|m| source_is_deliverable(&m.source, openfan_available, hwmon_available))
+        .filter(|m| member_is_deliverable(m, targets))
         .count();
     match live {
         0 => Deliverability::None,
@@ -475,7 +529,10 @@ mod tests {
         // the `false` arm alone would pass against a classifier that always says
         // `None`, and the `true` arm alone against one that always says `All`.
         for openfan in [true, false] {
-            let got = control_deliverability(&control_with(&["openfan"]), openfan, true);
+            let got = control_deliverability(
+                &control_with(&["openfan"]),
+                DeliveryTargets::backends(openfan, true),
+            );
             let want = if openfan {
                 Deliverability::All
             } else {
@@ -494,13 +551,19 @@ mod tests {
         // board with no writable header is the same defect, and gating this on
         // OpenFan alone would be the two-shapes-for-one-flag trap (DEC-334).
         assert_eq!(
-            control_deliverability(&control_with(&["hwmon"]), true, false),
+            control_deliverability(
+                &control_with(&["hwmon"]),
+                DeliveryTargets::backends(true, false)
+            ),
             Deliverability::None
         );
         // GPU is never a backend that can be absent here — `gpu_be` is a value,
         // not an `Option` — so a GPU-only control is always deliverable.
         assert_eq!(
-            control_deliverability(&control_with(&["amd_gpu"]), false, false),
+            control_deliverability(
+                &control_with(&["amd_gpu"]),
+                DeliveryTargets::backends(false, false)
+            ),
             Deliverability::All
         );
     }
@@ -511,15 +574,62 @@ mod tests {
         // hwmon fan, so it must never be reported as uncommanded. Without this
         // arm, an `any`-shaped predicate would pass every other test here.
         assert_eq!(
-            control_deliverability(&control_with(&["openfan", "hwmon"]), false, true),
+            control_deliverability(
+                &control_with(&["openfan", "hwmon"]),
+                DeliveryTargets::backends(false, true)
+            ),
             Deliverability::Partial
         );
         // ...and with neither backend the same control IS fully undeliverable,
         // which is what proves the `Partial` answer came from the member split
         // rather than from the member count.
         assert_eq!(
-            control_deliverability(&control_with(&["openfan", "hwmon"]), false, false),
+            control_deliverability(
+                &control_with(&["openfan", "hwmon"]),
+                DeliveryTargets::backends(false, false)
+            ),
             Deliverability::None
+        );
+    }
+
+    /// `OFN-al`: on a MIXED board the hwmon backend exists, so a per-backend
+    /// answer called every `hwmon:` member deliverable. Per member, one bound
+    /// only to headers outside the writable set is `None`. The discriminating
+    /// arm (DEC-340) is the first: only the new lookup can produce it, since
+    /// the backend is present. The others pin the rest of the split, so a
+    /// classifier stuck at any one answer fails.
+    #[test]
+    fn hwmon_members_are_resolved_against_the_writable_set() {
+        let writable: HashSet<String> = ["hwmon:1".to_string()].into();
+        let mixed = DeliveryTargets {
+            openfan: false,
+            hwmon: HwmonTargets::Writable(&writable),
+        };
+        // `control_with` names members `{source}:{index}`.
+        assert_eq!(
+            control_deliverability(&control_with(&["hwmon"]), mixed),
+            Deliverability::None,
+            "a control bound only to a header the daemon cannot write"
+        );
+        assert_eq!(
+            control_deliverability(&control_with(&["amd_gpu", "hwmon"]), mixed),
+            Deliverability::All,
+            "the writable header is deliverable"
+        );
+        assert_eq!(
+            control_deliverability(&control_with(&["hwmon", "hwmon"]), mixed),
+            Deliverability::Partial,
+            "one writable member and one not"
+        );
+        // An unmeasured set keeps the per-backend answer: never hide a control
+        // the daemon may well be driving.
+        let unmeasured = DeliveryTargets {
+            openfan: false,
+            hwmon: HwmonTargets::Unmeasured,
+        };
+        assert_eq!(
+            control_deliverability(&control_with(&["hwmon"]), unmeasured),
+            Deliverability::All
         );
     }
 
@@ -528,7 +638,7 @@ mod tests {
         // It still publishes a tick output for any Sync that mirrors it
         // (DEC-151), so it must not be reported as uncommanded.
         assert_eq!(
-            control_deliverability(&control_with(&[]), false, false),
+            control_deliverability(&control_with(&[]), DeliveryTargets::backends(false, false)),
             Deliverability::NoMembers
         );
     }

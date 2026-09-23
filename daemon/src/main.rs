@@ -288,7 +288,7 @@ fn install_panic_hook() {
     }));
 }
 
-use control_ofc_daemon::api::handlers::AppState;
+use control_ofc_daemon::api::handlers::{config, AppState};
 use control_ofc_daemon::api::server;
 use control_ofc_daemon::config::DaemonConfig;
 use control_ofc_daemon::daemon_state;
@@ -2583,16 +2583,26 @@ async fn async_main() {
             ipc_dead_rx,
             engine_dead_rx,
             hwmon_dead_rx,
+            // `TS-aq`: under `config_write`, so a reload cannot read the files
+            // before a concurrent setter writes them and apply the stale value
+            // after it. Spawned, never awaited here: a setter holds that lock
+            // across an fsync, and this loop is also the one that hears SIGTERM.
             || {
-                if let Err(e) = apply_config_reload(
-                    &config_path,
-                    &runtime_config_path,
-                    &app_state.profile_search_dirs,
-                    &app_state.runtime_config_degraded,
-                    &app_state.cache,
-                ) {
-                    log::error!("{e}");
-                }
+                let config_path = config_path.clone();
+                let runtime_config_path = runtime_config_path.clone();
+                tokio::spawn(config::reload_under_config_write(
+                    app_state.clone(),
+                    move |s| {
+                        apply_config_reload(
+                            &config_path,
+                            &runtime_config_path,
+                            &s.profile_search_dirs,
+                            &s.runtime_config_degraded,
+                            &s.cache,
+                        )
+                        .map(|_| ())
+                    },
+                ));
             },
         )
         .await
@@ -3358,6 +3368,42 @@ mod tests {
             Duration::from_secs(stop) > drains + restore,
             "TimeoutStopSec={stop} does not cover the bounded stop ({:?})",
             drains + restore
+        );
+    }
+
+    /// `TS-aq`: the SIGHUP handler reloads through
+    /// `config::reload_under_config_write`, never by calling `apply_config_reload`
+    /// directly. The helper's own test proves it waits for `config_write`; this
+    /// proves the signal loop actually goes through it — the call site, which a
+    /// helper test cannot see. Production half only, and within the
+    /// `wait_for_stop(` call, so this test's literals cannot match.
+    #[test]
+    fn the_sighup_reload_is_serialised_with_the_config_setters() {
+        let whole = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let src = whole
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .expect("main.rs has a #[cfg(test)] module");
+        let call = src
+            .find("        wait_for_stop(\n")
+            .expect("the signal loop's wait_for_stop call");
+        let block = &src[call..];
+        let block = &block[..block.find("        .await").expect("end of the call")];
+        assert!(
+            block.contains("config::reload_under_config_write("),
+            "the SIGHUP reload must take config_write (`TS-aq`)"
+        );
+        let direct = block
+            .lines()
+            .filter(|l| l.trim_start().starts_with("apply_config_reload("))
+            .count();
+        let inside = block
+            .split_once("config::reload_under_config_write(")
+            .map(|(_, after)| after)
+            .unwrap_or("");
+        assert!(
+            direct == 1 && inside.contains("apply_config_reload("),
+            "apply_config_reload must be called only inside the serialised helper"
         );
     }
 
