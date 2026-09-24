@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.56.0] — 2026-09-24
+
 ### Fixed
 
 **A PWM test stops when the fan it is testing becomes a pump** (`TS-aw`, DEC-418). Verify,
