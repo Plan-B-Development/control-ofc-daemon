@@ -2308,6 +2308,195 @@ pub(crate) mod tests {
         assert_eq!(body["mode"], "stop", "{body}");
     }
 
+    /// [SAFETY] TS-ax / DEC-419: identify reads the user's role assignment under
+    /// the `override_table` guard it inserts with. `POST /config/header-role`
+    /// swaps `header_roles` and then takes `override_table` to release a hold on
+    /// a new pump, so this is what makes that release sound: the swap is either
+    /// seen by identify or its release lands after the insert.
+    ///
+    /// Three steps, each forced by a lock the test holds, so nothing depends on
+    /// timing:
+    /// 1. The test holds `override_table`; identify parks at its insert holding
+    ///    `active_profile` (DEC-394 — a precondition fixed before this defect
+    ///    can act, DEC-348).
+    /// 2. The test takes the role map's WRITE lock, commits a `pump` assignment
+    ///    under it, as the role handler's swap does, and releases only the
+    ///    table. Fixed, identify takes the table and then blocks reading the map,
+    ///    so the table stays locked and identify cannot finish. A shape that
+    ///    reads the map anywhere before the table — before any lock (the pre-fix
+    ///    code), or inside `active_profile` only, which the role handler never
+    ///    takes — has either read it already, and then inserts a 0 % stop and
+    ///    finishes without the map, or is blocked on the map outside the table,
+    ///    and then never takes the table. The first goes red at `finished` (or,
+    ///    if its brief insert is seen, at the `mode` assertion); the second at
+    ///    the deadline.
+    /// 3. The test releases the map; identify reads `pump` and perturbs at or
+    ///    above the floor.
+    ///
+    /// The opposite branch — no assignment, so a stop — is the DEC-394 test
+    /// directly above, over the same harness.
+    #[test]
+    fn identify_reads_the_role_assignment_under_its_insert_guard() {
+        let (state, _writes, _tx) = unlabelled_header_state();
+        assert_eq!(
+            state.resolved_header_role(PROFILED),
+            crate::hwmon::roles::HeaderRole::Unknown,
+            "precondition: the header has no pump evidence before the assignment"
+        );
+        let table = state.override_table.lock();
+
+        let st = state.clone();
+        let identify = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(identify_stop(&st))
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !state.active_profile.is_locked() {
+            assert!(
+                !identify.is_finished(),
+                "fixture fault: identify returned before reaching its insert"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture fault: identify never entered its critical section"
+            );
+            std::thread::yield_now();
+        }
+
+        // Step 2 — the role handler's commit, with its release still to come.
+        // Until `roles` drops, nothing on this thread may read the map
+        // (`resolved_header_role`, `header_is_pump_protected`): it holds the
+        // write lock.
+        let mut roles = state.header_roles.write();
+        *roles = Arc::new(
+            [(PROFILED.to_string(), crate::hwmon::roles::HeaderRole::Pump)]
+                .into_iter()
+                .collect(),
+        );
+        drop(table);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !state.override_table.is_locked() {
+            assert!(
+                !identify.is_finished(),
+                "identify finished its insert while the test held the role map — it \
+                 decided from an assignment read before its insert guard"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "identify never took its insert guard while the test held the role \
+                 map — it waits on the map outside that guard, where a role \
+                 assignment is not ordered against its insert"
+            );
+            std::thread::yield_now();
+        }
+
+        // Step 3.
+        drop(roles);
+        let body = identify.join().unwrap();
+
+        let floor = crate::profile::HARD_PUMP_CPU_FLOOR_PCT.round() as u64;
+        assert_eq!(
+            body["mode"], "pump_perturb",
+            "identify decided from an assignment read before its insert guard — a \
+             pump assigned in that gap is held stopped for the deadman: {body}"
+        );
+        let held = body["identify_pwm_percent"].as_u64().unwrap();
+        assert!(held >= floor, "held {held}% on a pump, floor {floor}%");
+        assert_eq!(
+            state
+                .override_table
+                .lock()
+                .snapshot()
+                .identify
+                .get(PROFILED)
+                .map(|&d| u64::from(d)),
+            Some(held),
+            "the table must hold the duty identify reported"
+        );
+    }
+
+    /// [SAFETY] TS-ax / DEC-419, the handler's half: `update_header_role_handler`
+    /// commits a `pump` assignment BEFORE it takes `override_table` to release
+    /// an identify hold. Identify's fix depends on that order. Reversed, the
+    /// release could run while identify — which reads the map under the table —
+    /// was still to insert, find nothing, and leave identify to insert a 0 %
+    /// stop from the old map afterwards. The sequential
+    /// `assigning_pump_releases_a_live_identify_hold` passes with the two
+    /// statements swapped, because the hold ends released either way.
+    ///
+    /// The observable: with the test holding `override_table`, the real handler
+    /// must commit the assignment and only then park on the table. Reversed, it
+    /// parks before the swap, the map never reads `pump`, and the deadline
+    /// fires with the defect's message — unwinding drops the table, so the
+    /// handler still finishes and nothing hangs. A handler that returns before
+    /// committing (a persistence failure) is a fixture fault with its own
+    /// message. Presence before absence: the stop is asserted live first.
+    #[test]
+    fn the_role_handler_commits_a_pump_assignment_before_it_takes_the_table() {
+        let (state, _writes, _shutdown_tx, _tmp) =
+            verify_test_state_at_duty(230, crate::hwmon::roles::HeaderRole::Unknown);
+        let id = "hwmon:test:dev:pwm1";
+        state.override_table.lock().identify_hold(
+            id,
+            0,
+            crate::control_override::IdentifyMode::Stop,
+            std::time::Duration::from_secs(15),
+        );
+        assert_eq!(
+            state.override_table.lock().snapshot().identify.get(id),
+            Some(&0),
+            "precondition: the header must actually be held at 0"
+        );
+        let table = state.override_table.lock();
+
+        let st = state.clone();
+        let handler = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(crate::api::handlers::update_header_role_handler(
+                    axum::extract::State(st),
+                    axum::response::Json(serde_json::json!({ "header_id": id, "role": "pump" })),
+                ))
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while state.header_roles().get(id) != Some(&crate::hwmon::roles::HeaderRole::Pump) {
+            assert!(
+                !handler.is_finished(),
+                "fixture fault: the role handler returned before committing the assignment"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the role handler waited on `override_table` before committing the \
+                 assignment — its release runs before the swap, so an identify \
+                 holding the table decides from the old map after it"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            !handler.is_finished(),
+            "the role handler finished while the test held `override_table` — it \
+             committed a `pump` assignment without taking the table to release the hold"
+        );
+        drop(table);
+        let (status, body) = handler.join().unwrap();
+        assert_eq!(status, 200, "{body:?}");
+        assert!(
+            !state
+                .override_table
+                .lock()
+                .snapshot()
+                .identify
+                .contains_key(id),
+            "once it has the table, the handler's release must remove the stop"
+        );
+    }
+
     /// [SAFETY] DEC-322's invariant with the new term: every endpoint that
     /// publishes a header publishes `stop_permitted == !header_is_pump_protected`
     /// — for `/hwmon/headers` and `/inventory/hwmon` both, which hold the

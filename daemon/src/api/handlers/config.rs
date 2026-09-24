@@ -462,6 +462,12 @@ pub async fn update_header_role_handler(
     //
     // Ordered after the `header_roles` write guard is released, so this takes
     // `override_table` on its own and adds no lock-ordering cycle.
+    //
+    // [SAFETY] TS-ax / DEC-419: the order — swap, THEN release — is load-bearing.
+    // Identify reads the assignment inside the `override_table` guard it inserts
+    // under, so it either sees this swap (and perturbs) or holds the table until
+    // its insert is done, and this release then removes the stop. Releasing
+    // before the swap would reopen the gap.
     if new_role.is_some_and(|r| r.is_pump()) {
         state.override_table.lock().identify_restore(&header_id);
     }

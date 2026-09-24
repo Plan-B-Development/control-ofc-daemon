@@ -18,6 +18,15 @@ protection that arrives after the last measurement — which leaves that measure
 keeps the pump at 30 % or above. If the test could not read the header's duty before it started, the
 header is left where the test left it, as before, but raised to 30 % if it has become a pump.
 
+**Assigning the pump role during a fan identify can no longer leave that pump stopped** (`TS-ax`,
+DEC-419). Assigning `pump` to a header releases any identify hold on it, so the fan returns to its
+curve. But identify read the header's role before it took the lock its hold is written under. An
+assignment that landed in between was missed both ways: identify had already decided the header was
+not a pump, and the release found no hold, because the hold did not exist yet. The pump was then held
+at 0 % for up to 15 s. Identify now reads the role under that lock, so it either sees the assignment
+and perturbs the pump instead of stopping it, or the assignment's release removes the stop. The same
+race with a profile activation was closed in 2.51.1 (DEC-394).
+
 ## [2.55.0] — 2026-09-23
 
 ### Added

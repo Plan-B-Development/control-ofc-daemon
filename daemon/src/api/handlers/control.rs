@@ -206,18 +206,35 @@ pub async fn fan_identify_handler(
             // profile term sees it) or strictly after (its release removes the
             // stop) — the DEC-189 order `override_take_handler` uses.
             //
-            // The role parts are gathered FIRST, with no profile lock held:
+            // The inferred role is gathered FIRST, with no profile lock held:
             // `header_role_parts` takes `hwmon_controller`, which the engine holds
             // across blocking sysfs writes, and the two are never held together
             // (DEC-384) — waiting on it with `active_profile` held would stall the
             // engine tick and `/poll` behind one wedged header.
-            let (assigned, inferred) = state.header_role_parts(&fan_id);
+            //
+            // [SAFETY] TS-ax / DEC-419: only `inferred` is taken from this read
+            // (`header_role_parts` also returns the assignment; it is ignored).
+            // The user's assignment is read below, INSIDE the `override_table`
+            // guard the insert takes, and the decision uses that read alone.
+            // `POST /config/header-role` swaps `header_roles` and only then
+            // takes `override_table` to release an identify hold on a new
+            // pump — so reading the assignment up here let that whole
+            // swap-and-release land before the insert: it found nothing to
+            // release, and this then pinned the new pump at 0 for the deadman.
+            // Read under the guard, the handler's swap is either seen (the role
+            // is `Pump`) or its release serialises strictly after the insert.
+            // `header_roles` is a leaf lock — every holder clones the `Arc` and
+            // drops the guard, taking nothing else meanwhile — so reading it
+            // under `override_table` cannot close a cycle.
+            let (_, inferred) = state.header_role_parts(&fan_id);
             let ttl = resolve_ttl(body.ttl_secs);
             let (role, target_pct, mode) = {
                 let profile_guard = state.active_profile.lock();
                 let profile_names_pump = profile_guard
                     .as_ref()
                     .is_some_and(|p| super::pump_header_ids(p).contains(&fan_id));
+                let mut table = state.override_table.lock();
+                let assigned = state.header_roles().get(&fan_id).copied();
                 let role = if crate::hwmon::roles::is_pump_protected(
                     assigned,
                     inferred,
@@ -229,10 +246,7 @@ pub async fn fan_identify_handler(
                 };
                 let (target_pct, mode) =
                     crate::control_override::identify_target_for_role(role, last_commanded);
-                state
-                    .override_table
-                    .lock()
-                    .identify_hold(&fan_id, target_pct, mode, ttl);
+                table.identify_hold(&fan_id, target_pct, mode, ttl);
                 (role, target_pct, mode)
             };
             log::info!(
