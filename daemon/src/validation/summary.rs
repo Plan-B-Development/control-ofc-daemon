@@ -198,6 +198,7 @@ fn pwm_header_control(session: &ValidationSession, interrupted: bool) -> Vec<Val
 /// | `effective` | `pass` |
 /// | `no_rpm_effect`, `pwm_enable_reverted`, `pwm_value_clamped` | `observed` — true of the device, not a failed test |
 /// | `rpm_unavailable`, `pwm_readback_unavailable` | `unavailable` |
+/// | `pump_protected_mid_run` (DEC-418) | `unavailable` — the header gained pump protection mid-test, so nothing was measured |
 /// | anything else, or no token (a pre-2.52.0 record) | `unknown` — rendered, never dropped |
 pub fn verify_outcome(v: &VerifyEvidence) -> &'static str {
     if !v.write_ok {
@@ -206,7 +207,9 @@ pub fn verify_outcome(v: &VerifyEvidence) -> &'static str {
     match v.result.as_deref() {
         Some("effective") => RESULT_PASS,
         Some("no_rpm_effect" | "pwm_enable_reverted" | "pwm_value_clamped") => RESULT_OBSERVED,
-        Some("rpm_unavailable" | "pwm_readback_unavailable") => RESULT_UNAVAILABLE,
+        Some("rpm_unavailable" | "pwm_readback_unavailable" | "pump_protected_mid_run") => {
+            RESULT_UNAVAILABLE
+        }
         _ => RESULT_UNKNOWN,
     }
 }

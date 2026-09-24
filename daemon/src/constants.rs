@@ -71,6 +71,13 @@ pub const GPU_FAIL_COOLDOWN: Duration = Duration::from_secs(60);
 /// respectively).
 pub const VERIFY_WAIT_SECONDS: u8 = 6;
 
+/// [SAFETY] `TS-aw` (DEC-418): how often the hwmon verify re-reads the
+/// pump-protection union during its [`VERIFY_WAIT_SECONDS`] settle, i.e. the
+/// longest a header that became pump-protected mid-settle stays at a test duty
+/// planned for an ordinary fan. The sample interval the other diagnostics use,
+/// so all of them honour a mid-run pump flip within the same bound.
+pub const VERIFY_PUMP_RECHECK_INTERVAL: Duration = CHARACTERIZATION_SAMPLE_INTERVAL;
+
 /// Generous deadman backstop for the profile-engine verify pause (DEC-165).
 /// The verify handler holds the pause for its whole lifetime via an RAII guard
 /// that clears it on drop/panic/cancel — this only fires if that guard somehow

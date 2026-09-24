@@ -770,6 +770,32 @@ rather than changed here. A consequence for clients: `restore_outcome:
 "restored"` now means *restored, floor-clamped* on a pump, so the duty on the
 hardware may exceed the original reported beside it.
 
+**A diagnostic re-reads the pump union while it runs (`TS-aw`, DEC-418).** Verify,
+characterisation and control-path discovery plan their duties from
+`header_is_pump_protected` at entry. Pump evidence can arrive mid-run — a profile
+naming the header a pump is activated (DEC-384's term), or it is assigned `pump`
+(DEC-311) — and until DEC-418 none of the three reconsidered it, so a run planned for
+an ordinary fan could keep driving a now-protected pump below 30 % until it ended.
+One shared `diagnostic_gates::PumpWatch` now re-reads the union before every write and
+on every 500 ms sample (verify's 6 s settle is sliced to match), always with no lock
+held and never once shutdown has been seen. A flip **stops the run** — the user's
+choice, DEC-407's `eligibility_lost` precedent, not clamp-and-continue: a
+characterisation or discovery ends `aborted` with a `detail` saying why, and a verify
+returns the seventh `result`, `pump_protected_mid_run`. `RestoreOnDrop` (and verify's
+own restore) re-reads the watch once more before it writes, so protection that arrives
+after the last sample still floors the restore at 30 %. **A hold whose time has elapsed is
+a completed measurement** (the user's rule at review): each loop consults the watch only
+while its window is open, so a flip seen as a window ends leaves the ordinary verdict and
+only floors the restore — nothing is written in between. The watch is sticky: once seen
+protected it stays so for the run. It also records the last duty the run wrote, for the
+one restore with nothing to floor: a header whose pre-run duty was unreadable
+(`no_original_duty`) is left where the run left it, as before, but raised to 30 % if it
+has become a pump; discovery's closing return to the baseline is raised to the floor the
+same way. `api::handlers::discovery::start_control_path_discovery` takes the monitor-only
+fan walk's root, which is what lets a test drive a discovery run end to end. A header already protected at entry is a pump run
+from the start and is never re-read. The stall probe keeps its own per-sample
+eligibility re-check (DEC-407), which refuses a pump outright.
+
 **A third parity oracle, `header_role_classification.json` (`AUD3-c`).** The GUI
 hand-mirrors `classify_header_role`'s label branches — it must, because a daemon
 < 2.31.0 publishes no `stop_permitted` and the reconstruction is then the only

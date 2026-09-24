@@ -345,6 +345,29 @@ pub async fn discover_control_path_handler(
     axum::extract::Path(header_id): axum::extract::Path<String>,
     Json(body): Json<disc::DiscoveryRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    start_control_path_discovery(
+        state,
+        header_id,
+        body,
+        std::path::Path::new(crate::hwmon::HWMON_SYSFS_ROOT),
+    )
+    .await
+}
+
+/// The handler's body, with the root of the monitor-only fan walk injected
+/// (`PTR-z`'s prerequisite, taken into DEC-418 by the user's choice).
+///
+/// Production passes [`crate::hwmon::HWMON_SYSFS_ROOT`] through
+/// [`discover_control_path_handler`]; a test passes a fake tree, which is the
+/// only way to drive a discovery run end to end — the walk is the one input a
+/// fixture's `AppState` cannot otherwise supply. Nothing else differs: every
+/// header-attached tach still comes from the controller, exactly as before.
+pub(crate) async fn start_control_path_discovery(
+    state: Arc<AppState>,
+    header_id: String,
+    body: disc::DiscoveryRequest,
+    monitor_only_root: &std::path::Path,
+) -> (StatusCode, Json<serde_json::Value>) {
     // [SAFETY] Refuse once the daemon is going down (DEC-317). Same first guard,
     // same reason, as verify and characterise: a diagnostic that starts after
     // `hand_back_hwmon` has run would re-assert `pwm_enable=1` through
@@ -433,9 +456,7 @@ pub async fn discover_control_path_handler(
     // They are read directly for the duration of this run and nowhere else, which
     // is what makes §2's "tach signal with no discovered controllable PWM"
     // outcome representable at all.
-    match crate::hwmon::inventory::discover_monitor_only_fans(std::path::Path::new(
-        crate::hwmon::HWMON_SYSFS_ROOT,
-    )) {
+    match crate::hwmon::inventory::discover_monitor_only_fans(monitor_only_root) {
         Ok(fans) => {
             for fan in fans {
                 channels.push(disc::TachChannel {
@@ -468,7 +489,8 @@ pub async fn discover_control_path_handler(
         );
     };
 
-    // [SAFETY] The UNION predicate, never the wire `role` (DEC-312).
+    // [SAFETY] The UNION predicate, never the wire `role` (DEC-312). This entry
+    // answer plans the duties; the task re-reads it mid-run (`TS-aw`).
     let pump_protected = state.header_is_pump_protected(&header_id);
     let floor = if pump_protected {
         crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8
@@ -616,6 +638,17 @@ pub async fn discover_control_path_handler(
                 }
             };
 
+            // [SAFETY] `TS-aw` (DEC-418): the entry answer planned the duties;
+            // this re-reads the same union, with nothing held, before every
+            // write and on every sample, and once more before the restore.
+            let watch_state = state_for_persist.clone();
+            let watch_id = hid.clone();
+            let pump_watch = crate::api::diagnostic_gates::PumpWatch::new(
+                hid.clone(),
+                "control-path discovery",
+                pump_protected,
+                move || watch_state.header_is_pump_protected(&watch_id),
+            );
             let outcome = disc::run_discovery(
                 &cache,
                 &hid,
@@ -630,6 +663,7 @@ pub async fn discover_control_path_handler(
                 // is a restore rather than a command.
                 floor,
                 pump_protected,
+                &pump_watch,
                 window,
                 crate::constants::DISCOVERY_SETTLE_WAIT_MAX,
                 write_fn,

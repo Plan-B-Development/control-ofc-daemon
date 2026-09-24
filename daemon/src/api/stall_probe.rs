@@ -1314,6 +1314,8 @@ where
         wrote_any: &wrote_any,
         report,
         restore_floor,
+        // DEC-407's own re-check raises `restore_floor` below; see its field doc.
+        pump_watch: None,
     };
 
     let ended = if probe.wedged {

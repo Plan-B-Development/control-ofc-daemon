@@ -69,7 +69,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::api::calibration::thermal_force_state;
-use crate::api::diagnostic_gates::{step_gate, thermal_gate, GateStop};
+use crate::api::diagnostic_gates::{
+    pump_protected_mid_run_detail, step_gate, thermal_gate, GateStop, PumpWatch,
+};
 use crate::api::responses::HwmonVerifyState;
 use crate::constants;
 use crate::health::cache::StateCache;
@@ -1331,6 +1333,15 @@ pub(crate) struct RestoreOnDrop<'a, W: Fn(u8) -> Result<(), String>, S: Fn() -> 
     /// converted "0 under firmware control" into "0 under `pwm_enable=1` with no
     /// writer" — a stopped pump. Same clamp as `hwmon_ctl::restore_duty`.
     pub(crate) restore_floor: u8,
+    /// [SAFETY] `TS-aw` (DEC-418). The run's pump watch, re-read once more
+    /// immediately before the restore writes: a header that became
+    /// pump-protected at any point in the run — after its last sample
+    /// included — is restored no lower than the pump floor, whatever
+    /// `restore_floor` was planned as. Consulted only after both authority
+    /// skips, so it is never read while shutting down. `None` for the stall
+    /// probe, which refuses a pump outright and raises `restore_floor` itself
+    /// from its own eligibility re-check (DEC-407).
+    pub(crate) pump_watch: Option<&'a PumpWatch<'a>>,
 }
 
 impl<W: Fn(u8) -> Result<(), String>, S: Fn() -> bool> Drop for RestoreOnDrop<'_, W, S> {
@@ -1383,17 +1394,45 @@ impl<W: Fn(u8) -> Result<(), String>, S: Fn() -> bool> Drop for RestoreOnDrop<'_
         }
         let Some(restore) = self.original_pct else {
             if moved {
-                log::warn!(
-                    "characterize: {} was swept but its pre-sweep duty could not be \
-                     read, so it is left at the last swept duty",
-                    self.header_id
-                );
+                // [SAFETY] `TS-aw` `K1` (DEC-418): left where the run left it, as
+                // always — unless it has become a pump, when that duty is raised
+                // to the pump floor. Still `no_original_duty`: the header was
+                // moved and cannot be put back where it was found.
+                match self.pump_watch.and_then(|w| w.floored_fallback()) {
+                    Some(pct) => {
+                        log::warn!(
+                            "characterize: {} was swept but its pre-sweep duty could not \
+                             be read, and it became pump-protected during the run, so it \
+                             is raised to {pct}% (the last swept duty, floored)",
+                            self.header_id
+                        );
+                        if let Err(e) = (self.write_fn)(pct) {
+                            log::warn!(
+                                "characterize: raising {} to {pct}% failed; it is left at \
+                                 the last swept duty: {e}",
+                                self.header_id
+                            );
+                        }
+                    }
+                    None => log::warn!(
+                        "characterize: {} was swept but its pre-sweep duty could not be \
+                         read, so it is left at the last swept duty",
+                        self.header_id
+                    ),
+                }
             }
             self.report.set(left_behind(RestoreOutcome::NoOriginalDuty));
             return;
         };
         // [SAFETY] `AUD3-l` — clamp on the way out, as the sweep does on the way in.
-        let restore = restore.max(self.restore_floor);
+        // `TS-aw` — and re-read the pump union first, so evidence that arrived
+        // mid-run raises the floor even when the run itself never saw it.
+        let pump_floor = crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8;
+        let floor = match self.pump_watch {
+            Some(w) if w.restore_is_pump() => self.restore_floor.max(pump_floor),
+            _ => self.restore_floor,
+        };
+        let restore = restore.max(floor);
         match (self.write_fn)(restore) {
             Ok(()) => self.report.set(RestoreOutcome::Restored),
             Err(e) => {
@@ -1437,6 +1476,10 @@ pub async fn run_sweep<W, R, P, A, S, K>(
     // safety event. Passed explicitly rather than derived from `points[0]` for
     // exactly that reason.
     restore_floor: u8,
+    // [SAFETY] `TS-aw` (DEC-418): the pump union, re-read before every write and
+    // on every sample. A header that becomes pump-protected mid-run stops the
+    // sweep (`aborted`), and the restore guard re-reads it before it writes.
+    pump_watch: &PumpWatch<'_>,
     settle: Duration,
     // `§7`. `None` on every shipped machine — no `DevicePolicy` entry sets one.
     correction: Option<RpmCorrection>,
@@ -1477,6 +1520,7 @@ where
         wrote_any: &wrote_any,
         report,
         restore_floor,
+        pump_watch: Some(pump_watch),
     };
 
     for (idx, step) in plan.iter().enumerate() {
@@ -1527,6 +1571,15 @@ where
                 points: measured,
             };
         }
+        // [SAFETY] `TS-aw`: after the step gate, so it is never read once
+        // shutdown has been seen, and immediately before the write it guards.
+        if pump_watch.became_protected() {
+            return SweepOutcome {
+                state: STATE_ABORTED,
+                detail: Some(pump_protected_mid_run_detail("characterisation")),
+                points: measured,
+            };
+        }
 
         let before = read_fn();
         let rpm_before = before.rpm;
@@ -1536,6 +1589,7 @@ where
         // "the header moved" is the safe direction; under-reporting it is the
         // `AUD2-c` defect.
         wrote_any.store(true, Ordering::SeqCst);
+        pump_watch.note_write(pct);
         let command_accepted = match write_fn(pct) {
             Ok(()) => true,
             Err(e) => {
@@ -1619,6 +1673,22 @@ where
                 return SweepOutcome {
                     state: STATE_ABORTED,
                     detail: Some("the daemon is shutting down".into()),
+                    points: measured,
+                };
+            }
+            // [SAFETY] `TS-aw`: per sample, not per renewal, so a flip during a
+            // long dwell stops the hold within one sample interval (the stall
+            // probe's S3-R2 rule). The point being held is not recorded: it was
+            // measured on a header whose floor has just changed.
+            //
+            // Only while the hold is still open. Once its time has elapsed the
+            // point is measured (the user's rule, DEC-418 review): the next
+            // step's check, or the restore's re-read, acts on the flip instead,
+            // and nothing is written in between.
+            if started.elapsed() < hold && pump_watch.became_protected() {
+                return SweepOutcome {
+                    state: STATE_ABORTED,
+                    detail: Some(pump_protected_mid_run_detail("characterisation")),
                     points: measured,
                 };
             }
@@ -1916,6 +1986,7 @@ mod tests {
             header_id,
             &plan_of(points),
             restore_floor,
+            &PumpWatch::fixed(false),
             settle,
             None,
             write_fn,
@@ -2393,6 +2464,220 @@ mod tests {
             *log.last().unwrap(),
             floor,
             "the restore should be the captured 0 raised to the floor"
+        );
+    }
+
+    // ── TS-aw / DEC-418: a header that becomes a pump mid-sweep ──────────────
+
+    /// Run a sweep whose pump union flips when `flip_on` says so. `flip_on` sees
+    /// the union flag and is handed to both `write_fn` (`Written(pct)`) and
+    /// `publish` (`Published(pct)`), so a test picks the exact moment evidence
+    /// arrives. The header reads `original` before the sweep — 10 %, below the
+    /// pump floor, so the restore's floor is observable, or `None` for a pre-run
+    /// duty that could not be read (review `K1`).
+    enum Moment {
+        Written(u8),
+        Published(u8),
+    }
+
+    async fn sweep_with_flip(
+        plan: &[u8],
+        settle: Duration,
+        flip_on: impl Fn(&Moment) -> bool,
+    ) -> (SweepOutcome, Vec<u8>, &'static str) {
+        sweep_with_flip_from(Some(10), plan, settle, flip_on).await
+    }
+
+    async fn sweep_with_flip_from(
+        original: Option<u8>,
+        plan: &[u8],
+        settle: Duration,
+        flip_on: impl Fn(&Moment) -> bool,
+    ) -> (SweepOutcome, Vec<u8>, &'static str) {
+        let cache = cache_at(40.0, None);
+        let rig = Rig::new();
+        let union = Arc::new(AtomicBool::new(false));
+        let u = union.clone();
+        let watch = PumpWatch::new("hwmon:test:pwm1", "characterisation", false, move || {
+            u.load(Ordering::SeqCst)
+        });
+        let writes = rig.writes.clone();
+        let flip = |m: Moment| {
+            if flip_on(&m) {
+                union.store(true, Ordering::SeqCst);
+            }
+        };
+        let out = run_sweep(
+            &cache,
+            "hwmon:test:pwm1",
+            &plan_of(plan),
+            0,
+            &watch,
+            settle,
+            None,
+            |p: u8| {
+                writes.lock().unwrap().push(p);
+                flip(Moment::Written(p));
+                Ok(())
+            },
+            || sample(original, Some(1), Some(900)),
+            &rig.cancel,
+            || false,
+            || true,
+            &rig.report,
+            |pt: CharPoint| flip(Moment::Published(pt.requested_pct)),
+            |_| {},
+        )
+        .await;
+        let (_, token) = rig.restore();
+        (out, rig.written(), token)
+    }
+
+    /// [SAFETY] `TS-aw`: evidence arriving while a sub-floor point is being held
+    /// stops the sweep within the hold — the point is not recorded and no
+    /// further point is written — and the restore is the captured 10 % raised
+    /// to the pump floor, not the captured 10 %.
+    #[tokio::test(start_paused = true)]
+    async fn a_pump_flip_mid_hold_stops_the_sweep_and_floors_the_restore() {
+        let (out, log, token) = sweep_with_flip(&[20, 60, 80], Duration::from_secs(2), |m| {
+            matches!(m, Moment::Written(20))
+        })
+        .await;
+        assert_eq!(out.state, STATE_ABORTED, "detail: {:?}", out.detail);
+        assert!(
+            out.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("became pump-protected")),
+            "detail: {:?}",
+            out.detail
+        );
+        // Stopped INSIDE the hold: the step gate alone would have recorded the
+        // 20 % point before stopping at the 60 % one.
+        assert!(out.points.is_empty(), "points: {:?}", out.points);
+        assert_eq!(
+            log,
+            vec![20, PUMP_FLOOR],
+            "after the flip the only write must be the floored restore"
+        );
+        assert_eq!(token, RestoreOutcome::Restored.token());
+    }
+
+    /// [SAFETY] `TS-aw`: evidence arriving between points is caught by the check
+    /// before the next write, so the next — planned for an ordinary fan — is
+    /// never written.
+    #[tokio::test(start_paused = true)]
+    async fn a_pump_flip_between_points_stops_before_the_next_write() {
+        let (out, log, _) = sweep_with_flip(&[20, 25, 80], Duration::from_secs(1), |m| {
+            matches!(m, Moment::Published(20))
+        })
+        .await;
+        assert_eq!(out.state, STATE_ABORTED, "detail: {:?}", out.detail);
+        assert_eq!(
+            out.points.len(),
+            1,
+            "precondition: the 20 % point completed"
+        );
+        assert_eq!(log, vec![20, PUMP_FLOOR]);
+    }
+
+    /// [SAFETY] `TS-aw`: the restore guard re-reads the union itself. Evidence
+    /// that arrives after the last point — when no loop check remains — still
+    /// floors the restore; the sweep measured every point, so it stays
+    /// `complete`. The opposite arm, with nothing arriving, restores the
+    /// captured 10 % exactly: the floor is not applied to every sweep.
+    #[tokio::test(start_paused = true)]
+    async fn the_restore_rereads_the_union_after_the_last_point() {
+        let (out, log, _) = sweep_with_flip(&[60], Duration::from_secs(1), |m| {
+            matches!(m, Moment::Published(60))
+        })
+        .await;
+        assert_eq!(out.state, STATE_COMPLETE, "detail: {:?}", out.detail);
+        assert_eq!(log, vec![60, PUMP_FLOOR]);
+
+        let (out, log, _) = sweep_with_flip(&[60], Duration::from_secs(1), |_| false).await;
+        assert_eq!(out.state, STATE_COMPLETE);
+        assert_eq!(log, vec![60, 10], "an ordinary fan is restored as found");
+    }
+
+    /// [SAFETY] Review `K1`: the pre-run duty could not be read, so there is no
+    /// original to floor. The header is left where the run left it, as it always
+    /// was — raised to the pump floor when that was below it, never lowered to it.
+    #[tokio::test(start_paused = true)]
+    async fn an_unreadable_original_is_left_at_the_last_duty_raised_to_the_floor() {
+        // Stopped at a sub-floor point: the last duty, 20 %, is raised to 30 %.
+        let (out, log, token) =
+            sweep_with_flip_from(None, &[20, 60, 80], Duration::from_secs(2), |m| {
+                matches!(m, Moment::Written(20))
+            })
+            .await;
+        assert_eq!(out.state, STATE_ABORTED, "detail: {:?}", out.detail);
+        assert_eq!(log, vec![20, PUMP_FLOOR]);
+        assert_eq!(token, RestoreOutcome::NoOriginalDuty.token());
+
+        // Stopped above the floor: left at 60 %, not lowered to 30 %.
+        let (_, log, _) = sweep_with_flip_from(None, &[20, 60, 80], Duration::from_secs(2), |m| {
+            matches!(m, Moment::Written(60))
+        })
+        .await;
+        assert_eq!(log, vec![20, 60, 60]);
+
+        // The opposite arm: an ordinary fan with no original is left exactly
+        // where the run left it, with no write added.
+        let (out, log, _) =
+            sweep_with_flip_from(None, &[20, 60], Duration::from_secs(1), |_| false).await;
+        assert_eq!(out.state, STATE_COMPLETE);
+        assert_eq!(log, vec![20, 60]);
+    }
+
+    /// [SAFETY] The user's rule (DEC-418 review, `C3`): a hold whose time has
+    /// elapsed is measured. Evidence that becomes visible exactly as the last
+    /// hold ends — before its closing sample — must not discard the point: the
+    /// run is `complete`, every point recorded, and the restore still floored.
+    /// Paused time makes "exactly" exact: the watch answers yes from the instant
+    /// the last hold's settle has fully elapsed.
+    #[tokio::test(start_paused = true)]
+    async fn a_flip_as_the_last_hold_ends_leaves_the_sweep_complete_and_floored() {
+        let cache = cache_at(40.0, None);
+        let rig = Rig::new();
+        let settle = Duration::from_secs(2);
+        let flip_at: Arc<Mutex<Option<tokio::time::Instant>>> = Arc::new(Mutex::new(None));
+        let fa = flip_at.clone();
+        let watch = PumpWatch::new("hwmon:test:pwm1", "characterisation", false, move || {
+            fa.lock()
+                .unwrap()
+                .is_some_and(|t| tokio::time::Instant::now() >= t)
+        });
+        let writes = rig.writes.clone();
+        let out = run_sweep(
+            &cache,
+            "hwmon:test:pwm1",
+            &plan_of(&[60]),
+            0,
+            &watch,
+            settle,
+            None,
+            |p: u8| {
+                writes.lock().unwrap().push(p);
+                if p == 60 {
+                    *flip_at.lock().unwrap() = Some(tokio::time::Instant::now() + settle);
+                }
+                Ok(())
+            },
+            || sample(Some(10), Some(1), Some(900)),
+            &rig.cancel,
+            || false,
+            || true,
+            &rig.report,
+            |_| {},
+            |_| {},
+        )
+        .await;
+        assert_eq!(out.state, STATE_COMPLETE, "detail: {:?}", out.detail);
+        assert_eq!(out.points.len(), 1, "the completed point was discarded");
+        assert_eq!(
+            rig.written(),
+            vec![60, PUMP_FLOOR],
+            "the restore must be floored"
         );
     }
 
@@ -3192,6 +3477,7 @@ mod tests {
                 "hwmon:test:pwm1",
                 &plan,
                 0,
+                &PumpWatch::fixed(false),
                 Duration::from_millis(1),
                 None,
                 move |pct: u8| {
@@ -3420,6 +3706,7 @@ mod tests {
                 "hwmon:test:pwm1",
                 &plan,
                 0,
+                &PumpWatch::fixed(false),
                 Duration::from_secs(constants::CHARACTERIZATION_SETTLE_MIN_S),
                 None,
                 |_p: u8| Ok(()),
@@ -3499,6 +3786,7 @@ mod tests {
                 "hwmon:test:pwm1",
                 &plan,
                 0,
+                &PumpWatch::fixed(false),
                 Duration::from_millis(1),
                 None,
                 move |p: u8| {
@@ -3559,6 +3847,7 @@ mod tests {
                 "hwmon:test:pwm1",
                 &plan,
                 floor,
+                &PumpWatch::fixed(false),
                 Duration::from_millis(1),
                 None,
                 move |p: u8| {
@@ -3621,6 +3910,7 @@ mod tests {
                 "hwmon:test:pwm1",
                 &plan,
                 0,
+                &PumpWatch::fixed(false),
                 Duration::from_secs(constants::CHARACTERIZATION_DEFAULT_SETTLE_S),
                 None,
                 |_p: u8| Ok(()),
@@ -3688,6 +3978,7 @@ mod tests {
                 "hwmon:test:pwm1",
                 &plan,
                 0,
+                &PumpWatch::fixed(false),
                 settle,
                 None,
                 |_p: u8| Ok(()),
@@ -3811,6 +4102,7 @@ mod tests {
                 "hwmon:test:pwm1",
                 &plan,
                 0,
+                &PumpWatch::fixed(false),
                 settle,
                 None,
                 |_p: u8| Ok(()),
@@ -3976,6 +4268,7 @@ mod tests {
                 "hwmon:test:pwm1",
                 &plan,
                 0,
+                &PumpWatch::fixed(false),
                 settle,
                 None,
                 move |pct: u8| {
@@ -4104,6 +4397,7 @@ mod tests {
                 "hwmon:test:pwm1",
                 &plan,
                 0,
+                &PumpWatch::fixed(false),
                 settle,
                 None,
                 move |pct: u8| {

@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Fixed
+
+**A PWM test stops when the fan it is testing becomes a pump** (`TS-aw`, DEC-418). Verify,
+PWM characterisation and control-path discovery decide at the start whether a header drives a
+pump, and choose their test duties from that. If you activated a profile that names the header a
+pump, or assigned it the pump role, while one of them was running, the test carried on with duties
+chosen for an ordinary fan — which can be below the 30 % pump floor — until it finished. The daemon
+now re-checks before every write and every half second. When the header becomes pump-protected, the
+test stops, and the restore the daemon then writes is never below 30 %. A characterisation or
+discovery run ends `aborted`, and its `detail` says why. A verify returns a new result,
+`pump_protected_mid_run`. Nothing was measured, so it is not a finding about your board: run the test
+again, and it will use pump-safe duties. The restore checks once more just before it writes, so
+protection that arrives after the last measurement — which leaves that measurement standing — still
+keeps the pump at 30 % or above. If the test could not read the header's duty before it started, the
+header is left where the test left it, as before, but raised to 30 % if it has become a pump.
+
 ## [2.55.0] — 2026-09-23
 
 ### Added

@@ -467,11 +467,22 @@ pub async fn hwmon_verify_handler(
     // a fixed duty and nothing left to drive it.
     let bg_shutdown = state.openfan_runtime.shutdown.clone();
     let bg_header_id = header_id.clone();
-    // DEC-311: resolved BEFORE the blocking task so the role lookup never runs
-    // under `spawn_blocking` with the controller lock in play. The UNION
-    // predicate, not the resolved role — a user assignment must not be able to
-    // strip protection the header's own label already earned.
+    // DEC-311: the UNION predicate, not the resolved role — a user assignment
+    // must not be able to strip protection the header's own label already
+    // earned. This entry answer plans the test duty.
     let bg_is_pump = state.header_is_pump_protected(&header_id);
+    // [SAFETY] `TS-aw` (DEC-418): the same union, re-read inside the task
+    // before the test write, on every slice of the settle, and before the
+    // restore. Always called with no lock held — never inside a `set_pwm`
+    // critical section below.
+    let watch_state = Arc::clone(&state);
+    let watch_id = header_id.clone();
+    let pump_watch = crate::api::diagnostic_gates::PumpWatch::new(
+        header_id.clone(),
+        "verify",
+        bg_is_pump,
+        move || watch_state.header_is_pump_protected(&watch_id),
+    );
     let bg_lease_id = verify_lease_id.clone();
     let join = tokio::task::spawn_blocking(move || {
         // Moved, not borrowed: dropped only when this task finishes, so the
@@ -484,6 +495,23 @@ pub async fn hwmon_verify_handler(
         // Test PWM: a significant delta from current, in whichever direction has room.
         let current_pct = initial.pwm_percent.unwrap_or(50);
         let test_pct: u8 = verify_test_duty(bg_is_pump, current_pct);
+
+        // [SAFETY] `TS-aw`: the test duty above was planned for an ordinary fan
+        // if `bg_is_pump` was false. Evidence that arrived since stops the
+        // verify before it writes anything, so there is nothing to restore.
+        // Never read once shutdown has been seen (`PumpWatch`'s contract): the
+        // exit path owns the header then, and the lookup would contend with the
+        // exit floor for the controller lock.
+        if !*bg_shutdown.borrow() && pump_watch.became_protected() {
+            let unchanged = initial.clone();
+            return Ok(VerifyRun {
+                initial,
+                final_state: unchanged,
+                test_pct,
+                restore_failed: false,
+                pump_protected_mid_run: true,
+            });
+        }
 
         // Write test value via controller (sets pwm_enable=1 + PWM).
         // Route errors through the shared HwmonControlError mapper: if the daemon's
@@ -498,7 +526,16 @@ pub async fn hwmon_verify_handler(
         // Blocking sleep, deliberately: this task is the uncancellable unit, and
         // an async sleep here would reintroduce the cancellation point the whole
         // restructure exists to remove.
-        std::thread::sleep(std::time::Duration::from_secs(VERIFY_WAIT_SECONDS as u64));
+        //
+        // [SAFETY] `TS-aw`: sliced, so the pump union is re-read every
+        // `VERIFY_PUMP_RECHECK_INTERVAL`. A header that becomes pump-protected
+        // mid-settle ends the settle there — it may be sitting at a test duty
+        // below the pump floor — and goes straight to the (floored) restore.
+        let pump_protected_mid_run = hold_verify_settle(
+            std::time::Duration::from_secs(VERIFY_WAIT_SECONDS as u64),
+            crate::constants::VERIFY_PUMP_RECHECK_INTERVAL,
+            || !*bg_shutdown.borrow() && pump_watch.became_protected(),
+        );
 
         let final_state = read_header_state(&pwm_path, &enable_path, &rpm_path);
 
@@ -522,7 +559,13 @@ pub async fn hwmon_verify_handler(
                  engine tick to correct.",
                 initial.pwm_percent.unwrap_or(50)
             );
-            return Ok((initial, final_state, test_pct, true));
+            return Ok(VerifyRun {
+                initial,
+                final_state,
+                test_pct,
+                restore_failed: true,
+                pump_protected_mid_run,
+            });
         }
 
         // Restore original PWM. Failures here are surfaced via ``restore_failed``
@@ -539,7 +582,13 @@ pub async fn hwmon_verify_handler(
                 "verify: skipping restore of {bg_header_id} — the daemon is \
                  shutting down and the hardware restore owns the header"
             );
-            return Ok((initial, final_state, test_pct, true));
+            return Ok(VerifyRun {
+                initial,
+                final_state,
+                test_pct,
+                restore_failed: true,
+                pump_protected_mid_run,
+            });
         }
 
         // [SAFETY] `AUD3-l`: clamp the RESTORE to the pump floor, not just the
@@ -566,7 +615,10 @@ pub async fn hwmon_verify_handler(
         //
         // Newly reachable rather than merely old: Phase 5's orchestrator aims
         // both diagnostics at `device.pump_member` by default.
-        let restore_pct = restore_duty(bg_is_pump, current_pct);
+        //
+        // `TS-aw`: the union is re-read once more here, after the shutdown skip
+        // above, so evidence that arrived after the last slice still floors it.
+        let restore_pct = restore_duty(pump_watch.restore_is_pump(), current_pct);
         let restore_failed = {
             let mut ctrl = bg_controller.lock();
             match ctrl.set_pwm(&bg_header_id, restore_pct, &bg_lease_id) {
@@ -581,13 +633,25 @@ pub async fn hwmon_verify_handler(
             }
         };
 
-        Ok::<_, HwmonControlError>((initial, final_state, test_pct, restore_failed))
+        Ok::<_, HwmonControlError>(VerifyRun {
+            initial,
+            final_state,
+            test_pct,
+            restore_failed,
+            pump_protected_mid_run,
+        })
     });
 
     // If the caller has gone away this `.await` resolves with a JoinError only
     // when the task itself panicked — the task keeps running either way, and its
     // restore lands regardless. That is the point.
-    let (initial, final_state, test_pct, restore_failed) = match join.await {
+    let VerifyRun {
+        initial,
+        final_state,
+        test_pct,
+        restore_failed,
+        pump_protected_mid_run,
+    } = match join.await {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => return hwmon_control_error_response(e),
         // `JoinError` is also returned when the runtime shuts down before the
@@ -617,8 +681,13 @@ pub async fn hwmon_verify_handler(
     // is true now because the sequence is uncancellable, not because it ever was
     // (DEC-290).
 
-    // Classify result
-    let (result, details) = classify_verify_result(&initial, &final_state, test_pct);
+    // Classify result. A verify the pump watch stopped measured nothing, so it
+    // gets its own verdict rather than a classification of a truncated settle.
+    let (result, details) = if pump_protected_mid_run {
+        pump_protected_mid_run_verdict()
+    } else {
+        classify_verify_result(&initial, &final_state, test_pct)
+    };
 
     json_ok(
         StatusCode::OK,
@@ -632,6 +701,62 @@ pub async fn hwmon_verify_handler(
             details,
             restore_failed,
         },
+    )
+}
+
+/// [SAFETY] `TS-aw` (DEC-418): hold verify's settle for `settle`, calling `stop`
+/// every `interval`. Returns `true` if `stop` ended the hold early.
+///
+/// `stop` is consulted **only while the window is still open**. The last slice
+/// sleeps out the remainder, so a check after it would run with the full
+/// window already elapsed — and a flip caught there would discard a measurement
+/// that had completed, reporting "the window did not complete" (review `C3`).
+/// By the user's rule a completed settle is classified as usual; the restore's
+/// own re-read floors it instead, and nothing is written in between.
+///
+/// A blocking sleep, deliberately: it runs inside verify's uncancellable
+/// `spawn_blocking` task (DEC-290).
+fn hold_verify_settle(
+    settle: std::time::Duration,
+    interval: std::time::Duration,
+    stop: impl Fn() -> bool,
+) -> bool {
+    let started = std::time::Instant::now();
+    while started.elapsed() < settle {
+        let remaining = settle.saturating_sub(started.elapsed());
+        std::thread::sleep(remaining.min(interval));
+        if started.elapsed() < settle && stop() {
+            return true;
+        }
+    }
+    false
+}
+
+/// What the verify's blocking task hands back to the handler.
+struct VerifyRun {
+    initial: HwmonVerifyState,
+    final_state: HwmonVerifyState,
+    test_pct: u8,
+    restore_failed: bool,
+    /// `TS-aw`: the header became pump-protected before the settle finished.
+    pump_protected_mid_run: bool,
+}
+
+/// The seventh verify `result` (DEC-418). Stable wire token; a client owns the
+/// sentence it shows, and an older client renders the token verbatim (273-i).
+pub(crate) const VERIFY_PUMP_PROTECTED_MID_RUN: &str = "pump_protected_mid_run";
+
+/// [SAFETY] `TS-aw` (DEC-418): the verdict for a verify stopped because the
+/// header became pump-protected while the test held it. Inconclusive, never a
+/// finding about the board: the settle was cut short, so nothing was measured.
+fn pump_protected_mid_run_verdict() -> (String, String) {
+    (
+        VERIFY_PUMP_PROTECTED_MID_RUN.into(),
+        format!(
+            "{}. The {VERIFY_WAIT_SECONDS}s test window did not complete, so nothing \
+             was measured. Re-run the verify: it now uses pump-safe duties.",
+            crate::api::diagnostic_gates::pump_protected_mid_run_detail("verify")
+        ),
     )
 }
 
@@ -867,9 +992,11 @@ pub async fn hwmon_characterize_handler(
 
     // [SAFETY] The UNION predicate, never the wire `role` (DEC-312): a user who
     // assigns `chassis_fan` to a header the hardware labels PUMP must still get
-    // the pump floor. Resolved here, before the task, so the role lookup never
-    // races the controller lock inside the sweep.
-    let floor = if state.header_is_pump_protected(&header_id) {
+    // the pump floor. This entry answer plans the sweep; the task re-reads the
+    // union between writes, never inside `write_fn`'s controller critical
+    // section (`TS-aw`, DEC-418).
+    let pump_at_start = state.header_is_pump_protected(&header_id);
+    let floor = if pump_at_start {
         crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8
     } else {
         0
@@ -1064,6 +1191,17 @@ pub async fn hwmon_characterize_handler(
             // the holds observe. Read once, before the sweep: it is a chip
             // attribute and does not change mid-run.
             let driver_interval = super::discovery::read_update_interval(&pwm_path);
+            // [SAFETY] `TS-aw` (DEC-418): the entry answer above planned the
+            // sweep; this re-reads the same union, with nothing held, before every
+            // write and on every sample, and once more before the restore.
+            let watch_state = Arc::clone(&state_for_persist);
+            let watch_id = hid.clone();
+            let pump_watch = crate::api::diagnostic_gates::PumpWatch::new(
+                hid.clone(),
+                "characterisation",
+                pump_at_start,
+                move || watch_state.header_is_pump_protected(&watch_id),
+            );
             let outcome = ch::run_sweep(
                 &cache,
                 &hid,
@@ -1074,6 +1212,7 @@ pub async fn hwmon_characterize_handler(
                 // captured pre-sweep duty straight through, so a pump reading 0
                 // was restored to 0 with `pwm_enable=1` and left stopped.
                 floor,
+                &pump_watch,
                 settle,
                 correction,
                 write_fn,
@@ -1429,6 +1568,294 @@ pub(crate) mod tests {
             duties.contains(&20),
             "an ordinary header at 90% must still test at 20%: {duties:?}"
         );
+    }
+
+    // ── TS-aw / DEC-418: a header that becomes a pump mid-verify ────────────
+
+    /// Run the real verify handler, and assign `pump` to the header through the
+    /// real role handler ~0.7 s into its settle (or not at all). Returns the
+    /// response, how long the verify took, and every duty it wrote.
+    pub(crate) async fn verify_with_mid_settle_pump_assignment(
+        raw: u8,
+        assign: bool,
+    ) -> (serde_json::Value, std::time::Duration, Vec<u8>) {
+        let (state, writes, _tx, _tmp) =
+            verify_test_state_at_duty(raw, crate::hwmon::roles::HeaderRole::ChassisFan);
+        let id = "hwmon:test:dev:pwm1";
+        assert!(
+            !state.header_is_pump_protected(id),
+            "precondition: the verify is planned for an ordinary fan"
+        );
+        let started = std::time::Instant::now();
+        let verify = tokio::spawn(hwmon_verify_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(id.to_string()),
+        ));
+        if assign {
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            assert!(
+                !verify.is_finished(),
+                "precondition: the assignment must land mid-settle"
+            );
+            let (status, body) = crate::api::handlers::update_header_role_handler(
+                axum::extract::State(state.clone()),
+                axum::response::Json(serde_json::json!({ "header_id": id, "role": "pump" })),
+            )
+            .await;
+            assert_eq!(status, 200, "{body:?}");
+            assert!(
+                state.header_is_pump_protected(id),
+                "precondition: now protected"
+            );
+        }
+        let (status, Json(body)) = verify.await.expect("verify task");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        (body, started.elapsed(), pwm_duties(&writes))
+    }
+
+    /// [SAFETY] `TS-aw`: a header at ~90 % is tested at 20 %, below the pump
+    /// floor. Assigned `pump` mid-settle, the verify stops there rather than
+    /// holding 20 % for the rest of its window, reports the seventh token, and
+    /// restores the captured duty.
+    #[tokio::test]
+    async fn a_pump_assigned_mid_settle_stops_the_verify_early() {
+        let (body, took, duties) = verify_with_mid_settle_pump_assignment(230, true).await;
+        assert_eq!(body["result"], VERIFY_PUMP_PROTECTED_MID_RUN, "{body}");
+        assert!(
+            body["details"]
+                .as_str()
+                .is_some_and(|d| d.contains("became pump-protected")),
+            "{body}"
+        );
+        assert!(
+            took < std::time::Duration::from_secs(VERIFY_WAIT_SECONDS as u64),
+            "the verify held its sub-floor test duty for the whole {VERIFY_WAIT_SECONDS}s \
+             settle ({took:?}) instead of stopping when the header became a pump"
+        );
+        assert_eq!(
+            duties,
+            vec![20, crate::pwm::raw_to_percent(230)],
+            "{duties:?}"
+        );
+    }
+
+    /// [SAFETY] `TS-aw`: the restore obeys the floor the header gained mid-run.
+    /// A header at ~10 % is tested at 80 % (above the floor), then assigned
+    /// `pump`: the restore is the pump floor, not the captured ~10 %. The
+    /// opposite arm, with no assignment, restores the captured duty exactly and
+    /// classifies as usual — so neither the floor nor the token is applied to
+    /// every verify.
+    #[tokio::test]
+    async fn a_pump_assigned_mid_settle_floors_the_verify_restore() {
+        let floor = crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8;
+        let captured = crate::pwm::raw_to_percent(25);
+        assert!(
+            captured < floor,
+            "precondition: the captured duty is below the floor"
+        );
+
+        let (body, _, duties) = verify_with_mid_settle_pump_assignment(25, true).await;
+        assert_eq!(body["result"], VERIFY_PUMP_PROTECTED_MID_RUN, "{body}");
+        assert_eq!(duties, vec![80, floor], "{duties:?}");
+
+        let (body, _, duties) = verify_with_mid_settle_pump_assignment(25, false).await;
+        assert_ne!(body["result"], VERIFY_PUMP_PROTECTED_MID_RUN, "{body}");
+        assert_eq!(duties, vec![80, captured], "{duties:?}");
+    }
+
+    // ── DEC-418 review `C3`: verify's settle checks only while it is open ────
+
+    /// A stop that answers yes at once ends the hold early.
+    #[test]
+    fn the_settle_stops_as_soon_as_the_watch_says_so() {
+        let settle = std::time::Duration::from_millis(400);
+        let t = std::time::Instant::now();
+        assert!(hold_verify_settle(
+            settle,
+            std::time::Duration::from_millis(20),
+            || true
+        ));
+        assert!(
+            t.elapsed() < settle,
+            "held {:?} after the stop",
+            t.elapsed()
+        );
+    }
+
+    /// [SAFETY] `C3`: a stop that turns true exactly as the window completes is
+    /// never consulted — the settle ran its full length and is a measurement.
+    /// Before the fix the check after the final slice fired here and discarded it.
+    #[test]
+    fn a_stop_that_turns_true_as_the_settle_completes_is_not_consulted() {
+        let settle = std::time::Duration::from_millis(60);
+        let t = std::time::Instant::now();
+        let stopped = hold_verify_settle(settle, std::time::Duration::from_millis(20), || {
+            t.elapsed() >= settle
+        });
+        assert!(!stopped, "a completed settle was reported as stopped");
+        assert!(
+            t.elapsed() >= settle,
+            "precondition: the full window was held"
+        );
+    }
+
+    #[test]
+    fn a_stop_that_never_fires_holds_the_whole_settle() {
+        let settle = std::time::Duration::from_millis(60);
+        let t = std::time::Instant::now();
+        assert!(!hold_verify_settle(
+            settle,
+            std::time::Duration::from_millis(20),
+            || false
+        ));
+        assert!(t.elapsed() >= settle);
+    }
+
+    // ── DEC-418 review `K2`: the real handlers wire the watch to the union ──
+
+    /// Poll `done` every 50 ms until it answers, or panic at the deadline.
+    async fn poll_until<T>(what: &str, mut done: impl FnMut() -> Option<T>) -> T {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if let Some(v) = done() {
+                return v;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what} never finished"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Assign `pump` to the fixture header through the real role handler.
+    async fn assign_pump_mid_run(state: &Arc<AppState>) {
+        let id = "hwmon:test:dev:pwm1";
+        let (status, body) = crate::api::handlers::update_header_role_handler(
+            axum::extract::State(state.clone()),
+            axum::response::Json(serde_json::json!({ "header_id": id, "role": "pump" })),
+        )
+        .await;
+        assert_eq!(status, 200, "{body:?}");
+        assert!(
+            state.header_is_pump_protected(id),
+            "precondition: now protected"
+        );
+    }
+
+    /// [SAFETY] `TS-aw` `K2`: the characterisation HANDLER builds its watch over
+    /// the real union — not only `run_sweep`, whose tests hand it a flag. A pump
+    /// assigned during the 20 % point's hold stops the run there: `aborted` with
+    /// the pump detail, the planned 60 % point never written, and the captured
+    /// ~90 % restored. With the closure replaced by `|| false` the run completes
+    /// and writes 60 %.
+    #[tokio::test]
+    async fn a_pump_assigned_mid_hold_stops_a_real_characterisation() {
+        let (state, writes, _tx, _tmp) =
+            verify_test_state_at_duty(230, crate::hwmon::roles::HeaderRole::ChassisFan);
+        let (status, Json(body)) = hwmon_characterize_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("hwmon:test:dev:pwm1".to_string()),
+            Json(
+                serde_json::from_value(
+                    serde_json::json!({"points_pct": [20, 60], "settle_seconds": 2}),
+                )
+                .expect("request"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        assert_eq!(
+            pwm_duties(&writes),
+            vec![20],
+            "precondition: the assignment lands during the 20 % hold"
+        );
+        assign_pump_mid_run(&state).await;
+
+        let run = poll_until("the characterisation", || {
+            state
+                .characterization
+                .lock()
+                .clone()
+                .filter(|r| r.state != crate::api::characterization::STATE_RUNNING)
+        })
+        .await;
+        assert_eq!(
+            run.state,
+            crate::api::characterization::STATE_ABORTED,
+            "{run:?}"
+        );
+        assert!(
+            run.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("became pump-protected")),
+            "{run:?}"
+        );
+        assert_eq!(
+            pwm_duties(&writes),
+            vec![20, crate::pwm::raw_to_percent(230)]
+        );
+    }
+
+    /// [SAFETY] `TS-aw` `K2`: the same for the control-path discovery HANDLER,
+    /// driven end to end through the injected monitor-only walk root (an empty
+    /// tree, so the only tach is the header's own). The header at ~90 % is
+    /// planned to perturb DOWN; a pump assigned during its first window stops
+    /// the run before the perturbed write. With the closure replaced by
+    /// `|| false` the run writes the perturbed duty and completes.
+    #[tokio::test]
+    async fn a_pump_assigned_mid_window_stops_a_real_discovery() {
+        let (state, writes, _tx, tmp) = build_verify_state_with(
+            Some(230),
+            crate::hwmon::roles::HeaderRole::ChassisFan,
+            Some(|raw| 300 + raw * 8),
+        );
+        let _tmp = tmp.expect("a duty was requested");
+        let empty_root = tempfile::tempdir().unwrap();
+        let (status, Json(body)) = crate::api::handlers::discovery::start_control_path_discovery(
+            state.clone(),
+            "hwmon:test:dev:pwm1".to_string(),
+            serde_json::from_value(serde_json::json!({"window_seconds": 2})).expect("request"),
+            empty_root.path(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let perturbed = body["perturbed_pct"].as_u64().expect("perturbed_pct") as u8;
+        let baseline = body["baseline_pct"].as_u64().expect("baseline_pct") as u8;
+        assert!(
+            perturbed < baseline,
+            "precondition: the plan perturbs down: {body}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        assert!(
+            !pwm_duties(&writes).contains(&perturbed),
+            "precondition: the assignment lands before the perturbed write"
+        );
+        assign_pump_mid_run(&state).await;
+
+        let run = poll_until("the discovery", || {
+            state
+                .control_path
+                .lock()
+                .clone()
+                .filter(|r| r.state != crate::api::discovery::STATE_RUNNING)
+        })
+        .await;
+        assert_eq!(run.state, crate::api::discovery::STATE_ABORTED, "{run:?}");
+        assert!(
+            run.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("became pump-protected")),
+            "{run:?}"
+        );
+        let duties = pwm_duties(&writes);
+        assert!(
+            !duties.contains(&perturbed),
+            "the perturbed duty was written: {duties:?}"
+        );
+        let floor = crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8;
+        assert!(duties.last().is_some_and(|d| *d >= floor), "{duties:?}");
     }
 
     /// [SAFETY] DEC-311: assigning `pump` to a header that is ALREADY held at 0

@@ -1708,6 +1708,26 @@ mod tests {
         );
     }
 
+    /// DEC-418 (`TS-aw`): a verify the header's mid-run pump protection stopped
+    /// is `unavailable` — it measured nothing — never the `unknown` an
+    /// unmapped token would fall into. The body is the REAL handler's, with the
+    /// pump role assigned mid-settle through the real role handler.
+    #[tokio::test]
+    async fn a_verify_stopped_by_a_mid_run_pump_is_unavailable() {
+        let (body, _, _) =
+            super::super::hwmon_ctl::tests::verify_with_mid_settle_pump_assignment(230, true).await;
+        let ev = verify_evidence("hwmon:test:dev:pwm1", StatusCode::OK, &body);
+        assert_eq!(
+            ev.result.as_deref(),
+            Some(super::super::hwmon_ctl::VERIFY_PUMP_PROTECTED_MID_RUN),
+            "{ev:?}"
+        );
+        assert_eq!(
+            crate::validation::summary::verify_outcome(&ev),
+            RESULT_UNAVAILABLE
+        );
+    }
+
     /// DEC-405 S1-6: a refused verify is `unavailable` — in the evidence AND in
     /// the `pwm_header_control` finding, which used to read `write_ok` alone and
     /// file "fail" for a thermal refusal.

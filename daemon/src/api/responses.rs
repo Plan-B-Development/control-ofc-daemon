@@ -1894,7 +1894,10 @@ pub struct HwmonVerifyResponse {
     pub header_id: String,
     /// "effective", "pwm_enable_reverted", "pwm_value_clamped",
     /// "no_rpm_effect", "rpm_unavailable", or — daemon >= 2.48.0, `ACK-m` —
-    /// "pwm_readback_unavailable".
+    /// "pwm_readback_unavailable", or — `TS-aw`, DEC-418 —
+    /// "pump_protected_mid_run": the header became pump-protected before the
+    /// settle finished, so the test stopped, nothing was measured and the
+    /// restore was floored at the pump floor. Inconclusive, not a failure.
     ///
     /// The last is the one case `rpm_unavailable` used to absorb: no usable
     /// tach reading AND a post-write readback of `pwmN` (or of a `pwmN_enable`

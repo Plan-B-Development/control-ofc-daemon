@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use control_ofc_daemon::api::calibration as cal;
 use control_ofc_daemon::api::characterization::{RestoreOutcome, RestoreReport};
+use control_ofc_daemon::api::diagnostic_gates::PumpWatch;
 use control_ofc_daemon::api::discovery as disc;
 use control_ofc_daemon::api::preflight as pf;
 use control_ofc_daemon::api::responses::HwmonVerifyState;
@@ -321,6 +322,7 @@ async fn sweep(
         cycles,
         restore_floor,
         pump_protected,
+        &PumpWatch::fixed(pump_protected),
         Duration::from_millis(20),
         Duration::from_millis(20),
         write_fn,
@@ -3247,6 +3249,7 @@ async fn discover_pump_with(
         2,
         0,
         false,
+        &PumpWatch::fixed(false),
         Duration::from_secs(constants::CHARACTERIZATION_DEFAULT_SETTLE_S),
         constants::DISCOVERY_SETTLE_WAIT_MAX,
         move |pct: u8| {
@@ -3637,4 +3640,236 @@ fn the_stall_probe_row_blocks_on_ineligibility_and_on_no_cpu_temperature() {
         Some(pf::Diagnostic::StallProbe)
     );
     assert!(pf::Diagnostic::StallProbe.blocks_on_stale_temperature());
+}
+
+// ── TS-aw / DEC-418: a header that becomes a pump mid-discovery ─────────────
+
+/// When the union flips during a discovery run: on a write of `pct`, once
+/// cycle `n` has been published, or on keepalive call `k` (0-based; in cycle 1,
+/// call 2 is the last thing before the perturbed write).
+#[derive(Clone, Copy)]
+enum PumpFlip {
+    OnWrite(u8),
+    AfterCycle(u8),
+    OnKeepalive(usize),
+    /// Visible from the instant the window opened by a write of `pct` has fully
+    /// elapsed — i.e. exactly as that window ends, before its closing sample.
+    AtWindowEnd(u8),
+}
+
+/// The real `run_discovery` on a header that reads 10 % before the run —
+/// below the pump floor — planned as an ordinary fan: baseline 20 %, perturbed
+/// DOWN to 10 %. Returns the outcome and every duty written, restore included.
+async fn discover_with_pump_flip(cycles: u8, flip: PumpFlip) -> (disc::DiscoveryOutcome, Vec<u8>) {
+    discover_with_pump_flip_from(true, cycles, flip).await
+}
+
+/// `original_readable: false` makes the run's own first read of `pwmN` fail,
+/// so it has no pre-run duty to restore (review `K1`).
+async fn discover_with_pump_flip_from(
+    original_readable: bool,
+    cycles: u8,
+    flip: PumpFlip,
+) -> (disc::DiscoveryOutcome, Vec<u8>) {
+    let cache = cache_at(40.0, Some("normal"));
+    let chans = channels(&[("fan_target", true)]);
+    let report = RestoreReport::new();
+    let cancel = AtomicBool::new(false);
+    let window = Duration::from_secs(1);
+    let union = Arc::new(AtomicBool::new(false));
+    let flip_at: Arc<Mutex<Option<tokio::time::Instant>>> = Arc::new(Mutex::new(None));
+    let (u, fa, fw) = (union.clone(), flip_at.clone(), flip_at.clone());
+    let watch = PumpWatch::new(
+        "hwmon:t:d:pwm2",
+        "control-path discovery",
+        false,
+        move || {
+            u.load(Ordering::SeqCst)
+                || fa
+                    .lock()
+                    .unwrap()
+                    .is_some_and(|t| tokio::time::Instant::now() >= t)
+        },
+    );
+    let first_read = AtomicBool::new(true);
+    let duty = Arc::new(Mutex::new(10u8));
+    let written = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let (dw, dr, ww, uw, up, uk) = (
+        duty.clone(),
+        duty.clone(),
+        written.clone(),
+        union.clone(),
+        union.clone(),
+        union.clone(),
+    );
+    let keepalives = AtomicUsize::new(0);
+    let outcome = disc::run_discovery(
+        &cache,
+        "hwmon:t:d:pwm2",
+        &chans,
+        20,
+        10,
+        "down",
+        cycles,
+        0,
+        false,
+        &watch,
+        window,
+        Duration::from_secs(1),
+        move |pct: u8| {
+            ww.lock().unwrap().push(pct);
+            *dw.lock().unwrap() = pct;
+            if matches!(flip, PumpFlip::OnWrite(p) if p == pct) {
+                uw.store(true, Ordering::SeqCst);
+            }
+            if matches!(flip, PumpFlip::AtWindowEnd(p) if p == pct) {
+                *fw.lock().unwrap() = Some(tokio::time::Instant::now() + window);
+            }
+            Ok(())
+        },
+        move || {
+            let d = *dr.lock().unwrap();
+            let readable = original_readable || !first_read.swap(false, Ordering::SeqCst);
+            std::future::ready(disc::DiscoverySample {
+                header: HwmonVerifyState {
+                    pwm_enable: Some(1),
+                    pwm_raw: Some(((u16::from(d) * 255) / 100) as u8),
+                    pwm_percent: readable.then_some(d),
+                    rpm: Some(u16::from(d) * 10),
+                },
+                tachs: vec![Some(u16::from(d) * 10)],
+            })
+        },
+        &cancel,
+        || false,
+        || {
+            let k = keepalives.fetch_add(1, Ordering::SeqCst);
+            if matches!(flip, PumpFlip::OnKeepalive(n) if n == k) {
+                uk.store(true, Ordering::SeqCst);
+            }
+            true
+        },
+        &report,
+        move |c: disc::DiscoveryCycle| {
+            if matches!(flip, PumpFlip::AfterCycle(n) if n == c.cycle) {
+                up.store(true, Ordering::SeqCst);
+            }
+        },
+        |_| {},
+    )
+    .await;
+    let log = written.lock().unwrap().clone();
+    (outcome, log)
+}
+
+fn stopped_for_the_pump(o: &disc::DiscoveryOutcome) -> bool {
+    o.state == disc::STATE_ABORTED
+        && o.detail
+            .as_deref()
+            .is_some_and(|d| d.contains("became pump-protected"))
+}
+
+/// [SAFETY] `TS-aw`: a flip while the sub-floor perturbed duty is being held is
+/// caught by that window's per-sample check — the cycle is not recorded — and
+/// the restore is the captured 10 % raised to the floor.
+#[tokio::test(start_paused = true)]
+async fn a_pump_flip_during_the_perturbed_window_stops_and_floors_the_restore() {
+    let (o, log) = discover_with_pump_flip(2, PumpFlip::OnWrite(10)).await;
+    assert!(stopped_for_the_pump(&o), "{:?} {:?}", o.state, o.detail);
+    assert!(o.cycles.is_empty(), "the held cycle must not be recorded");
+    assert_eq!(log, vec![20, 10, pump_floor()]);
+}
+
+/// [SAFETY] `TS-aw`: the settle-wait window checks too. Cycle 1 waits (the
+/// header read 10 %, not its 20 % baseline), so a flip on the baseline write
+/// stops the run before the perturbed write is ever issued.
+#[tokio::test(start_paused = true)]
+async fn a_pump_flip_during_the_settle_wait_stops_before_the_perturbed_write() {
+    let (o, log) = discover_with_pump_flip(2, PumpFlip::OnWrite(20)).await;
+    assert!(stopped_for_the_pump(&o), "{:?} {:?}", o.state, o.detail);
+    assert_eq!(log, vec![20, pump_floor()]);
+    // Stopped by the wait's OWN check: no window took a sample. Without it the
+    // baseline window runs in full and the perturbed write's check stops the
+    // run with the identical write log.
+    assert_eq!(o.sample_count, 0, "the settle-wait sampled past the flip");
+}
+
+/// [SAFETY] `TS-aw`: the check immediately before the perturbed write. The
+/// flip lands on the keepalive that follows the baseline window — after every
+/// window check has passed — so only that check stands between it and a
+/// sub-floor write planned for an ordinary fan.
+#[tokio::test(start_paused = true)]
+async fn a_pump_flip_just_before_the_perturbed_write_prevents_it() {
+    let (o, log) = discover_with_pump_flip(2, PumpFlip::OnKeepalive(2)).await;
+    assert!(stopped_for_the_pump(&o), "{:?} {:?}", o.state, o.detail);
+    assert!(o.sample_count > 0, "precondition: the baseline window ran");
+    assert_eq!(
+        log,
+        vec![20, pump_floor()],
+        "the 10 % perturbed write went out"
+    );
+}
+
+/// [SAFETY] `TS-aw`: a flip between cycles is caught by the check before the
+/// next baseline write.
+#[tokio::test(start_paused = true)]
+async fn a_pump_flip_between_cycles_stops_before_the_next_write() {
+    let (o, log) = discover_with_pump_flip(2, PumpFlip::AfterCycle(1)).await;
+    assert!(stopped_for_the_pump(&o), "{:?} {:?}", o.state, o.detail);
+    assert_eq!(o.cycles.len(), 1, "precondition: cycle 1 completed");
+    assert_eq!(log, vec![20, 10, pump_floor()]);
+}
+
+/// [SAFETY] `TS-aw`: a flip after the last window leaves a `complete` run (every
+/// window was measured); the return to the 20 % baseline is raised to the floor,
+/// then the restore guard floors the captured 10 %. The opposite arm, nothing
+/// arriving: back to the baseline, then the captured 10 % exactly.
+#[tokio::test(start_paused = true)]
+async fn a_pump_flip_after_the_last_window_floors_the_baseline_return() {
+    let (o, log) = discover_with_pump_flip(1, PumpFlip::AfterCycle(1)).await;
+    assert_eq!(o.state, disc::STATE_COMPLETE, "{:?}", o.detail);
+    assert_eq!(log, vec![20, 10, pump_floor(), pump_floor()]);
+
+    let (o, log) = discover_with_pump_flip(1, PumpFlip::OnWrite(0)).await;
+    assert_eq!(o.state, disc::STATE_COMPLETE, "{:?}", o.detail);
+    assert_eq!(
+        log,
+        vec![20, 10, 20, 10],
+        "an ordinary fan is restored as found"
+    );
+}
+
+/// [SAFETY] Review `K1`: the run could not read the header's pre-run duty, so
+/// there is no original to floor. Stopped in the sub-floor perturbed window, the
+/// header is raised from its last duty (10 %) to the floor rather than left
+/// there; after the last window, the floored baseline return is where it stays —
+/// never the perturbed duty, which is what skipping that write used to leave.
+#[tokio::test(start_paused = true)]
+async fn an_unreadable_original_is_raised_to_the_floor_not_left_below_it() {
+    let (o, log) = discover_with_pump_flip_from(false, 2, PumpFlip::OnWrite(10)).await;
+    assert!(stopped_for_the_pump(&o), "{:?} {:?}", o.state, o.detail);
+    assert_eq!(log, vec![20, 10, pump_floor()]);
+
+    let (o, log) = discover_with_pump_flip_from(false, 1, PumpFlip::AfterCycle(1)).await;
+    assert_eq!(o.state, disc::STATE_COMPLETE, "{:?}", o.detail);
+    assert_eq!(log, vec![20, 10, pump_floor(), pump_floor()]);
+
+    // The opposite arm: an ordinary fan with no original ends at the baseline
+    // return, with no restore added.
+    let (o, log) = discover_with_pump_flip_from(false, 1, PumpFlip::OnWrite(0)).await;
+    assert_eq!(o.state, disc::STATE_COMPLETE, "{:?}", o.detail);
+    assert_eq!(log, vec![20, 10, 20]);
+}
+
+/// [SAFETY] The user's rule (DEC-418 review, `C3`): a window whose time has
+/// elapsed is measured. Evidence that becomes visible exactly as the last
+/// perturbed window ends — before its closing sample — leaves the run
+/// `complete` with its cycle recorded, and still floors the baseline return and
+/// the restore.
+#[tokio::test(start_paused = true)]
+async fn a_flip_as_the_last_window_ends_leaves_the_run_complete_and_floored() {
+    let (o, log) = discover_with_pump_flip(1, PumpFlip::AtWindowEnd(10)).await;
+    assert_eq!(o.state, disc::STATE_COMPLETE, "{:?}", o.detail);
+    assert_eq!(o.cycles.len(), 1, "the completed cycle was discarded");
+    assert_eq!(log, vec![20, 10, pump_floor(), pump_floor()]);
 }

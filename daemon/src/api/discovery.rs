@@ -58,6 +58,7 @@ use crate::api::calibration::{
     check_thermal_safety, stale_temperature_refusal, thermal_force_state,
 };
 use crate::api::characterization::{RestoreOnDrop, RestoreReport, RunStep};
+use crate::api::diagnostic_gates::{pump_protected_mid_run_detail, PumpWatch};
 use crate::api::responses::HwmonVerifyState;
 use crate::constants;
 use crate::health::cache::StateCache;
@@ -654,6 +655,12 @@ pub async fn run_discovery<W, R, Fut, P, A, S, K>(
     // ordinary fan back at its own captured 0 is a restore, not a safety event.
     restore_floor: u8,
     pump_protected: bool,
+    // [SAFETY] `TS-aw` (DEC-418): the pump union, re-read before every write and
+    // on every sample. A header that becomes pump-protected mid-run stops the
+    // run (`aborted`), and the restore guard re-reads it before it writes.
+    // `pump_protected` above stays the entry answer: it is what `baseline_pct`
+    // and `perturbed_pct` were planned from.
+    pump_watch: &PumpWatch<'_>,
     window: Duration,
     // DEC-405: the bound on each settle-wait. Production passes
     // `constants::DISCOVERY_SETTLE_WAIT_MAX`; a parameter, like `window`, so a
@@ -737,6 +744,7 @@ where
         wrote_any: &wrote_any,
         report,
         restore_floor,
+        pump_watch: Some(pump_watch),
     };
 
     macro_rules! bail {
@@ -748,6 +756,12 @@ where
                 sample_count,
                 observed_resolution_ms: fold_resolution(&resolution_samples, target_idx),
             }
+        };
+    }
+    // Why a window ended early, as an abort: both arms are `aborted`.
+    macro_rules! bail_window {
+        ($stop:expr) => {
+            bail!(STATE_ABORTED, $stop.detail())
         };
     }
 
@@ -830,7 +844,13 @@ where
         if shutting_down() {
             bail!(STATE_ABORTED, "the daemon is shutting down".into());
         }
+        // [SAFETY] `TS-aw`: after the shutdown check, so it is never read while
+        // the exit path holds the controller, and immediately before the write.
+        if pump_watch.became_protected() {
+            bail_window!(WindowStop::PumpProtected);
+        }
         wrote_any.store(true, Ordering::SeqCst);
+        pump_watch.note_write(baseline_pct);
         if let Err(e) = write_fn(baseline_pct) {
             bail!(
                 STATE_FAILED,
@@ -857,6 +877,7 @@ where
                 &read_fn,
                 settle_wait_max,
                 &shutting_down,
+                pump_watch,
                 run_started,
                 &mut resolution_samples,
                 &mut sample_count,
@@ -864,8 +885,8 @@ where
             )
             .await
             {
-                Some(w) => w,
-                None => bail!(STATE_ABORTED, "the daemon is shutting down".into()),
+                Ok(w) => w,
+                Err(stop) => bail_window!(stop),
             };
             // [SAFETY] The wait held the baseline duty for up to a window, so its
             // last reading gets the same reclaim / lost-pump-tach check every
@@ -922,14 +943,15 @@ where
             &read_fn,
             window,
             &shutting_down,
+            pump_watch,
             run_started,
             &mut resolution_samples,
             &mut sample_count,
         )
         .await
         {
-            Some(s) => s,
-            None => bail!(STATE_ABORTED, "the daemon is shutting down".into()),
+            Ok(s) => s,
+            Err(stop) => bail_window!(stop),
         };
         if let Some(reason) = reclaim_or_lost_pump(
             &base.last,
@@ -990,6 +1012,12 @@ where
         if shutting_down() {
             bail!(STATE_ABORTED, "the daemon is shutting down".into());
         }
+        // [SAFETY] `TS-aw`: the write that can take the header DOWN by up to
+        // `DISCOVERY_DELTA_MAX_PCT`, on a duty planned for an ordinary fan.
+        if pump_watch.became_protected() {
+            bail_window!(WindowStop::PumpProtected);
+        }
+        pump_watch.note_write(perturbed_pct);
         if let Err(e) = write_fn(perturbed_pct) {
             bail!(
                 STATE_FAILED,
@@ -1006,14 +1034,15 @@ where
             &read_fn,
             window,
             &shutting_down,
+            pump_watch,
             run_started,
             &mut resolution_samples,
             &mut sample_count,
         )
         .await
         {
-            Some(s) => s,
-            None => bail!(STATE_ABORTED, "the daemon is shutting down".into()),
+            Ok(s) => s,
+            Err(stop) => bail_window!(stop),
         };
         if let Some(reason) = reclaim_or_lost_pump(
             &pert.last,
@@ -1129,8 +1158,22 @@ where
     // exemption is now moot for the voluntary-abort limbs — the gate above bails
     // before reaching this line — and what remains true is only the narrow claim
     // about a force.
+    //
+    // `TS-aw` (DEC-418): a header that became pump-protected after the last
+    // window returns to the baseline raised to the pump floor. Every window
+    // completed, so the run still reports `complete`; the baseline was planned
+    // for an ordinary fan and may sit below the floor. Written rather than
+    // skipped (review `K1`): when the pre-run duty was unreadable, this is the
+    // duty `RestoreOnDrop` leaves the header at, and skipping it left the header
+    // at the perturbed duty — lower than before this change.
     if !shutting_down() && thermal_force_state(cache).is_none() {
-        let _ = write_fn(baseline_pct);
+        let pct = if pump_watch.became_protected() {
+            baseline_pct.max(crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8)
+        } else {
+            baseline_pct
+        };
+        pump_watch.note_write(pct);
+        let _ = write_fn(pct);
     }
 
     DiscoveryOutcome {
@@ -1187,16 +1230,56 @@ struct Observed {
     per_channel: Vec<Vec<Option<u16>>>,
 }
 
-/// Hold for `window`, sub-sampling every channel. `None` means the daemon began
-/// shutting down mid-window, which the caller turns into an abort.
+/// Why a window ([`observe`], [`settle_wait`]) ended before its time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowStop {
+    /// The daemon began shutting down.
+    ShuttingDown,
+    /// `TS-aw`: the header became pump-protected mid-window.
+    PumpProtected,
+}
+
+impl WindowStop {
+    /// The abort detail; both arms end the run as `aborted`.
+    fn detail(self) -> String {
+        match self {
+            WindowStop::ShuttingDown => "the daemon is shutting down".into(),
+            WindowStop::PumpProtected => pump_protected_mid_run_detail("control-path discovery"),
+        }
+    }
+}
+
+/// The per-sample stop check both windows run first: shutdown, then — never
+/// while shutting down, and only while the window is still `open` — the pump
+/// watch (`TS-aw`). A window whose time has elapsed is measured (the user's
+/// rule, DEC-418 review); the next write's check or the restore acts on a flip
+/// seen after that, and nothing is written in between.
+fn window_stop<S: Fn() -> bool>(
+    shutting_down: &S,
+    pump_watch: &PumpWatch<'_>,
+    open: bool,
+) -> Result<(), WindowStop> {
+    if shutting_down() {
+        return Err(WindowStop::ShuttingDown);
+    }
+    if open && pump_watch.became_protected() {
+        return Err(WindowStop::PumpProtected);
+    }
+    Ok(())
+}
+
+/// Hold for `window`, sub-sampling every channel. An `Err` means the window
+/// ended early — shutdown, or a header that became pump-protected — which the
+/// caller turns into an abort.
 async fn observe<R, Fut, S>(
     read_fn: &R,
     window: Duration,
     shutting_down: &S,
+    pump_watch: &PumpWatch<'_>,
     run_started: tokio::time::Instant,
     resolution: &mut [Vec<(u64, Option<u16>)>],
     sample_count: &mut u32,
-) -> Option<Observed>
+) -> Result<Observed, WindowStop>
 where
     R: Fn() -> Fut,
     Fut: std::future::Future<Output = DiscoverySample>,
@@ -1211,11 +1294,9 @@ where
     let mut per_channel: Vec<Vec<Option<u16>>> = vec![Vec::new(); resolution.len()];
     loop {
         // Same rule as the characterisation settle: the sub-sample cadence is
-        // what bounds how long a shutdown waits for this task to stop touching
-        // hardware.
-        if shutting_down() {
-            return None;
-        }
+        // what bounds how long a shutdown — or a mid-run pump flip — waits for
+        // this task to stop touching hardware.
+        window_stop(shutting_down, pump_watch, started.elapsed() < window)?;
         // `.await`, not a call: the production `read_fn` dispatches this
         // sample's ~35 blocking `std::fs` reads to the blocking pool, so a tach
         // `open(2)` wedged in the driver parks a pool thread instead of a tokio
@@ -1237,7 +1318,7 @@ where
         let remaining = window.saturating_sub(started.elapsed());
         tokio::time::sleep(remaining.min(constants::DISCOVERY_SAMPLE_INTERVAL)).await;
     }
-    Some(Observed { last, per_channel })
+    Ok(Observed { last, per_channel })
 }
 
 /// The run's observed update interval (DEC-405): the header's own tach's, when
@@ -1294,21 +1375,24 @@ fn nothing_to_settle(history: &[(u64, Option<u16>)], reference: Option<u16>) -> 
 }
 
 /// DEC-405 (`PTR-c`): hold the just-written duty until every channel that can
-/// move has settled, or `bound` elapses. `None` means shutdown began.
+/// move has settled, or `bound` elapses. An `Err` means shutdown began or the
+/// header became pump-protected (`TS-aw`).
 ///
 /// Settling is judged with [`stats::settled_on_updates`] while the wait is open
 /// and only with the full [`stats::settling_ms`] once it has closed: online, the
 /// constant-window rule would release a slow register before its first refresh.
 /// Samples are appended to `resolution`, so the wait also informs the cadence.
+#[allow(clippy::too_many_arguments)]
 async fn settle_wait<R, Fut, S>(
     read_fn: &R,
     bound: Duration,
     shutting_down: &S,
+    pump_watch: &PumpWatch<'_>,
     run_started: tokio::time::Instant,
     resolution: &mut [Vec<(u64, Option<u16>)>],
     sample_count: &mut u32,
     reference: &[Option<u16>],
-) -> Option<SettleWait>
+) -> Result<SettleWait, WindowStop>
 where
     R: Fn() -> Fut,
     Fut: std::future::Future<Output = DiscoverySample>,
@@ -1322,9 +1406,9 @@ where
     let reference_of = |i: usize| reference.get(i).copied().flatten();
     let mut last;
     loop {
-        if shutting_down() {
-            return None;
-        }
+        // Always open: the wait is not a measurement, and the baseline window
+        // that follows it would catch the flip at its first sample anyway.
+        window_stop(shutting_down, pump_watch, true)?;
         let sample = read_fn().await;
         *sample_count = sample_count.saturating_add(1);
         let at_run = run_started.elapsed().as_millis() as u64;
@@ -1353,7 +1437,7 @@ where
                 || stats::settling_ms(&per_channel[i], reference_of(i)).is_some()
         })
         .collect();
-    Some(SettleWait {
+    Ok(SettleWait {
         settled,
         elapsed_ms: started.elapsed().as_millis() as u64,
         last,
