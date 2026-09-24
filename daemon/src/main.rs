@@ -1193,6 +1193,11 @@ fn restore_panic_targets(targets: &'static PanicRestoreTargets, timeout: Duratio
         let Some(ledger) = &targets.hwmon_handback else {
             return;
         };
+        // [SAFETY] `PTR-s` (DEC-420, SR-3): the same rule as the clean stop's
+        // hand-back — from here on `set_pwm` refuses every write to a header the
+        // ledger owns, so a worker still running until `abort()` cannot re-take
+        // one this gives back.
+        ledger.begin_shutdown_hand_back();
         let Some(taken) = ledger.try_taken(Duration::from_millis(200)) else {
             eprintln!(
                 "  WARNING: hwmon hand-back ledger is locked; leaving the headers to \
@@ -1340,6 +1345,11 @@ fn hand_back_hwmon(
     let Some(ledger) = ledger else {
         return HwmonRestore::NoController;
     };
+    // [SAFETY] `PTR-s` (DEC-420): before anything is written, and before the
+    // lock wait, so a write that is still wedged in a driver when this starts
+    // is refused by `set_pwm` whenever it returns, rather than landing over the
+    // mode given back here.
+    ledger.begin_shutdown_hand_back();
     let Some(taken) = ledger.try_taken(lock_timeout) else {
         log::error!(
             "hwmon hand-back ledger was still locked after {}s — leaving the headers \
@@ -1382,13 +1392,13 @@ fn hand_back_hwmon(
             }
             // [SAFETY] Deliberately NOT struck from the record (DEC-382 review,
             // concurrency F1). This path cannot take the controller mutex, so a
-            // write can still land after it — an undrained engine write, a
-            // detached sweep past its shutdown check — and one to a header given
-            // back as `Manual(raw)` or the 1+255 fallback reads `pwm_enable=1`,
-            // which the watchdog does not call a reclaim: it moves the duty with no
-            // new take. On the record, ExecStopPost gives it back again; replaying
-            // a header already given back is idempotent. Only the runtime
-            // give-back, which holds the controller lock, strikes a header.
+            // write can still land after it. Since DEC-420 (`PTR-s`) `set_pwm`
+            // refuses every write to these headers once `begin_shutdown_hand_back`
+            // has run, which leaves one: a write already past its last check and
+            // wedged in `write(2)`, which lands whenever the driver lets it. On
+            // the record, ExecStopPost gives it back again; replaying a header
+            // already given back is idempotent. Only the runtime give-back, which
+            // holds the controller lock, strikes a header.
             if outcome.released() {
                 released_w.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             } else {
@@ -4509,19 +4519,23 @@ mod tests {
         );
     }
 
-    /// [SAFETY] DEC-382 review (concurrency F1): a write that lands after the stop
-    /// is still covered by `ExecStopPost`. Found in manual, `h1` is given back as
-    /// `Manual(90)` and reads `pwm_enable=1`; a late `set_pwm` then moves its duty
-    /// without a new take, because the watchdog does not call mode 1 a reclaim.
-    /// The record must still name it, or the crash backstop skips it — the one
-    /// thing the old glob over every `pwm*_enable` did cover.
+    /// [SAFETY] DEC-382 review (concurrency F1), tightened by DEC-420 (`PTR-s`).
+    /// Found in manual, `h1` is given back as `Manual(90)` and reads
+    /// `pwm_enable=1`, so the watchdog would not call a late write a reclaim —
+    /// before DEC-420 a late `set_pwm` moved its duty with no new take. It is
+    /// now refused, because the stop marked the hand-back begun before writing,
+    /// and the header keeps the duty it was given back. The record must still
+    /// name it: ExecStopPost is the backstop for a write that was already past
+    /// its last check, and the one thing the old glob over every
+    /// `pwm*_enable` did cover.
     #[test]
-    fn a_write_after_the_stop_is_still_on_the_record_for_exec_stop_post() {
+    fn a_write_after_the_stop_is_refused_and_still_on_the_record() {
         let tmp = tempfile::tempdir().unwrap();
         let (ctrl, ledger) =
             controller_with_taken(vec![handback_header(tmp.path(), 1, Some("1"))], &["h1"]);
         let record = tmp.path().join(handback::RECORD_FILE_NAME);
         ledger.set_record_path(record.clone());
+        assert!(!ledger.shutdown_hand_back_begun(), "precondition");
 
         let outcome = hand_back_hwmon(
             Some(&ledger),
@@ -4535,6 +4549,9 @@ mod tests {
                 failed: 0
             }
         );
+        assert!(ledger.shutdown_hand_back_begun());
+        let given_back = read_trimmed(&tmp.path().join("pwm1"));
+        assert_eq!(given_back, "90", "precondition: given back at its duty");
 
         let lease = ctrl
             .lock()
@@ -4542,11 +4559,14 @@ mod tests {
             .active_lease()
             .map(|l| l.lease_id.clone())
             .expect("the take's lease is still live");
-        ctrl.lock().set_pwm("h1", 30, &lease).unwrap();
+        assert!(
+            ctrl.lock().set_pwm("h1", 30, &lease).is_err(),
+            "a write after the stop began must be refused"
+        );
         assert_eq!(
             read_trimmed(&tmp.path().join("pwm1")),
-            control_ofc_daemon::pwm::percent_to_raw(30).to_string(),
-            "precondition: the late write landed"
+            given_back,
+            "the late write must not move the duty the stop gave back"
         );
 
         let body = std::fs::read_to_string(&record).unwrap();
@@ -4554,6 +4574,23 @@ mod tests {
             body.lines().any(|l| l.ends_with("\tmanual\t90")),
             "ExecStopPost's record must still name the header; got {body:?}"
         );
+    }
+
+    /// [SAFETY] `PTR-s` (DEC-420): the stop marks itself begun even when it has
+    /// nothing to give back — the mark precedes every early return, so no path
+    /// through the stop leaves a late write unrefused.
+    #[test]
+    fn the_stop_marks_the_hand_back_begun_even_with_nothing_taken() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_ctrl, ledger) =
+            controller_with_taken(vec![handback_header(tmp.path(), 1, Some("5"))], &[]);
+        let outcome = hand_back_hwmon(
+            Some(&ledger),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        );
+        assert_eq!(outcome, HwmonRestore::NothingTaken, "precondition");
+        assert!(ledger.shutdown_hand_back_begun());
     }
 
     /// [SAFETY] 277-b, half one — now structural: the hand-back never takes the
@@ -4788,12 +4825,16 @@ mod tests {
             "1",
             "precondition"
         );
+        let marker = ledger.clone();
         let targets: &'static PanicRestoreTargets = Box::leak(Box::new(PanicRestoreTargets {
             gpu_curves: Vec::new(),
             hwmon_handback: Some(ledger),
         }));
         assert!(restore_panic_targets(targets, Duration::from_secs(5)));
         assert_eq!(read_trimmed(&tmp.path().join("pwm1_enable")), "5");
+        // `PTR-s` SR-3 (DEC-420): the panic path is a hand-back too, so from
+        // here on `set_pwm` refuses a late write to what it gave back.
+        assert!(marker.shutdown_hand_back_begun());
     }
 
     /// [SAFETY] 278-a. The panic hook carried the same unbounded shape.

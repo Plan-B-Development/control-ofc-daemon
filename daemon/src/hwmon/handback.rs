@@ -37,6 +37,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -309,6 +310,13 @@ struct LedgerState {
 #[derive(Debug)]
 pub struct HandBackLedger {
     state: Mutex<LedgerState>,
+    /// [SAFETY] `PTR-s` (DEC-420). Set by the shutdown hand-back before it
+    /// writes anything, and never cleared: from then on `set_pwm` writes nothing
+    /// to a header this ledger tracks. An atomic beside the lock, not a field
+    /// under it or under the controller's, because the write it has to stop is
+    /// one that wedged in the kernel while holding the controller mutex and
+    /// returns after the hand-back — only a lock-free read reaches it.
+    shutdown_hand_back: AtomicBool,
 }
 
 impl HandBackLedger {
@@ -338,7 +346,20 @@ impl HandBackLedger {
                 entries,
                 ..LedgerState::default()
             }),
+            shutdown_hand_back: AtomicBool::new(false),
         }
+    }
+
+    /// Mark the shutdown hand-back as begun (`PTR-s`, DEC-420). Call before its
+    /// first write; there is no way back.
+    pub fn begin_shutdown_hand_back(&self) {
+        self.shutdown_hand_back.store(true, Ordering::SeqCst);
+    }
+
+    /// True once the shutdown hand-back has begun: the headers this ledger
+    /// tracks belong to it, and no other write may reach them.
+    pub fn shutdown_hand_back_begun(&self) -> bool {
+        self.shutdown_hand_back.load(Ordering::SeqCst)
     }
 
     /// Keep the on-disk record at `path` from now on, writing it once

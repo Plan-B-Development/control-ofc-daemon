@@ -597,9 +597,11 @@ pub(crate) async fn start_control_path_discovery(
             // `std::fs` reads, taken every 500 ms for the whole run (~186
             // samples), over a chip set drawn from a full `/sys/class/hwmon`
             // walk. `AIO3-d` accepted this shape on the characterisation sweep
-            // at **three** reads per sample; discovery multiplies it ~11× and
+            // at **three** reads per sample (DEC-420 has since bounded those on
+            // the blocking pool, `PTR-v`); discovery multiplies it ~11× and
             // widens the chip set, which is what makes it worth the dispatch
-            // here (`P8-am`).
+            // here (`P8-am`). Unlike characterisation's, these are not bounded
+            // (`P8-b`, accepted posture).
             //
             // On the blocking pool, per the DEC-290 precedent: a tach `open(2)`
             // wedged in a driver then parks a pool thread — sized for exactly

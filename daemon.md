@@ -147,7 +147,11 @@ daemon/src/
                          No I/O, no locks, no clock — and written to be reused by
                          Batch 3's steady-state detector, which is its temperature twin
     characterization.rs — PWM/RPM response sweep (DEC-313), reused by validation.
-                         Owns RestoreOnDrop, which the discovery sweep reuses verbatim
+                         Owns RestoreOnDrop, which the discovery sweep reuses verbatim.
+                         Its reads are bounded at DIAGNOSTIC_READ_BUDGET (2 s) on the
+                         blocking pool, as the stall probe's are, and after a read that
+                         does not return it writes nothing more — no restore, unless the
+                         header became a pump (`skipped_unresponsive`, DEC-420)
     discovery.rs       — PWM-to-tach control-path sweep (DEC-333). Perturbs one header
                          away from the nearer rail, watches every tach incl. monitor-only
     preflight.rs       — the shared diagnostic safety predicates + typed report (DEC-333).
@@ -231,7 +235,9 @@ rather than with the command is what keeps a coarse driver (`dell_smm`'s three
 levels, `thinkpad_acpi`'s eight) or a clamping chip from reading as drift after
 every write; a clamp stays visible through `verify_mismatch_counts`. A correction
 "did not hold" when the next tick still disagrees (one whose write failed did not
-land and is not counted); after `DUTY_CORRECTION_ATTEMPTS` (3) of those in a row the engine stops rewriting that
+land and is not counted — and since DEC-420 any failed duty write clears the
+header's manual flag, so the next command re-takes the header and is written
+rather than coalesced, which restarts the count, `TS-au`); after `DUTY_CORRECTION_ATTEMPTS` (3) of those in a row the engine stops rewriting that
 header and flags it `duty_not_holding`, so it cannot fight a persistent second
 writer indefinitely. It resumes when the command changes, and the flag
 clears when a coalesced readback agrees again (or the header is handed back or the
@@ -557,7 +563,17 @@ gating each have their own register rows and regression tests.
     its request, a verify restore, or an engine write that outlived the drains
     cannot take an output back down. `ExecStopPost`
     cannot repeat it — serial is out of its reach — so after a crash or SIGKILL
-    those outputs keep their last duty.
+    those outputs keep their last duty. The hwmon hand-back that follows marks
+    itself begun before its first write — as does the panic-time hand-back — and from
+    then on `HwmonPwmController::set_pwm` refuses every write to a header WITH a mode
+    switch (`HwmonControlError::ShuttingDown`, a retryable `503` at the API; DEC-420,
+    `PTR-s`): the
+    hand-back is the last writer, so a late engine or diagnostic write can no
+    longer re-take a header it gave back. A write already past its last check and
+    wedged in `write(2)` still lands when the driver lets it; `ExecStopPost`
+    replays the record for that. A failed floor write, like a failed `set_pwm`
+    duty write, leaves the next command to be written rather than coalesced
+    (`TS-au`).
 
 12. **The stall/restart probe is the one diagnostic below 20 %** (`api::stall_probe`,
     DEC-407). Every other diagnostic clamps to `max(20, header floor)`, and still does.

@@ -745,6 +745,9 @@ where
         report,
         restore_floor,
         pump_watch: Some(pump_watch),
+        // Discovery's reads are not bounded (`P8-b`), so it never detects a
+        // hung read to skip after.
+        unresponsive: None,
     };
 
     macro_rules! bail {

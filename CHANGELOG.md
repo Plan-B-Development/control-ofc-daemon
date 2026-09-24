@@ -27,6 +27,45 @@ at 0 % for up to 15 s. Identify now reads the role under that lock, so it either
 and perturbs the pump instead of stopping it, or the assignment's release removes the stop. The same
 race with a profile activation was closed in 2.51.1 (DEC-394).
 
+**A write can no longer re-take a header the daemon has just given back at shutdown** (`PTR-s`,
+DEC-420). A clean stop gives every header the daemon took back to what it was doing before. That
+hand-back cannot wait for the controller's lock, so a write that had stalled in a slow driver could
+land just after it — and since 2.53.0's duty check, even a repeat of the same duty did, pulling a
+header just given back to full speed back down to the curve's duty, in manual mode with nothing left
+to drive it until `ExecStopPost` replayed the record. The stop now marks the hand-back begun before
+it writes anything — the crash-time hand-back too — and from then on the daemon refuses every write to
+a header it gives back. A verify still running when the daemon stops gets `503 hardware_unavailable`
+(retryable), the same answer as a request that arrives while stopping.
+
+**After a failed duty write, the next identical command is written instead of skipped** (`TS-au`,
+DEC-420). The daemon skips a write whose duty equals the last one it wrote successfully. A write the
+driver reported as failed may still have landed, so after `60 %` → `30 %` (failed) → `60 %` the header
+could stay at 30 % until the curve moved — and where the register could not be read back, 2.53.0's duty
+check could not notice. A failed write now makes the next command write again, re-asserting manual
+mode where the header has a mode switch. The same applies after the stop's exit floor fails to write.
+One side effect is deliberate: a correction whose write fails is followed by a fresh write, which
+restarts the count behind `duty_not_holding`, so a header whose writes fail now and then while
+something else fights it takes longer to be flagged.
+
+**A PWM characterisation can no longer hang on a stuck driver** (`PTR-v`, DEC-420). The sweep read the
+header directly on the daemon's async runtime with no time limit, so a driver that stopped answering
+left the fan at a test duty with every safety check — temperature, cancel, the pump re-check —
+waiting behind that read, and could stall other daemon work. Every read now runs off the runtime and
+gives up after 2 s: the run ends `aborted`, its `detail` says a read did not return, and the sweep
+reads and writes that header no further. **The duty it had before the sweep is then not written back**
+(new `restore_outcome`: `skipped_unresponsive`, with `restore_failed: true` once the sweep had written):
+a write goes through a path whose own reads have no time limit and hold the lock the rest of fan
+control needs, so writing to a driver that has stopped answering could stall every hwmon fan. The fan
+stays at the last test duty, which is never below 20 % (30 % for a pump), until your profile drives it
+again. The one exception: a header that became a pump during the run still gets its restore, raised
+to 30 %. The sweep also checks for a shutdown
+immediately before each write, takes its reference reading before its safety checks rather than
+between them and the write, and reports a mode change it sees while the daemon is stopping as the
+shutdown rather than as another controller taking the fan. **`original_pct` in the 202 response to
+`POST /hwmon/{id}/characterize` is now `null`**: the daemon no longer reads the header while answering
+the request. The finished run carries it, taken from the same reading the restore uses, so the
+published value and the restored duty can no longer differ.
+
 ## [2.55.0] — 2026-09-23
 
 ### Added

@@ -6408,6 +6408,23 @@ async fn characterize_reports_a_thermally_skipped_restore_rather_than_a_success(
         "a live run has no outcome yet"
     );
 
+    // Wait for the first point's write before the ladder starts. Since DEC-420
+    // the sweep's reads run on the blocking pool, so its task yields before that
+    // write, and a force recorded straight after the 202 can win the step gate —
+    // a correct abort BEFORE any write, which reports `restored` (the header
+    // never moved). This test is about the skip AFTER a write; it used to get
+    // one by winning a race. `current_step` is announced once the write returns.
+    let mut written = false;
+    for _ in 0..100 {
+        let (_, snap) = uds_get(&path, "/diagnostics/characterization").await;
+        if snap["current_step"].is_object() {
+            written = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(written, "precondition: the first point was written");
+
     cache.record_engine_tick(
         "emergency",
         control_ofc_daemon::constants::THERMAL_EMERGENCY_TRIGGER_C,

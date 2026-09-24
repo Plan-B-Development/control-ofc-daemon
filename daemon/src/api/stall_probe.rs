@@ -36,7 +36,7 @@
 //!   temperatures, a lost lease), on the hottest fresh CPU reading rising
 //!   [`constants::STALL_PROBE_RISE_LIMIT_C`] above its start, on lost
 //!   eligibility, on the budget, on a reclaim, on an unreadable sample or a read
-//!   that does not return within [`constants::STALL_PROBE_READ_BUDGET`], and on
+//!   that does not return within [`constants::DIAGNOSTIC_READ_BUDGET`], and on
 //!   cancel. Every abort and cancel ends with a **100 % recovery kick** held
 //!   until the fan is seen spinning (bounded) — **never while shutting down**,
 //!   when a write after the hand-back would re-take the header (S3-R3).
@@ -538,7 +538,7 @@ enum Stop {
     RefreshUnknown,
     RefreshTooSlow(u64),
     /// A probe sample could not be read, or a read did not return at all
-    /// within [`constants::STALL_PROBE_READ_BUDGET`] (`wedged`). Unknown is
+    /// within [`constants::DIAGNOSTIC_READ_BUDGET`] (`wedged`). Unknown is
     /// never a pass: without a reading a stall or restart cannot be judged, and
     /// walking on regardless would report a result nothing measured.
     TachUnreadable {
@@ -603,7 +603,7 @@ impl Stop {
             ),
             Stop::TachUnreadable { wedged: true } => format!(
                 "a read of the header did not return within {} ms; the probe stopped reading it",
-                constants::STALL_PROBE_READ_BUDGET.as_millis()
+                constants::DIAGNOSTIC_READ_BUDGET.as_millis()
             ),
             Stop::TachUnreadable { wedged: false } => "the tach could not be read during the \
                                                        probe, so a stall or restart cannot be \
@@ -1238,7 +1238,7 @@ where
 /// same shape as `characterization::run_sweep`. `read_fn` resolves as a future
 /// so the caller can put the blocking reads on the blocking pool (`P8-am`), and
 /// resolves to `None` when a read did not return within the caller's bound
-/// ([`constants::STALL_PROBE_READ_BUDGET`] in production): a wedge.
+/// ([`constants::DIAGNOSTIC_READ_BUDGET`] in production): a wedge.
 ///
 /// `eligible` is called before every write, on every probe sample, and once
 /// more at the end: its pump answer at any point raises the restore floor, so a
@@ -1314,6 +1314,9 @@ where
         wrote_any: &wrote_any,
         report,
         restore_floor,
+        // DEC-420's skip-after-a-hung-read is characterisation's; the probe
+        // keeps DEC-407's kick and restore after a wedge (`PTR-ab`).
+        unresponsive: None,
         // DEC-407's own re-check raises `restore_floor` below; see its field doc.
         pump_watch: None,
     };

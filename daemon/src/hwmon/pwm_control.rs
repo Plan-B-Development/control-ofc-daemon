@@ -53,6 +53,12 @@ pub enum HwmonControlError {
     Validation(String),
     /// Hardware/sysfs write failure.
     Hardware(HwmonError),
+    /// Refused because the shutdown hand-back has begun and owns the header
+    /// (DEC-420, `PTR-s`). Transient by nature — the daemon is stopping — so it
+    /// maps to a retryable `503 hardware_unavailable`, like the handlers' own
+    /// shutdown refusals, and is never a `Lease` error the thermal force would
+    /// answer by re-taking the lease and retrying.
+    ShuttingDown(String),
 }
 
 impl std::fmt::Display for HwmonControlError {
@@ -61,6 +67,7 @@ impl std::fmt::Display for HwmonControlError {
             Self::Lease(e) => write!(f, "lease error: {e}"),
             Self::Validation(msg) => write!(f, "validation error: {msg}"),
             Self::Hardware(e) => write!(f, "hardware error: {e}"),
+            Self::ShuttingDown(msg) => write!(f, "shutting down: {msg}"),
         }
     }
 }
@@ -440,12 +447,19 @@ impl HwmonPwmController {
                     .insert(header_id.clone(), written.is_ok().then_some(target_pct));
                 // Keep the coalesce truthful: once the floor has landed, a late
                 // command the latch raises to the same duty writes nothing.
-                if written.is_ok() {
-                    if let Some(ws) = self.write_state.get_mut(&header_id) {
+                if let Some(ws) = self.write_state.get_mut(&header_id) {
+                    if written.is_ok() {
                         ws.last_commanded_pct = Some(target_pct);
                         // DEC-406: this write was not read back, so the drift
                         // check falls back to comparing with the floor's duty.
                         ws.held_pct = None;
+                    } else {
+                        // [SAFETY] `TS-au` (DEC-420): a failed floor write may
+                        // still have landed, or left the header at a failed
+                        // earlier write's duty, so the next command must be
+                        // written, not coalesced against `last_commanded_pct` —
+                        // which stays, as in `set_pwm`.
+                        ws.manual_mode_set = false;
                     }
                 }
                 Some(written)
@@ -669,6 +683,11 @@ impl HwmonPwmController {
             )
         };
 
+        // [SAFETY] `PTR-s` (DEC-420): the headers the shutdown hand-back gives
+        // back are exactly the ledger's — those with a mode switch.
+        let owned_by_hand_back = supports_enable && enable_path.is_some();
+        self.refuse_after_hand_back(header_id, owned_by_hand_back)?;
+
         // Validate PWM range
         if pwm_percent > 100 {
             return Err(HwmonControlError::Validation(format!(
@@ -860,6 +879,10 @@ impl HwmonPwmController {
                 } else {
                     None
                 };
+                // Again here: the reads above can wedge across the hand-back.
+                // BEFORE `note_take`, so a refused take adds nothing to the record
+                // ExecStopPost replays (DEC-420 review, SR-2).
+                self.refuse_after_hand_back(header_id, owned_by_hand_back)?;
                 self.handback.note_take(header_id, original);
                 self.writer
                     .write_file(ep, PWM_ENABLE_MANUAL)
@@ -875,15 +898,38 @@ impl HwmonPwmController {
             // success — and confirmed below once it has.
             self.exit_record.insert(header_id.to_string(), None);
         }
-        if let Err(e) = self.writer.write_file(&pwm_path, &raw.to_string()) {
-            // DEC-406: a correction that never landed is not one that "did not
-            // hold", so it must not count toward the give-up — or three EIOs would
-            // publish `duty_not_holding` beside `duty_corrections: 0`. The episode
-            // stays open (no repeat WARN); the failure reaches the engine's own
-            // throttled write-failure log, and the next tick tries again, as it
-            // does for any failed write.
+        // And immediately before the duty write: the watchdog's and the drift
+        // check's reads, and the enable write, can all wedge across the hand-back.
+        if let Err(refused) = self.refuse_after_hand_back(header_id, owned_by_hand_back) {
+            // A refused correction never landed, so — as for a failed write
+            // below — it must not count toward DEC-406's give-up (SR-1).
             if correcting {
                 if let Some(ws) = self.write_state.get_mut(header_id) {
+                    ws.drift.corrections = ws.drift.corrections.saturating_sub(1);
+                }
+            }
+            return Err(refused);
+        }
+        if let Err(e) = self.writer.write_file(&pwm_path, &raw.to_string()) {
+            if let Some(ws) = self.write_state.get_mut(header_id) {
+                // [SAFETY] `TS-au` (DEC-420): a failed write may still have
+                // landed, so the header may hold this duty rather than the last
+                // one that succeeded. Clearing the mode flag makes the next
+                // command write instead of coalescing against
+                // `last_commanded_pct` — at the cost of one `pwm_enable=1`
+                // re-assert on a header with a mode switch. `last_commanded_pct`
+                // itself stays: the thermal force floors a held header against
+                // it, and wiping it is `TS-p`'s defect (DEC-386).
+                ws.manual_mode_set = false;
+                // DEC-406: a correction that never landed is not one that "did
+                // not hold", so it must not count toward the give-up — or three
+                // EIOs would publish `duty_not_holding` beside
+                // `duty_corrections: 0`. The next tick re-takes the header as a
+                // plain write, which restarts the count (DEC-420 accepts that a
+                // header whose writes fail intermittently reaches the give-up
+                // later); the failure reaches the engine's own throttled
+                // write-failure log.
+                if correcting {
                     ws.drift.corrections = ws.drift.corrections.saturating_sub(1);
                 }
             }
@@ -970,6 +1016,35 @@ impl HwmonPwmController {
             pwm_percent: effective_pct,
             raw_value: raw,
         })
+    }
+
+    /// [SAFETY] `PTR-s` (DEC-420). Once the shutdown hand-back has begun, refuse
+    /// any write to a header it owns: the hand-back is the last writer, and a
+    /// write landing after it re-takes the header — through the reclaim
+    /// watchdog on one given back to a firmware mode, or by moving the duty of
+    /// one given back in manual — with nothing left to drive it. Before
+    /// DEC-406 such a late write moved the duty only when its command changed;
+    /// DEC-406's readback made a same-command one rewrite it too, which is the
+    /// widening `PTR-s` recorded.
+    ///
+    /// [`HwmonControlError::ShuttingDown`], deliberately never `Lease`: the
+    /// thermal force answers a lease error by force-taking the lease and
+    /// retrying, which would only meet this again; and a verify still in flight
+    /// when the daemon stops gets the retryable `503` the handlers' own shutdown
+    /// refusals give, not a `400` (DEC-420 review). A header with no mode switch
+    /// is never refused — the hand-back does not reach it, and DEC-392's
+    /// exit-floor latch relies on a late write to it still landing, raised.
+    fn refuse_after_hand_back(
+        &self,
+        header_id: &str,
+        owned_by_hand_back: bool,
+    ) -> Result<(), HwmonControlError> {
+        if owned_by_hand_back && self.handback.shutdown_hand_back_begun() {
+            return Err(HwmonControlError::ShuttingDown(format!(
+                "hwmon {header_id}: the shutdown hand-back has begun, and it owns this header"
+            )));
+        }
+        Ok(())
     }
 
     /// Called when a lease is released. Resets coalescing state so the next
@@ -1398,10 +1473,295 @@ mod tests {
         assert!(ctrl.set_pwm("h", 30, &lease).is_err(), "precondition");
         assert_eq!(ctrl.apply_exit_floor(50)[0].target_pct, 100, "precondition");
 
+        let before = writes.lock().len();
         assert_eq!(ctrl.set_pwm("h", 30, &lease).unwrap().pwm_percent, 100);
+        // The COUNT, not `writes.last()`, which the floor's own 100 satisfies
+        // whether or not the late write happens (`F2`, retired by DEC-420).
+        let writes = writes.lock();
+        assert_eq!(writes.len(), before + 1, "the late write landed");
+        assert_eq!(writes[before].1, percent_to_raw(100).to_string());
+    }
+
+    /// [SAFETY] `TS-au` (DEC-420), the row's own scenario. A no-mode header last
+    /// written at 100, a failed write of 30 and a failed floor write: the
+    /// header may be at 30, below the floor, so the late write the latch raises
+    /// to 100 must be WRITTEN, not coalesced against the 100 that was last
+    /// written successfully. Asserted by the write count — the last write is
+    /// 100 whether or not the late one happens (the `F2` weakness of
+    /// `an_unknown_duty_latches_at_full_speed`). The mock has no `pwmN` to
+    /// read back, which is the unreadable-register case DEC-406's correction
+    /// cannot see.
+    #[test]
+    fn a_failed_write_then_a_failed_floor_leaves_the_late_write_to_land() {
+        let eio = || {
+            Err(HwmonError::WriteError {
+                path: "/sys/class/hwmon/hwmon0/pwm2".to_string(),
+                message: "EIO".to_string(),
+            })
+        };
+        let (mut ctrl, writes, _cache) =
+            setup_scripted_controller(vec![no_mode_header("h", 2)], vec![Ok(()), eio(), eio()]);
+        let lease = engine_lease(&mut ctrl);
+        ctrl.set_pwm("h", 100, &lease).unwrap();
+        assert!(ctrl.set_pwm("h", 30, &lease).is_err(), "precondition");
+        let floor = ctrl.apply_exit_floor(50);
+        assert_eq!(floor[0].target_pct, 100, "precondition: an unknown duty");
+        assert!(
+            matches!(floor[0].result, Some(Err(_))),
+            "precondition: the floor's own write failed"
+        );
+        let before = writes.lock().len();
+
+        assert_eq!(ctrl.set_pwm("h", 20, &lease).unwrap().pwm_percent, 100);
+        let writes = writes.lock();
         assert_eq!(
-            writes.lock().last().map(|(_, v)| v.clone()),
-            Some(percent_to_raw(100).to_string())
+            writes.len(),
+            before + 1,
+            "the latch's late write must land: the header may still hold the failed 30"
+        );
+        assert_eq!(writes[before].1, percent_to_raw(100).to_string());
+    }
+
+    /// [SAFETY] `TS-au` (DEC-420) in normal control: `60` ok, `30`
+    /// failed-but-possibly-landed, then `60` again must be written, on a header
+    /// with a mode switch (which re-asserts `pwm_enable=1`) and on one without.
+    #[test]
+    fn after_a_failed_duty_write_the_same_command_is_written_again() {
+        let eio = || {
+            Err(HwmonError::WriteError {
+                path: "pwm".to_string(),
+                message: "EIO".to_string(),
+            })
+        };
+        // enable + pwm, then the failed pwm.
+        let (mut ctrl, writes, _cache) = setup_scripted_controller(
+            vec![make_header("h1", "CHA_FAN1", 0)],
+            vec![Ok(()), Ok(()), eio()],
+        );
+        let lease = engine_lease(&mut ctrl);
+        ctrl.set_pwm("h1", 60, &lease).unwrap();
+        assert!(ctrl.set_pwm("h1", 30, &lease).is_err(), "precondition");
+        let before = writes.lock().len();
+        ctrl.set_pwm("h1", 60, &lease).unwrap();
+        assert_eq!(
+            writes.lock()[before..].to_vec(),
+            vec![
+                (
+                    "/sys/class/hwmon/hwmon0/pwm1_enable".to_string(),
+                    PWM_ENABLE_MANUAL.to_string()
+                ),
+                (
+                    "/sys/class/hwmon/hwmon0/pwm1".to_string(),
+                    percent_to_raw(60).to_string()
+                ),
+            ],
+            "re-taken and rewritten, not coalesced"
+        );
+        assert_eq!(
+            ctrl.last_commanded_pct("h1"),
+            Some(60),
+            "the failed write never replaced the last successful duty"
+        );
+
+        let (mut ctrl, writes, _cache) =
+            setup_scripted_controller(vec![no_mode_header("h", 2)], vec![Ok(()), eio()]);
+        let lease = engine_lease(&mut ctrl);
+        ctrl.set_pwm("h", 60, &lease).unwrap();
+        assert!(ctrl.set_pwm("h", 30, &lease).is_err(), "precondition");
+        let before = writes.lock().len();
+        ctrl.set_pwm("h", 60, &lease).unwrap();
+        assert_eq!(writes.lock().len(), before + 1, "no-mode header rewritten");
+    }
+
+    /// A writer whose read of one path starts the shutdown hand-back — a read
+    /// that wedged in the kernel and returned after `hand_back_hwmon` began.
+    /// Writes go through to `files` (and are logged), so a readback sees them;
+    /// a test changes a file to model another writer.
+    struct HandBackRaceWriter {
+        writes: WriteLog,
+        files: RaceFiles,
+        ledger: Arc<Mutex<Option<Arc<crate::hwmon::handback::HandBackLedger>>>>,
+        trip_on: Arc<Mutex<Option<String>>>,
+    }
+
+    impl SysfsWriter for HandBackRaceWriter {
+        fn write_file(&mut self, path: &str, value: &str) -> Result<(), HwmonError> {
+            self.writes
+                .lock()
+                .push((path.to_string(), value.to_string()));
+            self.files
+                .lock()
+                .insert(path.to_string(), format!("{value}\n"));
+            Ok(())
+        }
+
+        fn read_file(&self, path: &str) -> Result<String, HwmonError> {
+            let mut trip = self.trip_on.lock();
+            if trip.as_deref() == Some(path) {
+                *trip = None;
+                if let Some(l) = self.ledger.lock().as_ref() {
+                    l.begin_shutdown_hand_back();
+                }
+            }
+            self.files
+                .lock()
+                .get(path)
+                .cloned()
+                .ok_or(HwmonError::ReadError {
+                    path: path.to_string(),
+                    message: "not found".to_string(),
+                })
+        }
+    }
+
+    type TripOn = Arc<Mutex<Option<String>>>;
+    type RaceFiles = Arc<Mutex<StdHashMap<String, String>>>;
+
+    fn setup_race_controller(
+        headers: Vec<PwmHeaderDescriptor>,
+        files: &[(&str, &str)],
+    ) -> (HwmonPwmController, WriteLog, TripOn, RaceFiles) {
+        let writes: WriteLog = Arc::new(Mutex::new(Vec::new()));
+        let ledger = Arc::new(Mutex::new(None));
+        let trip_on: TripOn = Arc::new(Mutex::new(None));
+        let files: RaceFiles = Arc::new(Mutex::new(
+            files
+                .iter()
+                .map(|(p, v)| (p.to_string(), v.to_string()))
+                .collect(),
+        ));
+        let writer = HandBackRaceWriter {
+            writes: writes.clone(),
+            files: files.clone(),
+            ledger: ledger.clone(),
+            trip_on: trip_on.clone(),
+        };
+        let ctrl = HwmonPwmController::new(
+            headers,
+            LeaseManager::new(),
+            Box::new(writer),
+            Arc::new(StateCache::new()),
+        );
+        *ledger.lock() = Some(ctrl.handback().clone());
+        (ctrl, writes, trip_on, files)
+    }
+
+    const EN1: &str = "/sys/class/hwmon/hwmon0/pwm1_enable";
+    const PWM1: &str = "/sys/class/hwmon/hwmon0/pwm1";
+
+    /// [SAFETY] `PTR-s` (DEC-420), the entry check. After the hand-back gave
+    /// `h1` back to mode 5, a late engine write — here the same command, the
+    /// case DEC-406 made rewrite — is refused before it reads anything, so the
+    /// hand-back's own mode is not counted as a firmware reclaim and nothing is
+    /// written. The refusal is `ShuttingDown` (a retryable 503 at the API),
+    /// never `Lease`. A header with no mode switch is not the hand-back's, and a
+    /// late write to it still lands (DEC-392's latch depends on that).
+    #[test]
+    fn once_the_hand_back_has_begun_a_late_write_is_refused() {
+        let (mut ctrl, writes, _trip, files) = setup_race_controller(
+            vec![make_header("h1", "CHA_FAN1", 0), no_mode_header("h", 2)],
+            &[(EN1, "5\n")],
+        );
+        let lease = engine_lease(&mut ctrl);
+        ctrl.set_pwm("h1", 60, &lease).unwrap();
+        ctrl.set_pwm("h", 60, &lease).unwrap();
+        // The hand-back gives h1 its recorded mode 5, then marks itself begun.
+        files.lock().insert(EN1.to_string(), "5\n".to_string());
+        ctrl.handback().begin_shutdown_hand_back();
+        let before = writes.lock().len();
+
+        let err = ctrl.set_pwm("h1", 60, &lease).unwrap_err();
+        assert!(
+            matches!(err, HwmonControlError::ShuttingDown(ref m) if m.contains("hand-back")),
+            "refused as shutting down, never a lease error: {err}"
+        );
+        assert_eq!(writes.lock().len(), before, "nothing written to h1");
+        assert!(
+            ctrl.enable_revert_counts().is_empty(),
+            "the hand-back's own mode must not be counted as a reclaim"
+        );
+
+        assert_eq!(ctrl.set_pwm("h", 70, &lease).unwrap().pwm_percent, 70);
+        assert_eq!(
+            writes.lock().len(),
+            before + 1,
+            "the no-mode header is written"
+        );
+    }
+
+    /// [SAFETY] `PTR-s`, the check before the enable write: the take's reads of
+    /// the original mode wedge across the hand-back's start, so the take must
+    /// not switch the header to manual after it — nor add it to the record
+    /// ExecStopPost replays (SR-2: the refusal precedes `note_take`).
+    #[test]
+    fn a_hand_back_begun_during_the_take_refuses_the_enable_write() {
+        let (mut ctrl, writes, trip, _files) =
+            setup_race_controller(vec![make_header("h1", "CHA_FAN1", 0)], &[(EN1, "5\n")]);
+        let lease = engine_lease(&mut ctrl);
+        *trip.lock() = Some(EN1.to_string());
+
+        assert!(ctrl.set_pwm("h1", 60, &lease).is_err());
+        assert!(
+            trip.lock().is_none(),
+            "precondition: the take read the mode"
+        );
+        assert!(writes.lock().is_empty(), "no enable write, no duty write");
+        assert!(
+            !ctrl.handback().is_taken("h1"),
+            "a refused take must not be recorded as taken"
+        );
+    }
+
+    /// [SAFETY] `PTR-s`, the check before the duty write: the watchdog's read
+    /// of the mode wedges across the hand-back's start, so the duty write that
+    /// would follow it must not land.
+    #[test]
+    fn a_hand_back_begun_during_the_watchdog_read_refuses_the_duty_write() {
+        let (mut ctrl, writes, trip, _files) =
+            setup_race_controller(vec![make_header("h1", "CHA_FAN1", 0)], &[(EN1, "1\n")]);
+        let lease = engine_lease(&mut ctrl);
+        ctrl.set_pwm("h1", 60, &lease).unwrap();
+        let before = writes.lock().len();
+        *trip.lock() = Some(EN1.to_string());
+
+        assert!(ctrl.set_pwm("h1", 40, &lease).is_err());
+        assert!(
+            trip.lock().is_none(),
+            "precondition: the watchdog read the mode"
+        );
+        assert_eq!(writes.lock().len(), before, "the duty write must not land");
+    }
+
+    /// [SAFETY] SR-1 (DEC-420 review): a DEC-406 correction refused because the
+    /// hand-back began during its readback never landed, so — like one whose
+    /// write fails — it is not counted toward the give-up.
+    #[test]
+    fn a_correction_refused_by_the_hand_back_is_not_counted() {
+        let (mut ctrl, writes, trip, files) =
+            setup_race_controller(vec![make_header("h1", "CHA_FAN1", 0)], &[(EN1, "1\n")]);
+        let lease = engine_lease(&mut ctrl);
+        ctrl.set_pwm("h1", 40, &lease).unwrap();
+        // Another writer moves the duty; the next tick's readback of it is
+        // where the hand-back begins.
+        files
+            .lock()
+            .insert(PWM1.to_string(), format!("{}\n", percent_to_raw(60)));
+        *trip.lock() = Some(PWM1.to_string());
+        let before = writes.lock().len();
+
+        assert!(ctrl.set_pwm("h1", 40, &lease).is_err());
+        assert!(
+            trip.lock().is_none(),
+            "precondition: the drift readback ran"
+        );
+        assert!(
+            ctrl.write_state["h1"].drift.in_episode,
+            "precondition: the readback judged it a correction"
+        );
+        assert_eq!(writes.lock().len(), before, "precondition: refused");
+        assert_eq!(
+            ctrl.write_state["h1"].drift.corrections, 0,
+            "a refused correction must not count toward the give-up"
         );
     }
 
@@ -3454,8 +3814,14 @@ mod tests {
     }
 
     /// A correction whose write fails did not land, so it is not one that "did
-    /// not hold": however many fail, the header is never flagged, the episode's
-    /// first WARN is not repeated, and the next landed correction is counted.
+    /// not hold": however many fail, the header is never flagged and the
+    /// episode's first WARN is not repeated.
+    ///
+    /// Since DEC-420 (`TS-au`) a failed write also clears the header's mode
+    /// flag, so the next tick RE-TAKES the header as a plain write rather than
+    /// correcting it: that write restores the duty but is not counted, and it
+    /// restarts the count (DEC-420 accepts the later give-up). A drift after it
+    /// is corrected and counted as before.
     #[test]
     fn a_failed_correction_write_does_not_count_toward_the_give_up() {
         let (mut ctrl, sysfs, cache, lease) = drift_controller(HwmonWriter::Engine);
@@ -3481,9 +3847,22 @@ mod tests {
         ctrl.set_pwm("h1", 40, &lease).unwrap();
         assert_eq!(
             sysfs.live.get(PWM).as_deref(),
+            Some(percent_to_raw(40).to_string().as_str()),
+            "the re-take restores the duty"
+        );
+        assert_eq!(
+            published(&cache).corrections,
+            0,
+            "a re-take after a failed write is a plain write, not a correction"
+        );
+
+        sysfs.external_write(60);
+        ctrl.set_pwm("h1", 40, &lease).unwrap();
+        assert_eq!(
+            sysfs.live.get(PWM).as_deref(),
             Some(percent_to_raw(40).to_string().as_str())
         );
-        assert_eq!(published(&cache).corrections, 1);
+        assert_eq!(published(&cache).corrections, 1, "a later drift is counted");
     }
 
     /// S2-2: after an emergency the engine adopts the thermal-safety lease and

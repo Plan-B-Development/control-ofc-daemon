@@ -42,22 +42,27 @@
 //!   back, so the run *ends* at the highest duty and the early part of a long
 //!   run sits near maximum. The order was chosen for exactly this reason: the
 //!   spec's illustrative rising-then-falling order would have ended every
-//!   completed run at the LOWEST duty, and `RestoreOnDrop` has four exits that
+//!   completed run at the LOWEST duty, and `RestoreOnDrop` has five exits that
 //!   leave the header where the sweep put it — the two deliberate skips, an
-//!   unreadable pre-sweep duty, and a shutdown whose `hand_back_hwmon`
-//!   found no `pwmN_enable` to hand back (`main.rs`, `NothingToRestore` /
-//!   `WritesTimedOut` / `Unresolvable`). Ending high keeps all four benign.
+//!   unreadable pre-sweep duty, a read that did not return (DEC-420), and a
+//!   shutdown whose `hand_back_hwmon` found no `pwmN_enable` to hand back
+//!   (`main.rs`, `NothingToRestore` / `WritesTimedOut` / `Unresolvable`).
+//!   Ending high keeps all five benign.
 //! - The invariant that holds in **both** modes, and the one to reason from:
 //!   **no walked duty is ever below `max(CHARACTERIZATION_MIN_PCT, floor)`.**
 //! - The pre-sweep duty is restored by [`RestoreOnDrop`] on every exit path on
-//!   which nothing else owns the header — completion, cancellation, a failed
-//!   write, a reclaim, and a thermal abort below the forcing threshold. (The
-//!   same narrowing DEC-295 applied to DEC-134's identical claim for calibrate.)
+//!   which nothing else owns the header and its driver still answers —
+//!   completion, cancellation, a failed write, a reclaim, and a thermal abort
+//!   below the forcing threshold. (The same narrowing DEC-295 applied to
+//!   DEC-134's identical claim for calibrate.)
 //! - The restore is skipped while the thermal ladder is forcing (DEC-295) and
 //!   while the daemon is shutting down (DEC-290) — in both cases something with
-//!   more authority owns the header.
+//!   more authority owns the header — and after a read that did not return
+//!   (DEC-420), because the restore's write path could hang holding the
+//!   controller lock; a header that became a pump during the run is restored,
+//!   floored, even then.
 //! - **A skipped restore is reported, not silently reported as a success.**
-//!   [`RestoreOutcome`] records which of the five exits the guard actually took,
+//!   [`RestoreOutcome`] records which of the six exits the guard actually took,
 //!   and `restore_failed` is derived from it, so "the header is back where it
 //!   was" is answerable from the wire on every path.
 
@@ -448,7 +453,10 @@ pub struct CharacterizationRun {
     /// `None` while running.
     pub summary: Option<CharSummary>,
     /// The duty the header held before the sweep. `None` means it could not be
-    /// read, in which case there is nothing to put back.
+    /// read, in which case there is nothing to put back — **and, since DEC-420,
+    /// also means "not yet known"**: the `202` and every `running` snapshot
+    /// carry `None`, because the value is the sweep's own pre-sweep read and is
+    /// published only on the terminal run.
     pub original_pct: Option<u8>,
     /// **The header was NOT put back.** True on every exit that leaves it parked
     /// at the last swept point — a failed restore write *and* the two deliberate
@@ -508,7 +516,7 @@ pub const STATE_FAILED: &str = "failed";
 /// Which exit [`RestoreOnDrop`] took — the single source of truth for both
 /// `restore_failed` and `restore_outcome` on the wire.
 ///
-/// [SAFETY-adjacent] Two of these five are *deliberate* skips, not faults, and
+/// [SAFETY-adjacent] Three of these six are *deliberate* skips, not faults, and
 /// conflating them with a success is what `AUD2-c` recorded: the guard returned
 /// early under a thermal force or a shutdown and the run still published
 /// `restore_failed: false`, i.e. "the header is back where it was" about a
@@ -531,6 +539,15 @@ pub enum RestoreOutcome {
     /// The pre-sweep duty could not be read *and* the sweep moved the header, so
     /// there was nothing to put it back to.
     NoOriginalDuty = 5,
+    /// Skipped: a read of the header did not return within
+    /// [`constants::DIAGNOSTIC_READ_BUDGET`], so the run writes nothing more to
+    /// it (DEC-420, the user's choice at review). A restore goes through
+    /// `set_pwm`, whose own sysfs reads are unbounded and run under the
+    /// controller lock, so on a driver that has stopped answering it could hold
+    /// that lock — the one the engine and the thermal force need — for as long
+    /// as the driver does. The header is left at the last swept duty, which is
+    /// never below `max(20, its floor)`.
+    SkippedUnresponsive = 6,
 }
 
 impl RestoreOutcome {
@@ -542,6 +559,7 @@ impl RestoreOutcome {
             Self::SkippedShuttingDown => "skipped_shutting_down",
             Self::SkippedThermalForce => "skipped_thermal_force",
             Self::NoOriginalDuty => "no_original_duty",
+            Self::SkippedUnresponsive => "skipped_unresponsive",
         }
     }
 
@@ -561,6 +579,7 @@ impl RestoreOutcome {
             3 => Self::SkippedShuttingDown,
             4 => Self::SkippedThermalForce,
             5 => Self::NoOriginalDuty,
+            6 => Self::SkippedUnresponsive,
             _ => Self::Pending,
         }
     }
@@ -1342,6 +1361,13 @@ pub(crate) struct RestoreOnDrop<'a, W: Fn(u8) -> Result<(), String>, S: Fn() -> 
     /// probe, which refuses a pump outright and raises `restore_floor` itself
     /// from its own eligibility re-check (DEC-407).
     pub(crate) pump_watch: Option<&'a PumpWatch<'a>>,
+    /// [SAFETY] DEC-420 (the user's choice at review). Set by the run when a
+    /// read of the header did not return within its bound. The restore is then
+    /// skipped ([`RestoreOutcome::SkippedUnresponsive`]) — unless the header has
+    /// become pump-protected during the run, when the floored restore is still
+    /// attempted, because DEC-418's 30 % floor outranks the risk of a write that
+    /// hangs. `None` for the diagnostics whose reads are not bounded this way.
+    pub(crate) unresponsive: Option<&'a AtomicBool>,
 }
 
 impl<W: Fn(u8) -> Result<(), String>, S: Fn() -> bool> Drop for RestoreOnDrop<'_, W, S> {
@@ -1391,6 +1417,29 @@ impl<W: Fn(u8) -> Result<(), String>, S: Fn() -> bool> Drop for RestoreOnDrop<'_
             self.report
                 .set(left_behind(RestoreOutcome::SkippedThermalForce));
             return;
+        }
+        // [SAFETY] DEC-420: after the driver stopped answering, no write — a
+        // restore through `set_pwm` could hold the controller lock for as long
+        // as the driver does. `became_protected`, not `restore_is_pump`: a
+        // header that was a pump from the start was swept on duties at or above
+        // the pump floor, so where the run left it is already safe.
+        if self.unresponsive.is_some_and(|u| u.load(Ordering::SeqCst)) {
+            if !self.pump_watch.is_some_and(|w| w.became_protected()) {
+                log::warn!(
+                    "characterize: {} left at the last swept duty instead of restoring \
+                     it — a read of it did not return, and a write to a driver that is \
+                     not responding could hang with the controller lock held",
+                    self.header_id
+                );
+                self.report
+                    .set(left_behind(RestoreOutcome::SkippedUnresponsive));
+                return;
+            }
+            log::warn!(
+                "characterize: {} stopped responding AND became pump-protected during \
+                 the run, so its floored restore is attempted anyway",
+                self.header_id
+            );
         }
         let Some(restore) = self.original_pct else {
             if moved {
@@ -1452,6 +1501,27 @@ pub struct SweepOutcome {
     pub state: &'static str,
     pub detail: Option<String>,
     pub points: Vec<CharPoint>,
+    /// The pre-sweep duty the restore aims at — the sweep's own first read, the
+    /// ONLY read of it (DEC-420, `PTR-v`). The handler publishes this rather
+    /// than reading the header a second time, so the published duty and the
+    /// restore target cannot disagree. `None` when that read found no duty or
+    /// did not return.
+    pub original_pct: Option<u8>,
+}
+
+/// A read of the header did not return within
+/// [`constants::DIAGNOSTIC_READ_BUDGET`] (DEC-420, `PTR-v`): mark the run
+/// unresponsive — which is what makes `RestoreOnDrop` skip its write — and
+/// return the run's `detail`. One function, so no wedge exit can report the
+/// wedge without also arming the skip.
+fn note_unresponsive(unresponsive: &AtomicBool) -> String {
+    unresponsive.store(true, Ordering::SeqCst);
+    format!(
+        "a read of the header did not return within {} s (a driver that is not \
+         responding), so the sweep stopped and does not read it again; \
+         `restore_outcome` says whether its pre-sweep duty was written back",
+        constants::DIAGNOSTIC_READ_BUDGET.as_secs()
+    )
 }
 
 /// Walk `points` on one header, publishing each measured point as it lands.
@@ -1462,10 +1532,19 @@ pub struct SweepOutcome {
 /// `GET /diagnostics/characterization` while it is still running.
 ///
 /// Aborts, all of which restore: `cancel` set (→ `cancelled`), a failed write
-/// (→ `failed`), `pwm_enable != 1` (→ `aborted`, reclaim), a sensor over the
-/// calibrate/verify limit or the ladder forcing (→ `aborted`).
+/// (→ `failed`), `pwm_enable != 1` (→ `aborted`, reclaim), and a sensor over
+/// the calibrate/verify limit or the ladder forcing (→ `aborted`). One abort
+/// does NOT restore: a read that did not return (→ `aborted`, DEC-420), after
+/// which nothing more is written unless the header became a pump.
+///
+/// [SAFETY] `read_fn` is BOUNDED (DEC-420, `PTR-v`, the stall probe's DEC-407
+/// shape): `None` is a read that did not return within
+/// [`constants::DIAGNOSTIC_READ_BUDGET`]. While a read is outstanding no gate
+/// runs, so an unbounded one left the header at a swept duty with the thermal,
+/// cancel and pump gates blind. A wedge ends the run, and — `spawn_blocking`
+/// being uncancellable — the header is never read again by it.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_sweep<W, R, P, A, S, K>(
+pub async fn run_sweep<W, R, Fut, P, A, S, K>(
     cache: &StateCache,
     header_id: &str,
     plan: &[SweepStep],
@@ -1497,16 +1576,20 @@ pub async fn run_sweep<W, R, P, A, S, K>(
 ) -> SweepOutcome
 where
     W: Fn(u8) -> Result<(), String>,
-    R: Fn() -> HwmonVerifyState,
+    R: Fn() -> Fut,
+    Fut: std::future::Future<Output = Option<HwmonVerifyState>>,
     P: FnMut(CharPoint),
     A: FnMut(RunStep),
     S: Fn() -> bool,
     K: Fn() -> bool,
 {
-    let original_pct = read_fn().pwm_percent;
+    let first = read_fn().await;
+    let original_pct = first.as_ref().and_then(|s| s.pwm_percent);
     let mut measured: Vec<CharPoint> = Vec::with_capacity(plan.len());
     // Declared BEFORE the guard so it outlives it — the guard reads it in `drop`.
     let wrote_any = AtomicBool::new(false);
+    // DEC-420: set by `note_unresponsive` on every wedge exit; read in `drop`.
+    let unresponsive = AtomicBool::new(false);
 
     // Declared LAST so it drops FIRST — while the caller's lease guard is still
     // held. Reversed, the restore write fails `InvalidLease` and the header is
@@ -1521,10 +1604,38 @@ where
         report,
         restore_floor,
         pump_watch: Some(pump_watch),
+        unresponsive: Some(&unresponsive),
     };
+
+    // A pre-sweep read that did not return: nothing has been written, so the
+    // guard reports the header as where it was found.
+    if first.is_none() {
+        return SweepOutcome {
+            state: STATE_ABORTED,
+            detail: Some(note_unresponsive(&unresponsive)),
+            points: measured,
+            original_pct,
+        };
+    }
 
     for (idx, step) in plan.iter().enumerate() {
         let pct = step.pct;
+        // [SAFETY] DEC-420 (`PTR-v`, the stall probe's DEC-407 rule): the
+        // reference read comes FIRST, before every gate, so the gates below are
+        // the last thing between it and the write. It used to sit between the
+        // step gate and the write, where a read wedged across
+        // `shutdown_sequence`'s drains let the write land after
+        // `hand_back_hwmon`.
+        let Some(before) = read_fn().await else {
+            return SweepOutcome {
+                state: STATE_ABORTED,
+                detail: Some(note_unresponsive(&unresponsive)),
+                points: measured,
+                original_pct,
+            };
+        };
+        let rpm_before = before.rpm;
+
         // [SAFETY] Stop writing the moment the daemon starts going down. The
         // drop guard's shutdown skip covers the RESTORE, but not this loop: the
         // task is detached, so it keeps running through `shutdown_sequence` and
@@ -1569,6 +1680,7 @@ where
                 state,
                 detail: Some(detail),
                 points: measured,
+                original_pct,
             };
         }
         // [SAFETY] `TS-aw`: after the step gate, so it is never read once
@@ -1578,11 +1690,23 @@ where
                 state: STATE_ABORTED,
                 detail: Some(pump_protected_mid_run_detail("characterisation")),
                 points: measured,
+                original_pct,
             };
         }
-
-        let before = read_fn();
-        let rpm_before = before.rpm;
+        // [SAFETY] DEC-420 (`PTR-v`): shutdown once more, immediately before
+        // the write — the stall probe's rule. The pump re-read above takes
+        // locks, and this task is detached, so nothing else stops a write that
+        // reaches here after the hand-back began. (`set_pwm` also refuses a
+        // header the hand-back owns once it has begun, DEC-420's `PTR-s`; this
+        // covers the no-mode headers it deliberately does not refuse.)
+        if shutting_down() {
+            return SweepOutcome {
+                state: STATE_ABORTED,
+                detail: Some("the daemon is shutting down".into()),
+                points: measured,
+                original_pct,
+            };
+        }
 
         // Stamped BEFORE the call, deliberately: `set_pwm` writes sysfs and then
         // reads back, so an `Err` can still have moved the header. Over-reporting
@@ -1615,6 +1739,7 @@ where
                     state: STATE_FAILED,
                     detail: Some(format!("PWM write of {pct}% failed: {e}")),
                     points: measured,
+                    original_pct,
                 };
             }
         };
@@ -1674,6 +1799,7 @@ where
                     state: STATE_ABORTED,
                     detail: Some("the daemon is shutting down".into()),
                     points: measured,
+                    original_pct,
                 };
             }
             // [SAFETY] `TS-aw`: per sample, not per renewal, so a flip during a
@@ -1690,6 +1816,7 @@ where
                     state: STATE_ABORTED,
                     detail: Some(pump_protected_mid_run_detail("characterisation")),
                     points: measured,
+                    original_pct,
                 };
             }
             if last_renew.elapsed() >= renew_every {
@@ -1725,6 +1852,7 @@ where
                         state: STATE_ABORTED,
                         detail: Some(detail),
                         points: measured,
+                        original_pct,
                     };
                 }
                 if !keepalive() {
@@ -1734,6 +1862,7 @@ where
                             "superseded by a later diagnostic; this run's lease is gone".into(),
                         ),
                         points: measured,
+                        original_pct,
                     };
                 }
                 last_renew = tokio::time::Instant::now();
@@ -1761,6 +1890,7 @@ where
                         plan.len()
                     )),
                     points: measured,
+                    original_pct,
                 };
             }
             if !dwell_announced && started.elapsed() >= settle {
@@ -1773,7 +1903,15 @@ where
                 ));
             }
             let at_ms = started.elapsed().as_millis() as u64;
-            let sampled = read_fn().rpm;
+            let Some(sample) = read_fn().await else {
+                return SweepOutcome {
+                    state: STATE_ABORTED,
+                    detail: Some(note_unresponsive(&unresponsive)),
+                    points: measured,
+                    original_pct,
+                };
+            };
+            let sampled = sample.rpm;
             samples.push(crate::api::stats::RpmSample {
                 at_ms,
                 rpm: sampled,
@@ -1787,7 +1925,14 @@ where
             }
         }
 
-        let after = read_fn();
+        let Some(after) = read_fn().await else {
+            return SweepOutcome {
+                state: STATE_ABORTED,
+                detail: Some(note_unresponsive(&unresponsive)),
+                points: measured,
+                original_pct,
+            };
+        };
         // DEC-405: one settle point, used for both the published `settled_ms`
         // and the window the statistics describe, so the two cannot disagree.
         // The pre-write reading is the reference: a first sample still showing
@@ -1822,6 +1967,18 @@ where
 
         // A reclaim ends the sweep and is reported, per the brief: continuing
         // would measure a header somebody else is driving.
+        //
+        // [SAFETY] DEC-420 (`PTR-v`): a mode change seen while shutting down is
+        // the hand-back's own write, not a reclaim (DEC-407's rule), and is
+        // reported as the shutdown it is.
+        if reclaimed && shutting_down() {
+            return SweepOutcome {
+                state: STATE_ABORTED,
+                detail: Some("the daemon is shutting down".into()),
+                points: measured,
+                original_pct,
+            };
+        }
         if reclaimed {
             return SweepOutcome {
                 state: STATE_ABORTED,
@@ -1831,6 +1988,7 @@ where
                     after.pwm_enable.unwrap_or(0)
                 )),
                 points: measured,
+                original_pct,
             };
         }
     }
@@ -1839,6 +1997,7 @@ where
         state: STATE_COMPLETE,
         detail: None,
         points: measured,
+        original_pct,
     }
 }
 
@@ -1959,6 +2118,14 @@ mod tests {
     /// correction. Every test written before §1/§7 existed is asserting about
     /// exactly that walk, so routing them through one shim keeps their meaning
     /// identical instead of restating the new arguments 11 times.
+    /// Tests' reads never wedge: adapt a plain read to the bounded shape
+    /// `run_sweep` takes (DEC-420), where `None` is a read that did not return.
+    fn sync_read<R: Fn() -> HwmonVerifyState>(
+        r: R,
+    ) -> impl Fn() -> std::future::Ready<Option<HwmonVerifyState>> {
+        move || std::future::ready(Some(r()))
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn run_sweep_uni<W, R, P, S, K>(
         cache: &StateCache,
@@ -1990,7 +2157,7 @@ mod tests {
             settle,
             None,
             write_fn,
-            read_fn,
+            sync_read(read_fn),
             cancel,
             shutting_down,
             keepalive,
@@ -2520,7 +2687,7 @@ mod tests {
                 flip(Moment::Written(p));
                 Ok(())
             },
-            || sample(original, Some(1), Some(900)),
+            sync_read(|| sample(original, Some(1), Some(900))),
             &rig.cancel,
             || false,
             || true,
@@ -2663,7 +2830,7 @@ mod tests {
                 }
                 Ok(())
             },
-            || sample(Some(10), Some(1), Some(900)),
+            sync_read(|| sample(Some(10), Some(1), Some(900))),
             &rig.cancel,
             || false,
             || true,
@@ -3485,10 +3652,10 @@ mod tests {
                     *last_w.lock().unwrap() = pct;
                     Ok(())
                 },
-                move || {
+                sync_read(move || {
                     let p = *last.lock().unwrap();
                     sample(Some(p), Some(1), rpm_for(p))
-                },
+                }),
                 &rig.cancel,
                 || false,
                 || true,
@@ -3710,7 +3877,7 @@ mod tests {
                 Duration::from_secs(constants::CHARACTERIZATION_SETTLE_MIN_S),
                 None,
                 |_p: u8| Ok(()),
-                || sample(Some(50), Some(1), Some(1200)),
+                sync_read(|| sample(Some(50), Some(1), Some(1200))),
                 &cancel,
                 || false,
                 move || {
@@ -3796,10 +3963,10 @@ mod tests {
                     *n += 1;
                     Ok(())
                 },
-                move || {
+                sync_read(move || {
                     let p = *last.lock().unwrap();
                     sample(Some(p), Some(1), Some(500 + u16::from(p) * 20))
-                },
+                }),
                 flag,
                 || false,
                 || true,
@@ -3854,7 +4021,7 @@ mod tests {
                     writes.lock().unwrap().push(p);
                     Ok(())
                 },
-                || sample(Some(0), Some(1), Some(900)),
+                sync_read(|| sample(Some(0), Some(1), Some(900))),
                 &rig.cancel,
                 || false,
                 || true,
@@ -3914,7 +4081,7 @@ mod tests {
                 Duration::from_secs(constants::CHARACTERIZATION_DEFAULT_SETTLE_S),
                 None,
                 |_p: u8| Ok(()),
-                move || {
+                sync_read(move || {
                     let mut n = reads_r.lock().unwrap();
                     *n += 1;
                     // Mid-settle, not before it and not between steps.
@@ -3922,7 +4089,7 @@ mod tests {
                         flag.store(true, Ordering::SeqCst);
                     }
                     sample(Some(50), Some(1), Some(1200))
-                },
+                }),
                 &cancel,
                 || false,
                 || true,
@@ -3982,7 +4149,7 @@ mod tests {
                 settle,
                 None,
                 |_p: u8| Ok(()),
-                move || {
+                sync_read(move || {
                     let mut n = reads_r.lock().unwrap();
                     *n += 1;
                     if *n == 2 {
@@ -3991,7 +4158,7 @@ mod tests {
                             .update_sensors(vec![hot_cpu(constants::CALIBRATION_MAX_TEMP_C + 5.0)]);
                     }
                     sample(Some(50), Some(1), Some(1200))
-                },
+                }),
                 &cancel,
                 || false,
                 || true,
@@ -4106,14 +4273,14 @@ mod tests {
                 settle,
                 None,
                 |_p: u8| Ok(()),
-                move || {
+                sync_read(move || {
                     let mut n = reads_r.lock().unwrap();
                     *n += 1;
                     if *n == 2 {
                         cache_w.update_sensors(vec![stale_cpu(cache_w)]);
                     }
                     sample(Some(50), Some(1), Some(1200))
-                },
+                }),
                 &cancel,
                 || false,
                 || true,
@@ -4280,10 +4447,10 @@ mod tests {
                     t.last_pct = pct;
                     Ok(())
                 },
-                move || {
+                sync_read(move || {
                     let t = tach.lock().unwrap();
                     sample(Some(t.last_pct), Some(1), Some(t.register()))
-                },
+                }),
                 &rig.cancel,
                 || false,
                 || true,
@@ -4405,10 +4572,10 @@ mod tests {
                     *last_w.lock().unwrap() = pct;
                     Ok(())
                 },
-                move || {
+                sync_read(move || {
                     let p = *last.lock().unwrap();
                     sample(Some(p), Some(1), Some(600 + u16::from(p) * 10))
-                },
+                }),
                 &rig.cancel,
                 || false,
                 || true,
@@ -4829,5 +4996,267 @@ mod tests {
         // or every ordinary request silently changes shape.
         let pts = resolve_points(Some(&[20, 40, 60, 80, 100]), 20);
         assert_eq!(pts, vec![20, 40, 60, 80, 100]);
+    }
+
+    // ── DEC-420 (`PTR-v`): bounded reads, and the stall probe's write rules ──
+
+    type ReadFut = std::future::Ready<Option<HwmonVerifyState>>;
+
+    /// A read that counts itself and answers from `script(n)` for the n-th read
+    /// (1-based). `None` is a read that did not return within its bound.
+    fn scripted_read(
+        reads: Arc<Mutex<usize>>,
+        script: impl Fn(usize) -> Option<HwmonVerifyState>,
+    ) -> impl Fn() -> ReadFut {
+        move || {
+            let mut n = reads.lock().unwrap();
+            *n += 1;
+            std::future::ready(script(*n))
+        }
+    }
+
+    /// Run a two-step (30 %, 60 %) sweep with a 2 s settle — four in-hold
+    /// samples a step, so the reads are: 1 pre-sweep; 2 step 0's reference;
+    /// 3-6 its samples; 7 its after-read; 8 step 1's reference.
+    async fn bounded_sweep(
+        rig: &Rig,
+        read_fn: impl Fn() -> ReadFut,
+        pump_check: impl Fn() -> bool + Send + Sync,
+        shutting_down: impl Fn() -> bool,
+    ) -> SweepOutcome {
+        let cache = cache_at(45.0, Some("normal"));
+        let watch = PumpWatch::new("hwmon:test:pwm1", "characterisation", false, pump_check);
+        let writes = rig.writes.clone();
+        run_sweep(
+            &cache,
+            "hwmon:test:pwm1",
+            &plan_of(&[30, 60]),
+            0,
+            &watch,
+            Duration::from_secs(2),
+            None,
+            move |p: u8| {
+                writes.lock().unwrap().push(p);
+                Ok(())
+            },
+            read_fn,
+            &rig.cancel,
+            shutting_down,
+            || true,
+            &rig.report,
+            |_| {},
+            |_| {},
+        )
+        .await
+    }
+
+    /// [SAFETY] A pre-sweep read that does not return ends the run before any
+    /// write, and the header is not read again.
+    #[tokio::test(start_paused = true)]
+    async fn a_pre_sweep_read_that_never_returns_ends_the_run_unwritten() {
+        let rig = Rig::new();
+        let reads = Arc::new(Mutex::new(0));
+        let out = bounded_sweep(
+            &rig,
+            scripted_read(reads.clone(), |_| None),
+            || false,
+            || false,
+        )
+        .await;
+        assert_eq!(out.state, STATE_ABORTED);
+        assert!(out.detail.as_deref().unwrap().contains("did not return"));
+        assert!(rig.written().is_empty());
+        assert_eq!(*reads.lock().unwrap(), 1, "never read again");
+        assert_eq!(out.original_pct, None);
+        assert_eq!(rig.restore(), (false, "restored"), "the header never moved");
+    }
+
+    /// [SAFETY] A sample that does not return mid-hold ends the run at once —
+    /// the gates were blind for as long as it was outstanding — the header is
+    /// not read again, and (the user's choice, DEC-420 review) nothing more is
+    /// WRITTEN to it either: a restore goes through `set_pwm`, whose own reads
+    /// are unbounded and run under the controller lock. It stays at the swept
+    /// duty, and the run says so (`skipped_unresponsive`, header left moved).
+    #[tokio::test(start_paused = true)]
+    async fn a_sample_that_never_returns_mid_hold_ends_the_run_and_writes_nothing_more() {
+        let rig = Rig::new();
+        let reads = Arc::new(Mutex::new(0));
+        let out = bounded_sweep(
+            &rig,
+            scripted_read(reads.clone(), |n| {
+                (n != 3).then(|| sample(Some(50), Some(1), Some(900)))
+            }),
+            || false,
+            || false,
+        )
+        .await;
+        assert_eq!(out.state, STATE_ABORTED);
+        assert!(out.detail.as_deref().unwrap().contains("did not return"));
+        assert_eq!(
+            *reads.lock().unwrap(),
+            3,
+            "never read again after the wedge"
+        );
+        assert_eq!(out.original_pct, Some(50));
+        assert_eq!(rig.written(), vec![30], "the sweep point, and no restore");
+        assert_eq!(rig.restore(), (true, "skipped_unresponsive"));
+    }
+
+    /// [SAFETY] The same before the first write: a reference read that does not
+    /// return leaves the header untouched — no restore even of a known duty,
+    /// which the guard writes back for an unmoved run otherwise — and reports it
+    /// as where it was found.
+    #[tokio::test(start_paused = true)]
+    async fn a_reference_read_that_never_returns_writes_nothing_at_all() {
+        let rig = Rig::new();
+        let reads = Arc::new(Mutex::new(0));
+        let out = bounded_sweep(
+            &rig,
+            scripted_read(reads.clone(), |n| {
+                (n != 2).then(|| sample(Some(50), Some(1), Some(900)))
+            }),
+            || false,
+            || false,
+        )
+        .await;
+        assert_eq!(out.state, STATE_ABORTED);
+        assert_eq!(*reads.lock().unwrap(), 2);
+        assert!(rig.written().is_empty(), "{:?}", rig.written());
+        assert_eq!(rig.restore(), (false, "restored"), "the header never moved");
+    }
+
+    /// [SAFETY] The pump exception (DEC-420 review, the user's choice): a header
+    /// that became pump-protected during the run — here, seen only by the
+    /// restore's re-read, after the hung read — still gets its restore floored
+    /// at the pump floor, because DEC-418's 30 % outranks the risk of a write
+    /// that hangs. Its pre-sweep 10 % is written back as 30 %.
+    #[tokio::test(start_paused = true)]
+    async fn a_header_that_became_a_pump_is_still_floored_after_a_hung_read() {
+        let rig = Rig::new();
+        let reads = Arc::new(Mutex::new(0));
+        let pump = Arc::new(AtomicBool::new(false));
+        let p = pump.clone();
+        let out = bounded_sweep(
+            &rig,
+            scripted_read(reads.clone(), move |n| {
+                if n == 3 {
+                    p.store(true, Ordering::SeqCst);
+                    return None;
+                }
+                Some(sample(Some(10), Some(1), Some(900)))
+            }),
+            move || pump.load(Ordering::SeqCst),
+            || false,
+        )
+        .await;
+        assert_eq!(out.state, STATE_ABORTED);
+        assert!(out.detail.as_deref().unwrap().contains("did not return"));
+        assert_eq!(
+            rig.written(),
+            vec![30, PUMP_FLOOR],
+            "the point, then the floor"
+        );
+        assert_eq!(rig.restore(), (false, "restored"));
+    }
+
+    /// [SAFETY] The reference read comes BEFORE the gates (the stall probe's
+    /// rule). A cancel that arrives while it is outstanding — a read wedged
+    /// across the request — must stop the step's write. With the read after
+    /// the gates, as it was, the cancel is seen only after the write lands.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_during_the_reference_read_stops_the_write() {
+        let rig = Arc::new(Rig::new());
+        let reads = Arc::new(Mutex::new(0));
+        let r = rig.clone();
+        let out = bounded_sweep(
+            &rig,
+            scripted_read(reads.clone(), move |n| {
+                if n == 2 {
+                    r.cancel.store(true, Ordering::SeqCst);
+                }
+                Some(sample(Some(50), Some(1), Some(900)))
+            }),
+            || false,
+            || false,
+        )
+        .await;
+        // `>= 2`, not `== 2`: how many reads follow depends on whether the
+        // write landed, which is what this test is asking (DEC-348).
+        assert!(
+            *reads.lock().unwrap() >= 2,
+            "precondition: the reference read ran"
+        );
+        assert_eq!(out.state, STATE_CANCELLED, "{:?}", out.detail);
+        // Only the restore, which writes the captured duty back even for a run
+        // that never moved the header (pre-existing, DEC-407's Consequences).
+        assert_eq!(rig.written(), vec![50], "the 30 % point must not land");
+    }
+
+    /// [SAFETY] Shutdown is re-checked immediately before the write. Here it
+    /// begins during the pump re-read, which sits after the step gate: without
+    /// the re-check the step's duty is written after the hand-back started.
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_after_the_step_gate_stops_the_write() {
+        let rig = Rig::new();
+        let down = Arc::new(AtomicBool::new(false));
+        let (d, seen) = (down.clone(), Arc::new(AtomicBool::new(false)));
+        let seen_c = seen.clone();
+        let out = bounded_sweep(
+            &rig,
+            sync_read(|| sample(Some(50), Some(1), Some(900))),
+            move || {
+                seen_c.store(true, Ordering::SeqCst);
+                d.store(true, Ordering::SeqCst);
+                false
+            },
+            move || down.load(Ordering::SeqCst),
+        )
+        .await;
+        assert!(
+            seen.load(Ordering::SeqCst),
+            "precondition: the pump re-read ran"
+        );
+        assert_eq!(out.state, STATE_ABORTED);
+        assert!(out.detail.as_deref().unwrap().contains("shutting down"));
+        assert!(rig.written().is_empty(), "{:?}", rig.written());
+    }
+
+    /// [SAFETY] A mode change seen while shutting down is the hand-back's own
+    /// write, reported as the shutdown — never as another controller's reclaim.
+    #[tokio::test(start_paused = true)]
+    async fn a_mode_change_seen_while_shutting_down_is_the_shutdown() {
+        let rig = Rig::new();
+        let down = Arc::new(AtomicBool::new(false));
+        let d = down.clone();
+        let reads = Arc::new(Mutex::new(0));
+        let out = bounded_sweep(
+            &rig,
+            scripted_read(reads.clone(), move |n| {
+                if n == 7 {
+                    // Step 0's after-read: the hand-back has begun and given
+                    // the header back to mode 2.
+                    d.store(true, Ordering::SeqCst);
+                    return Some(sample(Some(30), Some(2), Some(900)));
+                }
+                Some(sample(Some(50), Some(1), Some(900)))
+            }),
+            || false,
+            move || down.load(Ordering::SeqCst),
+        )
+        .await;
+        assert_eq!(
+            *reads.lock().unwrap(),
+            7,
+            "precondition: the after-read ran"
+        );
+        assert_eq!(out.state, STATE_ABORTED);
+        let detail = out.detail.unwrap();
+        assert!(detail.contains("shutting down"), "{detail}");
+        assert!(!detail.contains("reclaimed"), "{detail}");
+        assert_eq!(
+            rig.written(),
+            vec![30],
+            "and no restore while shutting down"
+        );
     }
 }

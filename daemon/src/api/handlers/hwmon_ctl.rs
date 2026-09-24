@@ -109,6 +109,12 @@ fn hwmon_control_error_response(err: HwmonControlError) -> (StatusCode, Json<ser
             StatusCode::SERVICE_UNAVAILABLE,
             &ErrorEnvelope::hardware_unavailable(err.to_string()),
         ),
+        // DEC-420: the shutdown hand-back owns the header. The same answer the
+        // handlers' own shutdown refusals give — transient, so retryable.
+        HwmonControlError::ShuttingDown(_) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::hardware_unavailable("the daemon is shutting down"),
+        ),
     }
 }
 
@@ -1076,7 +1082,13 @@ pub async fn hwmon_characterize_handler(
         settle_seconds: settle.as_secs(),
         points: vec![],
         summary: None,
-        original_pct: read_header_state(&pwm_path, &enable_path, &rpm_path).pwm_percent,
+        // [SAFETY] DEC-420 (`PTR-v`): not read here. This is the request worker,
+        // holding the single-flight slot and the Verify lease, and a read of a
+        // wedged chip would park it with both — the stall probe's rule
+        // (DEC-407). The task publishes the sweep's own pre-sweep read at the
+        // end, which is also the one the restore aims at; before, this was a
+        // second read that could disagree with it.
+        original_pct: None,
         restore_failed: false,
         restore_outcome: ch::RestoreOutcome::Pending.token().to_string(),
         detail: None,
@@ -1153,16 +1165,35 @@ pub async fn hwmon_characterize_handler(
                     .map(|_| ())
                     .map_err(|e| e.to_string())
             };
-            // KNOWN LIMITATION, recorded as `AIO3-d`: these are blocking
-            // `std::fs` reads issued from the async runtime — ~12 per point
-            // during the settle sub-sampling — where the verify does the same
-            // reads inside `spawn_blocking`. On a wedged chip (the DEC-278
-            // hazard) this parks a tokio worker with no bound. Calibrate is NOT
-            // a precedent for this specific point: its sweep reads RPM from the
-            // cache, not from sysfs. Left as-is deliberately — wrapping each read
-            // is a change to a hardware path that this diff did not scope — but
-            // the note is here because an unremarked gap is an invisible one.
-            let read_fn = || read_header_state(&pwm_path, &enable_path, &rpm_path);
+            // [SAFETY] DEC-420 (`PTR-v`, closing what `AIO3-d` accepted): on the
+            // blocking pool, and BOUNDED, exactly as the stall probe reads
+            // (DEC-407). These used to be blocking `std::fs` reads on a tokio
+            // worker — ~12 per point — so a wedged chip (the DEC-278 hazard)
+            // parked the worker with no bound, and while the read was
+            // outstanding no gate ran: the header sat at a swept duty with the
+            // thermal, cancel and pump gates blind. A read that does not return
+            // within `DIAGNOSTIC_READ_BUDGET` is `None`, which ends the run; a
+            // failed join is a read that finished without a value — unreadable,
+            // never a value.
+            let paths = Arc::new((pwm_path.clone(), enable_path, rpm_path));
+            let read_fn = move || {
+                let paths = paths.clone();
+                async move {
+                    let join = tokio::task::spawn_blocking(move || {
+                        read_header_state(&paths.0, &paths.1, &paths.2)
+                    });
+                    match tokio::time::timeout(crate::constants::DIAGNOSTIC_READ_BUDGET, join).await
+                    {
+                        Err(_elapsed) => None,
+                        Ok(joined) => Some(joined.unwrap_or(HwmonVerifyState {
+                            pwm_enable: None,
+                            pwm_raw: None,
+                            pwm_percent: None,
+                            rpm: None,
+                        })),
+                    }
+                }
+            };
             // Fenced on `run_id`: a run whose deadman elapsed can be superseded
             // (`try_begin_verify` deliberately permits the steal), and without the
             // fence the loser would append its points into the winner's list and
@@ -1189,8 +1220,21 @@ pub async fn hwmon_characterize_handler(
 
             // §4 / DEC-405: the chip's declared tach cadence outranks the one
             // the holds observe. Read once, before the sweep: it is a chip
-            // attribute and does not change mid-run.
-            let driver_interval = super::discovery::read_update_interval(&pwm_path);
+            // attribute and does not change mid-run. DEC-420 (`PTR-v`): off the
+            // runtime and bounded, like every sweep read — a wedge here is
+            // simply "not declared", and the sweep's own first read then finds
+            // the wedge and stops.
+            let interval_path = pwm_path.clone();
+            let driver_interval = tokio::time::timeout(
+                crate::constants::DIAGNOSTIC_READ_BUDGET,
+                tokio::task::spawn_blocking(move || {
+                    super::discovery::read_update_interval(&interval_path)
+                }),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten();
             // [SAFETY] `TS-aw` (DEC-418): the entry answer above planned the
             // sweep; this re-reads the same union, with nothing held, before every
             // write and on every sample, and once more before the restore.
@@ -1240,6 +1284,8 @@ pub async fn hwmon_characterize_handler(
             if let Some(r) = slot.lock().as_mut() {
                 if r.run_id == my_run_id {
                     r.points = outcome.points;
+                    // DEC-420: the sweep's own pre-sweep read — the restore's target.
+                    r.original_pct = outcome.original_pct;
                     r.summary = Some(ch::summarise(&r.points, &learned, driver_interval));
                     r.state = outcome.state.to_string();
                     r.detail = outcome.detail;
@@ -1796,6 +1842,256 @@ pub(crate) mod tests {
             pwm_duties(&writes),
             vec![20, crate::pwm::raw_to_percent(230)]
         );
+    }
+
+    /// DEC-420 (`PTR-v`): the handler no longer reads the header on the request
+    /// worker, so the 202 carries `original_pct: null`, and the terminal run
+    /// publishes the SWEEP's own pre-sweep read — the duty the restore wrote,
+    /// asserted against the realised write log rather than a second read.
+    #[tokio::test]
+    async fn a_real_characterisation_publishes_the_duty_it_restores_to() {
+        let (state, writes, _tx, _tmp) =
+            verify_test_state_at_duty(230, crate::hwmon::roles::HeaderRole::ChassisFan);
+        let (status, Json(body)) = hwmon_characterize_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("hwmon:test:dev:pwm1".to_string()),
+            Json(
+                serde_json::from_value(
+                    serde_json::json!({"points_pct": [20], "settle_seconds": 2}),
+                )
+                .expect("request"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert!(body["original_pct"].is_null(), "{body}");
+
+        let run = poll_until("the characterisation", || {
+            state
+                .characterization
+                .lock()
+                .clone()
+                .filter(|r| r.state != crate::api::characterization::STATE_RUNNING)
+        })
+        .await;
+        assert_eq!(run.state, crate::api::characterization::STATE_COMPLETE);
+        let duties = pwm_duties(&writes);
+        assert_eq!(duties.len(), 2, "the point, then the restore: {duties:?}");
+        assert_eq!(run.original_pct, Some(crate::pwm::raw_to_percent(230)));
+        assert_eq!(
+            run.original_pct,
+            duties.last().copied(),
+            "published == restored"
+        );
+    }
+
+    /// [SAFETY] DEC-420 (`PTR-v`), through the REAL read path: a tach whose
+    /// `open(2)` blocks in the kernel (a FIFO with no writer — the DEC-342
+    /// wedge, not a sleep) is abandoned after `DIAGNOSTIC_READ_BUDGET`, and the
+    /// run ends `aborted` having written nothing. Before, the read ran on a
+    /// tokio worker with no bound and the run waited on it forever. Real time
+    /// on purpose: tokio will not auto-advance paused time while a
+    /// `spawn_blocking` task is outstanding (tokio-test trap 2). The wedged path
+    /// is read once — by the sweep's pre-sweep read (DEC-342's rule).
+    #[tokio::test]
+    async fn a_wedged_read_ends_a_real_characterisation_within_its_budget() {
+        let (state, writes, _tx, tmp) = build_verify_state_with(
+            Some(230),
+            crate::hwmon::roles::HeaderRole::ChassisFan,
+            Some(|raw| 300 + raw * 8),
+        );
+        let tmp = tmp.expect("a duty was requested");
+        let tach = tmp.path().join("fan1_input");
+        std::fs::remove_file(&tach).unwrap();
+        let c = std::ffi::CString::new(tach.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        // Self-release (tokio-test trap 3), non-blocking for the reason the
+        // stall probe's twin records: a blocking write-open waits for a reader.
+        fn release_fifo(path: &std::path::Path) {
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path);
+        }
+        let releaser = tach.clone();
+        let (done, wait) = std::sync::mpsc::channel::<()>();
+        let release = std::thread::spawn(move || {
+            if wait.recv_timeout(std::time::Duration::from_secs(8)).is_ok() {
+                release_fifo(&releaser);
+                return;
+            }
+            for _ in 0..200 {
+                release_fifo(&releaser);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let (status, Json(body)) = hwmon_characterize_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("hwmon:test:dev:pwm1".to_string()),
+            Json(
+                serde_json::from_value(
+                    serde_json::json!({"points_pct": [20], "settle_seconds": 2}),
+                )
+                .expect("request"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let run = loop {
+            if let Some(r) = state.characterization.lock().clone() {
+                if r.state != crate::api::characterization::STATE_RUNNING {
+                    break r;
+                }
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(6),
+                "the wedge was never bounded"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(
+            run.state,
+            crate::api::characterization::STATE_ABORTED,
+            "{run:?}"
+        );
+        assert!(
+            run.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("did not return")),
+            "{run:?}"
+        );
+        assert!(started.elapsed() >= crate::constants::DIAGNOSTIC_READ_BUDGET);
+        assert!(pwm_duties(&writes).is_empty(), "{:?}", pwm_duties(&writes));
+        release_fifo(&tach);
+        done.send(()).unwrap();
+        release.join().unwrap();
+    }
+
+    /// [SAFETY] DEC-420 review (contract F1 / concurrency F1), through the REAL
+    /// handler: a tach that hangs MID-RUN — after the first point was written —
+    /// ends the run within its budget, and the run writes nothing more. The
+    /// restore is skipped (`skipped_unresponsive`), so no `set_pwm` touches the
+    /// hung driver, and the controller lock is free when the run has ended.
+    /// Before the review's fix the restore's `set_pwm` read this same
+    /// `fan1_input` under the controller lock and parked there, and the run read
+    /// `running` for as long as the driver hung. The FIFO is swapped in only
+    /// once `current_step` is published, i.e. after the first `set_pwm` (whose
+    /// own tach read would otherwise be the one to hang) has returned.
+    ///
+    /// The deadline assertion below is NOT what catches a regression: this is a
+    /// `current_thread` test, so a restore parked in `set_pwm` freezes the test
+    /// body too (tokio-test trap 4) until the release thread frees the FIFO at
+    /// 12 s. The discriminators are `restore_outcome` and the write log, which
+    /// the mutation check confirmed (DEC-420 § Tests).
+    #[tokio::test]
+    async fn a_tach_that_hangs_mid_run_ends_the_run_without_touching_it_again() {
+        let (state, writes, _tx, tmp) = build_verify_state_with(
+            Some(230),
+            crate::hwmon::roles::HeaderRole::ChassisFan,
+            Some(|raw| 300 + raw * 8),
+        );
+        let tmp = tmp.expect("a duty was requested");
+        let tach = tmp.path().join("fan1_input");
+        fn release_fifo(path: &std::path::Path) {
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path);
+        }
+        let releaser = tach.clone();
+        let (done, wait) = std::sync::mpsc::channel::<()>();
+        let release = std::thread::spawn(move || {
+            if wait
+                .recv_timeout(std::time::Duration::from_secs(12))
+                .is_ok()
+            {
+                release_fifo(&releaser);
+                return;
+            }
+            for _ in 0..200 {
+                release_fifo(&releaser);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let (status, Json(body)) = hwmon_characterize_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("hwmon:test:dev:pwm1".to_string()),
+            Json(
+                serde_json::from_value(
+                    serde_json::json!({"points_pct": [20, 60], "settle_seconds": 4}),
+                )
+                .expect("request"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        poll_until("the first point's write", || {
+            state
+                .characterization
+                .lock()
+                .as_ref()
+                .and_then(|r| r.current_step.as_ref().map(|_| ()))
+        })
+        .await;
+        assert_eq!(
+            pwm_duties(&writes),
+            vec![20],
+            "precondition: one point written"
+        );
+        std::fs::remove_file(&tach).unwrap();
+        let c = std::ffi::CString::new(tach.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+
+        let run = loop {
+            if let Some(r) = state.characterization.lock().clone() {
+                if r.state != crate::api::characterization::STATE_RUNNING {
+                    break r;
+                }
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the run never ended — the hang was not bounded"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(
+            run.state,
+            crate::api::characterization::STATE_ABORTED,
+            "{run:?}"
+        );
+        assert!(
+            run.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("did not return")),
+            "{run:?}"
+        );
+        assert_eq!(run.restore_outcome, "skipped_unresponsive", "{run:?}");
+        assert!(run.restore_failed, "left at the swept duty: {run:?}");
+        assert_eq!(
+            pwm_duties(&writes),
+            vec![20],
+            "nothing written after the hang"
+        );
+        assert!(
+            state
+                .hwmon_controller
+                .as_ref()
+                .expect("a controller")
+                .try_lock()
+                .is_some(),
+            "the controller lock must be free once the run has ended"
+        );
+        release_fifo(&tach);
+        done.send(()).unwrap();
+        release.join().unwrap();
     }
 
     /// [SAFETY] `TS-aw` `K2`: the same for the control-path discovery HANDLER,
@@ -2944,6 +3240,40 @@ pub(crate) mod tests {
     }
 
     /// DEC-170 regression: post-2.0.0 the client holds no hwmon lease, so a
+    /// DEC-420 review (contract F2), at the CALL SITE: a verify whose write
+    /// reaches `set_pwm` after the shutdown hand-back began is refused, and the
+    /// client gets the retryable `503 hardware_unavailable` the handlers' own
+    /// shutdown refusals give — never a non-retryable `400` — and nothing is
+    /// written to the header the hand-back owns.
+    #[tokio::test]
+    async fn a_verify_refused_by_the_shutdown_hand_back_is_a_retryable_503() {
+        let (state, writes, _tx, _tmp) =
+            verify_test_state_at_duty(230, crate::hwmon::roles::HeaderRole::ChassisFan);
+        state
+            .hwmon_controller
+            .as_ref()
+            .expect("a controller")
+            .lock()
+            .handback()
+            .begin_shutdown_hand_back();
+
+        let (status, Json(body)) = hwmon_verify_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("hwmon:test:dev:pwm1".to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["code"], "hardware_unavailable", "{body}");
+        assert_eq!(body["error"]["retryable"], true, "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("shutting down")),
+            "{body}"
+        );
+        assert!(pwm_duties(&writes).is_empty(), "{:?}", pwm_duties(&writes));
+    }
+
     /// `HwmonControlError::Lease(_)` from a verify write is an internal race
     /// (the daemon's own "verify" lease lapsed mid-call), not a client
     /// precondition. Every `LeaseError` variant must map to a retryable

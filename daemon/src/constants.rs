@@ -1240,14 +1240,21 @@ pub const STALL_PROBE_KICK_MAX: Duration = Duration::from_secs(15);
 /// probe start before the probe aborts. Checked on every sample.
 pub const STALL_PROBE_RISE_LIMIT_C: f64 = 5.0;
 
-/// [SAFETY] The longest one probe read of the header (`pwmN`, `pwmN_enable`,
-/// `fanN_input`) may take before it counts as wedged (S3-R4). A healthy read
-/// takes microseconds; this is about one it87 refresh. While a read is
-/// outstanding no per-sample gate runs, so this bounds how long the gates can be
-/// blind with the header possibly at 0 %. A wedge ends the run as
-/// `tach_unreadable`; `spawn_blocking` cannot be cancelled, so the probe then
-/// stops reading that header altogether (DEC-289's lesson).
-pub const STALL_PROBE_READ_BUDGET: Duration = Duration::from_secs(2);
+/// [SAFETY] The longest one diagnostic read of the header (`pwmN`,
+/// `pwmN_enable`, `fanN_input`, or the chip's `update_interval`) may take before
+/// it counts as wedged — the stall probe's (S3-R4, DEC-407) and, since DEC-420
+/// (`PTR-v`), characterisation's. A healthy read takes microseconds; this is
+/// about one it87 refresh. While a read is outstanding no per-sample gate runs,
+/// so this bounds how long the gates can be blind with the header at a
+/// diagnostic duty (possibly 0 % for the probe). A wedge ends the run — the
+/// probe's as `tach_unreadable`, characterisation's as `aborted` — and,
+/// because `spawn_blocking` cannot be cancelled, the run then stops reading
+/// that header altogether (DEC-289's lesson). Characterisation also stops
+/// WRITING it — no restore, unless the header has become a pump — because a
+/// write goes through `set_pwm`, whose own reads are not bounded and run under
+/// the controller lock (DEC-420 review); the probe still kicks and restores
+/// after a wedge (`PTR-ab`). One definition for both.
+pub const DIAGNOSTIC_READ_BUDGET: Duration = Duration::from_secs(2);
 
 // The descent must land exactly on 0 %, so the start must be a whole number of
 // steps; and the probe must never start above the characterisation clamp.
@@ -1258,8 +1265,8 @@ const _: () = assert!(STALL_PROBE_START_PCT <= CHARACTERIZATION_MIN_PCT);
 const _: () = assert!(STALL_PROBE_KICK_PCT > STALL_PROBE_START_PCT);
 const _: () = assert!(STALL_PROBE_MIN_DWELL.as_secs() <= STALL_PROBE_KICK_MAX.as_secs());
 // A wedged read must be detected well inside one renewal interval, so a wedge
-// cannot outlast the engine-pause deadman before the probe notices it.
-const _: () = assert!(STALL_PROBE_READ_BUDGET.as_secs() < STABILITY_RENEW_INTERVAL_S);
+// cannot outlast the engine-pause deadman before the diagnostic notices it.
+const _: () = assert!(DIAGNOSTIC_READ_BUDGET.as_secs() < STABILITY_RENEW_INTERVAL_S);
 // Every probe hold renews the lease and the engine pause on the
 // `STABILITY_RENEW_INTERVAL_S` cadence (DEC-334's rule), so no hold length can
 // outrun either deadline; the renewal interval is what must fit, and does:

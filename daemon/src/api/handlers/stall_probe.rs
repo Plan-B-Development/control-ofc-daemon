@@ -185,7 +185,7 @@ pub async fn stall_probe_handler(
         // the probe's own first read then finds the wedge and stops.
         let interval_path = pwm_path.clone();
         let driver_refresh_ms = tokio::time::timeout(
-            crate::constants::STALL_PROBE_READ_BUDGET,
+            crate::constants::DIAGNOSTIC_READ_BUDGET,
             tokio::task::spawn_blocking(move || {
                 super::discovery::read_update_interval(&interval_path)
             }),
@@ -225,7 +225,7 @@ pub async fn stall_probe_handler(
             // outstanding no per-sample gate runs, so an unbounded join would
             // leave the header at a probe duty — possibly 0 % — with the rise,
             // thermal and budget gates blind. A read that does not return within
-            // `STALL_PROBE_READ_BUDGET` is `None`, a wedge, and ends the run. A
+            // `DIAGNOSTIC_READ_BUDGET` is `None`, a wedge, and ends the run. A
             // failed join is a read that finished without a value: unreadable,
             // never a value.
             let paths = Arc::new((pwm_path, enable_path, rpm_path));
@@ -235,8 +235,7 @@ pub async fn stall_probe_handler(
                     let join = tokio::task::spawn_blocking(move || {
                         super::hwmon_ctl::read_header_state(&paths.0, &paths.1, &paths.2)
                     });
-                    match tokio::time::timeout(crate::constants::STALL_PROBE_READ_BUDGET, join)
-                        .await
+                    match tokio::time::timeout(crate::constants::DIAGNOSTIC_READ_BUDGET, join).await
                     {
                         Err(_elapsed) => None,
                         Ok(joined) => Some(joined.unwrap_or(HwmonVerifyState {
@@ -711,7 +710,7 @@ mod tests {
 
     /// Concurrency F2 / S3-R4, through the REAL read path: a tach whose `open(2)`
     /// blocks in the kernel (a FIFO with no writer — the DEC-342 wedge, not a
-    /// sleep) is abandoned after `STALL_PROBE_READ_BUDGET`, and the run ends as
+    /// sleep) is abandoned after `DIAGNOSTIC_READ_BUDGET`, and the run ends as
     /// `tach_unreadable` having written nothing. Real time on purpose: tokio will
     /// not auto-advance paused time while a `spawn_blocking` task is outstanding
     /// (tokio-test trap 2), so a paused clock would hang here instead of failing.
@@ -775,7 +774,7 @@ mod tests {
             Some(sp::ABORT_TACH_UNREADABLE),
             "{run:?}"
         );
-        assert!(started.elapsed() >= crate::constants::STALL_PROBE_READ_BUDGET);
+        assert!(started.elapsed() >= crate::constants::DIAGNOSTIC_READ_BUDGET);
         assert!(
             pwm_duties(&f.writes).is_empty(),
             "{:?}",
