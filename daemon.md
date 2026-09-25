@@ -87,8 +87,8 @@ daemon/src/
     nvml_sys.rs        — isolated unsafe FFI to libnvidia-ml.so.1 via libloading (the only NVIDIA unsafe, DEC-204)
     gpu_fan.rs         — PMFW fan curve read/write/reset
     kernel_warnings.rs — kernel-version regression catalog
-                          (RDNA3/4 hard hang on 6.18.x + 6.19.x; R9700/Navi48
-                          0x7551 SMU mismatch — device-scoped, not kernel-tied)
+                          (drm/amd #4765 MES eviction hang on RDNA3/4,
+                          6.17.9–6.17.13 + 6.18.0–6.18.6, DEC-422)
                           surfaced via /capabilities.amd_gpu.kernel_warnings
     superio.rs         — passive Super-I/O chip detection (DMI + hwmon + /proc/modules + kmsg + ACPI evidence, DEC-202)
     superio_probe.rs   — opt-in active /dev/port Super-I/O probe, off by default (DEC-203)
@@ -492,7 +492,7 @@ gating each have their own register rows and regression tests.
 
 7. **Kernel-version regression catalogue** (`hwmon/kernel_warnings.rs`, DEC-098):
    - Curated list of published amdgpu regressions keyed by kernel version + GPU PCI device ID
-   - Currently flags `rdna_hang_kernel_6_18_6_19` (RDNA3/4 hard hang on **both** 6.18.x and 6.19.x, Phoronix-confirmed) and `smu_mismatch_navi48_r9700` (R9700-only SMU interface-version mismatch — no working fan-control path — across all current kernels, ROCm Issue #6101); see DEC-114 for the correctness fix
+   - Currently flags `rdna_mes_hang_drm_amd_4765` (DEC-422): the drm/amd #4765 MES eviction hang on every RDNA3 / RDNA3.5 / RDNA4 GPU. It is present on 6.17.9–6.17.13 (a backport never fixed before 6.17 went end-of-life) and 6.18.0–6.18.6, and fixed in 6.18.7 and 6.19. DEC-422 retired `rdna_hang_kernel_6_18_6_19`, whose advice to pin 6.15–6.17 was wrong, and `smu_mismatch_navi48_r9700`, whose premise, a benign SMU interface-version message, was refuted. Daemon v2.56.0 and older still raise both.
    - Surfaced via `GET /capabilities` (`devices.amd_gpu.kernel_warnings`); each entry carries `id` (stable knowledge-base key), `severity` (`info` / `medium` / `high` / `critical`), and `message` (pre-formatted user-visible text). The daemon owns the wording so a message update doesn't require coordinated GUI redeploys.
    - The field uses `#[serde(skip_serializing_if = "Vec::is_empty")]` so older clients that don't know about it see no change in the wire shape
    - The GUI raises a one-time `QMessageBox` for `high` and `critical` warnings; the user's acknowledgement is persisted in `app_settings.acknowledged_kernel_warnings` so the popup does not re-fire on every reconnect

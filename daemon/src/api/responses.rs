@@ -1233,8 +1233,8 @@ pub struct AmdGpuCapability {
     /// Kernel-version advisories applicable to this GPU.
     ///
     /// Empty in normal operation. Populated when the running kernel matches a
-    /// known amdgpu regression (e.g. RDNA3/RDNA4 hard-hang on 6.19, R9700 SMU
-    /// mismatch on 7.0). The GUI surfaces high/critical entries as a one-time
+    /// known amdgpu regression (since DEC-422 one rule: the drm/amd #4765 MES
+    /// eviction hang on RDNA3/RDNA4). The GUI surfaces high/critical entries as a one-time
     /// popup. See `crate::hwmon::kernel_warnings` for the catalog.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kernel_warnings: Vec<crate::hwmon::kernel_warnings::KernelWarning>,

@@ -4,6 +4,16 @@
 
 ### Fixed
 
+**The AMD GPU kernel advisory is the one bisected, fixed hang, on the kernels and GPUs that carry it**
+(DEC-422). `rdna_hang_kernel_6_18_6_19` flagged every 6.18/6.19 kernel on RDNA3/4 as critical and advised
+pinning 6.15–6.17, none of which was ever a longterm kernel. `smu_mismatch_navi48_r9700` told every
+R9700 owner their fan curve could not work, on the strength of a benign message. Both are retired. The
+daemon now raises `rdna_mes_hang_drm_amd_4765` (drm/amd #4765, the MES eviction hang) on 6.17.9–6.17.13,
+a backport that 6.17 never fixed, and on 6.18.0–6.18.6. The hang is fixed in 6.18.7 and 6.19.
+`is_rdna3_or_rdna4` now matches every RDNA3, RDNA3.5 and RDNA4 product in libdrm's `amdgpu.ids`. It used
+to miss the RX 9060 series, four RDNA3 cards and the integrated GPUs. The same list chooses the
+actionable `amdgpu.ppfeaturemask` hint for a read-only GPU, so that hint now reaches those cards too.
+
 **The Gigabyte dual-chip board table is corrected and extended, so working boards stop reporting a
 missing chip** (DEC-421). `GET /diagnostics/hardware`'s `expected_chips` listed an IT87952E for the X670E
 AORUS MASTER, whose second chip is an IT8792E. It also listed two chips for the X670 AORUS ELITE AX,

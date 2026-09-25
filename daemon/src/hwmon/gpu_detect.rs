@@ -117,22 +117,47 @@ impl AmdGpuInfo {
     }
 }
 
-/// Whether a PCI device ID is RDNA3 or RDNA4 (for kernel-regression warnings).
+/// Whether a PCI device ID is an RDNA3 or RDNA4 GPU (for kernel-regression warnings).
 ///
-/// Used by `kernel_warnings::detect_kernel_warnings` to scope warnings to GPU
-/// architectures actually affected by the regression. RDNA2 and earlier are
-/// not affected by the 6.19 hard-hang or the SMU mismatch on 7.0.
+/// Used by `kernel_warnings::detect_kernel_warnings`, whose drm/amd #4765 rule
+/// is a bug in amdgpu's MES scheduler path: every GC 11.x (RDNA3 / RDNA3.5) and
+/// GC 12.x (RDNA4) part enables MES (`amdgpu_discovery_set_mes_ip_blocks`,
+/// v6.18); RDNA2 and older do not. Also used to pick the actionable
+/// `feature_unavailable` hint in `api::handlers::gpu`.
+///
+/// DEC-422: the IDs are every RDNA3 / RDNA3.5 / RDNA4 product in libdrm's
+/// `amdgpu.ids` (libdrm 2.4.134, read 2026-09-25 by enumerating the table's
+/// 0x74xx / 0x75xx / 0x11xx / 0x15xx / 0x19xx ranges, not by searching for
+/// expected names — a name search missed five, one of them on a line the table
+/// spaces rather than tabs). The list used to hold nine IDs, missing the RX 9060
+/// series (0x7590) and seven RDNA3 cards, with two of its comments naming the
+/// wrong die. It also covers
+/// the RDNA3 / RDNA3.5 iGPUs, because on an APU-only machine the primary GPU the
+/// advisory is evaluated for IS the iGPU. An ID missing here only loses that
+/// advisory and hint — nothing writes on this answer. Product names only, from
+/// the table: it does not name dies, so neither does this.
 pub fn is_rdna3_or_rdna4(device_id: u16) -> bool {
     matches!(
         device_id,
-        // RDNA4 — Navi 48 and related
-        0x7550 | 0x7551
-        // RDNA3 — Navi 31 (RX 7900 series)
-        | 0x744C | 0x7448 | 0x7480
-        // RDNA3 — Navi 32 (RX 7800/7700)
-        | 0x7470 | 0x747E
-        // RDNA3 — Navi 33 (RX 7600)
-        | 0x7460 | 0x7461
+        // RDNA4 (GC 12.0.x): RX 9070 XT / 9070 / 9070 GRE (0x7550); Radeon AI PRO
+        // R9700 / R9600D (0x7551); RX 9060 XT / 9060 XT LP / 9060 (0x7590)
+        0x7550 | 0x7551 | 0x7590
+        // RDNA3 discrete (GC 11.0.x): Pro W7900 (0x7448); Pro W7800 48GB (0x7449);
+        // Pro W7900 Dual Slot (0x744A); Pro W7900D (0x744B); RX 7900 XTX / XT /
+        // GRE / 7900M (0x744C); Pro W7800 (0x745E); Pro V710 (0x7460, 0x7461
+        // MxGPU); Pro W7700 (0x7470); RX 7800 XT / 7700 XT / 7700 / 7800M
+        // (0x747E); RX 7600 XT / 7600 / 7650 GRE / 7700S / 7600S / 7600M XT,
+        // Pro W7600 (0x7480); Steam Machine (0x7481, Valve's semi-custom RDNA3);
+        // RX 7600M (0x7483); Pro W7500 (0x7489); RX 7400 / 7300, Pro W7400
+        // (0x7499)
+        | 0x7448 | 0x7449 | 0x744A | 0x744B | 0x744C | 0x745E | 0x7460 | 0x7461
+        | 0x7470 | 0x747E | 0x7480 | 0x7481 | 0x7483 | 0x7489 | 0x7499
+        // RDNA3 iGPUs (GC 11.0.x): Radeon 780M / 760M / 740M (0x15BF, 0x1900),
+        // 740M (0x15C8, 0x1901)
+        | 0x15BF | 0x15C8 | 0x1900 | 0x1901
+        // RDNA3.5 iGPUs (GC 11.5.x): Radeon 890M / 880M (0x150E), 860M / 840M
+        // (0x1114), 8060S / 8050S / 8040S (0x1586), 840M / 820M (0x1902)
+        | 0x150E | 0x1114 | 0x1586 | 0x1902
     )
 }
 
@@ -652,6 +677,40 @@ mod tests {
     #[test]
     fn unknown_id_returns_none() {
         assert_eq!(lookup_marketing_name(0xFFFF, 0x00), None);
+    }
+
+    /// DEC-422: the list is every MES-era (GC 11.x / 12.x) product in libdrm's
+    /// `amdgpu.ids`. The RX 9060 series and four RDNA3 parts were missing, so the
+    /// drm/amd #4765 advisory could never reach them; the iGPUs are in because an
+    /// APU-only machine's primary GPU is the iGPU.
+    #[test]
+    fn rdna3_or_rdna4_covers_every_mes_era_family_and_no_rdna2() {
+        for (id, what) in [
+            (0x7550, "RX 9070 XT"),
+            (0x7551, "Radeon AI PRO R9700"),
+            (0x7590, "RX 9060 XT (was missing)"),
+            (0x744C, "RX 7900 XTX"),
+            (0x745E, "Pro W7800 (was missing)"),
+            (0x747E, "RX 7800 XT"),
+            (0x7480, "RX 7600"),
+            (0x7483, "RX 7600M (was missing)"),
+            (0x7489, "Pro W7500 (was missing)"),
+            (0x7499, "RX 7400 (was missing)"),
+            (0x744A, "Pro W7900 Dual Slot (was missing)"),
+            (0x7481, "Steam Machine (was missing)"),
+            (0x1902, "Radeon 840M (was missing)"),
+            (0x15BF, "Radeon 780M"),
+            (0x1900, "Radeon 780M"),
+            (0x150E, "Radeon 890M"),
+            (0x1586, "Radeon 8060S"),
+        ] {
+            assert!(is_rdna3_or_rdna4(id), "{what} ({id:#06x}) must be RDNA3/4");
+        }
+        // RDNA2 and older run no MES: RX 6900 XT / 6700 XT / 6600, and the RDNA2
+        // iGPUs Radeon 610M (0x164E) and 680M / 660M (0x1681).
+        for id in [0x73BF_u16, 0x73DF, 0x73FF, 0x164E, 0x1681] {
+            assert!(!is_rdna3_or_rdna4(id), "{id:#06x} is not RDNA3/4");
+        }
     }
 
     // ── Detection integration tests ────────────────────────────────
