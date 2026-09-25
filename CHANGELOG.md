@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.56.1] — 2026-09-25
+
 ### Fixed
 
 **Controlling some channels of an ARCTIC Fan Controller no longer stops the rest** (DEC-425). The
