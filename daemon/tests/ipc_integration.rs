@@ -1739,10 +1739,7 @@ async fn unknown_endpoint_returns_error_envelope() {
     assert_eq!(status, 404);
     assert_eq!(json["error"]["code"], "not_found");
     assert_eq!(json["error"]["retryable"], false);
-    assert!(json["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("/nonexistent"));
+    assert_eq!(json["error"]["message"], "endpoint not found: /nonexistent");
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
@@ -7453,6 +7450,123 @@ async fn validation_ingest_rejects_over_long_free_text() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// `DC-m`: at a session's cap the two append routes answer truthfully. The event
+/// route used to answer `200 {"recorded": true}` for a marker it dropped, and the
+/// measurement route `404` "no validation session is recording" while one was.
+///
+/// Driven through the real routes, with the caps filled in-process: the defect
+/// was the handlers' mapping, which a recorder-level test cannot see.
+#[tokio::test]
+async fn validation_appends_at_the_cap_answer_409_session_full() {
+    use control_ofc_daemon::constants::{
+        VALIDATION_MAX_EVENTS, VALIDATION_MAX_EXTERNAL_MEASUREMENTS,
+    };
+    use control_ofc_daemon::validation::recorder::AppendOutcome;
+    use control_ofc_daemon::validation::session::{ExternalMeasurement, EV_USER_MARKER};
+
+    ipc_temp_state_dir();
+    let (state, _tmp) = cooling_device_test_state();
+    let engine = state.validation.clone();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_post(
+        &path,
+        "/config/cooling-device",
+        &serde_json::json!({"id": "aio-1", "pump_member": "h2", "radiator_members": ["h1"]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{json}");
+    let (status, json) = uds_post(
+        &path,
+        "/validation/session",
+        &serde_json::json!({"cooling_device_id": "aio-1"}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a session must start for this test to mean anything: {json}"
+    );
+
+    // Presence first: below the caps both routes record.
+    let (status, json) = uds_post(&path, "/validation/session/event", &serde_json::json!({})).await;
+    assert_eq!(
+        (status, json["recorded"].clone()),
+        (200, serde_json::json!(true)),
+        "{json}"
+    );
+    let measurement = serde_json::json!({"kind": "rpm", "value": 1200.0});
+    let (status, json) = uds_post(&path, "/validation/session/measurement", &measurement).await;
+    assert_eq!(
+        (status, json["recorded"].clone()),
+        (200, serde_json::json!(true)),
+        "{json}"
+    );
+
+    // Fill both caps. Bounded, so an engine that never reports the cap fails
+    // this test instead of hanging it.
+    for _ in 0..VALIDATION_MAX_EVENTS {
+        if engine.push_event(EV_USER_MARKER, None, None) != AppendOutcome::Recorded {
+            break;
+        }
+    }
+    for _ in 0..VALIDATION_MAX_EXTERNAL_MEASUREMENTS {
+        let outcome = engine.add_measurement(ExternalMeasurement {
+            unix_ms: 0,
+            kind: "rpm".into(),
+            value: 1.0,
+            unit: String::new(),
+            member_id: None,
+            note: None,
+        });
+        if outcome != AppendOutcome::Recorded {
+            break;
+        }
+    }
+    let events_before = engine.snapshot().unwrap().events.len();
+    assert_eq!(
+        events_before, VALIDATION_MAX_EVENTS,
+        "precondition: the event cap is reached"
+    );
+
+    for (route, body, limit) in [
+        (
+            "/validation/session/event",
+            serde_json::json!({"detail": "late"}),
+            VALIDATION_MAX_EVENTS,
+        ),
+        (
+            "/validation/session/measurement",
+            measurement.clone(),
+            VALIDATION_MAX_EXTERNAL_MEASUREMENTS,
+        ),
+    ] {
+        let (status, json) = uds_post(&path, route, &body).await;
+        assert_eq!(status, 409, "{route}: {json}");
+        assert_eq!(json["error"]["code"], "session_full", "{route}: {json}");
+        assert_eq!(json["error"]["retryable"], false, "{route}: {json}");
+        assert_eq!(json["error"]["details"]["limit"], limit, "{route}: {json}");
+        assert!(json.get("recorded").is_none(), "{route}: {json}");
+    }
+    assert_eq!(
+        engine.snapshot().unwrap().events.len(),
+        events_before,
+        "the refused marker must not have been appended"
+    );
+
+    // And once the session has stopped, the answer is the 404 again.
+    let (status, _) = uds_post(&path, "/validation/session/stop", &serde_json::json!({})).await;
+    assert_eq!(status, 200);
+    let (status, json) = uds_post(&path, "/validation/session/event", &serde_json::json!({})).await;
+    assert_eq!(status, 404, "{json}");
+    assert_eq!(
+        json["error"]["message"],
+        "no validation session is recording"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
 /// A cooling device's sensor ids are copied into every validation sample, so an
 /// unbounded one scaled the session document without bound — the route by which
 /// `AUD3-i` was still reproducible inside its own fix.
@@ -8036,6 +8150,9 @@ async fn stall_probe_is_advertised_routed_and_refuses_without_acknowledgement() 
     let (status, body) = uds_get(&path, "/diagnostics/stall-probe").await;
     assert_eq!(status, 404, "{body}");
     assert_eq!(body["error"]["code"], "not_found", "{body}");
+    // `DC-n`: the route exists, so the message names the missing run, never
+    // "endpoint not found", the fallback's wording (`unknown_endpoint_returns_error_envelope`).
+    assert_eq!(body["error"]["message"], "no stall probe has run", "{body}");
     let (status, _) = uds_delete(&path, "/diagnostics/stall-probe").await;
     assert_eq!(status, 409);
 

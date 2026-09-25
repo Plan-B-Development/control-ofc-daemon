@@ -24,7 +24,7 @@ use axum::response::Json;
 use super::{error_response, json_ok, AppState};
 use crate::api::responses::ErrorEnvelope;
 use crate::constants;
-use crate::validation::recorder::{RecorderContext, StartError};
+use crate::validation::recorder::{AppendOutcome, RecorderContext, StartError};
 use crate::validation::session::*;
 use crate::validation::store;
 
@@ -387,7 +387,7 @@ fn start_error_response(e: StartError) -> (StatusCode, Json<serde_json::Value>) 
         ),
         StartError::UnknownDevice(id) => error_response(
             StatusCode::NOT_FOUND,
-            &ErrorEnvelope::not_found(&format!("cooling device '{id}'")),
+            &ErrorEnvelope::not_found(format!("no cooling device with id '{id}'")),
         ),
         StartError::NotAMember(id) => error_response(
             StatusCode::BAD_REQUEST,
@@ -769,17 +769,13 @@ pub async fn post_event_handler(
             return resp;
         }
     }
-    if state
-        .validation
-        .push_event(EV_USER_MARKER, body.detail, body.member_id)
-    {
-        json_ok(StatusCode::OK, serde_json::json!({"recorded": true}))
-    } else {
-        error_response(
-            StatusCode::NOT_FOUND,
-            &ErrorEnvelope::not_found("no validation session is recording"),
-        )
-    }
+    append_response(
+        state
+            .validation
+            .push_event(EV_USER_MARKER, body.detail, body.member_id),
+        "events",
+        "marker",
+    )
 }
 
 /// `POST /validation/session/measurement` — an external measurement (§14).
@@ -814,13 +810,40 @@ pub async fn post_measurement_handler(
         member_id: body.member_id,
         note: body.note,
     };
-    if state.validation.add_measurement(m) {
-        json_ok(StatusCode::OK, serde_json::json!({"recorded": true}))
-    } else {
-        error_response(
+    append_response(
+        state.validation.add_measurement(m),
+        "external measurements",
+        "measurement",
+    )
+}
+
+/// Render a marker or measurement append (`DC-m`). Shared so the two routes
+/// cannot drift: `200 {"recorded": true}` only when something was appended,
+/// `404 not_found` only when no session is recording, and `409 session_full`
+/// when one is recording but holds its cap — before this, the event route
+/// answered `recorded: true` for a marker it dropped, and the measurement route
+/// said no session was recording while one was.
+fn append_response(
+    outcome: AppendOutcome,
+    plural: &str,
+    what: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match outcome {
+        AppendOutcome::Recorded => json_ok(StatusCode::OK, serde_json::json!({"recorded": true})),
+        AppendOutcome::NotRecording => error_response(
             StatusCode::NOT_FOUND,
             &ErrorEnvelope::not_found("no validation session is recording"),
-        )
+        ),
+        AppendOutcome::Full { limit } => error_response(
+            StatusCode::CONFLICT,
+            &ErrorEnvelope::session_full(
+                format!(
+                    "this validation session already holds {limit} {plural}, its maximum \
+                     — the {what} was not recorded"
+                ),
+                limit,
+            ),
+        ),
     }
 }
 
@@ -900,7 +923,7 @@ pub async fn get_session_by_id_handler(
         Ok(Some(s)) => json_ok(StatusCode::OK, s),
         Ok(None) => error_response(
             StatusCode::NOT_FOUND,
-            &ErrorEnvelope::not_found(&format!("validation session '{session_id}'")),
+            &ErrorEnvelope::not_found(format!("no validation session with id '{session_id}'")),
         ),
         Err(e) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,

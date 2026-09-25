@@ -250,7 +250,11 @@ impl FanController {
 
     /// Set PWM on a single channel. `pwm_percent` is 0–100.
     ///
-    /// - 0% is allowed for up to `constants::STOP_TIMEOUT` (8s), after which it's rejected.
+    /// - A held 0% is not time-limited: a repeat of the last command coalesces
+    ///   (below) before the stop timeout is checked, so it never meets it.
+    ///   `apply_safety` refuses only a wire-bound 0% against a stop timer at
+    ///   least `constants::STOP_TIMEOUT` old, which no normal sequence leaves
+    ///   running (DEC-426, `DC-b`).
     /// - Values are passed through as-is (0–100).
     /// - If the value equals the last commanded value, the write is coalesced (skipped).
     pub fn set_pwm(

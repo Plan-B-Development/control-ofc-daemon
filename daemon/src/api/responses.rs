@@ -2084,11 +2084,23 @@ pub struct ErrorBody {
 }
 
 impl ErrorEnvelope {
-    pub fn not_found(path: &str) -> Self {
+    /// The route fallback's `404 not_found`: no route matches `path`. The only
+    /// caller is `fallback_handler`, and "endpoint not found" is true only there.
+    pub fn route_not_found(path: &str) -> Self {
+        Self::not_found(format!("endpoint not found: {path}"))
+    }
+
+    /// A `404 not_found` from a handler on a known route: the thing it names
+    /// does not exist (no session recording, no probe run, an unknown cooling
+    /// device). `message` is sent as-is — it used to be prefixed "endpoint not
+    /// found:", which told a client the ROUTE was missing when the route
+    /// answered (`DC-n`). Same code as the fallback's, so a client cannot tell
+    /// the two apart by `code`: gate on the capability, never on a probe.
+    pub fn not_found(message: impl Into<String>) -> Self {
         Self {
             error: ErrorBody {
                 code: "not_found".into(),
-                message: format!("endpoint not found: {path}"),
+                message: message.into(),
                 details: None,
                 retryable: false,
                 source: "validation".into(),
@@ -2243,6 +2255,22 @@ impl ErrorEnvelope {
         }
     }
 
+    /// A `409 session_full` — the validation session is recording but already
+    /// holds its cap of the entry the client tried to add, so nothing was
+    /// appended (`DC-m`). `details.limit` is the cap. Not retryable: the session
+    /// cannot take more of that kind until a new one is started.
+    pub fn session_full(message: impl Into<String>, limit: usize) -> Self {
+        Self {
+            error: ErrorBody {
+                code: "session_full".into(),
+                message: message.into(),
+                details: Some(serde_json::json!({ "limit": limit })),
+                retryable: false,
+                source: "validation".into(),
+            },
+        }
+    }
+
     /// A `validation_error` carrying structured per-field violations in
     /// `details` (DEC-160). The envelope shape is unchanged — `details` is the
     /// existing free-form field — so older clients that read only
@@ -2267,17 +2295,24 @@ mod tests {
 
     #[test]
     fn error_envelope_serializes() {
-        let env = ErrorEnvelope::not_found("/nonexistent");
+        let env = ErrorEnvelope::route_not_found("/nonexistent");
         let json = serde_json::to_value(&env).unwrap();
         assert_eq!(json["error"]["code"], "not_found");
         assert_eq!(json["error"]["retryable"], false);
         assert_eq!(json["error"]["source"], "validation");
-        assert!(json["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("/nonexistent"));
+        assert_eq!(json["error"]["message"], "endpoint not found: /nonexistent");
         // details should be absent (skip_serializing_if)
         assert!(json["error"].get("details").is_none());
+    }
+
+    /// `DC-n`: a handler's `not_found` names a missing resource on a route that
+    /// exists, so its message must not claim the endpoint is missing.
+    #[test]
+    fn a_resource_not_found_sends_its_message_unprefixed() {
+        let json =
+            serde_json::to_value(ErrorEnvelope::not_found("no stall probe has run")).unwrap();
+        assert_eq!(json["error"]["code"], "not_found");
+        assert_eq!(json["error"]["message"], "no stall probe has run");
     }
 
     #[test]

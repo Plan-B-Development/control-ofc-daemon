@@ -22,8 +22,11 @@ pub const STALL_PWM_THRESHOLD: u8 = 20;
 
 // ── OpenFan serial controller ────────────────────────────────────────
 
-/// Duration after which a 0% PWM command is rejected to prevent
-/// accidental prolonged motor stop.
+/// Age of a recorded OpenFan stop past which a WIRE-BOUND 0% is refused. It does
+/// not bound a held stop: a repeated 0% coalesces before this is checked, so a
+/// stop lasts as long as it is commanded, and no normal command sequence
+/// reaches the refusal — defence in depth against tracking drift (DEC-426,
+/// `DC-b`). Published as `limits.openfan_stop_timeout_s`.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Maximum bytes to read per serial line. Prevents unbounded memory growth

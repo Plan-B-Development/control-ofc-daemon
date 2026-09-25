@@ -115,6 +115,23 @@ pub enum StartError {
     Persistence(String),
 }
 
+/// What became of a client's marker or measurement (§5, §14).
+///
+/// Three outcomes, because the handler owes the client three different answers
+/// (`DC-m`). With a `bool`, a marker dropped at the event cap answered
+/// `200 {"recorded": true}`, and a measurement refused at its cap answered
+/// "no validation session is recording" while one was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppendOutcome {
+    /// Appended.
+    Recorded,
+    /// No session, or the current one has stopped recording.
+    NotRecording,
+    /// The session is recording but already holds `limit` entries of this
+    /// kind, so nothing was appended.
+    Full { limit: usize },
+}
+
 /// Flush to disk every this many ticks. Flushing every tick would rewrite the
 /// whole document once a second; flushing only at the end would lose the whole
 /// recording to a crash. On an interruption the file simply ends at the last
@@ -567,34 +584,40 @@ impl ValidationEngine {
         kind: &str,
         detail: Option<String>,
         member_id: Option<String>,
-    ) -> bool {
+    ) -> AppendOutcome {
         let mut slot = self.slot.lock();
         let Some(session) = slot.as_mut() else {
-            return false;
+            return AppendOutcome::NotRecording;
         };
         if !session.is_recording() {
-            return false;
+            return AppendOutcome::NotRecording;
         }
-        push_event_locked(session, kind, detail, member_id);
+        if !push_event_locked(session, kind, detail, member_id) {
+            return AppendOutcome::Full {
+                limit: constants::VALIDATION_MAX_EVENTS,
+            };
+        }
         self.refresh_live(session);
-        true
+        AppendOutcome::Recorded
     }
 
     /// Attach an externally measured observation (§14). Untrusted; read by
     /// nothing, and no control path may ever consult one.
-    pub fn add_measurement(&self, m: ExternalMeasurement) -> bool {
+    pub fn add_measurement(&self, m: ExternalMeasurement) -> AppendOutcome {
         let mut slot = self.slot.lock();
         let Some(session) = slot.as_mut() else {
-            return false;
+            return AppendOutcome::NotRecording;
         };
         if !session.is_recording() {
-            return false;
+            return AppendOutcome::NotRecording;
         }
         if session.external_measurements.len() >= constants::VALIDATION_MAX_EXTERNAL_MEASUREMENTS {
-            return false;
+            return AppendOutcome::Full {
+                limit: constants::VALIDATION_MAX_EXTERNAL_MEASUREMENTS,
+            };
         }
         session.external_measurements.push(m);
-        true
+        AppendOutcome::Recorded
     }
 
     /// Record the result of an orchestrated diagnostic (§6), **fenced on the
@@ -1083,15 +1106,18 @@ impl ValidationEngine {
     }
 }
 
-/// Append an event, bounded. Caller holds the slot lock.
+/// Append an event, bounded. Caller holds the slot lock. Returns `false` when
+/// the session already holds `VALIDATION_MAX_EVENTS` and nothing was appended;
+/// only the client marker path reports that (`DC-m`) — an engine event at the
+/// cap is dropped, as it always was.
 fn push_event_locked(
     session: &mut ValidationSession,
     kind: &str,
     detail: Option<String>,
     member_id: Option<String>,
-) {
+) -> bool {
     if session.events.len() >= constants::VALIDATION_MAX_EVENTS {
-        return;
+        return false;
     }
     let now = unix_ms();
     session.events.push(ValidationEvent {
@@ -1101,6 +1127,7 @@ fn push_event_locked(
         detail,
         member_id,
     });
+    true
 }
 
 fn seed_watch(ctx: &RecorderContext) -> Watch {

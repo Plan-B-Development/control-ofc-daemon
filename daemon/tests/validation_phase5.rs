@@ -978,17 +978,23 @@ fn an_engine_with_no_session_is_inert() {
 
     assert!(engine.snapshot().is_none());
     assert!(!engine.is_recording());
-    assert!(!engine.push_event(EV_USER_MARKER, None, None));
+    assert_eq!(
+        engine.push_event(EV_USER_MARKER, None, None),
+        AppendOutcome::NotRecording
+    );
     assert!(engine.stop().is_none());
     assert!(engine.cancel().is_none());
-    assert!(!engine.add_measurement(ExternalMeasurement {
-        unix_ms: 0,
-        kind: "x".into(),
-        value: 1.0,
-        unit: "V".into(),
-        member_id: None,
-        note: None,
-    }));
+    assert_eq!(
+        engine.add_measurement(ExternalMeasurement {
+            unix_ms: 0,
+            kind: "x".into(),
+            value: 1.0,
+            unit: "V".into(),
+            member_id: None,
+            note: None,
+        }),
+        AppendOutcome::NotRecording
+    );
 }
 
 // ── Token hygiene ───────────────────────────────────────────────────────────
@@ -1007,7 +1013,7 @@ fn only_known_diagnostics_are_accepted() {
 
 // ── Cap-and-stop (§4, §9) ───────────────────────────────────────────────────
 
-use control_ofc_daemon::validation::recorder::{RecorderContext, ValidationEngine};
+use control_ofc_daemon::validation::recorder::{AppendOutcome, RecorderContext, ValidationEngine};
 use std::sync::Arc;
 
 /// Point the process's state dir at a temp directory so the recorder's periodic
@@ -1202,7 +1208,10 @@ fn a_user_marker_is_recorded_only_while_a_session_is_live() {
     let ctx = test_context();
     engine.start(unique_session("marker"), &ctx).unwrap();
 
-    assert!(engine.push_event(EV_USER_MARKER, Some("pump to Quiet".into()), None));
+    assert_eq!(
+        engine.push_event(EV_USER_MARKER, Some("pump to Quiet".into()), None),
+        AppendOutcome::Recorded
+    );
     let s = engine.snapshot().unwrap();
     let marker = s
         .events
@@ -1212,8 +1221,9 @@ fn a_user_marker_is_recorded_only_while_a_session_is_live() {
     assert_eq!(marker.detail.as_deref(), Some("pump to Quiet"));
 
     engine.stop();
-    assert!(
-        !engine.push_event(EV_USER_MARKER, Some("too late".into()), None),
+    assert_eq!(
+        engine.push_event(EV_USER_MARKER, Some("too late".into()), None),
+        AppendOutcome::NotRecording,
         "a finalised session must not accept new events"
     );
 }
@@ -1226,33 +1236,72 @@ fn external_measurements_are_stored_untrusted_and_bounded() {
     let ctx = test_context();
     engine.start(unique_session("measurements"), &ctx).unwrap();
 
-    assert!(engine.add_measurement(ExternalMeasurement {
-        unix_ms: 1,
-        kind: "supply_voltage_v".into(),
-        value: 11.94,
-        unit: "V".into(),
-        member_id: Some("hwmon:it87:pwm2:PUMP".into()),
-        note: None,
-    }));
+    assert_eq!(
+        engine.add_measurement(ExternalMeasurement {
+            unix_ms: 1,
+            kind: "supply_voltage_v".into(),
+            value: 11.94,
+            unit: "V".into(),
+            member_id: Some("hwmon:it87:pwm2:PUMP".into()),
+            note: None,
+        }),
+        AppendOutcome::Recorded
+    );
     let s = engine.snapshot().unwrap();
     assert_eq!(s.external_measurements.len(), 1);
     assert_eq!(s.external_measurements[0].value, 11.94);
 
-    // Bounded — a client cannot grow the session without limit.
-    for i in 0..control_ofc_daemon::constants::VALIDATION_MAX_EXTERNAL_MEASUREMENTS + 50 {
-        engine.add_measurement(ExternalMeasurement {
-            unix_ms: i as u64,
-            kind: "pwm_duty_pct".into(),
-            value: 50.0,
-            unit: "%".into(),
-            member_id: None,
-            note: None,
-        });
+    // Bounded — a client cannot grow the session without limit, and past the
+    // cap it is TOLD so (`DC-m`), rather than told no session is recording.
+    let cap = control_ofc_daemon::constants::VALIDATION_MAX_EXTERNAL_MEASUREMENTS;
+    let outcomes: Vec<AppendOutcome> = (0..cap + 50)
+        .map(|i| {
+            engine.add_measurement(ExternalMeasurement {
+                unix_ms: i as u64,
+                kind: "pwm_duty_pct".into(),
+                value: 50.0,
+                unit: "%".into(),
+                member_id: None,
+                note: None,
+            })
+        })
+        .collect();
+    assert_eq!(engine.snapshot().unwrap().external_measurements.len(), cap);
+    // One was added above, so the loop's first `cap - 1` land and the rest are full.
+    assert!(outcomes[..cap - 1]
+        .iter()
+        .all(|o| *o == AppendOutcome::Recorded));
+    assert!(outcomes[cap - 1..]
+        .iter()
+        .all(|o| *o == AppendOutcome::Full { limit: cap }));
+}
+
+/// `DC-m`: a marker past the event cap is reported as not recorded. The engine
+/// used to drop it and answer `true`, which the route turned into
+/// `200 {"recorded": true}`.
+#[test]
+fn a_marker_past_the_event_cap_is_reported_full_not_recorded() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let ctx = test_context();
+    engine.start(unique_session("event-cap"), &ctx).unwrap();
+
+    let cap = control_ofc_daemon::constants::VALIDATION_MAX_EVENTS;
+    let mut recorded = 0;
+    while engine.push_event(EV_USER_MARKER, None, None) == AppendOutcome::Recorded {
+        recorded += 1;
+        assert!(recorded <= cap, "the event cap must bind");
     }
-    assert_eq!(
-        engine.snapshot().unwrap().external_measurements.len(),
-        control_ofc_daemon::constants::VALIDATION_MAX_EXTERNAL_MEASUREMENTS
+    assert!(
+        recorded > 0,
+        "precondition: markers were recorded before the cap"
     );
+    assert_eq!(engine.snapshot().unwrap().events.len(), cap);
+    assert_eq!(
+        engine.push_event(EV_USER_MARKER, Some("late".into()), None),
+        AppendOutcome::Full { limit: cap }
+    );
+    assert_eq!(engine.snapshot().unwrap().events.len(), cap);
 }
 
 // ── Interleavings (added after the DEC-317 concurrency review) ──────────────

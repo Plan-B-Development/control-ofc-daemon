@@ -6,7 +6,7 @@
 
 use std::time::Instant;
 
-use crate::health::state::DaemonState;
+use crate::health::state::{DaemonState, SkipReason, SkippedControl};
 
 /// Status level for a subsystem or overall health.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -412,9 +412,11 @@ fn poll_subsystem_health(
 ///
 /// A live engine ticking on schedule over a control whose curve will not resolve
 /// is a healthy `engine` entry and an unhealthy machine: nothing is commanding
-/// those fans, they hold their last duty indefinitely (DEC-269), and until this
-/// entry existed `/status.overall_status` stayed `"ok"` throughout. The GUI
-/// ribbon, Dashboard and System State all read that rollup, so the only signals
+/// those fans, they hold their last duty indefinitely (DEC-269) — or, for a
+/// `backend_unavailable` control, were never this daemon's to command, which is
+/// why [`controls_reason`] words the two apart — and until this entry existed
+/// `/status.overall_status` stayed `"ok"` throughout. The GUI ribbon, Dashboard
+/// and System State all read that rollup, so the only signals
 /// were one journal WARN and a Controls-card chip — itself suppressed while a
 /// Manual or External override is showing.
 ///
@@ -459,13 +461,40 @@ fn controls_health(state: &DaemonState, now: Instant) -> SubsystemHealth {
         );
     };
 
-    let n = state.skipped_controls.len();
-    let noun = if n == 1 { "control" } else { "controls" };
     entry(
         HealthStatus::Warn,
-        format!("{n} {noun} not being commanded — their fans hold their last speed"),
+        controls_reason(&state.skipped_controls),
         Some(age),
     )
+}
+
+/// The `controls` reason, worded per skip reason (`DC-k`).
+///
+/// Every reason but one names a control the daemon WAS driving and has stopped
+/// driving, so its fans hold what they were last told (DEC-269). A
+/// `backend_unavailable` control's fans were never this daemon's to hold — a
+/// read-only header runs on its firmware, an absent OpenFan on nothing — so
+/// saying they hold their last speed would be false for exactly that case. The
+/// GUI's per-control tooltip draws the same line (DEC-412).
+fn controls_reason(skipped: &[SkippedControl]) -> String {
+    let n = skipped.len();
+    let undeliverable = skipped
+        .iter()
+        .filter(|c| c.reason == SkipReason::BackendUnavailable)
+        .count();
+    let holding = n - undeliverable;
+    let noun = if n == 1 { "control" } else { "controls" };
+    let tail = match (holding, undeliverable) {
+        (_, 0) => "their fans hold their last speed".to_string(),
+        (0, _) => "their fans' speed is up to the hardware, not this daemon".to_string(),
+        (h, u) => format!(
+            "{h} {} {} fans' last speed, {u} {} fans this daemon cannot drive",
+            if h == 1 { "holds" } else { "hold" },
+            if h == 1 { "its" } else { "their" },
+            if u == 1 { "has" } else { "have" },
+        ),
+    };
+    format!("{n} {noun} not being commanded — {tail}")
 }
 
 /// Compute the health summary for the daemon.
@@ -973,6 +1002,84 @@ mod tests {
             controls.reason.starts_with("2 controls"),
             "the count must be plural and accurate: {}",
             controls.reason
+        );
+    }
+
+    fn skipped(id: &str, reason: SkipReason, now: Instant) -> SkippedControl {
+        SkippedControl {
+            control_id: id.into(),
+            control_name: id.into(),
+            reason,
+            since: now - Duration::from_secs(10),
+        }
+    }
+
+    /// `DC-k`: a `backend_unavailable` control's fans were never commanded by
+    /// this daemon, so "their fans hold their last speed" is false for it. This
+    /// arm is the one the old single sentence could not produce.
+    #[test]
+    fn a_backend_unavailable_control_does_not_claim_its_fans_hold_their_speed() {
+        let now = Instant::now();
+        let mut state = state_with_live_engine(now);
+        state.skipped_controls = vec![skipped("ofn", SkipReason::BackendUnavailable, now)];
+
+        let reason = controls_health(&state, now).reason;
+        assert_eq!(
+            reason,
+            "1 control not being commanded — their fans' speed is up to the hardware, \
+             not this daemon"
+        );
+        assert!(!reason.contains("last speed"), "{reason}");
+    }
+
+    /// The four curve-resolution reasons keep the hold wording — those fans were
+    /// commanded and hold their last duty (DEC-269).
+    #[test]
+    fn curve_resolution_skips_keep_the_hold_wording() {
+        let now = Instant::now();
+        let mut state = state_with_live_engine(now);
+        state.skipped_controls = [
+            SkipReason::CurveNotFound,
+            SkipReason::SensorUnavailable,
+            SkipReason::MixUnresolvable,
+            SkipReason::SyncUnresolvable,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| skipped(&format!("c{i}"), r, now))
+        .collect();
+
+        assert_eq!(
+            controls_health(&state, now).reason,
+            "4 controls not being commanded — their fans hold their last speed"
+        );
+    }
+
+    /// A mix says how many of each, with singular and plural agreeing per count.
+    #[test]
+    fn a_mix_of_reasons_is_counted_per_kind() {
+        let now = Instant::now();
+        let mut state = state_with_live_engine(now);
+        state.skipped_controls = vec![
+            skipped("a", SkipReason::CurveNotFound, now),
+            skipped("b", SkipReason::SensorUnavailable, now),
+            skipped("c", SkipReason::BackendUnavailable, now),
+        ];
+        assert_eq!(
+            controls_health(&state, now).reason,
+            "3 controls not being commanded — 2 hold their fans' last speed, \
+             1 has fans this daemon cannot drive"
+        );
+
+        state.skipped_controls = vec![
+            skipped("a", SkipReason::CurveNotFound, now),
+            skipped("b", SkipReason::BackendUnavailable, now),
+            skipped("c", SkipReason::BackendUnavailable, now),
+        ];
+        assert_eq!(
+            controls_health(&state, now).reason,
+            "3 controls not being commanded — 1 holds its fans' last speed, \
+             2 have fans this daemon cannot drive"
         );
     }
 

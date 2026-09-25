@@ -2,6 +2,36 @@
 
 ## [Unreleased]
 
+## [2.56.2] — 2026-09-25
+
+### Fixed
+
+**A validation session that is full now says so** (DEC-426). A session keeps up to 4096 events
+and 512 external measurements. Past those caps, `POST /validation/session/event` answered
+`200 {"recorded": true}` for a marker it had dropped, and `POST /validation/session/measurement`
+answered `404` "no validation session is recording" while one was. Both now answer
+`409 session_full` (not retryable), with the cap in `details.limit`, and nothing is appended. The
+`404` is kept for a session that is not recording. This is a new error code: a client that does not
+know it can show the message.
+
+**A missing resource no longer reports a missing endpoint** (DEC-426). The handlers that answer
+`404 not_found` when a session, run or cooling device does not exist all prefixed their message
+with "endpoint not found:". Only the unknown-route fallback says that now. The others send
+their own message, such as "no stall probe has run". The code is still `not_found` in both cases.
+
+**The `controls` health reason no longer says every skipped control holds its fans' speed**
+(DEC-426). A `backend_unavailable` control's fans were never driven by the daemon, so for them the
+reason now says their speed is up to the hardware. When the reasons are mixed, it gives a count
+for each.
+
+### Documentation
+
+**An OpenFan stop is not limited to 8 seconds.** The user guide and developer handover said a 0%
+OpenFan command is refused after 8 seconds. It is not: a repeated 0% is never re-sent, so a stop
+lasts as long as it is commanded. `limits.openfan_stop_timeout_s` bounds only a check that no
+normal sequence of commands reaches. The GUI contract (`docs/08` in the GUI repository) is
+corrected in the same change, including which success responses carry `api_version`.
+
 ## [2.56.1] — 2026-09-25
 
 ### Fixed

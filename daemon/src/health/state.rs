@@ -242,8 +242,10 @@ pub enum SkipReason {
     ///
     /// Raised only when EVERY member is undeliverable. A control with one live
     /// member and one dead one is still commanding fans, and `/status`'s contract
-    /// for this list is "nothing is commanded and its fans hold their last
-    /// speed" — listing a partly-live control would make that false.
+    /// for this list is "nothing is commanded" — listing a partly-live control
+    /// would make that false. (Its fans do not "hold their last speed": this
+    /// daemon never commanded them, which is why the `controls` health reason
+    /// words this reason apart from the other four — `DC-k`.)
     BackendUnavailable,
 }
 

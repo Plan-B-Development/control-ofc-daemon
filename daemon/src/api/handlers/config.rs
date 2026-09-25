@@ -1627,7 +1627,7 @@ pub async fn delete_cooling_device_handler(
     if !runtime.remove_cooling_device(&id) {
         return error_response(
             StatusCode::NOT_FOUND,
-            &ErrorEnvelope::not_found(&format!("no cooling device with id: {id}")),
+            &ErrorEnvelope::not_found(format!("no cooling device with id: {id}")),
         );
     }
 

@@ -352,8 +352,11 @@ pub async fn capabilities_handler(
             // Legacy floor fields removed — thermal safety centralized.
             // Derived from the constant the stop path actually uses, not a
             // literal: a hardcoded 8 here silently drifts the moment
-            // STOP_TIMEOUT changes, and clients size their identify/stop UI
-            // timeouts from this advertised value.
+            // STOP_TIMEOUT changes. It does NOT bound a held stop: a repeated 0%
+            // coalesces before the timeout is checked (CONC-2), so a stop lasts
+            // as long as it is commanded, and the timer only refuses a wire-bound
+            // 0% against a stop no normal sequence leaves running — defence in
+            // depth (`DC-b`). No client needs to size anything from it.
             // Saturating rather than `as u8`: a raw cast would silently wrap a
             // future STOP_TIMEOUT above 255 s into a tiny advertised value.
             openfan_stop_timeout_s: u8::try_from(crate::constants::STOP_TIMEOUT.as_secs())
@@ -462,6 +465,6 @@ pub async fn history_handler(
 pub async fn fallback_handler(uri: axum::http::Uri) -> (StatusCode, Json<ErrorEnvelope>) {
     (
         StatusCode::NOT_FOUND,
-        Json(ErrorEnvelope::not_found(uri.path())),
+        Json(ErrorEnvelope::route_not_found(uri.path())),
     )
 }
