@@ -34,6 +34,25 @@ use crate::hwmon::pwm_discovery::PwmHeaderDescriptor;
 /// every driver family (`hwmon::handback`, DEC-382).
 const PWM_ENABLE_MANUAL: &str = "1";
 
+/// hwmon `name`s whose driver sends EVERY channel's duty in every write, taken
+/// from a driver-side cache that starts at 0 (DEC-425, `BRD-d`).
+///
+/// `arctic_fan_controller.c` (mainline 7.2 / 7.3): each `pwmN` write builds one
+/// OUT report carrying all ten channels — the written one at its new duty, the
+/// other nine at `pwm_duty[i]` — and that cache is `devm_kzalloc`-zeroed at
+/// probe and `memset` to 0 in `reset_resume`. The device is manual-only, so a
+/// report is obeyed as sent. The FIRST write to one channel after probe or
+/// resume therefore commands 0 % on every channel not written since, and
+/// reading `pwmN` back returns the cache, not the device. A change queued for
+/// 7.4 starts the cache at 40 %; a cache reading 40 is not a zero nobody chose,
+/// so it is left alone.
+const SHARED_REPORT_CHIPS: &[&str] = &["arctic_fan"];
+
+/// What a sibling channel whose cached duty is an unchosen 0 is set to before
+/// the write that would send that 0 (DEC-425): full speed — the fallback this
+/// codebase uses for any duty nobody chose (`pwm::exit_duty`, `fancontrol`).
+const PRIME_PCT: u8 = 100;
+
 use crate::pwm::{percent_to_raw, raw_to_percent};
 
 /// Result of a successful PWM write.
@@ -359,6 +378,15 @@ pub struct HwmonPwmController {
     /// mutex the floor ran under, so there is no window between a check and a
     /// write. Raising is never refused: a forced 100 % still lands.
     exit_min: HashMap<String, u8>,
+    /// Shared-report devices (DEC-425) whose priming is suspended, by hwmon
+    /// directory: a priming write failed, and none of the device's writes has
+    /// succeeded since. Such a device is not answering, and its driver commits
+    /// a duty to its cache only on the device's ACK, so a further prime would
+    /// wait the driver's 1 s ACK timeout for nothing — nine times per write,
+    /// under this controller's lock, ahead of the thermal force's motherboard
+    /// headers (DEC-425 review, concurrency P1 / security P2). Cleared by the
+    /// next write to that device that succeeds, which then primes the rest.
+    priming_suspended: std::collections::HashSet<std::path::PathBuf>,
 }
 
 /// One header's exit-floor write (DEC-388), for the caller's report.
@@ -397,6 +425,7 @@ impl HwmonPwmController {
             handback,
             exit_record: HashMap::new(),
             exit_min: HashMap::new(),
+            priming_suspended: std::collections::HashSet::new(),
         }
     }
 
@@ -440,11 +469,16 @@ impl HwmonPwmController {
             let result = if was_pct == Some(target_pct) {
                 None
             } else {
+                // DEC-425: the floor's own write is a write like any other.
+                self.prime_shared_report_siblings(&header_id);
                 let written = self
                     .writer
                     .write_file(&pwm_path, &percent_to_raw(target_pct).to_string());
                 self.exit_record
                     .insert(header_id.clone(), written.is_ok().then_some(target_pct));
+                if written.is_ok() {
+                    self.resume_priming_after_success(&header_id);
+                }
                 // Keep the coalesce truthful: once the floor has landed, a late
                 // command the latch raises to the same duty writes nothing.
                 if let Some(ws) = self.write_state.get_mut(&header_id) {
@@ -910,6 +944,11 @@ impl HwmonPwmController {
             }
             return Err(refused);
         }
+        // [SAFETY] DEC-425 (`BRD-d`): on a device whose driver sends every
+        // channel in each write, this write would also command each sibling's
+        // cached duty — 0 after probe or resume — so set any sibling holding an
+        // unchosen 0 to full speed first. A no-op on every other chip.
+        self.prime_shared_report_siblings(header_id);
         if let Err(e) = self.writer.write_file(&pwm_path, &raw.to_string()) {
             if let Some(ws) = self.write_state.get_mut(header_id) {
                 // [SAFETY] `TS-au` (DEC-420): a failed write may still have
@@ -939,6 +978,9 @@ impl HwmonPwmController {
             self.exit_record
                 .insert(header_id.to_string(), Some(effective_pct));
         }
+        // DEC-425: a device that answers again has its priming resumed — at
+        // once, if a failed prime had suspended it.
+        self.resume_priming_after_success(header_id);
 
         // Verify write: read back and compare (best-effort). On mismatch,
         // increment a per-header counter so the discrepancy is observable
@@ -1045,6 +1087,136 @@ impl HwmonPwmController {
             )));
         }
         Ok(())
+    }
+
+    /// [SAFETY] DEC-425 (`BRD-d`): set to [`PRIME_PCT`] every writable SIBLING
+    /// channel of `header_id` — same device, i.e. the same hwmon directory —
+    /// whose cached duty reads 0 and which the daemon did not itself command to
+    /// 0. Called before each write to `header_id`, and right after one when a
+    /// suspended device answers again ([`Self::resume_priming_after_success`]).
+    /// Only on [`SHARED_REPORT_CHIPS`]: there, every write sends each sibling's
+    /// cache as that sibling's command, so an unwritten sibling would be stopped.
+    ///
+    /// "Commanded to 0" is `write_state`'s `last_commanded_pct`: a zero the
+    /// daemon itself last wrote there (a curve at 0 %, a zero-RPM member) is
+    /// kept, and a zero from a probe or a resume is not. `write_state` is cleared
+    /// only when a profile is DEACTIVATED (`on_lease_released`); activating one
+    /// profile over another keeps it, so a 0 the previous profile chose stays
+    /// until then — as it did before DEC-425. Once the exit floor has latched a
+    /// header (`exit_min`), its zero is no longer a live choice and is primed
+    /// like any other. The rule is a readback, so it re-arms by itself after a
+    /// resume zeroes the cache — nothing has to detect the resume.
+    ///
+    /// **A device that stops answering is not primed again** until one of its
+    /// writes succeeds ([`Self::priming_suspended`]): the batch stops at the
+    /// first failed write, because the driver commits a duty only on the
+    /// device's ACK — a prime that timed out changed nothing, and nine more
+    /// would each wait the full timeout. A dead device therefore costs one
+    /// failed priming write, then none; a call sees two only if the device
+    /// fails one, answers the write, and fails the catch-up.
+    ///
+    /// Each priming write is itself one of the device's ten-channel reports, so
+    /// the first one of a batch still sends 0 to the siblings not yet primed —
+    /// for as long as the batch takes (the driver waits for each report's ACK,
+    /// measured at up to ~0.56 s). That transient is inherent to the driver; this
+    /// bounds it to one batch per probe or resume instead of leaving the channels
+    /// at 0. A sibling whose cache cannot be read is left alone, and a failed
+    /// priming write records its duty as unknown, which the exit floor raises to
+    /// full speed.
+    fn prime_shared_report_siblings(&mut self, header_id: &str) {
+        let Some(target) = self.headers.get(header_id) else {
+            return;
+        };
+        if !SHARED_REPORT_CHIPS.contains(&target.chip_name.as_str()) {
+            return;
+        }
+        let device_dir = std::path::Path::new(&target.pwm_path)
+            .parent()
+            .map(std::path::Path::to_path_buf);
+        let Some(device_dir) = device_dir else {
+            return;
+        };
+        if self.priming_suspended.contains(&device_dir) {
+            return;
+        }
+        let mut siblings: Vec<(String, String)> = self
+            .headers
+            .values()
+            .filter(|h| {
+                h.id != header_id
+                    && h.is_writable
+                    && std::path::Path::new(&h.pwm_path).parent() == Some(device_dir.as_path())
+            })
+            .map(|h| (h.id.clone(), h.pwm_path.clone()))
+            .collect();
+        siblings.sort();
+        for (sibling_id, sibling_path) in siblings {
+            let cached = self
+                .writer
+                .read_file(&sibling_path)
+                .ok()
+                .and_then(|s| s.trim().parse::<u8>().ok());
+            if cached != Some(0) {
+                continue;
+            }
+            // A zero the exit floor has since latched above is no longer chosen
+            // (DEC-425 review, security P3).
+            let chosen_zero = self
+                .write_state
+                .get(&sibling_id)
+                .and_then(|ws| ws.last_commanded_pct)
+                == Some(0)
+                && self.exit_min.get(&sibling_id).is_none_or(|m| *m == 0);
+            if chosen_zero {
+                continue;
+            }
+            let written = self
+                .writer
+                .write_file(&sibling_path, &percent_to_raw(PRIME_PCT).to_string());
+            match written {
+                Ok(()) => {
+                    log::info!(
+                        "hwmon {sibling_id}: set to {PRIME_PCT} % for a write to {header_id} — \
+                         this driver sends every channel in each write, and this one's cached \
+                         duty was an unchosen 0 (after probe or resume; DEC-425)"
+                    );
+                    self.exit_record.insert(sibling_id, Some(PRIME_PCT));
+                }
+                Err(e) => {
+                    // Logged once per episode: the suspension below stops the
+                    // next write from trying — and logging — again.
+                    log::warn!(
+                        "hwmon {sibling_id}: could not set it to {PRIME_PCT} % for a write to \
+                         {header_id} ({e}). The device is not answering, so its channels are \
+                         not primed again until one of its writes succeeds; until then a \
+                         write may command its unprimed channels to 0 (DEC-425)"
+                    );
+                    self.exit_record.insert(sibling_id, None);
+                    self.priming_suspended.insert(device_dir);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// DEC-425: a successful write to a shared-report device shows it is
+    /// answering. If its priming was suspended, the suspension is lifted and
+    /// the siblings are primed NOW, not at the device's next write: this write
+    /// sent each unprimed sibling its cached 0, and the engine coalesces an
+    /// unchanged duty, so the next write here may not come until a curve moves.
+    fn resume_priming_after_success(&mut self, header_id: &str) {
+        let Some(h) = self.headers.get(header_id) else {
+            return;
+        };
+        if !SHARED_REPORT_CHIPS.contains(&h.chip_name.as_str()) {
+            return;
+        }
+        let Some(dir) = std::path::Path::new(&h.pwm_path).parent() else {
+            return;
+        };
+        if self.priming_suspended.remove(dir) {
+            self.prime_shared_report_siblings(header_id);
+        }
     }
 
     /// Called when a lease is released. Resets coalescing state so the next
@@ -3878,5 +4050,345 @@ mod tests {
         ctrl.set_pwm("h1", 40, &lease).unwrap();
         assert_eq!(sysfs.duty_writes(), before + 1);
         assert_eq!(published(&cache).corrections, 1);
+    }
+
+    // ── DEC-425 (`BRD-d`): a driver that sends every channel in each write ──
+
+    /// A model of `arctic_fan_controller.c` (v7.2): ten channels in one device
+    /// directory. Every `pwmN` write sends ONE report carrying all ten duties —
+    /// the written one new, the other nine from a cache that starts at 0 — then
+    /// commits the written duty to the cache; `pwmN` reads the cache, not the
+    /// device. `reports` is what the device was told, in order.
+    ///
+    /// A write to a channel in `refused` is not ACKed: it fails and commits
+    /// nothing, as the driver commits only on ACK (after a 1 s timeout on real
+    /// hardware). Per channel so a test can fail one write in a batch; a device
+    /// that has stopped answering is every channel. `attempts` is every write
+    /// tried, ACKed or not, by channel index.
+    struct ArcticFake {
+        cache: Arc<Mutex<[u8; 10]>>,
+        reports: Arc<Mutex<Vec<[u8; 10]>>>,
+        refused: Arc<Mutex<std::collections::HashSet<usize>>>,
+        attempts: Arc<Mutex<Vec<usize>>>,
+    }
+
+    const ARCTIC_DIR: &str = "/sys/class/hwmon/hwmon7";
+
+    fn arctic_channel(path: &str) -> Option<usize> {
+        let n: usize = path
+            .strip_prefix(ARCTIC_DIR)?
+            .strip_prefix("/pwm")?
+            .parse()
+            .ok()?;
+        (1..=10).contains(&n).then(|| n - 1)
+    }
+
+    impl SysfsWriter for ArcticFake {
+        fn write_file(&mut self, path: &str, value: &str) -> Result<(), HwmonError> {
+            let ch = arctic_channel(path).expect("only pwmN is written on this device");
+            let duty: u8 = value.trim().parse().expect("a raw duty");
+            self.attempts.lock().push(ch);
+            if self.refused.lock().contains(&ch) {
+                return Err(HwmonError::WriteError {
+                    path: path.to_string(),
+                    message: "Connection timed out (os error 110)".to_string(),
+                });
+            }
+            let mut cache = self.cache.lock();
+            let mut report = *cache;
+            report[ch] = duty;
+            self.reports.lock().push(report);
+            cache[ch] = duty;
+            Ok(())
+        }
+
+        fn read_file(&self, path: &str) -> Result<String, HwmonError> {
+            match arctic_channel(path) {
+                Some(ch) => Ok(format!("{}\n", self.cache.lock()[ch])),
+                None => Err(HwmonError::ReadError {
+                    path: path.to_string(),
+                    message: "not modelled".to_string(),
+                }),
+            }
+        }
+    }
+
+    fn arctic_header(n: u8) -> PwmHeaderDescriptor {
+        PwmHeaderDescriptor {
+            id: format!("hwmon:arctic_fan:0003:3904:F001.0001:pwm{n}:pwm{n}"),
+            label: format!("pwm{n}"),
+            chip_name: "arctic_fan".to_string(),
+            device_id: "0003:3904:F001.0001".to_string(),
+            pwm_index: n,
+            supports_enable: false,
+            pwm_path: format!("{ARCTIC_DIR}/pwm{n}"),
+            enable_path: None,
+            rpm_available: false,
+            rpm_path: None,
+            ..make_header("x", "x", 0)
+        }
+    }
+
+    fn arctic_id(n: u8) -> String {
+        arctic_header(n).id
+    }
+
+    struct ArcticRig {
+        ctrl: HwmonPwmController,
+        cache: Arc<Mutex<[u8; 10]>>,
+        reports: Arc<Mutex<Vec<[u8; 10]>>>,
+        refused: Arc<Mutex<std::collections::HashSet<usize>>>,
+        attempts: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl ArcticRig {
+        fn stop_answering(&self) {
+            self.refused.lock().extend(0..10);
+        }
+
+        fn answer_again(&self) {
+            self.refused.lock().clear();
+        }
+    }
+
+    fn arctic_rig() -> ArcticRig {
+        let cache = Arc::new(Mutex::new([0u8; 10]));
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let refused = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let writer = ArcticFake {
+            cache: cache.clone(),
+            reports: reports.clone(),
+            refused: refused.clone(),
+            attempts: attempts.clone(),
+        };
+        let ctrl = HwmonPwmController::new(
+            (1..=10).map(arctic_header).collect(),
+            LeaseManager::new(),
+            Box::new(writer),
+            Arc::new(StateCache::new()),
+        );
+        ArcticRig {
+            ctrl,
+            cache,
+            reports,
+            refused,
+            attempts,
+        }
+    }
+
+    /// [SAFETY] DEC-425: the first write to one channel after probe must not
+    /// command the other nine to 0 and leave them there — the profile that
+    /// controls one ARCTIC channel used to stop every fan on the other nine.
+    #[test]
+    fn a_first_write_to_one_arctic_channel_primes_the_others_to_full_speed() {
+        let mut rig = arctic_rig();
+        let lease = engine_lease(&mut rig.ctrl);
+        rig.ctrl.set_pwm(&arctic_id(1), 30, &lease).unwrap();
+
+        let cache = *rig.cache.lock();
+        assert_eq!(
+            cache[0],
+            percent_to_raw(30),
+            "the written channel holds its duty"
+        );
+        for (i, duty) in cache.iter().enumerate().skip(1) {
+            assert_eq!(
+                *duty,
+                percent_to_raw(PRIME_PCT),
+                "channel {} was left at {duty}",
+                i + 1
+            );
+        }
+        // Once a channel is primed, no later report sends it 0 again.
+        let reports = rig.reports.lock().clone();
+        for ch in 1..10 {
+            let first = reports
+                .iter()
+                .position(|r| r[ch] == percent_to_raw(PRIME_PCT))
+                .expect("every sibling is primed");
+            assert!(
+                reports[first..].iter().all(|r| r[ch] != 0),
+                "channel {} fell back to 0",
+                ch + 1
+            );
+        }
+    }
+
+    /// The opposite branch: a 0 the current profile chose — a curve at 0 %, a
+    /// zero-RPM member — is kept, not "primed" away.
+    #[test]
+    fn a_zero_the_current_profile_chose_is_left_at_zero() {
+        let mut rig = arctic_rig();
+        let lease = engine_lease(&mut rig.ctrl);
+        rig.ctrl.set_pwm(&arctic_id(2), 0, &lease).unwrap();
+        rig.ctrl.set_pwm(&arctic_id(1), 30, &lease).unwrap();
+
+        let cache = *rig.cache.lock();
+        assert_eq!(
+            cache[1], 0,
+            "channel 2's chosen 0 must survive the write to channel 1"
+        );
+        assert_eq!(cache[0], percent_to_raw(30));
+        assert!(
+            cache[2..].iter().all(|d| *d == percent_to_raw(PRIME_PCT)),
+            "{cache:?}"
+        );
+    }
+
+    /// `reset_resume` zeroes the driver's cache; the rule is a readback, so the
+    /// next write re-primes without anything having to detect the resume.
+    #[test]
+    fn after_a_resume_zeroes_the_cache_the_next_write_primes_again() {
+        let mut rig = arctic_rig();
+        let lease = engine_lease(&mut rig.ctrl);
+        rig.ctrl.set_pwm(&arctic_id(1), 30, &lease).unwrap();
+        *rig.cache.lock() = [0; 10];
+        rig.ctrl.set_pwm(&arctic_id(1), 35, &lease).unwrap();
+
+        let cache = *rig.cache.lock();
+        assert_eq!(cache[0], percent_to_raw(35));
+        assert!(
+            cache[1..].iter().all(|d| *d == percent_to_raw(PRIME_PCT)),
+            "{cache:?}"
+        );
+    }
+
+    /// The exit floor's own write is a ten-channel report too: after a resume
+    /// has zeroed the cache, raising channel 1 to the floor must not stop the
+    /// others on the way out.
+    #[test]
+    fn the_exit_floor_primes_before_its_own_write() {
+        let mut rig = arctic_rig();
+        let lease = engine_lease(&mut rig.ctrl);
+        rig.ctrl.set_pwm(&arctic_id(1), 30, &lease).unwrap();
+        *rig.cache.lock() = [0; 10];
+        rig.ctrl.apply_exit_floor(40);
+
+        let cache = *rig.cache.lock();
+        assert_eq!(cache[0], percent_to_raw(40), "the floor raised channel 1");
+        assert!(
+            cache[1..].iter().all(|d| *d == percent_to_raw(PRIME_PCT)),
+            "{cache:?}"
+        );
+    }
+
+    /// Only a shared-report chip is primed: an ordinary chip's sibling that
+    /// reads 0 is left alone, and only the written header is touched.
+    #[test]
+    fn a_chip_that_writes_one_channel_at_a_time_is_never_primed() {
+        let (writer, writes) = MockSysfsWriter::new();
+        let writer = writer.with_file("/sys/class/hwmon/hwmon0/pwm3", "0\n");
+        let mut ctrl = HwmonPwmController::new(
+            vec![no_mode_header("a", 2), no_mode_header("b", 3)],
+            LeaseManager::new(),
+            Box::new(writer),
+            Arc::new(StateCache::new()),
+        );
+        let lease = engine_lease(&mut ctrl);
+        ctrl.set_pwm("a", 30, &lease).unwrap();
+
+        let written: Vec<String> = writes.lock().iter().map(|(p, _)| p.clone()).collect();
+        assert!(
+            !written.is_empty(),
+            "precondition: the header itself was written"
+        );
+        assert!(
+            written.iter().all(|p| p.ends_with("/pwm2")),
+            "an it8696 sibling was written: {written:?}"
+        );
+    }
+
+    /// [SAFETY] DEC-425 review (concurrency P1): a device that has stopped
+    /// answering costs ONE failed priming write, not nine per write — each
+    /// waits the driver's 1 s ACK timeout under this controller's lock, ahead
+    /// of the thermal force's motherboard headers. And it is not primed again
+    /// while it stays silent.
+    #[test]
+    fn a_device_that_stops_answering_costs_one_failed_prime_then_none() {
+        let mut rig = arctic_rig();
+        let lease = engine_lease(&mut rig.ctrl);
+        rig.stop_answering();
+
+        assert!(rig.ctrl.set_pwm(&arctic_id(1), 30, &lease).is_err());
+        let first = rig.attempts.lock().clone();
+        assert_eq!(
+            first.len(),
+            2,
+            "one prime, then the write itself: {first:?}"
+        );
+        assert_ne!(first[0], 0, "the first attempt was a sibling's prime");
+        assert_eq!(first[1], 0, "then channel 1's own write");
+        // A prime that failed leaves that channel's duty unknown, which the
+        // exit floor raises to full speed.
+        let failed = arctic_id(first[0] as u8 + 1);
+        assert_eq!(rig.ctrl.exit_record.get(&failed), Some(&None));
+
+        rig.attempts.lock().clear();
+        assert!(rig.ctrl.set_pwm(&arctic_id(1), 30, &lease).is_err());
+        assert_eq!(
+            *rig.attempts.lock(),
+            vec![0],
+            "no prime is tried while the device stays silent"
+        );
+    }
+
+    /// [SAFETY] The other side of the suspension: once the device answers
+    /// again, its channels are primed by that same write — not left at the 0
+    /// it just sent them until some later write, which a steady duty never
+    /// makes, as the coalesced tick below shows.
+    #[test]
+    fn a_device_that_answers_again_is_primed_by_that_write() {
+        let mut rig = arctic_rig();
+        let lease = engine_lease(&mut rig.ctrl);
+        rig.stop_answering();
+        assert!(rig.ctrl.set_pwm(&arctic_id(1), 30, &lease).is_err());
+
+        rig.answer_again();
+        rig.ctrl.set_pwm(&arctic_id(1), 30, &lease).unwrap();
+        let cache = *rig.cache.lock();
+        assert_eq!(cache[0], percent_to_raw(30));
+        assert!(
+            cache[1..].iter().all(|d| *d == percent_to_raw(PRIME_PCT)),
+            "{cache:?}"
+        );
+
+        let tried = rig.attempts.lock().len();
+        rig.ctrl.set_pwm(&arctic_id(1), 30, &lease).unwrap();
+        assert_eq!(
+            rig.attempts.lock().len(),
+            tried,
+            "an unchanged duty coalesces, so no later write would have primed them"
+        );
+    }
+
+    /// [SAFETY] DEC-425 review (security P3): a 0 the profile chose stops
+    /// being a choice once the exit floor latches that channel above it. If the
+    /// floor could not write the channel, a later write to the device must not
+    /// keep sending it 0.
+    #[test]
+    fn a_chosen_zero_the_exit_floor_latched_above_is_primed() {
+        let mut rig = arctic_rig();
+        let lease = engine_lease(&mut rig.ctrl);
+        rig.ctrl.set_pwm(&arctic_id(2), 0, &lease).unwrap();
+        rig.ctrl.set_pwm(&arctic_id(1), 30, &lease).unwrap();
+        assert_eq!(
+            rig.cache.lock()[1],
+            0,
+            "precondition: channel 2 holds its chosen 0"
+        );
+
+        // The floor latches channel 2 at 40 %, and every write to it fails.
+        rig.refused.lock().insert(1);
+        rig.ctrl.apply_exit_floor(40);
+        assert_eq!(
+            rig.cache.lock()[1],
+            0,
+            "precondition: the floor could not raise channel 2"
+        );
+        rig.answer_again();
+
+        rig.ctrl.set_pwm(&arctic_id(1), 50, &lease).unwrap();
+        assert_eq!(rig.cache.lock()[1], percent_to_raw(PRIME_PCT));
     }
 }

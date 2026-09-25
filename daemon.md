@@ -60,7 +60,7 @@ daemon/src/
     classify.rs        — refines each temp sensor's CPU/motherboard classification for the inventory (DEC-200)
     readiness.rs       — turns the inventory into an actionable hardware-readiness list (DEC-200)
     pwm_discovery.rs   — PWM header discovery (fan outputs)
-    pwm_control.rs     — HwmonPwmController + SysfsWriter trait; write coalescing with engine duty reconciliation (DEC-073/DEC-406)
+    pwm_control.rs     — HwmonPwmController + SysfsWriter trait; write coalescing with engine duty reconciliation (DEC-073/DEC-406); shared-report sibling priming (DEC-425)
     lease.rs           — LeaseManager (exclusive write access)
     aio.rs             — liquid-cooler (AIO/custom-loop) recognition: coolant-sensor + is_aio flag + aio_hwmon cap (DEC-156)
     roles.rs           — per-channel header role inference + resolution, and THE
@@ -249,6 +249,22 @@ it asked for — and the thermal force is unaffected, because it clears
 `manual_mode_set` first (`forget_manual_mode`) and so never coalesces. Both
 figures are published through the cache on every hwmon `/fans` and `/poll` entry
 (`duty_corrections`, `duty_not_holding`), gated by `control.duty_reconciliation`.
+
+**A write to one channel of a shared-report chip primes the others (DEC-425).** The
+`arctic_fan` driver (`SHARED_REPORT_CHIPS`) sends all ten channels in every write,
+filling the ones not being written from a cache that is 0 at probe and after resume,
+so a write to one channel used to command 0 % on the other nine. Before each write to
+such a header — in `set_pwm`, which the engine, overrides, identify, every diagnostic
+and the thermal force all reach, and in `apply_exit_floor` — the controller sets to
+100 % every sibling (same hwmon directory) whose cache reads 0, unless the daemon last
+commanded that sibling to 0 itself and the exit floor has not latched it above that.
+It is a readback, so it re-arms by itself after a resume. The batch stops at the
+first write the device does not answer, and that device is not primed again until
+one of its writes succeeds; that write then primes the rest at once, because an
+unchanged duty coalesces and the next write may be long in coming. A dead device
+therefore costs one failed priming write (the driver's 1 s ACK timeout), not nine on
+every write. On a healthy device the first write after probe or resume carries up to
+nine extra reports (up to ~0.56 s each), under the controller lock.
 
 ## Startup Sequence — OpenFan adoption (DEC-291 / DEC-361)
 
@@ -573,7 +589,9 @@ gating each have their own register rows and regression tests.
     wedged in `write(2)` still lands when the driver lets it; `ExecStopPost`
     replays the record for that. A failed floor write, like a failed `set_pwm`
     duty write, leaves the next command to be written rather than coalesced
-    (`TS-au`).
+    (`TS-au`). On `arctic_fan` each floor write primes the device's unwritten
+    channels first (DEC-425), so on a device whose cache a resume zeroed since the
+    daemon's last write the step can outlast its 3 s bound (`BRD-t`).
 
 12. **The stall/restart probe is the one diagnostic below 20 %** (`api::stall_probe`,
     DEC-407). Every other diagnostic clamps to `max(20, header floor)`, and still does.

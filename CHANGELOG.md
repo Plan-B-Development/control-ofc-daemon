@@ -4,6 +4,17 @@
 
 ### Fixed
 
+**Controlling some channels of an ARCTIC Fan Controller no longer stops the rest** (DEC-425). The
+`arctic_fan` driver (kernel 7.2 and 7.3) sends all ten channels in every write, taking the ones not being
+written from a cache that starts at 0 at probe and after resume. So the first write to one channel
+commanded 0% on every other channel. A profile that controlled some channels stopped every fan on the
+rest, and so did a verify, an identify or the thermal emergency's first write. Before any write to such
+a device, the daemon now sets every other channel whose cached duty reads 0 to 100%, unless the daemon
+itself last set that channel to 0. The exit floor's own writes do the same. It re-applies by itself after
+a resume. If the device stops answering, the daemon stops at the first write that fails and logs one
+warning, then sets the remaining channels straight after the next write the device accepts. The
+uncontrolled channels run at full speed; control all ten channels to keep them quiet.
+
 **The Super-I/O guard covers every Gigabyte board** (DEC-424). `control-ofc-superio-guard` used to suppress
 `nct6775`/`w83627ehf` only on the 46 boards in its list. Every other Gigabyte board was therefore still probed
 at every boot, an AM5 board behind the same ITE eSPI bridge included, and that probe can hide a chip's fan
