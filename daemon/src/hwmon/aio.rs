@@ -27,7 +27,8 @@
 //! Chip strings below are the kernel hwmon **device** `name`s (NOT module
 //! names) — verified in `drivers/hwmon/{nzxt-kraken3,nzxt-kraken2,
 //! aquacomputer_d5next}.c`:
-//!   - NZXT Kraken3 driver → `x53`, `z53`, `kraken2023`, `kraken2023elite`
+//!   - NZXT Kraken3 driver → `x53`, `z53`, `kraken2023`, `kraken2023elite`,
+//!     `kraken2024elite` (kernel 7.3+; same `KRAKEN2023` kind, DEC-423)
 //!   - NZXT Kraken2 driver → `kraken2`
 //!   - Aquacomputer family → `d5next`, `highflownext`, `leakshield`, …
 
@@ -41,6 +42,11 @@ const LIQUID_COOLER_CHIPS: &[&str] = &[
     "z53",
     "kraken2023",
     "kraken2023elite",
+    // DEC-423 (`BRD-c`): the Kraken 2024 Elite, added to mainline in 7.3. Its
+    // pump was already protected by its "Pump speed" label; what this adds is
+    // `is_aio`, `aio_hwmon`, the radiator-fan channel's cooler floor, and its
+    // chip-mapped role (channel 2 was `unknown`).
+    "kraken2024elite",
     "kraken2",
     // Aquacomputer liquid devices (aquacomputer_d5next driver) that report a
     // coolant temperature: pump (D5 Next), inline flow meter, leak shield.
@@ -56,7 +62,14 @@ const LIQUID_COOLER_CHIPS: &[&str] = &[
 /// are intentionally absent here — their coolant channel classifies via the
 /// label hint (the driver labels it "Coolant temp"), avoiding false positives
 /// on external probes.
-const COOLANT_TEMP_CHIPS: &[&str] = &["x53", "z53", "kraken2023", "kraken2023elite", "kraken2"];
+const COOLANT_TEMP_CHIPS: &[&str] = &[
+    "x53",
+    "z53",
+    "kraken2023",
+    "kraken2023elite",
+    "kraken2024elite",
+    "kraken2",
+];
 
 /// hwmon `name` strings the **`nzxt-kraken3`** driver registers — the subset of
 /// [`LIQUID_COOLER_CHIPS`] that driver owns (`kraken2` is a different driver, with
@@ -68,9 +81,10 @@ const COOLANT_TEMP_CHIPS: &[&str] = &["x53", "z53", "kraken2023", "kraken2023eli
 /// write ever fills. Writing `2` back to a Kraken therefore puts the pump on a 0 %
 /// curve, so `hwmon::handback` never hands one back that way.
 ///
-/// `kraken2024elite` (USB 1e71:3012) is newer than this file's other lists, which
-/// do not carry it; added from mainline `kraken3_probe` (DEC-382 review), where it
-/// maps to the same `KRAKEN2023` kind and therefore the same zeroed buffer.
+/// `kraken2024elite` (USB 1e71:3012) was added here from mainline `kraken3_probe`
+/// (DEC-382 review), where it maps to the same `KRAKEN2023` kind and therefore the
+/// same zeroed buffer. It was missing from this file's other two lists until
+/// DEC-423 (`BRD-c`).
 const NZXT_KRAKEN3_CHIPS: &[&str] = &[
     "x53",
     "z53",
@@ -118,9 +132,27 @@ mod tests {
 
     #[test]
     fn kraken_chips_are_liquid_coolers() {
-        for chip in ["x53", "z53", "kraken2023", "kraken2023elite", "kraken2"] {
+        for chip in [
+            "x53",
+            "z53",
+            "kraken2023",
+            "kraken2023elite",
+            "kraken2024elite",
+            "kraken2",
+        ] {
             assert!(is_liquid_cooler_chip(chip), "{chip} should be a cooler");
         }
+    }
+
+    /// DEC-423 (`BRD-c`): the Kraken 2024 Elite's temp channel is its coolant, by
+    /// chip — not only through the "Coolant temp" label, which an unlabelled read
+    /// would not have.
+    #[test]
+    fn the_kraken_2024_elite_coolant_classifies_by_chip() {
+        assert!(is_coolant_sensor("kraken2024elite", "temp1"));
+        assert!(is_coolant_sensor("KRAKEN2024ELITE", ""));
+        // Opposite branch: an unlabelled channel on a non-cooler chip is not.
+        assert!(!is_coolant_sensor("it8696", "temp1"));
     }
 
     /// DEC-382: the hand-back's Kraken rule keys on the DRIVER. `kraken2` is a

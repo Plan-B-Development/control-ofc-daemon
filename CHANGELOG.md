@@ -4,6 +4,15 @@
 
 ### Fixed
 
+**The NZXT Kraken 2024 Elite is on the liquid-cooler lists** (DEC-423). `kraken2024elite` (mainline 7.3)
+was in `NZXT_KRAKEN3_CHIPS` but not in `LIQUID_COOLER_CHIPS` or `COOLANT_TEMP_CHIPS`. Its pump was always
+protected by its "Pump speed" label. What changes now: `is_aio` and `aio_hwmon.present` hold for it; its
+channel 2 classifies as `radiator_fan` rather than `unknown`; that channel gets the cooler floor through
+`member_is_pump_or_cpu`; and its temperature classifies as coolant by chip. The cross-stack role oracle
+gains both channels. Because `validate()` rejects a pump/CPU control below 30% (`FLOOR_TOO_LOW`), a profile
+that a GUI older than the paired release stamped at 20% on that channel is refused. Upgrade the GUI with
+this daemon; the paired GUI raises the floor when it loads a profile.
+
 **The AMD GPU kernel advisory is the one bisected, fixed hang, on the kernels and GPUs that carry it**
 (DEC-422). `rdna_hang_kernel_6_18_6_19` flagged every 6.18/6.19 kernel on RDNA3/4 as critical and advised
 pinning 6.15–6.17, none of which was ever a longterm kernel. `smu_mismatch_navi48_r9700` told every

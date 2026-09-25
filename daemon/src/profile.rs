@@ -1923,6 +1923,24 @@ mod tests {
         }
     }
 
+    /// [SAFETY] DEC-423 (`BRD-c`): the Kraken 2024 Elite's radiator-fan channel is
+    /// floored like every other cooler channel. Its label, "Fan speed", names no
+    /// pump or CPU, so only the chip in the stable id can decide — which it could
+    /// not while the chip was missing from the cooler list (20 % instead of 30 %).
+    /// The motherboard header beside it, same label, stays chassis: the chip is
+    /// what decides.
+    #[test]
+    fn the_kraken_2024_elite_fan_channel_gets_the_cooler_floor() {
+        let fan = member(
+            "hwmon",
+            "hwmon:kraken2024elite:nodev:pwm2:Fan speed",
+            "Fan speed",
+        );
+        assert!(member_is_pump_or_cpu(&fan));
+        let mobo = member("hwmon", "hwmon:it8696:dev:pwm2:Fan speed", "Fan speed");
+        assert!(!member_is_pump_or_cpu(&mobo));
+    }
+
     #[test]
     fn classify_radiator_and_openfan_are_not_pump() {
         let rad = member("hwmon", "hwmon:it8696:dev:pwm2:CHA_FAN", "Radiator Top");
