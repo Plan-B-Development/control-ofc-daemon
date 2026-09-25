@@ -14,7 +14,14 @@
 //! channels, so the existing file-permission `is_writable` check is already
 //! truthful per-channel — verified against the mainline drivers:
 //!   - `nzxt-kraken3`: `pwm1` (pump) `0644`; `pwm2` (fan) `0644` on Z-series/2023.
-//!   - `corsair-cpro`, `nzxt-smart2`, `aquacomputer_d5next`: fan `pwm` `0644`.
+//!   - `aquacomputer_d5next`: on the **D5 Next, `pwm1` is the PUMP duty and
+//!     `pwm2` the fan, both `0644`** (`d5next_ctrl_fan_offsets[] = { 0x97, 0x42 }
+//!     /* Pump and fan speed */`, since v6.0 / 09e893092e00). This comment said
+//!     "fan `pwm`" only until 2026-09-24 (DEC-421). The pump is still protected:
+//!     `roles::classify_header_role` maps channel 1 of a `LIQUID_COOLER_CHIPS`
+//!     chip to `Pump`. Octo (pwm1–8), Quadro and Aquaero (pwm1–4) are writable
+//!     fan controllers; flow/leak/farbwerk devices expose no pwm.
+//!   - `corsair-cpro`, `nzxt-smart2`: fan `pwm` `0644`.
 //!   - `nzxt-kraken2`: **no** `pwm` attribute → monitor-only by absence.
 //!
 //! Chip strings below are the kernel hwmon **device** `name`s (NOT module

@@ -65,8 +65,8 @@ The daemon discovers sensors and fan headers by scanning `/sys/class/hwmon/`. Fo
 
 | Module | Chipset | Common boards |
 |--------|---------|---------------|
-| `nct6775` | Nuvoton NCT6775/6776/6779/6798 | ASUS, Gigabyte, MSI |
-| `it87` | ITE IT8686/8688/8689/8696 | Gigabyte, ASRock |
+| `nct6775` | Nuvoton NCT6775–NCT6799 (incl. NCT5585D and the ASUS NCT6701D, which it reports as `nct6799`) | ASUS (AM4 500-series onward, Intel), ASRock, older MSI (AM4 300/400, the original X570 boards, Intel ≤ 300-series) |
+| `it87` | ITE IT87xx/IT86xx — the in-kernel driver covers only older parts plus IT8689E (7.1+) and IT87952E (6.3+); IT8686E/IT8688E/IT8696E/IT8665E need `it87-dkms-git` | Gigabyte; ASUS AM4 300/400-series (IT8665E) |
 | `w83627ehf` | Winbond W83627EHF/DHG | Older boards |
 | `drivetemp` | SATA/SAS drive temperature | All SATA drives |
 
@@ -76,14 +76,14 @@ CPU temperature modules (`coretemp` for Intel, `k10temp` for AMD) and SMBus adap
 ```bash
 sudo sensors-detect
 ```
-This interactively probes for additional sensor chips and persists the results. Probing is at your own risk: it "can access chips in a way these chips do not like, causing problems ranging from SMBus lockup to permanent hardware damage (a rare case, thankfully)" — [sensors-detect(8)](https://man.archlinux.org/man/extra/lm_sensors/sensors-detect.8.en). Accept the conservative defaults, and never run it after boot on a dual-chip Gigabyte board (it can wedge the Super-I/O bridge so the secondary chip vanishes until reboot). Then restart the daemon:
+This interactively probes for additional sensor chips and persists the results. Probing is at your own risk: it "can access chips in a way these chips do not like, causing problems ranging from SMBus lockup to permanent hardware damage (a rare case, thankfully)" — [sensors-detect(8)](https://man.archlinux.org/man/extra/lm_sensors/sensors-detect.8.en). Accept the conservative defaults, and never run it on a dual-chip Gigabyte board: it writes a Super-I/O unlock to 0x4E that can wedge the ITE bridge in front of the secondary chip, which then vanishes — sometimes until the machine is powered down at the wall, because the bridge runs on standby power and survives a reboot. Then restart the daemon:
 ```bash
 sudo systemctl restart control-ofc-daemon
 ```
 
-**ACPI conflicts:** Some boards (particularly Gigabyte) require the `acpi_enforce_resources=lax` kernel parameter for Super I/O modules to bind. Add it to your bootloader kernel command line if you see `ACPI resource conflict` messages in `dmesg`.
+**ACPI conflicts:** If a Super I/O module fails to bind with `ACPI resource conflict` / "Device or resource busy" in the kernel log, keep the driver current first (current `it87-dkms-git` builds sidestep most conflicts through MMIO). For `it87`, prefer the driver-local `options it87 ignore_resource_conflict=1` in `/etc/modprobe.d/it87.conf` — the it87 documentation notes that the system-wide `acpi_enforce_resources=lax` can cause boot failures on some systems. The Nuvoton drivers (`nct6775`, `nct6687`) have no driver-local option, so there `acpi_enforce_resources=lax` on the kernel command line is the only kernel-side remedy.
 
-**Out-of-tree modules:** Some newer motherboard chipsets require DKMS modules not yet in mainline (e.g. `it87` for newer ITE chips, `nct6687` for some MSI/ASUS boards). These are available from the AUR and must be installed separately.
+**Out-of-tree modules:** Some newer motherboard chipsets require DKMS modules not yet in mainline (e.g. `it87` for newer ITE chips, `nct6687` for MSI NCT6687D boards and some ASRock NCT6686D boards). These are available from the AUR and must be installed separately. Two cautions from the 2026-09 review: builds of `it87-dkms-git` from 2026-09-09 (it87 v2.0) rename Gigabyte chips (e.g. `it8696_a008090a`), which changes every fan header's id, so re-check pump roles, fan names and profile members after rebuilding; and never load `nct6687` with `force=1` on a board whose chip is an NCT679x.
 
 ### What the daemon detects — and what it deliberately doesn't
 

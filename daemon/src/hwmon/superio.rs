@@ -212,21 +212,28 @@ const SUPERIO_ALLOWLIST: &[AllowlistEntry] = &[
     AllowlistEntry {
         module: "nct6775",
         vendor: SuperIoVendor::Nuvoton,
-        risk_note: "On MSI boards exposing an NCT6687, do not load nct6775 alongside the \
-                    out-of-tree nct6687 driver — chip-ID overlap can brick a fan header (DEC-106).",
+        risk_note: "Do not load nct6775 alongside the out-of-tree nct6687 on a board whose only \
+                    Nuvoton chip is an NCT679x — an nct6687 that claims it (old builds, or any \
+                    build loaded with force=1) can brick a fan header (DEC-106). Boards with two \
+                    genuine Nuvoton chips (e.g. ASRock Taichi: NCT6686D + NCT6796D-S) need both.",
     },
     AllowlistEntry {
         module: "nct6687",
         vendor: SuperIoVendor::Nuvoton,
-        risk_note: "Out-of-tree nct6687d (DKMS), common on MSI boards. Do not load alongside \
-                    in-kernel nct6775 (DEC-106 brick risk); use a build post-Fred78290 PR #164.",
+        risk_note: "Out-of-tree nct6687d (DKMS), common on MSI boards. Blacklist the in-kernel \
+                    nct6683 (both can bind the same chip and garble readings). Do not load \
+                    alongside in-kernel nct6775 (DEC-106 brick risk); use a build post-Fred78290 \
+                    PR #164, and never load it with force=1 on an NCT679x board — since PR #174 \
+                    force=1 attaches to any 0xDxxx chip ID.",
     },
     AllowlistEntry {
         module: "nct6683",
         vendor: SuperIoVendor::Nuvoton,
-        risk_note: "Mainline nct6683 is monitoring-only — its firmware disables writes, so it \
-                    reads temps/fans but offers no PWM control. For fan control on these MSI/ASRock \
-                    chips, the out-of-tree nct6687d (module `nct6687`) is needed instead.",
+        risk_note: "Mainline nct6683 is monitoring-only: the driver publishes pwm read-only on \
+                    every board except Mitac OEM systems (writes are refused even as root) and \
+                    exposes no pwm_enable. For fan control on MSI NCT6687D boards use the \
+                    out-of-tree nct6687d (module `nct6687`); ASRock NCT6686D boards need \
+                    asrock-nct6683 (listed boards) or nct6687d.",
     },
     AllowlistEntry {
         module: "f71882fg",
@@ -565,31 +572,40 @@ fn ite_unbound_tail(out_of_tree: bool) -> &'static str {
         // while the GUI beside it correctly tells them to update. "Reinstalling
         // the same build" and "updating to a current one" are different actions
         // and only the first is futile.
+        // DEC-421: one recovery ladder, not a DEVID branch the user cannot see —
+        // `Unsupported chip (DEVID=…)` is `pr_debug`, and a 0xFFFF read prints
+        // nothing at all. And a rebuild past it87 v2.0 renames the chips.
         " You are already running an out-of-tree `it87` build, so reinstalling \
          the same build will not change anything — the plain 'install \
          it87-dkms-git' advice is for somebody still on the in-tree driver. If \
          yours is old, updating is still worth doing: `it87-dkms-git` is a \
          `-git` package, so reinstalling it rebuilds the current upstream \
          snapshot, and several secondary-chip fixes landed in 2026-03 and later. \
-         Do not pass force_id, and do not add `mmio=on` (it is already the \
-         driver default). If the chip still does not bind on a current build and \
-         its DEVID reads 0x8883, an ITE eSPI-to-LPC bridge has been latched into \
-         configuration mode and is answering in place of the chip behind it. \
-         That IS recoverable: it is caused by a driver writing a config-mode \
-         unlock to 0x2E/0x4E, almost always nct6775 or w83627ehf, and this \
-         package now ships a guard that stops them loading on affected boards. \
-         The catch is that clearing the latch needs the machine fully powered \
-         down at the wall — a reboot does not clear it. Full steps in the \
-         Hardware Troubleshooting guide."
+         Builds from 2026-09-09 (it87 v2.0) on rename Gigabyte chips with a \
+         suffix (e.g. it8696_a008090a), which changes every fan header's id: \
+         re-check pump roles, fan names and profile members afterwards. Do not \
+         pass force_id, and do not add `mmio=on` (it is already the driver \
+         default). If the chip still does not bind, the usual cause on these \
+         boards is an ITE eSPI-to-LPC bridge latched in configuration mode in \
+         front of it (the kernel log shows 0x8883 for it only with it87 dynamic \
+         debug on). It is recoverable: something wrote a Super-I/O unlock to \
+         0x2E/0x4E — nct6775, w83627ehf or sensors-detect — and this package \
+         ships a guard that stops the two modules on known boards. Stop the \
+         trigger and reboot; if the chip is still missing, the machine must be \
+         powered down at the wall, because the bridge runs on standby power and \
+         a reboot does not always clear it. Full steps in the Hardware \
+         Troubleshooting guide."
     } else {
         " For newer Gigabyte ITE boards the in-tree it87 often cannot drive the \
-         chip — install the it87-dkms-git build. (Do not add `mmio=on`: it is \
-         already the driver default, DEC-326.) Do not pass force_id. If the chip \
-         still does not bind and its DEVID reads 0x8883, an ITE eSPI-to-LPC \
-         bridge is latched in configuration mode and masking it — recoverable by \
-         keeping nct6775/w83627ehf off the board and then powering fully down at \
-         the wall, since a reboot does not clear it. Full steps in the Hardware \
-         Troubleshooting guide."
+         chip — install the it87-dkms-git build (builds from 2026-09-09 name \
+         Gigabyte chips with a suffix, e.g. it8696_a008090a). (Do not add \
+         `mmio=on`: it is already the driver default, DEC-326.) Do not pass \
+         force_id. If the chip still does not bind, the usual cause on these \
+         boards is an ITE eSPI-to-LPC bridge latched in configuration mode in \
+         front of it (0x8883 in the kernel log with it87 dynamic debug on): keep \
+         nct6775/w83627ehf off the board and do not run sensors-detect, reboot, \
+         and if it is still missing, power fully down at the wall. Full steps in \
+         the Hardware Troubleshooting guide."
     }
 }
 

@@ -28,7 +28,8 @@ use crate::api::responses::{AcpiConflictInfo, KernelModuleInfo, ModuleCollisionI
 /// AM5/Z790-class chips people run (IT8625E/IT8686E/IT8688E/IT8696E, and —
 /// pragmatically — IT8689E) still want the out-of-tree frankcrawford/it87
 /// fork. IT8689E fan *control* only landed in mainline 7.1 (commit 66b8eaf)
-/// and IT87952E enumerates since 6.4, but on the 6.12/6.18 LTS kernels most
+/// and IT87952E enumerates since 6.3 (commit d44cb4cd7456 — v6.2 lacks it,
+/// v6.3 has it; re-checked 2026-09-24), but on the 6.12/6.18 LTS kernels most
 /// users run, and for dual-chip control, the DKMS build is what they need.
 /// Marking the module `false` keeps the modules table honest for DKMS users;
 /// the chip-level column (`chip_driver_in_mainline`) reports per-chip.
@@ -97,17 +98,26 @@ pub(crate) fn expected_driver_for_chip(chip_name: &str) -> &'static str {
     let lower = chip_name.to_lowercase();
 
     // ── Nuvoton ──
-    // NCT6683/6686/6687 are a distinct family from the nct6775 line. The
-    // mainline `nct6683` driver (monitoring-only — firmware disables writes)
-    // reports hwmon name "nct6683"; the out-of-tree `nct6687d` driver reports
-    // the actual chip ("nct6686"/"nct6687") and adds fan control. So the hwmon
-    // name we observe tells us which driver bound it. Everything else in the
+    // NCT6683/6686/6687 are a distinct family from the nct6775 line.
+    //
+    // ⚠ The hwmon name does NOT tell us which driver bound the chip (DEC-421,
+    // correcting what this comment claimed until 2026-09-24). Mainline
+    // `nct6683` registers its hwmon device by chip kind — `nct6683_device_names[]
+    // = {"nct6683","nct6686","nct6687"}` — exactly the names the out-of-tree
+    // `nct6687d` uses. So an MSI NCT6687D bound by the in-kernel, read-only
+    // `nct6683` (pwm 0444 on every customer ID but Mitac; no pwm_enable) is
+    // hwmon "nct6687", and this function maps it to the out-of-tree module it is
+    // not running. The mapping below is a best guess keyed on the name; telling
+    // the two apart needs the bound driver (`/sys/class/hwmon/hwmonN/device/
+    // driver`), which is register row `BRD-g`. Everything else in the
     // NCT6xxx/NCT5xxx range is the in-kernel nct6775 driver.
     if lower.starts_with("nct6683") {
-        return "nct6683"; // mainline, monitoring-only
+        return "nct6683"; // mainline, monitoring-only (driver withholds write permission)
     }
     if lower.starts_with("nct6686") || lower.starts_with("nct6687") {
-        return "nct6687"; // out-of-tree nct6687d; DEC-106 collision risk vs nct6775
+        // Usually out-of-tree nct6687d — but mainline nct6683 uses these names
+        // too (see above). DEC-106 collision risk vs nct6775.
+        return "nct6687";
     }
     if lower.starts_with("nct6") || lower.starts_with("nct5") {
         return "nct6775";
@@ -348,28 +358,39 @@ const MODULE_COLLISIONS: &[ModuleCollisionEntry] = &[ModuleCollisionEntry {
     module_b: "nct6775",
     severity: "critical",
     summary: "nct6687 (out-of-tree) and nct6775 (in-kernel) are both loaded. \
-             They race for the same Super I/O chip on MSI AM4/AM5 boards. \
+             They can race for the same Super I/O chip on boards whose chip is \
+             an NCT679x (MSI AM4 boards and the original 2019 X570 boards). \
              Older nct6687 builds declare chip ID 0xd450 — the legitimate \
              NCT6797D ID — so the wrong driver can write into the chip's \
              non-volatile fan control state and brick the affected header \
              (CPU_FAN is the most common casualty). The 0xd450 claim was \
-             removed upstream in Fred78290/nct6687d PR #164 (2026); updating \
-             the driver removes the brick mechanism, but already-loaded \
-             modules and not-yet-updated packages remain at risk.",
-    remediation: "(1) Identify the chip FIRST: run `cat /sys/class/hwmon/hwmon*/name` \
-             to see which driver actually bound on this boot. \
-             (2) If the chip is NCT6687-R (genuine MSI 500/600-series chip), \
-             blacklist nct6775 instead: `echo 'blacklist nct6775' | sudo tee \
-             /etc/modprobe.d/blacklist-nct6775.conf`. \
-             (3) If the chip is NCT6797D or NCT6798D (common on AM4 400/500 MSI \
-             boards e.g. B450M MORTAR, X470 GAMING PRO CARBON, MAG B450 TOMAHAWK \
-             MAX), blacklist nct6687: `echo 'blacklist nct6687' | sudo tee \
+             removed upstream in Fred78290/nct6687d PR #164 (2026-05-19); \
+             updating the driver removes the default mechanism, but \
+             already-loaded modules, not-yet-updated packages, and any \
+             nct6687 loaded with force=1 remain at risk — since nct6687d \
+             PR #174 (2026-05-22) force=1 attaches to any chip ID in \
+             0xD000-0xDFFF, NCT6797D and NCT6798D included.",
+    remediation: "(1) Identify the chip FIRST: run `sudo dmesg | grep -i 'found nct'` \
+             to see which driver found which chip on this boot — two drivers \
+             reporting a chip at the same address claimed the same one. (The \
+             hwmon name does not tell you: the in-kernel nct6683 names its \
+             devices `nct6687` too.) \
+             (2) If the chip is a genuine NCT6687D (MSI B550 and newer; it reports \
+             0xd592), keep nct6687 and never load it with force=1. nct6775 has \
+             nothing of its own to bind there unless the board carries a second \
+             Nuvoton chip — ASRock AM5 Taichi boards need both drivers. \
+             (3) If the chip is NCT6797D or NCT6798D (NCT6797D is common on MSI \
+             AM4 boards e.g. B450M MORTAR, MAG B450 TOMAHAWK MAX, MAG X570 \
+             TOMAHAWK WIFI, X570-A PRO and the original MPG X570 boards), \
+             blacklist nct6687: `echo 'blacklist nct6687' | sudo tee \
              /etc/modprobe.d/blacklist-nct6687.conf`. \
-             (4) Reboot. Do NOT write PWM until you have verified the chip and \
-             blacklisted the OTHER driver — blacklisting the wrong one will \
-             leave you with no fan control. \
+             (4) Reboot. Do NOT write PWM until you have verified the chip and, \
+             on an NCT679x board, blacklisted nct6687 — blacklisting the wrong \
+             driver will leave you with no fan control. \
              (Prevention: a current nct6687d build, post-PR #164, no longer \
-             claims 0xd450 — updating the package is the durable fix.)",
+             claims 0xd450 by default — updating the package is the durable fix. \
+             Never load nct6687 with force=1 on a board whose chip is an \
+             NCT679x: force=1 attaches it to any 0xDxxx chip ID.)",
 }];
 
 /// Minimal chip-binding record passed into the collision detector so it
@@ -613,127 +634,215 @@ pub fn read_board_info_from(dmi_dir: &Path) -> BoardInfo {
 // Some Gigabyte boards expose two ITE Super-IO chips on a single PCB. The
 // upstream frankcrawford/it87 driver scans both 0x2E and 0x4E SuperIO base
 // addresses. When the secondary chip does not enumerate, only N of M expected
-// PWM headers reach hwmon — and there are **two distinct failure modes** that
-// produce that same visible symptom. They have different causes, different
-// evidence and different remedies, so do not conflate them (DEC-326 / `HOST-b`):
+// PWM headers reach hwmon.
 //
-//   MODE 1 — secondary DEVID reads 0xFFFF. A stale SuperIO state, canonically
-//   left in config-mode by a prior `sensors-detect` run (or, on PR-#77-era
-//   code, a missing `mmio=on`). Recoverable: reboot without running
-//   `sensors-detect`. This mode is real and this comment's original account of
-//   it stands.
+// **One blocked state, not two modes (DEC-421, 2026-09-24).** This comment used
+// to describe a "MODE 1" (secondary DEVID 0xFFFF, cleared by a reboot) and a
+// "MODE 2" (DEVID 0x8883, cleared only by a power cut) as distinct faults. The
+// 2026-09-24 review found no upstream support for a separate 0xFFFF state: in
+// frankcrawford/it87 #70 one wedged board read **0xFFFF on the no-key read and
+// 0x8883 on the keyed read** — two views of the same blocked bridge. The
+// secondary on these boards is left in configuration mode by the firmware and
+// `it87` reads its DEVID *without* sending a key; a chip that is answering in
+// config mode returns its real ID, so 0xFFFF on that read means "nothing is
+// answering", not "stuck in config mode". Neither value is visible to users by
+// default anyway: `Unsupported chip (DEVID=…)` is `pr_debug`, and a 0xFFFF read
+// exits silently (fork HEAD `it87_find()`; mainline identical).
 //
-//   MODE 2 — secondary DEVID reads 0x8883. An ITE eSPI→LPC bridge has been
-//   latched into configuration mode and answers in place of the chip behind it.
-//   **Recoverable, and the cause is measured (DEC-332, 2026-09-05.)** Some
-//   driver wrote a config-mode unlock to 0x4E: `nct6775` and `w83627ehf` both
-//   do so unconditionally in `superio_enter()` before reading the DEVID, and
-//   loading `nct6775` on an X870E AORUS MASTER reproduced the latch inside a
-//   single boot, against an `it87`-reload control that did not. Remedy: keep
-//   those modules off the board (the package ships a modprobe guard that does
-//   this automatically), then clear the latch with a FULL POWER CUT — it
-//   survives a warm reboot and a soft power-off, so a reboot alone is a false
-//   negative. Note `mmio=on` is NOT the remedy for either mode, because `mmio`
-//   already defaults to `true` (`it87.c:314`, `static bool mmio = true;`) —
-//   advice to "enable" it names a state that is already in effect.
+// What IS established: the block is an ITE IT8883 eSPI→LPC bridge latched in
+// configuration mode (ITE: "3VSB and VBAT Supported", so it survives a soft
+// power-off). Something wrote a Super-I/O key or exit sequence to 0x4E:
+// `nct6775` and `w83627ehf` both write `0x87,0x87` unconditionally in
+// `superio_enter()` before reading the DEVID (loading `nct6775` on an X870E AORUS
+// MASTER reproduced it within one boot, DEC-332); `sensors-detect` writes the
+// same bytes and exits config mode before it probes; the it87 README's own
+// `isadump` test does too (owner, #100). Recovery, as upstream states it and as
+// measured here: stop the trigger (the packaged modprobe guard suppresses the two
+// modules on every board in this table), reboot, and if the chip is still
+// missing, power down fully at the wall. Note `mmio=on` is never the remedy —
+// `mmio` already defaults to `true` in the fork.
 //
-//   This entry said "Not recoverable locally" until 2026-09-05. It asked to be
-//   re-retracted only against a fresh measurement; that is what happened.
+// The IT8883 evidence is AM5-only (X670E / X870 / X870E / B850 boards). On the
+// AM4 and Intel rows below the guard is harmless and no latch has been observed.
 //
-// We expose the expected chip-list to the GUI so it can render a dual-chip
-// warning when `expected_chips - chips_detected` is non-empty. The list is
-// sourced from the it87.c DMI table (see linux source) plus community
-// reports — chip names are normalised to the same format hwmon reports
-// (lowercased, no `E` suffix). When a board is not in the table we return
-// an empty Vec, the GUI does nothing and the rest of diagnostics keep
-// working unchanged.
+// We expose the expected chip-list to the GUI so it can render a missing-chip
+// warning when `expected_chips - chips_detected` is non-empty. Chip names are
+// normalised to the format hwmon reports (lowercased, no `E` suffix). When a
+// board is not in the table we return an empty Vec, the GUI does nothing and the
+// rest of diagnostics keep working unchanged.
+//
+// **Evidence standard (DEC-421).** Each row cites an exact-board log, an upstream
+// lm-sensors config, LibreHardwareMonitor's board definition, or the
+// frankcrawford/it87 SIV catalogue (`Sensors configs/Gigabyte/configs/`, keyed by
+// the Gigabyte SIV the daemon already reads). The fork's DMI-table chip
+// *comments* are **not** evidence: they drift onto neighbouring entries
+// (1663f97, ae7b408, 108b0a1, 5d34804), which is how three rows here were wrong
+// until 2026-09-24. Gigabyte manuals never name the chip.
+//
+// **Single-chip rows are deliberate.** A few ITE boards whose name a dual-chip
+// row used to over-match are listed with ONE chip: that keeps them under the
+// modprobe guard while no longer raising a false "missing chip" warning. The
+// table is therefore "Gigabyte ITE boards with a known chip complement", not
+// only dual-chip boards — the name is kept for continuity.
 //
 // Updates to this table are board-by-board; do not encode "any X870E
 // Aorus" globs because Gigabyte ships single-chip variants with similar
-// names. Each entry is a deliberate match.
+// names. Each entry is a deliberate match, and FIRST MATCH WINS, so a row must
+// never be a substring of a board with a different complement.
 
-/// One entry in the dual-chip board lookup. `board_name` is matched
-/// case-insensitively as a substring (or exact, if more specific
-/// matching is needed) against DMI `board_name`. `chips` lists the
-/// hwmon chip names expected — usually two, occasionally three.
+/// One entry in the Gigabyte ITE board lookup. `board_name` is matched
+/// case-insensitively as a substring against DMI `board_name` (first match
+/// wins). `chips` lists the hwmon chip names expected — two on a dual-chip
+/// board, ONE on the few single-chip boards kept here for the modprobe guard
+/// (see the table header).
 struct DualChipEntry {
-    /// DMI board_name (case-insensitive substring match).
+    /// DMI board_name (case-insensitive substring match; written UPPERCASE).
     board_name: &'static str,
     /// Expected chip names in `chip_name` format (e.g. "it8696", "it87952").
     chips: &'static [&'static str],
 }
 
 const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
-    // ── X870E AORUS family (IT8696E + IT87952E) ────────────────
+    // ── AM5 800-series (IT8696E + IT87952E) ────────────────────
+    // X870E AORUS MASTER: this project's host (journal: IT8696E rev 0 @0xa40,
+    // IT87952E rev 1 @0xa60, SIV A008090A) and it87 PR #100.
     DualChipEntry {
         board_name: "X870E AORUS MASTER",
         chips: &["it8696", "it87952"],
     },
+    // it87 #70 (`it8696-isa-0a40` + `it87952-isa-0a60`); also covers PRO ICE and
+    // PRO X3D (ICE), which share SIV A008090A in the it87 SIV catalogue.
     DualChipEntry {
         board_name: "X870E AORUS PRO",
         chips: &["it8696", "it87952"],
     },
-    // DEC-144: owner-confirmed dual-chip per frankcrawford/it87 issue
-    // #89 (`it8696-isa-0a40` 5 fans + `it87952-isa-0a60` 3 fans,
-    // control working). Substring match also covers the 2026 "X870E
-    // AORUS ELITE X3D" refresh.
+    // DEC-421 (was the bare "X870E AORUS ELITE", which also matched the
+    // single-chip ELITE WIFI7 and raised a false missing-chip warning there).
+    // it87 #89 is the X3D: `it8696-isa-0a40` 5 fans + `it87952-isa-0a60` 3 fans,
+    // control working. Covers "X870E AORUS ELITE X3D ICE" too (same pair).
     DualChipEntry {
-        board_name: "X870E AORUS ELITE",
+        board_name: "X870E AORUS ELITE X3D",
         chips: &["it8696", "it87952"],
     },
+    // Single chip, kept under the guard (DEC-421): IT8696E only, 6 fan headers
+    // (it87 PR #131 — "loads without force_id", six fan inputs; vendor manual).
+    DualChipEntry {
+        board_name: "X870E AORUS ELITE WIFI7",
+        chips: &["it8696"],
+    },
+    // LHM PR #1647 + SIV 0xA10A090A (5 + 5 headers). Evidence B.
+    DualChipEntry {
+        board_name: "X870E AORUS XTREME AI TOP",
+        chips: &["it8696", "it87952"],
+    },
+    // it87 #39, LHM PR #1510.
     DualChipEntry {
         board_name: "X870 AORUS ELITE WIFI7",
         chips: &["it8696", "it87952"],
     },
-    // DEC-144 caveat: the frankcrawford/it87 DMI table annotates the
-    // ICE variant as a SINGLE-chip IT8696E board, conflicting with this
-    // dual-chip expectation. Driver comments are contributor notes, not
-    // authoritative, and removing this entry would not change behaviour
-    // anyway (the plain "X870 AORUS ELITE WIFI7" entry above substring-
-    // matches the ICE name). Resolving it properly needs exact-match
-    // lookup support — deferred until an ICE owner report settles the
-    // topology.
+    // Resolved 2026-09-24: the ICE variant IS dual-chip — it87 #51's own
+    // `sensors` output shows `it8696-isa-0a40` + `it87952-isa-0a60`, #75 agrees,
+    // and the SIV catalogue lists it with the non-ICE board. The fork's DMI
+    // comment "IT8696E" beside its entry is one of the drifted comments. This
+    // row is shadowed by the one above (substring) and kept only so the guard
+    // list names the board explicitly.
     DualChipEntry {
         board_name: "X870 AORUS ELITE WIFI7 ICE",
         chips: &["it8696", "it87952"],
     },
-    // ── X670E AORUS family (IT8689E + IT87952E) ────────────────
+    // ── AM5 600-series (IT8689E + IT8792E — NOT IT87952E) ───────
+    // DEC-421: the secondary on these boards is an IT8792E/IT8795E (ID 0x8733),
+    // which hwmon names `it8792`. it87 #96 and #15 dmesg on the X670E AORUS
+    // MASTER: "Found IT8792E/IT8795E chip at 0xa60, revision 3"; SIV catalogue
+    // 0x900A0909 stanzas it8689 + it8792. The row said `it87952` until
+    // 2026-09-24, which made a working board report a missing chip.
     DualChipEntry {
         board_name: "X670E AORUS MASTER",
-        chips: &["it8689", "it87952"],
+        chips: &["it8689", "it8792"],
     },
+    // Evidence C (SIV catalogue 0x90080909 only: it8689 + it8792) — no
+    // exact-board log. The previous `it87952` had no source at all.
     DualChipEntry {
         board_name: "X670E AORUS PRO X",
-        chips: &["it8689", "it87952"],
+        chips: &["it8689", "it8792"],
     },
-    // DEC-144: plain X670 (non-E) ELITE AX — annotated "IT8689E +
-    // IT87952E" in the frankcrawford/it87 DMI table (master, 2026-04).
-    // The substring cannot false-match the X670E boards above ("X670 "
-    // with a space is not a substring of "X670E ...").
+    // Single chip, kept under the guard (DEC-421): IT8689E only, 5 fan headers
+    // (manual rev 1304; SIV 0x90050506 single it8689 stanza). The dual-chip
+    // annotation it rested on was the fork's X570S AERO G comment, shifted onto
+    // this entry by 1663f97. The substring cannot false-match the X670E boards
+    // ("X670 " with a space is not a substring of "X670E ...").
     DualChipEntry {
         board_name: "X670 AORUS ELITE AX",
-        chips: &["it8689", "it87952"],
+        chips: &["it8689"],
     },
-    // ── Z690 / Z790 AORUS family (IT8689E + IT87952E) ──────────
+    // ── LGA1700 Z690 / Z790 (IT8689E + IT87952E) ───────────────
+    // SIV 0x8108090A; LHM lists IT87952E as the second chip. Evidence B.
     DualChipEntry {
         board_name: "Z690 AORUS PRO",
         chips: &["it8689", "it87952"],
     },
+    // LHM `SuperIOHardware.cs` IT87952E config; SIV catalogue. Evidence B.
     DualChipEntry {
-        board_name: "Z790 AORUS ELITE AX",
+        board_name: "Z690 AORUS MASTER",
         chips: &["it8689", "it87952"],
     },
+    // Single chip, kept under the guard (DEC-421): IT8689E only, 6 fan headers
+    // (SIV 0x90060606 single it8689 stanza, shared by ELITE / ELITE AX / AX ICE /
+    // AX-W / ELITE X). The fork's entry was added six minutes after its owner told
+    // a *Z790M* AORUS ELITE AX user "I've added your board" (#22, ae7b408), and
+    // that user's sensors-detect found only 0x8689.
+    DualChipEntry {
+        board_name: "Z790 AORUS ELITE AX",
+        chips: &["it8689"],
+    },
+    // it87 #22 / #128: IT8689E rev 1 @0xa40 + IT87952E rev 1 at **0x0b10**
+    // (`it87952-isa-0b10`); SIV 900A090A, 10 headers (2 on an IT57xx EC).
     DualChipEntry {
         board_name: "Z790 AORUS MASTER",
         chips: &["it8689", "it87952"],
     },
+    // SIV catalogue 0x910A090A only. Evidence C.
     DualChipEntry {
         board_name: "Z790 AORUS XTREME",
         chips: &["it8689", "it87952"],
     },
-    // ── X570 AORUS family (IT8688E + IT8792E/IT8795E) ──────────
-    // The driver source comments group IT8792E and IT8795E together; on
-    // the X570 generation the secondary chip is `it8792` in hwmon.
+    // LHM (PRO X config) + SIV catalogue; covers PRO X WIFI7. Evidence B.
+    DualChipEntry {
+        board_name: "Z790 AORUS PRO X",
+        chips: &["it8689", "it87952"],
+    },
+    // ── LGA1851 Z890 (IT8696E + IT87952E) ──────────────────────
+    // LHM PR #2512 (MASTER / MASTER-CF / MASTER AI TOP) + SIV 0xA00A090B.
+    // Evidence B. NOT "Z890 AORUS ELITE": the ELITE WIFI7 (ICE / PLUS / DUO X) is
+    // a single IT8696E (SIV 0xA0060607) and is deliberately absent.
+    DualChipEntry {
+        board_name: "Z890 AORUS MASTER",
+        chips: &["it8696", "it87952"],
+    },
+    // ── LGA1200 / LGA1151 (IT8688E + IT8792E) ──────────────────
+    // hw-probe `it8792-isa-0a60` samples; LHM; SIV catalogue. Evidence A.
+    // "Z390 AORUS MASTER" also covers the G2 EDITION; "Z390 AORUS PRO" the PRO
+    // WIFI; "Z390 AORUS ULTRA" the ULTRA-CF.
+    DualChipEntry {
+        board_name: "Z390 AORUS MASTER",
+        chips: &["it8688", "it8792"],
+    },
+    DualChipEntry {
+        board_name: "Z390 AORUS PRO",
+        chips: &["it8688", "it8792"],
+    },
+    DualChipEntry {
+        board_name: "Z390 AORUS ULTRA",
+        chips: &["it8688", "it8792"],
+    },
+    // hw-probe (3 samples) + SIV catalogue it8688 + it8792. Evidence A.
+    DualChipEntry {
+        board_name: "Z490 AORUS MASTER",
+        chips: &["it8688", "it8792"],
+    },
+    // ── AM4 500-series X570 (IT8688E + IT8792E/IT8795E) ────────
+    // The driver groups IT8792E and IT8795E under one ID (0x8733); hwmon names
+    // the secondary `it8792`. hw-probe samples, it87 #19 / #66 / #99. Evidence A.
     DualChipEntry {
         board_name: "X570 AORUS MASTER",
         chips: &["it8688", "it8792"],
@@ -742,6 +851,7 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "X570 AORUS PRO",
         chips: &["it8688", "it8792"],
     },
+    // Shadowed by "X570 AORUS PRO" (same pair); kept so the guard names it.
     DualChipEntry {
         board_name: "X570 AORUS PRO WIFI",
         chips: &["it8688", "it8792"],
@@ -750,16 +860,61 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "X570 AORUS ULTRA",
         chips: &["it8688", "it8792"],
     },
+    // hw-probe `it8792-isa-0a60` ×3; SIV catalogue. Evidence B.
+    DualChipEntry {
+        board_name: "X570 AORUS XTREME",
+        chips: &["it8688", "it8792"],
+    },
+    // ── AM4 X570S refresh (IT8689E + IT87952E) ─────────────────
+    // it87 PR #119's config header: "Chip 1 (it8689-isa-0a40) = IT8689E …
+    // Chip 2 (it87952-isa-0a60) = IT87952E"; SIV 0x8108090A. Evidence B.
+    DualChipEntry {
+        board_name: "X570S AERO G",
+        chips: &["it8689", "it87952"],
+    },
+    // LHM PR #1091 (owner-contributor: "I can now control FAN4, FAN5_PUMP and
+    // FAN6_PUMP"); SIV 0x800A090A. Evidence B. "X570 AORUS MASTER" above is not a
+    // substring of this name ("X570S").
+    DualChipEntry {
+        board_name: "X570S AORUS MASTER",
+        chips: &["it8689", "it87952"],
+    },
+    // ── AM4 500-series B550 (IT8688E + IT8792E) ────────────────
+    // hw-probe (MASTER 7×, PRO 7×, PRO AC 5×, PRO V2 5×); LHM. Evidence A.
+    // "B550 AORUS PRO" covers PRO AC / PRO AX / PRO V2 and cannot match the
+    // single-chip B550M / B550I boards ("B550M"/"B550I" ≠ "B550 ").
+    DualChipEntry {
+        board_name: "B550 AORUS MASTER",
+        chips: &["it8688", "it8792"],
+    },
+    DualChipEntry {
+        board_name: "B550 AORUS PRO",
+        chips: &["it8688", "it8792"],
+    },
+    // ── sTRX4 TRX40 (IT8688E + IT8792E) ────────────────────────
+    // it87 #2 config, hw-probe; SIV catalogue. Evidence A.
     DualChipEntry {
         board_name: "TRX40 AORUS XTREME",
         chips: &["it8688", "it8792"],
     },
+    DualChipEntry {
+        board_name: "TRX40 AORUS MASTER",
+        chips: &["it8688", "it8792"],
+    },
+    DualChipEntry {
+        board_name: "TRX40 AORUS PRO WIFI",
+        chips: &["it8688", "it8792"],
+    },
+    DualChipEntry {
+        board_name: "TRX40 DESIGNARE",
+        chips: &["it8688", "it8792"],
+    },
     // ── AM4 400-series AORUS boards (IT8686E + IT8792E) ────────
-    // Same chip pairing as the X399 generation. Confirmed for X470 AORUS
-    // ULTRA GAMING by the upstream lm-sensors config (`configs/Gigabyte/
-    // X470-AORUS-ULTRA-GAMING.conf`). Other AM4 400-series AORUS boards
-    // share the same SuperIO topology per vendor service manuals and the
-    // frankcrawford/it87 driver's DMI table.
+    // X470 AORUS ULTRA GAMING: upstream lm-sensors config
+    // (`configs/Gigabyte/X470-AORUS-ULTRA-GAMING.conf`, `it8686-isa-0a40` +
+    // `it8792-isa-0a60`); GAMING 7 / GAMING 5 WIFI: hw-probe + SIV catalogue.
+    // (This comment used to add "per vendor service manuals"; Gigabyte manuals
+    // never name the chip, so that was never a source.)
     DualChipEntry {
         board_name: "X470 AORUS ULTRA GAMING",
         chips: &["it8686", "it8792"],
@@ -772,33 +927,50 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "X470 AORUS GAMING 5 WIFI",
         chips: &["it8686", "it8792"],
     },
-    // "B450 AORUS PRO" matches both the plain board and the WIFI variant via
-    // substring match. The -CF variant is listed separately below for
-    // legacy documentation continuity (same chips, identical behaviour).
+    // "B450 AORUS PRO" matches the plain board, the WIFI and the -CF variants.
+    // it87 #21: `sensors` shows both chips — but the IT8792E here carries NO fan
+    // headers (all 5 are on the IT8686E; its fans read 0 RPM), so a missing
+    // IT8792E costs temperatures and voltages, not fans.
     DualChipEntry {
         board_name: "B450 AORUS PRO",
         chips: &["it8686", "it8792"],
     },
-    // ── Older dual-chip boards ──────────────────────────────────
-    DualChipEntry {
-        board_name: "X399 DESIGNARE EX-CF",
-        chips: &["it8686", "it8792"],
-    },
+    // Shadowed by "B450 AORUS PRO"; kept so the guard names it.
     DualChipEntry {
         board_name: "B450 AORUS PRO-CF",
         chips: &["it8686", "it8792"],
     },
-    // ── DEC-106: AM4 500-series & AM5 800-series dual-chip AORUS ─
-    // B550 VISION D — verified against upstream lm-sensors config
-    // (`configs/Gigabyte/GA-B550-VISION-D.conf`): primary IT8688E at
-    // 0x0a40, secondary IT8792E at 0x0a60.
+    // ── TR4 X399 (IT8686E + IT8792E) ───────────────────────────
+    // Was "X399 DESIGNARE EX-CF"; the SIV catalogue spells the board "X399
+    // DESIGNARE EX", so the substring now covers both. it87 #50 owner. B.
+    DualChipEntry {
+        board_name: "X399 DESIGNARE EX",
+        chips: &["it8686", "it8792"],
+    },
+    // it87 #135 dmesg (PRO-CF: "IT8686E at 0xa40, revision 2 / IT8792E/IT8795E
+    // at 0xa60, revision 3"); hw-probe (PRO, XTREME, Gaming 7). Evidence A.
+    DualChipEntry {
+        board_name: "X399 AORUS PRO",
+        chips: &["it8686", "it8792"],
+    },
+    DualChipEntry {
+        board_name: "X399 AORUS XTREME",
+        chips: &["it8686", "it8792"],
+    },
+    DualChipEntry {
+        board_name: "X399 AORUS GAMING 7",
+        chips: &["it8686", "it8792"],
+    },
+    // ── B550 VISION D (IT8688E + IT8792E) ──────────────────────
+    // Upstream lm-sensors config (`configs/Gigabyte/GA-B550-VISION-D.conf`,
+    // globs `it8792-*` / `it8688-*`; its DMI line reads "B550 VISION D-CF") and
+    // hw-probe `it8792-isa-0a60`. The config gives no port addresses, whatever
+    // this comment used to say. Covers VISION D-CF / VISION D-P.
     DualChipEntry {
         board_name: "B550 VISION D",
         chips: &["it8688", "it8792"],
     },
-    // B850-AI-TOP — verified against frankcrawford/it87 issue #93:
-    // primary IT8696E + secondary IT87952E. Same dual-chip topology as
-    // the X870E AORUS MASTER above.
+    // it87 #93 `sensors`: IT8696E (5 fans) + IT87952E (3 fans). Evidence A.
     DualChipEntry {
         board_name: "B850 AI TOP",
         chips: &["it8696", "it87952"],
@@ -816,12 +988,12 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
     //
     // It was held out on the grounds that "no Linux driver can currently reach"
     // its secondary. That premise is now measured false twice over: the `0x8883`
-    // reading is a latched bridge and clears on a power cut (see MODE 2 at the
-    // head of this file), and #81's own thread records its reporter getting the
-    // second chip working and driving `pwmN` on it. Holding it out while
-    // `X870E AORUS ELITE` was enrolled on #89 owner-report evidence applied two
-    // different evidence tiers to the same class of report — the inconsistency
-    // that `X87-f` was opened for.
+    // reading is a latched bridge and clears on a power cut (see the head of this
+    // table, DEC-332 / DEC-421), and #81's own thread records its reporter getting
+    // the second chip working and driving `pwmN` on it. Holding it out while
+    // `X870E AORUS ELITE X3D` was enrolled on #89 owner-report evidence applied
+    // two different evidence tiers to the same class of report — the
+    // inconsistency that `X87-f` was opened for.
     //
     // Enrolling it has a second effect worth naming: the modprobe guard's board
     // list is parity-tested against this table, so an enrolled board is also a
@@ -868,7 +1040,7 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
     // re-retract this without a fresh measurement**; that rule is what got the
     // entry corrected both times.
     //
-    // This does NOT generalise to the family. `X870E AORUS ELITE` above is an
+    // This does NOT generalise to the family. `X870E AORUS ELITE X3D` above is an
     // owner-confirmed working it8696+it87952 pairing (#89, both chips, control
     // working), so the correct unit of judgement is the board pairing, never
     // "X870E" or "dual ITE".
@@ -951,12 +1123,21 @@ pub(crate) fn any_ite_only_board_for_test() -> (&'static str, &'static str) {
 // ── Kernel-level chip detection (DEC-101) ──────────────────────────
 //
 // Best-effort signal of "what the kernel saw" before/independent of the
-// hwmon binding step. When kernel logs are accessible (Arch default has
-// `kernel.dmesg_restrict=0`), parsing dmesg for `it87:` lines surfaces
-// the exact chip family the SuperIO scan returned. When logs are not
-// readable (privileged-restricted distro, daemon running unprivileged
-// without CAP_SYSLOG), we return an empty Vec and the GUI falls back
-// to expected_chips alone.
+// hwmon binding step. When kernel logs are accessible, parsing dmesg for
+// `it87:` lines surfaces the exact chip family the SuperIO scan returned.
+// When they are not, we return an empty Vec and the GUI falls back to
+// expected_chips alone.
+//
+// ⚠ In the shipped deployment they are NOT accessible, so this always returns
+// empty (DEC-421, correcting a premise this comment stated until 2026-09-24).
+// Two independent reasons: the packaged unit sets `ProtectKernelLogs=true`,
+// which makes `/dev/kmsg` and `/proc/kmsg` inaccessible and drops CAP_SYSLOG
+// (DEC-327 already recorded the sandbox); and Arch's and CachyOS's stock
+// kernels set `CONFIG_SECURITY_DMESG_RESTRICT=y` — the "Arch default
+// dmesg_restrict=0" this comment used to cite was never true. Even when the
+// ring buffer is readable, the one line that would distinguish a latched
+// bridge (`Unsupported chip (DEVID=0x8883)`) is `pr_debug` and needs dynamic
+// debug to appear at all.
 //
 // We do NOT shell out to `dmesg` or `journalctl` — both would add a
 // runtime dependency and add another failure mode. Instead we read
@@ -1520,32 +1701,134 @@ mod tests {
     }
 
     #[test]
-    fn expected_chips_x870e_aorus_elite_pairs_it8696_with_it87952() {
-        // DEC-144: owner-confirmed dual-chip per frankcrawford/it87
-        // issue #89 (it8696-isa-0a40 + it87952-isa-0a60, control
-        // working on current driver builds).
-        let chips = expected_chips_for_board("Gigabyte Technology Co., Ltd.", "X870E AORUS ELITE");
-        assert_eq!(chips, vec!["it8696".to_string(), "it87952".to_string()]);
+    fn expected_chips_x870e_aorus_elite_x3d_is_dual_and_the_wifi7_is_single() {
+        // DEC-421: the row used to be the bare "X870E AORUS ELITE", which also
+        // matched the ELITE WIFI7 — a single IT8696E board with 6 headers (it87
+        // PR #131) — and told its owner a second chip was missing. #89's
+        // owner-confirmed dual-chip report is the X3D.
+        let gb = "Gigabyte Technology Co., Ltd.";
+        assert_eq!(
+            expected_chips_for_board(gb, "X870E AORUS ELITE X3D"),
+            vec!["it8696".to_string(), "it87952".to_string()]
+        );
+        assert_eq!(
+            expected_chips_for_board(gb, "X870E AORUS ELITE X3D ICE"),
+            vec!["it8696".to_string(), "it87952".to_string()]
+        );
+        assert_eq!(
+            expected_chips_for_board(gb, "X870E AORUS ELITE WIFI7"),
+            vec!["it8696".to_string()],
+            "the WIFI7 is single-chip: expecting a second chip is a false alarm"
+        );
     }
 
     #[test]
-    fn expected_chips_x870e_aorus_elite_x3d_resolves_via_substring() {
-        // DEC-144: the 2026 X3D refresh must resolve through the plain
-        // "X870E AORUS ELITE" substring entry — issue #89's report is
-        // from this exact SKU.
-        let chips =
-            expected_chips_for_board("Gigabyte Technology Co., Ltd.", "X870E AORUS ELITE X3D");
-        assert_eq!(chips, vec!["it8696".to_string(), "it87952".to_string()]);
-    }
-
-    #[test]
-    fn expected_chips_x670_aorus_elite_ax_pairs_it8689_with_it87952() {
-        // DEC-144: plain X670 (non-E) ELITE AX — annotated IT8689E +
-        // IT87952E in the frankcrawford/it87 DMI table. Must not be
-        // shadowed by (or shadow) the X670E entries.
+    fn expected_chips_x670_aorus_elite_ax_is_single_chip() {
+        // DEC-421: IT8689E only (5 headers; SIV 0x90050506 single stanza). The
+        // dual-chip annotation it used to carry was the fork's X570S AERO G
+        // comment, shifted onto this entry by 1663f97. Kept as a one-chip row so
+        // the board stays under the modprobe guard. Must not be shadowed by (or
+        // shadow) the X670E entries.
         let chips =
             expected_chips_for_board("Gigabyte Technology Co., Ltd.", "X670 AORUS ELITE AX");
-        assert_eq!(chips, vec!["it8689".to_string(), "it87952".to_string()]);
+        assert_eq!(chips, vec!["it8689".to_string()]);
+    }
+
+    #[test]
+    fn expected_chips_x670e_aorus_master_secondary_is_it8792_not_it87952() {
+        // DEC-421 regression: it87 #96 / #15 dmesg on this board read "Found
+        // IT8792E/IT8795E chip at 0xa60, revision 3", which hwmon names `it8792`.
+        // Expecting `it87952` made a correctly working X670E AORUS MASTER report
+        // a missing secondary chip.
+        let chips = expected_chips_for_board("Gigabyte Technology Co., Ltd.", "X670E AORUS MASTER");
+        assert_eq!(chips, vec!["it8689".to_string(), "it8792".to_string()]);
+        assert!(!chips.iter().any(|c| c == "it87952"));
+    }
+
+    #[test]
+    fn expected_chips_z790_aorus_elite_ax_is_single_chip() {
+        // DEC-421: SIV 0x90060606 (ELITE / ELITE AX / AX ICE / AX-W / ELITE X) has
+        // a single it8689 stanza; the fork's entry traces to a Z790M single-chip
+        // report (#22). Every sibling the substring reaches is single-chip too.
+        let gb = "Gigabyte Technology Co., Ltd.";
+        for name in [
+            "Z790 AORUS ELITE AX",
+            "Z790 AORUS ELITE AX-W",
+            "Z790 AORUS ELITE AX ICE",
+        ] {
+            assert_eq!(
+                expected_chips_for_board(gb, name),
+                vec!["it8689".to_string()],
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn expected_chips_resolves_the_2026_09_additions() {
+        // DEC-421: dual-ITE boards added on exact-board / upstream-config / LHM /
+        // SIV-catalogue evidence (confidence A or B only). One sample per family,
+        // plus the substring siblings each row is meant to reach.
+        let gb = "Gigabyte Technology Co., Ltd.";
+        let cases: &[(&str, &[&str])] = &[
+            ("X870E AORUS XTREME AI TOP", &["it8696", "it87952"]),
+            ("Z890 AORUS MASTER", &["it8696", "it87952"]),
+            ("Z890 AORUS MASTER AI TOP", &["it8696", "it87952"]),
+            ("Z790 AORUS PRO X WIFI7", &["it8689", "it87952"]),
+            ("Z690 AORUS MASTER", &["it8689", "it87952"]),
+            ("Z390 AORUS PRO WIFI", &["it8688", "it8792"]),
+            ("Z390 AORUS ULTRA-CF", &["it8688", "it8792"]),
+            ("Z490 AORUS MASTER", &["it8688", "it8792"]),
+            ("X570S AERO G", &["it8689", "it87952"]),
+            ("X570S AORUS MASTER", &["it8689", "it87952"]),
+            ("X570 AORUS XTREME", &["it8688", "it8792"]),
+            ("B550 AORUS MASTER", &["it8688", "it8792"]),
+            ("B550 AORUS PRO AX", &["it8688", "it8792"]),
+            ("TRX40 AORUS PRO WIFI", &["it8688", "it8792"]),
+            ("TRX40 DESIGNARE", &["it8688", "it8792"]),
+            ("X399 AORUS PRO-CF", &["it8686", "it8792"]),
+            ("X399 AORUS GAMING 7", &["it8686", "it8792"]),
+            // Was "X399 DESIGNARE EX-CF"; the plain spelling now matches too.
+            ("X399 DESIGNARE EX", &["it8686", "it8792"]),
+            ("X399 DESIGNARE EX-CF", &["it8686", "it8792"]),
+        ];
+        for (board, want) in cases {
+            let got = expected_chips_for_board(gb, board);
+            let want: Vec<String> = want.iter().map(|s| (*s).to_string()).collect();
+            assert_eq!(got, want, "{board}");
+        }
+        // Single-chip siblings the new rows must NOT reach.
+        assert!(expected_chips_for_board(gb, "B550M AORUS PRO").is_empty());
+        assert!(expected_chips_for_board(gb, "B550I AORUS PRO AX").is_empty());
+        assert!(expected_chips_for_board(gb, "Z890 AORUS ELITE WIFI7").is_empty());
+    }
+
+    #[test]
+    fn no_row_shadows_a_later_row_with_a_different_complement() {
+        // First match wins. If an earlier row is a substring of a later row's
+        // name, the later row is unreachable — harmless only while both expect
+        // the same chips. A differing complement there would be a board silently
+        // answered by the wrong row (the shape of the X870E AORUS ELITE defect).
+        let rows = GIGABYTE_DUAL_CHIP_BOARDS;
+        let mut shadowed = 0;
+        for (i, early) in rows.iter().enumerate() {
+            for late in &rows[i + 1..] {
+                if late.board_name.contains(early.board_name) {
+                    shadowed += 1;
+                    assert_eq!(
+                        early.chips, late.chips,
+                        "{:?} shadows {:?} with a different complement",
+                        early.board_name, late.board_name
+                    );
+                }
+            }
+        }
+        // Presence before absence: the table does contain shadowed rows (kept so
+        // the guard names them), so this test is not passing vacuously.
+        assert!(
+            shadowed >= 3,
+            "expected the known shadowed rows, found {shadowed}"
+        );
     }
 
     #[test]
@@ -1566,7 +1849,7 @@ mod tests {
         // because its secondary was believed unreachable; the 0x8883 reading is
         // a latched ITE bridge that clears on a power cut, and it87 #81's
         // reporter drove `pwmN` on the second chip. Holding it out while
-        // X870E AORUS ELITE was enrolled on the same tier of evidence was the
+        // X870E AORUS ELITE X3D was enrolled on the same tier of evidence was the
         // inconsistency `X87-f` recorded.
         let chips =
             expected_chips_for_board("Gigabyte Technology Co., Ltd.", "X870 AORUS STEALTH ICE");

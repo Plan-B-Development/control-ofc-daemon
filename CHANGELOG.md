@@ -2,6 +2,42 @@
 
 ## [Unreleased]
 
+### Fixed
+
+**The Gigabyte dual-chip board table is corrected and extended, so working boards stop reporting a
+missing chip** (DEC-421). `GET /diagnostics/hardware`'s `expected_chips` listed an IT87952E for the X670E
+AORUS MASTER, whose second chip is an IT8792E. It also listed two chips for the X670 AORUS ELITE AX,
+the Z790 AORUS ELITE AX and — through the bare "X870E AORUS ELITE" entry — the X870E AORUS ELITE WIFI7,
+all of which have one. Each of those boards showed a missing-chip warning while working. The table can
+now hold single-chip boards, which keeps them under the modprobe guard without the false warning. It
+gains more boards with published evidence — X570 / B550 / TRX40 / X399 / Z390 / Z490 AORUS boards,
+X570S boards, the Z790 AORUS PRO X and Z890 AORUS MASTER, among others — 46 in all. The packaged
+`control-ofc-superio-guard` list matches it, so `nct6775` and `w83627ehf` are no longer probed on the
+added boards either. A test now fails if an entry would shadow a later board with a different chip
+complement.
+
+**The advice for an unbound ITE secondary chip gives one recovery ladder** (DEC-421). It used to branch
+on a device ID the driver prints only at debug level. It now says: stop `nct6775`, `w83627ehf` and
+`sensors-detect` reaching the chip, reboot, then remove mains power. It also warns that `it87-dkms-git`
+builds from 2026-09-09 rename Gigabyte chips.
+
+**The `nct6687` / `nct6775` collision text covers `force=1`** (DEC-421). Since nct6687d PR #174,
+`force=1` attaches to any Nuvoton chip ID from 0xD000 to 0xDFFF, so it can still claim an NCT679x chip
+that a current build otherwise leaves alone. The remediation now identifies the chip from the kernel log
+rather than the hwmon name, which both Nuvoton drivers share. It no longer tells owners of a genuine
+NCT6687D to blacklist `nct6775`.
+
+### Documentation
+
+The README's prerequisites and the User Guide's driver notes are corrected (DEC-421). ASUS AM4
+300/400-series boards need `it87-dkms-git` for their IT8665E. There is no `nct6686d-dkms-git` package,
+so the package's optional dependencies no longer offer one. They also name the MSI chip as the NCT6687D,
+and list the ASUS AM4 boards under `it87-dkms-git`. `it87` should use its own `ignore_resource_conflict=1` before the system-wide
+`acpi_enforce_resources=lax`. A BIOS fan curve must never have a 0% point, and "Full Speed" is a
+fail-safe, not a fix. The packaged `modules-load.d` file no longer says Gigabyte boards use Nuvoton chips
+or that ASRock boards use ITE ones. Code comments that described the D5 Next's pump channel as
+monitor-only, and `kernel_detected_chips` as populated on Arch, are corrected.
+
 ## [2.56.0] — 2026-09-24
 
 ### Fixed

@@ -1557,9 +1557,12 @@ pub struct HardwareDiagnosticsResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub board_firmware_counts: Option<crate::hwmon::gigabyte_siv::GigabyteSiv>,
     /// Best-effort kernel-level chip detection — chip names parsed out of
-    /// `/dev/kmsg` `it87:` log lines (DEC-101). Populated when the daemon
-    /// can read the kernel ring buffer (Arch default: `dmesg_restrict=0`).
-    /// Empty when kmsg is not readable or no matches were found. Useful
+    /// `/dev/kmsg` `it87:` log lines (DEC-101). **Empty in the shipped
+    /// deployment** (DEC-421): the packaged unit sets `ProtectKernelLogs=true`,
+    /// which denies `/dev/kmsg`, and Arch and CachyOS kernels build with
+    /// `CONFIG_SECURITY_DMESG_RESTRICT=y` — the "Arch default:
+    /// `dmesg_restrict=0`" this comment used to cite is false. Also empty when
+    /// no matches were found. Useful
     /// for the "kernel found chip but driver did not bind" diagnostic;
     /// not authoritative — the hwmon-bound chips in `chips_detected` are
     /// the source of truth for which PWM headers actually work.

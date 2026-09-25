@@ -38,9 +38,10 @@ pub struct PwmHeaderDescriptor {
     ///
     /// This is the kernel sysfs permission bit and is authoritative per-channel:
     /// liquid-cooler drivers expose a writable `pwmN` only for genuinely
-    /// controllable channels (e.g. NZXT Kraken `pwm1`=pump). Monitor-only
-    /// devices (NZXT Kraken2, an Aquacomputer pump duty) simply expose no
-    /// `pwmN`, so no writable header is produced. See `aio.rs`.
+    /// controllable channels (e.g. NZXT Kraken `pwm1`=pump, Aquacomputer D5
+    /// Next `pwm1`=pump). Monitor-only devices (NZXT Kraken2, Aquacomputer
+    /// flow/leak sensors) simply expose no `pwmN`, so no writable header is
+    /// produced. See `aio.rs`.
     pub is_writable: bool,
     /// PWM/DC mode from `pwmN_mode` (0=DC, 1=PWM, None if file absent).
     pub pwm_mode: Option<u8>,
