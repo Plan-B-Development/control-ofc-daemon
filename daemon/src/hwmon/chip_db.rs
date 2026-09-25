@@ -680,8 +680,10 @@ pub fn read_board_info_from(dmi_dir: &Path) -> BoardInfo {
 // until 2026-09-24. Gigabyte manuals never name the chip.
 //
 // **Single-chip rows are deliberate.** A few ITE boards whose name a dual-chip
-// row used to over-match are listed with ONE chip: that keeps them under the
-// modprobe guard while no longer raising a false "missing chip" warning. The
+// row used to over-match are listed with ONE chip: that keeps them named by the
+// modprobe guard (and covered by its no-vendor fallback, DEC-424 — every board
+// whose vendor is Gigabyte is suppressed regardless) while no longer raising a
+// false "missing chip" warning. The
 // table is therefore "Gigabyte ITE boards with a known chip complement", not
 // only dual-chip boards — the name is kept for continuity.
 //
@@ -693,8 +695,8 @@ pub fn read_board_info_from(dmi_dir: &Path) -> BoardInfo {
 /// One entry in the Gigabyte ITE board lookup. `board_name` is matched
 /// case-insensitively as a substring against DMI `board_name` (first match
 /// wins). `chips` lists the hwmon chip names expected — two on a dual-chip
-/// board, ONE on the few single-chip boards kept here for the modprobe guard
-/// (see the table header).
+/// board, ONE on the few single-chip boards listed so the guard, the port
+/// probe and the missing-chip check know them (see the table header).
 struct DualChipEntry {
     /// DMI board_name (case-insensitive substring match; written UPPERCASE).
     board_name: &'static str,
@@ -996,8 +998,9 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
     // inconsistency that `X87-f` was opened for.
     //
     // Enrolling it has a second effect worth naming: the modprobe guard's board
-    // list is parity-tested against this table, so an enrolled board is also a
-    // protected board.
+    // list is parity-tested against this table, so an enrolled board is named by
+    // the guard, and covered by it even where the firmware reports no vendor.
+    // (Since DEC-424 every board whose vendor is Gigabyte is suppressed anyway.)
     //
     // The measurements below stand and are why the enrolment is safe; only the
     // CONCLUSION drawn from them changed.
@@ -1077,9 +1080,11 @@ pub fn expected_chips_for_board(board_vendor: &str, board_name: &str) -> Vec<Str
 /// config-mode unlock (`X87-k`). DEC-332 measured that write latching an IT8883
 /// eSPI→LPC bridge into configuration mode, hiding the Super-I/O behind it until
 /// a full power cut, and shipped `packaging/control-ofc-superio-guard` to stop
-/// `nct6775`/`w83627ehf` writing it. That guard is keyed on
-/// [`GIGABYTE_DUAL_CHIP_BOARDS`]; so is this, which is what stops the daemon's
-/// own port probe writing the sequence its packaging exists to prevent.
+/// `nct6775`/`w83627ehf` writing it. That guard was keyed on
+/// [`GIGABYTE_DUAL_CHIP_BOARDS`] until DEC-424 widened it to every Gigabyte
+/// board. This predicate is still keyed on the table, and it is what stops the
+/// daemon's own port probe writing the sequence its packaging exists to prevent
+/// — on the listed boards only (register row `BRD-s`).
 ///
 /// `false` when the board is not in the table: an unknown board rules nothing
 /// out, and an unbound Nuvoton chip there is precisely what the probe exists to
@@ -1088,13 +1093,14 @@ pub fn expected_chips_for_board(board_vendor: &str, board_name: &str) -> Vec<Str
 /// a Nuvoton board were ever enrolled.
 ///
 /// **But do not enrol one.** [`GIGABYTE_DUAL_CHIP_BOARDS`] is not only a lookup
-/// — it is also the suppression list `packaging/control-ofc-superio-guard`
-/// declines to load `nct6775`/`w83627ehf` on, pinned row-for-row by
-/// `superio_guard_board_list_matches_chip_db` with **no ITE filter**. Adding a
-/// Nuvoton row would therefore stop that board's own driver loading and cost it
-/// every sensor, while the guard's header ("Every board matched below has an
-/// ITE Super-I/O") became silently false. A Nuvoton dual-chip board needs a
-/// second table, not a row in this one.
+/// — it is also the list `packaging/control-ofc-superio-guard` names boards
+/// from and falls back to when the firmware reports no vendor (DEC-424), pinned
+/// row-for-row by `superio_guard_board_list_matches_chip_db` with **no ITE
+/// filter**. Adding a Nuvoton row would therefore stop that board's own driver
+/// loading wherever its vendor is unreadable, and withhold this probe's Nuvoton
+/// leg on it, while the guard's premise (every listed board is ITE) became
+/// silently false. A Nuvoton dual-chip board needs a second table, not a row in
+/// this one.
 pub fn board_expects_only_ite_chips(board_vendor: &str, board_name: &str) -> bool {
     let chips = expected_chips_for_board(board_vendor, board_name);
     !chips.is_empty() && chips.iter().all(|c| expected_driver_for_chip(c) == "it87")
@@ -1727,7 +1733,8 @@ mod tests {
         // DEC-421: IT8689E only (5 headers; SIV 0x90050506 single stanza). The
         // dual-chip annotation it used to carry was the fork's X570S AERO G
         // comment, shifted onto this entry by 1663f97. Kept as a one-chip row so
-        // the board stays under the modprobe guard. Must not be shadowed by (or
+        // the guard names the board and its no-vendor fallback covers it (DEC-424
+        // suppresses on any Gigabyte-vendor board). Must not be shadowed by (or
         // shadow) the X670E entries.
         let chips =
             expected_chips_for_board("Gigabyte Technology Co., Ltd.", "X670 AORUS ELITE AX");

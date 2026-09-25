@@ -1,6 +1,6 @@
 #!/bin/sh
 # control-ofc-superio-guard — refuse a Nuvoton/Winbond Super-I/O probe on a
-# board whose Super-I/O is ITE.
+# Gigabyte board, whose Super-I/O is ITE.
 #
 # WHY THIS EXISTS (measured 2026-09-05, X870E AORUS MASTER, DEC-332)
 # ------------------------------------------------------------------
@@ -17,16 +17,29 @@
 # disappear. The probe FAILS ("could not insert 'nct6775': No such device") and
 # does the damage anyway -- the write happens before the -ENODEV.
 #
-# The latch survives a warm reboot AND a soft power-off. Only a FULL POWER CUT
-# clears it. See the Hardware Troubleshooting guide for the recovery procedure.
+# On that board the latch survived a warm reboot and a soft power-off, and only
+# a full power cut cleared it: the bridge stays on standby power. The recovery,
+# as the Hardware Troubleshooting guide gives it, is a ladder -- stop whatever
+# writes the unlock, reboot, and if the chip is still missing, power down at the
+# wall.
 #
-# WHY SUPPRESSION IS FREE HERE
-# ----------------------------
-# Every board matched below has an ITE Super-I/O. nct6775 and w83627ehf drive
-# Nuvoton and Winbond silicon, so on these boards they can only ever fail --
-# there is no functionality to lose, only a destructive probe to avoid. On every
-# OTHER board the real modprobe runs untouched, because nct6775 is genuinely
-# required on most Nuvoton boards and blanket removal would break them.
+# WHY SUPPRESSION IS FREE HERE (DEC-424)
+# --------------------------------------
+# Gigabyte boards use ITE Super-I/O chips: 131 of 131 Gigabyte models sampled on
+# linux-hardware.org, and no Gigabyte board with a Nuvoton or Winbond Super-I/O is
+# known (DEC-421, register row BRD-n). nct6775 and w83627ehf drive Nuvoton and
+# Winbond silicon, so on a Gigabyte board they can only ever fail -- there is no
+# functionality to lose, only a destructive probe to avoid. So the guard
+# suppresses them on EVERY board whose DMI vendor is Gigabyte. Until DEC-424 it
+# did so only on the boards listed below, which left every unlisted Gigabyte
+# board (an AM5 board behind the same bridge, say) probed at every boot.
+#
+# The list stays, for two jobs: it names a known board in the journal line, and
+# it is the ONLY evidence used when the firmware reports no board vendor at all
+# -- a listed board name is Gigabyte's, so that board is suppressed too. On
+# every OTHER vendor the real modprobe runs untouched, because nct6775 is
+# genuinely required on most Nuvoton boards. Gigabyte's server brand reports
+# "Giga Computing", which does not match, and is left alone.
 #
 # WHY `install` AND NOT `blacklist`
 # ---------------------------------
@@ -45,9 +58,12 @@
 #
 # FAIL-OPEN BY DESIGN
 # -------------------
-# Anything unexpected -- unreadable DMI, missing modprobe, no arguments -- falls
-# through to loading the module. A guard that breaks must not cost a user their
-# fan control on hardware this was never about.
+# Anything unexpected -- an unreadable board name, missing modprobe, no
+# arguments -- falls through to loading the module. A guard that breaks must not
+# cost a user their fan control on hardware this was never about. (A missing
+# VENDOR with a readable, listed board name is not "unexpected": the name alone
+# identifies the board. That is the one case DEC-424 decided the other way, by
+# the user's choice.)
 
 set -u
 
@@ -106,18 +122,12 @@ upper() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
 board_uc=$(upper "$board_name")
 vendor_uc=$(upper "$board_vendor")
 
-# Vendor gate first: every entry below is a Gigabyte board, and the names are
-# matched as substrings, so this stops a coincidental match on another vendor.
-case "$vendor_uc" in
-    *GIGABYTE*) ;;
-    *) load_it "$@" ;;
-esac
-
 # ── BEGIN GENERATED BOARD LIST ──
 # Parity-pinned against `GIGABYTE_DUAL_CHIP_BOARDS` in daemon/src/hwmon/chip_db.rs
 # by `superio_guard_board_list_matches_chip_db` -- edit the Rust table, then this,
 # and the test will tell you if they diverge. Matched case-insensitively as
-# SUBSTRINGS, exactly as chip_db.rs matches them.
+# SUBSTRINGS, exactly as chip_db.rs matches them. Since DEC-424 this list only
+# names a board and decides the no-vendor case; a Gigabyte vendor alone suppresses.
 DUAL_CHIP_ITE_BOARDS='X870E AORUS MASTER
 X870E AORUS PRO
 X870E AORUS ELITE X3D
@@ -178,16 +188,31 @@ for entry in $DUAL_CHIP_ITE_BOARDS; do
 done
 unset IFS
 
-[ -n "$matched" ] || load_it "$@"
+# The decision (DEC-424):
+#   a Gigabyte vendor               -> suppress (every Gigabyte board is ITE)
+#   no vendor, and a listed board   -> suppress (the name alone is Gigabyte's)
+#   anything else                   -> load
+case "$vendor_uc" in
+    *GIGABYTE*)
+        why="$board_name is a Gigabyte board, and Gigabyte boards use ITE Super-I/O chips${matched:+ (known board: $matched)}" ;;
+    '')
+        [ -n "$matched" ] || load_it "$@"
+        why="the firmware reports no board vendor, but $board_name is a listed Gigabyte board ($matched), whose Super-I/O is ITE" ;;
+    *)
+        load_it "$@" ;;
+esac
 
 # Suppressed. Say so in the journal: an absence from `lsmod` cannot distinguish
 # "we suppressed it" from "it failed to load", and those need different advice.
 if [ -n "$DRY_RUN" ]; then
-    printf 'SUPPRESS %s (%s)\n' "$MODULE" "$matched"
+    # The same reason the journal line gives, so a dry-run exercises `why`
+    # (DEC-424 review: under `set -u` a bad expansion there would abort a boot
+    # modprobe after deciding to suppress, and no test would have run it).
+    printf 'SUPPRESS %s (%s)\n' "$MODULE" "$why"
     exit 0
 fi
 if command -v logger >/dev/null 2>&1; then
     logger -t control-ofc-superio-guard -p daemon.notice \
-        "not loading $MODULE: $board_name has an ITE Super-I/O ($matched). A Nuvoton/Winbond probe writes a config-mode unlock to 0x2E/0x4E, which can latch an ITE eSPI-to-LPC bridge and hide the secondary chip's fan headers until a full power cut. Nothing is lost: this module cannot drive ITE silicon."
+        "not loading $MODULE: $why. A Nuvoton/Winbond probe writes a config-mode unlock to 0x2E/0x4E, which can latch an ITE eSPI-to-LPC bridge and hide a chip's fan headers (recovery: stop the trigger, reboot, then power down at the wall if still missing). Nothing is lost: this module cannot drive ITE silicon. To load it anyway, create an EMPTY /etc/modprobe.d/control-ofc-superio.conf (a copy of this package's file would keep the guard)."
 fi
 exit 0

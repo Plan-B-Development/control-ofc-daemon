@@ -8,8 +8,11 @@
 //! loss of 3 of 8 fan headers and 3 of 9 temperatures until a full power cut.
 //!
 //! Two properties are pinned here, and they fail for different reasons:
-//!   * the **decision table** — suppress on an ITE board, load everywhere else;
-//!   * **parity** with `GIGABYTE_DUAL_CHIP_BOARDS`, so the shell list cannot
+//!   * the **decision table** — since DEC-424, suppress on every Gigabyte board
+//!     (all use ITE Super-I/O) and on a listed board whose firmware reports no
+//!     vendor; load everywhere else;
+//!   * **parity** with `GIGABYTE_DUAL_CHIP_BOARDS`, so the shell list — which
+//!     now names a board in the journal and decides the no-vendor case — cannot
 //!     drift away from the Rust table it was copied from.
 
 use std::path::PathBuf;
@@ -26,6 +29,12 @@ fn guard_path() -> PathBuf {
 /// Run the guard against a synthetic DMI directory, in dry-run so it prints its
 /// decision instead of exec'ing the real `modprobe`.
 fn decide(vendor: &str, board: Option<&str>, module: &str) -> String {
+    decide_with(Some(vendor), board, module)
+}
+
+/// [`decide`], where `vendor: None` models a DMI directory with no
+/// `board_vendor` file at all (DEC-424's no-vendor case).
+fn decide_with(vendor: Option<&str>, board: Option<&str>, module: &str) -> String {
     // Distinct per CASE, not per board: two cases share the board name
     // "X870E AORUS MASTER" and differ only by vendor, so keying on the board
     // alone gave them one directory. Under cargo's parallel test threads each
@@ -39,7 +48,9 @@ fn decide(vendor: &str, board: Option<&str>, module: &str) -> String {
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).expect("create fake DMI dir");
-    std::fs::write(dir.join("board_vendor"), vendor).expect("write vendor");
+    if let Some(v) = vendor {
+        std::fs::write(dir.join("board_vendor"), v).expect("write vendor");
+    }
     match board {
         Some(b) => std::fs::write(dir.join("board_name"), b).expect("write board"),
         // Absent board_name models unreadable DMI (container, exotic firmware).
@@ -103,15 +114,13 @@ fn loads_normally_everywhere_the_module_is_actually_needed() {
     // This is the half that matters most: nct6775 is REQUIRED on most Nuvoton
     // boards. A guard that over-matches silently removes fan control from a much
     // larger population than the one it protects.
-    let cases: [(&str, Option<&str>, &str); 4] = [
+    let cases: [(&str, Option<&str>, &str); 5] = [
         // A Nuvoton board — the module's whole purpose.
         (
             "ASUSTeK COMPUTER INC.",
             Some("ROG STRIX X670E-E GAMING WIFI"),
             "a Nuvoton board",
         ),
-        // Gigabyte, but not a dual-chip ITE board.
-        (GIGABYTE, Some("B650M DS3H"), "a single-chip Gigabyte board"),
         // Another vendor that happens to collide on board_name: the vendor gate
         // must stop it.
         (
@@ -119,7 +128,16 @@ fn loads_normally_everywhere_the_module_is_actually_needed() {
             Some("X870E AORUS MASTER"),
             "a name collision on another vendor",
         ),
-        // Unreadable DMI: we cannot judge, so we must not suppress.
+        // Gigabyte's server brand reports its own vendor string, which is not
+        // "GIGABYTE"; its boards are left to the real modprobe (DEC-424).
+        (
+            "Giga Computing Technology Co., Ltd.",
+            Some("MC13-LE1"),
+            "a Giga Computing server board",
+        ),
+        // A vendor string that is only whitespace is not "no vendor": fail open.
+        ("  ", Some("B650M DS3H"), "a blank-but-present vendor"),
+        // Unreadable board name: we cannot judge, so we must not suppress.
         (GIGABYTE, None, "unreadable DMI"),
     ];
     for (vendor, board, why) in cases {
@@ -129,6 +147,70 @@ fn loads_normally_everywhere_the_module_is_actually_needed() {
             "nct6775 must still load for {why}, got: {d:?}"
         );
     }
+}
+
+/// DEC-424 (`BRD-n`): every Gigabyte board, listed or not. Before it only the
+/// listed boards were covered, and an unlisted Gigabyte board — an AM5 board
+/// behind the same eSPI bridge, say — was probed at every boot. The unlisted
+/// case is the one that fails if the vendor-wide arm is removed.
+#[test]
+fn suppresses_on_every_gigabyte_board_listed_or_not() {
+    for (board, why) in [
+        ("B650M DS3H", "an unlisted single-chip AM5 board"),
+        ("X870E AORUS MASTER", "the measured, listed board"),
+        ("Z790 UD AC", "an unlisted Intel board"),
+    ] {
+        for module in ["nct6775", "w83627ehf"] {
+            let d = decide(GIGABYTE, Some(board), module);
+            assert!(
+                d.starts_with(&format!("SUPPRESS {module}")),
+                "{module} must be suppressed on {why} ({board}), got: {d:?}"
+            );
+        }
+    }
+}
+
+/// DEC-424, by the user's choice: with NO vendor, a listed board name is still
+/// Gigabyte's and is suppressed; an unlisted one loads (fail-open), because the
+/// name alone says nothing about its Super-I/O.
+#[test]
+fn with_no_vendor_only_a_listed_board_is_suppressed() {
+    for vendor in [Some(""), None] {
+        let listed = decide_with(vendor, Some("X870E AORUS MASTER-CF"), "nct6775");
+        assert!(
+            listed.starts_with("SUPPRESS nct6775"),
+            "vendor {vendor:?}, listed board: {listed:?}"
+        );
+        let unlisted = decide_with(vendor, Some("B650M DS3H"), "nct6775");
+        assert!(
+            unlisted.starts_with("LOAD nct6775"),
+            "vendor {vendor:?}, unlisted board must fail open: {unlisted:?}"
+        );
+    }
+}
+
+/// The reason a suppression gives (DEC-424 review): the dry-run prints the same
+/// `why` the journal line carries, so every string and expansion on that path
+/// runs here. A listed board is named as known; an unlisted Gigabyte board is not;
+/// the no-vendor case says so.
+#[test]
+fn a_suppression_names_its_reason() {
+    let listed = decide(GIGABYTE, Some("X870E AORUS MASTER"), "nct6775");
+    assert!(
+        listed.contains("is a Gigabyte board")
+            && listed.contains("known board: X870E AORUS MASTER"),
+        "{listed:?}"
+    );
+    let unlisted = decide(GIGABYTE, Some("B650M DS3H"), "nct6775");
+    assert!(
+        unlisted.contains("B650M DS3H is a Gigabyte board") && !unlisted.contains("known board"),
+        "{unlisted:?}"
+    );
+    let no_vendor = decide_with(None, Some("X870E AORUS MASTER"), "nct6775");
+    assert!(
+        no_vendor.contains("reports no board vendor") && no_vendor.contains("(X870E AORUS MASTER)"),
+        "{no_vendor:?}"
+    );
 }
 
 #[test]
@@ -298,6 +380,8 @@ fn with_the_guard_the_line_hands_the_decision_to_it() {
     for (module, cmd) in install_lines() {
         for (vendor, board, want) in [
             (GIGABYTE, "X870E AORUS MASTER", "SUPPRESS"),
+            // DEC-424: an unlisted Gigabyte board through the real install line.
+            (GIGABYTE, "B650M DS3H", "SUPPRESS"),
             (
                 "ASUSTeK COMPUTER INC.",
                 "ROG STRIX X670E-E GAMING WIFI",

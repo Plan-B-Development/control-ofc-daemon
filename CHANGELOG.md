@@ -4,6 +4,15 @@
 
 ### Fixed
 
+**The Super-I/O guard covers every Gigabyte board** (DEC-424). `control-ofc-superio-guard` used to suppress
+`nct6775`/`w83627ehf` only on the 46 boards in its list. Every other Gigabyte board was therefore still probed
+at every boot, an AM5 board behind the same ITE eSPI bridge included, and that probe can hide a chip's fan
+headers until a power cut. The guard now suppresses the two modules on every board whose DMI vendor is
+Gigabyte. All 131 Gigabyte models sampled use ITE Super-I/O, and none is known with a Nuvoton or Winbond
+chip. It also suppresses them on a listed board when the firmware reports no vendor at all. Other vendors,
+and Gigabyte's server brand "Giga Computing", are unchanged. The journal line names the board and gives the
+recovery steps. To turn the guard off, create an empty `/etc/modprobe.d/control-ofc-superio.conf`.
+
 **The NZXT Kraken 2024 Elite is on the liquid-cooler lists** (DEC-423). `kraken2024elite` (mainline 7.3)
 was in `NZXT_KRAKEN3_CHIPS` but not in `LIQUID_COOLER_CHIPS` or `COOLANT_TEMP_CHIPS`. Its pump was always
 protected by its "Pump speed" label. What changes now: `is_aio` and `aio_hwmon.present` hold for it; its

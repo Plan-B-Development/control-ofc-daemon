@@ -590,7 +590,7 @@ fn ite_unbound_tail(out_of_tree: bool) -> &'static str {
          front of it (the kernel log shows 0x8883 for it only with it87 dynamic \
          debug on). It is recoverable: something wrote a Super-I/O unlock to \
          0x2E/0x4E — nct6775, w83627ehf or sensors-detect — and this package \
-         ships a guard that stops the two modules on known boards. Stop the \
+         ships a guard that stops the two modules on every Gigabyte board. Stop the \
          trigger and reboot; if the chip is still missing, the machine must be \
          powered down at the wall, because the bridge runs on standby power and \
          a reboot does not always clear it. Full steps in the Hardware \

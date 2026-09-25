@@ -28,8 +28,10 @@
 //! - **Never write the Nuvoton unlock on an all-ITE board.** `0x87,0x87` is the
 //!   sequence DEC-332 measured latching the IT8883 bridge, and
 //!   `packaging/control-ofc-superio-guard` exists to stop `nct6775`/`w83627ehf`
-//!   writing it on the boards in `chip_db::GIGABYTE_DUAL_CHIP_BOARDS`. This
-//!   probe now consults the same table: where DMI says the board's Super-I/O
+//!   writing it — since DEC-424 on every Gigabyte board, and before that on the
+//!   boards in `chip_db::GIGABYTE_DUAL_CHIP_BOARDS`. This probe consults that
+//!   table, not the vendor, so it withholds on the listed boards only (register
+//!   row `BRD-s`): where DMI says the board's Super-I/O
 //!   complement is ITE-only, the Nuvoton fall-through is **withheld** rather
 //!   than written, so the daemon cannot inflict the damage its own packaging
 //!   guards against. The ITE legs are untouched, which is the diagnostic those
