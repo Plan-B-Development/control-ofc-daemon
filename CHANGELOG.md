@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.56.3] — 2026-09-27
+
 ### Changed
 
 - **The `nct6687` / `nct6775` collision remediation now says what to do** (DEC-433). It used to

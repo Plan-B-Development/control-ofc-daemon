@@ -9,7 +9,7 @@ name = "control-ofc-tray"
 # line makes that expression evaluate to the string `version.workspace = true`,
 # which fails the tag check AFTER the tag is public (DEC-263 made `ci-green`
 # fail-closed, so recovery means delete-and-retag). Measured, not assumed.
-version = "2.56.2"
+version = "2.56.3"
 edition = "2021"
 license = "MIT"
 description = "KDE/freedesktop system-tray client for the Control-OFC daemon"
