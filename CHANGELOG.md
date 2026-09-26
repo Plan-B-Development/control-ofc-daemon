@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Fixed
+
+**Memory temperatures on nct6683-family chips are no longer treated as the CPU** (DEC-429). The
+`nct6683` driver (also used for `nct6686` and `nct6687`) reports four memory temperatures,
+`PECI DIMM 0` to `PECI DIMM 3`. They are read over the same PECI bus as the CPU, and the daemon
+reported them as `cpu_temp`. So the thermal safety check counted them as CPU readings. On a machine
+with no other CPU sensor (no `k10temp` or `coretemp`), a memory reading stood in for the missing CPU
+and kept the 40% no-CPU-sensor minimum from switching on. They are now reported as `mb_temp`.
+The CPU's own PECI channels (`PECI 0.0` to `PECI 3.1`) still count as CPU. Curves bound to these
+sensors still find them, because sensor ids do not change. Like any board sensor, though, a
+`PECI DIMM` that stops updating now holds its curve's fans at their last speed (the control is
+listed as not controlled) instead of running on the frozen value. And on a machine where these
+were the only CPU readings, the PWM Test Report's stall probe now refuses to run, because there is
+no CPU temperature to watch.
+
 ## [2.56.2] — 2026-09-25
 
 ### Fixed

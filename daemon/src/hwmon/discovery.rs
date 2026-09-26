@@ -261,7 +261,18 @@ pub(crate) fn classify_chip(chip_name: &str, label: &str, board_vendor: &str) ->
         _ if chip_name.starts_with("it87") => SensorKind::MbTemp,
         // Nuvoton Super I/O families: default MbTemp, but TSI/PECI labels indicate CPU
         c if NUVOTON_PECI_TSI_CHIPS.contains(&c) => {
-            if lower.contains("amd tsi")
+            // [SAFETY] `DC-f`: nct6683's `PECI DIMM 0`..`3` are memory
+            // temperatures read over PECI — `temp_type` 6, and "peci" in the
+            // label — so the promotion below took them for the CPU. As `CpuTemp`
+            // they joined the ladder's hottest-CPU reduce, and on a board with
+            // no k10temp/coretemp a DIMM reading stood in for the CPU and
+            // suppressed the no-sensor floor. Excluded first. The nct6775
+            // family's DIMM labels (`PCH_DIM0_TEMP`, `Agent0 Dimm0`) never
+            // matched a keyword, so this changes nothing for them. The `PCH`
+            // labels naming the CPU are deliberately left promoted (DEC-429).
+            if lower.contains("dimm") {
+                SensorKind::MbTemp
+            } else if lower.contains("amd tsi")
                 || lower.contains("tsi")
                 || lower.contains("peci")
                 || lower.contains("cpu")
@@ -1248,6 +1259,21 @@ mod tests {
             ),
             ("nct6779", "PECI Agent 0", SensorKind::CpuTemp),
             ("nct6798", "SYSTIN", SensorKind::MbTemp), // no keyword → MB, as before
+            // DC-f: nct6683's PECI-read memory temperatures are never CPU,
+            // on every chip of that driver; the CPU PECI channels beside them
+            // still are (presence, so the exclusion is not a blanket demotion).
+            ("nct6683", "PECI DIMM 0", SensorKind::MbTemp),
+            ("nct6683", "PECI DIMM 3", SensorKind::MbTemp),
+            ("nct6686", "PECI DIMM 1", SensorKind::MbTemp),
+            ("nct6687", "PECI DIMM 2", SensorKind::MbTemp),
+            ("nct6683", "PECI 0.0", SensorKind::CpuTemp),
+            ("nct6687", "PECI 3.1", SensorKind::CpuTemp),
+            ("nct6683", "DIMM 0", SensorKind::MbTemp), // no keyword, as before
+            // Left promoted on purpose (DEC-429): each is >= the CPU reading.
+            ("nct6683", "PCH CPU", SensorKind::CpuTemp),
+            ("nct6683", "PCH CHIP CPU MAX", SensorKind::CpuTemp),
+            ("nct6798", "PCH_CHIP_CPU_MAX_TEMP", SensorKind::CpuTemp),
+            ("nct6798", "Agent0 Dimm0", SensorKind::MbTemp), // no keyword, as before
             ("nct6798", "AUXTIN0", SensorKind::MbTemp),
             // ── ASUS EC / WMI arms ──
             ("asus_ec_sensors", "CPU", SensorKind::CpuTemp),

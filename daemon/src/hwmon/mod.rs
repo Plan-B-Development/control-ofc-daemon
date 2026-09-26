@@ -426,4 +426,117 @@ mod tests {
         assert!(!is_gpu_owned_hwmon_chip("xe"));
         assert!(!is_gpu_owned_hwmon_chip("i915"));
     }
+
+    /// [SAFETY] `DC-f` (end-to-end, sysfs bytes -> the ladder's CPU reading).
+    ///
+    /// nct6683 reads memory temperatures over PECI and labels them `PECI DIMM
+    /// 0`..`3`, with `temp_type` 6 like the CPU's own PECI channels. Classified
+    /// `CpuTemp`, a DIMM joined `hottest_cpu_reading`'s max-reduce, and on a
+    /// board with no k10temp/coretemp it stood in for the CPU — a fresh "CPU"
+    /// reading that kept the no-sensor floor from ever engaging.
+    ///
+    /// Two halves, and each runs the REAL discovery, read and reduction:
+    /// beside a real PECI CPU channel the ladder sees the CPU (the DIMM is set
+    /// hotter, so a `max` over it would show); with the DIMM alone the ladder
+    /// sees no CPU at all, which is what arms the floor.
+    #[test]
+    fn a_peci_dimm_reading_never_reaches_the_thermal_ladder() {
+        fn ladder_reading(
+            channels: &[(&str, &str, &str)],
+        ) -> (Vec<SensorDescriptor>, crate::profile_engine::CpuReading) {
+            let tmp = tempfile::tempdir().unwrap();
+            let hwmon0 = tmp.path().join("hwmon0");
+            fs::create_dir_all(&hwmon0).unwrap();
+            fs::write(hwmon0.join("name"), "nct6683\n").unwrap();
+            for (i, (label, millideg, temp_type)) in channels.iter().enumerate() {
+                let n = i + 1;
+                fs::write(
+                    hwmon0.join(format!("temp{n}_input")),
+                    format!("{millideg}\n"),
+                )
+                .unwrap();
+                fs::write(hwmon0.join(format!("temp{n}_label")), format!("{label}\n")).unwrap();
+                fs::write(
+                    hwmon0.join(format!("temp{n}_type")),
+                    format!("{temp_type}\n"),
+                )
+                .unwrap();
+            }
+            let descriptors = discovery::discover_sensors(tmp.path()).unwrap();
+            let outcome = read_sensor_values(&descriptors);
+            assert_eq!(outcome.failures.len(), 0, "every channel must read");
+            assert_eq!(outcome.readings.len(), channels.len());
+
+            let now = std::time::Instant::now();
+            let sensors: std::collections::HashMap<
+                String,
+                crate::health::state::CachedSensorReading,
+            > = outcome
+                .readings
+                .iter()
+                .map(|r| {
+                    (
+                        r.id.clone(),
+                        crate::health::state::CachedSensorReading {
+                            id: r.id.clone(),
+                            kind: r.kind,
+                            label: r.label.clone(),
+                            value_c: r.value_c,
+                            source: crate::health::state::DeviceLabel::Hwmon,
+                            updated_at: now,
+                            rate_c_per_s: None,
+                            session_min_c: None,
+                            session_max_c: None,
+                            chip_name: r.chip_name.clone(),
+                            temp_type: r.temp_type,
+                            thresholds: r.thresholds.clone(),
+                        },
+                    )
+                })
+                .collect();
+            let reading = crate::profile_engine::hottest_cpu_reading(
+                &sensors,
+                now,
+                std::time::Duration::from_secs(5),
+            );
+            (descriptors, reading)
+        }
+
+        // ── Beside a real CPU channel: the ladder sees the CPU, not the DIMM. ──
+        let (descs, reading) = ladder_reading(&[
+            ("PECI 0.0", "55000", "6"),
+            ("PECI DIMM 0", "70000", "6"),
+            ("Thermistor 0", "40000", "4"),
+        ]);
+        assert_eq!(
+            reading,
+            crate::profile_engine::CpuReading::Fresh(55.0),
+            "the ladder must see the CPU's 55\u{b0}C, never the DIMM's 70\u{b0}C"
+        );
+        // Presence: the CPU channel is still promoted, so the exclusion is not
+        // a blanket demotion of PECI.
+        assert!(
+            descs
+                .iter()
+                .any(|d| d.label == "PECI 0.0" && d.kind == SensorKind::CpuTemp),
+            "the PECI CPU channel must stay a CPU source"
+        );
+        assert!(
+            descs
+                .iter()
+                .any(|d| d.label == "PECI DIMM 0" && d.kind == SensorKind::MbTemp),
+            "a PECI DIMM must classify as a board sensor"
+        );
+
+        // ── The DIMM alone: no CPU reading, so the no-sensor floor can arm. ──
+        let (_, reading) = ladder_reading(&[
+            ("PECI DIMM 1", "48000", "6"),
+            ("Thermistor 0", "40000", "4"),
+        ]);
+        assert_eq!(
+            reading,
+            crate::profile_engine::CpuReading::Absent,
+            "a memory reading must not stand in for a missing CPU sensor"
+        );
+    }
 }
