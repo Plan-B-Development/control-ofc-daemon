@@ -370,7 +370,17 @@ const MODULE_COLLISIONS: &[ModuleCollisionEntry] = &[ModuleCollisionEntry {
              nct6687 loaded with force=1 remain at risk — since nct6687d \
              PR #174 (2026-05-22) force=1 attaches to any chip ID in \
              0xD000-0xDFFF, NCT6797D and NCT6798D included.",
-    remediation: "(1) Identify the chip FIRST: run `sudo dmesg | grep -i 'found nct'` \
+    remediation: "FIRST, until you have rebooted and this collision is no longer \
+             reported, deactivate the active profile (the tray's \"Stop profile \
+             control\", or `curl --unix-socket /run/control-ofc/control-ofc.sock \
+             -X POST http://localhost/profile/deactivate`) and run no fan tests. \
+             That stops the curve, not every write: this daemon does not stop on \
+             its own while the collision is reported, it restores each header's \
+             original mode once (100 % if it cannot confirm it), and a \
+             thermal emergency still drives writable headers to 100 %. Only \
+             removing the wrong driver — blacklist it, then reboot — stops writes \
+             to the chip. \
+             (1) Identify the chip: run `sudo dmesg | grep -i 'found nct'` \
              to see which driver found which chip on this boot — two drivers \
              reporting a chip at the same address claimed the same one. (The \
              hwmon name does not tell you: the in-kernel nct6683 names its \
@@ -384,9 +394,8 @@ const MODULE_COLLISIONS: &[ModuleCollisionEntry] = &[ModuleCollisionEntry {
              TOMAHAWK WIFI, X570-A PRO and the original MPG X570 boards), \
              blacklist nct6687: `echo 'blacklist nct6687' | sudo tee \
              /etc/modprobe.d/blacklist-nct6687.conf`. \
-             (4) Reboot. Do NOT write PWM until you have verified the chip and, \
-             on an NCT679x board, blacklisted nct6687 — blacklisting the wrong \
-             driver will leave you with no fan control. \
+             (4) Reboot. Blacklisting the wrong driver will leave you with no \
+             fan control, so verify the chip first. \
              (Prevention: a current nct6687d build, post-PR #164, no longer \
              claims 0xd450 by default — updating the package is the durable fix. \
              Never load nct6687 with force=1 on a board whose chip is an \
@@ -1908,6 +1917,21 @@ mod tests {
         assert_eq!(entry.severity, "critical");
         assert!(entry.summary.contains("0xd450"));
         assert!(entry.remediation.contains("blacklist"));
+        // DC-x (DEC-433): the engine ignores the collision, so the remediation
+        // must name the action that actually stops its writes, and must not tell
+        // the user to stop writing PWM, which a user of this daemon never does.
+        assert!(entry.remediation.contains("deactivate the active profile"));
+        assert!(entry.remediation.contains("Stop profile control"));
+        assert!(entry.remediation.contains("thermal emergency"));
+        assert!(!entry.remediation.to_lowercase().contains("write pwm"));
+        // Deactivating still writes (the hand-back, DEC-382), so the text must
+        // not claim it sets no duty, and must come before the steps it guards.
+        assert!(!entry.remediation.contains("sets no duty"));
+        let deactivate = entry
+            .remediation
+            .find("deactivate the active profile")
+            .unwrap();
+        assert!(deactivate < entry.remediation.find("(1)").unwrap());
     }
 
     #[test]

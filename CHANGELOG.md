@@ -2,7 +2,24 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **The `nct6687` / `nct6775` collision remediation now says what to do** (DEC-433). It used to
+  say "Do NOT write PWM", but users never write PWM, and the daemon keeps writing through a
+  reported collision. It now says, first, to deactivate the active profile (the tray's **Stop
+  profile control**, or `POST /profile/deactivate`) and run no fan tests until you have rebooted
+  and the collision is gone. It also says what that does not do: the daemon still restores each
+  header's original mode once, a thermal emergency still drives writable headers to 100 %, and
+  only removing the wrong driver stops writes to the chip.
+
 ### Documentation
+
+- **The port-probe consent texts now say what the probe writes and when it refuses** (DEC-433).
+  `superio-port-probe.conf.example` and `daemon.toml.example` called the probe read-only and said
+  it skipped only ports a driver owns. Where nothing answers, it writes a vendor unlock and exit,
+  including the Nuvoton `0x87,0x87` unlock except on boards listed as ITE-only. It refuses the whole
+  probe while any recognised Super-I/O driver is bound, as it does whenever `it87` is loaded on a
+  dual-chip Gigabyte board. `daemon.md` is corrected to match.
 
 - The user guide now says the example profile `/etc/control-ofc/profiles/quiet.json` controls no
   fan as shipped. Its one control has no members, and the GUI's starter profiles are the same
