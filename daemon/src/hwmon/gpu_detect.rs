@@ -60,25 +60,29 @@ pub struct AmdGpuInfo {
 impl AmdGpuInfo {
     /// User-facing display label following the product rule:
     /// specific model name if known (e.g. "9070XT"), otherwise "AMD D-GPU".
+    /// Only an "RX " name is compacted (prefix and spaces dropped); any other
+    /// name ("Pro W7900", "AI PRO R9700") is kept as written, because run
+    /// together it stops being readable (DEC-430).
     pub fn display_label(&self) -> String {
-        if let Some(ref name) = self.marketing_name {
-            // Compact label: strip "RX " prefix, remove spaces
-            name.replace("RX ", "").replace(' ', "")
-        } else {
-            "AMD D-GPU".to_string()
+        match self.marketing_name.as_deref() {
+            Some(name) => match name.strip_prefix("RX ") {
+                Some(model) => model.replace(' ', ""),
+                None => name.to_string(),
+            },
+            None => "AMD D-GPU".to_string(),
         }
     }
 
     /// Fan control method available on this GPU.
     ///
     /// - `"pmfw_curve"`: PMFW fan_curve exists (RDNA3+ with overdrive enabled)
-    /// - `"hwmon_pwm"`: pwm1 AND pwm1_enable both exist (pre-RDNA3)
+    /// - `"hwmon_pwm"`: [`Self::can_write_legacy_pwm`] (pre-RDNA3 only)
     /// - `"read_only"`: can read fan RPM but no write path available
     /// - `"none"`: no fan interface at all
     pub fn fan_control_method(&self) -> &'static str {
         if self.fan_curve_path.is_some() {
             "pmfw_curve"
-        } else if self.has_pwm && self.has_pwm_enable {
+        } else if self.can_write_legacy_pwm() {
             "hwmon_pwm"
         } else if self.has_fan_rpm || self.has_pwm {
             "read_only"
@@ -89,14 +93,62 @@ impl AmdGpuInfo {
 
     /// Whether the legacy hwmon `pwm1` write path is functional on this GPU.
     ///
-    /// `pwm1` existing alone is not sufficient — RDNA3/RDNA4 GPUs without
-    /// `amdgpu.ppfeaturemask=0xffffffff` expose `pwm1` as read-only and lack
-    /// `pwm1_enable`. Writing to `pwm1_enable` on those GPUs returns `ENOENT`
-    /// and surfaces a misleading 503 hardware_unavailable. Capability scoring
-    /// at `status.rs` and the GPU set/reset handlers must agree on this rule
-    /// to avoid drift between `/capabilities` and the actual handler outcome.
+    /// `pwm1` existing alone is not sufficient, and neither is `pwm1_enable`
+    /// existing beside it (DEC-430, kernel source read at torvalds master
+    /// 2026-09-26):
+    ///
+    /// - **RDNA4** (`smu_v14_0_2_ppt.c`) registers only the fan getters, so
+    ///   `hwmon_attributes_visible()` masks `pwm1` to read-only and
+    ///   `pwm1_enable` to mode 0, which never creates it. Writing it returned
+    ///   `ENOENT` and a misleading 503 before DEC-098.
+    /// - **RDNA3** (`smu_v13_0_{0,7}_ppt.c`) registers `set_fan_speed_pwm` and
+    ///   `get/set_fan_control_mode`, so `pwm1` and `pwm1_enable` BOTH exist at
+    ///   0644 — but `smu_v13_0_auto_fan_control()` returns 0 without acting when
+    ///   the firmware does not support `SMU_FEATURE_FAN_CONTROL_BIT`, so a write
+    ///   can succeed and change nothing. File presence cannot tell the two
+    ///   apart, so this fails closed on the device id: an RDNA3/RDNA4 card never
+    ///   qualifies, whatever files exist. Its only write path is PMFW
+    ///   `fan_curve`.
+    ///
+    /// Capability scoring at `status.rs` and the GPU reset/verify handlers
+    /// must agree on this rule to avoid drift between `/capabilities` and the
+    /// actual handler outcome (DEC-098).
     pub fn can_write_legacy_pwm(&self) -> bool {
-        self.has_pwm && self.has_pwm_enable
+        self.has_pwm && self.has_pwm_enable && !is_rdna3_or_rdna4(self.pci_device_id)
+    }
+
+    /// Why an RDNA3/RDNA4 card with a fan is read-only, or `None` when it has
+    /// its PMFW `fan_curve` or is not RDNA3/RDNA4 (DEC-430). PMFW is that
+    /// card's only write path, so a missing `fan_curve` is the whole story —
+    /// but not always the user's `ppfeaturemask`: since kernel 7.0 the driver
+    /// hides the curve when the firmware reports an invalid fan range, so the
+    /// kernel-parameter advice is given only while overdrive is off. The
+    /// startup log and the `feature_unavailable` hint both say this; it is
+    /// worded once, here.
+    pub fn rdna_read_only_reason(&self) -> Option<String> {
+        if self.fan_curve_path.is_some()
+            || !is_rdna3_or_rdna4(self.pci_device_id)
+            || !(self.has_fan_rpm || self.has_pwm)
+        {
+            return None;
+        }
+        let bdf = &self.pci_bdf;
+        Some(if self.overdrive_enabled {
+            format!(
+                "GPU {bdf} fan control is read-only: an RDNA3/RDNA4 fan is writable only \
+                 through the PMFW fan_curve, and the kernel did not expose one although \
+                 overdrive is enabled. Kernel 7.0 and later hide it when the card's \
+                 firmware reports an invalid fan range, and older kernels may not support \
+                 PMFW fan control for this card — check dmesg for amdgpu messages."
+            )
+        } else {
+            format!(
+                "GPU {bdf} fan control is read-only: an RDNA3/RDNA4 fan is writable only \
+                 through the PMFW fan_curve, which needs overdrive (amdgpu.ppfeaturemask \
+                 bit 14, 0x4000). Add 'amdgpu.ppfeaturemask=0xffffffff' to the kernel \
+                 parameters and reboot to enable PMFW fan control."
+            )
+        })
     }
 
     /// Whether this GPU has any fan-related sysfs files (fan or PWM).
@@ -133,9 +185,14 @@ impl AmdGpuInfo {
 /// series (0x7590) and seven RDNA3 cards, with two of its comments naming the
 /// wrong die. It also covers
 /// the RDNA3 / RDNA3.5 iGPUs, because on an APU-only machine the primary GPU the
-/// advisory is evaluated for IS the iGPU. An ID missing here only loses that
-/// advisory and hint — nothing writes on this answer. Product names only, from
-/// the table: it does not name dies, so neither does this.
+/// advisory is evaluated for IS the iGPU. **Since DEC-430 this list is also a
+/// write-path input:** [`AmdGpuInfo::can_write_legacy_pwm`] refuses the legacy
+/// `pwm1` path for every ID here, because RDNA3 exposes a writable-looking
+/// `pwm1_enable` that can silently no-op. An RDNA3 ID missing here would be
+/// judged by file presence alone and could be reported as `hwmon_pwm`; a
+/// missing RDNA4 ID is still read-only by construction (no `pwm1_enable`).
+/// Product names only, from the table: it does not name dies, so neither does
+/// this.
 pub fn is_rdna3_or_rdna4(device_id: u16) -> bool {
     matches!(
         device_id,
@@ -243,21 +300,7 @@ fn detect_single_gpu(hwmon_dir: &Path, overdrive_enabled: bool) -> Option<AmdGpu
     let fan_curve_path = find_fan_curve_path(&pci_path);
     let fan_zero_rpm_path = find_fan_zero_rpm_path(&pci_path);
 
-    if fan_curve_path.is_none() && !has_pwm_enable && has_fan_rpm && overdrive_enabled {
-        log::info!(
-            "GPU {pci_bdf}: overdrive enabled but gpu_od/fan_ctrl/fan_curve not found. \
-             Kernel/firmware may not support PMFW fan control for this GPU yet."
-        );
-    } else if fan_curve_path.is_none() && !has_pwm_enable && has_fan_rpm && !overdrive_enabled {
-        log::info!(
-            "GPU {pci_bdf}: RDNA3+ GPU detected without pwm1_enable. \
-             PMFW fan control requires amdgpu.ppfeaturemask with bit 14 (0x4000) set. \
-             Current ppfeaturemask does not include overdrive. \
-             Add 'amdgpu.ppfeaturemask=0xffffffff' to kernel parameters to enable."
-        );
-    }
-
-    Some(AmdGpuInfo {
+    let gpu = AmdGpuInfo {
         pci_bdf,
         pci_device_id,
         pci_revision,
@@ -271,7 +314,11 @@ fn detect_single_gpu(hwmon_dir: &Path, overdrive_enabled: bool) -> Option<AmdGpu
         has_pwm,
         has_pwm_enable,
         overdrive_enabled,
-    })
+    };
+    if let Some(reason) = gpu.rdna_read_only_reason() {
+        log::info!("{reason}");
+    }
+    Some(gpu)
 }
 
 /// Resolve the `device` symlink to the actual PCI device path.
@@ -362,54 +409,123 @@ fn find_fan_zero_rpm_path(pci_device_path: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Map a PCI device ID (and optional revision) to an AMD GPU marketing name.
+/// Every discrete RDNA2 / RDNA3 / RDNA4 product in libdrm's `amdgpu.ids`
+/// (libdrm 2.4.134, read 2026-09-26): `(device, revision, name)`, with the
+/// table's `AMD Radeon ` / `AMD ` prefix dropped (DEC-430).
 ///
-/// Verified against pci.ids database and lspci output.
+/// Generated from the table, not typed: the 0x73A0–0x73FF, 0x7420–0x743F,
+/// 0x7440–0x749F, 0x7550, 0x7551 and 0x7590 rows, in file order. Instinct
+/// (CDNA) parts are outside those ranges, and the iGPUs have no fan. Where the
+/// table lists one (device, revision) twice — 0x743F rev C3 is both "RX 6500"
+/// and "RX 6500M" — only the first is kept, which is the one libdrm's own
+/// lookup returns (`amdgpu_parse_asic_ids` stops at the first match).
+///
+/// **One device id is often several products,** told apart only by revision:
+/// 0x744C is the RX 7900 XTX, XT, GRE and 7900M; 0x7480 is seven cards from
+/// the Pro W7600 to the RX 7600. The table this replaced keyed most rows on the
+/// id alone and named several ids as the wrong product outright — an RX 7600
+/// showed as "7900GRE Fan", a Pro W6600 as "RX 6800".
+const AMDGPU_IDS: &[(u16, u8, &str)] = &[
+    (0x73A1, 0x00, "Pro V620"),
+    (0x73A3, 0x00, "Pro W6800"),
+    (0x73A5, 0xC0, "RX 6950 XT"),
+    (0x73AE, 0x00, "Pro V620 MxGPU"),
+    (0x73AF, 0xC0, "RX 6900 XT"),
+    (0x73BF, 0xC0, "RX 6900 XT"),
+    (0x73BF, 0xC1, "RX 6800 XT"),
+    (0x73BF, 0xC3, "RX 6800"),
+    (0x73DF, 0xC0, "RX 6750 XT"),
+    (0x73DF, 0xC1, "RX 6700 XT"),
+    (0x73DF, 0xC2, "RX 6800M"),
+    (0x73DF, 0xC3, "RX 6800M"),
+    (0x73DF, 0xC5, "RX 6700 XT"),
+    (0x73DF, 0xCF, "RX 6700M"),
+    (0x73DF, 0xD5, "RX 6750 GRE 12GB"),
+    (0x73DF, 0xD7, "TDC-235"),
+    (0x73DF, 0xDF, "RX 6700"),
+    (0x73DF, 0xE5, "RX 6750 GRE 12GB"),
+    (0x73DF, 0xFF, "RX 6700"),
+    (0x73E0, 0x00, "RX 6600M"),
+    (0x73E1, 0x00, "Pro W6600M"),
+    (0x73E3, 0x00, "Pro W6600"),
+    (0x73EF, 0xC0, "RX 6800S"),
+    (0x73EF, 0xC1, "RX 6650 XT"),
+    (0x73EF, 0xC2, "RX 6700S"),
+    (0x73EF, 0xC3, "RX 6650M"),
+    (0x73EF, 0xC4, "RX 6650M XT"),
+    (0x73FF, 0xC1, "RX 6600 XT"),
+    (0x73FF, 0xC3, "RX 6600M"),
+    (0x73FF, 0xC7, "RX 6600"),
+    (0x73FF, 0xCB, "RX 6600S"),
+    (0x73FF, 0xCF, "RX 6600 LE"),
+    (0x73FF, 0xDF, "RX 6750 GRE 10GB"),
+    (0x7421, 0x00, "Pro W6500M"),
+    (0x7422, 0x00, "Pro W6400"),
+    (0x7423, 0x00, "Pro W6300M"),
+    (0x7423, 0x01, "Pro W6300"),
+    (0x7424, 0x00, "RX 6300"),
+    (0x743F, 0xC1, "RX 6500 XT"),
+    (0x743F, 0xC3, "RX 6500"),
+    (0x743F, 0xC7, "RX 6400"),
+    (0x743F, 0xC8, "RX 6500M"),
+    (0x743F, 0xCC, "6550S"),
+    (0x743F, 0xCE, "RX 6450M"),
+    (0x743F, 0xCF, "RX 6300M"),
+    (0x743F, 0xD3, "RX 6550M"),
+    (0x743F, 0xD7, "RX 6400"),
+    (0x7448, 0x00, "Pro W7900"),
+    (0x7449, 0x00, "Pro W7800 48GB"),
+    (0x744A, 0x00, "Pro W7900 Dual Slot"),
+    (0x744B, 0x00, "Pro W7900D"),
+    (0x744C, 0xC8, "RX 7900 XTX"),
+    (0x744C, 0xCC, "RX 7900 XT"),
+    (0x744C, 0xCE, "RX 7900 GRE"),
+    (0x744C, 0xCF, "RX 7900M"),
+    (0x745E, 0xCC, "Pro W7800"),
+    (0x7460, 0x00, "Pro V710"),
+    (0x7461, 0x00, "Pro V710 MxGPU"),
+    (0x7470, 0x00, "Pro W7700"),
+    (0x747E, 0xC8, "RX 7800 XT"),
+    (0x747E, 0xD8, "RX 7800M"),
+    (0x747E, 0xDB, "RX 7700"),
+    (0x747E, 0xFF, "RX 7700 XT"),
+    (0x7480, 0x00, "Pro W7600"),
+    (0x7480, 0xC0, "RX 7600 XT"),
+    (0x7480, 0xC1, "RX 7700S"),
+    (0x7480, 0xC2, "RX 7650 GRE"),
+    (0x7480, 0xC3, "RX 7600S"),
+    (0x7480, 0xC7, "RX 7600M XT"),
+    (0x7480, 0xCF, "RX 7600"),
+    (0x7481, 0xC7, "Steam Machine"),
+    (0x7483, 0xCF, "RX 7600M"),
+    (0x7489, 0x00, "Pro W7500"),
+    (0x7499, 0x00, "Pro W7400"),
+    (0x7499, 0xC0, "RX 7400"),
+    (0x7499, 0xC1, "RX 7300"),
+    (0x7550, 0xC0, "RX 9070 XT"),
+    (0x7550, 0xC2, "RX 9070 GRE"),
+    (0x7550, 0xC3, "RX 9070"),
+    (0x7551, 0xC0, "AI PRO R9700"),
+    (0x7551, 0xC8, "AI PRO R9600D"),
+    (0x7590, 0xC0, "RX 9060 XT"),
+    (0x7590, 0xC1, "RX 9060 XT LP"),
+    (0x7590, 0xC7, "RX 9060"),
+];
+
+/// Map a PCI device ID and revision to an AMD GPU marketing name.
+///
+/// Exact `(device, revision)` match against [`AMDGPU_IDS`] only. Anything else
+/// — an unlisted revision of a known id included — is `None`, which displays as
+/// "AMD D-GPU": a generic name is honest, a guessed one is not (DEC-430).
 fn lookup_marketing_name(device_id: u16, revision: u8) -> Option<String> {
-    match device_id {
-        // RDNA4 — Navi 48 (RX 9070 series)
-        // Same device ID 0x7550, distinguished by PCI revision
-        0x7550 => match revision {
-            0xC0 => Some("RX 9070 XT".into()),
-            0xC3 => Some("RX 9070".into()),
-            _ => Some("RX 9070 Series".into()),
-        },
-
-        // RDNA3 — Navi 31 (RX 7900 series)
-        0x744C => Some("RX 7900 XTX".into()),
-        0x7448 => Some("RX 7900 XT".into()),
-        0x7480 => Some("RX 7900 GRE".into()),
-        // RDNA3 — Navi 32 (RX 7800/7700 series)
-        0x7470 => Some("RX 7800 XT".into()),
-        0x747E => Some("RX 7700 XT".into()),
-        // RDNA3 — Navi 33 (RX 7600 series)
-        0x7460 => Some("RX 7600 XT".into()),
-        0x7461 => Some("RX 7600".into()),
-
-        // RDNA2 — Navi 21 (RX 6900/6800 series)
-        0x73BF => Some("RX 6900 XT".into()),
-        0x73A5 => Some("RX 6950 XT".into()),
-        0x73EF => Some("RX 6800 XT".into()),
-        0x73E3 => Some("RX 6800".into()),
-        // RDNA2 — Navi 22 (RX 6700 series)
-        0x73DF => Some("RX 6700 XT".into()),
-        0x73D1 => Some("RX 6700".into()),
-        // RDNA2 — Navi 23 (RX 6600 series)
-        0x73FF => Some("RX 6600 XT".into()),
-        0x73E9 => Some("RX 6600".into()),
-
-        // Known iGPUs — return None (they get "AMD D-GPU" fallback but are filtered by
-        // has_any_fan_interface in practice)
-        0x13C0 => None, // Granite Ridge iGPU (Ryzen 9000 series)
-        0x1681 => None, // Rembrandt iGPU (Ryzen 6000/7000 mobile)
-        0x164E => None, // Raphael iGPU (Ryzen 7000 desktop)
-        0x15BF => None, // Phoenix iGPU (Ryzen 7040/8040)
-
-        _ => {
-            log::debug!("Unknown AMD GPU device ID: {device_id:#06x} rev {revision:#04x}");
-            None
-        }
+    let name = AMDGPU_IDS
+        .iter()
+        .find(|(d, r, _)| *d == device_id && *r == revision)
+        .map(|(_, _, name)| (*name).to_string());
+    if name.is_none() {
+        log::debug!("Unknown AMD GPU device ID: {device_id:#06x} rev {revision:#04x}");
     }
+    name
 }
 
 /// Instantaneous GPU power draw in watts, from an already-resolved GPU hwmon
@@ -653,12 +769,12 @@ mod tests {
         );
     }
 
+    /// DEC-430: only an exact (device, revision) match names a card. The old
+    /// table answered "RX 9070 Series" for an unknown 0x7550 revision.
     #[test]
-    fn navi48_unknown_revision_is_series() {
-        assert_eq!(
-            lookup_marketing_name(0x7550, 0xFF),
-            Some("RX 9070 Series".to_string())
-        );
+    fn unknown_revision_of_a_known_id_is_none() {
+        assert_eq!(lookup_marketing_name(0x7550, 0xFF), None);
+        assert_eq!(lookup_marketing_name(0x744C, 0x00), None);
     }
 
     #[test]
@@ -666,12 +782,96 @@ mod tests {
         assert_eq!(lookup_marketing_name(0x13C0, 0xCB), None);
     }
 
+    /// DEC-430 (`DC-d`): one device id is several products, told apart by
+    /// revision, and the old id-only rows named these wrong outright. Expected
+    /// names are libdrm `amdgpu.ids` rows (2.4.134).
     #[test]
-    fn rdna3_lookup() {
-        assert_eq!(
-            lookup_marketing_name(0x744C, 0x00),
-            Some("RX 7900 XTX".to_string())
-        );
+    fn names_follow_libdrm_by_device_and_revision() {
+        for (id, rev, want) in [
+            (0x744C, 0xC8, "RX 7900 XTX"),
+            (0x744C, 0xCC, "RX 7900 XT"),
+            (0x744C, 0xCE, "RX 7900 GRE"),
+            (0x7448, 0x00, "Pro W7900"), // was "RX 7900 XT"
+            (0x7480, 0xCF, "RX 7600"),   // was "RX 7900 GRE"
+            (0x7480, 0xC0, "RX 7600 XT"),
+            (0x7470, 0x00, "Pro W7700"), // was "RX 7800 XT"
+            (0x747E, 0xC8, "RX 7800 XT"),
+            (0x747E, 0xFF, "RX 7700 XT"),
+            (0x7460, 0x00, "Pro V710"), // was "RX 7600 XT"
+            (0x7550, 0xC2, "RX 9070 GRE"),
+            (0x7551, 0xC0, "AI PRO R9700"),
+            (0x7590, 0xC0, "RX 9060 XT"),
+            (0x73BF, 0xC1, "RX 6800 XT"),
+            (0x73E3, 0x00, "Pro W6600"),  // was "RX 6800"
+            (0x73EF, 0xC1, "RX 6650 XT"), // was "RX 6800 XT"
+            (0x73DF, 0xC0, "RX 6750 XT"),
+            // libdrm lists 0x743F rev C3 twice and its lookup returns the first.
+            (0x743F, 0xC3, "RX 6500"),
+        ] {
+            assert_eq!(
+                lookup_marketing_name(id, rev).as_deref(),
+                Some(want),
+                "{id:#06x} rev {rev:#04x}"
+            );
+        }
+    }
+
+    /// Every (device, revision) is listed once — a second row could never be
+    /// reached — and every name is non-empty with its vendor prefix dropped.
+    #[test]
+    fn amdgpu_ids_rows_are_unique_and_clean() {
+        let mut seen = std::collections::HashSet::new();
+        for (id, rev, name) in AMDGPU_IDS {
+            assert!(seen.insert((*id, *rev)), "{id:#06x} rev {rev:#04x} twice");
+            assert!(!name.is_empty() && !name.starts_with("AMD"), "{name:?}");
+        }
+    }
+
+    /// The name table and the write-path exclusion are two lists of the same
+    /// cards. Every RDNA3/RDNA4 id the name table knows (0x7440–0x749F, 0x7550,
+    /// 0x7551, 0x7590) must be excluded from the legacy path, and no RDNA2 id
+    /// (0x73A0–0x743F) may be — otherwise a named RX 7000 could be reported as
+    /// `hwmon_pwm` again, or an RX 6000 lose its only write path (DEC-430).
+    #[test]
+    fn every_named_rdna3_or_rdna4_id_is_excluded_from_legacy_pwm() {
+        let mut rdna34 = 0;
+        for (id, rev, name) in AMDGPU_IDS {
+            let is_rdna34_range =
+                (0x7440..=0x749F).contains(id) || matches!(id, 0x7550 | 0x7551 | 0x7590);
+            // Every file the legacy path could ask for, so the id decides.
+            let card = AmdGpuInfo {
+                pci_bdf: "0000:03:00.0".into(),
+                pci_device_id: *id,
+                pci_revision: *rev,
+                pci_class: PCI_CLASS_VGA,
+                marketing_name: Some((*name).into()),
+                hwmon_path: PathBuf::from("/nonexistent/hwmon"),
+                fan_curve_path: None,
+                fan_zero_rpm_path: None,
+                is_discrete: true,
+                has_fan_rpm: true,
+                has_pwm: true,
+                has_pwm_enable: true,
+                overdrive_enabled: false,
+            };
+            assert_eq!(
+                card.can_write_legacy_pwm(),
+                !is_rdna34_range,
+                "{name} ({id:#06x}) is in the wrong write-path class"
+            );
+            assert_eq!(
+                card.fan_control_method(),
+                if is_rdna34_range {
+                    "read_only"
+                } else {
+                    "hwmon_pwm"
+                },
+                "{name} ({id:#06x})"
+            );
+            rdna34 += usize::from(is_rdna34_range);
+        }
+        // Precondition: the loop really did visit both classes.
+        assert!(rdna34 > 0 && rdna34 < AMDGPU_IDS.len());
     }
 
     #[test]
@@ -791,8 +991,136 @@ mod tests {
         let gpus = detect_amd_gpus_with_ppfeaturemask(tmp.path(), &pp);
         let gpu = &gpus[0];
         assert_eq!(gpu.fan_control_method(), "hwmon_pwm");
+        assert!(gpu.can_write_legacy_pwm());
         assert!(gpu.has_pwm_enable);
-        assert_eq!(gpu.marketing_name.as_deref(), Some("RX 6900 XT"));
+        // 0x73BF rev C3 is the RX 6800 in libdrm; the old id-only table said
+        // "RX 6900 XT" for every revision, and this test enshrined it.
+        assert_eq!(gpu.marketing_name.as_deref(), Some("RX 6800"));
+        assert_eq!(gpu.rdna_read_only_reason(), None);
+    }
+
+    /// DEC-430 (`DC-c`): an RX 7000 exposes `pwm1` and `pwm1_enable` both
+    /// (kernel `smu_v13_0_0_ppt.c` registers `set_fan_control_mode`), but a
+    /// write can silently no-op, so without PMFW it is read-only. The card
+    /// has every file the pre-DEC-430 predicate asked for; only the device-id
+    /// exclusion can refuse it.
+    #[test]
+    fn detect_rdna3_with_pwm_enable_is_read_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pp = fake_ppfeaturemask(tmp.path(), "0x0");
+        create_fake_gpu_ext(
+            tmp.path(),
+            "hwmon0",
+            "0000:03:00.0",
+            "0x744C",
+            "0xc8",
+            "0x030000",
+            true,
+            true,
+            true, // pwm1_enable exists on RDNA3, at 0644
+            false,
+        );
+
+        let gpus = detect_amd_gpus_with_ppfeaturemask(tmp.path(), &pp);
+        let gpu = &gpus[0];
+        assert!(
+            gpu.has_pwm && gpu.has_pwm_enable,
+            "precondition: both files"
+        );
+        assert!(!gpu.can_write_legacy_pwm());
+        assert_eq!(gpu.fan_control_method(), "read_only");
+        assert_eq!(gpu.marketing_name.as_deref(), Some("RX 7900 XTX"));
+        assert_eq!(gpu.display_label(), "7900XTX");
+    }
+
+    /// The same card with its PMFW `fan_curve` has a write path, and the
+    /// read-only reason goes quiet.
+    #[test]
+    fn detect_rdna3_with_pmfw_is_pmfw_curve() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pp = fake_ppfeaturemask(tmp.path(), "0xffffffff");
+        create_fake_gpu_ext(
+            tmp.path(),
+            "hwmon0",
+            "0000:03:00.0",
+            "0x744C",
+            "0xc8",
+            "0x030000",
+            true,
+            true,
+            true,
+            true,
+        );
+        let gpu = &detect_amd_gpus_with_ppfeaturemask(tmp.path(), &pp)[0];
+        assert_eq!(gpu.fan_control_method(), "pmfw_curve");
+        assert_eq!(gpu.rdna_read_only_reason(), None);
+    }
+
+    /// DEC-430: the read-only reason names `ppfeaturemask` only while overdrive
+    /// is off. With it on, a missing curve is the kernel's or firmware's doing
+    /// (kernel 7.0+ hides it on an invalid firmware fan range), and telling the
+    /// user to set a parameter they already set would be wrong. Both an RDNA4
+    /// card (no `pwm1_enable`) and an RDNA3 one (with it) get the reason.
+    #[test]
+    fn rdna_read_only_reason_follows_overdrive() {
+        for (id, rev, pwm_enable) in [("0x7550", "0xc0", false), ("0x744C", "0xc8", true)] {
+            for (mask, overdrive) in [("0x0", false), ("0xffffffff", true)] {
+                let tmp = tempfile::tempdir().unwrap();
+                let pp = fake_ppfeaturemask(tmp.path(), mask);
+                create_fake_gpu_ext(
+                    tmp.path(),
+                    "hwmon0",
+                    "0000:03:00.0",
+                    id,
+                    rev,
+                    "0x030000",
+                    true,
+                    true,
+                    pwm_enable,
+                    false,
+                );
+                let gpu = &detect_amd_gpus_with_ppfeaturemask(tmp.path(), &pp)[0];
+                assert_eq!(gpu.overdrive_enabled, overdrive, "precondition");
+                let reason = gpu
+                    .rdna_read_only_reason()
+                    .unwrap_or_else(|| panic!("{id} overdrive={overdrive}: no reason"));
+                assert_eq!(
+                    reason.contains("amdgpu.ppfeaturemask=0xffffffff"),
+                    !overdrive,
+                    "{id} overdrive={overdrive}: {reason}"
+                );
+                assert_eq!(reason.contains("dmesg"), overdrive, "{reason}");
+            }
+        }
+    }
+
+    /// DEC-430: only an "RX " name is compacted; a workstation name is kept as
+    /// written rather than run together into "ProW7900".
+    #[test]
+    fn display_label_compacts_only_rx_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pp = fake_ppfeaturemask(tmp.path(), "0x0");
+        for (hwmon, bdf, id, rev, want) in [
+            ("hwmon0", "0000:03:00.0", "0x7550", "0xc0", "9070XT"),
+            ("hwmon1", "0000:04:00.0", "0x7448", "0x00", "Pro W7900"),
+            ("hwmon2", "0000:05:00.0", "0x7551", "0xc0", "AI PRO R9700"),
+        ] {
+            create_fake_gpu_ext(
+                tmp.path(),
+                hwmon,
+                bdf,
+                id,
+                rev,
+                "0x030000",
+                true,
+                false,
+                false,
+                false,
+            );
+            let gpus = detect_amd_gpus_with_ppfeaturemask(tmp.path(), &pp);
+            let gpu = gpus.iter().find(|g| g.pci_bdf == bdf).unwrap();
+            assert_eq!(gpu.display_label(), want, "{id} rev {rev}");
+        }
     }
 
     #[test]

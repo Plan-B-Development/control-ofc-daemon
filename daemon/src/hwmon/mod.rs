@@ -113,8 +113,9 @@ pub fn is_wireless_phy_chip(chip_name: &str) -> bool {
 /// by hwmon, so they must be excluded from hwmon PWM-header discovery
 /// ([`pwm_discovery`]) and monitor-only-fan discovery ([`inventory`]).
 ///
-/// - `amdgpu` — DEC-102: RDNA3+ exposes `pwm1` read-only (no `pwm1_enable`), so
-///   binding it as an hwmon header produces a 1 Hz EACCES storm.
+/// - `amdgpu` — DEC-102: RDNA4 exposes `pwm1` read-only (no `pwm1_enable`), so
+///   binding it as an hwmon header produces a 1 Hz EACCES storm; RDNA3 exposes
+///   both at 0644 but a write can silently no-op (DEC-430).
 /// - `nouveau` — DEC-204: the open NVIDIA driver exposes a **writable**
 ///   `pwm1`/`pwm1_enable`; leaking it as an hwmon header would let the profile
 ///   engine drive a GPU fan, violating the read-only-telemetry contract.

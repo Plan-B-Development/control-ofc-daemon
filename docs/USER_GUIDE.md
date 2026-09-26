@@ -451,6 +451,7 @@ AMD discrete GPU fans are supported. The control method depends on GPU generatio
   ```
   amdgpu.ppfeaturemask=0xffffffff
   ```
+  PMFW is the **only** write path the daemon uses on these cards. An RX 7000 also exposes `pwm1` and `pwm1_enable`, but a write there can succeed and change nothing, so without a `fan_curve` the daemon reports the fan as `read_only` (DEC-430).
 
 - **Pre-RDNA3 (RX 6000 and older):** Uses traditional `pwm1_enable=1` + `pwm1` control.
 

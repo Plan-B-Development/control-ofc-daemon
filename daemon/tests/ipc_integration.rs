@@ -2012,7 +2012,6 @@ async fn gpu_reset_fan_unsupported_returns_400_feature_unavailable() {
 fn test_app_state_with_read_only_gpu(pci_bdf: &str, pci_device_id: u16) -> Arc<AppState> {
     use control_ofc_daemon::hwmon::gpu_detect::AmdGpuInfo;
 
-    let cache = Arc::new(StateCache::new());
     let read_only = AmdGpuInfo {
         pci_bdf: pci_bdf.into(),
         pci_device_id,
@@ -2028,6 +2027,14 @@ fn test_app_state_with_read_only_gpu(pci_bdf: &str, pci_device_id: u16) -> Arc<A
         has_pwm_enable: false, // but pwm1_enable does NOT — this is the bug shape
         overdrive_enabled: false,
     };
+    test_app_state_with_amd_gpu_info(read_only)
+}
+
+/// AppState whose only GPU is `gpu`, exactly as given.
+fn test_app_state_with_amd_gpu_info(
+    gpu: control_ofc_daemon::hwmon::gpu_detect::AmdGpuInfo,
+) -> Arc<AppState> {
+    let cache = Arc::new(StateCache::new());
     let readiness_rollup = Arc::new(parking_lot::Mutex::new(None));
     Arc::new(AppState {
         cache,
@@ -2056,7 +2063,7 @@ fn test_app_state_with_read_only_gpu(pci_bdf: &str, pci_device_id: u16) -> Arc<A
         openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
         last_openfan_rescan: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         adopted_poll_tasks: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
-        amd_gpus: vec![read_only],
+        amd_gpus: vec![gpu],
         intel_gpus: Vec::new(),
         nvidia_gpus: Vec::new(),
         profile_search_dirs: parking_lot::RwLock::new(Vec::new()),
@@ -2104,10 +2111,19 @@ fn test_app_state_with_amd_gpu(
     let cache = Arc::new(StateCache::new());
     let gpu = AmdGpuInfo {
         pci_bdf: pci_bdf.into(),
-        pci_device_id: 0x7550,
+        // The legacy arm is pre-RDNA3 only (DEC-430), so a legacy card is an
+        // RX 6900 XT (Navi 21) and a PMFW one an RX 9070 XT.
+        pci_device_id: if is_legacy { 0x73BF } else { 0x7550 },
         pci_revision: 0xC0,
         pci_class: 0x030000,
-        marketing_name: Some("RX 9070 XT".into()),
+        marketing_name: Some(
+            if is_legacy {
+                "RX 6900 XT"
+            } else {
+                "RX 9070 XT"
+            }
+            .into(),
+        ),
         hwmon_path,
         fan_curve_path: curve_path,
         fan_zero_rpm_path: None,
@@ -2895,6 +2911,70 @@ async fn gpu_reset_fan_read_only_rdna_returns_400_feature_unavailable() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// DEC-430 (`DC-c`): an RX 7000 exposes `pwm1` AND `pwm1_enable` at 0644, but a
+/// write can silently no-op in `smu_v13_0_auto_fan_control`, so without its PMFW
+/// `fan_curve` it has no write path. File presence used to report it as
+/// `hwmon_pwm` with `fan_write_supported: true`, and reset took the legacy arm.
+/// The card here has every file the legacy predicate once asked for, so only the
+/// device-id exclusion can make it read-only.
+#[tokio::test]
+async fn rdna3_with_pwm1_enable_but_no_fan_curve_is_read_only_everywhere() {
+    use control_ofc_daemon::hwmon::gpu_detect::AmdGpuInfo;
+    let bdf = "0000:03:00.0";
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("pwm1_enable"), "2\n").unwrap();
+    let rx7900xtx = AmdGpuInfo {
+        pci_bdf: bdf.into(),
+        pci_device_id: 0x744C,
+        pci_revision: 0xC8,
+        pci_class: 0x030000,
+        marketing_name: Some("RX 7900 XTX".into()),
+        hwmon_path: dir.path().to_path_buf(),
+        fan_curve_path: None,
+        fan_zero_rpm_path: None,
+        is_discrete: true,
+        has_fan_rpm: true,
+        has_pwm: true,
+        has_pwm_enable: true,
+        overdrive_enabled: false,
+    };
+    let (path, shutdown, _sock_dir) =
+        start_test_server(test_app_state_with_amd_gpu_info(rx7900xtx)).await;
+
+    let (status, json) = uds_get(&path, "/capabilities").await;
+    assert_eq!(status, 200);
+    let cap = &json["devices"]["amd_gpu"];
+    assert_eq!(cap["fan_control_method"], "read_only");
+    assert_eq!(cap["fan_write_supported"], false);
+
+    let (status, json) = uds_get(&path, "/diagnostics/hardware").await;
+    assert_eq!(status, 200);
+    assert_eq!(json["gpu"]["fan_control_method"], "read_only", "{json:#}");
+
+    for route in ["reset", "verify"] {
+        let (status, json) = uds_post(
+            &path,
+            &format!("/gpu/{bdf}/fan/{route}"),
+            &serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, 400, "{route}: {json:#}");
+        assert_eq!(json["error"]["code"], "feature_unavailable", "{route}");
+        // The RDNA hint, not the generic one — the old hint required a missing
+        // pwm1_enable, which this card does not have.
+        let message = json["error"]["message"].as_str().unwrap();
+        assert!(message.contains("ppfeaturemask"), "{route}: {message}");
+    }
+    // Nothing reached the hardware: the legacy arm would have written 2 or 1.
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("pwm1_enable")).unwrap(),
+        "2\n"
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
 // ── /profile/deactivate (DEC-097) ───────────────────────────────────────
 
 /// Helper: test_app_state with an active profile pre-populated.
@@ -3414,7 +3494,7 @@ async fn hwmon_verify_response_includes_restore_failed_when_true() {
 
 /// DEC-102 integration: discovery + IPC. Build a fake hwmon root with one
 /// motherboard chip (`it8696` with `pwm1`/`pwm1_enable`) and one amdgpu
-/// chip (RDNA3+ shape: `pwm1` + `fan1_input`, no `pwm1_enable`). Run real
+/// chip (RDNA4 shape: `pwm1` + `fan1_input`, no `pwm1_enable`). Run real
 /// `discover_pwm_headers` over it, hand the result to `HwmonPwmController`,
 /// then call `GET /hwmon/headers` over the IPC socket. The amdgpu header
 /// must not appear on the wire — this is the canonical pre-DEC-102
@@ -3437,7 +3517,7 @@ async fn hwmon_discovery_excludes_amdgpu_end_to_end_via_ipc() {
         std::fs::write(dir.join("fan1_input"), "1200\n").unwrap();
         std::fs::write(dir.join("fan1_label"), "CPU_FAN\n").unwrap();
     }
-    // AMD GPU — RDNA3+ shape. pwm1 present, pwm1_enable absent.
+    // AMD GPU — RDNA4 shape. pwm1 present, pwm1_enable absent.
     {
         let dir = root.join("hwmon1");
         std::fs::create_dir_all(&dir).unwrap();

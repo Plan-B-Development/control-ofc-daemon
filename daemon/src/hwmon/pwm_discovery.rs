@@ -118,8 +118,9 @@ fn discover_device_pwm(hwmon_dir: &Path) -> Result<Vec<PwmHeaderDescriptor>, Hwm
         .to_string();
 
     // GPU-owned hwmon `pwm1` is never surfaced as an hwmon header.
-    // - amdgpu (DEC-102): RDNA3+ exposes `pwm1` read-only with no `pwm1_enable`,
-    //   so binding it produces a 1 Hz 503/EACCES storm.
+    // - amdgpu (DEC-102): RDNA4 exposes `pwm1` read-only with no `pwm1_enable`,
+    //   so binding it produces a 1 Hz 503/EACCES storm; RDNA3 exposes both, but
+    //   a write can silently no-op (DEC-430).
     // - nouveau (DEC-204): exposes a *writable* `pwm1`; leaking it here would let
     //   the profile engine drive a GPU fan, breaking the read-only contract.
     // GPU fans are addressed exclusively via the `amd_gpu:` / `nvidia_gpu:`
@@ -392,17 +393,18 @@ mod tests {
     }
 
     /// DEC-102: `amdgpu` chips must never appear in hwmon PWM discovery,
-    /// regardless of how their `pwm1` file looks. RDNA3+ exposes a
-    /// read-only `pwm1` (no `pwm1_enable`); RDNA2 and older expose a
-    /// writable `pwm1` + `pwm1_enable`. Both shapes are GPU-subsystem
+    /// regardless of how their `pwm1` file looks. RDNA4 exposes a
+    /// read-only `pwm1` (no `pwm1_enable`); RDNA3 and older expose a
+    /// writable-looking `pwm1` + `pwm1_enable` (on RDNA3 a write can
+    /// silently no-op, DEC-430). Both shapes are GPU-subsystem
     /// concerns and must be addressed via `amd_gpu:` prefix endpoints,
-    /// not via `/hwmon/{header_id}/pwm`. Pre-DEC-102, the read-only RDNA3+
+    /// not via `/hwmon/{header_id}/pwm`. Pre-DEC-102, the read-only
     /// shape produced a 1 Hz 503/EACCES storm whenever a GUI profile bound
     /// it; this test pins the bug fix.
     #[test]
     fn discover_amdgpu_excluded() {
         let tmp = tempfile::tempdir().unwrap();
-        // RDNA3/4 shape: pwm1 + fan1_input, no pwm1_enable.
+        // RDNA4 shape: pwm1 + fan1_input, no pwm1_enable.
         create_pwm_fixture(tmp.path(), "hwmon0", "amdgpu", &[(1, None, false, true)]);
 
         let headers = discover_pwm_headers(tmp.path()).unwrap();
@@ -415,7 +417,7 @@ mod tests {
     #[test]
     fn discover_amdgpu_excluded_even_with_enable_file() {
         let tmp = tempfile::tempdir().unwrap();
-        // RDNA2-and-older shape: pwm1 + pwm1_enable + fan1_input.
+        // RDNA3-and-older shape: pwm1 + pwm1_enable + fan1_input.
         // Still excluded — GPU fans are owned by the GPU subsystem.
         create_pwm_fixture(tmp.path(), "hwmon0", "amdgpu", &[(1, None, true, true)]);
 

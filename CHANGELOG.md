@@ -4,6 +4,26 @@
 
 ### Fixed
 
+**An RX 7000 GPU without its PMFW fan curve is no longer reported as controllable** (DEC-430).
+RDNA3 cards expose `pwm1` and `pwm1_enable`, but the driver can accept a write there and do
+nothing, so their only working fan control is the PMFW `fan_curve`. When that file was missing,
+`/capabilities` reported `fan_control_method: "hwmon_pwm"` and `fan_write_supported: true`, and
+`POST /gpu/{id}/fan/reset` and `/fan/verify` took the old `pwm1` path. An RDNA3 or RDNA4 card now
+never uses that path, whatever files exist (every such card libdrm 2.4.134 lists; a future card
+missing from that list would still be judged by its files): without `fan_curve` it reports
+`read_only`, and reset
+and verify answer `400 feature_unavailable`. The error message and the startup log now say why. They
+suggest `amdgpu.ppfeaturemask=0xffffffff` only while overdrive is off. With it on, they say the
+kernel did not expose the curve. Kernel 7.0 and later hide it when the card's firmware reports an
+invalid fan range. RX 6000 and older are unchanged.
+
+**GPU model names are correct** (DEC-430). The name table matched most cards on the PCI device id
+alone, but one id often covers several cards, told apart by revision. Several were named wrong: an
+RX 7600 appeared as "7900GRE", a Radeon Pro W7900 as "7900XT", a Pro W6600 as "6800". Names now
+come from libdrm's `amdgpu.ids` by device and revision, for every RDNA2, RDNA3 and RDNA4 card it
+lists. A card it does not list is shown as "AMD D-GPU" rather than a guess. Workstation names are
+kept as written ("Pro W7900", "AI PRO R9700"). Only "RX" names are shortened, as before ("9070XT").
+
 **Memory temperatures on nct6683-family chips are no longer treated as the CPU** (DEC-429). The
 `nct6683` driver (also used for `nct6686` and `nct6687`) reports four memory temperatures,
 `PECI DIMM 0` to `PECI DIMM 3`. They are read over the same PECI bus as the CPU, and the daemon

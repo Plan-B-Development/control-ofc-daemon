@@ -791,24 +791,13 @@ fn classify_gpu_verify_result(
 }
 
 /// Build a `feature_unavailable` message tailored to *why* the GPU has no
-/// write path. Distinguishes the "RDNA3+ without overdrive" case (we know
-/// the kernel parameter that would unlock PMFW) from the generic "no fan
-/// hardware" case so the error includes an actionable hint.
+/// write path. An RDNA3/RDNA4 card without its PMFW `fan_curve` gets the
+/// reason `AmdGpuInfo::rdna_read_only_reason` gives — keyed on the device id,
+/// not on `pwm1_enable`, which an RX 7000 exposes although it cannot be used
+/// (DEC-430) — and anything else the generic read-only message.
 fn unsupported_fan_control_message(gpu: &crate::hwmon::gpu_detect::AmdGpuInfo) -> String {
-    // RDNA3/RDNA4 shape: `pwm1` exists read-only, no `pwm1_enable`, no
-    // PMFW `fan_curve`. The fix is `amdgpu.ppfeaturemask=0xffffffff`.
-    if gpu.has_pwm
-        && !gpu.has_pwm_enable
-        && gpu.fan_curve_path.is_none()
-        && crate::hwmon::gpu_detect::is_rdna3_or_rdna4(gpu.pci_device_id)
-    {
-        return format!(
-            "GPU {} fan control is read-only on this kernel/firmware: \
-             pwm1_enable is missing and PMFW fan_curve is not exposed. \
-             Add 'amdgpu.ppfeaturemask=0xffffffff' to the kernel parameters \
-             and reboot to enable PMFW fan control.",
-            gpu.pci_bdf
-        );
+    if let Some(reason) = gpu.rdna_read_only_reason() {
+        return reason;
     }
     format!(
         "GPU {} fan control is read-only ({}); manual fan writes are not \

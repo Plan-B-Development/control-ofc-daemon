@@ -1216,13 +1216,15 @@ pub struct AmdGpuCapability {
     /// PCI revision (e.g. 0xC0 for XT variant).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pci_revision: Option<u8>,
-    /// Fan control method: "pmfw_curve", "hwmon_pwm", or "none".
+    /// Fan control method: "pmfw_curve", "hwmon_pwm", "read_only" or "none".
+    /// "hwmon_pwm" is pre-RDNA3 only (DEC-430).
     pub fan_control_method: String,
     /// Whether PMFW fan curve is supported (RDNA3+).
     pub pmfw_supported: bool,
     /// Whether fan RPM reading is available.
     pub fan_rpm_available: bool,
-    /// Whether this GPU has fan write capability (PMFW curve or hwmon pwm1+enable).
+    /// Whether this GPU has fan write capability (PMFW curve, or pre-RDNA3 hwmon
+    /// pwm1+enable — `AmdGpuInfo::can_write_legacy_pwm`).
     pub fan_write_supported: bool,
     /// Whether this is a discrete (VGA) GPU vs render-only.
     pub is_discrete: bool,
