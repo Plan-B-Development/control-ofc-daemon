@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.56.2] — 2026-09-26
+
 ### Fixed
 
 **An RX 7000 GPU without its PMFW fan curve is no longer reported as controllable** (DEC-430).
@@ -36,10 +38,6 @@ sensors still find them, because sensor ids do not change. Like any board sensor
 listed as not controlled) instead of running on the frozen value. And on a machine where these
 were the only CPU readings, the PWM Test Report's stall probe now refuses to run, because there is
 no CPU temperature to watch.
-
-## [2.56.2] — 2026-09-25
-
-### Fixed
 
 **A validation session that is full now says so** (DEC-426). A session keeps up to 4096 events
 and 512 external measurements. Past those caps, `POST /validation/session/event` answered
