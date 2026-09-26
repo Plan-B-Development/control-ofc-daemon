@@ -469,7 +469,7 @@ The GPU ID is available from `GET /capabilities`.
 
 ## Fan profiles
 
-The daemon can autonomously evaluate fan curve profiles at 1 Hz. Profiles use the **v7** schema (GUI v1.38.0 / daemon v1.17.0 and later). The GUI authors and upgrades profiles; the daemon reads them forward-compatibly — newer fields are accepted and missing fields are defaulted — so you do not need a matching daemon version to load a newer profile. The daemon logs a warning only for profiles older than v3 (v4 introduced the `fan_zero_rpm` member flag the daemon relies on). An example ships at `/etc/control-ofc/profiles/quiet.json`.
+The daemon can autonomously evaluate fan curve profiles at 1 Hz. Profiles use the **v7** schema (GUI v1.38.0 / daemon v1.17.0 and later). The GUI authors and upgrades profiles; the daemon reads them forward-compatibly — newer fields are accepted and missing fields are defaulted — so you do not need a matching daemon version to load a newer profile. The daemon logs a warning only for profiles older than v3 (v4 introduced the `fan_zero_rpm` member flag the daemon relies on). An example ships at `/etc/control-ofc/profiles/quiet.json`. **It controls no fan as shipped**: its one control has an empty `members` list, so activating it unchanged drives nothing. The GUI's three starter profiles (Quiet, Balanced, Performance) are the same — one *All Fans* control with no members and a curve with no sensor. Copy one, add your fans and a sensor, then activate it.
 
 ### Loading a profile
 

@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Documentation
+
+- The user guide now says the example profile `/etc/control-ofc/profiles/quiet.json` controls no
+  fan as shipped. Its one control has no members, and the GUI's starter profiles are the same
+  (DEC-432).
+
 ## [2.56.2] — 2026-09-26
 
 ### Fixed

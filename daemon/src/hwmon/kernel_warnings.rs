@@ -35,7 +35,8 @@
 //! emit them.
 //!
 //! These are *advisory* warnings. The daemon does not refuse writes. The GUI
-//! surfaces a one-time popup, and the support bundle records the kernel release.
+//! surfaces a popup (once per id per session, until the user dismisses it for
+//! good), and the support bundle records the kernel release.
 //! See DEC-098.
 //!
 //! Detection runs at capabilities-build time and is cheap (a single sysfs
@@ -70,7 +71,7 @@ pub fn parse_kernel_version(release: &str) -> Option<(u32, u32, u32)> {
 
 /// Severity of a kernel warning, ordered from informational to safety-critical.
 ///
-/// The GUI uses severity to decide whether to surface a one-time popup
+/// The GUI uses severity to decide whether to surface a popup
 /// (`high`/`critical`) versus only logging it (`info`/`medium`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
