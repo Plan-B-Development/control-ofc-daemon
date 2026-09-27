@@ -106,10 +106,11 @@ pub fn check_thermal_safety(cache: &StateCache) -> Result<(), CalibrationError> 
 /// that gap** in `verify_thermal_guard` — which is why it was separated rather
 /// than folded in: the two callers wanted the rule at different times.
 ///
-/// All three non-normal states force a duty — `emergency` 100%, `recovery` 60%,
-/// `no_sensor_fallback` 40% — so any of them means the engine is writing a
-/// value this sweep must not fight. `None` is a cache that has never published
-/// a state, which is normal.
+/// Both non-normal states force a duty floor (DEC-307) — `emergency` 100%,
+/// `no_sensor_fallback` 40% — so either means the engine is writing a value
+/// this sweep must not fight. (`recovery`, 60%, was a third until DEC-386
+/// removed it; any string other than `normal` still counts.) `None` is a cache
+/// that has never published a state, which is normal.
 pub fn thermal_force_state(cache: &StateCache) -> Option<String> {
     match cache.snapshot().thermal_override_state {
         None => None,

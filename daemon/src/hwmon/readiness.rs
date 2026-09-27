@@ -290,7 +290,7 @@ pub fn build_readiness(inp: &ReadinessInputs) -> Vec<ReadinessItem> {
             )
             .action(
                 "These are display-only and safe to ignore unless one you need is listed — see \
-                 Diagnostics ▸ Sensors.",
+                 the Overview page's Sensors table.",
             ),
         );
     }
@@ -527,12 +527,12 @@ pub fn superio_readiness_items(
                 // the same defect this change fixes, one field over — an
                 // incomplete correction of exactly the kind `CLAUDE.md`
                 // records as its own defect class.
-                "Open Diagnostics ▸ Super-I/O and read the per-chip recommendation — it says \
-                 whether anything can be done on this board, and on some there is nothing to \
-                 configure."
+                "Open the Hardware page's Super-I/O Architecture section and read the per-chip \
+                 recommendation — it says whether anything can be done on this board, and on \
+                 some there is nothing to configure."
             } else {
-                "Open Diagnostics ▸ Super-I/O for the exact module and copy-paste command; a \
-                 reboot or module reload may be needed."
+                "Open the Hardware page's Super-I/O Architecture section for the exact module \
+                 and copy-paste command; a reboot or module reload may be needed."
             })
             .reboot(),
         );
@@ -553,8 +553,9 @@ pub fn superio_readiness_items(
                 ),
             )
             .action(
-                "See Diagnostics ▸ Super-I/O. Do not switch to acpi_enforce_resources=lax without \
-                 understanding the driver/ACPI race it reintroduces.",
+                "See the Hardware page's Super-I/O Architecture section. Do not switch to \
+                 acpi_enforce_resources=lax without understanding the driver/ACPI race it \
+                 reintroduces.",
             ),
         );
     }
@@ -908,6 +909,82 @@ mod tests {
             notes: vec![],
         };
         assert!(superio_readiness_items(&report).is_empty());
+    }
+
+    /// [`DC-l`] The GUI shows `recommended_action` verbatim. Four actions sent
+    /// the user to "Diagnostics ▸ …", a page retired by DEC-216. The population
+    /// is every item both builders can emit — both `superio_driver_unloaded`
+    /// branches included — so an action added later cannot slip past by not
+    /// being one of the four this change rewrote.
+    #[test]
+    fn no_readiness_action_names_the_retired_diagnostics_page() {
+        use crate::hwmon::superio::{
+            Evidence, SuperIoChip, SuperIoRecommendation, SuperIoReport, SuperIoVendor,
+        };
+        let report = |module_loaded: bool| SuperIoReport {
+            arch_supported: true,
+            chips: vec![SuperIoChip {
+                chip_name: "it8696".into(),
+                vendor: SuperIoVendor::Ite,
+                evidence: vec![Evidence::DmiBoardTable],
+                confidence: crate::hwmon::classify::Confidence::Medium,
+                bound_driver: None,
+                expected_module: "it87".into(),
+                module_loaded,
+                hwmon_present: false,
+                recommendation: Some(SuperIoRecommendation {
+                    module: "it87".into(),
+                    in_mainline: false,
+                    load_hint: "irrelevant here".into(),
+                    reason: "board lists it8696".into(),
+                    risk_notes: vec![],
+                }),
+                caveats: vec![],
+            }],
+            acpi_conflict_drivers: vec!["it87".into()],
+            notes: vec![],
+        };
+        let mut items = build_readiness(&ReadinessInputs {
+            cpu_sensor_count: 0,
+            default_cpu_confident: None,
+            pwm_total: 3,
+            pwm_writable: 1,
+            monitor_only_fan_count: 1,
+            unavailable_sensor_count: 1,
+            unknown_sensor_count: 1,
+            selected_cpu_present: Some(false),
+            selected_mb_present: Some(false),
+        });
+        let loaded = superio_readiness_items(&report(true));
+        let not_loaded = superio_readiness_items(&report(false));
+
+        // Presence first: each rewritten action names where the GUI routes it
+        // (the Hardware page's `superio` target, the Overview page's `sensors`).
+        let action =
+            |items: &[ReadinessItem], code: &str| get(items, code).recommended_action.clone();
+        let superio = "the Hardware page's Super-I/O Architecture section";
+        assert!(action(&loaded, "superio_driver_unloaded").contains(superio));
+        assert!(action(&not_loaded, "superio_driver_unloaded").contains(superio));
+        assert!(action(&loaded, "superio_acpi_conflict").contains(superio));
+        assert!(action(&items, "sensors_unavailable").contains("the Overview page's Sensors table"));
+
+        items.extend(loaded);
+        items.extend(not_loaded);
+        assert!(
+            items
+                .iter()
+                .filter(|i| !i.recommended_action.is_empty())
+                .count()
+                >= 6
+        );
+        for it in &items {
+            assert!(
+                !it.recommended_action.contains("Diagnostics"),
+                "`{}` sends the user to the retired Diagnostics page: {}",
+                it.code,
+                it.recommended_action
+            );
+        }
     }
 
     // ── ReadinessRollup / derive_rollup (DEC-206) ──

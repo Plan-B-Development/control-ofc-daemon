@@ -1065,10 +1065,13 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
     //
     // MEASURED, on an X870E AORUS MASTER running the DKMS build at upstream HEAD
     // (it87-349.c567739), 2026-09-04:
-    //   * `mmio` is `true` BY DEFAULT (`it87.c:314`). This host passes the module
-    //     no parameters at all — `/sys/module/it87/parameters/` does not even
-    //     exist — so "recovered with mmio=on" named a state already in effect and
-    //     could never have been an outstanding remedy.
+    //   * `mmio` is `true` BY DEFAULT (`it87.c:314`), and this host does not set
+    //     it: its only it87 option is `ignore_resource_conflict=1`
+    //     (`/etc/modprobe.d/it87.conf`). `/sys/module/it87/parameters/` is absent
+    //     because every it87 parameter is registered with permission 0
+    //     (`it87.c:7217-7229`), not because none was passed. So "recovered with
+    //     mmio=on" named a state already in effect and could never have been an
+    //     outstanding remedy.
     //   * The kernel log reads `Found IT8696E chip at 0xa40 [MMIO at
     //     0x00000000fe100000]` and then, under `dyndbg=+p`, `Unsupported chip
     //     (DEVID=0x8883)`. One `it87` hwmon device enumerates, not two.

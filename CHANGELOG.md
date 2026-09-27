@@ -36,6 +36,15 @@
   It still wins on every start while it is set, but taking it out now brings back the profile last
   activated from the GUI or tray, where before it replaced that choice for good. The startup log line
   for no profile no longer says the daemon runs "in imperative mode (GUI-driven)".
+- **Hardware readiness actions name the GUI pages that exist** (DEC-437). Four
+  `/diagnostics/hardware` readiness actions sent users to "Diagnostics ▸ Sensors" or
+  "Diagnostics ▸ Super-I/O", a page the GUI retired. They now name the Overview page's Sensors
+  table and the Hardware page's Super-I/O Architecture section.
+- **Latched ITE bridge advice gives the full recovery ladder** (DEC-437). The port probe's journal
+  line, its note about a withheld Nuvoton probe, and the bridge caveat on `/diagnostics/hardware` said
+  a reboot cannot clear the latch. Each now says to keep `nct6775`, `w83627ehf` and `sensors-detect`
+  off the board and reboot, and to power down at the wall only if the chip is still missing, because
+  a reboot does not always clear it.
 
 ### Documentation
 
@@ -181,7 +190,7 @@ R9700 owner their fan curve could not work, on the strength of a benign message.
 daemon now raises `rdna_mes_hang_drm_amd_4765` (drm/amd #4765, the MES eviction hang) on 6.17.9–6.17.13,
 a backport that 6.17 never fixed, and on 6.18.0–6.18.6. The hang is fixed in 6.18.7 and 6.19.
 `is_rdna3_or_rdna4` now matches every RDNA3, RDNA3.5 and RDNA4 product in libdrm's `amdgpu.ids`. It used
-to miss the RX 9060 series, four RDNA3 cards and the integrated GPUs. The same list chooses the
+to miss the RX 9060 series, eight RDNA3 IDs (seven cards and the Steam Machine) and the integrated GPUs. The same list chooses the
 actionable `amdgpu.ppfeaturemask` hint for a read-only GPU, so that hint now reaches those cards too.
 
 **The Gigabyte dual-chip board table is corrected and extended, so working boards stop reporting a

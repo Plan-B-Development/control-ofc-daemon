@@ -1620,8 +1620,9 @@ impl WriteBackend for GpuBackend {
     /// GPU fan writes (async via spawn_blocking, no lease required).
     ///
     /// Suppresses writes whose delta from the last commanded value is below
-    /// `GPU_COALESCE_DELTA_PCT`, mirroring the API handler so headless and
-    /// imperative paths share DEC-070's single 5% threshold (DEC-131).
+    /// `GPU_COALESCE_DELTA_PCT`, DEC-070's single 5% threshold (DEC-131). The
+    /// API handler this once mirrored was a client PWM write, retired at 2.0.0
+    /// (DEC-165), so the engine is the only path that applies it.
     async fn apply(&mut self, commands: &[PwmCommand]) {
         // One snapshot per tick — advisory write-suppression state, not
         // correctness-critical (a torn read vs. the API path is harmless:

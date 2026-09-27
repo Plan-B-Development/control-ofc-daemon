@@ -662,9 +662,9 @@ fn run_port_probe_with_board(
             "Active port probe: nothing answered at {ports}, and the Nuvoton/Winbond \
              config-mode unlock was deliberately NOT attempted there. This board's \
              expected Super-I/O complement is ITE-only, and that write is what latches \
-             the ITE eSPI-to-LPC bridge — a state only a full power cut clears, not a \
-             reboot. If fan headers are missing, the it87 driver is the one to pursue; \
-             see the Hardware Troubleshooting guide."
+             the ITE eSPI-to-LPC bridge — a state a reboot does not always clear, and \
+             powering down at the wall does. If fan headers are missing, the it87 driver \
+             is the one to pursue; see the Hardware Troubleshooting guide."
         ));
     }
     (outcome.chips, notes)
@@ -796,10 +796,11 @@ fn probed_to_superio_chip(p: &superio_probe::ProbedChip) -> superio::SuperIoChip
     };
     let caveats = if is_bridge {
         vec![
-            "This is recoverable, but not by a reboot. The bridge is latched by a config-mode \
-             unlock written by the nct6775 or w83627ehf modules; keep them off this board, then \
-             power the machine down fully at the wall — the latch survives both a reboot and a \
-             normal shut-down. See the Hardware Troubleshooting guide for the full procedure."
+            "This is recoverable. The bridge is latched by a config-mode unlock written by the \
+             nct6775 or w83627ehf modules or by sensors-detect; keep them off this board and \
+             reboot. If the chip is still missing, power the machine down fully at the wall — \
+             the latch can survive both a reboot and a normal shut-down. See the Hardware \
+             Troubleshooting guide for the full procedure."
                 .to_string(),
         ]
     } else if expected_module == "unknown" {
@@ -1166,6 +1167,50 @@ mod tests {
             "the note must name the base it declined: {}",
             notes[0]
         );
+    }
+
+    /// [`DC-l`, DEC-421] The latched bridge has one recovery ladder: stop the
+    /// trigger, reboot, then power down at the wall. Both strings used to say a
+    /// reboot cannot clear it, which is what makes a user skip the step that
+    /// usually works. The withheld note comes from the real call site above.
+    #[test]
+    fn the_bridge_caveat_and_the_withheld_note_give_dec421s_ladder() {
+        let retired = [
+            "not by a reboot",
+            "not a reboot",
+            "a reboot does not clear",
+            "survives both a reboot",
+        ];
+        let bridge = probed_to_superio_chip(&superio_probe::ProbedChip {
+            base: 0x2e,
+            vendor: superio::SuperIoVendor::Ite,
+            devid: superio_probe::IT8883_BRIDGE_DEVID,
+            chip_name: None,
+        });
+        let (vendor, name) = crate::hwmon::chip_db::any_ite_only_board_for_test();
+        let (_, notes) = run_port_probe_with_board(
+            &NuvotonOnlyPort::default(),
+            &[0x2e],
+            &board_info(vendor, name),
+        );
+        let caveat = bridge.caveats.first().expect("a bridge carries its caveat");
+        let note = notes.first().expect("a withheld leg is explained");
+
+        // Presence: each names both rungs, and the caveat keeps their order.
+        assert!(
+            caveat.contains("and reboot") && caveat.contains("at the wall"),
+            "{caveat}"
+        );
+        assert!(caveat.find("reboot") < caveat.find("wall"), "{caveat}");
+        assert!(
+            note.contains("does not always clear") && note.contains("at the wall"),
+            "{note}"
+        );
+        for text in [caveat, note] {
+            for phrase in retired {
+                assert!(!text.contains(phrase), "says a reboot cannot help: {text}");
+            }
+        }
     }
 
     #[test]

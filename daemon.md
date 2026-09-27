@@ -873,7 +873,9 @@ its pump-safe identify, and until this field the entire notification was one
 `unreadable` (I/O error, or over the 4 MiB read cap) or `malformed` (read, but
 not valid TOML for this daemon version); `phase` is `startup`, `reload` or
 `update` and says what the degradation cost, since a startup load seeds every
-key while a SIGHUP reload commits only `profile_search_dirs`. `update` (2.51.0,
+key while a SIGHUP reload commits only `profile_search_dirs` and the exit floor
+(DEC-388) — so a failed reload keeps every header role, but an exit floor set in
+`runtime.toml` falls back to `daemon.toml`'s. `update` (2.51.0,
 `TS-r`) is a `/config/*` setter that found the file unreadable:
 `RuntimeConfig::load_for_update` hard-links the original to
 `runtime.toml.invalid-<unix-ts>` and atomically replaces it with the header roles

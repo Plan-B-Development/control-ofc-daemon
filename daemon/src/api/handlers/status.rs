@@ -365,7 +365,7 @@ pub async fn capabilities_handler(
             // never a literal (`PTA-i`).
             diagnostic_max_temp_c: crate::constants::CALIBRATION_MAX_TEMP_C,
         },
-        // Control-execution capability (DEC-159/160). 1.20.0 delivered daemon-
+        // Control-execution capability (DEC-159/160). 1.19.0 delivered daemon-
         // owned profile storage; 1.21.0 added the manual-override (DEC-163) and
         // fan-identify (DEC-166) APIs. The 2.0.0 cutover (DEC-165) makes the
         // engine the sole writer: `autonomous_control` flips true and

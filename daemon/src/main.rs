@@ -634,17 +634,20 @@ fn apply_config_reload(
         DaemonConfig::load(config_path).map_err(|e| format!("config reload failed: {e}"))?;
     // `AUD3-m`: a reload that cannot parse `runtime.toml` re-applies DEFAULTS to
     // the running config, exactly as the boot load does. Narrower in effect —
-    // only `profile_search_dirs` is committed below, so header roles keep
-    // whatever boot established — but it is the same silent degradation on the
-    // same surface, so it is reported rather than left in the journal.
+    // only `profile_search_dirs` and the exit floor (DEC-388) are committed
+    // below, so header roles keep whatever boot established, while an exit
+    // floor set in `runtime.toml` falls back to `daemon.toml`'s — but it is the
+    // same silent degradation on the same surface, so it is reported rather
+    // than left in the journal.
     //
     // [SAFETY] `WIRE-ao`: **most-severe wins, not latest-wins.** This used to
     // overwrite the slot unconditionally, and the two phases do not cost the
     // same. A `startup` degradation drops every `header_roles` assignment — on a
     // board with no `pwmN_label` files that is the only evidence a header drives
     // a pump, so its 30% floor, stop exemption and pump-safe identify are all
-    // gone. A `reload` degradation drops nothing: boot's roles are still in
-    // force. Letting the cheaper record overwrite the expensive one made
+    // gone. A `reload` degradation drops no role (only a runtime-set exit
+    // floor, above): boot's roles are still in force. Letting the cheaper
+    // record overwrite the expensive one made
     // `phase` under-report, so a client reading `reload` would reassure the user
     // while a hand-assigned pump was unprotected — reachable by editing a broken
     // `runtime.toml` and sending SIGHUP. GUI v2.58.0 works around it by never
@@ -769,8 +772,8 @@ fn profile_requests(args: &[String], env: Option<&str>) -> Vec<ProfileRequest> {
 /// (no pointer, missing file, corrupt/invalid/hand-edited JSON) to `None`.
 ///
 /// This is the boot-time fail-safe (DEC-165): a persisted profile that has gone
-/// bad on disk must never crash startup — the daemon falls back to imperative
-/// mode (no curve evaluation; only the thermal ladder writes on its own) and
+/// bad on disk must never crash startup — the daemon starts with no active
+/// profile (no curve evaluation; only the thermal ladder writes on its own) and
 /// waits for a valid profile to be activated.
 /// Pure over an injected `load` fn so the fail-safe is unit-testable without the
 /// real state file. The caller logs the success case (it owns the "restored"
@@ -2406,7 +2409,7 @@ async fn async_main() {
 
     // ── Spawn profile engine ─────────────────────────────────────────
     // Evaluates curves and writes PWM headlessly at 1Hz. The engine is the
-    // sole PWM writer (DEC-159/DEC-165). In imperative mode (no active profile)
+    // sole PWM writer (DEC-159/DEC-165). With no active profile
     // no curve is evaluated — the daemon writes for explicit API intent (manual
     // override, fan identify) and for the thermal ladder, which acts with or
     // without a profile (`TS-k`); the GUI never writes PWM.
@@ -3784,7 +3787,7 @@ mod tests {
     #[test]
     fn persisted_profile_resolves_to_none_when_corrupt() {
         // A persisted profile that is corrupt/hand-edited-invalid on disk must
-        // resolve to None (imperative mode), never crash startup. This is the
+        // resolve to None (no active profile), never crash startup. This is the
         // boot variant of "profile invalid" — the boot path skips validate(),
         // so load_profile failing safe is the load-bearing net.
         let dir = tempfile::tempdir().unwrap();
@@ -5498,7 +5501,7 @@ search_dirs = ["/custom/profiles", "/other/profiles"]
         // write was unconditional, so a FAILED reload replaced it. The two are not
         // equally severe: a startup failure drops every `header_roles` assignment
         // (no 30% floor, no stop exemption, no pump-safe identify), a reload
-        // failure drops nothing because boot's roles are still in force. Letting
+        // failure drops no role because boot's roles are still in force. Letting
         // `reload` win made `/status` under-report, and a client reading `reload`
         // would reassure a user whose hand-assigned pump was unprotected.
         //

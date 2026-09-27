@@ -95,8 +95,10 @@ fn bridge_report(base: u16, devid: u16) -> ProbedChip {
         "Super-I/O base {base:#06x} answered DEVID {devid:#06x}: an ITE eSPI→LPC \
          bridge is in configuration mode and is masking the Super-I/O behind it. \
          Not probing this base further — the config-mode unlock write is what \
-         causes this. Recovery needs a full power cut (a reboot does not clear \
-         it); see the Hardware Troubleshooting guide."
+         causes this. Recovery: keep nct6775, w83627ehf and sensors-detect off \
+         this board and reboot; if the chip is still missing, power down at the \
+         wall, because a reboot does not always clear it. See the Hardware \
+         Troubleshooting guide."
     );
     ProbedChip {
         base,

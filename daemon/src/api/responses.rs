@@ -930,7 +930,7 @@ pub struct CapabilitiesResponse {
     pub features: FeatureFlags,
     pub limits: Limits,
     /// Control-execution capability (GUI→daemon control migration). Additive
-    /// top-level field (DEC-159/160) — pre-1.20 daemons omit it, and the GUI
+    /// top-level field (DEC-159/160) — daemons before 1.19.0 omit it, and the GUI
     /// must treat its absence as "all false" (old behaviour). The GUI keys its
     /// daemon-owned-control startup gate on this block.
     pub control: ControlCapability,

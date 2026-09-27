@@ -6385,7 +6385,7 @@ mod tests {
         );
     }
 
-    /// Imperative mode (no active profile): the engine must issue NO writes, so
+    /// No active profile: the engine must issue NO writes, so
     /// deactivating a profile cleanly stops control instead of asserting stale
     /// curve outputs. The single-writer invariant has no dual-writer gap to
     /// cover post-flip (DEC-165) — this pins the "engine is silent with no
@@ -6393,7 +6393,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn loop_does_not_write_without_active_profile() {
         let cache = make_cache_with_sensor("cpu", 55.0);
-        let profile_arc = Arc::new(Mutex::new(None)); // no profile → imperative
+        let profile_arc = Arc::new(Mutex::new(None)); // no active profile
         let safety = Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new()));
 
         let (transport, written) = LoopTestTransport::new(10);
@@ -6426,7 +6426,7 @@ mod tests {
         let set_pwm_cmds: Vec<_> = cmds.iter().filter(|c| c.starts_with(">02")).collect();
         assert!(
             set_pwm_cmds.is_empty(),
-            "engine must not write in imperative mode (no active profile); got: {cmds:?}",
+            "engine must not write with no active profile; got: {cmds:?}",
         );
     }
 

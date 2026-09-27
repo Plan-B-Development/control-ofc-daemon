@@ -225,10 +225,12 @@ pub async fn activate_profile_handler(
 
 /// POST /profile/deactivate — clear the active profile so the daemon stops
 /// driving fans from a curve. Idempotent: deactivating when no profile is
-/// active is a success no-op. After deactivation, the daemon falls back to
-/// imperative-only behaviour — manual API writes from the GUI still work,
-/// but the headless evaluation loop will not push new PWM values until a
-/// new profile is activated.
+/// active is a success no-op. After deactivation no fan curve is evaluated
+/// until a new profile is activated: the engine hands back the motherboard
+/// (hwmon) headers it took (DEC-382) — not a GPU (`DC-cr`) — and the thermal
+/// emergency still acts on its own. There is
+/// no client PWM write to fall back to — those were retired at 2.0.0
+/// (DEC-165).
 pub async fn deactivate_profile_handler(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<serde_json::Value>) {

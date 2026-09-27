@@ -286,7 +286,7 @@ pub fn load_profile(path: &Path) -> Result<DaemonProfile, String> {
     // persisted-state restore) deliberately skip validate(), so this load-time
     // check is the net that keeps an oversized on-disk profile — hand-placed in
     // /etc/control-ofc/profiles, or predating this cap — from aborting the daemon
-    // at startup. Callers already fail safe to imperative mode on Err.
+    // at startup. Callers already fail safe to no active profile on Err.
     if profile.curves.len() > MAX_PROFILE_CURVES {
         return Err(format!(
             "profile '{}' has {} curves, exceeding the maximum of {MAX_PROFILE_CURVES}",
@@ -2356,7 +2356,7 @@ mod tests {
         // The load-time net. The boot paths (CLI --profile, persisted-state
         // restore) skip validate(), so an oversized profile already on disk must
         // be refused HERE or it aborts the daemon at startup — a crash loop that
-        // survives reboot. Callers treat Err as "no profile" (imperative mode).
+        // survives reboot. Callers treat Err as "no profile".
         let curves: Vec<CurveConfig> = (0..=MAX_PROFILE_CURVES)
             .map(|i| graph_curve(&format!("c{i}"), "cpu"))
             .collect();

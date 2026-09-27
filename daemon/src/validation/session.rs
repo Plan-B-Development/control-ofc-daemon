@@ -332,7 +332,8 @@ pub struct ValidationSample {
     /// summed here.
     #[serde(default)]
     pub gpu_power_w: Option<f64>,
-    /// `normal` / `recovery` / `emergency` / `no_sensor_fallback`.
+    /// `normal` / `emergency` / `no_sensor_fallback`. A session recorded before
+    /// DEC-386 removed the recovery rung can also hold `recovery`.
     pub thermal_state: String,
     pub members: Vec<MemberSample>,
 }

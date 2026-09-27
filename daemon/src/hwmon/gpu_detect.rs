@@ -880,7 +880,8 @@ mod tests {
     }
 
     /// DEC-422: the list is every MES-era (GC 11.x / 12.x) product in libdrm's
-    /// `amdgpu.ids`. The RX 9060 series and four RDNA3 parts were missing, so the
+    /// `amdgpu.ids`. The RX 9060 series and eight RDNA3 IDs (seven cards and the
+    /// Steam Machine) were missing, so the
     /// drm/amd #4765 advisory could never reach them; the iGPUs are in because an
     /// APU-only machine's primary GPU is the iGPU.
     #[test]
