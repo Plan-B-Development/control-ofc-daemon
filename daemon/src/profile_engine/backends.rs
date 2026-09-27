@@ -1412,6 +1412,11 @@ fn gpu_blocking_write(
     if cache.is_gpu_fan_relinquished(fan_id) {
         return None;
     }
+    // DEC-435: name the card BEFORE the write, so a stop — even a crash — resets
+    // it, and a card no profile has written is never reset.
+    cache
+        .gpu_handback()
+        .note_take(fan_id, fan_curve_path, zero_rpm_path);
     Some(
         match crate::hwmon::gpu_fan::set_static_speed_with_zero_rpm(
             fan_curve_path,
@@ -5284,6 +5289,75 @@ mod tests {
             "un-relinquished → write proceeds"
         );
         assert!(!std::fs::read_to_string(&curve_path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn gpu_blocking_write_names_the_card_before_it_writes_and_only_if_it_writes() {
+        // [SAFETY] DEC-435: every stop resets the cards on this list and no other,
+        // so the engine must put a card on it BEFORE its write — a write that
+        // fails, or a crash straight after it, still leaves the card named — and
+        // never for a write the in-task re-check skipped.
+        let dir = tempfile::tempdir().unwrap();
+        let (gpu, curve_path) = fake_gpu(&dir);
+        let cache = StateCache::new();
+        let fan_id = "amd_gpu:0000:03:00.0";
+        let record = dir
+            .path()
+            .join(crate::hwmon::gpu_fan::PMFW_RECORD_FILE_NAME);
+        cache.gpu_handback().set_record_path(record.clone());
+
+        let _ = cache.relinquish_gpu_fan(fan_id);
+        let out = gpu_blocking_write(
+            &cache,
+            gpu.fan_curve_path.as_deref().unwrap(),
+            gpu.fan_zero_rpm_path.as_deref(),
+            70,
+            true,
+            fan_id,
+        );
+        assert!(out.is_none(), "precondition: the write was skipped");
+        assert!(
+            !cache.gpu_handback().is_taken(fan_id),
+            "a skipped write must not put the card on the stop list"
+        );
+
+        cache.unrelinquish_gpu_fan(fan_id);
+        let out = gpu_blocking_write(
+            &cache,
+            gpu.fan_curve_path.as_deref().unwrap(),
+            gpu.fan_zero_rpm_path.as_deref(),
+            70,
+            true,
+            fan_id,
+        );
+        assert!(
+            matches!(out, Some(Ok(()))),
+            "precondition: the write landed"
+        );
+        assert!(cache.gpu_handback().is_taken(fan_id));
+        assert!(
+            std::fs::read_to_string(&record)
+                .unwrap()
+                .contains(&curve_path.display().to_string()),
+            "the crash record must name the card ExecStopPost resets"
+        );
+
+        // Write-ahead: a card whose write FAILS is still named, because the
+        // write may have landed some of its points before failing.
+        let other = "amd_gpu:0000:0a:00.0";
+        let out = gpu_blocking_write(
+            &cache,
+            std::path::Path::new("/nonexistent/gpu_od/fan_ctrl/fan_curve"),
+            None,
+            70,
+            true,
+            other,
+        );
+        assert!(
+            matches!(out, Some(Err(()))),
+            "precondition: the write failed"
+        );
+        assert!(cache.gpu_handback().is_taken(other));
     }
 
     #[test]

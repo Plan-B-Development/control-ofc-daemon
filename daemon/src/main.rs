@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 /// What the panic hook gives back if the daemon panics. Populated after hardware
 /// discovery, read by the panic hook.
 struct PanicRestoreTargets {
-    gpu_curves: Vec<(PathBuf, Option<PathBuf>)>,
+    /// The PMFW cards the daemon drove (DEC-435) — the only ones it resets.
+    gpu_handback: Arc<PmfwHandBack>,
     /// The hwmon hand-back ledger (DEC-382): which headers the daemon holds, and
     /// what each one gets back. Lock-free of the controller mutex by design.
     hwmon_handback: Option<Arc<HandBackLedger>>,
@@ -295,6 +296,7 @@ use control_ofc_daemon::daemon_state;
 use control_ofc_daemon::health::cache::{StateCache, MAX_SUPERVISABLE_POLL_INTERVAL_MS};
 use control_ofc_daemon::health::history::HistoryRing;
 use control_ofc_daemon::health::staleness::StalenessConfig;
+use control_ofc_daemon::hwmon::gpu_fan::{PmfwHandBack, PMFW_RECORD_FILE_NAME};
 use control_ofc_daemon::hwmon::handback::{self, HandBackLedger, HandBackOutcome};
 use control_ofc_daemon::hwmon::lease::LeaseManager;
 use control_ofc_daemon::hwmon::pwm_control::{HwmonPwmController, RealSysfsWriter};
@@ -329,7 +331,7 @@ fn running_as_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
-/// CLI flag parser for `--allow-non-root`. Separated from `parse_profile_arg`
+/// CLI flag parser for `--allow-non-root`. Separated from `profile_requests`
 /// so preflight can consult it before any config/profile plumbing runs.
 fn parse_allow_non_root_flag() -> bool {
     std::env::args().any(|a| a == ALLOW_NON_ROOT_FLAG)
@@ -697,9 +699,42 @@ fn resolve_config_path() -> String {
     DEFAULT_CONFIG_PATH.to_string()
 }
 
-/// Parse CLI arguments: --profile <name> or --profile-file <path>
-fn parse_profile_arg(search_dirs: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
-    let args: Vec<String> = std::env::args().collect();
+/// A startup profile source the operator named explicitly (DEC-435).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProfileRequest {
+    /// `--profile <name>`: a file stem in a profile search directory, not the
+    /// profile's display name.
+    CliName(String),
+    /// `--profile-file <path>`.
+    CliFile(PathBuf),
+    /// `OPENFAN_PROFILE=<name>`: a file stem, as `--profile`.
+    EnvName(String),
+}
+
+impl ProfileRequest {
+    /// How the log names this source.
+    fn describe(&self) -> String {
+        match self {
+            Self::CliName(name) => format!("--profile '{name}'"),
+            Self::CliFile(path) => format!("--profile-file '{}'", path.display()),
+            Self::EnvName(name) => format!("OPENFAN_PROFILE='{name}'"),
+        }
+    }
+
+    /// The file this source names, or `None` when there is no such file.
+    fn locate(&self, search_dirs: &[PathBuf]) -> Option<PathBuf> {
+        match self {
+            Self::CliName(name) | Self::EnvName(name) => profile::find_profile(name, search_dirs),
+            Self::CliFile(path) => path.exists().then(|| path.clone()),
+        }
+    }
+}
+
+/// The explicit startup sources, in the order they are tried (DEC-435): the
+/// first `--profile` or `--profile-file` on the command line, then
+/// `OPENFAN_PROFILE`. Pure over `args` and `env` so the order is testable.
+fn profile_requests(args: &[String], env: Option<&str>) -> Vec<ProfileRequest> {
+    let mut requests = Vec::new();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -713,36 +748,21 @@ fn parse_profile_arg(search_dirs: &[std::path::PathBuf]) -> Option<std::path::Pa
                 continue;
             }
             "--profile" if i + 1 < args.len() => {
-                let name = &args[i + 1];
-                return profile::find_profile(name, search_dirs).or_else(|| {
-                    log::error!("Profile '{name}' not found in search paths");
-                    None
-                });
+                requests.push(ProfileRequest::CliName(args[i + 1].clone()));
+                break;
             }
             "--profile-file" if i + 1 < args.len() => {
-                let path = std::path::PathBuf::from(&args[i + 1]);
-                if path.exists() {
-                    return Some(path);
-                }
-                log::error!("Profile file '{}' not found", path.display());
-                return None;
+                requests.push(ProfileRequest::CliFile(PathBuf::from(&args[i + 1])));
+                break;
             }
             _ => {}
         }
         i += 1;
     }
-
-    // Check OPENFAN_PROFILE env var
-    if let Ok(name) = std::env::var("OPENFAN_PROFILE") {
-        if !name.is_empty() {
-            return profile::find_profile(&name, search_dirs).or_else(|| {
-                log::warn!("OPENFAN_PROFILE='{name}' not found in search paths");
-                None
-            });
-        }
+    if let Some(name) = env.filter(|name| !name.is_empty()) {
+        requests.push(ProfileRequest::EnvName(name.to_string()));
     }
-
-    None
+    requests
 }
 
 /// Resolve a profile from persisted daemon state, mapping **any** load failure
@@ -774,41 +794,68 @@ fn resolve_persisted_profile(
     }
 }
 
-/// Load the initial profile from CLI, env, or persisted state.
-fn resolve_initial_profile(search_dirs: &[std::path::PathBuf]) -> Option<DaemonProfile> {
-    // Priority 1: CLI / env override
-    if let Some(path) = parse_profile_arg(search_dirs) {
-        return match profile::load_profile(&path) {
+/// Choose the startup profile (DEC-435, `DC-ab`): each explicit source in
+/// turn, then the saved one, and the first that loads wins. A source naming no
+/// file, or a file that will not load, is logged and the next is tried — so a
+/// broken `--profile` no longer leaves the machine with no profile while a good
+/// saved one sits unused.
+///
+/// **Nothing here writes `daemon_state.json`.** Until DEC-435 a `--profile` or
+/// `OPENFAN_PROFILE` profile was saved there "so it survives reboot", so it
+/// replaced the GUI's choice for good, even after the flag was taken out. The
+/// saved profile now records only what `POST /profile/activate` last
+/// activated; an explicit source still wins on every start it is given.
+///
+/// Pure over `requests`, `state` and `load`, so the order is testable without
+/// the real state file.
+fn resolve_startup_profile(
+    requests: &[ProfileRequest],
+    search_dirs: &[PathBuf],
+    state: &daemon_state::DaemonState,
+    load: impl Fn(&Path) -> Result<DaemonProfile, String>,
+) -> Option<DaemonProfile> {
+    for request in requests {
+        let source = request.describe();
+        let Some(path) = request.locate(search_dirs) else {
+            log::error!("Startup profile {source} not found — trying the next source");
+            continue;
+        };
+        match load(&path) {
             Ok(p) => {
-                // Persist the CLI choice so it survives reboot
-                if let Err(e) = daemon_state::save_state(&daemon_state::DaemonState {
-                    version: 1,
-                    active_profile_id: Some(p.id.clone()),
-                    active_profile_path: Some(path.display().to_string()),
-                }) {
-                    log::error!("Failed to persist CLI profile selection: {e}");
-                }
-                Some(p)
+                log::info!("Loaded profile '{}' from {source}", p.name);
+                return Some(p);
             }
             Err(e) => {
-                log::error!("Failed to load CLI profile: {e}");
-                None
+                log::error!("Startup profile {source} failed to load: {e} — trying the next source")
             }
-        };
+        }
     }
 
-    // Priority 2: Persisted state. A corrupt/missing/hand-edited persisted
-    // profile must fail SAFE to no-profile, never crash startup — see
-    // `resolve_persisted_profile`.
-    let state = daemon_state::load_state();
-    if let Some(p) = resolve_persisted_profile(&state, profile::load_profile) {
+    // A corrupt/missing/hand-edited saved profile must fail SAFE to no-profile,
+    // never crash startup — see `resolve_persisted_profile`.
+    if let Some(p) = resolve_persisted_profile(state, &load) {
         log::info!("Restored persisted profile: '{}'", p.name);
         return Some(p);
     }
 
-    // Priority 3: No profile — run in pure imperative mode
-    log::info!("No profile loaded — running in imperative mode (GUI-driven)");
+    log::info!(
+        "No profile loaded — no fan curve is evaluated until a profile is activated; \
+         the thermal emergency still acts on its own"
+    );
     None
+}
+
+/// Load the initial profile: `--profile`/`--profile-file`, then
+/// `OPENFAN_PROFILE`, then the saved profile (DEC-435).
+fn resolve_initial_profile(search_dirs: &[PathBuf]) -> Option<DaemonProfile> {
+    let args: Vec<String> = std::env::args().collect();
+    let env = std::env::var("OPENFAN_PROFILE").ok();
+    resolve_startup_profile(
+        &profile_requests(&args, env.as_deref()),
+        search_dirs,
+        &daemon_state::load_state(),
+        profile::load_profile,
+    )
 }
 
 /// Maximum time to wait for the IPC server or a poll/engine task to stop during
@@ -1086,7 +1133,7 @@ where
     done_rx.recv_timeout(timeout).is_ok()
 }
 
-/// Reset every AMD GPU fan curve to automatic (PMFW `fan_curve` `r` then `c`) —
+/// Reset the given AMD GPU fan curves to automatic (PMFW `fan_curve` `r` then `c`) —
 /// **bounded**, so a wedged PMFW write cannot stall shutdown (278-c).
 ///
 /// The same hazard and the same remedy as `hand_back_hwmon`, one device
@@ -1138,6 +1185,49 @@ fn restore_gpu_fans_to_auto(
     completed
 }
 
+/// How long a restore waits for the PMFW hand-back list's lock (DEC-435).
+///
+/// Short on purpose: nothing holds it across a GPU write — only a map update and
+/// a tmpfs record write — so a wait longer than this means the waiting thread is
+/// the holder, and `ExecStopPost` replays the record instead.
+const GPU_HANDBACK_LOCK_WAIT: Duration = Duration::from_millis(200);
+
+/// Reset the PMFW fan curve on every card the daemon drove, and on no other
+/// (DEC-435, `DC-aa`) — **bounded**, as [`restore_gpu_fans_to_auto`] is.
+///
+/// Every stop used to reset every AMD card, so a LACT or CoreCtrl curve on a
+/// card no profile names was replaced on each stop and restart.
+fn reset_driven_gpu_fans(ledger: &PmfwHandBack, write_timeout: Duration) -> bool {
+    let Some(curves) = ledger.try_taken(GPU_HANDBACK_LOCK_WAIT) else {
+        log::error!(
+            "the PMFW hand-back list was still locked after {} ms — leaving the GPU fan \
+             curves the daemon drove to ExecStopPost",
+            GPU_HANDBACK_LOCK_WAIT.as_millis()
+        );
+        return false;
+    };
+    if curves.is_empty() {
+        log::debug!("the daemon drove no PMFW GPU fan — nothing to reset");
+    }
+    restore_gpu_fans_to_auto(curves, write_timeout)
+}
+
+/// Keep the PMFW hand-back record in the unit's runtime directory (DEC-435),
+/// where `control-ofc-restore-auto` — `ExecStopPost` — replays it after a crash.
+/// The same directory and the same fallback as [`keep_handback_record`].
+fn keep_pmfw_record(ledger: &PmfwHandBack) {
+    let dir = handback::runtime_dir();
+    if dir.is_dir() {
+        ledger.set_record_path(dir.join(PMFW_RECORD_FILE_NAME));
+    } else {
+        log::warn!(
+            "no runtime directory at {} — the PMFW hand-back record is not kept, so \
+             after a crash ExecStopPost cannot reset the GPU fan curves the daemon drove",
+            dir.display()
+        );
+    }
+}
+
 /// The panic hook's last-resort hardware restore — **bounded** (278-a).
 ///
 /// Carries the same unbounded-write shape 277-b fixed in the shutdown path and
@@ -1158,7 +1248,20 @@ fn restore_gpu_fans_to_auto(
 /// installed.
 fn restore_panic_targets(targets: &'static PanicRestoreTargets, timeout: Duration) -> bool {
     run_bounded("panic", timeout, move || {
-        for (curve_path, zero_rpm_path) in &targets.gpu_curves {
+        // DEC-435: only the cards the daemon drove. A bounded wait, for the same
+        // reason as the hwmon ledger's below; on a miss `ExecStopPost` replays
+        // the record.
+        let gpu_curves = targets
+            .gpu_handback
+            .try_taken(GPU_HANDBACK_LOCK_WAIT)
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "  WARNING: PMFW hand-back list is locked; leaving the GPU fan \
+                     curves to ExecStopPost, which replays its record"
+                );
+                Vec::new()
+            });
+        for (curve_path, zero_rpm_path) in &gpu_curves {
             if let Err(e) = std::fs::write(curve_path, "r\n") {
                 eprintln!(
                     "  WARNING: failed to reset GPU curve {}: {e}",
@@ -2050,6 +2153,9 @@ async fn async_main() {
             );
         }
     }
+    if amd_gpus.iter().any(|g| g.fan_curve_path.is_some()) {
+        keep_pmfw_record(cache.gpu_handback());
+    }
 
     // Detect Intel discrete GPUs (DEC-121). Read-only monitoring — temps +
     // fan RPM; no fan write path exists in the kernel.
@@ -2187,21 +2293,10 @@ async fn async_main() {
     drop(runtime_cfg);
 
     // Populate panic hook targets now that hardware is discovered.
-    {
-        let gpu_curves: Vec<_> = app_state
-            .amd_gpus
-            .iter()
-            .filter_map(|g| {
-                g.fan_curve_path
-                    .clone()
-                    .map(|p| (p, g.fan_zero_rpm_path.clone()))
-            })
-            .collect();
-        let _ = PANIC_RESTORE.set(PanicRestoreTargets {
-            gpu_curves,
-            hwmon_handback: hwmon_handback.clone(),
-        });
-    }
+    let _ = PANIC_RESTORE.set(PanicRestoreTargets {
+        gpu_handback: app_state.cache.gpu_handback().clone(),
+        hwmon_handback: hwmon_handback.clone(),
+    });
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
@@ -2666,22 +2761,15 @@ async fn async_main() {
                 SHUTDOWN_TASK_TIMEOUT,
             );
 
-            // Reset GPU fans to automatic before shutting down (re-enables
-            // zero-RPM). Bounded since 278-c: this step runs FIRST, so leaving it
-            // unbounded meant a wedged PMFW write blocked here and the bounded
-            // hwmon restore below was never reached — the process stayed just as
-            // stuck as before 277-b. Paths are collected here and moved into the
-            // bounded thread; nothing borrows `app_state` across the deadline.
-            let gpu_curves: Vec<(PathBuf, Option<PathBuf>)> = app_state
-                .amd_gpus
-                .iter()
-                .filter_map(|gpu| {
-                    gpu.fan_curve_path
-                        .clone()
-                        .map(|c| (c, gpu.fan_zero_rpm_path.clone()))
-                })
-                .collect();
-            let _ = restore_gpu_fans_to_auto(gpu_curves, SHUTDOWN_TASK_TIMEOUT);
+            // Reset the GPU fans the daemon drove to automatic before shutting
+            // down (re-enables zero-RPM) — only those, since DEC-435: a card no
+            // profile wrote keeps the curve its own tool gave it. Bounded since
+            // 278-c: this step runs FIRST, so leaving it unbounded meant a wedged
+            // PMFW write blocked here and the bounded hwmon restore below was
+            // never reached — the process stayed just as stuck as before 277-b.
+            // The paths are copied out of the list and moved into the bounded
+            // thread; nothing borrows `app_state` across the deadline.
+            let _ = reset_driven_gpu_fans(app_state.cache.gpu_handback(), SHUTDOWN_TASK_TIMEOUT);
 
             // Give every hwmon header the daemon holds back to what it was doing
             // before the daemon took it (DEC-382) — never a hardcoded mode.
@@ -3297,9 +3385,7 @@ mod tests {
         let floor = restore
             .find("apply_exit_floor(")
             .expect("the restore applies the exit floor");
-        let gpu = restore
-            .find("restore_gpu_fans_to_auto(")
-            .expect("GPU reset");
+        let gpu = restore.find("reset_driven_gpu_fans(").expect("GPU reset");
         let hwmon = restore.find("hand_back_hwmon(").expect("hwmon hand-back");
         assert!(
             floor < gpu && floor < hwmon,
@@ -3723,6 +3809,141 @@ mod tests {
             active_profile_path: Some("/nonexistent/control-ofc/profile.json".into()),
         };
         assert!(resolve_persisted_profile(&state, |_| panic!("loader must not run")).is_none());
+    }
+
+    // ── DEC-435 (`DC-ab`): startup profile selection ─────────────────────
+
+    fn args(list: &[&str]) -> Vec<String> {
+        std::iter::once("control-ofc-daemon")
+            .chain(list.iter().copied())
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn startup_sources_are_the_first_cli_flag_then_the_env_var() {
+        assert_eq!(
+            profile_requests(
+                &args(&[
+                    "--config",
+                    "/x.toml",
+                    "--profile",
+                    "quiet",
+                    "--profile-file",
+                    "/p.json"
+                ]),
+                Some("loud"),
+            ),
+            vec![
+                ProfileRequest::CliName("quiet".into()),
+                ProfileRequest::EnvName("loud".into()),
+            ],
+            "--config's value is skipped, the first profile flag wins, the env var follows"
+        );
+        assert_eq!(
+            profile_requests(&args(&["--profile-file", "/p.json"]), None),
+            vec![ProfileRequest::CliFile(PathBuf::from("/p.json"))]
+        );
+        assert!(profile_requests(&args(&[]), Some("")).is_empty());
+    }
+
+    /// A search dir holding `good.json` (loads), `bad.json` (does not), and a
+    /// saved state pointing at `saved.json` (loads).
+    fn startup_fixture() -> (tempfile::TempDir, daemon_state::DaemonState) {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = |id: &str| format!(r#"{{"id":"{id}","name":"{id}","version":7}}"#);
+        std::fs::write(dir.path().join("good.json"), profile("good")).unwrap();
+        std::fs::write(dir.path().join("bad.json"), "{ not json").unwrap();
+        let saved = dir.path().join("saved.json");
+        std::fs::write(&saved, profile("saved")).unwrap();
+        let state = daemon_state::DaemonState {
+            version: 1,
+            active_profile_id: Some("saved".into()),
+            active_profile_path: Some(saved.display().to_string()),
+        };
+        (dir, state)
+    }
+
+    fn resolved(
+        requests: &[ProfileRequest],
+        dir: &Path,
+        state: &daemon_state::DaemonState,
+    ) -> Option<String> {
+        resolve_startup_profile(requests, &[dir.to_path_buf()], state, profile::load_profile)
+            .map(|p| p.id)
+    }
+
+    /// DEC-435 (Q22): a source that is not found, or that will not load, falls
+    /// through to the next — CLI, then `OPENFAN_PROFILE`, then the saved profile.
+    /// A broken `--profile` used to leave NO profile while a good saved one sat
+    /// unused, and a missing `--profile` skipped `OPENFAN_PROFILE` entirely.
+    #[test]
+    fn each_startup_source_that_fails_falls_through_to_the_next() {
+        let (dir, state) = startup_fixture();
+        let d = dir.path();
+        use ProfileRequest::{CliFile, CliName, EnvName};
+
+        assert_eq!(
+            resolved(&[CliName("bad".into()), EnvName("bad".into())], d, &state).as_deref(),
+            Some("saved"),
+            "an invalid CLI and env profile fall through to the saved one"
+        );
+        assert_eq!(
+            resolved(
+                &[CliName("missing".into()), EnvName("good".into())],
+                d,
+                &state
+            )
+            .as_deref(),
+            Some("good"),
+            "a missing --profile falls through to OPENFAN_PROFILE"
+        );
+        assert_eq!(
+            resolved(
+                &[CliFile(d.join("nope.json")), EnvName("bad".into())],
+                d,
+                &state
+            )
+            .as_deref(),
+            Some("saved")
+        );
+        // The order, not just the fall-through: each source outranks the next.
+        assert_eq!(
+            resolved(&[CliName("good".into()), EnvName("bad".into())], d, &state).as_deref(),
+            Some("good")
+        );
+        assert_eq!(
+            resolved(&[EnvName("good".into())], d, &state).as_deref(),
+            Some("good"),
+            "OPENFAN_PROFILE outranks the saved profile"
+        );
+        let nothing_saved = daemon_state::DaemonState {
+            version: 1,
+            active_profile_id: None,
+            active_profile_path: None,
+        };
+        assert_eq!(resolved(&[CliName("bad".into())], d, &nothing_saved), None);
+    }
+
+    /// DEC-435 (Q22): the startup path writes no state. A `--profile` used to be
+    /// saved to `daemon_state.json` "so it survives reboot", replacing the GUI's
+    /// choice for good. `POST /profile/activate` and `/deactivate` are the only
+    /// writers, and they live in `api::handlers::profile`, not here.
+    #[test]
+    fn startup_never_saves_the_profile_it_chose() {
+        let src = include_str!("main.rs");
+        let src = src
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .expect("main.rs has a #[cfg(test)] module");
+        let writers: Vec<&str> = src
+            .lines()
+            .filter(|l| l.contains("save_state") && !l.trim_start().starts_with("//"))
+            .collect();
+        assert!(
+            writers.is_empty(),
+            "main.rs must not save the startup profile: {writers:?}"
+        );
     }
 
     #[tokio::test]
@@ -4827,7 +5048,7 @@ mod tests {
         );
         let marker = ledger.clone();
         let targets: &'static PanicRestoreTargets = Box::leak(Box::new(PanicRestoreTargets {
-            gpu_curves: Vec::new(),
+            gpu_handback: Arc::default(),
             hwmon_handback: Some(ledger),
         }));
         assert!(restore_panic_targets(targets, Duration::from_secs(5)));
@@ -4835,6 +5056,71 @@ mod tests {
         // `PTR-s` SR-3 (DEC-420): the panic path is a hand-back too, so from
         // here on `set_pwm` refuses a late write to what it gave back.
         assert!(marker.shutdown_hand_back_begun());
+    }
+
+    /// Two PMFW cards in a fake sysfs tree; each `fan_curve` and
+    /// `fan_zero_rpm_enable` starts as `untouched`.
+    fn two_pmfw_cards(root: &Path) -> [(PathBuf, PathBuf); 2] {
+        [1, 2].map(|n| {
+            let ctrl = root.join(format!("card{n}/device/gpu_od/fan_ctrl"));
+            std::fs::create_dir_all(&ctrl).unwrap();
+            let (curve, zrp) = (ctrl.join("fan_curve"), ctrl.join("fan_zero_rpm_enable"));
+            std::fs::write(&curve, "untouched\n").unwrap();
+            std::fs::write(&zrp, "untouched\n").unwrap();
+            (curve, zrp)
+        })
+    }
+
+    /// [SAFETY] DEC-435 (`DC-aa`): the clean stop resets the card the daemon drove
+    /// and leaves alone a card it never wrote — one LACT or CoreCtrl manages. It
+    /// used to reset every AMD card the daemon had detected.
+    #[test]
+    fn the_stop_resets_only_the_gpu_fans_the_daemon_drove() {
+        let tmp = tempfile::tempdir().unwrap();
+        let [(driven, driven_zrp), (other, other_zrp)] = two_pmfw_cards(tmp.path());
+        let ledger = PmfwHandBack::default();
+        ledger.note_take("amd_gpu:1", &driven, Some(&driven_zrp));
+
+        assert!(reset_driven_gpu_fans(&ledger, Duration::from_secs(5)));
+
+        // `reset_to_auto` writes "r" then "c" to the curve and "1" then "c" to
+        // zero-RPM; a regular file keeps the last write.
+        assert_eq!(
+            read_trimmed(&driven),
+            "c",
+            "the driven card's curve is reset"
+        );
+        assert_eq!(
+            read_trimmed(&driven_zrp),
+            "c",
+            "and its zero-RPM re-enabled"
+        );
+        assert_eq!(
+            read_trimmed(&other),
+            "untouched",
+            "a card never driven is not touched"
+        );
+        assert_eq!(read_trimmed(&other_zrp), "untouched");
+    }
+
+    /// [SAFETY] DEC-435: the panic hook reads the same list.
+    #[test]
+    fn the_panic_restore_resets_only_the_gpu_fans_the_daemon_drove() {
+        let tmp = tempfile::tempdir().unwrap();
+        let [(driven, driven_zrp), (other, other_zrp)] = two_pmfw_cards(tmp.path());
+        let ledger: Arc<PmfwHandBack> = Arc::default();
+        ledger.note_take("amd_gpu:1", &driven, Some(&driven_zrp));
+        let targets: &'static PanicRestoreTargets = Box::leak(Box::new(PanicRestoreTargets {
+            gpu_handback: ledger,
+            hwmon_handback: None,
+        }));
+
+        assert!(restore_panic_targets(targets, Duration::from_secs(5)));
+
+        assert_eq!(read_trimmed(&driven), "c");
+        assert_eq!(read_trimmed(&driven_zrp), "c");
+        assert_eq!(read_trimmed(&other), "untouched");
+        assert_eq!(read_trimmed(&other_zrp), "untouched");
     }
 
     /// [SAFETY] 278-a. The panic hook carried the same unbounded shape.
@@ -4856,7 +5142,7 @@ mod tests {
         // `&'static` because `PANIC_RESTORE` is a static `OnceLock`, so the real
         // call site always has one.
         let targets: &'static PanicRestoreTargets = Box::leak(Box::new(PanicRestoreTargets {
-            gpu_curves: Vec::new(),
+            gpu_handback: Arc::default(),
             hwmon_handback: Some(ledger),
         }));
 
@@ -5019,6 +5305,11 @@ mod tests {
                  closure and the bounded half below is never reached (278-c)",
             ),
             (
+                "reset_driven_gpu_fans(",
+                "the shutdown closure must reset the GPU fans the daemon drove, \
+                 through the bounded helper (DEC-435)",
+            ),
+            (
                 "restore_panic_targets(",
                 "the panic hook's restore must be bounded — an unresponsive chip \
                  otherwise blocks the hook and the process never reaches abort(), \
@@ -5039,9 +5330,8 @@ mod tests {
         // every assertion above green and silently restore that shape, so assert
         // the relative position of the two call sites in the closure.
         let gpu_at = src
-            .find("restore_gpu_fans_to_auto(app_state")
-            .or_else(|| src.find("let _ = restore_gpu_fans_to_auto("))
-            .expect("the shutdown closure must call restore_gpu_fans_to_auto");
+            .find("let _ = reset_driven_gpu_fans(")
+            .expect("the shutdown closure must call reset_driven_gpu_fans");
         let hwmon_at = src
             .find("let _ = hand_back_hwmon(")
             .expect("the shutdown closure must call hand_back_hwmon");

@@ -67,6 +67,9 @@ pub async fn gpu_reset_fan_handler(
             match crate::hwmon::gpu_fan::reset_to_auto(&path, zero_rpm.as_deref()) {
                 Ok(()) => {
                     cache.set_gpu_fan_commanded_pct(&task_fan_id, 0);
+                    // DEC-435: back on firmware auto, so no stop resets it again —
+                    // a curve LACT puts on it afterwards is left alone.
+                    cache.gpu_handback().note_handed_back(&task_fan_id);
                     Ok(())
                 }
                 Err(e) => {
@@ -80,10 +83,10 @@ pub async fn gpu_reset_fan_handler(
                     Err(e)
                 }
             }
-            // A panic inside this closure skips the rollback, which is the
-            // correct outcome rather than a leak: the global panic hook resets
-            // every GPU curve to firmware-auto before unwinding, so a
-            // relinquished fan matches the hardware state it leaves behind.
+            // A panic inside this closure skips the rollback. The panic is
+            // contained (DEC-265: only a main-thread panic restores fans), so
+            // the fan stays relinquished — not driven by the engine — until the
+            // next activation, on whatever the interrupted reset left it at.
         })
         .await;
 
@@ -202,6 +205,23 @@ fn stamp_restored_pct(
         return;
     }
     cache.set_gpu_fan_commanded_pct(fan_id, prior_pct.filter(|p| *p > 0).unwrap_or(0));
+}
+
+/// Drop the card from the PMFW hand-back list when a verify's restore put it
+/// back on firmware auto (DEC-435) — the same arms as `restore_pmfw`.
+///
+/// A restore to a prior static speed keeps it: the engine drove the card before
+/// the verify and does again after it. A failed restore keeps it too: the card
+/// is still at the test speed, so the stop must reset it.
+fn note_pmfw_restored(
+    cache: &crate::health::cache::StateCache,
+    fan_id: &str,
+    prior_pct: Option<u8>,
+    restore_failed: bool,
+) {
+    if !restore_failed && !matches!(prior_pct, Some(p) if p > 0) {
+        cache.gpu_handback().note_handed_back(fan_id);
+    }
 }
 
 /// What a GPU verify's uncancellable sequence produced (DEC-297).
@@ -350,6 +370,13 @@ pub async fn gpu_verify_handler(
                 od_max,
             );
 
+            // DEC-435: name the card before the test write, so a crash mid-verify
+            // leaves ExecStopPost a card to reset.
+            task_cache.gpu_handback().note_take(
+                &task_fan_id,
+                &fan_curve_path,
+                zero_rpm_path.as_deref(),
+            );
             // Drive the test speed (disables zero-RPM, clamps to OD_RANGE, commits).
             if let Err(e) = crate::hwmon::gpu_fan::set_static_speed(
                 &fan_curve_path,
@@ -360,6 +387,7 @@ pub async fn gpu_verify_handler(
                 let restore_failed =
                     restore_pmfw(prior_pct, &fan_curve_path, zero_rpm_path.as_deref());
                 stamp_restored_pct(&task_cache, &task_fan_id, prior_pct, restore_failed);
+                note_pmfw_restored(&task_cache, &task_fan_id, prior_pct, restore_failed);
                 return GpuVerifySequence::WriteFailed {
                     initial: initial_state,
                     final_state: GpuVerifyState {
@@ -412,6 +440,7 @@ pub async fn gpu_verify_handler(
 
             let restore_failed = restore_pmfw(prior_pct, &fan_curve_path, zero_rpm_path.as_deref());
             stamp_restored_pct(&task_cache, &task_fan_id, prior_pct, restore_failed);
+            note_pmfw_restored(&task_cache, &task_fan_id, prior_pct, restore_failed);
             GpuVerifySequence::Completed {
                 initial: initial_state,
                 final_state,
@@ -978,6 +1007,34 @@ mod tests {
         assert!(body.contains("\tmode\t2"), "{body:?}");
     }
 
+    /// DEC-435: only a restore that actually put the card back on firmware auto
+    /// takes it off the stop list — the same arms as `restore_pmfw`.
+    #[test]
+    fn only_a_successful_auto_restore_hands_the_card_back() {
+        let cases = [
+            (None, false, false, "restored to auto"),
+            (Some(0), false, false, "a prior 0 is the auto arm too"),
+            (Some(40), false, true, "restored to the engine's prior duty"),
+            (
+                None,
+                true,
+                true,
+                "the restore failed: still at the test speed",
+            ),
+        ];
+        for (prior, failed, kept, why) in cases {
+            let cache = crate::health::cache::StateCache::new();
+            let fan_id = "amd_gpu:0000:03:00.0";
+            cache.gpu_handback().note_take(
+                fan_id,
+                std::path::Path::new("/sys/x/gpu_od/fan_ctrl/fan_curve"),
+                None,
+            );
+            note_pmfw_restored(&cache, fan_id, prior, failed);
+            assert_eq!(cache.gpu_handback().is_taken(fan_id), kept, "{why}");
+        }
+    }
+
     /// AppState carrying one PMFW GPU whose `fan_curve` is a real temp file, so
     /// the verify's writes and its restore are observable.
     fn pmfw_verify_state(curve: std::path::PathBuf) -> Arc<AppState> {
@@ -1101,6 +1158,13 @@ mod tests {
              duty for a firmware-controlled card and the engine coalesces away its own \
              correction"
         );
+        // DEC-435: back on firmware auto, so the card is off the stop list — a stop
+        // must not reset a curve another tool puts on it afterwards. (The sibling
+        // cancellation test proves the verify put it on the list.)
+        assert!(
+            !cache.gpu_handback().is_taken(fan_id),
+            "a verify that restored to auto must hand the card back"
+        );
     }
 
     /// DEC-297 (AUD-b2). The GPU verify used to run inline with a
@@ -1169,6 +1233,13 @@ mod tests {
             Some(40),
             "a cancelled GPU verify must still restore the prior duty; \
              {test_speed:?} means it was left at the test speed"
+        );
+        // DEC-435: the verify named the card before its test write (nothing else
+        // in this fixture writes a curve), and a restore to a prior duty keeps it
+        // on the stop list — the engine drove it before and drives it after.
+        assert!(
+            cache.gpu_handback().is_taken(fan_id),
+            "the verify must put the card on the stop list before its test write"
         );
     }
 

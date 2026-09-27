@@ -58,6 +58,14 @@ Options:
   --profile-file <path>   Load a profile from an absolute file path
 ```
 
+The startup profile is the first of these that loads: `--profile` or
+`--profile-file`, then `OPENFAN_PROFILE`, then the profile last activated through
+the API (DEC-435). One that is missing or invalid is logged and the next is tried.
+`<name>` is the file stem (`quiet` for `quiet.json`), not the profile's display
+name. Neither is saved as the active profile, so removing the flag brings back the
+last profile activated from the GUI. Under systemd, set either in a drop-in
+(`systemctl edit control-ofc-daemon`) — see `docs/USER_GUIDE.md`.
+
 (A hidden `--allow-non-root` flag exists for development only — it skips the
 root-privilege check but not file/socket access checks. It is intentionally
 undocumented for production use.)
@@ -68,7 +76,7 @@ undocumented for production use.)
 |----------|-------------|
 | `RUST_LOG` | Log level: `error`, `warn`, `info`, `debug`, `trace` |
 | `CONTROL_OFC_CONFIG` | Path to daemon.toml (overridden by `--config` CLI arg) |
-| `OPENFAN_PROFILE` | Profile name to load at startup (fallback if no `--profile`) |
+| `OPENFAN_PROFILE` | Profile file stem to load at startup; tried after `--profile`/`--profile-file` and before the saved profile |
 
 ## Configuration
 

@@ -225,8 +225,9 @@ Full build / install / CLI / environment reference lives in
 - **Systemd-hardened** (`ProtectHome=read-only`, `ProtectSystem=strict`,
   `SystemCallFilter=@system-service`, etc.); on stop, every motherboard fan
   header the daemon took goes back to exactly what it was doing before (its BIOS
-  mode, or its duty if it was already manual), and GPU fan curves to automatic —
-  in-process, and again via `ExecStopPost`, which replays the daemon's record.
+  mode, or its duty if it was already manual), and each GPU fan curve the daemon
+  drove to automatic, leaving alone a card another tool manages — in-process, and
+  again via `ExecStopPost`, which replays the daemon's records.
 
 ## Pairing with the GUI
 

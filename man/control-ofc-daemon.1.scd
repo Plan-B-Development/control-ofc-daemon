@@ -42,12 +42,19 @@ independently of OS fan control.
 
 *--profile* <name>
 	Load a named profile from configured search directories at startup.
+	_name_ is the file stem (quiet for quiet.json), not the profile's
+	display name.
 
 *--profile-file* <path>
 	Load a profile from an absolute file path at startup.
 
 *--allow-non-root*
 	Skip the root privilege check. For development and testing only.
+
+The startup profile is the first that loads of: *--profile* or
+*--profile-file*, then *OPENFAN_PROFILE*, then the profile saved in
+_daemon_state.json_. A source that is missing or invalid is logged and the
+next is tried. Neither *--profile* nor *OPENFAN_PROFILE* is saved.
 
 # FILES
 
@@ -59,8 +66,9 @@ _/var/lib/control-ofc/runtime.toml_
 	delay). Written by the daemon via API endpoints.
 
 _/var/lib/control-ofc/daemon_state.json_
-	Persistent state: active profile selection. Survives daemon restarts.
-	Atomic writes with 0600 permissions.
+	Persistent state: the profile last activated or deactivated through the
+	API. Survives daemon restarts. Never written by *--profile* or
+	*OPENFAN_PROFILE*. Atomic writes with 0600 permissions.
 
 _/run/control-ofc/control-ofc.sock_
 	Unix domain socket for the HTTP API. Permissions: 0666 (world-readable
@@ -76,7 +84,8 @@ _/run/control-ofc/control-ofc.sock_
 	Path to daemon.toml. Overridden by --config CLI flag.
 
 *OPENFAN_PROFILE*
-	Profile name to load at startup. Overridden by --profile CLI flag.
+	Profile file stem to load at startup. Tried after the *--profile* and
+	*--profile-file* flags, and before the saved profile.
 
 # SIGNALS
 

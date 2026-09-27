@@ -34,7 +34,8 @@ NotifyAccess=main
 # That is the one state DEC-266 cannot see, because the task is alive: every fan
 # holds its last duty and nothing evaluates the thermal ladder. On a timeout
 # systemd sends WatchdogSignal (below), runs ExecStopPost (which hands the hwmon
-# headers back and resets GPU curves) and restarts the daemon under the backoff
+# headers back and resets the GPU curves the daemon drove) and restarts the
+# daemon under the backoff
 # below.
 #
 # A slow or wedged DEVICE does not stop the pings, deliberately: since DEC-289 each
@@ -168,8 +169,8 @@ RestartMaxDelaySec=60
 # ExecStopPost=control-ofc-restore-auto does and does NOT cover: the script
 # replays the daemon's hand-back record — each hwmon header the daemon holds goes
 # back to what it was doing before the daemon took it (DEC-382), and nothing else
-# is touched — replays the legacy GPU verify's record (DEC-414), and resets GPU
-# `fan_curve`. OpenFan channels are USB-serial, out of
+# is touched — replays the legacy GPU verify's record (DEC-414), and resets the
+# PMFW `fan_curve` on each card the daemon drove (DEC-435). OpenFan channels are USB-serial, out of
 # its reach, and have no firmware-auto to fall back to: a clean stop leaves them at
 # the exit floor first (DEC-388), but after a crash or SIGKILL they stay latched
 # at the last commanded duty until a daemon owns them again. Fans hold, never

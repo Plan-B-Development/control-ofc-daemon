@@ -2263,6 +2263,50 @@ async fn a_failed_reset_does_not_undo_an_earlier_successful_one() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// [SAFETY] DEC-435 (`DC-aa`): a successful reset puts the card back on firmware
+/// auto, so it comes off the list every stop resets — a curve LACT puts on it
+/// afterwards survives the next stop. A reset that FAILED leaves it on: the card
+/// may still be on the daemon's curve.
+#[tokio::test]
+async fn a_pmfw_reset_takes_the_card_off_the_stop_list_only_when_it_lands() {
+    let bdf = "0000:03:00.0";
+    let fan_id = format!("amd_gpu:{bdf}");
+    let dir = tempfile::tempdir().unwrap();
+    let curve = dir.path().join("fan_curve");
+    std::fs::write(&curve, "").unwrap();
+
+    for (curve_path, expected_status, kept) in [
+        (curve.clone(), 200, false),
+        (
+            std::path::PathBuf::from("/nonexistent/dir/fan_curve"),
+            503,
+            true,
+        ),
+    ] {
+        let state = test_app_state_with_pmfw_gpu(bdf, curve_path.clone());
+        let cache = state.cache.clone();
+        // The engine drove the card before the reset.
+        cache.gpu_handback().note_take(&fan_id, &curve_path, None);
+        let (path, shutdown, _tmp) = start_test_server(state).await;
+
+        let (status, _) = uds_post(
+            &path,
+            &format!("/gpu/{bdf}/fan/reset"),
+            &serde_json::json!({}),
+        )
+        .await;
+
+        assert_eq!(status, expected_status, "precondition");
+        assert_eq!(
+            cache.gpu_handback().is_taken(&fan_id),
+            kept,
+            "a reset that landed hands the card back; one that failed does not"
+        );
+        let _ = shutdown.send(());
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 #[tokio::test]
 async fn legacy_pwm_reset_arm_relinquishes_and_rolls_back() {
     // DEC-255: the legacy (pre-RDNA3 `pwm1_enable`) arm had no test of any kind,

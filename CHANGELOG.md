@@ -4,6 +4,31 @@
 
 ### Changed
 
+- **A daemon stop resets only the AMD GPUs the daemon drove** (DEC-435). Every stop and restart used to
+  reset the fan curve and re-enable zero-RPM on every AMD GPU in the machine, so a curve that LACT or
+  CoreCtrl had put on a card no profile names was replaced each time. The daemon now records each card
+  before it first writes a fan curve to it, from a profile or a **Test GPU Fan Control**, and a stop
+  resets only those cards. That covers the daemon's own shutdown, a panic, and `ExecStopPost` after a
+  crash or SIGKILL (a new `gpu-pmfw-handback` record in `/run/control-ofc`). A card comes off the list
+  once the daemon has put it back on firmware auto itself, through `POST /gpu/{id}/fan/reset` or a
+  verify that restored to auto.
+- **Startup profile selection falls through, and `--profile` is no longer saved** (DEC-435). A
+  `--profile`/`--profile-file` or `OPENFAN_PROFILE` profile that is missing or will not load is now
+  logged, and the next source is tried: CLI, then `OPENFAN_PROFILE`, then the saved profile. Before,
+  an invalid one left the daemon with no profile at all, and a missing `--profile` skipped
+  `OPENFAN_PROFILE`. A CLI or environment profile is also no longer written to `daemon_state.json`.
+  It still wins on every start while it is set, but taking it out now brings back the profile last
+  activated from the GUI or tray, where before it replaced that choice for good. The startup log line
+  for no profile no longer says the daemon runs "in imperative mode (GUI-driven)".
+
+### Documentation
+
+- **The GPU fan reset endpoint's contract is written down** (DEC-435), in `docs/08` (GUI repo): its
+  response body, its `409` while a GPU verify runs, and that a reset keeps the fan off the engine until
+  the next profile activation or daemon restart, which deactivating does not change. The user guide, man page and README
+  describe the startup order, that `--profile` takes a file stem rather than the display name, and how
+  to set either source in a systemd drop-in.
+
 - **Eight more Gigabyte LGA1851 boards are in the dual-chip board table** (DEC-434): the Z890 AORUS
   XTREME AI TOP, PRO ICE, ELITE X ICE, TACHYON ICE and TACHYON DUO X ICE, the Z890 AI TOP, the Z890 AERO D
   and the W880 AI TOP. The it87 sensor catalogue gives each an IT8696E and an IT87952E. None has a report

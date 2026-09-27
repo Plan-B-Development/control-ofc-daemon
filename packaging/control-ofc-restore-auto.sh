@@ -1,5 +1,6 @@
 #!/bin/bash
-# Give hwmon fans back and reset GPU fan curves after the daemon stops.
+# Give hwmon fans back and reset the GPU fan curves the daemon drove after it
+# stops.
 #
 # This runs as ExecStopPost, so it runs after a clean stop and also after a
 # crash, SIGKILL, an OOM kill or a panic: systemd.service(5) runs ExecStopPost=
@@ -29,14 +30,13 @@
 # verify that did not finish: its card gets its original mode back. A card no
 # line names -- including one another tool put in manual mode -- is not touched.
 #
+# DEC-435 (DC-aa): a third record, gpu-pmfw-handback, for RDNA3+ cards driven
+# through the PMFW fan_curve interface; see the loop at the end.
+#
 # DEC-199: the writes go through the /sys/class/hwmon and /sys/class/drm
 # *symlinks*, but the service sandbox grants write access via
 # ReadWritePaths=/sys/devices (the real backing path). A ReadWritePaths entry on
 # the /sys/class/* symlink directories does NOT work — writes fail with EROFS.
-
-# A no-match glob must expand to nothing, not the literal pattern, so the loops
-# below simply skip on a machine with no GPU fan_curve nodes.
-shopt -s nullglob
 
 # systemd sets RUNTIME_DIRECTORY for RuntimeDirectory=control-ofc; a list is
 # ':'-separated, and this unit has one entry. CONTROL_OFC_SYSFS_ROOT exists only
@@ -121,25 +121,40 @@ for record in "${records[@]}"; do
     done < "$record"
 done
 
-# Also reset GPU fan curves to auto if the sysfs paths exist
-for fan_curve in "$sysfs_root"/class/drm/card*/device/gpu_od/fan_ctrl/fan_curve; do
-    if [ -w "$fan_curve" ]; then
-        echo r > "$fan_curve" 2>/dev/null
-        echo c > "$fan_curve" 2>/dev/null
-    fi
-done
-
-# Re-enable PMFW fan zero-RPM (firmware idle fan-stop) on every GPU that
-# exposes the sysfs file. The daemon disables zero-RPM before writing a
-# manual curve and re-enables it on graceful shutdown / panic; this is the
-# SIGKILL/OOM fallback. If we don't restore this, a fan that previously
-# stopped at idle will run continuously after a daemon crash.
-for zero_rpm in "$sysfs_root"/class/drm/card*/device/gpu_od/fan_ctrl/fan_zero_rpm_enable; do
-    if [ -w "$zero_rpm" ]; then
-        echo 1 > "$zero_rpm" 2>/dev/null
-        echo c > "$zero_rpm" 2>/dev/null
-    fi
-done
+# DEC-435 (DC-aa): a GPU fan curve is reset only on a card the daemon drove.
+# Before its first PMFW fan_curve write to a card -- a profile's curve or a
+# hardware verify -- the daemon names the card in gpu-pmfw-handback, and drops
+# it once it has put the card back on firmware auto itself (POST
+# /gpu/{id}/fan/reset). Each line is "<fan_curve>\t<fan_zero_rpm_enable or ->";
+# its card gets the curve reset ("r", then "c") and firmware zero-RPM idle
+# fan-stop back ("1", then "c"), which the daemon turns off before it writes a
+# curve. A card no line names -- one LACT or CoreCtrl manages -- is not touched.
+# This used to reset every card on the machine, replacing such a tool's curve on
+# every stop and restart.
+pmfw_record="${runtime_dir%%:*}/gpu-pmfw-handback"
+if [ -r "$pmfw_record" ]; then
+    while IFS=$'\t' read -r fan_curve zero_rpm; do
+        case "$fan_curve" in '' | '#'*) continue ;; esac
+        # Checked before anything is written, as a hwmon line is: a PMFW
+        # fan_curve under the sysfs root, and a zero-RPM file only if it is that
+        # card's own.
+        case "$fan_curve" in
+            *..*) continue ;;
+            "$sysfs_root"/*/gpu_od/fan_ctrl/fan_curve) ;;
+            *) continue ;;
+        esac
+        if [ -w "$fan_curve" ]; then
+            { echo r > "$fan_curve" && echo c > "$fan_curve"; } 2>/dev/null \
+                || echo "control-ofc-restore-auto: could not reset $fan_curve" >&2
+        fi
+        # Re-enabled even when the curve reset failed, as the daemon does: left
+        # off, a fan that stopped at idle would run continuously.
+        if [ "$zero_rpm" = "${fan_curve%/fan_curve}/fan_zero_rpm_enable" ] && [ -w "$zero_rpm" ]; then
+            { echo 1 > "$zero_rpm" && echo c > "$zero_rpm"; } 2>/dev/null \
+                || echo "control-ofc-restore-auto: could not re-enable $zero_rpm" >&2
+        fi
+    done < "$pmfw_record"
+fi
 
 # ExecStopPost's status is not a verdict on the fans — each failure is reported
 # above — and a non-zero exit here would only mark the unit failed after a clean

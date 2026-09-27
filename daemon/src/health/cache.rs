@@ -139,6 +139,13 @@ pub struct StateCache {
     /// takes `inner` briefly beneath it and no path holds `inner` across a GPU
     /// write, so no inversion is possible.
     gpu_write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The PMFW cards the daemon has written a curve to and not yet put back on
+    /// firmware auto (DEC-435) — what every stop resets, and nothing else.
+    ///
+    /// Here because each producer already reaches the cache: the engine's GPU
+    /// write, `fan/verify` and `fan/reset`. An `Arc` so `main` can hand the panic
+    /// hook its own reference; it has its own lock, apart from `inner`.
+    gpu_handback: Arc<crate::hwmon::gpu_fan::PmfwHandBack>,
     /// Monotonic counter bumped whenever the OpenFanController's *device-side*
     /// duty state may no longer match what we last commanded (DEC-256).
     ///
@@ -193,6 +200,7 @@ impl StateCache {
             profile_activation_epoch: AtomicU64::new(0),
             hwmon_poll_interval_ms: AtomicU64::new(DEFAULT_HWMON_POLL_INTERVAL_MS),
             gpu_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            gpu_handback: Arc::default(),
             openfan_write_generation: AtomicU64::new(0),
             resume_generation: AtomicU64::new(0),
             notifier: std::sync::OnceLock::new(),
@@ -773,6 +781,11 @@ impl StateCache {
     /// controlling them.
     pub fn clear_relinquished_gpu_fans(&self) {
         self.inner.write().relinquished_gpu_fans.clear();
+    }
+
+    /// The PMFW cards the daemon drove (DEC-435) — see the field.
+    pub fn gpu_handback(&self) -> &Arc<crate::hwmon::gpu_fan::PmfwHandBack> {
+        &self.gpu_handback
     }
 
     /// True if the given GPU fan has been relinquished to firmware-auto.

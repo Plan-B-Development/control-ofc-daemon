@@ -18,7 +18,8 @@
 //! Commit: `echo "c" > fan_curve`
 //! Reset to auto: `echo "r" > fan_curve`
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::error::HwmonError;
 use crate::pwm::percent_to_raw;
@@ -679,6 +680,144 @@ fn write_gpu_record(record: &Path, lines: &[String]) {
     }
 }
 
+// ── Which PMFW cards the daemon drove (DEC-435, `DC-aa`) ──────────────
+//
+// A stop resets the PMFW fan curve only on a card the daemon wrote one to. Every
+// stop used to reset every AMD card on the machine, so a curve LACT or CoreCtrl
+// had put on a card no profile names was replaced on each stop and restart.
+// [`PmfwHandBack`] is the one list all three restores read — the clean stop, the
+// panic hook, and `ExecStopPost` through its on-disk record.
+
+/// File name of the PMFW hand-back record in the unit's runtime directory.
+pub const PMFW_RECORD_FILE_NAME: &str = "gpu-pmfw-handback";
+
+const PMFW_RECORD_HEADER: &str = "# control-ofc PMFW GPU hand-back record v1";
+
+/// The PMFW cards the daemon has written a fan curve to and not yet put back on
+/// firmware auto itself, keyed by fan id (`amd_gpu:<bdf>`).
+///
+/// Held behind its own lock, like the hwmon [`HandBackLedger`], so the panic hook
+/// and the shutdown can read it with a deadline whatever else is held. Nothing
+/// under the lock touches a GPU; the only I/O is the record, which lives on
+/// the runtime directory's tmpfs.
+///
+/// [`HandBackLedger`]: crate::hwmon::handback::HandBackLedger
+#[derive(Debug, Default)]
+pub struct PmfwHandBack {
+    state: parking_lot::Mutex<PmfwState>,
+}
+
+#[derive(Debug, Default)]
+struct PmfwState {
+    /// fan id → (`fan_curve`, `fan_zero_rpm_enable`).
+    taken: std::collections::BTreeMap<String, (PathBuf, Option<PathBuf>)>,
+    record_path: Option<PathBuf>,
+    record_error_logged: bool,
+}
+
+impl PmfwHandBack {
+    /// Keep the on-disk record at `path` from now on, writing it at once so it
+    /// always describes this process.
+    pub fn set_record_path(&self, path: PathBuf) {
+        let mut state = self.state.lock();
+        state.record_path = Some(path);
+        persist_pmfw(&mut state);
+    }
+
+    /// Record that the daemon is about to write a curve to `fan_id`'s card.
+    ///
+    /// Call **before** the write: a line naming a card that never got the write
+    /// replays as a harmless reset, while a card on the daemon's curve that no
+    /// line names is left on it after a crash. The record is rewritten only when
+    /// the card is new, so the engine's 1 Hz writes cost a map lookup.
+    ///
+    /// A record that cannot be written is logged once and the write goes on
+    /// (the user's choice, DEC-435): the clean stop and the panic hook still read
+    /// this list; only the crash backstop is lost.
+    pub fn note_take(&self, fan_id: &str, fan_curve: &Path, zero_rpm: Option<&Path>) {
+        let mut state = self.state.lock();
+        if state.taken.contains_key(fan_id) {
+            // A record that failed to write is retried on every take until it
+            // lands; otherwise one refused write would leave the card off the
+            // crash record for the rest of the process.
+            if state.record_error_logged {
+                persist_pmfw(&mut state);
+            }
+            return;
+        }
+        state.taken.insert(
+            fan_id.to_string(),
+            (fan_curve.to_path_buf(), zero_rpm.map(Path::to_path_buf)),
+        );
+        persist_pmfw(&mut state);
+    }
+
+    /// Record that the daemon has put `fan_id`'s card back on firmware auto
+    /// itself — a successful `POST /gpu/{id}/fan/reset`, or a verify that
+    /// restored to auto — so no stop resets it again.
+    pub fn note_handed_back(&self, fan_id: &str) {
+        let mut state = self.state.lock();
+        if state.taken.remove(fan_id).is_some() {
+            persist_pmfw(&mut state);
+        }
+    }
+
+    /// True while the daemon holds `fan_id`'s card on a curve it wrote.
+    pub fn is_taken(&self, fan_id: &str) -> bool {
+        self.state.lock().taken.contains_key(fan_id)
+    }
+
+    /// The cards to reset — `(fan_curve, fan_zero_rpm_enable)` — or `None` when
+    /// the lock is still held after `timeout`: the caller may be the thread
+    /// holding it, and `parking_lot`'s mutex is not re-entrant.
+    pub fn try_taken(&self, timeout: Duration) -> Option<Vec<(PathBuf, Option<PathBuf>)>> {
+        let state = self.state.try_lock_for(timeout)?;
+        Some(state.taken.values().cloned().collect())
+    }
+}
+
+/// One record line: `<fan_curve>\t<fan_zero_rpm_enable or ->`, or `None` for a
+/// path the script could not parse back — never replayed wrong.
+fn pmfw_record_line(fan_curve: &Path, zero_rpm: Option<&Path>) -> Option<String> {
+    let zero_rpm = zero_rpm.map_or_else(|| "-".to_string(), |p| p.display().to_string());
+    let line = format!("{}\t{zero_rpm}", fan_curve.display());
+    (line.matches('\t').count() == 1 && !line.contains('\n')).then_some(line)
+}
+
+fn persist_pmfw(state: &mut PmfwState) {
+    let Some(path) = state.record_path.clone() else {
+        return;
+    };
+    let mut body = format!("{PMFW_RECORD_HEADER}\n");
+    for (fan_curve, zero_rpm) in state.taken.values() {
+        if let Some(line) = pmfw_record_line(fan_curve, zero_rpm.as_deref()) {
+            body.push_str(&line);
+            body.push('\n');
+        }
+    }
+    match crate::hwmon::handback::write_replacing(&path, &body) {
+        Ok(()) => {
+            if state.record_error_logged {
+                log::info!(
+                    "PMFW hand-back record {} is being written again",
+                    path.display()
+                );
+            }
+            state.record_error_logged = false;
+        }
+        Err(e) => {
+            if !state.record_error_logged {
+                log::warn!(
+                    "could not write the PMFW hand-back record {}: {e} — if the daemon \
+                     crashes now, ExecStopPost cannot reset the GPU fan curves it drove",
+                    path.display()
+                );
+            }
+            state.record_error_logged = true;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1296,5 +1435,110 @@ FAN_CURVE(fan speed): 15% 100%
 
         set_static_speed(&path, None, 50, 5).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "c\n");
+    }
+
+    // ── PMFW hand-back list (DEC-435) ────────────────────────────────
+
+    /// [SAFETY] DEC-435: a card is on the record from its first take, the record
+    /// names exactly the taken cards, and a hand-back takes the card off it.
+    #[test]
+    fn the_pmfw_record_names_exactly_the_cards_taken_and_not_handed_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join(PMFW_RECORD_FILE_NAME);
+        let ledger = PmfwHandBack::default();
+        ledger.set_record_path(record.clone());
+        assert!(record_lines(&record).is_empty(), "no card is taken yet");
+
+        let a = dir.path().join("a/gpu_od/fan_ctrl/fan_curve");
+        let a_zrp = dir.path().join("a/gpu_od/fan_ctrl/fan_zero_rpm_enable");
+        let b = dir.path().join("b/gpu_od/fan_ctrl/fan_curve");
+        ledger.note_take("amd_gpu:a", &a, Some(&a_zrp));
+        ledger.note_take("amd_gpu:b", &b, None);
+        ledger.note_take("amd_gpu:a", &a, Some(&a_zrp)); // a later tick: no second line
+        assert_eq!(
+            record_lines(&record),
+            vec![
+                format!("{}\t{}", a.display(), a_zrp.display()),
+                format!("{}\t-", b.display()),
+            ]
+        );
+        assert!(ledger.is_taken("amd_gpu:a") && ledger.is_taken("amd_gpu:b"));
+
+        ledger.note_handed_back("amd_gpu:a");
+        assert_eq!(record_lines(&record), vec![format!("{}\t-", b.display())]);
+        assert!(!ledger.is_taken("amd_gpu:a"));
+        assert_eq!(
+            ledger.try_taken(Duration::from_millis(50)),
+            Some(vec![(b.clone(), None)]),
+            "the in-process restores read the same list"
+        );
+    }
+
+    /// A record left by an earlier process is replaced at once, so it never
+    /// names a card this process did not take.
+    #[test]
+    fn setting_the_pmfw_record_path_replaces_a_stale_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join(PMFW_RECORD_FILE_NAME);
+        fs::write(&record, "/sys/stale/gpu_od/fan_ctrl/fan_curve\t-\n").unwrap();
+
+        PmfwHandBack::default().set_record_path(record.clone());
+
+        assert!(record_lines(&record).is_empty());
+    }
+
+    /// A path the script could not parse back is kept in memory — the clean stop
+    /// still resets it — but never written as a line that would replay wrong.
+    #[test]
+    fn a_pmfw_path_with_a_tab_is_kept_in_memory_but_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join(PMFW_RECORD_FILE_NAME);
+        let ledger = PmfwHandBack::default();
+        ledger.set_record_path(record.clone());
+        let odd = dir.path().join("od\td/gpu_od/fan_ctrl/fan_curve");
+
+        ledger.note_take("amd_gpu:odd", &odd, None);
+
+        assert!(ledger.is_taken("amd_gpu:odd"));
+        assert!(record_lines(&record).is_empty());
+    }
+
+    /// A record that failed to write is retried on the next take of a card that
+    /// is already listed (the engine's next tick), not only when the list
+    /// changes (DEC-435 review).
+    #[test]
+    fn a_failed_pmfw_record_write_is_retried_on_the_next_take() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        let record = run.join(PMFW_RECORD_FILE_NAME);
+        let ledger = PmfwHandBack::default();
+        ledger.set_record_path(record.clone()); // `run/` does not exist yet: fails
+        let curve = dir.path().join("a/gpu_od/fan_ctrl/fan_curve");
+        ledger.note_take("amd_gpu:a", &curve, None);
+        assert!(!record.exists(), "precondition: the write failed");
+
+        fs::create_dir_all(&run).unwrap();
+        ledger.note_take("amd_gpu:a", &curve, None);
+
+        assert_eq!(
+            record_lines(&record),
+            vec![format!("{}\t-", curve.display())]
+        );
+    }
+
+    /// A record that cannot be written does not stop the take: the list the
+    /// clean stop reads still names the card (the user's choice, DEC-435).
+    #[test]
+    fn an_unwritable_pmfw_record_still_takes_the_card() {
+        let ledger = PmfwHandBack::default();
+        ledger.set_record_path(PathBuf::from("/nonexistent/control-ofc/gpu-pmfw-handback"));
+
+        ledger.note_take(
+            "amd_gpu:a",
+            Path::new("/sys/x/gpu_od/fan_ctrl/fan_curve"),
+            None,
+        );
+
+        assert!(ledger.is_taken("amd_gpu:a"));
     }
 }

@@ -289,3 +289,116 @@ fn a_gpu_record_is_replayed_and_an_unrecorded_card_is_untouched() {
         "a card no record line names must not be touched"
     );
 }
+
+/// Two RDNA3+ cards where the unit's old glob found them —
+/// `class/drm/cardN/device/gpu_od/fan_ctrl/` — each file starting `untouched`.
+fn pmfw_cards(t: &Tree) -> [(PathBuf, PathBuf); 2] {
+    [1, 2].map(|n| {
+        let ctrl = t
+            .sys
+            .join(format!("class/drm/card{n}/device/gpu_od/fan_ctrl"));
+        std::fs::create_dir_all(&ctrl).unwrap();
+        let (curve, zrp) = (ctrl.join("fan_curve"), ctrl.join("fan_zero_rpm_enable"));
+        std::fs::write(&curve, "untouched\n").unwrap();
+        std::fs::write(&zrp, "untouched\n").unwrap();
+        (curve, zrp)
+    })
+}
+
+/// [SAFETY] DEC-435 (`DC-aa`): after a crash, the card the daemon drove gets its
+/// PMFW curve reset and zero-RPM back, and a card it never wrote — one LACT or
+/// CoreCtrl manages — is not touched. The script used to reset every card on the
+/// machine. The record is written by the daemon's own writer, so the format the
+/// script parses is the one production writes.
+#[test]
+fn only_the_gpu_fans_the_daemon_drove_are_reset() {
+    use control_ofc_daemon::hwmon::gpu_fan::{PmfwHandBack, PMFW_RECORD_FILE_NAME};
+    let t = Tree::new();
+    let [(driven, driven_zrp), (other, other_zrp)] = pmfw_cards(&t);
+    let record = t.run.join(PMFW_RECORD_FILE_NAME);
+    let ledger = PmfwHandBack::default();
+    ledger.set_record_path(record.clone());
+    ledger.note_take("amd_gpu:1", &driven, Some(&driven_zrp));
+    assert!(
+        read(&record).contains(&driven.display().to_string()),
+        "precondition: the daemon's writer recorded the driven card"
+    );
+
+    let out = t.run_script();
+
+    assert!(out.status.success(), "{out:?}");
+    // "r" then "c" to the curve, "1" then "c" to zero-RPM: a file keeps the last.
+    assert_eq!(read(&driven), "c", "the driven card's curve must be reset");
+    assert_eq!(
+        read(&driven_zrp),
+        "c",
+        "and its zero-RPM idle stop re-enabled"
+    );
+    assert_eq!(
+        read(&other),
+        "untouched",
+        "a card no line names must not be touched"
+    );
+    assert_eq!(read(&other_zrp), "untouched");
+}
+
+/// No record — no card was driven, or the daemon handed every one back itself —
+/// means no GPU is touched.
+#[test]
+fn no_pmfw_record_touches_no_gpu() {
+    let t = Tree::new();
+    let [(curve, zrp), _] = pmfw_cards(&t);
+
+    let out = t.run_script();
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(read(&curve), "untouched");
+    assert_eq!(read(&zrp), "untouched");
+}
+
+/// A line the daemon could not have written is refused: a path outside the sysfs
+/// root, one that is not a PMFW `fan_curve`, one climbing out with `..`, and a
+/// zero-RPM path that is not the same card's.
+#[test]
+fn a_pmfw_line_naming_a_foreign_path_is_skipped() {
+    let t = Tree::new();
+    let [(curve, zrp), (other, other_zrp)] = pmfw_cards(&t);
+    let outside = t.run.join("gpu_od/fan_ctrl/fan_curve");
+    std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+    std::fs::write(&outside, "untouched\n").unwrap();
+    let not_a_curve = t.hwmon.join("pwm1");
+    std::fs::write(&not_a_curve, "untouched\n").unwrap();
+    // Resolves to card 2's real curve, so only the `..` check refuses it.
+    let climbing = t
+        .sys
+        .join("class/drm/card1/../card2/device/gpu_od/fan_ctrl/fan_curve");
+    let body = format!(
+        "# control-ofc PMFW GPU hand-back record v1\n{}\t-\n{}\t-\n{}\t-\n{}\t{}\n",
+        outside.display(),
+        not_a_curve.display(),
+        climbing.display(),
+        curve.display(),
+        other_zrp.display(),
+    );
+    std::fs::write(t.run.join("gpu-pmfw-handback"), body).unwrap();
+
+    let out = t.run_script();
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(read(&outside), "untouched", "outside the sysfs root");
+    assert_eq!(read(&not_a_curve), "untouched", "not a PMFW fan_curve");
+    assert_eq!(read(&other), "untouched", "a path climbing out with ..");
+    // Presence first: the well-formed curve on the last line WAS reset, so the
+    // loop ran — then its mismatched zero-RPM path was refused.
+    assert_eq!(read(&curve), "c");
+    assert_eq!(
+        read(&other_zrp),
+        "untouched",
+        "another card's zero-RPM file"
+    );
+    assert_eq!(
+        read(&zrp),
+        "untouched",
+        "no line named this card's own zero-RPM file"
+    );
+}
