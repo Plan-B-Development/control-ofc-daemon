@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.56.4] — 2026-09-27
+
 ### Fixed
 
 - **Getting a dropped OpenFanController back no longer resets every other USB-serial device**
