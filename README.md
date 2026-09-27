@@ -160,28 +160,23 @@ makepkg -si
 
 ## Quick start
 
-Building and installing straight from a checkout, without going through the
-package at all:
+Once the package is installed and the service enabled (see Install above), check
+that the daemon is answering:
 
 ```bash
-# Build (workspace member — binary lands in the workspace-root target/)
-cd daemon
-cargo build --release
-
-# Install (run from inside daemon/ — the binary is one level up)
-sudo cp ../target/release/control-ofc-daemon /usr/local/bin/
-sudo cp ../packaging/control-ofc-daemon.service /etc/systemd/system/
-sudo mkdir -p /etc/control-ofc
-sudo cp ../packaging/daemon.toml.example /etc/control-ofc/daemon.toml
-sudo systemctl daemon-reload
-sudo systemctl enable --now control-ofc-daemon
-
-# Verify
 curl --unix-socket /run/control-ofc/control-ofc.sock http://localhost/status
 ```
 
-Full build / install / CLI / environment reference lives in
-[`daemon/README.md`](daemon/README.md).
+Install the package, not a hand-copied binary. The unit runs
+`/usr/bin/control-ofc-daemon` and, after every stop, `/usr/bin/control-ofc-restore-auto`,
+which gives each fan header back to what it was doing before the daemon took it;
+the package also installs the sleep hook, the Super-I/O guard and
+`/etc/modules-load.d/control-ofc.conf`. A binary copied to `/usr/local/bin` gets
+none of these, so the unit cannot start it or cannot hand the fans back. To run a
+build of your own checkout, see
+[`docs/DEVELOPER_HANDOVER.md`](docs/DEVELOPER_HANDOVER.md) § Running the daemon.
+
+CLI / environment reference: [`daemon/README.md`](daemon/README.md).
 
 ## Documentation index
 
@@ -209,7 +204,8 @@ Full build / install / CLI / environment reference lives in
 - **Thermal safety** is daemon-enforced: at the CPU trip point → every OpenFan channel and
   writable motherboard (hwmon) header the machine has to 100%, hysteresis down to 80°C, and a 40% floor on the
   fans the active profile controls when no CPU sensor reports for 5 cycles (fans no profile controls stay under
-  their firmware curve). The trip point is **per-machine** — at least 105°C,
+  their firmware curve — except on an ARCTIC Fan Controller, which has none: since 2.56.1, once the daemon
+  writes any of its channels, each channel reading 0 that it did not choose runs at 100%). The trip point is **per-machine** — at least 105°C,
   raised to `min(ceiling + 5 °C, 115 °C)` where the kernel publishes the CPU's own
   design ceiling (DEC-308) — and every duty is a **floor** over the active profile's output
   rather than a replacement for it (DEC-307), so the ladder can only raise a fan. GPU fans are excluded — AMD PMFW firmware owns
@@ -219,15 +215,25 @@ Full build / install / CLI / environment reference lives in
   backend (2.0.0+, DEC-159/DEC-165). There is no GUI defer window — the 30 s
   `gui_active` defer (DEC-071/074) was deleted at the 2.0.0 cutover; the GUI never
   writes PWM.
-- **Lease system** provides exclusive hwmon write access (60 s TTL), held
-  **internally** by the profile engine, to guard against conflicting external
-  hwmon writers. The GUI holds no lease (DEC-165).
+- **Lease system** — a daemon-internal token (60 s TTL) that decides which of the
+  daemon's own three hwmon writers may write at a time: the profile engine, a
+  hardware diagnostic, or the thermal-safety force, which can take it from a
+  diagnostic mid-run (DEC-197). It does not stop another program writing the
+  same fan, and nothing can: the engine rewrites a duty that another writer
+  moved, but gives up after three corrections that do not hold and flags the
+  header `duty_not_holding` (DEC-406). Stop other fan tools first (see
+  Prerequisites). The GUI holds no lease (DEC-165).
 - **Systemd-hardened** (`ProtectHome=read-only`, `ProtectSystem=strict`,
   `SystemCallFilter=@system-service`, etc.); on stop, every motherboard fan
-  header the daemon took goes back to exactly what it was doing before (its BIOS
-  mode, or its duty if it was already manual), and each GPU fan curve the daemon
-  drove to automatic, leaving alone a card another tool manages — in-process, and
-  again via `ExecStopPost`, which replays the daemon's records.
+  header the daemon took and that has a mode switch (`pwmN_enable`) goes back to
+  exactly what it was doing before (its BIOS mode, or its duty if it was already
+  manual), and each GPU fan curve the daemon drove to automatic, leaving alone a
+  card another tool manages — in-process, and again via `ExecStopPost`, which
+  replays the daemon's records. Fans with no firmware behaviour to go back to —
+  every OpenFan channel, and a header with no mode switch — are left on a clean
+  stop at their last speed or the **exit floor** (default 50 %,
+  `[shutdown] exit_floor_pct`), whichever is higher (DEC-388); a crash or SIGKILL
+  cannot apply it, so those keep their last speed.
 
 ## Pairing with the GUI
 

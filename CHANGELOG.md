@@ -48,6 +48,43 @@
 
 ### Documentation
 
+- **The operator docs say what `runtime.toml` holds: your fan header roles** (DEC-438). The man page
+  described it as "profile search dirs, startup delay". It also holds the header roles you assign — on a
+  board with no fan labels, a `pump` assignment there is what gives that header its 30 % floor and keeps
+  identify from stopping it — plus the cooling devices, the preferred sensors, the exit floor and every
+  setting changed through the API. The man page, the user guide and ADR-002 now say so, say not to
+  delete or hand-edit it, and explain what happens when it cannot be read: the daemon starts on defaults
+  with no header roles and reports `runtime_config_degraded`, and a setting saved meanwhile keeps the
+  unreadable file as `runtime.toml.invalid-<time>`.
+- **Build-from-source instructions no longer produce a daemon that cannot start or cannot hand the fans
+  back** (DEC-438). The README, `daemon/README.md` and the user guide copied the binary to
+  `/usr/local/bin` while the unit runs `/usr/bin/control-ofc-daemon`, and installed none of the restore
+  script, sleep hook, Super-I/O guard or `modules-load.d` file. They now build the package with
+  `makepkg -si`. The developer handover says how to run your own build (install the package, then swap
+  in the binary), and warns never to run the daemon by hand while the service is active: a second
+  daemon takes over the socket and drives the same fans. Uninstalling is now `pacman -R`.
+- **`daemon.toml` is documented with what makes an edit safe** (DEC-438). An unknown key or an
+  out-of-range value stops the daemon at startup, and systemd restarts it with nothing controlling the
+  fans until the file is fixed; the user guide, the man page and the shipped `daemon.toml` say so, with
+  each key's accepted range, the `[profiles]` block and its default, `systemctl reload`, and the
+  `ReadWritePaths=` drop-in a moved `state_dir` or `socket_path` needs.
+- **The user guide gained a service-supervision section and a troubleshooting table** (DEC-438): the
+  watchdog, the restart back-off (which needs systemd 254 or newer), the sleep hook and its journal
+  lines, what a resume or reconnect does to OpenFan duties, and what `duty_not_holding`,
+  `skipped_controls`, `unavailable_sensors` and `runtime_config_degraded` mean. It also documents
+  `GET /config` and the six `POST /config/*` setters it was missing, the Super-I/O guard, the ARCTIC
+  Fan Controller and the GPU kernel advisory (all since 2.56.1), and that only the GUI enforces the
+  all-or-none rule on a Dell with one BIOS fan switch.
+- **Corrections** (DEC-438): the GPU reset example used a prefixed id the endpoint rejects (it takes
+  the bare PCI address); Debian and Ubuntu need no `dialout` drop-in, because the daemon runs as root
+  and only the unit's `DeviceAllow=` list limits which serial devices it can open; calibration restores
+  100 % for an unknown duty and does not restore under a thermal force; a diagnostic stops when its
+  header becomes a pump mid-run; "fans no profile controls stay under their firmware curve" does not
+  hold on an ARCTIC Fan Controller; the tray man page no longer claims the menu warns that a quieter
+  profile will not help during a thermal event, and it now lists every line the menu can show; the man
+  page lists the files the package installs and writes, `SIGTERM`, and that the socket is
+  world-writable. The package's install message points at the user guide for setup, and its removal
+  message says an edited configuration is kept as `.pacsave`.
 - **The GPU fan reset endpoint's contract is written down** (DEC-435), in `docs/08` (GUI repo): its
   response body, its `409` while a GPU verify runs, and that a reset keeps the fan off the engine until
   the next profile activation or daemon restart, which deactivating does not change. The user guide, man page and README

@@ -27,12 +27,16 @@ tray/src/              — control-ofc-tray: an API client, not part of the daem
   menu.rs              — the StatusNotifierItem: what is shown, what clicks do
   launch.rs            — starting control-ofc-gui, detached
   single_instance.rs   — one tray per user (flock in $XDG_RUNTIME_DIR)
+  lib.rs               — crate root; the boundary (what the tray may call) stated once
 
 daemon/src/
   main.rs              — startup, config, signal handling, shutdown
   config.rs            — TOML config parsing + validation
   runtime_config.rs    — daemon-mutable runtime.toml (ADR-002)
   constants.rs         — centralized operational tuning values
+  sd_notify.rs         — READY / WATCHDOG / STOPPING to systemd, and the sleep-hook
+                         watchdog widen (DEC-387/396). WATCHDOG=1 has one sender
+  text.rs              — the shared length bound for text persisted in documents
   lib.rs               — crate re-exports
 
   serial/
@@ -61,7 +65,10 @@ daemon/src/
     readiness.rs       — turns the inventory into an actionable hardware-readiness list (DEC-200)
     pwm_discovery.rs   — PWM header discovery (fan outputs)
     pwm_control.rs     — HwmonPwmController + SysfsWriter trait; write coalescing with engine duty reconciliation (DEC-073/DEC-406); shared-report sibling priming (DEC-425)
-    lease.rs           — LeaseManager (exclusive write access)
+    lease.rs           — LeaseManager: the internal single-writer arbiter (DEC-197)
+    handback.rs        — [SAFETY] give each header back exactly as it was found (DEC-382):
+                         the write-ahead `hwmon-handback` record in /run/control-ofc that
+                         control-ofc-restore-auto replays, and the in-process hand-back
     aio.rs             — liquid-cooler (AIO/custom-loop) recognition: coolant-sensor + is_aio flag + aio_hwmon cap (DEC-156)
     roles.rs           — per-channel header role inference + resolution, and THE
                           pump-protection union `is_pump_protected` (DEC-311/312/316;
@@ -89,7 +96,7 @@ daemon/src/
     kernel_warnings.rs — kernel-version regression catalog
                           (drm/amd #4765 MES eviction hang on RDNA3/4,
                           6.17.9–6.17.13 + 6.18.0–6.18.6, DEC-422)
-                          surfaced via /capabilities.amd_gpu.kernel_warnings
+                          surfaced via /capabilities devices.amd_gpu.kernel_warnings
     superio.rs         — passive Super-I/O chip detection (DMI + hwmon + /proc/modules + kmsg + ACPI evidence, DEC-202)
     superio_probe.rs   — opt-in active /dev/port Super-I/O probe, off by default (DEC-203)
     chip_db.rs         — Super-I/O chip → expected-driver knowledge base (DEC-202)
@@ -131,12 +138,13 @@ daemon/src/
                          functions — it owns no lease, no floor and no PWM write
       profile.rs       — profile activation + CRUD endpoints
       control.rs       — manual-override + fan-identify endpoints (DEC-163/166)
-      config.rs        — runtime config endpoints (search dirs, startup delay)
+      config.rs        — GET /config and every POST /config/* setter (runtime.toml), incl. header roles and cooling devices
       hw_diagnostics.rs — hardware diagnostics endpoint
       inventory.rs     — /inventory/{hwmon,readiness,superio,hardware-readiness} reads + Super-I/O probe; shared assessment snapshot + coalesced scan (DEC-200/202/203/207)
       assessment.rs    — hardware-assessment cache + single-flight coordinator (DEC-207)
       path_confine.rs  — SO_PEERCRED search-dir confinement predicate (DEC-205)
       discovery.rs     — /diagnostics/preflight + the control-path routes (DEC-333)
+      stall_probe.rs   — the stall-probe routes (DEC-407); the probe itself is api/stall_probe.rs
     responses.rs       — response structs (Serialize)
     calibration.rs     — OpenFan calibration sweep
     diagnostics.rs     — hardware-diagnostics scanning logic behind /diagnostics/hardware
@@ -239,9 +247,10 @@ land and is not counted — and since DEC-420 any failed duty write clears the
 header's manual flag, so the next command re-takes the header and is written
 rather than coalesced, which restarts the count, `TS-au`); after `DUTY_CORRECTION_ATTEMPTS` (3) of those in a row the engine stops rewriting that
 header and flags it `duty_not_holding`, so it cannot fight a persistent second
-writer indefinitely. It resumes when the command changes, and the flag
-clears when a coalesced readback agrees again (or the header is handed back or the
-profile deactivated). One drift episode logs at most one WARN for its first
+writer indefinitely. It resumes, and the flag clears, when the command changes or
+the header is re-taken (a reclaim, a resume, the thermal force); the flag also
+clears when a coalesced readback agrees again, or the header is handed back or the
+profile deactivated. One drift episode logs at most one WARN for its first
 correction, one WARN for the give-up and one INFO for the recovery. An unreadable
 duty is unknown, never a mismatch. Scope: writes under a `Verify` lease (verify,
 characterise, discover) are never reconciled — a diagnostic gets exactly the duty
@@ -275,7 +284,7 @@ then gets out of the way:
 ```
 main
  │
- ├─ serial_port_candidates_enumerated()      # libudev + path scan, OPENS NOTHING
+ ├─ serial_port_candidates_enumerated()      # libudev + path scan; opens no candidate
  │    configured [serial] port first, but never the only candidate (DEC-250)
  │
  ├─ first_openfan_port()                     # opens each candidate AT MOST ONCE,
@@ -284,7 +293,7 @@ main
  ├─ spawn hwmon poll · spawn profile_engine · server::serve()
  │    ↑ these run whether or not a controller was adopted.
  │    `openfan_poll_loop` does NOT — it is gated on `Some(transport)`
- │    (`main.rs:1885`), which is why adoption must spawn it (DEC-266)
+ │    in `main`, which is why adoption must spawn it (DEC-266)
  │
  └─ post_boot_adoption_loop()                # ONLY if nothing was adopted
       detached, after the IPC server is already answering
@@ -299,8 +308,12 @@ no controller at all.
 **Enumerate, then identify.** The two halves are separate functions because the
 difference is a hardware side effect: `open(2)` on a tty asserts DTR, which
 resets Arduino-class boards. `enumerate_serial_candidates` is a libudev/sysfs read
-plus `Path::exists`; the only thing that opens is `first_openfan_port`, once per
-candidate, to run the identity handshake. `auto_detect_port`, which opened every
+plus `Path::exists`; the only thing that opens a candidate is `first_openfan_port`,
+once per candidate, to run the identity handshake. (Not "opens nothing":
+`serialport::available_ports()` opens the devnode of any `serial8250` tty before
+the `ttyACM`/`ttyUSB` filter runs. The shipped unit's `DeviceAllow=` blocks those
+opens, so only a dev or container run reaches them — see
+`enumerate_serial_candidates`.) `auto_detect_port`, which opened every
 tty to find one, was retired by `DC-ae`: its last caller was the reconnect probe
 below, and it swept the whole bus on every backoff cycle for as long as the
 controller stayed gone.
@@ -534,7 +547,7 @@ gating each have their own register rows and regression tests.
    - Currently flags `rdna_mes_hang_drm_amd_4765` (DEC-422): the drm/amd #4765 MES eviction hang on every RDNA3 / RDNA3.5 / RDNA4 GPU. It is present on 6.17.9–6.17.13 (a backport never fixed before 6.17 went end-of-life) and 6.18.0–6.18.6, and fixed in 6.18.7 and 6.19. DEC-422 retired `rdna_hang_kernel_6_18_6_19`, whose advice to pin 6.15–6.17 was wrong, and `smu_mismatch_navi48_r9700`, whose premise, a benign SMU interface-version message, was refuted. Daemon v2.56.0 and older still raise both.
    - Surfaced via `GET /capabilities` (`devices.amd_gpu.kernel_warnings`); each entry carries `id` (stable knowledge-base key), `severity` (`info` / `medium` / `high` / `critical`), and `message` (pre-formatted user-visible text). The daemon owns the wording so a message update doesn't require coordinated GUI redeploys.
    - The field uses `#[serde(skip_serializing_if = "Vec::is_empty")]` so older clients that don't know about it see no change in the wire shape
-   - The GUI raises a one-time `QMessageBox` for `high` and `critical` warnings; the user's acknowledgement is persisted in `app_settings.acknowledged_kernel_warnings` so the popup does not re-fire on every reconnect
+   - The GUI raises a popup for `high` and `critical` warnings once per id per session; its *Don't show again* records the id in `app_settings.acknowledged_kernel_warnings`, which stops it for good
    - Adding a new regression entry is a 30-line PR against `kernel_warnings.rs`; no schema or contract change required
 
 8. **Pump-stop guard** (`profile.rs`, DEC-167): a control with a pump/CPU member
@@ -635,8 +648,9 @@ gating each have their own register rows and regression tests.
 is not meant to be invoked directly — it requires root, and the runtime
 (`/run/control-ofc/`) and state (`/var/lib/control-ofc/`) directories are
 prepared by systemd via `RuntimeDirectory=` and `StateDirectory=` in the
-unit file. Running the binary by hand as a regular user hits `EACCES` on
-the IPC socket and exits immediately with an actionable message.
+unit file. Running the binary by hand as a regular user fails the EUID check
+in `preflight_check` before anything is opened, and exits with a message
+saying to start it through systemd.
 
 ```
 sudo systemctl enable --now control-ofc-daemon
@@ -659,12 +673,17 @@ Configuration lives in two files (see `docs/ADRs/002-runtime-config-split.md`):
   (default `/var/lib/control-ofc/runtime.toml`).
   Managed by the daemon. Holds the keys that API endpoints mutate at
   runtime: `[profiles] search_dirs`, `[startup] delay_secs`,
-  `[shutdown] exit_floor_pct` (DEC-388) and
-  `[hardware] preferred_cpu_sensor` / `preferred_mb_sensor` (DEC-200). Written
-  with 0600 permissions via atomic tmp+rename.
+  `[shutdown] exit_floor_pct` (DEC-388),
+  `[hardware] preferred_cpu_sensor` / `preferred_mb_sensor` (DEC-200) and
+  **`header_roles` (DEC-311) — a pump-floor safety input**, the top-level
+  `[[cooling_devices]]` (DEC-316), and the DEC-243 `[serial]` / `[polling]` /
+  `[detection]` overrides below. Written with 0600 permissions via atomic
+  tmp+rename. An unreadable file boots on defaults with no header roles
+  (`runtime_config_degraded`, below).
 
 On startup the daemon loads `daemon.toml`, then overlays `runtime.toml` on
-top; runtime values win. SIGHUP re-reads both and re-applies the overlay.
+top; runtime values win. SIGHUP (`systemctl reload`) re-reads both and re-applies
+the overlay, committing the profile search dirs and the exit floor (below).
 
 Other paths:
 
@@ -715,12 +734,12 @@ Full route table (source of truth: `daemon/src/api/server.rs`).
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/status` | Subsystem health + freshness; `thermal_state`; `unavailable_sensors[]` (present-but-unreadable sensors, DEC-193); `skipped_controls[]` (controls the engine cannot resolve, so is not commanding — 273-i); `runtime_config_degraded` (set when `runtime.toml` failed to load and the daemon is running on defaults — `AUD3-m`); `active_profile_id`/`active_profile_name` (active profile, DEC-194 — both **omitted** when none is active); `has_active_profile` (**always serialised**; the only field that tells "nothing is active" apart from "this daemon predates the mirror", so an absent KEY means a daemon < 2.45.0 while `false` is authoritative — DEC-355); `readiness` (compact cached hardware-readiness rollup for the GUI Dashboard chip — `{overall, critical, warning, info, top_summary, top_code}`, DEC-206); `validation_session` (the live session in miniature, DEC-317); `verify_active` (a verify / characterisation / calibration / validation sweep owns the engine's WRITE PAUSE — the engine keeps evaluating and keeps publishing `control_outputs[]`, it simply does not apply them, `WIRE-n`. **Not a safety signal:** the thermal force runs before this gate, DEC-297) |
+| GET | `/status` | Subsystem health + freshness; `thermal_state`; `unavailable_sensors[]` (present-but-unreadable sensors, DEC-193); `skipped_controls[]` (controls the engine cannot resolve, so is not commanding — 273-i); `runtime_config_degraded` (set when `runtime.toml` could not be read — at startup the daemon then runs on defaults with no header roles; on a failed `reload` the live search dirs and exit floor fall back to `daemon.toml`'s; on an `update` a setter replaced the file, keeping the live roles and cooling devices — `AUD3-m`, `TS-r`); `active_profile_id`/`active_profile_name` (active profile, DEC-194 — both **omitted** when none is active); `has_active_profile` (**always serialised**; the only field that tells "nothing is active" apart from "this daemon predates the mirror", so an absent KEY means a daemon < 2.45.0 while `false` is authoritative — DEC-355); `readiness` (compact cached hardware-readiness rollup for the GUI Dashboard chip — `{overall, critical, warning, info, top_summary, top_code}`, DEC-206); `validation_session` (the live session in miniature, DEC-317); `verify_active` (a verify / characterisation / calibration / validation sweep owns the engine's WRITE PAUSE — the engine keeps evaluating and keeps publishing `control_outputs[]`, it simply does not apply them, `WIRE-n`. **Not a safety signal:** the thermal force runs before this gate, DEC-297) |
 | GET | `/sensors` | All temperature readings (each entry optionally carries a curated hwmon `thresholds` object — DEC-117; each also carries `control_eligible: bool` — DEC-193) |
 | GET | `/fans` | Fan RPM + last commanded PWM (+ `stall_detected`, `fan_alarm`, `pwm_enable_mode`, `pwm_readback_pct` — the hardware readback, DEC-317 — and `pwm_commanded_pct` — the single-producer command, DEC-318; the two are the separate axes `last_commanded_pwm` conflates for an hwmon header) |
 | GET | `/poll` | Batch: status (incl. `unavailable_sensors[]`, `skipped_controls[]`, `runtime_config_degraded`, `active_profile_*`, `readiness` rollup, `verify_active` — the engine is evaluating but NOT writing, `WIRE-n`) + sensors (incl. `control_eligible`) + fans |
 | GET | `/sensors/history` | Per-entity time-series (ring buffer) |
-| GET | `/capabilities` | Device list, feature flags, limits, `amd_gpu.kernel_warnings` (kernel-version regression catalogue, DEC-098). `control.min_supported_gui` is the **single source** of the GUI pairing floor (`WIRE-ac`, `constants::MIN_SUPPORTED_GUI`); `WIRE-k` added flags for five older features (`gpu_fan_verify`, `hardware_readiness`, `superio_port_probe`, `preferred_sensors`, `daemon_config_report`) — an absent flag means "this daemon predates the key", never "unsupported" |
+| GET | `/capabilities` | Device list, feature flags, limits, `devices.amd_gpu.kernel_warnings` (kernel-version regression catalogue, DEC-098). `control.min_supported_gui` is the **single source** of the GUI pairing floor (`WIRE-ac`, `constants::MIN_SUPPORTED_GUI`); `WIRE-k` added flags for five older features (`gpu_fan_verify`, `hardware_readiness`, `superio_port_probe`, `preferred_sensors`, `daemon_config_report`) — an absent flag means "this daemon predates the key", never "unsupported" |
 | GET | `/config` | Effective merged configuration (DEC-243): per key its on-disk `value`, the `running_value` this process started with, `source` (`runtime`/`admin`/`default`), `mutable`, `requires_restart`, `restart_pending`, and `requires_privilege` where a drop-in is also needed. `/capabilities` carries no configuration at all — this is the only read side |
 | GET | `/hwmon/headers` | Controllable motherboard PWM outputs |
 | GET | `/profiles`, `/profiles/{id}` | Daemon-stored profiles (store of record — DEC-160) |
@@ -756,8 +775,10 @@ re-issued: `spawn_blocking` is uncancellable, so retrying each tick would strand
 one blocking thread per tick. While a write is outstanding the engine records
 `engine_writes_stalled_since`, and `/status`'s `engine` subsystem reports `warn`
 then `crit` — without it a wedged writer would look healthy, because the loop is
-now still ticking. **The GPU backend is not covered** (its task holds an owned
-write lock, so handle retention would just move the freeze); tracked as `AUD-a2`.
+now still ticking. The GPU backend was left out at first, because its task holds
+an owned write lock and retaining the handle would only move the freeze; DEC-299
+gave it its own bound (`GPU_WRITE_JOIN_BUDGET`) and folded it into the same stall
+report, so all three backends are covered (`AUD-a2`, closed).
 
 **Controls that cannot be resolved (273-i).** A control whose curve will not
 resolve is skipped — no command, fans hold their last duty. After three
@@ -818,12 +839,11 @@ reading 0 was restored to 0 with `pwm_enable=1` asserted — a firmware-controll
 0 converted into a stopped pump with no writer. Both sites now clamp to
 `max(HARD_PUMP_CPU_FLOOR_PCT, captured)` for pump-protected headers only; an
 ordinary fan is still restored exactly as captured, 0 included.
-Two boundaries stated rather than left implicit: a **CPU-labelled** header is
-outside the clamp (`header_is_pump_protected` is `Pump` only, while the engine
-floors CPU members at the same 30%) — `322-b`; and neither diagnostic restores
-the captured `pwm_enable`, so a header taken from firmware control stays in
-manual whatever duty it lands on — `322-c`. Both are pre-existing and recorded
-rather than changed here. A consequence for clients: `restore_outcome:
+Neither diagnostic restores the captured `pwm_enable` itself; since DEC-382 it
+does not need to. Once the diagnostic ends, the next engine tick gives back
+every header the daemon holds that the active profile does not name, to the mode
+recorded before the daemon first took it (`hwmon::handback`), and a header the
+profile does name is back under its curve and its floors. A consequence for clients: `restore_outcome:
 "restored"` now means *restored, floor-clamped* on a pump, so the duty on the
 hardware may exceed the original reported beside it.
 
@@ -856,9 +876,9 @@ eligibility re-check (DEC-407), which refuses a pump outright.
 **A third parity oracle, `header_role_classification.json` (`AUD3-c`).** The GUI
 hand-mirrors `classify_header_role`'s label branches — it must, because a daemon
 < 2.31.0 publishes no `stop_permitted` and the reconstruction is then the only
-answer. The copies agreed; what was missing was the *gate*. 29 cases of
+answer. The copies agreed; what was missing was the *gate*. Cases of
 `(chip_name, pwm_index, label) -> (role, pump_protected)`, asserted on both sides
-and compared byte-for-byte by `parity.yml`, which now covers three fixtures.
+and compared byte-for-byte by `parity.yml` alongside the other parity fixtures.
 
 **A runtime config that failed to load (`AUD3-m`, daemon >= 2.34.0).**
 `RuntimeConfig::load_from` degrades to `Self::default()` when `runtime.toml`
@@ -900,18 +920,18 @@ at startup and a later successful write does not retroactively apply them.
 `File::create`, which truncates — so two concurrent writers to one destination
 shared a scratch file and could publish a document half-overwritten by the
 other. Which writer wins the destination is still a race (that is the
-`/config/*` lock's job, below); the winner's document is now always whole. All
-five call sites — `runtime_config`, `daemon_state`, `profile_store`,
-`validation::store`, `validation::recorder` — are covered without any of them
-knowing, which is the point: the previous shape required every caller to carry
+`/config/*` lock's job, below); the winner's document is now always whole. Every
+call site — `runtime_config`, `daemon_state`, `profile_store`,
+`validation::store`, `validation::recorder` among them — is covered without
+knowing it, which is the point: the previous shape required every caller to carry
 its own save lock and only one did.
 
 **`/config/*` setters are serialised as of 2.34.0 (`AIO1-d`).** Every setter is
 load the whole file → change one key → write it back → commit in memory, and
 nothing ordered two of them: the later write won the file, the later commit won
-the cache, and **both requests answered `updated: true`**. All twelve write
-routes — through eleven acquisition sites, since the two preferred-sensor routes
-share a helper — now take one `tokio::sync::Mutex` inside `runtime_for_update`,
+the cache, and **both requests answered `updated: true`**. Every write
+route now takes one `tokio::sync::Mutex` inside `runtime_for_update` (the two
+preferred-sensor routes through a shared helper),
 held to the end of the handler, so a new setter cannot load the config without
 serialising. The lock is
 taken **first** and covers only leaf locks (`header_roles`, `cooling_devices`,
@@ -946,7 +966,7 @@ subsystem — DEC-102 / DEC-130).
 |--------|------|---------|
 | POST | `/fans/openfan/{channel}/calibrate` | PWM→RPM sweep (long-running, thermal-aborting; pauses the engine write phase for the sweep so an active profile cannot corrupt the readback — DEC-191) |
 | POST | `/fans/{fan_id}/identify` | Per-fan identify hold/restore — 0 for an ordinary fan (floor-exempt), a floored perturbation for a pump-protected header (DEC-311/312/384); deadman auto-restore (DEC-166) |
-| POST | `/config/header-role` | Assign or clear one PWM header's role (DEC-311). `{"header_id","role"}`; `role: null` clears |
+| POST | `/config/header-role` | Assign or clear one PWM header's role (DEC-311). `{"header_id","role"}`; `role: null` clears. Applies live. Assigning `pump` also releases an identify stop held on that header — swap first, then release, under the lock order DEC-419 made load-bearing |
 | POST | `/config/cooling-device` | Create or replace one cooling device by id (DEC-316). Safety numbers are **not** settable — a policy is chosen with `device_policy_id` and `minimum_safe_pwm` & siblings are rejected by name |
 | DELETE | `/config/cooling-device/{id}` | Remove one cooling device (DEC-316). `404` when no device has that id |
 
@@ -996,7 +1016,7 @@ commands still gets the forced duty, which is what keeps the reach above true.
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| POST | `/inventory/superio/probe` | Opt-in active Super-I/O `/dev/port` probe (DEC-203) — a deliberate one-shot that identifies an UNBOUND chip so the user can be told which driver to load. Refuses unless `[detection] allow_port_probe` + `CAP_SYS_RAWIO`; refuses the **whole** probe while any recognised Super-I/O driver is bound, or when `/proc/ioports` is unreadable (DEC-433); skips a base `/proc/ioports` shows reserved by a driver/ACPI; single-flight + 10 s cooldown. Reads the DEVID with no unlock and writes one only on `0xffff` or `0x0000` (DEC-332), and on a board the DMI table says is ITE-only it **withholds the Nuvoton `0x87,0x87` leg entirely** — the sequence that latches the eSPI→LPC bridge, keyed on the same board list as the shipped modprobe guard (`X87-k`); the skip is reported in `notes[]`. Returns the `/inventory/superio` shape enriched with probe hits |
+| POST | `/inventory/superio/probe` | Opt-in active Super-I/O `/dev/port` probe (DEC-203) — a deliberate one-shot that identifies an UNBOUND chip so the user can be told which driver to load. Refuses unless `[detection] allow_port_probe` + `CAP_SYS_RAWIO`; refuses the **whole** probe while any recognised Super-I/O driver is bound, or when `/proc/ioports` is unreadable (DEC-433); skips a base `/proc/ioports` shows reserved by a driver/ACPI; single-flight + 10 s cooldown. Reads the DEVID with no unlock and writes one only on `0xffff` or `0x0000` (DEC-332), and on a board the DMI table says is ITE-only it **withholds the Nuvoton `0x87,0x87` leg entirely** — the sequence that latches the eSPI→LPC bridge, keyed on the boards in `chip_db::GIGABYTE_DUAL_CHIP_BOARDS` whose DMI table says the Super-I/O complement is ITE-only (`X87-k`). That is narrower than the shipped modprobe guard, which since DEC-424 covers every Gigabyte board; aligning the two is register row `BRD-s`; the skip is reported in `notes[]`. Returns the `/inventory/superio` shape enriched with probe hits |
 
 ### Write endpoints — validation sessions (DEC-317, AIO-MB Phase 5)
 
@@ -1060,8 +1080,8 @@ that run. Thermal safety never depended on this — the forced-duty branch runs 
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST/PUT/DELETE | `/profiles`, `/profiles/{id}` | Profile CRUD + `?validate_only` — daemon is the store of record (DEC-160) |
-| POST | `/profile/activate` | Switch active profile by id or path; clears all active control-overrides, not identify holds (DEC-189) — except an identify stop on a header the new profile names a pump, which is released (DEC-394) |
-| POST | `/profile/deactivate` | Clear active profile (DEC-097); also clears all active control-overrides, not identify holds (DEC-218, ≥ 2.12.0); idempotent |
+| POST | `/profile/activate` | Switch active profile by id or path (a path must lie inside a search dir); clears all active control-overrides, not identify holds (DEC-189) — except an identify stop on a header the new profile names a pump, which is released (DEC-394). A header the old profile drove and the new one does not name is given back on the next tick (DEC-382) |
+| POST | `/profile/deactivate` | Clear active profile (DEC-097); also clears all active control-overrides, not identify holds (DEC-218, ≥ 2.12.0); idempotent. The next engine tick gives back every header the daemon holds to its recorded mode (DEC-382) |
 | POST | `/control/{control_id}/override` (+`/override/renew`, `DELETE`) | Expiring manual override — floor-clamped, deadman, monotonic fencing (DEC-163); cleared on profile activation/deactivation (DEC-189/DEC-218) |
 | POST | `/config/profile-search-dirs` | Edit the profile search path: `{"add": [...]}` and/or `{"remove": [...]}`, at least one required. Removals apply before additions, so `add`+`remove` is one atomic "move" (DEC-285, `remove` is ≥ 2.23.0 and gated by `control.profile_search_dir_remove`). `/etc/control-ofc/profiles` and the last remaining entry cannot be removed. Applies live; persists to `runtime.toml`; 503 `persistence_failed` on write error |
 | POST | `/config/poll-interval` | Set the sensor/fan poll interval, 250-2000 ms (DEC-243; persists to `runtime.toml`, restart to apply). **[SAFETY]** the ceiling bounds how stale a temperature the thermal-emergency rule can act on |

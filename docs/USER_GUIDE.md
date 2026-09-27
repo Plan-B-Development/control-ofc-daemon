@@ -28,6 +28,7 @@ The daemon provides a local API that a GUI (or scripts) can use to monitor tempe
 | AMD GPU fans (pre-RDNA3) | Yes | Yes (daemon-driven via pwm1) |
 | Intel Arc discrete GPU fans (`xe` / `i915`) | Yes (RPM) | No — firmware-managed, no kernel PWM interface (DEC-121) |
 | NVIDIA discrete GPU fans (`nouveau` / opt-in NVML) | Yes (RPM; firmware-measured duty via NVML) | No — read-only, no kernel/PMFW write path (DEC-204) |
+| ARCTIC Fan Controller (`arctic_fan`, Linux 7.2+) | Yes | Yes (daemon-driven). Every write carries all ten channels, so since 2.56.1 the daemon sets each channel reading 0 that it did not choose to 100 % first; a channel your profile does not control therefore runs at full speed. Control all ten to keep them quiet |
 | AIO coolers (hwmon-attached) | Yes — coolant temp (`CoolantTemp` kind) + pump RPM (DEC-156) | Yes — hwmon pump PWM via the guided Configure-AIO flow; fixed speed or a temperature curve, always floored at 30% (DEC-157, DEC-312). A motherboard-connected pump is configured the same way once its header carries the `pump` role (GUI ≥ v2.51.0 assigns it; `POST /config/header-role` otherwise) |
 
 ## Installation
@@ -38,24 +39,16 @@ a normal `sudo pacman -Syu`. The setup commands, the one-off `pacman -U` path
 using the package attached to every release, and the Sigstore verification step
 are all in the [Install section of the README](../README.md#install).
 
-Building from a checkout instead:
+To build it yourself instead, build the package from the in-repo `PKGBUILD`:
 
 ```bash
-# Build
-cd daemon
-cargo build --release
-
-# Install (run from inside daemon/ — this is a Cargo workspace, so the binary
-# and packaging files are one level up, under the workspace root)
-sudo cp ../target/release/control-ofc-daemon /usr/local/bin/
-
-# Install systemd service + example config
-sudo cp ../packaging/control-ofc-daemon.service /etc/systemd/system/
-sudo mkdir -p /etc/control-ofc
-sudo cp ../packaging/daemon.toml.example /etc/control-ofc/daemon.toml
-sudo systemctl daemon-reload
+git clone https://github.com/Plan-B-Development/control-ofc-daemon.git
+cd control-ofc-daemon/packaging
+makepkg -si
 sudo systemctl enable --now control-ofc-daemon
 ```
+
+`makepkg` builds the tagged release, not the checkout you cloned. **Do not install by copying the binary and unit file in by hand.** The unit runs `/usr/bin/control-ofc-daemon` and, after every stop, `/usr/bin/control-ofc-restore-auto`, which gives each fan header back to what it was doing before the daemon took it; the package also installs the sleep hook, the Super-I/O guard and `/etc/modules-load.d/control-ofc.conf`. A hand-copied binary gets none of these, so the unit cannot start it or cannot hand the fans back. To run a build of your own checkout, see `docs/DEVELOPER_HANDOVER.md` § Running the daemon.
 
 ## Hardware sensor modules
 
@@ -71,6 +64,8 @@ The daemon discovers sensors and fan headers by scanning `/sys/class/hwmon/`. Fo
 | `drivetemp` | SATA/SAS drive temperature | All SATA drives |
 
 CPU temperature modules (`coretemp` for Intel, `k10temp` for AMD) and SMBus adapter modules (`i2c-i801`, `i2c-piix4`) auto-load via PCI/ACPI matching — no configuration needed.
+
+**The Super-I/O guard.** On a Gigabyte board the package stops `nct6775` and `w83627ehf` from loading, even though the file above lists them. Gigabyte boards use ITE Super-I/O chips, which those Nuvoton/Winbond drivers can never bind, and their probe writes a config-mode unlock that can latch the ITE bridge in front of a board's second fan chip, hiding it — sometimes until the machine is unplugged from the wall. Since 2.56.1 the guard covers every Gigabyte board; before that, only the boards it listed. It is `/usr/lib/modprobe.d/control-ofc-superio.conf`, with its helper `/usr/lib/control-ofc/control-ofc-superio-guard`; on any other board it loads the module unchanged. To turn it off, create an empty file of the same name in `/etc/modprobe.d/`, which masks it.
 
 **If your hardware is not detected:** check the GUI's readiness report first (the **System State** page) — it identifies your board's chips and the exact module or AUR package needed **without probing the hardware**. As a **last resort**, install `lm_sensors` and run:
 ```bash
@@ -98,39 +93,48 @@ The daemon exposes a structured, **read-only** view of your cooling hardware for
 
 ## Configuration
 
-Configuration is optional. The daemon uses sensible defaults if no config file exists.
+Configuration is optional. The package installs `/etc/control-ofc/daemon.toml` with every key commented out, so the defaults apply until you uncomment one, and pacman keeps your edits on upgrade. With no file at all the daemon also runs on defaults.
 
-The config file path can be overridden:
-```bash
-# CLI argument (highest priority)
-control-ofc-daemon --config /path/to/daemon.toml
+The file's location can be changed with `--config <path>` or `CONTROL_OFC_CONFIG` (the flag wins). Under systemd, set either in a drop-in (`sudo systemctl edit control-ofc-daemon`), as § Loading a profile shows for `OPENFAN_PROFILE`.
 
-# Environment variable
-CONTROL_OFC_CONFIG=/path/to/daemon.toml control-ofc-daemon
+**Read this before editing.** The file is strict: **an unknown key, a misspelt section or an out-of-range value makes the daemon exit at startup**, and systemd restarts it on a back-off (3 s, then up to one start a minute) until the file is fixed. For all that time nothing controls the fans and the thermal emergency cannot run. `journalctl -u control-ofc-daemon` names the offending key.
 
-# Default (used when neither is set)
-# /etc/control-ofc/daemon.toml
-```
-
-Create `/etc/control-ofc/daemon.toml`:
+The keys, with their defaults:
 
 ```toml
 [serial]
-# port = "/dev/ttyACM0"   # auto-detect if omitted
-# timeout_ms = 500
+# port = "/dev/serial/by-id/usb-..."   # no default: auto-detect when unset
+# timeout_ms = 500                      # 50 or more
 
 [polling]
-# poll_interval_ms = 1000   # 100-6000; slower is clamped to 6000 (DEC-270)
+# poll_interval_ms = 1000   # 100 or more; slower than 6000 is clamped to 6000 (DEC-270)
 
 [ipc]
 # socket_path = "/run/control-ofc/control-ofc.sock"
 
-[shutdown]
-# exit_floor_pct = 50       # the exit minimum for fans with no firmware fallback (0 = off)
-
 [state]
 # state_dir = "/var/lib/control-ofc"
+
+[startup]
+# delay_secs = 0            # 0-30
+# record_startup = false    # record a short validation session at every start
+
+[profiles]
+# search_dirs = ["/etc/control-ofc/profiles", "/root/.config/control-ofc/profiles"]
+#   The default shown is what the service gets (it sets HOME=/root); see
+#   § Profile search directories. The daemon's own store is always searched first.
+
+[detection]
+# allow_port_probe = false          # also needs a systemd drop-in
+# enable_nvidia_telemetry = false   # also needs a systemd drop-in
+
+[shutdown]
+# exit_floor_pct = 50       # 0-100; the exit minimum for fans with no firmware fallback (0 = off)
 ```
+
+After an edit, `sudo systemctl reload control-ofc-daemon` applies the profile search directories and the exit minimum at once; every other key needs `sudo systemctl restart control-ofc-daemon`. A reload that finds the file invalid logs the error and keeps the running values.
+
+**Moving `state_dir` or `socket_path` needs a drop-in as well.** The service runs with `ProtectSystem=strict`, so outside its private `/tmp` it can write files only under `/run/control-ofc`, `/var/lib/control-ofc` and `/sys/devices`. Add the new directory with `ReadWritePaths=` in `sudo systemctl edit control-ofc-daemon`, or the daemon cannot create its socket or save its state there.
 
 ## The system tray
 
@@ -181,6 +185,17 @@ curl --unix-socket /run/control-ofc/control-ofc.sock http://localhost/sensors | 
 curl --unix-socket /run/control-ofc/control-ofc.sock http://localhost/fans | jq .
 ```
 
+## Service supervision
+
+The package's systemd unit supervises the daemon so that fan control does not quietly stop.
+
+- **Start.** The unit is `Type=notify`: `systemctl start` returns only once the profile engine is ticking and the API is answering.
+- **Watchdog.** If the control loop stops completing its once-a-second tick for 15 s (`WatchdogSec=15`) — a deadlock, say — systemd sends `SIGTERM`, so the normal stop runs (exit minimum, then every header and GPU fan given back); it sends `SIGKILL` if that has not finished within 10 s (`TimeoutAbortSec=10`), runs `control-ofc-restore-auto`, and restarts the daemon. The journal shows `Watchdog timeout`. A slow or wedged *device* does not trip it: the loop keeps ticking past a write that has not returned.
+- **Restarts.** A crash, a non-zero exit or a watchdog timeout restarts the daemon after 3 s, then about 5.5, 10, 18 and 33 s, then once a minute for as long as it keeps failing. There is no start limit, so it never gives up and never needs `systemctl reset-failed`. After five minutes of normal running the daemon resets the back-off, so a later, unrelated fault restarts fast again (systemd 258 or newer). **The back-off needs systemd 254 or newer.** Older releases — Debian 12 ships 252 — ignore `RestartSteps=` and `RestartMaxDelaySec=` with a warning, and restart every 3 s.
+- **Stop.** A stop is allowed 40 s (`TimeoutStopSec=40`); the daemon bounds each hardware step itself so that it can always exit. After every stop, whatever ended it, `ExecStopPost` runs `control-ofc-restore-auto`, which gives back each header and GPU fan the daemon's records name (§ Safety).
+- **Sleep.** The package installs a system-sleep hook, `/usr/lib/systemd/system-sleep/control-ofc-daemon`, because the watchdog keeps counting while user space is frozen for a suspend and resume. Before a sleep it sends the daemon `SIGUSR1`, which widens the watchdog to 120 s, and waits up to 2 s for the daemon to acknowledge; after the resume it sends `SIGUSR2`, which puts the 15 s back (the daemon does that itself after 120 s if no resume signal arrives). The handshake uses `/run/control-ofc/sleep-hook.pid` and `/run/control-ofc/sleep-hook.ack`. In the journal a normal sleep shows `system sleep: systemd watchdog widened for the suspend and resume` and then `system sleep: systemd watchdog restored`; the hook itself logs `control-ofc: the daemon could not widen its watchdog for this sleep` or `control-ofc: the daemon did not acknowledge the sleep within 2 s` when that went wrong, and the daemon may then be restarted by a slow resume.
+- **After a resume or an OpenFanController reconnect**, the daemon no longer knows what speed each OpenFan channel it had written is running at — the controller may have come back at its power-on default. It treats that as unknown, never as 0. Until the channel's curve writes it again, a clean stop leaves it at 100 % rather than the exit minimum, and if the no-CPU-sensor fallback (§ Safety) holds it while its curve cannot run, it goes to 100 % rather than 40 % and stays there until the curve runs again.
+
 ## API quick reference
 
 The `/status`, `/capabilities`, `/sensors`, `/fans` examples above are the
@@ -193,7 +208,7 @@ including request/response shapes.
 | Endpoint | Use |
 |---|---|
 | `GET /status` | Subsystem health + freshness, `thermal_state`, uptime, and any active manual overrides / fan-identify holds; one-line answer to "is the daemon happy?" |
-| `GET /capabilities` | Device list, feature flags, safety limits, kernel-warning catalogue (`amd_gpu.kernel_warnings`) |
+| `GET /capabilities` | Device list, feature flags, safety limits, kernel-warning catalogue (`devices.amd_gpu.kernel_warnings`) |
 | `GET /sensors` | All temperature readings |
 | `GET /fans` | Fan RPM + last-commanded PWM |
 | `GET /poll` | Combined status + sensors + fans in one round-trip (the GUI's primary 1 Hz read path) |
@@ -201,6 +216,7 @@ including request/response shapes.
 | `GET /hwmon/headers` | Controllable motherboard PWM outputs |
 | `GET /profiles`, `GET /profiles/{id}` | List stored profiles / fetch one full profile document (daemon is the store of record — DEC-160) |
 | `GET /profile/active` | Current active profile or `{"active": false}` |
+| `GET /config` | Every configuration key: its value on disk, the value this process started with, where it came from (`runtime`, `admin` or `default`), whether the API can change it, and whether a saved change is waiting for a restart (DEC-243) |
 | `GET /diagnostics/hardware` | **The central troubleshooting endpoint.** Hardware readiness report — hwmon chips, GPU detection, thermal-safety state, kernel modules, ACPI conflicts, board info, kernel warnings. Use this first when something looks wrong. |
 | `GET /inventory/hwmon` | Structured hwmon inventory — temps, fan tachs, PWM metadata (DEC-200) |
 | `GET /inventory/hardware-readiness` | **The readiness endpoint the GUI actually calls.** Readiness items with blocking flags *and* passive Super-I/O detection, from one shared coalesced hardware scan, so the two halves can never disagree (DEC-207) |
@@ -218,21 +234,22 @@ As of 2.0.0 the profile engine is the **sole writer** (DEC-159 / DEC-165) — th
 | `POST /profiles` | Create a stored profile (`?validate_only=true` validates only; `409 already_exists` on a duplicate id) |
 | `PUT /profiles/{id}` | Replace a stored profile's desired-state (re-activate to apply — no hot reload) |
 | `DELETE /profiles/{id}` | Remove a stored profile (`409 profile_in_use` if it is the active profile) |
-| `POST /profile/activate` | Activate a profile by id (`{"profile_id": "..."}`) or path (`{"profile_path": "..."}`) |
-| `POST /profile/deactivate` | Clear the active profile; releases the daemon's internal `profile-engine` lease (DEC-097); idempotent |
+| `POST /profile/activate` | Activate a profile by id (`{"profile_id": "..."}`) or path (`{"profile_path": "..."}` — the file must lie inside a profile search directory). Clears every control override |
+| `POST /profile/deactivate` | Clear the active profile; idempotent. Clears every control override, and on the next engine tick each motherboard header the daemon took goes back to what it was doing before (DEC-382); no fan curve runs until a profile is activated again |
 
 **Live control intent (DEC-163 / DEC-166):**
 
 | Endpoint | Use |
 |---|---|
-| `POST /control/{control_id}/override` | Pin a control's fans to a fixed PWM — expiring, floor-clamped, deadman auto-reverts to the curve. Body `{"pwm_percent": 0..100, "ttl_secs"?}` |
+| `POST /control/{control_id}/override` | Pin a control's fans to a fixed PWM — expiring, floor-clamped, deadman auto-reverts to the curve. Body `{"pwm_percent": 0..100, "ttl_secs"?}`; `ttl_secs` is clamped to 1-15 (default 15) |
 | `POST /control/{control_id}/override/renew` | Extend the override deadman (fresh TTL). Body `{"override_token": N}` |
 | `DELETE /control/{control_id}/override` | Release the override, reverting to curve control immediately. Body `{"override_token": N}` |
-| `POST /fans/{fan_id}/identify` | Hold or restore one fan for physical identification (deadman auto-restore). An ordinary fan is stopped; a header the daemon holds as a pump is perturbed instead, never stopped (DEC-311/384). Body `{"action": "stop"\|"restore", "ttl_secs"?}` |
-| `POST /config/header-role` | Assign or clear one PWM header's role (DEC-311). Body `{"header_id": "<id>", "role": "pump"\|"cpu_fan"\|"radiator_fan"\|"chassis_fan"\|"unknown"\|null}` |
+| `POST /fans/{fan_id}/identify` | Hold or restore one fan for physical identification (deadman auto-restore). An ordinary fan is stopped; a header the daemon holds as a pump is perturbed instead, never stopped (DEC-311/384). Body `{"action": "stop"\|"restore", "ttl_secs"?}`; `ttl_secs` is clamped to 1-15 |
+| `POST /config/header-role` | Assign or clear one PWM header's role (DEC-311). Body `{"header_id": "<id>", "role": "pump"\|"cpu_fan"\|"radiator_fan"\|"chassis_fan"\|"unknown"\|null}`. Takes effect at once; assigning `pump` to a header an identify is holding stopped releases that stop (DEC-419) |
 | `GET /inventory/cooling-devices` | The configured cooling-device topology — a pump, its radiator fans and an advisory sensor as one named assembly — plus every device policy this daemon ships (DEC-316) |
 | `GET /validation/session` | The current or most recent validation session — what a cooler did while it was recording, plus the evidence summary (DEC-317). `404` when none has ever run |
 | `GET /validation/sessions` | The last five retained sessions, newest first (DEC-317) |
+| `GET /validation/sessions/{id}` | One retained session in full; `404` for an unknown id |
 | `POST /config/cooling-device` | Create or replace one cooling device by id (DEC-316). Body `{"id": "<id>", "name"?, "kind"?, "pump_member"?, "radiator_members"?, "device_policy_id"?, ...}`. Safety limits are **not** settable — a policy is chosen by id and `minimum_safe_pwm` & siblings are rejected |
 | `DELETE /config/cooling-device/{id}` | Remove one cooling device (DEC-316) |
 | `POST /validation/session` | Start recording one session against a cooling device (DEC-317). Body `{"cooling_device_id": "<id>", "kind"?, "diagnostics"?, "sweep_members"?, "metadata"?, "stop_when_diagnostics_complete"?}`. **Read the lifecycle note below before starting one** — a session does not end when its diagnostics do unless you ask it to. **From 2.43.3, a repeated `diagnostics` entry is dropped at ingest** (DEC-341): the started session's `requested_diagnostics` is what the daemon actually took, so read it back rather than assuming your request was kept verbatim |
@@ -275,13 +292,13 @@ invented for the gap.
 
 | Endpoint | Use |
 |---|---|
-| `POST /fans/openfan/{ch}/calibrate` | Long-running PWM→RPM calibration sweep; restores pre-calibration PWM on every exit path, aborts on thermal limit (DEC-134) |
-| `POST /hwmon/{header}/verify` | Behavioural test of PWM write effectiveness; ~6 s (raised from 3 s in DEC-101 — slow-spinning fans need more settle time); the daemon uses its own internal verify lease (no `lease_id`). Returns `restore_failed: true` if the post-test restore-to-original-PWM write fails (DEC-100). |
-| `POST /hwmon/{header}/characterize` | Start a PWM/RPM response sweep (DEC-313, 2.29.0+). A *deeper* diagnostic beside the ~6 s verify above, not a replacement: it holds the header at several duties and reports **command acceptance, PWM readback and physical RPM response as three separate verdicts** — collapsing them would report a pump that overrides PWM during startup as a broken fan. Returns `202`; poll `GET /diagnostics/characterization`. Optional `{"points_pct": [...], "settle_seconds": N}`, both clamped server-side. **Since 2.40.0 (DEC-334), gated on `control.pwm_behaviour_characterization`:** `"bidirectional": true` walks the duties **down from the top and back up** so hysteresis can be measured — the run therefore *ends* high, which is what keeps an interrupted one benign — and `"stability_seconds": N` (5-60) adds a dwell at up to 3 daemon-chosen duties for tach stability statistics. The walked-step budget is unchanged, so the worst-case run length is too. **A pump is never swept below 30%, and 0% is unreachable for any header as a swept point (a *pump* is also never restored below 30% afterwards; an ordinary fan is put back exactly where it was found, 0 included).** **Since 2.52.0 (DEC-405)** each point holds 12 s by default, and its settling time and stability describe the tach *after* it settled — judged on the tach register's own refreshes, so a slow chip reports "not settled" rather than a figure it never measured. |
+| `POST /fans/openfan/{ch}/calibrate` | Long-running PWM→RPM calibration sweep; aborts on thermal limit (DEC-134). When a started sweep ends — finished, cancelled or aborted — the channel gets back the duty it had before; if that duty is unknown (never commanded, or lost to a reconnect or resume) it gets 100 %; while thermal safety is forcing fans (the emergency or the no-CPU-sensor fallback), it is left at the forced duty and not restored afterwards. A refused request changes nothing |
+| `POST /hwmon/{header}/verify` | Behavioural test of PWM write effectiveness; ~6 s (raised from 3 s in DEC-101 — slow-spinning fans need more settle time); the daemon uses its own internal verify lease (no `lease_id`). Returns `restore_failed: true` if the post-test restore-to-original-PWM write fails (DEC-100). If the header becomes a pump while the test runs — you assign it `pump`, or activate a profile that names it a pump — the test stops and returns `result: "pump_protected_mid_run"`, and the restore is floored at 30 % (DEC-418). |
+| `POST /hwmon/{header}/characterize` | Start a PWM/RPM response sweep (DEC-313, 2.29.0+). A *deeper* diagnostic beside the ~6 s verify above, not a replacement: it holds the header at several duties and reports **command acceptance, PWM readback and physical RPM response as three separate verdicts** — collapsing them would report a pump that overrides PWM during startup as a broken fan. Returns `202`; poll `GET /diagnostics/characterization`. Optional `{"points_pct": [...], "settle_seconds": N}`, both clamped server-side. **Since 2.40.0 (DEC-334), gated on `control.pwm_behaviour_characterization`:** `"bidirectional": true` walks the duties **down from the top and back up** so hysteresis can be measured — the run therefore *ends* high, which is what keeps an interrupted one benign — and `"stability_seconds": N` (5-60) adds a dwell at up to 3 daemon-chosen duties for tach stability statistics. The walked-step budget is unchanged, so the worst-case run length is too. **A pump is never swept below 30%, and 0% is unreachable for any header as a swept point (a *pump* is also never restored below 30% afterwards; an ordinary fan is put back exactly where it was found, 0 included). A header that becomes a pump mid-run — assigned `pump`, or named a pump by a profile activated during the run — stops the run as `aborted`, and its restore is floored at 30 % (DEC-418).** **Since 2.52.0 (DEC-405)** each point holds 12 s by default, and its settling time and stability describe the tach *after* it settled — judged on the tach register's own refreshes, so a slow chip reports "not settled" rather than a figure it never measured. |
 | `GET /diagnostics/characterization` | Current or most recent characterisation run, with points measured so far |
 | `DELETE /diagnostics/characterization` | Ask a running sweep to stop; the pre-sweep duty is restored on every exit path on which nothing else owns the header. The two skips — a thermal force, and daemon shutdown — are reported in `restore_outcome` and both leave the header *high*. A third, since 2.56.0: when a read of the header does not return within 2 s, the run writes nothing more to it and leaves it at the last test duty (never below 20 %, 30 % for a pump), reported as `skipped_unresponsive` — writing to a driver that has stopped answering could stall every hwmon fan. A header that became a pump during the run is still restored, raised to 30 %. A **stability dwell** honours the cancel mid-hold rather than making you wait it out; a settle window still finishes, as documented |
 | `GET /diagnostics/preflight?header=&diagnostic=` | The daemon's own safety verdict for one header and one diagnostic, before anything is driven (DEC-333, 2.39.0+). **Read-only: no lease, no slot, nothing reserved** — a `ready` verdict describes *now*, and the diagnostic's own POST still runs its own guards. Returns `{verdict, checks[], blocking[]}`; `verdict` is `ready`\|`warn`\|`blocked`. A stale temperature source **blocks** every diagnostic, and each one's POST returns `409 validation_error` on it (a run already in flight aborts), from the same predicate the verdict is built from — discovery since 2.42.0 (DEC-336), verify and characterisation since DEC-385. Older daemons only warn for those two. OpenFan calibration, which has no preflight, refuses and aborts on the same condition. A reading counts as stale once it is older than the thermal safety rule's own window — 5 poll intervals, so 5 s at the default 1 s poll (a flat 10 s before DEC-395) |
-| `POST /hwmon/{header}/discover-control-path` | Establish which tach channel(s) this PWM output actually drives, by measurement rather than by sysfs numbering (DEC-333, 2.39.0+). Returns `202`; poll `GET /diagnostics/control-path`. Optional `{"delta_pct": N, "cycles": N, "window_seconds": N}`, all clamped server-side. **Deliberately not `pwmconfig`'s stop-the-fan model**: the perturbation moves *away from the nearer rail* so there is always headroom, every commanded duty is clamped into `[max(20, header floor) .. 100]` — **0% is unreachable for any header** — and a pump-protected header never crosses its 30% floor. Two cycles run, because repeatability is a confidence input. **Since 2.52.0 (DEC-405)** a later cycle first waits (up to 15 s) for the fans to settle after the previous change, so a slow pump's recovery is not mistaken for noise; each window defaults to 12 s. A pump whose tachometer stops reporting mid-run aborts immediately and restores |
+| `POST /hwmon/{header}/discover-control-path` | Establish which tach channel(s) this PWM output actually drives, by measurement rather than by sysfs numbering (DEC-333, 2.39.0+). Returns `202`; poll `GET /diagnostics/control-path`. Optional `{"delta_pct": N, "cycles": N, "window_seconds": N}`, all clamped server-side. **Deliberately not `pwmconfig`'s stop-the-fan model**: the perturbation moves *away from the nearer rail* so there is always headroom, every commanded duty is clamped into `[max(20, header floor) .. 100]` — **0% is unreachable for any header** — and a pump-protected header never crosses its 30% floor. Two cycles run, because repeatability is a confidence input. A header that becomes a pump mid-run stops the run as `aborted`, and the return to its starting duty is floored at 30 % (DEC-418). **Since 2.52.0 (DEC-405)** a later cycle first waits (up to 15 s) for the fans to settle after the previous change, so a slow pump's recovery is not mistaken for noise; each window defaults to 12 s. A pump whose tachometer stops reporting mid-run aborts immediately and restores |
 | `GET /diagnostics/control-path` | Current or most recent discovery run, **plus every persisted relationship**. Records survive a restart and are keyed by the header's stable id, so a board or driver change invalidates one by construction. `no_tach_response` is a legitimate result, **not** a fault: the header may drive no tach-reporting device, or one running under its own internal control |
 | `DELETE /diagnostics/control-path` | Ask a running discovery to stop. Same restore semantics, and the same two deliberate skips, as the characterisation sweep above |
 | `POST /hwmon/{header}/stall-probe` | Find where a fan stops and where it starts again (DEC-407, 2.54.0+). **The only diagnostic that drives a fan below 20 %, down to 0 %** — opt-in, one header at a time, and only on a `chassis_fan` or `radiator_fan` header that is not pump-protected (assign the role first if it reads `unknown`). Send `{"acknowledge_below_floor": true}`; there is nothing else to set. Takes up to about three minutes below 20 %; any abort or cancel runs the fan at 100 % until it spins, then puts it back (a daemon shutdown puts every fan back itself instead). Stay at the machine while it runs. Poll `GET /diagnostics/stall-probe` |
@@ -292,7 +309,13 @@ invented for the gap.
 | `POST /gpu/{gpu_id}/fan/reset` | Restore GPU fan to firmware automatic and re-enable zero-RPM |
 | `POST /gpu/{gpu_id}/fan/verify` | Behavioural test of GPU fan-control effectiveness; ~6 s, no lease (DEC-120). Drives a test speed biased upward, reads back the applied PMFW `fan_curve`/`pwm1` + RPM, then restores. Detects the silent failures static checks miss (`ppfeaturemask` bit 14 unset, SMU mismatch, BIOS overdrive lock). |
 | `POST /config/profile-search-dirs` | Add and/or remove directories in the profile search path (immediate; persists to `runtime.toml`). `remove` needs ≥ 2.23.0 (DEC-285) |
-| `POST /config/startup-delay` | Set startup-delay seconds (persisted to `runtime.toml`, takes effect on restart) |
+| `POST /config/startup-delay` | Set startup-delay seconds, 0-30 (persisted to `runtime.toml`, takes effect on restart) |
+| `POST /config/exit-floor` | Set the exit minimum, `{"exit_floor_pct": 0..100}` — the lowest speed a clean stop leaves an OpenFan channel or a header with no mode switch at (DEC-388). Applies at once |
+| `POST /config/poll-interval` | Set the poll interval, `{"poll_interval_ms": 250..2000}`; takes effect on restart. The ceiling bounds how stale a temperature the thermal emergency can act on |
+| `POST /config/serial-port` | Set the OpenFanController port (`null` = auto-detect); takes effect on restart. A port that does not answer as an OpenFanController falls back to auto-detection |
+| `POST /config/serial-timeout` | Set the serial read timeout, 50-1000 ms; takes effect on restart |
+| `POST /config/allow-port-probe` | Opt into the active Super-I/O probe; also needs the `superio-port-probe.conf.example` drop-in |
+| `POST /config/nvidia-telemetry` | Opt into read-only NVIDIA telemetry; also needs the `nvidia-telemetry.conf.example` drop-in |
 | `POST /inventory/superio/probe` | Opt-in active Super-I/O `/dev/port` probe — off by default, needs `allow_port_probe` (DEC-203) |
 | `POST /config/preferred-cpu-sensor` | Persist the preferred CPU temp sensor (persists to `runtime.toml`; DEC-200) |
 | `POST /config/preferred-mb-sensor` | Persist the preferred motherboard temp sensor (persists to `runtime.toml`; DEC-200) |
@@ -429,13 +452,13 @@ ls -la /dev/serial/by-id/
 
 ### Serial permissions
 
-The daemon needs read/write access to the serial device. The systemd service file includes `SupplementaryGroups=uucp` for Arch-based distributions. Debian/Ubuntu users (where the serial group is `dialout`) should add a systemd drop-in override:
+The daemon runs as root, so no group membership is needed for it to open the serial device — the unit's `SupplementaryGroups=uucp` does not gate anything for a root service, and Debian/Ubuntu need no `dialout` drop-in. What does limit it is the unit's device allow-list, `DeviceAllow=char-ttyACM rw` and `DeviceAllow=char-ttyUSB rw`: the service can open only `/dev/ttyACM*` and `/dev/ttyUSB*` nodes (a `/dev/serial/by-id/` link to one of them is fine). A controller on any other kind of node would need a drop-in adding its device class:
 
 ```bash
 sudo systemctl edit control-ofc-daemon
-# Add:
+# Add, for example:
 #   [Service]
-#   SupplementaryGroups=uucp dialout
+#   DeviceAllow=char-ttyS rw
 ```
 
 A udev rule is **not required** — the daemon auto-detects the OpenFanController on `/dev/ttyACM*` and `/dev/ttyUSB*` at startup. Use this only if you want a specific group/mode on the device node. For a stable path, use the `/dev/serial/by-id/` link above: the daemon opens only `/dev/ttyS*`, `ttyUSB*`, `ttyACM*`, `ttyAMA*` and `/dev/serial/` paths, so a custom udev symlink such as `/dev/control-ofc-controller` is refused. The example no longer creates one.
@@ -466,17 +489,21 @@ AMD discrete GPU fans are supported. The control method depends on GPU generatio
 
 - **Pre-RDNA3 (RX 6000 and older):** Uses traditional `pwm1_enable=1` + `pwm1` control.
 
-GPU fans are driven by the daemon engine when a profile owns them — the bare `POST /gpu/{id}/fan/pwm` write was retired at 2.0.0 (DEC-165). For live manual control use the override API (DEC-163); to physically identify a GPU fan use the identify API (DEC-166); both are shown under **Setting fan speeds** above. GPU writes require no lease, and the daemon applies a 5% minimum-change threshold to avoid SMU firmware churn (DEC-070). Fan curves are restored to automatic mode on daemon shutdown.
+**Known kernel regressions.** The daemon matches the running kernel against a short list of published amdgpu regressions and reports any that apply in `GET /capabilities` (`devices.amd_gpu.kernel_warnings`); the GUI shows a high or critical one as a popup once per session. Since 2.56.1 the list holds one entry, `rdna_mes_hang_drm_amd_4765` (critical): on Linux 6.17.9–6.17.13 and 6.18.0–6.18.6, an RDNA3, RDNA3.5 or RDNA4 GPU can hang when a compute job runs beside a 3D workload, and nothing can change a fan's speed while the system is hung. It is fixed in 6.18.7 and 6.19 — update to the latest 6.18 longterm or a current 7.x kernel. The check uses the version number only, so a distribution kernel that already carries the fix may still be flagged. Daemon 2.56.0 and older raise two different advisories instead, both retired because their advice was wrong; the GUI manual's hardware-troubleshooting page says what to do about each.
+
+GPU fans are driven by the daemon engine when a profile owns them — the bare `POST /gpu/{id}/fan/pwm` write was retired at 2.0.0 (DEC-165). For live manual control use the override API (DEC-163); to physically identify a GPU fan use the identify API (DEC-166); both are shown under **Setting fan speeds** above. GPU writes require no lease, and the daemon applies a 5% minimum-change threshold to avoid SMU firmware churn (DEC-070). When the daemon stops, each GPU fan curve it drove is put back to automatic; a card it never drove is left alone (§ Safety).
 
 If a GPU fan has been left in a manual state and you want the firmware to take back over, reset it to automatic:
 
 ```bash
 # Restore GPU fan to firmware automatic (re-enables zero-RPM)
 curl --unix-socket /run/control-ofc/control-ofc.sock \
-  -X POST http://localhost/gpu/gpu:amd:0000:03:00.0/fan/reset | jq .
+  -X POST http://localhost/gpu/0000:03:00.0/fan/reset | jq .
 ```
 
-The GPU ID is available from `GET /capabilities`.
+The GPU id is the card's bare PCI address — `devices.amd_gpu.pci_bdf` in `GET /capabilities` — not the fan id (`amd_gpu:0000:03:00.0`) or anything with a prefix, which answers `404`.
+
+**A reset hands the fan to the firmware until the next profile activation.** The daemon stops writing that fan, even while the active profile names it, until a profile is activated again (the same one included); deactivating does not return it, and a daemon restart does. The GUI's *Restore GPU Fan to Automatic* is disabled while the active profile drives the card.
 
 ## Fan profiles
 
@@ -484,15 +511,10 @@ The daemon can autonomously evaluate fan curve profiles at 1 Hz. Profiles use th
 
 ### Loading a profile
 
+**Do not run `control-ofc-daemon` by hand while the service is active.** A second daemon deletes the service's socket, takes it over, and runs a second profile engine on the same fans. To start with a particular profile, set `--profile` or `OPENFAN_PROFILE` in a systemd drop-in (below), or activate one through the API:
+
 ```bash
-# Via CLI (highest priority)
-control-ofc-daemon --profile quiet
-control-ofc-daemon --profile-file /path/to/custom.json
-
-# Via environment variable
-OPENFAN_PROFILE=quiet control-ofc-daemon
-
-# Via API at runtime
+# Via API at runtime (saved, so it is also used at the next start)
 curl --unix-socket /run/control-ofc/control-ofc.sock \
   -X POST -H "Content-Type: application/json" \
   -d '{"profile_id": "quiet"}' \
@@ -568,9 +590,9 @@ Profile ids are filesystem-safe stems (non-empty, ≤128 bytes, no `/`, `\`, `..
 The daemon searches for profiles in (highest priority first):
 1. `/var/lib/control-ofc/profiles` — the daemon-owned **store of record**, prepended at startup so CRUD-created profiles are always found first (DEC-160)
 2. `/etc/control-ofc/profiles` (always included)
-3. `$HOME/.config/control-ofc/profiles` (or `$XDG_CONFIG_HOME/control-ofc/profiles`; `/root/.config/...` when `HOME` is unset for the systemd service)
+3. `$XDG_CONFIG_HOME/control-ofc/profiles` if that is set, else `$HOME/.config/control-ofc/profiles` — `/root/.config/control-ofc/profiles` under the service, which sets `HOME=/root`
 
-Additional directories can be registered at runtime via the API:
+Items 2 and 3 are the default for `[profiles] search_dirs` in `daemon.toml`; setting that key replaces them, and the store in item 1 is still searched first. Additional directories can be registered at runtime via the API — the GUI registers its own profile folder this way every time it connects:
 
 ```bash
 curl --unix-socket /run/control-ofc/control-ofc.sock \
@@ -598,16 +620,34 @@ which is the point — a stale entry usually no longer does.
 
 ### Profile engine ownership
 
-While a profile is active the profile engine is the **sole writer** of every backend (DEC-159 / DEC-165) — there is no second writer to coordinate with. The GUI never writes PWM; it only sends intent (activate / override / identify). A manual override (DEC-163) overlays the curve for the controls it targets until it is released or its deadman expires; everything else keeps curve-controlling. The thermal-safety override always takes priority over both the active profile and any manual override — as a **floor**, not a replacement (DEC-307): each fan receives `max(commanded, forced)`, and a fan no control commands still receives the forced duty.
+While a profile is active the profile engine is the **sole writer** of every backend among the daemon's clients (DEC-159 / DEC-165) — no client writes a fan. It cannot stop *another program* writing the same fan (fancontrol, CoolerControl, a vendor tool): when a duty it set moves, it writes it again, and after three corrections that do not hold it stops and flags the header `duty_not_holding` (DEC-406; see § Troubleshooting). The GUI never writes PWM; it only sends intent (activate / override / identify). A manual override (DEC-163) overlays the curve for the controls it targets until it is released or its deadman expires; everything else keeps curve-controlling. The thermal-safety override always takes priority over both the active profile and any manual override — as a **floor**, not a replacement (DEC-307): each fan receives `max(commanded, forced)`, and a fan no control commands still receives the forced duty.
 
 ## Runtime configuration
 
 Configuration is split between two files (see `docs/ADRs/002-runtime-config-split.md`):
 
 - **`/etc/control-ofc/daemon.toml`** — admin-owned, hand-edited. Contains static topology: serial port, polling interval, socket path, state directory. Never rewritten by the daemon.
-- **`/var/lib/control-ofc/runtime.toml`** — daemon-managed. Contains settings that API endpoints mutate at runtime: profile search directories, startup delay, the preferred CPU/motherboard temp sensors (DEC-200), and the exit minimum (DEC-388). Written with 0600 permissions via atomic rename.
+- **`/var/lib/control-ofc/runtime.toml`** — daemon-managed, written with 0600 permissions via atomic rename. It holds everything set through the API:
+  - **the fan header roles you assign** (`[hardware] header_roles`, `POST /config/header-role`). On a board whose Super-I/O publishes no fan labels, a `pump` assignment here is the **only** evidence that a header drives a pump, so it is what gives that header the 30 % floor and keeps fan identify from stopping it;
+  - the cooling devices (`[[cooling_devices]]`, `POST /config/cooling-device`);
+  - the preferred CPU/motherboard temp sensors (DEC-200) and the exit minimum (DEC-388);
+  - any profile search directory, startup delay, `[serial]`, `[polling]` or `[detection]` value changed through the API.
+
+  **Do not delete this file or edit it by hand.** Back it up with `daemon.toml` — a restore that copies only `daemon.toml` loses your pump roles.
 
 On startup the daemon loads `daemon.toml`, then overlays `runtime.toml` on top (runtime values win). `SIGHUP` / `systemctl reload` re-reads both files, but only the **profile search directories** and the **exit minimum** are applied live — changes to the startup delay, serial port, polling interval, or socket path are read but take effect only on the next restart.
+
+### When `runtime.toml` cannot be read
+
+The daemon still starts — a damaged settings file must never leave the fans with no controller — but it runs on **defaults, with no header roles**, so a pump you assigned by hand has no 30 % floor and can be stopped by fan identify. It says so on `GET /status` and `GET /poll` as `runtime_config_degraded = {reason, path, detail, phase}`, and the GUI shows a banner. `phase` says what the failure cost:
+
+| `phase` | What happened | What to do |
+|---|---|---|
+| `startup` | The file could not be read at start. Every setting in it, header roles included, is **not in effect**. | Repair the file (or restore it from a backup), then restart the daemon. Saving a setting does not bring the old ones back. |
+| `reload` | A `SIGHUP` reload could not read it. Header roles and every restart-only setting are kept, but the two live settings fall back to `daemon.toml`'s: the profile search directories set through the API and the exit minimum. | Repair the file, then reload or restart. |
+| `update` | A setting was saved while the file could not be read. The daemon kept the original as `runtime.toml.invalid-<unix-time>` beside it and replaced it with a new file carrying **the header roles and cooling devices it is running with**, plus the new setting. | Copy any other setting you need back from the `.invalid-` copy, then restart the daemon. |
+
+`reason` is `unreadable` (an I/O error, or a file over 4 MiB) or `malformed` (read, but not valid for this daemon version). The daemon's full error is in `journalctl -u control-ofc-daemon`. A **missing** file is not a failure: that is a first boot.
 
 ### Startup delay
 
@@ -622,6 +662,17 @@ curl --unix-socket /run/control-ofc/control-ofc.sock \
 ```
 
 The delay is capped at 30 seconds.
+
+## Troubleshooting
+
+`GET /status` (and `GET /poll`) and `GET /fans` report four conditions the daemon cannot fix by itself. The GUI shows each one; the fields are listed here for scripts and for reading a support bundle.
+
+| Field | What it means | What to do |
+|---|---|---|
+| `duty_not_holding: true` on an hwmon fan in `GET /fans` | Something else is writing this header. The daemon rewrote the duty it had set three times and the header did not keep it, so it has stopped fighting. It tries again when its curve asks for a different speed, and the flag clears when the header keeps a duty again. `duty_corrections` counts the rewrites since the daemon started. | Stop the other fan-control program (`fancontrol`, CoolerControl, CoreCtrl, `fan2go`, a vendor tool), or a BIOS/EC feature that drives the header. |
+| `skipped_controls[]` on `/status` | A control in the active profile has not been commanding its fans for at least 3 ticks, so they hold their last speed. `reason` says why: `curve_not_found` (the curve it names is gone), `sensor_unavailable` (its sensor is missing or has stopped updating), `mix_unresolvable` / `sync_unresolvable` (a combined curve cannot be worked out), or `backend_unavailable` (none of its fans can be reached — for example an OpenFan fan with no controller attached). | Fix the profile or the sensor. A frozen sensor is the usual cause: see § Safety, "Stalled sensors stop driving curves". |
+| `unavailable_sensors[]` on `/status` | A sensor the daemon found fails every read (a Wi-Fi card's temperature while the radio is off is the usual one) or reports an impossible temperature. It is logged once and left out of `GET /sensors`. | Nothing, unless a curve needs that sensor — then pick another. |
+| `runtime_config_degraded` on `/status` | The daemon could not read `runtime.toml`, which holds your header roles. | See § Runtime configuration, "When `runtime.toml` cannot be read". |
 
 ## Upgrade notes
 
@@ -641,28 +692,24 @@ Syslog/telemetry was de-scoped in R52 (v0.5.8). Remove any `[telemetry]` section
 ## Uninstall
 
 ```bash
-# Stop and disable the service
-sudo systemctl stop control-ofc-daemon
-sudo systemctl disable control-ofc-daemon
-
-# Remove files
-sudo rm /etc/systemd/system/control-ofc-daemon.service
-sudo rm /usr/local/bin/control-ofc-daemon
-sudo rm /usr/local/bin/control-ofc-restore-auto  # if installed
-
-# Remove config and state (optional — preserves your settings if omitted)
-sudo rm -rf /etc/control-ofc/
-sudo rm -rf /var/lib/control-ofc/
-
-# Remove udev rules if installed
-sudo rm -f /etc/udev/rules.d/99-control-ofc.rules
-sudo udevadm control --reload-rules
-
-# Reload systemd
-sudo systemctl daemon-reload
+sudo pacman -R control-ofc-daemon
 ```
 
-After stopping the daemon, every motherboard (hwmon) fan header the daemon took is given back to what it was doing before the daemon took it — usually its BIOS fan mode (via `ExecStopPost` in the service file, and by the daemon itself as it exits).
+The package stops and disables the service before it is removed. Stopping the daemon gives every motherboard (hwmon) fan header it took back to what it was doing before — usually its BIOS fan mode — both in-process as it exits and again through `ExecStopPost`; OpenFan channels and headers with no mode switch are left at the exit minimum (§ Safety).
+
+pacman leaves behind what it did not install or what you changed:
+
+- `/var/lib/control-ofc/` — the daemon's state: `runtime.toml` (your header roles and API-set settings), the saved active profile, the profile store and diagnostic records;
+- an edited `/etc/control-ofc/daemon.toml`, `/etc/control-ofc/profiles/quiet.json` or `/etc/modules-load.d/control-ofc.conf`, kept with a `.pacsave` suffix, and any profile you added under `/etc/control-ofc/profiles/`;
+- anything you installed by hand: a udev rule in `/etc/udev/rules.d/`, or a drop-in under `/etc/systemd/system/control-ofc-daemon.service.d/`.
+
+Remove those by hand if you no longer want them:
+
+```bash
+sudo rm -rf /var/lib/control-ofc/ /etc/control-ofc/
+sudo rm -f /etc/udev/rules.d/99-control-ofc.rules && sudo udevadm control --reload-rules
+sudo rm -rf /etc/systemd/system/control-ofc-daemon.service.d/ && sudo systemctl daemon-reload
+```
 
 ## Safety
 
@@ -670,11 +717,11 @@ The daemon enforces the following safety rules:
 
 - **Thermal emergency override** — if the hottest CPU temperature sensor reaches the emergency limit, every OpenFan channel and writable motherboard (hwmon) fan header the machine has is driven to 100%. **The limit is at least 105°C and is per-machine** (DEC-308): where the kernel reports the CPU's own design ceiling the daemon raises the limit to `min(ceiling + 5 °C, 115 °C)`, because a modern part is *meant* to sit at its ceiling under sustained load — a limit set *at* the ceiling would fire on a perfectly healthy machine and then latch, since release needs a reading at or below 80°C that such a part never produces. `GET /diagnostics/hardware` reports the limit in use. The override holds until a *fresh* CPU reading is at or below 80°C — a sensor that stops updating or disappears keeps it at 100% — and then control returns to the active profile at once (DEC-386 removed the 60% two-cycle recovery floor). One reading at or above the limit is enough to start it, and the daemon never decides afterwards that the reading was wrong: a faulty sensor stuck at or above the limit keeps those fans at 100% until it reads 80°C or below (DEC-400, following IEC 61511-1 — a safety action that has fired stays in force until its reset). If your fans stay at full speed with no real heat, look for the CPU sensor reporting the limit, and fix or report its driver. Every other fan the emergency took is given back at that point — a motherboard header to what it was doing before, an OpenFan channel to its duty from before the emergency (DEC-382). **Both duties are floors over the active profile's output, never replacements for it** (DEC-307) — the ladder can only raise a fan, never lower one. GPU fans are deliberately excluded: there is no GPU emergency threshold — AMD's PMFW firmware protects the GPU itself by throttling its clocks on junction temperature, independently of any OS fan control. It does not speed a fan up past a curve the daemon has set, so while the daemon drives a GPU fan the throttling is what protects the card; the fan returns to the firmware's own control when the daemon stops. A GPU fan in your profile keeps following its own curve throughout an emergency, as it does the rest of the time (DEC-399).
 - **The emergency is a backstop, not a cooling-failure detector.** A modern CPU protects itself by throttling at its own temperature ceiling, and the emergency limit sits above that ceiling on purpose, so a stopped pump or stalled fans usually show up as a CPU pinned at its ceiling and running slower rather than as an emergency. A CPU that sits at its ceiling under a load it used to handle is the sign to check the pump and fans.
-- **Missing sensor fallback** — if no CPU temperature sensor reports for 5 consecutive polling cycles and no emergency is under way, the fans your active profile controls are held at 40% or more as a defensive measure (GPU fans excluded, as above); a fan whose own curve can no longer be read keeps the speed it had (DEC-386). Fans no profile controls are left to their own firmware curve, which reads its own CPU sensor: a flat 40% there could run a fan *slower* than the BIOS would under load, and with no profile active nothing is forced at all. Only the 100% emergency takes every fan (DEC-382). A sensor that is still *listed* but has **stopped updating** counts as missing (DEC-267): a reading older than five polling intervals is not treated as current, because a frozen temperature can never rise and would otherwise hide a real emergency indefinitely. There are exceptions, all following one rule: losing sight of a sensor must never *reduce* cooling (DEC-269). If a thermal emergency is already active the 100% force continues, whether the sensor went quiet or disappeared (DEC-386); and if the last reading before the sensor went quiet was at or above the 80°C release temperature, fan curves simply keep running on it. The 40% fallback applies when the last thing the daemon knew was that the system was *cool* — which is the case it was written for.
+- **Missing sensor fallback** — if no CPU temperature sensor reports for 5 consecutive polling cycles and no emergency is under way, the fans your active profile controls are held at 40% or more as a defensive measure (GPU fans excluded, as above); a fan whose own curve can no longer be read keeps the speed it had (DEC-386). Fans no profile controls are left to their own firmware curve, which reads its own CPU sensor: a flat 40% there could run a fan *slower* than the BIOS would under load, and with no profile active nothing is forced at all. (An ARCTIC Fan Controller is the exception: it has no firmware curve, and every write to it carries all ten channels, so since 2.56.1 the daemon sets each channel reading 0 that it did not choose to 100 % before writing any of them. Control all ten channels to keep them quiet.) Only the 100% emergency takes every fan (DEC-382). A sensor that is still *listed* but has **stopped updating** counts as missing (DEC-267): a reading older than five polling intervals is not treated as current, because a frozen temperature can never rise and would otherwise hide a real emergency indefinitely. There are exceptions, all following one rule: losing sight of a sensor must never *reduce* cooling (DEC-269). If a thermal emergency is already active the 100% force continues, whether the sensor went quiet or disappeared (DEC-386); and if the last reading before the sensor went quiet was at or above the 80°C release temperature, fan curves simply keep running on it. The 40% fallback applies when the last thing the daemon knew was that the system was *cool* — which is the case it was written for.
 - **Stalled sensors stop driving curves** — the rule above concerns the CPU. Every other sensor that drives a fan curve (GPU, coolant, VRM, drive) is also checked for freshness: if it stops updating, its curve stops running and the fans it controls **hold at their current speed** rather than tracking a temperature that is no longer real. They are never dropped to zero, and never quietly lowered. A curve that combines several sensors keeps running on the ones it can still see, but is not allowed to command *less* than it already was until they are all back — so losing one input can make your fans stay high, never fall. If one of the sensors a combined curve names does not exist on your machine at all, the curve simply runs on the others. If your fans stop responding to a rising GPU or coolant temperature, check that sensor: a frozen reading is the likely cause, and the daemon has deliberately stopped trusting it. Sensors that disappear entirely (a driver unloaded, hardware removed) are dropped from `GET /sensors` instead of lingering at their last value.
 - **Override visibility** — the current thermal-override state is reported as `thermal_state` in `GET /status` (`normal`, `emergency`, or `no_sensor_fallback`; daemons before DEC-386 also send `recovery`); the GUI shows a poll-driven thermal banner from it (DEC-165). The GUI has no fan-control loop of its own to pause — the daemon owns control throughout.
 - **OpenFanController stops are not time-limited** — a channel commanded to 0% stays stopped for as long as it is commanded; the daemon does not restart it after a fixed time. The 8-second stop timer (advertised as `limits.openfan_stop_timeout_s`) refuses only a 0% command that would reach the device while an earlier stop is still timed as running, which no normal sequence of commands produces, because a repeated 0% is never re-sent (DEC-426). A pump is never stopped by a profile: pump and CPU members are held at or above the 30% floor, whatever the curve asks for.
 - **Per-member minimum floors (DEC-162)** — the daemon reports no per-*header* floor (`min_pwm_percent: 0` for every hwmon header), but it **does** enforce the role-aware minimum the GUI bakes into each control's `minimum_pct`. A profile whose pump/CPU control drops below the hard `HARD_PUMP_CPU_FLOOR_PCT` (30%) is rejected at validation with `400 validation_error` (`FLOOR_TOO_LOW`), and the profile engine re-clamps every member to its effective floor on each eval tick (`member_effective_floor`). So floor safety is daemon-enforced, not merely a GUI profile constraint.
-- **GPU fan curves and hwmon headers** are given back on daemon shutdown — each AMD GPU whose fan curve the daemon wrote (a profile's curve, or a hardware verify) back to PMFW's own curve with zero-RPM idle stop re-enabled, and each motherboard header the daemon took to exactly what it was doing before (DEC-382): its recorded `pwm_enable`, or its duty if it was already in manual mode. A GPU the daemon never wrote a curve to is not touched, so a curve LACT or CoreCtrl put on a card your profile does not name survives a stop or a restart; so does one put on a card after **Restore GPU Fan to Automatic** handed it back (DEC-435). An older AMD card (RX 6000 or earlier) that the daemon was testing with a hardware verify when it died goes back to the fan mode it had before the test (DEC-414). A header whose mode cannot be restored is set to full speed instead, as lm-sensors `fancontrol` does. The daemon never writes a fixed "automatic" value: `2` is automatic on `it87` but Thermal Cruise on `nct6775`, and on an NZXT Kraken it applies an empty curve. The one exception is a Dell machine whose `dell_smm` driver has a single BIOS fan-control switch for every fan: that switch can be set but not read, so the daemon gives it `2`, which on that driver hands the fans back to the BIOS (DEC-398). On such a machine a profile should control all of its fans or none of them. While the daemon holds the switch, a fan no profile controls has nothing driving it. When the daemon gives the switch back, the BIOS takes every fan, including any a profile still controls. Two mechanisms cover this: the daemon does it **in-process** as it shuts down, and `ExecStopPost` in the systemd unit repeats it once the daemon has exited, whatever ended it — a normal stop, a crash, a SIGKILL the daemon could not respond to, or the watchdog restarting a daemon that stopped responding. The in-process one is bounded, so a restore that hangs cannot keep the daemon from exiting, and `ExecStopPost` from running.
-- **OpenFan fans, and motherboard headers with no mode switch, are left at a minimum on stop** (DEC-388). These have no firmware behaviour to go back to — an OpenFan channel holds whatever it was last told, indefinitely — so on a clean stop (including `systemctl restart`, a reboot, or the watchdog restarting a daemon that stopped responding) each one the daemon drove is left at its last speed or the **exit minimum**, whichever is higher: 50 % unless you change it in the GUI (Settings → Daemon Configuration → Exit minimum) or with `[shutdown] exit_floor_pct`. A fan whose last speed the daemon lost track of is left at 100 %; a fan it never drove is not touched; 0 turns the minimum off. A crash or SIGKILL cannot run this — `ExecStopPost` cannot reach the OpenFan controller — so after one those fans keep their last speed until the daemon is back.
+- **GPU fan curves and hwmon headers** are given back on daemon shutdown — each AMD GPU whose fan curve the daemon wrote (a profile's curve, or a hardware verify) back to PMFW's own curve with zero-RPM idle stop re-enabled, and each motherboard header the daemon took to exactly what it was doing before (DEC-382): its recorded `pwm_enable`, or its duty if it was already in manual mode. A GPU the daemon never wrote a curve to is not touched, so a curve LACT or CoreCtrl put on a card your profile does not name survives a stop or a restart; so does one put on a card after **Restore GPU Fan to Automatic** handed it back (DEC-435). An older AMD card (RX 6000 or earlier) that the daemon was testing with a hardware verify when it died goes back to the fan mode it had before the test (DEC-414). A header whose mode cannot be restored is set to full speed instead, as lm-sensors `fancontrol` does. The daemon never writes a fixed "automatic" value: `2` is automatic on `it87` but Thermal Cruise on `nct6775`, and on an NZXT Kraken it applies an empty curve. The one exception is a Dell machine whose `dell_smm` driver has a single BIOS fan-control switch for every fan: that switch can be set but not read, so the daemon gives it `2`, which on that driver hands the fans back to the BIOS (DEC-398). On such a machine a profile should control all of its fans or none of them. Only the GUI enforces that (from 2.80.0 it will not save or activate a profile that controls some of them); the daemon does not, so a profile saved before then, imported, or written by another client is still started by the tray or at boot. While the daemon holds the switch, a fan no profile controls has nothing driving it. When the daemon gives the switch back, the BIOS takes every fan, including any a profile still controls. Two mechanisms cover this: the daemon does it **in-process** as it shuts down, and `ExecStopPost` in the systemd unit repeats it once the daemon has exited, whatever ended it — a normal stop, a crash, a SIGKILL the daemon could not respond to, or the watchdog restarting a daemon that stopped responding. The in-process one is bounded, so a restore that hangs cannot keep the daemon from exiting, and `ExecStopPost` from running.
+- **OpenFan fans, and motherboard headers with no mode switch, are left at a minimum on stop** (DEC-388). These have no firmware behaviour to go back to — an OpenFan channel holds whatever it was last told, indefinitely — so on a clean stop (including `systemctl restart`, a reboot, or the watchdog restarting a daemon that stopped responding) each one the daemon drove is left at its last speed or the **exit minimum**, whichever is higher: 50 % unless you change it in the GUI (Settings → Daemon Configuration → Exit minimum) or with `[shutdown] exit_floor_pct`. A fan whose last speed the daemon lost track of is left at 100 %; a fan it never drove is not touched, except an ARCTIC Fan Controller channel set to 100 % as above; 0 turns the minimum off. A crash or SIGKILL cannot run this — `ExecStopPost` cannot reach the OpenFan controller — so after one those fans keep their last speed until the daemon is back.
 - **Neither guarantees the hardware actually came back.** Each restore step gives up after a few seconds so the daemon can always exit; if a chip or card has stopped accepting writes, nothing can restore it and those fans hold their last speed until something takes them over again.

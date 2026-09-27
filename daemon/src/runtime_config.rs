@@ -1,9 +1,10 @@
 //! Runtime-mutable daemon configuration — the "intern" file.
 //!
-//! Holds the subset of settings that the daemon itself may rewrite at runtime
-//! in response to API calls (`POST /config/profile-search-dirs`,
-//! `POST /config/startup-delay`). Stored at `{state_dir}/runtime.toml`,
-//! never in `/etc/control-ofc/daemon.toml` — that file stays admin-owned.
+//! Holds every setting that the daemon itself may rewrite at runtime in
+//! response to a `POST /config/*` call — including the user's header roles
+//! (`[hardware] header_roles`, a pump-floor safety input) and the cooling
+//! devices. Stored at `{state_dir}/runtime.toml`, never in
+//! `/etc/control-ofc/daemon.toml` — that file stays admin-owned.
 //!
 //! This split mirrors the NetworkManager pattern of `/etc/NetworkManager/
 //! NetworkManager.conf` (admin) + `/var/lib/NetworkManager/NetworkManager-
@@ -214,7 +215,8 @@ pub enum LoadPhase {
     /// key, including `header_roles` and `cooling_devices`.
     Startup,
     /// A `SIGHUP` reload. Narrower: it re-applies the overlay but only commits
-    /// `profile_search_dirs`, so header roles keep whatever boot established.
+    /// `profile_search_dirs` and the exit floor (DEC-388), so header roles keep
+    /// whatever boot established.
     Reload,
     /// A `POST /config/*` setter found the file unreadable, kept the original
     /// as `runtime.toml.invalid-<unix-ts>` and replaced it

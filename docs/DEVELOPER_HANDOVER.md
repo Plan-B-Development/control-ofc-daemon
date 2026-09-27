@@ -11,107 +11,32 @@ The daemon owns all hardware access and exposes a stable HTTP-over-Unix-socket A
 ## Repository layout
 
 ```
-daemon/                     Rust crate (control-ofc-daemon)
-  src/
-    main.rs                 Entrypoint (tokio async runtime)
-    lib.rs                  Module exports
-    config.rs               TOML config + validation (incl. [state] section)
-    runtime_config.rs       Daemon-mutable runtime.toml (ADR-002)
-    constants.rs            Centralized operational tuning values
-    pwm.rs                  Shared PWM percent ↔ raw (0–255) conversion
-    clock.rs                Injectable monotonic clock (deterministic TTL/expiry in tests)
-    atomic_io.rs            Crash-safe atomic file write (tmp+fsync+rename)
-    control_override.rs     Manual-override + fan-identify state (expiring, fencing-guarded; DEC-163/166)
-    daemon_state.rs         Persistent state (configurable state_dir via OnceLock)
-    error.rs                Structured error types
-    api/
-      handlers/             HTTP request handlers (split by concern)
-        mod.rs              AppState, shared helpers, submodule re-exports
-        status.rs           Read endpoints (status, sensors, fans, poll, capabilities)
-        openfan.rs          OpenFan serial write + calibration handlers
-        gpu.rs              AMD GPU fan set/reset handlers
-        hwmon_ctl.rs        Hwmon header list, rescan, PWM-verify handlers
-        profile.rs          Profile activation + CRUD handlers
-        control.rs          Manual-override + fan-identify handlers (DEC-163/166)
-        config.rs           Runtime config handlers
-        hw_diagnostics.rs   Hardware diagnostics handler
-        inventory.rs        /inventory/{hwmon,readiness,superio,hardware-readiness} reads + Super-I/O probe; shared assessment snapshot + coalesced scan (DEC-200/202/203/207)
-        assessment.rs       Hardware-assessment cache + single-flight coordinator (DEC-207)
-        path_confine.rs     SO_PEERCRED search-dir confinement predicate (DEC-205)
-        discovery.rs        /diagnostics/preflight + the control-path routes (DEC-333)
-      responses.rs          JSON response/request types (v1 schema)
-      server.rs             Unix socket server lifecycle
-      calibration.rs        OpenFan calibration sweep
-      diagnostics.rs        Hardware-diagnostics scanning logic behind /diagnostics/hardware
-      discovery.rs          PWM-to-tach control-path sweep (DEC-333)
-      preflight.rs          Shared diagnostic safety predicates + typed report (DEC-333).
-                            CONSUMES the existing guards rather than restating them,
-                            which is why verify/characterize/calibrate needed no edit
-    health/
-      state.rs              Canonical state model (DaemonState)
-      cache.rs              RwLock in-memory cache
-      staleness.rs          Health computation (OK/Warn/Crit)
-      history.rs            Per-entity time-series ring buffer
-      sensor_failure.rs     SensorFailureTracker — quarantines present-but-unreadable sensors (DEC-193)
-    hwmon/
-      discovery.rs          hwmon sysfs sensor discovery
-      reader.rs             hwmon temp reads
-      types.rs              SensorKind, SensorReading, SensorDescriptor
-      pwm_discovery.rs      PWM header discovery with stable IDs
-      pwm_control.rs        PWM writes with lease enforcement (daemon-internal since 2.0.0)
-      lease.rs              Exclusive write lease (take/release/renew, 60s TTL) — **internal-only since 2.0.0**: the profile engine self-leases; there is no client `/hwmon/lease/*` route (DEC-165)
-      aio.rs                Liquid-cooler (AIO) recognition: coolant sensor + is_aio + aio_hwmon cap (DEC-156)
-      gpu_detect.rs         AMD GPU detection via sysfs/DRM
-      gpu_fan.rs            PMFW fan curve read/write/reset (RDNA3+)
-      intel_gpu_detect.rs   Intel discrete-GPU detection (read-only monitoring, DEC-121)
-      nouveau_detect.rs     NVIDIA discrete-GPU detection via the open nouveau driver (read-only, DEC-204)
-      nvidia.rs             Unified NVIDIA GPU identity (nouveau + NVML) for /capabilities + /diagnostics (DEC-204)
-      nvml.rs               Opt-in read-only NVIDIA telemetry backend over NVML (proprietary driver, DEC-204)
-      nvml_sys.rs           Isolated unsafe FFI to libnvidia-ml.so.1 via libloading (DEC-204)
-      kernel_warnings.rs    Kernel-version regression catalog (DEC-098).
-                            Matches running kernel against published amdgpu
-                            regressions; surfaced via
-                            /capabilities.amd_gpu.kernel_warnings.
-      gigabyte_siv.rs       Gigabyte SIV descriptor decode — the board's own firmware-declared fan/temp/voltage counts, read from /sys/class/gigabyte/id/gigabyte_siv (X87-d). Read-only sysfs; no port I/O
-      inventory.rs          Structured hwmon inventory (temps, fans, PWM metadata; DEC-200)
-      classify.rs           CPU/mobo sensor + PWM classification (DEC-200)
-      readiness.rs          Hardware-readiness item computation (DEC-200)
-      chip_db.rs            Super-I/O chip + Gigabyte dual-chip board database (DEC-202)
-      superio.rs            Passive Super-I/O detection (DEC-202)
-      superio_probe.rs      Opt-in active /dev/port Super-I/O probe (DEC-203)
-      util.rs               Shared sysfs path helpers
-    serial/
-      protocol.rs           OpenFanController protocol encode/decode
-      transport.rs          Serial transport trait
-      real_transport.rs     serialport impl + auto-detect
-      controller.rs         Fan control logic (per-channel PWM writes, coalescing)
-    profile.rs              Profile JSON loading + curve evaluation
-    profile_store.rs        Daemon-owned profile storage (store of record, DEC-160)
-    profile_engine/         Headless 1Hz curve evaluation loop (DEC-135)
-      mod.rs                  Loop body / coordinator: orchestrates safety_tick + curve_eval + tuning + backends
-      curve_eval.rs           Deadband + trigger latch + Mix/Sync composites (topological order)
-      tuning.rs               offset→floor→step-rate→stop-snap→start-kick→clamp + floor policy
-      safety_tick.rs          thermal ladder + no-sensor fallback, one exhaustive decision table (DEC-386)
-      backends.rs             WriteBackend impls (OpenFan/GPU/hwmon gating)
-    safety.rs               ThermalSafetyRule (CPU emergency override)
-    polling.rs              hwmon + OpenFan polling loops
-  tests/
-    ipc_integration.rs      Integration tests over the UDS HTTP server
-docs/
-  ADRs/                     Architecture decision records
-packaging/
-  control-ofc-daemon.service   systemd unit file
-  modules-load.d/control-ofc.conf  Super I/O module loading at boot
+Cargo.toml          Workspace manifest: two members, two binaries
+daemon/             control-ofc-daemon, the service (src/, tests/)
+tray/               control-ofc-tray, a system-tray API client (DEC-352).
+                    A separate crate so it cannot reach daemon internals
+man/                scdoc sources for both man pages
+completions/        bash / zsh / fish completions for both binaries
+packaging/          PKGBUILD, systemd unit, restore script, sleep hook,
+                    Super-I/O guard, modules-load.d, udev and drop-in examples
+docs/               USER_GUIDE.md, this file, ADRs/
+daemon.md           Architecture: module map, data flow, safety model, API
 ```
+
+**The per-file map is `daemon.md` § Module Map**, for both crates. It is not
+repeated here: this file used to carry a second copy, and it fell about twenty
+modules and the whole tray crate behind.
 
 ## Build and test
 
-**The canonical gate commands live in `CLAUDE.md § Quality gates` at the repo root.**
-This section deliberately does not restate them — it used to, and had drifted to a
-variant that tested a different set (`--all` runs doctests, `--all-targets` does not;
-`--all-features` was a no-op throughout).
+**The gate commands are the ones CI runs: the `cargo` steps in
+`.github/workflows/ci.yml`** (format, clippy with `-D warnings`, the tests, the
+doc tests, and `cargo deny`). They are not restated here — an earlier copy here
+drifted to a variant that tested a different set. The toolchain is pinned in
+`rust-toolchain.toml`, so a local run uses the compiler CI uses.
 
-To build a release binary:
+To build both binaries (from the repository root; they land in
+`target/release/`):
 
 ```bash
 cargo build --release
@@ -119,30 +44,40 @@ cargo build --release
 
 ## Running the daemon
 
+**Never run the daemon by hand while the service is active.** A second
+`control-ofc-daemon` deletes the running service's socket, takes it over, and
+runs a second profile engine: two writers on the same fans. That includes
+`cargo run`, a bare `sudo control-ofc-daemon`, and any command that passes
+`--profile` or `--config`. Stop the service first
+(`sudo systemctl stop control-ofc-daemon`).
+
+The supported way to run your own build is to install the package once and then
+swap in your binary, so the unit, `control-ofc-restore-auto` (the crash-time
+hand-back), the sleep hook, the Super-I/O guard and `modules-load.d` all stay in
+place:
+
 ```bash
-# Default config location (optional — daemon uses defaults if missing)
-sudo mkdir -p /etc/control-ofc
-sudo cp daemon.toml.example /etc/control-ofc/daemon.toml
-
-# Run directly (default config path: /etc/control-ofc/daemon.toml)
-RUST_LOG=info cargo run
-
-# Override config path via CLI or env var
-cargo run -- --config ./dev-config.toml
-CONTROL_OFC_CONFIG=./dev-config.toml cargo run
-
-# Or install and run via systemd
-sudo cp target/release/control-ofc-daemon /usr/local/bin/
-sudo cp packaging/control-ofc-daemon.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now control-ofc-daemon
+# once: install the package (README.md § Install), then
+cargo build --release
+sudo install -m755 target/release/control-ofc-daemon /usr/bin/control-ofc-daemon
+sudo systemctl restart control-ofc-daemon
+journalctl -u control-ofc-daemon -f
 ```
+
+pacman overwrites `/usr/bin/control-ofc-daemon` on the next upgrade of the
+package (and `pacman -Qkk control-ofc-daemon` reports it as modified until then).
+To go back to the released binary, reinstall the package:
+`sudo pacman -S control-ofc-daemon`. The config file is
+`/etc/control-ofc/daemon.toml`; `docs/USER_GUIDE.md` § Configuration says what an
+edit can break.
 
 ## IPC socket
 
 - Default path: `/run/control-ofc/control-ofc.sock`
 - Configurable via `[ipc] socket_path` in TOML config
-- The daemon creates the parent directory and cleans up stale sockets on start
+- The daemon creates the parent directory and, on start, deletes whatever socket
+  file is already at the path — a live one included, which is why § Running the
+  daemon says to stop the service first
 - GUI discovers the socket via config or the default path
 
 ## API endpoints (v1)
@@ -150,7 +85,7 @@ sudo systemctl enable --now control-ofc-daemon
 ### Read-only
 | Endpoint | Description |
 |---|---|
-| `GET /capabilities` | Device capabilities, feature flags, safety limits, `amd_gpu.kernel_warnings` (DEC-098) |
+| `GET /capabilities` | Device capabilities, feature flags, safety limits, `devices.amd_gpu.kernel_warnings` (DEC-098) |
 | `GET /status` | Health status + subsystem freshness |
 | `GET /sensors` | Cached temperature readings |
 | `GET /fans` | Fan RPM + last commanded PWM |
@@ -164,6 +99,8 @@ sudo systemctl enable --now control-ofc-daemon
 | `GET /inventory/readiness` | Readiness items (`blocks_monitoring`/`blocks_control`, `reboot_may_be_required`; DEC-200) |
 | `GET /inventory/superio` | Passive Super-I/O chip detection (DEC-202) |
 | `GET /inventory/hardware-readiness` | Combined readiness + Super-I/O snapshot from one shared scan (DEC-207) |
+| `GET /config` | Effective merged configuration: per key its value, running value, `source`, `mutable`, `requires_restart`, `restart_pending` (DEC-243) |
+| `GET /diagnostics/characterization` | Current or most recent characterisation run, with the points measured so far (DEC-313) |
 | `GET /diagnostics/preflight` | Typed safety verdict for one header + one diagnostic, before anything is driven (DEC-333). Read-only: no lease, no slot, nothing reserved |
 | `GET /diagnostics/control-path` | Current/most recent control-path discovery run, plus every persisted relationship (DEC-333). Records are keyed by stable header id and pruned at boot to whatever discovery still sees |
 
@@ -174,7 +111,7 @@ The profile engine is the **sole writer** as of 2.0.0 (DEC-159/DEC-165); the GUI
 |---|---|
 | `POST /profiles`, `PUT`/`DELETE /profiles/{id}` | Profile CRUD + `?validate_only` — daemon is the store of record (DEC-160) |
 | `POST /profile/activate` | Switch active profile at runtime |
-| `POST /profile/deactivate` | Clear active profile (DEC-097); idempotent |
+| `POST /profile/deactivate` | Clear active profile (DEC-097); idempotent. Clears every control override, and the next engine tick gives back each header the daemon took (DEC-382) |
 | `POST /control/{control_id}/override` (+ `/override/renew`, `DELETE`) | Expiring manual override — floor-clamped, deadman, monotonic fencing (DEC-163) |
 | `POST /fans/{fan_id}/identify` | Per-fan identify hold/restore — 0 for an ordinary fan (floor-exempt), a floored perturbation for a pump-protected header (DEC-311/312/384); deadman auto-restore (DEC-166) |
 | `POST /config/header-role` | Assign/clear a PWM header's role; a `pump` assignment earns the 30% floor (DEC-311) |
@@ -188,6 +125,7 @@ The profile engine is the **sole writer** as of 2.0.0 (DEC-159/DEC-165); the GUI
 | `DELETE /config/cooling-device/{id}` | Remove a cooling device (DEC-316) |
 | `POST /fans/openfan/{ch}/calibrate` | Run a PWM-to-RPM calibration sweep |
 | `POST /hwmon/{header_id}/verify` | Behavioural test of PWM write effectiveness (~6 s; daemon's own internal lease); returns `restore_failed: bool` per DEC-100 |
+| `DELETE /diagnostics/characterization` | Cooperative cancel of a running sweep; the pre-sweep duty is restored unless a thermal force or shutdown owns the header |
 | `POST /hwmon/{header_id}/characterize` (behaviour inputs) | DEC-334, 2.40.0+, gated on `control.pwm_behaviour_characterization`. `bidirectional` walks down-then-up (so the run ends high); `stability_seconds` adds a dwell at up to 3 daemon-chosen duties. **The dwell renews the engine pause and the hwmon lease from inside its own loop** under a bound derived from `STABILITY_RENEW_INTERVAL_S` — the settle bound holds at exactly `15 x 2 == 30`, so a longer hold under per-step renewal would overrun the deadman at any dwell length. Statistics live in the pure `api/stats.rs`; learned bands in `pwm_baselines.rs`, read by nothing in the control path |
 | `POST /hwmon/{header_id}/discover-control-path` | Establish which tach channel(s) this output drives, by measurement (DEC-333). Claims the **same** single-flight verify slot as verify/calibrate/characterize, so at most one of the four ever drives hardware. Perturbs away from the nearer rail; 0% unreachable for any header; a pump never crosses its floor. **DEC-336:** refuses (`409 validation_error`, retryable) and aborts in flight when every temperature reading is stale — the refusal the preflight publishes, from the same predicate |
 | `DELETE /diagnostics/control-path` | Cooperative cancel; same restore semantics and the same two deliberate skips as the characterisation sweep |
@@ -198,6 +136,10 @@ The profile engine is the **sole writer** as of 2.0.0 (DEC-159/DEC-165); the GUI
 | `POST /fans/openfan/rescan` | Adopt an OpenFanController found after boot (DEC-265) |
 | `POST /config/profile-search-dirs` | Add and/or remove profile search dirs (persists to `runtime.toml`); `remove` is >= 2.23.0, gated by `control.profile_search_dir_remove` (DEC-285) |
 | `POST /config/startup-delay` | Set startup delay seconds (persists to `runtime.toml`) |
+| `POST /config/exit-floor` | Set the exit floor, 0-100; applies live (DEC-388) |
+| `POST /config/poll-interval` | Set the poll interval, 250-2000 ms; restart to apply (DEC-243). The ceiling bounds how stale a temperature the thermal ladder can act on |
+| `POST /config/serial-port`, `/config/serial-timeout` | Set the OpenFan port (`null` = auto-detect) and the read timeout, 50-1000 ms; restart to apply (DEC-243) |
+| `POST /config/allow-port-probe`, `/config/nvidia-telemetry` | The two `[detection]` opt-ins; each also needs its systemd drop-in (DEC-243) |
 | `POST /inventory/superio/probe` | Opt-in active Super-I/O `/dev/port` probe (DEC-203) |
 | `POST /config/preferred-cpu-sensor` | Persist the preferred CPU temp sensor (DEC-200) |
 | `POST /config/preferred-mb-sensor` | Persist the preferred motherboard temp sensor (DEC-200) |
@@ -228,7 +170,7 @@ Every sensor/fan/header includes:
 - **OpenFan stop timeout** (`serial/controller.rs::apply_safety`): defence in depth, not a cap on a stop. A repeated 0% coalesces BEFORE the timeout is checked (CONC-2), so a held stop is unbounded; the timer refuses only a wire-bound 0% against a stop that started ≥ `STOP_TIMEOUT` (8 s) ago, and a non-zero write, a failed reply or a reconnect all clear it (DEC-426, `DC-b`)
 - **hwmon PWM**: no daemon-enforced per-header floors (`min_pwm_percent: 0` for all). The role-aware pump/CPU floor is GUI-baked and **daemon-enforced** (validate-time reject + eval-time clamp, DEC-162); the thermal force is the absolute backstop.
 - **Pump-stop guard** (`profile.rs`, DEC-167): a control with a pump/CPU member may not be set to stop — a non-zero `stop_pct` is rejected at profile-validate time (`PUMP_STOP_FORBIDDEN` → `400 validation_error`), and the eval-time stop-snap is skipped for pump/CPU members on any un-validated profile. Distinct from the DEC-162 *floor* above: this forbids *stopping*, not merely clamps the minimum.
-- **PWM enable mode** (`pwmN_enable=1`) set on first write per lease, reset on release
+- **PWM enable mode** (`pwmN_enable=1`) set on the first write that takes a header. It is given back by `hwmon::handback` to the mode (or duty) recorded before that write — never to a fixed value such as `2`, which is Thermal Cruise on `nct6775` (DEC-382) — once nothing holds the header: after a force, a diagnostic, a deactivation, or a switch to a profile that no longer names it
 - **ExecStopPost**: replays the hwmon hand-back record — each header the daemon took goes back to what it was doing before (DEC-382, `hwmon::handback`) — and the legacy GPU verify's record (`gpu-handback`, DEC-414: a pre-RDNA3 card a crashed verify left in manual mode gets its original mode back), and resets the PMFW fan curve on each GPU the daemon drove (`gpu-pmfw-handback`, DEC-435 — never every card) on any service stop
 - **GPU PMFW writes**: clamped to OD_RANGE from firmware PPTable (prevents EINVAL)
 
@@ -245,6 +187,6 @@ requires real hardware (everything is mocked or driven against tempdirs).
 For the current count consult the most recent `CHANGELOG.md` entry —
 release notes record the exact `cargo test` totals for the matching
 daemon version. To see the live count locally, run the test commands from
-`CLAUDE.md § Quality gates` — deliberately not restated here, for the same
+`.github/workflows/ci.yml` — deliberately not restated here, for the same
 reason the section above gives: this line had drifted to `--all-features`,
-which selects nothing and is absent from the canonical set (DEC-300).
+which selects nothing (DEC-300).

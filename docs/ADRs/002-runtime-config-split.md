@@ -4,7 +4,8 @@
 `[profiles]` / `[startup]` parsing was **superseded** — those sections are
 retained as valid admin-layer *defaults* (the base layer that `runtime.toml`
 overlays), parsed and never a parse error. See `daemon.md` for the current state.
-**Last reviewed:** 2026-07.
+**Last reviewed:** 2026-09 — the runtime-mutable keys table, the loss-on-unreadable behaviour
+and the references were brought up to date (DEC-438).
 
 > **Status as of v1.6.x:** This ADR is now historical for migration
 > purposes — the v1.0 → v1.1 → v1.2 transition has been baked into the
@@ -23,12 +24,9 @@ The daemon has two kinds of configuration:
    never be rewritten by the daemon.
 2. **Runtime-mutable settings** — the keys that API endpoints can
    change at runtime, such that the change must persist across
-   restarts. These are currently:
-   - `[profiles] search_dirs` (mutated by
-     `POST /config/profile-search-dirs`);
-   - `[startup] delay_secs` (mutated by `POST /config/startup-delay`);
-   - `[hardware] preferred_cpu_sensor` / `preferred_mb_sensor` (mutated by
-     `POST /config/preferred-cpu-sensor` / `-mb-sensor`; DEC-200).
+   restarts. At v1.1.0 these were `[profiles] search_dirs` and
+   `[startup] delay_secs`; the current set is the table under
+   § Runtime-mutable keys below.
 
 In v1.0.x both kinds lived in a single file at
 `/etc/control-ofc/daemon.toml`. The daemon's `POST /config/*`
@@ -71,6 +69,15 @@ Widened by **DEC-243**. The original set was `[profiles] search_dirs` and
 | `[serial]` | `port`, `timeout_ms` | `POST /config/serial-port`, `POST /config/serial-timeout` |
 | `[detection]` | `allow_port_probe`, `enable_nvidia_telemetry` | `POST /config/allow-port-probe`, `POST /config/nvidia-telemetry` |
 | `[shutdown]` | `exit_floor_pct` | `POST /config/exit-floor` (applies live, DEC-388) |
+| `[hardware]` | `header_roles` (header id → role) | `POST /config/header-role` (applies live, DEC-311). **A safety input:** on a board with no fan labels a `pump` assignment is the only evidence a header drives a pump, so losing the file loses that header's 30 % floor and stop exemption |
+| `[[cooling_devices]]` (top level) | one table per device | `POST /config/cooling-device`, `DELETE /config/cooling-device/{id}` (DEC-316). Metadata — no floor comes from a device |
+
+An unreadable `runtime.toml` does not stop the daemon: it boots on defaults, with no
+header roles, and reports `runtime_config_degraded` on `GET /status`. A setter that
+finds the file unreadable keeps the original as `runtime.toml.invalid-<unix-ts>` and
+writes a replacement carrying the live header roles and cooling devices (DEC-391).
+The operator-facing account is `docs/USER_GUIDE.md` § When `runtime.toml` cannot be
+read.
 
 **Never runtime-mutable:** `ipc.socket_path` (a bad value locks every client,
 including the one writing it, out of the daemon) and `state.state_dir` (moving it
@@ -147,12 +154,12 @@ On startup:
   file holds which key. Mitigated by a comment in the shipped
   `daemon.toml.example` and by `man control-ofc-daemon`.
 - A backup/restore script that previously copied `daemon.toml` alone
-  now also has to copy `runtime.toml` to fully preserve daemon state.
-  The Operations Guide documents this.
-- Migration window: 1.1.x → 1.2.0 needs the post_upgrade strip to run
-  successfully. The strip is `awk` over a `cp -a` backup and is
-  re-runnable; failure modes leave the legacy sections in place with
-  a printed warning.
+  now also has to copy `runtime.toml` to fully preserve daemon state —
+  and since DEC-311 that includes the fan header roles, which are a
+  safety input. `docs/USER_GUIDE.md` § Runtime configuration says so.
+- *(Historical.)* This ADR planned a 1.1.x → 1.2.0 `post_upgrade`
+  strip of the legacy sections. It never shipped (see § Migration), so
+  there is no migration window.
 
 ## Alternatives considered
 
@@ -177,7 +184,7 @@ On startup:
 - `daemon/src/runtime_config.rs` — type and serde model.
 - `daemon/src/api/handlers/config.rs` — write path with atomic
   tmp+rename and `503 persistence_failed` envelope.
-- `daemon/src/main.rs` — `apply_runtime_overlay()` (defined ~`main.rs:257`, invoked at startup ~`main.rs:552`).
-- `packaging/control-ofc-daemon.install` —
-  `_strip_legacy_runtime_sections` (1.1.x → 1.2.0 migration).
-- `daemon.md` § Configuration — operator-facing summary.
+- `daemon/src/main.rs` — `apply_runtime_overlay()`, applied at startup and on
+  every `SIGHUP` reload (`apply_config_reload`).
+- `daemon.md` § Configuration — architecture summary;
+  `docs/USER_GUIDE.md` § Runtime configuration — operator-facing.

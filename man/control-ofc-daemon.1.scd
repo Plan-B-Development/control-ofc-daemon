@@ -13,8 +13,10 @@ control-ofc-daemon - fan control daemon for OpenFan, hwmon, and AMD GPU hardware
 Control-OFC daemon is a Rust service that manages hardware fan control via
 hwmon sysfs, OpenFanController serial protocol, and AMD GPU PMFW interfaces.
 It serves an HTTP API over a Unix domain socket for client applications
-(such as control-ofc-gui) and can optionally evaluate fan curve profiles
-autonomously.
+(such as control-ofc-gui and control-ofc-tray) and is the only thing that
+writes fan speeds: while a profile is active it evaluates the profile's fan
+curves itself, once a second, whether or not a client is running. Clients
+only activate profiles, take short manual overrides and run diagnostics.
 
 The daemon owns thermal safety: the emergency limit (at least 105°C, raised
 per-machine to min(CPU-reported design ceiling + 5°C, 115°C) where the kernel
@@ -25,7 +27,10 @@ then returns to active control at once, and gives every other fan it took back
 to what it was doing before. With no emergency latched, holds the fans the
 active profile controls at 40% or more if no CPU sensor is reachable for 5
 consecutive poll cycles; a fan whose curve can no longer be read keeps its last
-speed, and fans no profile controls stay under their firmware curve.
+speed, and fans no profile controls stay under their firmware curve. (An
+ARCTIC Fan Controller has no firmware curve: every write to it carries all
+ten channels, so once the daemon writes any of them, each channel reading 0
+that it did not choose is set to 100% first.)
 
 Both duties are *floors* over the active profile's output, never
 replacements for it: each output receives max(commanded, forced), and at 100% an
@@ -59,20 +64,81 @@ next is tried. Neither *--profile* nor *OPENFAN_PROFILE* is saved.
 # FILES
 
 _/etc/control-ofc/daemon.toml_
-	Main configuration file (admin-owned, never modified by daemon).
+	Main configuration file (admin-owned, never modified by the daemon).
+	Installed with every key commented out. It is strict: an unknown key
+	or an out-of-range value makes the daemon exit at startup, and systemd
+	keeps restarting it, with nothing controlling the fans, until the file
+	is fixed. After an edit, *systemctl reload control-ofc-daemon* applies
+	the profile search directories and the exit floor; every other key
+	needs a restart. Moving _state_dir_ or _socket_path_ also needs a
+	*ReadWritePaths=* drop-in, because the unit uses *ProtectSystem=strict*.
+	See _/usr/share/doc/control-ofc-daemon/USER_GUIDE.md_.
 
 _/var/lib/control-ofc/runtime.toml_
-	Daemon-mutable runtime configuration (profile search dirs, startup
-	delay). Written by the daemon via API endpoints.
+	Settings changed through the API, written by the daemon (0600) and
+	overlaid on daemon.toml. *It holds the fan header roles you assign*
+	(*[hardware] header_roles*): on a board whose chip publishes no fan
+	labels, a *pump* assignment there is the only thing that gives that
+	header its 30% floor and keeps fan identify from stopping it. It also
+	holds the cooling devices (*[[cooling_devices]]*), the preferred
+	sensors, the exit floor, and any profile search directory, startup
+	delay, *[serial]*, *[polling]* or *[detection]* value set through the
+	API. Do not delete it or edit it by hand. If it cannot be read, the
+	daemon still starts, on defaults with no header roles, and reports
+	*runtime_config_degraded* on *GET /status*; the GUI shows a banner.
+	If a setting is saved while it is unreadable, the daemon keeps the
+	original as _runtime.toml.invalid-<timestamp>_ and writes a new file
+	carrying the header roles and cooling devices it is running with;
+	copy anything else you need back from the kept copy and restart.
 
 _/var/lib/control-ofc/daemon_state.json_
 	Persistent state: the profile last activated or deactivated through the
 	API. Survives daemon restarts. Never written by *--profile* or
 	*OPENFAN_PROFILE*. Atomic writes with 0600 permissions.
 
+_/var/lib/control-ofc/profiles/_
+	The daemon's profile store: profiles saved through the API. Searched
+	before every other profile directory.
+
+_/etc/control-ofc/profiles/_
+	Admin-installed profiles, including the example _quiet.json_, which
+	controls no fan as shipped.
+
+_/var/lib/control-ofc/validation/_, _control_paths.json_, _pwm_baselines.json_
+	Diagnostic evidence under _/var/lib/control-ofc/_: validation sessions,
+	measured PWM-to-tach relationships and learned RPM ranges. Nothing that
+	controls a fan reads them.
+
 _/run/control-ofc/control-ofc.sock_
 	Unix domain socket for the HTTP API. Permissions: 0666 (world-readable
-	for non-root GUI connections).
+	and world-writable, so a non-root GUI can connect). There is no
+	authentication: any local user can activate a profile or run a
+	diagnostic.
+
+_/run/control-ofc/hwmon-handback_, _gpu-handback_, _gpu-pmfw-handback_
+	What the daemon took and must give back: each motherboard header's
+	original mode or duty, and each GPU it put in manual mode or drove a
+	fan curve on. Written before the first write that needs it, and
+	replayed by *control-ofc-restore-auto* after every stop.
+
+_/run/control-ofc/sleep-hook.pid_, _sleep-hook.ack_
+	The handshake between the daemon and its system-sleep hook.
+
+_/usr/bin/control-ofc-restore-auto_
+	Run by the unit's *ExecStopPost=* after every stop, crash or kill: gives
+	each header and GPU in the records above back to what it had.
+
+_/usr/lib/systemd/system-sleep/control-ofc-daemon_
+	The system-sleep hook (see *SIGUSR1*, *SIGUSR2*).
+
+_/etc/modules-load.d/control-ofc.conf_
+	Loads the common Super-I/O sensor drivers at boot.
+
+_/usr/lib/modprobe.d/control-ofc-superio.conf_, _/usr/lib/control-ofc/control-ofc-superio-guard_
+	The Super-I/O guard: stops *nct6775* and *w83627ehf* from probing on a
+	Gigabyte board, where their probe can hide a second fan chip until the
+	machine is unplugged. To turn it off, create an empty
+	_/etc/modprobe.d/control-ofc-superio.conf_.
 
 # ENVIRONMENT
 
@@ -88,6 +154,13 @@ _/run/control-ofc/control-ofc.sock_
 	*--profile-file* flags, and before the saved profile.
 
 # SIGNALS
+
+*SIGTERM*, *SIGINT*
+	Stop. The daemon leaves every fan it cannot give back to firmware (an
+	OpenFan channel, or a header with no mode switch) at its last speed or
+	the exit floor, whichever is higher, then gives every other header and
+	GPU fan back to what it had before the daemon took it. *systemctl stop*
+	sends *SIGTERM*.
 
 *SIGHUP*
 	Reload configuration from daemon.toml and runtime.toml without
@@ -147,7 +220,10 @@ fan_curve interface is reachable.
 
 # SEE ALSO
 
-*control-ofc-gui*(1)
+*control-ofc-tray*(1), *control-ofc-gui*(1)
+
+_/usr/share/doc/control-ofc-daemon/USER_GUIDE.md_ -- setup, sensor drivers,
+configuration, troubleshooting.
 
 Project: https://github.com/Plan-B-Development/control-ofc-daemon
 

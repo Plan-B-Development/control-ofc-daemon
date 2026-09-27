@@ -48,7 +48,8 @@
 # Group/mode for the OpenFanController's node — EDIT VID/PID BEFORE USE
 SUBSYSTEM=="tty", ATTRS{idVendor}=="XXXX", ATTRS{idProduct}=="YYYY", MODE="0660", GROUP="uucp"
 
-# Optional: grant hwmon fan control to the daemon's supplementary group
-# (uncomment and adjust chip name to match your motherboard — check
-#  /sys/class/hwmon/hwmon*/name). Lets a non-root daemon write PWM.
+# Development only: grant hwmon fan control to a group, for a daemon run by
+# hand as a non-root user (--allow-non-root). The packaged service runs as root
+# and needs nothing here. (Uncomment and adjust the chip name to match your
+# motherboard — check /sys/class/hwmon/hwmon*/name.)
 # SUBSYSTEM=="hwmon", ATTR{name}=="it8696", RUN+="/bin/chmod g+w /sys%p/pwm1 /sys%p/pwm1_enable"

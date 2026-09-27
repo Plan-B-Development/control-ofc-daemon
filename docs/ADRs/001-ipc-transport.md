@@ -1,7 +1,7 @@
 # ADR-001: IPC transport — HTTP over Unix domain socket
 
 **Status:** Accepted (v1.0.0).
-**Last reviewed:** 2026-07 — transport unchanged; the Context's payload examples
+**Last reviewed:** 2026-09 (DEC-438: access logs and the client cap corrected) — transport unchanged; the Context's payload examples
 predate the 2.0.0 sole-writer cutover (client-facing PWM writes and lease
 operations were retired then — DEC-165). The transport decision itself stands.
 The SSE (`GET /events`, `text/event-stream`, `SSE_MAX_CLIENTS`, `too_many_clients`)
@@ -53,8 +53,10 @@ Implementation:
 - The GUI uses `httpx` (already a dep) to talk to the daemon via a
   trivial Unix-socket transport. No custom protocol code on either side.
 - `curl --unix-socket /run/control-ofc/control-ofc.sock http://./status`
-  is the diagnostic shortcut. `journalctl -u control-ofc-daemon` shows
-  axum's structured access logs.
+  is the diagnostic shortcut. *(Corrected 2026-09, DEC-438: this used to
+  say `journalctl -u control-ofc-daemon` shows axum's access logs. The
+  router installs no request-logging layer, so there are none; the
+  journal carries only what the handlers themselves log.)*
 - Errors are a uniform `{"error": {"code", "message", "retryable",
   "source", "details"}}` envelope. The GUI's `ApiClient` matches on
   `code` and renders deterministic UX. New error variants are additive.
@@ -88,8 +90,9 @@ Implementation:
 
 ## References
 
-- `daemon/src/api/server.rs` — server bootstrap and concurrent-client
-  cap.
+- `daemon/src/api/server.rs` — router and server bootstrap. (The
+  concurrent-client cap it once held was `SSE_MAX_CLIENTS`, removed with
+  `GET /events` in v2.5.0; there is no cap on ordinary requests.)
 - `daemon/src/api/responses.rs` — error envelope.
 - DEC-024 (GUI repo): "GUI does not consume `/events` in V1; relies on
   1 Hz polling."

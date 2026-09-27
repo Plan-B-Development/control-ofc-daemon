@@ -5,17 +5,16 @@ Rust-based fan control daemon for the Control-OFC system. Manages hardware acces
 ## Build
 
 ```bash
-cd daemon
 cargo build --release
 ```
 
-Binary: `../target/release/control-ofc-daemon` (this is a Cargo workspace
-member — the build emits to the workspace-root `target/`, one level above
-`daemon/`).
+Run from the repository root. This is a Cargo workspace with two binaries, so
+both land in the workspace-root `target/release/`: `control-ofc-daemon` and
+`control-ofc-tray`.
 
 ## Install
 
-> **Before installing manually**, verify the host has the kernel modules,
+> **Before installing**, verify the host has the kernel modules,
 > DKMS drivers, BIOS settings, and (for RDNA3+ AMD GPUs) the kernel
 > parameter described in the [Prerequisites section of the top-level
 > README](../README.md#prerequisites). The package declares the common
@@ -34,18 +33,20 @@ using the clean-room package attached to every release.
 > GitHub only. The top-level README has the migration note for existing
 > `paru -S control-ofc-daemon` installs.
 
-**Manual:**
+**Build the package yourself:** `cd packaging && makepkg -si` builds the tagged
+release from source and installs it. It fetches the release tarball, not your
+checkout.
 
-```bash
-sudo cp ../target/release/control-ofc-daemon /usr/local/bin/
-sudo cp ../packaging/control-ofc-daemon.service /etc/systemd/system/
-sudo mkdir -p /etc/control-ofc
-sudo cp ../packaging/daemon.toml.example /etc/control-ofc/daemon.toml
-sudo systemctl daemon-reload
-sudo systemctl enable --now control-ofc-daemon
-```
+**Do not install by copying files.** The unit runs `/usr/bin/control-ofc-daemon`
+and, after every stop, `/usr/bin/control-ofc-restore-auto`, which gives each fan
+header back to what it was doing before the daemon took it. The package also
+installs the sleep hook, the Super-I/O guard and
+`/etc/modules-load.d/control-ofc.conf`. A binary copied to `/usr/local/bin` gets
+none of these. To run a build of your own checkout, see
+`docs/DEVELOPER_HANDOVER.md` § Running the daemon.
 
-> **Note:** The packaged AUR install places the binary at `/usr/bin/control-ofc-daemon`. Manual installs use `/usr/local/bin/`. The systemd service file references `/usr/bin/` — update `ExecStart` if you installed manually.
+**Uninstall:** `sudo pacman -R control-ofc-daemon` — see `docs/USER_GUIDE.md`
+§ Uninstall for what it leaves behind.
 
 ## CLI
 
@@ -66,9 +67,9 @@ name. Neither is saved as the active profile, so removing the flag brings back t
 last profile activated from the GUI. Under systemd, set either in a drop-in
 (`systemctl edit control-ofc-daemon`) — see `docs/USER_GUIDE.md`.
 
-(A hidden `--allow-non-root` flag exists for development only — it skips the
-root-privilege check but not file/socket access checks. It is intentionally
-undocumented for production use.)
+`--allow-non-root` (development only, listed in `man control-ofc-daemon`) skips
+the root-privilege check but not file or socket access checks. It is not for
+production use.
 
 ## Environment variables
 
@@ -110,7 +111,7 @@ Package power comes from a CPU chip's hwmon power attribute where one exists, el
 
 **v1.6.0 (profile schema v4):** Profiles authored before v4 auto-migrate on load (role-aware `minimum_pct` floor lifted to 30 % for CPU/pump-labelled hwmon members, 20 % for chassis/openfan, 0 % for GPU-only). No file edit required; the migrated profile is re-saved when the user next persists it.
 
-**`daemon.toml` and `runtime.toml` — no action required:** These sections stay valid; they are the admin-owned **base** defaults for the profile search dirs and startup delay, and the daemon still parses them. When an API call mutates one of those keys (`POST /config/profile-search-dirs` / `POST /config/startup-delay`) the daemon writes a `runtime.toml` whose keys **overlay** the `daemon.toml` defaults (runtime wins, ADR-002). The two files coexist — nothing is copied, no section is removed, and parsing either one is never an error. If `runtime.toml` ends up shadowing a non-default `daemon.toml` value, the daemon notes it once in an `info` log at startup. **v2.16.0 (DEC-243)** widened the set of keys this applies to — `[polling] poll_interval_ms`, `[serial] port`/`timeout_ms` and the two `[detection]` opt-ins are now settable through the API as well, and `GET /config` reports every key with its value, its source (`runtime`/`admin`/`default`) and whether a saved change is still waiting on a restart. `ipc.socket_path` and `state.state_dir` remain read-only by design. **v2.23.0 (DEC-285)** made `POST /config/profile-search-dirs` accept a `remove` array as well as `add`, so a stale search directory can be pruned through the API instead of only ever added — the endpoint was add-only, and a client that re-registered a moved profiles directory left the old entry behind permanently. `/etc/control-ofc/profiles` and the last remaining entry are refused; the capability flag is `control.profile_search_dir_remove`. **No operator action required.**
+**`daemon.toml` and `runtime.toml` — no action required:** These sections stay valid; they are the admin-owned **base** defaults for the profile search dirs and startup delay, and the daemon still parses them. When an API call mutates one of those keys (`POST /config/profile-search-dirs` / `POST /config/startup-delay`) the daemon writes a `runtime.toml` whose keys **overlay** the `daemon.toml` defaults (runtime wins, ADR-002). The two files coexist — nothing is copied, no section is removed, and having these sections in either file is never an error (an unknown key or an out-of-range value in `daemon.toml` still is: see `docs/USER_GUIDE.md` § Configuration). If `runtime.toml` ends up shadowing a non-default `daemon.toml` value, the daemon notes it once in an `info` log at startup. **v2.16.0 (DEC-243)** widened the set of keys this applies to — `[polling] poll_interval_ms`, `[serial] port`/`timeout_ms` and the two `[detection]` opt-ins are now settable through the API as well, and `GET /config` reports every key with its value, its source (`runtime`/`admin`/`default`) and whether a saved change is still waiting on a restart. `ipc.socket_path` and `state.state_dir` remain read-only by design. **v2.23.0 (DEC-285)** made `POST /config/profile-search-dirs` accept a `remove` array as well as `add`, so a stale search directory can be pruned through the API instead of only ever added — the endpoint was add-only, and a client that re-registered a moved profiles directory left the old entry behind permanently. `/etc/control-ofc/profiles` and the last remaining entry are refused; the capability flag is `control.profile_search_dir_remove`. **No operator action required.**
 
 **Pre-v1.2 telemetry / polling:** `[telemetry]` and the `publish_interval_ms` field under `[polling]` were removed in the v0.7.x series. Anyone still upgrading from a pre-v0.8 install must delete those lines before starting the v1.x daemon.
 
@@ -118,16 +119,10 @@ For full upgrade details and the per-version contract changes, see `docs/USER_GU
 
 ## Quality gates
 
-**The canonical command set lives in `CLAUDE.md § Quality gates` at the repo root.**
-Run it from there; it is not repeated here.
+**The gate commands are the ones CI runs: see the `cargo` steps in
+`.github/workflows/ci.yml`.** They are not repeated here — a second copy of a
+command list is a second thing to keep true, and an earlier copy here drifted.
 
-This section used to restate the commands and had drifted away from the canonical
-set — it specified `cargo test --all`, where CLAUDE.md specified
-`cargo test --all-targets`, and those are not equivalent (`--all-targets` suppresses
-doctests). Both also carried an `--all-features` flag that did nothing, since this
-crate has no `[features]` table. A second copy of a command list is a second thing to
-keep true, and this one was not.
-
-Release-time supply-chain gates are in the same CLAUDE.md block. For context on what
-they enforce: `deny.toml` encodes the project's license/advisory policy (DEC-043
+CI also runs `cargo deny` against `deny.toml` (the `deny` job in the same file);
+`cargo audit` is run by hand at release time. `deny.toml` encodes the project's license/advisory policy (DEC-043
 no-LGPL, DEC-155 serialport MPL-2.0).

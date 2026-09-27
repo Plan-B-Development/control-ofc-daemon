@@ -1,8 +1,9 @@
 //! Configuration endpoints.
 //!
 //! Read: `GET /config` — the effective merged configuration (DEC-243).
-//! Write: profile search dirs, startup delay, preferred sensors, and the
-//! DEC-243 admin keys (poll interval, serial port/timeout, the two `[detection]`
+//! Write: profile search dirs, startup delay, preferred sensors, the exit floor,
+//! header roles (a pump-floor safety input), cooling devices, and the DEC-243
+//! admin keys (poll interval, serial port/timeout, the two `[detection]`
 //! opt-ins). Every write lands in `runtime.toml`, never in the admin-owned
 //! `daemon.toml` (ADR-002), and is persist-first: a failed write returns
 //! `503 persistence_failed` and changes nothing the daemon acts on.

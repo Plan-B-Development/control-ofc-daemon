@@ -45,10 +45,20 @@ only when its menu is about to be shown, and is otherwise asleep.
 
 *Right click* opens the menu, which shows:
 
-- the running daemon's version, or a note that the daemon is unreachable;
-- a warning line when the daemon reports a thermal state other than normal;
+- a greyed header line: *Control-OFC · daemon* followed by the running
+  daemon's version, or *daemon version unknown* when the daemon did not
+  report one, or *daemon unavailable* when it could not be reached;
+- a greyed warning line when the daemon reports a thermal state other than
+  normal: *⚠ Thermal emergency — fans forced to maximum*, *⚠ No CPU
+  temperature — fans held at a safety floor*, from a daemon older than
+  2.50.0 *⚠ Thermal recovery — fans held elevated*, or, for a state this
+  tray does not know, *⚠ Thermal state:* and the daemon's own name for it;
+- a greyed line when the last profile change you made did not happen (see
+  below);
 - *Profile*, listing every profile the daemon knows, with the active one
-  checked, plus *Stop profile control*;
+  checked, plus *Stop profile control*, which is greyed while no profile is
+  active. In place of the list it shows a greyed *Daemon unavailable*,
+  *Profiles could not be read*, or *No profiles available*;
 - *Open Control-OFC*, the same action as a left click;
 - *Quit tray*.
 
@@ -58,7 +68,12 @@ deduplicated by id rather than by name.
 
 Selecting a profile sends the change to the daemon and then re-reads it, so
 what the menu shows afterwards is what the daemon actually applied, not what
-was requested.
+was requested. If the change did not happen, the menu says so on a greyed
+line below the header and any thermal line — *⚠ Profile not switched — <profile> is still active*,
+*⚠ Not stopped — <profile> is still controlling the fans*, or, when the daemon
+did not answer the re-read either, *⚠ Profile switch failed, and the daemon is
+not answering* or *⚠ Stop failed, and the daemon is not answering*. The line
+stays until a later change succeeds.
 
 # BEHAVIOUR WORTH KNOWING
 
@@ -81,7 +96,8 @@ Activating a profile clears any manual control overrides that are in effect.
 When the daemon reports a thermal state other than normal, its forced fan
 duties are *floors over* the active profile's output, not replacements for it.
 Selecting a quieter profile during a thermal event will therefore not quieten
-the fans, which is why the menu says so.
+the fans. The menu does not say this; its warning line says only that the
+fans are forced to maximum or held at a safety floor.
 
 ## When the daemon is not running
 

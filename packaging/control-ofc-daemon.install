@@ -4,7 +4,8 @@ post_install() {
 
    Start now:        sudo systemctl enable --now control-ofc-daemon
    Load modules:     sudo systemctl start systemd-modules-load   (or reboot)
-   Setup guide:      man control-ofc-daemon
+   Setup guide:      /usr/share/doc/control-ofc-daemon/USER_GUIDE.md
+   Command, files:   man control-ofc-daemon
    Hardware check:   open the GUI -> Hardware page
 
    System tray:      this package also installs control-ofc-tray, a small
@@ -20,7 +21,8 @@ post_install() {
    discovered but never responds, one of these is usually missing:
      * Super I/O driver: motherboard headers need the matching chip driver
                          (e.g. it87-dkms-git / nct6687d-dkms-git — see the
-                         package optdepends and 'man control-ofc-daemon').
+                         package optdepends and USER_GUIDE.md, "Hardware
+                         sensor modules").
      * Gigabyte / ASUS:  may need 'acpi_enforce_resources=lax' on the kernel
                          command line for the Super I/O chip to bind.
      * AMD RDNA3+ GPU:   PMFW fan curves need 'amdgpu.ppfeaturemask=0xffffffff'
@@ -113,10 +115,10 @@ pre_remove() {
 }
 
 post_remove() {
-    echo ":: Configuration preserved in /etc/control-ofc/"
+    echo ":: Configuration you edited is kept in /etc/control-ofc/ as *.pacsave"
     echo "   Remove manually if no longer needed."
-    echo ":: State data preserved in /var/lib/control-ofc/"
-    echo "   Remove manually if no longer needed."
+    echo ":: State data preserved in /var/lib/control-ofc/ (includes runtime.toml,"
+    echo "   which holds your fan header roles). Remove manually if no longer needed."
     if [[ -f /etc/systemd/system/control-ofc-daemon.service.d/superio-port-probe.conf ]]; then
         echo ":: Opt-in Super-I/O port-probe drop-in left in place:"
         echo "   /etc/systemd/system/control-ofc-daemon.service.d/superio-port-probe.conf"

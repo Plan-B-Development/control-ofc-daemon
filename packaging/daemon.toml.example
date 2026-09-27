@@ -1,6 +1,15 @@
 # Control-OFC Daemon — admin-owned configuration.
-# Copy to /etc/control-ofc/daemon.toml and edit as needed.
-# All fields are optional — defaults are shown below.
+# The package installs this file as /etc/control-ofc/daemon.toml and keeps your
+# edits on upgrade. All fields are optional — defaults are shown below.
+#
+# READ BEFORE EDITING: this file is strict. An unknown key, a misspelt section or
+# an out-of-range value makes the daemon exit at startup, and systemd keeps
+# restarting it — with NOTHING controlling the fans and no thermal emergency —
+# until the file is fixed. `journalctl -u control-ofc-daemon` names the key.
+#
+# After an edit: `sudo systemctl reload control-ofc-daemon` applies
+# [profiles] search_dirs and [shutdown] exit_floor_pct at once; every other key
+# needs `sudo systemctl restart control-ofc-daemon`.
 #
 # NOTE: several settings below are admin-owned BASE defaults that the API may
 # later OVERRIDE. When a POST /config/* call mutates one of them, the daemon
@@ -27,18 +36,34 @@
 # at startup. See docs/ADRs/002-runtime-config-split.md.
 
 [serial]
-# Use stable /dev/serial/by-id/ path (survives USB re-enumeration)
+# No default port: when unset the daemon auto-detects the OpenFanController. To
+# pin it, use the stable /dev/serial/by-id/ path (survives USB re-enumeration).
 # port = "/dev/serial/by-id/usb-Karanovic_Research_OpenFan_...-if00"
+# At least 50.
 # timeout_ms = 500
 
 [polling]
+# At least 100. Slower than 6000 is clamped to 6000 with a warning: past that the
+# thermal emergency's staleness budget stops tracking the poll (DEC-270).
 # poll_interval_ms = 1000
 
 [ipc]
+# Moving the socket out of /run/control-ofc also needs a ReadWritePaths= drop-in:
+# the unit runs with ProtectSystem=strict.
 # socket_path = "/run/control-ofc/control-ofc.sock"
 
 [state]
+# Moving it also needs a ReadWritePaths= drop-in, for the same reason.
 # state_dir = "/var/lib/control-ofc"
+
+[profiles]
+# Where profiles are looked up. The default is /etc/control-ofc/profiles plus
+# $XDG_CONFIG_HOME/control-ofc/profiles, or $HOME/.config/control-ofc/profiles
+# when that is unset — /root/.config/control-ofc/profiles under the service,
+# which sets HOME=/root. Setting this replaces both. The daemon's own store,
+# {state_dir}/profiles, is always searched first, and the GUI adds its own
+# profile folder through the API.
+# search_dirs = ["/etc/control-ofc/profiles", "/root/.config/control-ofc/profiles"]
 
 [startup]
 # Seconds to wait before device detection at boot (0–30). The API
@@ -85,7 +110,10 @@
 # The exit floor (DEC-388). On a clean stop, a fan the daemon cannot hand back to
 # firmware — an OpenFan channel, or a motherboard header with no pwmN_enable — is
 # left at max(its last speed, this); one whose speed the daemon no longer knows
-# goes to 100 %. Fans the daemon never drove are left alone. 0 turns it off.
+# goes to 100 %. Fans the daemon never drove are left alone — except on an ARCTIC
+# Fan Controller (arctic_fan), where any write carries all ten channels: there a
+# channel reading 0 that the daemon did not choose is set to 100 % first, and is
+# left at 100 % (since 2.56.1). 0 turns it off.
 # Also settable from the GUI (Settings -> Daemon Configuration -> Exit minimum),
 # which applies at once. A crash or SIGKILL cannot run it: OpenFan channels then
 # keep their last speed.
