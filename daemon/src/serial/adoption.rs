@@ -13,8 +13,8 @@ use std::time::Duration;
 ///
 /// **No production caller since `OFN-b` (2026-09-12).** Boot adoption — its only
 /// one — moved to [`serial_port_candidates_enumerated`], because the `detect`
-/// injected here is `auto_detect_port`, which OPENS each candidate to identify
-/// it. This function is kept for its DEC-250 ordering tests, which are the record
+/// injected here was `auto_detect_port`, which OPENED each candidate to identify
+/// it (retired by `DC-ae`). This function is kept for its DEC-250 ordering tests, which are the record
 /// of why a configured port must never suppress detection; that rule now lives in
 /// the enumerated variant, which carries equivalent tests. Do not reintroduce a
 /// caller without re-reading that variant's doc comment first.
@@ -184,6 +184,218 @@ pub fn first_openfan_port<T: crate::serial::transport::SerialTransport>(
     None
 }
 
+/// Which device node a path names right now: its `(st_dev, st_ino)`, following
+/// symlinks (`DC-ae`).
+///
+/// A name is not an identity. When a USB-serial device goes away and another
+/// arrives, the kernel hands the newcomer the lowest free minor, so
+/// `/dev/ttyACM0` can name the OpenFanController at one reconnect attempt and an
+/// unrelated Arduino at the next, 30 cycles later, with nothing in between for a
+/// name comparison to see. devtmpfs removes a node with its device and creates a
+/// fresh inode for the next one, so the pair changes whenever the device behind a
+/// name does. A `/dev/serial/by-id/` link resolves to the node it points at.
+///
+/// `stat(2)` opens nothing, so this is safe to call on a stranger's device.
+/// `None` means the path does not resolve to anything (or cannot be stat'ed) —
+/// there is nothing to open there either way.
+pub fn node_id(path: &str) -> Option<NodeId> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).ok()?;
+    Some(NodeId {
+        dev: m.dev(),
+        ino: m.ino(),
+    })
+}
+
+/// A device node's identity — see [`node_id`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeId {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+/// How long a newly appeared node is re-probed on EVERY reconnect attempt, from
+/// the attempt that first saw it (`DC-ae`) — for a board whose tty enumerates
+/// before its firmware answers the handshake, or while ModemManager is still
+/// probing it. Counted in time, not attempts: the backoff packs its first
+/// attempts into the seconds after a drop (cycles 0, 2, 4, 8), so an attempt
+/// budget was spent in ~8 s and then stranded the controller for good.
+pub const RECONNECT_NEW_NODE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The fewest opens a new node gets before the window alone may end its
+/// every-attempt probing — where `polling.poll_interval_ms` is raised, fewer
+/// attempts fit in [`RECONNECT_NEW_NODE_WINDOW`].
+pub const RECONNECT_NEW_NODE_MIN_OPENS: u32 = 4;
+
+/// After its window, a new node that has not identified is re-probed at most
+/// once per this long, for as long as the controller stays gone (`DC-ae`, the
+/// user's choice at review). Never giving up is what keeps a slow controller
+/// findable — the reconnect probe is the only way back, and so the thermal
+/// emergency's only route to the OpenFan fans. The cost falls only on a stranger
+/// plugged in after adoption: one DTR reset per interval while the controller is
+/// away, where the retired sweep reset every tty about every 30 s.
+pub const RECONNECT_NEW_NODE_SLOW_RETRY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// What the OpenFan poll loop's reconnect probe may open, attempt by attempt
+/// (`DC-ae`).
+///
+/// The probe used to call `auto_detect_port`, which OPENS every `ttyACM`/`ttyUSB`
+/// node until one identifies — and it ran on every backoff cycle, one sweep every
+/// 30 cycles for as long as the controller stayed gone. Opening a tty asserts DTR
+/// and resets Arduino-class boards, so each unrelated one was reset on that cadence
+/// indefinitely: the hazard `OFN-b` removed from boot and DEC-361 kept out of the
+/// post-boot search, left standing on the one path that runs without end. It also
+/// ignored the configured port.
+///
+/// Each attempt now opens, in order and each node at most once:
+///
+/// 1. **The configured port**, when it resolves. The user named that device.
+/// 2. **The node the controller was adopted on**, while it is still the node it
+///    was — same `(dev, ino)`: a controller that stopped answering without
+///    re-enumerating. **This open cannot succeed while the poll loop still holds
+///    the old port**: serialport opens with an exclusive `flock`, which root does
+///    not bypass, and the old transport is released only when a replacement is
+///    swapped in. It is kept because it is harmless — the node is already open,
+///    so it resets nothing — and closing the old port first is a separate
+///    decision (register row `DC-ct`). Once the node is seen missing or
+///    re-created, it is never probed again for this drop, because its name may now
+///    belong to someone else.
+/// 3. **Every candidate node that appeared since the survey began** — a
+///    `(path, NodeId)` pair not in the previous observation when first seen — on
+///    every attempt for [`RECONNECT_NEW_NODE_WINDOW`] (and at least
+///    [`RECONNECT_NEW_NODE_MIN_OPENS`] times), then once per
+///    [`RECONNECT_NEW_NODE_SLOW_RETRY`] while it stays. A returning controller
+///    always arrives as a new node, even when two devices are replugged and swap
+///    names; a node present all along with the same identity is someone else's,
+///    and is left alone.
+///
+/// The first observation is seeded from the candidate list the adoption itself was
+/// made from, so a drop costs no sweep. What that seed cannot know about is a
+/// device plugged in after adoption: it is new at the first attempt, and is opened
+/// on the new-node schedule while the controller stays away.
+///
+/// Pure over the injected `observe` and `now` so the rule is testable without a
+/// device or a clock; production passes [`node_id`] and `Instant::now()`.
+#[derive(Debug, Clone)]
+pub struct ReconnectSurvey {
+    configured: Option<String>,
+    /// `None` once the adopted node has been seen missing or re-created.
+    adopted: Option<(String, NodeId)>,
+    baseline: Vec<(String, NodeId)>,
+    fresh: Vec<FreshNode>,
+}
+
+/// A node that appeared after the survey began, and its probe history.
+#[derive(Debug, Clone)]
+struct FreshNode {
+    node: (String, NodeId),
+    first_seen: std::time::Instant,
+    last_open: std::time::Instant,
+    opens: u32,
+}
+
+impl FreshNode {
+    fn due(&self, now: std::time::Instant) -> bool {
+        self.opens < RECONNECT_NEW_NODE_MIN_OPENS
+            || now.saturating_duration_since(self.first_seen) < RECONNECT_NEW_NODE_WINDOW
+            || now.saturating_duration_since(self.last_open) >= RECONNECT_NEW_NODE_SLOW_RETRY
+    }
+}
+
+impl ReconnectSurvey {
+    /// Start a survey for a controller just adopted on `adopted`, seeded with the
+    /// candidates that adoption was chosen from. Build it at the adoption, not
+    /// later: a node read after the controller re-enumerated would seed the new
+    /// node as "present all along" and the controller would never be probed.
+    pub fn new(
+        configured: Option<String>,
+        adopted: &str,
+        seed: &[String],
+        observe: impl Fn(&str) -> Option<NodeId>,
+    ) -> Self {
+        Self {
+            configured,
+            adopted: observe(adopted).map(|id| (adopted.to_string(), id)),
+            baseline: observed(seed, &observe),
+            fresh: Vec::new(),
+        }
+    }
+
+    /// The configured port this survey tries first — for `first_openfan_port`'s
+    /// log level, which must agree with the plan about which port the user named.
+    pub fn configured(&self) -> Option<&str> {
+        self.configured.as_deref()
+    }
+
+    /// The ports this attempt may open, in order, given the candidates enumerated
+    /// now (without opening them). Advances the survey: the observation becomes
+    /// the next attempt's baseline, and each new node's schedule moves on.
+    pub fn plan(
+        &mut self,
+        candidates: &[String],
+        observe: impl Fn(&str) -> Option<NodeId>,
+        now: std::time::Instant,
+    ) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut ids: Vec<NodeId> = Vec::new();
+        let mut push = |path: &str, id: NodeId| {
+            if !out.iter().any(|p| p == path) && !ids.contains(&id) {
+                out.push(path.to_string());
+                ids.push(id);
+            }
+        };
+
+        if let Some(c) = self.configured.as_deref() {
+            if let Some(id) = observe(c) {
+                push(c, id);
+            }
+        }
+
+        if let Some((path, id)) = self.adopted.clone() {
+            if observe(&path) == Some(id) {
+                push(&path, id);
+            } else {
+                log::info!(
+                    "OpenFan reconnect: {path} is gone or now names a different device — \
+                     no longer re-probing it"
+                );
+                self.adopted = None;
+            }
+        }
+
+        let observed_now = observed(candidates, &observe);
+        // A node that left, or came back as a different device, is forgotten.
+        self.fresh.retain(|f| observed_now.contains(&f.node));
+        for entry in &observed_now {
+            if !self.baseline.contains(entry) && !self.fresh.iter().any(|f| &f.node == entry) {
+                self.fresh.push(FreshNode {
+                    node: entry.clone(),
+                    first_seen: now,
+                    last_open: now,
+                    opens: 0,
+                });
+            }
+            if let Some(f) = self.fresh.iter_mut().find(|f| &f.node == entry) {
+                if f.opens == 0 || f.due(now) {
+                    f.opens = f.opens.saturating_add(1);
+                    f.last_open = now;
+                    push(&entry.0, entry.1);
+                }
+            }
+        }
+        self.baseline = observed_now;
+        out
+    }
+}
+
+/// The candidates that resolve right now, each with its node identity.
+fn observed(paths: &[String], observe: &impl Fn(&str) -> Option<NodeId>) -> Vec<(String, NodeId)> {
+    paths
+        .iter()
+        .filter_map(|p| observe(p).map(|id| (p.clone(), id)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +493,221 @@ mod tests {
             &["/dev/ttyACM0".to_string()],
             &["/dev/ttyACM1".to_string()]
         ));
+    }
+
+    // ── `DC-ae`: what a reconnect attempt may open ──────────────────────────
+
+    const OPENFAN: &str = "/dev/ttyACM0";
+    const ARDUINO: &str = "/dev/ttyACM1";
+
+    fn id(ino: u64) -> NodeId {
+        NodeId { dev: 5, ino }
+    }
+
+    /// A fake `/dev`: path → the node it names right now. `observe` over it.
+    fn bus<'a>(nodes: &'a [(&'a str, u64)]) -> impl Fn(&str) -> Option<NodeId> + 'a {
+        move |p| nodes.iter().find(|(n, _)| *n == p).map(|(_, i)| id(*i))
+    }
+
+    fn names(nodes: &[(&str, u64)]) -> Vec<String> {
+        nodes.iter().map(|(n, _)| n.to_string()).collect()
+    }
+
+    /// The controller adopted on ACM0 beside an Arduino on ACM1, both present
+    /// at adoption.
+    fn adopted_beside_an_arduino() -> ReconnectSurvey {
+        let at_adoption = [(OPENFAN, 1), (ARDUINO, 2)];
+        ReconnectSurvey::new(None, OPENFAN, &names(&at_adoption), bus(&at_adoption))
+    }
+
+    /// Run one attempt per entry of `secs` (seconds after the first) over an
+    /// unchanging bus, returning how many times `path` was planned at each.
+    fn opens_of(
+        s: &mut ReconnectSurvey,
+        now: &[(&str, u64)],
+        secs: &[u64],
+        path: &str,
+    ) -> Vec<(u64, usize)> {
+        let t0 = std::time::Instant::now();
+        secs.iter()
+            .map(|&t| {
+                let plan = s.plan(&names(now), bus(now), t0 + Duration::from_secs(t));
+                (t, plan.iter().filter(|p| *p == path).count())
+            })
+            .collect()
+    }
+
+    /// Attempts every 30 s for 20 minutes — the loop's settled cadence at the
+    /// default poll interval — after the early ramp at 0, 2, 4, 8 and 16 s.
+    fn schedule() -> Vec<u64> {
+        let mut v = vec![0, 2, 4, 8, 16];
+        v.extend((1..=40).map(|k| k * 30));
+        v
+    }
+
+    #[test]
+    fn a_stranger_present_all_along_is_never_opened() {
+        // The DISCRIMINATING arm, and the defect: `auto_detect_port` opened ACM1
+        // on every attempt — a DTR reset every 30 cycles, for as long as the
+        // controller stayed gone. Here the controller has wedged on its own node.
+        let mut s = adopted_beside_an_arduino();
+        let now = [(OPENFAN, 1), (ARDUINO, 2)];
+        for (t, n) in opens_of(&mut s, &now, &schedule(), ARDUINO) {
+            assert_eq!(n, 0, "t={t}s: a tty present all along must never be opened");
+        }
+        let mut s = adopted_beside_an_arduino();
+        for (t, n) in opens_of(&mut s, &now, &schedule(), OPENFAN) {
+            assert_eq!(n, 1, "t={t}s: the adopted node is re-probed every attempt");
+        }
+    }
+
+    #[test]
+    fn a_new_node_is_never_given_up_on() {
+        // The review's P1. The controller came back on ACM2 and does not answer
+        // at first (slow firmware, ModemManager probing it). An ATTEMPT budget was
+        // spent in the backoff's first ~8 s and never probed ACM2 again, so the
+        // controller — and the thermal emergency's OpenFan leg — was lost until a
+        // restart. It must still be probed after any length of absence.
+        let mut s = adopted_beside_an_arduino();
+        let now = [(ARDUINO, 2), ("/dev/ttyACM2", 7)];
+        let opens = opens_of(&mut s, &now, &schedule(), "/dev/ttyACM2");
+        let window = RECONNECT_NEW_NODE_WINDOW.as_secs();
+        let slow = RECONNECT_NEW_NODE_SLOW_RETRY.as_secs();
+        for &(t, n) in &opens {
+            if t < window {
+                assert_eq!(n, 1, "t={t}s: every attempt inside the window opens it");
+            }
+        }
+        let late: Vec<u64> = opens
+            .iter()
+            .filter(|(t, n)| *t >= 600 && *n > 0)
+            .map(|(t, _)| *t)
+            .collect();
+        assert!(!late.is_empty(), "never probed after 10 minutes: {opens:?}");
+        // …and after the window, at most once per slow-retry interval.
+        let after: Vec<u64> = opens
+            .iter()
+            .filter(|(t, n)| *t >= window && *n > 0)
+            .map(|(t, _)| *t)
+            .collect();
+        for pair in after.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= slow,
+                "opened {}s apart: {after:?}",
+                pair[1] - pair[0]
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_node_gets_its_minimum_opens_even_when_attempts_are_sparse() {
+        // A raised poll interval puts fewer attempts inside the window.
+        let mut s = adopted_beside_an_arduino();
+        let now = [(ARDUINO, 2), ("/dev/ttyACM2", 7)];
+        let opens = opens_of(&mut s, &now, &[0, 50, 100, 150, 200], "/dev/ttyACM2");
+        let total: usize = opens.iter().map(|(_, n)| n).sum();
+        assert_eq!(total, RECONNECT_NEW_NODE_MIN_OPENS as usize, "{opens:?}");
+    }
+
+    #[test]
+    fn the_adopted_name_reused_by_another_device_is_not_the_adopted_node() {
+        // Between two attempts the controller left and a stranger took its name
+        // — same path, re-created node, new inode. A name comparison sees nothing
+        // and would re-open the stranger on EVERY attempt as the adopted node; the
+        // inode shows it is a new node, on the slow schedule once its window ends.
+        let mut s = adopted_beside_an_arduino();
+        let now = [(OPENFAN, 9), (ARDUINO, 2)];
+        let opens = opens_of(
+            &mut s,
+            &now,
+            &[0, 30, 60, 90, 120, 150, 180, 210, 240, 270],
+            OPENFAN,
+        );
+        assert_eq!(opens[0].1, 1, "a new node is opened when first seen");
+        let quiet: usize = opens
+            .iter()
+            .filter(|(t, _)| (120..=270).contains(t))
+            .map(|(_, n)| n)
+            .sum();
+        assert_eq!(quiet, 0, "{opens:?}");
+    }
+
+    #[test]
+    fn a_node_seen_gone_is_never_treated_as_the_adopted_node_again() {
+        let mut s = adopted_beside_an_arduino();
+        let gone = [(ARDUINO, 2)];
+        let t0 = std::time::Instant::now();
+        assert!(s.plan(&names(&gone), bus(&gone), t0).is_empty());
+        // Even the SAME inode reappearing is only a new node from here on.
+        let back = [(OPENFAN, 1), (ARDUINO, 2)];
+        let opens = opens_of(
+            &mut s,
+            &back,
+            &[0, 30, 60, 90, 120, 150, 180, 210, 240, 270],
+            OPENFAN,
+        );
+        let quiet: usize = opens
+            .iter()
+            .filter(|(t, _)| (120..=270).contains(t))
+            .map(|(_, n)| n)
+            .sum();
+        assert_eq!(opens[0].1, 1);
+        assert_eq!(quiet, 0, "{opens:?}");
+    }
+
+    #[test]
+    fn two_devices_that_swap_names_are_both_new() {
+        // Both unplugged and replugged between attempts, the other way round. The
+        // set of NAMES is unchanged, so a name comparison would never look — and
+        // would keep re-opening ACM0, now the Arduino, as the "adopted node".
+        let mut s = adopted_beside_an_arduino();
+        let now = [(OPENFAN, 3), (ARDUINO, 4)];
+        let plan = s.plan(&names(&now), bus(&now), std::time::Instant::now());
+        assert_eq!(plan, vec![OPENFAN, ARDUINO]);
+    }
+
+    #[test]
+    fn the_configured_port_is_tried_first_every_time_and_opened_once() {
+        // The user named the device, by its by-id link. It resolves to the same
+        // node as ACM0, so ACM0 must not be opened a second time under its other
+        // name — each open is a DTR reset.
+        let by_id = "/dev/serial/by-id/usb-Karanovic_Research_OpenFan-if00";
+        let at_adoption = [(by_id, 1), (OPENFAN, 1), (ARDUINO, 2)];
+        let mut s = ReconnectSurvey::new(
+            Some(by_id.to_string()),
+            by_id,
+            &names(&at_adoption),
+            bus(&at_adoption),
+        );
+        assert_eq!(s.configured(), Some(by_id));
+        for _ in 0..5 {
+            assert_eq!(
+                s.plan(
+                    &names(&at_adoption[1..]),
+                    bus(&at_adoption),
+                    std::time::Instant::now()
+                ),
+                vec![by_id]
+            );
+        }
+    }
+
+    #[test]
+    fn a_configured_port_that_does_not_resolve_is_not_opened() {
+        let at_adoption = [(OPENFAN, 1)];
+        let mut s = ReconnectSurvey::new(
+            Some("/dev/serial/by-id/absent".to_string()),
+            OPENFAN,
+            &names(&at_adoption),
+            bus(&at_adoption),
+        );
+        assert_eq!(
+            s.plan(
+                &names(&at_adoption),
+                bus(&at_adoption),
+                std::time::Instant::now()
+            ),
+            vec![OPENFAN]
+        );
     }
 }

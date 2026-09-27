@@ -107,9 +107,9 @@ package() {
     # Optional udev rules example (documentation only).
     # The daemon auto-detects the OpenFan controller on /dev/ttyACM* and
     # /dev/ttyUSB* at startup — no udev rule is required for normal operation.
-    # Ship the rule as a reference for users who want a stable
-    # /dev/control-ofc-controller symlink; they copy it into
-    # /etc/udev/rules.d/ and fill in their VID/PID.
+    # Ship the rule as a reference for users who want a specific group/mode on
+    # the device node; they copy it into /etc/udev/rules.d/ and fill in their
+    # VID/PID. A stable path is /dev/serial/by-id/, which udev already provides.
     install -Dm644 packaging/99-control-ofc.rules \
         "$pkgdir/usr/share/doc/$pkgname/99-control-ofc.rules.example"
 

@@ -399,6 +399,17 @@ Two consequences worth knowing if you have **other** USB-serial hardware attache
   changes — so plugging the controller in during the window is picked up within a
   few seconds, while a machine whose devices never change is never re-probed.
 
+If a controller that was working drops off — unplugged, or a USB reset — the
+daemon keeps trying to get it back for as long as it runs, about every 30 seconds
+at the default poll interval. Each try opens only the configured port, the
+controller's own device node, and a serial device that has appeared since the
+controller dropped off — on every try for its first minute, then once every five
+minutes while the controller stays away. Other USB-serial devices that were
+already attached are left alone, so an Arduino-class board beside the controller
+is not reset while it is away. A controller that stops answering without dropping
+off the USB bus is not recovered this way; restart the daemon
+(`systemctl restart control-ofc-daemon`).
+
 If a controller is attached but was not detected — it appeared after the window,
 say — use **Rescan Hardware** in the GUI (`POST /fans/openfan/rescan`) rather than
 restarting, or pin the port as below. For reliable detection across reboots, use a
@@ -427,7 +438,7 @@ sudo systemctl edit control-ofc-daemon
 #   SupplementaryGroups=uucp dialout
 ```
 
-A udev rule is **not required** — the daemon auto-detects the OpenFanController on `/dev/ttyACM*` and `/dev/ttyUSB*` at startup. Use this only if you want a stable `/dev/control-ofc-controller` symlink or a specific group/mode on the device node.
+A udev rule is **not required** — the daemon auto-detects the OpenFanController on `/dev/ttyACM*` and `/dev/ttyUSB*` at startup. Use this only if you want a specific group/mode on the device node. For a stable path, use the `/dev/serial/by-id/` link above: the daemon opens only `/dev/ttyS*`, `ttyUSB*`, `ttyACM*`, `ttyAMA*` and `/dev/serial/` paths, so a custom udev symlink such as `/dev/control-ofc-controller` is refused. The example no longer creates one.
 
 The package installs the example as documentation-only at `/usr/share/doc/control-ofc-daemon/99-control-ofc.rules.example`. To enable it, copy into `/etc/udev/rules.d/` and edit there (do not edit the shipped example — pacman will overwrite it on upgrade):
 ```bash

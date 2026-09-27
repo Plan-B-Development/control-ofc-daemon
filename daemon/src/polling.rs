@@ -772,11 +772,13 @@ fn read_nvml_states(backend: &dyn NvmlBackend) -> (Vec<SensorReading>, Vec<AmdGp
 /// the pre-release review could delete either one with the whole suite green.
 /// They are:
 ///
-/// 1. **Identity** (DEC-250/255) — detection probes on its own fd and then
-///    closes it, so the transport actually adopted has never been verified.
-///    "Openability is not identity" applies hardest here, because this is the
-///    path that runs continuously at runtime, where a device swap between
-///    probe and open is the entire risk.
+/// 1. **Identity** (DEC-250/255) — the transport actually adopted is the one
+///    verified here, whatever `open` did before returning it. Detection used to
+///    probe on its own fd and close it, so the adopted fd had never been
+///    verified; the production `open` now hands back the very transport
+///    `first_openfan_port` identified (`DC-ae`), and this check still stands so
+///    no `open` can skip it. "Openability is not identity" applies hardest here,
+///    because this is the path that runs continuously at runtime.
 /// 2. **Invalidation** (DEC-256) — the device just re-enumerated, so
 ///    `FanController`'s per-channel coalescing cache describes a state that may
 ///    no longer exist. Invalidate *before* the transport goes live, or the next
@@ -858,6 +860,15 @@ fn poll_attempt_failed<T>(
 /// OpenFanController is worse than no port, because every subsequent write
 /// silently goes somewhere else.
 ///
+/// Which candidates an attempt may open is `survey`'s decision
+/// ([`ReconnectSurvey`](crate::serial::adoption::ReconnectSurvey), `DC-ae`): the
+/// configured port, the node the controller was adopted on while it is still
+/// that node, and nodes that appeared since the survey began (every attempt for
+/// their first minute, then once per five). Every other
+/// tty is left closed — opening one asserts DTR and resets Arduino-class
+/// boards, and this path runs for as long as the controller stays gone. The
+/// caller seeds the survey with the candidate list its adoption was made from.
+///
 /// Spawned either when a controller is adopted at startup (`main.rs`) or when
 /// one is adopted later by `POST /fans/openfan/rescan` (DEC-265,
 /// `api::handlers::openfan`). Exactly one loop exists per adopted controller:
@@ -879,21 +890,78 @@ pub async fn openfan_poll_loop(
     timeout: Duration,
     interval: Duration,
     shutdown: watch::Receiver<bool>,
+    survey: crate::serial::adoption::ReconnectSurvey,
 ) {
+    use crate::serial::adoption::node_id;
+
     // DEC-266: the real reconnect probe, injected. Everything else lives in
     // `openfan_poll_loop_with`, which is the same code the daemon runs — so a
     // test can drive the actual loop instead of a copy of its arithmetic. Before
     // this split the loop had never been executed by any test ("driving the real
     // loop needs a serial device"), and that is exactly how the panic-counting
     // fix came to be pinned at its helper but not at its call site.
-    openfan_poll_loop_with(cache, transport, timeout, interval, shutdown, |c, t| {
-        adopt_reconnected_transport(c, t, || {
-            let path = crate::serial::real_transport::auto_detect_port(t)?;
-            let rt = crate::serial::real_transport::RealSerialTransport::open(&path, t).ok()?;
-            Some((path, rt))
-        })
-    })
+    //
+    // `DC-ae`: which ports an attempt may open is the survey's decision — it used
+    // to be `auto_detect_port`, which opened every tty on every attempt. The loop
+    // runs one probe at a time, so the lock is never contended.
+    let survey = Arc::new(parking_lot::Mutex::new(survey));
+    openfan_poll_loop_with(
+        cache,
+        transport,
+        timeout,
+        interval,
+        shutdown,
+        move |c, t| {
+            reconnect_via_survey(
+                c,
+                t,
+                &survey,
+                crate::serial::real_transport::enumerate_serial_candidates,
+                node_id,
+                |p| crate::serial::real_transport::RealSerialTransport::open(p, t),
+                std::time::Instant::now(),
+            )
+        },
+    )
     .await;
+}
+
+/// One reconnect attempt: plan with the survey, open and identify, and on
+/// success re-seed the survey for the controller just adopted (`DC-ae`).
+///
+/// The I/O and the clock are injected (`enumerate` lists without opening,
+/// `observe` stats, `open` opens, `now` is the attempt's time) so the production
+/// composition — which ports reach `open`, in what order, and that a success
+/// moves the survey on — is testable without a serial device.
+fn reconnect_via_survey<T: SerialTransport + Send + 'static>(
+    cache: &StateCache,
+    timeout: Duration,
+    survey: &parking_lot::Mutex<crate::serial::adoption::ReconnectSurvey>,
+    enumerate: impl FnOnce() -> Vec<String>,
+    observe: impl Fn(&str) -> Option<crate::serial::adoption::NodeId>,
+    open: impl FnMut(&str) -> Result<T, crate::error::SerialError>,
+    now: std::time::Instant,
+) -> Option<Box<dyn SerialTransport + Send>> {
+    let mut s = survey.lock();
+    let candidates = enumerate();
+    let plan = s.plan(&candidates, &observe, now);
+    let configured = s.configured().map(str::to_string);
+    let mut chosen: Option<String> = None;
+    let adopted = adopt_reconnected_transport(cache, timeout, || {
+        let found = crate::serial::adoption::first_openfan_port(
+            &plan,
+            configured.as_deref(),
+            timeout,
+            open,
+        )?;
+        chosen = Some(found.0.clone());
+        Some(found)
+    })?;
+    if let Some(path) = chosen {
+        log::info!("OpenFan Controller re-found on {path}");
+        *s = crate::serial::adoption::ReconnectSurvey::new(configured, &path, &candidates, observe);
+    }
+    Some(adopted)
 }
 
 /// The poll loop proper, with the reconnect probe as a parameter.
@@ -1143,6 +1211,87 @@ mod tests {
             before,
             "a refused impostor must not invalidate the real device's write cache"
         );
+    }
+
+    // ── `DC-ae`: the reconnect probe opens what the survey plans, and no more ──
+
+    /// An OpenFanController that answers the identity exchange as often as it is
+    /// asked — `first_openfan_port` and `adopt_reconnected_transport` each run it.
+    fn openfan_answering_twice() -> ReplayTransport {
+        let mut t = openfan_replies();
+        let again = t.0[0].clone();
+        t.0.push_back(again);
+        t
+    }
+
+    #[test]
+    fn a_reconnect_opens_only_what_the_survey_plans_and_follows_the_controller() {
+        use crate::serial::adoption::{NodeId, ReconnectSurvey};
+        let node = |p: &str| match p {
+            "/dev/ttyACM0" => None, // the controller left its node…
+            "/dev/ttyACM1" => Some(NodeId { dev: 5, ino: 2 }), // …an Arduino, all along
+            "/dev/ttyACM2" => Some(NodeId { dev: 5, ino: 7 }), // …and it came back here
+            _ => None,
+        };
+        let seed = vec!["/dev/ttyACM0".to_string(), "/dev/ttyACM1".to_string()];
+        let at_adoption = |p: &str| match p {
+            "/dev/ttyACM0" => Some(NodeId { dev: 5, ino: 1 }),
+            other => node(other),
+        };
+        let survey = parking_lot::Mutex::new(ReconnectSurvey::new(
+            None,
+            "/dev/ttyACM0",
+            &seed,
+            at_adoption,
+        ));
+        let enumerate = || vec!["/dev/ttyACM1".to_string(), "/dev/ttyACM2".to_string()];
+        let cache = StateCache::new();
+        let t0 = std::time::Instant::now();
+
+        let mut opened: Vec<String> = Vec::new();
+        let adopted = reconnect_via_survey(
+            &cache,
+            Duration::from_millis(50),
+            &survey,
+            enumerate,
+            node,
+            |p| {
+                opened.push(p.to_string());
+                Ok(openfan_answering_twice())
+            },
+            t0,
+        );
+        assert!(
+            adopted.is_some(),
+            "the controller on its new node is adopted"
+        );
+        assert_eq!(
+            opened,
+            vec!["/dev/ttyACM2"],
+            "only the new node may be opened — the Arduino present all along must not be"
+        );
+
+        // The survey now follows the controller on ACM2. Once ACM2's new-node
+        // window has passed it is still re-opened on EVERY attempt, because it is
+        // now the ADOPTED node; a survey left un-seeded would treat it as a new
+        // node past its window and open it only once per slow-retry interval.
+        let after_window = t0 + crate::serial::adoption::RECONNECT_NEW_NODE_WINDOW;
+        for attempt in 0..(crate::serial::adoption::RECONNECT_NEW_NODE_MIN_OPENS + 4) {
+            let mut opened: Vec<String> = Vec::new();
+            let _ = reconnect_via_survey(
+                &cache,
+                Duration::from_millis(50),
+                &survey,
+                enumerate,
+                node,
+                |p| {
+                    opened.push(p.to_string());
+                    Err::<ReplayTransport, _>(crate::error::SerialError::Timeout { timeout_ms: 1 })
+                },
+                after_window + Duration::from_secs(u64::from(attempt)),
+            );
+            assert_eq!(opened, vec!["/dev/ttyACM2"], "attempt {attempt}");
+        }
     }
 
     #[test]

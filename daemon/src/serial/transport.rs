@@ -29,8 +29,8 @@ pub trait SerialTransport {
 /// ever returned, so no `THERMAL SAFETY ... FAILED` is logged, `/status` reports
 /// OpenFan healthy, and not one OpenFan-attached fan is actually being driven.
 ///
-/// `ReadAllRpm` is the same handshake `auto_detect_port` uses to recognise the
-/// controller in the first place. Sharing it keeps "what counts as an
+/// `ReadAllRpm` is the same handshake `first_openfan_port` runs on every candidate
+/// to recognise the controller in the first place. Sharing it keeps "what counts as an
 /// OpenFanController" in exactly one place, so the configured-port path and the
 /// detection path can never disagree about what they accept.
 pub fn verify_openfan_identity(

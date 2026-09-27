@@ -1923,6 +1923,10 @@ async fn async_main() {
     // this list so it can tell "the bus changed" from "the bus is the same", and
     // therefore never re-probes hardware boot already tried (`OFN-r`).
     let boot_candidates;
+    // `DC-ae`: the reconnect survey for the controller boot adopts — built AT the
+    // adoption, from the list it was chosen from, so a re-enumeration before the
+    // poll loop is spawned cannot be seeded as "present all along".
+    let mut boot_survey: Option<control_ofc_daemon::serial::adoption::ReconnectSurvey> = None;
     {
         // [SAFETY] Try the configured port first, then every enumerated
         // candidate. The ordering rule lives in
@@ -1980,6 +1984,12 @@ async fn async_main() {
             },
         ) {
             log::info!("OpenFanController connected on {port}");
+            boot_survey = Some(control_ofc_daemon::serial::adoption::ReconnectSurvey::new(
+                config.serial.port.clone(),
+                &port,
+                &candidates,
+                control_ofc_daemon::serial::adoption::node_id,
+            ));
             let boxed: Box<dyn control_ofc_daemon::serial::transport::SerialTransport + Send> =
                 Box::new(transport);
             let shared = Arc::new(Mutex::new(boxed));
@@ -2374,23 +2384,25 @@ async fn async_main() {
     }
 
     // ── Spawn OpenFanController polling loop ────────────────────────
-    let openfan_poll_handle = if let Some(transport) = openfan_transport {
-        let openfan_cache = cache.clone();
-        let openfan_interval = Duration::from_millis(config.polling.poll_interval_ms);
-        let openfan_shutdown = poll_shutdown_rx.clone();
-        Some(tokio::spawn(async move {
-            control_ofc_daemon::polling::openfan_poll_loop(
-                openfan_cache,
-                transport,
-                serial_timeout,
-                openfan_interval,
-                openfan_shutdown,
-            )
-            .await;
-        }))
-    } else {
-        None
-    };
+    let openfan_poll_handle =
+        if let (Some(transport), Some(survey)) = (openfan_transport, boot_survey) {
+            let openfan_cache = cache.clone();
+            let openfan_interval = Duration::from_millis(config.polling.poll_interval_ms);
+            let openfan_shutdown = poll_shutdown_rx.clone();
+            Some(tokio::spawn(async move {
+                control_ofc_daemon::polling::openfan_poll_loop(
+                    openfan_cache,
+                    transport,
+                    serial_timeout,
+                    openfan_interval,
+                    openfan_shutdown,
+                    survey,
+                )
+                .await;
+            }))
+        } else {
+            None
+        };
 
     // ── Spawn profile engine ─────────────────────────────────────────
     // Evaluates curves and writes PWM headlessly at 1Hz. The engine is the
@@ -3651,12 +3663,12 @@ mod tests {
 
     /// `OFN-b`, the CALL SITE — the half a unit test cannot reach.
     ///
-    /// `probe_order` and `first_openfan_port` pin "each candidate is opened at
-    /// most once", but neither proves BOOT goes through them. The defect was
-    /// precisely a call site: boot called `auto_detect_port`, whose own doc
-    /// comment says it is not the function to call merely to learn what ports
-    /// exist. DEC-291 built the non-opening path for the rescan endpoint and
-    /// boot was never moved onto it. This is `CLAUDE.md`'s most-recorded failure
+    /// `first_openfan_port` pins "each candidate is opened at most once" (and
+    /// `probe_order` did, until `DC-ae` retired it), but that does not prove BOOT
+    /// goes through it. The defect was precisely a call site: boot called
+    /// `auto_detect_port`, whose own doc comment said it was not the function to
+    /// call merely to learn what ports exist. DEC-291 built the non-opening path
+    /// for the rescan endpoint and boot was never moved onto it. This is `CLAUDE.md`'s most-recorded failure
     /// mode — an extracted rule with thorough tests and an untested caller.
     ///
     /// Comment lines are stripped before matching. A source-scanning guard that

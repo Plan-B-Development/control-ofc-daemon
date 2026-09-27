@@ -872,6 +872,10 @@ where
     // was already gone, so a retry raced the orphan for the same tty.
     let (tx, rx) = tokio::sync::oneshot::channel::<RescanOutcome>();
     let task_state = state.clone();
+    // `DC-ae`: the adopted controller's reconnect survey is seeded with the list
+    // this probe chose from; the probe itself takes the originals.
+    let survey_seed = candidates.clone();
+    let survey_configured = configured.clone();
     tokio::spawn(async move {
         let guard = guard;
 
@@ -893,6 +897,12 @@ where
                 let shared = Arc::new(parking_lot::Mutex::new(boxed));
                 let ctrl =
                     FanController::new_shared(shared.clone(), task_state.cache.clone(), timeout);
+                let survey = crate::serial::adoption::ReconnectSurvey::new(
+                    survey_configured,
+                    &port,
+                    &survey_seed,
+                    crate::serial::adoption::node_id,
+                );
 
                 // The install, the DEC-266 conditional and the 277-c handle
                 // registration all happen inside `adopt_openfan_controller`,
@@ -913,6 +923,7 @@ where
                             rt.timeout,
                             rt.interval,
                             rt.shutdown,
+                            survey,
                         )
                         .await;
                     })

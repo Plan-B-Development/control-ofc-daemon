@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Getting a dropped OpenFanController back no longer resets every other USB-serial device**
+  (DEC-436). When an adopted controller stopped answering, the daemon looked for it by opening every
+  `/dev/ttyACM*` and `/dev/ttyUSB*` node, about every 30 seconds for as long as it stayed away. Opening a
+  serial port resets Arduino-class boards, so a board beside the controller was reset on that cadence
+  until the controller came back or the daemon restarted. Each try now opens only the configured port,
+  the node the controller was on while it is still the same node, and a node that has appeared since the
+  controller dropped off: on every try for its first minute, then once every five minutes while the
+  controller stays away, so a slow controller is never given up on. A device that was attached all along
+  is never opened. The search also tries the configured port first now, which it used to ignore.
+- **The udev rules example no longer makes a symlink the daemon refuses** (DEC-436). It told users to
+  set `port = "/dev/control-ofc-controller"` "to skip auto-detect". The daemon does not accept that path,
+  and a configured port never skipped auto-detect. The example now sets group and mode only, and it,
+  the user guide and the package comment point at the `/dev/serial/by-id/` link instead.
+
 ### Changed
 
 - **A daemon stop resets only the AMD GPUs the daemon drove** (DEC-435). Every stop and restart used to

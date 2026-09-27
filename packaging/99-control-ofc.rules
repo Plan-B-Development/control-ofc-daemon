@@ -1,11 +1,16 @@
 # Control-OFC — OPTIONAL udev rules example
 #
 # This file is NOT required for the daemon to function. control-ofc-daemon
-# already auto-detects the Karanovic Research OpenFanController by probing
-# /dev/ttyACM* and /dev/ttyUSB* at startup (serial/real_transport.rs::
-# auto_detect_port), and the service unit's DeviceAllow= directives cover
-# device-class access. Use this file only if you want a stable symlink
-# (/dev/control-ofc-controller) or a specific group/mode on the device node.
+# already auto-detects the Karanovic Research OpenFanController among the
+# /dev/ttyACM* and /dev/ttyUSB* nodes at startup, and the service unit's
+# DeviceAllow= directives cover device-class access. Use this file only if you
+# want a specific group/mode on the device node.
+#
+# For a stable path, udev already provides one: /dev/serial/by-id/. Name that
+# in the daemon's config (below). This rule deliberately makes no symlink of
+# its own — the daemon opens only /dev/ttyS*, ttyUSB*, ttyACM*, ttyAMA* and
+# /dev/serial/ paths, so a custom name such as /dev/control-ofc-controller is
+# refused (DC-ac).
 #
 # Shipped location:
 #   /usr/share/doc/control-ofc-daemon/99-control-ofc.rules.example
@@ -33,13 +38,15 @@
 # The shipped example lives in /usr/share/doc/, so there is nothing to
 # override — the /etc/ copy is simply the live rule.
 #
-# Once the stable symlink exists, point the daemon at it to skip auto-detect:
+# To pin the controller's path, use its /dev/serial/by-id/ link (find it with
+# `ls -la /dev/serial/by-id/`). The daemon tries a configured port first, but
+# still auto-detects if that port does not identify as an OpenFanController:
 #   # /etc/control-ofc/daemon.toml
 #   [serial]
-#   port = "/dev/control-ofc-controller"
+#   port = "/dev/serial/by-id/usb-Karanovic_Research_OpenFan_...-if00"
 
-# Stable symlink for OpenFanController — EDIT VID/PID BEFORE USE
-SUBSYSTEM=="tty", ATTRS{idVendor}=="XXXX", ATTRS{idProduct}=="YYYY", SYMLINK+="control-ofc-controller", MODE="0660", GROUP="uucp"
+# Group/mode for the OpenFanController's node — EDIT VID/PID BEFORE USE
+SUBSYSTEM=="tty", ATTRS{idVendor}=="XXXX", ATTRS{idProduct}=="YYYY", MODE="0660", GROUP="uucp"
 
 # Optional: grant hwmon fan control to the daemon's supplementary group
 # (uncomment and adjust chip name to match your motherboard — check

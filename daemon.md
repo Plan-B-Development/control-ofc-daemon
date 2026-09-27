@@ -299,9 +299,33 @@ no controller at all.
 **Enumerate, then identify.** The two halves are separate functions because the
 difference is a hardware side effect: `open(2)` on a tty asserts DTR, which
 resets Arduino-class boards. `enumerate_serial_candidates` is a libudev/sysfs read
-plus `Path::exists`; `auto_detect_port` — which opens — has exactly one remaining
-caller, the OpenFan poll loop's reconnect probe, and that runs only after a
-controller that was *already adopted* has dropped off.
+plus `Path::exists`; the only thing that opens is `first_openfan_port`, once per
+candidate, to run the identity handshake. `auto_detect_port`, which opened every
+tty to find one, was retired by `DC-ae`: its last caller was the reconnect probe
+below, and it swept the whole bus on every backoff cycle for as long as the
+controller stayed gone.
+
+**The reconnect probe** (`openfan_poll_loop`, `polling.rs`) runs after 5
+consecutive failed polls of an adopted controller, on a backoff that settles at
+one attempt per 30 cycles and never gives up — `POST /fans/openfan/rescan`
+refuses while a controller is installed, so this is the only way a dropped one
+comes back. Each attempt opens only what `ReconnectSurvey` (`serial/adoption.rs`)
+plans: the configured port; the node the controller was adopted on, while it is
+still that node (same `(st_dev, st_ino)` — devtmpfs re-creates a node for a new
+device, so a reused name is caught); and each node that appeared after the survey
+began, on every attempt for its first 60 s (at least 4 opens), then once per
+5 minutes for as long as it stays — never given up on, because a slow controller
+must stay findable. The survey is seeded with the candidate list the adoption was
+made from, built at the adoption, and re-seeded on each reconnect. A tty present
+all along is never opened.
+
+**The adopted-node re-probe cannot rescue a wedged controller today.** serialport
+opens with an exclusive `flock`, which root does not bypass, and the loop holds the
+old port until a replacement is swapped in, so re-opening the same node fails. It
+resets nothing (the node is already open) and is kept; closing the old port first
+is register row `DC-ct`, a decision, because the close drops DTR and resets the
+controller. A controller that wedges without re-enumerating needs a daemon
+restart.
 
 **The detached search** (`post_boot_adoption_loop`, `api/handlers/openfan.rs`):
 
