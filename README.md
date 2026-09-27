@@ -200,7 +200,7 @@ CLI / environment reference: [`daemon/README.md`](daemon/README.md).
   PWM), and AMD GPU (RDNA3+ PMFW fan curves, legacy hwmon PWM for pre-RDNA3).
 - **HTTP over Unix domain socket** at `/run/control-ofc/control-ofc.sock`, exposing
   snapshot reads (`/poll`) — the GUI's 1 Hz poll path (the unused `/events` SSE
-  stream was removed at v2.5.0, DEC-198).
+  stream was removed at v2.5.1, DEC-198).
 - **Thermal safety** is daemon-enforced: at the CPU trip point → every OpenFan channel and
   writable motherboard (hwmon) header the machine has to 100%, hysteresis down to 80°C, and a 40% floor on the
   fans the active profile controls when no CPU sensor reports for 5 cycles (fans no profile controls stay under

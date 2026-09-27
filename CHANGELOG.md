@@ -48,6 +48,15 @@
 
 ### Documentation
 
+- **Every version the docs name can be installed** (DEC-439). `daemon.md`, the user guide, the
+  README and ADR 001 named 2.5.0, 2.34.0 or 2.52.0 as the version a change arrived in, and none of
+  them was published. They now name the first published release that carries the change (2.5.1,
+  2.35.0 or 2.53.0) and say where it was merged. The 2.2.2, 2.5.1 and 2.35.0 entries below now say
+  which unpublished version they carry (2.2.1, 2.5.0 and 2.34.0), as 2.53.0 already did.
+- **The Super-I/O port-probe drop-in no longer suggests the kernel log could have found your chip**
+  (DEC-439). Its comment listed `/dev/kmsg` among the places passive detection looks. The shipped
+  unit's `ProtectKernelLogs=true` denies the daemon `/dev/kmsg`, and the drop-in does not lift it, so
+  the comment now says so. The drop-in's settings are unchanged.
 - **The operator docs say what `runtime.toml` holds: your fan header roles** (DEC-438). The man page
   described it as "profile search dirs, startup delay". It also holds the header roles you assign — on a
   board with no fan labels, a `pump` assignment there is what gives that header its 30 % floor and keeps
@@ -2834,6 +2843,12 @@ characterisation — see below.
 
 ## [2.35.0] — 2026-09-04
 
+This release also carries **2.34.0**, which was never published on its own —
+its changes (`AUD3-b`, `AIO1-d`, `AUD3-m`: a user-assigned pump role could vanish
+from `runtime.toml`, and nothing reported it) are listed under
+[2.34.0](https://github.com/Plan-B-Development/control-ofc-daemon/blob/v2.35.0/CHANGELOG.md#2340--2026-09-04)
+below.
+
 Pairs with `control-ofc-gui` >= v2.23.0 (unchanged floor). **Three P2 fixes from the
 `/ofc:audit` register (`AUD3-l`, `AIO7-d`, `AUD3-c`), which are one failure story: the
 daemon could drive or describe a pump wrongly.** No new routes and no new capability flag.
@@ -5533,6 +5548,12 @@ daemon (they stayed in BIOS/PMFW automatic mode) and journald was spammed at
 
 ## [2.5.1] — 2026-07-04
 
+This release also carries **2.5.0**, which was never published on its own —
+its changes (DEC-198: the unused `GET /events` SSE endpoint removed, and other
+post-2.0.0 cleanup) are listed under
+[2.5.0](https://github.com/Plan-B-Development/control-ofc-daemon/blob/v2.5.1/CHANGELOG.md#250--2026-07-03)
+below.
+
 Packaging + supply-chain hardening pass (Cluster 6 + 7). No API, wire-contract, or
 control-loop behaviour change — the systemd unit, the release CI, the stop-time restore
 script, and a dev-only advisory/licence cleanup. Verify on real hardware after install.
@@ -5715,6 +5736,12 @@ runtime behaviour change. Pairs with `control-ofc-gui` ≥ v2.0.0.
   re-anchors (DEC-188 activation-epoch bump).
 
 ## [2.2.2] — 2026-06-27
+
+This release also carries **2.2.1**, which was never published on its own —
+its changes (DEC-189: activating a profile clears every standing control-override)
+are listed under
+[2.2.1](https://github.com/Plan-B-Development/control-ofc-daemon/blob/v2.2.2/CHANGELOG.md#221--2026-06-26)
+below.
 
 ### Fixed
 - **Hardware verify can no longer be clobbered by an in-flight engine tick (audit P2-1).** The

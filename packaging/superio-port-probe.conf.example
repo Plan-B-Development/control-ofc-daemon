@@ -5,8 +5,10 @@
 # /dev/port so it can actively probe the Super-I/O configuration ports
 # (0x2E / 0x4E) to identify a motherboard chip whose kernel driver is NOT
 # loaded. Passive detection already covers the common cases; you only need
-# this for an unbound chip that never reached hwmon, /dev/kmsg, or the DMI
-# board table.
+# this for an unbound chip that never reached hwmon or the DMI board table.
+# (Kernel-log detection is no help here: the shipped unit sets
+# ProtectKernelLogs=true, which denies /dev/kmsg, and this drop-in does not
+# lift it.)
 #
 # SECURITY WARNING
 #   CAP_SYS_RAWIO is effectively root-equivalent — it permits raw I/O port

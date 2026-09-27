@@ -5,7 +5,7 @@
 predate the 2.0.0 sole-writer cutover (client-facing PWM writes and lease
 operations were retired then — DEC-165). The transport decision itself stands.
 The SSE (`GET /events`, `text/event-stream`, `SSE_MAX_CLIENTS`, `too_many_clients`)
-details below are **historical** — that endpoint was removed in v2.5.0 (DEC-198);
+details below are **historical** — that endpoint was removed in v2.5.1 (DEC-198; merged as v2.5.0, which was never published);
 it had no consumers.
 
 ## Context
@@ -92,7 +92,7 @@ Implementation:
 
 - `daemon/src/api/server.rs` — router and server bootstrap. (The
   concurrent-client cap it once held was `SSE_MAX_CLIENTS`, removed with
-  `GET /events` in v2.5.0; there is no cap on ordinary requests.)
+  `GET /events` in v2.5.1; there is no cap on ordinary requests.)
 - `daemon/src/api/responses.rs` — error envelope.
 - DEC-024 (GUI repo): "GUI does not consume `/events` in V1; relies on
   1 Hz polling."
