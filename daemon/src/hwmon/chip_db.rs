@@ -830,6 +830,50 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         board_name: "Z890 AORUS MASTER",
         chips: &["it8696", "it87952"],
     },
+    // The rest of the LGA1851 dual-chip SIVs, enrolled at the catalogue-only tier
+    // as "Z790 AORUS XTREME" is (G161, Q19): each SIV has both an `it8696_<siv>`
+    // and an `it87952_<siv>` stanza in the it87 fork's
+    // `Sensors configs/Gigabyte/configs/gigabyte-it87-intel.conf` (626ad08). No
+    // exact-board log. Evidence C. Every name is exact and matches only itself
+    // among the catalogue's 751 board names; the single-chip ELITE WIFI7 / ELITE
+    // DUO X / AERO G / EAGLE siblings reach none of them.
+    // SIV 0xA008090B.
+    DualChipEntry {
+        board_name: "Z890 AORUS ELITE X ICE",
+        chips: &["it8696", "it87952"],
+    },
+    DualChipEntry {
+        board_name: "Z890 AORUS PRO ICE",
+        chips: &["it8696", "it87952"],
+    },
+    // SIV 0xA009090B. "TACHYON ICE" is not a substring of "TACHYON DUO X ICE",
+    // so both are listed.
+    DualChipEntry {
+        board_name: "Z890 AORUS TACHYON ICE",
+        chips: &["it8696", "it87952"],
+    },
+    DualChipEntry {
+        board_name: "Z890 AORUS TACHYON DUO X ICE",
+        chips: &["it8696", "it87952"],
+    },
+    // SIV 0xA00B090B.
+    DualChipEntry {
+        board_name: "Z890 AORUS XTREME AI TOP",
+        chips: &["it8696", "it87952"],
+    },
+    // SIV 0xA108090B (W880 is the workstation chipset of the same socket).
+    DualChipEntry {
+        board_name: "Z890 AI TOP",
+        chips: &["it8696", "it87952"],
+    },
+    DualChipEntry {
+        board_name: "Z890 AERO D",
+        chips: &["it8696", "it87952"],
+    },
+    DualChipEntry {
+        board_name: "W880 AI TOP",
+        chips: &["it8696", "it87952"],
+    },
     // ── LGA1200 / LGA1151 (IT8688E + IT8792E) ──────────────────
     // hw-probe `it8792-isa-0a60` samples; LHM; SIV catalogue. Evidence A.
     // "Z390 AORUS MASTER" also covers the G2 EDITION; "Z390 AORUS PRO" the PRO
@@ -1817,6 +1861,38 @@ mod tests {
         assert!(expected_chips_for_board(gb, "B550M AORUS PRO").is_empty());
         assert!(expected_chips_for_board(gb, "B550I AORUS PRO AX").is_empty());
         assert!(expected_chips_for_board(gb, "Z890 AORUS ELITE WIFI7").is_empty());
+    }
+
+    #[test]
+    fn expected_chips_resolves_the_lga1851_catalogue_enrolments() {
+        // G161 (Q19): every LGA1851 SIV the it87 catalogue gives an `it87952`
+        // stanza is enrolled at the catalogue-only tier.
+        let gb = "Gigabyte Technology Co., Ltd.";
+        let pair = vec!["it8696".to_string(), "it87952".to_string()];
+        for board in [
+            "Z890 AORUS ELITE X ICE",
+            "Z890 AORUS PRO ICE",
+            "Z890 AORUS TACHYON ICE",
+            "Z890 AORUS TACHYON DUO X ICE",
+            "Z890 AORUS XTREME AI TOP",
+            "Z890 AI TOP",
+            "Z890 AERO D",
+            "W880 AI TOP",
+        ] {
+            assert_eq!(expected_chips_for_board(gb, board), pair, "{board}");
+        }
+        // The catalogue's single-chip LGA1851 siblings (IT8696E stanza only) must
+        // stay unmatched, or their owners get a false missing-chip warning.
+        for board in [
+            "Z890 AORUS ELITE WIFI7 ICE",
+            "Z890 AORUS ELITE WIFI7 PLUS",
+            "Z890 AORUS ELITE DUO X",
+            "Z890 AERO G",
+            "Z890 EAGLE WIFI7",
+            "Z890M AORUS ELITE WIFI7",
+        ] {
+            assert!(expected_chips_for_board(gb, board).is_empty(), "{board}");
+        }
     }
 
     #[test]

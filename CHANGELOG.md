@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **Eight more Gigabyte LGA1851 boards are in the dual-chip board table** (DEC-434): the Z890 AORUS
+  XTREME AI TOP, PRO ICE, ELITE X ICE, TACHYON ICE and TACHYON DUO X ICE, the Z890 AI TOP, the Z890 AERO D
+  and the W880 AI TOP. The it87 sensor catalogue gives each an IT8696E and an IT87952E. None has a report
+  in the it87 tracker yet, so the catalogue is the only evidence, as it was for the Z790 AORUS XTREME. On these
+  boards `/diagnostics/hardware` now lists both chips in `expected_chips`, so a missing IT87952E raises the
+  GUI's missing-chip warning. The port probe also skips its Nuvoton unlock there. The packaged
+  Super-I/O guard names them too, which matters only where the firmware reports no board vendor.
+
 ## [2.56.3] — 2026-09-27
 
 ### Changed
