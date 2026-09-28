@@ -342,111 +342,39 @@ pub async fn gpu_verify_handler(
         tokio::task::spawn_blocking(move || {
             let verify_guard = verify_guard;
             let _gpu_write_guard = gpu_write_guard;
-            let read_rpm = |hwmon: &std::path::Path| -> Option<u16> {
-                std::fs::read_to_string(hwmon.join("fan1_input"))
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u16>().ok())
-            };
-
-            let initial_curve = crate::hwmon::gpu_fan::read_fan_curve(&fan_curve_path).ok();
-            let (od_min, od_max) = initial_curve
-                .as_ref()
-                .and_then(|c| c.speed_range)
-                .unwrap_or((15, 100));
-            let initial_state = GpuVerifyState {
-                applied_speed_pct: initial_curve
-                    .as_ref()
-                    .and_then(crate::hwmon::gpu_fan::flat_speed_pct),
-                rpm: read_rpm(&hwmon_path),
-                pwm_enable: None,
-                zero_rpm_enabled: zero_rpm_path
-                    .as_deref()
-                    .and_then(crate::hwmon::gpu_fan::read_zero_rpm_enabled),
-            };
-
-            let test_speed = select_gpu_test_speed(
-                prior_pct.or(initial_state.applied_speed_pct),
-                od_min,
-                od_max,
-            );
-
-            // DEC-435: name the card before the test write, so a crash mid-verify
-            // leaves ExecStopPost a card to reset.
-            task_cache.gpu_handback().note_take(
+            pmfw_verify_sequence(
+                &fan_curve_path,
+                zero_rpm_path.as_deref(),
+                &hwmon_path,
+                prior_pct,
+                &task_cache,
                 &task_fan_id,
-                &fan_curve_path,
-                zero_rpm_path.as_deref(),
-            );
-            // Drive the test speed (disables zero-RPM, clamps to OD_RANGE, commits).
-            if let Err(e) = crate::hwmon::gpu_fan::set_static_speed(
-                &fan_curve_path,
-                zero_rpm_path.as_deref(),
-                test_speed,
-                constants::GPU_PMFW_NUM_CURVE_POINTS,
-            ) {
-                let restore_failed =
-                    restore_pmfw(prior_pct, &fan_curve_path, zero_rpm_path.as_deref());
-                stamp_restored_pct(&task_cache, &task_fan_id, prior_pct, restore_failed);
-                note_pmfw_restored(&task_cache, &task_fan_id, prior_pct, restore_failed);
-                return GpuVerifySequence::WriteFailed {
-                    initial: initial_state,
-                    final_state: GpuVerifyState {
-                        applied_speed_pct: None,
-                        rpm: read_rpm(&hwmon_path),
-                        pwm_enable: None,
-                        zero_rpm_enabled: None,
-                    },
-                    test_speed,
-                    restore_failed,
-                    details: format!(
-                        "The PMFW fan_curve write was rejected by the driver/firmware: {e}. \
-                         Manual fan control is not functional in this state."
-                    ),
-                };
-            }
-            // DEC-297: keep the cache truthful about what was last COMMANDED.
-            // The engine's `apply` coalesces against this value (5% band), so a
-            // cache still reporting the pre-verify duty would suppress the
-            // engine's correction if the restore below ever fails — the strand
-            // would then survive even under an active profile, which is the
-            // opposite of what the register row assumed.
-            task_cache.set_gpu_fan_commanded_pct(&task_fan_id, test_speed);
-
-            // Blocking sleep, deliberately: this task is the uncancellable unit,
-            // and an async sleep would reintroduce the cancellation point the
-            // restructure exists to remove.
-            std::thread::sleep(std::time::Duration::from_secs(
-                constants::VERIFY_WAIT_SECONDS as u64,
-            ));
-
-            let final_curve = crate::hwmon::gpu_fan::read_fan_curve(&fan_curve_path).ok();
-            let final_state = GpuVerifyState {
-                applied_speed_pct: final_curve
-                    .as_ref()
-                    .and_then(crate::hwmon::gpu_fan::flat_speed_pct),
-                rpm: read_rpm(&hwmon_path),
-                pwm_enable: None,
-                zero_rpm_enabled: zero_rpm_path
-                    .as_deref()
-                    .and_then(crate::hwmon::gpu_fan::read_zero_rpm_enabled),
-            };
-
-            // DEC-296 liveness: prove we are still alive and keep the pause for
-            // the restore. Unlike the hwmon verify we hold no lease to lose, so
-            // a supersession cannot break the restore itself — but if the window
-            // lapses with no successor the engine resumes writing and the
-            // restore below races its curve output.
-            let _ = verify_guard.renew(constants::VERIFY_PAUSE_DEADMAN);
-
-            let restore_failed = restore_pmfw(prior_pct, &fan_curve_path, zero_rpm_path.as_deref());
-            stamp_restored_pct(&task_cache, &task_fan_id, prior_pct, restore_failed);
-            note_pmfw_restored(&task_cache, &task_fan_id, prior_pct, restore_failed);
-            GpuVerifySequence::Completed {
-                initial: initial_state,
-                final_state,
-                test_speed,
-                restore_failed,
-            }
+                |speed| {
+                    // Drive the test speed (disables zero-RPM, clamps to OD_RANGE, commits).
+                    crate::hwmon::gpu_fan::set_static_speed(
+                        &fan_curve_path,
+                        zero_rpm_path.as_deref(),
+                        speed,
+                        constants::GPU_PMFW_NUM_CURVE_POINTS,
+                    )
+                },
+                || {
+                    // Blocking sleep, deliberately: this task is the uncancellable unit,
+                    // and an async sleep would reintroduce the cancellation point the
+                    // restructure exists to remove.
+                    std::thread::sleep(std::time::Duration::from_secs(
+                        constants::VERIFY_WAIT_SECONDS as u64,
+                    ))
+                },
+                || {
+                    // DEC-296 liveness: prove we are still alive and keep the pause for
+                    // the restore. Unlike the hwmon verify we hold no lease to lose, so
+                    // a supersession cannot break the restore itself — but if the window
+                    // lapses with no successor the engine resumes writing and the
+                    // restore below races its curve output.
+                    let _ = verify_guard.renew(constants::VERIFY_PAUSE_DEADMAN);
+                },
+            )
         })
     } else {
         // ── Legacy hwmon pwm1 path (pre-RDNA3) ────────────────────────
@@ -584,6 +512,112 @@ fn restore_pmfw(
         log::warn!("verify: GPU PMFW restore failed (fan may be left at test speed): {e}");
     }
     result.is_err()
+}
+
+/// The PMFW (RDNA3+) GPU verify: read, name the card, test write, settle, read
+/// back, restore (DEC-297's uncancellable sequence).
+///
+/// A named function rather than the closure body, as `legacy_verify_sequence`
+/// is, so the hand-back bookkeeping on each arm can be tested (`DC-cq`). Of the
+/// two writes, only the test write is injected: it and the restore write the
+/// same `fan_curve` file, so no sysfs fixture can refuse one and accept the
+/// other. The restore stays
+/// the real `restore_pmfw`. `settle` is the sleep and `renew` the deadman
+/// renewal, in the order the handler has always run them.
+#[allow(clippy::too_many_arguments)]
+fn pmfw_verify_sequence(
+    fan_curve_path: &std::path::Path,
+    zero_rpm_path: Option<&std::path::Path>,
+    hwmon_path: &std::path::Path,
+    prior_pct: Option<u8>,
+    task_cache: &crate::health::cache::StateCache,
+    task_fan_id: &str,
+    test_write: impl FnOnce(u8) -> Result<(), crate::error::HwmonError>,
+    settle: impl FnOnce(),
+    renew: impl FnOnce(),
+) -> GpuVerifySequence {
+    let read_rpm = |hwmon: &std::path::Path| -> Option<u16> {
+        std::fs::read_to_string(hwmon.join("fan1_input"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u16>().ok())
+    };
+
+    let initial_curve = crate::hwmon::gpu_fan::read_fan_curve(fan_curve_path).ok();
+    let (od_min, od_max) = initial_curve
+        .as_ref()
+        .and_then(|c| c.speed_range)
+        .unwrap_or((15, 100));
+    let initial_state = GpuVerifyState {
+        applied_speed_pct: initial_curve
+            .as_ref()
+            .and_then(crate::hwmon::gpu_fan::flat_speed_pct),
+        rpm: read_rpm(hwmon_path),
+        pwm_enable: None,
+        zero_rpm_enabled: zero_rpm_path.and_then(crate::hwmon::gpu_fan::read_zero_rpm_enabled),
+    };
+
+    let test_speed = select_gpu_test_speed(
+        prior_pct.or(initial_state.applied_speed_pct),
+        od_min,
+        od_max,
+    );
+
+    // DEC-435: name the card before the test write, so a crash mid-verify
+    // leaves ExecStopPost a card to reset.
+    task_cache
+        .gpu_handback()
+        .note_take(task_fan_id, fan_curve_path, zero_rpm_path);
+    if let Err(e) = test_write(test_speed) {
+        let restore_failed = restore_pmfw(prior_pct, fan_curve_path, zero_rpm_path);
+        stamp_restored_pct(task_cache, task_fan_id, prior_pct, restore_failed);
+        note_pmfw_restored(task_cache, task_fan_id, prior_pct, restore_failed);
+        return GpuVerifySequence::WriteFailed {
+            initial: initial_state,
+            final_state: GpuVerifyState {
+                applied_speed_pct: None,
+                rpm: read_rpm(hwmon_path),
+                pwm_enable: None,
+                zero_rpm_enabled: None,
+            },
+            test_speed,
+            restore_failed,
+            details: format!(
+                "The PMFW fan_curve write was rejected by the driver/firmware: {e}. \
+                 Manual fan control is not functional in this state."
+            ),
+        };
+    }
+    // DEC-297: keep the cache truthful about what was last COMMANDED.
+    // The engine's `apply` coalesces against this value (5% band), so a
+    // cache still reporting the pre-verify duty would suppress the
+    // engine's correction if the restore below ever fails — the strand
+    // would then survive even under an active profile, which is the
+    // opposite of what the register row assumed.
+    task_cache.set_gpu_fan_commanded_pct(task_fan_id, test_speed);
+
+    settle();
+
+    let final_curve = crate::hwmon::gpu_fan::read_fan_curve(fan_curve_path).ok();
+    let final_state = GpuVerifyState {
+        applied_speed_pct: final_curve
+            .as_ref()
+            .and_then(crate::hwmon::gpu_fan::flat_speed_pct),
+        rpm: read_rpm(hwmon_path),
+        pwm_enable: None,
+        zero_rpm_enabled: zero_rpm_path.and_then(crate::hwmon::gpu_fan::read_zero_rpm_enabled),
+    };
+
+    renew();
+
+    let restore_failed = restore_pmfw(prior_pct, fan_curve_path, zero_rpm_path);
+    stamp_restored_pct(task_cache, task_fan_id, prior_pct, restore_failed);
+    note_pmfw_restored(task_cache, task_fan_id, prior_pct, restore_failed);
+    GpuVerifySequence::Completed {
+        initial: initial_state,
+        final_state,
+        test_speed,
+        restore_failed,
+    }
 }
 
 /// The legacy (pre-RDNA3) GPU verify: read, record, write manual mode, settle,
@@ -1032,6 +1066,92 @@ mod tests {
             );
             note_pmfw_restored(&cache, fan_id, prior, failed);
             assert_eq!(cache.gpu_handback().is_taken(fan_id), kept, "{why}");
+        }
+    }
+
+    /// `DC-cq` (DEC-435's residual): the PMFW verify's `WriteFailed` arm runs the
+    /// same hand-back bookkeeping as its `Completed` arm. The test write is
+    /// refused and the REAL restore runs, so each case's outcome comes from what
+    /// the restore actually did to the file — a regular file for a restore that
+    /// lands, a directory for one that fails.
+    #[test]
+    fn a_refused_pmfw_test_write_hands_back_only_a_card_restored_to_auto() {
+        // (prior, restore fails, kept on the stop list, commanded duty after, why).
+        // A failed restore stamps nothing, and this arm never stamps the test
+        // speed, so the cache then holds no duty for the card.
+        let cases = [
+            (
+                None,
+                false,
+                false,
+                Some(0),
+                "restored to auto: off the stop list",
+            ),
+            (
+                Some(40),
+                false,
+                true,
+                Some(40),
+                "restored to the engine's prior duty: still the daemon's",
+            ),
+            (
+                None,
+                true,
+                true,
+                None,
+                "the restore failed: the stop must reset it",
+            ),
+        ];
+        for (prior, restore_fails, kept, commanded, why) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let curve = dir.path().join("fan_curve");
+            if restore_fails {
+                std::fs::create_dir(&curve).unwrap();
+            } else {
+                std::fs::write(&curve, "0: 0C 40%\n").unwrap();
+            }
+            let cache = crate::health::cache::StateCache::new();
+            let fan_id = "amd_gpu:0000:03:00.0";
+            let taken_at_write = std::cell::Cell::new(false);
+            let sequence = pmfw_verify_sequence(
+                &curve,
+                None,
+                dir.path(),
+                prior,
+                &cache,
+                fan_id,
+                |_| {
+                    taken_at_write.set(cache.gpu_handback().is_taken(fan_id));
+                    Err(crate::error::HwmonError::WriteError {
+                        path: "fan_curve".into(),
+                        message: "EINVAL".into(),
+                    })
+                },
+                || panic!("a refused test write must not settle"),
+                || panic!("a refused test write must not renew"),
+            );
+            assert!(
+                taken_at_write.get(),
+                "precondition ({why}): the card is on the stop list when the test write runs"
+            );
+            assert!(
+                matches!(
+                    sequence,
+                    GpuVerifySequence::WriteFailed { restore_failed, .. }
+                        if restore_failed == restore_fails
+                ),
+                "precondition ({why}): the WriteFailed arm ran with this restore outcome"
+            );
+            assert_eq!(cache.gpu_handback().is_taken(fan_id), kept, "{why}");
+            assert_eq!(
+                cache
+                    .snapshot()
+                    .gpu_fans
+                    .get(fan_id)
+                    .and_then(|f| f.last_commanded_pct),
+                commanded,
+                "{why}: the restore's duty must be stamped as the Completed arm stamps it"
+            );
         }
     }
 
