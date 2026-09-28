@@ -82,6 +82,12 @@
 
 ### Fixed
 
+- **The RX 6000-and-older fan test gives the card back as it found it** (DEC-447, `TS-bi`, `TS-bj`).
+  After a test whose restore failed, the next test put the card back in manual mode at the old
+  test speed (75–100 %), because it restored to the last speed the daemon had written; it now
+  restores to the state the card was first found in — usually automatic — and gives it back. A
+  card another tool had in manual mode at a speed is recorded with that speed, so a daemon crash
+  during the test gives it back at that speed too, not at the test speed.
 - **`/capabilities` no longer reports a pre-RDNA3 AMD GPU as writable** (DEC-445, `DC-ch`). The
   profile engine drives GPU fans through the PMFW fan curve only, so an RX 6000 or older card —
   whose legacy `pwm1` the GPU fan verify and reset use — was never driven by a profile, while

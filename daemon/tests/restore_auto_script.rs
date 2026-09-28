@@ -253,7 +253,9 @@ fn no_record_writes_nothing() {
 /// writer, so the line format the script parses is the one production writes.
 #[test]
 fn a_gpu_record_is_replayed_and_an_unrecorded_card_is_untouched() {
-    use control_ofc_daemon::hwmon::gpu_fan::{note_legacy_take, GPU_RECORD_FILE_NAME};
+    use control_ofc_daemon::hwmon::gpu_fan::{
+        note_legacy_take, LegacyOriginal, GPU_RECORD_FILE_NAME,
+    };
     let t = Tree::new();
     let card = |n: u8| {
         let dir = t.sys.join(format!("class/hwmon/hwmon{n}"));
@@ -266,7 +268,7 @@ fn a_gpu_record_is_replayed_and_an_unrecorded_card_is_untouched() {
     let verified = card(1);
     let other = card(2);
     let record = t.run.join(GPU_RECORD_FILE_NAME);
-    note_legacy_take(&record, &verified, Some(2));
+    note_legacy_take(&record, &verified, LegacyOriginal::Mode(2));
     // Presence first: the writer produced a line the script can see.
     assert!(
         std::fs::read_to_string(&record)
@@ -287,6 +289,40 @@ fn a_gpu_record_is_replayed_and_an_unrecorded_card_is_untouched() {
         read(&other.join("pwm1_enable")),
         "1",
         "a card no record line names must not be touched"
+    );
+}
+
+/// [SAFETY] DEC-447 (`TS-bj`): a card another tool had in manual at a duty,
+/// which the daemon died verifying, gets that duty back — not only manual mode
+/// at the verify's test speed, which a `mode 1` line used to leave it at. The
+/// line is written by the daemon's own writer from what the verify reads.
+#[test]
+fn a_gpu_found_in_manual_gets_its_duty_back_after_a_crash() {
+    use control_ofc_daemon::hwmon::gpu_fan::{
+        note_legacy_take, LegacyOriginal, GPU_RECORD_FILE_NAME,
+    };
+    let t = Tree::new();
+    let card = t.sys.join("class/hwmon/hwmon1");
+    std::fs::create_dir_all(&card).unwrap();
+    std::fs::write(card.join("name"), "amdgpu\n").unwrap();
+    let record = t.run.join(GPU_RECORD_FILE_NAME);
+    note_legacy_take(
+        &record,
+        &card,
+        LegacyOriginal::from_read(Some(1), Some(120)),
+    );
+    // The crash left the verify's test speed on it.
+    std::fs::write(card.join("pwm1_enable"), "1\n").unwrap();
+    std::fs::write(card.join("pwm1"), "191\n").unwrap();
+
+    let out = t.run_script();
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(read(&card.join("pwm1_enable")), "1", "manual, as found");
+    assert_eq!(
+        read(&card.join("pwm1")),
+        "120",
+        "the other tool's duty, not the verify's test speed"
     );
 }
 

@@ -25,10 +25,11 @@
 # DEC-414 (TS-aa): a second record, gpu-handback, in the same line format. The
 # legacy (pre-RDNA3) GPU verify is the one path that puts an amdgpu fan in
 # manual mode (pwm1_enable=1), and amdgpu is outside the hwmon ledger by design,
-# so the verify records the card's original mode there before its write and
-# drops the line once it has restored the fan. A line still present here is a
-# verify that did not finish: its card gets its original mode back. A card no
-# line names -- including one another tool put in manual mode -- is not touched.
+# so the verify records the card's original there before its write -- its mode,
+# or "manual <raw>" with its duty when another tool had it in manual (DEC-447) --
+# and drops the line once it has restored the fan. A line still present here is
+# a verify that did not finish: its card gets its original back. A card no line
+# names -- including one another tool put in manual mode -- is not touched.
 #
 # DEC-435 (DC-aa): a third record, gpu-pmfw-handback, for RDNA3+ cards driven
 # through the PMFW fan_curve interface; see the loop at the end.
