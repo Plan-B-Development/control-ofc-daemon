@@ -23,7 +23,9 @@
 //! Identical to the control-path store, deliberately: the key is the header's
 //! **stable id**, which embeds chip, device, `pwmN` and label. Swap the board or
 //! change the driver and the id changes with it, so a stale record stops matching
-//! any live header and [`PwmBaselineStore::prune_to_live`] drops it at boot.
+//! any live header and [`PwmBaselineStore::prune_to_live`] drops it at boot. The
+//! it87 v2.0 board suffix is not such a change: a suffixed record is re-keyed at
+//! load (DEC-442).
 //!
 //! # Bounds
 //!
@@ -83,6 +85,16 @@ pub struct PwmBaselineStore {
 }
 
 impl PwmBaselineStore {
+    /// Re-key every record by canonical header id (DEC-442) — see
+    /// `chip_name::canonicalize_keyed`.
+    pub fn canonicalize_ids(mut self) -> Self {
+        self.records = crate::hwmon::chip_name::canonicalize_keyed(
+            std::mem::take(&mut self.records),
+            |id, r| r.header_id = id.to_string(),
+        );
+        self
+    }
+
     pub fn get(&self, header_id: &str) -> Option<&PwmBaselineRecord> {
         self.records.get(header_id)
     }
@@ -208,7 +220,7 @@ pub fn load_from(dir: &Path) -> PwmBaselineStore {
     }
     match atomic_io::read_to_string_with_cap(&path, constants::PWM_BASELINES_MAX_BYTES) {
         Ok(text) => match serde_json::from_str::<PwmBaselineStore>(&text) {
-            Ok(store) => store,
+            Ok(store) => store.canonicalize_ids(),
             Err(e) => {
                 log::warn!(
                     "PWM baseline store {} will not parse ({e}); starting empty",
@@ -438,5 +450,23 @@ mod tests {
         std::fs::write(store_path_in(&dir), "{not json").expect("write");
         assert!(load_from(&dir).records.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `BRD-a`: see `control_paths`' twin — a baseline a pre-DEC-442 daemon
+    /// saved under the suffixed spelling survives the boot prune, re-keyed.
+    #[test]
+    fn a_suffixed_baseline_survives_the_boot_prune_under_its_canonical_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let suffixed = "hwmon:it8696_a008090a:it87.2624:pwm5:pwm5";
+        let canonical = "hwmon:it8696:it87.2624:pwm5:pwm5";
+        let mut store = PwmBaselineStore::default();
+        store
+            .records
+            .insert(suffixed.into(), rec(suffixed, &[(50, 900, 950)], 1));
+        save_to(dir.path(), &store).unwrap();
+
+        let mut loaded = load_from(dir.path());
+        assert_eq!(loaded.prune_to_live(&[canonical.to_string()]), 0);
+        assert_eq!(loaded.get(canonical).unwrap().header_id, canonical);
     }
 }

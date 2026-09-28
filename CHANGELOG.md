@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Fan ids survive the it87 v2.0 driver rename** (DEC-442). `it87-dkms-git` builds from 2026-09-09
+  name Gigabyte chips after the board's ID, for example `it8696_a008090a` instead of `it8696`. Every
+  fan header, sensor and voltage id embeds the chip name, so the rebuild used to change all of them
+  and orphan pump roles, profile members, preferred sensors and cooling devices. The daemon now
+  strips that suffix where it reads the chip name, so the ids stay what they were. Anything an older
+  daemon saved under the new names is read back under the old ones: header roles (where both
+  spellings carry a role, the more protective one wins), preferred sensors, cooling devices,
+  profiles, and the control-path and PWM-baseline records, which the boot clean-up no longer
+  deletes. Your files are not rewritten; the next change you make to a setting saves it under the
+  canonical id. The Super-I/O report no longer shows a phantom unbound chip beside the renamed one,
+  and its advice no longer tells you to re-check your ids.
+- **`/hwmon/headers` reports the chip name as sysfs published it** (DEC-442), as `sysfs_chip_name`,
+  beside the canonical `chip_name`. `chips_detected` on `/diagnostics/hardware` carries it too. A
+  client matching `/etc/sensors.d` blocks needs this spelling. New capability
+  `control.canonical_chip_names`.
+- **`GET /profiles/{id}` serves canonical fan and sensor ids** (DEC-442). A profile stored with the
+  new chip names is served under the ids `/hwmon/headers` publishes, so a client comparing the two
+  does not mistake its fans for missing ones. The stored file is left as it is, and every other
+  field is served as stored.
+
 ### Changed
 
 - **The upgrade notice about the Super-I/O guard appears once** (DEC-441). It now shows only when

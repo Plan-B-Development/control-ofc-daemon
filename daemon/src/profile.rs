@@ -276,11 +276,100 @@ fn evaluate_trigger_stateless(curve: &CurveConfig, temp_c: f64) -> f64 {
     }
 }
 
+/// Canonicalise every hwmon id a profile document names (DEC-442).
+///
+/// A daemon before DEC-442 running an it87 v2.0 driver published — and a
+/// client saved into profiles — member and sensor ids carrying the suffixed
+/// chip spelling (`hwmon:it8696_a008090a:…`), which discovery no longer
+/// publishes. Rewrites `controls[].members[].member_id` and
+/// `curves[].sensor_id` in place; every other field, known or not, is left
+/// exactly as it was, so the stored document stays lossless.
+///
+/// Two members of one control whose *different* spellings collapse to the
+/// same id keep **one**: the one whose label names a pump or CPU (it carries
+/// the 30% floor), otherwise the suffixed one, which can only have been
+/// written after the rebuild. Members that were already spelled identically
+/// are left as they were — that is not this function's business.
+///
+/// Operates on the JSON document rather than on [`DaemonProfile`] so the same
+/// rule serves the engine's load path, the API's write path, which stores the
+/// raw body, and `GET /profiles/{id}`. Linear in the member count: a POST body
+/// reaches this before `validate()` bounds anything.
+pub fn canonicalize_profile_document(doc: &mut serde_json::Value) {
+    use crate::hwmon::chip_name::{canonical_hwmon_id, is_suffixed_hwmon_id};
+
+    if let Some(controls) = doc.get_mut("controls").and_then(|v| v.as_array_mut()) {
+        for control in controls {
+            let Some(members) = control.get_mut("members").and_then(|v| v.as_array_mut()) else {
+                continue;
+            };
+            let mut kept: Vec<serde_json::Value> = Vec::with_capacity(members.len());
+            // canonical id -> (index into `kept`, the raw spelling kept there)
+            let mut first: HashMap<String, (usize, String)> = HashMap::new();
+            for mut member in std::mem::take(members) {
+                let Some(raw) = member.get("member_id").and_then(|v| v.as_str()) else {
+                    kept.push(member);
+                    continue;
+                };
+                let raw = raw.to_string();
+                let suffixed = is_suffixed_hwmon_id(&raw);
+                let canonical = canonical_hwmon_id(&raw).into_owned();
+                member["member_id"] = serde_json::Value::String(canonical.clone());
+                let at = match first.get(&canonical) {
+                    Some((at, kept_raw)) if *kept_raw != raw => *at,
+                    // First sighting, or an identical spelling repeated.
+                    found => {
+                        if found.is_none() {
+                            first.insert(canonical, (kept.len(), raw));
+                        }
+                        kept.push(member);
+                        continue;
+                    }
+                };
+                let floored = |m: &serde_json::Value| {
+                    serde_json::from_value::<ControlMember>(m.clone())
+                        .is_ok_and(|m| member_is_pump_or_cpu(&m))
+                };
+                let (new_floored, kept_floored) = (floored(&member), floored(&kept[at]));
+                let takes_over =
+                    (new_floored && !kept_floored) || (new_floored == kept_floored && suffixed);
+                log::warn!(
+                    "A control names header '{canonical}' under two chip spellings; keeping \
+                     the {} member (DEC-442)",
+                    if takes_over { "later" } else { "earlier" }
+                );
+                if takes_over {
+                    kept[at] = member;
+                    if let Some(entry) = first.get_mut(&canonical) {
+                        entry.1 = raw;
+                    }
+                }
+            }
+            *members = kept;
+        }
+    }
+    if let Some(curves) = doc.get_mut("curves").and_then(|v| v.as_array_mut()) {
+        for curve in curves {
+            let canonical = match curve.get("sensor_id").and_then(|v| v.as_str()) {
+                Some(raw) if is_suffixed_hwmon_id(raw) => canonical_hwmon_id(raw).into_owned(),
+                _ => continue,
+            };
+            curve["sensor_id"] = serde_json::Value::String(canonical);
+        }
+    }
+}
+
 /// Load a profile from a JSON file.
+///
+/// Hwmon ids are canonicalised on the way in (DEC-442,
+/// [`canonicalize_profile_document`]); the file itself is never rewritten.
 pub fn load_profile(path: &Path) -> Result<DaemonProfile, String> {
     let content = crate::atomic_io::read_to_string_capped(path)
         .map_err(|e| format!("failed to read profile '{}': {e}", path.display()))?;
-    let profile: DaemonProfile = serde_json::from_str(&content)
+    let mut doc: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| format!("failed to parse profile '{}': {e}", path.display()))?;
+    canonicalize_profile_document(&mut doc);
+    let profile: DaemonProfile = serde_json::from_value(doc)
         .map_err(|e| format!("failed to parse profile '{}': {e}", path.display()))?;
     // Recursion bound (see MAX_PROFILE_CURVES). The boot paths (CLI --profile and
     // persisted-state restore) deliberately skip validate(), so this load-time
@@ -2803,5 +2892,108 @@ mod tests {
         let details = report.field_violations_json();
         assert!(details["field_violations"].is_array());
         assert!(!details["field_violations"].as_array().unwrap().is_empty());
+    }
+
+    // ── DEC-442: the it87 v2.0 chip suffix in a stored profile ──────────
+
+    fn two_spellings(bare_label: &str, suffixed_label: &str) -> Vec<serde_json::Value> {
+        let mut doc = serde_json::json!({
+            "controls": [{"id": "c", "members": [
+                {"source": "hwmon", "member_id": "hwmon:it8696:it87.2624:pwm5:pwm5",
+                 "member_label": bare_label},
+                {"source": "hwmon", "member_id": "hwmon:it8696_a008090a:it87.2624:pwm5:pwm5",
+                 "member_label": suffixed_label},
+            ]}],
+        });
+        canonicalize_profile_document(&mut doc);
+        doc["controls"][0]["members"].as_array().unwrap().clone()
+    }
+
+    /// Two spellings of one header collapse to ONE member: the one whose label
+    /// carries the pump/CPU floor, else the suffixed (post-rebuild) one.
+    #[test]
+    fn two_spellings_of_one_member_keep_the_floored_one_else_the_suffixed_one() {
+        for (bare, suffixed, kept) in [
+            ("CPU_FAN", "Rear", "CPU_FAN"),
+            ("Rear", "AIO Pump", "AIO Pump"),
+            ("Rear", "Front", "Front"),
+            ("Pump", "CPU", "CPU"),
+        ] {
+            let members = two_spellings(bare, suffixed);
+            assert_eq!(members.len(), 1, "{bare}/{suffixed}");
+            assert_eq!(members[0]["member_label"], kept, "{bare}/{suffixed}");
+            assert_eq!(members[0]["member_id"], "hwmon:it8696:it87.2624:pwm5:pwm5");
+        }
+    }
+
+    /// Only DIFFERENT spellings collapse. Members already spelled identically
+    /// are left as they were — the rename is not a licence to dedupe — and a
+    /// later spelling still collapses against the member that was kept.
+    #[test]
+    fn identical_spellings_are_not_collapsed() {
+        let bare = "hwmon:it8696:it87.2624:pwm5:pwm5";
+        let suffixed = "hwmon:it8696_a008090a:it87.2624:pwm5:pwm5";
+        for id in [bare, suffixed] {
+            let mut doc = serde_json::json!({"controls": [{"id": "c", "members": [
+                {"source": "hwmon", "member_id": id, "member_label": "A"},
+                {"source": "hwmon", "member_id": id, "member_label": "B"},
+            ]}]});
+            canonicalize_profile_document(&mut doc);
+            let members = doc["controls"][0]["members"].as_array().unwrap();
+            assert_eq!(
+                members.len(),
+                2,
+                "{id}: an identical repeat is not a rename"
+            );
+            assert_eq!(members[1]["member_label"], "B");
+        }
+
+        let mut doc = serde_json::json!({"controls": [{"id": "c", "members": [
+            {"source": "hwmon", "member_id": bare, "member_label": "Rear"},
+            {"source": "hwmon", "member_id": suffixed, "member_label": "Front"},
+            {"source": "hwmon", "member_id": bare, "member_label": "Top"},
+        ]}]});
+        canonicalize_profile_document(&mut doc);
+        let members = doc["controls"][0]["members"].as_array().unwrap();
+        assert_eq!(members.len(), 1, "{members:?}");
+        assert_eq!(members[0]["member_label"], "Front");
+    }
+
+    /// The engine's own load path: a profile file a pre-DEC-442 client saved
+    /// with suffixed ids reaches the engine under the ids discovery publishes,
+    /// and the file on disk is left as it was.
+    #[test]
+    fn load_profile_canonicalises_hwmon_ids_without_rewriting_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.json");
+        let text = serde_json::json!({
+            "id": "p", "name": "P", "version": 7,
+            "controls": [{"id": "c", "name": "C", "curve_id": "k", "members": [
+                {"source": "hwmon",
+                 "member_id": "hwmon:it87952_a008090a:it87.2640:pwm1:pwm1"},
+                {"source": "openfan", "member_id": "openfan:ch03"},
+            ]}],
+            "curves": [{"id": "k", "name": "K", "type": "graph",
+                        "sensor_id": "hwmon:it8696_a008090a:it87.2624:temp1"}],
+        })
+        .to_string();
+        std::fs::write(&path, &text).unwrap();
+
+        let profile = load_profile(&path).unwrap();
+        let ids: Vec<&str> = profile.controls[0]
+            .members
+            .iter()
+            .map(|m| m.member_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["hwmon:it87952:it87.2640:pwm1:pwm1", "openfan:ch03"]
+        );
+        assert_eq!(profile.curves[0].sensor_id, "hwmon:it8696:it87.2624:temp1");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            text,
+            "file untouched"
+        );
     }
 }

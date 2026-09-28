@@ -359,14 +359,21 @@ pub async fn list_profiles_handler(
     )
 }
 
-/// GET /profiles/{id} — fetch one profile's full document (lossless).
+/// GET /profiles/{id} — fetch one profile's full document, lossless except
+/// that hwmon ids are canonicalised (DEC-442): a document stored with the it87
+/// v2.0 suffixed chip spelling is served with the ids discovery publishes, so a
+/// client comparing its members against `/hwmon/headers` does not see them as
+/// missing. The file itself is not rewritten.
 pub async fn get_profile_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let dirs = state.profile_search_dirs.read().clone();
     match crate::profile_store::get_raw(&dirs, &id) {
-        Some(value) => (StatusCode::OK, Json(value)),
+        Some(mut value) => {
+            crate::profile::canonicalize_profile_document(&mut value);
+            (StatusCode::OK, Json(value))
+        }
         None => error_response(
             StatusCode::NOT_FOUND,
             &ErrorEnvelope::validation(format!("profile '{id}' not found")),
@@ -412,6 +419,13 @@ async fn validate_and_store(
             )
         }
     }
+
+    // DEC-442: canonicalise hwmon ids before validating and storing, so a
+    // member or sensor carrying the it87 v2.0 suffixed chip spelling is stored
+    // under the id discovery publishes. Every other field is untouched.
+    let mut body = body.clone();
+    crate::profile::canonicalize_profile_document(&mut body);
+    let body = &body;
 
     // Parse into the model to validate (storage keeps the raw document).
     let profile: crate::profile::DaemonProfile = match serde_json::from_value(body.clone()) {

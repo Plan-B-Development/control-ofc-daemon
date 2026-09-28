@@ -463,7 +463,19 @@ pub struct ValidationSessionSummary {
 pub struct PwmHeaderEntry {
     pub id: String,
     pub label: String,
+    /// Canonical chip name — the one embedded in `id`. On an it87 v2.0
+    /// Gigabyte chip the driver's board suffix is stripped (DEC-442), so this is
+    /// `it8696`, not the sysfs `it8696_a008090a`; compare hardware tables
+    /// against this.
     pub chip_name: String,
+    /// The hwmon `name` attribute exactly as sysfs published it (DEC-442,
+    /// daemon >= the release that carries it). Differs from `chip_name` only on
+    /// an it87 v2.0 Gigabyte chip. **Match `/etc/sensors.d` `chip "…"` blocks
+    /// against this and nothing else** — upstream writes those against the
+    /// suffixed name, and matching them against `chip_name` would apply another
+    /// board's labels. Never build or compare an id from it. Older daemons omit
+    /// it; consumers fall back to `chip_name`.
+    pub sysfs_chip_name: String,
     /// Device identifier (PCI BDF or platform device name).
     pub device_id: String,
     pub pwm_index: u8,
@@ -583,6 +595,7 @@ impl PwmHeaderEntry {
             id: h.id.clone(),
             label: h.label.clone(),
             chip_name: h.chip_name.clone(),
+            sysfs_chip_name: h.sysfs_chip_name().to_string(),
             device_id: h.device_id.clone(),
             pwm_index: h.pwm_index,
             supports_enable: h.supports_enable,
@@ -1165,6 +1178,17 @@ pub struct ControlCapability {
     /// token with a 400.
     #[serde(default)]
     pub stall_probe: bool,
+    /// Every hwmon chip name and every id built from one is canonical: the
+    /// it87 v2.0 board suffix (`it8696_a008090a`) is stripped where the name is
+    /// read, stored ids saved under the suffixed spelling are canonicalised on
+    /// read and on every incoming write, and `/hwmon/headers` carries the sysfs
+    /// spelling as `sysfs_chip_name` (DEC-442, `BRD-a`).
+    ///
+    /// A client gates its "a driver rebuild changes your ids" caution on this:
+    /// on an older daemon an it87 v2.0 rebuild still renames every id, and the
+    /// caution is true there. Absent means an older daemon.
+    #[serde(default)]
+    pub canonical_chip_names: bool,
 }
 
 /// Per-device-group capability info.
@@ -1682,7 +1706,12 @@ pub struct HwmonDiagnostics {
 /// Per-chip identification and driver info.
 #[derive(Debug, Clone, Serialize)]
 pub struct HwmonChipInfo {
+    /// Canonical chip name (DEC-442) — compare `expected_chips` against this.
     pub chip_name: String,
+    /// The chip's hwmon `name` exactly as sysfs published it; differs from
+    /// `chip_name` only on an it87 v2.0 Gigabyte chip (DEC-442). Display and
+    /// support-report only.
+    pub sysfs_chip_name: String,
     pub device_id: String,
     pub expected_driver: String,
     pub in_mainline_kernel: bool,
@@ -2517,6 +2546,7 @@ mod tests {
             id: "hwmon:it8696:pci0:pwm3:AIO_PUMP".into(),
             label: "AIO_PUMP".into(),
             chip_name: "it8696".into(),
+            sysfs_chip_name: "it8696_a008090a".into(),
             device_id: "pci0".into(),
             pwm_index: 3,
             supports_enable: true,

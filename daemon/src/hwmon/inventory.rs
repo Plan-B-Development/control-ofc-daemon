@@ -91,9 +91,9 @@ pub fn discover_monitor_only_fans(
 fn discover_device_monitor_only_fans(
     hwmon_dir: &Path,
 ) -> Result<Vec<FanInputDescriptor>, HwmonError> {
-    let chip_name = read_sysfs_string(&hwmon_dir.join("name"))?
-        .trim()
-        .to_string();
+    // Canonical: the it87 v2.0 board suffix is stripped here, so the ids
+    // built below match the ones saved before that driver's rename (DEC-442).
+    let chip_name = crate::hwmon::chip_name::read_chip_name(hwmon_dir)?.canonical;
 
     // GPU-owned fans are never surfaced in the hwmon inventory — consistent
     // with `pwm_discovery`. amdgpu (DEC-102) and nouveau (DEC-204) fan RPM is

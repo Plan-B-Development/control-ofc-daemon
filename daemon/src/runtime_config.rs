@@ -580,33 +580,42 @@ impl RuntimeConfig {
         self.startup = Some(RuntimeStartup { delay_secs: delay });
     }
 
-    /// Preferred CPU temperature sensor (stable id), if set.
-    pub fn preferred_cpu_sensor(&self) -> Option<&str> {
+    /// Preferred CPU temperature sensor (stable id), if set — canonical: an id
+    /// saved under the it87 v2.0 suffixed chip spelling is returned without the
+    /// suffix, matching what discovery publishes (DEC-442).
+    pub fn preferred_cpu_sensor(&self) -> Option<String> {
         self.hardware
             .as_ref()
             .and_then(|h| h.preferred_cpu_sensor.as_deref())
+            .map(|id| crate::hwmon::chip_name::canonical_hwmon_id(id).into_owned())
     }
 
-    /// Preferred case/motherboard temperature sensor (stable id), if set.
-    pub fn preferred_mb_sensor(&self) -> Option<&str> {
+    /// Preferred case/motherboard temperature sensor (stable id), if set —
+    /// canonical, as [`Self::preferred_cpu_sensor`].
+    pub fn preferred_mb_sensor(&self) -> Option<String> {
         self.hardware
             .as_ref()
             .and_then(|h| h.preferred_mb_sensor.as_deref())
+            .map(|id| crate::hwmon::chip_name::canonical_hwmon_id(id).into_owned())
     }
 
     /// Set (or clear, with `None`) the preferred CPU sensor. Preserves the mb
     /// selection; drops the whole `[hardware]` section when both are cleared.
+    /// The id is stored canonical (DEC-442).
     pub fn set_preferred_cpu_sensor(&mut self, id: Option<String>) {
         let mut hw = self.hardware.take().unwrap_or_default();
-        hw.preferred_cpu_sensor = id;
+        hw.preferred_cpu_sensor =
+            id.map(|id| crate::hwmon::chip_name::canonical_hwmon_id(&id).into_owned());
         self.hardware = if hw.is_empty() { None } else { Some(hw) };
     }
 
     /// Set (or clear, with `None`) the preferred motherboard sensor. Preserves
     /// the CPU selection; drops the `[hardware]` section when both are cleared.
+    /// The id is stored canonical (DEC-442).
     pub fn set_preferred_mb_sensor(&mut self, id: Option<String>) {
         let mut hw = self.hardware.take().unwrap_or_default();
-        hw.preferred_mb_sensor = id;
+        hw.preferred_mb_sensor =
+            id.map(|id| crate::hwmon::chip_name::canonical_hwmon_id(&id).into_owned());
         self.hardware = if hw.is_empty() { None } else { Some(hw) };
     }
 
@@ -623,25 +632,61 @@ impl RuntimeConfig {
     /// Dropping is the honest middle: the assignment is gone, the log says so,
     /// and the header falls back to its inferred role, which is the same state
     /// it was in before anyone assigned anything.
+    ///
+    /// **Keys are canonicalised (DEC-442).** A daemon before DEC-442 running an
+    /// it87 v2.0 driver saved assignments under the suffixed chip spelling
+    /// (`hwmon:it8696_a008090a:…`), which discovery no longer publishes; read
+    /// raw, such an assignment would silently stop matching and a pump assigned
+    /// that way would lose its floor. When both spellings of one header carry an
+    /// assignment, **the more protective role wins** — pump, then CPU fan, then
+    /// the rest — and on a tie the suffixed entry, which can only have been
+    /// written after the rebuild. The file is never rewritten here; the next
+    /// `POST /config/header-role` for that header replaces both spellings.
     pub fn header_roles_parsed(&self) -> HashMap<String, crate::hwmon::roles::HeaderRole> {
+        use crate::hwmon::roles::HeaderRole;
+        use std::collections::hash_map::Entry;
+
         let Some(hw) = self.hardware.as_ref() else {
             return HashMap::new();
         };
-        hw.header_roles
-            .iter()
-            .filter_map(
-                |(id, token)| match crate::hwmon::roles::HeaderRole::from_token(token) {
-                    Some(role) => Some((id.clone(), role)),
-                    None => {
-                        log::warn!(
-                            "Ignoring unrecognised header role '{token}' for '{id}' in \
-                             runtime configuration — the header keeps its detected role"
-                        );
-                        None
+        // (role, came from a suffixed key) per canonical id.
+        let mut out: HashMap<String, (HeaderRole, bool)> = HashMap::new();
+        for (id, token) in &hw.header_roles {
+            let Some(role) = HeaderRole::from_token(token) else {
+                log::warn!(
+                    "Ignoring unrecognised header role '{token}' for '{id}' in \
+                     runtime configuration — the header keeps its detected role"
+                );
+                continue;
+            };
+            let canonical = crate::hwmon::chip_name::canonical_hwmon_id(id);
+            let suffixed = matches!(canonical, std::borrow::Cow::Owned(_));
+            match out.entry(canonical.into_owned()) {
+                Entry::Vacant(slot) => {
+                    slot.insert((role, suffixed));
+                }
+                Entry::Occupied(mut slot) => {
+                    let (kept, kept_suffixed) = *slot.get();
+                    let takes_over = role_protection_rank(role) > role_protection_rank(kept)
+                        || (role_protection_rank(role) == role_protection_rank(kept)
+                            && suffixed
+                            && !kept_suffixed);
+                    let winner = if takes_over { role } else { kept };
+                    log::warn!(
+                        "Header '{}' has a role saved under two chip spellings ('{}' and \
+                         '{}'); using '{}' (DEC-442: the more protective role wins)",
+                        slot.key(),
+                        kept.as_str(),
+                        role.as_str(),
+                        winner.as_str()
+                    );
+                    if takes_over {
+                        slot.insert((role, suffixed));
                     }
-                },
-            )
-            .collect()
+                }
+            }
+        }
+        out.into_iter().map(|(id, (role, _))| (id, role)).collect()
     }
 
     /// Every configured cooling device, with unusable entries dropped.
@@ -649,8 +694,18 @@ impl RuntimeConfig {
     /// Sanitised on **read** rather than on load, matching `header_roles_parsed`:
     /// a hand-edited file keeps its good devices, one bad device costs only
     /// itself, and nothing rewrites the user's file behind their back.
+    ///
+    /// Member and sensor ids are canonicalised first (DEC-442), so a device
+    /// saved under the it87 v2.0 suffixed chip spelling still names the headers
+    /// discovery publishes.
     pub fn cooling_devices(&self) -> Vec<crate::hwmon::cooling_device::CoolingDeviceConfig> {
-        crate::hwmon::cooling_device::sanitize(self.cooling_devices.clone())
+        crate::hwmon::cooling_device::sanitize(
+            self.cooling_devices
+                .iter()
+                .cloned()
+                .map(crate::hwmon::cooling_device::canonicalize_ids)
+                .collect(),
+        )
     }
 
     /// Create or replace a cooling device, keyed by id. Returns false when the
@@ -700,14 +755,14 @@ impl RuntimeConfig {
         role: Option<crate::hwmon::roles::HeaderRole>,
     ) {
         let mut hw = self.hardware.take().unwrap_or_default();
-        match role {
-            Some(r) => {
-                hw.header_roles
-                    .insert(header_id.to_string(), r.as_str().into());
-            }
-            None => {
-                hw.header_roles.remove(header_id);
-            }
+        // DEC-442: an assignment saved under the it87 v2.0 suffixed spelling is
+        // the same header. Remove every spelling, so a clear really clears and a
+        // set leaves exactly one entry, under the canonical id.
+        let canonical = crate::hwmon::chip_name::canonical_hwmon_id(header_id).into_owned();
+        hw.header_roles
+            .retain(|id, _| crate::hwmon::chip_name::canonical_hwmon_id(id) != canonical);
+        if let Some(r) = role {
+            hw.header_roles.insert(canonical, r.as_str().into());
         }
         self.hardware = if hw.is_empty() { None } else { Some(hw) };
     }
@@ -770,6 +825,18 @@ impl RuntimeConfig {
         let mut d = self.detection.take().unwrap_or_default();
         d.enable_nvidia_telemetry = enable;
         self.detection = if d.is_empty() { None } else { Some(d) };
+    }
+}
+
+/// How protective an assigned role is, for choosing between two spellings of
+/// one header (DEC-442): a pump (30% floor, never stopped), then a CPU fan
+/// (30% floor), then everything else.
+fn role_protection_rank(role: crate::hwmon::roles::HeaderRole) -> u8 {
+    use crate::hwmon::roles::HeaderRole;
+    match role {
+        HeaderRole::Pump => 2,
+        HeaderRole::CpuFan => 1,
+        HeaderRole::Unknown | HeaderRole::RadiatorFan | HeaderRole::ChassisFan => 0,
     }
 }
 
@@ -1042,8 +1109,14 @@ mod tests {
         cfg.save_to(&path).unwrap();
 
         let loaded = RuntimeConfig::load_from(&path);
-        assert_eq!(loaded.preferred_cpu_sensor(), Some("hwmon:k10temp:x:Tctl"));
-        assert_eq!(loaded.preferred_mb_sensor(), Some("hwmon:nct6798:x:SYSTIN"));
+        assert_eq!(
+            loaded.preferred_cpu_sensor().as_deref(),
+            Some("hwmon:k10temp:x:Tctl")
+        );
+        assert_eq!(
+            loaded.preferred_mb_sensor().as_deref(),
+            Some("hwmon:nct6798:x:SYSTIN")
+        );
     }
 
     #[test]
@@ -1052,8 +1125,8 @@ mod tests {
         cfg.set_preferred_cpu_sensor(Some("cpu".into()));
         cfg.set_preferred_mb_sensor(Some("mb".into()));
         cfg.set_preferred_cpu_sensor(None);
-        assert_eq!(cfg.preferred_cpu_sensor(), None);
-        assert_eq!(cfg.preferred_mb_sensor(), Some("mb"));
+        assert_eq!(cfg.preferred_cpu_sensor().as_deref(), None);
+        assert_eq!(cfg.preferred_mb_sensor().as_deref(), Some("mb"));
     }
 
     #[test]
@@ -1110,7 +1183,7 @@ mod tests {
         cfg.set_preferred_cpu_sensor(Some("cpu".into()));
         cfg.set_header_role("hwmon:x:pwm1:PUMP", Some(HeaderRole::Pump));
         cfg.set_header_role("hwmon:x:pwm1:PUMP", None);
-        assert_eq!(cfg.preferred_cpu_sensor(), Some("cpu"));
+        assert_eq!(cfg.preferred_cpu_sensor().as_deref(), Some("cpu"));
         cfg.set_preferred_cpu_sensor(None);
         assert!(cfg.hardware.is_none());
     }
@@ -1144,7 +1217,7 @@ mod tests {
             "an unknown token must be dropped, never defaulted to Unknown"
         );
         assert_eq!(
-            loaded.preferred_cpu_sensor(),
+            loaded.preferred_cpu_sensor().as_deref(),
             Some("cpu"),
             "one bad role must not take the rest of the runtime config with it"
         );
@@ -1161,7 +1234,7 @@ mod tests {
 
         let loaded = RuntimeConfig::load_from(&path);
         assert_eq!(loaded.profile_search_dirs().unwrap(), &["/p".to_string()]);
-        assert_eq!(loaded.preferred_cpu_sensor(), Some("cpu"));
+        assert_eq!(loaded.preferred_cpu_sensor().as_deref(), Some("cpu"));
     }
 
     // ── DEC-243: new runtime-mutable admin keys ──────────────────────────
@@ -1823,5 +1896,166 @@ mod tests {
         let devices = cfg.cooling_devices();
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].id, "good");
+    }
+
+    // ── DEC-442: the it87 v2.0 chip suffix in saved state ──────────────
+
+    const SUFFIXED_PWM5: &str = "hwmon:it8696_a008090a:it87.2624:pwm5:pwm5";
+    const CANONICAL_PWM5: &str = "hwmon:it8696:it87.2624:pwm5:pwm5";
+
+    fn with_roles(roles: &[(&str, &str)]) -> RuntimeConfig {
+        let mut text = String::from("[hardware.header_roles]\n");
+        for (id, role) in roles {
+            text.push_str(&format!("\"{id}\" = \"{role}\"\n"));
+        }
+        toml::from_str(&text).expect("parse runtime.toml fixture")
+    }
+
+    /// [SAFETY] `BRD-a`: a pump role a pre-DEC-442 daemon saved under the
+    /// suffixed spelling must still floor the header discovery now publishes
+    /// without it — asserted through the engine's own floor function, the
+    /// call site the role exists for, against a member whose labels carry no
+    /// pump hint (the it8696 case: no label files, so the assignment is the
+    /// only evidence).
+    #[test]
+    fn a_pump_role_saved_under_the_suffixed_spelling_still_floors_the_header() {
+        use crate::profile::{ControlMember, LogicalControl, HARD_PUMP_CPU_FLOOR_PCT};
+        let control: LogicalControl = serde_json::from_value(serde_json::json!({
+            "id": "c", "name": "c", "minimum_pct": 20.0,
+        }))
+        .unwrap();
+        let member = ControlMember {
+            source: "hwmon".into(),
+            member_id: CANONICAL_PWM5.into(),
+            member_label: "Rear".into(),
+            fan_zero_rpm: false,
+        };
+        let floor = |cfg: &RuntimeConfig| {
+            crate::profile_engine::member_effective_floor(
+                &control,
+                &member,
+                &cfg.header_roles_parsed(),
+            )
+        };
+
+        // The discriminating branch: only a canonicalised key reaches the member.
+        assert_eq!(
+            floor(&with_roles(&[(SUFFIXED_PWM5, "pump")])),
+            HARD_PUMP_CPU_FLOOR_PCT
+        );
+        // And the opposite branch, so a stuck predicate cannot pass.
+        assert_eq!(floor(&with_roles(&[(SUFFIXED_PWM5, "chassis_fan")])), 20.0);
+    }
+
+    /// Q4-a: two spellings of one header resolve to the more protective role,
+    /// not simply the newer one; on a tie the suffixed (post-rebuild) entry wins.
+    #[test]
+    fn two_spellings_of_one_header_resolve_to_the_more_protective_role() {
+        use crate::hwmon::roles::HeaderRole;
+        let resolved = |bare: &str, suffixed: &str| {
+            with_roles(&[(CANONICAL_PWM5, bare), (SUFFIXED_PWM5, suffixed)]).header_roles_parsed()
+        };
+        for (bare, suffixed, want) in [
+            ("chassis_fan", "pump", HeaderRole::Pump),
+            ("pump", "chassis_fan", HeaderRole::Pump),
+            ("cpu_fan", "radiator_fan", HeaderRole::CpuFan),
+            ("pump", "cpu_fan", HeaderRole::Pump),
+            ("radiator_fan", "chassis_fan", HeaderRole::ChassisFan),
+            ("chassis_fan", "radiator_fan", HeaderRole::RadiatorFan),
+        ] {
+            let roles = resolved(bare, suffixed);
+            assert_eq!(roles.len(), 1, "one header, one entry ({bare}/{suffixed})");
+            assert_eq!(roles.get(CANONICAL_PWM5), Some(&want), "{bare}/{suffixed}");
+        }
+    }
+
+    /// A clear must clear every spelling, or a suffixed pump assignment the user
+    /// just removed would keep flooring the header; a set leaves exactly one
+    /// entry, under the canonical id, whichever spelling it arrived in.
+    #[test]
+    fn setting_or_clearing_a_role_replaces_every_spelling() {
+        use crate::hwmon::roles::HeaderRole;
+        let mut cfg = with_roles(&[(SUFFIXED_PWM5, "pump"), (CANONICAL_PWM5, "cpu_fan")]);
+        assert_eq!(
+            cfg.header_roles_parsed().get(CANONICAL_PWM5),
+            Some(&HeaderRole::Pump),
+            "precondition: the suffixed pump is in force"
+        );
+        cfg.set_header_role(CANONICAL_PWM5, None);
+        assert!(cfg.header_roles_parsed().is_empty());
+        assert!(cfg.hardware.is_none(), "nothing may be left behind");
+
+        cfg.set_header_role(SUFFIXED_PWM5, Some(HeaderRole::ChassisFan));
+        let raw: Vec<&String> = cfg.hardware.as_ref().unwrap().header_roles.keys().collect();
+        assert_eq!(
+            raw,
+            vec![CANONICAL_PWM5],
+            "stored under the canonical id only"
+        );
+    }
+
+    #[test]
+    fn a_preferred_sensor_saved_suffixed_reads_back_canonical() {
+        let cfg: RuntimeConfig = toml::from_str(
+            "[hardware]\n\
+             preferred_cpu_sensor = \"hwmon:it8696_a008090a:it87.2624:temp1\"\n\
+             preferred_mb_sensor = \"hwmon:k10temp:0000:00:18.3:Tctl\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.preferred_cpu_sensor().as_deref(),
+            Some("hwmon:it8696:it87.2624:temp1")
+        );
+        assert_eq!(
+            cfg.preferred_mb_sensor().as_deref(),
+            Some("hwmon:k10temp:0000:00:18.3:Tctl"),
+            "an id without the suffix is untouched"
+        );
+
+        let mut cfg = RuntimeConfig::default();
+        cfg.set_preferred_mb_sensor(Some("hwmon:it87952_a008090a:it87.2640:temp3".into()));
+        assert_eq!(
+            cfg.hardware
+                .as_ref()
+                .unwrap()
+                .preferred_mb_sensor
+                .as_deref(),
+            Some("hwmon:it87952:it87.2640:temp3"),
+            "stored canonical"
+        );
+    }
+
+    #[test]
+    fn a_cooling_device_saved_suffixed_reads_back_canonical() {
+        let cfg: RuntimeConfig = toml::from_str(
+            "[[cooling_devices]]\n\
+             id = \"aio\"\n\
+             kind = \"aio\"\n\
+             pump_member = \"hwmon:it8696_a008090a:it87.2624:pwm5:pwm5\"\n\
+             radiator_members = [\"hwmon:it8696_a008090a:it87.2624:pwm2:pwm2\", \"hwmon:it8696:it87.2624:pwm2:pwm2\", \"openfan:ch00\"]\n\
+             auxiliary_members = [\"hwmon:it8696:it87.2624:pwm5:pwm5\"]\n\
+             preferred_sensor = \"hwmon:it8696_a008090a:it87.2624:temp1\"\n",
+        )
+        .unwrap();
+        let devices = cfg.cooling_devices();
+        assert_eq!(devices.len(), 1, "the device must survive sanitising");
+        let d = &devices[0];
+        assert_eq!(d.pump_member.as_deref(), Some(CANONICAL_PWM5));
+        assert_eq!(
+            d.radiator_members,
+            vec![
+                "hwmon:it8696:it87.2624:pwm2:pwm2".to_string(),
+                "openfan:ch00".into()
+            ],
+            "two spellings of one radiator fan collapse to one entry"
+        );
+        assert!(
+            d.auxiliary_members.is_empty(),
+            "the bare spelling of the pump yields to the suffixed pump role"
+        );
+        assert_eq!(
+            d.preferred_sensor.as_deref(),
+            Some("hwmon:it8696:it87.2624:temp1")
+        );
     }
 }

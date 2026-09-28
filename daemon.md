@@ -64,6 +64,13 @@ daemon/src/
     classify.rs        — refines each temp sensor's CPU/motherboard classification for the inventory (DEC-200)
     readiness.rs       — turns the inventory into an actionable hardware-readiness list (DEC-200)
     pwm_discovery.rs   — PWM header discovery (fan outputs)
+    chip_name.rs       — canonical chip names (DEC-442): strips the it87 v2.0 board suffix
+                         (`it8696_a008090a` → `it8696`) at every hwmon `name` read, so no id
+                         changes across that driver's rename; `canonical_hwmon_id` brings ids
+                         a pre-DEC-442 daemon saved (header roles, preferred sensors, cooling
+                         devices, profiles, control_paths/pwm_baselines) back on read and on
+                         every incoming write. The sysfs spelling rides on the header
+                         descriptor as `sysfs_chip_name`, for `/etc/sensors.d` matching only
     pwm_control.rs     — HwmonPwmController + SysfsWriter trait; write coalescing with engine duty reconciliation (DEC-073/DEC-406); shared-report sibling priming (DEC-425)
     lease.rs           — LeaseManager: the internal single-writer arbiter (DEC-197)
     handback.rs        — [SAFETY] give each header back exactly as it was found (DEC-382):

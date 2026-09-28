@@ -7,6 +7,7 @@
 
 pub mod aio;
 pub mod chip_db;
+pub mod chip_name;
 pub mod classify;
 pub mod cooling_device;
 pub mod device_policy;

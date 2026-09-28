@@ -13,7 +13,9 @@
 //! `pwmN` and label (`hwmon:<chip>:<device>:pwm<N>:<LABEL>`). Swap the board,
 //! change the driver, or have the chip start publishing labels, and the id
 //! changes with it — so a stale record simply stops matching any live header and
-//! [`prune_to_live`] drops it. Nothing has to detect "the hardware changed",
+//! [`prune_to_live`] drops it. (The it87 v2.0 board suffix is not such a change:
+//! the chip segment is canonical, and a suffixed record is re-keyed at load,
+//! DEC-442.) Nothing has to detect "the hardware changed",
 //! because a record that survives *is* a record whose hardware did not.
 //!
 //! # Bounds
@@ -76,6 +78,19 @@ pub struct ControlPathStore {
 }
 
 impl ControlPathStore {
+    /// Re-key every record by canonical header id and canonicalise the tach
+    /// ids it carries (DEC-442) — see `chip_name::canonicalize_keyed`.
+    pub fn canonicalize_ids(mut self) -> Self {
+        use crate::hwmon::chip_name::{canonical_hwmon_id, canonicalize_keyed};
+        self.records = canonicalize_keyed(std::mem::take(&mut self.records), |id, r| {
+            r.header_id = id.to_string();
+            for tach in &mut r.tach_ids {
+                *tach = canonical_hwmon_id(tach).into_owned();
+            }
+        });
+        self
+    }
+
     pub fn get(&self, header_id: &str) -> Option<&ControlPathRecord> {
         self.records.get(header_id)
     }
@@ -183,7 +198,7 @@ pub fn load_from(dir: &Path) -> ControlPathStore {
     }
     match atomic_io::read_to_string_with_cap(&path, constants::CONTROL_PATHS_MAX_BYTES) {
         Ok(text) => match serde_json::from_str::<ControlPathStore>(&text) {
-            Ok(store) => store,
+            Ok(store) => store.canonicalize_ids(),
             Err(e) => {
                 log::warn!(
                     "control-path store {} will not parse ({e}); starting empty",
@@ -229,4 +244,71 @@ pub fn unix_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(header: &str, tach: &str, run_id: &str) -> ControlPathRecord {
+        ControlPathRecord {
+            header_id: header.into(),
+            relationship: "confirmed".into(),
+            confidence: "high".into(),
+            tach_ids: vec![tach.into()],
+            tach_labels: vec!["fan5".into()],
+            direction: "positive".into(),
+            baseline_rpm: Some(900),
+            perturbed_rpm: Some(1400),
+            change_pct: Some(55.0),
+            run_id: run_id.into(),
+            validated_unix_ms: 1,
+        }
+    }
+
+    /// `BRD-a`: the boot prune deletes every record whose key is not a live
+    /// header id. A record a pre-DEC-442 daemon saved under the it87 v2.0
+    /// suffixed spelling must survive it, re-keyed — so the load and the prune
+    /// are driven together, the way `main.rs` runs them.
+    #[test]
+    fn a_suffixed_record_survives_the_boot_prune_under_its_canonical_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let suffixed = "hwmon:it8696_a008090a:it87.2624:pwm5:pwm5";
+        let canonical = "hwmon:it8696:it87.2624:pwm5:pwm5";
+        let mut store = ControlPathStore::default();
+        store.records.insert(
+            suffixed.into(),
+            record(suffixed, "hwmon:it8696_a008090a:it87.2624:pwm5:pwm5", "r1"),
+        );
+        save_to(dir.path(), &store).unwrap();
+
+        let loaded = load_from(dir.path());
+        let pruned =
+            crate::api::handlers::discovery::prune_store_to_live(&loaded, &[canonical.into()]);
+        let kept = pruned
+            .get(canonical)
+            .expect("the record must survive the prune");
+        assert_eq!(kept.header_id, canonical);
+        assert_eq!(kept.tach_ids, vec![canonical.to_string()]);
+    }
+
+    #[test]
+    fn where_both_spellings_hold_a_record_the_suffixed_one_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let suffixed = "hwmon:it8696_a008090a:it87.2624:pwm5:pwm5";
+        let canonical = "hwmon:it8696:it87.2624:pwm5:pwm5";
+        let mut store = ControlPathStore::default();
+        store.records.insert(
+            canonical.into(),
+            record(canonical, canonical, "before-rebuild"),
+        );
+        store
+            .records
+            .insert(suffixed.into(), record(suffixed, suffixed, "after-rebuild"));
+        save_to(dir.path(), &store).unwrap();
+
+        let loaded = load_from(dir.path());
+        assert_eq!(loaded.records.len(), 1);
+        assert_eq!(loaded.get(canonical).unwrap().run_id, "after-rebuild");
+    }
 }

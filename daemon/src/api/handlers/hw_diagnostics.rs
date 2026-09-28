@@ -32,11 +32,17 @@ pub async fn hardware_diagnostics_handler(
 /// `spawn_blocking` from the handler above.
 fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json::Value>) {
     // Collect per-chip info from hwmon headers
+    // Keyed by the canonical chip name (DEC-442); the sysfs spelling rides
+    // beside it and is the same for every header of one chip.
     let mut chip_map: HashMap<(String, String), usize> = HashMap::new();
+    let mut sysfs_names: HashMap<(String, String), String> = HashMap::new();
     if let Some(ref controller) = state.hwmon_controller {
         let ctrl = controller.lock();
         for h in ctrl.headers() {
             let key = (h.chip_name.clone(), h.device_id.clone());
+            sysfs_names
+                .entry(key.clone())
+                .or_insert_with(|| h.sysfs_chip_name().to_string());
             *chip_map.entry(key).or_insert(0) += 1;
         }
     }
@@ -53,8 +59,12 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
         .map(|((chip_name, device_id), count)| {
             let driver = diagnostics::expected_driver(&chip_name);
             let in_mainline = diagnostics::chip_driver_in_mainline(&chip_name);
+            let sysfs_chip_name = sysfs_names
+                .remove(&(chip_name.clone(), device_id.clone()))
+                .unwrap_or_else(|| chip_name.clone());
             HwmonChipInfo {
                 chip_name,
+                sysfs_chip_name,
                 device_id,
                 expected_driver: driver.to_string(),
                 in_mainline_kernel: in_mainline,

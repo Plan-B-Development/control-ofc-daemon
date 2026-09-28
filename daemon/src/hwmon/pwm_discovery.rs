@@ -14,8 +14,16 @@ pub struct PwmHeaderDescriptor {
     pub id: String,
     /// Human-readable label (from `fanN_label` / `pwmN_label`, or fallback).
     pub label: String,
-    /// Chip name (e.g. `it8696`).
+    /// Chip name (e.g. `it8696`) — **canonical**: the it87 v2.0 board suffix
+    /// is stripped where the name is read, so this and every id built from it
+    /// stay the same across that driver's rename (DEC-442).
     pub chip_name: String,
+    /// The hwmon `name` attribute exactly as sysfs published it, when that
+    /// differs from `chip_name` — `Some("it8696_a008090a")` on an it87 v2.0
+    /// Gigabyte chip, `None` everywhere else. Read it through
+    /// [`PwmHeaderDescriptor::sysfs_chip_name`]. Only `/etc/sensors.d` matching
+    /// wants this spelling; never build an id or compare a table from it.
+    pub sysfs_chip_name: Option<String>,
     /// Device identifier (PCI BDF or platform device name).
     pub device_id: String,
     /// PWM index (the N in `pwmN`).
@@ -76,6 +84,14 @@ pub struct PwmHeaderDescriptor {
     pub alarm_path: Option<String>,
 }
 
+impl PwmHeaderDescriptor {
+    /// The chip name as sysfs published it (DEC-442): the suffixed spelling on
+    /// an it87 v2.0 Gigabyte chip, otherwise `chip_name`.
+    pub fn sysfs_chip_name(&self) -> &str {
+        self.sysfs_chip_name.as_deref().unwrap_or(&self.chip_name)
+    }
+}
+
 /// Discover all controllable PWM outputs under a given hwmon root.
 ///
 /// A header is considered controllable if it has a `pwmN` file.
@@ -113,9 +129,9 @@ pub fn discover_pwm_headers(hwmon_root: &Path) -> Result<Vec<PwmHeaderDescriptor
 
 /// Discover PWM outputs for a single hwmon device directory.
 fn discover_device_pwm(hwmon_dir: &Path) -> Result<Vec<PwmHeaderDescriptor>, HwmonError> {
-    let chip_name = read_sysfs_string(&hwmon_dir.join("name"))?
-        .trim()
-        .to_string();
+    let names = crate::hwmon::chip_name::read_chip_name(hwmon_dir)?;
+    let chip_name = names.canonical;
+    let sysfs_chip_name = (names.sysfs != chip_name).then_some(names.sysfs);
 
     // GPU-owned hwmon `pwm1` is never surfaced as an hwmon header.
     // - amdgpu (DEC-102): RDNA4 exposes `pwm1` read-only with no `pwm1_enable`,
@@ -205,6 +221,7 @@ fn discover_device_pwm(hwmon_dir: &Path) -> Result<Vec<PwmHeaderDescriptor>, Hwm
             id,
             label,
             chip_name: chip_name.clone(),
+            sysfs_chip_name: sysfs_chip_name.clone(),
             device_id: device_id.clone(),
             pwm_index,
             supports_enable,

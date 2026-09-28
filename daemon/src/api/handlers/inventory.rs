@@ -54,8 +54,8 @@ fn build_hwmon_inventory(state: &AppState) -> (StatusCode, Json<serde_json::Valu
     // Persisted user selections (Phase 5): the preferred CPU sensor wins over the
     // auto-pick when present; both selections are echoed under `preferences`.
     let runtime = crate::runtime_config::RuntimeConfig::load_from(&state.runtime_config_path);
-    let preferred_cpu = runtime.preferred_cpu_sensor().map(str::to_string);
-    let preferred_mb = runtime.preferred_mb_sensor().map(str::to_string);
+    let preferred_cpu = runtime.preferred_cpu_sensor();
+    let preferred_mb = runtime.preferred_mb_sensor();
     let default_cpu = build_default_cpu(&classified, preferred_cpu.as_deref());
     let preferences = if preferred_cpu.is_some() || preferred_mb.is_some() {
         Some(InventoryPreferences {

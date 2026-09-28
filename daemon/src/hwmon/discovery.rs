@@ -472,9 +472,9 @@ fn discover_device_sensors(
     hwmon_dir: &Path,
     board_vendor: &str,
 ) -> Result<Vec<SensorDescriptor>, HwmonError> {
-    let chip_name = read_sysfs_string(&hwmon_dir.join("name"))?
-        .trim()
-        .to_string();
+    // Canonical: the it87 v2.0 board suffix is stripped here, so the ids
+    // built below match the ones saved before that driver's rename (DEC-442).
+    let chip_name = crate::hwmon::chip_name::read_chip_name(hwmon_dir)?.canonical;
 
     let device_id = device_id_for_hwmon_dir(hwmon_dir);
 

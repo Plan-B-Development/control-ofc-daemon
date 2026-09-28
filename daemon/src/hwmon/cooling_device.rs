@@ -311,6 +311,46 @@ pub fn validate_device(dev: &CoolingDeviceConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Canonicalise every member and sensor id in a device (DEC-442).
+///
+/// A daemon before DEC-442 running an it87 v2.0 driver published — and a
+/// client saved — ids carrying the suffixed chip spelling
+/// (`hwmon:it8696_a008090a:…`), which discovery no longer publishes. Where one
+/// device names the same header under both spellings, the suffixed spelling's
+/// role is kept (it can only have been written after the rebuild) and the bare
+/// one dropped; a repeat within one list collapses to one entry. Anything left
+/// that still names a header twice is `validate_device`'s to reject.
+pub fn canonicalize_ids(mut dev: CoolingDeviceConfig) -> CoolingDeviceConfig {
+    use crate::hwmon::chip_name::{canonical_hwmon_id, is_suffixed_hwmon_id};
+
+    let claimed_by_suffixed: std::collections::HashSet<String> = dev
+        .all_members()
+        .into_iter()
+        .filter(|m| is_suffixed_hwmon_id(m))
+        .map(|m| canonical_hwmon_id(m).into_owned())
+        .collect();
+    // A bare spelling yields to a suffixed spelling of the same header.
+    let keep = |m: &String| is_suffixed_hwmon_id(m) || !claimed_by_suffixed.contains(m.as_str());
+    let canon = |m: String| canonical_hwmon_id(&m).into_owned();
+    let canon_list = |list: Vec<String>| {
+        let mut out: Vec<String> = Vec::with_capacity(list.len());
+        for m in list.into_iter().filter(&keep).map(canon) {
+            if !out.contains(&m) {
+                out.push(m);
+            }
+        }
+        out
+    };
+
+    dev.pump_member = dev.pump_member.filter(&keep).map(canon);
+    dev.radiator_members = canon_list(std::mem::take(&mut dev.radiator_members));
+    dev.auxiliary_members = canon_list(std::mem::take(&mut dev.auxiliary_members));
+    dev.preferred_sensor = dev.preferred_sensor.map(canon);
+    dev.fallback_sensor = dev.fallback_sensor.map(canon);
+    dev.coolant_sensor = dev.coolant_sensor.map(canon);
+    dev
+}
+
 /// Drop devices that cannot be trusted, keeping the rest.
 ///
 /// Used on the load path: one bad hand-edited device must not cost the user

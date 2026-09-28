@@ -370,8 +370,12 @@ pub async fn update_header_role_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // DEC-442: canonical, so an id carrying the it87 v2.0 suffixed chip
+    // spelling addresses the header discovery now publishes without it.
     let header_id = match body.get("header_id") {
-        Some(serde_json::Value::String(s)) if !s.is_empty() => s.clone(),
+        Some(serde_json::Value::String(s)) if !s.is_empty() => {
+            crate::hwmon::chip_name::canonical_hwmon_id(s).into_owned()
+        }
         _ => {
             return error_response(
                 StatusCode::BAD_REQUEST,
@@ -543,7 +547,11 @@ async fn set_preferred_sensor(
             );
         }
         Some(serde_json::Value::Null) => None,
-        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        // DEC-442: an id saved under the it87 v2.0 suffixed chip spelling names
+        // the same sensor the daemon now publishes without the suffix.
+        Some(serde_json::Value::String(s)) => {
+            Some(crate::hwmon::chip_name::canonical_hwmon_id(s).into_owned())
+        }
         Some(_) => {
             return error_response(
                 StatusCode::BAD_REQUEST,
@@ -1528,18 +1536,22 @@ pub async fn set_cooling_device_handler(
         }
     }
 
-    let dev = crate::hwmon::cooling_device::CoolingDeviceConfig {
-        id: id.clone(),
-        name: name.unwrap_or_default(),
-        kind: kind.unwrap_or_default(),
-        pump_member,
-        radiator_members,
-        auxiliary_members,
-        preferred_sensor,
-        fallback_sensor,
-        coolant_sensor,
-        device_policy_id: policy_id.unwrap_or_default(),
-    };
+    // DEC-442: canonical ids, so a member or sensor carrying the it87 v2.0
+    // suffixed chip spelling addresses what discovery now publishes.
+    let dev = crate::hwmon::cooling_device::canonicalize_ids(
+        crate::hwmon::cooling_device::CoolingDeviceConfig {
+            id: id.clone(),
+            name: name.unwrap_or_default(),
+            kind: kind.unwrap_or_default(),
+            pump_member,
+            radiator_members,
+            auxiliary_members,
+            preferred_sensor,
+            fallback_sensor,
+            coolant_sensor,
+            device_policy_id: policy_id.unwrap_or_default(),
+        },
+    );
 
     if let Err(reason) = crate::hwmon::cooling_device::validate_device(&dev) {
         return error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(reason));

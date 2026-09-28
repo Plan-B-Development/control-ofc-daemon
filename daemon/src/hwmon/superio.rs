@@ -574,16 +574,19 @@ fn ite_unbound_tail(out_of_tree: bool) -> &'static str {
         // and only the first is futile.
         // DEC-421: one recovery ladder, not a DEVID branch the user cannot see —
         // `Unsupported chip (DEVID=…)` is `pr_debug`, and a 0xFFFF read prints
-        // nothing at all. And a rebuild past it87 v2.0 renames the chips.
+        // nothing at all. A rebuild past it87 v2.0 renames the chips, which
+        // this daemon absorbs (DEC-442) — so the text says so, rather than
+        // telling the user to re-check ids that no longer change.
         " You are already running an out-of-tree `it87` build, so reinstalling \
          the same build will not change anything — the plain 'install \
          it87-dkms-git' advice is for somebody still on the in-tree driver. If \
          yours is old, updating is still worth doing: `it87-dkms-git` is a \
          `-git` package, so reinstalling it rebuilds the current upstream \
          snapshot, and several secondary-chip fixes landed in 2026-03 and later. \
-         Builds from 2026-09-09 (it87 v2.0) on rename Gigabyte chips with a \
-         suffix (e.g. it8696_a008090a), which changes every fan header's id: \
-         re-check pump roles, fan names and profile members afterwards. Do not \
+         Builds from 2026-09-09 (it87 v2.0) on name Gigabyte chips with a board \
+         suffix (e.g. it8696_a008090a); this daemon strips it, so fan header \
+         ids, pump roles and profile members stay the same across the \
+         rebuild. Do not \
          pass force_id, and do not add `mmio=on` (it is already the driver \
          default). If the chip still does not bind, the usual cause on these \
          boards is an ITE eSPI-to-LPC bridge latched in configuration mode in \
@@ -598,7 +601,8 @@ fn ite_unbound_tail(out_of_tree: bool) -> &'static str {
     } else {
         " For newer Gigabyte ITE boards the in-tree it87 often cannot drive the \
          chip — install the it87-dkms-git build (builds from 2026-09-09 name \
-         Gigabyte chips with a suffix, e.g. it8696_a008090a). (Do not add \
+         Gigabyte chips with a board suffix, e.g. it8696_a008090a, which this \
+         daemon strips, so ids do not change). (Do not add \
          `mmio=on`: it is already the driver default, DEC-326.) Do not pass \
          force_id. If the chip still does not bind, the usual cause on these \
          boards is an ITE eSPI-to-LPC bridge latched in configuration mode in \
@@ -832,6 +836,55 @@ mod tests {
             .iter()
             .find(|c| c.chip_name == chip)
             .unwrap_or_else(|| panic!("chip {chip} not in report: {:?}", r.chips))
+    }
+
+    /// `BRD-a`: on it87 v2.0 the bound chips publish as `it8696_a008090a` /
+    /// `it87952_a008090a` while the board table names `it8696` / `it87952`.
+    /// Driven from real discovery output, the report must hold ONE card per
+    /// chip — not a bound suffixed card plus a phantom "loaded but no hwmon
+    /// device appeared" card for the same chip.
+    #[test]
+    fn it87_v2_suffixed_chips_do_not_raise_phantom_unbound_cards() {
+        let root = tempfile::tempdir().unwrap();
+        for (dir, name, dev) in [
+            ("hwmon3", "it8696_a008090a", "it87.2624"),
+            ("hwmon4", "it87952_a008090a", "it87.2640"),
+        ] {
+            let platform = root.path().join(format!("devices/{dev}"));
+            std::fs::create_dir_all(&platform).unwrap();
+            let d = root.path().join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            std::os::unix::fs::symlink(&platform, d.join("device")).unwrap();
+            std::fs::write(d.join("name"), format!("{name}\n")).unwrap();
+            std::fs::write(d.join("pwm1"), "128\n").unwrap();
+        }
+        let bound_chips: Vec<BoundChip> =
+            crate::hwmon::pwm_discovery::discover_pwm_headers(root.path())
+                .unwrap()
+                .into_iter()
+                .map(|h| bound(&h.chip_name, &h.device_id))
+                .collect();
+        assert_eq!(bound_chips.len(), 2, "precondition: both chips discovered");
+
+        let ev = FakeEvidence {
+            board: (
+                "Gigabyte Technology Co., Ltd.".into(),
+                "X870E AORUS MASTER".into(),
+            ),
+            bound: bound_chips,
+            loaded: vec!["it87".into()],
+            ..Default::default()
+        };
+        let r = detect_superio(&ev);
+        let names: Vec<&str> = r.chips.iter().map(|c| c.chip_name.as_str()).collect();
+        assert_eq!(names, vec!["it8696", "it87952"], "{:?}", r.chips);
+        for c in &r.chips {
+            assert!(c.hwmon_present, "{c:?}");
+            assert!(
+                c.recommendation.is_none(),
+                "a bound chip needs no fix: {c:?}"
+            );
+        }
     }
 
     #[test]

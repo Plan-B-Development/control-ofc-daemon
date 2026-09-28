@@ -8329,3 +8329,122 @@ async fn stall_probe_is_advertised_routed_and_refuses_without_acknowledgement() 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
 }
+
+// ── DEC-442: the it87 v2.0 chip suffix in saved state, through the routes ──
+
+#[tokio::test]
+async fn a_role_clear_removes_the_suffixed_spelling_of_the_same_header() {
+    // [SAFETY] `BRD-a`. A pre-DEC-442 daemon on an it87 v2.0 driver saved roles
+    // under `hwmon:it8696_a008090a:…`. The GUI only ever sees the canonical id,
+    // so a clear it sends names that spelling — and must still remove the
+    // suffixed pump, or the header keeps a floor the user just took away.
+    let (state, tmp) = config_test_state_with_hwmon();
+    let rc = state.runtime_config_path.clone();
+    std::fs::write(
+        &rc,
+        "[hardware.header_roles]\n\"hwmon:it8696_a008090a:it87.2624:pwm5:pwm5\" = \"pump\"\n",
+    )
+    .unwrap();
+    let roles = state.header_roles.clone();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+    let canonical = "hwmon:it8696:it87.2624:pwm5:pwm5";
+
+    // Any setter rebuilds the live map from the file; an unrelated clear does it
+    // without touching the entry under test.
+    let (status, json) = uds_post(
+        &path,
+        "/config/header-role",
+        &serde_json::json!({"header_id": "h2", "role": null}),
+    )
+    .await;
+    assert_eq!(status, 200, "{json}");
+    // Precondition: the suffixed assignment is live under the canonical id.
+    assert_eq!(
+        roles.read().get(canonical),
+        Some(&control_ofc_daemon::hwmon::roles::HeaderRole::Pump)
+    );
+
+    let (status, json) = uds_post(
+        &path,
+        "/config/header-role",
+        &serde_json::json!({"header_id": canonical, "role": null}),
+    )
+    .await;
+    assert_eq!(status, 200, "{json}");
+    assert!(
+        roles.read().get(canonical).is_none(),
+        "the clear must reach the live map"
+    );
+    let written = std::fs::read_to_string(&rc).unwrap();
+    assert!(!written.contains("pump"), "and the file: {written}");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+    drop(tmp);
+}
+
+#[tokio::test]
+async fn a_profile_written_with_suffixed_ids_is_stored_canonical_and_otherwise_lossless() {
+    let (state, store) = state_with_temp_store();
+    let (sock, _tx, _sock_tmp) = start_test_server(state).await;
+
+    let mut doc = valid_profile("p1");
+    doc["controls"][0]["minimum_pct"] = 30.0.into();
+    doc["controls"][0]["members"] = serde_json::json!([
+        {"source": "hwmon", "member_id": "hwmon:it8696_a008090a:it87.2624:pwm5:pwm5",
+         "member_label": "Pump", "gui_only_field": 7},
+        {"source": "openfan", "member_id": "openfan:ch00", "member_label": "Front"}
+    ]);
+    doc["curves"][0]["sensor_id"] = "hwmon:it8696_a008090a:it87.2624:temp1".into();
+    doc["unknown_top_level"] = "kept".into();
+
+    let (st, body) = uds_send(&sock, "POST", "/profiles", Some(&doc)).await;
+    assert_eq!(st, 201, "create: {body}");
+
+    let stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(store.path().join("p1.json")).unwrap()).unwrap();
+    let members = &stored["controls"][0]["members"];
+    assert_eq!(members[0]["member_id"], "hwmon:it8696:it87.2624:pwm5:pwm5");
+    assert_eq!(members[1]["member_id"], "openfan:ch00");
+    assert_eq!(
+        stored["curves"][0]["sensor_id"],
+        "hwmon:it8696:it87.2624:temp1"
+    );
+    // Lossless for everything else, known or not.
+    assert_eq!(members[0]["gui_only_field"], 7);
+    assert_eq!(stored["unknown_top_level"], "kept");
+    assert_eq!(members[0]["member_label"], "Pump");
+}
+
+/// DEC-442: a profile stored with the it87 v2.0 suffixed spelling (saved
+/// before this daemon) is served canonical, so a client comparing members
+/// against `/hwmon/headers` does not see them as missing; the file is left as
+/// it was.
+#[tokio::test]
+async fn get_profile_serves_a_suffixed_stored_profile_canonical_without_rewriting_it() {
+    let (state, store) = state_with_temp_store();
+    let mut doc = valid_profile("p1");
+    doc["controls"][0]["members"] = serde_json::json!([
+        {"source": "hwmon", "member_id": "hwmon:it8696_a008090a:it87.2624:pwm5:pwm5",
+         "member_label": "Rear", "gui_only_field": 7}
+    ]);
+    doc["curves"][0]["sensor_id"] = "hwmon:it8696_a008090a:it87.2624:temp1".into();
+    let on_disk = serde_json::to_vec_pretty(&doc).unwrap();
+    std::fs::write(store.path().join("p1.json"), &on_disk).unwrap();
+    let (sock, _tx, _sock_tmp) = start_test_server(state).await;
+
+    let (st, body) = uds_send(&sock, "GET", "/profiles/p1", None).await;
+    assert_eq!(st, 200, "get: {body}");
+    let member = &body["controls"][0]["members"][0];
+    assert_eq!(member["member_id"], "hwmon:it8696:it87.2624:pwm5:pwm5");
+    assert_eq!(member["gui_only_field"], 7);
+    assert_eq!(
+        body["curves"][0]["sensor_id"],
+        "hwmon:it8696:it87.2624:temp1"
+    );
+    assert_eq!(
+        std::fs::read(store.path().join("p1.json")).unwrap(),
+        on_disk,
+        "GET must not rewrite the stored file"
+    );
+}

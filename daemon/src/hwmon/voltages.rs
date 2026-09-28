@@ -148,9 +148,9 @@ fn is_gpu_voltage_chip(chip_name: &str) -> bool {
 
 /// Discover voltage rails for a single hwmon device directory.
 fn discover_device_voltages(hwmon_dir: &Path) -> Result<Vec<VoltageDescriptor>, HwmonError> {
-    let chip_name = read_sysfs_string(&hwmon_dir.join("name"))?
-        .trim()
-        .to_string();
+    // Canonical: the it87 v2.0 board suffix is stripped here, so the ids
+    // built below match the ones saved before that driver's rename (DEC-442).
+    let chip_name = crate::hwmon::chip_name::read_chip_name(hwmon_dir)?.canonical;
 
     // GPU core voltages are not board rails — see the module docs.
     if is_gpu_voltage_chip(&chip_name) {
