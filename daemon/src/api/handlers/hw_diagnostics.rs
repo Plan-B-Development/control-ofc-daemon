@@ -11,6 +11,82 @@ use super::{error_response, json_ok, AppState};
 use crate::api::diagnostics;
 use crate::api::responses::*;
 
+/// The primary AMD GPU's diagnostics (`select_primary_gpu`), with the kernel
+/// advisories for every AMD GPU on the machine (DEC-449, `BRD-q`).
+///
+/// Takes the whole list and selects the primary card itself, so a caller cannot
+/// hand the advisories the primary card alone. `kernel_release` is injected so a
+/// test can pick an affected one.
+fn amd_gpu_diagnostics(
+    gpus: &[crate::hwmon::gpu_detect::AmdGpuInfo],
+    amd_pci_raw: &[crate::hwmon::gpu_detect::AmdPciDevice],
+    kernel_release: Option<&str>,
+) -> Option<GpuDiagnostics> {
+    crate::hwmon::gpu_detect::select_primary_gpu(gpus).map(|gpu| {
+        let ppfeaturemask = diagnostics::read_ppfeaturemask();
+        let bit14_set = ppfeaturemask
+            .as_ref()
+            .map(|s| {
+                let trimmed = s.trim().strip_prefix("0x").unwrap_or(s.trim());
+                u32::from_str_radix(trimmed, 16)
+                    .map(|v| (v & 0x4000) != 0)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+
+        // DEC-119: firmware-enforced OD_RANGE fan-speed bounds (the ~15% min
+        // on RDNA3+ that the user perceives as a "minimum"). Read on demand —
+        // diagnostics already runs on the blocking pool.
+        let (fan_speed_min_pct, fan_speed_max_pct) = gpu
+            .fan_curve_path
+            .as_ref()
+            .and_then(|p| crate::hwmon::gpu_fan::read_fan_curve(p).ok())
+            .and_then(|c| c.speed_range)
+            .map_or((None, None), |(lo, hi)| (Some(lo), Some(hi)));
+
+        // Best-effort PMFW fan_minimum_pwm (optional attribute).
+        let fan_minimum_pwm = gpu
+            .fan_minimum_pwm_path()
+            .as_deref()
+            .and_then(crate::hwmon::gpu_fan::read_fan_minimum_pwm);
+
+        // Kernel-regression advisories (same catalog as
+        // /capabilities.amd_gpu.kernel_warnings, duplicated for the bundle) —
+        // for every AMD GPU, each message naming its card (DEC-449, `BRD-q`).
+        let kernel_warnings = kernel_release
+            .map(|r| crate::hwmon::kernel_warnings::detect_kernel_warnings(r, gpus))
+            .unwrap_or_default();
+
+        // Driver-bound status cross-referenced from the PCI scan; an hwmon
+        // node implies a bound driver, so default to true if the BDF is
+        // somehow absent from the PCI listing.
+        let amdgpu_driver_bound = amd_pci_raw
+            .iter()
+            .find(|d| d.pci_bdf == gpu.pci_bdf)
+            .is_none_or(|d| d.amdgpu_bound());
+
+        GpuDiagnostics {
+            pci_bdf: gpu.pci_bdf.clone(),
+            // M11: emit the same BDF under both names so callers aligned to
+            // `/capabilities.amd_gpu.pci_id` can use the identical field here.
+            pci_id: gpu.pci_bdf.clone(),
+            pci_device_id: gpu.pci_device_id,
+            pci_revision: gpu.pci_revision,
+            model_name: gpu.marketing_name.clone(),
+            fan_control_method: gpu.fan_control_method().to_string(),
+            overdrive_enabled: gpu.overdrive_enabled,
+            ppfeaturemask,
+            ppfeaturemask_bit14_set: bit14_set,
+            zero_rpm_available: gpu.fan_zero_rpm_path.is_some(),
+            fan_speed_min_pct,
+            fan_speed_max_pct,
+            fan_minimum_pwm,
+            amdgpu_driver_bound,
+            kernel_warnings,
+        }
+    })
+}
+
 /// GET /diagnostics/hardware — comprehensive hardware readiness report.
 ///
 /// The report performs ~6 blocking sysfs/procfs reads (modules, ioports, DMI,
@@ -90,73 +166,11 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
         })
         .collect();
 
-    // Kernel release read once and reused for the primary GPU's advisories.
+    // Kernel release read once and reused for the GPU advisories and the report.
     let kernel_release = crate::hwmon::kernel_warnings::read_kernel_release();
 
     // GPU diagnostics from detected GPUs
-    let gpu_diag = crate::hwmon::gpu_detect::select_primary_gpu(&state.amd_gpus).map(|gpu| {
-        let ppfeaturemask = diagnostics::read_ppfeaturemask();
-        let bit14_set = ppfeaturemask
-            .as_ref()
-            .map(|s| {
-                let trimmed = s.trim().strip_prefix("0x").unwrap_or(s.trim());
-                u32::from_str_radix(trimmed, 16)
-                    .map(|v| (v & 0x4000) != 0)
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false);
-
-        // DEC-119: firmware-enforced OD_RANGE fan-speed bounds (the ~15% min
-        // on RDNA3+ that the user perceives as a "minimum"). Read on demand —
-        // diagnostics already runs on the blocking pool.
-        let (fan_speed_min_pct, fan_speed_max_pct) = gpu
-            .fan_curve_path
-            .as_ref()
-            .and_then(|p| crate::hwmon::gpu_fan::read_fan_curve(p).ok())
-            .and_then(|c| c.speed_range)
-            .map_or((None, None), |(lo, hi)| (Some(lo), Some(hi)));
-
-        // Best-effort PMFW fan_minimum_pwm (optional attribute).
-        let fan_minimum_pwm = gpu
-            .fan_minimum_pwm_path()
-            .as_deref()
-            .and_then(crate::hwmon::gpu_fan::read_fan_minimum_pwm);
-
-        // Kernel-regression advisories for this GPU (same catalog as
-        // /capabilities.amd_gpu.kernel_warnings, duplicated for the bundle).
-        let kernel_warnings = kernel_release
-            .as_deref()
-            .map(|r| crate::hwmon::kernel_warnings::detect_kernel_warnings(r, gpu))
-            .unwrap_or_default();
-
-        // Driver-bound status cross-referenced from the PCI scan; an hwmon
-        // node implies a bound driver, so default to true if the BDF is
-        // somehow absent from the PCI listing.
-        let amdgpu_driver_bound = amd_pci_raw
-            .iter()
-            .find(|d| d.pci_bdf == gpu.pci_bdf)
-            .is_none_or(|d| d.amdgpu_bound());
-
-        GpuDiagnostics {
-            pci_bdf: gpu.pci_bdf.clone(),
-            // M11: emit the same BDF under both names so callers aligned to
-            // `/capabilities.amd_gpu.pci_id` can use the identical field here.
-            pci_id: gpu.pci_bdf.clone(),
-            pci_device_id: gpu.pci_device_id,
-            pci_revision: gpu.pci_revision,
-            model_name: gpu.marketing_name.clone(),
-            fan_control_method: gpu.fan_control_method().to_string(),
-            overdrive_enabled: gpu.overdrive_enabled,
-            ppfeaturemask,
-            ppfeaturemask_bit14_set: bit14_set,
-            zero_rpm_available: gpu.fan_zero_rpm_path.is_some(),
-            fan_speed_min_pct,
-            fan_speed_max_pct,
-            fan_minimum_pwm,
-            amdgpu_driver_bound,
-            kernel_warnings,
-        }
-    });
+    let gpu_diag = amd_gpu_diagnostics(&state.amd_gpus, &amd_pci_raw, kernel_release.as_deref());
 
     // Intel discrete GPU diagnostics (DEC-121). Read-only — the note explains
     // why fan control is unavailable, grounded in the kernel ABI / firmware.
@@ -370,4 +384,52 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
             voltages,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `BRD-q` machine: an RDNA2 discrete card, which `select_primary_gpu`
+    /// puts first, and an RDNA3 iGPU behind it.
+    fn rdna2_card_and_rdna3_igpu() -> Vec<crate::hwmon::gpu_detect::AmdGpuInfo> {
+        let card = |bdf: &str, device_id: u16, name: &str, discrete: bool| {
+            crate::hwmon::gpu_detect::AmdGpuInfo {
+                pci_bdf: bdf.into(),
+                pci_device_id: device_id,
+                pci_revision: 0xC0,
+                pci_class: 0x030000,
+                marketing_name: Some(name.into()),
+                hwmon_path: std::path::PathBuf::from("/nonexistent"),
+                fan_curve_path: None,
+                fan_zero_rpm_path: None,
+                is_discrete: discrete,
+                has_fan_rpm: true,
+                has_pwm: true,
+                has_pwm_enable: true,
+                overdrive_enabled: false,
+            }
+        };
+        vec![
+            card("0000:03:00.0", 0x73BF, "AMD Radeon RX 6900 XT", true),
+            card("0000:c5:00.0", 0x15BF, "AMD Radeon 780M", false),
+        ]
+    }
+
+    /// DEC-449 (`BRD-q`): the report's GPU section describes the primary card
+    /// and carries the iGPU's advisory, as `/capabilities` does.
+    #[test]
+    fn the_report_warns_about_an_affected_card_that_is_not_the_primary() {
+        let gpus = rdna2_card_and_rdna3_igpu();
+        let diag = amd_gpu_diagnostics(&gpus, &[], Some("6.18.2")).expect("a GPU");
+        assert_eq!(diag.pci_bdf, "0000:03:00.0", "the primary card");
+        assert_eq!(diag.kernel_warnings.len(), 1);
+        assert!(diag.kernel_warnings[0]
+            .message
+            .contains("the AMD Radeon 780M (0000:c5:00.0)"));
+        assert!(amd_gpu_diagnostics(&gpus, &[], Some("6.18.7"))
+            .expect("a GPU")
+            .kernel_warnings
+            .is_empty());
+    }
 }

@@ -130,39 +130,69 @@ fn carries_mes_eviction_hang(major: u32, minor: u32, patch: u32) -> bool {
     }
 }
 
-/// Detect kernel-version warnings applicable to a single GPU.
+/// Detect kernel-version warnings for the AMD GPUs on this machine.
 ///
 /// `kernel_release` is the contents of `/proc/sys/kernel/osrelease` (or an
 /// equivalent test injection). Returns an empty Vec when nothing is wrong
 /// or when the kernel version can't be parsed (fail-soft — better to omit
 /// a warning than to surface a wrong one).
 ///
+/// **Every card is evaluated, not only the primary one (DEC-449, `BRD-q`).**
+/// `select_primary_gpu` prefers a discrete card, so an RDNA2 card beside an
+/// RDNA3 iGPU used to hide the iGPU's hang. Each warning is raised once,
+/// whichever cards it applies to, and its message names them: the wire keeps
+/// one list, on `devices.amd_gpu`, which describes the primary card.
+///
 /// DEC-422 rewrote this from two rules to one: see the module docs for the
 /// rule and for why `rdna_hang_kernel_6_18_6_19` and
 /// `smu_mismatch_navi48_r9700` are no longer raised.
-pub fn detect_kernel_warnings(kernel_release: &str, gpu: &AmdGpuInfo) -> Vec<KernelWarning> {
+pub fn detect_kernel_warnings(kernel_release: &str, gpus: &[AmdGpuInfo]) -> Vec<KernelWarning> {
     let mut warnings = Vec::new();
     let Some((major, minor, patch)) = parse_kernel_version(kernel_release) else {
         return warnings;
     };
 
-    if carries_mes_eviction_hang(major, minor, patch) && is_rdna3_or_rdna4(gpu.pci_device_id) {
+    let mes_cards: Vec<&AmdGpuInfo> = gpus
+        .iter()
+        .filter(|g| is_rdna3_or_rdna4(g.pci_device_id))
+        .collect();
+    if carries_mes_eviction_hang(major, minor, patch) && !mes_cards.is_empty() {
+        let cards = name_cards(&mes_cards);
         warnings.push(KernelWarning {
             id: MES_HANG_4765_ID.into(),
             severity: KernelWarningSeverity::Critical,
             message: format!(
                 "Kernel {kernel_release} carries a known amdgpu hang for RDNA3/RDNA4 GPUs \
-                 (drm/amd #4765): a compute job running alongside a 3D workload can hang \
-                 the GPU, and while the system is hung no fan speed can change. It is \
-                 fixed in 6.18.7 and 6.19. Update to the latest 6.18 longterm point \
-                 release or a current 7.x kernel; 6.17 is end-of-life and was never fixed. \
-                 (This is matched on the version number, so a distribution kernel that \
-                 backported the fix may be flagged anyway.)"
+                 (drm/amd #4765), which affects {cards} on this machine: a compute job \
+                 running alongside a 3D workload can hang the GPU, and while the system \
+                 is hung no fan speed can change. It is fixed in 6.18.7 and 6.19. Update \
+                 to the latest 6.18 longterm point release or a current 7.x kernel; 6.17 \
+                 is end-of-life and was never fixed. (This is matched on the version \
+                 number, so a distribution kernel that backported the fix may be flagged \
+                 anyway.)"
             ),
         });
     }
 
     warnings
+}
+
+/// "the RX 7900 XTX (0000:03:00.0)", joined with commas and a final "and" —
+/// each card by its model name where libdrm knows it, and always by its PCI
+/// address, which is what tells two identical cards apart.
+fn name_cards(cards: &[&AmdGpuInfo]) -> String {
+    let named: Vec<String> = cards
+        .iter()
+        .map(|g| {
+            let model = g.marketing_name.as_deref().unwrap_or("AMD GPU");
+            format!("the {model} ({})", g.pci_bdf)
+        })
+        .collect();
+    match named.as_slice() {
+        [] => String::new(),
+        [one] => one.clone(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    }
 }
 
 /// Read the running kernel release from `/proc/sys/kernel/osrelease`.
@@ -244,7 +274,7 @@ mod tests {
     const RETIRED: [&str; 2] = ["rdna_hang_kernel_6_18_6_19", "smu_mismatch_navi48_r9700"];
 
     fn ids(release: &str, gpu: &AmdGpuInfo) -> Vec<String> {
-        detect_kernel_warnings(release, gpu)
+        detect_kernel_warnings(release, std::slice::from_ref(gpu))
             .into_iter()
             .map(|w| w.id)
             .collect()
@@ -254,7 +284,7 @@ mod tests {
     fn mes_hang_fires_across_6_18_0_to_6_18_6_and_clears_at_6_18_7() {
         let gpu = make_gpu(0x7550, true); // RX 9070 XT
         for release in ["6.18.0", "6.18.3-2-cachyos", "6.18.6"] {
-            let warnings = detect_kernel_warnings(release, &gpu);
+            let warnings = detect_kernel_warnings(release, std::slice::from_ref(&gpu));
             assert_eq!(warnings.len(), 1, "{release}");
             assert_eq!(warnings[0].id, MES_HANG_4765_ID, "{release}");
             assert_eq!(warnings[0].severity, KernelWarningSeverity::Critical);
@@ -362,7 +392,7 @@ mod tests {
 
     #[test]
     fn the_message_gives_the_fixed_releases_and_never_the_eol_ones() {
-        let w = &detect_kernel_warnings("6.18.4", &make_gpu(0x7550, true))[0];
+        let w = &detect_kernel_warnings("6.18.4", &[make_gpu(0x7550, true)])[0];
         assert!(w.message.contains("#4765"));
         assert!(w.message.contains("6.18.7") && w.message.contains("6.19"));
         assert!(w.message.contains("6.18.4"), "names the running release");
@@ -370,6 +400,76 @@ mod tests {
         // longterm (the retired rule's advice).
         assert!(!w.message.contains("6.15"));
         assert!(!w.message.to_lowercase().contains("pin to"));
+    }
+
+    // ── every AMD GPU, not the primary alone (DEC-449, `BRD-q`) ─────
+
+    fn named_gpu(device_id: u16, bdf: &str, name: &str) -> AmdGpuInfo {
+        AmdGpuInfo {
+            pci_bdf: bdf.into(),
+            marketing_name: Some(name.into()),
+            ..make_gpu(device_id, false)
+        }
+    }
+
+    /// The `BRD-q` machine: an RDNA2 discrete card, which `select_primary_gpu`
+    /// puts first, beside an RDNA3 iGPU. The iGPU's hang is raised, and the
+    /// message names the iGPU and not the card the list is filed under.
+    #[test]
+    fn an_rdna3_igpu_behind_an_rdna2_primary_is_warned_about_by_name() {
+        let gpus = [
+            named_gpu(0x73BF, "0000:03:00.0", "AMD Radeon RX 6900 XT"),
+            named_gpu(0x15BF, "0000:c5:00.0", "AMD Radeon 780M"),
+        ];
+        let warnings = detect_kernel_warnings("6.18.2", &gpus);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].id, MES_HANG_4765_ID);
+        assert!(
+            warnings[0]
+                .message
+                .contains("the AMD Radeon 780M (0000:c5:00.0)"),
+            "{}",
+            warnings[0].message
+        );
+        assert!(
+            !warnings[0].message.contains("6900"),
+            "the unaffected card is not named"
+        );
+    }
+
+    /// Two affected cards raise one warning — the GUI keys acknowledgements on
+    /// the id — naming both.
+    #[test]
+    fn two_affected_cards_share_one_warning_that_names_both() {
+        let gpus = [
+            named_gpu(0x744C, "0000:03:00.0", "AMD Radeon RX 7900 XTX"),
+            named_gpu(0x15BF, "0000:c5:00.0", "AMD Radeon 780M"),
+        ];
+        let warnings = detect_kernel_warnings("6.17.9", &gpus);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].message.contains(
+            "the AMD Radeon RX 7900 XTX (0000:03:00.0) and the AMD Radeon 780M (0000:c5:00.0)"
+        ));
+    }
+
+    #[test]
+    fn no_affected_card_and_no_card_raise_nothing() {
+        assert!(detect_kernel_warnings(
+            "6.18.2",
+            &[named_gpu(0x73BF, "0000:03:00.0", "AMD Radeon RX 6900 XT")]
+        )
+        .is_empty());
+        assert!(detect_kernel_warnings("6.18.2", &[]).is_empty());
+    }
+
+    #[test]
+    fn a_card_libdrm_does_not_name_is_named_by_its_address() {
+        let w = &detect_kernel_warnings("6.18.2", &[make_gpu(0x7550, true)])[0];
+        assert!(
+            w.message.contains("the AMD GPU (0000:03:00.0)"),
+            "{}",
+            w.message
+        );
     }
 
     // ── read_kernel_release_at ──────────────────────────────────────

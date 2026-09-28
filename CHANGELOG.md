@@ -59,6 +59,12 @@
   skipped or overridden control still names is kept; a GPU fan verify in progress defers it; a
   reset that fails is logged, retried after a minute, and still made at the next stop. Motherboard
   headers have been handed back this way since DEC-382.
+- **The kernel hang advisory checks every AMD GPU, not only the first one** (DEC-449, `BRD-q`). The
+  drm/amd #4765 advisory was evaluated for the card `devices.amd_gpu` describes, which is the
+  discrete one where there is one, so an RX 6000 or older beside an RDNA3 integrated GPU hid the
+  integrated GPU's hang. Every AMD GPU is now checked, in `GET /capabilities` and
+  `GET /diagnostics/hardware` alike; the advisory still appears once, and its message names the
+  affected cards by model and PCI address. No field changed.
 - **The RX 6000-and-older fan test gives the card back as it found it** (DEC-447, `TS-bi`, `TS-bj`).
   After a test whose restore failed, the next test put the card back in manual mode at the old
   test speed (75–100 %), because it restored to the last speed the daemon had written; it now

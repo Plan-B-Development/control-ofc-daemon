@@ -186,8 +186,8 @@ impl AmdGpuInfo {
 /// spaces rather than tabs). The list used to hold nine IDs, missing the RX 9060
 /// series (0x7590) and seven RDNA3 cards, with two of its comments naming the
 /// wrong die. It also covers
-/// the RDNA3 / RDNA3.5 iGPUs, because on an APU-only machine the primary GPU the
-/// advisory is evaluated for IS the iGPU. **Since DEC-430 this list is also a
+/// the RDNA3 / RDNA3.5 iGPUs, because the advisory is evaluated for every AMD GPU
+/// on the machine (DEC-449) — an iGPU beside a discrete card as well as one alone. **Since DEC-430 this list is also a
 /// write-path input:** [`AmdGpuInfo::can_write_legacy_pwm`] refuses the legacy
 /// `pwm1` path for every ID here, because RDNA3 exposes a writable-looking
 /// `pwm1_enable` that can silently no-op. An RDNA3 ID missing here would be

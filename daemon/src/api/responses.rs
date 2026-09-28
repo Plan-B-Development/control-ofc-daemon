@@ -1327,7 +1327,8 @@ pub struct AmdGpuCapability {
     pub overdrive_enabled: bool,
     /// Whether the PMFW zero-RPM sysfs file exists.
     pub gpu_zero_rpm_available: bool,
-    /// Kernel-version advisories applicable to this GPU.
+    /// Kernel-version advisories applicable to any AMD GPU on the machine, not
+    /// only the card this entry describes; each message names its cards (DEC-449).
     ///
     /// Empty in normal operation. Populated when the running kernel matches a
     /// known amdgpu regression (since DEC-422 one rule: the drm/amd #4765 MES
@@ -1829,7 +1830,8 @@ pub struct GpuDiagnostics {
     /// `HardwareDiagnosticsResponse.amd_pci_devices` and forward-proofing.
     #[serde(default)]
     pub amdgpu_driver_bound: bool,
-    /// Kernel-regression advisories for this GPU — the same catalog surfaced
+    /// Kernel-regression advisories for any AMD GPU on the machine (DEC-449) —
+    /// the same catalog surfaced
     /// in `/capabilities.amd_gpu.kernel_warnings`, duplicated here so the
     /// diagnostics support bundle is self-contained. Empty (and omitted) when
     /// nothing applies.

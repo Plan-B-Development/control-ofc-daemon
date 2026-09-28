@@ -148,44 +148,17 @@ pub async fn poll_handler(State(state): State<Arc<AppState>>) -> Json<PollRespon
     })
 }
 
-/// GET /capabilities — describe what the daemon can do on this machine.
-pub async fn capabilities_handler(
-    State(state): State<Arc<AppState>>,
-) -> Json<CapabilitiesResponse> {
-    let openfan_present = state.openfan().is_some();
-    let hwmon_present = state.hwmon_controller.is_some();
-    // `OFN-ak`, DEC-376: presence and WRITE support are different questions, and
-    // deriving both from `is_some()` made the second one untruthful on a board
-    // whose every `pwmN` is read-only — the daemon advertised a write path it
-    // does not have, and the GUI's "headers detected but all are read-only"
-    // banner (`dashboard_view.py`, `hw.present and not hw.write_support`) was
-    // unreachable because its two operands were two copies of one expression
-    // (`AUD2-g`/DEC-325, inverted). Write support is the same "≥ 1 writable
-    // header" predicate the profile engine gates its backend on
-    // (`HwmonBackend::new`) and the thermal force filters to
-    // (`forced_target_ids`, DEC-295/DEC-372) — one definition, four readers
-    // since the engine's per-member deliverability joined them (`OFN-al`).
-    //
-    // These two values come from ONE lock acquisition rather than two. The
-    // controller lock is held for the whole of an uncancellable blocking
-    // `std::fs::write`, so an avoidable second acquisition is avoidable
-    // exposure. Note this is NOT a claim about the handler as a whole — it takes
-    // the lock again below for the AIO header fold, which is safe (the
-    // descriptors are frozen at discovery, so the two acquisitions cannot tear)
-    // but means the honest statement is "one acquisition for these two reads",
-    // not "one for the handler". Raised by `ofc:concurrency-reviewer` against an
-    // earlier wording of this comment that claimed the latter.
-    let (hwmon_header_count, hwmon_writable) = match state.hwmon_controller.as_ref() {
-        Some(c) => {
-            let guard = c.lock();
-            (guard.headers().len(), !guard.forced_target_ids().is_empty())
-        }
-        None => (0, false),
-    };
-
-    // AMD GPU detection
-    let primary_gpu = crate::hwmon::gpu_detect::select_primary_gpu(&state.amd_gpus);
-    let amd_gpu_cap = if let Some(gpu) = primary_gpu {
+/// `devices.amd_gpu`: the primary AMD GPU (`select_primary_gpu`), with the
+/// kernel advisories for every AMD GPU on the machine (DEC-449, `BRD-q`).
+///
+/// Takes the whole list, and selects the primary card itself, so a caller
+/// cannot hand the advisories the primary card alone. `kernel_release` is
+/// `/proc/sys/kernel/osrelease`, injected so a test can pick an affected one.
+fn amd_gpu_capability(
+    gpus: &[crate::hwmon::gpu_detect::AmdGpuInfo],
+    kernel_release: Option<&str>,
+) -> AmdGpuCapability {
+    if let Some(gpu) = crate::hwmon::gpu_detect::select_primary_gpu(gpus) {
         // DEC-445 (`DC-ch`): "can a profile drive this fan" — PMFW `fan_curve`
         // only, because that is all the engine's GPU backend writes. A pre-RDNA3
         // card keeps `fan_control_method: "hwmon_pwm"`, since verify and reset do
@@ -195,10 +168,11 @@ pub async fn capabilities_handler(
         // (`GpuBackend::delivery_targets`), so for the card described here the two
         // agree; `devices.amd_gpu` describes only the primary card (`GPU-b`).
         let fan_write = gpu.fan_curve_path.is_some();
-        let kernel_warnings = match crate::hwmon::kernel_warnings::read_kernel_release() {
-            Some(release) => crate::hwmon::kernel_warnings::detect_kernel_warnings(&release, gpu),
-            None => Vec::new(),
-        };
+        // DEC-449 (`BRD-q`): the advisories cover every AMD GPU, not only the
+        // card this entry describes; each message names the card it is about.
+        let kernel_warnings = kernel_release
+            .map(|release| crate::hwmon::kernel_warnings::detect_kernel_warnings(release, gpus))
+            .unwrap_or_default();
         AmdGpuCapability {
             present: true,
             model_name: gpu.marketing_name.clone(),
@@ -235,7 +209,49 @@ pub async fn capabilities_handler(
             gpu_zero_rpm_available: false,
             kernel_warnings: Vec::new(),
         }
+    }
+}
+
+/// GET /capabilities — describe what the daemon can do on this machine.
+pub async fn capabilities_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<CapabilitiesResponse> {
+    let openfan_present = state.openfan().is_some();
+    let hwmon_present = state.hwmon_controller.is_some();
+    // `OFN-ak`, DEC-376: presence and WRITE support are different questions, and
+    // deriving both from `is_some()` made the second one untruthful on a board
+    // whose every `pwmN` is read-only — the daemon advertised a write path it
+    // does not have, and the GUI's "headers detected but all are read-only"
+    // banner (`dashboard_view.py`, `hw.present and not hw.write_support`) was
+    // unreachable because its two operands were two copies of one expression
+    // (`AUD2-g`/DEC-325, inverted). Write support is the same "≥ 1 writable
+    // header" predicate the profile engine gates its backend on
+    // (`HwmonBackend::new`) and the thermal force filters to
+    // (`forced_target_ids`, DEC-295/DEC-372) — one definition, four readers
+    // since the engine's per-member deliverability joined them (`OFN-al`).
+    //
+    // These two values come from ONE lock acquisition rather than two. The
+    // controller lock is held for the whole of an uncancellable blocking
+    // `std::fs::write`, so an avoidable second acquisition is avoidable
+    // exposure. Note this is NOT a claim about the handler as a whole — it takes
+    // the lock again below for the AIO header fold, which is safe (the
+    // descriptors are frozen at discovery, so the two acquisitions cannot tear)
+    // but means the honest statement is "one acquisition for these two reads",
+    // not "one for the handler". Raised by `ofc:concurrency-reviewer` against an
+    // earlier wording of this comment that claimed the latter.
+    let (hwmon_header_count, hwmon_writable) = match state.hwmon_controller.as_ref() {
+        Some(c) => {
+            let guard = c.lock();
+            (guard.headers().len(), !guard.forced_target_ids().is_empty())
+        }
+        None => (0, false),
     };
+
+    // AMD GPU detection
+    let amd_gpu_cap = amd_gpu_capability(
+        &state.amd_gpus,
+        crate::hwmon::kernel_warnings::read_kernel_release().as_deref(),
+    );
 
     // Intel discrete GPU detection (DEC-121) — read-only monitoring only.
     let intel_gpu_cap =
@@ -493,4 +509,68 @@ pub async fn fallback_handler(uri: axum::http::Uri) -> (StatusCode, Json<ErrorEn
         StatusCode::NOT_FOUND,
         Json(ErrorEnvelope::route_not_found(uri.path())),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `BRD-q` machine: an RDNA2 discrete card, which `select_primary_gpu`
+    /// puts first, and an RDNA3 iGPU behind it.
+    fn rdna2_card_and_rdna3_igpu() -> Vec<crate::hwmon::gpu_detect::AmdGpuInfo> {
+        let card = |bdf: &str, device_id: u16, name: &str, discrete: bool| {
+            crate::hwmon::gpu_detect::AmdGpuInfo {
+                pci_bdf: bdf.into(),
+                pci_device_id: device_id,
+                pci_revision: 0xC0,
+                pci_class: 0x030000,
+                marketing_name: Some(name.into()),
+                hwmon_path: std::path::PathBuf::from("/nonexistent"),
+                fan_curve_path: None,
+                fan_zero_rpm_path: None,
+                is_discrete: discrete,
+                has_fan_rpm: true,
+                has_pwm: true,
+                has_pwm_enable: true,
+                overdrive_enabled: false,
+            }
+        };
+        vec![
+            card("0000:03:00.0", 0x73BF, "AMD Radeon RX 6900 XT", true),
+            card("0000:c5:00.0", 0x15BF, "AMD Radeon 780M", false),
+        ]
+    }
+
+    /// DEC-449 (`BRD-q`): the entry describes the primary card, and its
+    /// advisories cover the iGPU behind it. Before, only the primary card was
+    /// evaluated, so this machine got no warning at all.
+    #[test]
+    fn the_capability_warns_about_an_affected_card_that_is_not_the_primary() {
+        let gpus = rdna2_card_and_rdna3_igpu();
+        let cap = amd_gpu_capability(&gpus, Some("6.18.2"));
+        assert_eq!(
+            cap.pci_bdf.as_deref(),
+            Some("0000:03:00.0"),
+            "the primary card"
+        );
+        assert_eq!(cap.kernel_warnings.len(), 1);
+        assert_eq!(
+            cap.kernel_warnings[0].id,
+            crate::hwmon::kernel_warnings::MES_HANG_4765_ID
+        );
+        assert!(cap.kernel_warnings[0]
+            .message
+            .contains("the AMD Radeon 780M (0000:c5:00.0)"));
+    }
+
+    #[test]
+    fn a_fixed_or_unread_kernel_raises_nothing() {
+        let gpus = rdna2_card_and_rdna3_igpu();
+        assert!(amd_gpu_capability(&gpus, Some("7.2.7-1-cachyos"))
+            .kernel_warnings
+            .is_empty());
+        assert!(amd_gpu_capability(&gpus, None).kernel_warnings.is_empty());
+        let none = amd_gpu_capability(&[], Some("6.18.2"));
+        assert!(!none.present && none.kernel_warnings.is_empty());
+    }
 }
