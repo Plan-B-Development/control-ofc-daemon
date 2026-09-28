@@ -73,10 +73,11 @@ pub enum SensorKind {
     DiskTemp,
     GpuTemp,
     /// Liquid-cooler coolant temperature (AIO / custom loop) — e.g. an NZXT
-    /// Kraken `temp1` or an Aquacomputer "Coolant temp" channel. Display/
-    /// classification only: it carries **no** safety semantics (there is no
-    /// coolant emergency threshold; the CPU-only `safety.rs` rule is
-    /// unchanged).
+    /// Kraken `temp1` or an Aquacomputer "Coolant temp" channel. Since DEC-443
+    /// (`TS-f`) the hottest fresh reading of this kind drives the coolant
+    /// emergency — the same 100 % force as the CPU rung, at the configurable
+    /// `safety.coolant_limit_c`. Only this kind triggers it: a CPU or board
+    /// sensor above the coolant limit does not.
     CoolantTemp,
 }
 

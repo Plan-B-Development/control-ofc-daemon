@@ -212,7 +212,17 @@ pub fn resolve(id: &str) -> &'static DevicePolicy {
 /// function must never fail in: reporting a floor lower than reality would make
 /// the GUI's displayed pump minimum a lie, which is worse than the client-side
 /// reconstruction this value replaces.
-pub fn resolve_policy_floor(policy: &DevicePolicy, pump_protected: bool) -> f64 {
+///
+/// **DEC-443: a pump on a DC-mode header reports the DC pump floor.** The
+/// engine enforces it (`member_effective_floor`) whatever the device policy
+/// says, so reporting anything lower would be the dishonest direction.
+/// `pwm_mode` is the header's `pwmN_mode`; it raises only in DC mode, so a
+/// validated relaxing policy on a PWM header keeps its (lower) floor.
+pub fn resolve_policy_floor(
+    policy: &DevicePolicy,
+    pump_protected: bool,
+    pwm_mode: Option<u8>,
+) -> f64 {
     if !pump_protected {
         // Nothing applies a DEVICE-POLICY floor to a header that is not
         // pump-protected: every site that could keys on
@@ -240,7 +250,12 @@ pub fn resolve_policy_floor(policy: &DevicePolicy, pump_protected: bool) -> f64 
     } else {
         policy.minimum_safe_pwm
     };
-    declared.max(ABSOLUTE_PUMP_FLOOR_PCT)
+    let floor = declared.max(ABSOLUTE_PUMP_FLOOR_PCT);
+    if pwm_mode == Some(crate::profile::PWM_MODE_DC) {
+        floor.max(crate::profile::pump_floor_pct(pwm_mode))
+    } else {
+        floor
+    }
 }
 
 /// Whether the daemon will let this header be driven to 0.
@@ -342,7 +357,7 @@ mod tests {
     #[test]
     fn reported_floor_matches_enforced_floor_for_every_shipped_policy() {
         for p in POLICIES {
-            let reported = resolve_policy_floor(p, true);
+            let reported = resolve_policy_floor(p, true, None);
             assert_eq!(
                 reported,
                 crate::profile::HARD_PUMP_CPU_FLOOR_PCT,
@@ -359,7 +374,7 @@ mod tests {
             // site honours — the exact failure the assertion above exists to
             // prevent, one branch over. Testing only `true` is what let
             // `generic_pump` publish 30 for a radiator fan.
-            let unprotected = resolve_policy_floor(p, false);
+            let unprotected = resolve_policy_floor(p, false, None);
             assert_eq!(
                 unprotected, 0.0,
                 "policy {} reports a floor of {unprotected} for a header that is not \
@@ -367,6 +382,30 @@ mod tests {
                 p.id
             );
         }
+    }
+
+    /// [SAFETY] DEC-443: the honesty invariant, per `pwm_mode`. A pump on a DC
+    /// header reports the floor the engine enforces for it — the DC pump floor —
+    /// for every shipped policy; PWM and unreported modes keep the 30 % floor;
+    /// and an unprotected header reports 0 in every mode.
+    #[test]
+    fn reported_floor_matches_enforced_floor_in_every_pwm_mode() {
+        for p in POLICIES {
+            for mode in [None, Some(1), Some(crate::profile::PWM_MODE_DC)] {
+                assert_eq!(
+                    resolve_policy_floor(p, true, mode),
+                    crate::profile::pump_floor_pct(mode),
+                    "policy {} in mode {mode:?}",
+                    p.id
+                );
+                assert_eq!(resolve_policy_floor(p, false, mode), 0.0);
+            }
+        }
+        // The value the pre-DEC-443 code could not produce.
+        assert_eq!(
+            resolve_policy_floor(&GENERIC_PUMP, true, Some(crate::profile::PWM_MODE_DC)),
+            crate::profile::DC_PUMP_FLOOR_PCT
+        );
     }
 
     /// **`WIRE-b`.** The shape measured on an X870E AORUS MASTER: a radiator fan
@@ -383,13 +422,13 @@ mod tests {
     #[test]
     fn a_non_pump_member_of_a_pump_policy_device_reports_no_floor() {
         assert_eq!(
-            resolve_policy_floor(&GENERIC_PUMP, false),
+            resolve_policy_floor(&GENERIC_PUMP, false, None),
             0.0,
             "a radiator fan inheriting its device's pump policy must not be published \
              a floor the engine does not enforce for it"
         );
         assert_eq!(
-            resolve_policy_floor(&GENERIC_PUMP, true),
+            resolve_policy_floor(&GENERIC_PUMP, true, None),
             crate::profile::HARD_PUMP_CPU_FLOOR_PCT,
             "the pump member of that same device must keep the enforced floor"
         );
@@ -406,14 +445,14 @@ mod tests {
             supports_stop: false,
             ..GENERIC_PUMP
         };
-        assert_eq!(resolve_policy_floor(&validated, true), 25.0);
+        assert_eq!(resolve_policy_floor(&validated, true, None), 25.0);
 
         let tighter = DevicePolicy {
             minimum_safe_pwm: 45.0,
             ..validated
         };
         assert_eq!(
-            resolve_policy_floor(&tighter, true),
+            resolve_policy_floor(&tighter, true, None),
             45.0,
             "a policy above the generic floor must raise it"
         );
@@ -431,7 +470,7 @@ mod tests {
             ..GENERIC_PUMP
         };
         assert_eq!(
-            resolve_policy_floor(&reckless, true),
+            resolve_policy_floor(&reckless, true, None),
             ABSOLUTE_PUMP_FLOOR_PCT,
             "a policy below the backstop must be clamped up to it"
         );
@@ -444,12 +483,12 @@ mod tests {
     #[test]
     fn a_fan_policy_cannot_lower_a_pump_protected_header() {
         assert_eq!(
-            resolve_policy_floor(&GENERIC_FAN, true),
+            resolve_policy_floor(&GENERIC_FAN, true, None),
             crate::profile::HARD_PUMP_CPU_FLOOR_PCT,
             "a stoppable policy must not move a pump's floor"
         );
         // The same policy on an ordinary header does what it says.
-        assert_eq!(resolve_policy_floor(&GENERIC_FAN, false), 0.0);
+        assert_eq!(resolve_policy_floor(&GENERIC_FAN, false, None), 0.0);
     }
 
     #[test]

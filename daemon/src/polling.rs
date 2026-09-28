@@ -86,7 +86,8 @@ fn to_cached(reading: &SensorReading) -> CachedSensorReading {
 /// to report, so the poll loop leaves `subsystem_timestamps.aio` unset. When a
 /// coolant sensor exists, the summary carries the hottest coolant reading; pump
 /// duty/RPM are surfaced through the normal fan table, so they stay `None` here.
-/// No safety semantics (there is no coolant threshold — see `safety.rs`).
+/// Display only: the coolant emergency (DEC-443) reads the sensors directly in
+/// the engine, never this summary.
 fn derive_aio_state(sensors: &[CachedSensorReading], now: Instant) -> Option<AioPumpState> {
     let coolant_temp_c = sensors
         .iter()

@@ -607,6 +607,41 @@ const KNOWN_MEMBER_SOURCES: [&str; 5] = ["openfan", "hwmon", "amd_gpu", "intel_g
 /// time (reject, see [`validate`]) and at eval time (clamp, see `profile_engine`).
 pub(crate) const HARD_PUMP_CPU_FLOOR_PCT: f64 = 30.0;
 
+/// The pump floor for a header the kernel reports in **DC mode** (DEC-443,
+/// `TS-e`). The kernel ABI's `pwmN_mode` is `0` for DC (voltage) output and `1`
+/// for PWM (`Documentation/hwmon/sysfs-interface.rst`).
+///
+/// [SAFETY] 30 % of a DC header is ~3.6 V, below the ~7 V a 3-pin DC pump
+/// commonly needs to keep turning (forum- and vendor-sourced; none was measured
+/// here, and the duty-to-voltage mapping of real boards is unverified). 70 % is
+/// ~8.4 V — the user's choice over the recorded 60 % (~7.2 V, marginal).
+///
+/// Pumps only. A CPU fan on a DC header keeps [`HARD_PUMP_CPU_FLOOR_PCT`]: a fan
+/// that stops is a fan, and raising every DC CPU fan to 70 % would be a noise
+/// change nobody asked for. Reported by `nct6775` and a few older chips; the
+/// it87 driver publishes no `pwmN_mode`, so on it87 boards this never applies.
+pub(crate) const DC_PUMP_FLOOR_PCT: f64 = 70.0;
+
+/// `pwmN_mode` value meaning DC (voltage) output (hwmon sysfs ABI).
+pub(crate) const PWM_MODE_DC: u8 = 0;
+
+/// The floor a **pump** on a header in `pwm_mode` gets (DEC-443).
+///
+/// [SAFETY] The ONE definition every pump-floor site reads — the engine clamp,
+/// identify, verify, characterisation, discovery, the stall probe, every
+/// diagnostic restore, and the published `effective_min_pwm_pct` — so one header
+/// can never have two pump floors (the user's Q11 decision). `None` (the chip
+/// does not say) and PWM mode keep [`HARD_PUMP_CPU_FLOOR_PCT`]: an unknown mode
+/// must not RAISE a floor on evidence we do not have, and it cannot LOWER one
+/// below the value every pump already had.
+pub(crate) fn pump_floor_pct(pwm_mode: Option<u8>) -> f64 {
+    if pwm_mode == Some(PWM_MODE_DC) {
+        DC_PUMP_FLOOR_PCT
+    } else {
+        HARD_PUMP_CPU_FLOOR_PCT
+    }
+}
+
 /// Header-label keywords (case-insensitive substring) marking a hwmon member as a
 /// CPU or pump header. Mirror of the GUI's `_CPU_PUMP_LABEL_HINTS`. Distinct from
 /// `hwmon::aio` `COOLANT_LABEL_HINTS`, which classifies temperature *sensors*.
@@ -617,7 +652,13 @@ const CPU_PUMP_LABEL_HINTS: &[&str] = &["cpu", "pump", "aio"];
 /// OD_RANGE minimum (DEC-119). Intel + NVIDIA are read-only (no backend writes
 /// them). Mirrors the GUI's `infer_member_role` GPU branch.
 pub(crate) fn member_is_gpu(member: &ControlMember) -> bool {
-    member.source == "amd_gpu" || member.source == "intel_gpu" || member.source == "nvidia_gpu"
+    member_is_gpu_source(&member.source)
+}
+
+/// [`member_is_gpu`] on a bare source string — for a `PwmCommand`, which carries
+/// the source but not the member (DEC-443's advisory excludes GPU outputs).
+pub(crate) fn member_is_gpu_source(source: &str) -> bool {
+    source == "amd_gpu" || source == "intel_gpu" || source == "nvidia_gpu"
 }
 
 /// True when a control member is a pump/CPU header that needs the hard floor.

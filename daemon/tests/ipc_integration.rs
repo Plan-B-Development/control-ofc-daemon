@@ -8448,3 +8448,247 @@ async fn get_profile_serves_a_suffixed_stored_profile_canonical_without_rewritin
         "GET must not rewrite the stored file"
     );
 }
+
+// ── DEC-443 (`W-SAFE`): coolant emergency, pump stall, cooling advisory ─────
+
+/// DEC-443: `/status` and `/poll` publish WHY an emergency is in force and the
+/// engine's cooling watch, from the cache — and omit all three when nothing is
+/// happening, so a client of an older daemon and a quiet newer one read alike.
+#[tokio::test]
+async fn status_and_poll_publish_the_cooling_watch() {
+    use control_ofc_daemon::health::cache::EngineSafetyReport;
+    use control_ofc_daemon::health::state::{CoolingAdvisoryRecord, PumpStallRecord};
+    let state = test_app_state();
+    let cache = state.cache.clone();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    for endpoint in ["/status", "/poll"] {
+        let (status, json) = uds_get(&path, endpoint).await;
+        assert_eq!(status, 200);
+        let st = if endpoint == "/poll" {
+            &json["status"]
+        } else {
+            &json
+        };
+        for field in ["emergency_causes", "pump_stalls", "advisories"] {
+            assert!(
+                st.get(field).is_none(),
+                "{endpoint}: {field} when quiet: {st}"
+            );
+        }
+    }
+
+    cache.record_engine_safety(&EngineSafetyReport {
+        thermal_state: "emergency",
+        trigger_c: control_ofc_daemon::constants::THERMAL_EMERGENCY_TRIGGER_C,
+        causes: vec!["cpu", "coolant"],
+        coolant_limit_c: Some(60.0),
+        coolant_release_c: Some(55.0),
+    });
+    cache.update_cooling_watch(
+        vec![PumpStallRecord {
+            header_id: "hwmon:nct6798:nct6775.656:pwm2:PUMP".into(),
+            state: "held",
+            since: Instant::now(),
+            stall_count: 2,
+        }],
+        vec![CoolingAdvisoryRecord {
+            code: "cpu_at_ceiling_low_cooling",
+            since: Instant::now(),
+            cpu_temp_c: 95.5,
+            ceiling_c: 95.0,
+            max_duty_pct: 35,
+        }],
+    );
+    for endpoint in ["/status", "/poll"] {
+        let (_, json) = uds_get(&path, endpoint).await;
+        let st = if endpoint == "/poll" {
+            &json["status"]
+        } else {
+            &json
+        };
+        assert_eq!(st["thermal_state"], "emergency", "{endpoint}");
+        assert_eq!(
+            st["emergency_causes"],
+            serde_json::json!(["cpu", "coolant"]),
+            "{endpoint}"
+        );
+        let stall = &st["pump_stalls"][0];
+        assert_eq!(stall["header_id"], "hwmon:nct6798:nct6775.656:pwm2:PUMP");
+        assert_eq!(stall["state"], "held");
+        assert_eq!(stall["stall_count"], 2);
+        assert!(stall["since_ms"].is_u64(), "{endpoint}: {stall}");
+        let adv = &st["advisories"][0];
+        assert_eq!(adv["code"], "cpu_at_ceiling_low_cooling");
+        assert_eq!(adv["cpu_temp_c"], 95.5);
+        assert_eq!(adv["ceiling_c"], 95.0);
+        assert_eq!(adv["max_duty_pct"], 35);
+        assert!(adv["since_ms"].is_u64(), "{endpoint}: {adv}");
+    }
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// [SAFETY] DEC-443 — `/diagnostics/hardware` reports the coolant thresholds the
+/// ENGINE acted on (the DEC-308 shape): seeded deliberately unlike the cache's
+/// configured limit, so a handler reading the configuration would fail here.
+#[tokio::test]
+async fn hardware_diagnostics_reports_the_coolant_limit_the_engine_acted_on() {
+    use control_ofc_daemon::health::cache::EngineSafetyReport;
+    let state = test_app_state();
+    let acted = 52.0;
+    assert_ne!(
+        acted,
+        f64::from(state.cache.coolant_limit_c()),
+        "precondition: the acted-on limit must differ from the configured one"
+    );
+    state.cache.record_engine_safety(&EngineSafetyReport {
+        thermal_state: "normal",
+        trigger_c: control_ofc_daemon::constants::THERMAL_EMERGENCY_TRIGGER_C,
+        causes: vec![],
+        coolant_limit_c: Some(acted),
+        coolant_release_c: Some(acted - control_ofc_daemon::constants::COOLANT_RELEASE_MARGIN_C),
+    });
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_get(&path, "/diagnostics/hardware").await;
+    assert_eq!(status, 200);
+    assert_eq!(json["thermal_safety"]["coolant_limit_c"], acted);
+    assert_eq!(
+        json["thermal_safety"]["coolant_release_c"],
+        acted - control_ofc_daemon::constants::COOLANT_RELEASE_MARGIN_C
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// [SAFETY] DEC-443. The coolant limit applies LIVE and persists, `GET /config`
+/// reports the running value, the capability is advertised by the build that
+/// serves the route, and before the engine's first tick `/diagnostics/hardware`
+/// reports the configured value rather than nothing.
+#[tokio::test]
+async fn the_coolant_limit_applies_live_and_is_advertised() {
+    let (state, _tmp) = config_test_state("");
+    let cache = state.cache.clone();
+    let runtime_path = state.runtime_config_path.clone();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (_status, caps) = uds_get(&path, "/capabilities").await;
+    assert_eq!(
+        caps["control"]["cooling_failure_detection"], true,
+        "this daemon serves POST /config/coolant-limit but does not advertise it: {caps}"
+    );
+    assert_eq!(
+        cache.coolant_limit_c(),
+        control_ofc_daemon::constants::DEFAULT_COOLANT_LIMIT_C,
+        "precondition: the default is in force"
+    );
+
+    let (status, json) = uds_post(
+        &path,
+        "/config/coolant-limit",
+        &serde_json::json!({"coolant_limit_c": 50}),
+    )
+    .await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json["value"], 50);
+    assert_eq!(cache.coolant_limit_c(), 50, "in force at once");
+    assert_eq!(
+        control_ofc_daemon::runtime_config::RuntimeConfig::load_from(&runtime_path)
+            .coolant_limit_c(),
+        Some(50),
+        "and persisted"
+    );
+
+    let (_status, cfg) = uds_get(&path, "/config").await;
+    let key = cfg["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["key"] == "safety.coolant_limit_c")
+        .expect("GET /config reports the coolant limit");
+    assert_eq!(key["value"], 50);
+    assert_eq!(key["running_value"], 50);
+    assert_eq!(key["source"], "runtime");
+    assert_eq!(key["requires_restart"], false);
+    assert_eq!(key["restart_pending"], false);
+
+    let (_status, diag) = uds_get(&path, "/diagnostics/hardware").await;
+    assert_eq!(diag["thermal_safety"]["coolant_limit_c"], 50.0);
+    assert_eq!(
+        diag["thermal_safety"]["coolant_release_c"],
+        50.0 - control_ofc_daemon::constants::COOLANT_RELEASE_MARGIN_C
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn the_coolant_limit_rejects_out_of_range_and_changes_nothing() {
+    let (state, _tmp) = config_test_state("");
+    let cache = state.cache.clone();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+    let before = cache.coolant_limit_c();
+    let (lo, hi) = (
+        control_ofc_daemon::constants::COOLANT_LIMIT_MIN_C,
+        control_ofc_daemon::constants::COOLANT_LIMIT_MAX_C,
+    );
+
+    for bad in [
+        serde_json::json!({"coolant_limit_c": lo - 1}),
+        serde_json::json!({"coolant_limit_c": hi + 1}),
+        serde_json::json!({"coolant_limit_c": -1}),
+        serde_json::json!({"coolant_limit_c": 55.5}),
+        serde_json::json!({"coolant_limit_c": "55"}),
+        serde_json::json!({}),
+    ] {
+        let (status, json) = uds_post(&path, "/config/coolant-limit", &bad).await;
+        assert_eq!(status, 400, "{bad} must be rejected: {json}");
+        assert_eq!(json["error"]["code"], "validation_error");
+    }
+    assert_eq!(
+        cache.coolant_limit_c(),
+        before,
+        "a rejected write changes nothing"
+    );
+
+    for edge in [lo, hi] {
+        let (status, json) = uds_post(
+            &path,
+            "/config/coolant-limit",
+            &serde_json::json!({"coolant_limit_c": edge}),
+        )
+        .await;
+        assert_eq!(status, 200, "{edge} is inside the range: {json}");
+        assert_eq!(cache.coolant_limit_c(), edge);
+    }
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A limit that cannot be persisted is not put in force: the engine must never
+/// act on a value the next start would not keep.
+#[tokio::test]
+async fn an_unpersisted_coolant_limit_is_not_applied() {
+    let state = test_app_state();
+    let cache = state.cache.clone();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+    let before = cache.coolant_limit_c();
+
+    let (status, json) = uds_post(
+        &path,
+        "/config/coolant-limit",
+        &serde_json::json!({"coolant_limit_c": 45}),
+    )
+    .await;
+    assert_eq!(status, 503, "{json}");
+    assert_eq!(json["error"]["code"], "persistence_failed");
+    assert_eq!(cache.coolant_limit_c(), before);
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}

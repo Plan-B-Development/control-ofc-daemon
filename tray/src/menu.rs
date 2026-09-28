@@ -2,7 +2,7 @@
 
 use ksni::menu::{MenuItem, RadioGroup, RadioItem, StandardItem, SubMenu};
 
-use crate::client::{DaemonApi, ProfileSummary, Status};
+use crate::client::{DaemonApi, ProfileSummary, PumpStall, Status};
 use crate::launch::GuiLauncher;
 
 /// Freedesktop icon name, installed by the daemon package as
@@ -297,6 +297,11 @@ impl ksni::Tray for ControlOfcTray {
             if status.thermal_is_abnormal() {
                 items.push(disabled(&thermal_label(&status.thermal_state)));
             }
+            // DEC-443: a pump under a stall response. After the thermal line — a
+            // force on every fan outranks one pump — and before a refused action.
+            for label in pump_stall_labels(&status.pump_stalls) {
+                items.push(disabled(&label));
+            }
         }
 
         // AFTER the thermal line, not before it: `CLAUDE.md`'s visible-warning
@@ -382,6 +387,45 @@ pub fn thermal_label(state: &str) -> String {
         "no_sensor_fallback" => "⚠ No CPU temperature — fans held at a safety floor".to_string(),
         other => format!("⚠ Thermal state: {other}"),
     }
+}
+
+/// Human wording for a `pump_stalls[].state` token (DEC-443). As with
+/// [`thermal_label`], an unrecognised token renders rather than disappearing.
+pub fn pump_stall_label(state: &str) -> String {
+    match state {
+        "not_turning" => "⚠ Pump not turning at full speed — check the pump".to_string(),
+        "held" => "⚠ Pump stalled twice — held at full speed".to_string(),
+        "stall_response" => "⚠ Pump stalled — running it at full speed".to_string(),
+        other => format!("⚠ Pump state: {other}"),
+    }
+}
+
+/// One line per distinct pump state, most severe first, with a count where
+/// more than one pump shares it.
+pub fn pump_stall_labels(stalls: &[PumpStall]) -> Vec<String> {
+    fn rank(state: &str) -> u8 {
+        match state {
+            "not_turning" => 0,
+            "held" => 2,
+            "stall_response" => 3,
+            _ => 1, // unknown: render it, and above the states we can explain
+        }
+    }
+    let mut states: Vec<&str> = stalls.iter().map(|s| s.state.as_str()).collect();
+    states.sort_by_key(|s| (rank(s), *s));
+    states.dedup();
+    states
+        .into_iter()
+        .map(|state| {
+            let n = stalls.iter().filter(|s| s.state == state).count();
+            let label = pump_stall_label(state);
+            if n > 1 {
+                format!("{label} ({n} pumps)")
+            } else {
+                label
+            }
+        })
+        .collect()
 }
 
 /// Menu labels for a profile list, disambiguating repeated names.

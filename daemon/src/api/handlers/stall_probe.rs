@@ -96,6 +96,7 @@ pub async fn stall_probe_handler(
     // the mid-run re-check call. The pump UNION, never the wire role (DEC-312);
     // the controller lock above is released, as `header_role_parts` requires.
     let pump_protected = state.header_is_pump_protected(&header_id);
+    let pump_floor = state.header_pump_floor_pct(&header_id);
     let role = state.resolved_header_role(&header_id);
     if let Some(token) = sp::ineligibility(role, pump_protected, is_writable, has_tach) {
         let message = format!(
@@ -287,6 +288,8 @@ pub async fn stall_probe_handler(
                 // `run_probe` raises it to the pump floor if a pump role appears
                 // while the probe runs (`AUD3-l`).
                 0,
+                // DEC-443: that floor is this header's own — DC-aware.
+                pump_floor,
                 std::time::Duration::from_secs(crate::constants::CHARACTERIZATION_DEFAULT_SETTLE_S),
                 driver_refresh_ms,
                 write_fn,

@@ -192,6 +192,10 @@ pub struct PumpWatch<'a> {
     header_id: String,
     subject: &'static str,
     at_start: bool,
+    /// The header's own pump floor (DEC-443): the DC pump floor on a DC-mode
+    /// header, else the 30 % pump floor. Static — `pwmN_mode` is read once at
+    /// discovery — so it is taken once, from `AppState::header_pump_floor_pct`.
+    pump_floor: u8,
     check: Box<dyn Fn() -> bool + Send + Sync + 'a>,
     seen: AtomicBool,
     /// The last duty the run wrote; `None` until [`PumpWatch::note_write`].
@@ -202,16 +206,20 @@ pub struct PumpWatch<'a> {
 impl<'a> PumpWatch<'a> {
     /// `at_start` is the union read when the run was planned; `check` re-reads
     /// it. `subject` names the diagnostic in the log line, e.g. `"verify"`.
+    /// `pump_floor` is the header's pump floor (DEC-443); a value below the 30 %
+    /// pump floor is raised to it — the DC floor can only raise.
     pub fn new(
         header_id: impl Into<String>,
         subject: &'static str,
         at_start: bool,
+        pump_floor: u8,
         check: impl Fn() -> bool + Send + Sync + 'a,
     ) -> Self {
         Self {
             header_id: header_id.into(),
             subject,
             at_start,
+            pump_floor: pump_floor.max(crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8),
             check: Box::new(check),
             seen: AtomicBool::new(false),
             last_written: AtomicU8::new(0),
@@ -234,15 +242,29 @@ impl<'a> PumpWatch<'a> {
         if !self.wrote.load(Ordering::SeqCst) || !self.restore_is_pump() {
             return None;
         }
-        let floor = crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8;
-        Some(self.last_written.load(Ordering::SeqCst).max(floor))
+        Some(
+            self.last_written
+                .load(Ordering::SeqCst)
+                .max(self.pump_floor),
+        )
+    }
+
+    /// The header's pump floor this watch applies (DEC-443).
+    pub fn pump_floor(&self) -> u8 {
+        self.pump_floor
     }
 
     /// A watch whose entry answer is final — for a caller with no union to
     /// consult: the pure loops' own tests, unit and integration alike (a
     /// `#[cfg(test)]` item is invisible to `daemon/tests/`).
     pub fn fixed(at_start: bool) -> PumpWatch<'static> {
-        PumpWatch::new("", "test", at_start, || false)
+        PumpWatch::new(
+            "",
+            "test",
+            at_start,
+            crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8,
+            || false,
+        )
     }
 
     /// Whether the header was NOT pump-protected when the run was planned and
@@ -269,7 +291,7 @@ impl<'a> PumpWatch<'a> {
                  its restore is floored there",
                 self.header_id,
                 self.subject,
-                crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8
+                self.pump_floor
             );
         }
         true
@@ -288,12 +310,11 @@ impl<'a> PumpWatch<'a> {
 /// It says the restore is *floored*, not that it happened: whether it landed is
 /// the run's `restore_outcome` / `restore_failed`, which a shutdown or a thermal
 /// force can legitimately skip.
-pub(crate) fn pump_protected_mid_run_detail(subject: &str) -> String {
+pub(crate) fn pump_protected_mid_run_detail(subject: &str, pump_floor: u8) -> String {
     format!(
         "the header became pump-protected during the {subject} (a profile naming it a \
          pump was activated, or it was assigned the pump role), so the {subject} stopped \
-         and its restore is floored at the {}% pump floor",
-        crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8
+         and its restore is floored at the {pump_floor}% pump floor"
     )
 }
 
@@ -303,12 +324,15 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
 
+    const PWM_FLOOR: u8 = crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8;
+    const DC_FLOOR: u8 = crate::profile::DC_PUMP_FLOOR_PCT as u8;
+
     /// A watch over a union the test flips, counting how often it is read.
     fn flipping() -> (PumpWatch<'static>, Arc<AtomicBool>, Arc<AtomicUsize>) {
         let union = Arc::new(AtomicBool::new(false));
         let reads = Arc::new(AtomicUsize::new(0));
         let (u, r) = (union.clone(), reads.clone());
-        let watch = PumpWatch::new("hwmon:t:d:pwm1", "verify", false, move || {
+        let watch = PumpWatch::new("hwmon:t:d:pwm1", "verify", false, PWM_FLOOR, move || {
             r.fetch_add(1, Ordering::SeqCst);
             u.load(Ordering::SeqCst)
         });
@@ -347,7 +371,7 @@ mod tests {
     fn a_pump_run_never_aborts_and_always_floors_its_restore() {
         let reads = Arc::new(AtomicUsize::new(0));
         let r = reads.clone();
-        let watch = PumpWatch::new("h", "verify", true, move || {
+        let watch = PumpWatch::new("h", "verify", true, PWM_FLOOR, move || {
             r.fetch_add(1, Ordering::SeqCst);
             false
         });
@@ -360,7 +384,7 @@ mod tests {
     /// — never lowered to it — and there is none without a write or a pump.
     #[test]
     fn the_fallback_raises_the_last_duty_to_the_floor_and_never_lowers_it() {
-        let floor = crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8;
+        let floor = PWM_FLOOR;
         let (watch, union, _) = flipping();
         union.store(true, Ordering::SeqCst);
         assert_eq!(watch.floored_fallback(), None, "no write, no restore owed");
@@ -380,14 +404,22 @@ mod tests {
 
     #[test]
     fn the_detail_names_the_diagnostic_and_the_floor() {
-        let d = pump_protected_mid_run_detail("characterisation");
+        let d = pump_protected_mid_run_detail("characterisation", DC_FLOOR);
         assert!(d.contains("during the characterisation"), "{d}");
-        assert!(
-            d.contains(&format!(
-                "{}%",
-                crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8
-            )),
-            "{d}"
-        );
+        assert!(d.contains(&format!("{DC_FLOOR}%")), "{d}");
+    }
+
+    /// [SAFETY] DEC-443: a DC-mode pump's restore fallback is raised to ITS
+    /// floor, not to the 30 % one — the relationship, asserted on the one value
+    /// the pre-DEC-443 code could not produce.
+    #[test]
+    fn a_dc_pump_watch_floors_its_fallback_at_the_dc_floor() {
+        let watch = PumpWatch::new("h", "verify", true, DC_FLOOR, || false);
+        watch.note_write(40);
+        assert_eq!(watch.floored_fallback(), Some(DC_FLOOR));
+        assert_eq!(watch.pump_floor(), DC_FLOOR);
+        // And a floor below 30 is not honoured.
+        let low = PumpWatch::new("h", "verify", true, 5, || false);
+        assert_eq!(low.pump_floor(), PWM_FLOOR);
     }
 }

@@ -33,6 +33,21 @@
 //! latched. The user chose that over a bounded latch, following IEC 61511-1
 //! 11.2.7: a safety function that has tripped stays tripped until its reset.
 
+//!
+//! # Coolant (DEC-443, `TS-f`)
+//!
+//! A second table, [`evaluate_coolant_tick`], runs the coolant rule the same
+//! way over the hottest `CoolantTemp` reading, and [`combine`] folds the two into
+//! the tick's one decision. The coolant table has three rows and no blind floor
+//! — the user's Q4: a coolant sensor that goes stale or vanishes with nothing
+//! latched forces nothing, and the CPU ladder stays the backstop.
+//!
+//! | coolant reading | latched | decision |
+//! | --- | --- | --- |
+//! | fresh | — | the coolant rule decides (latch at the limit, release at limit − 5) |
+//! | stale or absent | yes | **emergency, 100 %** — held until a FRESH reading at or below release |
+//! | stale or absent | no | normal |
+
 use super::*;
 
 /// Outcome of one safety-tick evaluation (pure decision, unit-testable).
@@ -177,4 +192,191 @@ pub(crate) fn evaluate_safety_tick(
     }
 
     decision
+}
+
+/// Which rules are forcing the emergency this tick (DEC-443). Published as
+/// `emergency_causes[]` on `/status` and `/poll`, in the same cache write as
+/// `thermal_state`, so a client can say WHAT is hot — the GUI's banner said
+/// "a critical CPU temperature" for every emergency until coolant could cause
+/// one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct EmergencyCauses {
+    pub(crate) cpu: bool,
+    pub(crate) coolant: bool,
+}
+
+impl EmergencyCauses {
+    /// The wire tokens, in a stable order: `"cpu"`, then `"coolant"`.
+    pub(crate) fn tokens(self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.cpu {
+            out.push("cpu");
+        }
+        if self.coolant {
+            out.push("coolant");
+        }
+        out
+    }
+}
+
+/// The tick's combined safety outcome (DEC-443): the one decision the engine
+/// acts on, and which rules produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TickSafety {
+    pub(crate) decision: SafetyDecision,
+    pub(crate) causes: EmergencyCauses,
+}
+
+/// Evaluate the coolant emergency rule for one tick (DEC-443, `TS-f`) — the
+/// three-row table in the module doc.
+///
+/// [SAFETY] The same freshness discipline as the CPU table (DEC-269): only a
+/// FRESH reading moves the latch, and going blind never lowers a latched
+/// emergency. Unlike the CPU table there is no no-sensor floor: most machines
+/// have no coolant sensor at all, and "absent" is their permanent, healthy state.
+pub(crate) fn evaluate_coolant_tick(
+    reading: super::CpuReading,
+    rule: &mut crate::safety::ThermalSafetyRule,
+) -> SafetyDecision {
+    use super::CpuReading;
+    match (reading, rule.is_active()) {
+        (CpuReading::Fresh(t), _) => match rule.evaluate(t) {
+            Some(_) => SafetyDecision::emergency(rule),
+            None => SafetyDecision::NORMAL,
+        },
+        (CpuReading::Stale(_) | CpuReading::Absent, true) => SafetyDecision::emergency(rule),
+        (CpuReading::Stale(_) | CpuReading::Absent, false) => SafetyDecision::NORMAL,
+    }
+}
+
+/// Fold the CPU and coolant decisions into the tick's one decision (DEC-443).
+///
+/// [SAFETY] Monotone by construction: the forced duty is the MAX of the two, so
+/// adding the coolant rule can never lower what the CPU ladder forces, and the
+/// state is `"emergency"` whenever either rule is latched. Exhaustive over which
+/// rules are in emergency; the coolant table produces only `"normal"` or
+/// `"emergency"`, so a CPU `"no_sensor_fallback"` survives exactly when coolant
+/// is not forcing.
+pub(crate) fn combine(cpu: SafetyDecision, coolant: SafetyDecision) -> TickSafety {
+    let causes = EmergencyCauses {
+        cpu: cpu.thermal_state == "emergency",
+        coolant: coolant.thermal_state == "emergency",
+    };
+    let forced_pct = match (cpu.forced_pct, coolant.forced_pct) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
+    let thermal_state = match (causes.cpu, causes.coolant) {
+        (true, _) | (_, true) => "emergency",
+        (false, false) => cpu.thermal_state,
+    };
+    TickSafety {
+        decision: SafetyDecision {
+            thermal_state,
+            forced_pct,
+        },
+        causes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::CpuReading;
+    use super::*;
+    use crate::safety::ThermalSafetyRule;
+
+    const LIMIT: u8 = constants::DEFAULT_COOLANT_LIMIT_C;
+
+    fn rule() -> ThermalSafetyRule {
+        ThermalSafetyRule::coolant(LIMIT)
+    }
+
+    fn latched() -> ThermalSafetyRule {
+        let mut r = rule();
+        assert!(r.evaluate(f64::from(LIMIT)).is_some(), "precondition");
+        r
+    }
+
+    /// [SAFETY] DEC-443: every CPU state crossed with both coolant states. The
+    /// combined duty is never below either input's, the state is `emergency`
+    /// exactly when one rule is, and a CPU fallback survives only while coolant
+    /// is not forcing.
+    #[test]
+    fn combine_is_monotone_and_names_its_causes() {
+        let cpu_emergency = SafetyDecision::emergency(&ThermalSafetyRule::new());
+        let cool_emergency = SafetyDecision::emergency(&rule());
+        let cpus = [
+            SafetyDecision::NORMAL,
+            SafetyDecision::NO_SENSOR_FALLBACK,
+            cpu_emergency,
+        ];
+        for cpu in cpus {
+            for coolant in [SafetyDecision::NORMAL, cool_emergency] {
+                let t = combine(cpu, coolant);
+                let floor = |d: SafetyDecision| d.forced_pct.unwrap_or(0);
+                assert!(floor(t.decision) >= floor(cpu), "{cpu:?} {coolant:?}");
+                assert!(floor(t.decision) >= floor(coolant), "{cpu:?} {coolant:?}");
+                assert_eq!(
+                    t.decision.forced_pct.is_some(),
+                    cpu.forced_pct.is_some() || coolant.forced_pct.is_some()
+                );
+                let any = cpu.thermal_state == "emergency" || coolant.thermal_state == "emergency";
+                assert_eq!(t.decision.thermal_state == "emergency", any);
+                if !any {
+                    assert_eq!(t.decision.thermal_state, cpu.thermal_state);
+                }
+                assert_eq!(t.causes.cpu, cpu.thermal_state == "emergency");
+                assert_eq!(t.causes.coolant, coolant.thermal_state == "emergency");
+            }
+        }
+        let both = combine(cpu_emergency, cool_emergency);
+        assert_eq!(both.causes.tokens(), vec!["cpu", "coolant"]);
+        assert!(combine(SafetyDecision::NORMAL, SafetyDecision::NORMAL)
+            .causes
+            .tokens()
+            .is_empty());
+    }
+
+    /// [SAFETY] DEC-443, the coolant table: only a FRESH reading moves the
+    /// latch; going blind holds a latched emergency and, with nothing latched,
+    /// does nothing (the user's Q4) — however hot the last stale value was.
+    #[test]
+    fn the_coolant_table_follows_freshness() {
+        let limit = f64::from(LIMIT);
+        let release = limit - constants::COOLANT_RELEASE_MARGIN_C;
+
+        let mut r = rule();
+        assert_eq!(
+            evaluate_coolant_tick(CpuReading::Fresh(limit - 0.1), &mut r),
+            SafetyDecision::NORMAL
+        );
+        assert_eq!(
+            evaluate_coolant_tick(CpuReading::Fresh(limit), &mut r).thermal_state,
+            "emergency"
+        );
+
+        for blind in [CpuReading::Stale(limit + 10.0), CpuReading::Absent] {
+            let mut r = rule();
+            assert_eq!(
+                evaluate_coolant_tick(blind, &mut r),
+                SafetyDecision::NORMAL,
+                "nothing latched: a blind tick forces nothing ({blind:?})"
+            );
+            let mut r = latched();
+            let held = evaluate_coolant_tick(blind, &mut r);
+            assert_eq!(held.thermal_state, "emergency", "{blind:?}");
+            assert_eq!(held.forced_pct, Some(r.forced_output_pct()));
+        }
+
+        let mut r = latched();
+        assert_eq!(
+            evaluate_coolant_tick(CpuReading::Fresh(release + 0.1), &mut r).thermal_state,
+            "emergency",
+            "the hysteresis band holds"
+        );
+        assert_eq!(
+            evaluate_coolant_tick(CpuReading::Fresh(release), &mut r),
+            SafetyDecision::NORMAL
+        );
+    }
 }

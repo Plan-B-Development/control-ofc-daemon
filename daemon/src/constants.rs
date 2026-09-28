@@ -344,6 +344,59 @@ pub const THERMAL_TRIGGER_MAX_C: f64 = 115.0;
 /// [`THERMAL_EMERGENCY_TRIGGER_C`].
 pub const THERMAL_EMERGENCY_RELEASE_C: f64 = 80.0;
 
+// ── Cooling-failure detection (DEC-443, `W-SAFE`) ────────────────────
+
+/// The default coolant limit, in whole °C (DEC-443, `TS-f`).
+///
+/// [SAFETY] Fresh coolant at or above this latches the SAME 100 % force as the
+/// CPU emergency — the same reach, GPU excluded (DEC-130), floor-not-replacement
+/// (DEC-307). D5/DDC and AIO pumps are rated for coolant at or below 60 °C
+/// (EKWB, via retailer spec pages — the manufacturer's own page refuses
+/// automated fetches). With a GPU in the loop, or radiator fans stalled, coolant
+/// can pass that while the CPU sits under its throttle point, where the CPU
+/// ladder cannot see it. Settable through `[safety] coolant_limit_c` and
+/// `POST /config/coolant-limit`, clamped to
+/// [`COOLANT_LIMIT_MIN_C`]..=[`COOLANT_LIMIT_MAX_C`]; there is no off switch.
+pub const DEFAULT_COOLANT_LIMIT_C: u8 = 60;
+
+/// The lowest coolant limit a user may set (DEC-443). Below this an ordinary
+/// warm loop would latch the emergency.
+pub const COOLANT_LIMIT_MIN_C: u8 = 40;
+
+/// The highest coolant limit a user may set (DEC-443) — past the pumps' rating,
+/// but not so far that the trigger stops meaning anything.
+pub const COOLANT_LIMIT_MAX_C: u8 = 70;
+
+/// How far below the coolant limit a FRESH reading must fall to release a
+/// latched coolant emergency (DEC-443, the user's Q3). The hysteresis that
+/// stops a loop sitting at the limit flapping the force at 1 Hz.
+pub const COOLANT_RELEASE_MARGIN_C: f64 = 5.0;
+
+/// How long a pump must read 0 RPM, while commanded at or above the pump floor,
+/// before the engine responds (DEC-443, `TS-e`; the user's N = 10 s).
+pub const PUMP_STALL_DETECT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long the stall response holds a pump at 100 % before judging whether it
+/// recovered (DEC-443; the user's M = 30 s).
+pub const PUMP_STALL_KICK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The duty a pump stall response commands (DEC-443). Raise-only: it is a
+/// floor over the member's own command, never a replacement for it.
+pub const PUMP_STALL_RESPONSE_PCT: u8 = 100;
+
+/// The ceiling the cooling advisory uses where the CPU publishes no `crit`
+/// (DEC-443, `TS-m`; the user's Q12). `k10temp` (AMD) publishes none. Not a
+/// safety threshold: the advisory forces nothing.
+pub const ADVISORY_FALLBACK_CEILING_C: f64 = 85.0;
+
+/// How long the CPU must sit at its ceiling, with its cooling outputs low,
+/// before the advisory is raised (DEC-443; the user's 60 s).
+pub const ADVISORY_HOLD: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The advisory's "cooling outputs are low" line: the highest duty the engine
+/// commands to any non-GPU output is below this (DEC-443; the user's 50 %).
+pub const ADVISORY_LOW_DUTY_PCT: u8 = 50;
+
 // ── Calibration ──────────────────────────────────────────────────────
 
 /// Maximum temperature (°C) during calibration before aborting the

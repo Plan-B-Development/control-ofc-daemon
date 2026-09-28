@@ -30,6 +30,10 @@ pub struct DaemonConfig {
 
     #[serde(default)]
     pub shutdown: ShutdownConfig,
+
+    /// Cooling-failure detection (DEC-443).
+    #[serde(default)]
+    pub safety: SafetyConfig,
 }
 
 /// Serial port configuration.
@@ -262,6 +266,30 @@ fn default_exit_floor_pct() -> u8 {
     crate::constants::DEFAULT_EXIT_FLOOR_PCT
 }
 
+/// Cooling-failure detection settings (DEC-443, `W-SAFE`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SafetyConfig {
+    /// The coolant limit, in whole °C. Fresh coolant at or above it latches the
+    /// thermal emergency's 100 % force; it releases at 5 °C below. Must be
+    /// within `COOLANT_LIMIT_MIN_C..=COOLANT_LIMIT_MAX_C` (40–70); there is no
+    /// off switch. Applies live, like the exit floor.
+    #[serde(default = "default_coolant_limit_c")]
+    pub coolant_limit_c: u8,
+}
+
+impl Default for SafetyConfig {
+    fn default() -> Self {
+        Self {
+            coolant_limit_c: default_coolant_limit_c(),
+        }
+    }
+}
+
+fn default_coolant_limit_c() -> u8 {
+    crate::constants::DEFAULT_COOLANT_LIMIT_C
+}
+
 impl DaemonConfig {
     /// Parse configuration from a TOML string.
     pub fn from_toml(input: &str) -> Result<Self, ConfigError> {
@@ -315,6 +343,17 @@ impl DaemonConfig {
             return Err(ConfigError::Validation {
                 field: "shutdown.exit_floor_pct".into(),
                 message: "must be 0-100".into(),
+            });
+        }
+
+        let (lo, hi) = (
+            crate::constants::COOLANT_LIMIT_MIN_C,
+            crate::constants::COOLANT_LIMIT_MAX_C,
+        );
+        if !(lo..=hi).contains(&self.safety.coolant_limit_c) {
+            return Err(ConfigError::Validation {
+                field: "safety.coolant_limit_c".into(),
+                message: format!("must be {lo}-{hi}"),
             });
         }
 
@@ -514,6 +553,53 @@ delay_secs = 60
         let config = DaemonConfig::from_toml("[shutdown]\nexit_floor_pct = 70\n").unwrap();
         assert_eq!(config.shutdown.exit_floor_pct, 70);
         assert!(config.validate().is_ok());
+    }
+
+    /// DEC-443: the shipped example documents the key, uncommentably, in the
+    /// section that reads it — and uncommenting it yields a config that loads.
+    #[test]
+    fn the_example_config_documents_the_coolant_limit() {
+        const EXAMPLE: &str = include_str!("../../packaging/daemon.toml.example");
+        let section = EXAMPLE
+            .split("\n[safety]\n")
+            .nth(1)
+            .expect("the example config must have a [safety] section");
+        let section = section.split("\n[").next().unwrap();
+        let line = format!(
+            "# coolant_limit_c = {}",
+            crate::constants::DEFAULT_COOLANT_LIMIT_C
+        );
+        assert!(
+            section.contains(&line),
+            "[safety] lacks `{line}`:\n{section}"
+        );
+        let cfg: DaemonConfig = toml::from_str(&format!("[safety]\n{}\n", &line[2..]))
+            .expect("uncommented line parses");
+        assert_eq!(
+            cfg.safety.coolant_limit_c,
+            crate::constants::DEFAULT_COOLANT_LIMIT_C
+        );
+    }
+
+    #[test]
+    fn the_coolant_limit_defaults_parses_and_is_range_checked() {
+        let config = DaemonConfig::from_toml("").unwrap();
+        assert_eq!(
+            config.safety.coolant_limit_c,
+            crate::constants::DEFAULT_COOLANT_LIMIT_C
+        );
+        let config = DaemonConfig::from_toml("[safety]\ncoolant_limit_c = 55\n").unwrap();
+        assert_eq!(config.safety.coolant_limit_c, 55);
+        config.validate().unwrap();
+        for bad in [
+            crate::constants::COOLANT_LIMIT_MIN_C - 1,
+            crate::constants::COOLANT_LIMIT_MAX_C + 1,
+        ] {
+            let config =
+                DaemonConfig::from_toml(&format!("[safety]\ncoolant_limit_c = {bad}\n")).unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(err.to_string().contains("safety.coolant_limit_c"), "{bad}");
+        }
     }
 
     #[test]

@@ -1476,9 +1476,10 @@ impl<W: Fn(u8) -> Result<(), String>, S: Fn() -> bool> Drop for RestoreOnDrop<'_
         // [SAFETY] `AUD3-l` — clamp on the way out, as the sweep does on the way in.
         // `TS-aw` — and re-read the pump union first, so evidence that arrived
         // mid-run raises the floor even when the run itself never saw it.
-        let pump_floor = crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8;
+        // DEC-443: the watch carries the header's own pump floor — the DC pump
+        // floor on a DC-mode header.
         let floor = match self.pump_watch {
-            Some(w) if w.restore_is_pump() => self.restore_floor.max(pump_floor),
+            Some(w) if w.restore_is_pump() => self.restore_floor.max(w.pump_floor()),
             _ => self.restore_floor,
         };
         let restore = restore.max(floor);
@@ -1688,7 +1689,10 @@ where
         if pump_watch.became_protected() {
             return SweepOutcome {
                 state: STATE_ABORTED,
-                detail: Some(pump_protected_mid_run_detail("characterisation")),
+                detail: Some(pump_protected_mid_run_detail(
+                    "characterisation",
+                    pump_watch.pump_floor(),
+                )),
                 points: measured,
                 original_pct,
             };
@@ -1814,7 +1818,10 @@ where
             if started.elapsed() < hold && pump_watch.became_protected() {
                 return SweepOutcome {
                     state: STATE_ABORTED,
-                    detail: Some(pump_protected_mid_run_detail("characterisation")),
+                    detail: Some(pump_protected_mid_run_detail(
+                        "characterisation",
+                        pump_watch.pump_floor(),
+                    )),
                     points: measured,
                     original_pct,
                 };
@@ -2665,9 +2672,13 @@ mod tests {
         let rig = Rig::new();
         let union = Arc::new(AtomicBool::new(false));
         let u = union.clone();
-        let watch = PumpWatch::new("hwmon:test:pwm1", "characterisation", false, move || {
-            u.load(Ordering::SeqCst)
-        });
+        let watch = PumpWatch::new(
+            "hwmon:test:pwm1",
+            "characterisation",
+            false,
+            30,
+            move || u.load(Ordering::SeqCst),
+        );
         let writes = rig.writes.clone();
         let flip = |m: Moment| {
             if flip_on(&m) {
@@ -2809,11 +2820,17 @@ mod tests {
         let settle = Duration::from_secs(2);
         let flip_at: Arc<Mutex<Option<tokio::time::Instant>>> = Arc::new(Mutex::new(None));
         let fa = flip_at.clone();
-        let watch = PumpWatch::new("hwmon:test:pwm1", "characterisation", false, move || {
-            fa.lock()
-                .unwrap()
-                .is_some_and(|t| tokio::time::Instant::now() >= t)
-        });
+        let watch = PumpWatch::new(
+            "hwmon:test:pwm1",
+            "characterisation",
+            false,
+            30,
+            move || {
+                fa.lock()
+                    .unwrap()
+                    .is_some_and(|t| tokio::time::Instant::now() >= t)
+            },
+        );
         let writes = rig.writes.clone();
         let out = run_sweep(
             &cache,
@@ -5025,7 +5042,7 @@ mod tests {
         shutting_down: impl Fn() -> bool,
     ) -> SweepOutcome {
         let cache = cache_at(45.0, Some("normal"));
-        let watch = PumpWatch::new("hwmon:test:pwm1", "characterisation", false, pump_check);
+        let watch = PumpWatch::new("hwmon:test:pwm1", "characterisation", false, 30, pump_check);
         let writes = rig.writes.clone();
         run_sweep(
             &cache,

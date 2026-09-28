@@ -416,7 +416,9 @@ gating each have their own register rows and regression tests.
      sits above the CPU's own throttle point on purpose, and a CPU holds itself
      there by throttling, so a stopped pump or stalled fans show up as a CPU
      pinned at its ceiling — not as an emergency. The ladder catches a CPU that
-     can no longer protect itself, not a cooling fault
+     can no longer protect itself, not a cooling fault. The cooling faults are
+     watched separately since DEC-443 — the coolant rung, the pump stall response
+     and the cooling advisory, below
    - GPU fans are deliberately excluded (DEC-130) — there is no GPU emergency
      threshold; AMD PMFW firmware protects the GPU by throttling its clocks on
      junction temperature, independently of OS fan control. It does not ramp a
@@ -453,14 +455,50 @@ gating each have their own register rows and regression tests.
      control skipped that tick keeps its fans at their last duty under the floor
      (DEC-386, `TS-p`); an OpenFan channel whose duty a reconnect or resume lost
      goes to 100% instead, and any other unknown duty gets the bare floor (DEC-401)
+   - **The coolant rung (DEC-443, `TS-f`).** A second `ThermalSafetyRule`
+     (`ThermalSafetyRule::coolant`, engine-local) watches the hottest FRESH
+     `CoolantTemp` reading: at or above `safety.coolant_limit_c` (whole C, default
+     60, settable 40–70, no off switch; `daemon.toml [safety]`, `runtime.toml`,
+     `POST /config/coolant-limit`, SIGHUP — read every tick) it latches the same
+     100% force with the same reach, and releases at a fresh reading at or below
+     the limit − 5 (`COOLANT_RELEASE_MARGIN_C`). Only the `CoolantTemp` kind
+     triggers it. `safety_tick::evaluate_coolant_tick` keeps the CPU table's
+     freshness discipline — stale or absent holds a latch — but has no no-sensor
+     floor: with nothing latched a blind tick does nothing, because most machines
+     have no coolant sensor. `safety_tick::combine` folds it into the CPU
+     decision by maximum, so it can only raise what the ladder forces;
+     `emergency_causes` (`cpu`, `coolant`) on `/status` says which rule fired
    - Override state is surfaced as `thermal_state` in `GET /status`
      (`normal` | `emergency` | `no_sensor_fallback`, DEC-132; `recovery` was
      emitted before DEC-386)
      so the GUI shows a poll-driven thermal banner (DEC-165 — there is no GUI
      loop to stand down; the daemon owns control)
 
+   - **The pump stall response (DEC-443, `TS-e`, `profile_engine::pump_stall`).**
+     The active profile's hwmon pump members (the pump-protection union) that
+     have been seen spinning this run are watched through their cached tach: 0
+     RPM for `PUMP_STALL_DETECT` (10 s) while `pwm_commanded_pct` ≥ 30 drives
+     the pump to `PUMP_STALL_RESPONSE_PCT` (100) for `PUMP_STALL_KICK` (30 s).
+     Turning again → back to its curve; still 0 RPM → held at 100 until the tach
+     returns; a second stall in one run → held at 100 until a restart or a
+     profile activation. Raise-only, applied to the tick's commands above the
+     safety branch (so a forced tick floors them like any other), paused while a
+     diagnostic owns the write pause. Published as `pump_stalls[]`
+   - **The DC pump floor (DEC-443, `TS-e`).** A pump-protected hwmon header whose
+     `pwmN_mode` reads DC (0) is floored at `DC_PUMP_FLOOR_PCT` (70) rather than
+     30 — everywhere the pump floor applies: the engine (`HeaderFacts`, measured
+     once by `HwmonBackend` and empty for `ProfileEngineState::new()`, so the
+     parity oracle is unperturbed), overrides, identify, verify, characterisation,
+     discovery, the stall probe's restore, and `effective_min_pwm_pct`. One
+     function decides it: `profile::pump_floor_pct(pwm_mode)`
+   - **The cooling advisory (DEC-443, `TS-m`, `profile_engine::cooling_advisory`).**
+     The hottest FRESH CPU reading at or above its ceiling (the CPU's own `crit`
+     on an authoritative chip, else 85C) for `ADVISORY_HOLD` (60 s) while the
+     highest non-GPU duty this tick is below `ADVISORY_LOW_DUTY_PCT` (50) raises
+     `cpu_at_ceiling_low_cooling` on `/status` `advisories[]`. It forces nothing
+
 2. **Curve sensor freshness** (`profile_engine::curve_eligible`, DEC-272)
-   - The rule above is CPU-only. Every *other* sensor driving a fan curve — GPU
+   - The CPU ladder is CPU-only and the coolant rung keys on `CoolantTemp`. Every *other* sensor driving a fan curve — GPU
      edge, coolant, VRM, drive — is age-filtered before curve evaluation: a
      reading older than the same freshness budget stops driving its curve, so a
      frozen GPU or coolant sensor can no longer command a fan forever while
@@ -565,12 +603,13 @@ gating each have their own register rows and regression tests.
    for pump/CPU members. Stopping a pump risks coolant-flow loss and rapid thermal
    runaway. GPU- and chassis-only controls are unaffected.
 
-9. **AIO / coolant surface, no coolant safety rule** (`hwmon/aio.rs`, DEC-156):
+9. **AIO / coolant surface** (`hwmon/aio.rs`, DEC-156):
    liquid-cooler coolant temperatures are classified as the `CoolantTemp` sensor
    kind and AIO PWM headers carry an `is_aio` flag (surfaced via the dynamic
-   `aio_hwmon` capability). This is detection only — there is **deliberately no
-   coolant thermal-override rule**; the CPU-only `ThermalSafetyRule` is the sole
-   emergency backstop. Scope is hwmon-only (USB-only coolers are out of scope).
+   `aio_hwmon` capability). DEC-156 made this detection only; **since DEC-443 the
+   `CoolantTemp` kind is a safety input** — it drives the coolant rung above — so
+   a change to what this module classifies as coolant is a change to what can
+   trigger an emergency. Scope is hwmon-only (USB-only coolers are out of scope).
 
 10. **Engine liveness watchdog** (`sd_notify.rs`, DEC-387): the unit is
     `Type=notify` with `WatchdogSec=15`. DEC-266 restarts the daemon when the

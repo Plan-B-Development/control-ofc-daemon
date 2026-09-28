@@ -10,7 +10,8 @@ mod common;
 
 use common::*;
 use control_ofc_tray::client::ClientError;
-use control_ofc_tray::menu::{thermal_label, ControlOfcTray};
+use control_ofc_tray::client::PumpStall;
+use control_ofc_tray::menu::{pump_stall_labels, thermal_label, ControlOfcTray};
 use ksni::Tray;
 
 #[test]
@@ -447,9 +448,17 @@ fn action_error_lines(
         .status
         .as_ref()
         .map(|s| thermal_label(&s.thermal_state));
+    let pumps = tray
+        .snapshot()
+        .status
+        .as_ref()
+        .map(|s| pump_stall_labels(&s.pump_stalls))
+        .unwrap_or_default();
     top_labels(items)
         .into_iter()
-        .filter(|label| label.starts_with('⚠') && Some(label) != thermal.as_ref())
+        .filter(|label| {
+            label.starts_with('⚠') && Some(label) != thermal.as_ref() && !pumps.contains(label)
+        })
         .collect()
 }
 
@@ -723,5 +732,101 @@ fn a_failed_action_with_no_answer_at_all_claims_nothing_about_the_fans() {
         after[0].contains("not answering"),
         "it must say what is actually known instead; got {:?}",
         after[0]
+    );
+}
+
+fn stalls(states: &[&str]) -> Vec<PumpStall> {
+    states
+        .iter()
+        .enumerate()
+        .map(|(i, state)| PumpStall {
+            header_id: format!("hwmon:nct6798:nct6775.656:pwm{i}"),
+            state: (*state).to_string(),
+        })
+        .collect()
+}
+
+/// DEC-443 (the user's Q16): a pump under a stall response gets a line of its
+/// own — none while no pump is stalled, one for every state the daemon
+/// publishes plus a token it cannot yet explain, which must render rather than
+/// vanish.
+#[test]
+fn a_stalled_pump_is_reported_in_the_menu() {
+    let launcher = RecordingLauncher::new(true);
+    let quiet = FakeDaemon::new(status("2.57.0", "normal", None), vec![]);
+    let mut tray = make_tray(&quiet, &launcher);
+    tray.refresh();
+    let labels = top_labels(&tray.menu());
+    assert!(
+        !labels.iter().any(|l| l.contains("Pump")),
+        "no pump line while nothing is stalled: {labels:?}"
+    );
+
+    for state in ["stall_response", "not_turning", "held", "some_future_state"] {
+        let mut st = status("2.57.0", "normal", None);
+        st.pump_stalls = stalls(&[state]);
+        let daemon = FakeDaemon::new(st, vec![]);
+        let mut tray = make_tray(&daemon, &launcher);
+        tray.refresh();
+        let labels = top_labels(&tray.menu());
+        let expected = pump_stall_labels(&stalls(&[state]));
+        assert_eq!(expected.len(), 1);
+        assert!(
+            labels.contains(&expected[0]),
+            "state {state:?} must surface its line; got {labels:?}"
+        );
+        if state == "some_future_state" {
+            assert!(expected[0].contains(state), "{expected:?}");
+        }
+    }
+}
+
+/// Most severe first, one line per state, counted where pumps share one.
+#[test]
+fn pump_lines_are_ordered_by_severity_and_counted() {
+    let labels = pump_stall_labels(&stalls(&[
+        "stall_response",
+        "not_turning",
+        "stall_response",
+    ]));
+    assert_eq!(labels.len(), 2, "{labels:?}");
+    assert!(labels[0].contains("not turning"), "{labels:?}");
+    assert!(labels[1].ends_with("(2 pumps)"), "{labels:?}");
+}
+
+/// The warning hierarchy: fans forced to maximum outrank one pump, and a pump
+/// the daemon is fighting outranks a click that did not take.
+#[test]
+fn a_pump_line_sits_between_the_thermal_line_and_a_refused_action() {
+    let profiles = vec![profile("quiet", "Quiet"), profile("balanced", "Balanced")];
+    let mut st = status("2.57.0", "emergency", Some("quiet"));
+    st.pump_stalls = stalls(&["stall_response"]);
+    let daemon = FakeDaemon::new(st, profiles);
+    let launcher = RecordingLauncher::new(true);
+    let mut tray = make_tray(&daemon, &launcher);
+    tray.refresh();
+
+    daemon.set_action_result(Err(control_ofc_tray::client::ClientError::Daemon {
+        status: 503,
+        code: "hardware_unavailable".into(),
+        message: "thermal force-all is active".into(),
+    }));
+    let items = tray.menu();
+    (profile_radio(&items).expect("radio").select)(&mut tray, 1);
+
+    let labels = top_labels(&tray.menu());
+    let at = |needle: &str| {
+        labels
+            .iter()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} missing from {labels:?}"))
+    };
+    let pump = pump_stall_labels(&stalls(&["stall_response"]));
+    assert!(at("Thermal emergency") < at(&pump[0]), "{labels:?}");
+    assert!(at(&pump[0]) < at("still active"), "{labels:?}");
+    assert_eq!(
+        action_error_lines(&tray, &tray.menu()).len(),
+        1,
+        "the pump line is not an action error"
     );
 }

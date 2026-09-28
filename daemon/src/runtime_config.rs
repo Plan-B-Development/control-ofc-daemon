@@ -72,6 +72,12 @@ pub struct RuntimeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shutdown: Option<RuntimeShutdown>,
 
+    /// The coolant limit (DEC-443). A new top-level section, for the reason the
+    /// exit floor's is: an older daemon ignores it rather than failing to parse
+    /// the file, so a downgrade costs the limit and never a header role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safety: Option<RuntimeSafety>,
+
     /// Cooling-device topology (AIO-MB Phase 4, DEC-316).
     ///
     /// **Top-level, deliberately** — not a key under `[hardware]` beside
@@ -154,6 +160,15 @@ pub struct RuntimeStartup {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeShutdown {
     pub exit_floor_pct: u8,
+}
+
+/// Runtime override for `[safety]` (DEC-443). Applies live, like
+/// `[shutdown]`: `POST /config/coolant-limit` updates the running engine as well
+/// as this file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSafety {
+    pub coolant_limit_c: u8,
 }
 
 /// User-approved hardware selections (Phase 5). Persisted by stable sensor id
@@ -563,6 +578,18 @@ impl RuntimeConfig {
         self.shutdown.as_ref().map(|s| s.exit_floor_pct)
     }
 
+    /// Return the `safety.coolant_limit_c` value if present (DEC-443).
+    pub fn coolant_limit_c(&self) -> Option<u8> {
+        self.safety.as_ref().map(|s| s.coolant_limit_c)
+    }
+
+    /// Set `safety.coolant_limit_c`, creating the section if absent.
+    pub fn set_coolant_limit_c(&mut self, limit_c: u8) {
+        self.safety = Some(RuntimeSafety {
+            coolant_limit_c: limit_c,
+        });
+    }
+
     /// Set `shutdown.exit_floor_pct`, creating the section if absent.
     pub fn set_exit_floor_pct(&mut self, pct: u8) {
         self.shutdown = Some(RuntimeShutdown {
@@ -968,6 +995,17 @@ mod tests {
             ]
         );
         assert!(loaded.startup_delay_secs().is_none());
+    }
+
+    #[test]
+    fn roundtrip_coolant_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.toml");
+        let mut cfg = RuntimeConfig::default();
+        assert!(cfg.coolant_limit_c().is_none(), "absent until set");
+        cfg.set_coolant_limit_c(55);
+        cfg.save_to(&path).unwrap();
+        assert_eq!(RuntimeConfig::load_from(&path).coolant_limit_c(), Some(55));
     }
 
     #[test]
@@ -1935,6 +1973,7 @@ mod tests {
                 &control,
                 &member,
                 &cfg.header_roles_parsed(),
+                &std::collections::HashMap::new(),
             )
         };
 

@@ -161,6 +161,65 @@ pub struct StatusResponse {
     /// (`false`, "writes are landing") is also its common value. An older daemon
     /// omits it and a client reads `false`, which is what it renders today.
     pub verify_active: bool,
+    /// Which rules are forcing a `thermal_state: "emergency"` (DEC-443):
+    /// `"cpu"`, `"coolant"`, or both, in that order. Published in the same
+    /// cache write as `thermal_state`, so the two always describe one tick.
+    /// Omitted when nothing is latched (additive): an older daemon omits it, and
+    /// a client then treats an emergency as the CPU's, which was the only cause
+    /// before this field. A client must render an unrecognised token.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub emergency_causes: Vec<String>,
+    /// Pumps the stall response is acting on (DEC-443, `TS-e`). Omitted when
+    /// none (additive).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pump_stalls: Vec<PumpStallEntry>,
+    /// Cooling advisories in force (DEC-443, `TS-m`). Advisory only: nothing is
+    /// forced because of one. Omitted when none (additive).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub advisories: Vec<CoolingAdvisoryEntry>,
+}
+
+/// One pump under the stall response, on `/status` + `/poll` (DEC-443).
+#[derive(Debug, Clone, Serialize)]
+pub struct PumpStallEntry {
+    /// The hwmon header id.
+    pub header_id: String,
+    /// Stable token: `"stall_response"` (at 100 % for the response window after
+    /// a stall), `"not_turning"` (still 0 RPM while held at 100 %), `"held"`
+    /// (turning, but held at 100 % after a second stall this run, until a
+    /// restart or a profile activation). A client must render an unrecognised
+    /// token; adding one is additive, renaming one is breaking.
+    pub state: String,
+    /// Milliseconds since the pump entered this state.
+    pub since_ms: u64,
+    /// Stalls seen on this header since the daemon started.
+    pub stall_count: u32,
+}
+
+/// One cooling advisory on `/status` + `/poll` (DEC-443).
+#[derive(Debug, Clone, Serialize)]
+pub struct CoolingAdvisoryEntry {
+    /// Stable token: `"cpu_at_ceiling_low_cooling"` — the hottest fresh CPU
+    /// reading has sat at or above its ceiling for a minute while no non-GPU
+    /// output is commanded at 50 % or more. A client owns the wording and must
+    /// render an unrecognised token.
+    pub code: String,
+    /// Milliseconds since the condition was first met.
+    pub since_ms: u64,
+    /// The hottest fresh CPU reading, and the ceiling it was judged against —
+    /// the CPU's own `crit` where it publishes one, else 85 °C.
+    pub cpu_temp_c: f64,
+    pub ceiling_c: f64,
+    /// The highest duty the engine commanded to any non-GPU output.
+    pub max_duty_pct: u8,
+}
+
+/// The DEC-443 fields of a status response, built under the cache read guard.
+#[derive(Debug, Clone, Default)]
+pub struct CoolingSafetyEntries {
+    pub emergency_causes: Vec<String>,
+    pub pump_stalls: Vec<PumpStallEntry>,
+    pub advisories: Vec<CoolingAdvisoryEntry>,
 }
 
 /// One present-but-unreadable sensor on the `/status` + `/poll` surface
@@ -590,7 +649,8 @@ impl PwmHeaderEntry {
             None if pump_protected => &crate::hwmon::device_policy::GENERIC_PUMP,
             None => &crate::hwmon::device_policy::GENERIC_FAN,
         };
-        let floor = crate::hwmon::device_policy::resolve_policy_floor(policy, pump_protected);
+        let floor =
+            crate::hwmon::device_policy::resolve_policy_floor(policy, pump_protected, h.pwm_mode);
         PwmHeaderEntry {
             id: h.id.clone(),
             label: h.label.clone(),
@@ -1189,6 +1249,15 @@ pub struct ControlCapability {
     /// caution is true there. Absent means an older daemon.
     #[serde(default)]
     pub canonical_chip_names: bool,
+    /// Cooling-failure detection (DEC-443, `W-SAFE`): the coolant emergency
+    /// (`emergency_causes[]` on `/status`, `coolant_limit_c`/`coolant_release_c`
+    /// on `/diagnostics/hardware`, `POST /config/coolant-limit`), the pump stall
+    /// response (`pump_stalls[]`), the DC-aware pump floor, and the cooling
+    /// advisory (`advisories[]`). One flag for the whole feature: a client gates
+    /// its coolant-limit control and its cause-aware emergency wording on it.
+    /// Absent means an older daemon — every array reads as empty there.
+    #[serde(default)]
+    pub cooling_failure_detection: bool,
 }
 
 /// Per-device-group capability info.
@@ -1849,6 +1918,11 @@ pub struct ThermalSafetyInfo {
     pub cpu_sensor_found: bool,
     pub emergency_threshold_c: f64,
     pub release_threshold_c: f64,
+    /// The coolant limit and release point the engine ACTED on (DEC-443) — the
+    /// DEC-292 rule; before the first tick, the limit in force. Whole-degree
+    /// limit, release = limit − 5.
+    pub coolant_limit_c: f64,
+    pub coolant_release_c: f64,
 }
 
 /// Kernel module load status.
@@ -3051,6 +3125,8 @@ mod tests {
                 cpu_sensor_found: true,
                 emergency_threshold_c: 110.0,
                 release_threshold_c: 80.0,
+                coolant_limit_c: 60.0,
+                coolant_release_c: 55.0,
             },
             kernel_modules: vec![kernel_module],
             acpi_conflicts: Vec::new(),
@@ -3122,6 +3198,28 @@ mod tests {
             ..Default::default()
         };
         expect(&serde_json::to_value(&probe_run).unwrap(), "StallProbeRun");
+        // DEC-443 (`W-SAFE`): the cooling watch's two `/status` entries.
+        let pump_stall = PumpStallEntry {
+            header_id: "hwmon:nct6798:nct6775.656:pwm2:PUMP".into(),
+            state: "held".into(),
+            since_ms: 1200,
+            stall_count: 2,
+        };
+        expect(
+            &serde_json::to_value(&pump_stall).unwrap(),
+            "PumpStallEntry",
+        );
+        let advisory = CoolingAdvisoryEntry {
+            code: "cpu_at_ceiling_low_cooling".into(),
+            since_ms: 61_000,
+            cpu_temp_c: 95.5,
+            ceiling_c: 95.0,
+            max_duty_pct: 35,
+        };
+        expect(
+            &serde_json::to_value(&advisory).unwrap(),
+            "CoolingAdvisoryEntry",
+        );
 
         // **Both directions, and this is what makes the oracle an interlock
         // rather than a workflow (`P8-cb`).** A struct declared in the fixture
@@ -3177,6 +3275,8 @@ mod tests {
                     cpu_sensor_found: true,
                     emergency_threshold_c: 105.0,
                     release_threshold_c: 80.0,
+                    coolant_limit_c: 60.0,
+                    coolant_release_c: 55.0,
                 },
                 kernel_modules: Vec::new(),
                 acpi_conflicts: Vec::new(),
@@ -3341,6 +3441,9 @@ mod tests {
             has_active_profile: false,
             readiness: None,
             verify_active: false,
+            emergency_causes: Vec::new(),
+            pump_stalls: Vec::new(),
+            advisories: Vec::new(),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["api_version"], 1);
@@ -3403,6 +3506,9 @@ mod tests {
                 top_code: Some("no_pwm_controls".into()),
             }),
             verify_active: false,
+            emergency_causes: Vec::new(),
+            pump_stalls: Vec::new(),
+            advisories: Vec::new(),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["readiness"]["overall"], "warning");
@@ -3439,6 +3545,9 @@ mod tests {
             has_active_profile: false,
             readiness: None,
             verify_active: false,
+            emergency_causes: Vec::new(),
+            pump_stalls: Vec::new(),
+            advisories: Vec::new(),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert!(
@@ -3475,6 +3584,9 @@ mod tests {
             has_active_profile: false,
             readiness: None,
             verify_active: false,
+            emergency_causes: Vec::new(),
+            pump_stalls: Vec::new(),
+            advisories: Vec::new(),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["skipped_controls"][0]["control_id"], "ctl-front");
@@ -3511,6 +3623,9 @@ mod tests {
             has_active_profile: false,
             readiness: None,
             verify_active: false,
+            emergency_causes: Vec::new(),
+            pump_stalls: Vec::new(),
+            advisories: Vec::new(),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(
@@ -4045,6 +4160,38 @@ mod tests {
             Some(crate::profile::HARD_PUMP_CPU_FLOOR_PCT.round() as u8),
             "the pump member of the same device must keep the enforced floor"
         );
+    }
+
+    /// [SAFETY] DEC-443 (`TS-e`, the user's Q10/Q11): the call site that
+    /// publishes `effective_min_pwm_pct` passes the header's `pwmN_mode`, so a
+    /// DC-mode pump advertises the DC pump floor the engine enforces — and a
+    /// DC-mode header that is not a pump advertises no floor at all.
+    #[test]
+    fn a_dc_mode_pump_advertises_the_dc_floor() {
+        let header = |mode| crate::hwmon::pwm_discovery::PwmHeaderDescriptor {
+            id: "hwmon:nct6798:nct6775.656:pwm2:PUMP".into(),
+            label: "PUMP".into(),
+            pwm_mode: mode,
+            ..Default::default()
+        };
+        let floor = |mode, pump| {
+            PwmHeaderEntry::from_descriptor(&header(mode), None, pump, None).effective_min_pwm_pct
+        };
+        let dc = Some(crate::profile::PWM_MODE_DC);
+        assert_eq!(
+            floor(dc, true),
+            Some(crate::profile::DC_PUMP_FLOOR_PCT.round() as u8)
+        );
+        assert_eq!(
+            floor(Some(1), true),
+            Some(crate::profile::HARD_PUMP_CPU_FLOOR_PCT.round() as u8)
+        );
+        assert_eq!(
+            floor(None, true),
+            Some(crate::profile::HARD_PUMP_CPU_FLOOR_PCT.round() as u8),
+            "a driver that publishes no mode keeps the ordinary pump floor"
+        );
+        assert_eq!(floor(dc, false), Some(0), "the DC floor is pump-only");
     }
 }
 

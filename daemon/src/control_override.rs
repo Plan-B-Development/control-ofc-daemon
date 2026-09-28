@@ -105,7 +105,9 @@ impl IdentifyMode {
 /// - `role: Pump` → [`IdentifyMode::PumpPerturb`]. Shifted by
 ///   [`IDENTIFY_PUMP_DELTA_PCT`], **upward wherever there is headroom** so the
 ///   pump never moves toward its stall floor, and clamped into
-///   `[HARD_PUMP_CPU_FLOOR_PCT, 100]` on **both** branches.
+///   `[pump_floor, 100]` on **both** branches. `pump_floor` is the header's
+///   own pump floor — `HARD_PUMP_CPU_FLOOR_PCT`, or the DC pump floor on a
+///   DC-mode header (DEC-443), from `AppState::header_pump_floor_pct`.
 ///
 /// Clamping the upward branch matters and is not defensive noise: a baseline of
 /// 0 (nothing commanded yet) computes `0 + 25 = 25`, which is *below* the 30%
@@ -114,11 +116,14 @@ impl IdentifyMode {
 pub fn identify_target_for_role(
     role: crate::hwmon::roles::HeaderRole,
     last_commanded_pct: Option<u8>,
+    pump_floor: u8,
 ) -> (u8, IdentifyMode) {
     if !role.is_pump() {
         return (0, IdentifyMode::Stop);
     }
-    let floor = crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8;
+    // Never below the 30 % pump floor, whatever a caller passes: the DC floor
+    // can only raise it (DEC-443).
+    let floor = pump_floor.max(crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8);
     let baseline =
         last_commanded_pct.unwrap_or(crate::constants::IDENTIFY_PUMP_BASELINE_FALLBACK_PCT);
     let delta = crate::constants::IDENTIFY_PUMP_DELTA_PCT;
@@ -658,6 +663,9 @@ mod tests {
         );
     }
 
+    const PWM_PUMP_FLOOR: u8 = crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8;
+    const DC_PUMP_FLOOR: u8 = crate::profile::DC_PUMP_FLOOR_PCT as u8;
+
     /// [SAFETY] DEC-311, the headline invariant. No input — none — makes a pump
     /// identify target 0, or anything below the pump floor.
     ///
@@ -667,18 +675,33 @@ mod tests {
     /// the un-clamped upward branch (`0 + 25 = 25`) that the first draft had.
     #[test]
     fn pump_identify_never_targets_zero_or_below_the_floor() {
-        let floor = crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8;
-        for baseline in (0..=100u8).map(Some).chain(std::iter::once(None)) {
-            let (target, mode) =
-                identify_target_for_role(crate::hwmon::roles::HeaderRole::Pump, baseline);
-            assert_eq!(mode, IdentifyMode::PumpPerturb, "baseline {baseline:?}");
-            assert_ne!(target, 0, "baseline {baseline:?} produced a pump STOP");
-            assert!(
-                target >= floor,
-                "baseline {baseline:?} produced {target}%, below the {floor}% pump floor"
-            );
-            assert!(target <= 100, "baseline {baseline:?} produced {target}%");
+        // DEC-443: over both pump floors — a DC-mode pump's is higher, and an
+        // identify must never walk it below that one either.
+        for floor in [PWM_PUMP_FLOOR, DC_PUMP_FLOOR] {
+            for baseline in (0..=100u8).map(Some).chain(std::iter::once(None)) {
+                let (target, mode) = identify_target_for_role(
+                    crate::hwmon::roles::HeaderRole::Pump,
+                    baseline,
+                    floor,
+                );
+                assert_eq!(mode, IdentifyMode::PumpPerturb, "baseline {baseline:?}");
+                assert_ne!(target, 0, "baseline {baseline:?} produced a pump STOP");
+                assert!(
+                    target >= floor,
+                    "baseline {baseline:?} produced {target}%, below the {floor}% pump floor"
+                );
+                assert!(target <= 100, "baseline {baseline:?} produced {target}%");
+            }
         }
+    }
+
+    /// DEC-443: a caller cannot pass a floor below the 30 % pump floor and get
+    /// it honoured — the DC floor only ever raises.
+    #[test]
+    fn a_pump_floor_below_thirty_is_not_honoured() {
+        let (target, _) =
+            identify_target_for_role(crate::hwmon::roles::HeaderRole::Pump, Some(0), 5);
+        assert!(target >= PWM_PUMP_FLOOR, "got {target}");
     }
 
     /// The perturbation must actually be perceptible — a "safe" identify that
@@ -687,8 +710,11 @@ mod tests {
     #[test]
     fn pump_identify_actually_moves_the_pump() {
         for baseline in 0..=100u8 {
-            let (target, _) =
-                identify_target_for_role(crate::hwmon::roles::HeaderRole::Pump, Some(baseline));
+            let (target, _) = identify_target_for_role(
+                crate::hwmon::roles::HeaderRole::Pump,
+                Some(baseline),
+                PWM_PUMP_FLOOR,
+            );
             // Below the floor the pump is not really running there; the clamp
             // to the floor is itself the change, and is checked above.
             if baseline >= crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8 {
@@ -707,8 +733,11 @@ mod tests {
     fn pump_identify_prefers_the_upward_direction() {
         let delta = crate::constants::IDENTIFY_PUMP_DELTA_PCT;
         for baseline in 30..=(100 - delta) {
-            let (target, _) =
-                identify_target_for_role(crate::hwmon::roles::HeaderRole::Pump, Some(baseline));
+            let (target, _) = identify_target_for_role(
+                crate::hwmon::roles::HeaderRole::Pump,
+                Some(baseline),
+                PWM_PUMP_FLOOR,
+            );
             assert_eq!(
                 target,
                 baseline + delta,
@@ -717,8 +746,11 @@ mod tests {
         }
         // No headroom → downward, clamped at the floor.
         for baseline in (100 - delta + 1)..=100 {
-            let (target, _) =
-                identify_target_for_role(crate::hwmon::roles::HeaderRole::Pump, Some(baseline));
+            let (target, _) = identify_target_for_role(
+                crate::hwmon::roles::HeaderRole::Pump,
+                Some(baseline),
+                PWM_PUMP_FLOOR,
+            );
             assert!(
                 target < baseline,
                 "without headroom, {baseline}% must perturb DOWNWARD"
@@ -739,7 +771,7 @@ mod tests {
         ] {
             for baseline in [None, Some(0), Some(50), Some(100)] {
                 assert_eq!(
-                    identify_target_for_role(role, baseline),
+                    identify_target_for_role(role, baseline, PWM_PUMP_FLOOR),
                     (0, IdentifyMode::Stop),
                     "{role:?} at {baseline:?} must still stop"
                 );

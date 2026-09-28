@@ -764,7 +764,7 @@ where
     // Why a window ended early, as an abort: both arms are `aborted`.
     macro_rules! bail_window {
         ($stop:expr) => {
-            bail!(STATE_ABORTED, $stop.detail())
+            bail!(STATE_ABORTED, $stop.detail(pump_watch.pump_floor()))
         };
     }
 
@@ -1171,7 +1171,8 @@ where
     // at the perturbed duty — lower than before this change.
     if !shutting_down() && thermal_force_state(cache).is_none() {
         let pct = if pump_watch.became_protected() {
-            baseline_pct.max(crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8)
+            // DEC-443: the header's own pump floor, DC-aware.
+            baseline_pct.max(pump_watch.pump_floor())
         } else {
             baseline_pct
         };
@@ -1244,10 +1245,12 @@ enum WindowStop {
 
 impl WindowStop {
     /// The abort detail; both arms end the run as `aborted`.
-    fn detail(self) -> String {
+    fn detail(self, pump_floor: u8) -> String {
         match self {
             WindowStop::ShuttingDown => "the daemon is shutting down".into(),
-            WindowStop::PumpProtected => pump_protected_mid_run_detail("control-path discovery"),
+            WindowStop::PumpProtected => {
+                pump_protected_mid_run_detail("control-path discovery", pump_floor)
+            }
         }
     }
 }

@@ -284,9 +284,12 @@ pub(crate) fn read_header_state(
 /// This is the counterpart of [`verify_test_duty`], which has always floored the
 /// duty written on the way IN. `api/characterization.rs` applies the same clamp
 /// to its own restore through `RestoreOnDrop::restore_floor`.
-fn restore_duty(is_pump: bool, captured_pct: u8) -> u8 {
+///
+/// `pump_floor` is the header's own pump floor — the DC pump floor on a
+/// DC-mode header (DEC-443) — from `AppState::header_pump_floor_pct`.
+fn restore_duty(is_pump: bool, pump_floor: u8, captured_pct: u8) -> u8 {
     if is_pump {
-        captured_pct.max(crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8)
+        captured_pct.max(pump_floor)
     } else {
         captured_pct
     }
@@ -318,12 +321,16 @@ fn restore_duty(is_pump: bool, captured_pct: u8) -> u8 {
 /// which asserts both over every possible input rather than sampling.
 ///
 /// A non-pump header keeps the original 20/80 pair, byte-identical.
-fn verify_test_duty(is_pump: bool, current_pct: u8) -> u8 {
+///
+/// `pump_floor` is the header's own pump floor (DEC-443): on a DC-mode pump
+/// (floor 70) a delta of 35 is not always reachable, and the floor wins — a
+/// weaker measurement is the price of never under-driving the pump.
+fn verify_test_duty(is_pump: bool, pump_floor: u8, current_pct: u8) -> u8 {
     if !is_pump {
         return if current_pct > 50 { 20 } else { 80 };
     }
     const DELTA: u8 = 40;
-    let floor = crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8;
+    let floor = pump_floor.max(crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8);
     let up = current_pct.saturating_add(DELTA).min(100).max(floor);
     let down = current_pct.saturating_sub(DELTA).max(floor);
     let up_delta = up.abs_diff(current_pct);
@@ -477,6 +484,8 @@ pub async fn hwmon_verify_handler(
     // must not be able to strip protection the header's own label already
     // earned. This entry answer plans the test duty.
     let bg_is_pump = state.header_is_pump_protected(&header_id);
+    // DEC-443: this header's pump floor — the DC pump floor on a DC-mode header.
+    let bg_pump_floor = state.header_pump_floor_pct(&header_id);
     // [SAFETY] `TS-aw` (DEC-418): the same union, re-read inside the task
     // before the test write, on every slice of the settle, and before the
     // restore. Always called with no lock held — never inside a `set_pwm`
@@ -487,6 +496,7 @@ pub async fn hwmon_verify_handler(
         header_id.clone(),
         "verify",
         bg_is_pump,
+        bg_pump_floor,
         move || watch_state.header_is_pump_protected(&watch_id),
     );
     let bg_lease_id = verify_lease_id.clone();
@@ -500,7 +510,7 @@ pub async fn hwmon_verify_handler(
 
         // Test PWM: a significant delta from current, in whichever direction has room.
         let current_pct = initial.pwm_percent.unwrap_or(50);
-        let test_pct: u8 = verify_test_duty(bg_is_pump, current_pct);
+        let test_pct: u8 = verify_test_duty(bg_is_pump, bg_pump_floor, current_pct);
 
         // [SAFETY] `TS-aw`: the test duty above was planned for an ordinary fan
         // if `bg_is_pump` was false. Evidence that arrived since stops the
@@ -624,7 +634,11 @@ pub async fn hwmon_verify_handler(
         //
         // `TS-aw`: the union is re-read once more here, after the shutdown skip
         // above, so evidence that arrived after the last slice still floors it.
-        let restore_pct = restore_duty(pump_watch.restore_is_pump(), current_pct);
+        let restore_pct = restore_duty(
+            pump_watch.restore_is_pump(),
+            pump_watch.pump_floor(),
+            current_pct,
+        );
         let restore_failed = {
             let mut ctrl = bg_controller.lock();
             match ctrl.set_pwm(&bg_header_id, restore_pct, &bg_lease_id) {
@@ -690,7 +704,7 @@ pub async fn hwmon_verify_handler(
     // Classify result. A verify the pump watch stopped measured nothing, so it
     // gets its own verdict rather than a classification of a truncated settle.
     let (result, details) = if pump_protected_mid_run {
-        pump_protected_mid_run_verdict()
+        pump_protected_mid_run_verdict(bg_pump_floor)
     } else {
         classify_verify_result(&initial, &final_state, test_pct)
     };
@@ -755,13 +769,13 @@ pub(crate) const VERIFY_PUMP_PROTECTED_MID_RUN: &str = "pump_protected_mid_run";
 /// [SAFETY] `TS-aw` (DEC-418): the verdict for a verify stopped because the
 /// header became pump-protected while the test held it. Inconclusive, never a
 /// finding about the board: the settle was cut short, so nothing was measured.
-fn pump_protected_mid_run_verdict() -> (String, String) {
+fn pump_protected_mid_run_verdict(pump_floor: u8) -> (String, String) {
     (
         VERIFY_PUMP_PROTECTED_MID_RUN.into(),
         format!(
             "{}. The {VERIFY_WAIT_SECONDS}s test window did not complete, so nothing \
              was measured. Re-run the verify: it now uses pump-safe duties.",
-            crate::api::diagnostic_gates::pump_protected_mid_run_detail("verify")
+            crate::api::diagnostic_gates::pump_protected_mid_run_detail("verify", pump_floor)
         ),
     )
 }
@@ -1002,11 +1016,9 @@ pub async fn hwmon_characterize_handler(
     // union between writes, never inside `write_fn`'s controller critical
     // section (`TS-aw`, DEC-418).
     let pump_at_start = state.header_is_pump_protected(&header_id);
-    let floor = if pump_at_start {
-        crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8
-    } else {
-        0
-    };
+    // DEC-443: the header's own pump floor — the DC pump floor on a DC header.
+    let pump_floor = state.header_pump_floor_pct(&header_id);
+    let floor = if pump_at_start { pump_floor } else { 0 };
     let points = ch::resolve_points(body.points_pct.as_deref(), floor);
     let settle = ch::resolve_settle(body.settle_seconds);
     if points.is_empty() {
@@ -1244,6 +1256,7 @@ pub async fn hwmon_characterize_handler(
                 hid.clone(),
                 "characterisation",
                 pump_at_start,
+                pump_floor,
                 move || watch_state.header_is_pump_protected(&watch_id),
             );
             let outcome = ch::run_sweep(
@@ -1460,6 +1473,9 @@ pub(crate) mod tests {
 
     pub(crate) type WriteLog = Arc<parking_lot::Mutex<Vec<(String, String)>>>;
 
+    const PWM_PUMP_FLOOR: u8 = crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8;
+    const DC_PUMP_FLOOR: u8 = crate::profile::DC_PUMP_FLOOR_PCT as u8;
+
     /// Records every sysfs write so a test can see whether the restore landed.
     struct RecordingWriter(WriteLog);
     impl crate::hwmon::pwm_control::SysfsWriter for RecordingWriter {
@@ -1484,7 +1500,7 @@ pub(crate) mod tests {
     fn pump_verify_duty_is_always_floored_and_measurable() {
         let floor = crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8;
         for current in 0..=100u8 {
-            let t = verify_test_duty(true, current);
+            let t = verify_test_duty(true, PWM_PUMP_FLOOR, current);
             assert!(
                 t >= floor,
                 "pump at {current}% tested at {t}%, below the {floor}% floor"
@@ -1500,6 +1516,22 @@ pub(crate) mod tests {
         }
     }
 
+    /// [SAFETY] DEC-443: on a DC-mode pump the verify duty never goes below the
+    /// DC pump floor, and a restore is raised to it — exhaustive, like the two
+    /// 30 % tests. Measurability is not asserted here: at a 70 % floor a 30-point
+    /// move is not always reachable, and the floor wins by design.
+    #[test]
+    fn a_dc_pump_is_never_verified_or_restored_below_the_dc_floor() {
+        for v in 0..=100u8 {
+            let t = verify_test_duty(true, DC_PUMP_FLOOR, v);
+            assert!(t >= DC_PUMP_FLOOR, "DC pump at {v}% tested at {t}%");
+            assert!(t <= 100);
+            assert!(restore_duty(true, DC_PUMP_FLOOR, v) >= DC_PUMP_FLOOR);
+        }
+        // The opposite branch: the DC floor is not applied to an ordinary fan.
+        assert_eq!(restore_duty(false, DC_PUMP_FLOOR, 10), 10);
+    }
+
     /// The non-pump path must be byte-identical to the pre-DEC-311 rule, or this
     /// change silently altered verify for every fan on every machine.
     #[test]
@@ -1507,7 +1539,7 @@ pub(crate) mod tests {
         for current in 0..=100u8 {
             let expected = if current > 50 { 20 } else { 80 };
             assert_eq!(
-                verify_test_duty(false, current),
+                verify_test_duty(false, PWM_PUMP_FLOOR, current),
                 expected,
                 "ordinary header at {current}% must keep the original duty"
             );
@@ -1525,17 +1557,17 @@ pub(crate) mod tests {
         let floor = crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8;
         for captured in 0u8..=100 {
             assert!(
-                restore_duty(true, captured) >= floor,
+                restore_duty(true, PWM_PUMP_FLOOR, captured) >= floor,
                 "a pump captured at {captured}% would be restored to {}%, below \
                  the {floor}% floor — with pwm_enable=1 asserted, that is a \
                  stopped pump no writer will revise",
-                restore_duty(true, captured)
+                restore_duty(true, PWM_PUMP_FLOOR, captured)
             );
             // Above the floor the captured value is returned untouched: this is a
             // restore, not a re-clamp, and raising a pump that was legitimately
             // at 55% would be its own defect.
             if captured >= floor {
-                assert_eq!(restore_duty(true, captured), captured);
+                assert_eq!(restore_duty(true, PWM_PUMP_FLOOR, captured), captured);
             }
         }
     }
@@ -1555,7 +1587,7 @@ pub(crate) mod tests {
     #[test]
     fn a_non_pump_header_is_restored_exactly_as_captured() {
         for captured in 0u8..=100 {
-            assert_eq!(restore_duty(false, captured), captured);
+            assert_eq!(restore_duty(false, PWM_PUMP_FLOOR, captured), captured);
         }
     }
 
@@ -2378,6 +2410,7 @@ pub(crate) mod tests {
             let floored = crate::profile_engine::member_effective_floor(
                 &profile.controls[0],
                 &profile.controls[0].members[0],
+                &std::collections::HashMap::new(),
                 &std::collections::HashMap::new(),
             ) >= floor;
             *state.active_profile.lock() = Some(profile);
@@ -3440,7 +3473,7 @@ pub(crate) mod tests {
         // "no pump duty reaches 100" (exposure gone, test now vacuous), not a
         // particular arithmetic result.
         let window: Vec<u8> = (0..=100u8)
-            .filter(|&c| verify_test_duty(true, c) == 100)
+            .filter(|&c| verify_test_duty(true, PWM_PUMP_FLOOR, c) == 100)
             .collect();
         assert!(
             !window.is_empty(),
@@ -3456,7 +3489,7 @@ pub(crate) mod tests {
         );
         // ...and no non-pump header reaches it, which bounds the exposure.
         assert!(
-            (0..=100u8).all(|c| verify_test_duty(false, c) != 100),
+            (0..=100u8).all(|c| verify_test_duty(false, PWM_PUMP_FLOOR, c) != 100),
             "an ordinary fan is never verified at full speed"
         );
     }

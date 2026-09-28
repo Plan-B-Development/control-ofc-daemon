@@ -40,6 +40,7 @@ fn pump_floor() -> u8 {
     control_ofc_daemon::hwmon::device_policy::resolve_policy_floor(
         &control_ofc_daemon::hwmon::device_policy::GENERIC_PUMP,
         true,
+        None,
     ) as u8
 }
 
@@ -3683,6 +3684,7 @@ async fn discover_with_pump_flip_from(
         "hwmon:t:d:pwm2",
         "control-path discovery",
         false,
+        30,
         move || {
             u.load(Ordering::SeqCst)
                 || fa

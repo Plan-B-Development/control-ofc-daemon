@@ -81,6 +81,26 @@ pub const MAX_SUPERVISABLE_POLL_INTERVAL_MS: u64 =
 // *derived* by that division, so it holds for every input.
 const _: () = assert!(MAX_SUPERVISABLE_POLL_INTERVAL_MS >= 250);
 
+/// One tick's safety publication (DEC-443) — see
+/// [`StateCache::record_engine_safety`].
+#[derive(Debug, Clone)]
+pub struct EngineSafetyReport<'a> {
+    pub thermal_state: &'a str,
+    pub trigger_c: f64,
+    pub causes: Vec<&'static str>,
+    pub coolant_limit_c: Option<f64>,
+    pub coolant_release_c: Option<f64>,
+}
+
+/// Clamp a coolant limit into the settable range (DEC-443). The one definition
+/// the cache, `main`'s config merge and the API's config report share.
+pub fn clamp_coolant_limit_c(limit_c: u8) -> u8 {
+    limit_c.clamp(
+        crate::constants::COOLANT_LIMIT_MIN_C,
+        crate::constants::COOLANT_LIMIT_MAX_C,
+    )
+}
+
 /// Thread-safe in-memory cache for daemon state.
 ///
 /// All IPC responses should read from this cache rather than polling
@@ -189,6 +209,11 @@ pub struct StateCache {
     /// reads it at the moment of the stop. Seeded by `main` from the effective
     /// config; the default only covers tests and a cache nothing configured.
     exit_floor_pct: std::sync::atomic::AtomicU8,
+    /// The coolant limit in force (DEC-443), in whole °C. Written by `main` from
+    /// the effective config, by a SIGHUP reload and by `POST /config/coolant-limit`;
+    /// read by the profile engine every tick. Always within
+    /// `COOLANT_LIMIT_MIN_C..=COOLANT_LIMIT_MAX_C` — the setter clamps.
+    coolant_limit_c: std::sync::atomic::AtomicU8,
 }
 
 impl StateCache {
@@ -207,7 +232,27 @@ impl StateCache {
             exit_floor_pct: std::sync::atomic::AtomicU8::new(
                 crate::constants::DEFAULT_EXIT_FLOOR_PCT,
             ),
+            coolant_limit_c: std::sync::atomic::AtomicU8::new(
+                crate::constants::DEFAULT_COOLANT_LIMIT_C,
+            ),
         }
+    }
+
+    /// The coolant limit in force now (DEC-443), in whole °C.
+    pub fn coolant_limit_c(&self) -> u8 {
+        self.coolant_limit_c.load(Ordering::Relaxed)
+    }
+
+    /// Set the coolant limit in force (DEC-443), clamped into
+    /// `COOLANT_LIMIT_MIN_C..=COOLANT_LIMIT_MAX_C`.
+    ///
+    /// [SAFETY] Clamped here, where it is relied on, as well as at each setter:
+    /// a hand-edited `runtime.toml` reaches this without the API's validation,
+    /// and a limit of 0 would latch the emergency on every machine with a
+    /// coolant sensor while 255 would switch the trigger off.
+    pub fn set_coolant_limit_c(&self, limit_c: u8) {
+        self.coolant_limit_c
+            .store(clamp_coolant_limit_c(limit_c), Ordering::Relaxed);
     }
 
     /// The exit floor in force now (DEC-388) — read by the shutdown path.
@@ -533,10 +578,28 @@ impl StateCache {
     /// what the rule acts on, and since DEC-308 that value is per-machine rather
     /// than a constant the handler could read for itself.
     pub fn record_engine_tick(&self, thermal_state: &str, trigger_c: f64) {
+        self.record_engine_safety(&EngineSafetyReport {
+            thermal_state,
+            trigger_c,
+            causes: Vec::new(),
+            coolant_limit_c: None,
+            coolant_release_c: None,
+        });
+    }
+
+    /// The engine's per-tick safety publication (DEC-443): everything
+    /// [`Self::record_engine_tick`] writes, plus which rules are forcing and the
+    /// coolant thresholds acted on — in ONE write, so `/status` can never pair a
+    /// state with another tick's causes. The profile engine calls this;
+    /// `record_engine_tick` is the form for callers with no coolant rule.
+    pub fn record_engine_safety(&self, report: &EngineSafetyReport<'_>) {
         let now = Instant::now();
         let mut state = self.inner.write();
-        state.thermal_override_state = Some(thermal_state.to_string());
-        state.thermal_emergency_trigger_c = Some(trigger_c);
+        state.thermal_override_state = Some(report.thermal_state.to_string());
+        state.thermal_emergency_trigger_c = Some(report.trigger_c);
+        state.emergency_causes = report.causes.clone();
+        state.coolant_limit_c = report.coolant_limit_c;
+        state.coolant_release_c = report.coolant_release_c;
         state.subsystem_timestamps.engine_started = Some(now);
     }
 
@@ -969,6 +1032,25 @@ impl StateCache {
             return;
         }
         self.inner.write().skipped_controls = skipped;
+    }
+
+    /// Publish the engine's cooling-watch state for this tick (DEC-443): the
+    /// pumps under a stall response, and the advisories in force. One write,
+    /// from `TickCompletion::drop`, so every exit from a tick publishes it.
+    pub fn update_cooling_watch(
+        &self,
+        pump_stalls: Vec<crate::health::state::PumpStallRecord>,
+        advisories: Vec<crate::health::state::CoolingAdvisoryRecord>,
+    ) {
+        if pump_stalls.is_empty() && advisories.is_empty() {
+            let snap = self.inner.read();
+            if snap.pump_stalls.is_empty() && snap.cooling_advisories.is_empty() {
+                return;
+            }
+        }
+        let mut state = self.inner.write();
+        state.pump_stalls = pump_stalls;
+        state.cooling_advisories = advisories;
     }
 
     /// Publish the engine's per-tick control state — which controls are skipped

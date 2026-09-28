@@ -304,6 +304,38 @@ pub struct ControlOutput {
     pub output_pct: f64,
 }
 
+/// One pump the stall response is acting on, for the `/status` surface
+/// (DEC-443, `TS-e`). Built by `profile_engine::pump_stall`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PumpStallRecord {
+    /// The hwmon header id of the pump.
+    pub header_id: String,
+    /// Stable wire token: `"stall_response"` (held at 100 % for the response
+    /// window), `"not_turning"` (still 0 RPM at 100 %), or `"held"` (a second
+    /// stall this run — held at 100 % until a restart or a profile change).
+    pub state: &'static str,
+    /// When the pump entered this state.
+    pub since: Instant,
+    /// Stalls seen on this header since the daemon started.
+    pub stall_count: u32,
+}
+
+/// One cooling advisory in force, for the `/status` surface (DEC-443, `TS-m`).
+/// Advisory only: nothing is forced because of it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoolingAdvisoryRecord {
+    /// Stable wire token, e.g. `"cpu_at_ceiling_low_cooling"`.
+    pub code: &'static str,
+    /// When the condition was first met (the advisory is raised only once it
+    /// has held for `ADVISORY_HOLD`).
+    pub since: Instant,
+    /// The hottest fresh CPU reading and the ceiling it was judged against.
+    pub cpu_temp_c: f64,
+    pub ceiling_c: f64,
+    /// The highest duty the engine commanded to any non-GPU output.
+    pub max_duty_pct: u8,
+}
+
 /// Placeholder for AIO pump state (future implementation).
 #[derive(Debug, Clone, Default)]
 pub struct AioPumpState {
@@ -396,6 +428,20 @@ pub struct DaemonState {
     /// design ceiling; `None` until the first tick, where readers fall back to
     /// `constants::THERMAL_EMERGENCY_TRIGGER_C`.
     pub thermal_emergency_trigger_c: Option<f64>,
+    /// Which rules are forcing the emergency, published in the same write as
+    /// `thermal_override_state` (DEC-443): `"cpu"`, `"coolant"`, both, or empty
+    /// when nothing is latched.
+    pub emergency_causes: Vec<&'static str>,
+    /// The coolant limit and release point the engine ACTED on at its last tick
+    /// (DEC-443) — the DEC-292 rule: report what the rule acts on, never a
+    /// constant the reader would have to trust matches. `None` before the first
+    /// tick.
+    pub coolant_limit_c: Option<f64>,
+    pub coolant_release_c: Option<f64>,
+    /// Pumps the stall response is acting on (DEC-443). Empty when none.
+    pub pump_stalls: Vec<PumpStallRecord>,
+    /// Cooling advisories in force (DEC-443). Empty when none.
+    pub cooling_advisories: Vec<CoolingAdvisoryRecord>,
     /// True while a hardware verify (hwmon or GPU) is in progress. Held for the
     /// verify's entire lifetime by the handler's RAII guard, so the engine pause
     /// outlasts a slow verify rather than expiring on a fixed timer. Single-
@@ -493,6 +539,11 @@ impl Default for DaemonState {
             subsystem_timestamps: SubsystemTimestamps::default(),
             thermal_override_state: None,
             thermal_emergency_trigger_c: None,
+            emergency_causes: Vec::new(),
+            coolant_limit_c: None,
+            coolant_release_c: None,
+            pump_stalls: Vec::new(),
+            cooling_advisories: Vec::new(),
             verify_in_progress: false,
             verify_epoch: 0,
             verify_active_until: None,

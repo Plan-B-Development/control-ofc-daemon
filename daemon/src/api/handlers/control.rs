@@ -227,6 +227,9 @@ pub async fn fan_identify_handler(
             // drops the guard, taking nothing else meanwhile — so reading it
             // under `override_table` cannot close a cycle.
             let (_, inferred) = state.header_role_parts(&fan_id);
+            // DEC-443: the header's pump floor (DC-aware), gathered with the
+            // inferred role for the same reason — it takes the controller lock.
+            let pump_floor = state.header_pump_floor_pct(&fan_id);
             let ttl = resolve_ttl(body.ttl_secs);
             let (role, target_pct, mode) = {
                 let profile_guard = state.active_profile.lock();
@@ -244,8 +247,11 @@ pub async fn fan_identify_handler(
                 } else {
                     crate::hwmon::roles::resolve_role(assigned, inferred).0
                 };
-                let (target_pct, mode) =
-                    crate::control_override::identify_target_for_role(role, last_commanded);
+                let (target_pct, mode) = crate::control_override::identify_target_for_role(
+                    role,
+                    last_commanded,
+                    pump_floor,
+                );
                 table.identify_hold(&fan_id, target_pct, mode, ttl);
                 (role, target_pct, mode)
             };

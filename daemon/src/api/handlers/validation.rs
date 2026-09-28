@@ -318,7 +318,11 @@ fn build_metadata(
             inferred,
             profile_pump_ids.contains(id),
         );
-        let floor = crate::hwmon::device_policy::resolve_policy_floor(policy, pump_protected);
+        let floor = crate::hwmon::device_policy::resolve_policy_floor(
+            policy,
+            pump_protected,
+            header.and_then(|h| h.pwm_mode),
+        );
         members.push(MemberRoleSnapshot {
             member_id: id.to_string(),
             label: header

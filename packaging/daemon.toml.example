@@ -8,7 +8,8 @@
 # until the file is fixed. `journalctl -u control-ofc-daemon` names the key.
 #
 # After an edit: `sudo systemctl reload control-ofc-daemon` applies
-# [profiles] search_dirs and [shutdown] exit_floor_pct at once; every other key
+# [profiles] search_dirs, [shutdown] exit_floor_pct and [safety] coolant_limit_c
+# at once; every other key
 # needs `sudo systemctl restart control-ofc-daemon`.
 #
 # NOTE: several settings below are admin-owned BASE defaults that the API may
@@ -26,6 +27,7 @@
 #   [detection] allow_port_probe      POST /config/allow-port-probe
 #   [detection] enable_nvidia_telemetry  POST /config/nvidia-telemetry
 #   [shutdown] exit_floor_pct         POST /config/exit-floor         (0-100, applies at once)
+#   [safety]   coolant_limit_c        POST /config/coolant-limit      (40-70, applies at once)
 #
 # The API's bounds on the two interval keys are deliberately TIGHTER than what
 # this file accepts: they bound how stale a temperature the thermal emergency
@@ -118,3 +120,13 @@
 # which applies at once. A crash or SIGKILL cannot run it: OpenFan channels then
 # keep their last speed.
 # exit_floor_pct = 50
+
+[safety]
+# The coolant emergency (DEC-443). When the hottest current coolant reading — an
+# AIO or custom-loop coolant sensor the daemon recognises — is at or above this,
+# every OpenFan channel and writable motherboard header is forced to 100 %, the
+# same as the CPU emergency, until a current reading is 5 C below it. Whole
+# degrees C, 40-70; there is no off switch. A machine with no coolant sensor is
+# unaffected. Also settable from the GUI (Settings -> Daemon Configuration ->
+# Coolant limit), which applies at once.
+# coolant_limit_c = 60

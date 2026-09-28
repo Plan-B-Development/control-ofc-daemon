@@ -556,6 +556,10 @@ fn apply_runtime_overlay(config: &mut DaemonConfig, runtime: &RuntimeConfig, adm
         log::info!("runtime.toml overrides [shutdown] exit_floor_pct = {pct}");
         config.shutdown.exit_floor_pct = pct;
     }
+    if let Some(limit) = runtime.coolant_limit_c() {
+        log::info!("runtime.toml overrides [safety] coolant_limit_c = {limit}");
+        config.safety.coolant_limit_c = limit;
+    }
 
     // Sanity: if the admin config *also* has non-default runtime-mutable keys,
     // the runtime values still win — but warn so the admin knows their edits
@@ -604,6 +608,22 @@ fn apply_runtime_overlay(config: &mut DaemonConfig, runtime: &RuntimeConfig, adm
         );
         config.shutdown.exit_floor_pct = 100;
     }
+
+    // [SAFETY] DEC-443: the same reason — `runtime.toml` is not re-validated,
+    // and a hand-edited limit outside 40–70 °C would either latch the emergency
+    // on a healthy loop or switch the trigger off. Clamp rather than refuse to
+    // boot, for DEC-270's reason: no controller at all is worse.
+    let clamped =
+        control_ofc_daemon::health::cache::clamp_coolant_limit_c(config.safety.coolant_limit_c);
+    if clamped != config.safety.coolant_limit_c {
+        log::warn!(
+            "[safety] coolant_limit_c = {} is outside {}-{} °C — using {clamped}",
+            config.safety.coolant_limit_c,
+            control_ofc_daemon::constants::COOLANT_LIMIT_MIN_C,
+            control_ofc_daemon::constants::COOLANT_LIMIT_MAX_C
+        );
+        config.safety.coolant_limit_c = clamped;
+    }
 }
 
 /// Reload the daemon config and runtime overlay, updating the shared
@@ -634,9 +654,10 @@ fn apply_config_reload(
         DaemonConfig::load(config_path).map_err(|e| format!("config reload failed: {e}"))?;
     // `AUD3-m`: a reload that cannot parse `runtime.toml` re-applies DEFAULTS to
     // the running config, exactly as the boot load does. Narrower in effect —
-    // only `profile_search_dirs` and the exit floor (DEC-388) are committed
-    // below, so header roles keep whatever boot established, while an exit
-    // floor set in `runtime.toml` falls back to `daemon.toml`'s — but it is the
+    // only `profile_search_dirs`, the exit floor (DEC-388) and the coolant
+    // limit (DEC-443) are committed below, so header roles keep whatever boot
+    // established, while an exit floor or coolant limit set in `runtime.toml`
+    // falls back to `daemon.toml`'s — but it is the
     // same silent degradation on the same surface, so it is reported rather
     // than left in the journal.
     //
@@ -646,7 +667,7 @@ fn apply_config_reload(
     // board with no `pwmN_label` files that is the only evidence a header drives
     // a pump, so its 30% floor, stop exemption and pump-safe identify are all
     // gone. A `reload` degradation drops no role (only a runtime-set exit
-    // floor, above): boot's roles are still in force. Letting the cheaper
+    // floor or coolant limit, above): boot's roles are still in force. Letting the cheaper
     // record overwrite the expensive one made
     // `phase` under-report, so a client reading `reload` would reassure the user
     // while a hand-assigned pump was unprotected — reachable by editing a broken
@@ -679,6 +700,8 @@ fn apply_config_reload(
     // DEC-388: the exit floor applies live, so a reload re-applies it as it does
     // the search dirs.
     cache.set_exit_floor_pct(new_config.shutdown.exit_floor_pct);
+    // DEC-443: the coolant limit applies live too; the engine reads it next tick.
+    cache.set_coolant_limit_c(new_config.safety.coolant_limit_c);
     Ok(new_dirs)
 }
 
@@ -1893,6 +1916,8 @@ async fn async_main() {
     }
     // DEC-388: the exit floor in force until an API write or a SIGHUP changes it.
     cache.set_exit_floor_pct(config.shutdown.exit_floor_pct);
+    // DEC-443: the coolant limit in force until an API write or a SIGHUP.
+    cache.set_coolant_limit_c(config.safety.coolant_limit_c);
     let serial_timeout = Duration::from_millis(config.serial.timeout_ms);
 
     // ── Initialize OpenFanController ─────────────────────────────────────────
@@ -2144,8 +2169,10 @@ async fn async_main() {
     // become a fifth copy of a threshold that varies.
     log::info!(
         "Thermal safety rule active: hottest CpuTemp emergency at {}°C or above \
-         (raised per-machine where the CPU reports its own ceiling)",
-        control_ofc_daemon::constants::THERMAL_EMERGENCY_TRIGGER_C
+         (raised per-machine where the CPU reports its own ceiling); coolant \
+         emergency at {}°C where a coolant sensor exists",
+        control_ofc_daemon::constants::THERMAL_EMERGENCY_TRIGGER_C,
+        config.safety.coolant_limit_c
     );
 
     // ── Profile loading (CLI > env > persisted state > none) ────────
@@ -3086,6 +3113,7 @@ mod tests {
         runtime.set_allow_port_probe(Some(true));
         runtime.set_enable_nvidia_telemetry(Some(true));
         runtime.set_exit_floor_pct(65);
+        runtime.set_coolant_limit_c(50);
 
         apply_runtime_overlay(&mut config, &runtime, "/etc/control-ofc/daemon.toml");
 
@@ -3095,6 +3123,7 @@ mod tests {
         assert!(config.detection.allow_port_probe);
         assert!(config.detection.enable_nvidia_telemetry);
         assert_eq!(config.shutdown.exit_floor_pct, 65);
+        assert_eq!(config.safety.coolant_limit_c, 50);
     }
 
     /// DEC-388: `runtime.toml` is not re-validated, and a duty above 100 %
@@ -3526,6 +3555,70 @@ mod tests {
         .unwrap();
 
         assert_eq!(cache.exit_floor_pct(), 40);
+    }
+
+    /// [SAFETY] DEC-443: the coolant limit applies live, so a SIGHUP re-applies
+    /// it from the files — `runtime.toml` over `daemon.toml` — like the exit floor.
+    #[test]
+    fn a_config_reload_reapplies_the_coolant_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("daemon.toml");
+        std::fs::write(&config_path, "[safety]\ncoolant_limit_c = 45\n").unwrap();
+        let runtime_path = tmp.path().join("runtime.toml");
+        let cache = StateCache::new();
+        assert_ne!(cache.coolant_limit_c(), 45, "precondition");
+        let reload = |cache: &StateCache| {
+            apply_config_reload(
+                config_path.to_str().unwrap(),
+                &runtime_path,
+                &parking_lot::RwLock::new(Vec::new()),
+                &parking_lot::RwLock::new(None),
+                cache,
+            )
+            .unwrap();
+        };
+
+        reload(&cache);
+        assert_eq!(cache.coolant_limit_c(), 45, "daemon.toml's value");
+
+        let mut runtime = RuntimeConfig::default();
+        runtime.set_coolant_limit_c(65);
+        runtime.save_to(&runtime_path).unwrap();
+        reload(&cache);
+        assert_eq!(cache.coolant_limit_c(), 65, "runtime.toml wins");
+    }
+
+    /// [SAFETY] DEC-443: `runtime.toml` is not re-validated, so a hand-edited
+    /// limit outside the settable range is clamped — by BOTH copies of the merge,
+    /// so `GET /config` reports what the engine acts on.
+    #[test]
+    fn an_out_of_range_coolant_limit_is_clamped_by_both_copies_of_the_merge() {
+        let (lo, hi) = (
+            control_ofc_daemon::constants::COOLANT_LIMIT_MIN_C,
+            control_ofc_daemon::constants::COOLANT_LIMIT_MAX_C,
+        );
+        for (written, expected) in [(hi + 20, hi), (lo - 20, lo)] {
+            let dir = tempfile::tempdir().unwrap();
+            let admin_path = dir.path().join("daemon.toml");
+            std::fs::write(&admin_path, "").unwrap();
+            let runtime_path = dir.path().join("runtime.toml");
+            let mut runtime = RuntimeConfig::default();
+            runtime.set_coolant_limit_c(written);
+            runtime.save_to(&runtime_path).unwrap();
+
+            let mut via_overlay = DaemonConfig::load(admin_path.to_str().unwrap()).unwrap();
+            apply_runtime_overlay(
+                &mut via_overlay,
+                &RuntimeConfig::load_from(&runtime_path),
+                admin_path.to_str().unwrap(),
+            );
+            let (via_api, _) = control_ofc_daemon::api::handlers::config::effective_on_disk_paths(
+                admin_path.to_str().unwrap(),
+                &runtime_path,
+            );
+            assert_eq!(via_overlay.safety.coolant_limit_c, expected, "{written}");
+            assert_eq!(via_api.safety.coolant_limit_c, expected, "{written}");
+        }
     }
 
     // ── [SAFETY] serial port fallback (DEC-243) ──────────────────────────

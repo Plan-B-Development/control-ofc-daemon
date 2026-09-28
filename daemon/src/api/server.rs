@@ -256,6 +256,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/config/exit-floor",
             post(handlers::update_exit_floor_handler),
         )
+        // DEC-443: the coolant limit — applies live, like the exit floor.
+        .route(
+            "/config/coolant-limit",
+            post(handlers::update_coolant_limit_handler),
+        )
         // Persisted preferred CPU / motherboard sensor (Phase 5, DEC-200). Set
         // via {"sensor_id": "<id>"} or clear via {"sensor_id": null}. Advisory —
         // thermal safety still uses the hottest CpuTemp.

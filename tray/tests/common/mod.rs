@@ -147,6 +147,7 @@ pub fn status(version: &str, thermal: &str, active: Option<&str>) -> Status {
         thermal_state: thermal.to_string(),
         active_profile_id: active.map(str::to_string),
         active_profile_name: active.map(str::to_string),
+        pump_stalls: vec![],
     }
 }
 

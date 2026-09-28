@@ -1,4 +1,13 @@
-//! CPU Tctl emergency thermal safety rule.
+//! The latched thermal emergency rule — for the CPU, and since DEC-443 a
+//! second instance for coolant (`TS-f`).
+//!
+//! **Two instances, one force (DEC-443).** The engine keeps the CPU rule (shared
+//! behind `Arc<Mutex<_>>`, with the per-machine trip point of DEC-308) and a
+//! coolant rule of its own, built by [`ThermalSafetyRule::coolant`]. Each feeds
+//! its own decision table in `profile_engine::safety_tick`, and one exhaustive
+//! combine turns the pair into the tick's single forced duty. Everything below
+//! about the CPU rule's reach and floors is true of the coolant force too — it
+//! is the same `force_present_backends` call.
 //!
 //! Single latched rule: at [`crate::constants::THERMAL_EMERGENCY_TRIGGER_C`],
 //! force every OpenFan channel and writable hwmon header the machine HAS to
@@ -61,6 +70,8 @@
 /// that restates a threshold drifts from it exactly like a duplicated literal).
 /// Edge-triggered logging — only logs on state transitions.
 pub struct ThermalSafetyRule {
+    /// What the rule watches, for its log lines: `"CPU Tctl"` or `"Coolant"`.
+    subject: &'static str,
     trigger_temp_c: f64,
     release_temp_c: f64,
     forced_output_pct: u8,
@@ -71,11 +82,40 @@ impl ThermalSafetyRule {
     /// Create the default CPU Tctl emergency rule.
     pub fn new() -> Self {
         Self {
+            subject: "CPU Tctl",
             trigger_temp_c: crate::constants::THERMAL_EMERGENCY_TRIGGER_C,
             release_temp_c: crate::constants::THERMAL_EMERGENCY_RELEASE_C,
             forced_output_pct: 100,
             active: false,
         }
+    }
+
+    /// The coolant emergency rule (DEC-443, `TS-f`): latches at `limit_c`,
+    /// releases at `limit_c` − [`crate::constants::COOLANT_RELEASE_MARGIN_C`],
+    /// forces 100 %. See [`Self::set_coolant_limit_c`].
+    pub fn coolant(limit_c: u8) -> Self {
+        let mut rule = Self {
+            subject: "Coolant",
+            trigger_temp_c: 0.0,
+            release_temp_c: 0.0,
+            forced_output_pct: 100,
+            active: false,
+        };
+        rule.set_coolant_limit_c(limit_c);
+        rule
+    }
+
+    /// Move the coolant limit (DEC-443). Both thresholds move together — the
+    /// release is always the limit less the margin.
+    ///
+    /// [SAFETY] Safe while latched, like [`Self::set_trigger_temp_c`]: `active`
+    /// is untouched, so moving the limit never releases an emergency by itself —
+    /// only a FRESH reading at or below the new release point does. Lowering
+    /// the limit mid-emergency therefore holds it longer; raising it lets the
+    /// next fresh reading release it sooner, which is the user's explicit act.
+    pub fn set_coolant_limit_c(&mut self, limit_c: u8) {
+        self.trigger_temp_c = f64::from(limit_c);
+        self.release_temp_c = f64::from(limit_c) - crate::constants::COOLANT_RELEASE_MARGIN_C;
     }
 
     /// Apply a FRESH CPU Tctl reading — the only thing that may move the latch.
@@ -92,7 +132,8 @@ impl ThermalSafetyRule {
         if !self.active && tctl_c >= self.trigger_temp_c {
             self.active = true;
             log::warn!(
-                "THERMAL EMERGENCY: CPU Tctl {:.1}°C >= {}°C — forcing fans to {}%",
+                "THERMAL EMERGENCY: {} {:.1}°C >= {}°C — forcing fans to {}%",
+                self.subject,
                 tctl_c,
                 self.trigger_temp_c,
                 self.forced_output_pct
@@ -100,8 +141,9 @@ impl ThermalSafetyRule {
         } else if self.active && tctl_c <= self.release_temp_c {
             self.active = false;
             log::info!(
-                "Thermal emergency released: CPU Tctl {:.1}°C <= {}°C — control returns \
+                "Thermal emergency released: {} {:.1}°C <= {}°C — control returns \
                  to the profile",
+                self.subject,
                 tctl_c,
                 self.release_temp_c
             );
@@ -182,6 +224,32 @@ mod tests {
     /// its test-suite form, so it gets DEC-292's fix: derive from the constant,
     /// and express "just above"/"just below" as offsets from it.
     const TRIGGER: f64 = crate::constants::THERMAL_EMERGENCY_TRIGGER_C;
+
+    /// DEC-443: the coolant rule latches at its limit, holds until a reading at
+    /// or below limit − margin, and moving the limit never releases it.
+    #[test]
+    fn the_coolant_rule_latches_at_its_limit_and_releases_below_the_margin() {
+        let limit = crate::constants::DEFAULT_COOLANT_LIMIT_C;
+        let lim = f64::from(limit);
+        let margin = crate::constants::COOLANT_RELEASE_MARGIN_C;
+        let mut rule = ThermalSafetyRule::coolant(limit);
+        assert_eq!(rule.evaluate(lim - 0.1), None);
+        assert_eq!(rule.evaluate(lim), Some(100));
+        assert_eq!(rule.release_temp_c(), lim - margin);
+        assert_eq!(
+            rule.evaluate(lim - margin + 0.1),
+            Some(100),
+            "above release"
+        );
+        // Raising the limit while latched does not release on its own.
+        rule.set_coolant_limit_c(70);
+        assert!(rule.is_active());
+        assert_eq!(
+            rule.evaluate(70.0 - margin),
+            None,
+            "released at the new point"
+        );
+    }
 
     #[test]
     fn normal_temp_no_override() {

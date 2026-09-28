@@ -122,6 +122,43 @@ pub(crate) fn build_skipped_entries(snap: &DaemonState, now: Instant) -> Vec<Ski
     entries
 }
 
+/// Build the DEC-443 status fields from a cache snapshot: the emergency's
+/// causes, the pumps under a stall response and the advisories in force.
+pub(crate) fn build_cooling_safety_entries(
+    snap: &DaemonState,
+    now: Instant,
+) -> CoolingSafetyEntries {
+    let ms = |since: Instant| now.saturating_duration_since(since).as_millis() as u64;
+    CoolingSafetyEntries {
+        emergency_causes: snap
+            .emergency_causes
+            .iter()
+            .map(|c| (*c).to_string())
+            .collect(),
+        pump_stalls: snap
+            .pump_stalls
+            .iter()
+            .map(|p| PumpStallEntry {
+                header_id: p.header_id.clone(),
+                state: p.state.to_string(),
+                since_ms: ms(p.since),
+                stall_count: p.stall_count,
+            })
+            .collect(),
+        advisories: snap
+            .cooling_advisories
+            .iter()
+            .map(|a| CoolingAdvisoryEntry {
+                code: a.code.to_string(),
+                since_ms: ms(a.since),
+                cpu_temp_c: a.cpu_temp_c,
+                ceiling_c: a.ceiling_c,
+                max_duty_pct: a.max_duty_pct,
+            })
+            .collect(),
+    }
+}
+
 /// Build the per-control applied-output list from a cache snapshot (277-k).
 ///
 /// Already sorted by `control_id` upstream (`ProfileEngineState::outputs_snapshot`)
@@ -793,6 +830,26 @@ impl AppState {
         (assigned, inferred)
     }
 
+    /// The pump floor for one header, as a duty (DEC-443): the DC pump floor when
+    /// its `pwmN_mode` says DC, otherwise the 30 % pump floor.
+    ///
+    /// [SAFETY] Says nothing about WHETHER the header is a pump — that is
+    /// [`Self::header_is_pump_protected`]. Every site that floors a pump asks
+    /// both and applies this value only when the answer is yes. Takes the
+    /// controller lock alone and releases it, like `header_role_parts`, so a
+    /// caller must hold neither that lock nor `active_profile`. An unknown
+    /// header gets the 30 % floor — the value it had before the mode was read.
+    pub fn header_pump_floor_pct(&self, header_id: &str) -> u8 {
+        let mode = self.hwmon_controller.as_ref().and_then(|c| {
+            c.lock()
+                .headers()
+                .into_iter()
+                .find(|h| h.id == header_id)
+                .and_then(|h| h.pwm_mode)
+        });
+        pump_floor_duty(mode)
+    }
+
     /// Header ids the active profile names as pumps: every member whose label
     /// satisfies [`crate::profile::member_label_names_pump`] (TS-h, DEC-384).
     ///
@@ -850,6 +907,13 @@ impl AppState {
         // holding the controller lock must call that directly instead.
         crate::hwmon::roles::is_pump_protected(assigned, inferred, profile_names_pump)
     }
+}
+
+/// [`crate::profile::pump_floor_pct`] as a whole duty, for the diagnostic paths
+/// that write `u8` (DEC-443). Both floors are whole numbers, so the conversion
+/// is exact.
+pub(crate) fn pump_floor_duty(pwm_mode: Option<u8>) -> u8 {
+    crate::profile::pump_floor_pct(pwm_mode) as u8
 }
 
 /// Header ids `profile` names as pumps: every member whose label satisfies
@@ -1043,6 +1107,10 @@ where
     }
 }
 
+// Eight since DEC-443's `cooling`: each argument is one snapshot-guarded read
+// the two callers build under a single `read_with`, so bundling them would only
+// move the list into a struct both callers must fill field by field.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_status_response(
     state: &AppState,
     thermal_state: String,
@@ -1051,6 +1119,7 @@ pub(crate) fn build_status_response(
     control_outputs: Vec<ControlOutputEntry>,
     health: crate::health::staleness::HealthSummary,
     verify_active: bool,
+    cooling: CoolingSafetyEntries,
 ) -> StatusResponse {
     // `AUD3-m`. Hoisted out of the struct literal deliberately: a temporary in a
     // field initialiser lives until the end of the whole statement, so reading it
@@ -1166,6 +1235,11 @@ pub(crate) fn build_status_response(
         // would re-enter that lock. Passed in for the same reason
         // `thermal_state` is.
         verify_active,
+        // DEC-443: built under the same guard, so the causes and the
+        // `thermal_state` above describe the same engine tick.
+        emergency_causes: cooling.emergency_causes,
+        pump_stalls: cooling.pump_stalls,
+        advisories: cooling.advisories,
     }
 }
 

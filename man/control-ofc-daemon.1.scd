@@ -171,9 +171,9 @@ _/usr/lib/modprobe.d/control-ofc-superio.conf_, _/usr/lib/control-ofc/control-of
 
 *SIGHUP*
 	Reload configuration from daemon.toml and runtime.toml without
-	restarting. Only the *profile search directories* and the *exit
-	floor* (*[shutdown] exit_floor_pct*) are re-applied to the running
-	daemon. Every other key -- polling interval, serial port
+	restarting. Only the *profile search directories*, the *exit
+	floor* (*[shutdown] exit_floor_pct*) and the *coolant limit*
+	(*[safety] coolant_limit_c*) are re-applied to the running daemon. Every other key -- polling interval, serial port
 	and timeout, socket path, state directory, startup delay, and the
 	*[detection]* opt-ins -- is consumed once at process start, so
 	changing it requires a restart. *GET /config* reports which keys have

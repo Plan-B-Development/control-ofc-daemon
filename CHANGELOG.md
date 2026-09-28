@@ -4,6 +4,28 @@
 
 ### Added
 
+- **A coolant emergency** (DEC-443). When the hottest current reading from a coolant sensor — an
+  AIO or custom-loop coolant temperature the daemon recognises — reaches the coolant limit, the
+  daemon forces every OpenFan fan and writable motherboard header to 100 %, exactly as the CPU
+  emergency does, until a current reading is 5 °C below the limit. The limit is `[safety]
+  coolant_limit_c` in `daemon.toml`, whole °C from 40 to 70, **default 60**; it can also be set from
+  the GUI or with the new `POST /config/coolant-limit`, and applies at once. There is no off
+  switch, and a machine with no coolant sensor is unaffected. A coolant sensor that stops updating
+  holds an emergency already under way, and otherwise does nothing. `GET /status` names what
+  tripped an emergency in the new `emergency_causes` (`cpu`, `coolant`), and
+  `/diagnostics/hardware` reports the coolant limit and release point in use.
+- **Pump stall response** (DEC-443). A pump in the active profile that the daemon has seen
+  spinning, and that then reads 0 RPM for 10 seconds while it is being asked to run at 30 % or
+  more, is driven to full speed for 30 seconds to restart it. If it turns it goes back to its
+  curve; if it still reads 0 RPM it stays at full speed until it does. A second stall in the same
+  run holds it at full speed until the daemon restarts or a profile is activated. Each stall is
+  logged and listed on `GET /status` as `pump_stalls[]`; the tray shows a line for it.
+- **Cooling advisory** (DEC-443). A CPU that sits at or above its ceiling (its own reported limit,
+  or 85 °C where it reports none) for a minute while no fan or pump is commanded at 50 % or more
+  is logged and listed on `GET /status` as `advisories[]` — the shape a stopped pump takes under a
+  CPU that throttles itself, which the CPU emergency practically never sees. It forces nothing.
+- New capability `control.cooling_failure_detection` advertises all of the above.
+
 - **Fan ids survive the it87 v2.0 driver rename** (DEC-442). `it87-dkms-git` builds from 2026-09-09
   name Gigabyte chips after the board's ID, for example `it8696_a008090a` instead of `it8696`. Every
   fan header, sensor and voltage id embeds the chip name, so the rebuild used to change all of them
@@ -25,6 +47,13 @@
   field is served as stored.
 
 ### Changed
+
+- **A pump on a DC-mode header is never driven below 70 %** (DEC-443), rather than the 30 % pump
+  floor: a pump driven by voltage stalls much higher in its range than a PWM one. It applies
+  wherever the pump floor does — curves, manual overrides, identify, hardware verify, PWM
+  characterisation, control-path discovery and the stall probe's restore — and
+  `effective_min_pwm_pct` on `/hwmon/headers` reports it. A header whose driver does not report
+  its mode (it87) keeps the 30 % floor.
 
 - **The upgrade notice about the Super-I/O guard appears once** (DEC-441). It now shows only when
   upgrading from a version older than 2.56.1, the release that extended the guard to every Gigabyte

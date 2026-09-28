@@ -238,6 +238,14 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
             .thermal_emergency_trigger_c
             .unwrap_or(crate::constants::THERMAL_EMERGENCY_TRIGGER_C),
         release_threshold_c: crate::constants::THERMAL_EMERGENCY_RELEASE_C,
+        // DEC-443: the coolant thresholds the engine acted on, published in the
+        // same write as `state`; the limit in force before the first tick.
+        coolant_limit_c: snap
+            .coolant_limit_c
+            .unwrap_or_else(|| f64::from(state.cache.coolant_limit_c())),
+        coolant_release_c: snap.coolant_release_c.unwrap_or_else(|| {
+            f64::from(state.cache.coolant_limit_c()) - crate::constants::COOLANT_RELEASE_MARGIN_C
+        }),
     };
 
     // Kernel module detection

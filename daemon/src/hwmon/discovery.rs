@@ -228,7 +228,8 @@ pub(crate) fn classify_chip(chip_name: &str, label: &str, board_vendor: &str) ->
     // chip/label heuristics below: an NZXT Kraken `temp1` is coolant, and any
     // sensor a vendor labels coolant/water/liquid is coolant regardless of chip
     // (covers Aquacomputer "Coolant temp" and ASUS-EC "Water In"/"Water Out").
-    // No safety semantics — see `safety.rs` (CPU-only) and `aio.rs`.
+    // A safety input since DEC-443: the coolant emergency keys on this kind —
+    // see `safety.rs` and `aio.rs`.
     if crate::hwmon::aio::is_coolant_sensor(chip_name, label) {
         return SensorKind::CoolantTemp;
     }

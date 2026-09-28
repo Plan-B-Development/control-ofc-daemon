@@ -5,9 +5,11 @@
 //!
 //! Scope is **hwmon-only** — the daemon never shells out to `liquidctl` or
 //! opens USB-HID, so USB-only coolers are detected-but-uncontrollable and stay
-//! out of scope. There is **no coolant safety rule**: classifying a sensor as
-//! coolant has no thermal-override semantics (the CPU-only `safety.rs` rule is
-//! unchanged).
+//! out of scope. Classifying a sensor as coolant **is** a safety input since
+//! DEC-443 (`TS-f`): the hottest fresh `CoolantTemp` reading drives the coolant
+//! emergency at `safety.coolant_limit_c` (`safety.rs`, `profile_engine`). A sensor
+//! this module does not recognise as coolant is therefore also one that cannot
+//! trigger it.
 //!
 //! Per-driver pump writability is **not** second-guessed here. The kernel hwmon
 //! ABI exposes a writable (`0644`) `pwmN` only for genuinely controllable

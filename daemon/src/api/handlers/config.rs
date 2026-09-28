@@ -699,6 +699,9 @@ pub fn effective_on_disk_paths(
     if let Some(p) = runtime.exit_floor_pct() {
         cfg.shutdown.exit_floor_pct = p;
     }
+    if let Some(l) = runtime.coolant_limit_c() {
+        cfg.safety.coolant_limit_c = l;
+    }
     // DEC-270: the same clamp `apply_runtime_overlay` applies, for the same
     // reason the doc comment above gives. Without it this copy reports the
     // hand-edited value while the process runs the clamped one, so
@@ -710,6 +713,9 @@ pub fn effective_on_disk_paths(
     // DEC-388: the same clamp `apply_runtime_overlay` applies to a hand-edited
     // `runtime.toml`, for the reason the doc comment above gives.
     cfg.shutdown.exit_floor_pct = cfg.shutdown.exit_floor_pct.min(100);
+    // DEC-443: the same clamp `apply_runtime_overlay` applies.
+    cfg.safety.coolant_limit_c =
+        crate::health::cache::clamp_coolant_limit_c(cfg.safety.coolant_limit_c);
     (cfg, runtime)
 }
 
@@ -873,6 +879,19 @@ pub async fn get_config_handler(
             serde_json::json!(state.cache.exit_floor_pct()),
             runtime.exit_floor_pct().is_some(),
             admin_has("shutdown.exit_floor_pct"),
+            true,
+            false,
+            None,
+        ),
+        // DEC-443: applies LIVE, like the exit floor — the engine re-reads the
+        // cache every tick — so the running value comes from the cache and
+        // nothing is owed to a restart.
+        config_key(
+            "safety.coolant_limit_c",
+            serde_json::json!(disk.safety.coolant_limit_c),
+            serde_json::json!(state.cache.coolant_limit_c()),
+            runtime.coolant_limit_c().is_some(),
+            admin_has("safety.coolant_limit_c"),
             true,
             false,
             None,
@@ -1264,6 +1283,70 @@ pub async fn update_exit_floor_handler(
             "key": "shutdown.exit_floor_pct",
             "value": pct,
             "note": "In force now; applies at the daemon's next stop",
+        })),
+    )
+}
+
+/// POST /config/coolant-limit — `{"coolant_limit_c": 40..=70}` (DEC-443).
+///
+/// The coolant temperature, in whole °C, at which a fresh coolant reading
+/// latches the thermal emergency's 100 % force (released 5 °C below). **Applies
+/// live**, persisted first and put in force only after the persist succeeds —
+/// the exit-floor handler's order, so a failed persist changes nothing. The
+/// range has no off switch by the user's decision: a limit above 70 would stop
+/// meaning anything, and below 40 an ordinary warm loop would trip it.
+pub async fn update_coolant_limit_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (lo, hi) = (
+        crate::constants::COOLANT_LIMIT_MIN_C,
+        crate::constants::COOLANT_LIMIT_MAX_C,
+    );
+    let limit = match body.get("coolant_limit_c").and_then(|v| v.as_u64()) {
+        Some(v) if (u64::from(lo)..=u64::from(hi)).contains(&v) => v as u8,
+        Some(v) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(format!("coolant_limit_c must be {lo}-{hi}, got {v}")),
+            );
+        }
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(format!(
+                    "missing 'coolant_limit_c' (whole degrees C, {lo}-{hi})"
+                )),
+            );
+        }
+    };
+    let (_config_guard, mut runtime) = match runtime_for_update(&state).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    runtime.set_coolant_limit_c(limit);
+    let runtime_owned = runtime.clone();
+    let path = state.runtime_config_path.clone();
+    if let Err(e) = super::persist_off_runtime(move || runtime_owned.save_to(&path)).await {
+        log::error!(
+            "Failed to persist safety.coolant_limit_c to {}: {e}",
+            state.runtime_config_path.display()
+        );
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::persistence_failed("failed to persist runtime configuration"),
+        );
+    }
+    state.cache.set_coolant_limit_c(limit);
+    log::info!("safety.coolant_limit_c set to {limit} °C (in force from the next tick)");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "api_version": API_VERSION,
+            "updated": true,
+            "key": "safety.coolant_limit_c",
+            "value": limit,
+            "note": "In force from the next engine tick",
         })),
     )
 }

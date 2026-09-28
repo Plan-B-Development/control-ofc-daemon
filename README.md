@@ -209,7 +209,10 @@ CLI / environment reference: [`daemon/README.md`](https://github.com/Plan-B-Deve
   raised to `min(ceiling + 5 °C, 115 °C)` where the kernel publishes the CPU's own
   design ceiling (DEC-308) — and every duty is a **floor** over the active profile's output
   rather than a replacement for it (DEC-307), so the ladder can only raise a fan. GPU fans are excluded — AMD PMFW firmware owns
-  GPU thermal protection independently of OS fan control (DEC-130).
+  GPU thermal protection independently of OS fan control (DEC-130). A **coolant sensor** at or above the coolant
+  limit (default 60 °C, `[safety] coolant_limit_c`) takes the same 100 % force; a profile pump that stalls is driven
+  to full speed; a pump on a DC-mode header is never driven below 70 %; and a CPU held at its ceiling with every fan
+  slow raises an advisory (DEC-443).
 - **Headless profile engine** (`profile_engine/`) evaluates the active profile's
   fan curves autonomously on a 1 Hz loop and is the **sole writer** of every
   backend (2.0.0+, DEC-159/DEC-165). There is no GUI defer window — the 30 s

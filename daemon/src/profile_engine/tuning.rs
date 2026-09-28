@@ -135,10 +135,13 @@ pub(crate) fn member_effective_floor(
     control: &LogicalControl,
     member: &ControlMember,
     assigned_roles: &std::collections::HashMap<String, crate::hwmon::roles::HeaderRole>,
+    header_facts: &std::collections::HashMap<String, HeaderFacts>,
 ) -> f64 {
     if member_is_gpu(member) {
-        0.0
-    } else if member_needs_hard_floor(member)
+        return 0.0;
+    }
+    let mut floor = control.minimum_pct;
+    if member_needs_hard_floor(member)
         || crate::profile::assigned_role_is_pump(member, assigned_roles)
     {
         // DEC-252: the eval-time superset — the author's label OR the daemon's
@@ -150,8 +153,47 @@ pub(crate) fn member_effective_floor(
         // and `validate`'s rejection line does not move for the same reason it
         // did not move for DEC-252 (a daemon that rejected more than the paired
         // GUI stamps would block profile saving on a split upgrade).
-        control.minimum_pct.max(HARD_PUMP_CPU_FLOOR_PCT)
-    } else {
-        control.minimum_pct
+        floor = floor.max(HARD_PUMP_CPU_FLOOR_PCT);
     }
+    if let Some(pump_floor) = member_pump_floor(member, assigned_roles, header_facts) {
+        // DEC-443: a pump on a DC-mode header gets the DC pump floor. Raise-only
+        // by construction (`max`), so it can never lower what the terms above
+        // established; for a PWM or unreported header it is the 30 % above.
+        floor = floor.max(pump_floor);
+    }
+    floor
+}
+
+/// The pump floor for `member` when the daemon's pump-protection union says it
+/// drives a pump, else `None` (DEC-443).
+///
+/// [SAFETY] The same three-term union `AppState::header_is_pump_protected`
+/// computes for identify and every diagnostic (`roles::is_pump_protected`): the
+/// inferred role, the resolved role, or a profile label naming a pump. Here the
+/// profile term is this member's own label, since the member IS the profile's
+/// binding. One union, so the engine and the diagnostics agree on which headers
+/// are pumps and therefore on which get the DC floor.
+///
+/// With empty `header_facts` (the parity oracle, or a contended controller at
+/// engine start) the inferred term is `Unknown` and `pwm_mode` unknown, so this
+/// returns at most [`HARD_PUMP_CPU_FLOOR_PCT`], which every such member already
+/// had through `member_needs_hard_floor` — no floor moves on missing evidence.
+pub(crate) fn member_pump_floor(
+    member: &ControlMember,
+    assigned_roles: &std::collections::HashMap<String, crate::hwmon::roles::HeaderRole>,
+    header_facts: &std::collections::HashMap<String, HeaderFacts>,
+) -> Option<f64> {
+    if member.source != "hwmon" {
+        return None;
+    }
+    let facts = header_facts
+        .get(&member.member_id)
+        .copied()
+        .unwrap_or_default();
+    let is_pump = crate::hwmon::roles::is_pump_protected(
+        assigned_roles.get(&member.member_id).copied(),
+        facts.inferred_role,
+        crate::profile::member_label_names_pump(member),
+    );
+    is_pump.then(|| crate::profile::pump_floor_pct(facts.pwm_mode))
 }

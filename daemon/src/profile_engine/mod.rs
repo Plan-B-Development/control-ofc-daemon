@@ -25,7 +25,9 @@ use crate::profile::{
     DaemonProfile, LogicalControl, HARD_PUMP_CPU_FLOOR_PCT,
 };
 
+mod cooling_advisory;
 mod curve_eval;
+mod pump_stall;
 mod safety_tick;
 pub mod skipped;
 mod tuning;
@@ -154,11 +156,40 @@ pub struct ProfileEngineState {
     /// as empty. An `Arc` so the per-tick read in the evaluator is a refcount
     /// bump, not a map clone.
     assigned_roles: Arc<HashMap<String, crate::hwmon::roles::HeaderRole>>,
+    /// DEC-443: what discovery measured about each hwmon header — its
+    /// `pwmN_mode` and inferred role — for the DC-aware pump floor. Installed
+    /// by the engine loop from [`backends::HwmonBackend::header_facts`].
+    ///
+    /// [SAFETY] State, not an evaluator argument, for exactly the reason
+    /// `assigned_roles` is: the parity oracle's `ProfileEngineState::new()`
+    /// leaves it empty, so `parity_vectors.json` is unperturbed by construction.
+    /// Empty facts can only ever yield the 30 % pump floor a member already had.
+    header_facts: Arc<HashMap<String, HeaderFacts>>,
+}
+
+/// What discovery measured about one hwmon header that the engine's pump floor
+/// needs (DEC-443). Static for the process lifetime: `pwmN_mode` is read once at
+/// discovery, and a running controller's headers are never replaced.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct HeaderFacts {
+    /// `pwmN_mode` (`0` DC, `1` PWM), or `None` when the chip publishes none.
+    pub pwm_mode: Option<u8>,
+    /// The role discovery inferred, before any user assignment.
+    pub inferred_role: (
+        crate::hwmon::roles::HeaderRole,
+        crate::hwmon::roles::RoleSource,
+    ),
 }
 
 impl ProfileEngineState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Install the per-header discovery facts (DEC-443). Called by the engine
+    /// loop once the hwmon backend has measured them.
+    pub(crate) fn set_header_facts(&mut self, facts: Arc<HashMap<String, HeaderFacts>>) {
+        self.header_facts = facts;
     }
 
     /// Install this tick's header-role assignments (DEC-311). Called by the
@@ -520,6 +551,8 @@ pub fn evaluate_profile_with_overrides(
     // `Arc` bump) so the borrow checker lets the rest of the function keep
     // mutating `engine_state`; empty for every parity-oracle call.
     let assigned_roles = Arc::clone(&engine_state.assigned_roles);
+    // DEC-443: this tick's header facts, the same way and for the same reason.
+    let header_facts = Arc::clone(&engine_state.header_facts);
     // EFF-3: (re)build the cached topological order + curve index for this
     // activation (no-op on the steady-state path), then evaluate against the
     // cache instead of rebuilding both every tick.
@@ -563,7 +596,7 @@ pub fn evaluate_profile_with_overrides(
             tick_outputs.insert(control.id.clone(), f64::from(override_pwm));
             for member in &control.members {
                 let gpu_fan_zero_rpm = member.source == "amd_gpu" && member.fan_zero_rpm;
-                let floor = member_effective_floor(control, member, &assigned_roles);
+                let floor = member_effective_floor(control, member, &assigned_roles, &header_facts);
                 let member_pwm = f64::from(override_pwm).max(floor).round().clamp(0.0, 100.0) as u8;
                 commands.push(PwmCommand {
                     member_id: member.member_id.clone(),
@@ -657,7 +690,8 @@ pub fn evaluate_profile_with_overrides(
             // DEC-119 + DEC-162 + DEC-167: each member's effective minimum-PWM
             // floor. GPU members carry no floor (0% — PMFW enforces its own
             // OD_RANGE minimum). A pump/CPU header is hard-floored to at least
-            // HARD_PUMP_CPU_FLOOR_PCT even when the control declares a lower
+            // HARD_PUMP_CPU_FLOOR_PCT (a pump on a DC-mode header to
+            // DC_PUMP_FLOOR_PCT, DEC-443) even when the control declares a lower
             // `minimum_pct`, AND its stop-snap is skipped (`floor_is_hard`) so a
             // non-zero `stop_pct` can never zero a pump — coolant-flow loss leads
             // to rapid thermal runaway. validate() rejects both shapes at the API
@@ -674,12 +708,16 @@ pub fn evaluate_profile_with_overrides(
             // matches the GUI's per-member flooring (the DEC-096 consistency
             // guarantee); otherwise reuse the control-wide value so the common
             // path stays byte-identical and the parity oracle is unperturbed.
-            let effective_floor = member_effective_floor(control, member, &assigned_roles);
+            let effective_floor =
+                member_effective_floor(control, member, &assigned_roles, &header_facts);
             // DEC-252: same eval-time superset the floor uses. A pump the author
             // renamed must not lose its stop-snap exemption either — that is the
             // half that keeps a non-zero `stop_pct` from zeroing it outright.
-            let floor_is_hard =
-                member_needs_hard_floor(member) || assigned_role_is_pump(member, &assigned_roles);
+            // DEC-443: and so must a pump only the union's other terms name —
+            // its floor is hard wherever `member_pump_floor` gave it one.
+            let floor_is_hard = member_needs_hard_floor(member)
+                || assigned_role_is_pump(member, &assigned_roles)
+                || member_pump_floor(member, &assigned_roles, &header_facts).is_some();
             let member_pwm = if effective_floor != control.minimum_pct || floor_is_hard {
                 // EFF-4: this per-member step-rate key allocates each tick for
                 // pump/CPU/GPU members. Left as-is deliberately — the key scheme
@@ -721,8 +759,8 @@ pub fn evaluate_profile_with_overrides(
     //
     // [SAFETY] The duty is chosen by `identify_target_for_role` at request time,
     // NOT here — an ordinary fan gets 0 (floor-exempt, unchanged since DEC-166),
-    // a pump gets a perturbation already clamped at or above
-    // `HARD_PUMP_CPU_FLOOR_PCT`. This pass deliberately applies the stored value
+    // a pump gets a perturbation already clamped at or above its pump floor
+    // (`HARD_PUMP_CPU_FLOOR_PCT`, or the DC pump floor, DEC-443). This pass deliberately applies the stored value
     // verbatim and does not re-clamp: re-clamping here would silently repair a
     // bad target instead of failing, and the single-place-to-get-it-wrong
     // property is what the identify tests rely on.
@@ -796,6 +834,12 @@ struct TickCompletion<'a> {
     /// "tick stuck"). Withholding the stamp keeps that surface behaving exactly
     /// as it did before the bound, with no new field and no wire change.
     writes_outstanding: bool,
+    /// DEC-443: this tick's pump-stall records and cooling advisories,
+    /// published on drop for the reasons documented on `skipped`: every exit
+    /// path must publish them, or `/status` would keep reporting a stall the
+    /// engine has stopped acting on.
+    pump_stalls: Vec<crate::health::state::PumpStallRecord>,
+    advisories: Vec<crate::health::state::CoolingAdvisoryRecord>,
 }
 
 impl<'a> TickCompletion<'a> {
@@ -805,7 +849,20 @@ impl<'a> TickCompletion<'a> {
             skipped: Vec::new(),
             outputs: Vec::new(),
             writes_outstanding: false,
+            pump_stalls: Vec::new(),
+            advisories: Vec::new(),
         }
+    }
+
+    /// Record this tick's cooling-watch state (DEC-443). Not published until
+    /// drop.
+    fn set_cooling_watch(
+        &mut self,
+        pump_stalls: Vec<crate::health::state::PumpStallRecord>,
+        advisories: Vec<crate::health::state::CoolingAdvisoryRecord>,
+    ) {
+        self.pump_stalls = pump_stalls;
+        self.advisories = advisories;
     }
 
     /// Record that a backend write is still in flight (DEC-289). Suppresses only
@@ -836,6 +893,10 @@ impl Drop for TickCompletion<'_> {
         self.cache.update_control_state(
             std::mem::take(&mut self.skipped),
             std::mem::take(&mut self.outputs),
+        );
+        self.cache.update_cooling_watch(
+            std::mem::take(&mut self.pump_stalls),
+            std::mem::take(&mut self.advisories),
         );
         self.cache.record_engine_tick_complete();
         // DEC-289: the loop DID complete a pass — that stamp is truthful and
@@ -901,10 +962,42 @@ pub(crate) fn hottest_cpu_reading(
     now: std::time::Instant,
     stale_after: std::time::Duration,
 ) -> CpuReading {
+    hottest_reading_where(sensors, now, stale_after, |s| s.kind == SensorKind::CpuTemp)
+}
+
+/// Reduce the coolant sensors to one reading, fresh over stale (DEC-443, `TS-f`).
+///
+/// [SAFETY] Keyed on `SensorKind::CoolantTemp` — the sensor's own kind — and
+/// never on a cooling device's `coolant_sensor`, which is user metadata the
+/// engine does not read (DEC-316; `TS-v`, DEC-416): a device whose
+/// `coolant_sensor` names a CPU sensor must not make a CPU reading a coolant
+/// trigger. The [`CpuReading`] enum is reused for its three-way freshness, not
+/// for its name. A non-finite value is ignored: an unconnected ASUS-EC probe
+/// reads −40/−62 °C, which is finite and cannot trip a high limit, but a NaN
+/// would otherwise seed the fold.
+pub(crate) fn hottest_coolant_reading(
+    sensors: &HashMap<String, CachedSensorReading>,
+    now: std::time::Instant,
+    stale_after: std::time::Duration,
+) -> CpuReading {
+    hottest_reading_where(sensors, now, stale_after, |s| {
+        s.kind == SensorKind::CoolantTemp && s.value_c.is_finite()
+    })
+}
+
+/// The shared fold behind [`hottest_cpu_reading`] and
+/// [`hottest_coolant_reading`]: the hottest FRESH reading among the sensors
+/// `keep` selects, else the hottest stale one, else `Absent`.
+fn hottest_reading_where(
+    sensors: &HashMap<String, CachedSensorReading>,
+    now: std::time::Instant,
+    stale_after: std::time::Duration,
+    keep: impl Fn(&CachedSensorReading) -> bool,
+) -> CpuReading {
     let mut hottest_fresh: Option<f64> = None;
     let mut hottest_stale: Option<f64> = None;
 
-    for s in sensors.values().filter(|s| s.kind == SensorKind::CpuTemp) {
+    for s in sensors.values().filter(|s| keep(s)) {
         // `saturating_duration_since` because `updated_at` can be marginally in
         // the future relative to `now` across a clock read boundary; that is a
         // fresh reading, not an absent one.
@@ -1046,6 +1139,93 @@ pub(crate) fn curve_eligible(
         || now.saturating_duration_since(sensor.updated_at) <= stale_after
 }
 
+/// The active profile's hwmon members the pump-protection union names a pump
+/// (DEC-443, the user's Q9) — the headers the stall response watches. The same
+/// predicate that gives them their pump floor (`member_pump_floor`), so a pump
+/// that is floored is a pump that is watched.
+fn profile_pump_member_ids(profile: &DaemonProfile, state: &ProfileEngineState) -> Vec<String> {
+    let mut ids: Vec<String> = profile
+        .controls
+        .iter()
+        .flat_map(|c| &c.members)
+        .filter(|m| member_pump_floor(m, &state.assigned_roles, &state.header_facts).is_some())
+        .map(|m| m.member_id.clone())
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// This tick's stall-watch inputs, read from the cache under one read guard
+/// (DEC-443). A tach is fresh on the same budget the thermal ladder uses; no
+/// reading, or an old one, is `Stale` — evidence of nothing.
+fn pump_stall_inputs(
+    cache: &StateCache,
+    pump_ids: &[String],
+    stale_after: std::time::Duration,
+) -> Vec<pump_stall::PumpInput> {
+    if pump_ids.is_empty() {
+        return Vec::new();
+    }
+    let now = std::time::Instant::now();
+    cache.read_with(|snap| {
+        pump_ids
+            .iter()
+            .map(|id| {
+                let fan = snap.hwmon_fans.get(id);
+                let tach = match fan {
+                    Some(f) if now.saturating_duration_since(f.updated_at) <= stale_after => f
+                        .rpm
+                        .map_or(pump_stall::Tach::Stale, pump_stall::Tach::Fresh),
+                    _ => pump_stall::Tach::Stale,
+                };
+                pump_stall::PumpInput {
+                    header_id: id.clone(),
+                    tach,
+                    commanded_pct: fan.and_then(|f| f.pwm_commanded_pct),
+                }
+            })
+            .collect()
+    })
+}
+
+/// One log line per stall-watch transition (DEC-443).
+fn log_stall_event(ev: &pump_stall::StallEvent) {
+    use pump_stall::StallEvent;
+    match ev {
+        StallEvent::Stalled {
+            header_id,
+            held: false,
+        } => log::warn!(
+            "PUMP STALL: {header_id} reads 0 RPM while commanded to run — driving it to \
+             {}% for {}s",
+            constants::PUMP_STALL_RESPONSE_PCT,
+            constants::PUMP_STALL_KICK.as_secs()
+        ),
+        StallEvent::Stalled {
+            header_id,
+            held: true,
+        } => log::error!(
+            "PUMP STALL: {header_id} stalled a second time this run — holding it at {}% \
+             until the daemon restarts or a profile is activated",
+            constants::PUMP_STALL_RESPONSE_PCT
+        ),
+        StallEvent::NotTurning { header_id } => log::error!(
+            "PUMP STALL: {header_id} still reads 0 RPM after {}s at {}% — holding it at \
+             {}%; check the pump and its tach",
+            constants::PUMP_STALL_KICK.as_secs(),
+            constants::PUMP_STALL_RESPONSE_PCT,
+            constants::PUMP_STALL_RESPONSE_PCT
+        ),
+        StallEvent::Recovered { header_id } => {
+            log::info!("Pump {header_id} is turning again — it returns to its curve")
+        }
+        StallEvent::Released { header_id } => {
+            log::info!("Pump {header_id}: the stall hold is released by a profile activation")
+        }
+    }
+}
+
 /// Run the profile engine loop as an async task.
 ///
 /// One tick per second: safety evaluation (forced overrides short-circuit
@@ -1104,6 +1284,19 @@ pub async fn profile_engine_loop(
     // Track consecutive cycles with no CPU temperature sensor (P0-R1).
     // If no CpuTemp sensor is found for N cycles, force fans to a safe minimum.
     let mut no_cpu_sensor_cycles: u32 = 0;
+
+    // DEC-443 (`TS-f`): the coolant emergency rule. Engine-local — unlike the
+    // CPU rule, nothing outside the engine reads its latch; diagnostics gate on
+    // the published `thermal_state`, which a coolant emergency sets too. Its
+    // limit is re-read from the cache every tick, so `POST /config/coolant-limit`
+    // and a SIGHUP reload take effect on the next tick.
+    let mut coolant_rule = crate::safety::ThermalSafetyRule::coolant(cache.coolant_limit_c());
+
+    // DEC-443 (`TS-e`, `TS-m`): the pump stall response and the cooling
+    // advisory. Both are the engine's own cross-tick state, fed once per tick
+    // below; neither is visible to the evaluator (the parity oracle's surface).
+    let mut pump_watch = pump_stall::PumpStallWatch::default();
+    let mut advisory = cooling_advisory::CoolingAdvisory::default();
 
     // DEC-372 (`OFN-af`): throttle for the forced branch's operator-facing log,
     // which used to emit every tick for the whole hold — unbounded on a machine
@@ -1173,7 +1366,7 @@ pub async fn profile_engine_loop(
         let snapshot_taken_at = std::time::Instant::now();
         let mut sensors = cache.sensors_snapshot();
         let stale_after = cache.cpu_temp_stale_after();
-        let (decision, hottest_cpu_c, effective_trigger, emergency_latched) = {
+        let (cpu_decision, hottest_cpu_c, effective_trigger, cpu_latched) = {
             // DEC-267/269: classify the reading before acting on it. `now` is
             // sampled BEFORE the snapshot above, so any reading written during
             // the gap saturates to age 0 (fresh) rather than being judged late —
@@ -1199,6 +1392,19 @@ pub async fn profile_engine_loop(
             )
         };
 
+        // DEC-443 (`TS-f`): the coolant table, on the same snapshot and the same
+        // freshness budget, then ONE combined decision — the max of the two
+        // forced duties, `emergency` if either rule is latched. Everything below
+        // acts on `decision` exactly as it did on the CPU decision alone.
+        let coolant_reading = hottest_coolant_reading(&sensors, snapshot_taken_at, stale_after);
+        coolant_rule.set_coolant_limit_c(cache.coolant_limit_c());
+        let coolant_decision = evaluate_coolant_tick(coolant_reading, &mut coolant_rule);
+        let tick_safety = combine(cpu_decision, coolant_decision);
+        let decision = tick_safety.decision;
+        // DEC-382's give-back gate asks "is an emergency latched?", and a
+        // latched coolant emergency is one.
+        let emergency_latched = cpu_latched || coolant_rule.is_active();
+
         // DEC-272 (01-a): the safety leg above has had the raw snapshot; from here
         // on, curve evaluation sees only sensors current enough to drive a fan.
         // Filtered IN PLACE rather than into a second map so DEC-146 P3-6's
@@ -1219,7 +1425,16 @@ pub async fn profile_engine_loop(
         // distinguishes a *slow* tick from a stopped one, which supervision
         // cannot. Do not conclude from the supervisor's existence that this is
         // redundant, or from this that the supervisor is.
-        cache.record_engine_tick(decision.thermal_state, effective_trigger);
+        //
+        // DEC-443: published through `record_engine_safety`, which adds which
+        // rules are forcing and the coolant thresholds acted on to the same write.
+        cache.record_engine_safety(&crate::health::cache::EngineSafetyReport {
+            thermal_state: decision.thermal_state,
+            trigger_c: effective_trigger,
+            causes: tick_safety.causes.tokens(),
+            coolant_limit_c: Some(coolant_rule.trigger_temp_c()),
+            coolant_release_c: Some(coolant_rule.release_temp_c()),
+        });
         // DEC-259: pairs the start stamp above with a completion stamp on every
         // exit from this body. Without the pair a *slow* tick was indistinguishable
         // from a *stopped* engine, and the surface reported the worse of the two —
@@ -1270,6 +1485,11 @@ pub async fn profile_engine_loop(
         // an `.await`. `POST /config/header-role` swaps the whole `Arc`, so a
         // tick either sees the old map or the new one, never a torn one.
         engine_state.set_assigned_roles(Arc::clone(&header_roles.read()));
+        // DEC-443: the headers' DC/PWM mode and inferred role, for the DC-aware
+        // pump floor. Measured once by the backend (never a wait on the tick).
+        if let Some(be) = hwmon_be.as_mut() {
+            engine_state.set_header_facts(be.header_facts());
+        }
 
         // Get active profile — scope guard strictly to avoid !Send across .await
         //
@@ -1296,10 +1516,11 @@ pub async fn profile_engine_loop(
         // DEC-382: the profile's MEMBERS are taken here too, under the same lock
         // and from the same profile, so a tick's reach and its give-back can never
         // be judged against a different profile than the one it commanded.
-        let (profile_commands, members, held): (
+        let (mut profile_commands, members, held, pump_ids): (
             Option<Vec<PwmCommand>>,
             ProfileMembers,
             HeldMembers,
+            Vec<String>,
         ) = {
             let profile_guard = profile.lock();
 
@@ -1314,6 +1535,11 @@ pub async fn profile_engine_loop(
             if epoch != last_epoch {
                 last_epoch = epoch;
                 engine_state.deactivate();
+                // DEC-443, the user's Q6: a profile change releases a pump held
+                // at 100 % after a second stall.
+                for ev in pump_watch.release_holds() {
+                    log_stall_event(&ev);
+                }
             }
 
             match *profile_guard {
@@ -1366,13 +1592,27 @@ pub async fn profile_engine_loop(
                         active_profile,
                         &engine_state.skipped_ids_this_tick(),
                     );
-                    (Some(cmds), ProfileMembers::of(active_profile), held)
+                    // DEC-443: the pumps the stall response watches — the
+                    // profile's hwmon members the pump union names (Q9), from
+                    // the same profile under the same lock.
+                    let pump_ids = profile_pump_member_ids(active_profile, &engine_state);
+                    (
+                        Some(cmds),
+                        ProfileMembers::of(active_profile),
+                        held,
+                        pump_ids,
+                    )
                 }
                 None => {
                     // No profile loaded — drop any leftover tuning state so a
                     // later activation doesn't pick up stale cross-cycle outputs.
                     engine_state.deactivate();
-                    (None, ProfileMembers::default(), HeldMembers::default())
+                    (
+                        None,
+                        ProfileMembers::default(),
+                        HeldMembers::default(),
+                        Vec::new(),
+                    )
                 }
             }
         };
@@ -1407,6 +1647,53 @@ pub async fn profile_engine_loop(
             }
         }
         tick_done.set_skipped(engine_state.skipped_snapshot());
+
+        // DEC-443 (`TS-e`): the pump stall watch, then its raise-only response
+        // on this tick's commands — ABOVE the safety branch, so a forced tick
+        // floors the raised commands like any others and the response survives
+        // a no-sensor floor. Frozen while a diagnostic holds the write pause.
+        //
+        // Both timers read tokio's clock: identical to `std::time::Instant` in
+        // production, and advanced by a paused-time test, so the loop-level
+        // tests can drive a 10 s stall or a 60 s advisory without waiting.
+        let timer_now = tokio::time::Instant::now().into_std();
+        let stall_inputs = pump_stall_inputs(&cache, &pump_ids, stale_after);
+        for ev in pump_watch.tick(&stall_inputs, timer_now, cache.verify_active()) {
+            log_stall_event(&ev);
+        }
+        if let Some(cmds) = profile_commands.as_mut() {
+            pump_stall::apply_stall_response(cmds, &pump_watch.raised_headers());
+        }
+
+        // DEC-443 (`TS-m`): the cooling advisory. Forces nothing.
+        let fresh_cpu_c = match hottest_cpu_c {
+            CpuReading::Fresh(t) => Some(t),
+            _ => None,
+        };
+        let max_duty = profile_commands
+            .as_deref()
+            .and_then(|c| cooling_advisory::max_non_gpu_duty(c, decision.forced_pct));
+        match advisory.tick(
+            fresh_cpu_c,
+            cooling_advisory::cpu_ceiling_c(&sensors),
+            max_duty,
+            timer_now,
+        ) {
+            Some(cooling_advisory::AdvisoryEvent::Raised(r)) => log::warn!(
+                "Cooling advisory: the CPU has been at or above its {:.0}°C ceiling \
+                 ({:.1}°C) for {}s while no fan or pump is commanded above {}% — \
+                 check that the pump and fans are running (nothing is forced)",
+                r.ceiling_c,
+                r.cpu_temp_c,
+                constants::ADVISORY_HOLD.as_secs(),
+                r.max_duty_pct
+            ),
+            Some(cooling_advisory::AdvisoryEvent::Cleared) => {
+                log::info!("Cooling advisory cleared")
+            }
+            None => {}
+        }
+        tick_done.set_cooling_watch(pump_watch.snapshot(), advisory.snapshot());
 
         if let Some(forced_pct) = decision.forced_pct {
             // Forced safety override — every OpenFan channel and writable
@@ -1468,13 +1755,25 @@ pub async fn profile_engine_loop(
                 // DEC-269: name the three cases distinctly. "stale" is the one an
                 // operator most needs to tell apart — the sensor is still listed,
                 // so a log saying "no CPU temp sensor" would contradict the UI.
-                let reason = match hottest_cpu_c {
+                let mut reason = match hottest_cpu_c {
                     CpuReading::Fresh(temp) => format!("CPU temp {temp:.1}°C"),
                     CpuReading::Stale(temp) => {
                         format!("CPU temp {temp:.1}°C, STALE — the sensor has stopped updating")
                     }
                     CpuReading::Absent => "no CPU temp sensor".to_string(),
                 };
+                // DEC-443: name the coolant when it is what is forcing.
+                if tick_safety.causes.coolant {
+                    let coolant = match coolant_reading {
+                        CpuReading::Fresh(t) => format!("{t:.1}°C"),
+                        CpuReading::Stale(t) => format!("{t:.1}°C, STALE"),
+                        CpuReading::Absent => "sensor gone".to_string(),
+                    };
+                    reason = format!(
+                        "coolant {coolant} at or over its {:.0}°C limit; {reason}",
+                        coolant_rule.trigger_temp_c()
+                    );
+                }
                 // DEC-371/372: the reach is reported from the backends that had
                 // outputs to drive, never from a literal. The `None` arm is a
                 // real machine — a GPU-only box, a VM, or (since DEC-372) a
@@ -7425,6 +7724,242 @@ mod tests {
         let _ = handle.await;
     }
 
+    // ── DEC-443 (`W-SAFE`): the coolant rung, the pump stall response and the
+    // DC pump floor, proven through the loop rather than through their helpers.
+
+    fn coolant_reading(id: &str, temp_c: f64) -> CachedSensorReading {
+        CachedSensorReading {
+            kind: SensorKind::CoolantTemp,
+            label: "Coolant".into(),
+            chip_name: "kraken3".into(),
+            ..cpu_reading(id, temp_c, Instant::now())
+        }
+    }
+
+    /// A cache with a cool CPU (so the CPU rung is out of the picture) plus the
+    /// given readings.
+    fn cool_cpu_cache_with(extra: Vec<CachedSensorReading>) -> Arc<StateCache> {
+        let cache = make_cache_with_sensor("cpu", 30.0);
+        cache.update_sensors(extra);
+        cache
+    }
+
+    /// [SAFETY] DEC-443 (`TS-f`): a coolant reading at the limit takes the same
+    /// 100 % force as the CPU rung — a header no profile controls included —
+    /// publishes `emergency` with cause `coolant`, holds through the hysteresis
+    /// band, and releases (giving the header back) at limit − margin.
+    #[tokio::test(start_paused = true)]
+    async fn a_coolant_emergency_forces_every_output_and_releases_below_the_margin() {
+        let limit = f64::from(crate::constants::DEFAULT_COOLANT_LIMIT_C);
+        let release = limit - crate::constants::COOLANT_RELEASE_MARGIN_C;
+        let cache = cool_cpu_cache_with(vec![coolant_reading("coolant", limit)]);
+        assert_eq!(f64::from(cache.coolant_limit_c()), limit, "precondition");
+        let sysfs = LiveHwmonSysfs::default().with(EN1, "5").with(PWM1, "90");
+        let (handle, shutdown_tx) = spawn_engine(
+            cache.clone(),
+            Arc::new(Mutex::new(None)),
+            &sysfs,
+            vec![writable_pwm_header(H1)],
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let snap = cache.snapshot();
+        assert_eq!(snap.thermal_override_state.as_deref(), Some("emergency"));
+        assert_eq!(snap.emergency_causes, vec!["coolant"]);
+        assert_eq!(snap.coolant_limit_c, Some(limit));
+        assert_eq!(snap.coolant_release_c, Some(release));
+        assert_eq!(
+            sysfs.get(EN1).as_deref(),
+            Some("1"),
+            "the force took the header"
+        );
+        assert_eq!(
+            sysfs.get(PWM1),
+            Some(crate::pwm::percent_to_raw(100).to_string()),
+            "a coolant emergency forces 100 %"
+        );
+
+        // Inside the hysteresis band: still latched.
+        cache.update_sensors(vec![coolant_reading("coolant", release + 1.0)]);
+        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+        assert_eq!(
+            cache.snapshot().thermal_override_state.as_deref(),
+            Some("emergency"),
+            "the coolant rung holds until limit − margin"
+        );
+
+        // At limit − margin: released, header given back.
+        cache.update_sensors(vec![coolant_reading("coolant", release)]);
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        stop(handle, shutdown_tx).await;
+        let snap = cache.snapshot();
+        assert_ne!(snap.thermal_override_state.as_deref(), Some("emergency"));
+        assert!(snap.emergency_causes.is_empty());
+        assert_eq!(sysfs.get(EN1).as_deref(), Some("5"));
+    }
+
+    /// [SAFETY] DEC-443: the limit is read every tick, so a runtime change
+    /// (`POST /config/coolant-limit`, SIGHUP) reaches the rung without a restart.
+    #[tokio::test(start_paused = true)]
+    async fn a_lowered_coolant_limit_is_acted_on_the_next_tick() {
+        let cache = cool_cpu_cache_with(vec![coolant_reading("coolant", 55.0)]);
+        let sysfs = LiveHwmonSysfs::default().with(EN1, "5").with(PWM1, "90");
+        let (handle, shutdown_tx) = spawn_engine(
+            cache.clone(),
+            Arc::new(Mutex::new(None)),
+            &sysfs,
+            vec![writable_pwm_header(H1)],
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert_ne!(
+            cache.snapshot().thermal_override_state.as_deref(),
+            Some("emergency"),
+            "precondition: 55 °C is under the default limit"
+        );
+
+        cache.set_coolant_limit_c(50);
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        stop(handle, shutdown_tx).await;
+        let snap = cache.snapshot();
+        assert_eq!(snap.thermal_override_state.as_deref(), Some("emergency"));
+        assert_eq!(snap.emergency_causes, vec!["coolant"]);
+        assert_eq!(snap.coolant_limit_c, Some(50.0));
+    }
+
+    /// [SAFETY] DEC-443: the coolant rung keys on the sensor KIND. A CPU at 65 °C
+    /// (under its own trip point) and a board sensor at 70 °C are both above the
+    /// coolant limit, and neither is coolant — nothing is forced.
+    #[tokio::test(start_paused = true)]
+    async fn only_a_coolant_sensor_triggers_the_coolant_rung() {
+        let limit = f64::from(crate::constants::DEFAULT_COOLANT_LIMIT_C);
+        let cache = make_cache_with_sensor("cpu", limit + 5.0);
+        cache.update_sensors(vec![CachedSensorReading {
+            kind: SensorKind::MbTemp,
+            chip_name: "it8696".into(),
+            ..cpu_reading("board", limit + 10.0, Instant::now())
+        }]);
+        let sysfs = LiveHwmonSysfs::default().with(EN1, "5").with(PWM1, "90");
+        let (handle, shutdown_tx) = spawn_engine(
+            cache.clone(),
+            Arc::new(Mutex::new(None)),
+            &sysfs,
+            vec![writable_pwm_header(H1)],
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+        stop(handle, shutdown_tx).await;
+        let snap = cache.snapshot();
+        assert_ne!(snap.thermal_override_state.as_deref(), Some("emergency"));
+        assert!(snap.emergency_causes.is_empty());
+        assert_eq!(sysfs.writes_to(EN1), 0, "nothing took the header");
+    }
+
+    /// A pump header in the given `pwmN_mode`, with a tach the test can stop.
+    const RPM1: &str = "/sys/class/hwmon/hwmon0/fan1_input";
+
+    fn pump_header(pwm_mode: Option<u8>) -> crate::hwmon::pwm_discovery::PwmHeaderDescriptor {
+        let mut h = writable_pwm_header(H1);
+        h.pwm_mode = pwm_mode;
+        h.rpm_available = true;
+        h.rpm_path = Some(RPM1.into());
+        h
+    }
+
+    /// `hwmon_profile` with its member labelled as a pump — the profile term of
+    /// the pump-protection union. The curve asks for 20 % at the cache's 30 °C.
+    fn pump_profile() -> DaemonProfile {
+        let mut p = hwmon_profile(&[H1]);
+        p.controls[0].members[0].member_label = "Pump".into();
+        p
+    }
+
+    /// [SAFETY] DEC-443 (`TS-e`, the user's Q10/Q11): the DC pump floor is
+    /// wired from the backend's measured `pwmN_mode` into the engine's floor. The
+    /// same pump in PWM mode takes the ordinary pump floor — so the floor follows
+    /// the mode, not the label alone.
+    #[tokio::test(start_paused = true)]
+    async fn a_dc_mode_pump_is_written_at_the_dc_floor_through_the_loop() {
+        for (mode, floor) in [
+            (
+                Some(crate::profile::PWM_MODE_DC),
+                crate::profile::DC_PUMP_FLOOR_PCT,
+            ),
+            (Some(1), crate::profile::HARD_PUMP_CPU_FLOOR_PCT),
+            (None, crate::profile::HARD_PUMP_CPU_FLOOR_PCT),
+        ] {
+            let cache = make_cache_with_sensor("cpu", 30.0);
+            let sysfs = LiveHwmonSysfs::default()
+                .with(EN1, "5")
+                .with(PWM1, "90")
+                .with(RPM1, "1500");
+            let (handle, shutdown_tx) = spawn_engine(
+                cache.clone(),
+                Arc::new(Mutex::new(Some(pump_profile()))),
+                &sysfs,
+                vec![pump_header(mode)],
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+            stop(handle, shutdown_tx).await;
+            assert_eq!(
+                sysfs.get(PWM1),
+                Some(crate::pwm::percent_to_raw(floor as u8).to_string()),
+                "pwm_mode {mode:?}: a 20 % curve is floored at {floor} %"
+            );
+        }
+    }
+
+    /// [SAFETY] DEC-443 (`TS-e`, the user's Q5/Q6/Q8): a pump that has been seen
+    /// spinning and reads 0 RPM for the detection window while commanded to run is
+    /// driven to 100 % for the kick; once it turns again it returns to the curve.
+    /// The stall is published on `/status` while the response runs.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_pump_is_kicked_to_full_duty_and_returns_when_it_turns() {
+        let cache = make_cache_with_sensor("cpu", 30.0);
+        let sysfs = LiveHwmonSysfs::default()
+            .with(EN1, "5")
+            .with(PWM1, "90")
+            .with(RPM1, "1500");
+        let (handle, shutdown_tx) = spawn_engine(
+            cache.clone(),
+            Arc::new(Mutex::new(Some(pump_profile()))),
+            &sysfs,
+            vec![pump_header(None)],
+        );
+        let floor_raw = crate::pwm::percent_to_raw(crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8);
+        let full_raw = crate::pwm::percent_to_raw(crate::constants::PUMP_STALL_RESPONSE_PCT);
+        tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+        assert_eq!(sysfs.get(PWM1), Some(floor_raw.to_string()), "precondition");
+        assert!(cache.snapshot().pump_stalls.is_empty());
+
+        // The tach stops. Before the window closes nothing changes.
+        sysfs.files.lock().insert(RPM1.into(), "0".into());
+        let detect = crate::constants::PUMP_STALL_DETECT;
+        tokio::time::sleep(detect - std::time::Duration::from_secs(2)).await;
+        assert_eq!(
+            sysfs.get(PWM1),
+            Some(floor_raw.to_string()),
+            "not yet a stall"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        assert_eq!(
+            sysfs.get(PWM1),
+            Some(full_raw.to_string()),
+            "a stalled pump is driven to the response duty"
+        );
+        let stalls = cache.snapshot().pump_stalls;
+        assert_eq!(stalls.len(), 1);
+        assert_eq!(stalls[0].header_id, H1);
+        assert_eq!(stalls[0].state, "stall_response");
+
+        // It turns again; after the kick it is back on the curve.
+        sysfs.files.lock().insert(RPM1.into(), "1400".into());
+        tokio::time::sleep(crate::constants::PUMP_STALL_KICK + std::time::Duration::from_secs(2))
+            .await;
+        stop(handle, shutdown_tx).await;
+        assert_eq!(sysfs.get(PWM1), Some(floor_raw.to_string()));
+        assert!(cache.snapshot().pump_stalls.is_empty());
+    }
+
     /// [SAFETY] DEC-382 (`TS-b`): the emergency takes a header no profile controls
     /// — that reach is unchanged — and gives it back to the mode it found when the
     /// 100 % phase ends. Before DEC-382 it stayed in manual at the forced duty for
@@ -8875,6 +9410,7 @@ mod tests {
         let (target, mode) = crate::control_override::identify_target_for_role(
             crate::hwmon::roles::HeaderRole::Pump,
             Some(50),
+            crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8,
         );
         assert_eq!(mode, crate::control_override::IdentifyMode::PumpPerturb);
         assert_eq!(target, 75, "50% + 25 points of headroom");
@@ -8994,6 +9530,130 @@ mod tests {
         assert_eq!(
             assigned[0].pwm_percent, HARD_PUMP_CPU_FLOOR_PCT as u8,
             "a user-assigned pump must be held at the hard floor"
+        );
+    }
+
+    /// Evaluate one single-member control at a cool 20 °C (curve output ~5 %)
+    /// with the given header facts and label, returning that member's duty.
+    fn floored_duty_with_facts(label: &str, facts: Option<HeaderFacts>, stop_pct: f64) -> u8 {
+        const ID: &str = "hwmon:nct6798:nct6775.2592:pwm2:pwm2";
+        let mut profile = make_profile("curve", "graph", 5.0);
+        profile.controls[0].minimum_pct = 0.0;
+        profile.controls[0].stop_pct = stop_pct;
+        profile.controls[0].members = vec![ControlMember {
+            source: "hwmon".into(),
+            member_id: ID.into(),
+            member_label: label.into(),
+            fan_zero_rpm: false,
+        }];
+        let sensors = make_cache_with_sensor("cpu", 20.0).sensors_snapshot();
+        let mut state = ProfileEngineState::new();
+        if let Some(f) = facts {
+            state.set_header_facts(Arc::new(HashMap::from([(ID.to_string(), f)])));
+        }
+        evaluate_profile_with_overrides(
+            &profile,
+            &sensors,
+            &mut state,
+            &OverrideSnapshot::default(),
+        )[0]
+        .pwm_percent
+    }
+
+    /// [SAFETY] DEC-443 (`TS-e`): a pump on a DC-mode header is held at the DC
+    /// pump floor by the engine; the same pump in PWM mode, or where the chip
+    /// reports no mode, keeps the 30 % floor. Asserted against the one function
+    /// every site reads (`pump_floor_pct`), a relationship rather than a literal.
+    #[test]
+    fn a_dc_mode_pump_is_held_at_the_dc_pump_floor() {
+        use crate::hwmon::roles::{HeaderRole, RoleSource};
+        let pump = |mode| HeaderFacts {
+            pwm_mode: mode,
+            inferred_role: (HeaderRole::Pump, RoleSource::Label),
+        };
+        let dc = Some(crate::profile::PWM_MODE_DC);
+        assert_eq!(
+            floored_duty_with_facts("Pump", Some(pump(dc)), 0.0),
+            crate::profile::pump_floor_pct(dc) as u8,
+            "a DC pump must be held at the DC pump floor"
+        );
+        assert!(crate::profile::pump_floor_pct(dc) > HARD_PUMP_CPU_FLOOR_PCT);
+        for mode in [None, Some(1)] {
+            assert_eq!(
+                floored_duty_with_facts("Pump", Some(pump(mode)), 0.0),
+                HARD_PUMP_CPU_FLOOR_PCT as u8,
+                "mode {mode:?}: no DC evidence, no DC floor"
+            );
+        }
+        // No facts at all (parity oracle / contended start): the 30 % floor.
+        assert_eq!(
+            floored_duty_with_facts("Pump", None, 0.0),
+            HARD_PUMP_CPU_FLOOR_PCT as u8
+        );
+    }
+
+    /// [SAFETY] DEC-443 (the user's Q11): the DC floor reaches every path the
+    /// pump floor does — a manual override below it is clamped to it too.
+    #[test]
+    fn a_manual_override_on_a_dc_pump_is_clamped_to_the_dc_floor() {
+        use crate::hwmon::roles::{HeaderRole, RoleSource};
+        const ID: &str = "hwmon:nct6798:nct6775.2592:pwm2:pwm2";
+        let mut profile = make_profile("curve", "graph", 5.0);
+        profile.controls[0].members = vec![ControlMember {
+            source: "hwmon".into(),
+            member_id: ID.into(),
+            member_label: "Pump".into(),
+            fan_zero_rpm: false,
+        }];
+        let sensors = make_cache_with_sensor("cpu", 20.0).sensors_snapshot();
+        let dc = Some(crate::profile::PWM_MODE_DC);
+        let mut state = ProfileEngineState::new();
+        state.set_header_facts(Arc::new(HashMap::from([(
+            ID.to_string(),
+            HeaderFacts {
+                pwm_mode: dc,
+                inferred_role: (HeaderRole::Pump, RoleSource::Label),
+            },
+        )])));
+        let mut overrides = OverrideSnapshot::default();
+        overrides.controls.insert("ctrl1".into(), 10);
+        let cmds = evaluate_profile_with_overrides(&profile, &sensors, &mut state, &overrides);
+        assert_eq!(
+            cmds[0].pwm_percent,
+            crate::profile::pump_floor_pct(dc) as u8,
+            "an override is floored at the DC pump floor, not the 30 % one"
+        );
+    }
+
+    /// [SAFETY] DEC-443: the DC floor is for pumps only — a CPU fan on a DC
+    /// header keeps the 30 % floor — and the pump evidence may come from the
+    /// inferred role alone, with a label that says nothing (the it8696 shape).
+    #[test]
+    fn the_dc_floor_is_pump_only_and_follows_the_inferred_role() {
+        use crate::hwmon::roles::{HeaderRole, RoleSource};
+        let dc = Some(crate::profile::PWM_MODE_DC);
+        let cpu = HeaderFacts {
+            pwm_mode: dc,
+            inferred_role: (HeaderRole::CpuFan, RoleSource::Label),
+        };
+        assert_eq!(
+            floored_duty_with_facts("CPU Fan", Some(cpu), 0.0),
+            HARD_PUMP_CPU_FLOOR_PCT as u8
+        );
+        let inferred_pump = HeaderFacts {
+            pwm_mode: dc,
+            inferred_role: (HeaderRole::Pump, RoleSource::Label),
+        };
+        assert_eq!(
+            floored_duty_with_facts("Rear", Some(inferred_pump), 0.0),
+            crate::profile::DC_PUMP_FLOOR_PCT as u8,
+            "the inferred pump role must earn the DC floor without a pump label"
+        );
+        // And the stop-snap exemption comes with it: a stop_pct above the
+        // curve cannot zero a DC pump the union names only by role.
+        assert_eq!(
+            floored_duty_with_facts("Rear", Some(inferred_pump), 90.0),
+            crate::profile::DC_PUMP_FLOOR_PCT as u8
         );
     }
 

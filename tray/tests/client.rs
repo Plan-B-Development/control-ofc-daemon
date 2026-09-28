@@ -141,6 +141,30 @@ fn an_absent_thermal_state_reads_as_normal_not_as_abnormal() {
     );
 }
 
+/// DEC-443: `pump_stalls[]` parses, and its absence — an older daemon, or a
+/// newer one with nothing stalled — reads as none.
+#[test]
+fn pump_stalls_parse_and_default_to_none() {
+    let server = spawn(Behaviour::Respond(http(
+        "200 OK",
+        r#"{"api_version":1,"daemon_version":"2.57.0","thermal_state":"normal",
+            "pump_stalls":[{"header_id":"hwmon:x:pwm2","state":"not_turning",
+            "since_ms":1200,"stall_count":1}]}"#,
+    )));
+    let status = DaemonClient::new(&server.path)
+        .status()
+        .expect("should parse");
+    assert_eq!(status.pump_stalls.len(), 1);
+    assert_eq!(status.pump_stalls[0].header_id, "hwmon:x:pwm2");
+    assert_eq!(status.pump_stalls[0].state, "not_turning");
+
+    let server = spawn(Behaviour::Respond(http("200 OK", STATUS_BODY)));
+    let status = DaemonClient::new(&server.path)
+        .status()
+        .expect("should parse");
+    assert!(status.pump_stalls.is_empty());
+}
+
 #[test]
 fn profiles_are_unwrapped_from_the_envelope() {
     let server = spawn(Behaviour::Respond(http(

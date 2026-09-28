@@ -1824,6 +1824,31 @@ pub(crate) struct HwmonBackend {
     /// best of. Lets a members-only force report its reach without locking the
     /// controller on the async side (DEC-382).
     writable: Option<HashSet<String>>,
+    /// DEC-443: each header's `pwmN_mode` and inferred role, for the engine's
+    /// DC-aware pump floor. Measured under the same bounded lock as `writable`;
+    /// `None` until a lock is had — [`Self::header_facts`] retries without
+    /// waiting, so a contended start costs at most a few ticks at the 30 % floor
+    /// every pump already had, never a missing floor.
+    facts: Option<Arc<HashMap<String, super::HeaderFacts>>>,
+}
+
+/// The per-header facts the engine's pump floor needs, read from the
+/// controller's frozen descriptors (DEC-443).
+fn measure_header_facts(ctrl: &HwmonPwmController) -> Arc<HashMap<String, super::HeaderFacts>> {
+    Arc::new(
+        ctrl.headers()
+            .into_iter()
+            .map(|h| {
+                (
+                    h.id.clone(),
+                    super::HeaderFacts {
+                        pwm_mode: h.pwm_mode,
+                        inferred_role: (h.role, h.role_source),
+                    },
+                )
+            })
+            .collect(),
+    )
 }
 
 impl HwmonBackend {
@@ -1870,9 +1895,14 @@ impl HwmonBackend {
         // board) rather than dropping the hwmon leg of the thermal force on a
         // board that may well have writable headers. Dropping it would be the
         // v2.38.0 P1 — an emergency losing its reach — reached by timeout.
-        let writable: Option<HashSet<String>> = ctrl
-            .try_lock_for(std::time::Duration::from_millis(250))
-            .map(|guard| guard.forced_target_ids().into_iter().collect());
+        let (writable, facts): (Option<HashSet<String>>, _) =
+            match ctrl.try_lock_for(std::time::Duration::from_millis(250)) {
+                Some(guard) => (
+                    Some(guard.forced_target_ids().into_iter().collect()),
+                    Some(measure_header_facts(&guard)),
+                ),
+                None => (None, None),
+            };
         let has_writable_header = match &writable {
             Some(ids) => !ids.is_empty(),
             None => {
@@ -1901,7 +1931,24 @@ impl HwmonBackend {
             writes: BoundedWrite::default(),
             stall_logged: false,
             writable,
+            facts,
         })
+    }
+
+    /// The per-header discovery facts (DEC-443), measuring them now if the
+    /// controller was contended at construction.
+    ///
+    /// [SAFETY] `try_lock`, never a wait: the controller is held across an
+    /// uncancellable blocking sysfs write, and this runs on the engine's tick.
+    /// Contended → empty facts for this tick, which yields the 30 % pump floor
+    /// every pump member already had; the next tick tries again.
+    pub(crate) fn header_facts(&mut self) -> Arc<HashMap<String, super::HeaderFacts>> {
+        if self.facts.is_none() {
+            if let Some(guard) = self.ctrl.try_lock() {
+                self.facts = Some(measure_header_facts(&guard));
+            }
+        }
+        self.facts.clone().unwrap_or_default()
     }
 
     /// The headers this backend can deliver a write to, for the engine's

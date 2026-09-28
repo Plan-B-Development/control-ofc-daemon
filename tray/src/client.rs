@@ -65,6 +65,23 @@ pub struct Status {
     pub active_profile_id: Option<String>,
     #[serde(default)]
     pub active_profile_name: Option<String>,
+    /// Pumps under a stall response (DEC-443). Absent on a daemon that predates
+    /// the watch, and omitted by one that has nothing to report — both read as
+    /// none.
+    #[serde(default)]
+    pub pump_stalls: Vec<PumpStall>,
+}
+
+/// One entry of `GET /status`'s `pump_stalls[]` (DEC-443).
+///
+/// Only `state` is rendered: the tray holds no aliases, so the raw header id
+/// would name nothing the user recognises.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct PumpStall {
+    #[serde(default)]
+    pub header_id: String,
+    #[serde(default)]
+    pub state: String,
 }
 
 impl Status {

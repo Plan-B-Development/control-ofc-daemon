@@ -1249,6 +1249,10 @@ pub async fn run_probe<W, R, Fut, E, S, K, P>(
     cache: &StateCache,
     header_id: &str,
     restore_floor: u8,
+    // [SAFETY] DEC-443: this header's pump floor — the DC pump floor on a
+    // DC-mode header — which the restore is raised to if the header turns out to
+    // be a pump. From `AppState::header_pump_floor_pct`.
+    pump_floor: u8,
     baseline_max: Duration,
     driver_refresh_ms: Option<u64>,
     write_fn: W,
@@ -1380,7 +1384,7 @@ where
     if pump_now {
         restore.restore_floor = restore
             .restore_floor
-            .max(crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8);
+            .max(pump_floor.max(crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8));
     }
     std::mem::take(&mut probe.res)
 }
@@ -1583,6 +1587,7 @@ mod tests {
             cache,
             ID,
             0,
+            PUMP_FLOOR,
             Duration::from_secs(constants::CHARACTERIZATION_DEFAULT_SETTLE_S),
             o.driver_refresh_ms,
             |p: u8| {
@@ -2158,6 +2163,7 @@ mod tests {
             &cache,
             ID,
             0,
+            PUMP_FLOOR,
             Duration::from_secs(constants::CHARACTERIZATION_DEFAULT_SETTLE_S),
             None,
             |p: u8| {
@@ -2260,6 +2266,7 @@ mod tests {
             &cache,
             ID,
             0,
+            PUMP_FLOOR,
             Duration::from_secs(constants::CHARACTERIZATION_DEFAULT_SETTLE_S),
             None,
             |p: u8| {
@@ -2663,6 +2670,7 @@ mod tests {
                 &cache,
                 ID,
                 0,
+                PUMP_FLOOR,
                 Duration::from_secs(constants::CHARACTERIZATION_DEFAULT_SETTLE_S),
                 None,
                 |p: u8| {

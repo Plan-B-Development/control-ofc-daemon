@@ -8,8 +8,9 @@ use axum::http::StatusCode;
 use axum::response::Json;
 
 use super::{
-    build_control_output_entries, build_fan_entries, build_sensor_entries, build_skipped_entries,
-    build_status_response, build_unavailable_entries, error_response, json_ok, AppState,
+    build_control_output_entries, build_cooling_safety_entries, build_fan_entries,
+    build_sensor_entries, build_skipped_entries, build_status_response, build_unavailable_entries,
+    error_response, json_ok, AppState,
 };
 use crate::api::responses::*;
 use crate::health::staleness::{compute_health, OpenFanPresence};
@@ -47,7 +48,7 @@ pub async fn status_handler(State(state): State<Arc<AppState>>) -> Json<StatusRe
     // EFF-1: read the state once under a shared guard instead of cloning the
     // whole `DaemonState`. Only pure reads happen inside; the override_table
     // lock in `build_status_response` stays outside the guard.
-    let (health, thermal_state, unavailable, skipped, outputs, verify_active) =
+    let (health, thermal_state, unavailable, skipped, outputs, verify_active, cooling) =
         state.cache.read_with(|snap| {
             (
                 compute_health(snap, &state.staleness_config, now, openfan),
@@ -60,6 +61,8 @@ pub async fn status_handler(State(state): State<Arc<AppState>>) -> Json<StatusRe
                 // `inner.read()`, and calling it here would re-enter the guard
                 // this closure already holds.
                 snap.verify_active_at(now),
+                // DEC-443: under the same guard as `thermal_state`.
+                build_cooling_safety_entries(snap, now),
             )
         });
     Json(build_status_response(
@@ -70,6 +73,7 @@ pub async fn status_handler(State(state): State<Arc<AppState>>) -> Json<StatusRe
         outputs,
         health,
         verify_active,
+        cooling,
     ))
 }
 
@@ -101,20 +105,31 @@ pub async fn poll_handler(State(state): State<Arc<AppState>>) -> Json<PollRespon
     // the entire state. The `override_table` lock lives in
     // `build_status_response`, kept outside this guard to preserve lock order.
     let openfan = openfan_presence(&state);
-    let (health, thermal_state, unavailable, skipped, outputs, sensors, fans, verify_active) =
-        state.cache.read_with(|snap| {
-            (
-                compute_health(snap, &state.staleness_config, now, openfan),
-                thermal_state_of(snap),
-                build_unavailable_entries(snap, now),
-                build_skipped_entries(snap, now),
-                build_control_output_entries(snap),
-                build_sensor_entries(snap, now),
-                build_fan_entries(snap, now),
-                // `WIRE-n` — see the note in `status_handler`.
-                snap.verify_active_at(now),
-            )
-        });
+    let (
+        health,
+        thermal_state,
+        unavailable,
+        skipped,
+        outputs,
+        sensors,
+        fans,
+        verify_active,
+        cooling,
+    ) = state.cache.read_with(|snap| {
+        (
+            compute_health(snap, &state.staleness_config, now, openfan),
+            thermal_state_of(snap),
+            build_unavailable_entries(snap, now),
+            build_skipped_entries(snap, now),
+            build_control_output_entries(snap),
+            build_sensor_entries(snap, now),
+            build_fan_entries(snap, now),
+            // `WIRE-n` — see the note in `status_handler`.
+            snap.verify_active_at(now),
+            // DEC-443 — see the note in `status_handler`.
+            build_cooling_safety_entries(snap, now),
+        )
+    });
 
     Json(PollResponse {
         api_version: API_VERSION,
@@ -126,6 +141,7 @@ pub async fn poll_handler(State(state): State<Arc<AppState>>) -> Json<PollRespon
             outputs,
             health,
             verify_active,
+            cooling,
         ),
         sensors,
         fans,
@@ -428,6 +444,9 @@ pub async fn capabilities_handler(
             stall_probe: true,
             // DEC-442: hwmon chip names and ids survive the it87 v2.0 rename.
             canonical_chip_names: true,
+            // DEC-443: coolant emergency, pump stall response, DC-aware pump
+            // floor, cooling advisory, and `POST /config/coolant-limit`.
+            cooling_failure_detection: true,
         },
     })
 }

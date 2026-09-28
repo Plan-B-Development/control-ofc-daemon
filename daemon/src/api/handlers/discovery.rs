@@ -122,8 +122,9 @@ fn gather_preflight(
         None => (false, false, false, None, 0),
     };
 
+    // DEC-443: the header's own pump floor — the DC pump floor on a DC header.
     let effective_floor_pct = if pump_protected {
-        crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8
+        state.header_pump_floor_pct(header_id)
     } else {
         0
     };
@@ -492,11 +493,9 @@ pub(crate) async fn start_control_path_discovery(
     // [SAFETY] The UNION predicate, never the wire `role` (DEC-312). This entry
     // answer plans the duties; the task re-reads it mid-run (`TS-aw`).
     let pump_protected = state.header_is_pump_protected(&header_id);
-    let floor = if pump_protected {
-        crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8
-    } else {
-        0
-    };
+    // DEC-443: the header's own pump floor — the DC pump floor on a DC header.
+    let pump_floor = state.header_pump_floor_pct(&header_id);
+    let floor = if pump_protected { pump_floor } else { 0 };
 
     let live = super::hwmon_ctl::read_header_state(&pwm_path, &enable_path, &rpm_path);
     let delta = disc::resolve_delta(body.delta_pct);
@@ -649,6 +648,7 @@ pub(crate) async fn start_control_path_discovery(
                 hid.clone(),
                 "control-path discovery",
                 pump_protected,
+                pump_floor,
                 move || watch_state.header_is_pump_protected(&watch_id),
             );
             let outcome = disc::run_discovery(
