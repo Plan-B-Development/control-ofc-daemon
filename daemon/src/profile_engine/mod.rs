@@ -11,8 +11,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use backends::{
-    ForceLogAction, ForceLogThrottle, ForceReach, GpuBackend, HeldMembers, HwmonBackend,
-    OpenFanBackend, ProfileMembers, WriteBackend,
+    ForceLogAction, ForceLogThrottle, ForceReach, GpuBackend, GpuMembers, HeldMembers,
+    HwmonBackend, OpenFanBackend, ProfileMembers,
 };
 
 use crate::constants;
@@ -1516,9 +1516,12 @@ pub async fn profile_engine_loop(
         // DEC-382: the profile's MEMBERS are taken here too, under the same lock
         // and from the same profile, so a tick's reach and its give-back can never
         // be judged against a different profile than the one it commanded.
-        let (mut profile_commands, members, held, pump_ids): (
+        // DEC-448: the GPU members likewise, in their own type — `members` is
+        // the thermal force's reach, and a GPU fan is outside it (DEC-130).
+        let (mut profile_commands, members, gpu_members, held, pump_ids): (
             Option<Vec<PwmCommand>>,
             ProfileMembers,
+            GpuMembers,
             HeldMembers,
             Vec<String>,
         ) = {
@@ -1602,6 +1605,7 @@ pub async fn profile_engine_loop(
                     (
                         Some(cmds),
                         ProfileMembers::of(active_profile),
+                        GpuMembers::of(active_profile),
                         held,
                         pump_ids,
                     )
@@ -1613,6 +1617,7 @@ pub async fn profile_engine_loop(
                     (
                         None,
                         ProfileMembers::default(),
+                        GpuMembers::default(),
                         HeldMembers::default(),
                         Vec::new(),
                     )
@@ -1883,10 +1888,15 @@ pub async fn profile_engine_loop(
             // and join never delay the safety writes, and a forced tick is then
             // no slower than a normal one, which the watchdog budget already
             // covers (`the_systemd_watchdog_outlasts_the_slowest_healthy_tick`).
-            if let Some(commands) = profile_commands.as_deref() {
-                if !*shutdown.borrow() && !cache.verify_active() {
-                    gpu_be.apply(commands).await;
-                }
+            //
+            // DEC-448: with the hand-back of any card no profile names, and so
+            // with no profile too — a profile deactivated mid-force gives its
+            // cards back now, not when the force ends. The GPU is outside the
+            // force, so nothing here waits on it.
+            if !*shutdown.borrow() && !cache.verify_active() {
+                gpu_be
+                    .apply_and_give_back(profile_commands.as_deref().unwrap_or(&[]), &gpu_members)
+                    .await;
             }
             continue;
         } else if let Some(ticks) = force_log.on_normal_tick() {
@@ -1935,6 +1945,8 @@ pub async fn profile_engine_loop(
                 if let Some(be) = hwmon_be.as_mut() {
                     be.apply_and_give_back(&[], &members).await;
                 }
+                // DEC-448: and every GPU card the daemon drove.
+                gpu_be.apply_and_give_back(&[], &gpu_members).await;
             }
             continue;
         };
@@ -1978,11 +1990,12 @@ pub async fn profile_engine_loop(
         // DEC-382: the OpenFan and hwmon writes also give back, in the same task,
         // whatever the daemon took that this profile does not name — the end of a
         // force, the end of a diagnostic, or a profile switch that dropped a header.
+        // DEC-448: the GPU write does too, for a card the profile no longer names.
         if !cache.verify_active() {
             if let Some(be) = openfan_be.as_mut() {
                 be.apply_and_give_back(&commands, &members).await;
             }
-            gpu_be.apply(&commands).await;
+            gpu_be.apply_and_give_back(&commands, &gpu_members).await;
             if let Some(be) = hwmon_be.as_mut() {
                 be.apply_and_give_back(&commands, &members).await;
             }
@@ -8167,6 +8180,285 @@ mod tests {
             Some("1"),
             "the kept header stays the profile's"
         );
+    }
+
+    // ── DEC-448 (`DC-cr`): the GPU hand-back, through the loop ──────────
+    //
+    // Real time throughout: a GPU write is a `spawn_blocking`, which suspends
+    // paused time's auto-advance (DEC-272 trap 2).
+
+    const GPU_X: &str = "amd_gpu:0000:03:00.0";
+    const GPU_Y: &str = "amd_gpu:0000:0b:00.0";
+
+    /// Two fake PMFW cards, X (`make_fake_gpu`'s) and Y, each in its own dir.
+    fn two_fake_gpus(
+        dir_x: &tempfile::TempDir,
+        dir_y: &tempfile::TempDir,
+    ) -> Vec<crate::hwmon::gpu_detect::AmdGpuInfo> {
+        let (x, _) = make_fake_gpu(dir_x);
+        let (mut y, _) = make_fake_gpu(dir_y);
+        y.pci_bdf = "0000:0b:00.0".into();
+        vec![x, y]
+    }
+
+    /// `make_gpu_profile` with one control whose members are `fans`.
+    fn gpu_profile_naming(fans: &[&str]) -> DaemonProfile {
+        let mut profile = make_gpu_profile("curve", "graph", 50.0);
+        let template = profile.controls[0].members[0].clone();
+        profile.controls[0].members = fans
+            .iter()
+            .map(|id| ControlMember {
+                member_id: (*id).into(),
+                ..template.clone()
+            })
+            .collect();
+        profile
+    }
+
+    fn spawn_gpu_engine(
+        cache: Arc<StateCache>,
+        profile_arc: Arc<Mutex<Option<DaemonProfile>>>,
+        gpus: Vec<crate::hwmon::gpu_detect::AmdGpuInfo>,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::watch::Sender<bool>,
+    ) {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(profile_engine_loop(
+            cache,
+            profile_arc,
+            Arc::new(parking_lot::RwLock::new(None)),
+            None,
+            gpus,
+            Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new())),
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
+            shutdown_rx,
+        ));
+        (handle, shutdown_tx)
+    }
+
+    /// Run until `ready` holds, at most `max_ms` of real time, keeping the CPU
+    /// reading at `temp_c` fresh so no tick turns into the no-sensor floor.
+    /// Returns whether `ready` held.
+    async fn run_gpu_engine_until(
+        cache: &StateCache,
+        temp_c: f64,
+        max_ms: u64,
+        ready: impl Fn() -> bool,
+    ) -> bool {
+        for _ in 0..max_ms / 100 {
+            cache.update_sensors(vec![cpu_reading("cpu", temp_c, Instant::now())]);
+            if ready() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        ready()
+    }
+
+    /// DEC-448: deactivating the profile gives its GPU back to firmware auto.
+    /// Before it the card kept the profile's last flat curve until the daemon
+    /// stopped.
+    #[tokio::test]
+    async fn deactivating_the_profile_gives_its_gpu_back() {
+        let (dir_x, dir_y) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let profile_arc = Arc::new(Mutex::new(Some(gpu_profile_naming(&[GPU_X]))));
+        let (handle, shutdown_tx) = spawn_gpu_engine(
+            cache.clone(),
+            profile_arc.clone(),
+            two_fake_gpus(&dir_x, &dir_y),
+        );
+        let ledger = cache.gpu_handback().clone();
+        assert!(
+            run_gpu_engine_until(&cache, 50.0, 3000, || ledger.is_taken(GPU_X)).await,
+            "precondition: the profile drove the card"
+        );
+
+        *profile_arc.lock() = None;
+        let handed_back =
+            run_gpu_engine_until(&cache, 50.0, 3000, || !ledger.is_taken(GPU_X)).await;
+        stop(handle, shutdown_tx).await;
+
+        assert!(
+            handed_back,
+            "a deactivated profile's GPU must be given back"
+        );
+        assert_eq!(cache.gpu_fans_snapshot()[GPU_X].last_commanded_pct, None);
+    }
+
+    /// `DC-cr` review F1: a card handed back and then named again is driven
+    /// again even when its curve asks for less than the 5 % GPU coalescing
+    /// step. Had the hand-back left 0 % as the last command, a 3 % curve would
+    /// coalesce away and the card would stay on firmware auto under a profile.
+    #[tokio::test]
+    async fn a_card_handed_back_is_driven_again_at_a_low_duty() {
+        let (dir_x, dir_y) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let mut low = gpu_profile_naming(&[GPU_X]);
+        for point in &mut low.curves[0].points {
+            point.output_pct = 3.0;
+        }
+        let profile_arc = Arc::new(Mutex::new(Some(low.clone())));
+        let (handle, shutdown_tx) = spawn_gpu_engine(
+            cache.clone(),
+            profile_arc.clone(),
+            two_fake_gpus(&dir_x, &dir_y),
+        );
+        let ledger = cache.gpu_handback().clone();
+        assert!(
+            run_gpu_engine_until(&cache, 50.0, 3000, || ledger.is_taken(GPU_X)).await,
+            "precondition: the 3 % profile drove the card"
+        );
+        *profile_arc.lock() = None;
+        assert!(
+            run_gpu_engine_until(&cache, 50.0, 3000, || !ledger.is_taken(GPU_X)).await,
+            "precondition: handed back"
+        );
+
+        *profile_arc.lock() = Some(low);
+        let driven = run_gpu_engine_until(&cache, 50.0, 3000, || ledger.is_taken(GPU_X)).await;
+        stop(handle, shutdown_tx).await;
+
+        assert!(driven, "the re-named card must be driven again at 3 %");
+        assert_eq!(cache.gpu_fans_snapshot()[GPU_X].last_commanded_pct, Some(3));
+    }
+
+    /// A profile switch gives back only the card the new profile drops; the
+    /// card it keeps stays the profile's.
+    #[tokio::test]
+    async fn a_profile_switch_gives_back_only_the_gpu_it_drops() {
+        let (dir_x, dir_y) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let profile_arc = Arc::new(Mutex::new(Some(gpu_profile_naming(&[GPU_X, GPU_Y]))));
+        let (handle, shutdown_tx) = spawn_gpu_engine(
+            cache.clone(),
+            profile_arc.clone(),
+            two_fake_gpus(&dir_x, &dir_y),
+        );
+        let ledger = cache.gpu_handback().clone();
+        assert!(
+            run_gpu_engine_until(&cache, 50.0, 3000, || {
+                ledger.is_taken(GPU_X) && ledger.is_taken(GPU_Y)
+            })
+            .await,
+            "precondition: the first profile drove both cards"
+        );
+
+        *profile_arc.lock() = Some(gpu_profile_naming(&[GPU_X]));
+        let dropped = run_gpu_engine_until(&cache, 50.0, 3000, || !ledger.is_taken(GPU_Y)).await;
+        stop(handle, shutdown_tx).await;
+
+        assert!(dropped, "the card the new profile drops must be given back");
+        assert!(
+            ledger.is_taken(GPU_X),
+            "the card the new profile keeps stays on its curve"
+        );
+    }
+
+    /// A control that is skipped still names its card: the card holds its last
+    /// duty (DEC-269) and is not given back. The switch to the skipping profile
+    /// is proven to have reached the loop by the skip being published.
+    #[tokio::test]
+    async fn a_skipped_controls_gpu_is_kept() {
+        let (dir_x, dir_y) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let profile_arc = Arc::new(Mutex::new(Some(gpu_profile_naming(&[GPU_X]))));
+        let (handle, shutdown_tx) = spawn_gpu_engine(
+            cache.clone(),
+            profile_arc.clone(),
+            two_fake_gpus(&dir_x, &dir_y),
+        );
+        let ledger = cache.gpu_handback().clone();
+        assert!(
+            run_gpu_engine_until(&cache, 50.0, 3000, || ledger.is_taken(GPU_X)).await,
+            "precondition: the profile drove the card"
+        );
+
+        let mut skipping = gpu_profile_naming(&[GPU_X]);
+        skipping.curves[0].sensor_id = "gone".into();
+        *profile_arc.lock() = Some(skipping);
+        let skipped = run_gpu_engine_until(&cache, 50.0, 6000, || {
+            !cache.snapshot().skipped_controls.is_empty()
+        })
+        .await;
+        stop(handle, shutdown_tx).await;
+
+        assert!(skipped, "precondition: the control is skipped");
+        assert!(
+            ledger.is_taken(GPU_X),
+            "a skipped control's card must not be given back"
+        );
+    }
+
+    /// The forced branch gives back too: a profile deactivated during a thermal
+    /// emergency returns its GPU now, not when the emergency ends — the GPU is
+    /// outside the force (DEC-130), so nothing is holding it.
+    #[tokio::test]
+    async fn a_profile_deactivated_mid_emergency_gives_its_gpu_back_at_once() {
+        let (dir_x, dir_y) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let hot = TRIGGER + 1.0;
+        let cache = make_cache_with_sensor("cpu", hot);
+        let profile_arc = Arc::new(Mutex::new(Some(gpu_profile_naming(&[GPU_X]))));
+        let (handle, shutdown_tx) = spawn_gpu_engine(
+            cache.clone(),
+            profile_arc.clone(),
+            two_fake_gpus(&dir_x, &dir_y),
+        );
+        let ledger = cache.gpu_handback().clone();
+        assert!(
+            run_gpu_engine_until(&cache, hot, 3000, || ledger.is_taken(GPU_X)).await,
+            "precondition: the profile drove the card through the force"
+        );
+
+        *profile_arc.lock() = None;
+        let handed_back = run_gpu_engine_until(&cache, hot, 3000, || !ledger.is_taken(GPU_X)).await;
+        let state = cache.snapshot().thermal_override_state;
+        stop(handle, shutdown_tx).await;
+
+        assert_eq!(
+            state.as_deref(),
+            Some("emergency"),
+            "precondition: still forced when the card went back"
+        );
+        assert!(handed_back, "the card goes back during the force");
+    }
+
+    /// A verify holding the write pause owns the card: a deactivation during it
+    /// gives nothing back until the verify ends. Held twice — the loop's gate
+    /// and the in-task re-check (`a_verify_holding_the_pause_defers_the_hand_back`
+    /// proves the second alone).
+    #[tokio::test]
+    async fn a_verify_defers_the_gpu_give_back_until_it_ends() {
+        let (dir_x, dir_y) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let cache = make_cache_with_sensor("cpu", 50.0);
+        let profile_arc = Arc::new(Mutex::new(Some(gpu_profile_naming(&[GPU_X]))));
+        let (handle, shutdown_tx) = spawn_gpu_engine(
+            cache.clone(),
+            profile_arc.clone(),
+            two_fake_gpus(&dir_x, &dir_y),
+        );
+        let ledger = cache.gpu_handback().clone();
+        assert!(
+            run_gpu_engine_until(&cache, 50.0, 3000, || ledger.is_taken(GPU_X)).await,
+            "precondition: the profile drove the card"
+        );
+
+        let epoch = cache
+            .try_begin_verify(std::time::Duration::from_secs(30))
+            .expect("claim the pause");
+        *profile_arc.lock() = None;
+        let early = run_gpu_engine_until(&cache, 50.0, 2500, || !ledger.is_taken(GPU_X)).await;
+        assert!(cache.end_verify(epoch));
+        let after = run_gpu_engine_until(&cache, 50.0, 3000, || !ledger.is_taken(GPU_X)).await;
+        stop(handle, shutdown_tx).await;
+
+        assert!(
+            !early,
+            "nothing is given back while the verify holds the pause"
+        );
+        assert!(after, "the verify's end releases the give-back");
     }
 
     /// [SAFETY] DEC-382: with no CPU sensor the no-sensor floor holds for as long

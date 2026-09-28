@@ -315,6 +315,12 @@ pub(crate) trait WriteBackend {
     /// The engine is the sole authoritative writer (DEC-165): there is no GUI
     /// deferral. Each backend still owns its coalescing, failure caching, and
     /// lease handling behind this call.
+    ///
+    /// The engine loop calls each backend's `apply_and_give_back` instead, which
+    /// also hands back what the profile no longer names (DEC-382, DEC-448); the
+    /// GPU backend was the last to move (DEC-448). This member-less form stays
+    /// for the backend tests, which exercise the write path on its own.
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn apply(&mut self, commands: &[PwmCommand]);
 }
 
@@ -387,7 +393,8 @@ pub(crate) struct ProfileMembers {
 
 impl ProfileMembers {
     /// The members of `profile`'s controls. GPU members are not collected: the
-    /// thermal force never reaches a GPU fan (DEC-130), and nothing gives one back.
+    /// thermal force never reaches a GPU fan (DEC-130). The GPU hand-back judges
+    /// by its own [`GpuMembers`] (DEC-448).
     pub(crate) fn of(profile: &crate::profile::DaemonProfile) -> Self {
         Self::collect(profile.controls.iter())
     }
@@ -424,6 +431,35 @@ impl ProfileMembers {
             }
         }
         members
+    }
+}
+
+/// The AMD GPU fans the active profile's controls name (DEC-448, `DC-cr`), for
+/// the GPU backend's hand-back.
+///
+/// Deliberately its own type and NOT a field of [`ProfileMembers`]: that type is
+/// the thermal force's reach (DEC-382), and a GPU fan is outside the force
+/// (DEC-130). Sharing it would put a GPU one edit away from the force — the
+/// shape `OFN-ae` (DEC-378) warns about. Every member of every control counts,
+/// as there: a skipped or overridden control still names its card.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct GpuMembers(HashSet<String>);
+
+impl GpuMembers {
+    pub(crate) fn of(profile: &crate::profile::DaemonProfile) -> Self {
+        Self(
+            profile
+                .controls
+                .iter()
+                .flat_map(|c| &c.members)
+                .filter(|m| m.source == "amd_gpu")
+                .map(|m| m.member_id.clone())
+                .collect(),
+        )
+    }
+
+    fn names(&self, fan_id: &str) -> bool {
+        self.0.contains(fan_id)
     }
 }
 
@@ -1452,6 +1488,14 @@ const GPU_WRITE_JOIN_BUDGET: std::time::Duration = std::time::Duration::from_sec
 /// because a harvested result belongs to an earlier tick's batch.
 type GpuWriteOutcome = (String, u8, Option<Result<(), ()>>);
 
+/// What one GPU write task returns: the profile's writes, and the cards it gave
+/// back to firmware auto with whether each reset landed (DEC-448).
+#[derive(Default)]
+struct GpuTaskOutcome {
+    writes: Vec<GpuWriteOutcome>,
+    handed_back: Vec<(String, Result<(), String>)>,
+}
+
 /// One fan's pending GPU write, resolved on the async side so the blocking
 /// closure owns everything it needs (DEC-299).
 #[derive(Clone)]
@@ -1485,7 +1529,7 @@ pub(crate) struct GpuBackend {
     /// acquiring it — moving the freeze rather than removing it. Taking the lock
     /// with a bounded wait and skipping the tick when it is unavailable is what
     /// makes the bound work here.
-    writes: BoundedWrite<Vec<GpuWriteOutcome>>,
+    writes: BoundedWrite<GpuTaskOutcome>,
     /// Edge-trigger for the "write still in flight" log, as on the other two.
     stall_logged: bool,
     /// Edge-trigger for LOCK CONTENTION, kept separate from `stall_logged`
@@ -1505,6 +1549,11 @@ pub(crate) struct GpuBackend {
     /// `fan_curve`, the same check its write loop makes (`GPU-a`, DEC-445).
     /// Fixed at construction because `gpu_infos` is.
     pmfw_fan_ids: HashSet<String>,
+    /// Cards whose hand-back reset failed, and when (DEC-448). A card stays on
+    /// the hand-back list when its reset fails — so every stop still resets it —
+    /// and is retried after [`constants::GPU_FAIL_COOLDOWN`] rather than every
+    /// tick; the entry is also the edge-trigger for its log lines.
+    give_back_failed: HashMap<String, std::time::Instant>,
 }
 
 impl GpuBackend {
@@ -1531,6 +1580,7 @@ impl GpuBackend {
             cache,
             gpu_infos,
             pmfw_fan_ids,
+            give_back_failed: HashMap::new(),
             fail_cache: HashMap::new(),
             clock,
             writes: BoundedWrite::default(),
@@ -1584,11 +1634,15 @@ impl GpuBackend {
     ///
     /// `&mut self` cannot cross into the `'static` closure, so this runs on the
     /// returned outcomes — the same shape as `HwmonBackend::note_outcomes`.
-    fn note_gpu_outcomes(&mut self, progress: WriteProgress<Vec<GpuWriteOutcome>>) {
+    fn note_gpu_outcomes(&mut self, progress: WriteProgress<GpuTaskOutcome>) {
         for joined in progress.completed() {
             match joined {
-                Ok(outcomes) => {
-                    for (fan_id, pct, outcome) in outcomes {
+                Ok(GpuTaskOutcome {
+                    writes,
+                    handed_back,
+                }) => {
+                    self.note_give_backs(handed_back);
+                    for (fan_id, pct, outcome) in writes {
                         match outcome {
                             Some(Ok(())) => {
                                 self.fail_cache.remove(&fan_id);
@@ -1632,6 +1686,118 @@ impl GpuBackend {
             }
         }
     }
+
+    /// Log each hand-back and track the failures for the retry cooldown
+    /// (DEC-448): one line when a card goes back, one when a reset first fails,
+    /// one when a failing card finally goes back.
+    fn note_give_backs(&mut self, handed_back: Vec<(String, Result<(), String>)>) {
+        for (fan_id, outcome) in handed_back {
+            match outcome {
+                Ok(()) => {
+                    if self.give_back_failed.remove(&fan_id).is_some() {
+                        log::info!(
+                            "GPU fan {fan_id} is back on firmware auto (an earlier reset \
+                             had failed)"
+                        );
+                    } else {
+                        log::info!(
+                            "GPU fan {fan_id} handed back to firmware auto — no active \
+                             profile names it"
+                        );
+                    }
+                }
+                Err(e) => {
+                    let first = self
+                        .give_back_failed
+                        .insert(fan_id.clone(), self.clock.now())
+                        .is_none();
+                    if first {
+                        log::warn!(
+                            "could not hand GPU fan {fan_id} back to firmware auto: {e} — \
+                             it keeps the daemon's last curve; retrying every {}s, and \
+                             the daemon resets it when it stops",
+                            constants::GPU_FAIL_COOLDOWN.as_secs()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The cards this tick should give back: held by the daemon, named by no
+    /// control of the active profile, and not inside a failed reset's cooldown.
+    /// Empty when the hand-back list is locked right now — a peek on the async
+    /// side must not wait, and the next tick looks again.
+    ///
+    /// Also forgets the failure of a card that has since left the list another
+    /// way (the reset endpoint, a verify) or that a control names again, so its
+    /// next failure is logged and its next success is not reported as a
+    /// recovery.
+    fn give_back_candidates(&mut self, members: &GpuMembers) -> Vec<String> {
+        let Some(taken) = self.cache.gpu_handback().try_taken_ids() else {
+            return Vec::new();
+        };
+        self.give_back_failed
+            .retain(|id, _| taken.contains(id) && !members.names(id));
+        let now = self.clock.now();
+        taken
+            .into_iter()
+            .filter(|id| !members.names(id))
+            .filter(|id| {
+                self.give_back_failed.get(id).is_none_or(|failed_at| {
+                    now.saturating_duration_since(*failed_at) >= constants::GPU_FAIL_COOLDOWN
+                })
+            })
+            .collect()
+    }
+
+    /// Write this tick's GPU commands and give back — reset to firmware auto —
+    /// every card the daemon drove that `members` does not name, in ONE bounded,
+    /// write-locked task (DEC-448, `DC-cr`).
+    ///
+    /// The GPU half of DEC-382's hand-back: a profile deactivated, or switched to
+    /// one that no longer names a card, used to leave that card on the daemon's
+    /// last flat curve until the daemon stopped. One task rather than two for the
+    /// reason on [`OpenFanBackend::apply_and_give_back`]. The reset is the one
+    /// `POST /gpu/{id}/fan/reset` makes, under the same GPU write lock, so the two
+    /// never interleave (DEC-255).
+    pub(crate) async fn apply_and_give_back(
+        &mut self,
+        commands: &[PwmCommand],
+        members: &GpuMembers,
+    ) {
+        let give_back = self.give_back_candidates(members);
+        self.write(commands, give_back).await;
+    }
+}
+
+/// Give `fan_id`'s card back to firmware auto (DEC-448) — the reset
+/// `POST /gpu/{id}/fan/reset` makes — and take it off the hand-back list, so no
+/// stop resets it again. Runs inside the engine's write-locked GPU task.
+///
+/// The cache's last commanded duty is cleared, not set to 0 as the reset
+/// endpoint does: a 0 would let the 5 % coalescing skip a later profile's
+/// command of 0–4 %, leaving the card on auto while a profile names it.
+///
+/// `None` when not attempted: a verify claimed the pause (it owns the card, and
+/// hands it back itself), or the card left the list after the peek (a reset or
+/// a verify handed it back first). A failed reset leaves the card on the list,
+/// so every stop still resets it.
+fn gpu_give_back(cache: &StateCache, fan_id: &str) -> Option<Result<(), String>> {
+    if cache.verify_active() {
+        return None;
+    }
+    let (fan_curve, zero_rpm) = cache.gpu_handback().taken_paths(fan_id)?;
+    Some(
+        match crate::hwmon::gpu_fan::reset_to_auto(&fan_curve, zero_rpm.as_deref()) {
+            Ok(()) => {
+                cache.clear_gpu_fan_commanded_pct(fan_id);
+                cache.gpu_handback().note_handed_back(fan_id);
+                Ok(())
+            }
+            Err(e) => Err(e.to_string()),
+        },
+    )
 }
 
 impl WriteBackend for GpuBackend {
@@ -1641,7 +1807,18 @@ impl WriteBackend for GpuBackend {
     /// `GPU_COALESCE_DELTA_PCT`, DEC-070's single 5% threshold (DEC-131). The
     /// API handler this once mirrored was a client PWM write, retired at 2.0.0
     /// (DEC-165), so the engine is the only path that applies it.
+    ///
+    /// Gives nothing back: it has no member set to judge "nothing names this
+    /// card" by. The engine calls [`GpuBackend::apply_and_give_back`] (DEC-448).
     async fn apply(&mut self, commands: &[PwmCommand]) {
+        self.write(commands, Vec::new()).await;
+    }
+}
+
+impl GpuBackend {
+    /// `apply`'s body, with the hand-back of `give_back` folded into the same
+    /// task (DEC-448).
+    async fn write(&mut self, commands: &[PwmCommand], give_back: Vec<String>) {
         // One snapshot per tick — advisory write-suppression state, not
         // correctness-critical (a torn read vs. the API path is harmless:
         // the next tick re-evaluates).
@@ -1704,9 +1881,10 @@ impl WriteBackend for GpuBackend {
             });
         }
 
-        // DEC-299: nothing to command, but an earlier write may still be
-        // outstanding and must be harvested — the same shape as `HwmonBackend`.
-        if pending_writes.is_empty() {
+        // DEC-299: nothing to command or give back, but an earlier write may
+        // still be outstanding and must be harvested — the same shape as
+        // `HwmonBackend`.
+        if pending_writes.is_empty() && give_back.is_empty() {
             if self.writes.outstanding() {
                 let progress = self.writes.harvest_only(GPU_WRITE_JOIN_BUDGET).await;
                 self.note_gpu_outcomes(progress);
@@ -1780,7 +1958,7 @@ impl WriteBackend for GpuBackend {
             .writes
             .run(GPU_WRITE_JOIN_BUDGET, move || {
                 let _write_guard = write_guard;
-                batch
+                let writes = batch
                     .into_iter()
                     .map(|w| {
                         let outcome = gpu_blocking_write(
@@ -1793,7 +1971,18 @@ impl WriteBackend for GpuBackend {
                         );
                         (w.fan_id, w.pct, outcome)
                     })
-                    .collect::<Vec<_>>()
+                    .collect();
+                // DEC-448: after the writes, as hwmon's Phase 2b is. The two sets
+                // are disjoint — a card is given back only when no control names
+                // it, so no command this tick is for it.
+                let handed_back = give_back
+                    .into_iter()
+                    .filter_map(|id| gpu_give_back(&cache_ref, &id).map(|r| (id, r)))
+                    .collect();
+                GpuTaskOutcome {
+                    writes,
+                    handed_back,
+                }
             })
             .await;
 
@@ -3235,6 +3424,229 @@ mod tests {
             "after the cooldown the failed speed must be retried"
         );
         assert_eq!(be.fail_cache_len(), 0, "successful retry clears the cache");
+    }
+
+    // ── GPU hand-back (DEC-448, `DC-cr`) ─────────────────────────────
+
+    const GPU_FAN: &str = "amd_gpu:0000:03:00.0";
+
+    fn gpu_members(ids: &[&str]) -> GpuMembers {
+        GpuMembers(ids.iter().map(|s| s.to_string()).collect())
+    }
+
+    /// A GPU backend that has written a curve to the fake card, so the card is
+    /// on the hand-back list — then the curve file emptied, so any later write
+    /// to it shows. The reset writes `"r"` then `"c"`, leaving `"c\n"`.
+    async fn gpu_backend_holding_the_card(
+        dir: &tempfile::TempDir,
+        clock: Arc<dyn Clock>,
+    ) -> (GpuBackend, Arc<StateCache>, std::path::PathBuf) {
+        let (gpu, curve_path) = fake_gpu(dir);
+        let cache = Arc::new(StateCache::new());
+        let mut be = GpuBackend::with_clock(cache.clone(), Arc::new(vec![gpu]), clock);
+        be.apply(&[cmd(GPU_FAN, "amd_gpu", 70)]).await;
+        assert!(
+            cache.gpu_handback().is_taken(GPU_FAN),
+            "precondition: the profile write put the card on the hand-back list"
+        );
+        std::fs::write(&curve_path, "").unwrap();
+        (be, cache, curve_path)
+    }
+
+    /// DEC-448: a card the daemon drove that no control names goes back to
+    /// firmware auto — reset, off the list, and its last commanded duty
+    /// cleared, so nothing claims to command it and the next command is written.
+    #[tokio::test]
+    async fn a_card_no_profile_names_is_reset_to_firmware_auto_and_handed_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut be, cache, curve_path) =
+            gpu_backend_holding_the_card(&dir, Arc::new(crate::clock::SystemClock)).await;
+        assert_eq!(
+            cache.gpu_fans_snapshot()[GPU_FAN].last_commanded_pct,
+            Some(70),
+            "precondition: the profile's duty is recorded"
+        );
+
+        be.apply_and_give_back(&[], &GpuMembers::default()).await;
+
+        assert_eq!(
+            std::fs::read_to_string(&curve_path).unwrap(),
+            "c\n",
+            "the card must be reset (\"r\" + \"c\")"
+        );
+        assert!(!cache.gpu_handback().is_taken(GPU_FAN));
+        assert_eq!(cache.gpu_fans_snapshot()[GPU_FAN].last_commanded_pct, None);
+    }
+
+    /// `DC-cr` review F2: a failed hand-back's cooldown belongs to that episode.
+    /// Once the card leaves the list another way — here the reset endpoint's
+    /// bookkeeping — and is driven and unnamed again, it is handed back at once,
+    /// not held off by the old failure's cooldown (and its next failure logs).
+    #[tokio::test]
+    async fn a_failure_is_forgotten_once_the_card_leaves_the_list_another_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut be, cache, curve_path) =
+            gpu_backend_holding_the_card(&dir, Arc::new(crate::clock::SystemClock)).await;
+
+        std::fs::remove_file(&curve_path).unwrap();
+        std::fs::create_dir(&curve_path).unwrap();
+        be.apply_and_give_back(&[], &GpuMembers::default()).await;
+        assert!(
+            cache.gpu_handback().is_taken(GPU_FAN),
+            "precondition: the hand-back failed and is cooling down"
+        );
+
+        // The reset endpoint puts the card on auto; then a profile drives it
+        // again (the tick sees the card off the list once, as it would).
+        std::fs::remove_dir(&curve_path).unwrap();
+        std::fs::write(&curve_path, "").unwrap();
+        cache.gpu_handback().note_handed_back(GPU_FAN);
+        be.apply_and_give_back(&[], &gpu_members(&[GPU_FAN])).await;
+        cache.set_gpu_fan_commanded_pct(GPU_FAN, 0);
+        be.apply_and_give_back(&[cmd(GPU_FAN, "amd_gpu", 60)], &gpu_members(&[GPU_FAN]))
+            .await;
+        assert!(
+            cache.gpu_handback().is_taken(GPU_FAN),
+            "precondition: driven again"
+        );
+        std::fs::write(&curve_path, "").unwrap();
+
+        // Unnamed again, well inside the old failure's cooldown.
+        be.apply_and_give_back(&[], &GpuMembers::default()).await;
+        assert_eq!(std::fs::read_to_string(&curve_path).unwrap(), "c\n");
+        assert!(!cache.gpu_handback().is_taken(GPU_FAN));
+    }
+
+    /// The opposite arm: a card a control still names is kept even on a tick
+    /// that commands it nothing — a skipped control's card holds its last duty
+    /// (DEC-269), it is not handed back.
+    #[tokio::test]
+    async fn a_card_a_control_names_is_kept_with_no_command_this_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut be, cache, curve_path) =
+            gpu_backend_holding_the_card(&dir, Arc::new(crate::clock::SystemClock)).await;
+
+        be.apply_and_give_back(&[], &gpu_members(&[GPU_FAN])).await;
+
+        assert!(std::fs::read_to_string(&curve_path).unwrap().is_empty());
+        assert!(cache.gpu_handback().is_taken(GPU_FAN));
+    }
+
+    /// The in-task re-check: a verify that claims the pause after the engine's
+    /// loop-level gate owns the card, so the hand-back waits for it to end.
+    /// Called here without that gate, so only the in-task check can hold it.
+    #[tokio::test]
+    async fn a_verify_holding_the_pause_defers_the_hand_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut be, cache, curve_path) =
+            gpu_backend_holding_the_card(&dir, Arc::new(crate::clock::SystemClock)).await;
+        let epoch = cache
+            .try_begin_verify(std::time::Duration::from_secs(30))
+            .expect("claim the pause");
+
+        be.apply_and_give_back(&[], &GpuMembers::default()).await;
+        assert!(
+            std::fs::read_to_string(&curve_path).unwrap().is_empty(),
+            "nothing may touch the card while a verify holds the pause"
+        );
+        assert!(cache.gpu_handback().is_taken(GPU_FAN));
+
+        assert!(cache.end_verify(epoch));
+        be.apply_and_give_back(&[], &GpuMembers::default()).await;
+        assert!(
+            !cache.gpu_handback().is_taken(GPU_FAN),
+            "the verify's end releases the hand-back"
+        );
+    }
+
+    /// A reset that fails leaves the card on the list — so every stop still
+    /// resets it — and is retried only after the cooldown, not at 1 Hz.
+    #[tokio::test]
+    async fn a_failed_hand_back_keeps_the_card_and_retries_after_the_cooldown() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        struct AdvanceClock {
+            base: std::time::Instant,
+            offset_ms: AtomicU64,
+        }
+        impl Clock for AdvanceClock {
+            fn now(&self) -> std::time::Instant {
+                self.base + std::time::Duration::from_millis(self.offset_ms.load(Ordering::SeqCst))
+            }
+        }
+        let clock = Arc::new(AdvanceClock {
+            base: std::time::Instant::now(),
+            offset_ms: AtomicU64::new(0),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (mut be, cache, curve_path) = gpu_backend_holding_the_card(&dir, clock.clone()).await;
+
+        // A directory where the file was: the reset's write fails.
+        std::fs::remove_file(&curve_path).unwrap();
+        std::fs::create_dir(&curve_path).unwrap();
+        be.apply_and_give_back(&[], &GpuMembers::default()).await;
+        assert!(
+            cache.gpu_handback().is_taken(GPU_FAN),
+            "a failed reset must leave the card for the stop path to reset"
+        );
+
+        // Repaired, but inside the cooldown: not retried yet.
+        std::fs::remove_dir(&curve_path).unwrap();
+        std::fs::write(&curve_path, "").unwrap();
+        be.apply_and_give_back(&[], &GpuMembers::default()).await;
+        assert!(std::fs::read_to_string(&curve_path).unwrap().is_empty());
+        assert!(cache.gpu_handback().is_taken(GPU_FAN));
+
+        clock.offset_ms.store(
+            (constants::GPU_FAIL_COOLDOWN + std::time::Duration::from_secs(1)).as_millis() as u64,
+            Ordering::SeqCst,
+        );
+        be.apply_and_give_back(&[], &GpuMembers::default()).await;
+        assert_eq!(std::fs::read_to_string(&curve_path).unwrap(), "c\n");
+        assert!(!cache.gpu_handback().is_taken(GPU_FAN));
+    }
+
+    /// `GpuMembers` names every `amd_gpu` member of every control and nothing
+    /// else — and `ProfileMembers`, the force's reach, still names no GPU.
+    #[test]
+    fn gpu_members_name_the_profiles_gpu_fans_and_the_force_reach_does_not() {
+        let member = |source: &str, id: &str| crate::profile::ControlMember {
+            source: source.into(),
+            member_id: id.into(),
+            member_label: String::new(),
+            fan_zero_rpm: false,
+        };
+        let control = |id: &str, members| crate::profile::LogicalControl {
+            id: id.into(),
+            name: id.into(),
+            mode: "curve".into(),
+            curve_id: "c".into(),
+            manual_output_pct: 50.0,
+            members,
+            step_up_pct: 100.0,
+            step_down_pct: 100.0,
+            offset_pct: 0.0,
+            minimum_pct: 0.0,
+            start_pct: 0.0,
+            stop_pct: 0.0,
+        };
+        let profile = crate::profile::DaemonProfile {
+            id: "p".into(),
+            name: "P".into(),
+            version: 7,
+            description: String::new(),
+            controls: vec![
+                control("a", vec![member("amd_gpu", GPU_FAN), member("hwmon", "h1")]),
+                control("b", vec![member("amd_gpu", "amd_gpu:0000:0a:00.0")]),
+            ],
+            curves: vec![],
+        };
+        assert_eq!(
+            GpuMembers::of(&profile),
+            gpu_members(&[GPU_FAN, "amd_gpu:0000:0a:00.0"])
+        );
+        let reach = ProfileMembers::of(&profile);
+        assert_eq!(reach.hwmon, HashSet::from(["h1".to_string()]));
+        assert!(reach.openfan.is_empty());
     }
 
     // ── hwmon backend ────────────────────────────────────────────────

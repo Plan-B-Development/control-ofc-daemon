@@ -862,6 +862,19 @@ impl PmfwHandBack {
         self.state.lock().taken.contains_key(fan_id)
     }
 
+    /// The ids of the cards the daemon holds, or `None` while the lock is held:
+    /// the engine's per-tick peek (DEC-448), which runs on the async executor
+    /// and so must not wait. A contended peek costs one tick.
+    pub fn try_taken_ids(&self) -> Option<Vec<String>> {
+        let state = self.state.try_lock()?;
+        Some(state.taken.keys().cloned().collect())
+    }
+
+    /// `fan_id`'s `(fan_curve, fan_zero_rpm_enable)` while the daemon holds it.
+    pub fn taken_paths(&self, fan_id: &str) -> Option<(PathBuf, Option<PathBuf>)> {
+        self.state.lock().taken.get(fan_id).cloned()
+    }
+
     /// The cards to reset — `(fan_curve, fan_zero_rpm_enable)` — or `None` when
     /// the lock is still held after `timeout`: the caller may be the thread
     /// holding it, and `parking_lot`'s mutex is not re-entrant.

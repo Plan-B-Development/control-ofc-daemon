@@ -966,6 +966,22 @@ impl StateCache {
         state.snapshot_at = now;
     }
 
+    /// Forget the last commanded speed for an AMD GPU fan: nothing commands it
+    /// now (DEC-448 — the engine handed it back to firmware auto).
+    ///
+    /// `None` rather than 0 so the next command is always written: a 0 would
+    /// coalesce away a later command under `GPU_COALESCE_DELTA_PCT`, leaving the
+    /// card on firmware auto while a profile names it. A verify reads `None` as
+    /// "on auto" and restores to auto, as it does 0. Like the setter above, it
+    /// leaves `updated_at` alone — that stamps telemetry, not commands.
+    pub fn clear_gpu_fan_commanded_pct(&self, gpu_id: &str) {
+        let mut state = self.inner.write();
+        if let Some(fan) = state.gpu_fans.get_mut(gpu_id) {
+            fan.last_commanded_pct = None;
+        }
+        state.snapshot_at = Instant::now();
+    }
+
     /// Update AIO pump state.
     pub fn update_aio(&self, aio: AioPumpState) {
         let now = Instant::now();

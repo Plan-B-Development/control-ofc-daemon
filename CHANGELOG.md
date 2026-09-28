@@ -46,6 +46,39 @@
   does not mistake its fans for missing ones. The stored file is left as it is, and every other
   field is served as stored.
 
+### Fixed
+
+- **A GPU the active profile stops naming goes back to its firmware fan curve at once** (DEC-448,
+  `DC-cr`). Deactivating a profile, or switching to one that does not name a GPU the old one
+  drove, left that card on the profile's last curve — zero-RPM idle off — until the daemon stopped
+  or you pressed *Restore GPU Fan to Automatic*; LACT or CoreCtrl could not take it over in
+  between. On the next engine tick the daemon now resets it to PMFW's own curve with zero-RPM idle
+  re-enabled, as a daemon stop does, and leaves it alone until a profile names it again; its
+  `last_commanded_pwm` on `/fans` is then absent, and a profile that names it again drives it at
+  once, however low its curve. A card a
+  skipped or overridden control still names is kept; a GPU fan verify in progress defers it; a
+  reset that fails is logged, retried after a minute, and still made at the next stop. Motherboard
+  headers have been handed back this way since DEC-382.
+- **The RX 6000-and-older fan test gives the card back as it found it** (DEC-447, `TS-bi`, `TS-bj`).
+  After a test whose restore failed, the next test put the card back in manual mode at the old
+  test speed (75–100 %), because it restored to the last speed the daemon had written; it now
+  restores to the state the card was first found in — usually automatic — and gives it back. A
+  card another tool had in manual mode at a speed is recorded with that speed, so a daemon crash
+  during the test gives it back at that speed too, not at the test speed.
+- **`/capabilities` no longer reports a pre-RDNA3 AMD GPU as writable** (DEC-445, `DC-ch`). The
+  profile engine drives GPU fans through the PMFW fan curve only, so an RX 6000 or older card —
+  whose legacy `pwm1` the GPU fan verify and reset use — was never driven by a profile, while
+  `devices.amd_gpu.fan_write_supported` said `true`. It now says `false`; `fan_control_method`
+  stays `"hwmon_pwm"`, and verify and reset work as before. `USER_GUIDE.md`, the man page and the
+  README said "daemon-driven via pwm1" and are corrected.
+- **A control whose fans the daemon cannot write is listed, GPUs included** (DEC-445, `GPU-a`).
+  A profile control bound only to an AMD GPU without a PMFW fan curve (an RX 6000 or older, a
+  read-only RX 7000/9000, or a card not on this machine), or to an Intel or NVIDIA GPU fan,
+  commanded nothing and was never listed. It now appears in `skipped_controls[]` as
+  `backend_unavailable`, like an OpenFan or motherboard fan the daemon cannot reach. Because older
+  GUIs let you assign an RX 6000 or older to a control, such a control now makes `GET /status`
+  report a `warn` overall status on upgrade; remove the GPU from the control to clear it.
+
 ### Changed
 
 - **A pump on a DC-mode header is never driven below 70 %** (DEC-443), rather than the 30 % pump
@@ -82,25 +115,6 @@
 
 ### Fixed
 
-- **The RX 6000-and-older fan test gives the card back as it found it** (DEC-447, `TS-bi`, `TS-bj`).
-  After a test whose restore failed, the next test put the card back in manual mode at the old
-  test speed (75–100 %), because it restored to the last speed the daemon had written; it now
-  restores to the state the card was first found in — usually automatic — and gives it back. A
-  card another tool had in manual mode at a speed is recorded with that speed, so a daemon crash
-  during the test gives it back at that speed too, not at the test speed.
-- **`/capabilities` no longer reports a pre-RDNA3 AMD GPU as writable** (DEC-445, `DC-ch`). The
-  profile engine drives GPU fans through the PMFW fan curve only, so an RX 6000 or older card —
-  whose legacy `pwm1` the GPU fan verify and reset use — was never driven by a profile, while
-  `devices.amd_gpu.fan_write_supported` said `true`. It now says `false`; `fan_control_method`
-  stays `"hwmon_pwm"`, and verify and reset work as before. `USER_GUIDE.md`, the man page and the
-  README said "daemon-driven via pwm1" and are corrected.
-- **A control whose fans the daemon cannot write is listed, GPUs included** (DEC-445, `GPU-a`).
-  A profile control bound only to an AMD GPU without a PMFW fan curve (an RX 6000 or older, a
-  read-only RX 7000/9000, or a card not on this machine), or to an Intel or NVIDIA GPU fan,
-  commanded nothing and was never listed. It now appears in `skipped_controls[]` as
-  `backend_unavailable`, like an OpenFan or motherboard fan the daemon cannot reach. Because older
-  GUIs let you assign an RX 6000 or older to a control, such a control now makes `GET /status`
-  report a `warn` overall status on upgrade; remove the GPU from the control to clear it.
 - **Getting a dropped OpenFanController back no longer resets every other USB-serial device**
   (DEC-436). When an adopted controller stopped answering, the daemon looked for it by opening every
   `/dev/ttyACM*` and `/dev/ttyUSB*` node, about every 30 seconds for as long as it stayed away. Opening a
