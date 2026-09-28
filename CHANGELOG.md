@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [3.0.0] — 2026-09-28
+
+Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor; GUI 3.0.0 uses the new
+`control.canonical_chip_names` and `control.cooling_failure_detection` capabilities, and its
+package requires this daemon.
+
 ### Added
 
 - **A coolant emergency** (DEC-443). When the hottest current reading from a coolant sensor — an
