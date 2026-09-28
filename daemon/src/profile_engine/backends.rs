@@ -1372,7 +1372,7 @@ impl SafetyWriteBackend for OpenFanBackend {
     }
 }
 
-// ─── AMD GPU (PMFW fan_curve / legacy pwm1) ──────────────────────────────
+// ─── AMD GPU (PMFW fan_curve only — legacy pwm1 is verify/reset's, DEC-445) ──
 
 /// GPU fan writes via the PMFW `fan_curve` interface.
 ///
@@ -1501,6 +1501,10 @@ pub(crate) struct GpuBackend {
     /// wrong fans at the wrong duty. Ordinary outcomes carry their own pct in the
     /// tuple; this covers only the case where no outcome comes back at all.
     outstanding_batch: Vec<(String, u8)>,
+    /// The fan ids `apply` can write: each detected card with a PMFW
+    /// `fan_curve`, the same check its write loop makes (`GPU-a`, DEC-445).
+    /// Fixed at construction because `gpu_infos` is.
+    pmfw_fan_ids: HashSet<String>,
 }
 
 impl GpuBackend {
@@ -1518,9 +1522,15 @@ impl GpuBackend {
         gpu_infos: Arc<Vec<crate::hwmon::gpu_detect::AmdGpuInfo>>,
         clock: Arc<dyn Clock>,
     ) -> Self {
+        let pmfw_fan_ids = gpu_infos
+            .iter()
+            .filter(|g| g.fan_curve_path.is_some())
+            .map(|g| format!("amd_gpu:{}", g.pci_bdf))
+            .collect();
         Self {
             cache,
             gpu_infos,
+            pmfw_fan_ids,
             fail_cache: HashMap::new(),
             clock,
             writes: BoundedWrite::default(),
@@ -1551,6 +1561,14 @@ impl GpuBackend {
 }
 
 impl GpuBackend {
+    /// The `amd_gpu:` members this backend can deliver to, for the engine's
+    /// `backend_unavailable` classification (`GPU-a`). A member outside it — a
+    /// card with no PMFW `fan_curve`, or one not on this machine — is skipped by
+    /// `apply` before any write.
+    pub(crate) fn delivery_targets(&self) -> &HashSet<String> {
+        &self.pmfw_fan_ids
+    }
+
     /// True while a GPU write is not getting through (DEC-298 semantics: nothing
     /// completed, not merely something in flight).
     pub(crate) fn writes_stalled(&self) -> bool {

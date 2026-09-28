@@ -1569,6 +1569,8 @@ pub async fn profile_engine_loop(
                     // `OFN-al`: hwmon members are resolved one by one against the
                     // backend's writable set, so a control bound only to read-only
                     // headers is listed on a board that has writable ones too.
+                    // `GPU-a`: GPU members likewise, against the cards the GPU
+                    // backend can write (PMFW `fan_curve` only, DEC-445).
                     for id in engine_state.note_backend_unavailable(
                         active_profile,
                         &override_snapshot,
@@ -1577,6 +1579,7 @@ pub async fn profile_engine_loop(
                             hwmon: hwmon_be
                                 .as_ref()
                                 .map_or(HwmonTargets::Absent, HwmonBackend::delivery_targets),
+                            amd_gpu: gpu_be.delivery_targets(),
                         },
                     ) {
                         log::info!(
@@ -2256,13 +2259,17 @@ mod tests {
         );
     }
 
-    /// A control whose member the ENGINE TEST HARNESS can deliver to.
+    /// A control whose member the ENGINE TEST HARNESS can deliver to, when the
+    /// harness is given the PMFW card `make_fake_gpu` builds
+    /// (`run_engine_ticks_until_with_gpus`).
     ///
-    /// `run_engine_ticks_until` passes no OpenFan controller and no hwmon
-    /// controller, so since `OFN-j` an openfan-member control in that harness is
-    /// correctly classified `BackendUnavailable` — listed as skipped, and absent
-    /// from `control_outputs` per the 277-k invariant. The GPU backend is not
-    /// optional in the tick body, so a GPU member is deliverable there.
+    /// The harness passes no OpenFan controller and no hwmon controller, so
+    /// since `OFN-j` an openfan-member control there is correctly classified
+    /// `BackendUnavailable` — listed as skipped, and absent from
+    /// `control_outputs` per the 277-k invariant. This used to rely on every GPU
+    /// member being deliverable whether or not its card existed, which was
+    /// `GPU-a`'s defect (DEC-445); the member now names a card the harness
+    /// really has.
     ///
     /// Use this wherever a test needs a control that genuinely COMMANDS
     /// something; use `openfan_control` where the member source is the subject.
@@ -3329,9 +3336,11 @@ mod tests {
             curves: vec![linear_curve("lin", "cpu")],
         };
         let cache = make_cache_with_sensor("cpu", 40.0);
+        let dir = tempfile::tempdir().unwrap();
+        let (gpu, _curve) = make_fake_gpu(&dir);
 
         let observed = cache.clone();
-        run_engine_ticks_until(cache.clone(), Some(profile), 1, move || {
+        run_engine_ticks_until_with_gpus(cache.clone(), Some(profile), vec![gpu], 1, move || {
             observed.read_with(|s| !s.control_outputs.is_empty())
         })
         .await;
@@ -3382,13 +3391,15 @@ mod tests {
             curves: vec![linear_curve("lin", "cpu")],
         };
         let cache = make_cache_with_sensor("cpu", 40.0); // nowhere near emergency
+        let dir = tempfile::tempdir().unwrap();
+        let (gpu, _curve) = make_fake_gpu(&dir);
 
         let observed = cache.clone();
         let phase = Arc::new(AtomicU8::new(0));
         let p = phase.clone();
         let saw_output = Arc::new(AtomicU8::new(0));
         let saw = saw_output.clone();
-        run_engine_ticks_until(cache.clone(), Some(profile), 1, move || {
+        run_engine_ticks_until_with_gpus(cache.clone(), Some(profile), vec![gpu], 1, move || {
             if p.load(Ordering::SeqCst) == 0 {
                 if observed.read_with(|s| !s.control_outputs.is_empty()) {
                     // A real duty is on the wire. Record that we saw it — the
@@ -3472,13 +3483,29 @@ mod tests {
         ticks: u32,
         ready: impl Fn() -> bool,
     ) {
+        run_engine_ticks_until_with_gpus(cache, profile, Vec::new(), ticks, ready).await;
+    }
+
+    /// [`run_engine_ticks_until`] with AMD GPUs attached, for a test that needs
+    /// a control which really commands something (`deliverable_control`).
+    ///
+    /// Real time only: a GPU write is a `spawn_blocking`, and an outstanding one
+    /// suspends paused time's auto-advance (DEC-272 trap 2), so a
+    /// `start_paused` caller must keep the GPU-less form.
+    async fn run_engine_ticks_until_with_gpus(
+        cache: Arc<StateCache>,
+        profile: Option<DaemonProfile>,
+        gpu_infos: Vec<crate::hwmon::gpu_detect::AmdGpuInfo>,
+        ticks: u32,
+        ready: impl Fn() -> bool,
+    ) {
         let (tx, rx) = tokio::sync::watch::channel(false);
         let handle = tokio::spawn(profile_engine_loop(
             cache,
             Arc::new(Mutex::new(profile)),
             Arc::new(parking_lot::RwLock::new(None)),
             None,
-            Vec::new(),
+            gpu_infos,
             Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new())),
             Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
             Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
@@ -7314,6 +7341,16 @@ mod tests {
         hwmon_headers: Vec<crate::hwmon::pwm_discovery::PwmHeaderDescriptor>,
         ready: impl Fn(&crate::health::state::DaemonState) -> bool,
     ) -> Arc<StateCache> {
+        run_loop_with_backends(profile, hwmon_headers, vec![], ready).await
+    }
+
+    /// [`run_loop_with_hwmon_headers`] with AMD GPUs too (`GPU-a`).
+    async fn run_loop_with_backends(
+        profile: DaemonProfile,
+        hwmon_headers: Vec<crate::hwmon::pwm_discovery::PwmHeaderDescriptor>,
+        gpu_infos: Vec<crate::hwmon::gpu_detect::AmdGpuInfo>,
+        ready: impl Fn(&crate::health::state::DaemonState) -> bool,
+    ) -> Arc<StateCache> {
         let cache = make_cache_with_sensor("cpu", 50.0); // well under any trigger
         let writes: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let ctrl = crate::hwmon::pwm_control::HwmonPwmController::new(
@@ -7331,7 +7368,7 @@ mod tests {
             Arc::new(Mutex::new(Some(profile))),
             Arc::new(parking_lot::RwLock::new(None)), // no OpenFan — isolates the hwmon leg
             Some(Arc::new(Mutex::new(ctrl))),
-            vec![], // no GPU
+            gpu_infos,
             Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new())),
             Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
             Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
@@ -7452,6 +7489,75 @@ mod tests {
             !outputs.iter().any(|o| o.control_id == "c"),
             "a control reported as commanding nothing must be absent from \
              control_outputs — got {outputs:?}"
+        );
+    }
+
+    /// [SAFETY-adjacent] `GPU-a` (DEC-445) — the CALL SITE for GPU members.
+    ///
+    /// A pre-RDNA3 card (legacy `pwm1`, no PMFW `fan_curve`) has never been
+    /// written by the engine, yet a control bound only to it was called
+    /// deliverable and so was never listed. `legacy` is the discriminating arm:
+    /// only a tick body that hands `note_backend_unavailable` the GPU backend's
+    /// own writable set can list it. `pmfw`, bound to a card with a `fan_curve`,
+    /// is the opposite arm — it must still be commanded, so a gate stuck at
+    /// "never deliverable" fails. Driven through the real loop for `OFN-ah`'s
+    /// reason: the argument the tick body passes is what is most likely wrong.
+    #[tokio::test]
+    async fn loop_reports_a_control_of_a_legacy_gpu_as_backend_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pmfw_gpu, _curve) = make_fake_gpu(&dir);
+        let legacy_gpu = crate::hwmon::gpu_detect::AmdGpuInfo {
+            pci_bdf: "0000:0a:00.0".into(),
+            pci_device_id: 0x73bf, // RX 6800 XT: pre-RDNA3, so the legacy path
+            marketing_name: Some("RX 6800 XT".into()),
+            fan_curve_path: None,
+            has_pwm: true,
+            has_pwm_enable: true,
+            ..pmfw_gpu.clone()
+        };
+        assert!(
+            legacy_gpu.can_write_legacy_pwm() && legacy_gpu.fan_curve_path.is_none(),
+            "fixture check: a card only the legacy verify/reset can write"
+        );
+        let gpu_control = |id: &str, member: &str| {
+            let mut c = openfan_control(id, "cv", member);
+            c.members[0].source = "amd_gpu".into();
+            c
+        };
+        let profile = DaemonProfile {
+            id: "p".into(),
+            name: "P".into(),
+            version: 7,
+            description: String::new(),
+            controls: vec![
+                gpu_control("legacy", "amd_gpu:0000:0a:00.0"),
+                gpu_control("pmfw", "amd_gpu:0000:03:00.0"),
+            ],
+            curves: vec![linear_curve("cv", "cpu")],
+        };
+
+        let cache = run_loop_with_backends(profile, vec![], vec![pmfw_gpu, legacy_gpu], |s| {
+            !s.skipped_controls.is_empty()
+        })
+        .await;
+
+        let (skipped, outputs) =
+            cache.read_with(|s| (s.skipped_controls.clone(), s.control_outputs.clone()));
+        let listed: Vec<&str> = skipped.iter().map(|c| c.control_id.as_str()).collect();
+        assert_eq!(
+            listed,
+            ["legacy"],
+            "only the control of the card the engine cannot write is listed"
+        );
+        assert_eq!(skipped[0].reason, SkipReason::BackendUnavailable);
+        assert!(
+            !outputs.iter().any(|o| o.control_id == "legacy"),
+            "a control reported as commanding nothing must be absent from \
+             control_outputs — got {outputs:?}"
+        );
+        assert!(
+            outputs.iter().any(|o| o.control_id == "pmfw"),
+            "the PMFW card's control is still commanded — got {outputs:?}"
         );
     }
 

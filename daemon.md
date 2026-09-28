@@ -5,7 +5,7 @@
 A Rust daemon (`control-ofc-daemon`) that controls PC fans via three backends:
 - **OpenFan** — custom serial (USB) fan controller
 - **hwmon** — motherboard fans via Linux sysfs (`/sys/class/hwmon/`)
-- **AMD GPU** — RDNA3+ PMFW fan curves or legacy hwmon PWM
+- **AMD GPU** — RDNA3+ PMFW fan curves (the only GPU path the engine drives); a pre-RDNA3 card's legacy hwmon PWM is written by the GPU fan verify and reset only (DEC-445)
 
 Exposes an HTTP API over a Unix domain socket for the PySide6 GUI.
 
@@ -845,7 +845,13 @@ unreachable). From **2.55.0** it is resolved per MEMBER (`OFN-al`, DEC-412): an
 control bound only to such headers is listed on a board with writable ones too
 — except on a boot where `HwmonBackend::new` could not take the controller lock
 within 250 ms, which leaves the set unmeasured (`HwmonTargets::Unmeasured`) and
-every `hwmon:` member deliverable, the per-backend answer, for that boot. Raised only when EVERY member is undeliverable; a partly-live
+every `hwmon:` member deliverable, the per-backend answer, for that boot. From
+**DEC-445** (`GPU-a`) an `amd_gpu:` member is deliverable only when its card is in
+`GpuBackend::delivery_targets` — detected, with a PMFW `fan_curve` — so a control
+bound only to a pre-RDNA3 card, a read-only RDNA4 or a card not on this machine is
+listed; `intel_gpu`, `nvidia_gpu` and any source no backend knows are never
+deliverable. Before it every non-OpenFan, non-hwmon member counted as deliverable, on
+the false premise that validation rejected an unwritable GPU. Raised only when EVERY member is undeliverable; a partly-live
 control is still commanding fans and is logged once per activation instead. Additive and omitted when
 empty, so an older client sees the wire shape it always did and a newer client
 reads `skipped_controls = []` from an older daemon. See Safety Model item 3.

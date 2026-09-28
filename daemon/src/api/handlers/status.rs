@@ -186,10 +186,15 @@ pub async fn capabilities_handler(
     // AMD GPU detection
     let primary_gpu = crate::hwmon::gpu_detect::select_primary_gpu(&state.amd_gpus);
     let amd_gpu_cap = if let Some(gpu) = primary_gpu {
-        // Fan write requires either PMFW fan_curve or legacy hwmon pwm1+enable.
-        // The legacy half is canonicalised in `AmdGpuInfo::can_write_legacy_pwm`
-        // so handlers and capability scoring agree on the same rule (DEC-098).
-        let fan_write = gpu.fan_curve_path.is_some() || gpu.can_write_legacy_pwm();
+        // DEC-445 (`DC-ch`): "can a profile drive this fan" — PMFW `fan_curve`
+        // only, because that is all the engine's GPU backend writes. A pre-RDNA3
+        // card keeps `fan_control_method: "hwmon_pwm"`, since verify and reset do
+        // write its legacy `pwm1` (`AmdGpuInfo::can_write_legacy_pwm`, DEC-098),
+        // but no engine has ever driven it, so it is not reported writable. The
+        // engine's `backend_unavailable` classification reads the same predicate
+        // (`GpuBackend::delivery_targets`), so for the card described here the two
+        // agree; `devices.amd_gpu` describes only the primary card (`GPU-b`).
+        let fan_write = gpu.fan_curve_path.is_some();
         let kernel_warnings = match crate::hwmon::kernel_warnings::read_kernel_release() {
             Some(release) => crate::hwmon::kernel_warnings::detect_kernel_warnings(&release, gpu),
             None => Vec::new(),

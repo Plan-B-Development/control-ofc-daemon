@@ -3019,6 +3019,85 @@ async fn rdna3_with_pwm1_enable_but_no_fan_curve_is_read_only_everywhere() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// DEC-445 (`DC-ch`): a pre-RDNA3 card's legacy `pwm1` is written by verify and
+/// reset and by nothing else — the engine's GPU backend drives PMFW only — so
+/// `/capabilities` keeps `fan_control_method: "hwmon_pwm"` and reports
+/// `fan_write_supported: false`. Older daemons said `true`, telling the user a
+/// profile controlled a fan no engine had ever written. Reset still works on it.
+/// The PMFW card is the opposite arm, so a flag stuck at `false` fails too.
+#[tokio::test]
+async fn a_legacy_gpu_is_verify_only_and_a_pmfw_gpu_is_writable() {
+    use control_ofc_daemon::hwmon::gpu_detect::AmdGpuInfo;
+    let bdf = "0000:0a:00.0";
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("pwm1_enable"), "1\n").unwrap();
+    std::fs::write(dir.path().join("pwm1"), "200\n").unwrap();
+    let rx6800xt = AmdGpuInfo {
+        pci_bdf: bdf.into(),
+        pci_device_id: 0x73BF,
+        pci_revision: 0xC1,
+        pci_class: 0x030000,
+        marketing_name: Some("RX 6800 XT".into()),
+        hwmon_path: dir.path().to_path_buf(),
+        fan_curve_path: None,
+        fan_zero_rpm_path: None,
+        is_discrete: true,
+        has_fan_rpm: true,
+        has_pwm: true,
+        has_pwm_enable: true,
+        overdrive_enabled: false,
+    };
+    assert!(
+        rx6800xt.can_write_legacy_pwm(),
+        "fixture check: a card the legacy verify/reset can write"
+    );
+    let pmfw_curve = dir.path().join("fan_curve");
+    std::fs::write(&pmfw_curve, "").unwrap();
+    let rx9070xt = AmdGpuInfo {
+        pci_bdf: "0000:03:00.0".into(),
+        pci_device_id: 0x7550,
+        pci_revision: 0xC0,
+        marketing_name: Some("RX 9070 XT".into()),
+        fan_curve_path: Some(pmfw_curve),
+        has_pwm: false,
+        has_pwm_enable: false,
+        overdrive_enabled: true,
+        ..rx6800xt.clone()
+    };
+
+    for (card, method, writable) in [
+        (rx6800xt, "hwmon_pwm", false),
+        (rx9070xt, "pmfw_curve", true),
+    ] {
+        let (path, shutdown, _sock_dir) =
+            start_test_server(test_app_state_with_amd_gpu_info(card)).await;
+        let (status, json) = uds_get(&path, "/capabilities").await;
+        assert_eq!(status, 200);
+        let cap = &json["devices"]["amd_gpu"];
+        assert_eq!(cap["fan_control_method"], method, "{cap:#}");
+        assert_eq!(cap["fan_write_supported"], writable, "{method}: {cap:#}");
+        if method == "hwmon_pwm" {
+            // Verify-only is not read-only: reset still gives the card back.
+            let (status, json) = uds_post(
+                &path,
+                &format!("/gpu/{bdf}/fan/reset"),
+                &serde_json::json!({}),
+            )
+            .await;
+            assert_eq!(status, 200, "reset on a legacy card: {json:#}");
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("pwm1_enable"))
+                    .unwrap()
+                    .trim(),
+                "2",
+                "the legacy reset put the card back on automatic"
+            );
+        }
+        let _ = shutdown.send(());
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 // ── /profile/deactivate (DEC-097) ───────────────────────────────────────
 
 /// Helper: test_app_state with an active profile pre-populated.

@@ -189,11 +189,13 @@ _/usr/lib/modprobe.d/control-ofc-superio.conf_, _/usr/lib/control-ofc/control-of
 
 # AMD GPU SUPPORT
 
-The daemon controls AMD GPU fans via one of two sysfs interfaces:
+The daemon writes AMD GPU fans through one of two sysfs interfaces:
 
 . PMFW *fan_curve* -- required for RDNA3+ cards (RX 7000 / RX 9000 series).
-. Legacy *pwm1_enable* + *pwm1* pair -- used on RDNA2 and older
-  (RX 6000 series and earlier).
+  This is the only path a profile drives.
+. Legacy *pwm1_enable* + *pwm1* pair -- RDNA2 and older (RX 6000 series and
+  earlier). Written by the GPU fan verify and reset only; no profile drives
+  these fans.
 
 RDNA3+ cards do *not* accept *pwm1_enable=1* and must use the PMFW path.
 

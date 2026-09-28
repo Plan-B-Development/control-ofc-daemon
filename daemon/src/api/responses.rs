@@ -1316,8 +1316,10 @@ pub struct AmdGpuCapability {
     pub pmfw_supported: bool,
     /// Whether fan RPM reading is available.
     pub fan_rpm_available: bool,
-    /// Whether this GPU has fan write capability (PMFW curve, or pre-RDNA3 hwmon
-    /// pwm1+enable — `AmdGpuInfo::can_write_legacy_pwm`).
+    /// Whether a profile can drive this GPU's fan: a PMFW `fan_curve` exists
+    /// (DEC-445). A pre-RDNA3 card reports `fan_control_method: "hwmon_pwm"` and
+    /// `false` here — verify and reset write its legacy `pwm1`, the engine never
+    /// does. Older daemons reported `true` for it.
     pub fan_write_supported: bool,
     /// Whether this is a discrete (VGA) GPU vs render-only.
     pub is_discrete: bool,

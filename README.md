@@ -197,7 +197,8 @@ CLI / environment reference: [`daemon/README.md`](https://github.com/Plan-B-Deve
 ## Architecture summary
 
 - **Three fan backends**: OpenFanController (serial/USB), motherboard hwmon (sysfs
-  PWM), and AMD GPU (RDNA3+ PMFW fan curves, legacy hwmon PWM for pre-RDNA3).
+  PWM), and AMD GPU (RDNA3+ PMFW fan curves; a pre-RDNA3 card's legacy hwmon PWM
+  is used by the GPU fan verify and reset only).
 - **HTTP over Unix domain socket** at `/run/control-ofc/control-ofc.sock`, exposing
   snapshot reads (`/poll`) — the GUI's 1 Hz poll path (the unused `/events` SSE
   stream was removed at v2.5.1, DEC-198).

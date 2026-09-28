@@ -76,7 +76,8 @@ impl AmdGpuInfo {
     /// Fan control method available on this GPU.
     ///
     /// - `"pmfw_curve"`: PMFW fan_curve exists (RDNA3+ with overdrive enabled)
-    /// - `"hwmon_pwm"`: [`Self::can_write_legacy_pwm`] (pre-RDNA3 only)
+    /// - `"hwmon_pwm"`: [`Self::can_write_legacy_pwm`] (pre-RDNA3 only) — verify
+    ///   and reset only; no profile drives it (DEC-445)
     /// - `"read_only"`: can read fan RPM but no write path available
     /// - `"none"`: no fan interface at all
     pub fn fan_control_method(&self) -> &'static str {
@@ -110,9 +111,10 @@ impl AmdGpuInfo {
     ///   qualifies, whatever files exist. Its only write path is PMFW
     ///   `fan_curve`.
     ///
-    /// Capability scoring at `status.rs` and the GPU reset/verify handlers
-    /// must agree on this rule to avoid drift between `/capabilities` and the
-    /// actual handler outcome (DEC-098).
+    /// `fan_control_method` and the GPU reset/verify handlers must agree on
+    /// this rule to avoid drift between `/capabilities` and the actual handler
+    /// outcome (DEC-098). It is NOT a profile write path: the engine drives PMFW
+    /// only, so `fan_write_supported` does not read it (DEC-445).
     pub fn can_write_legacy_pwm(&self) -> bool {
         self.has_pwm && self.has_pwm_enable && !is_rdna3_or_rdna4(self.pci_device_id)
     }

@@ -64,7 +64,8 @@ pub struct SkipRecord {
 /// Distinct from every other skip reason: the curve resolved and an output was
 /// computed: it is the *delivery* that has nowhere to go, because no backend
 /// can write a member — its source's backend is absent, or (`OFN-al`) its
-/// header is one the daemon cannot write.
+/// header is one the daemon cannot write, or (`GPU-a`) its GPU has no PMFW
+/// `fan_curve`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Deliverability {
     /// No members at all. Not a fault — a member-less control still publishes a
@@ -94,18 +95,28 @@ pub enum HwmonTargets<'a> {
     Writable(&'a HashSet<String>),
 }
 
-/// The backends a control's members are resolved against (`OFN-j`, `OFN-al`).
+/// The backends a control's members are resolved against (`OFN-j`, `OFN-al`,
+/// `GPU-a`).
 #[derive(Debug, Clone, Copy)]
 pub struct DeliveryTargets<'a> {
     /// An OpenFanController has been adopted.
     pub openfan: bool,
     pub hwmon: HwmonTargets<'a>,
+    /// The `amd_gpu:` fan ids the GPU backend can write — every detected card
+    /// with a PMFW `fan_curve` (`GpuBackend::delivery_targets`). Nothing else
+    /// on a GPU is written by the engine: a pre-RDNA3 card's legacy `pwm1` is
+    /// used only by verify and reset (DEC-445).
+    pub amd_gpu: &'a HashSet<String>,
 }
+
+/// No GPU fan the engine can write, for [`DeliveryTargets::backends`].
+static NO_GPU_FANS: std::sync::LazyLock<HashSet<String>> = std::sync::LazyLock::new(HashSet::new);
 
 impl DeliveryTargets<'static> {
     /// Backend presence alone, with every header of a present hwmon backend
     /// taken as writable — the per-backend answer this replaced, for a caller
-    /// that has no writable set to consult.
+    /// that has no writable set to consult — and no GPU fan the engine can
+    /// write.
     pub fn backends(openfan: bool, hwmon: bool) -> Self {
         Self {
             openfan,
@@ -114,6 +125,7 @@ impl DeliveryTargets<'static> {
             } else {
                 HwmonTargets::Absent
             },
+            amd_gpu: &NO_GPU_FANS,
         }
     }
 }
@@ -128,9 +140,17 @@ impl DeliveryTargets<'static> {
 /// which also covers an id this board never discovered (a profile imported
 /// from another machine): nothing can write that either.
 ///
-/// GPU sources are always deliverable: the GPU backend is not optional in the
-/// tick body (`gpu_be` is a value, not an `Option`), and a GPU with no writable
-/// fan path is rejected far earlier, at profile validation (DEC-102).
+/// An `amd_gpu:` member is deliverable only when its card is one the GPU
+/// backend can write (`GPU-a`, DEC-445). This used to say every GPU member was
+/// deliverable because a GPU with no write path "is rejected at profile
+/// validation" — it is not: validation checks only that the source name is
+/// known. So a control bound to a read-only RDNA4, a pre-RDNA3 card (whose
+/// legacy `pwm1` the engine has never written) or a card not on this machine
+/// commanded nothing and was never listed.
+///
+/// Every other source is undeliverable: `intel_gpu` and `nvidia_gpu` have no
+/// write path at all (DEC-121/DEC-204), and a source no backend knows — which a
+/// boot path that skips `validate()` can still carry — has none either.
 pub fn member_is_deliverable(
     member: &crate::profile::ControlMember,
     targets: DeliveryTargets<'_>,
@@ -142,7 +162,8 @@ pub fn member_is_deliverable(
             HwmonTargets::Unmeasured => true,
             HwmonTargets::Writable(ids) => ids.contains(&member.member_id),
         },
-        _ => true,
+        "amd_gpu" => targets.amd_gpu.contains(&member.member_id),
+        _ => false,
     }
 }
 
@@ -557,13 +578,65 @@ mod tests {
             ),
             Deliverability::None
         );
-        // GPU is never a backend that can be absent here — `gpu_be` is a value,
-        // not an `Option` — so a GPU-only control is always deliverable.
+    }
+
+    /// `GPU-a` (DEC-445): an `amd_gpu:` member is deliverable only when its card
+    /// is in the GPU backend's writable set. The discriminating arm is the
+    /// first: before the fix every GPU member was deliverable, so only the new
+    /// lookup can list a GPU-only control. The second is the opposite arm, so a
+    /// classifier stuck at "never" fails too.
+    #[test]
+    fn amd_gpu_members_are_resolved_against_the_pmfw_set() {
+        // `control_with` names members `{source}:{index}`.
+        let legacy_only = control_with(&["amd_gpu"]);
         assert_eq!(
-            control_deliverability(
-                &control_with(&["amd_gpu"]),
-                DeliveryTargets::backends(false, false)
-            ),
+            control_deliverability(&legacy_only, DeliveryTargets::backends(true, true)),
+            Deliverability::None,
+            "a GPU the backend cannot write (no PMFW fan_curve, or not on this machine)"
+        );
+        let pmfw: HashSet<String> = ["amd_gpu:0".to_string()].into();
+        let targets = DeliveryTargets {
+            openfan: false,
+            hwmon: HwmonTargets::Absent,
+            amd_gpu: &pmfw,
+        };
+        assert_eq!(
+            control_deliverability(&legacy_only, targets),
+            Deliverability::All,
+            "a PMFW card the backend writes"
+        );
+        assert_eq!(
+            control_deliverability(&control_with(&["amd_gpu", "amd_gpu"]), targets),
+            Deliverability::Partial,
+            "one PMFW card and one the backend cannot write"
+        );
+    }
+
+    /// Sources no backend writes are never deliverable (DEC-445): Intel and
+    /// NVIDIA GPU fans have no write path, and an unknown source — which a boot
+    /// path that skips `validate()` can carry — has none either. Every backend
+    /// is present, so only the source can be the reason.
+    #[test]
+    fn sources_no_backend_writes_are_never_deliverable() {
+        let all_gpus: HashSet<String> = ["intel_gpu:0".to_string(), "nvidia_gpu:0".to_string()]
+            .into_iter()
+            .chain(["bogus:0".to_string()])
+            .collect();
+        let everything = DeliveryTargets {
+            openfan: true,
+            hwmon: HwmonTargets::Unmeasured,
+            amd_gpu: &all_gpus,
+        };
+        for source in ["intel_gpu", "nvidia_gpu", "bogus"] {
+            assert_eq!(
+                control_deliverability(&control_with(&[source]), everything),
+                Deliverability::None,
+                "{source}"
+            );
+        }
+        // The opposite arm: the same targets deliver the three writable sources.
+        assert_eq!(
+            control_deliverability(&control_with(&["openfan", "hwmon"]), everything),
             Deliverability::All
         );
     }
@@ -601,9 +674,11 @@ mod tests {
     #[test]
     fn hwmon_members_are_resolved_against_the_writable_set() {
         let writable: HashSet<String> = ["hwmon:1".to_string()].into();
+        let pmfw: HashSet<String> = ["amd_gpu:0".to_string()].into();
         let mixed = DeliveryTargets {
             openfan: false,
             hwmon: HwmonTargets::Writable(&writable),
+            amd_gpu: &pmfw,
         };
         // `control_with` names members `{source}:{index}`.
         assert_eq!(
@@ -626,6 +701,7 @@ mod tests {
         let unmeasured = DeliveryTargets {
             openfan: false,
             hwmon: HwmonTargets::Unmeasured,
+            amd_gpu: &pmfw,
         };
         assert_eq!(
             control_deliverability(&control_with(&["hwmon"]), unmeasured),
