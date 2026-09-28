@@ -136,12 +136,16 @@ package() {
     # Super-I/O probe guard (DEC-332). The modules-load.d file above asks for
     # nct6775 and w83627ehf; on a Gigabyte board with an ITE Super-I/O their
     # probe writes a config-mode unlock that can latch an eSPI-to-LPC bridge and
-    # hide the secondary chip's fan headers until a full power cut. The guard
-    # suppresses them on exactly those boards and is a no-op everywhere else.
+    # hide the secondary chip's fan headers until a reboot, or on some boards
+    # until the machine is powered down at the wall.
+    # The guard suppresses them on every Gigabyte board (DEC-424: all use ITE
+    # Super-I/O), and on a listed board whose firmware reports no vendor; it is
+    # a no-op everywhere else.
     #
     # /usr/lib/modprobe.d, not /etc: this is vendor policy, and a user who wants
-    # it gone drops an overriding file in /etc/modprobe.d (which wins) or edits
-    # nothing we will overwrite on upgrade. Not in backup=() for the same reason.
+    # it gone creates an empty /etc/modprobe.d/control-ofc-superio.conf, which
+    # masks it (the same name matters: a differently named file does not reliably
+    # win), and edits nothing we will overwrite on upgrade. Not in backup=() for the same reason.
     install -Dm755 packaging/control-ofc-superio-guard \
         "$pkgdir/usr/lib/control-ofc/control-ofc-superio-guard"
     install -Dm644 packaging/modprobe.d-control-ofc-superio.conf \

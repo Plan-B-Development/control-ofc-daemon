@@ -3,7 +3,7 @@ post_install() {
 :: control-ofc-daemon installed.
 
    Start now:        sudo systemctl enable --now control-ofc-daemon
-   Load modules:     sudo systemctl start systemd-modules-load   (or reboot)
+   Load modules:     sudo systemctl restart systemd-modules-load   (or reboot)
    Setup guide:      /usr/share/doc/control-ofc-daemon/USER_GUIDE.md
    Command, files:   man control-ofc-daemon
    Hardware check:   open the GUI -> Hardware page
@@ -23,8 +23,15 @@ post_install() {
                          (e.g. it87-dkms-git / nct6687d-dkms-git — see the
                          package optdepends and USER_GUIDE.md, "Hardware
                          sensor modules").
-     * Gigabyte / ASUS:  may need 'acpi_enforce_resources=lax' on the kernel
-                         command line for the Super I/O chip to bind.
+     * ACPI conflict:    an it87 chip (Gigabyte; ASUS AM4) may need
+                         'options it87 ignore_resource_conflict=1' in
+                         /etc/modprobe.d/it87.conf to bind. The Nuvoton
+                         drivers have no such option: they need
+                         'acpi_enforce_resources=lax' on the kernel command
+                         line, which affects every driver, so use it only then.
+     * Gigabyte:         the package keeps nct6775/w83627ehf from probing
+                         (journalctl -b -t control-ofc-superio-guard); an empty
+                         /etc/modprobe.d/control-ofc-superio.conf turns that off.
      * AMD RDNA3+ GPU:   PMFW fan curves need 'amdgpu.ppfeaturemask=0xffffffff'
                          on the kernel command line.
    The GUI's Hardware page (readiness + Super-I/O detection) detects each of
@@ -84,23 +91,30 @@ post_upgrade() {
         echo "   updated example in case the required directives changed:"
         echo "   /usr/share/doc/control-ofc-daemon/nvidia-telemetry.conf.example"
     fi
-    # Only speak up on a board that is actually affected, and only when the
-    # symptom is present -- a Super-I/O chip the DMI table expects is missing.
-    # The guard shipped by this version PREVENTS the latch on the next boot; it
-    # does NOT clear one already set, and nothing short of removing mains power
-    # does. Without this the user restarts the daemon as told, sees no change,
-    # and has no pointer to the recovery except a journal line they may not read.
-    if [[ -r /sys/class/dmi/id/board_vendor ]] &&
+    # Only speak up once, on the upgrade that first brings the guard to every
+    # Gigabyte board (2.56.1, DEC-424), and only on a board that could be
+    # affected: a Gigabyte vendor with exactly one ITE chip visible. That is
+    # also the ordinary state of a single-chip board, so the wording is
+    # conditional, and it fires once rather than on every upgrade. The guard
+    # PREVENTS the latch from the next boot; it does NOT clear one already set.
+    # Without this the user restarts the daemon as told, sees no change, and has
+    # no pointer to the recovery except a journal line they may not read.
+    # The recovery is DEC-421's ladder; the old "look for DEVID=0x8883 in dmesg"
+    # check is gone, because the kernel logs that line at debug level only.
+    if [[ -n "${2-}" ]] && (( $(vercmp "$2" 2.56.1) < 0 )) &&
+       [[ -r /sys/class/dmi/id/board_vendor ]] &&
        grep -qi gigabyte /sys/class/dmi/id/board_vendor 2>/dev/null &&
        [[ $(ls -d /sys/class/hwmon/hwmon*/ 2>/dev/null |
             xargs -r -I{} cat {}name 2>/dev/null |
             grep -c '^it8') -eq 1 ]]; then
-        echo ":: This version adds a guard that stops nct6775/w83627ehf hiding a second"
-        echo "   Super-I/O chip on Gigabyte ITE boards. Only one ITE chip is visible here."
-        echo "   If fan headers are missing, check: sudo dmesg | grep it87"
-        echo "   A line reading 'Unsupported chip (DEVID=0x8883)' means a bridge is latched."
-        echo "   The guard prevents it recurring but CANNOT clear it — that needs a full"
-        echo "   power cut (PSU switch or unplug); a reboot will not work. Full steps:"
+        echo ":: This package now keeps nct6775/w83627ehf from probing on every Gigabyte"
+        echo "   board: their probe can hide a board's second Super-I/O chip. One ITE chip"
+        echo "   is visible here, which is normal on a single-chip board. If fan headers"
+        echo "   you expect are missing, the guard will not bring them back by itself:"
+        echo "   do not run sensors-detect (it probes the same way), reboot, and if they"
+        echo "   are still missing, shut down and switch off at the wall (PSU switch or"
+        echo "   unplug) -- the bridge that latches runs on standby power."
+        echo "   Full steps:"
         echo "   https://github.com/Plan-B-Development/control-ofc-gui/blob/main/manual/hardware-troubleshooting.md"
     fi
 }

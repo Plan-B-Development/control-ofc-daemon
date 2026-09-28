@@ -460,6 +460,10 @@ impl HardwareAssessment {
     }
 }
 
+/// Modules the package's Super-I/O guard (`packaging/control-ofc-superio-guard`)
+/// declines on a Gigabyte board.
+const SUPERIO_GUARD_MODULES: &[&str] = &["nct6775", "w83627ehf"];
+
 /// Map a passive Super-I/O detection report (DEC-202) into readiness items, so
 /// board-specific "your chip has no driver loaded" guidance surfaces in the
 /// existing readiness list alongside the generic `no_pwm_controls` item. Lives
@@ -508,6 +512,23 @@ pub fn superio_readiness_items(
                  appear.",
             )
         };
+        // `DC-bw` (i): on a Gigabyte board the package's Super-I/O guard declines
+        // `nct6775` and `w83627ehf`, so a `modprobe` of either reports success and
+        // binds nothing. The report carries no board vendor, so this is keyed on
+        // the modules and says which boards it applies to.
+        let guard_note = if !any_loaded
+            && report.chips.iter().any(|c| {
+                c.recommendation.is_some()
+                    && SUPERIO_GUARD_MODULES.contains(&c.expected_module.as_str())
+            }) {
+            " On a Gigabyte board this package's Super-I/O guard declines nct6775 and \
+             w83627ehf, because Gigabyte boards carry their fans on ITE chips and those \
+             modules' probe can hide a second one. Loading either there reports success and \
+             nothing appears; `sudo journalctl -b -t control-ofc-superio-guard` shows each \
+             module it declined."
+        } else {
+            ""
+        };
         items.push(
             ReadinessItem::new(
                 "superio_driver_unloaded",
@@ -516,7 +537,7 @@ pub fn superio_readiness_items(
                 title,
                 format!(
                     "{} Super-I/O chip(s) were detected but no matching kernel driver is bound: \
-                     {}. {tail}",
+                     {}. {tail}{guard_note}",
                     unbound.len(),
                     unbound.join(", ")
                 ),
@@ -820,6 +841,91 @@ mod tests {
         assert!(unloaded.detail.contains("it8688 → it87"));
         assert!(unloaded.reboot_may_be_required);
         assert_eq!(unloaded.severity, ReadinessSeverity::Warning);
+    }
+
+    /// `DC-bw` (i): on a Gigabyte board the package's guard declines `nct6775`
+    /// and `w83627ehf`, so "load the driver" is a promise a `modprobe` there
+    /// cannot keep. The item names the guard exactly when an unbound chip wants
+    /// one of those modules and it is not loaded — asserted against the other
+    /// two states, so a note that always or never appears fails.
+    #[test]
+    fn the_unbound_item_names_the_guard_only_for_a_module_it_declines() {
+        use crate::hwmon::superio::{
+            Evidence, SuperIoChip, SuperIoRecommendation, SuperIoReport, SuperIoVendor,
+        };
+        let report =
+            |chip: &str, module: &str, vendor: SuperIoVendor, loaded: bool| SuperIoReport {
+                arch_supported: true,
+                chips: vec![SuperIoChip {
+                    chip_name: chip.into(),
+                    vendor,
+                    evidence: vec![Evidence::DmiBoardTable],
+                    confidence: crate::hwmon::classify::Confidence::Medium,
+                    bound_driver: None,
+                    expected_module: module.into(),
+                    module_loaded: loaded,
+                    hwmon_present: false,
+                    recommendation: Some(SuperIoRecommendation {
+                        module: module.into(),
+                        in_mainline: true,
+                        load_hint: "irrelevant here".into(),
+                        reason: "irrelevant here".into(),
+                        risk_notes: vec![],
+                    }),
+                    caveats: vec![],
+                }],
+                acpi_conflict_drivers: vec![],
+                notes: vec![],
+            };
+        let detail = |r: SuperIoReport| {
+            superio_readiness_items(&r)
+                .into_iter()
+                .find(|i| i.code == "superio_driver_unloaded")
+                .expect("an unbound chip with a recommendation must emit the item")
+                .detail
+        };
+        let guard = "control-ofc-superio-guard";
+
+        for module in SUPERIO_GUARD_MODULES {
+            let d = detail(report("nct6798", module, SuperIoVendor::Nuvoton, false));
+            assert!(
+                d.contains(guard),
+                "{module} unloaded must name the guard: {d}"
+            );
+            assert!(d.contains("Gigabyte"), "...and say which boards: {d}");
+        }
+        // A module the guard never touches: no note.
+        let ite = detail(report("it8696", "it87", SuperIoVendor::Ite, false));
+        assert!(!ite.contains(guard), "it87 is never declined: {ite}");
+        // Loaded but unbound: the guard did not decline it, so no note.
+        let loaded = detail(report("nct6798", "nct6775", SuperIoVendor::Nuvoton, true));
+        assert!(
+            !loaded.contains(guard),
+            "a loaded module was not declined: {loaded}"
+        );
+    }
+
+    /// The readiness note's module list is the guard's. Read from the shipped
+    /// modprobe file, so adding a module to the guard without the note fails.
+    #[test]
+    fn superio_guard_modules_match_the_shipped_modprobe_file() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../packaging/modprobe.d-control-ofc-superio.conf");
+        let text = std::fs::read_to_string(&path).expect("modprobe.d file is in the repo");
+        let mut guarded: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("install "))
+            .filter_map(|l| l.split_whitespace().nth(1))
+            .collect();
+        guarded.sort_unstable();
+        let mut ours = SUPERIO_GUARD_MODULES.to_vec();
+        ours.sort_unstable();
+        assert!(
+            !guarded.is_empty(),
+            "no install lines parsed from {}",
+            path.display()
+        );
+        assert_eq!(guarded, ours);
     }
 
     /// [HOST-d / DEC-327] The item fires for two different states and must not

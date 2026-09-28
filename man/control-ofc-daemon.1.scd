@@ -132,13 +132,20 @@ _/usr/lib/systemd/system-sleep/control-ofc-daemon_
 	The system-sleep hook (see *SIGUSR1*, *SIGUSR2*).
 
 _/etc/modules-load.d/control-ofc.conf_
-	Loads the common Super-I/O sensor drivers at boot.
+	Loads the common Super-I/O sensor drivers at boot. To stop loading one,
+	comment out its line; do not rename or delete the file, which pacman
+	restores at the next upgrade. Apply an edit with *systemctl restart
+	systemd-modules-load* or a reboot.
 
 _/usr/lib/modprobe.d/control-ofc-superio.conf_, _/usr/lib/control-ofc/control-ofc-superio-guard_
-	The Super-I/O guard: stops *nct6775* and *w83627ehf* from probing on a
-	Gigabyte board, where their probe can hide a second fan chip until the
-	machine is unplugged. To turn it off, create an empty
-	_/etc/modprobe.d/control-ofc-superio.conf_.
+	The Super-I/O guard: stops *nct6775* and *w83627ehf* from probing on
+	every Gigabyte board, and on a listed board whose firmware reports no
+	vendor. Their probe can hide a second fan chip until a reboot, and on
+	some boards until the machine is powered down at the wall. Each
+	suppression is logged: *journalctl -b -t control-ofc-superio-guard*.
+	To turn it off, create an empty
+	_/etc/modprobe.d/control-ofc-superio.conf_; a file of any other name
+	does not reliably override it.
 
 # ENVIRONMENT
 

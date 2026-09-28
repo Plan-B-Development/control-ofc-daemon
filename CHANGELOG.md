@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **The upgrade notice about the Super-I/O guard appears once** (DEC-441). It now shows only when
+  upgrading from a version older than 2.56.1, the release that extended the guard to every Gigabyte
+  board. It was reworded to give the current recovery steps: do not run `sensors-detect`, reboot,
+  and if the headers are still missing, power down at the wall. The old advice to look for a DEVID
+  line in `dmesg` is gone, because the kernel logs that line only at debug level. A fresh install
+  mentions the guard in three lines, and `systemd-modules-load` is now restarted, not started.
+- **The readiness item for an unbound Super-I/O chip mentions the guard** (DEC-441). When the chip's
+  module is `nct6775` or `w83627ehf`, the item now says that on a Gigabyte board the guard declines
+  them. There, loading either reports success and nothing appears. The item's code and fields are
+  unchanged.
+
+### Documentation
+
+- **The package's config comments, man page, README and user guide describe the current guard and
+  recovery steps** (DEC-441).
+  - The guard's reach, its `journalctl -t control-ofc-superio-guard` line, and its only off-switch (an
+    empty file with the same name) are covered.
+  - `/etc/modules-load.d/control-ofc.conf` is a `backup=` file: comment lines out rather than deleting
+    it, and restart `systemd-modules-load` after editing.
+  - The user guide widens the `sensors-detect` warning to every Gigabyte board. It also says the
+    thermal floor reaches fans no profile controls only in the emergency.
+  - The NVIDIA telemetry example names `nvidia-utils`. README links now work from the installed copy.
+
 ## [2.56.4] — 2026-09-27
 
 ### Fixed

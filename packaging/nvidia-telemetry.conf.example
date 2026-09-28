@@ -19,6 +19,7 @@
 #   telemetry and accept that trade-off.
 #
 # ────────────────────────────  TO ENABLE  ─────────────────────────────
+#   0. Install nvidia-utils, which provides libnvidia-ml.so.1.
 #   1. Set the config flag in /etc/control-ofc/daemon.toml:
 #          [detection]
 #          enable_nvidia_telemetry = true
