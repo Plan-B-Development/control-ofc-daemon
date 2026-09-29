@@ -2186,6 +2186,64 @@ pub(crate) mod tests {
         assert!(duties.last().is_some_and(|d| *d >= floor), "{duties:?}");
     }
 
+    /// `PTR-z`: the discovery HANDLER's `current_step` wiring, end to end through
+    /// the injected monitor-only walk root. While the run holds a window the slot
+    /// publishes it — the `perturbed` window names the planned perturbed duty —
+    /// and once the run has ended the slot carries none. `run_discovery`'s own
+    /// announce sequence is pinned separately; this pins the handler's fenced
+    /// `announce` closure and its terminal clear, either of which could be
+    /// dropped without any other test noticing.
+    #[tokio::test]
+    async fn a_running_discovery_publishes_its_current_step_and_clears_it() {
+        let (state, _writes, _tx, tmp) = build_verify_state_with(
+            Some(230),
+            crate::hwmon::roles::HeaderRole::ChassisFan,
+            Some(|raw| 300 + raw * 8),
+        );
+        let _tmp = tmp.expect("a duty was requested");
+        let empty_root = tempfile::tempdir().unwrap();
+        let (status, Json(body)) = crate::api::handlers::discovery::start_control_path_discovery(
+            state.clone(),
+            "hwmon:test:dev:pwm1".to_string(),
+            serde_json::from_value(serde_json::json!({"window_seconds": 2})).expect("request"),
+            empty_root.path(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let perturbed = body["perturbed_pct"].as_u64().expect("perturbed_pct") as u8;
+
+        // Presence first: the running slot publishes the window it holds.
+        let step = poll_until("a published perturbed window", || {
+            state
+                .control_path
+                .lock()
+                .as_ref()
+                .filter(|r| r.state == crate::api::discovery::STATE_RUNNING)
+                .and_then(|r| r.current_step.clone())
+                .filter(|s| s.phase == crate::api::discovery::STEP_PHASE_PERTURBED)
+        })
+        .await;
+        assert_eq!(step.duty_pct, perturbed, "{step:?}");
+        assert!(step.max_ms > 0 && step.started_unix_ms > 0, "{step:?}");
+
+        let (status, _) = crate::api::handlers::discovery::control_path_cancel_handler(
+            axum::extract::State(state.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let run = poll_until("the discovery", || {
+            state
+                .control_path
+                .lock()
+                .clone()
+                .filter(|r| r.state != crate::api::discovery::STATE_RUNNING)
+        })
+        .await;
+        assert_eq!(run.state, crate::api::discovery::STATE_CANCELLED, "{run:?}");
+        // Then the absence: nothing is being held once the run has ended.
+        assert_eq!(run.current_step, None, "{run:?}");
+    }
+
     /// [SAFETY] DEC-311: assigning `pump` to a header that is ALREADY held at 0
     /// by a live identify must release that hold.
     ///

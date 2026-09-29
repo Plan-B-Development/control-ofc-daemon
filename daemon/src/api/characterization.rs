@@ -276,9 +276,12 @@ pub struct CharPoint {
     pub rpm_after: Option<u16>,
     /// How long this point actually held.
     pub settle_ms: u64,
-    /// Time from the write to the first sub-sample whose RPM had moved beyond
-    /// the noise floor, when one was seen. `None` means it never moved (or the
-    /// tach is unreadable) — not that it responded instantly.
+    /// Time from the write to the first reading whose RPM had moved away from
+    /// `rpm_before` by more than the threshold `rpm_verdict` uses (`PTR-y`) —
+    /// a hold sub-sample, or the after-read at `settle_ms` — so a `changed`
+    /// point carries one unless no hold sample was readable. `None` means it
+    /// never moved (or the tach was unreadable) — not that it responded
+    /// instantly.
     pub first_change_ms: Option<u64>,
     /// `match` | `clamped` | `reverted` | `unavailable`
     pub readback_verdict: String,
@@ -830,10 +833,74 @@ pub fn resolve_settle(requested: Option<u64>) -> Duration {
 
 // ── Per-point and summary derivation (pure) ──────────────────────────
 
-/// Did this tach reading move enough to mean anything?
-fn rpm_moved(before: u16, after: u16) -> bool {
-    let delta = before.abs_diff(after);
-    delta > constants::CHARACTERIZATION_RPM_NOISE_FLOOR.max(before / 10)
+/// How far a tach reading must move from `before` to count as movement — the
+/// one rule behind both [`rpm_verdict`] and [`first_change_ms`] (`PTR-y`).
+///
+/// `PTR-m`: judged against the point's own measured noise where it has one —
+/// `stddev_rpm` over a window that SETTLED — rather than the proportional
+/// `before / 10`. The proportional rule scales with the reading, not with the
+/// tach's spread, so a smooth high-RPM device's genuine ~265 rpm steps read
+/// `unchanged` while the sweep-level `rpm_response` passed.
+///
+/// Falls back to the proportional rule when no trustworthy settled spread
+/// exists: a point that did not settle computed its σ over its own step
+/// transient, and using that would grade the step by itself — the bigger the
+/// response, the larger the "noise". Too few readings, or none, is no spread at
+/// all.
+fn rpm_move_threshold(before: u16, stability: Option<&PointStability>) -> f64 {
+    use crate::api::stats::{STABILITY_INSUFFICIENT, STABILITY_NOT_SETTLED, STABILITY_UNAVAILABLE};
+    let settled_sigma = stability
+        .filter(|st| {
+            ![
+                STABILITY_NOT_SETTLED,
+                STABILITY_INSUFFICIENT,
+                STABILITY_UNAVAILABLE,
+            ]
+            .contains(&st.verdict.as_str())
+        })
+        .and_then(|st| st.stddev_rpm);
+    match settled_sigma {
+        Some(sigma) => (sigma * constants::CHARACTERIZATION_RPM_VERDICT_SIGMA)
+            .max(f64::from(constants::CHARACTERIZATION_RPM_NOISE_FLOOR)),
+        None => f64::from(constants::CHARACTERIZATION_RPM_NOISE_FLOOR.max(before / 10)),
+    }
+}
+
+/// When did the tach first move away from `before`, in ms from the write?
+///
+/// `PTR-y`: derived AFTER the hold, from the retained samples and then the
+/// after-read (`after`, stamped with the point's `settle_ms`), against exactly
+/// the threshold the verdict uses. It used to be detected live inside the hold
+/// with the proportional rule `PTR-m` retired from the verdict, so a smooth
+/// high-RPM step could read `changed` with no time at all — its Response column
+/// empty, the member's median short a point, and a session's `response_latency`
+/// `unavailable` where every step had moved. Now a `changed` verdict always
+/// carries a time: the after-read that earns it is the last candidate here —
+/// **provided at least one hold sample was readable** (DEC-454 review). With
+/// none, the after-read's timestamp is only the hold's length (up to settle +
+/// dwell), an upper bound rather than a reaction time, so the point reports
+/// `None` as it always did.
+///
+/// `None` means nothing moved, the tach was unreadable throughout the hold, or
+/// there was no reference reading — never that it responded instantly.
+fn first_change_ms(
+    samples: &[crate::api::stats::RpmSample],
+    before: Option<u16>,
+    after: Option<(u64, u16)>,
+    stability: Option<&PointStability>,
+) -> Option<u64> {
+    let b = before?;
+    let threshold = rpm_move_threshold(b, stability);
+    let readable: Vec<(u64, u16)> = samples
+        .iter()
+        .filter_map(|s| s.rpm.map(|rpm| (s.at_ms, rpm)))
+        .collect();
+    let after = if readable.is_empty() { None } else { after };
+    readable
+        .into_iter()
+        .chain(after)
+        .find(|&(_, rpm)| f64::from(b.abs_diff(rpm)) > threshold)
+        .map(|(at_ms, _)| at_ms)
 }
 
 /// Classify one point's PWM readback. `reverted` outranks everything: if
@@ -861,18 +928,8 @@ fn readback_verdict(requested_pct: u8, readback_pct: Option<u8>, pwm_enable: Opt
 }
 
 /// Did this point's fan physically respond? `changed` | `unchanged` |
-/// `unavailable`.
-///
-/// `PTR-m`: judged against the point's own measured noise where it has one —
-/// `stddev_rpm` over a window that SETTLED — rather than the proportional
-/// `before / 10` of [`rpm_moved`]. The proportional rule scales with the
-/// reading, not with the tach's spread, so a smooth high-RPM device's genuine
-/// ~265 rpm steps read `unchanged` while the sweep-level `rpm_response` passed.
-///
-/// Falls back to [`rpm_moved`] when no trustworthy settled spread exists: a
-/// point that did not settle computed its σ over its own step transient, and
-/// using that would grade the step by itself — the bigger the response, the
-/// larger the "noise". Too few readings, or none, is no spread at all.
+/// `unavailable`. The threshold is [`rpm_move_threshold`]'s, shared with
+/// [`first_change_ms`] so a `changed` point always has a response time.
 fn rpm_verdict(
     before: Option<u16>,
     after: Option<u16>,
@@ -881,26 +938,7 @@ fn rpm_verdict(
     let (Some(b), Some(a)) = (before, after) else {
         return "unavailable".into();
     };
-    use crate::api::stats::{STABILITY_INSUFFICIENT, STABILITY_NOT_SETTLED, STABILITY_UNAVAILABLE};
-    let settled_sigma = stability
-        .filter(|st| {
-            ![
-                STABILITY_NOT_SETTLED,
-                STABILITY_INSUFFICIENT,
-                STABILITY_UNAVAILABLE,
-            ]
-            .contains(&st.verdict.as_str())
-        })
-        .and_then(|st| st.stddev_rpm);
-    let moved = match settled_sigma {
-        Some(sigma) => {
-            let threshold = (sigma * constants::CHARACTERIZATION_RPM_VERDICT_SIGMA)
-                .max(f64::from(constants::CHARACTERIZATION_RPM_NOISE_FLOOR));
-            f64::from(b.abs_diff(a)) > threshold
-        }
-        None => rpm_moved(b, a),
-    };
-    if moved {
+    if f64::from(b.abs_diff(a)) > rpm_move_threshold(b, stability) {
         "changed".into()
     } else {
         "unchanged".into()
@@ -1774,7 +1812,6 @@ where
         let started = tokio::time::Instant::now();
         announce(RunStep::now(STEP_PHASE_SETTLE, idx as u16, pct, settle));
         let mut dwell_announced = dwell.is_zero();
-        let mut first_change_ms: Option<u64> = None;
         let mut samples: Vec<crate::api::stats::RpmSample> = Vec::new();
         let mut last_renew = tokio::time::Instant::now();
         while started.elapsed() < hold {
@@ -1792,7 +1829,9 @@ where
                     rpm_before,
                     rpm_after: None,
                     settle_ms: started.elapsed().as_millis() as u64,
-                    first_change_ms,
+                    // No after-read and no settled spread on a hold cut short:
+                    // the retained samples against the proportional rule.
+                    first_change_ms: first_change_ms(&samples, rpm_before, None, None),
                     readback_verdict: "unavailable".into(),
                     rpm_verdict: "unavailable".into(),
                     direction: step.direction.token().into(),
@@ -1918,18 +1957,10 @@ where
                     original_pct,
                 };
             };
-            let sampled = sample.rpm;
             samples.push(crate::api::stats::RpmSample {
                 at_ms,
-                rpm: sampled,
+                rpm: sample.rpm,
             });
-            if first_change_ms.is_none() {
-                if let (Some(b), Some(now)) = (rpm_before, sampled) {
-                    if rpm_moved(b, now) {
-                        first_change_ms = Some(at_ms);
-                    }
-                }
-            }
         }
 
         let Some(after) = read_fn().await else {
@@ -1946,6 +1977,7 @@ where
         // it is the register not having refreshed yet, never a settle.
         let settled_ms = crate::api::stats::settling_ms(&samples, rpm_before);
         let stability = point_stability(&samples, dwell, settled_ms);
+        let settle_ms = started.elapsed().as_millis() as u64;
         let point = CharPoint {
             requested_pct: pct,
             command_accepted,
@@ -1954,8 +1986,14 @@ where
             pwm_enable: after.pwm_enable,
             rpm_before,
             rpm_after: after.rpm,
-            settle_ms: started.elapsed().as_millis() as u64,
-            first_change_ms,
+            settle_ms,
+            // `PTR-y`: after the hold, against the verdict's own threshold.
+            first_change_ms: first_change_ms(
+                &samples,
+                rpm_before,
+                after.rpm.map(|rpm| (settle_ms, rpm)),
+                Some(&stability),
+            ),
             readback_verdict: readback_verdict(pct, after.pwm_percent, after.pwm_enable),
             rpm_verdict: rpm_verdict(rpm_before, after.rpm, Some(&stability)),
             direction: step.direction.token().into(),
@@ -4695,7 +4733,7 @@ mod tests {
                 // Precondition: the old proportional rule really did call this
                 // step unchanged, so a `changed` below is the new rule's doing.
                 assert!(
-                    !rpm_moved(before, after),
+                    f64::from(before.abs_diff(after)) <= rpm_move_threshold(before, None),
                     "precondition: {before} -> {after} is under the proportional threshold"
                 );
                 let st = p.stability.as_ref().unwrap();
@@ -4706,6 +4744,230 @@ mod tests {
                     p.requested_pct, st.stddev_rpm
                 );
             }
+        }
+
+        /// `PTR-y`, the pure half. A smooth ~2650 rpm tach stepping 125 rpm: the
+        /// verdict's settled-σ threshold sees it, so the response time must too.
+        /// The old live detector needed more than a tenth of the reading.
+        #[test]
+        fn first_change_uses_the_verdicts_threshold() {
+            let st = PointStability {
+                verdict: crate::api::stats::STABILITY_STABLE.into(),
+                stddev_rpm: Some(2.0),
+                ..Default::default()
+            };
+            let samples: Vec<crate::api::stats::RpmSample> = [2651, 2776, 2773, 2775]
+                .iter()
+                .enumerate()
+                .map(|(i, &rpm)| crate::api::stats::RpmSample {
+                    at_ms: 500 * (i as u64 + 1),
+                    rpm: Some(rpm),
+                })
+                .collect();
+            // Precondition: the proportional rule calls the step unmoved.
+            assert!(f64::from(2650u16.abs_diff(2775)) <= rpm_move_threshold(2650, None));
+            assert_eq!(first_change_ms(&samples, Some(2650), None, None), None);
+            // The first sample is jitter, the second is the step.
+            assert_eq!(
+                first_change_ms(&samples, Some(2650), Some((2500, 2775)), Some(&st)),
+                Some(1000)
+            );
+            assert_eq!(rpm_verdict(Some(2650), Some(2775), Some(&st)), "changed");
+        }
+
+        /// DEC-454 review (P3): a hold whose every tach read failed has no
+        /// reaction time to report. The after-read's stamp would be the hold's
+        /// length — an upper bound — so the point stays `None`, as before, even
+        /// though the verdict reads `changed`.
+        #[test]
+        fn an_unreadable_hold_publishes_no_first_change() {
+            let unreadable = [
+                crate::api::stats::RpmSample {
+                    at_ms: 500,
+                    rpm: None,
+                },
+                crate::api::stats::RpmSample {
+                    at_ms: 1000,
+                    rpm: None,
+                },
+            ];
+            // Precondition: the verdict does read the step as moved.
+            assert_eq!(rpm_verdict(Some(1000), Some(1300), None), "changed");
+            assert_eq!(
+                first_change_ms(&unreadable, Some(1000), Some((26_000, 1300)), None),
+                None
+            );
+            // One readable sample is enough to let the after-read stand.
+            let one = [
+                unreadable[0],
+                crate::api::stats::RpmSample {
+                    at_ms: 1000,
+                    rpm: Some(1000),
+                },
+            ];
+            assert_eq!(
+                first_change_ms(&one, Some(1000), Some((26_000, 1300)), None),
+                Some(26_000)
+            );
+        }
+
+        /// `PTR-y`: the after-read is the last candidate, so a verdict that reads
+        /// `changed` has a time even when no readable hold sample had moved yet.
+        /// And nothing moved is `None`, never an instant response.
+        #[test]
+        fn a_changed_verdict_always_has_a_first_change() {
+            let unmoved = [crate::api::stats::RpmSample {
+                at_ms: 500,
+                rpm: Some(1000),
+            }];
+            assert_eq!(rpm_verdict(Some(1000), Some(1300), None), "changed");
+            assert_eq!(
+                first_change_ms(&unmoved, Some(1000), Some((6000, 1300)), None),
+                Some(6000)
+            );
+            assert_eq!(rpm_verdict(Some(1000), Some(1010), None), "unchanged");
+            assert_eq!(
+                first_change_ms(&unmoved, Some(1000), Some((6000, 1010)), None),
+                None
+            );
+            // No reference reading: nothing to have moved from.
+            assert_eq!(
+                first_change_ms(&unmoved, None, Some((6000, 1300)), None),
+                None
+            );
+        }
+
+        /// `PTR-y` through the real sweep and on into the session summary. The
+        /// smooth device of `a_smooth_high_rpm_step_is_changed_against_its_own_noise`
+        /// reads `changed` at every step; before the fix none of those steps had a
+        /// response time, so the member's `response_latency` read `unavailable`.
+        #[tokio::test(start_paused = true)]
+        async fn a_changed_step_is_timed_and_the_session_reads_its_latency() {
+            use crate::validation::session::{
+                DevicePolicySnapshot, EvidenceRef, SessionMetadata, ValidationSession,
+                DIAG_CHARACTERIZATION, F_RESPONSE_LATENCY, KIND_VALIDATION, RESULT_OBSERVED,
+                STATE_COMPLETED,
+            };
+            let rig = Rig::new();
+            let cache = cache_at(40.0, None);
+            let level = Arc::new(Mutex::new(90u8));
+            let level_w = level.clone();
+            let reads = Arc::new(Mutex::new(0u32));
+            let rpm_for = |pct: u8| 2650 + (u16::from(pct) - 90) * 25;
+            let out = run_sweep_uni(
+                &cache,
+                "hwmon:test:pwm1",
+                &[95, 100],
+                0,
+                Duration::from_secs(constants::CHARACTERIZATION_DEFAULT_SETTLE_S),
+                move |pct: u8| {
+                    *level_w.lock().unwrap() = pct;
+                    Ok(())
+                },
+                move || {
+                    let mut n = reads.lock().unwrap();
+                    *n += 1;
+                    let jitter: i32 = [0, 3, -2, 1][(*n % 4) as usize];
+                    let p = *level.lock().unwrap();
+                    sample(
+                        Some(p),
+                        Some(1),
+                        Some((i32::from(rpm_for(p)) + jitter) as u16),
+                    )
+                },
+                &rig.cancel,
+                || false,
+                || true,
+                &rig.report,
+                |_| {},
+            )
+            .await;
+            assert_eq!(out.state, STATE_COMPLETE, "{:?}", out.detail);
+            assert_eq!(out.points.len(), 2);
+            for p in &out.points {
+                assert_eq!(p.rpm_verdict, "changed", "precondition: {p:?}");
+                // The tach steps with the write, so the first hold sample moved.
+                assert_eq!(
+                    p.first_change_ms,
+                    Some(constants::CHARACTERIZATION_SAMPLE_INTERVAL.as_millis() as u64),
+                    "{}% read changed with no response time",
+                    p.requested_pct
+                );
+            }
+
+            let run = CharacterizationRun {
+                run_id: "char-1".into(),
+                header_id: "hwmon:test:pwm1".into(),
+                state: STATE_COMPLETE.into(),
+                points: out.points,
+                ..Default::default()
+            };
+            let session = ValidationSession {
+                session_id: "val-1".into(),
+                kind: KIND_VALIDATION.into(),
+                state: STATE_COMPLETED.into(),
+                started_unix_ms: 1,
+                completed_unix_ms: Some(2),
+                metadata: SessionMetadata {
+                    cooling_device_id: "dev-1".into(),
+                    device_name: "Test AIO".into(),
+                    device_kind: "aio_liquid".into(),
+                    pump_member: None,
+                    radiator_members: vec![],
+                    auxiliary_members: vec![],
+                    temperature_sensor: None,
+                    coolant_sensor: None,
+                    coolant_telemetry: "unavailable".into(),
+                    device_policy: DevicePolicySnapshot {
+                        id: "generic_pump".into(),
+                        display_name: "Generic pump".into(),
+                        minimum_safe_pwm_pct: 30.0,
+                        supports_stop: false,
+                        startup_override_seconds: None,
+                        expected_rpm_min: None,
+                        expected_rpm_max: None,
+                        internal_control_possible: true,
+                    },
+                    members: vec![],
+                    active_profile_id: None,
+                    active_profile_name: None,
+                    daemon_version: "0.0.0-test".into(),
+                    user_metadata: Default::default(),
+                },
+                requested_diagnostics: vec![],
+                sweep_members: vec![],
+                samples: vec![],
+                events: vec![],
+                evidence: vec![EvidenceRef {
+                    kind: DIAG_CHARACTERIZATION.into(),
+                    member_id: "hwmon:test:pwm1".into(),
+                    run_id: Some("char-1".into()),
+                    started_unix_ms: 1,
+                    completed_unix_ms: Some(2),
+                    outcome: RESULT_OBSERVED.into(),
+                    detail: None,
+                    characterization: Some(run),
+                    verify: None,
+                    control_path: None,
+                }],
+                external_measurements: vec![],
+                findings: vec![],
+                sample_limit_reached: false,
+                interrupted_reason: None,
+                truncated_at_unix_ms: None,
+                auto_started: false,
+                stop_when_diagnostics_complete: false,
+                startup_fingerprints: vec![],
+                steady_state: None,
+            };
+            let findings = crate::validation::summary::summarise(&session);
+            let latency: Vec<_> = findings
+                .iter()
+                .filter(|f| f.id == F_RESPONSE_LATENCY)
+                .collect();
+            assert_eq!(latency.len(), 1, "{latency:?}");
+            assert_eq!(latency[0].member_id.as_deref(), Some("hwmon:test:pwm1"));
+            assert_eq!(latency[0].state, RESULT_OBSERVED, "{:?}", latency[0].detail);
         }
 
         /// A tach that never changes value establishes no cadence: UNKNOWN, not

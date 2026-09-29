@@ -67,6 +67,15 @@
   keeps each such fan's speed exactly as before. The daemon then no longer treats an ARCTIC channel
   the old profile set to 0 as a deliberate 0, so the channel can be set to full speed the next
   time another channel on the hub is written.
+- **A characterisation step that reads `changed` now has a response time** (DEC-454, `PTR-y`).
+  `first_change_ms` is now the first reading that moved further than the same threshold
+  `rpm_verdict` uses, worked out once the step's hold is over. Before, it was detected during the
+  hold with the older "more than a tenth of the reading" rule. On a smooth, fast fan a step could
+  therefore read `changed` with no response time: its Response column was blank, the typical
+  response left it out, and a validation session reported the fan's response latency as
+  `unavailable`. A step whose tach could not be read at any point during the hold still has no
+  response time, because the only time available would be the length of the hold. No response
+  shape changes.
 
 ## [3.0.0] — 2026-09-28
 

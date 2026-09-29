@@ -3237,6 +3237,35 @@ mod tests {
             &serde_json::to_value(&cal_run).unwrap(),
             "OpenFanCalibrationRun",
         );
+        // `PTR-aa` (W-DIAGD): the characterisation run itself. Its children
+        // were pinned above long before it was, which is how it was missed.
+        let char_run = crate::api::characterization::CharacterizationRun {
+            run_id: "char-1".into(),
+            header_id: "hwmon:nct6798:nct6775.656:pwm2:SYS_FAN1".into(),
+            state: "running".into(),
+            requested_points_pct: vec![30, 60, 100],
+            settle_seconds: 6,
+            points: vec![point],
+            summary: Some(char_summary),
+            original_pct: Some(45),
+            restore_outcome: "pending".into(),
+            detail: Some("cancelled after 1 of 3 steps".into()),
+            bidirectional: true,
+            stability_seconds: 20,
+            completed_unix_ms: Some(1_790_000_000_000),
+            provenance: [("rpm_after".to_string(), "OBSERVED".to_string())].into(),
+            current_step: Some(crate::api::characterization::RunStep::now(
+                crate::api::characterization::STEP_PHASE_SETTLE,
+                0,
+                30,
+                std::time::Duration::from_secs(6),
+            )),
+            ..Default::default()
+        };
+        expect(
+            &serde_json::to_value(&char_run).unwrap(),
+            "CharacterizationRun",
+        );
         // DEC-443 (`W-SAFE`): the cooling watch's two `/status` entries.
         let pump_stall = PumpStallEntry {
             header_id: "hwmon:nct6798:nct6775.656:pwm2:PUMP".into(),
