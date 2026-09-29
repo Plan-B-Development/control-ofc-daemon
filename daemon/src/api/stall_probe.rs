@@ -40,7 +40,7 @@
 //!   cancel. Every abort and cancel ends with a **100 % recovery kick** held
 //!   until the fan is seen spinning (bounded) — **never while shutting down**,
 //!   when a write after the hand-back would re-take the header (S3-R3).
-//! - **Restore** is the shared [`RestoreOnDrop`] with its DEC-315 tokens, and
+//! - **Restore** is the shared [`RestoreGuard`] with its DEC-315 tokens, and
 //!   the mode is handed back by DEC-382 on the next engine tick.
 //!
 //! # Why the loop is its own and the gates are not
@@ -59,10 +59,12 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::api::characterization::{
-    RestoreOnDrop, RestoreReport, STATE_ABORTED, STATE_CANCELLED, STATE_COMPLETE, STATE_FAILED,
-    STATE_RUNNING,
+    AfterStuckWrite, RestoreGuard, RestoreReport, STATE_ABORTED, STATE_CANCELLED, STATE_COMPLETE,
+    STATE_FAILED, STATE_RUNNING,
 };
-use crate::api::diagnostic_gates::{step_gate, thermal_refusal, GateStop, ThermalRefusal};
+use crate::api::diagnostic_gates::{
+    note_write_unresponsive, step_gate, thermal_refusal, GateStop, ThermalRefusal, WriteFailure,
+};
 use crate::api::preflight::Diagnostic;
 use crate::api::responses::HwmonVerifyState;
 use crate::api::stats::{self, RpmSample};
@@ -535,6 +537,13 @@ enum Stop {
         pct: u8,
         error: String,
     },
+    /// A write did not return within [`constants::DIAGNOSTIC_WRITE_BUDGET`]
+    /// (DEC-455). Reported as a failed write (`write_failed`, the user's
+    /// choice), with its own detail; the write still holds the controller lock,
+    /// so there is no kick and no restore after it.
+    WriteUnresponsive {
+        detail: String,
+    },
     RefreshUnknown,
     RefreshTooSlow(u64),
     /// A probe sample could not be read, or a read did not return at all
@@ -558,7 +567,7 @@ impl Stop {
             Stop::EligibilityLost(_) => ABORT_ELIGIBILITY_LOST,
             Stop::Budget(_) => ABORT_BUDGET_EXCEEDED,
             Stop::Reclaimed { .. } => ABORT_RECLAIMED,
-            Stop::WriteFailed { .. } => ABORT_WRITE_FAILED,
+            Stop::WriteFailed { .. } | Stop::WriteUnresponsive { .. } => ABORT_WRITE_FAILED,
             Stop::RefreshUnknown => ABORT_REFRESH_UNKNOWN,
             Stop::RefreshTooSlow(_) => ABORT_REFRESH_TOO_SLOW,
             Stop::TachUnreadable { .. } => ABORT_TACH_UNREADABLE,
@@ -594,6 +603,7 @@ impl Stop {
                 "another controller reclaimed the header at {at_pct}% (pwm_enable={pwm_enable})"
             ),
             Stop::WriteFailed { pct, error } => format!("PWM write of {pct}% failed: {error}"),
+            Stop::WriteUnresponsive { detail } => detail.clone(),
             Stop::RefreshUnknown => "the tach refresh could not be measured at 20% and the \
                                      driver publishes no update_interval"
                 .into(),
@@ -619,8 +629,13 @@ impl Stop {
     /// lease the kick is still attempted: its write either raises the duty,
     /// which can lower no floor, or fails harmlessly because the ladder or the
     /// successor holds the lease.
+    ///
+    /// [SAFETY] DEC-455: nor after a write that did not return — it still holds
+    /// the controller lock, so a kick would only queue behind it (the user's
+    /// choice, 2026-09-29). The engine's next tick takes the header once the
+    /// write lets go.
     fn kicks(&self) -> bool {
-        !matches!(self, Stop::ShuttingDown)
+        !matches!(self, Stop::ShuttingDown | Stop::WriteUnresponsive { .. })
     }
 }
 
@@ -683,6 +698,8 @@ struct Probe<'a, W, R, E, S, K, P> {
     shutting_down: &'a S,
     keepalive: &'a K,
     wrote_any: &'a AtomicBool,
+    /// DEC-455: a write did not return; nothing more is written or re-read.
+    write_stuck: &'a AtomicBool,
     publish: P,
     start_temp_c: f64,
     last_renew: tokio::time::Instant,
@@ -699,9 +716,10 @@ struct Probe<'a, W, R, E, S, K, P> {
     res: ProbeResult,
 }
 
-impl<W, R, Fut, E, S, K, P> Probe<'_, W, R, E, S, K, P>
+impl<W, WF, R, Fut, E, S, K, P> Probe<'_, W, R, E, S, K, P>
 where
-    W: Fn(u8) -> Result<(), String>,
+    W: Fn(u8) -> WF,
+    WF: std::future::Future<Output = Result<(), WriteFailure>>,
     R: Fn() -> Fut,
     Fut: std::future::Future<Output = Option<HwmonVerifyState>>,
     E: Fn() -> Eligibility,
@@ -860,7 +878,10 @@ where
     ///
     /// The header is counted as moved BEFORE the call, because `set_pwm` can
     /// write sysfs and then fail its readback — the `AUD2-c` direction.
-    fn write(&mut self, pct: u8) -> Result<(), Stop> {
+    ///
+    /// [SAFETY] DEC-455: `write_fn` is bounded in production; a write that did
+    /// not return is [`Stop::WriteUnresponsive`], which arms the restore's skip.
+    async fn write(&mut self, pct: u8) -> Result<(), Stop> {
         if (self.shutting_down)() {
             return Err(Stop::ShuttingDown);
         }
@@ -874,7 +895,13 @@ where
         } else {
             self.close_below_floor();
         }
-        (self.write_fn)(pct).map_err(|error| Stop::WriteFailed { pct, error })
+        match (self.write_fn)(pct).await {
+            Ok(()) => Ok(()),
+            Err(WriteFailure::Error(error)) => Err(Stop::WriteFailed { pct, error }),
+            Err(WriteFailure::Unresponsive) => Err(Stop::WriteUnresponsive {
+                detail: note_write_unresponsive(self.write_stuck, pct),
+            }),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1020,7 +1047,7 @@ where
             return Err(Stop::TachUnreadable { wedged: true });
         };
         self.before_write()?;
-        if let Err(stop) = self.write(pct) {
+        if let Err(stop) = self.write(pct).await {
             if matches!(stop, Stop::WriteFailed { .. }) {
                 let held = Held::empty(Some(before.clone()));
                 self.push_point(phase, pct, false, &before, &held, OBS_INTERRUPTED);
@@ -1180,10 +1207,16 @@ where
                 rpm: p.rpm_after,
             })
             .unwrap_or(UNREAD);
-        match self.write(pct) {
+        match self.write(pct).await {
             Ok(()) => {}
             // The exit path owns the header now; not even a record of an attempt.
             Err(Stop::ShuttingDown) => return,
+            // DEC-455: a kick write that did not return may yet land; whether it
+            // was accepted is unknown, so no point claims either.
+            Err(stop @ Stop::WriteUnresponsive { .. }) => {
+                log::warn!("stall probe: the {pct}% recovery kick: {}", stop.detail());
+                return;
+            }
             Err(stop) => {
                 log::warn!(
                     "stall probe: the {pct}% recovery kick failed: {}",
@@ -1243,9 +1276,15 @@ where
 /// `eligible` is called before every write, on every probe sample, and once
 /// more at the end: its pump answer at any point raises the restore floor, so a
 /// pump role assigned while the probe ran is never restored below the pump
-/// floor (`AUD3-l`'s rule).
+/// floor (`AUD3-l`'s rule) — except after a write that did not return, when
+/// nothing that takes the controller lock is called again (DEC-455).
+///
+/// [SAFETY] `write_fn` is BOUNDED in production (DEC-455, `PTR-ab`,
+/// [`crate::api::diagnostic_gates::bounded_hwmon_write`]), the kick's and the
+/// restore's included, and the run ends in the explicit
+/// [`RestoreGuard::restore`].
 #[allow(clippy::too_many_arguments)]
-pub async fn run_probe<W, R, Fut, E, S, K, P>(
+pub async fn run_probe<W, WF, R, Fut, E, S, K, P>(
     cache: &StateCache,
     header_id: &str,
     restore_floor: u8,
@@ -1253,6 +1292,10 @@ pub async fn run_probe<W, R, Fut, E, S, K, P>(
     // DC-mode header — which the restore is raised to if the header turns out to
     // be a pump. From `AppState::header_pump_floor_pct`.
     pump_floor: u8,
+    // [SAFETY] DEC-455: whether the header has a mode switch — without one, a
+    // write that did not return gets one full-speed write queued behind it
+    // (`AfterStuckWrite::QueueFullSpeed`), since nothing else would move it.
+    has_mode_switch: bool,
     baseline_max: Duration,
     driver_refresh_ms: Option<u64>,
     write_fn: W,
@@ -1265,7 +1308,8 @@ pub async fn run_probe<W, R, Fut, E, S, K, P>(
     publish: P,
 ) -> ProbeResult
 where
-    W: Fn(u8) -> Result<(), String>,
+    W: Fn(u8) -> WF,
+    WF: std::future::Future<Output = Result<(), WriteFailure>>,
     R: Fn() -> Fut,
     Fut: std::future::Future<Output = Option<HwmonVerifyState>>,
     E: Fn() -> Eligibility,
@@ -1276,6 +1320,8 @@ where
     let first = read_fn().await;
     let original_pct = first.as_ref().and_then(|s| s.pwm_percent);
     let wrote_any = AtomicBool::new(false);
+    // DEC-455: set when a write does not return.
+    let write_stuck = AtomicBool::new(false);
     let start_temp_c = hottest_fresh_cpu_c(cache);
     let mut probe = Probe {
         cache,
@@ -1286,6 +1332,7 @@ where
         shutting_down: &shutting_down,
         keepalive: &keepalive,
         wrote_any: &wrote_any,
+        write_stuck: &write_stuck,
         publish,
         start_temp_c: start_temp_c.unwrap_or(f64::NAN),
         last_renew: tokio::time::Instant::now(),
@@ -1305,11 +1352,10 @@ where
         },
     };
 
-    // Declared LAST so it drops FIRST — while the caller's lease guard is still
-    // held. Same invariant, same reason, as `characterization::run_sweep`; read
-    // `RestoreOnDrop`'s docs before touching this ordering, and keep every new
-    // binding above it.
-    let mut restore = RestoreOnDrop {
+    // Awaited at the end, before this returns — while the caller's lease guard
+    // is still held. Same invariant, same reason, as
+    // `characterization::run_sweep`; read `RestoreGuard`'s docs.
+    let mut restore = RestoreGuard {
         header_id,
         original_pct,
         write_fn: &write_fn,
@@ -1323,6 +1369,12 @@ where
         unresponsive: None,
         // DEC-407's own re-check raises `restore_floor` below; see its field doc.
         pump_watch: None,
+        write_stuck: &write_stuck,
+        after_stuck_write: AfterStuckWrite::for_header(
+            has_mode_switch,
+            AfterStuckWrite::QueueFullSpeed,
+        ),
+        armed: true,
     };
 
     let ended = if probe.wedged {
@@ -1345,7 +1397,7 @@ where
             let cancelled = stop == Stop::Cancelled;
             let state = match stop {
                 Stop::Cancelled => STATE_CANCELLED,
-                Stop::WriteFailed { .. } => STATE_FAILED,
+                Stop::WriteFailed { .. } | Stop::WriteUnresponsive { .. } => STATE_FAILED,
                 _ => STATE_ABORTED,
             };
             let outcome = if cancelled {
@@ -1376,16 +1428,21 @@ where
     probe.close_below_floor();
 
     // [SAFETY] The final re-check. A pump role assigned after the last sample —
-    // during the kick, say — must still raise the restore floor; the guard reads
-    // the field when it drops, just below. Skipped while shutting down: the
-    // guard skips the restore then, and the lookup takes the controller lock the
-    // exit path may be holding.
-    let pump_now = probe.pump_seen || (!shutting_down() && (probe.eligible)().pump_protected);
+    // during the kick, say — must still raise the restore floor; the restore
+    // just below reads the field. Skipped while shutting down: the restore is
+    // skipped then, and the lookup takes the controller lock the exit path may
+    // be holding. Skipped after a write that did not return, for the same lock
+    // (DEC-455): that write still holds it, and the restore is skipped anyway.
+    let pump_now = probe.pump_seen
+        || (!shutting_down()
+            && !write_stuck.load(Ordering::SeqCst)
+            && (probe.eligible)().pump_protected);
     if pump_now {
         restore.restore_floor = restore
             .restore_floor
             .max(pump_floor.max(crate::profile::HARD_PUMP_CPU_FLOOR_PCT as u8));
     }
+    restore.restore().await;
     std::mem::take(&mut probe.res)
 }
 
@@ -1588,9 +1645,10 @@ mod tests {
             ID,
             0,
             PUMP_FLOOR,
+            true,
             Duration::from_secs(constants::CHARACTERIZATION_DEFAULT_SETTLE_S),
             o.driver_refresh_ms,
-            |p: u8| {
+            crate::api::diagnostic_gates::sync_write(|p: u8| {
                 if rig.fail_write_at == Some(p) {
                     rig.writes.lock().unwrap().push(p);
                     return Err("EIO".into());
@@ -1605,7 +1663,7 @@ mod tests {
                     h(n, p);
                 }
                 Ok(())
-            },
+            }),
             || {
                 let delay = rig.read_delay;
                 let s = rig.read();
@@ -2164,16 +2222,17 @@ mod tests {
             ID,
             0,
             PUMP_FLOOR,
+            true,
             Duration::from_secs(constants::CHARACTERIZATION_DEFAULT_SETTLE_S),
             None,
-            |p: u8| {
+            crate::api::diagnostic_gates::sync_write(|p: u8| {
                 rig.fan.lock().unwrap().write(p);
                 rig.writes.lock().unwrap().push(p);
                 if let Some(h) = rig.hook.lock().unwrap().as_ref() {
                     h(0, p);
                 }
                 Ok(())
-            },
+            }),
             || {
                 let mut f = rig.fan.lock().unwrap();
                 // After the 16 % write the firmware owns the mode — until the
@@ -2209,6 +2268,123 @@ mod tests {
         let w = rig.written();
         assert_eq!(&w[w.len() - 3..], &[12, 100, 40]);
         assert_eq!(report.get().token(), "restored");
+    }
+
+    /// Run the probe with a write that errors at `error_at` and does not return
+    /// at `stuck_at`, logging every write and every eligibility lookup in order.
+    async fn run_with_stuck_write(
+        error_at: Option<u8>,
+        stuck_at: u8,
+        has_mode_switch: bool,
+    ) -> (ProbeResult, RestoreReport, Vec<String>) {
+        let fan = Mutex::new(FanSim::new(Some(6), 10));
+        let cache = cache_at(45.0);
+        let cancel = AtomicBool::new(false);
+        let report = RestoreReport::new();
+        let events: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let eligible = || {
+            events.lock().unwrap().push("eligibility".into());
+            eligible_always()
+        };
+        let res = run_probe(
+            &cache,
+            ID,
+            0,
+            PUMP_FLOOR,
+            has_mode_switch,
+            Duration::from_secs(constants::CHARACTERIZATION_DEFAULT_SETTLE_S),
+            None,
+            |p: u8| {
+                events.lock().unwrap().push(format!("write {p}"));
+                std::future::ready(if p == stuck_at {
+                    Err(WriteFailure::Unresponsive)
+                } else if Some(p) == error_at {
+                    Err(WriteFailure::Error("EIO".into()))
+                } else {
+                    fan.lock().unwrap().write(p);
+                    Ok(())
+                })
+            },
+            || std::future::ready(Some(fan.lock().unwrap().read())),
+            &eligible,
+            &cancel,
+            &|| false,
+            || true,
+            &report,
+            |_: &ProbeResult| {},
+        )
+        .await;
+        let events = events.into_inner().unwrap();
+        (res, report, events)
+    }
+
+    /// The events after the stuck write — which must be none — having first
+    /// checked that the eligibility lookup was live before it (presence before
+    /// absence).
+    fn after_the_stuck_write(events: &[String], stuck_at: u8) -> Vec<String> {
+        let stuck = events
+            .iter()
+            .position(|e| *e == format!("write {stuck_at}"))
+            .expect("precondition: the stuck write was attempted");
+        assert!(
+            events[..stuck].iter().any(|e| e == "eligibility"),
+            "precondition: eligibility is read while the run is live: {events:?}"
+        );
+        events[stuck + 1..].to_vec()
+    }
+
+    /// [SAFETY] DEC-455 (`PTR-ab`), 5A: a step write that does not return is a
+    /// `failed` run (`write_failed`, no new token) that writes nothing more —
+    /// no 100 % kick, unlike an errored write (the test above), because the
+    /// kick would queue behind the parked write on the controller lock and
+    /// land whenever it did; no restore (`skipped_unresponsive`); and no
+    /// eligibility re-check, which takes that lock too.
+    #[tokio::test(start_paused = true)]
+    async fn a_step_write_that_does_not_return_writes_nothing_more_not_even_the_kick() {
+        let (res, report, events) = run_with_stuck_write(None, 12, true).await;
+        assert_eq!(res.state, STATE_FAILED, "{res:?}");
+        assert_eq!(res.abort_reason, Some(ABORT_WRITE_FAILED));
+        assert!(
+            res.detail.as_deref().is_some_and(|d| {
+                d.contains("PWM write of 12%") && d.contains("did not return")
+            }),
+            "{res:?}"
+        );
+        assert_eq!(report.get().token(), "skipped_unresponsive");
+        assert_eq!(after_the_stuck_write(&events, 12), Vec::<String>::new());
+    }
+
+    /// [SAFETY] DEC-455 review F1 (the user's choice): on a header with NO mode
+    /// switch nothing else would ever move the header again — the engine holds
+    /// only what it wrote (DEC-451) — so after a stuck step exactly one
+    /// full-speed write is queued behind it: no kick hold, no restore, no
+    /// eligibility re-check. Reported `skipped_unresponsive`: full speed is not
+    /// where the header was found.
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_step_on_a_header_with_no_mode_switch_queues_full_speed() {
+        let (res, report, events) = run_with_stuck_write(None, 12, false).await;
+        assert_eq!(res.state, STATE_FAILED, "{res:?}");
+        assert_eq!(res.abort_reason, Some(ABORT_WRITE_FAILED));
+        assert_eq!(report.get().token(), "skipped_unresponsive");
+        assert_eq!(
+            after_the_stuck_write(&events, 12),
+            vec![format!("write {}", constants::STALL_PROBE_KICK_PCT)]
+        );
+    }
+
+    /// DEC-455: the KICK not returning — after an errored step — leaves the
+    /// restore skipped (`skipped_unresponsive`): the restore would queue behind
+    /// the parked kick. The run keeps the errored step's `write_failed`.
+    #[tokio::test(start_paused = true)]
+    async fn a_kick_that_does_not_return_skips_the_restore() {
+        let (res, report, events) =
+            run_with_stuck_write(Some(12), constants::STALL_PROBE_KICK_PCT, true).await;
+        assert_eq!(res.abort_reason, Some(ABORT_WRITE_FAILED), "{res:?}");
+        assert_eq!(report.get().token(), "skipped_unresponsive");
+        assert_eq!(
+            after_the_stuck_write(&events, constants::STALL_PROBE_KICK_PCT),
+            Vec::<String>::new()
+        );
     }
 
     /// A slow chip: each read takes 800 ms, so every hold overruns its dwell and
@@ -2267,16 +2443,17 @@ mod tests {
             ID,
             0,
             PUMP_FLOOR,
+            true,
             Duration::from_secs(constants::CHARACTERIZATION_DEFAULT_SETTLE_S),
             None,
-            |p: u8| {
+            crate::api::diagnostic_gates::sync_write(|p: u8| {
                 rig.fan.lock().unwrap().write(p);
                 rig.writes.lock().unwrap().push(p);
                 if let Some(h) = rig.hook.lock().unwrap().as_ref() {
                     h(0, p);
                 }
                 Ok(())
-            },
+            }),
             || std::future::ready(rig.read()),
             &eligible_always,
             &cancel,
@@ -2671,9 +2848,10 @@ mod tests {
                 ID,
                 0,
                 PUMP_FLOOR,
+                true,
                 Duration::from_secs(constants::CHARACTERIZATION_DEFAULT_SETTLE_S),
                 None,
-                |p: u8| {
+                crate::api::diagnostic_gates::sync_write(|p: u8| {
                     rig.fan.lock().unwrap().write(p);
                     let n = {
                         let mut w = rig.writes.lock().unwrap();
@@ -2684,7 +2862,7 @@ mod tests {
                         h(n, p);
                     }
                     Ok(())
-                },
+                }),
                 || std::future::ready(rig.read()),
                 &eligible_always,
                 &cancel,
@@ -2724,7 +2902,7 @@ mod tests {
         let (res, report) = run_default(&rig, &cache).await;
         assert_eq!(res.abort_reason, Some(ABORT_NO_CPU_TEMPERATURE), "{res:?}");
         // Only the shared guard's restore of the captured duty — which
-        // `RestoreOnDrop` performs for every run — and no probe write at all.
+        // `RestoreGuard` performs for every run — and no probe write at all.
         assert_eq!(rig.written(), vec![40]);
         assert_eq!(report.get().token(), "restored");
     }

@@ -76,6 +76,27 @@
   `unavailable`. A step whose tach could not be read at any point during the hold still has no
   response time, because the only time available would be the length of the hold. No response
   shape changes.
+- **A motherboard fan driver that stops answering a write no longer stalls the daemon during a
+  hardware diagnostic** (DEC-455, `PTR-ab`). A characterisation, a control-path discovery or a PWM
+  stall probe wrote each duty on one of the daemon's request threads, holding the lock the fan
+  loop and the thermal emergency need for every motherboard write. If the driver never answered,
+  that thread and the lock stayed stuck, and the emergency could not force those fans. Each write
+  now runs in the background and is given 2 seconds. A write that takes longer ends the run as
+  `failed` (the stall probe's `abort_reason` is `write_failed`, as for a write that returned an
+  error), and its `detail` says the write did not return; `restore_outcome` reads
+  `skipped_unresponsive`. The stuck write itself may still land later. On a header with an automatic
+  mode (`pwmN_enable`), the run then writes nothing more to it — no restore, and no full-speed kick
+  from the stall probe — because anything more would wait behind the stuck write and land whenever
+  the driver answered; once the lock is free, the fan loop drives the header or hands it back to
+  the firmware, as it does for any header it holds but no profile names. A header with no
+  automatic mode to hand back (an ARCTIC fan hub's channels, for example) would otherwise stay
+  where the stuck write left it, so there characterisation and discovery queue their normal restore
+  behind the stuck write, and the stall probe queues one full-speed write; each lands after the
+  stuck write, when the driver answers. The run also no longer waits for the lock to release its
+  hold on the header. A restore write that does not return is reported the same way. A diagnostic
+  that ends without reaching its restore (a crash of the run itself) now writes nothing more and
+  logs an error; it used to attempt the restore from its cleanup code, where the write could not
+  be bounded.
 
 ## [3.0.0] — 2026-09-28
 

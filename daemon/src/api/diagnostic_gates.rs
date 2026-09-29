@@ -155,7 +155,7 @@ where
 /// clamp-and-continue: **when the header becomes pump-protected mid-run the run
 /// stops, and its restore is floored at the pump floor.** Each run calls
 /// [`PumpWatch::became_protected`] before every write and on every sample, and
-/// `RestoreOnDrop` (or verify's own restore) consults
+/// `RestoreGuard` (or verify's own restore) consults
 /// [`PumpWatch::restore_is_pump`] once more immediately before it writes.
 ///
 /// A header protected at entry cannot *become* protected: its run is already a
@@ -184,7 +184,7 @@ where
 /// `header_roles` and `hwmon_controller` one at a time and releases each, so
 /// every call site calls it with nothing held — never from inside a `set_pwm`
 /// critical section. Nor is it called once shutdown has been seen: each run
-/// checks shutdown first, and `RestoreOnDrop` skips before it reaches the watch.
+/// checks shutdown first, and `RestoreGuard` skips before it reaches the watch.
 /// Nothing a stopping run could do with the answer is left by then — it writes
 /// nothing more — and the exit floor is contending for the controller lock the
 /// lookup takes (bounded, `apply_exit_floor`'s `try_lock_for`).
@@ -239,7 +239,18 @@ impl<'a> PumpWatch<'a> {
     /// run wrote, raised to the pump floor. `None` when no restore is owed: the
     /// run wrote nothing, or the header is not a pump.
     pub fn floored_fallback(&self) -> Option<u8> {
-        if !self.wrote.load(Ordering::SeqCst) || !self.restore_is_pump() {
+        self.floored_fallback_if(self.restore_is_pump())
+    }
+
+    /// [`Self::floored_fallback`] from what the watch has already seen, with
+    /// no lookup — for a restore queued behind a write that did not return,
+    /// which must not take the controller lock that write holds (DEC-455).
+    pub fn floored_fallback_as_seen(&self) -> Option<u8> {
+        self.floored_fallback_if(self.seen_as_pump())
+    }
+
+    fn floored_fallback_if(&self, pump: bool) -> Option<u8> {
+        if !self.wrote.load(Ordering::SeqCst) || !pump {
             return None;
         }
         Some(
@@ -247,6 +258,14 @@ impl<'a> PumpWatch<'a> {
                 .load(Ordering::SeqCst)
                 .max(self.pump_floor),
         )
+    }
+
+    /// [`Self::restore_is_pump`] from what the watch has already seen: pump at
+    /// entry, or seen protected by an earlier read. Never re-reads the union,
+    /// so it takes no lock (DEC-455) — and so misses evidence that arrived
+    /// after the last read.
+    pub fn seen_as_pump(&self) -> bool {
+        self.at_start || self.seen.load(Ordering::SeqCst)
     }
 
     /// The header's pump floor this watch applies (DEC-443).
@@ -316,6 +335,81 @@ pub(crate) fn pump_protected_mid_run_detail(subject: &str, pump_floor: u8) -> St
          pump was activated, or it was assigned the pump role), so the {subject} stopped \
          and its restore is floored at the {pump_floor}% pump floor"
     )
+}
+
+// ── Diagnostic writes (DEC-455, `PTR-ab`) ─────────────────────────────
+
+/// Why a diagnostic's PWM write did not succeed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteFailure {
+    /// The write returned, with an error.
+    Error(String),
+    /// The write did not return within [`crate::constants::DIAGNOSTIC_WRITE_BUDGET`].
+    /// It still runs on the blocking pool, holding the controller lock, and
+    /// may land whenever the driver answers — so the run writes nothing more to
+    /// the header and calls nothing that takes that lock.
+    Unresponsive,
+}
+
+/// [SAFETY] One diagnostic PWM write, bounded (DEC-455, `PTR-ab`).
+///
+/// `set_pwm` and the controller lock it needs both run on the blocking pool:
+/// `set_pwm` reads sysfs several times (the reclaim watchdog's `pwm_enable`,
+/// the readback, the tach refresh), so on a driver that stops answering it
+/// used to park a tokio worker while holding the lock the engine's and the
+/// thermal force's hwmon writes take. The engine's own writes have been shaped
+/// this way since DEC-278 (`profile_engine::backends`); this is the same shape
+/// for the three diagnostics. `spawn_blocking` cannot be cancelled, so a write
+/// that times out keeps running and keeps the lock until the driver answers —
+/// which is why [`WriteFailure::Unresponsive`] means "write nothing more".
+///
+/// A join error is a write that finished without an answer (it panicked): an
+/// error, never success.
+pub(crate) async fn bounded_hwmon_write(
+    controller: std::sync::Arc<parking_lot::Mutex<crate::hwmon::pwm_control::HwmonPwmController>>,
+    header_id: String,
+    lease_id: String,
+    pct: u8,
+) -> Result<(), WriteFailure> {
+    let join = tokio::task::spawn_blocking(move || {
+        controller
+            .lock()
+            .set_pwm(&header_id, pct, &lease_id)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    });
+    match tokio::time::timeout(crate::constants::DIAGNOSTIC_WRITE_BUDGET, join).await {
+        Err(_elapsed) => Err(WriteFailure::Unresponsive),
+        Ok(Err(join_error)) => Err(WriteFailure::Error(format!(
+            "the write task did not finish: {join_error}"
+        ))),
+        Ok(Ok(result)) => result.map_err(WriteFailure::Error),
+    }
+}
+
+/// A write that did not return (DEC-455): mark the run's write as stuck —
+/// which is what makes the restore write nothing — and return the run's
+/// `detail`. One function, so no stuck-write exit can report the write
+/// without also arming the skip (the `note_unresponsive` rule, DEC-420).
+pub(crate) fn note_write_unresponsive(write_stuck: &AtomicBool, pct: u8) -> String {
+    write_stuck.store(true, Ordering::SeqCst);
+    format!(
+        "the PWM write of {pct}% did not return within {} s (a driver that is not \
+         responding), so the run stopped and writes nothing more to the header; \
+         `restore_outcome` says what was left",
+        crate::constants::DIAGNOSTIC_WRITE_BUDGET.as_secs()
+    )
+}
+
+/// Adapt a synchronous write that cannot hang — a test fake — to the
+/// diagnostics' async write shape. `pub` because `daemon/tests/` drives the
+/// loops too, and a `#[cfg(test)]` item is invisible there ([`PumpWatch::fixed`]'s
+/// reason). A production write goes through [`bounded_hwmon_write`].
+pub fn sync_write<F>(f: F) -> impl Fn(u8) -> std::future::Ready<Result<(), WriteFailure>>
+where
+    F: Fn(u8) -> Result<(), String>,
+{
+    move |pct| std::future::ready(f(pct).map_err(WriteFailure::Error))
 }
 
 #[cfg(test)]

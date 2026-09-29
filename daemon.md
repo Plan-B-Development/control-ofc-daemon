@@ -162,11 +162,19 @@ daemon/src/
                          No I/O, no locks, no clock — and written to be reused by
                          Batch 3's steady-state detector, which is its temperature twin
     characterization.rs — PWM/RPM response sweep (DEC-313), reused by validation.
-                         Owns RestoreOnDrop, which the discovery sweep reuses verbatim.
-                         Its reads are bounded at DIAGNOSTIC_READ_BUDGET (2 s) on the
-                         blocking pool, as the stall probe's are, and after a read that
-                         does not return it writes nothing more — no restore, unless the
-                         header became a pump (`skipped_unresponsive`, DEC-420)
+                         Owns RestoreGuard, which the discovery sweep and the stall probe
+                         reuse: an explicit restore awaited on every exit, before the
+                         lease drops; its Drop only logs (DEC-455). Its reads are bounded
+                         at DIAGNOSTIC_READ_BUDGET (2 s) on the blocking pool, as the stall
+                         probe's are, and after a read that does not return it writes
+                         nothing more — no restore, unless the header became a pump
+                         (`skipped_unresponsive`, DEC-420). Every diagnostic write goes
+                         through diagnostic_gates::bounded_hwmon_write (set_pwm + the
+                         controller lock on the blocking pool, DIAGNOSTIC_WRITE_BUDGET 2 s);
+                         after a write that does not return, nothing more is written to
+                         a header with a mode switch, pump or not — the engine hands it
+                         back — while one with none gets its restore (the stall probe:
+                         100 %) queued behind the stuck write (DEC-455)
     discovery.rs       — PWM-to-tach control-path sweep (DEC-333). Perturbs one header
                          away from the nearer rail, watches every tach incl. monitor-only
     preflight.rs       — the shared diagnostic safety predicates + typed report (DEC-333).
@@ -174,11 +182,13 @@ daemon/src/
                          why the three older diagnostics needed no edit
     diagnostic_gates.rs — [SAFETY] the per-step write gates (shutdown, cancel, the three
                          thermal gates, keepalive), defined once (DEC-407) and called by
-                         characterisation and the stall probe
+                         characterisation and the stall probe; and the bounded diagnostic
+                         write, bounded_hwmon_write (DEC-455)
     stall_probe.rs     — [SAFETY] the stall/restart probe (DEC-407): the ONLY diagnostic
                          that writes below 20 %. Pure eligibility + timing rules, and the
                          adaptive loop (baseline → descent → ascent → kick) over the shared
-                         gates and RestoreOnDrop
+                         gates and RestoreGuard; no kick after a write that did not return
+                         (a header with no mode switch gets 100 % queued behind it)
 
   validation/            — AIO-MB Phase 5 (DEC-317). Split by who may have side effects.
     mod.rs             — subsystem re-exports + the safety posture, stated once
@@ -938,7 +948,7 @@ on every 500 ms sample (verify's 6 s settle is sliced to match), always with no 
 held and never once shutdown has been seen. A flip **stops the run** — the user's
 choice, DEC-407's `eligibility_lost` precedent, not clamp-and-continue: a
 characterisation or discovery ends `aborted` with a `detail` saying why, and a verify
-returns the seventh `result`, `pump_protected_mid_run`. `RestoreOnDrop` (and verify's
+returns the seventh `result`, `pump_protected_mid_run`. `RestoreGuard` (and verify's
 own restore) re-reads the watch once more before it writes, so protection that arrives
 after the last sample still floors the restore at 30 %. **A hold whose time has elapsed is
 a completed measurement** (the user's rule at review): each loop consults the watch only

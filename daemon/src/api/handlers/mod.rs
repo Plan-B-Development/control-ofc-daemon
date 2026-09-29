@@ -443,7 +443,7 @@ pub struct AppState {
     ///
     /// [SAFETY] Because the task is detached it is NOT in
     /// `main::shutdown_sequence`'s `task_handles`. What makes that safe is the
-    /// shutdown check inside `characterization::RestoreOnDrop` — see its docs.
+    /// shutdown check inside `characterization::RestoreGuard` — see its docs.
     pub characterization: crate::api::characterization::RunSlot,
     /// The validation-session engine (AIO-MB Phase 5).
     ///
@@ -466,7 +466,7 @@ pub struct AppState {
     ///
     /// Same shape, same lifetime and the same detached-task caveat as
     /// `characterization` above — including that its safety comes from the
-    /// shutdown check inside the shared `RestoreOnDrop`. It claims the SAME
+    /// shutdown check inside the shared `RestoreGuard`. It claims the SAME
     /// single verify slot, so discovery, verify, characterise and calibrate are
     /// still mutually exclusive: this field adds a fourth claimant, not a fourth
     /// concurrent writer.
@@ -476,7 +476,7 @@ pub struct AppState {
     /// flag `DELETE /diagnostics/stall-probe` sets to ask it to stop.
     ///
     /// Same shape and the same detached-task caveat as `characterization`: its
-    /// safety at shutdown comes from the shared `RestoreOnDrop` plus the probe's
+    /// safety at shutdown comes from the shared `RestoreGuard` plus the probe's
     /// own per-sample shutdown check. It claims the SAME single verify slot, so
     /// it is a fifth claimant, never a fifth concurrent writer.
     pub stall_probe: crate::api::stall_probe::StallProbeSlot,

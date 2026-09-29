@@ -6582,7 +6582,7 @@ async fn characterize_refused_when_hot() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// `AUD2-c` at the CALL SITE: the skip branches live in `RestoreOnDrop`, but the
+/// `AUD2-c` at the CALL SITE: the skip branches live in `RestoreGuard`, but the
 /// two wire fields are derived in the handler's terminal publish. A unit test of
 /// the guard proves the reason is *recorded*; only this proves it is *published*.
 ///

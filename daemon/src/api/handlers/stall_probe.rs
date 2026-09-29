@@ -31,7 +31,7 @@ use crate::hwmon::lease::HwmonWriter;
 ///
 /// [SAFETY] The task is detached, so it is NOT in `main::shutdown_sequence`'s
 /// `task_handles`. What makes that safe is the shutdown check inside the shared
-/// `characterization::RestoreOnDrop`, plus `run_probe`'s own shutdown check on
+/// `characterization::RestoreGuard`, plus `run_probe`'s own shutdown check on
 /// every write and every sample — the guard covers only the restore.
 pub async fn stall_probe_handler(
     State(state): State<Arc<AppState>>,
@@ -73,7 +73,9 @@ pub async fn stall_probe_handler(
         );
     };
 
-    let (pwm_path, enable_path, rpm_path, is_writable) = {
+    // DEC-455: `has_mode_switch` is exactly when `set_pwm` records its take for
+    // the engine to hand back (`supports_enable` with an enable path).
+    let (pwm_path, enable_path, rpm_path, is_writable, has_mode_switch) = {
         let ctrl = controller.lock();
         match ctrl.header(&header_id) {
             Some(h) => (
@@ -81,6 +83,7 @@ pub async fn stall_probe_handler(
                 h.enable_path.clone(),
                 h.rpm_path.clone(),
                 h.is_writable,
+                h.supports_enable && h.enable_path.is_some(),
             ),
             None => {
                 return error_response(
@@ -195,10 +198,10 @@ pub async fn stall_probe_handler(
         .ok()
         .and_then(Result::ok)
         .flatten();
-        // Guard drop order is load-bearing, and is the characterisation order:
-        // `run_probe` declares its own `RestoreOnDrop` internally, so that guard
-        // drops when the probe future completes — BEFORE `pause` and `_lease`
-        // below, which is the only order in which the restore can still succeed.
+        // Order is load-bearing, and is the characterisation order: `run_probe`
+        // awaits its own `RestoreGuard::restore` before it returns — BEFORE
+        // `pause` and `_lease` below drop, which is the only order in which the
+        // restore can still succeed.
         {
             let pause = verify_guard;
             let _lease = verify_lease;
@@ -214,11 +217,15 @@ pub async fn stall_probe_handler(
                 lease_ok && pause_ok
             };
             let shutting_down = || *shutdown_rx.borrow();
-            let write_fn = |pct: u8| -> Result<(), String> {
-                let mut c = ctrl_arc.lock();
-                c.set_pwm(&hid, pct, &verify_lease_id)
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
+            // [SAFETY] DEC-455 (`PTR-ab`): on the blocking pool, lock and all,
+            // and BOUNDED — the kick and the restore included.
+            let write_fn = |pct: u8| {
+                crate::api::diagnostic_gates::bounded_hwmon_write(
+                    ctrl_arc.clone(),
+                    hid.clone(),
+                    verify_lease_id.clone(),
+                    pct,
+                )
             };
             // On the blocking pool, per the DEC-290 / `P8-am` precedent: a tach
             // `open(2)` wedged in a driver parks a pool thread instead of a
@@ -290,6 +297,7 @@ pub async fn stall_probe_handler(
                 0,
                 // DEC-443: that floor is this header's own — DC-aware.
                 pump_floor,
+                has_mode_switch,
                 std::time::Duration::from_secs(crate::constants::CHARACTERIZATION_DEFAULT_SETTLE_S),
                 driver_refresh_ms,
                 write_fn,
@@ -363,7 +371,10 @@ pub async fn stall_probe_cancel_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::handlers::hwmon_ctl::tests::{build_verify_state_with, pwm_duties, WriteLog};
+    use crate::api::handlers::hwmon_ctl::tests::{
+        build_verify_state_with, build_wedged_verify_state, only_these_land_after_the_wedge,
+        pwm_duties, FifoRelease, WriteLog,
+    };
     use crate::hwmon::roles::HeaderRole;
     use std::time::Duration;
 
@@ -505,6 +516,107 @@ mod tests {
         let (status, Json(got)) = stall_probe_status_handler(State(f.state.clone())).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(got["outcome"], sp::OUTCOME_STALL_AND_RESTART_FOUND);
+    }
+
+    /// [SAFETY] DEC-455 (`PTR-ab`), through the REAL handler and the real
+    /// controller: the baseline write not returning ([`WedgingWriter`]'s FIFO,
+    /// under the controller lock) ends the probe `failed` with `write_failed`
+    /// within `DIAGNOSTIC_WRITE_BUDGET`, and the probe writes nothing more — no
+    /// 100 % kick (5A: it would queue behind the parked write and land after
+    /// it) and no restore (`skipped_unresponsive`). The baseline, because it
+    /// is the one write real time reaches quickly: the baseline hold waits out
+    /// register updates the fake tach never makes. Real time and
+    /// `current_thread`, for the characterisation twin's reasons: a write moved
+    /// back onto the worker freezes this body until the 12 s self-release.
+    ///
+    /// [`WedgingWriter`]: crate::api::handlers::hwmon_ctl::tests
+    #[tokio::test]
+    async fn a_write_that_does_not_return_ends_a_real_probe_within_its_budget() {
+        let (state, writes, _tx, tmp, fifo) = build_wedged_verify_state(102, stall_fan, 1, true);
+        std::fs::write(tmp.path().join("update_interval"), "1000\n").unwrap();
+        let wedge = FifoRelease::arm(&fifo, Duration::from_secs(12));
+        let started = std::time::Instant::now();
+        let (status, body) = post(&state, ack()).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let run = loop {
+            if let Some(r) = state.stall_probe.lock().clone() {
+                if !r.is_running() && r.restore_outcome != "pending" {
+                    break r;
+                }
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the probe never ended — the write was not bounded"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the probe ended, but the worker was parked until the wedge released: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            run.state,
+            crate::api::characterization::STATE_FAILED,
+            "{run:?}"
+        );
+        assert_eq!(
+            run.abort_reason.as_deref(),
+            Some(sp::ABORT_WRITE_FAILED),
+            "{run:?}"
+        );
+        let start = crate::constants::STALL_PROBE_START_PCT;
+        assert!(
+            run.detail.as_deref().is_some_and(|d| {
+                d.contains(&format!("PWM write of {start}%")) && d.contains("did not return")
+            }),
+            "{run:?}"
+        );
+        // The parked write may land, so the header counts as moved.
+        assert_eq!(run.restore_outcome, "skipped_unresponsive", "{run:?}");
+        assert!(run.restore_failed, "{run:?}");
+        only_these_land_after_the_wedge(&state, &writes, wedge, &[], &[start]).await;
+    }
+
+    /// [SAFETY] DEC-455 review F1 (the user's choice): the probe HANDLER on a
+    /// header with no mode switch queues one full-speed write behind the stuck
+    /// baseline write — nothing else would ever move the header again — and no
+    /// restore. Pins the handler's `has_mode_switch` wiring.
+    #[tokio::test]
+    async fn a_stuck_write_on_a_header_with_no_mode_switch_queues_full_speed() {
+        let (state, writes, _tx, tmp, fifo) = build_wedged_verify_state(102, stall_fan, 1, false);
+        std::fs::write(tmp.path().join("update_interval"), "1000\n").unwrap();
+        let wedge = FifoRelease::arm(&fifo, Duration::from_secs(12));
+        let started = std::time::Instant::now();
+        let (status, body) = post(&state, ack()).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let run = loop {
+            if let Some(r) = state.stall_probe.lock().clone() {
+                if !r.is_running() && r.restore_outcome != "pending" {
+                    break r;
+                }
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the probe never ended — the write was not bounded"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(
+            run.abort_reason.as_deref(),
+            Some(sp::ABORT_WRITE_FAILED),
+            "{run:?}"
+        );
+        assert_eq!(run.restore_outcome, "skipped_unresponsive", "{run:?}");
+        let start = crate::constants::STALL_PROBE_START_PCT;
+        only_these_land_after_the_wedge(
+            &state,
+            &writes,
+            wedge,
+            &[],
+            &[start, crate::constants::STALL_PROBE_KICK_PCT],
+        )
+        .await;
     }
 
     #[tokio::test]

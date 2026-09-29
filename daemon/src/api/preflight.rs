@@ -19,7 +19,7 @@
 //! [`super::handlers::AppState::header_is_pump_protected`]). So this module
 //! achieves "one definition" by **calling those same functions**, and the three
 //! handlers needed no edit at all. Their control flow, their guard drop order
-//! and the two skip rules living inside `RestoreOnDrop::drop` are untouched by
+//! and the two skip rules living inside `RestoreGuard::restore` are untouched by
 //! construction rather than by care — which is the only way to be sure a
 //! reporting layer did not move a safety boundary.
 //!

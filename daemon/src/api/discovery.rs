@@ -24,9 +24,9 @@
 //!   for any header and a pump-protected one never crosses its 30 % floor.
 //! * The header is returned to its baseline between cycles, and to its captured
 //!   pre-run duty on every exit path, by the same
-//!   [`RestoreOnDrop`](crate::api::characterization) guard the characterisation
-//!   sweep uses — including its two deliberate skips (shutdown, thermal force)
-//!   and its load-bearing drop order.
+//!   [`RestoreGuard`](crate::api::characterization::RestoreGuard) guard the characterisation
+//!   sweep uses — including its deliberate skips (shutdown, thermal force, a
+//!   write that did not return) and its place before the lease is released.
 //! * A pump whose tach **disappears** mid-run aborts immediately
 //!   ([`pump_tach_lost`]) — §1 lists that as an abort trigger, and it is the one
 //!   signal that distinguishes "the pump is fine and we are perturbing it" from
@@ -57,8 +57,10 @@ use std::time::Duration;
 use crate::api::calibration::{
     check_thermal_safety, stale_temperature_refusal, thermal_force_state,
 };
-use crate::api::characterization::{RestoreOnDrop, RestoreReport, RunStep};
-use crate::api::diagnostic_gates::{pump_protected_mid_run_detail, PumpWatch};
+use crate::api::characterization::{AfterStuckWrite, RestoreGuard, RestoreReport, RunStep};
+use crate::api::diagnostic_gates::{
+    note_write_unresponsive, pump_protected_mid_run_detail, PumpWatch, WriteFailure,
+};
 use crate::api::responses::HwmonVerifyState;
 use crate::constants;
 use crate::health::cache::StateCache;
@@ -638,9 +640,14 @@ pub struct DiscoveryOutcome {
 /// (→ `failed`), `pwm_enable != 1` (→ `aborted`, reclaim), a sensor over the
 /// diagnostic limit or the ladder forcing (→ `aborted`), the daemon shutting
 /// down (→ `aborted`), and **a pump-protected header whose tach disappears**
-/// (→ `aborted`).
+/// (→ `aborted`). One does NOT restore: a write that did not return (→
+/// `failed`, DEC-455), after which nothing more is written.
+///
+/// [SAFETY] `write_fn` is BOUNDED in production (DEC-455, `PTR-ab`,
+/// [`crate::api::diagnostic_gates::bounded_hwmon_write`]). Every exit ends in
+/// the explicit [`RestoreGuard::restore`], awaited before this returns.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_discovery<W, R, Fut, P, A, S, K>(
+pub async fn run_discovery<W, WF, R, Fut, P, A, S, K>(
     cache: &StateCache,
     header_id: &str,
     channels: &[TachChannel],
@@ -654,6 +661,9 @@ pub async fn run_discovery<W, R, Fut, P, A, S, K>(
     // the reason `AUD3-l` records on the characterisation path: putting an
     // ordinary fan back at its own captured 0 is a restore, not a safety event.
     restore_floor: u8,
+    // [SAFETY] DEC-455: whether the header has a mode switch — without one the
+    // restore is queued behind a write that did not return (`AfterStuckWrite`).
+    has_mode_switch: bool,
     pump_protected: bool,
     // [SAFETY] `TS-aw` (DEC-418): the pump union, re-read before every write and
     // on every sample. A header that becomes pump-protected mid-run stops the
@@ -681,7 +691,8 @@ pub async fn run_discovery<W, R, Fut, P, A, S, K>(
     mut announce: A,
 ) -> DiscoveryOutcome
 where
-    W: Fn(u8) -> Result<(), String>,
+    W: Fn(u8) -> WF,
+    WF: std::future::Future<Output = Result<(), WriteFailure>>,
     R: Fn() -> Fut,
     Fut: std::future::Future<Output = DiscoverySample>,
     P: FnMut(DiscoveryCycle),
@@ -709,14 +720,12 @@ where
     let mut sample_count: u32 = 0;
     let mut resolution_samples: Vec<Vec<(u64, Option<u16>)>> = vec![Vec::new(); channels.len()];
     let wrote_any = AtomicBool::new(false);
+    // DEC-455: set by `note_write_unresponsive` when a write does not return.
+    let write_stuck = AtomicBool::new(false);
     let run_started = tokio::time::Instant::now();
 
-    // [SAFETY] Bound BEFORE `_restore`, deliberately. `_restore` must remain the
-    // last binding in this scope so it drops first (see its own comment below),
-    // and while this closure is `Drop`-free — it captures one shared reference —
-    // relying on that would leave the guard's stated invariant false at its own
-    // site and would silently mis-order the next binding someone adds here.
-    // Keep new bindings above `_restore`.
+    // The three thermal gates, as one closure (see the note above the cycle
+    // loop).
     let thermal_gate = || -> Option<String> {
         if let Err(e) = check_thermal_safety(cache) {
             return Some(e.to_string());
@@ -730,12 +739,11 @@ where
         stale_temperature_refusal(cache, DISCOVERY_DIAGNOSTIC)
     };
 
-    // Declared LAST so it drops FIRST — while the caller's lease guard is still
-    // held. Reversed, the restore write fails `InvalidLease` and the header is
-    // parked at the last perturbed duty. Same invariant, same reason, as
-    // `characterization::run_sweep`; see `RestoreOnDrop`'s docs before touching
-    // this ordering.
-    let _restore = RestoreOnDrop {
+    // Awaited at the end, before this returns — while the caller's lease guard
+    // is still held. After it, the restore write would fail `InvalidLease` and
+    // the header would be parked at the last perturbed duty. Same invariant,
+    // same reason, as `characterization::run_sweep`; see `RestoreGuard`'s docs.
+    let mut restore = RestoreGuard {
         header_id,
         original_pct,
         write_fn: &write_fn,
@@ -748,6 +756,12 @@ where
         // Discovery's reads are not bounded (`P8-b`), so it never detects a
         // hung read to skip after.
         unresponsive: None,
+        write_stuck: &write_stuck,
+        after_stuck_write: AfterStuckWrite::for_header(
+            has_mode_switch,
+            AfterStuckWrite::QueueRestore,
+        ),
+        armed: true,
     };
 
     macro_rules! bail {
@@ -793,400 +807,424 @@ where
     // two gating shapes for one safety rule is how a site ends up checking a
     // subset. A fourth write site added later gets all three or none.
     //
-    // The closure itself is defined above, before `_restore`, so the guard stays
-    // the last binding in scope.
-
-    for cycle in 1..=cycle_count {
-        // [SAFETY] The same four gates the characterisation sweep applies at the
-        // top of every point, for the same reasons. The shutdown check is not
-        // covered by the drop guard's own skip: this task is detached, so it
-        // keeps running through `shutdown_sequence` and could otherwise land a
-        // write after `hand_back_hwmon` handed the header back to firmware.
-        if shutting_down() {
-            bail!(STATE_ABORTED, "the daemon is shutting down".into());
-        }
-        if cancel.load(Ordering::SeqCst) {
-            bail!(
-                STATE_CANCELLED,
-                format!("cancelled after {} of {cycle_count} cycles", cycle - 1)
-            );
-        }
-        // Gate 1 of 2 per cycle — guards the BASELINE write below.
-        if let Some(reason) = thermal_gate() {
-            bail!(STATE_ABORTED, reason);
-        }
-        // ── Baseline window ──
-        // Written explicitly rather than assumed: cycle 2 arrives here straight
-        // from cycle 1's perturbed duty, and an unwritten baseline would compare
-        // a perturbed reading against another perturbed reading.
-        //
-        // [SAFETY] DEC-296: liveness is proved before **every observation
-        // window**, not once per cycle. A cycle holds TWO windows, so renewing
-        // per cycle makes the renewal interval `2 × window` — which at the
-        // documented maximum (15 s) equals `VERIFY_PAUSE_DEADMAN` (30 s) before
-        // any I/O overhead, i.e. the pause expires before it is re-armed. The
-        // engine's write phase would then resume mid-run, and `try_begin_verify`
-        // would enter its steal branch, letting a second diagnostic force-take
-        // this run's lease so that even the restore write fails `InvalidLease`
-        // and the header is parked at the perturbed duty. That is precisely the
-        // defect DEC-296 recorded, and it is why the compile-time assertion in
-        // `constants.rs` describes a ONE-window interval: this is the code that
-        // has to make that true.
-        if !keepalive() {
-            bail!(
-                STATE_ABORTED,
-                "superseded by a later diagnostic; this run's lease is gone".into()
-            );
-        }
-        // [SAFETY] Re-check immediately before the write. `observe` checks at the
-        // top of each sample iteration, but returns after one more read — up to
-        // `DISCOVERY_MAX_TACH_CHANNELS` blocking sysfs reads later — so shutdown
-        // can land in that gap and a write issued after `hand_back_hwmon`
-        // would re-assert `pwm_enable=1` at a fixed duty with no writer left
-        // (the DEC-290 / 277-c hazard the drop guard's own skip exists for).
-        if shutting_down() {
-            bail!(STATE_ABORTED, "the daemon is shutting down".into());
-        }
-        // [SAFETY] `TS-aw`: after the shutdown check, so it is never read while
-        // the exit path holds the controller, and immediately before the write.
-        if pump_watch.became_protected() {
-            bail_window!(WindowStop::PumpProtected);
-        }
-        wrote_any.store(true, Ordering::SeqCst);
-        pump_watch.note_write(baseline_pct);
-        if let Err(e) = write_fn(baseline_pct) {
-            bail!(
-                STATE_FAILED,
-                format!("PWM write of {baseline_pct}% failed: {e}")
-            );
-        }
-        // ── Settle-wait (DEC-405, `PTR-c`) ──
-        // A baseline window that opens as the previous perturbation is reversed
-        // measures the recovery ramp, and `noise_floor` then calls that ramp
-        // noise: on 2026-09-08 a +796 rpm pump response was graded `ambiguous`
-        // against an 804 rpm cycle-2 floor. So wait, bounded, for every channel
-        // that can move to settle — before any baseline whose write moved the
-        // duty, which is every later cycle and cycle 1 only when the header was
-        // below the discovery floor.
-        let needs_wait = cycle > 1 || original_pct != Some(baseline_pct);
-        let (baseline_settled, settle_wait_ms, channel_settled) = if needs_wait {
-            announce(RunStep::now(
-                STEP_PHASE_SETTLE_WAIT,
-                u16::from(cycle),
-                baseline_pct,
-                settle_wait_max,
-            ));
-            let waited = match settle_wait(
-                &read_fn,
-                settle_wait_max,
-                &shutting_down,
-                pump_watch,
-                run_started,
-                &mut resolution_samples,
-                &mut sample_count,
-                &previous_tachs,
-            )
-            .await
-            {
-                Ok(w) => w,
-                Err(stop) => bail_window!(stop),
-            };
-            // [SAFETY] The wait held the baseline duty for up to a window, so its
-            // last reading gets the same reclaim / lost-pump-tach check every
-            // observation window's does. Without it a pump whose tach vanished
-            // during the wait would be noticed only after the baseline window
-            // too — two windows at the baseline duty instead of one.
-            if let Some(reason) = reclaim_or_lost_pump(
-                &waited.last,
-                baseline_pct,
-                pump_protected,
-                had_target_tach,
-                target_idx.and_then(|i| waited.last.tachs.get(i).copied().flatten()),
-            ) {
-                bail!(STATE_ABORTED, reason);
+    // DEC-455: every exit of the walk is a `return` from this block (the
+    // `bail!` macros included), so every one reaches the explicit restore.
+    let outcome = async {
+        for cycle in 1..=cycle_count {
+            // [SAFETY] The same four gates the characterisation sweep applies at the
+            // top of every point, for the same reasons. The shutdown check is not
+            // covered by the drop guard's own skip: this task is detached, so it
+            // keeps running through `shutdown_sequence` and could otherwise land a
+            // write after `hand_back_hwmon` handed the header back to firmware.
+            if shutting_down() {
+                bail!(STATE_ABORTED, "the daemon is shutting down".into());
             }
-            // DEC-405 (F2): a cancel is honoured at every window boundary, so it
-            // lands when the window being held ends — the wait included, which
-            // would otherwise add up to `DISCOVERY_SETTLE_WAIT_MAX` to it.
             if cancel.load(Ordering::SeqCst) {
                 bail!(
                     STATE_CANCELLED,
                     format!("cancelled after {} of {cycle_count} cycles", cycle - 1)
                 );
             }
-            // [SAFETY] The wait is an observation window in its own right, so
-            // the one-window renewal cadence (DEC-296) and the thermal gates
-            // beside it (DEC-339) are applied again before the baseline window.
-            // Without this the baseline window would run up to
-            // `DISCOVERY_SETTLE_WAIT_MAX + window` (30 s) past the last renewal —
-            // exactly the deadman — and a thermal condition that arose during
-            // the wait would go unexamined for two windows. Same order as every
-            // other gate site in this function: thermal, then keepalive.
+            // Gate 1 of 2 per cycle — guards the BASELINE write below.
             if let Some(reason) = thermal_gate() {
                 bail!(STATE_ABORTED, reason);
             }
+            // ── Baseline window ──
+            // Written explicitly rather than assumed: cycle 2 arrives here straight
+            // from cycle 1's perturbed duty, and an unwritten baseline would compare
+            // a perturbed reading against another perturbed reading.
+            //
+            // [SAFETY] DEC-296: liveness is proved before **every observation
+            // window**, not once per cycle. A cycle holds TWO windows, so renewing
+            // per cycle makes the renewal interval `2 × window` — which at the
+            // documented maximum (15 s) equals `VERIFY_PAUSE_DEADMAN` (30 s) before
+            // any I/O overhead, i.e. the pause expires before it is re-armed. The
+            // engine's write phase would then resume mid-run, and `try_begin_verify`
+            // would enter its steal branch, letting a second diagnostic force-take
+            // this run's lease so that even the restore write fails `InvalidLease`
+            // and the header is parked at the perturbed duty. That is precisely the
+            // defect DEC-296 recorded, and it is why the compile-time assertion in
+            // `constants.rs` describes a ONE-window interval: this is the code that
+            // has to make that true.
             if !keepalive() {
                 bail!(
                     STATE_ABORTED,
                     "superseded by a later diagnostic; this run's lease is gone".into()
                 );
             }
-            let all = waited.settled.iter().all(|s| *s);
-            (Some(all), waited.elapsed_ms, waited.settled)
-        } else {
-            (None, 0, vec![true; channels.len()])
-        };
-        announce(RunStep::now(
-            STEP_PHASE_BASELINE,
-            u16::from(cycle),
-            baseline_pct,
-            window,
-        ));
-        let base = match observe(
-            &read_fn,
-            window,
-            &shutting_down,
-            pump_watch,
-            run_started,
-            &mut resolution_samples,
-            &mut sample_count,
-        )
-        .await
-        {
-            Ok(s) => s,
-            Err(stop) => bail_window!(stop),
-        };
-        if let Some(reason) = reclaim_or_lost_pump(
-            &base.last,
-            baseline_pct,
-            pump_protected,
-            had_target_tach,
-            target_idx.and_then(|i| base.last.tachs.get(i).copied().flatten()),
-        ) {
-            bail!(STATE_ABORTED, reason);
+            // [SAFETY] Re-check immediately before the write. `observe` checks at the
+            // top of each sample iteration, but returns after one more read — up to
+            // `DISCOVERY_MAX_TACH_CHANNELS` blocking sysfs reads later — so shutdown
+            // can land in that gap and a write issued after `hand_back_hwmon`
+            // would re-assert `pwm_enable=1` at a fixed duty with no writer left
+            // (the DEC-290 / 277-c hazard the drop guard's own skip exists for).
+            if shutting_down() {
+                bail!(STATE_ABORTED, "the daemon is shutting down".into());
+            }
+            // [SAFETY] `TS-aw`: after the shutdown check, so it is never read while
+            // the exit path holds the controller, and immediately before the write.
+            if pump_watch.became_protected() {
+                bail_window!(WindowStop::PumpProtected);
+            }
+            wrote_any.store(true, Ordering::SeqCst);
+            pump_watch.note_write(baseline_pct);
+            match write_fn(baseline_pct).await {
+                Ok(()) => {}
+                // [SAFETY] DEC-455: a failed write, as the user chose — and nothing
+                // more is written or re-read, because the stuck write holds the
+                // controller lock.
+                Err(WriteFailure::Unresponsive) => bail!(
+                    STATE_FAILED,
+                    note_write_unresponsive(&write_stuck, baseline_pct)
+                ),
+                Err(WriteFailure::Error(e)) => bail!(
+                    STATE_FAILED,
+                    format!("PWM write of {baseline_pct}% failed: {e}")
+                ),
+            }
+            // ── Settle-wait (DEC-405, `PTR-c`) ──
+            // A baseline window that opens as the previous perturbation is reversed
+            // measures the recovery ramp, and `noise_floor` then calls that ramp
+            // noise: on 2026-09-08 a +796 rpm pump response was graded `ambiguous`
+            // against an 804 rpm cycle-2 floor. So wait, bounded, for every channel
+            // that can move to settle — before any baseline whose write moved the
+            // duty, which is every later cycle and cycle 1 only when the header was
+            // below the discovery floor.
+            let needs_wait = cycle > 1 || original_pct != Some(baseline_pct);
+            let (baseline_settled, settle_wait_ms, channel_settled) = if needs_wait {
+                announce(RunStep::now(
+                    STEP_PHASE_SETTLE_WAIT,
+                    u16::from(cycle),
+                    baseline_pct,
+                    settle_wait_max,
+                ));
+                let waited = match settle_wait(
+                    &read_fn,
+                    settle_wait_max,
+                    &shutting_down,
+                    pump_watch,
+                    run_started,
+                    &mut resolution_samples,
+                    &mut sample_count,
+                    &previous_tachs,
+                )
+                .await
+                {
+                    Ok(w) => w,
+                    Err(stop) => bail_window!(stop),
+                };
+                // [SAFETY] The wait held the baseline duty for up to a window, so its
+                // last reading gets the same reclaim / lost-pump-tach check every
+                // observation window's does. Without it a pump whose tach vanished
+                // during the wait would be noticed only after the baseline window
+                // too — two windows at the baseline duty instead of one.
+                if let Some(reason) = reclaim_or_lost_pump(
+                    &waited.last,
+                    baseline_pct,
+                    pump_protected,
+                    had_target_tach,
+                    target_idx.and_then(|i| waited.last.tachs.get(i).copied().flatten()),
+                ) {
+                    bail!(STATE_ABORTED, reason);
+                }
+                // DEC-405 (F2): a cancel is honoured at every window boundary, so it
+                // lands when the window being held ends — the wait included, which
+                // would otherwise add up to `DISCOVERY_SETTLE_WAIT_MAX` to it.
+                if cancel.load(Ordering::SeqCst) {
+                    bail!(
+                        STATE_CANCELLED,
+                        format!("cancelled after {} of {cycle_count} cycles", cycle - 1)
+                    );
+                }
+                // [SAFETY] The wait is an observation window in its own right, so
+                // the one-window renewal cadence (DEC-296) and the thermal gates
+                // beside it (DEC-339) are applied again before the baseline window.
+                // Without this the baseline window would run up to
+                // `DISCOVERY_SETTLE_WAIT_MAX + window` (30 s) past the last renewal —
+                // exactly the deadman — and a thermal condition that arose during
+                // the wait would go unexamined for two windows. Same order as every
+                // other gate site in this function: thermal, then keepalive.
+                if let Some(reason) = thermal_gate() {
+                    bail!(STATE_ABORTED, reason);
+                }
+                if !keepalive() {
+                    bail!(
+                        STATE_ABORTED,
+                        "superseded by a later diagnostic; this run's lease is gone".into()
+                    );
+                }
+                let all = waited.settled.iter().all(|s| *s);
+                (Some(all), waited.elapsed_ms, waited.settled)
+            } else {
+                (None, 0, vec![true; channels.len()])
+            };
+            announce(RunStep::now(
+                STEP_PHASE_BASELINE,
+                u16::from(cycle),
+                baseline_pct,
+                window,
+            ));
+            let base = match observe(
+                &read_fn,
+                window,
+                &shutting_down,
+                pump_watch,
+                run_started,
+                &mut resolution_samples,
+                &mut sample_count,
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(stop) => bail_window!(stop),
+            };
+            if let Some(reason) = reclaim_or_lost_pump(
+                &base.last,
+                baseline_pct,
+                pump_protected,
+                had_target_tach,
+                target_idx.and_then(|i| base.last.tachs.get(i).copied().flatten()),
+            ) {
+                bail!(STATE_ABORTED, reason);
+            }
+
+            // ── Perturbed window ──
+            // [SAFETY] Gate 2 of 2 per cycle (DEC-339, `P8-u`) — and the site the
+            // register row was actually about. The baseline window has just elapsed,
+            // so the reading the cycle-top gate passed on is up to `window` old; the
+            // write below is the one that can lower the duty. Checking here makes the
+            // thermal cadence exactly equal to the keepalive cadence — one evaluation
+            // per observation window — which is the invariant the DEC-296 note below
+            // already establishes for liveness. Read the two together: this function
+            // proves liveness AND thermal safety before every window, never once per
+            // cycle for two windows.
+            //
+            // **Ordered ABOVE `keepalive()`, matching the cycle top and
+            // `characterization.rs`'s in-hold block — do not swap them.** A ladder
+            // engagement force-takes the hwmon lease (`backends.rs`
+            // `force_take_lease(ThermalSafety)`), so `keepalive()` fails on the very
+            // same condition. Checked in the other order, a thermal trip reports
+            // `"superseded by a later diagnostic; this run's lease is gone"` — false,
+            // and it points the operator at a competing diagnostic instead of at the
+            // heat. The hardware outcome is identical either way; the abort *detail*
+            // is not, and it is what the UI shows. The characterisation sweep states
+            // this reasoning at its own renewal site.
+            //
+            // It stays ABOVE the shutdown check too: `shutting_down()` is
+            // load-bearing *immediately* before the write, because `observe` can
+            // return one read after a shutdown began and a write landing after
+            // `hand_back_hwmon` would re-assert `pwm_enable=1` on a header the
+            // firmware has been handed back (the DEC-290 / 277-c hazard).
+            //
+            // DEC-405 (F2): a cancel pressed during the baseline window lands here,
+            // when that window ends, rather than a whole perturbed window later.
+            if cancel.load(Ordering::SeqCst) {
+                bail!(
+                    STATE_CANCELLED,
+                    format!("cancelled after {} of {cycle_count} cycles", cycle - 1)
+                );
+            }
+            if let Some(reason) = thermal_gate() {
+                bail!(STATE_ABORTED, reason);
+            }
+            // Second renewal of the cycle — see the note above the first.
+            if !keepalive() {
+                bail!(
+                    STATE_ABORTED,
+                    "superseded by a later diagnostic; this run's lease is gone".into()
+                );
+            }
+            if shutting_down() {
+                bail!(STATE_ABORTED, "the daemon is shutting down".into());
+            }
+            // [SAFETY] `TS-aw`: the write that can take the header DOWN by up to
+            // `DISCOVERY_DELTA_MAX_PCT`, on a duty planned for an ordinary fan.
+            if pump_watch.became_protected() {
+                bail_window!(WindowStop::PumpProtected);
+            }
+            pump_watch.note_write(perturbed_pct);
+            match write_fn(perturbed_pct).await {
+                Ok(()) => {}
+                // [SAFETY] DEC-455: a failed write, as the user chose — and nothing
+                // more is written or re-read, because the stuck write holds the
+                // controller lock.
+                Err(WriteFailure::Unresponsive) => bail!(
+                    STATE_FAILED,
+                    note_write_unresponsive(&write_stuck, perturbed_pct)
+                ),
+                Err(WriteFailure::Error(e)) => bail!(
+                    STATE_FAILED,
+                    format!("PWM write of {perturbed_pct}% failed: {e}")
+                ),
+            }
+            announce(RunStep::now(
+                STEP_PHASE_PERTURBED,
+                u16::from(cycle),
+                perturbed_pct,
+                window,
+            ));
+            let pert = match observe(
+                &read_fn,
+                window,
+                &shutting_down,
+                pump_watch,
+                run_started,
+                &mut resolution_samples,
+                &mut sample_count,
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(stop) => bail_window!(stop),
+            };
+            if let Some(reason) = reclaim_or_lost_pump(
+                &pert.last,
+                perturbed_pct,
+                pump_protected,
+                had_target_tach,
+                target_idx.and_then(|i| pert.last.tachs.get(i).copied().flatten()),
+            ) {
+                bail!(STATE_ABORTED, reason);
+            }
+
+            let observations: Vec<TachObservation> = channels
+                .iter()
+                .enumerate()
+                .map(|(i, ch)| {
+                    let baseline_rpm = base.last.tachs.get(i).copied().flatten();
+                    let perturbed_rpm = pert.last.tachs.get(i).copied().flatten();
+                    let own_noise = noise_floor(&base.per_channel[i]);
+                    // DEC-405: a channel that settled measured its noise on a steady
+                    // baseline. One that did not falls back to cycle 1's floor for it
+                    // when there is one; cycle 1 itself has nothing earlier to use,
+                    // and its `baseline_settled` says so.
+                    let fallback = if channel_settled[i] {
+                        None
+                    } else {
+                        cycle_1_noise[i]
+                    };
+                    let noise = fallback.unwrap_or(own_noise);
+                    if cycle == 1 {
+                        cycle_1_noise[i] = channel_settled[i].then_some(own_noise);
+                    }
+                    TachObservation {
+                        tach_id: ch.tach_id.clone(),
+                        baseline_rpm,
+                        perturbed_rpm,
+                        delta_rpm: baseline_rpm
+                            .zip(perturbed_rpm)
+                            .map(|(b, p)| i32::from(p) - i32::from(b)),
+                        noise_floor_rpm: noise,
+                        responded: responded(baseline_rpm, perturbed_rpm, noise),
+                        noise_floor_from_cycle_1: fallback.is_some(),
+                    }
+                })
+                .collect();
+
+            let done = DiscoveryCycle {
+                cycle,
+                baseline_pct,
+                perturbed_pct,
+                direction: direction.to_string(),
+                observations,
+                baseline_settled,
+                settle_wait_ms,
+            };
+            previous_tachs = pert.last.tachs.clone();
+            measured.push(done.clone());
+            publish(done);
         }
 
-        // ── Perturbed window ──
-        // [SAFETY] Gate 2 of 2 per cycle (DEC-339, `P8-u`) — and the site the
-        // register row was actually about. The baseline window has just elapsed,
-        // so the reading the cycle-top gate passed on is up to `window` old; the
-        // write below is the one that can lower the duty. Checking here makes the
-        // thermal cadence exactly equal to the keepalive cadence — one evaluation
-        // per observation window — which is the invariant the DEC-296 note below
-        // already establishes for liveness. Read the two together: this function
-        // proves liveness AND thermal safety before every window, never once per
-        // cycle for two windows.
+        // [SAFETY] DEC-339, second review round: the gate has to reach the VERDICT,
+        // not just the writes.
         //
-        // **Ordered ABOVE `keepalive()`, matching the cycle top and
-        // `characterization.rs`'s in-hold block — do not swap them.** A ladder
-        // engagement force-takes the hwmon lease (`backends.rs`
-        // `force_take_lease(ThermalSafety)`), so `keepalive()` fails on the very
-        // same condition. Checked in the other order, a thermal trip reports
-        // `"superseded by a later diagnostic; this run's lease is gone"` — false,
-        // and it points the operator at a competing diagnostic instead of at the
-        // heat. The hardware outcome is identical either way; the abort *detail*
-        // is not, and it is what the UI shows. The characterisation sweep states
-        // this reasoning at its own renewal site.
+        // Every write above is now preceded by a fresh evaluation — but the last
+        // observation window has no write after it, so without this nothing
+        // re-examines the conditions under which that window's DATA was collected.
+        // That matters here in a way it does not on the characterisation path,
+        // because this run's output is persisted as a durable claim about the
+        // hardware: `handlers::discovery` writes a `ControlPathRecord` if and only
+        // if `state == STATE_COMPLETE`, on the stated reasoning that "a cancelled or
+        // aborted run measured a partial window, and recording it as 'last
+        // validated' would be the §5 error of turning absent evidence into a
+        // result".
         //
-        // It stays ABOVE the shutdown check too: `shutting_down()` is
-        // load-bearing *immediately* before the write, because `observe` can
-        // return one read after a shutdown began and a write landing after
-        // `hand_back_hwmon` would re-assert `pwm_enable=1` on a header the
-        // firmware has been handed back (the DEC-290 / 277-c hazard).
+        // A ladder engagement during the final window is exactly that error wearing
+        // a `complete` label. `force_all_with_floor` force-takes the hwmon lease and
+        // drives every writable header to `max(commanded, forced)` — and
+        // `forget_manual_mode()` is called specifically so the force re-asserts
+        // `pwm_enable=1` (DEC-386; it was `on_lease_released()` before), which means `reclaim_or_lost_pump` **cannot** see it: that
+        // predicate keys on `pwm_enable != 1`. So every watched tach jumps for a
+        // reason unrelated to our perturbation, the deltas are meaningless, and the
+        // run would otherwise persist them as a confirmed PWM→tach mapping that
+        // later runs and the UI treat as measured fact. A wrong mapping is worse
+        // than no mapping.
         //
-        // DEC-405 (F2): a cancel pressed during the baseline window lands here,
-        // when that window ends, rather than a whole perturbed window later.
-        if cancel.load(Ordering::SeqCst) {
-            bail!(
-                STATE_CANCELLED,
-                format!("cancelled after {} of {cycle_count} cycles", cycle - 1)
-            );
-        }
+        // Reported as an abort rather than silently suppressing the persist, so the
+        // operator is told the measurement was abandoned instead of watching a run
+        // succeed and quietly record nothing.
         if let Some(reason) = thermal_gate() {
             bail!(STATE_ABORTED, reason);
         }
-        // Second renewal of the cycle — see the note above the first.
-        if !keepalive() {
-            bail!(
-                STATE_ABORTED,
-                "superseded by a later diagnostic; this run's lease is gone".into()
-            );
-        }
-        if shutting_down() {
-            bail!(STATE_ABORTED, "the daemon is shutting down".into());
-        }
-        // [SAFETY] `TS-aw`: the write that can take the header DOWN by up to
-        // `DISCOVERY_DELTA_MAX_PCT`, on a duty planned for an ordinary fan.
-        if pump_watch.became_protected() {
-            bail_window!(WindowStop::PumpProtected);
-        }
-        pump_watch.note_write(perturbed_pct);
-        if let Err(e) = write_fn(perturbed_pct) {
-            bail!(
-                STATE_FAILED,
-                format!("PWM write of {perturbed_pct}% failed: {e}")
-            );
-        }
-        announce(RunStep::now(
-            STEP_PHASE_PERTURBED,
-            u16::from(cycle),
-            perturbed_pct,
-            window,
-        ));
-        let pert = match observe(
-            &read_fn,
-            window,
-            &shutting_down,
-            pump_watch,
-            run_started,
-            &mut resolution_samples,
-            &mut sample_count,
-        )
-        .await
-        {
-            Ok(s) => s,
-            Err(stop) => bail_window!(stop),
-        };
-        if let Some(reason) = reclaim_or_lost_pump(
-            &pert.last,
-            perturbed_pct,
-            pump_protected,
-            had_target_tach,
-            target_idx.and_then(|i| pert.last.tachs.get(i).copied().flatten()),
-        ) {
-            bail!(STATE_ABORTED, reason);
+
+        // Return to the baseline before the guard runs, so a run whose captured
+        // original duty is unreadable still leaves the header somewhere deliberate
+        // rather than at the perturbed duty. Guarded by the same shutdown re-check
+        // as the two writes above, and for the same reason.
+        //
+        // [SAFETY] The thermal-force term is kept even though the gate above
+        // subsumes it today: it is the TOCTOU backstop for a force that engages in
+        // the microseconds between, and it is the condition `RestoreGuard` — which
+        // runs straight after — uses for its own stand-down before logging
+        // that the header was "left at the thermal-safety forced duty". Before
+        // DEC-339 this write ran unconditionally, so it could move the header off
+        // the forced duty and make the guard's own log line false: the one write in
+        // this function that could fight the ladder, immediately above the code that
+        // stood down from exactly that.
+        //
+        // **Direction note, corrected in review.** An earlier draft justified
+        // exempting this write from the other two predicates by saying refusal
+        // "would strand the header at the perturbed duty". That is backwards for the
+        // common case: `perturbation_target` picks `up` whenever `room_up >=
+        // room_down`, which is any baseline at or below ~60, so the perturbed duty is
+        // usually HIGHER and returning to baseline is the duty-lowering move. The
+        // exemption is now moot for the voluntary-abort limbs — the gate above bails
+        // before reaching this line — and what remains true is only the narrow claim
+        // about a force.
+        //
+        // `TS-aw` (DEC-418): a header that became pump-protected after the last
+        // window returns to the baseline raised to the pump floor. Every window
+        // completed, so the run still reports `complete`; the baseline was planned
+        // for an ordinary fan and may sit below the floor. Written rather than
+        // skipped (review `K1`): when the pre-run duty was unreadable, this is the
+        // duty `RestoreGuard` leaves the header at, and skipping it left the header
+        // at the perturbed duty — lower than before this change.
+        if !shutting_down() && thermal_force_state(cache).is_none() {
+            let pct = if pump_watch.became_protected() {
+                // DEC-443: the header's own pump floor, DC-aware.
+                baseline_pct.max(pump_watch.pump_floor())
+            } else {
+                baseline_pct
+            };
+            pump_watch.note_write(pct);
+            // DEC-455: a return that does not come back arms the restore's skip; the
+            // run's measurements are complete either way.
+            if write_fn(pct).await == Err(WriteFailure::Unresponsive) {
+                write_stuck.store(true, Ordering::SeqCst);
+            }
         }
 
-        let observations: Vec<TachObservation> = channels
-            .iter()
-            .enumerate()
-            .map(|(i, ch)| {
-                let baseline_rpm = base.last.tachs.get(i).copied().flatten();
-                let perturbed_rpm = pert.last.tachs.get(i).copied().flatten();
-                let own_noise = noise_floor(&base.per_channel[i]);
-                // DEC-405: a channel that settled measured its noise on a steady
-                // baseline. One that did not falls back to cycle 1's floor for it
-                // when there is one; cycle 1 itself has nothing earlier to use,
-                // and its `baseline_settled` says so.
-                let fallback = if channel_settled[i] {
-                    None
-                } else {
-                    cycle_1_noise[i]
-                };
-                let noise = fallback.unwrap_or(own_noise);
-                if cycle == 1 {
-                    cycle_1_noise[i] = channel_settled[i].then_some(own_noise);
-                }
-                TachObservation {
-                    tach_id: ch.tach_id.clone(),
-                    baseline_rpm,
-                    perturbed_rpm,
-                    delta_rpm: baseline_rpm
-                        .zip(perturbed_rpm)
-                        .map(|(b, p)| i32::from(p) - i32::from(b)),
-                    noise_floor_rpm: noise,
-                    responded: responded(baseline_rpm, perturbed_rpm, noise),
-                    noise_floor_from_cycle_1: fallback.is_some(),
-                }
-            })
-            .collect();
-
-        let done = DiscoveryCycle {
-            cycle,
-            baseline_pct,
-            perturbed_pct,
-            direction: direction.to_string(),
-            observations,
-            baseline_settled,
-            settle_wait_ms,
-        };
-        previous_tachs = pert.last.tachs.clone();
-        measured.push(done.clone());
-        publish(done);
+        DiscoveryOutcome {
+            state: STATE_COMPLETE,
+            detail: None,
+            cycles: measured,
+            sample_count,
+            observed_resolution_ms: fold_resolution(&resolution_samples, target_idx),
+        }
     }
-
-    // [SAFETY] DEC-339, second review round: the gate has to reach the VERDICT,
-    // not just the writes.
-    //
-    // Every write above is now preceded by a fresh evaluation — but the last
-    // observation window has no write after it, so without this nothing
-    // re-examines the conditions under which that window's DATA was collected.
-    // That matters here in a way it does not on the characterisation path,
-    // because this run's output is persisted as a durable claim about the
-    // hardware: `handlers::discovery` writes a `ControlPathRecord` if and only
-    // if `state == STATE_COMPLETE`, on the stated reasoning that "a cancelled or
-    // aborted run measured a partial window, and recording it as 'last
-    // validated' would be the §5 error of turning absent evidence into a
-    // result".
-    //
-    // A ladder engagement during the final window is exactly that error wearing
-    // a `complete` label. `force_all_with_floor` force-takes the hwmon lease and
-    // drives every writable header to `max(commanded, forced)` — and
-    // `forget_manual_mode()` is called specifically so the force re-asserts
-    // `pwm_enable=1` (DEC-386; it was `on_lease_released()` before), which means `reclaim_or_lost_pump` **cannot** see it: that
-    // predicate keys on `pwm_enable != 1`. So every watched tach jumps for a
-    // reason unrelated to our perturbation, the deltas are meaningless, and the
-    // run would otherwise persist them as a confirmed PWM→tach mapping that
-    // later runs and the UI treat as measured fact. A wrong mapping is worse
-    // than no mapping.
-    //
-    // Reported as an abort rather than silently suppressing the persist, so the
-    // operator is told the measurement was abandoned instead of watching a run
-    // succeed and quietly record nothing.
-    if let Some(reason) = thermal_gate() {
-        bail!(STATE_ABORTED, reason);
-    }
-
-    // Return to the baseline before the guard runs, so a run whose captured
-    // original duty is unreadable still leaves the header somewhere deliberate
-    // rather than at the perturbed duty. Guarded by the same shutdown re-check
-    // as the two writes above, and for the same reason.
-    //
-    // [SAFETY] The thermal-force term is kept even though the gate above
-    // subsumes it today: it is the TOCTOU backstop for a force that engages in
-    // the microseconds between, and it is the condition `RestoreOnDrop` — which
-    // runs on the very next line — uses for its own stand-down before logging
-    // that the header was "left at the thermal-safety forced duty". Before
-    // DEC-339 this write ran unconditionally, so it could move the header off
-    // the forced duty and make the guard's own log line false: the one write in
-    // this function that could fight the ladder, immediately above the code that
-    // stood down from exactly that.
-    //
-    // **Direction note, corrected in review.** An earlier draft justified
-    // exempting this write from the other two predicates by saying refusal
-    // "would strand the header at the perturbed duty". That is backwards for the
-    // common case: `perturbation_target` picks `up` whenever `room_up >=
-    // room_down`, which is any baseline at or below ~60, so the perturbed duty is
-    // usually HIGHER and returning to baseline is the duty-lowering move. The
-    // exemption is now moot for the voluntary-abort limbs — the gate above bails
-    // before reaching this line — and what remains true is only the narrow claim
-    // about a force.
-    //
-    // `TS-aw` (DEC-418): a header that became pump-protected after the last
-    // window returns to the baseline raised to the pump floor. Every window
-    // completed, so the run still reports `complete`; the baseline was planned
-    // for an ordinary fan and may sit below the floor. Written rather than
-    // skipped (review `K1`): when the pre-run duty was unreadable, this is the
-    // duty `RestoreOnDrop` leaves the header at, and skipping it left the header
-    // at the perturbed duty — lower than before this change.
-    if !shutting_down() && thermal_force_state(cache).is_none() {
-        let pct = if pump_watch.became_protected() {
-            // DEC-443: the header's own pump floor, DC-aware.
-            baseline_pct.max(pump_watch.pump_floor())
-        } else {
-            baseline_pct
-        };
-        pump_watch.note_write(pct);
-        let _ = write_fn(pct);
-    }
-
-    DiscoveryOutcome {
-        state: STATE_COMPLETE,
-        detail: None,
-        cycles: measured,
-        sample_count,
-        observed_resolution_ms: fold_resolution(&resolution_samples, target_idx),
-    }
+    .await;
+    restore.restore().await;
+    outcome
 }
 
 /// [SAFETY] The two mid-run abort predicates that depend on a fresh reading.

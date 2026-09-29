@@ -52,7 +52,7 @@
 //! relaxing entry must wire **all five** or a policy floor would be honoured by
 //! the profile engine and silently ignored by identify, verify and
 //! characterize — **plus, since DEC-322, the two diagnostic RESTORE writes
-//! (`hwmon_ctl::restore_duty` and `characterization::RestoreOnDrop::restore_floor`),
+//! (`hwmon_ctl::restore_duty` and `characterization::RestoreGuard::restore_floor`),
 //! so a future relaxing policy must wire SIX sites and not five** (`AUD3-l`).
 //! `reported_floor_matches_enforced_floor_for_every_shipped_policy`
 //! below is what keeps the reported number honest until that happens: it fails

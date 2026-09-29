@@ -322,11 +322,12 @@ async fn sweep(
         "up",
         cycles,
         restore_floor,
+        true,
         pump_protected,
         &PumpWatch::fixed(pump_protected),
         Duration::from_millis(20),
         Duration::from_millis(20),
-        write_fn,
+        control_ofc_daemon::api::diagnostic_gates::sync_write(write_fn),
         read_fn,
         cancel,
         || false,
@@ -593,7 +594,7 @@ async fn restoration_occurs_on_cancellation() {
 ///
 /// The ladder is engaged **mid-run**, after the sweep has genuinely moved the
 /// header. That ordering IS the test: with the ladder already forcing at entry
-/// nothing is ever written, and `RestoreOnDrop` then correctly reports
+/// nothing is ever written, and `RestoreGuard` then correctly reports
 /// `Restored` because the header was never moved — so a version of this test
 /// that tripped the ladder up front would assert the wrong outcome and would
 /// pass with the thermal skip deleted. (The entry case is its own test below.)
@@ -2344,7 +2345,7 @@ async fn a_stale_temperature_source_aborts_the_sweep_before_it_writes() {
         "detail was {:?}",
         outcome.detail
     );
-    // Not "wrote nothing": `RestoreOnDrop` puts the header back on EVERY exit
+    // Not "wrote nothing": `RestoreGuard` puts the header back on EVERY exit
     // path, including this one, so the pre-run duty is legitimately re-commanded
     // and asserting an empty list would fail for the right behaviour. The safety
     // property is that the header was never moved OFF its pre-run duty.
@@ -3249,18 +3250,19 @@ async fn discover_pump_with(
         "up",
         2,
         0,
+        true,
         false,
         &PumpWatch::fixed(false),
         Duration::from_secs(constants::CHARACTERIZATION_DEFAULT_SETTLE_S),
         constants::DISCOVERY_SETTLE_WAIT_MAX,
-        move |pct: u8| {
+        control_ofc_daemon::api::diagnostic_gates::sync_write(move |pct: u8| {
             let mut p = pw.lock().unwrap();
             let now = tokio::time::Instant::now();
             let from = p.speed_at(now);
             p.segments.push((now, from, SlowPump::target(pct)));
             p.duty = pct;
             Ok(())
-        },
+        }),
         move || {
             let p = pr.lock().unwrap();
             let rpm = Some(p.register());
@@ -3714,11 +3716,12 @@ async fn discover_with_pump_flip_from(
         "down",
         cycles,
         0,
+        true,
         false,
         &watch,
         window,
         Duration::from_secs(1),
-        move |pct: u8| {
+        control_ofc_daemon::api::diagnostic_gates::sync_write(move |pct: u8| {
             ww.lock().unwrap().push(pct);
             *dw.lock().unwrap() = pct;
             if matches!(flip, PumpFlip::OnWrite(p) if p == pct) {
@@ -3728,7 +3731,7 @@ async fn discover_with_pump_flip_from(
                 *fw.lock().unwrap() = Some(tokio::time::Instant::now() + window);
             }
             Ok(())
-        },
+        }),
         move || {
             let d = *dr.lock().unwrap();
             let readable = original_readable || !first_read.swap(false, Ordering::SeqCst);
@@ -3874,4 +3877,125 @@ async fn a_flip_as_the_last_window_ends_leaves_the_run_complete_and_floored() {
     assert_eq!(o.state, disc::STATE_COMPLETE, "{:?}", o.detail);
     assert_eq!(o.cycles.len(), 1, "the completed cycle was discarded");
     assert_eq!(log, vec![20, 10, pump_floor(), pump_floor()]);
+}
+
+// ── DEC-455 (`PTR-ab`): a write that does not return ────────────────
+
+/// A two-cycle discovery from 45 % whose perturbed 70 % write does not return,
+/// logging every write and pump lookup in order; the union flips to pump AT the
+/// stuck write. Returns the restore report and the events before and after
+/// the stuck write.
+async fn stuck_discovery(has_mode_switch: bool) -> (RestoreReport, Vec<String>, Vec<String>) {
+    use control_ofc_daemon::api::diagnostic_gates::WriteFailure;
+    let cache = cache_at(40.0, Some("normal"));
+    let chans = channels(&[("pump", true)]);
+    let report = RestoreReport::new();
+    let cancel = AtomicBool::new(false);
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let union = Arc::new(AtomicBool::new(false));
+    let duty = Arc::new(Mutex::new(45u8));
+
+    let (u, ev) = (union.clone(), events.clone());
+    let watch = PumpWatch::new(
+        "hwmon:nct6798:isa:pwm2:AIO_PUMP",
+        "control-path discovery",
+        false,
+        pump_floor(),
+        move || {
+            ev.lock().unwrap().push("pump-lookup".into());
+            u.load(Ordering::SeqCst)
+        },
+    );
+    let (u, ev, duty_w) = (union.clone(), events.clone(), duty.clone());
+    let write_fn = move |pct: u8| {
+        ev.lock().unwrap().push(format!("write {pct}"));
+        if pct == 70 {
+            u.store(true, Ordering::SeqCst);
+            return std::future::ready(Err(WriteFailure::Unresponsive));
+        }
+        *duty_w.lock().unwrap() = pct;
+        std::future::ready(Ok(()))
+    };
+    let read_fn = move || {
+        let d = *duty.lock().unwrap();
+        std::future::ready(disc::DiscoverySample {
+            header: HwmonVerifyState {
+                pwm_enable: Some(1),
+                pwm_raw: Some(((d as u16 * 255) / 100) as u8),
+                pwm_percent: Some(d),
+                rpm: Some(u16::from(d) * 20),
+            },
+            tachs: vec![Some(u16::from(d) * 20)],
+        })
+    };
+
+    let outcome = disc::run_discovery(
+        &cache,
+        "hwmon:nct6798:isa:pwm2:AIO_PUMP",
+        &chans,
+        45,
+        70,
+        "up",
+        2,
+        0,
+        has_mode_switch,
+        false,
+        &watch,
+        Duration::from_millis(20),
+        Duration::from_millis(20),
+        write_fn,
+        read_fn,
+        &cancel,
+        || false,
+        || true,
+        &report,
+        |_| {},
+        |_| {},
+    )
+    .await;
+
+    assert_eq!(outcome.state, disc::STATE_FAILED, "{:?}", outcome.detail);
+    assert!(
+        outcome
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("PWM write of 70%") && d.contains("did not return")),
+        "{:?}",
+        outcome.detail
+    );
+    let events = events.lock().unwrap().clone();
+    let stuck = events
+        .iter()
+        .position(|e| e == "write 70")
+        .expect("precondition: the stuck write was attempted");
+    let (before, after) = events.split_at(stuck + 1);
+    (report, before.to_vec(), after.to_vec())
+}
+
+/// [SAFETY] DEC-455: the perturbed write not returning ends the run `failed`,
+/// and on a header with a mode switch nothing more touches it — no return to
+/// baseline, no restore (`skipped_unresponsive`), and no pump-watch lookup,
+/// which in production takes the controller lock the parked write still holds.
+/// The union flips to pump AT the stuck write, so this also pins 4A: no floored
+/// restore after a stuck write either.
+#[tokio::test]
+async fn a_write_that_does_not_return_ends_the_run_and_touches_nothing_more() {
+    let (report, before, after) = stuck_discovery(true).await;
+    assert_eq!(report.get(), RestoreOutcome::SkippedUnresponsive);
+    assert!(report.get().header_left_moved());
+    assert!(
+        before.iter().any(|e| e == "pump-lookup"),
+        "precondition: the watch is read while the run is live: {before:?}"
+    );
+    assert_eq!(after, Vec::<String>::new(), "after the stuck write");
+}
+
+/// [SAFETY] DEC-455 review F1: on a header with NO mode switch the engine never
+/// hands it back (it holds only what it wrote, DEC-451), so the restore to the
+/// pre-run 45 % is queued behind the stuck write — and still no pump lookup.
+#[tokio::test]
+async fn a_stuck_write_on_a_header_with_no_mode_switch_queues_the_restore() {
+    let (report, _, after) = stuck_discovery(false).await;
+    assert_eq!(after, vec!["write 45".to_string()], "only the restore");
+    assert_eq!(report.get(), RestoreOutcome::Restored);
 }

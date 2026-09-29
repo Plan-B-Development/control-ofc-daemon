@@ -468,7 +468,7 @@ pub const CHARACTERIZATION_DEFAULT_POINTS: [u8; 8] = [30, 40, 50, 60, 70, 80, 90
 ///
 /// **Scope, precisely (`AUD3-l`).** This governs *commanded sweep points*: none
 /// can be 0, for any header. The RESTORE is governed separately, by
-/// `RestoreOnDrop::restore_floor` and `hwmon_ctl::restore_duty` — a pump is
+/// `RestoreGuard::restore_floor` and `hwmon_ctl::restore_duty` — a pump is
 /// never restored below its floor, while an ordinary fan is put back exactly
 /// where it was found, 0 included, because that is a restore rather than a
 /// command. Until DEC-322 the restore had no floor at all, and this sentence
@@ -1353,8 +1353,22 @@ pub const STALL_PROBE_RISE_LIMIT_C: f64 = 5.0;
 /// WRITING it — no restore, unless the header has become a pump — because a
 /// write goes through `set_pwm`, whose own reads are not bounded and run under
 /// the controller lock (DEC-420 review); the probe still kicks and restores
-/// after a wedge (`PTR-ab`). One definition for both.
+/// after a wedge, and since DEC-455 those writes are bounded too
+/// ([`DIAGNOSTIC_WRITE_BUDGET`]). One definition for both.
 pub const DIAGNOSTIC_READ_BUDGET: Duration = Duration::from_secs(2);
+
+/// [SAFETY] The longest one diagnostic WRITE may take before it counts as not
+/// returning (DEC-455, `PTR-ab`) — characterisation's, discovery's and the
+/// stall probe's, the restore and the recovery kick included. Each write runs
+/// `set_pwm` on the blocking pool with the controller lock taken there, so a
+/// driver that stops answering parks a pool thread, never a tokio worker. A
+/// write that does not return ends the run as a failed write, and the run
+/// writes nothing more to that header and re-reads nothing that takes the
+/// controller lock (the stuck write still holds it): the restore reports
+/// `skipped_unresponsive`, the probe skips its kick, and the engine's next tick
+/// takes the header back once the write lets go. Same figure as the read
+/// budget, and for the same reason: a healthy write takes microseconds.
+pub const DIAGNOSTIC_WRITE_BUDGET: Duration = Duration::from_secs(2);
 
 // The descent must land exactly on 0 %, so the start must be a whole number of
 // steps; and the probe must never start above the characterisation clamp.
@@ -1367,6 +1381,8 @@ const _: () = assert!(STALL_PROBE_MIN_DWELL.as_secs() <= STALL_PROBE_KICK_MAX.as
 // A wedged read must be detected well inside one renewal interval, so a wedge
 // cannot outlast the engine-pause deadman before the diagnostic notices it.
 const _: () = assert!(DIAGNOSTIC_READ_BUDGET.as_secs() < STABILITY_RENEW_INTERVAL_S);
+// The same for a write that does not return (DEC-455).
+const _: () = assert!(DIAGNOSTIC_WRITE_BUDGET.as_secs() < STABILITY_RENEW_INTERVAL_S);
 // Every probe hold renews the lease and the engine pause on the
 // `STABILITY_RENEW_INTERVAL_S` cadence (DEC-334's rule), so no hold length can
 // outrun either deadline; the renewal interval is what must fit, and does:

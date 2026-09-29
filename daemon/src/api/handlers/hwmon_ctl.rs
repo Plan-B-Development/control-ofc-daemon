@@ -209,12 +209,34 @@ pub(crate) struct VerifyLeaseGuard {
     pub(crate) lease_id: String,
 }
 impl Drop for VerifyLeaseGuard {
+    /// [SAFETY] DEC-455 (`PTR-ab`): never waits for the controller lock on a
+    /// tokio worker. After a diagnostic write that did not return, that write
+    /// still holds the lock on the blocking pool, and a plain `lock()` here would
+    /// park the worker behind it — undoing the bound the write was given. So the
+    /// lock is tried; when it is busy the release is handed to the blocking pool,
+    /// where it waits its turn and lands once the lock is free. `release_lease`
+    /// matches on this lease's id, so a late release cannot drop a lease a
+    /// later diagnostic has taken since. With no runtime (a caller that is
+    /// already a blocking thread outside tokio) it simply waits.
     fn drop(&mut self) {
-        let _ = self
-            .controller
-            .lock()
-            .lease_manager_mut()
-            .release_lease(&self.lease_id);
+        if let Some(mut ctrl) = self.controller.try_lock() {
+            let _ = ctrl.lease_manager_mut().release_lease(&self.lease_id);
+            return;
+        }
+        let controller = self.controller.clone();
+        let lease_id = std::mem::take(&mut self.lease_id);
+        let release = move || {
+            let _ = controller
+                .lock()
+                .lease_manager_mut()
+                .release_lease(&lease_id);
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(release);
+            }
+            Err(_) => release(),
+        }
     }
 }
 
@@ -283,7 +305,7 @@ pub(crate) fn read_header_state(
 ///
 /// This is the counterpart of [`verify_test_duty`], which has always floored the
 /// duty written on the way IN. `api/characterization.rs` applies the same clamp
-/// to its own restore through `RestoreOnDrop::restore_floor`.
+/// to its own restore through `RestoreGuard::restore_floor`.
 ///
 /// `pump_floor` is the header's own pump floor — the DC pump floor on a
 /// DC-mode header (DEC-443) — from `AppState::header_pump_floor_pct`.
@@ -928,11 +950,12 @@ fn classify_verify_result(
 /// and for the reason already recorded at `calibration.rs:143-156`: a sweep is
 /// minutes long, and making it uncancellable would pin a blocking thread and
 /// hold the single verify slot for that whole time after the client had gone.
-/// The restore is protected by a drop guard instead, which restores the hardware
-/// without extending the work's lifetime.
+/// The restore is an explicit step the detached task awaits on every exit
+/// (`characterization::RestoreGuard::restore`, DEC-455), so a client that goes
+/// away does not skip it: dropping the `JoinHandle` does not end the task.
 ///
 /// [SAFETY] The task is detached, so it is not in `main::shutdown_sequence`'s
-/// `task_handles`. `characterization::RestoreOnDrop` carries the shutdown check
+/// `task_handles`. `characterization::RestoreGuard` carries the shutdown check
 /// that makes that safe — read its docs before changing anything here.
 pub async fn hwmon_characterize_handler(
     State(state): State<Arc<AppState>>,
@@ -980,13 +1003,16 @@ pub async fn hwmon_characterize_handler(
         );
     };
 
-    let (pwm_path, enable_path, rpm_path) = {
+    // DEC-455: `has_mode_switch` is exactly when `set_pwm` records its take for
+    // the engine to hand back (`supports_enable` with an enable path).
+    let (pwm_path, enable_path, rpm_path, has_mode_switch) = {
         let ctrl = controller.lock();
         match ctrl.header(&header_id) {
             Some(h) => (
                 h.pwm_path.clone(),
                 h.enable_path.clone(),
                 h.rpm_path.clone(),
+                h.supports_enable && h.enable_path.is_some(),
             ),
             None => {
                 return error_response(
@@ -1137,12 +1163,11 @@ pub async fn hwmon_characterize_handler(
         // ("restore first; perform non-essential analysis/export second").
         let mut terminal: Option<ch::CharacterizationRun> = None;
 
-        // Guard drop order is load-bearing and is asserted by
+        // Order is load-bearing and is asserted by
         // `characterization::tests::the_restore_write_lands_while_the_lease_is_still_valid`.
-        // `run_sweep`
-        // declares its own `RestoreOnDrop` internally, so that guard drops when
-        // the sweep future completes — i.e. BEFORE `lease` and `pause` below,
-        // which is the only order in which the restore write can still succeed.
+        // `run_sweep` awaits its own `RestoreGuard::restore` before it returns
+        // — i.e. BEFORE `lease` and `pause` below drop, which is the only
+        // order in which the restore write can still succeed.
         {
             let pause = verify_guard;
             let _lease = verify_lease;
@@ -1171,11 +1196,17 @@ pub async fn hwmon_characterize_handler(
                 lease_ok && pause_ok
             };
             let shutting_down = || *shutdown_rx.borrow();
-            let write_fn = |pct: u8| -> Result<(), String> {
-                let mut c = ctrl_arc.lock();
-                c.set_pwm(&hid, pct, &verify_lease_id)
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
+            // [SAFETY] DEC-455 (`PTR-ab`): `set_pwm`, and the controller lock it
+            // needs, on the blocking pool and BOUNDED — the engine's DEC-278
+            // shape. Inline, a driver that stopped answering parked this tokio
+            // worker with the lock the engine and the thermal force need.
+            let write_fn = |pct: u8| {
+                crate::api::diagnostic_gates::bounded_hwmon_write(
+                    ctrl_arc.clone(),
+                    hid.clone(),
+                    verify_lease_id.clone(),
+                    pct,
+                )
             };
             // [SAFETY] DEC-420 (`PTR-v`, closing what `AIO3-d` accepted): on the
             // blocking pool, and BOUNDED, exactly as the stall probe reads
@@ -1269,6 +1300,7 @@ pub async fn hwmon_characterize_handler(
                 // captured pre-sweep duty straight through, so a pump reading 0
                 // was restored to 0 with `pwm_enable=1` and left stopped.
                 floor,
+                has_mode_switch,
                 &pump_watch,
                 settle,
                 correction,
@@ -1287,8 +1319,8 @@ pub async fn hwmon_characterize_handler(
             // Inside, because the single-flight slot is released the moment this
             // block ends — a terminal write placed after it could legally land on
             // a run that had already started in the gap. `run_sweep`'s own
-            // `RestoreOnDrop` has already dropped by here (it lives in that
-            // future), so the restore report is final — which is why
+            // restore has already run by here (`run_sweep` awaits it before it
+            // returns), so the restore report is final — which is why
             // `RestoreOutcome::Pending` is unreachable below.
             //
             // `summarise` is the ONLY place the derived verdicts come from —
@@ -2124,6 +2156,256 @@ pub(crate) mod tests {
         release_fifo(&tach);
         done.send(()).unwrap();
         release.join().unwrap();
+    }
+
+    /// The run is over; on `current_thread`, check what a wedged write left.
+    /// The parked write still holds the controller lock (the precondition that
+    /// makes this a test of the bound at all), and nothing past `before` has
+    /// landed. Then release the wedge: the parked write lands, late, then
+    /// anything queued behind it (DEC-455's no-mode-switch case), and the lease
+    /// `VerifyLeaseGuard` handed to the blocking pool is released after them —
+    /// and nothing else is written. `late` is those writes in order: the wedged
+    /// one first.
+    pub(crate) async fn only_these_land_after_the_wedge(
+        state: &Arc<AppState>,
+        writes: &WriteLog,
+        wedge: FifoRelease,
+        before: &[u8],
+        late: &[u8],
+    ) {
+        let ctrl = state.hwmon_controller.clone().expect("a controller");
+        assert!(
+            ctrl.try_lock().is_none(),
+            "precondition: the write is still parked, holding the controller lock"
+        );
+        assert_eq!(pwm_duties(writes), before, "nothing landed after the wedge");
+        wedge.release();
+        poll_until("the deferred lease release", || {
+            ctrl.try_lock()
+                .and_then(|c| c.lease_manager().active_lease().is_none().then_some(()))
+        })
+        .await;
+        let expected: Vec<u8> = before.iter().chain(late).copied().collect();
+        assert_eq!(
+            pwm_duties(writes),
+            expected,
+            "the late writes, and nothing else"
+        );
+    }
+
+    /// [SAFETY] DEC-455 (`PTR-ab`), through the REAL handler and the real
+    /// controller: a PWM write that does not return — its `open(2)` parked in
+    /// the kernel mid-`set_pwm`, under the controller lock ([`WedgingWriter`]) —
+    /// ends the run `failed` within `DIAGNOSTIC_WRITE_BUDGET`, writes nothing
+    /// more (`skipped_unresponsive`: the restore would queue behind the parked
+    /// write and land whenever the driver answered), and parks no tokio worker
+    /// on the way out: the lease release waits on the blocking pool instead.
+    ///
+    /// `current_thread` on purpose (tokio-test trap 4): the test body shares
+    /// the one worker, so a write moved back onto it — or a lease guard that
+    /// waits for the lock — freezes the body until the 12 s self-release, and
+    /// the elapsed check AFTER the loop sees it. The run has ended by then, so
+    /// a check only inside the loop would not.
+    #[tokio::test]
+    async fn a_write_that_does_not_return_ends_a_real_characterisation_within_its_budget() {
+        let (state, writes, _tx, _tmp, fifo) =
+            build_wedged_verify_state(230, |raw| 300 + raw * 8, 2, true);
+        let wedge = FifoRelease::arm(&fifo, std::time::Duration::from_secs(12));
+        let started = std::time::Instant::now();
+        let (status, Json(body)) = hwmon_characterize_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("hwmon:test:dev:pwm1".to_string()),
+            Json(
+                serde_json::from_value(
+                    serde_json::json!({"points_pct": [20, 60], "settle_seconds": 2}),
+                )
+                .expect("request"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let run = loop {
+            if let Some(r) = state.characterization.lock().clone() {
+                if r.state != crate::api::characterization::STATE_RUNNING {
+                    break r;
+                }
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the run never ended — the write was not bounded"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the run ended, but the worker was parked until the wedge released: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            run.state,
+            crate::api::characterization::STATE_FAILED,
+            "{run:?}"
+        );
+        assert!(
+            run.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("PWM write of 60%") && d.contains("did not return")),
+            "{run:?}"
+        );
+        assert_eq!(run.restore_outcome, "skipped_unresponsive", "{run:?}");
+        assert!(run.restore_failed, "left at the swept duty: {run:?}");
+        only_these_land_after_the_wedge(&state, &writes, wedge, &[20], &[60]).await;
+    }
+
+    /// [SAFETY] DEC-455 review F1, through the REAL handler, controller and lock:
+    /// on a header with NO mode switch (no `pwm1_enable`, so the engine will
+    /// never hand it back), the restore is queued behind the stuck write. It
+    /// waits for the lock on the blocking pool — its own 2 s bound runs out, so
+    /// it reports `skipped_unresponsive` — and lands AFTER the stuck write, and
+    /// before the deferred lease release, which it needs. With the header given
+    /// a mode switch this is the test above, where nothing follows.
+    #[tokio::test]
+    async fn a_stuck_write_on_a_real_header_with_no_mode_switch_queues_the_restore() {
+        let (state, writes, _tx, _tmp, fifo) =
+            build_wedged_verify_state(230, |raw| 300 + raw * 8, 2, false);
+        let wedge = FifoRelease::arm(&fifo, std::time::Duration::from_secs(12));
+        let started = std::time::Instant::now();
+        let (status, Json(body)) = hwmon_characterize_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("hwmon:test:dev:pwm1".to_string()),
+            Json(
+                serde_json::from_value(
+                    serde_json::json!({"points_pct": [20, 60], "settle_seconds": 2}),
+                )
+                .expect("request"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let run = loop {
+            if let Some(r) = state.characterization.lock().clone() {
+                if r.state != crate::api::characterization::STATE_RUNNING {
+                    break r;
+                }
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the run never ended — the write was not bounded"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the run ended, but the worker was parked until the wedge released: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            run.state,
+            crate::api::characterization::STATE_FAILED,
+            "{run:?}"
+        );
+        assert_eq!(run.restore_outcome, "skipped_unresponsive", "{run:?}");
+        let original = crate::pwm::raw_to_percent(230);
+        assert_eq!(run.original_pct, Some(original), "{run:?}");
+        only_these_land_after_the_wedge(&state, &writes, wedge, &[20], &[60, original]).await;
+    }
+
+    /// [SAFETY] DEC-455 review F1: the discovery HANDLER on a header with no
+    /// mode switch queues its restore — the pre-run duty — behind the stuck
+    /// perturbed write. Pins the handler's `has_mode_switch` wiring.
+    #[tokio::test]
+    async fn a_stuck_write_on_a_real_header_with_no_mode_switch_queues_the_discovery_restore() {
+        let (state, writes, _tx, _tmp, fifo) =
+            build_wedged_verify_state(230, |raw| 300 + raw * 8, 2, false);
+        let wedge = FifoRelease::arm(&fifo, std::time::Duration::from_secs(12));
+        let empty_root = tempfile::tempdir().unwrap();
+        let (status, Json(body)) = crate::api::handlers::discovery::start_control_path_discovery(
+            state.clone(),
+            "hwmon:test:dev:pwm1".to_string(),
+            serde_json::from_value(serde_json::json!({"window_seconds": 2})).expect("request"),
+            empty_root.path(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let perturbed = body["perturbed_pct"].as_u64().expect("perturbed_pct") as u8;
+        let baseline = body["baseline_pct"].as_u64().expect("baseline_pct") as u8;
+        let started = std::time::Instant::now();
+        let run = loop {
+            if let Some(r) = state.control_path.lock().clone() {
+                if r.state != crate::api::discovery::STATE_RUNNING {
+                    break r;
+                }
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the run never ended — the write was not bounded"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(run.state, crate::api::discovery::STATE_FAILED, "{run:?}");
+        let original = run.original_pct.expect("the pre-run duty was read");
+        assert_ne!(
+            original, perturbed,
+            "precondition: the restore is distinguishable"
+        );
+        only_these_land_after_the_wedge(
+            &state,
+            &writes,
+            wedge,
+            &[baseline],
+            &[perturbed, original],
+        )
+        .await;
+    }
+
+    /// [SAFETY] DEC-455 (`PTR-ab`): the same for the control-path discovery
+    /// HANDLER, through the injected monitor-only walk root. The wedge is the
+    /// perturbed write (the second `pwm1` write, after the baseline); the run
+    /// ends `failed` and neither returns to baseline nor restores.
+    #[tokio::test]
+    async fn a_write_that_does_not_return_ends_a_real_discovery_within_its_budget() {
+        let (state, writes, _tx, _tmp, fifo) =
+            build_wedged_verify_state(230, |raw| 300 + raw * 8, 2, true);
+        let wedge = FifoRelease::arm(&fifo, std::time::Duration::from_secs(12));
+        let empty_root = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let (status, Json(body)) = crate::api::handlers::discovery::start_control_path_discovery(
+            state.clone(),
+            "hwmon:test:dev:pwm1".to_string(),
+            serde_json::from_value(serde_json::json!({"window_seconds": 2})).expect("request"),
+            empty_root.path(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let perturbed = body["perturbed_pct"].as_u64().expect("perturbed_pct") as u8;
+        let baseline = body["baseline_pct"].as_u64().expect("baseline_pct") as u8;
+        assert_ne!(perturbed, baseline, "precondition: {body}");
+        let run = loop {
+            if let Some(r) = state.control_path.lock().clone() {
+                if r.state != crate::api::discovery::STATE_RUNNING {
+                    break r;
+                }
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the run never ended — the write was not bounded"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the run ended, but the worker was parked until the wedge released: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(run.state, crate::api::discovery::STATE_FAILED, "{run:?}");
+        assert!(
+            run.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("PWM write") && d.contains("did not return")),
+            "{run:?}"
+        );
+        assert_eq!(run.restore_outcome, "skipped_unresponsive", "{run:?}");
+        only_these_land_after_the_wedge(&state, &writes, wedge, &[baseline], &[perturbed]).await;
     }
 
     /// [SAFETY] `TS-aw` `K2`: the same for the control-path discovery HANDLER,
@@ -3066,6 +3348,121 @@ pub(crate) mod tests {
         tokio::sync::watch::Sender<bool>,
         Option<tempfile::TempDir>,
     ) {
+        build_verify_state_inner(initial_raw, role, fan, None, false)
+    }
+
+    /// DEC-455 (`PTR-ab`): parks its `wedge_at`-th `pwm1` write (1-based) in a
+    /// real `open(2)` of a FIFO nobody has opened for writing — a driver that
+    /// stopped answering mid-write, not a sleep pretending to be one (the
+    /// DEC-278 lesson) — and then lets the write land, late, once
+    /// [`FifoRelease`] opens the other end. The wedge is inside `write_file`,
+    /// so it runs under the controller lock exactly where a hung driver would.
+    /// It fires once: the FIFO is opened by that one write and nothing else.
+    struct WedgingWriter {
+        inner: TreeWriter,
+        fifo: std::path::PathBuf,
+        wedge_at: usize,
+        pwm_writes: usize,
+    }
+    impl crate::hwmon::pwm_control::SysfsWriter for WedgingWriter {
+        fn write_file(&mut self, p: &str, v: &str) -> Result<(), crate::error::HwmonError> {
+            if p.ends_with("/pwm1") {
+                self.pwm_writes += 1;
+                if self.pwm_writes == self.wedge_at {
+                    let _ = std::fs::File::open(&self.fifo);
+                }
+            }
+            self.inner.write_file(p, v)
+        }
+        fn read_file(&self, p: &str) -> Result<String, crate::error::HwmonError> {
+            self.inner.read_file(p)
+        }
+    }
+
+    /// Frees a FIFO wedge. Armed with a self-release deadline (tokio-test trap
+    /// 3): a failed assertion skips the test's own release, and dropping the
+    /// runtime would then wait forever on the wedged blocking task.
+    pub(crate) struct FifoRelease {
+        done: std::sync::mpsc::Sender<()>,
+        thread: std::thread::JoinHandle<()>,
+    }
+    impl FifoRelease {
+        /// Whether a write-open met the parked reader, releasing it.
+        fn open_writer(path: &std::path::Path) -> bool {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Non-blocking: a blocking write-open would itself wait for a reader.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+                .is_ok()
+        }
+        pub(crate) fn arm(path: &std::path::Path, deadline: std::time::Duration) -> Self {
+            let path = path.to_path_buf();
+            let (done, wait) = std::sync::mpsc::channel::<()>();
+            // Keeps trying until a write-open finds the parked reader (a
+            // non-blocking write-open of a FIFO with no reader fails, ENXIO):
+            // a failing test can reach the wedge AFTER its own release, and a
+            // release that gave up first would hang the runtime's drop
+            // (DEC-342). Capped, so a wedge never reached cannot leak forever.
+            let thread = std::thread::spawn(move || {
+                let _ = wait.recv_timeout(deadline);
+                for _ in 0..1200 {
+                    if Self::open_writer(&path) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            });
+            Self { done, thread }
+        }
+        /// Release now, and wait until the parked write has been let go.
+        pub(crate) fn release(self) {
+            let _ = self.done.send(());
+            self.thread.join().unwrap();
+        }
+    }
+
+    /// A header at `initial_raw` with a fan on a real tree, whose `wedge_at`-th
+    /// `pwm1` write parks until the returned FIFO is released
+    /// ([`WedgingWriter`]). Without `has_mode_switch` the header has no
+    /// `pwm1_enable` (an ARCTIC hub channel's shape, DEC-451).
+    pub(crate) fn build_wedged_verify_state(
+        initial_raw: u8,
+        fan: fn(u32) -> u32,
+        wedge_at: usize,
+        has_mode_switch: bool,
+    ) -> (
+        Arc<AppState>,
+        WriteLog,
+        tokio::sync::watch::Sender<bool>,
+        tempfile::TempDir,
+        std::path::PathBuf,
+    ) {
+        let (state, writes, tx, tmp) = build_verify_state_inner(
+            Some(initial_raw),
+            crate::hwmon::roles::HeaderRole::ChassisFan,
+            Some(fan),
+            Some(wedge_at),
+            !has_mode_switch,
+        );
+        let tmp = tmp.expect("a duty was requested");
+        let fifo = tmp.path().join("wedge");
+        (state, writes, tx, tmp, fifo)
+    }
+
+    fn build_verify_state_inner(
+        initial_raw: Option<u8>,
+        role: crate::hwmon::roles::HeaderRole,
+        fan: Option<fn(u32) -> u32>,
+        wedge_at: Option<usize>,
+        no_mode_switch: bool,
+    ) -> (
+        Arc<AppState>,
+        WriteLog,
+        tokio::sync::watch::Sender<bool>,
+        Option<tempfile::TempDir>,
+    ) {
         let (pwm_path, enable_path, tmp) = match initial_raw {
             Some(raw) => {
                 let dir = tempfile::tempdir().unwrap();
@@ -3107,9 +3504,9 @@ pub(crate) mod tests {
             chip_name: "test".into(),
             device_id: "dev".into(),
             pwm_index: 1,
-            supports_enable: true,
+            supports_enable: !no_mode_switch,
             pwm_path,
-            enable_path,
+            enable_path: enable_path.filter(|_| !no_mode_switch),
             rpm_available: rpm_path.is_some(),
             rpm_path: rpm_path.clone(),
             min_pwm_percent: 0,
@@ -3131,14 +3528,32 @@ pub(crate) mod tests {
         // with an empty sensor map would test nothing but that refusal.
         cache.update_sensors(vec![fresh_cpu(40.0)]);
         let writes: WriteLog = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let writer: Box<dyn crate::hwmon::pwm_control::SysfsWriter> = match (fan, &rpm_path) {
-            (Some(rpm_at), Some(r)) => Box::new(TreeWriter {
-                log: writes.clone(),
-                rpm_path: Some(std::path::PathBuf::from(r)),
-                rpm_at,
-            }),
-            _ => Box::new(RecordingWriter(writes.clone())),
-        };
+        let writer: Box<dyn crate::hwmon::pwm_control::SysfsWriter> =
+            match (fan, &rpm_path, wedge_at, &tmp) {
+                (Some(rpm_at), Some(r), Some(wedge_at), Some(dir)) => {
+                    let fifo = dir.path().join("wedge");
+                    let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+                    // SAFETY: `c` is a valid NUL-terminated path that outlives the call.
+                    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+                    Box::new(WedgingWriter {
+                        inner: TreeWriter {
+                            log: writes.clone(),
+                            rpm_path: Some(std::path::PathBuf::from(r)),
+                            rpm_at,
+                        },
+                        fifo,
+                        wedge_at,
+                        pwm_writes: 0,
+                    })
+                }
+                (Some(rpm_at), Some(r), None, _) => Box::new(TreeWriter {
+                    log: writes.clone(),
+                    rpm_path: Some(std::path::PathBuf::from(r)),
+                    rpm_at,
+                }),
+                (_, _, Some(_), _) => panic!("a wedge needs a fan on a real tree"),
+                _ => Box::new(RecordingWriter(writes.clone())),
+            };
         let ctrl = crate::hwmon::pwm_control::HwmonPwmController::new(
             vec![header],
             crate::hwmon::lease::LeaseManager::new(),
@@ -3779,6 +4194,58 @@ pub(crate) mod tests {
         fn read_file(&self, _path: &str) -> Result<String, crate::error::HwmonError> {
             Ok("0\n".into())
         }
+    }
+
+    /// [SAFETY] DEC-455 (`PTR-ab`): a `VerifyLeaseGuard` dropped while the
+    /// controller lock is busy — a diagnostic write that did not return still
+    /// holds it on the blocking pool — does not wait for it on the worker. The
+    /// drop returns at once, and the lease is released once the lock frees.
+    /// With a plain `lock()` in the drop, the drop takes as long as the holder.
+    #[tokio::test]
+    async fn a_busy_controller_lock_does_not_park_the_lease_release() {
+        use crate::hwmon::lease::LeaseManager;
+        use crate::hwmon::pwm_control::HwmonPwmController;
+        let cache = std::sync::Arc::new(crate::health::cache::StateCache::new());
+        let ctrl = std::sync::Arc::new(parking_lot::Mutex::new(HwmonPwmController::new(
+            vec![],
+            LeaseManager::new(),
+            Box::new(NoopWriter),
+            cache,
+        )));
+        let lease_id = ctrl
+            .lock()
+            .lease_manager_mut()
+            .force_take_lease(HwmonWriter::Verify)
+            .lease_id;
+        // The holder takes the lock and keeps it until told to let go — or for
+        // 3 s at most, so a regression reds rather than hangs.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
+        let (free_tx, free_rx) = std::sync::mpsc::channel::<()>();
+        let holder_ctrl = ctrl.clone();
+        let holder = std::thread::spawn(move || {
+            let _held = holder_ctrl.lock();
+            locked_tx.send(()).unwrap();
+            let _ = free_rx.recv_timeout(std::time::Duration::from_secs(3));
+        });
+        locked_rx.recv().unwrap();
+
+        let t = std::time::Instant::now();
+        drop(VerifyLeaseGuard {
+            controller: ctrl.clone(),
+            lease_id,
+        });
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(500),
+            "the drop waited for the lock: {:?}",
+            t.elapsed()
+        );
+        let _ = free_tx.send(());
+        holder.join().unwrap();
+        poll_until("the deferred lease release", || {
+            ctrl.try_lock()
+                .and_then(|c| c.lease_manager().active_lease().is_none().then_some(()))
+        })
+        .await;
     }
 
     #[test]

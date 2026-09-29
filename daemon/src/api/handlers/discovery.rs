@@ -337,7 +337,7 @@ fn bound_tach_channels(channels: &mut Vec<disc::TachChannel>, tach_paths: &mut V
 ///
 /// [SAFETY] The task is detached, so it is NOT in `main::shutdown_sequence`'s
 /// `task_handles`. What makes that safe is the shutdown check inside the shared
-/// `characterization::RestoreOnDrop` — read its docs before changing anything
+/// `characterization::RestoreGuard` — read its docs before changing anything
 /// here, and note that `run_discovery` additionally checks shutdown at the top of
 /// every cycle and inside every observation window, because the guard covers only
 /// the restore.
@@ -412,7 +412,17 @@ pub(crate) async fn start_control_path_discovery(
     };
 
     // Header paths, and every OTHER header's tach, under one controller lock.
-    let (pwm_path, enable_path, rpm_path, is_writable, mut channels, mut tach_paths) = {
+    // DEC-455: `has_mode_switch` is exactly when `set_pwm` records its take for
+    // the engine to hand back (`supports_enable` with an enable path).
+    let (
+        pwm_path,
+        enable_path,
+        rpm_path,
+        is_writable,
+        has_mode_switch,
+        mut channels,
+        mut tach_paths,
+    ) = {
         let ctrl = controller.lock();
         let Some(target) = ctrl.header(&header_id) else {
             return error_response(
@@ -420,11 +430,12 @@ pub(crate) async fn start_control_path_discovery(
                 &ErrorEnvelope::validation(format!("unknown header: {header_id}")),
             );
         };
-        let (pwm, en, rpm, writable) = (
+        let (pwm, en, rpm, writable, mode_switch) = (
             target.pwm_path.clone(),
             target.enable_path.clone(),
             target.rpm_path.clone(),
             target.is_writable,
+            target.supports_enable && target.enable_path.is_some(),
         );
         let mut channels: Vec<disc::TachChannel> = Vec::new();
         let mut paths: Vec<String> = Vec::new();
@@ -440,7 +451,7 @@ pub(crate) async fn start_control_path_discovery(
             });
             paths.push(path.clone());
         }
-        (pwm, en, rpm, writable, channels, paths)
+        (pwm, en, rpm, writable, mode_switch, channels, paths)
     };
 
     if !is_writable {
@@ -561,11 +572,10 @@ pub(crate) async fn start_control_path_discovery(
     tokio::spawn(async move {
         let report = crate::api::characterization::RestoreReport::new();
 
-        // Guard drop order is load-bearing, and is the same order the
-        // characterisation handler documents: `run_discovery` declares its own
-        // `RestoreOnDrop` internally, so that guard drops when the sweep future
-        // completes — i.e. BEFORE `pause` and `_lease` below, which is the only
-        // order in which the restore write can still succeed.
+        // Order is load-bearing, and is the one the characterisation handler
+        // documents: `run_discovery` awaits its own `RestoreGuard::restore`
+        // before it returns — i.e. BEFORE `pause` and `_lease` below drop,
+        // which is the only order in which the restore write can still succeed.
         {
             let pause = verify_guard;
             let _lease = verify_lease;
@@ -575,7 +585,7 @@ pub(crate) async fn start_control_path_discovery(
             // duration. Renewing only the pause is the DEC-296 defect: nothing
             // else renews a Verify lease and `set_pwm` merely validates it, so a
             // long run would write fine until the 60 s TTL and then fail every
-            // write — including the drop guard's restore.
+            // write — including the restore.
             let keepalive = || {
                 let lease_ok = ctrl_arc
                     .lock()
@@ -586,11 +596,15 @@ pub(crate) async fn start_control_path_discovery(
                 lease_ok && pause_ok
             };
             let shutting_down = || *shutdown_rx.borrow();
-            let write_fn = |pct: u8| -> Result<(), String> {
-                let mut c = ctrl_arc.lock();
-                c.set_pwm(&hid, pct, &verify_lease_id)
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
+            // [SAFETY] DEC-455 (`PTR-ab`): on the blocking pool, lock and all,
+            // and BOUNDED — the characterisation handler's shape.
+            let write_fn = |pct: u8| {
+                crate::api::diagnostic_gates::bounded_hwmon_write(
+                    ctrl_arc.clone(),
+                    hid.clone(),
+                    verify_lease_id.clone(),
+                    pct,
+                )
             };
             // Every sample is `DISCOVERY_MAX_TACH_CHANNELS + 3 = 35` blocking
             // `std::fs` reads, taken every 500 ms for the whole run (~186
@@ -664,6 +678,7 @@ pub(crate) async fn start_control_path_discovery(
                 // else, because putting an ordinary fan back at its captured 0
                 // is a restore rather than a command.
                 floor,
+                has_mode_switch,
                 pump_protected,
                 &pump_watch,
                 window,
@@ -844,7 +859,7 @@ fn sample_or_unreadable(
         //
         // **One consumer does read it differently, and it is worth naming.** On
         // the PRE-RUN sample — `run_discovery`'s `first` — an unreadable header
-        // makes `original_pct` `None`, so `RestoreOnDrop` takes its
+        // makes `original_pct` `None`, so `RestoreGuard` takes its
         // `NoOriginalDuty` branch and leaves the header alone instead of
         // restoring it. That needs this arm to fire on the very first sample,
         // before any duty has been written: the teardown case bails at the
