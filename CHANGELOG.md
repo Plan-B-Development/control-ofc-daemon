@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [3.1.0] — 2026-09-29
+
+Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor; GUI 3.1.0 uses the new
+`control.openfan_calibration` capability for its OpenFan calibration dialog.
+
 ### Added
 
 - **OpenFan calibration now finds where a fan stops and where it starts again, and runs in the
