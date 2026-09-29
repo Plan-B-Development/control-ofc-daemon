@@ -11,6 +11,15 @@
   changed, which does not happen while a profile runs, so a later crash could leave a header in
   manual mode at its last duty until the daemon restarted. The record is now written again on the
   next fan write. A clean stop was never affected.
+- **A thermal emergency reaches the motherboard's fans before an ARCTIC fan hub's** (DEC-450). On a
+  machine with an ARCTIC fan hub (`arctic_fan`), the emergency wrote every hub channel first. Each
+  hub write waits for the device's reply, up to about half a second, so the CPU fan and pump
+  headers could be forced seconds late on the first emergency after boot or resume. The
+  daemon now writes the hub's channels after every other header, both for the emergency and for
+  the exit floor applied at stop. The emergency's error line for a write still in progress, and
+  the stop's timeout line, now say that headers not yet reached keep their last duty, and that a
+  slow device is not necessarily a dead one. Other USB fan controllers keep their place in the
+  order.
 
 ## [3.0.0] — 2026-09-28
 

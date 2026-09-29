@@ -1078,8 +1078,9 @@ fn apply_exit_floor(
         if !finished {
             complete.store(false, SeqCst);
             log::error!(
-                "hwmon exit floor did not finish within {}s — a chip is not responding \
-                 to writes",
+                "hwmon exit floor did not finish within {}s — headers it had not reached \
+                 keep their last duty (an ARCTIC fan hub, written last, answers each write in \
+                 up to ~0.6 s, so a slow device is not necessarily a dead one)",
                 step_timeout.as_secs()
             );
         }

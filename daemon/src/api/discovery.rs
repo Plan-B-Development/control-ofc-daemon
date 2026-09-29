@@ -1122,8 +1122,8 @@ where
     // A ladder engagement during the final window is exactly that error wearing
     // a `complete` label. `force_all_with_floor` force-takes the hwmon lease and
     // drives every writable header to `max(commanded, forced)` — and
-    // `on_lease_released()` is called specifically so the force re-asserts
-    // `pwm_enable=1`, which means `reclaim_or_lost_pump` **cannot** see it: that
+    // `forget_manual_mode()` is called specifically so the force re-asserts
+    // `pwm_enable=1` (DEC-386; it was `on_lease_released()` before), which means `reclaim_or_lost_pump` **cannot** see it: that
     // predicate keys on `pwm_enable != 1`. So every watched tach jumps for a
     // reason unrelated to our perturbation, the deltas are meaningless, and the
     // run would otherwise persist them as a confirmed PWM→tach mapping that

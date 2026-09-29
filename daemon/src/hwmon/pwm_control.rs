@@ -48,6 +48,17 @@ const PWM_ENABLE_MANUAL: &str = "1";
 /// so it is left alone.
 const SHARED_REPORT_CHIPS: &[&str] = &["arctic_fan"];
 
+/// True for a [`SHARED_REPORT_CHIPS`] chip. Such a chip's writes are also slow
+/// and serialised: each is a USB report that waits for the device's ACK — measured by the driver's author at up to
+/// ~0.56 s, with a 1 s timeout — and the first write after probe or resume also
+/// primes its siblings (DEC-425). The thermal force and the exit floor write
+/// these LAST (DEC-450, `BRD-t`), so a fan hub's round-trips never stand between an
+/// emergency and the motherboard's headers, where the CPU fan and the pump
+/// usually are. A Super-I/O write is a register write and returns at once.
+fn is_shared_report_chip(chip_name: &str) -> bool {
+    SHARED_REPORT_CHIPS.contains(&chip_name)
+}
+
 /// What a sibling channel whose cached duty is an unchosen 0 is set to before
 /// the write that would send that 0 (DEC-425): full speed — the fallback this
 /// codebase uses for any duty nobody chose (`pwm::exit_duty`, `fancontrol`).
@@ -458,7 +469,16 @@ impl HwmonPwmController {
             self.exit_min.insert(h.id.clone(), min);
         }
         let mut ids: Vec<String> = self.exit_record.keys().cloned().collect();
-        ids.sort();
+        // By id, with a slow shared-report chip's headers last (`BRD-t`): the
+        // step has a deadline, and a header it has not reached keeps its last
+        // duty, so the fast headers go first.
+        ids.sort_by_cached_key(|id| {
+            let slow = self
+                .headers
+                .get(id)
+                .is_some_and(|h| is_shared_report_chip(&h.chip_name));
+            (slow, id.clone())
+        });
         let mut out = Vec::with_capacity(ids.len());
         for header_id in ids {
             let Some(pwm_path) = self.headers.get(&header_id).map(|h| h.pwm_path.clone()) else {
@@ -580,7 +600,10 @@ impl HwmonPwmController {
     }
 
     /// The header ids the thermal force actually drives — every **writable**
-    /// header, in `headers()` order.
+    /// header, in `headers()` order, except that the headers of a slow
+    /// shared-report chip come after all the others (DEC-450,
+    /// [`is_shared_report_chip`]). The force writes in this order; its
+    /// other readers use the ids as a set.
     ///
     /// [SAFETY] `OFN-ad`, DEC-372; `OFN-ah`/`OFN-ak`, DEC-376. This is the ONE
     /// definition of "a hwmon output this daemon can drive", and it now has
@@ -600,11 +623,14 @@ impl HwmonPwmController {
     /// (`pwm_discovery.rs`) and never recomputed — `hwmon_rescan_handler` does
     /// not replace a running controller.
     pub fn forced_target_ids(&self) -> Vec<String> {
-        self.headers()
-            .iter()
+        let mut targets: Vec<&PwmHeaderDescriptor> = self
+            .headers()
+            .into_iter()
             .filter(|h| h.is_writable)
-            .map(|h| h.id.clone())
-            .collect()
+            .collect();
+        // Stable: each group keeps `headers()` order.
+        targets.sort_by_key(|h| is_shared_report_chip(&h.chip_name));
+        targets.into_iter().map(|h| h.id.clone()).collect()
     }
 
     /// Get the list of discovered PWM headers.
@@ -1137,7 +1163,7 @@ impl HwmonPwmController {
         let Some(target) = self.headers.get(header_id) else {
             return;
         };
-        if !SHARED_REPORT_CHIPS.contains(&target.chip_name.as_str()) {
+        if !is_shared_report_chip(&target.chip_name) {
             return;
         }
         let device_dir = std::path::Path::new(&target.pwm_path)
@@ -1218,7 +1244,7 @@ impl HwmonPwmController {
         let Some(h) = self.headers.get(header_id) else {
             return;
         };
-        if !SHARED_REPORT_CHIPS.contains(&h.chip_name.as_str()) {
+        if !is_shared_report_chip(&h.chip_name) {
             return;
         }
         let Some(dir) = std::path::Path::new(&h.pwm_path).parent() else {
@@ -4277,6 +4303,74 @@ mod tests {
                 reports[first..].iter().all(|r| r[ch] != 0),
                 "channel {} fell back to 0",
                 ch + 1
+            );
+        }
+    }
+
+    /// A sysfs that stores writes and logs them in order; an unwritten file
+    /// reads `0` (an ARCTIC cache after probe or resume).
+    #[derive(Clone, Default)]
+    struct OrderedSysfs {
+        files: Arc<Mutex<StdHashMap<String, String>>>,
+        writes: WriteLog,
+    }
+
+    impl SysfsWriter for OrderedSysfs {
+        fn write_file(&mut self, path: &str, value: &str) -> Result<(), HwmonError> {
+            self.writes.lock().push((path.into(), value.into()));
+            self.files.lock().insert(path.into(), value.trim().into());
+            Ok(())
+        }
+        fn read_file(&self, path: &str) -> Result<String, HwmonError> {
+            let v = self.files.lock().get(path).cloned();
+            Ok(format!("{}\n", v.as_deref().unwrap_or("0")))
+        }
+    }
+
+    /// [SAFETY] `BRD-t`: the exit floor has a deadline, and a header it has not
+    /// reached keeps its last duty, so a USB fan hub — one ACKed report per
+    /// write — goes after every other header with no mode switch. `hwmon:arctic…`
+    /// sorts before `hwmon:pwmfan…`, so by-id order alone would write the hub
+    /// first. Reach is unchanged: every header below the floor is raised.
+    #[test]
+    fn the_exit_floor_writes_a_usb_fan_hub_last() {
+        let sysfs = OrderedSysfs::default();
+        let mut fan = make_header("hwmon:pwmfan:fan0:pwm1:pwm1", "pwm1", 0);
+        fan.chip_name = "pwmfan".into();
+        fan.supports_enable = false;
+        fan.enable_path = None;
+        fan.pwm_path = "/sys/class/hwmon/hwmon1/pwm1".into();
+        let mut headers = vec![fan.clone()];
+        headers.extend((1..=3).map(arctic_header));
+        let mut ctrl = HwmonPwmController::new(
+            headers,
+            LeaseManager::new(),
+            Box::new(sysfs.clone()),
+            Arc::new(StateCache::new()),
+        );
+        let lease = engine_lease(&mut ctrl);
+        for id in [fan.id.clone(), arctic_id(1), arctic_id(2), arctic_id(3)] {
+            ctrl.set_pwm(&id, 20, &lease).unwrap();
+        }
+        sysfs.writes.lock().clear();
+
+        let out = ctrl.apply_exit_floor(50);
+
+        let order: Vec<&str> = out.iter().map(|w| w.header_id.as_str()).collect();
+        assert_eq!(order.first().copied(), Some(fan.id.as_str()), "{order:?}");
+        let w = sysfs.writes.lock().clone();
+        assert_eq!(
+            w.first().map(|(p, _)| p.as_str()),
+            Some("/sys/class/hwmon/hwmon1/pwm1"),
+            "the other header is written before any hub channel: {w:?}"
+        );
+        for path in std::iter::once(fan.pwm_path.clone())
+            .chain((1..=3).map(|n| format!("{ARCTIC_DIR}/pwm{n}")))
+        {
+            assert_eq!(
+                sysfs.files.lock().get(&path).map(String::as_str),
+                Some(percent_to_raw(50).to_string().as_str()),
+                "{path} was not raised to the floor"
             );
         }
     }

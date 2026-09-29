@@ -280,7 +280,15 @@ one of its writes succeeds; that write then primes the rest at once, because an
 unchanged duty coalesces and the next write may be long in coming. A dead device
 therefore costs one failed priming write (the driver's 1 s ACK timeout), not nine on
 every write. On a healthy device the first write after probe or resume carries up to
-nine extra reports (up to ~0.56 s each), under the controller lock.
+nine extra reports (up to ~0.56 s each), under the controller lock. **So such a chip is
+written last (DEC-450):** `forced_target_ids()` — the order the thermal force writes in
+— lists every shared-report header after all the others, and `apply_exit_floor` orders
+its headers the same way, so an ARCTIC hub's round-trips never stand between an
+emergency (or a timed-out stop step) and the other headers. Other USB fan controllers
+(`corsaircpro`, `nzxtsmart2`, the Aquacomputer family) are not shared-report chips and
+keep their `headers()` place. The force still shares one
+single-flight write slot with the engine's `apply`, so at the trip point it first waits
+for any hub writes an engine tick has in flight (`BRD-z`, recorded).
 
 ## Startup Sequence — OpenFan adoption (DEC-291 / DEC-361)
 
@@ -673,8 +681,10 @@ gating each have their own register rows and regression tests.
     replays the record for that. A failed floor write, like a failed `set_pwm`
     duty write, leaves the next command to be written rather than coalesced
     (`TS-au`). On `arctic_fan` each floor write primes the device's unwritten
-    channels first (DEC-425), so on a device whose cache a resume zeroed since the
-    daemon's last write the step can outlast its 3 s bound (`BRD-t`).
+    channels first (DEC-425), and each write waits for the device's ACK, so a hub
+    with several channels below the floor can outlast the step's 3 s bound. Its
+    channels are written after every other header (DEC-450), so it is they that
+    keep their last duty when that happens, and the log says so.
 
 12. **The stall/restart probe is the one diagnostic below 20 %** (`api::stall_probe`,
     DEC-407). Every other diagnostic clamps to `max(20, header floor)`, and still does.

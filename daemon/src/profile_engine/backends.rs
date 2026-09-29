@@ -2636,9 +2636,14 @@ impl SafetyWriteBackend for HwmonBackend {
         if stalled {
             if !self.stall_logged {
                 self.stall_logged = true;
+                // `BRD-t`: say what is true on a machine with an ARCTIC hub,
+                // where every force outlasts the budget — the hub is written
+                // last (DEC-450), and a slow hub is not a dead one.
                 log::error!(
                     "THERMAL SAFETY: hwmon force_all_with_floor still in flight after {}s — \
-                     the emergency write has not reached the header yet",
+                     headers it has not reached yet keep their last duty until it does \
+                     (an ARCTIC fan hub is written last, and answers each write in up to \
+                     ~0.6 s, so a slow device is not necessarily a dead one)",
                     WRITE_JOIN_BUDGET.as_secs()
                 );
             }
@@ -4325,6 +4330,116 @@ mod tests {
                 vals.iter().all(|v| *v == "255"),
                 "header pwm{i} must be forced to 100% (raw 255); got {vals:?}"
             );
+        }
+    }
+
+    /// A sysfs holding a Super-I/O chip (`hwmon2`, with `pwmN_enable`) and an
+    /// ARCTIC hub (`hwmon7`, none) whose driver cache starts at 0, as after
+    /// probe or resume — so the hub's first write also primes its siblings.
+    /// Writes are stored and logged in order; an unwritten `pwmN_enable` reads
+    /// `5` (firmware), an unwritten Super-I/O duty `100`, an unwritten hub
+    /// channel `0`.
+    struct MixedRigWriter {
+        writes: WriteLog,
+        files: Arc<Mutex<HashMap<String, String>>>,
+    }
+
+    impl SysfsWriter for MixedRigWriter {
+        fn write_file(&mut self, path: &str, value: &str) -> Result<(), HwmonError> {
+            self.writes.lock().push((path.into(), value.into()));
+            self.files.lock().insert(path.into(), value.trim().into());
+            Ok(())
+        }
+        fn read_file(&self, path: &str) -> Result<String, HwmonError> {
+            let stored = self.files.lock().get(path).cloned();
+            let default = if path.ends_with("_enable") {
+                "5"
+            } else if path.starts_with("/sys/class/hwmon/hwmon7/") {
+                "0"
+            } else {
+                "100"
+            };
+            Ok(format!("{}\n", stored.as_deref().unwrap_or(default)))
+        }
+    }
+
+    const MIXED_SIO_DIR: &str = "/sys/class/hwmon/hwmon2";
+    const MIXED_HUB_DIR: &str = "/sys/class/hwmon/hwmon7";
+
+    /// Three `nct6775` headers and four ARCTIC channels. `nct6775` sorts after
+    /// `arctic_fan`, so `headers()` order puts every hub channel first — the
+    /// order the force used before `BRD-t`.
+    fn mixed_rig_headers() -> Vec<PwmHeaderDescriptor> {
+        let sio = (1..=3u8).map(|n| {
+            let mut h = make_header(&format!("hwmon:nct6775:nct6775.656:pwm{n}:pwm{n}"));
+            h.chip_name = "nct6775".into();
+            h.pwm_index = n;
+            h.pwm_path = format!("{MIXED_SIO_DIR}/pwm{n}");
+            h.enable_path = Some(format!("{MIXED_SIO_DIR}/pwm{n}_enable"));
+            h
+        });
+        let hub = (1..=4u8).map(|n| {
+            let mut h = make_header(&format!(
+                "hwmon:arctic_fan:0003:3904:F001.0001:pwm{n}:pwm{n}"
+            ));
+            h.chip_name = "arctic_fan".into();
+            h.pwm_index = n;
+            h.supports_enable = false;
+            h.enable_path = None;
+            h.pwm_path = format!("{MIXED_HUB_DIR}/pwm{n}");
+            h
+        });
+        sio.chain(hub).collect()
+    }
+
+    /// [SAFETY] `BRD-t`, at the call site: the 100 % force writes every
+    /// motherboard header before the first write to a USB fan hub, whose every
+    /// write waits for the device's ACK (and whose first after probe or resume
+    /// primes its siblings too). Reach is unchanged: every header of both chips
+    /// is still driven to full speed.
+    #[tokio::test]
+    async fn the_force_writes_motherboard_headers_before_a_usb_fan_hub() {
+        let writes: WriteLog = Arc::new(Mutex::new(Vec::new()));
+        let writer = MixedRigWriter {
+            writes: writes.clone(),
+            files: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let ctrl = HwmonPwmController::new(
+            mixed_rig_headers(),
+            LeaseManager::new(),
+            Box::new(writer),
+            Arc::new(StateCache::new()),
+        );
+        assert_eq!(
+            ctrl.headers()[0].chip_name,
+            "arctic_fan",
+            "precondition: discovery order puts the hub first, so the test can tell"
+        );
+        let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl))).expect("writable headers");
+
+        be.force_all_with_floor(100, &[], ForceReach::All).await;
+
+        let w = writes.lock().clone();
+        let first_hub = w
+            .iter()
+            .position(|(p, _)| p.starts_with(MIXED_HUB_DIR))
+            .expect("the hub is forced too");
+        let last_sio = w
+            .iter()
+            .rposition(|(p, _)| p.starts_with(MIXED_SIO_DIR))
+            .expect("the motherboard headers are forced");
+        assert!(
+            last_sio < first_hub,
+            "a motherboard header was written after the hub's first write: {w:?}"
+        );
+        for (dir, n) in [(MIXED_SIO_DIR, 3), (MIXED_HUB_DIR, 4)] {
+            for i in 1..=n {
+                let path = format!("{dir}/pwm{i}");
+                assert!(
+                    w.iter().any(|(p, v)| *p == path && v == "255"),
+                    "{path} was not forced to full speed: {w:?}"
+                );
+            }
         }
     }
 
