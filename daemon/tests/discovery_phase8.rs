@@ -2557,7 +2557,7 @@ fn preflight_state_with_members(
         start_time: Instant::now(),
         history: Arc::new(control_ofc_daemon::health::history::HistoryRing::new(250)),
         active_profile: Arc::new(parking_lot::Mutex::new(None)),
-        calibrating: AtomicBool::new(false),
+        openfan_calibration: Default::default(),
         characterization: Arc::new(parking_lot::Mutex::new(None)),
         validation: Arc::new(Default::default()),
         characterization_cancel: Arc::new(AtomicBool::new(false)),

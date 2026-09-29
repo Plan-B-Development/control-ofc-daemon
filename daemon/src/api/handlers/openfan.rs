@@ -1,7 +1,8 @@
-//! OpenFan serial calibration endpoint. The bare PWM/RPM write endpoints were
-//! retired at 2.0.0 (DEC-165) — the profile engine is the sole writer.
+//! OpenFan calibration (DEC-452), rescan and post-boot adoption. The bare
+//! PWM/RPM write endpoints were retired at 2.0.0 (DEC-165) — the profile engine
+//! is the sole writer.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,6 +11,7 @@ use axum::http::StatusCode;
 use axum::response::Json;
 
 use super::{error_response, json_ok, AdoptOutcome, AppState, LastRescan};
+use crate::api::calibration::{self as cal, OpenFanCalibrationRun};
 use crate::api::responses::*;
 use crate::serial::controller::FanControlError;
 
@@ -439,190 +441,389 @@ async fn post_boot_adoption_loop_with<E, EFut, P, PFut>(
     }
 }
 
-/// RAII guard that resets the calibrating flag on drop, ensuring cleanup
-/// even on early return or panic.
-struct CalibrationGuard<'a> {
-    flag: &'a AtomicBool,
+/// A calibration refusal's 409, in the verify family's shape: retryable,
+/// because every condition it reports clears by itself.
+fn calibration_conflict(code: &str, message: String) -> (StatusCode, Json<serde_json::Value>) {
+    error_response(
+        StatusCode::CONFLICT,
+        &ErrorEnvelope {
+            error: ErrorBody {
+                code: code.into(),
+                message,
+                retryable: true,
+                source: if code == "thermal_abort" {
+                    "hardware".into()
+                } else {
+                    "validation".into()
+                },
+                details: None,
+            },
+        },
+    )
 }
-impl Drop for CalibrationGuard<'_> {
-    fn drop(&mut self) {
-        self.flag.store(false, Ordering::SeqCst);
+
+/// [SAFETY] Start an OpenFan calibration (DEC-452): every entry refusal, then
+/// claim the calibration slot and the engine pause, install the run and spawn
+/// the walk. Returns the run's 202 snapshot and a receiver for the finished
+/// run, or the refusal. Shared by the new route and the deprecated synchronous
+/// one, so the two cannot drift.
+///
+/// Refusals, in order — every one before anything is written: shutting down
+/// (503) · no `acknowledge_below_floor: true` (400) · no controller (503) · a
+/// channel out of range (400) · too hot (409 `thermal_abort`) · the ladder
+/// forcing or stale temperatures (409, retryable) · no fresh CPU reading for
+/// the rise gate (400, retryable) · a calibration task still alive (409,
+/// retryable) · another diagnostic in the single slot (409).
+///
+/// [SAFETY] The task is detached, so it is not in `main::shutdown_sequence`'s
+/// `task_handles`. What makes that safe is the walk's shutdown check on every
+/// sample, and its restore — which an OpenFan channel's exit-floor latch keeps
+/// at or above the floor whichever of the two writes last (module docs of
+/// `api::calibration`).
+fn start_openfan_calibration(
+    state: &Arc<AppState>,
+    channel: u8,
+    acknowledged: Option<bool>,
+    hold_seconds: Option<u64>,
+) -> Result<
+    (
+        OpenFanCalibrationRun,
+        tokio::sync::oneshot::Receiver<OpenFanCalibrationRun>,
+    ),
+    (StatusCode, Json<serde_json::Value>),
+> {
+    if *state.openfan_runtime.shutdown.borrow() {
+        return Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::hardware_unavailable("the daemon is shutting down"),
+        ));
+    }
+    // [SAFETY] `PTR-i`: the daemon holds no pump evidence for an OpenFan
+    // channel, so the user's confirmation is the only guard (DEC-452, Q3-A).
+    if acknowledged != Some(true) {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorEnvelope::validation(
+                "OpenFan calibration drives this channel down to 0% and cannot tell whether \
+                 it powers a pump; send {\"acknowledge_below_floor\": true} to confirm it \
+                 does not",
+            ),
+        ));
+    }
+    let Some(ctrl) = state.openfan() else {
+        return Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::hardware_unavailable("OpenFanController not connected"),
+        ));
+    };
+    if channel >= crate::serial::protocol::NUM_CHANNELS {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorEnvelope::validation(format!("invalid channel: {channel}")),
+        ));
+    }
+    if let Err(cal::CalibrationError::ThermalAbort {
+        sensor_id,
+        temp_c,
+        limit_c,
+    }) = cal::check_thermal_safety(&state.cache)
+    {
+        return Err(calibration_conflict(
+            "thermal_abort",
+            format!(
+                "Cannot calibrate while hot: {sensor_id} at {temp_c:.1}\u{00B0}C (limit \
+                 {limit_c:.0}\u{00B0}C). Let the system cool, then retry."
+            ),
+        ));
+    }
+    // DEC-295: the latched band the temperature test above cannot see.
+    if let Some(forcing) = cal::thermal_force_state(&state.cache) {
+        return Err(calibration_conflict(
+            "validation_error",
+            format!("thermal safety is forcing fan output ({forcing}); calibration cannot run"),
+        ));
+    }
+    // DEC-385 (`TS-q`): a wedged poll freezes a hot reading the ladder ignores.
+    if let Some(reason) = cal::temperature_refusal(&state.cache) {
+        return Err(calibration_conflict(
+            "validation_error",
+            format!("calibration cannot run: {reason}. Retry once sensor polling recovers."),
+        ));
+    }
+    // [SAFETY] The rise gate needs a fresh CPU reading to compare against — the
+    // stall probe's rule (DEC-407). Retryable: it may be between polls.
+    let Some(start_cpu_c) = crate::api::stall_probe::hottest_fresh_cpu_c(&state.cache) else {
+        let mut e = ErrorEnvelope::validation(
+            "no fresh CPU temperature reading, so calibration's rise gate cannot be evaluated",
+        );
+        e.error.retryable = true;
+        e.error.details = Some(serde_json::json!({ "reason": cal::ABORT_NO_CPU_TEMPERATURE }));
+        return Err(error_response(StatusCode::BAD_REQUEST, &e));
+    };
+
+    // [SAFETY] One calibration task at a time, whatever the engine pause says:
+    // a pause whose deadman lapsed under a wedged write can be claimed again
+    // while the first task is still alive (DEC-452 review, F1). Released by
+    // the guard's drop — here on a refused pause, else when the task ends.
+    let Some(mut alive) = state.openfan_calibration.claim() else {
+        return Err(calibration_conflict(
+            "validation_error",
+            "an OpenFan calibration is still running".into(),
+        ));
+    };
+    // The single slot every hardware diagnostic claims (DEC-191): at most one
+    // drives hardware, and the engine's write phase is paused for the run. It is
+    // renewed on every sample (DEC-296), so the generic deadman fits a run of
+    // any length — the whole-sweep window DEC-191 sized is retired.
+    let Some(pause) =
+        super::begin_verify_pause(&state.cache, crate::constants::VERIFY_PAUSE_DEADMAN)
+    else {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            &ErrorEnvelope::validation("a hardware verify or calibration is already in progress"),
+        ));
+    };
+
+    let hold = cal::clamp_hold(hold_seconds);
+    let run = OpenFanCalibrationRun {
+        run_id: cal::next_run_id(),
+        fan_id: crate::serial::openfan_member_id(channel),
+        channel,
+        state: crate::api::characterization::STATE_RUNNING.to_string(),
+        hold_ms: hold.as_millis() as u64,
+        start_cpu_temp_c: Some(start_cpu_c),
+        max_cpu_temp_c: Some(start_cpu_c),
+        rise_limit_c: crate::constants::STALL_PROBE_RISE_LIMIT_C,
+        restore_outcome: crate::api::characterization::RestoreOutcome::Pending
+            .token()
+            .to_string(),
+        started_unix_ms: crate::control_paths::unix_ms(),
+        ..Default::default()
+    };
+    alive.install(run.clone());
+
+    let slot = state.openfan_calibration.clone();
+    let my_run_id = run.run_id.clone();
+    let mut finished = run.clone();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let cache = state.cache.clone();
+    let shutdown_rx = state.openfan_runtime.shutdown.clone();
+
+    tokio::spawn(async move {
+        // Dropped last, after the pause: the slot is free only once the task
+        // is done. A panic drops it too, and it marks the run aborted.
+        let alive = alive;
+        // The pause lives until the task ends — after the restore.
+        let pause = pause;
+        // [SAFETY] `TS-bh`: the duty to restore, read from the controller
+        // UNDER ITS LOCK and only now, after the pause was claimed. A
+        // pre-emergency give-back re-checks the pause under that same lock
+        // before each channel (DEC-413), so from here it writes nothing, and a
+        // write it had already started has finished by the time this lock is
+        // ours. The cache this used to read is updated after the wire write,
+        // outside the lock, so it could still show the forced 100 %. On the
+        // blocking pool: the lock can wait behind a serial write.
+        let reader = ctrl.clone();
+        let original =
+            tokio::task::spawn_blocking(move || reader.lock().last_commanded_pct(channel))
+                .await
+                .ok()
+                .flatten();
+
+        let write: cal::CalWriteFn = Arc::new(move |ch: u8, pct: u8| {
+            let mut guard = ctrl.lock();
+            match guard.set_pwm(ch, pct) {
+                Ok(_) => Ok(()),
+                Err(FanControlError::Validation(msg)) => {
+                    Err(cal::CalibrationError::Validation(msg))
+                }
+                Err(e @ FanControlError::Serial(_)) => {
+                    Err(cal::CalibrationError::Hardware(e.to_string()))
+                }
+            }
+        });
+        // Fenced on `run_id`: a run whose deadman elapsed can be superseded,
+        // and without the fence the loser would publish over the winner.
+        let publish = |p: &cal::CalProgress| {
+            if let Some(run) = slot.run.lock().as_mut() {
+                if run.run_id == my_run_id && run.is_running() {
+                    let mut progress = p.clone();
+                    // Only the terminal publish below may end the run.
+                    progress.state = "";
+                    progress.outcome = None;
+                    progress.abort_reason = None;
+                    progress.detail = None;
+                    run.apply(&progress);
+                }
+            }
+        };
+
+        let result = cal::run_calibration(
+            &cache,
+            channel,
+            hold,
+            original,
+            start_cpu_c,
+            write,
+            &slot.cancel,
+            || *shutdown_rx.borrow(),
+            || pause.renew(crate::constants::VERIFY_PAUSE_DEADMAN),
+            publish,
+        )
+        .await;
+
+        finished.apply(&result);
+        finished.completed_unix_ms = Some(crate::control_paths::unix_ms());
+        if let Some(run) = slot.run.lock().as_mut() {
+            if run.run_id == my_run_id {
+                *run = finished.clone();
+            }
+        }
+        // The deprecated route waits on this; the new route has dropped it.
+        let _ = done_tx.send(finished);
+        drop(pause);
+        drop(alive);
+    });
+
+    Ok((run, done_rx))
+}
+
+/// `POST /fans/openfan/{channel}/calibration` — start a calibration (DEC-452).
+/// Returns **202** with the run snapshot; the client polls
+/// `GET /diagnostics/openfan-calibration`.
+pub async fn openfan_calibration_handler(
+    State(state): State<Arc<AppState>>,
+    Path(channel): Path<u8>,
+    Json(body): Json<cal::OpenFanCalibrationRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match start_openfan_calibration(
+        &state,
+        channel,
+        body.acknowledge_below_floor,
+        body.hold_seconds,
+    ) {
+        Ok((run, _done)) => json_ok(StatusCode::ACCEPTED, run),
+        Err(resp) => resp,
     }
 }
 
-/// Deadman window for the profile-engine write-pause held across an OpenFan
-/// calibration sweep (DEC-191). It must span the WHOLE sweep — `(steps + 1)`
-/// settle holds plus slack for the per-step + restore writes and scheduling —
-/// because the generic [`crate::constants::VERIFY_PAUSE_DEADMAN`] (30 s) is sized
-/// for the brief hwmon/GPU verifies and a sweep runs far longer (a default
-/// 10 × 5 s sweep is ~55 s); too short a deadman would self-clear mid-sweep and
-/// reopen the overwrite race. `steps`/`hold_seconds` are clamped to the same
-/// range [`crate::api::calibration::calibrate_openfan_channel`] uses, so the
-/// window matches the actual sweep duration. The handler's RAII guard clears the
-/// pause on the normal path; this bound only matters if that guard leaks.
-fn calibration_pause_window(steps: u8, hold_seconds: u64) -> Duration {
-    let clamped_steps = steps.clamp(2, 20) as u64;
-    let clamped_hold = hold_seconds.clamp(2, 15);
-    // (steps+1) settle holds + ~1 s per write (the serial timeout is 500 ms and
-    // there are steps+1 sweep writes plus the restore) + 10 s scheduling slack.
-    // The write-time term matters at the maximum (20 × 15 ≈ 325 s of holds):
-    // without it the deadman could expire ~1 s before a slow-serial sweep
-    // finished and let the engine overwrite the final data point.
-    Duration::from_secs((clamped_steps + 1) * clamped_hold + (clamped_steps + 2) + 10)
+/// `GET /diagnostics/openfan-calibration` — the current or most recent run.
+/// Held in memory only.
+pub async fn openfan_calibration_status_handler(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match state.openfan_calibration.run.lock().clone() {
+        Some(run) => json_ok(StatusCode::OK, run),
+        None => error_response(
+            StatusCode::NOT_FOUND,
+            &ErrorEnvelope::not_found("no OpenFan calibration has run"),
+        ),
+    }
 }
 
-/// POST /fans/openfan/{channel}/calibrate — run a PWM-to-RPM calibration sweep.
+/// `DELETE /diagnostics/openfan-calibration` — ask the running calibration to
+/// stop. Honoured on the next sample (≤ 500 ms) during the descent and ascent;
+/// the recovery kick and the restore run to their end. A fan the walk may have
+/// stopped is kicked at 100 % before the original duty is restored.
+pub async fn openfan_calibration_cancel_handler(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // ONE lock across the check and the set (the characterisation rule).
+    let snapshot = {
+        let guard = state.openfan_calibration.run.lock();
+        match guard.as_ref() {
+            Some(run) if run.is_running() => {
+                state
+                    .openfan_calibration
+                    .cancel
+                    .store(true, Ordering::SeqCst);
+                run.clone()
+            }
+            _ => {
+                return error_response(
+                    StatusCode::CONFLICT,
+                    &ErrorEnvelope::validation("no OpenFan calibration is running"),
+                )
+            }
+        }
+    };
+    json_ok(StatusCode::ACCEPTED, snapshot)
+}
+
+/// `POST /fans/openfan/{channel}/calibrate` — **deprecated** (DEC-452): starts
+/// the same run as `POST .../calibration` and holds the request open until it
+/// ends, answering in the pre-DEC-452 shape.
 ///
-/// Delegates the sweep to [`crate::api::calibration::calibrate_openfan_channel`]
-/// (DEC-134) — the handler owns only HTTP mapping, the concurrency flag, the
-/// profile-engine write-pause for the sweep's duration (DEC-191), and the
-/// controller-backed write closure. The helper restores the
-/// pre-calibration PWM on every exit path, including a failed write
-/// mid-sweep (previously the inline copy returned early without restoring,
-/// which could park a fan at a sweep step).
+/// Two behaviour changes from before DEC-452, both deliberate: it requires
+/// `acknowledge_below_floor: true` like the new route, and `steps` is ignored.
+/// `stop_pwm` and `start_pwm` are now measured by a descent and an ascent.
+/// A client that disconnects no longer ends the run: it restores itself when
+/// it ends, and `DELETE /diagnostics/openfan-calibration` stops it. The answer
+/// is the run this request started, handed back by the task itself — never
+/// read from the shared slot, which a later run may already hold.
 pub async fn calibrate_openfan_handler(
     State(state): State<Arc<AppState>>,
     Path(channel): Path<u8>,
-    Json(body): Json<crate::api::calibration::CalibrationRequest>,
+    Json(body): Json<cal::CalibrationRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    use crate::api::calibration::CalibrationError;
-
-    let Some(ctrl) = state.openfan() else {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &ErrorEnvelope::hardware_unavailable("OpenFanController not connected"),
-        );
-    };
-
-    if channel > 9 {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            &ErrorEnvelope::validation(format!("invalid channel: {channel}")),
-        );
-    }
-
-    // Prevent concurrent calibration sweeps
-    if state
-        .calibrating
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return error_response(
-            StatusCode::CONFLICT,
-            &ErrorEnvelope::validation("calibration already in progress"),
-        );
-    }
-
-    // Drop guard resets `calibrating` to false on any exit path (early return, panic, success)
-    let _guard = CalibrationGuard {
-        flag: &state.calibrating,
-    };
-
-    // DEC-191: pause the profile engine's write phase for the whole sweep. With
-    // an active profile, the engine's 1 Hz tick would otherwise overwrite each
-    // step's test PWM during the settle window — corrupting the RPM readback and
-    // the derived start/stop PWM (the OpenFan backend has no lease to fence it,
-    // unlike hwmon). The pause reuses the verify single-flight slot, so a
-    // hardware verify in progress rejects calibration (and vice-versa) — both
-    // drive hardware directly. `calibrating` above still guards
-    // calibration-vs-calibration.
-    let pause_window = calibration_pause_window(body.steps, body.hold_seconds);
-    let Some(_pause) = super::begin_verify_pause(&state.cache, pause_window) else {
-        return error_response(
-            StatusCode::CONFLICT,
-            &ErrorEnvelope::validation(
-                "a hardware verify is in progress — retry calibration once it completes",
-            ),
-        );
-    };
-
-    // Controller-backed write closure. Preserves the pre-DEC-134 status
-    // mapping: serial faults surface as Hardware (503), controller-side
-    // validation (e.g. stop-timeout safety) as Validation (400).
-    let write_fn = move |ch: u8, pwm: u8| -> Result<(), CalibrationError> {
-        let mut guard = ctrl.lock(); // parking_lot — always succeeds
-        match guard.set_pwm(ch, pwm) {
-            Ok(_) => Ok(()),
-            Err(FanControlError::Validation(msg)) => Err(CalibrationError::Validation(msg)),
-            Err(e @ FanControlError::Serial(_)) => Err(CalibrationError::Hardware(e.to_string())),
-        }
-    };
-
-    match crate::api::calibration::calibrate_openfan_channel(
-        state.cache.clone(),
+    let done = match start_openfan_calibration(
+        &state,
         channel,
-        body.steps,
+        body.acknowledge_below_floor,
         body.hold_seconds,
-        write_fn,
-    )
-    .await
-    {
-        Ok(result) => json_ok(
-            StatusCode::OK,
-            CalibrationResponse {
-                api_version: API_VERSION,
-                fan_id: result.fan_id,
-                points: result.points,
-                start_pwm: result.start_pwm,
-                stop_pwm: result.stop_pwm,
-                min_rpm: result.min_rpm,
-                max_rpm: result.max_rpm,
-            },
+    ) {
+        Ok((_, done)) => done,
+        Err(resp) => return resp,
+    };
+    // The run always ends: its walk is a bounded list of bounded holds. A
+    // sender dropped without a send is a task that died (a panic).
+    match done.await {
+        Ok(finished) => legacy_calibration_response(&finished),
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &ErrorEnvelope::internal("the calibration task ended without a result"),
         ),
-        Err(CalibrationError::ThermalAbort {
-            sensor_id, temp_c, ..
-        }) => error_response(
-            StatusCode::CONFLICT,
-            &ErrorEnvelope {
-                error: ErrorBody {
-                    code: "thermal_abort".into(),
-                    message: format!("Thermal abort: {sensor_id} at {temp_c:.1}\u{00B0}C"),
-                    retryable: true,
-                    source: "hardware".into(),
-                    details: None,
-                },
-            },
-        ),
-        // DEC-295: 409 + `validation_error`, matching the DEC-191 single-flight
-        // refusal two functions up rather than inventing a shape. `retryable`
-        // is TRUE like the rescan cooldown's 409 and unlike the sibling
-        // single-flight ones: the condition clears by itself when the ladder
-        // releases. A 400 would have told the client its REQUEST was malformed
-        // and not to retry, which is wrong on both counts.
-        Err(e @ CalibrationError::ThermalForceActive { .. }) => error_response(
-            StatusCode::CONFLICT,
-            &ErrorEnvelope {
-                error: ErrorBody {
-                    code: "validation_error".into(),
-                    message: e.to_string(),
-                    retryable: true,
-                    source: "validation".into(),
-                    details: None,
-                },
-            },
-        ),
-        // DEC-385 (`TS-q`): the same 409 shape as the verify-family's
-        // `stale_temperature_guard` — the machine may be cool, and the daemon
-        // cannot tell; the condition clears once the poll recovers.
-        Err(e @ CalibrationError::StaleTemperature { .. }) => error_response(
-            StatusCode::CONFLICT,
-            &ErrorEnvelope {
-                error: ErrorBody {
-                    code: "validation_error".into(),
-                    message: format!("{e}. Retry once sensor polling recovers."),
-                    retryable: true,
-                    source: "validation".into(),
-                    details: None,
-                },
-            },
-        ),
-        Err(CalibrationError::Validation(msg)) => {
-            error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(msg))
+    }
+}
+
+/// The deprecated route's answer for a finished run, in the pre-DEC-452 status
+/// mapping: a thermal limit is `409 thermal_abort`, a condition that clears by
+/// itself is a retryable `409 validation_error`, a write or read failure is
+/// `503 hardware_unavailable`.
+fn legacy_calibration_response(
+    run: &OpenFanCalibrationRun,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let detail = run.detail.clone().unwrap_or_default();
+    match (run.outcome.as_deref(), run.abort_reason.as_deref()) {
+        (Some(cal::OUTCOME_CANCELLED), _) => {
+            calibration_conflict("validation_error", "the calibration was cancelled".into())
         }
-        Err(CalibrationError::Hardware(msg)) => error_response(
+        (Some(cal::OUTCOME_ABORTED), Some("thermal_limit")) => {
+            calibration_conflict("thermal_abort", format!("Thermal abort: {detail}"))
+        }
+        (
+            Some(cal::OUTCOME_ABORTED),
+            Some(cal::ABORT_WRITE_FAILED | cal::ABORT_RPM_UNREADABLE | cal::ABORT_SHUTTING_DOWN),
+        ) => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            &ErrorEnvelope::hardware_unavailable(msg),
+            &ErrorEnvelope::hardware_unavailable(detail),
         ),
+        (Some(cal::OUTCOME_ABORTED), _) => calibration_conflict("validation_error", detail),
+        _ => {
+            let r = run.legacy_result();
+            json_ok(
+                StatusCode::OK,
+                CalibrationResponse {
+                    api_version: API_VERSION,
+                    fan_id: r.fan_id,
+                    points: r.points,
+                    start_pwm: r.start_pwm,
+                    stop_pwm: r.stop_pwm,
+                    min_rpm: r.min_rpm,
+                    max_rpm: r.max_rpm,
+                },
+            )
+        }
     }
 }
 
@@ -1298,7 +1499,7 @@ mod tests {
             start_time: std::time::Instant::now(),
             history: Arc::new(crate::health::history::HistoryRing::new(10)),
             active_profile: Arc::new(parking_lot::Mutex::new(None)),
-            calibrating: std::sync::atomic::AtomicBool::new(false),
+            openfan_calibration: Default::default(),
             characterization: Arc::new(parking_lot::Mutex::new(None)),
             validation: Arc::new(Default::default()),
             characterization_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1465,133 +1666,480 @@ mod tests {
         );
     }
 
-    #[test]
-    fn calibration_pause_window_spans_the_whole_sweep() {
-        // DEC-191: the engine write-pause must outlast the sweep. A default
-        // 10×5 s sweep (~55 s of settle holds) must get a window comfortably
-        // above the 30 s VERIFY_PAUSE_DEADMAN, which would otherwise self-clear
-        // mid-sweep and reopen the overwrite race.
-        let w = calibration_pause_window(10, 5);
-        assert!(
-            w >= Duration::from_secs(11 * 5),
-            "window must cover (steps+1) settle holds; got {w:?}"
-        );
-        assert!(
-            w > crate::constants::VERIFY_PAUSE_DEADMAN,
-            "a calibration window must exceed the generic verify deadman"
-        );
+    // ── DEC-452: OpenFan calibration through the real handlers ───────────────
 
-        // Maximum sweep (clamped 20 steps × 15 s) — the case the bespoke window
-        // sizing exists for. It must outlast the worst-case real sweep:
-        // (steps+1) settle holds + (steps+1) sweep writes + 1 restore write, each
-        // write bounded by the 500 ms serial timeout (audit P3 follow-up).
-        let max = calibration_pause_window(20, 15);
-        let worst_case_sweep = Duration::from_millis(21 * 15_000 + 22 * 500);
-        assert!(
-            max > worst_case_sweep,
-            "max-param window {max:?} must outlast the worst-case sweep {worst_case_sweep:?}"
-        );
-
-        // Clamps mirror calibrate_openfan_channel (steps 2..=20, hold 2..=15),
-        // so out-of-range inputs cannot under- or over-size the window.
-        assert_eq!(
-            calibration_pause_window(0, 0),
-            calibration_pause_window(2, 2)
-        );
-        assert_eq!(
-            calibration_pause_window(99, 99),
-            calibration_pause_window(20, 15)
-        );
-    }
-
-    // ── `TS-q` / DEC-385: calibration refuses a stale temperature source ─────
-
-    /// Records every frame written, answers nothing — a controller that would
-    /// show any write the handler made.
-    struct RecordingTransport(Arc<parking_lot::Mutex<Vec<String>>>);
-    impl crate::serial::transport::SerialTransport for RecordingTransport {
+    /// Records every frame and answers each the way the firmware does — same
+    /// opcode, same channel — so `set_pwm` succeeds.
+    struct EchoTransport(Arc<parking_lot::Mutex<Vec<String>>>);
+    impl crate::serial::transport::SerialTransport for EchoTransport {
         fn write_line(&mut self, data: &str) -> Result<(), crate::error::SerialError> {
             self.0.lock().push(data.to_string());
             Ok(())
         }
         fn read_line(&mut self, _timeout: Duration) -> Result<String, crate::error::SerialError> {
-            Err(crate::error::SerialError::Timeout { timeout_ms: 1 })
+            match self.0.lock().last() {
+                Some(cmd) => Ok(crate::serial::protocol::firmware_echo_for(cmd)),
+                None => Err(crate::error::SerialError::Timeout { timeout_ms: 1 }),
+            }
         }
     }
 
-    /// [SAFETY] TS-q at the CALL SITE: `POST /fans/openfan/{ch}/calibrate` with
-    /// the poll wedged on a hot reading answers the verify family's `409
-    /// validation_error` (retryable) and writes NOTHING to the controller. The
-    /// sweep's own tests prove the check exists; only this proves the endpoint
-    /// maps it — a missing arm would be a 500 or a 503.
-    ///
-    /// Opposite arm: the same reading fresh reaches the wire, so the refusal is
-    /// the reading's age and nothing else about the fixture.
-    #[tokio::test]
-    async fn calibrate_refuses_a_stale_temperature_source_before_any_frame() {
-        let stale = crate::api::calibration::diagnostic_temp_max_age(
-            &crate::health::cache::StateCache::new(),
-        ) + Duration::from_secs(60);
-        for (age, refused) in [(stale, true), (Duration::ZERO, false)] {
-            let (_tx, rx) = tokio::sync::watch::channel(false);
-            let state = adoption_state(rx);
-            let frames = Arc::new(parking_lot::Mutex::new(Vec::new()));
-            let transport: Box<dyn crate::serial::transport::SerialTransport + Send> =
-                Box::new(RecordingTransport(frames.clone()));
-            let ctrl = crate::serial::controller::FanController::new_shared(
+    type SharedCtrl = Arc<parking_lot::Mutex<crate::serial::controller::FanController>>;
+
+    struct CalFixture {
+        state: Arc<AppState>,
+        ctrl: SharedCtrl,
+        frames: Arc<parking_lot::Mutex<Vec<String>>>,
+        shutdown: tokio::sync::watch::Sender<bool>,
+        poller: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for CalFixture {
+        fn drop(&mut self) {
+            self.poller.abort();
+        }
+    }
+
+    fn fresh_cpu(temp_c: f64, age: Duration) -> crate::health::state::CachedSensorReading {
+        crate::health::state::CachedSensorReading {
+            id: "cpu".into(),
+            kind: crate::hwmon::types::SensorKind::CpuTemp,
+            label: "Tctl".into(),
+            value_c: temp_c,
+            source: crate::health::state::DeviceLabel::Hwmon,
+            updated_at: std::time::Instant::now() - age,
+            rate_c_per_s: None,
+            session_min_c: None,
+            session_max_c: None,
+            chip_name: "k10temp".into(),
+            temp_type: None,
+            thresholds: None,
+        }
+    }
+
+    /// A controller on channel 0 at 40 %, a CPU at 50 °C, and a fan that stops at
+    /// or below 10 % and restarts at 16 %: a poller publishes the RPM the
+    /// controller's current duty would produce, every 250 ms, as the OpenFan
+    /// poll loop would.
+    fn cal_fixture() -> CalFixture {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let state = adoption_state(rx);
+        let frames = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let transport: Box<dyn crate::serial::transport::SerialTransport + Send> =
+            Box::new(EchoTransport(frames.clone()));
+        let ctrl = Arc::new(parking_lot::Mutex::new(
+            crate::serial::controller::FanController::new_shared(
                 Arc::new(parking_lot::Mutex::new(transport)),
                 state.cache.clone(),
                 Duration::from_millis(1),
-            );
-            *state.fan_controller.write() = Some(Arc::new(parking_lot::Mutex::new(ctrl)));
-            state
-                .cache
-                .update_sensors(vec![crate::health::state::CachedSensorReading {
-                    id: "cpu".into(),
-                    kind: crate::hwmon::types::SensorKind::CpuTemp,
-                    label: "Tctl".into(),
-                    value_c: 84.0,
-                    source: crate::health::state::DeviceLabel::Hwmon,
-                    updated_at: std::time::Instant::now() - age,
-                    rate_c_per_s: None,
-                    session_min_c: None,
-                    session_max_c: None,
-                    chip_name: "k10temp".into(),
-                    temp_type: None,
-                    thresholds: None,
+            ),
+        ));
+        ctrl.lock().set_pwm(0, 40).expect("seed 40 %");
+        *state.fan_controller.write() = Some(ctrl.clone());
+        state
+            .cache
+            .update_sensors(vec![fresh_cpu(50.0, Duration::ZERO)]);
+        let (cache, c) = (state.cache.clone(), ctrl.clone());
+        let poller = tokio::spawn(async move {
+            let mut spinning = true;
+            loop {
+                let duty = c.lock().last_commanded_pct(0).unwrap_or(0);
+                spinning = if spinning { duty > 10 } else { duty >= 16 };
+                cache.update_openfan_fans(vec![crate::health::state::OpenFanState {
+                    channel: 0,
+                    rpm: if spinning { 300 + duty as u16 * 15 } else { 0 },
+                    last_commanded_pwm: None,
+                    updated_at: std::time::Instant::now(),
+                    rpm_polled: true,
                 }]);
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        });
+        CalFixture {
+            state,
+            ctrl,
+            frames,
+            shutdown: tx,
+            poller,
+        }
+    }
 
-            let (status, Json(body)) = calibrate_openfan_handler(
-                State(state.clone()),
+    /// The duties written to channel 0, in order, decoded from the frames.
+    fn ch0_duties(frames: &parking_lot::Mutex<Vec<String>>) -> Vec<u8> {
+        frames
+            .lock()
+            .iter()
+            .filter_map(|f| {
+                let body = f.trim_start_matches('>').trim_end();
+                (body.get(0..2) == Some("02") && body.get(2..4) == Some("00"))
+                    .then(|| u8::from_str_radix(&body[4..6], 16).ok())
+                    .flatten()
+                    .map(crate::pwm::raw_to_percent)
+            })
+            .collect()
+    }
+
+    async fn post_cal(
+        state: &Arc<AppState>,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let (status, Json(b)) = openfan_calibration_handler(
+            State(state.clone()),
+            Path(0),
+            Json(serde_json::from_value(body).expect("request")),
+        )
+        .await;
+        (status, b)
+    }
+
+    fn ack() -> serde_json::Value {
+        serde_json::json!({ "acknowledge_below_floor": true, "hold_seconds": 2 })
+    }
+
+    async fn cal_finished(state: &Arc<AppState>) -> OpenFanCalibrationRun {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(900);
+        loop {
+            if let Some(r) = state.openfan_calibration.run.lock().clone() {
+                if !r.is_running() && r.completed_unix_ms.is_some() {
+                    return r;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the calibration never finished"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    /// The whole route: the 202 snapshot, the walk down to the stall and back up
+    /// to the restart on the real controller, the restore to the duty the
+    /// controller held, and the slot released for the next diagnostic.
+    #[tokio::test(start_paused = true)]
+    async fn a_channel_is_calibrated_end_to_end() {
+        let f = cal_fixture();
+        let (status, body) = post_cal(&f.state, ack()).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(body["state"], "running");
+        assert_eq!(body["fan_id"], "openfan:ch00");
+        assert_eq!(body["hold_ms"], 2000);
+        assert!(body["original_pct"].is_null(), "read by the task: {body}");
+
+        let run = cal_finished(&f.state).await;
+        assert_eq!(
+            run.outcome.as_deref(),
+            Some(cal::OUTCOME_STALL_AND_RESTART_FOUND),
+            "{run:?}"
+        );
+        assert_eq!(run.stall_duty_pct, Some(10));
+        assert_eq!(run.restart_duty_pct, Some(16));
+        assert_eq!(run.hysteresis_pct, Some(6));
+        assert_eq!(run.original_pct, Some(40));
+        assert_eq!(run.restore_outcome, "restored");
+        assert!(!run.restore_failed);
+        assert_eq!(run.phase, None);
+        let duties = ch0_duties(&f.frames);
+        assert_eq!(duties.first(), Some(&40), "the fixture's seed");
+        assert_eq!(duties[1], 100, "the walk starts at full speed: {duties:?}");
+        assert_eq!(duties.last(), Some(&40), "restored: {duties:?}");
+        assert!(!f.state.cache.verify_active(), "the pause is released");
+        assert!(
+            !f.state.openfan_calibration.is_alive(),
+            "and so is the calibration slot"
+        );
+        let (status, Json(got)) = openfan_calibration_status_handler(State(f.state.clone())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(got["restart_duty_pct"], 16);
+    }
+
+    /// [SAFETY] `TS-bh`: the duty restored is the one the CONTROLLER holds,
+    /// read under its lock after the pause is claimed — never the cache's
+    /// `last_commanded_pwm`, which a give-back mid-write had not updated yet and
+    /// could still show the forced 100 %. Here the two disagree on purpose.
+    #[tokio::test(start_paused = true)]
+    async fn the_restore_is_the_controllers_duty_not_the_caches() {
+        let f = cal_fixture();
+        let generation = f.state.cache.openfan_write_generation();
+        f.state.cache.set_openfan_commanded_pwm(0, 100, generation);
+        assert_eq!(
+            f.state.cache.snapshot().openfan_fans[&0].last_commanded_pwm,
+            Some(100),
+            "precondition: the cache shows the forced duty"
+        );
+        assert_eq!(
+            f.ctrl.lock().last_commanded_pct(0),
+            Some(40),
+            "precondition"
+        );
+
+        let (status, body) = post_cal(&f.state, ack()).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let run = cal_finished(&f.state).await;
+        assert_eq!(run.original_pct, Some(40), "{run:?}");
+        assert_eq!(ch0_duties(&f.frames).last(), Some(&40));
+    }
+
+    #[tokio::test]
+    async fn the_request_must_acknowledge_the_walk_to_zero() {
+        let f = cal_fixture();
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({ "acknowledge_below_floor": false }),
+        ] {
+            let (status, resp) = post_cal(&f.state, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+            assert_eq!(resp["error"]["code"], "validation_error");
+        }
+        assert_eq!(ch0_duties(&f.frames), vec![40], "only the seed");
+        assert!(f.state.openfan_calibration.run.lock().is_none());
+        // No tunables but the hold: a crafted body cannot name a duty or a step.
+        for extra in ["steps", "start_pct", "step_pct"] {
+            let v = serde_json::json!({ "acknowledge_below_floor": true, extra: 1 });
+            assert!(
+                serde_json::from_value::<cal::OpenFanCalibrationRequest>(v).is_err(),
+                "{extra} was accepted"
+            );
+        }
+    }
+
+    /// The deprecated route: the same run, held open, answered in the old shape
+    /// — and it too requires the acknowledgement.
+    #[tokio::test(start_paused = true)]
+    async fn the_deprecated_route_runs_the_same_walk_and_answers_the_old_shape() {
+        let f = cal_fixture();
+        let (status, Json(body)) = calibrate_openfan_handler(
+            State(f.state.clone()),
+            Path(0),
+            Json(cal::CalibrationRequest {
+                steps: Some(10),
+                hold_seconds: Some(2),
+                acknowledge_below_floor: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(ch0_duties(&f.frames), vec![40]);
+
+        let (status, Json(body)) = calibrate_openfan_handler(
+            State(f.state.clone()),
+            Path(0),
+            Json(cal::CalibrationRequest {
+                steps: Some(10),
+                hold_seconds: Some(2),
+                acknowledge_below_floor: Some(true),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["stop_pwm"], 10, "a measured stop: {body}");
+        assert_eq!(body["start_pwm"], 16, "a measured start: {body}");
+        assert_eq!(body["fan_id"], "openfan:ch00");
+        assert!(body["max_rpm"].as_u64().unwrap() > 0);
+        assert_eq!(ch0_duties(&f.frames).last(), Some(&40));
+    }
+
+    /// The deprecated route answers from the run it started, handed back by the
+    /// task — not from the shared slot, which a later run may hold by the time
+    /// this one ends (DEC-452 review). Here the slot is emptied mid-run; the old
+    /// poll of the slot answered that as `superseded`.
+    #[tokio::test(start_paused = true)]
+    async fn the_deprecated_route_answers_from_its_own_run_not_the_slot() {
+        let f = cal_fixture();
+        let state = f.state.clone();
+        let call = tokio::spawn(async move {
+            calibrate_openfan_handler(
+                State(state),
                 Path(0),
-                Json(crate::api::calibration::CalibrationRequest {
-                    steps: 2,
-                    hold_seconds: 2,
+                Json(cal::CalibrationRequest {
+                    steps: None,
+                    hold_seconds: Some(2),
+                    acknowledge_below_floor: Some(true),
                 }),
             )
-            .await;
+            .await
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+        while !ch0_duties(&f.frames).contains(&60) {
+            assert!(tokio::time::Instant::now() < deadline, "never reached 60 %");
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert!(
+            f.state.openfan_calibration.run.lock().take().is_some(),
+            "precondition: the run was in the slot"
+        );
+        let (status, Json(body)) = call.await.expect("the handler");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["stop_pwm"], 10, "{body}");
+        assert_eq!(body["start_pwm"], 16, "{body}");
+    }
 
-            if refused {
-                assert_eq!(status, StatusCode::CONFLICT, "{body}");
-                assert_eq!(body["error"]["code"], "validation_error", "{body}");
-                assert_eq!(body["error"]["retryable"], true, "{body}");
-                assert!(
-                    frames.lock().is_empty(),
-                    "a refused calibration wrote to the controller: {:?}",
-                    frames.lock()
-                );
-            } else {
-                assert_ne!(
-                    status,
-                    StatusCode::CONFLICT,
-                    "a FRESH reading was refused: {body}"
-                );
-                assert!(
-                    !frames.lock().is_empty(),
-                    "precondition: with a fresh reading the sweep reaches the wire"
-                );
+    /// [SAFETY] DEC-452 review F1: a calibration task that is still alive keeps
+    /// a second one out even when the engine pause is free — as it is once the
+    /// pause's deadman has lapsed under a wedged write.
+    #[tokio::test]
+    async fn a_live_calibration_task_refuses_a_second_even_with_the_pause_free() {
+        let f = cal_fixture();
+        let live = f
+            .state
+            .openfan_calibration
+            .claim()
+            .expect("the slot is free");
+        assert!(
+            !f.state.cache.verify_active(),
+            "precondition: no pause held"
+        );
+        let (status, body) = post_cal(&f.state, ack()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"]["retryable"], true);
+        assert_eq!(ch0_duties(&f.frames), vec![40], "nothing written");
+        assert!(!f.state.cache.verify_active(), "and no pause taken");
+
+        drop(live);
+        let (status, body) = post_cal(&f.state, ack()).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        f.state
+            .openfan_calibration
+            .cancel
+            .store(true, Ordering::SeqCst);
+    }
+
+    /// A cancel mid-walk is honoured within a sample; the fan the walk had
+    /// stopped is kicked, then restored.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_mid_walk_kicks_then_restores() {
+        let f = cal_fixture();
+        let (status, _) = post_cal(
+            &f.state,
+            serde_json::json!({ "acknowledge_below_floor": true, "hold_seconds": 15 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+        while !ch0_duties(&f.frames).contains(&10) {
+            assert!(tokio::time::Instant::now() < deadline, "never reached 10 %");
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let before = ch0_duties(&f.frames).len();
+        let (status, _) = openfan_calibration_cancel_handler(State(f.state.clone())).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let run = cal_finished(&f.state).await;
+        assert_eq!(run.state, "cancelled");
+        assert_eq!(run.outcome.as_deref(), Some(cal::OUTCOME_CANCELLED));
+        assert_eq!(
+            ch0_duties(&f.frames)[before..],
+            [100, 40],
+            "kick, then restore"
+        );
+        let (status, _) = openfan_calibration_cancel_handler(State(f.state.clone())).await;
+        assert_eq!(status, StatusCode::CONFLICT, "nothing left to cancel");
+    }
+
+    /// [SAFETY] `TS-q` at the call site, on the new route: a stale temperature
+    /// source is a retryable 409 and writes nothing; the same reading fresh is
+    /// accepted. No fresh CPU reading at all is the rise gate's 400.
+    #[tokio::test]
+    async fn stale_or_missing_temperatures_are_refused_before_any_frame() {
+        let f = cal_fixture();
+        let stale = cal::diagnostic_temp_max_age(&f.state.cache) + Duration::from_secs(60);
+        f.state.cache.update_sensors(vec![fresh_cpu(84.0, stale)]);
+        let (status, body) = post_cal(&f.state, ack()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"]["code"], "validation_error");
+        assert_eq!(body["error"]["retryable"], true);
+        assert_eq!(ch0_duties(&f.frames), vec![40]);
+
+        f.state
+            .cache
+            .retain_sensors(&std::collections::HashSet::new());
+        f.state
+            .cache
+            .update_sensors(vec![crate::health::state::CachedSensorReading {
+                id: "board".into(),
+                kind: crate::hwmon::types::SensorKind::MbTemp,
+                ..fresh_cpu(35.0, Duration::ZERO)
+            }]);
+        assert!(
+            cal::temperature_refusal(&f.state.cache).is_none(),
+            "precondition: the shared staleness guard passes on a board sensor"
+        );
+        let (status, body) = post_cal(&f.state, ack()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["error"]["details"]["reason"],
+            cal::ABORT_NO_CPU_TEMPERATURE
+        );
+        assert_eq!(ch0_duties(&f.frames), vec![40]);
+
+        f.state
+            .cache
+            .update_sensors(vec![fresh_cpu(84.0, Duration::ZERO)]);
+        let (status, body) = post_cal(&f.state, ack()).await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "a FRESH reading was refused: {body}"
+        );
+        f.state
+            .openfan_calibration
+            .cancel
+            .store(true, Ordering::SeqCst);
+    }
+
+    #[tokio::test]
+    async fn a_busy_slot_shutdown_and_a_bad_channel_are_refused() {
+        let f = cal_fixture();
+        let held = crate::api::handlers::begin_verify_pause(
+            &f.state.cache,
+            crate::constants::VERIFY_PAUSE_DEADMAN,
+        )
+        .expect("the slot is free");
+        let (status, _) = post_cal(&f.state, ack()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            !f.state.openfan_calibration.is_alive(),
+            "a refused pause releases the calibration slot it claimed"
+        );
+        drop(held);
+
+        let (status, _) = openfan_calibration_handler(
+            State(f.state.clone()),
+            Path(10),
+            Json(serde_json::from_value(ack()).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        f.shutdown.send(true).unwrap();
+        let (status, _) = post_cal(&f.state, ack()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(ch0_duties(&f.frames), vec![40]);
+    }
+
+    #[tokio::test]
+    async fn get_and_delete_with_no_run_and_the_capability() {
+        let f = cal_fixture();
+        let (status, Json(body)) = openfan_calibration_status_handler(State(f.state.clone())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "not_found");
+        let (status, _) = openfan_calibration_cancel_handler(State(f.state.clone())).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let Json(caps) = crate::api::handlers::capabilities_handler(State(f.state.clone())).await;
+        let caps = serde_json::to_value(caps).unwrap();
+        fn find<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+            match v {
+                serde_json::Value::Object(m) => {
+                    m.get(key).or_else(|| m.values().find_map(|x| find(x, key)))
+                }
+                _ => None,
             }
         }
+        assert_eq!(
+            find(&caps, "openfan_calibration"),
+            Some(&serde_json::json!(true))
+        );
     }
 
     // ── `OFN-t`: adoption racing shutdown ────────────────────────────────────

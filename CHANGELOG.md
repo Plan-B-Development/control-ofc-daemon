@@ -2,7 +2,42 @@
 
 ## [Unreleased]
 
+### Added
+
+- **OpenFan calibration now finds where a fan stops and where it starts again, and runs in the
+  background** (DEC-452). `POST /fans/openfan/{channel}/calibration` returns at once (`202`), and a
+  client follows the run on `GET /diagnostics/openfan-calibration` and can stop it with `DELETE` on
+  the same path, which takes effect within half a second while the run is stepping (a full-speed kick
+  or the final restore already under way finishes first). Capability `control.openfan_calibration`.
+  The run walks the fan **down** from 100 % (10 % steps to 30 %, then 2 % steps) until it is seen
+  stopped, then back **up** in 2 % steps until it starts again, so both duties are measured. The
+  old sweep only went up from 0 %, so its "stop" duty was always the step below the start and told
+  you nothing. Each step is held for `hold_seconds` (default 5, 2–15). Every half second the run
+  stops itself if the daemon is stopping, if a sensor passes 85 °C, if thermal safety starts
+  forcing fans, if temperatures go stale, or if the CPU gets more than 5 °C warmer than at the
+  start. A run that stops early with the fan possibly stopped gives it a full-speed kick first —
+  or, if the daemon is shutting down and there is no time for one, leaves it at full speed rather
+  than at an earlier duty that might not start it again. Otherwise the channel gets its earlier duty
+  back. Only one calibration runs at a time.
+
+### Changed
+
+- **Both calibration routes now require `{"acknowledge_below_floor": true}`** (DEC-452). The run
+  takes the fan to a stop, and the daemon has no way to tell whether an OpenFan channel powers a
+  pump. The confirmation is the user's.
+- **`POST /fans/openfan/{channel}/calibrate` is deprecated** (DEC-452). It now starts the same run
+  as the new route and answers when the run ends, in its old shape. `stop_pwm` and `start_pwm` are
+  now measured stop and start duties, each point carries `phase` and `observation`, and `steps` is
+  accepted and ignored. A client that disconnects no longer ends the run; it restores the fan
+  itself when it ends.
+
 ### Fixed
+
+- **A calibration started just as a thermal emergency ended could put its fan back at full speed
+  afterwards** (`TS-bh`). It read the duty to restore from a copy that is updated only after the
+  write reaches the controller, so it could read the emergency's 100 % while the fan was being
+  given its earlier duty back. It now reads the duty from the controller itself, after taking the
+  engine pause.
 
 - **The crash record of the motherboard headers the daemon holds is written again after a failed
   write** (`DC-cs`). The daemon keeps a small record in `/run/control-ofc` of each header it has

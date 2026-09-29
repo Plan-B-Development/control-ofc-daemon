@@ -1238,6 +1238,17 @@ pub struct ControlCapability {
     /// token with a 400.
     #[serde(default)]
     pub stall_probe: bool,
+    /// Daemon exposes `POST /fans/openfan/{channel}/calibration` plus the
+    /// `GET`/`DELETE /diagnostics/openfan-calibration` pair — the 202 + poll
+    /// OpenFan calibration, descent and ascent (DEC-452). An older daemon 404s
+    /// these routes and has only the synchronous `POST .../calibrate`, which
+    /// measured no real stop duty.
+    ///
+    /// Hardcoded `true` like `openfan_rescan`: it advertises the endpoint, a
+    /// property of the build, not whether a controller is attached — that is
+    /// the route's `503 hardware_unavailable`.
+    #[serde(default)]
+    pub openfan_calibration: bool,
     /// Every hwmon chip name and every id built from one is canonical: the
     /// it87 v2.0 board suffix (`it8696_a008090a`) is stripped where the name is
     /// read, stored ids saved under the suffixed spelling are canonicalised on

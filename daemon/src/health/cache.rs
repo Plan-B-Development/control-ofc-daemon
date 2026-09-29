@@ -720,8 +720,9 @@ impl StateCache {
     /// phase with no competitor involved at all** — the engine would then
     /// overwrite a live diagnostic's test duty and falsify its verdict.
     /// (2) The slot becomes stealable. The `run_id` fence makes that safe *only
-    /// for characterisation*: `hwmon_verify_handler`, the GPU verify and
-    /// calibrate share this same slot and have no run id to fence on, so a steal
+    /// for characterisation*: `hwmon_verify_handler` and the GPU verify share
+    /// this same slot and have no run id to fence on (OpenFan calibration fences
+    /// only what it publishes, DEC-452), so a steal
     /// there force-takes their lease and can strand a header at a test duty.
     ///
     /// Neither reduces the thermal emergency's reach: `force_all_with_floor`

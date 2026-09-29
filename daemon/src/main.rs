@@ -963,9 +963,9 @@ enum ExitFloor {
 /// final batch that outlived the drains locks per channel or header (DEC-099,
 /// DEC-154), so this step can run between two of its writes and the rest of the
 /// batch lands after it. That is harmless because the floor latches:
-/// `FanController::set_pwm` raises anything lower to it — which also covers a
-/// calibration sweep still running inside an HTTP request that outlived the
-/// server drain — and a header with no mode switch is latched the same way in
+/// `FanController::set_pwm` raises anything lower to it — which also covers an
+/// OpenFan calibration, whose detached run outlives the server drain and still
+/// writes its restore (DEC-452) — and a header with no mode switch is latched the same way in
 /// `HwmonPwmController` (DEC-392), so an engine write or a verify restore that
 /// outlived the drains cannot lower it either.
 ///
@@ -2269,7 +2269,7 @@ async fn async_main() {
         start_time: Instant::now(),
         history: history.clone(),
         active_profile: active_profile.clone(),
-        calibrating: std::sync::atomic::AtomicBool::new(false),
+        openfan_calibration: Default::default(),
         characterization: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         validation: std::sync::Arc::new(Default::default()),
         characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

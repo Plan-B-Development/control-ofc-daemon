@@ -405,6 +405,50 @@ pub const ADVISORY_LOW_DUTY_PCT: u8 = 50;
 /// more headroom.
 pub const CALIBRATION_MAX_TEMP_C: f64 = 85.0;
 
+/// OpenFan calibration (DEC-452): the descent walks down from 100 % in these
+/// steps until it reaches [`OPENFAN_CAL_FINE_BELOW_PCT`].
+pub const OPENFAN_CAL_COARSE_STEP_PCT: u8 = 10;
+
+/// OpenFan calibration (DEC-452): below this duty the walk uses
+/// [`OPENFAN_CAL_FINE_STEP_PCT`], because that is where fans stop and start,
+/// and the ascent from a stop climbs no higher than this before giving up on a
+/// restart and kicking at full speed.
+pub const OPENFAN_CAL_FINE_BELOW_PCT: u8 = 30;
+
+/// OpenFan calibration (DEC-452): the fine step — the stall probe's resolution,
+/// so the two diagnostics report stop and start duties at the same precision.
+pub const OPENFAN_CAL_FINE_STEP_PCT: u8 = STALL_PROBE_STEP_PCT;
+
+/// OpenFan calibration (DEC-452): how often a hold samples the RPM and re-runs
+/// every gate. This is also the cancel latency.
+pub const OPENFAN_CAL_SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// OpenFan calibration (DEC-452): how many consecutive fresh samples must agree
+/// before a hold is called stopped or spinning. Three at
+/// [`OPENFAN_CAL_SAMPLE_INTERVAL`] span a second — at least one fresh poll at
+/// the default 1 Hz OpenFan cadence.
+pub const OPENFAN_CAL_CONFIRM_SAMPLES: usize = 3;
+
+/// OpenFan calibration (DEC-452): the default hold per step, and its clamp. The
+/// shortest hold must fit [`OPENFAN_CAL_CONFIRM_SAMPLES`].
+pub const OPENFAN_CAL_DEFAULT_HOLD_S: u64 = 5;
+pub const OPENFAN_CAL_MIN_HOLD_S: u64 = 2;
+pub const OPENFAN_CAL_MAX_HOLD_S: u64 = 15;
+
+/// [SAFETY] OpenFan calibration (DEC-452): the longest the 100 % recovery kick
+/// is held waiting for the fan to be seen spinning.
+pub const OPENFAN_CAL_KICK_MAX: Duration = Duration::from_secs(10);
+
+const _: () = assert!(OPENFAN_CAL_FINE_BELOW_PCT.is_multiple_of(OPENFAN_CAL_COARSE_STEP_PCT));
+const _: () = assert!(OPENFAN_CAL_FINE_BELOW_PCT.is_multiple_of(OPENFAN_CAL_FINE_STEP_PCT));
+const _: () = assert!(
+    OPENFAN_CAL_MIN_HOLD_S * 1000
+        >= OPENFAN_CAL_SAMPLE_INTERVAL.as_millis() as u64 * OPENFAN_CAL_CONFIRM_SAMPLES as u64
+);
+// Every sample renews the engine pause, so the renewal interval must sit well
+// inside the pause deadman.
+const _: () = assert!(OPENFAN_CAL_SAMPLE_INTERVAL.as_secs() * 2 < VERIFY_PAUSE_DEADMAN.as_secs());
+
 // ── PWM/RPM characterisation (AIO-MB Phase 3) ────────────────────────
 
 /// Default sweep points for `POST /hwmon/{id}/characterize`, from

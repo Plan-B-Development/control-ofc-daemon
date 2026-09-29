@@ -1181,7 +1181,7 @@ impl WriteBackend for OpenFanBackend {
 ///
 /// [SAFETY] While the write pause is held, every entry is recorded as unknown.
 /// An OpenFan calibration owns its channel then, and its last commanded duty is a
-/// sweep step — 0 % on the early ones. The calibration aborts under the force and
+/// sweep step — as low as 0 % (DEC-452's walk descends to a stop). The calibration aborts under the force and
 /// skips its own restore (`api/calibration.rs`), so a snapshot of that step would
 /// be the only thing ever writing the channel again, and it would stop the fan.
 /// Unknown stays at the forced duty (DEC-382 review, security F2).

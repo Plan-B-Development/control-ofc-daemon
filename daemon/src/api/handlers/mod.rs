@@ -421,8 +421,16 @@ pub struct AppState {
     pub history: Arc<crate::health::history::HistoryRing>,
     /// Active profile for headless curve evaluation.
     pub active_profile: Arc<Mutex<Option<crate::profile::DaemonProfile>>>,
-    /// Prevents concurrent calibration sweeps from corrupting each other.
-    pub calibrating: AtomicBool,
+    /// The current or most recent OpenFan calibration run (DEC-452), the flag
+    /// `DELETE /diagnostics/openfan-calibration` sets to ask it to stop, and
+    /// whether a calibration task is alive.
+    ///
+    /// Same detached-task caveat as `stall_probe` below. A calibration claims
+    /// the single verify slot, so it is one more claimant, never a concurrent
+    /// writer with another diagnostic; the slot's own `alive` claim is what
+    /// keeps two calibrations apart when the verify slot's deadman has lapsed
+    /// under a live run (the `calibrating` flag it replaced is gone).
+    pub openfan_calibration: Arc<crate::api::calibration::OpenFanCalibrationSlot>,
     /// The current or most recent PWM/RPM characterisation run (AIO-MB Phase 3),
     /// and the flag `DELETE /diagnostics/characterization` sets to ask it to stop.
     ///

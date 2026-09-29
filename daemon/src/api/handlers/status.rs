@@ -463,6 +463,8 @@ pub async fn capabilities_handler(
             duty_reconciliation: true,
             // DEC-407: the stall/restart probe below 20 %.
             stall_probe: true,
+            // DEC-452: OpenFan calibration as a 202 + poll run.
+            openfan_calibration: true,
             // DEC-442: hwmon chip names and ids survive the it87 v2.0 rename.
             canonical_chip_names: true,
             // DEC-443: coolant emergency, pump stall response, DC-aware pump

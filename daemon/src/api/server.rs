@@ -50,9 +50,20 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/fans", get(handlers::fans_handler))
         .route("/poll", get(handlers::poll_handler))
         .route("/sensors/history", get(handlers::history_handler))
-        // OpenFanController calibration sweep (diagnostic; daemon-performed).
-        // The bare PWM/RPM write endpoints were retired at 2.0.0 (DEC-165) —
-        // the profile engine is the sole writer.
+        // OpenFanController calibration (DEC-452): 202 + detached, like the
+        // stall probe, on the SAME single verify slot. Capability-gated on
+        // `control.openfan_calibration`. The bare PWM/RPM write endpoints were
+        // retired at 2.0.0 (DEC-165) — the profile engine is the sole writer.
+        .route(
+            "/fans/openfan/{channel}/calibration",
+            post(handlers::openfan_calibration_handler),
+        )
+        .route(
+            "/diagnostics/openfan-calibration",
+            get(handlers::openfan_calibration_status_handler)
+                .delete(handlers::openfan_calibration_cancel_handler),
+        )
+        // DEPRECATED (DEC-452): the same run, held open until it ends.
         .route(
             "/fans/openfan/{channel}/calibrate",
             post(handlers::calibrate_openfan_handler),

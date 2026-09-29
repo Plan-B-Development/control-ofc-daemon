@@ -123,7 +123,8 @@ The profile engine is the **sole writer** as of 2.0.0 (DEC-159/DEC-165); the GUI
 | `POST /validation/session/event`, `/validation/session/measurement` | User marker and external instrument reading. Both free-text fields are bounded at `VALIDATION_MAX_TEXT_FIELD_BYTES` at ingest (DEC-320) |
 | `POST /config/cooling-device` | Create/replace a cooling device. Confers **no** pump protection: that is still `/config/header-role` (DEC-316) |
 | `DELETE /config/cooling-device/{id}` | Remove a cooling device (DEC-316) |
-| `POST /fans/openfan/{ch}/calibrate` | Run a PWM-to-RPM calibration sweep |
+| `POST /fans/openfan/{ch}/calibration` + `GET`/`DELETE /diagnostics/openfan-calibration` | OpenFan calibration as a 202 + poll run (DEC-452): descent to the stall duty, ascent to the restart duty, gated on every 500 ms sample; requires `acknowledge_below_floor: true` |
+| `POST /fans/openfan/{ch}/calibrate` | Deprecated (DEC-452): the same run, held open until it ends |
 | `POST /hwmon/{header_id}/verify` | Behavioural test of PWM write effectiveness (~6 s; daemon's own internal lease); returns `restore_failed: bool` per DEC-100 |
 | `DELETE /diagnostics/characterization` | Cooperative cancel of a running sweep; the pre-sweep duty is restored unless a thermal force or shutdown owns the header |
 | `POST /hwmon/{header_id}/characterize` (behaviour inputs) | DEC-334, 2.40.0+, gated on `control.pwm_behaviour_characterization`. `bidirectional` walks down-then-up (so the run ends high); `stability_seconds` adds a dwell at up to 3 daemon-chosen duties. **The dwell renews the engine pause and the hwmon lease from inside its own loop** under a bound derived from `STABILITY_RENEW_INTERVAL_S` — the settle bound holds at exactly `15 x 2 == 30`, so a longer hold under per-step renewal would overrun the deadman at any dwell length. Statistics live in the pure `api/stats.rs`; learned bands in `pwm_baselines.rs`, read by nothing in the control path |

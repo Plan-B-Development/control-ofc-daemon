@@ -44,7 +44,7 @@ daemon/src/
     transport.rs       — SerialTransport trait + mock
     real_transport.rs  — serialport impl + auto-detect
     protocol.rs        — OpenFan wire protocol encode/decode
-    controller.rs      — FanController (set_pwm, read_rpm, calibration)
+    controller.rs      — FanController (set_pwm, read_rpm, last_commanded_pct)
     adoption.rs        — [SAFETY] the single path deciding which port becomes the fan
                          controller, shared by boot adoption and POST /fans/openfan/rescan
                          (DEC-265). One copy on purpose — two would be two chances to skip
@@ -137,7 +137,7 @@ daemon/src/
     handlers/
       mod.rs           — AppState, shared helpers, submodule re-exports
       status.rs        — read endpoints (status, sensors, fans, poll, capabilities, history)
-      openfan.rs       — OpenFan serial write endpoints + calibration handler
+      openfan.rs       — OpenFan calibration handlers (DEC-452), rescan, post-boot adoption
       gpu.rs           — AMD GPU fan set/reset endpoints
       hwmon_ctl.rs     — hwmon header list, rescan, PWM-verify + characterize endpoints
       validation.rs    — validation-session endpoints + the diagnostic orchestrator
@@ -153,7 +153,7 @@ daemon/src/
       discovery.rs     — /diagnostics/preflight + the control-path routes (DEC-333)
       stall_probe.rs   — the stall-probe routes (DEC-407); the probe itself is api/stall_probe.rs
     responses.rs       — response structs (Serialize)
-    calibration.rs     — OpenFan calibration sweep
+    calibration.rs     — OpenFan calibration: descent + ascent walk, gates, kick, restore (DEC-452)
     diagnostics.rs     — hardware-diagnostics scanning logic behind /diagnostics/hardware
     stats.rs           — pure statistics over retained tach samples (DEC-334): mean,
                          median, sigma, CV, dropouts, robust (median/MAD) outliers,
@@ -667,8 +667,8 @@ gating each have their own register rows and regression tests.
     in the restore, because a watchdog stop's abort window is 10 s — enough while
     the hung engine is the only task that will not drain — and it latches: once it
     has run, `FanController::set_pwm` and `HwmonPwmController::set_pwm` (DEC-392)
-    raise any lower command to it, so an OpenFan calibration still running inside
-    its request, a verify restore, or an engine write that outlived the drains
+    raise any lower command to it, so an OpenFan calibration's detached run (its
+    restore still writes, DEC-452), a verify restore, or an engine write that outlived the drains
     cannot take an output back down. `ExecStopPost`
     cannot repeat it — serial is out of its reach — so after a crash or SIGKILL
     those outputs keep their last duty. The hwmon hand-back that follows marks
@@ -1044,7 +1044,9 @@ subsystem — DEC-102 / DEC-130).
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| POST | `/fans/openfan/{channel}/calibrate` | PWM→RPM sweep (long-running, thermal-aborting; pauses the engine write phase for the sweep so an active profile cannot corrupt the readback — DEC-191) |
+| POST | `/fans/openfan/{channel}/calibration` | Start an OpenFan calibration (DEC-452, `control.openfan_calibration`). Requires `{"acknowledge_below_floor": true}` — the walk reaches 0 % and the daemon has no pump evidence for an OpenFan channel (`PTR-i`); optional `hold_seconds` (default 5, clamped 2–15); unknown fields rejected. Returns `202`; poll `GET /diagnostics/openfan-calibration`. Walks **down** from 100 % (10 % steps to 30 %, then 2 %) until the fan is confirmed stopped (the **stall duty**), then **up** in 2 % steps to at most 30 % until it restarts (the **restart duty**); a fan not restarted by then is kicked at 100 %. Every sample (500 ms) re-runs shutdown, cancel, the 85 °C limit, the ladder force, stale temperatures, a +5 °C CPU rise over the start and the engine-pause keepalive (DEC-296 — the whole-sweep window DEC-191 sized is retired). A verdict needs three fresh samples that agree. An abort or cancel that may have left the fan stopped — not last confirmed spinning, or with no verdict after reaching 30 % or finding a stall — kicks at 100 % first (never while forcing). The restore writes the duty read from the controller under its lock after the pause was claimed (`TS-bh`), or 100 % when unknown (DEC-412) or when a kick was owed and shutdown stopped it (`restored_full_speed`), skipped only while forcing (DEC-295). Claims the single verify slot, and refuses (`409`, retryable) while an earlier calibration's task is still alive even if its pause lapsed |
+| GET / DELETE | `/diagnostics/openfan-calibration` | The current or most recent run (`404 not_found` before any) / ask it to stop, honoured within one sample during the descent and ascent — a kick or restore under way runs to its end (`409` when none is running) |
+| POST | `/fans/openfan/{channel}/calibrate` | **Deprecated (DEC-452).** Starts the same run and holds the request until it ends, answering the pre-DEC-452 shape (`points`, `start_pwm` = restart duty, `stop_pwm` = stall duty, `min_rpm`, `max_rpm`). Now also requires `acknowledge_below_floor: true`; `steps` is accepted and ignored. Answers from the run it started, handed back by its task; `500 internal_error` if that task died |
 | POST | `/fans/{fan_id}/identify` | Per-fan identify hold/restore — 0 for an ordinary fan (floor-exempt), a floored perturbation for a pump-protected header (DEC-311/312/384); deadman auto-restore (DEC-166) |
 | POST | `/config/header-role` | Assign or clear one PWM header's role (DEC-311). `{"header_id","role"}`; `role: null` clears. Applies live. Assigning `pump` also releases an identify stop held on that header — swap first, then release, under the lock order DEC-419 made load-bearing |
 | POST | `/config/cooling-device` | Create or replace one cooling device by id (DEC-316). Safety numbers are **not** settable — a policy is chosen with `device_policy_id` and `minimum_safe_pwm` & siblings are rejected by name |
@@ -1200,8 +1202,8 @@ Codes (note `validation_error` is returned with **two** HTTP statuses):
 - `profile_in_use` (409, source: validation) — `DELETE /profiles/{id}` of the active profile (DEC-160)
 - `session_full` (409, source: validation, not retryable) — `POST /validation/session/event` or `/measurement` while the recording session already holds its cap (4096 events, 512 measurements); nothing was appended, and `details.limit` carries the cap (DEC-426, `DC-m`, daemon ≥ 2.56.2). Before 2.56.2 a marker past the cap answered `200 {"recorded": true}` and a measurement `404 not_found`
 - `stale_fencing_token` (409, source: validation) — override renew/release bearing a superseded `override_token` (DEC-163)
-- `thermal_abort` (409, source: hardware) — calibration aborted due to high temperature
-- `validation_error` (409, source: validation) — `POST /fans/openfan/{ch}/calibrate` when a calibration **or** a hardware verify is already in progress; the sweep shares the verify single-flight pause (DEC-191)
+- `thermal_abort` (409, source: hardware) — an OpenFan calibration refused (or, on the deprecated sync route, aborted) because a sensor is over 85 °C
+- `validation_error` (409, source: validation) — `POST /fans/openfan/{ch}/calibration` (or the deprecated `/calibrate`) when a calibration **or** a hardware verify is already in progress; it shares the verify single-flight pause (DEC-191), and is also refused (retryable) while an earlier calibration's task is still alive even if that pause has lapsed (DEC-452)
 - `internal_error` (500, source: internal)
 - `hardware_unavailable` (503, source: hardware)
 - `persistence_failed` (503, source: internal) — `POST /config/*` could not persist `runtime.toml`

@@ -3103,7 +3103,7 @@ pub(crate) mod tests {
             start_time: std::time::Instant::now(),
             history: Arc::new(crate::health::history::HistoryRing::new(250)),
             active_profile: Arc::new(parking_lot::Mutex::new(None)),
-            calibrating: std::sync::atomic::AtomicBool::new(false),
+            openfan_calibration: Default::default(),
             characterization: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             validation: std::sync::Arc::new(Default::default()),
             characterization_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
