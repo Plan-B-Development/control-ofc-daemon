@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **The crash record of the motherboard headers the daemon holds is written again after a failed
+  write** (`DC-cs`). The daemon keeps a small record in `/run/control-ofc` of each header it has
+  taken from the firmware, so that `ExecStopPost` can give them back if the daemon crashes or is
+  killed. If writing that record ever failed, it was written again only when the set of headers
+  changed, which does not happen while a profile runs, so a later crash could leave a header in
+  manual mode at its last duty until the daemon restarted. The record is now written again on the
+  next fan write. A clean stop was never affected.
+
 ## [3.0.0] — 2026-09-28
 
 Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor; GUI 3.0.0 uses the new

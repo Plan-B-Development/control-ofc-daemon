@@ -527,6 +527,10 @@ impl HwmonPwmController {
         self.lease_manager
             .validate_lease(lease_id)
             .map_err(HwmonControlError::Lease)?;
+        // `DC-cs`: a tick that only gives headers back reaches no `set_pwm`, and
+        // a hand-back that keeps failing changes no ledger entry — so without
+        // this a stale record would stay stale while the header stays taken.
+        self.handback.retry_record_if_failed();
         let Some(taken) = self.handback.taken_header(header_id) else {
             return Ok(None);
         };
@@ -728,6 +732,12 @@ impl HwmonPwmController {
                 "pwm_percent {pwm_percent} out of range (0–100)"
             )));
         }
+
+        // `DC-cs`: a hand-back record whose last write failed is written again
+        // here, on every write — before the coalesce return below, because a
+        // running profile's steady writes coalesce and take nothing, so no
+        // ledger change would ever rewrite it. One atomic load while healthy.
+        self.handback.retry_record_if_failed();
 
         // DEC-392 (`TS-ar`): once the stop's exit floor has run, a command may
         // raise a header with no mode switch but never take it below the duty
@@ -3347,6 +3357,32 @@ mod tests {
         assert!(ctrl.handback().is_taken("h1"));
     }
 
+    /// `DC-cs` at the call site: the take's record write fails, and the
+    /// profile's next write — the same duty, which coalesces and takes nothing,
+    /// so no ledger entry changes — is what lands the record once the runtime
+    /// directory can be written.
+    #[test]
+    fn a_steady_write_lands_a_hand_back_record_the_take_failed_to_write() {
+        let (mut ctrl, _sysfs, _cache, lease) = live_controller("5", "90");
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        let record = run.join(crate::hwmon::handback::RECORD_FILE_NAME);
+        ctrl.handback().set_record_path(record.clone());
+
+        ctrl.set_pwm("h1", 60, &lease).unwrap();
+        assert!(ctrl.handback().is_taken("h1"), "precondition: taken");
+        assert!(!record.exists(), "precondition: the take's write failed");
+
+        std::fs::create_dir(&run).unwrap();
+        ctrl.set_pwm("h1", 60, &lease).unwrap();
+        let body = std::fs::read_to_string(&record).unwrap_or_default();
+        assert!(
+            body.lines()
+                .any(|l| l == format!("{ENABLE}\t{PWM}\tmode\t5")),
+            "the held header is on the record; got {body:?}"
+        );
+    }
+
     /// [SAFETY] `TS-ab` at the call site: `set_pwm` hands the reading the
     /// header's own chip. A `dell_smm` switch that cannot be read is recorded as
     /// BIOS control and given back as it; the same unreadable switch on another
@@ -3910,6 +3946,36 @@ mod tests {
                 "hand_back = {hand_back}"
             );
         }
+    }
+
+    /// `DC-cs`, the give-back-only tick: nothing commands the header, so no
+    /// `set_pwm` runs, and its hand-back keeps failing, so no ledger entry
+    /// changes. The failing hand-back itself must land the record the take
+    /// could not write, or a crash strands the header it is still holding.
+    #[test]
+    fn a_failing_hand_back_lands_a_hand_back_record_the_take_failed_to_write() {
+        let (mut ctrl, sysfs, _cache, lease) = drift_controller(HwmonWriter::Engine);
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        let record = run.join(crate::hwmon::handback::RECORD_FILE_NAME);
+        ctrl.handback().set_record_path(record.clone());
+        ctrl.set_pwm("h1", 20, &lease).unwrap();
+        assert!(!record.exists(), "precondition: the take's write failed");
+
+        std::fs::create_dir(&run).unwrap();
+        *sysfs.fail_enable_writes.lock() = true;
+        assert_eq!(
+            ctrl.hand_back("h1", &lease).unwrap(),
+            Some(HandBackOutcome::Failed),
+            "precondition: nothing could be written, so the header stays taken"
+        );
+        assert!(ctrl.handback().is_taken("h1"), "precondition");
+        let body = std::fs::read_to_string(&record).unwrap_or_default();
+        assert!(
+            body.lines()
+                .any(|l| l == format!("{ENABLE}\t{PWM}\tmode\t2")),
+            "the still-held header is on the record; got {body:?}"
+        );
     }
 
     /// `PTA-k`: a hand-back that FAILS leaves the header taken but uncommanded,

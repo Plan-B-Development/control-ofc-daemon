@@ -317,6 +317,11 @@ pub struct HandBackLedger {
     /// one that wedged in the kernel while holding the controller mutex and
     /// returns after the hand-back — only a lock-free read reaches it.
     shutdown_hand_back: AtomicBool,
+    /// The last write of the on-disk record failed, so it may not name every
+    /// header held now (`DC-cs`). Mirrors `LedgerState::record_error_logged`,
+    /// outside the lock so [`Self::retry_record_if_failed`] — called on every
+    /// `set_pwm` — costs one atomic load while the record is healthy.
+    record_stale: AtomicBool,
 }
 
 impl HandBackLedger {
@@ -347,6 +352,7 @@ impl HandBackLedger {
                 ..LedgerState::default()
             }),
             shutdown_hand_back: AtomicBool::new(false),
+            record_stale: AtomicBool::new(false),
         }
     }
 
@@ -367,7 +373,32 @@ impl HandBackLedger {
     pub fn set_record_path(&self, path: PathBuf) {
         let mut state = self.state.lock();
         state.record_path = Some(path);
-        persist(&mut state);
+        self.persist(&mut state);
+    }
+
+    /// Write the record again if its last write failed (`DC-cs`).
+    ///
+    /// The record is otherwise rewritten only when an entry changes, and a
+    /// running profile changes none: `note_take` runs on a take, not on every
+    /// write. So without this, one refused write left a held header off the
+    /// record — and stranded in manual mode after a crash — for as long as the
+    /// profile ran unchanged. `HwmonPwmController::set_pwm` calls it on every
+    /// write; while the record is healthy it is a single atomic load.
+    pub fn retry_record_if_failed(&self) {
+        if !self.record_stale.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut state = self.state.lock();
+        if state.record_error_logged {
+            self.persist(&mut state);
+        }
+    }
+
+    /// Rewrite the record from `state`, keeping [`Self::record_stale`] in step.
+    fn persist(&self, state: &mut LedgerState) {
+        write_record(state);
+        self.record_stale
+            .store(state.record_error_logged, Ordering::Relaxed);
     }
 
     /// True when `id` is tracked and has no recorded original yet: the next take
@@ -405,7 +436,7 @@ impl HandBackLedger {
             }
         };
         if changed {
-            persist(&mut state);
+            self.persist(&mut state);
         }
     }
 
@@ -467,7 +498,7 @@ impl HandBackLedger {
             _ => false,
         };
         if changed {
-            persist(&mut state);
+            self.persist(&mut state);
         }
     }
 
@@ -496,7 +527,7 @@ fn taken(id: &str, e: &Entry) -> TakenHeader {
     }
 }
 
-fn persist(state: &mut LedgerState) {
+fn write_record(state: &mut LedgerState) {
     let Some(path) = state.record_path.clone() else {
         return;
     };
@@ -970,6 +1001,36 @@ mod tests {
             body.lines()
                 .any(|l| l == format!("{EN}\t/sys/class/hwmon/hwmon3/pwm2\twrite-only\t2")),
             "got {body:?}"
+        );
+    }
+
+    /// `DC-cs`: a record whose write failed is written by the next retry once
+    /// it can be — with nothing in the ledger having changed in between — and a
+    /// healthy record is not rewritten by one.
+    #[test]
+    fn a_failed_record_write_is_retried_until_it_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        let record = run.join(RECORD_FILE_NAME);
+        let ledger = HandBackLedger::new(&[header("pwm2", Some(EN))]);
+        ledger.set_record_path(record.clone()); // `run/` does not exist yet: fails
+        ledger.note_take("pwm2", Some(HandBack::Mode(5)));
+        assert!(!record.exists(), "precondition: the take's write failed");
+
+        std::fs::create_dir(&run).unwrap();
+        ledger.retry_record_if_failed();
+        let body = std::fs::read_to_string(&record).unwrap();
+        assert!(
+            body.lines()
+                .any(|l| l == format!("{EN}\t/sys/class/hwmon/hwmon3/pwm2\tmode\t5")),
+            "the retry wrote the held header; got {body:?}"
+        );
+
+        std::fs::remove_file(&record).unwrap();
+        ledger.retry_record_if_failed();
+        assert!(
+            !record.exists(),
+            "a record that last wrote fine is not rewritten on every write"
         );
     }
 
