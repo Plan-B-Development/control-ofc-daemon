@@ -3213,6 +3213,30 @@ mod tests {
             ..Default::default()
         };
         expect(&serde_json::to_value(&probe_run).unwrap(), "StallProbeRun");
+        // DEC-453 (`W-OFAN` Run 2, `WIRE-l`): the DEC-452 OpenFan calibration
+        // run, enrolled when the GUI's calibration dialog modelled and read it.
+        let cal_point = crate::api::calibration::CalPoint {
+            pwm_percent: 12,
+            rpm: 0,
+            phase: "descent".into(),
+            observation: "stopped".into(),
+        };
+        expect(&serde_json::to_value(&cal_point).unwrap(), "CalPoint");
+        let cal_run = crate::api::calibration::OpenFanCalibrationRun {
+            run_id: "ofcal-1".into(),
+            fan_id: "openfan:ch03".into(),
+            channel: 3,
+            state: "complete".into(),
+            outcome: Some("stall_and_restart_found".into()),
+            stall_duty_pct: Some(12),
+            restart_duty_pct: Some(18),
+            points: vec![cal_point],
+            ..Default::default()
+        };
+        expect(
+            &serde_json::to_value(&cal_run).unwrap(),
+            "OpenFanCalibrationRun",
+        );
         // DEC-443 (`W-SAFE`): the cooling watch's two `/status` entries.
         let pump_stall = PumpStallEntry {
             header_id: "hwmon:nct6798:nct6775.656:pwm2:PUMP".into(),
