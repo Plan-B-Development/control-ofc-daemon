@@ -443,7 +443,8 @@ gating each have their own register rows and regression tests.
      back to the profile — there is no recovery rung since DEC-386 (it held 60%
      for two 1 Hz ticks, which was thermally meaningless). Every other output the
      emergency took is given back at the release — an hwmon header to its
-     recorded mode, an OpenFan channel to its pre-emergency duty (DEC-382)
+     recorded mode, an OpenFan channel to its pre-emergency duty raised to the
+     exit floor (DEC-382, DEC-451)
    - One fresh reading at or above the trip point is enough to latch, and a
      sensor stuck in [trip point, 250C] keeps the latch for as long as it keeps
      reporting that. There is no plausibility gate, maximum latch time or sibling
@@ -906,7 +907,23 @@ Neither diagnostic restores the captured `pwm_enable` itself; since DEC-382 it
 does not need to. Once the diagnostic ends, the next engine tick gives back
 every header the daemon holds that the active profile does not name, to the mode
 recorded before the daemon first took it (`hwmon::handback`), and a header the
-profile does name is back under its curve and its floors. A consequence for clients: `restore_outcome:
+profile does name is back under its curve and its floors.
+
+**An output with no mode to give back is released instead (DEC-451, `BRD-u`).** An
+hwmon header with no `pwmN_enable` and an OpenFan channel have nothing for firmware
+to take back, so on the same routes — a profile switch, a deactivation (the
+no-profile tick), the end of a diagnostic, the members-only force's give-back — the
+engine leaves each one it commanded (`HwmonPwmController::engine_held`,
+`OpenFanBackend::held`; a diagnostic's write holds nothing) that the active profile
+no longer names at `exit_duty(last, exit_floor_pct)`: DEC-388's stop rule, applied
+at release, so it only ever raises. A floor of 0 writes nothing. The header's write
+state is forgotten as on a hand-back, so an ARCTIC 0 the old profile chose is no
+longer "chosen" to DEC-425's priming. A failed raise keeps the output held and is
+retried every tick. After a 100 % emergency an OpenFan channel no profile names gets
+its pre-emergency duty raised to the floor, while a no-mode hwmon header stays at
+100 % — it has no pre-emergency record (`BRD-aa`, accepted).
+
+A consequence for clients: `restore_outcome:
 "restored"` now means *restored, floor-clamped* on a pump, so the duty on the
 hardware may exceed the original reported beside it.
 

@@ -31,7 +31,7 @@ use crate::constants;
 use crate::health::cache::StateCache;
 use crate::hwmon::handback::HandBackOutcome;
 use crate::hwmon::lease::HwmonWriter;
-use crate::hwmon::pwm_control::{HwmonControlError, HwmonPwmController};
+use crate::hwmon::pwm_control::{HwmonControlError, HwmonPwmController, NoModeRelease};
 use crate::serial::protocol::NUM_CHANNELS;
 
 /// How long the engine will wait for one backend's blocking write before it
@@ -866,6 +866,23 @@ pub(crate) struct OpenFanBackend {
     /// Shared with the blocking write task because that is where the controller
     /// lock is held; it is never locked at the same time as the controller.
     pre_emergency: Arc<Mutex<Option<Vec<Option<u8>>>>>,
+    /// The channels the engine has commanded and not yet released (DEC-451,
+    /// `BRD-u`): when a profile switch or a deactivation stops naming one, it is
+    /// left at `exit_duty(its last duty, exit floor)` rather than at whatever
+    /// the previous profile last chose. Filled by the engine's commands and by
+    /// the members-only force; the 100 % force's channels are the pre-emergency
+    /// give-back's.
+    /// Shared with the blocking write task and never locked at the same time as
+    /// the controller.
+    held: Arc<Mutex<OpenFanHeld>>,
+}
+
+/// [`OpenFanBackend::held`]'s state.
+#[derive(Debug, Default)]
+struct OpenFanHeld {
+    channels: std::collections::BTreeSet<u8>,
+    /// Channels whose raising write failed, logged once until one succeeds.
+    failure_logged: HashSet<u8>,
 }
 
 /// Which of the engine's two drop warnings a bad OpenFan member id earns.
@@ -900,6 +917,7 @@ impl OpenFanBackend {
             writes: BoundedWrite::default(),
             stall_logged: false,
             pre_emergency: Arc::new(Mutex::new(None)),
+            held: Arc::new(Mutex::new(OpenFanHeld::default())),
         }
     }
 
@@ -924,11 +942,14 @@ impl OpenFanBackend {
         commands: &[PwmCommand],
         members: &ProfileMembers,
     ) {
-        let give_back = self
-            .pre_emergency
+        let unheld = self
+            .held
             .lock()
-            .is_some()
-            .then(|| members.openfan.clone());
+            .channels
+            .iter()
+            .any(|ch| !members.openfan.contains(ch));
+        let give_back =
+            (unheld || self.pre_emergency.lock().is_some()).then(|| members.openfan.clone());
         self.write(commands, give_back).await;
     }
 
@@ -966,9 +987,21 @@ impl OpenFanBackend {
         let ctrl = self.ctrl.clone();
         let cache = self.cache.clone();
         let pre_emergency = self.pre_emergency.clone();
+        let held = self.held.clone();
         let join = self
             .writes
             .run(WRITE_JOIN_BUDGET, move || {
+                // DEC-451: every channel commanded here is the engine's until a
+                // profile stops naming it. Before the writes, so a failed one —
+                // which may still have landed — is held too.
+                // Only real channels: the id parser accepts any `u8`, and a
+                // channel the controller does not have could never be released.
+                held.lock().channels.extend(
+                    chans
+                        .iter()
+                        .map(|&(ch, _)| ch)
+                        .filter(|&ch| ch < NUM_CHANNELS),
+                );
                 let mut results = chans
                     .into_iter()
                     .filter_map(|(ch, pct)| {
@@ -996,10 +1029,11 @@ impl OpenFanBackend {
                     })
                     .collect::<Vec<(u8, Result<(), String>)>>();
                 if let Some(members) = give_back {
-                    results.extend(give_back_pre_emergency(
+                    results.extend(give_back_openfan(
                         &ctrl,
                         &cache,
                         &pre_emergency,
+                        &held,
                         &members,
                     ));
                 }
@@ -1173,6 +1207,92 @@ fn record_pre_emergency(
     }
 }
 
+/// Everything the OpenFan give-back does, in order (DEC-382, DEC-451): release
+/// each channel the engine commanded that `members` no longer names, then give
+/// the pre-emergency duties back. The release runs first, so a channel in both
+/// ends at its pre-emergency duty raised to the exit floor — the user's Q8-A
+/// (2026-09-29) — rather than at the forced duty the release would keep.
+fn give_back_openfan(
+    ctrl: &Mutex<crate::serial::controller::FanController>,
+    cache: &StateCache,
+    pre_emergency: &Mutex<Option<Vec<Option<u8>>>>,
+    held: &Mutex<OpenFanHeld>,
+    members: &HashSet<u8>,
+) -> Vec<(u8, Result<(), String>)> {
+    release_unheld_openfan(ctrl, cache, held, members);
+    give_back_pre_emergency(ctrl, cache, pre_emergency, members)
+}
+
+/// Release every channel the engine commanded that `members` no longer names
+/// (DEC-451, `BRD-u`): leave it at `exit_duty(its last duty, exit floor)` —
+/// DEC-388's stop rule, applied when the engine lets go — so it is never
+/// lowered, and one whose duty is unknown goes to full speed. An exit floor of
+/// 0 writes nothing. Before this such a channel kept the previous profile's
+/// duty, 0 included (an OpenFan 0 % lasts while it is commanded, DEC-426),
+/// until a clean stop.
+///
+/// A failed write keeps the channel held, so the next tick tries again; it is
+/// logged once, here — never through `note_outcomes`, whose per-tick failure
+/// streaks and link alarms are for the engine's commands. Skipped, with every channel still held, while the engine
+/// write-pause is held (a calibration owns the channels), re-checked under the
+/// controller lock as `give_back_pre_emergency` does.
+fn release_unheld_openfan(
+    ctrl: &Mutex<crate::serial::controller::FanController>,
+    cache: &StateCache,
+    held: &Mutex<OpenFanHeld>,
+    members: &HashSet<u8>,
+) {
+    let unheld: Vec<u8> = held
+        .lock()
+        .channels
+        .iter()
+        .copied()
+        .filter(|ch| !members.contains(ch))
+        .collect();
+    let floor = cache.exit_floor_pct();
+    for ch in unheld {
+        let mut guard = ctrl.lock();
+        if cache.verify_active() {
+            return;
+        }
+        let was = guard.last_commanded_pct(ch);
+        let target = (floor > 0)
+            .then(|| crate::pwm::exit_duty(was, floor))
+            .filter(|to| Some(*to) != was);
+        let written = target.map(|to| (to, guard.set_pwm(ch, to)));
+        drop(guard);
+        let describe =
+            |d: Option<u8>| d.map_or("an unknown duty".to_string(), |p| format!("{p} %"));
+        match written {
+            None => {
+                log::info!(
+                    "OpenFan channel {ch}: no profile control commands it any more — left at {}",
+                    describe(was)
+                );
+            }
+            Some((to, Ok(_))) => {
+                log::info!(
+                    "OpenFan channel {ch}: no profile control commands it any more — raised \
+                     from {} to {to} % (the exit floor)",
+                    describe(was)
+                );
+            }
+            Some((to, Err(e))) => {
+                if held.lock().failure_logged.insert(ch) {
+                    log::warn!(
+                        "OpenFan channel {ch}: no profile control commands it any more, but \
+                         raising it to {to} % (the exit floor) failed ({e}); retrying every tick"
+                    );
+                }
+                continue;
+            }
+        }
+        let mut h = held.lock();
+        h.channels.remove(&ch);
+        h.failure_logged.remove(&ch);
+    }
+}
+
 /// Give every channel `members` does not name its pre-emergency duty back, and
 /// clear the snapshot (DEC-382). Returns the writes it attempted, for the
 /// ordinary failure accounting.
@@ -1200,7 +1320,12 @@ fn give_back_pre_emergency(
     };
     // A member is the profile's to drive, and an unknown duty is not guessed:
     // that channel stays at the forced duty.
-    let returnable = |ch: u8, duty: Option<u8>| duty.filter(|_| !members.contains(&ch));
+    // DEC-451 (Q8-A): raised to the exit floor, as a released channel is.
+    let floor = cache.exit_floor_pct();
+    let returnable = |ch: u8, duty: Option<u8>| {
+        duty.filter(|_| !members.contains(&ch))
+            .map(|d| crate::pwm::exit_duty(Some(d), floor))
+    };
     let mut results = Vec::new();
     for (ch, duty) in (0..NUM_CHANNELS).zip(duties.iter().copied()) {
         let Some(duty) = returnable(ch, duty) else {
@@ -1232,7 +1357,7 @@ fn give_back_pre_emergency(
         match &res {
             Ok(()) => log::info!(
                 "Thermal emergency over: OpenFan ch{ch} (no profile controls it) returned \
-                 to its pre-emergency {duty}%"
+                 to {duty}% — its pre-emergency duty, at least the exit floor"
             ),
             // Not "stays at the forced duty": a failed reply says nothing about
             // whether the command landed (DEC-383), so the duty is unknown — and
@@ -1283,6 +1408,13 @@ impl SafetyWriteBackend for OpenFanBackend {
         };
         let reached = !targets.is_empty();
         let record_snapshot = matches!(reach, ForceReach::All);
+        // DEC-451: a members-only force commands the profile's channels, so they
+        // are the engine's until a profile stops naming them — a profile that
+        // has only ever run under the no-sensor floor included. The 100 %
+        // force's channels are the pre-emergency give-back's instead.
+        if !record_snapshot {
+            self.held.lock().channels.extend(targets.iter().copied());
+        }
         let give_back = match reach {
             ForceReach::ProfileMembers {
                 members,
@@ -1304,6 +1436,7 @@ impl SafetyWriteBackend for OpenFanBackend {
         };
         let cache = self.cache.clone();
         let pre_emergency = self.pre_emergency.clone();
+        let engine_held = self.held.clone();
         let ctrl = self.ctrl.clone();
         // D1-j: this tick's profile duty per channel, so `pct` acts as a floor
         // over it rather than replacing it. Parsed silently — `apply` owns the
@@ -1353,7 +1486,7 @@ impl SafetyWriteBackend for OpenFanBackend {
                 }
                 match give_back {
                     Some(members) => {
-                        give_back_pre_emergency(&ctrl, &cache, &pre_emergency, &members)
+                        give_back_openfan(&ctrl, &cache, &pre_emergency, &engine_held, &members)
                     }
                     None => Vec::new(),
                 }
@@ -2176,11 +2309,7 @@ impl HwmonBackend {
     /// decides under the lock, as every write task does.
     fn may_give_back(&self, members: &ProfileMembers) -> bool {
         match self.ctrl.try_lock() {
-            Some(guard) => guard
-                .handback()
-                .taken_ids()
-                .iter()
-                .any(|id| !members.hwmon.contains(id)),
+            Some(guard) => has_unheld(&guard, &members.hwmon),
             None => true,
         }
     }
@@ -2414,20 +2543,61 @@ impl WriteBackend for HwmonBackend {
     }
 }
 
+/// True when the daemon holds a header `members` does not name: one it took
+/// from firmware (DEC-382), or one with no mode switch the engine wrote
+/// (DEC-451).
+fn has_unheld(ctrl: &HwmonPwmController, members: &HashSet<String>) -> bool {
+    ctrl.handback()
+        .taken_ids()
+        .into_iter()
+        .chain(ctrl.releasable_no_mode())
+        .any(|id| !members.contains(&id))
+}
+
 /// Give back every header the daemon holds that `members` does not name
-/// (DEC-382), one controller lock per header like every other write here.
+/// (DEC-382), and release every header with no mode switch the engine wrote
+/// that `members` does not name (DEC-451) — one controller lock per header
+/// like every other write here.
 ///
 /// Called only from inside a write task that already holds a valid lease. A
 /// header whose lease is lost mid-scan (a verify force-took it) is skipped, not
 /// forced: the verify owns it now, and a later tick gives it back.
 fn give_back_unheld(ctrl: &Mutex<HwmonPwmController>, lease_id: &str, members: &HashSet<String>) {
-    let unheld: Vec<String> = ctrl
-        .lock()
-        .handback()
-        .taken_ids()
-        .into_iter()
-        .filter(|id| !members.contains(id))
-        .collect();
+    let (unheld, unheld_no_mode): (Vec<String>, Vec<String>) = {
+        let guard = ctrl.lock();
+        let unnamed = |ids: Vec<String>| -> Vec<String> {
+            ids.into_iter().filter(|id| !members.contains(id)).collect()
+        };
+        (
+            unnamed(guard.handback().taken_ids()),
+            unnamed(guard.releasable_no_mode()),
+        )
+    };
+    for id in unheld_no_mode {
+        let mut guard = ctrl.lock();
+        match guard.release_no_mode(&id, lease_id) {
+            Ok(Some(NoModeRelease::Raised { was, to })) => log::info!(
+                "hwmon {id}: no profile control commands it any more, and it has no mode to \
+                 give back — raised from {} to {to} % (the exit floor)",
+                was.map_or("an unknown duty".to_string(), |p| format!("{p} %"))
+            ),
+            Ok(Some(NoModeRelease::Kept { at })) => log::info!(
+                "hwmon {id}: no profile control commands it any more, and it has no mode to \
+                 give back — left at {}",
+                at.map_or("its last duty".to_string(), |p| format!("{p} %"))
+            ),
+            Ok(Some(NoModeRelease::Failed { to, error })) => {
+                if guard.note_release_failed(&id) {
+                    log::warn!(
+                        "hwmon {id}: no profile control commands it any more, but raising it \
+                         to {to} % (the exit floor) failed ({error}); retrying every tick"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(e) => log::debug!("hwmon {id}: release deferred: {e}"),
+        }
+    }
     for id in unheld {
         let mut guard = ctrl.lock();
         match guard.hand_back(&id, lease_id) {
@@ -2543,12 +2713,7 @@ impl SafetyWriteBackend for HwmonBackend {
                     // A members-only force with nothing to force and nothing to
                     // give back takes nothing — not even the lease, which would
                     // otherwise reset every header's write state for no write.
-                    let give_back_pending = give_back
-                        && guard
-                            .handback()
-                            .taken_ids()
-                            .iter()
-                            .any(|id| !m.contains(id));
+                    let give_back_pending = give_back && has_unheld(&guard, m);
                     if hdr_ids.is_empty() && !give_back_pending {
                         return Vec::new();
                     }
@@ -5255,6 +5420,374 @@ mod tests {
         assert_eq!(
             crate::serial::openfan_channel_of("openfan:chXX").map_err(openfan_drop_reason),
             Err("unparseable channel")
+        );
+    }
+
+    // ── DEC-451 (`BRD-u`): release an output a profile stops naming ─────────
+
+    const NO_MODE_ID: &str = "hwmon:pwmfan:fan0:pwm1:pwm1";
+    const NO_MODE_PWM: &str = "/sys/class/hwmon/hwmon1/pwm1";
+
+    /// A backend over one header with no mode switch and one with (it87,
+    /// `hwmon0/pwm2`), sharing `cache`, so a test can set the exit floor.
+    fn release_rig() -> (HwmonBackend, WriteLog, Arc<StateCache>) {
+        let mut no_mode = make_header(NO_MODE_ID);
+        no_mode.chip_name = "pwmfan".into();
+        no_mode.supports_enable = false;
+        no_mode.enable_path = None;
+        no_mode.pwm_path = NO_MODE_PWM.into();
+        let writes: WriteLog = Arc::new(Mutex::new(Vec::new()));
+        let cache = Arc::new(StateCache::new());
+        let ctrl = HwmonPwmController::new(
+            vec![no_mode, header_with_paths(2)],
+            LeaseManager::new(),
+            Box::new(TestWriter {
+                writes: writes.clone(),
+            }),
+            cache.clone(),
+        );
+        let be = HwmonBackend::new(Arc::new(Mutex::new(ctrl))).expect("writable headers");
+        (be, writes, cache)
+    }
+
+    fn hwmon_members(ids: &[&str]) -> ProfileMembers {
+        ProfileMembers {
+            hwmon: ids.iter().map(|s| s.to_string()).collect(),
+            openfan: HashSet::new(),
+        }
+    }
+
+    fn no_mode_writes(w: &WriteLog) -> Vec<String> {
+        w.lock()
+            .iter()
+            .filter(|(p, _)| p == NO_MODE_PWM)
+            .map(|(_, v)| v.clone())
+            .collect()
+    }
+
+    /// [SAFETY] DEC-451 at the call site: profile A drove a header with no mode
+    /// switch; B does not name it. It is left at `exit_duty(last, floor)` —
+    /// raised when below the floor, untouched at or above it or with the floor
+    /// off — and never again while B runs. Profile A's other header, with a mode
+    /// switch, is still handed back (DEC-382).
+    #[tokio::test]
+    async fn a_header_with_no_mode_switch_a_switch_drops_is_raised_to_the_exit_floor() {
+        const TAKEN: &str = "hwmon:it8696:pwm2";
+        // (A's last duty, exit floor, what the release writes)
+        for (last, floor, expect) in [(20u8, 50u8, Some(50u8)), (70, 50, None), (20, 0, None)] {
+            let (mut be, writes, cache) = release_rig();
+            cache.set_exit_floor_pct(floor);
+            let a = hwmon_members(&[NO_MODE_ID, TAKEN]);
+            be.apply_and_give_back(
+                &[cmd(NO_MODE_ID, "hwmon", last), cmd(TAKEN, "hwmon", last)],
+                &a,
+            )
+            .await;
+            assert!(be.ctrl.lock().handback().is_taken(TAKEN), "precondition");
+            writes.lock().clear();
+
+            let b = hwmon_members(&[]);
+            be.apply_and_give_back(&[], &b).await;
+            be.apply_and_give_back(&[], &b).await;
+
+            let want: Vec<String> = expect
+                .map(|p| crate::pwm::percent_to_raw(p).to_string())
+                .into_iter()
+                .collect();
+            assert_eq!(
+                no_mode_writes(&writes),
+                want,
+                "last {last} %, floor {floor} %: one release, never repeated"
+            );
+            let ctrl = be.ctrl.lock();
+            assert!(ctrl.engine_held_no_mode().is_empty(), "released");
+            assert!(!ctrl.handback().is_taken(TAKEN), "the hand-back still runs");
+        }
+    }
+
+    /// Deactivation clears the write state before the engine's no-profile tick
+    /// gives anything back (`on_lease_released`), so the release must read the
+    /// duty from the exit record — and still raise it.
+    #[tokio::test]
+    async fn a_deactivation_raises_a_header_with_no_mode_switch_to_the_exit_floor() {
+        let (mut be, writes, cache) = release_rig();
+        cache.set_exit_floor_pct(50);
+        be.apply_and_give_back(
+            &[cmd(NO_MODE_ID, "hwmon", 20)],
+            &hwmon_members(&[NO_MODE_ID]),
+        )
+        .await;
+        be.ctrl.lock().on_lease_released();
+        writes.lock().clear();
+
+        be.apply_and_give_back(&[], &hwmon_members(&[])).await;
+
+        assert_eq!(
+            no_mode_writes(&writes),
+            vec![crate::pwm::percent_to_raw(50).to_string()]
+        );
+    }
+
+    /// The opposite branch: a header the new profile still names is its to
+    /// drive, and is not released however low it runs.
+    #[tokio::test]
+    async fn a_header_the_new_profile_names_is_not_released() {
+        let (mut be, writes, cache) = release_rig();
+        cache.set_exit_floor_pct(50);
+        let members = hwmon_members(&[NO_MODE_ID]);
+        be.apply_and_give_back(&[cmd(NO_MODE_ID, "hwmon", 20)], &members)
+            .await;
+        writes.lock().clear();
+
+        be.apply_and_give_back(&[], &members).await;
+
+        assert!(no_mode_writes(&writes).is_empty());
+        assert_eq!(
+            be.ctrl.lock().engine_held_no_mode(),
+            vec![NO_MODE_ID.to_string()]
+        );
+    }
+
+    fn openfan_values(written: &Mutex<Vec<String>>, ch: u8) -> Vec<String> {
+        let prefix = format!(">02{ch:02}");
+        written
+            .lock()
+            .iter()
+            .filter(|c| c.starts_with(&prefix))
+            .map(|c| c[c.len() - 3..c.len() - 1].to_string())
+            .collect()
+    }
+
+    fn openfan_members(chs: &[u8]) -> ProfileMembers {
+        ProfileMembers {
+            hwmon: HashSet::new(),
+            openfan: chs.iter().copied().collect(),
+        }
+    }
+
+    /// [SAFETY] DEC-451, the OpenFan half: a channel profile A commanded and B
+    /// does not name is left at `exit_duty(last, floor)` — 0 included, which an
+    /// OpenFan channel otherwise holds for as long as it is commanded (DEC-426)
+    /// — and a channel B names is not touched.
+    #[tokio::test]
+    async fn an_openfan_channel_a_switch_drops_is_raised_to_the_exit_floor() {
+        let hex = |pct: u8| format!("{:02X}", crate::pwm::percent_to_raw(pct));
+        for (last, floor, expect) in [(0u8, 50u8, Some(50u8)), (70, 50, None), (0, 0, None)] {
+            let (mut be, written, cache) = openfan_backend();
+            cache.set_exit_floor_pct(floor);
+            be.apply_and_give_back(
+                &[
+                    cmd("openfan:ch00", "openfan", last),
+                    cmd("openfan:ch01", "openfan", 20),
+                ],
+                &openfan_members(&[0, 1]),
+            )
+            .await;
+            written.lock().clear();
+
+            let b = openfan_members(&[1]);
+            be.apply_and_give_back(&[], &b).await;
+            be.apply_and_give_back(&[], &b).await;
+
+            let want: Vec<String> = expect.map(hex).into_iter().collect();
+            assert_eq!(
+                openfan_values(&written, 0),
+                want,
+                "last {last} %, floor {floor} %: one release, never repeated"
+            );
+            assert!(
+                openfan_values(&written, 1).is_empty(),
+                "a channel B names is B's"
+            );
+        }
+    }
+
+    /// DEC-451: a profile that has only ever run under the members-only force
+    /// (the no-sensor floor) holds its channels too — the force commanded them,
+    /// and a switch away from that profile releases them.
+    #[tokio::test]
+    async fn an_openfan_channel_only_the_members_only_force_drove_is_released() {
+        let (mut be, written, cache) = openfan_backend();
+        cache.set_exit_floor_pct(50);
+        let a = openfan_members(&[0]);
+        let held = HeldMembers(ProfileMembers::default());
+        be.force_all_with_floor(
+            40,
+            &[],
+            ForceReach::ProfileMembers {
+                members: &a,
+                give_back: true,
+                held: &held,
+            },
+        )
+        .await;
+        let hex = |pct: u8| format!("{:02X}", crate::pwm::percent_to_raw(pct));
+        assert_eq!(openfan_values(&written, 0), vec![hex(40)], "precondition");
+
+        be.apply_and_give_back(&[], &openfan_members(&[])).await;
+
+        assert_eq!(openfan_values(&written, 0), vec![hex(40), hex(50)]);
+    }
+
+    /// DEC-451 review F1: `openfan:ch12` parses (any `u8` does) and a boot-loaded
+    /// profile is not validated, but no controller has channel 12. It must not
+    /// be held — a release could never write it, so it would be retried and
+    /// fail every tick for the life of the process.
+    #[tokio::test]
+    async fn a_channel_the_controller_does_not_have_is_never_held() {
+        let (mut be, _written, _cache) = openfan_backend();
+        be.apply_and_give_back(
+            &[
+                cmd("openfan:ch00", "openfan", 20),
+                cmd("openfan:ch12", "openfan", 20),
+            ],
+            &openfan_members(&[0, 12]),
+        )
+        .await;
+        assert!(be.held.lock().channels.contains(&0), "precondition");
+        assert!(!be.held.lock().channels.contains(&12));
+
+        be.apply_and_give_back(&[], &openfan_members(&[])).await;
+        assert!(be.held.lock().channels.is_empty());
+    }
+
+    /// A serial link whose writes can be made to fail, so a release can.
+    struct FailableSerial {
+        written: Arc<Mutex<Vec<String>>>,
+        failing: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::serial::transport::SerialTransport for FailableSerial {
+        fn write_line(&mut self, data: &str) -> Result<(), crate::error::SerialError> {
+            if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::error::SerialError::Timeout { timeout_ms: 100 });
+            }
+            self.written.lock().push(data.to_string());
+            Ok(())
+        }
+        fn read_line(
+            &mut self,
+            _timeout: std::time::Duration,
+        ) -> Result<String, crate::error::SerialError> {
+            Ok("<02|00:0000;>".into())
+        }
+    }
+
+    /// DEC-451 review F1: a release that fails is retried and logged once by the
+    /// release itself. It must not reach `note_outcomes`, whose per-tick streaks
+    /// and link alarms describe the engine's commands — on a no-profile tick the
+    /// release is the only write, so it alone would call the link down.
+    #[tokio::test]
+    async fn a_failing_release_is_retried_without_feeding_the_link_alarms() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cache = Arc::new(StateCache::new());
+        cache.set_exit_floor_pct(50);
+        let ctrl = crate::serial::controller::FanController::new(
+            Box::new(FailableSerial {
+                written: written.clone(),
+                failing: failing.clone(),
+            }),
+            cache.clone(),
+            std::time::Duration::from_millis(100),
+        );
+        let mut be = OpenFanBackend::new(Arc::new(Mutex::new(ctrl)), cache);
+        be.apply_and_give_back(
+            &[cmd("openfan:ch00", "openfan", 20)],
+            &openfan_members(&[0]),
+        )
+        .await;
+        assert!(
+            written.lock().iter().any(|f| f.starts_with(">0200")),
+            "precondition"
+        );
+
+        failing.store(true, std::sync::atomic::Ordering::SeqCst);
+        be.apply_and_give_back(&[], &openfan_members(&[])).await;
+        be.apply_and_give_back(&[], &openfan_members(&[])).await;
+        assert!(
+            be.held.lock().channels.contains(&0),
+            "still held, so retried"
+        );
+        assert!(
+            be.channel_failures.is_empty(),
+            "a release is not an engine command: {:?}",
+            be.channel_failures
+        );
+
+        failing.store(false, std::sync::atomic::Ordering::SeqCst);
+        be.apply_and_give_back(&[], &openfan_members(&[])).await;
+        assert!(
+            be.held.lock().channels.is_empty(),
+            "released once it landed"
+        );
+    }
+
+    /// DEC-451 review F2: while a diagnostic holds the engine write-pause, a
+    /// pending release must not make the members-only force take the lease from
+    /// it — before DEC-451 a force with nothing of its own to write took nothing.
+    #[tokio::test]
+    async fn a_pending_release_does_not_take_the_lease_from_a_diagnostic() {
+        let (mut be, writes, cache) = release_rig();
+        cache.set_exit_floor_pct(50);
+        be.apply_and_give_back(
+            &[cmd(NO_MODE_ID, "hwmon", 20)],
+            &hwmon_members(&[NO_MODE_ID]),
+        )
+        .await;
+        let claimed = cache
+            .try_begin_verify(std::time::Duration::from_secs(30))
+            .expect("the pause is free");
+        be.ctrl
+            .lock()
+            .lease_manager_mut()
+            .force_take_lease(HwmonWriter::Verify);
+        writes.lock().clear();
+
+        let none = hwmon_members(&[]);
+        let held = HeldMembers(ProfileMembers::default());
+        be.force_all_with_floor(
+            40,
+            &[],
+            ForceReach::ProfileMembers {
+                members: &none,
+                give_back: true,
+                held: &held,
+            },
+        )
+        .await;
+
+        let owner = be
+            .ctrl
+            .lock()
+            .lease_manager()
+            .active_lease()
+            .map(|l| l.owner);
+        assert_eq!(
+            owner,
+            Some(HwmonWriter::Verify),
+            "the diagnostic keeps its lease"
+        );
+        assert!(
+            no_mode_writes(&writes).is_empty(),
+            "nothing released under it"
+        );
+
+        cache.end_verify(claimed);
+        be.force_all_with_floor(
+            40,
+            &[],
+            ForceReach::ProfileMembers {
+                members: &none,
+                give_back: true,
+                held: &held,
+            },
+        )
+        .await;
+        assert_eq!(
+            no_mode_writes(&writes),
+            vec![crate::pwm::percent_to_raw(50).to_string()],
+            "released once the diagnostic ended"
         );
     }
 

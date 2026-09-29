@@ -398,6 +398,30 @@ pub struct HwmonPwmController {
     /// headers (DEC-425 review, concurrency P1 / security P2). Cleared by the
     /// next write to that device that succeeds, which then primes the rest.
     priming_suspended: std::collections::HashSet<std::path::PathBuf>,
+    /// Headers with NO `pwmN_enable` that the ENGINE has written — a profile,
+    /// an override or the thermal force, never a diagnostic — and not yet
+    /// released (DEC-451, `BRD-u`). DEC-382's ledger holds the headers with a
+    /// mode switch; this is the same fact for a header that has none, so a
+    /// profile switch or deactivation can release it
+    /// ([`Self::release_no_mode`]). Not `write_state`, which deactivation
+    /// clears before the release runs.
+    engine_held: std::collections::BTreeSet<String>,
+    /// Released headers whose raising write failed, logged once until one
+    /// succeeds (as `HandBackLedger::note_hand_back_failed`).
+    release_failure_logged: std::collections::HashSet<String>,
+}
+
+/// What releasing a header with no mode switch did (DEC-451).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoModeRelease {
+    /// Raised to the exit floor: its last duty, `was` (`None` = unknown), was
+    /// below it.
+    Raised { was: Option<u8>, to: u8 },
+    /// Left at the duty it holds: at or above the exit floor, or the floor is
+    /// 0. `None` = unknown.
+    Kept { at: Option<u8> },
+    /// The raising write failed; the header stays held and is retried.
+    Failed { to: u8, error: String },
 }
 
 /// One header's exit-floor write (DEC-388), for the caller's report.
@@ -437,6 +461,8 @@ impl HwmonPwmController {
             exit_record: HashMap::new(),
             exit_min: HashMap::new(),
             priming_suspended: std::collections::HashSet::new(),
+            engine_held: std::collections::BTreeSet::new(),
+            release_failure_logged: std::collections::HashSet::new(),
         }
     }
 
@@ -589,6 +615,85 @@ impl HwmonPwmController {
             self.cache.clear_hwmon_duty_not_holding([header_id]);
         }
         Ok(Some(outcome))
+    }
+
+    /// The headers with no mode switch the engine holds now (DEC-451), sorted.
+    pub fn engine_held_no_mode(&self) -> Vec<String> {
+        self.engine_held.iter().cloned().collect()
+    }
+
+    /// The held headers a release may act on now: none while a diagnostic
+    /// holds the engine write-pause, so a pending release never makes the
+    /// members-only force take the lease from it (DEC-451 review). The release
+    /// waits for the diagnostic to end, as the GPU and OpenFan give-backs do.
+    pub fn releasable_no_mode(&self) -> Vec<String> {
+        if self.cache.verify_active() {
+            return Vec::new();
+        }
+        self.engine_held_no_mode()
+    }
+
+    /// Release `header_id`, a header with no mode switch the engine holds and
+    /// no longer commands (DEC-451, `BRD-u`): leave it at
+    /// `exit_duty(its last duty, exit floor)` — DEC-388's stop rule, applied
+    /// when the engine lets go — so it is never lowered, a pump floor it ran
+    /// under survives, and one whose duty is unknown goes to full speed. An
+    /// exit floor of 0 writes nothing. Requires a valid lease, like every
+    /// other write.
+    ///
+    /// Before this a header a new profile (or a deactivation) dropped kept the
+    /// previous profile's duty — 0 included — until a clean stop.
+    ///
+    /// Released, the header's write state is forgotten as on a hand-back: a 0
+    /// the previous profile chose on a shared-report chip is then nobody's
+    /// choice, and DEC-425 may prime it (the user's choice, 2026-09-29).
+    /// `exit_record` keeps its duty, which the stop's exit floor reads.
+    ///
+    /// `Ok(None)` when the engine does not hold it, or while a diagnostic holds
+    /// the engine write-pause ([`Self::releasable_no_mode`]).
+    pub fn release_no_mode(
+        &mut self,
+        header_id: &str,
+        lease_id: &str,
+    ) -> Result<Option<NoModeRelease>, HwmonControlError> {
+        self.lease_manager
+            .validate_lease(lease_id)
+            .map_err(HwmonControlError::Lease)?;
+        if !self.engine_held.contains(header_id) || self.cache.verify_active() {
+            return Ok(None);
+        }
+        let was = self.exit_record.get(header_id).copied().flatten();
+        let floor = self.cache.exit_floor_pct();
+        let target = (floor > 0)
+            .then(|| crate::pwm::exit_duty(was, floor))
+            .filter(|to| Some(*to) != was);
+        let outcome = match target {
+            None => NoModeRelease::Kept { at: was },
+            Some(to) => match self.set_pwm(header_id, to, lease_id) {
+                Ok(_) => NoModeRelease::Raised { was, to },
+                Err(HwmonControlError::Hardware(e)) => {
+                    return Ok(Some(NoModeRelease::Failed {
+                        to,
+                        error: e.to_string(),
+                    }));
+                }
+                Err(e) => return Err(e),
+            },
+        };
+        self.engine_held.remove(header_id);
+        self.release_failure_logged.remove(header_id);
+        // As `hand_back`: nothing commands it, so nothing about its commands
+        // may outlive the release.
+        self.write_state.remove(header_id);
+        self.cache.clear_hwmon_commanded(header_id);
+        self.cache.clear_hwmon_duty_not_holding([header_id]);
+        Ok(Some(outcome))
+    }
+
+    /// Record a failed release. `true` the first time since the header was last
+    /// released, so the caller logs once.
+    pub fn note_release_failed(&mut self, header_id: &str) -> bool {
+        self.release_failure_logged.insert(header_id.to_string())
     }
 
     /// Cumulative PWM verify-after-write mismatch events per header.
@@ -884,6 +989,14 @@ impl HwmonPwmController {
             }
         }
 
+        // DEC-451: every engine command holds a header with no mode switch until
+        // a profile stops naming it — marked BEFORE the coalesce return, since a
+        // command that repeats a diagnostic's duty writes nothing and is still
+        // the engine's. A diagnostic's write does not hold it.
+        if reconciles && !supports_enable {
+            self.engine_held.insert(header_id.to_string());
+        }
+
         let ws = self.write_state.entry(header_id.to_string()).or_default();
         if enable_reclaimed {
             ws.manual_mode_set = false;
@@ -1135,10 +1248,10 @@ impl HwmonPwmController {
     ///
     /// "Commanded to 0" is `write_state`'s `last_commanded_pct`: a zero the
     /// daemon itself last wrote there (a curve at 0 %, a zero-RPM member) is
-    /// kept, and a zero from a probe or a resume is not. `write_state` is cleared
-    /// only when a profile is DEACTIVATED (`on_lease_released`); activating one
-    /// profile over another keeps it, so a 0 the previous profile chose stays
-    /// until then — as it did before DEC-425. Once the exit floor has latched a
+    /// kept, and a zero from a probe or a resume is not. A header the active
+    /// profile stops naming is released (DEC-451, [`Self::release_no_mode`]),
+    /// which forgets its write state, so a 0 the previous profile chose is no
+    /// longer a choice once a switch or a deactivation drops it. Once the exit floor has latched a
     /// header (`exit_min`), its zero is no longer a live choice and is primed
     /// like any other. The rule is a readback, so it re-arms by itself after a
     /// resume zeroes the cache — nothing has to detect the resume.
@@ -4373,6 +4486,60 @@ mod tests {
                 "{path} was not raised to the floor"
             );
         }
+    }
+
+    /// DEC-451 with the exit floor off (the user's 2026-09-29 choice): the
+    /// release writes nothing, yet a 0 the previous profile chose is no longer
+    /// anyone's choice — so the next write to a sibling primes it (DEC-425)
+    /// rather than leaving the fan stopped for a profile that no longer names it.
+    #[test]
+    fn a_released_arctic_zero_is_no_longer_a_chosen_one() {
+        let mut rig = arctic_rig();
+        rig.ctrl.cache.set_exit_floor_pct(0);
+        let lease = engine_lease(&mut rig.ctrl);
+        rig.ctrl.set_pwm(&arctic_id(2), 0, &lease).unwrap();
+        rig.ctrl.set_pwm(&arctic_id(1), 30, &lease).unwrap();
+        assert_eq!(rig.cache.lock()[1], 0, "precondition: a chosen 0 is kept");
+
+        assert_eq!(
+            rig.ctrl.release_no_mode(&arctic_id(2), &lease).unwrap(),
+            Some(NoModeRelease::Kept { at: Some(0) }),
+            "the floor is off, so the release writes nothing"
+        );
+        assert_eq!(rig.cache.lock()[1], 0);
+        rig.ctrl.set_pwm(&arctic_id(1), 40, &lease).unwrap();
+        assert_eq!(
+            rig.cache.lock()[1],
+            percent_to_raw(PRIME_PCT),
+            "released, the 0 is unchosen and is primed"
+        );
+    }
+
+    /// DEC-451: only the ENGINE holds a header with no mode switch. A
+    /// diagnostic's write (a `Verify` lease) restores its own duty, and the
+    /// release must not then override that restore.
+    #[test]
+    fn a_diagnostic_write_does_not_hold_a_header_with_no_mode_switch() {
+        let mut rig = arctic_rig();
+        let verify = rig
+            .ctrl
+            .lease_manager_mut()
+            .force_take_lease(HwmonWriter::Verify)
+            .lease_id;
+        rig.ctrl.set_pwm(&arctic_id(1), 30, &verify).unwrap();
+        assert!(rig.ctrl.engine_held_no_mode().is_empty());
+        assert_eq!(
+            rig.ctrl.release_no_mode(&arctic_id(1), &verify).unwrap(),
+            None
+        );
+
+        let engine = rig
+            .ctrl
+            .lease_manager_mut()
+            .force_take_lease(HwmonWriter::Engine)
+            .lease_id;
+        rig.ctrl.set_pwm(&arctic_id(1), 30, &engine).unwrap();
+        assert_eq!(rig.ctrl.engine_held_no_mode(), vec![arctic_id(1)]);
     }
 
     /// The opposite branch: a 0 the current profile chose — a curve at 0 %, a

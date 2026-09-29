@@ -8572,7 +8572,9 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
         stop(handle, shutdown_tx).await;
 
-        assert_eq!(ch3(&written.lock()), vec![hex(35), hex(100), hex(35)]);
+        // DEC-451 (Q8-A): the pre-emergency duty, raised to the exit floor.
+        let back = crate::pwm::exit_duty(Some(35), cache.exit_floor_pct());
+        assert_eq!(ch3(&written.lock()), vec![hex(35), hex(100), hex(back)]);
         assert_eq!(sysfs.get(EN1).as_deref(), Some("5"));
     }
 
@@ -8811,11 +8813,18 @@ mod tests {
                 .filter(|c| c.starts_with(">02"))
                 .collect::<Vec<_>>()
         );
+        // DEC-451 (Q8-A): the pre-emergency duty, raised to the exit floor —
+        // with the default floor, 35 % comes back above it.
+        let back = crate::pwm::exit_duty(Some(35), cache.exit_floor_pct());
+        assert!(
+            back > 35,
+            "precondition: the default exit floor is above 35 %"
+        );
         assert_eq!(
             values_for(3),
-            vec![hex(35), hex(100), hex(35)],
+            vec![hex(35), hex(100), hex(back)],
             "a channel no profile controls must be forced to 100% by the emergency \
-             and then get its own pre-emergency duty back"
+             and then get its own pre-emergency duty back, raised to the exit floor"
         );
         for ch in (1..crate::serial::protocol::NUM_CHANNELS).filter(|&ch| ch != 3) {
             assert_eq!(

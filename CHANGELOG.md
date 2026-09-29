@@ -20,6 +20,18 @@
   the stop's timeout line, now say that headers not yet reached keep their last duty, and that a
   slow device is not necessarily a dead one. Other USB fan controllers keep their place in the
   order.
+- **A fan a new profile does not name no longer keeps the old profile's speed** (DEC-451). This
+  covers an OpenFan channel, or a motherboard header with no automatic mode to return to (an ARCTIC
+  fan hub's channels, for example), that the old profile drove and the new one does not name. Such
+  a fan used to stay at the old profile's last speed, 0 % included, until the daemon stopped. It is
+  now left at that speed or the exit minimum (`[shutdown] exit_floor_pct`, 50 % by default),
+  whichever is higher, or at full speed if the daemon has lost track of its speed (after a
+  reconnect, say). The same applies when a profile is deactivated. Headers with an automatic
+  mode are still handed back to it, as before. After a thermal emergency, an OpenFan channel no
+  profile names gets its earlier speed back raised to the exit minimum too. An exit minimum of 0
+  keeps each such fan's speed exactly as before. The daemon then no longer treats an ARCTIC channel
+  the old profile set to 0 as a deliberate 0, so the channel can be set to full speed the next
+  time another channel on the hub is written.
 
 ## [3.0.0] — 2026-09-28
 
