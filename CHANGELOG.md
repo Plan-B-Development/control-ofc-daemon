@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [3.2.0] — 2026-09-30
+
+Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor; GUI 3.2.0 uses the new
+`control.pwm_verification_records` capability for its per-header fan-control test results.
+
 ### Added
 
 - **The daemon remembers each fan header's PWM-control test result** (DEC-456). A
