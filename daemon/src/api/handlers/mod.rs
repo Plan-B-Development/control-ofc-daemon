@@ -177,6 +177,28 @@ pub(crate) fn build_control_output_entries(snap: &DaemonState) -> Vec<ControlOut
     entries
 }
 
+/// The `stall_detected` verdict for one hwmon header (DEC-458, `PTR-k`).
+///
+/// A header the daemon commands is measured against the duty it commanded
+/// (`pwm_commanded_pct`, one producer). One it does not command — never taken,
+/// or given back — is measured against the hardware readback, but only once
+/// its fan has been seen spinning: a header with no fan reads 0 RPM under a
+/// firmware duty exactly as a fan that stopped does, and only the fan ever
+/// turned. Never `last_commanded_pwm`, which mixes the two (AIO5-a). `None` is
+/// "not evaluated", never "not stalled".
+fn hwmon_stall_verdict(
+    fan: &crate::health::state::HwmonFanState,
+    seen_spinning: bool,
+) -> Option<bool> {
+    let rpm = fan.rpm?;
+    let duty = match fan.pwm_commanded_pct {
+        Some(commanded) => commanded,
+        None if seen_spinning => fan.pwm_readback_pct?,
+        None => return None,
+    };
+    Some(rpm == 0 && duty > constants::STALL_PWM_THRESHOLD)
+}
+
 /// Build the sorted list of fan entries from a cache snapshot.
 pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntry> {
     let mut fans: Vec<FanEntry> = Vec::new();
@@ -224,10 +246,7 @@ pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntr
             .get(id)
             .copied()
             .unwrap_or_default();
-        let stall = match (fan.rpm, fan.last_commanded_pwm) {
-            (Some(rpm), Some(pwm)) => Some(rpm == 0 && pwm > constants::STALL_PWM_THRESHOLD),
-            _ => None,
-        };
+        let stall = hwmon_stall_verdict(fan, snap.hwmon_seen_spinning.contains(id));
         fans.push(FanEntry {
             id: id.clone(),
             source: "hwmon".into(),
@@ -1556,38 +1575,103 @@ mod tests {
         }
     }
 
-    #[test]
-    fn stall_detection_uses_constant_threshold() {
+    /// The `/fans` stall verdict for one hwmon header, shaped as the 1 Hz poll
+    /// leaves it: `last_commanded_pwm` holds the sysfs readback (AIO5-a),
+    /// `pwm_commanded_pct` what the daemon asked for, if it asked, and `seen`
+    /// whether its fan has been seen spinning.
+    fn hwmon_stall(
+        rpm: Option<u16>,
+        readback: u8,
+        commanded: Option<u8>,
+        seen: bool,
+    ) -> Option<bool> {
         let mut state = DaemonState::default();
         let now = Instant::now();
-
-        // Fan at PWM=20 with RPM=0 should NOT be stalled (threshold is >20)
         state.hwmon_fans.insert(
             "hwmon:fan1".into(),
             crate::health::state::HwmonFanState {
                 id: "hwmon:fan1".into(),
-                rpm: Some(0),
-                last_commanded_pwm: Some(constants::STALL_PWM_THRESHOLD),
-                pwm_readback_pct: None,
-                pwm_commanded_pct: None,
+                rpm,
+                last_commanded_pwm: Some(readback),
+                pwm_readback_pct: Some(readback),
+                pwm_commanded_pct: commanded,
                 updated_at: now,
                 alarm: None,
                 pwm_enable_mode: None,
             },
         );
+        if seen {
+            state.hwmon_seen_spinning.insert("hwmon:fan1".into());
+        }
+        build_fan_entries(&state, now)[0].stall_detected
+    }
 
-        let entries = build_fan_entries(&state, now);
-        assert_eq!(entries[0].stall_detected, Some(false));
+    /// A commanded header is measured against the COMMAND. Each case puts the
+    /// readback on the other side of the threshold, so a verdict taken from the
+    /// readback flips both answers.
+    #[test]
+    fn stall_detection_uses_constant_threshold() {
+        let at = constants::STALL_PWM_THRESHOLD;
+        // Commanded 20 % at 0 RPM is not a stall (the threshold is > 20).
+        assert_eq!(hwmon_stall(Some(0), at + 1, Some(at), true), Some(false));
+        // Commanded 21 % at 0 RPM is.
+        assert_eq!(hwmon_stall(Some(0), at, Some(at + 1), true), Some(true));
+    }
 
-        // Fan at PWM=21 with RPM=0 SHOULD be stalled
-        state
-            .hwmon_fans
-            .get_mut("hwmon:fan1")
-            .unwrap()
-            .last_commanded_pwm = Some(constants::STALL_PWM_THRESHOLD + 1);
+    /// PTR-k: a header the daemon does not command, whose fan it has never
+    /// seen spinning, reports no verdict whatever duty the firmware holds it
+    /// at. A BIOS-held 40 % on an empty header read as a stall before this,
+    /// and the GUI raised it as an error alert.
+    #[test]
+    fn an_empty_uncommanded_header_has_no_stall_verdict() {
+        // Presence first: the same header, once its fan has been seen spinning.
+        assert_eq!(hwmon_stall(Some(0), 40, None, true), Some(true));
+        assert_eq!(hwmon_stall(Some(0), 40, None, false), None);
+        // A commanded header needs no such evidence: the daemon asked for 40 %.
+        assert_eq!(hwmon_stall(Some(0), 40, Some(40), false), Some(true));
+    }
 
-        let entries = build_fan_entries(&state, now);
-        assert_eq!(entries[0].stall_detected, Some(true));
+    /// DEC-458: a fan that stops while the firmware drives it is still a stall,
+    /// measured against the readback and the same threshold.
+    #[test]
+    fn an_uncommanded_fan_seen_spinning_is_measured_against_the_readback() {
+        let at = constants::STALL_PWM_THRESHOLD;
+        assert_eq!(hwmon_stall(Some(0), at + 1, None, true), Some(true));
+        assert_eq!(hwmon_stall(Some(0), at, None, true), Some(false));
+        assert_eq!(hwmon_stall(Some(900), 40, None, true), Some(false));
+    }
+
+    /// A low command is not a stall even when the firmware holds the header
+    /// higher, and no RPM reading is still no verdict.
+    #[test]
+    fn hwmon_stall_needs_a_high_command_and_an_rpm_reading() {
+        assert_eq!(hwmon_stall(Some(0), 40, Some(10), true), Some(false));
+        assert_eq!(hwmon_stall(None, 40, Some(40), true), None);
+        assert_eq!(hwmon_stall(Some(900), 40, Some(40), true), Some(false));
+    }
+
+    /// DEC-458 at the call site: the cache's own record of a spinning fan is
+    /// what `/fans` reads. Two uncommanded headers at a firmware 40 % stop
+    /// reading RPM; only the one whose fan had turned is a stall.
+    #[test]
+    fn the_caches_seen_spinning_record_reaches_the_stall_verdict() {
+        let cache = StateCache::new();
+        let poll = |id: &str, rpm: u16| crate::health::state::HwmonFanState {
+            id: id.into(),
+            rpm: Some(rpm),
+            last_commanded_pwm: Some(40),
+            pwm_readback_pct: Some(40),
+            pwm_commanded_pct: None,
+            updated_at: Instant::now(),
+            alarm: None,
+            pwm_enable_mode: Some(5),
+        };
+        cache.update_hwmon_fans(vec![poll("hwmon:fan", 900), poll("hwmon:empty", 0)]);
+        cache.update_hwmon_fans(vec![poll("hwmon:fan", 0), poll("hwmon:empty", 0)]);
+        let entries = build_fan_entries(&cache.snapshot(), Instant::now());
+        let stall = |id: &str| entries.iter().find(|e| e.id == id).unwrap().stall_detected;
+        assert_eq!(stall("hwmon:fan"), Some(true));
+        assert_eq!(stall("hwmon:empty"), None);
     }
 
     #[test]

@@ -24,6 +24,18 @@
   writable headers have no result yet ("2 of 5 …") and goes away once all of them are verified. A
   new `pwm_control_failed` warning says how many writable headers' latest result is a failure.
 
+### Fixed
+
+- **An empty fan header the daemon does not control is no longer reported as a stalled fan**
+  (DEC-458). `stall_detected` on `GET /fans` and `/poll` was worked out, for a motherboard header,
+  from `last_commanded_pwm`, which for a header nothing controls holds the duty read back from the
+  hardware. So a header with no fan that the BIOS held above 20 % read as stalled, and the GUI showed
+  an error alert for it. Now a header the daemon controls is measured against the duty the daemon
+  commanded. A header it does not control is measured against the hardware readback only once the
+  daemon has seen a fan spinning on it since it started; until then it reports no verdict (`null`).
+  A fan that stops while the BIOS drives it is still reported, and an empty header is not. A fan
+  unplugged while the daemon runs reads as stalled. OpenFan channels and GPU fans are unchanged.
+
 ## [3.1.0] — 2026-09-29
 
 Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor; GUI 3.1.0 uses the new

@@ -512,6 +512,11 @@ impl StateCache {
                     }
                 }
             }
+            // DEC-458: every producer's RPM reading counts — the poll's and a
+            // write's — so a fan seen turning once is remembered for good.
+            if fan.rpm.is_some_and(|rpm| rpm > 0) {
+                state.hwmon_seen_spinning.insert(fan.id.clone());
+            }
             state.hwmon_fans.insert(fan.id.clone(), fan);
         }
         state.snapshot_at = now;

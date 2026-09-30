@@ -486,6 +486,16 @@ pub struct DaemonState {
     /// with one producer needs no carry-forward rule. A header absent here has
     /// never been corrected and is not flagged — the wire reports 0 / false.
     pub hwmon_duty_reconciliation: HashMap<String, DutyReconciliation>,
+    /// The hwmon headers whose fan the daemon has seen spinning (RPM above 0)
+    /// since it started (DEC-458).
+    ///
+    /// The evidence that tells a fan that stopped from a header with no fan:
+    /// both read 0 RPM under a firmware duty, and only one of them ever spun.
+    /// `/fans` gives a header the daemon does not command a stall verdict only
+    /// when it is in this set. Filled by [`crate::health::cache::StateCache::update_hwmon_fans`],
+    /// its one producer, and never emptied: a fan unplugged while the daemon runs
+    /// reads as stopped, which is what the user would want to hear.
+    pub hwmon_seen_spinning: HashSet<String>,
 }
 
 /// One hwmon header's duty-reconciliation record (DEC-406).
@@ -552,6 +562,7 @@ impl Default for DaemonState {
             skipped_controls: Vec::new(),
             control_outputs: Vec::new(),
             hwmon_duty_reconciliation: HashMap::new(),
+            hwmon_seen_spinning: HashSet::new(),
         }
     }
 }

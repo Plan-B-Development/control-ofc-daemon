@@ -3612,6 +3612,56 @@ mod tests {
         assert_eq!(commanded(&cache), None);
     }
 
+    /// DEC-458 through the real write and hand-back paths, for a header whose
+    /// tach reads `rpm_before` while the daemon commands it: the `/fans` stall
+    /// verdict after the hand-back, on a poll that finds the firmware at 60 %
+    /// and the fan at 0 RPM. The poll also stores that readback in
+    /// `last_commanded_pwm` (AIO5-a), which on its own used to be enough for
+    /// `true` on a header with no fan (`PTR-k`).
+    fn stall_after_hand_back(rpm_before: &str) -> Option<bool> {
+        let (mut ctrl, sysfs, cache, lease) = live_controller("5", "90");
+        sysfs.set("/sys/class/hwmon/hwmon0/fan1_input", rpm_before);
+        let stall = |c: &StateCache| {
+            crate::api::handlers::build_fan_entries(&c.snapshot(), Instant::now())
+                .into_iter()
+                .find(|e| e.id == "h1")
+                .and_then(|e| e.stall_detected)
+        };
+        ctrl.set_pwm("h1", 60, &lease).unwrap();
+        let spinning = rpm_before != "0";
+        assert_eq!(
+            stall(&cache),
+            Some(!spinning),
+            "precondition: commanded 60 %"
+        );
+
+        ctrl.hand_back("h1", &lease).unwrap();
+        cache.update_hwmon_fans(vec![HwmonFanState {
+            id: "h1".into(),
+            rpm: Some(0),
+            last_commanded_pwm: Some(60),
+            pwm_readback_pct: Some(60),
+            pwm_commanded_pct: None,
+            alarm: None,
+            pwm_enable_mode: Some(5),
+            updated_at: Instant::now(),
+        }]);
+        stall(&cache)
+    }
+
+    /// PTR-k: a header with no fan, given back, reports no verdict.
+    #[test]
+    fn a_handed_back_empty_header_has_no_stall_verdict() {
+        assert_eq!(stall_after_hand_back("0"), None);
+    }
+
+    /// DEC-458: a fan the write path saw turning that stops after the header
+    /// is given back is still a stall — the write's own RPM read counts.
+    #[test]
+    fn a_handed_back_fan_that_stops_is_still_a_stall() {
+        assert_eq!(stall_after_hand_back("900"), Some(true));
+    }
+
     // ── DEC-406 (`PTR-g`): the engine reconciles a coalesced duty ─────────
 
     /// `LiveSysfs` plus a log of every duty write and an optional clamp, so a
