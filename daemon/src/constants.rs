@@ -687,6 +687,22 @@ pub const PWM_BASELINE_RECORD_MAX_BYTES: usize = {
 pub const PWM_BASELINES_MAX_BYTES: u64 =
     (PWM_BASELINES_MAX_ENTRIES * PWM_BASELINE_RECORD_MAX_BYTES + 8192) as u64;
 
+/// Per-header PWM verification store (`{state_dir}/pwm_verification.json`,
+/// DEC-456), bounded exactly like the control-path store: a cap on entries, a
+/// cap on every stored string at ingest, and a file cap derived from both, so
+/// "too large to read" can only mean "written by something else" (DEC-320).
+pub const PWM_VERIFICATION_MAX_ENTRIES: usize = 64;
+pub const PWM_VERIFICATION_MAX_TEXT_BYTES: usize = VALIDATION_MAX_TEXT_FIELD_BYTES;
+/// Derived, not guessed: 5 text fields (`header_id`, `state`, `method`,
+/// `result`, `run_id`), each padded for JSON punctuation and key names, plus
+/// the timestamp and the map key (a second copy of `header_id`).
+pub const PWM_VERIFICATION_RECORD_MAX_BYTES: usize = {
+    let text_fields = 6;
+    text_fields * (PWM_VERIFICATION_MAX_TEXT_BYTES + 128) + 512
+};
+pub const PWM_VERIFICATION_MAX_BYTES: u64 =
+    (PWM_VERIFICATION_MAX_ENTRIES * PWM_VERIFICATION_RECORD_MAX_BYTES + 8192) as u64;
+
 // Compile-time invariant checks — these fail the build if someone changes a
 // constant to an unsafe value.
 const _: () = assert!(CALIBRATION_MAX_TEMP_C < THERMAL_EMERGENCY_TRIGGER_C);
@@ -737,6 +753,12 @@ const _: () = assert!(PWM_BASELINE_MAX_TEXT_BYTES > 0);
 const _: () = assert!(PWM_BASELINE_MAX_POINTS > 0);
 const _: () = assert!(
     PWM_BASELINES_MAX_BYTES > (PWM_BASELINES_MAX_ENTRIES * PWM_BASELINE_RECORD_MAX_BYTES) as u64
+);
+const _: () = assert!(PWM_VERIFICATION_MAX_ENTRIES > 0);
+const _: () = assert!(PWM_VERIFICATION_MAX_TEXT_BYTES > 0);
+const _: () = assert!(
+    PWM_VERIFICATION_MAX_BYTES
+        > (PWM_VERIFICATION_MAX_ENTRIES * PWM_VERIFICATION_RECORD_MAX_BYTES) as u64
 );
 // [SAFETY] The hwmon lease is renewed once per point, so the renewal interval is
 // one settle window. It must sit well inside BOTH deadlines the sweep depends on:

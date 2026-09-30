@@ -15,6 +15,7 @@ pub mod profile_engine;
 pub mod profile_store;
 pub mod pwm;
 pub mod pwm_baselines;
+pub mod pwm_verification;
 pub mod runtime_config;
 pub mod safety;
 pub mod sd_notify;

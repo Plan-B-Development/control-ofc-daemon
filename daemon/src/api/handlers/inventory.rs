@@ -292,17 +292,31 @@ fn compute_hardware_assessment(state: &AppState) -> crate::hwmon::readiness::Har
         select_default_cpu(classified.iter().map(|(s, c)| (s.id.as_str(), c)))
             .map(|r| r.confidence == Confidence::High);
 
-    // PWM header counts (structural) — read the controller's discovered set.
-    let (pwm_total, pwm_writable) = match &state.hwmon_controller {
+    // PWM header counts (structural) — read the controller's discovered set —
+    // and, of the writable ones, how many carry a verified / failed verdict
+    // (DEC-456). Only writable headers are counted: a verdict can only exist for
+    // one, and the readiness note is about headers the daemon could drive.
+    let (pwm_total, pwm_writable, pwm_verified, pwm_failed) = match &state.hwmon_controller {
         Some(controller) => {
-            let ctrl = controller.lock();
-            let headers = ctrl.headers();
-            (
-                headers.len(),
-                headers.iter().filter(|h| h.is_writable).count(),
-            )
+            let writable_ids: Vec<String>;
+            let total;
+            {
+                let ctrl = controller.lock();
+                let headers = ctrl.headers();
+                total = headers.len();
+                writable_ids = headers
+                    .iter()
+                    .filter(|h| h.is_writable)
+                    .map(|h| h.id.clone())
+                    .collect();
+            }
+            let (verified, failed) = state
+                .pwm_verification
+                .read()
+                .counts(writable_ids.iter().map(String::as_str));
+            (total, writable_ids.len(), verified, failed)
         }
-        None => (0, 0),
+        None => (0, 0, 0, 0),
     };
 
     let monitor_only_fan_count = discover_monitor_only_fans(std::path::Path::new(HWMON_SYSFS_ROOT))
@@ -329,6 +343,8 @@ fn compute_hardware_assessment(state: &AppState) -> crate::hwmon::readiness::Har
         unknown_sensor_count,
         selected_cpu_present,
         selected_mb_present,
+        pwm_verified,
+        pwm_failed,
     };
 
     let items = build_readiness(&inputs);
@@ -888,6 +904,63 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// DEC-456, the GATHERER (DEC-340: a handler split into gather + decide has
+    /// two call sites, and `build_readiness`'s own tests hand it the counts).
+    /// The fixture's one writable header is counted against the daemon's
+    /// verification store: no record → the note; `verified` → no note;
+    /// `failed` → the warning.
+    #[test]
+    fn readiness_counts_the_writable_headers_against_the_verification_store() {
+        use crate::pwm_verification::{PwmVerificationRecord, STATE_FAILED, STATE_VERIFIED};
+        let (state, _tmp) = super::super::hwmon_ctl::tests::verify_state_on_tree(128, |_| 900);
+        let id = "hwmon:test:dev:pwm1";
+        let codes = |state: &AppState| -> Vec<String> {
+            compute_hardware_assessment(state)
+                .items
+                .iter()
+                .map(|i| i.code.to_string())
+                .collect()
+        };
+        let seed = |state: &AppState, verdict: &str| {
+            let mut store = crate::pwm_verification::PwmVerificationStore::default();
+            store.upsert(PwmVerificationRecord {
+                header_id: id.into(),
+                state: verdict.into(),
+                method: "verify".into(),
+                result: "effective".into(),
+                run_id: String::new(),
+                verified_unix_ms: 1,
+            });
+            *state.pwm_verification.write() = std::sync::Arc::new(store);
+        };
+
+        let none = codes(&state);
+        assert!(none.iter().any(|c| c == "pwm_controls_present"), "{none:?}");
+        assert!(
+            none.iter().any(|c| c == "pwm_control_unverified"),
+            "{none:?}"
+        );
+        assert!(!none.iter().any(|c| c == "pwm_control_failed"), "{none:?}");
+
+        seed(&state, STATE_VERIFIED);
+        let verified = codes(&state);
+        assert!(
+            !verified.iter().any(|c| c == "pwm_control_unverified"),
+            "a verified header still reads as unverified: {verified:?}"
+        );
+
+        seed(&state, STATE_FAILED);
+        let failed = codes(&state);
+        assert!(
+            failed.iter().any(|c| c == "pwm_control_failed"),
+            "{failed:?}"
+        );
+        assert!(
+            !failed.iter().any(|c| c == "pwm_control_unverified"),
+            "{failed:?}"
+        );
     }
 
     #[test]

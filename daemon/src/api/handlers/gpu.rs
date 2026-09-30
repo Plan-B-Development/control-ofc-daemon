@@ -1280,6 +1280,7 @@ mod tests {
             stall_probe_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
             pwm_baselines: Default::default(),
+            pwm_verification: Default::default(),
             openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
             last_openfan_rescan: Arc::new(parking_lot::Mutex::new(None)),
             adopted_poll_tasks: Arc::new(parking_lot::Mutex::new(Default::default())),

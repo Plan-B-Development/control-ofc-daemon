@@ -209,6 +209,11 @@ daemon/src/
   control_paths.rs     — {state_dir}/control_paths.json: discovered PWM-to-tach
                          relationships, keyed by stable header id and pruned at boot to
                          whatever discovery can still see (DEC-333)
+  pwm_verification.rs  — {state_dir}/pwm_verification.json: each header's latest
+                         conclusive PWM-control verdict (a verify, or a completed sweep),
+                         published as `pwm_verification` on /hwmon/headers and counted by
+                         the readiness items; pruned at boot like the two above (DEC-456).
+                         Reported, never read by the control path
   profile_engine/      — headless 1Hz curve evaluation loop (DEC-135)
     mod.rs             — loop body / coordinator: orchestrates safety_tick + curve_eval + tuning + backends
     curve_eval.rs      — deadband + trigger latch + Mix/Sync composites (topological order)

@@ -470,6 +470,8 @@ pub async fn capabilities_handler(
             // DEC-443: coolant emergency, pump stall response, DC-aware pump
             // floor, cooling advisory, and `POST /config/coolant-limit`.
             cooling_failure_detection: true,
+            // DEC-456: per-header PWM-control verdicts on `/hwmon/headers`.
+            pwm_verification_records: true,
         },
     })
 }

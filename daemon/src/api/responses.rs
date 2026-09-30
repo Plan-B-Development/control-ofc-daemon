@@ -608,6 +608,13 @@ pub struct PwmHeaderEntry {
     /// Tachometer pulses per revolution from `fanN_pulses`. Absent on `it87`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tach_pulses_per_rev: Option<u8>,
+    /// The header's latest conclusive PWM-control verdict (DEC-456, capability
+    /// `control.pwm_verification_records`): `{header_id, state, method, result,
+    /// run_id, verified_unix_ms}`. Absent when no verify or sweep has settled
+    /// it, which means "not yet verified" — never "failed". Overlaid by
+    /// `published_header_entries`; `from_descriptor` leaves it `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pwm_verification: Option<crate::pwm_verification::PwmVerificationRecord>,
 }
 
 impl PwmHeaderEntry {
@@ -678,6 +685,7 @@ impl PwmHeaderEntry {
             rpm_min_threshold: h.caps.rpm_min_threshold,
             rpm_max_threshold: h.caps.rpm_max_threshold,
             tach_pulses_per_rev: h.caps.tach_pulses_per_rev,
+            pwm_verification: None,
         }
     }
 }
@@ -1269,6 +1277,17 @@ pub struct ControlCapability {
     /// Absent means an older daemon — every array reads as empty there.
     #[serde(default)]
     pub cooling_failure_detection: bool,
+    /// The daemon keeps each writable hwmon header's latest conclusive
+    /// PWM-control verdict (DEC-456) and publishes it as `pwm_verification` on
+    /// `GET /hwmon/headers`; the `pwm_control_unverified` readiness item counts
+    /// against it and `pwm_control_failed` reports a failed one.
+    ///
+    /// A client gates on this, not on the field's presence: the field is absent
+    /// for every header that has not been verified, so on its own an absent
+    /// field cannot tell "not yet verified" from "an older daemon that keeps no
+    /// record". Absent means an older daemon.
+    #[serde(default)]
+    pub pwm_verification_records: bool,
 }
 
 /// Per-device-group capability info.
@@ -2655,8 +2674,20 @@ mod tests {
             rpm_min_threshold: Some(300),
             rpm_max_threshold: Some(3000),
             tach_pulses_per_rev: Some(2),
+            pwm_verification: Some(crate::pwm_verification::PwmVerificationRecord {
+                header_id: "hwmon:it8696:pci0:pwm3:AIO_PUMP".into(),
+                state: "verified".into(),
+                method: "verify".into(),
+                result: "effective".into(),
+                run_id: String::new(),
+                verified_unix_ms: 1,
+            }),
         };
         expect(&serde_json::to_value(&header).unwrap(), "PwmHeaderEntry");
+        expect(
+            &serde_json::to_value(header.pwm_verification.as_ref().unwrap()).unwrap(),
+            "PwmVerificationRecord",
+        );
 
         // `temp_sensors[]` flattens the whole SensorEntry alongside the
         // refinement — the exact shape whose six dropped keys were `WIRE-h`.

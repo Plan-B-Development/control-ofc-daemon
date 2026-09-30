@@ -68,11 +68,15 @@ pub(crate) fn published_header_entries<'a>(
     // only what discovery could infer.
     let assigned = state.header_roles();
     let devices = state.cooling_devices();
+    // DEC-456: the verification verdicts, overlaid here so all three endpoints
+    // publish the same record. A momentary read guard that clones the `Arc` and
+    // takes no other lock, so it is safe under the controller lock.
+    let verification = state.pwm_verification.read().clone();
     headers
         .into_iter()
         .map(|h| {
             let assign = assigned.get(&h.id).copied();
-            PwmHeaderEntry::from_descriptor(
+            let mut entry = PwmHeaderEntry::from_descriptor(
                 h,
                 assign,
                 crate::hwmon::roles::is_pump_protected(
@@ -81,7 +85,9 @@ pub(crate) fn published_header_entries<'a>(
                     profile_pumps.contains(&h.id),
                 ),
                 devices.iter().find(|d| d.claims(&h.id)),
-            )
+            );
+            entry.pwm_verification = verification.get(&h.id).cloned();
+            entry
         })
         .collect()
 }
@@ -731,6 +737,29 @@ pub async fn hwmon_verify_handler(
         classify_verify_result(&initial, &final_state, test_pct)
     };
 
+    // DEC-456: record the verdict before answering, so a client that reads
+    // `/hwmon/headers` after this response sees it. A client that hangs up
+    // before this point records nothing — the record under-claims, never
+    // over-claims. So does a run whose restore did not land: the thermal force
+    // evicted it, a later diagnostic superseded it, or the daemon is stopping —
+    // and in each case the final read may be another writer's duty, so the run
+    // cannot vouch for the header either way.
+    let verdict = crate::pwm_verification::verdict_for_verify(&result).filter(|_| !restore_failed);
+    if let Some(verdict) = verdict {
+        persist_verification(
+            &state,
+            crate::pwm_verification::PwmVerificationRecord {
+                header_id: header_id.clone(),
+                state: verdict.to_string(),
+                method: crate::pwm_verification::METHOD_VERIFY.to_string(),
+                result: result.clone(),
+                run_id: String::new(),
+                verified_unix_ms: crate::control_paths::unix_ms(),
+            },
+        )
+        .await;
+    }
+
     json_ok(
         StatusCode::OK,
         HwmonVerifyResponse {
@@ -1362,6 +1391,12 @@ pub async fn hwmon_characterize_handler(
                     persist_baseline(&state_for_persist, record).await;
                 }
             }
+            // DEC-456: a sweep that proved control (or disproved it) is a
+            // verification verdict too. `verdict_for_sweep` is the only place
+            // that rule lives, and it requires a complete run itself.
+            if let Some(record) = verification_record_for_sweep(&run) {
+                persist_verification(&state_for_persist, record).await;
+            }
         }
     });
 
@@ -1450,6 +1485,58 @@ async fn persist_baseline(state: &Arc<AppState>, record: crate::pwm_baselines::P
             // disk from ever disagreeing.
             log::warn!("could not persist the PWM baseline store: {e}");
         }
+    }
+}
+
+/// The DEC-456 verification record a finished sweep earns, or `None`.
+fn verification_record_for_sweep(
+    run: &crate::api::characterization::CharacterizationRun,
+) -> Option<crate::pwm_verification::PwmVerificationRecord> {
+    let (state, result) = crate::pwm_verification::verdict_for_sweep(run)?;
+    Some(crate::pwm_verification::PwmVerificationRecord {
+        header_id: run.header_id.clone(),
+        state: state.to_string(),
+        method: crate::pwm_verification::METHOD_CHARACTERIZATION.to_string(),
+        result: result.to_string(),
+        run_id: run.run_id.clone(),
+        verified_unix_ms: run
+            .completed_unix_ms
+            .unwrap_or_else(crate::control_paths::unix_ms),
+    })
+}
+
+/// Record one header's verdict and persist it off the runtime (DEC-456).
+///
+/// The learned-response store's discipline, for the same reason: persist
+/// first, then commit **re-applied under the write lock** rather than a
+/// snapshot taken before the fsync, so two verdicts landing together (the
+/// DEC-296 deadman steal allows it) cannot drop one from memory. A failed write
+/// leaves the in-memory store untouched; the test itself is still reported.
+/// Two writes racing can still leave the FILE one verdict short of memory (each
+/// saves its own snapshot) until the next verdict is saved — the record then
+/// under-claims after a restart, never over-claims.
+async fn persist_verification(
+    state: &Arc<AppState>,
+    record: crate::pwm_verification::PwmVerificationRecord,
+) {
+    let to_write = {
+        let guard = state.pwm_verification.read();
+        let mut store = (**guard).clone();
+        store.upsert(record.clone());
+        store
+    };
+    let result = super::persist_off_runtime(move || {
+        crate::pwm_verification::save_to(&crate::daemon_state::state_dir_path(), &to_write)
+    })
+    .await;
+    match result {
+        Ok(()) => {
+            let mut guard = state.pwm_verification.write();
+            let mut store = (**guard).clone();
+            store.upsert(record);
+            *guard = Arc::new(store);
+        }
+        Err(e) => log::warn!("could not persist the PWM verification store: {e}"),
     }
 }
 
@@ -1947,6 +2034,156 @@ pub(crate) mod tests {
             duties.last().copied(),
             "published == restored"
         );
+    }
+
+    // ── DEC-456 (`PTR-l`): the daemon records each header's verdict ─────────
+
+    /// The published record for the fixture header, from the REAL
+    /// `/hwmon/headers` handler — the one mapping every header endpoint shares.
+    async fn published_verification(state: &Arc<AppState>) -> serde_json::Value {
+        let (status, Json(body)) = hwmon_headers_handler(axum::extract::State(state.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let header = body["headers"]
+            .as_array()
+            .and_then(|h| h.iter().find(|h| h["id"] == "hwmon:test:dev:pwm1"))
+            .unwrap_or_else(|| panic!("precondition: the fixture header is published: {body}"))
+            .clone();
+        header
+            .get("pwm_verification")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    async fn verify_on_tree(
+        rpm_at: fn(u32) -> u32,
+    ) -> (Arc<AppState>, serde_json::Value, tempfile::TempDir) {
+        // The record persists before it is committed to memory, so the state
+        // dir must be a temp dir, never the installed daemon's.
+        temp_state_dir();
+        let (state, tmp) = verify_state_on_tree(128, rpm_at);
+        state.cache.update_sensors(vec![fresh_cpu(40.0)]);
+        assert!(
+            published_verification(&state).await.is_null(),
+            "precondition: a header nothing has verified carries no record"
+        );
+        let (status, Json(body)) = hwmon_verify_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("hwmon:test:dev:pwm1".to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        (state, body, tmp)
+    }
+
+    /// A verify whose fan followed the duty is recorded `verified` and is on
+    /// the header the next `GET /hwmon/headers` returns — the response and the
+    /// record name the same result. The record reaches memory only after its
+    /// file write succeeded, so its presence is also the persistence evidence.
+    #[tokio::test]
+    async fn an_effective_verify_is_recorded_and_published_on_its_header() {
+        let (state, body, _tmp) = verify_on_tree(|raw| 300 + raw * 8).await;
+        assert_eq!(body["result"], "effective", "{body}");
+        let record = published_verification(&state).await;
+        assert_eq!(record["state"], "verified", "{record}");
+        assert_eq!(record["method"], "verify", "{record}");
+        assert_eq!(record["result"], body["result"], "{record}");
+        assert_eq!(record["header_id"], "hwmon:test:dev:pwm1", "{record}");
+        assert!(record["verified_unix_ms"].as_u64().is_some_and(|t| t > 0));
+    }
+
+    /// The opposite arm: a verify that moved no fan is recorded `failed` —
+    /// a verdict the pre-fix daemon could not produce at all.
+    #[tokio::test]
+    async fn a_verify_that_moved_no_fan_is_recorded_as_failed() {
+        let (state, body, _tmp) = verify_on_tree(|_| 1200).await;
+        assert_eq!(body["result"], "no_rpm_effect", "{body}");
+        let record = published_verification(&state).await;
+        assert_eq!(record["state"], "failed", "{record}");
+        assert_eq!(record["result"], "no_rpm_effect", "{record}");
+    }
+
+    /// A verify whose restore did not land records nothing — here the daemon
+    /// starts stopping mid-settle, the same `restore_failed` exit the thermal
+    /// force's eviction and a DEC-296 successor take. The fan followed the duty,
+    /// so the classification alone WOULD earn `verified` (asserted first): only
+    /// the `restore_failed` skip keeps the store empty.
+    #[tokio::test]
+    async fn a_verify_whose_restore_did_not_land_records_nothing() {
+        temp_state_dir();
+        let (state, _writes, shutdown_tx, _tmp) = build_verify_state_with(
+            Some(128),
+            crate::hwmon::roles::HeaderRole::ChassisFan,
+            Some(|raw| 300 + raw * 8),
+        );
+        state.cache.update_sensors(vec![fresh_cpu(40.0)]);
+        let task = tokio::spawn(hwmon_verify_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("hwmon:test:dev:pwm1".to_string()),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(!task.is_finished(), "precondition: still settling");
+        shutdown_tx.send(true).unwrap();
+        let (status, Json(body)) = task.await.expect("the verify task");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["result"], "effective",
+            "precondition: a verdict was earned: {body}"
+        );
+        assert_eq!(body["restore_failed"], true, "precondition: {body}");
+        assert!(
+            state
+                .pwm_verification
+                .read()
+                .get("hwmon:test:dev:pwm1")
+                .is_none(),
+            "a run that lost its header recorded a verdict"
+        );
+        assert!(published_verification(&state).await.is_null());
+    }
+
+    /// A completed sweep whose duty read back and whose fan followed is a
+    /// verification too, recorded with the run that earned it. It lands after
+    /// the run turns terminal (persistence runs after the restore), so the
+    /// wait is on the record itself.
+    #[tokio::test]
+    async fn a_sweep_whose_fan_followed_is_recorded_as_verified() {
+        temp_state_dir();
+        let (state, _writes, _tx, _tmp) = build_verify_state_with(
+            Some(128),
+            crate::hwmon::roles::HeaderRole::ChassisFan,
+            Some(|raw| 300 + raw * 8),
+        );
+        state.cache.update_sensors(vec![fresh_cpu(40.0)]);
+        let (status, Json(body)) = hwmon_characterize_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("hwmon:test:dev:pwm1".to_string()),
+            Json(
+                serde_json::from_value(
+                    serde_json::json!({"points_pct": [30, 80], "settle_seconds": 2}),
+                )
+                .expect("request"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let record = poll_until("the sweep's verification record", || {
+            state
+                .pwm_verification
+                .read()
+                .get("hwmon:test:dev:pwm1")
+                .cloned()
+        })
+        .await;
+        let run = state.characterization.lock().clone().expect("the run");
+        assert_eq!(run.state, crate::api::characterization::STATE_COMPLETE);
+        assert_eq!(record.state, crate::pwm_verification::STATE_VERIFIED);
+        assert_eq!(
+            record.method,
+            crate::pwm_verification::METHOD_CHARACTERIZATION
+        );
+        assert_eq!(record.result, crate::pwm_verification::SWEEP_PASS);
+        assert_eq!(record.run_id, run.run_id, "the record names its run");
+        assert_eq!(published_verification(&state).await["state"], "verified");
     }
 
     /// [SAFETY] DEC-420 (`PTR-v`), through the REAL read path: a tach whose
@@ -3586,6 +3823,7 @@ pub(crate) mod tests {
             stall_probe_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             control_paths: std::sync::Arc::new(parking_lot::RwLock::new(Default::default())),
             pwm_baselines: Default::default(),
+            pwm_verification: Default::default(),
             openfan_rescanning: std::sync::atomic::AtomicBool::new(false),
             last_openfan_rescan: Arc::new(parking_lot::Mutex::new(None)),
             adopted_poll_tasks: Arc::new(parking_lot::Mutex::new(Default::default())),

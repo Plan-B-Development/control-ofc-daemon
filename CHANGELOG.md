@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Added
+
+- **The daemon remembers each fan header's PWM-control test result** (DEC-456). A
+  `POST /hwmon/{id}/verify` that ends `effective` records the header as verified; one that ends
+  `pwm_enable_reverted`, `pwm_value_clamped` or `no_rpm_effect` records it as failed. A completed
+  characterisation sweep counts too: verified when every point was accepted, read back as written
+  and the fan followed; failed when a point's duty was put back or its `pwm_enable` left manual
+  mode. Any other outcome records nothing and keeps the previous result, and so does a verify
+  whose restore did not land (the thermal force, a later diagnostic or shutdown took the header
+  mid-test, so its reading may be another writer's). Only the latest result per
+  header is kept, in `{state_dir}/pwm_verification.json`; it survives a restart and is dropped at
+  boot when its header is no longer discovered. Each header on `GET /hwmon/headers` (and
+  `/hwmon/rescan`, `/inventory/hwmon`) carries it as `pwm_verification`, omitted when there is
+  none. Capability `control.pwm_verification_records`. Nothing in fan control reads it.
+
+### Changed
+
+- **The readiness checklist counts what is left to verify** (DEC-456). `pwm_control_unverified`
+  used to appear whenever any header was writable, whatever had been tested. It now says how many
+  writable headers have no result yet ("2 of 5 …") and goes away once all of them are verified. A
+  new `pwm_control_failed` warning says how many writable headers' latest result is a failure.
+
 ## [3.1.0] — 2026-09-29
 
 Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor; GUI 3.1.0 uses the new

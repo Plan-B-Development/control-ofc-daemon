@@ -133,6 +133,11 @@ pub struct ReadinessInputs {
     pub selected_cpu_present: Option<bool>,
     /// Persisted preferred motherboard sensor status (same tri-state).
     pub selected_mb_present: Option<bool>,
+    /// Writable headers whose latest conclusive PWM-control verdict is
+    /// `verified` (DEC-456). Never more than `pwm_writable`.
+    pub pwm_verified: usize,
+    /// Writable headers whose latest conclusive verdict is `failed` (DEC-456).
+    pub pwm_failed: usize,
 }
 
 /// Build the structured readiness list from the read-only inventory facts.
@@ -241,16 +246,47 @@ pub fn build_readiness(inp: &ReadinessInputs) -> Vec<ReadinessItem> {
                 .blocks_control(),
             );
         }
-        if inp.pwm_writable > 0 {
+        // DEC-456: each writable header counts against the daemon's own record
+        // of its latest conclusive verdict. A failed verdict is a warning; a
+        // header with no verdict yet is the informational note, stated as a
+        // count so a partly-verified system says how much is left.
+        if inp.pwm_failed > 0 {
+            items.push(
+                ReadinessItem::new(
+                    "pwm_control_failed",
+                    ReadinessSeverity::Warning,
+                    "pwm",
+                    "PWM control failed verification",
+                    format!(
+                        "{} of {} writable PWM header(s) failed their latest verification: \
+                         a write did not change the fan's speed, or the header did not keep \
+                         the value written.",
+                        inp.pwm_failed, inp.pwm_writable
+                    ),
+                )
+                .action(
+                    "Re-run verification from the Hardware page. If it fails again, check the \
+                     BIOS fan setting for that header (a BIOS curve or Smart Fan mode can take \
+                     it back) and that a fan is connected to it.",
+                ),
+            );
+        }
+        let unverified = inp
+            .pwm_writable
+            .saturating_sub(inp.pwm_verified + inp.pwm_failed);
+        if unverified > 0 {
             items.push(
                 ReadinessItem::new(
                     "pwm_control_unverified",
                     ReadinessSeverity::Info,
                     "pwm",
                     "PWM control not yet verified",
-                    "Writable PWM headers were found, but whether a write actually changes fan \
-                     speed has not been verified on this hardware."
-                        .into(),
+                    format!(
+                        "{} of {} writable PWM header(s) have not been verified yet: whether a \
+                         write actually changes that fan's speed has not been checked on this \
+                         hardware.",
+                        unverified, inp.pwm_writable
+                    ),
                 )
                 .action(
                     "Run fan-control verification for each header to confirm it drives the fan.",
@@ -711,6 +747,64 @@ mod tests {
         assert!(!has(&items, "pwm_control_unverified"));
     }
 
+    fn pwm_inputs(writable: usize, verified: usize, failed: usize) -> ReadinessInputs {
+        ReadinessInputs {
+            cpu_sensor_count: 1,
+            default_cpu_confident: Some(true),
+            pwm_total: writable,
+            pwm_writable: writable,
+            pwm_verified: verified,
+            pwm_failed: failed,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn partly_verified_headers_count_what_is_left() {
+        // DEC-456: the note states how many writable headers still lack a
+        // verdict, not merely that some writable header exists.
+        let items = build_readiness(&pwm_inputs(3, 1, 0));
+        let it = get(&items, "pwm_control_unverified");
+        assert_eq!(it.severity, ReadinessSeverity::Info);
+        assert!(it.detail.starts_with("2 of 3 "), "{}", it.detail);
+        assert!(!has(&items, "pwm_control_failed"));
+    }
+
+    #[test]
+    fn every_header_verified_clears_the_note() {
+        // Presence first: the same hardware with no verdicts carries the note.
+        assert!(has(
+            &build_readiness(&pwm_inputs(2, 0, 0)),
+            "pwm_control_unverified"
+        ));
+        let items = build_readiness(&pwm_inputs(2, 2, 0));
+        assert!(!has(&items, "pwm_control_unverified"));
+        assert!(!has(&items, "pwm_control_failed"));
+        assert!(has(&items, "pwm_controls_present"));
+    }
+
+    #[test]
+    fn a_failed_verdict_is_a_warning_and_is_not_counted_as_unverified() {
+        let items = build_readiness(&pwm_inputs(3, 1, 1));
+        let failed = get(&items, "pwm_control_failed");
+        assert_eq!(failed.severity, ReadinessSeverity::Warning);
+        assert!(failed.detail.starts_with("1 of 3 "), "{}", failed.detail);
+        assert!(!failed.blocks_control);
+        assert!(!failed.recommended_action.is_empty());
+        let unverified = get(&items, "pwm_control_unverified");
+        assert!(
+            unverified.detail.starts_with("1 of 3 "),
+            "{}",
+            unverified.detail
+        );
+
+        // Every header failed: the warning alone, no "not yet verified" note.
+        let all_failed = build_readiness(&pwm_inputs(2, 0, 2));
+        assert!(has(&all_failed, "pwm_control_failed"));
+        assert!(!has(&all_failed, "pwm_control_unverified"));
+        assert_eq!(overall_severity(&all_failed), ReadinessSeverity::Warning);
+    }
+
     #[test]
     fn monitor_unavailable_and_unknown_surface_as_items() {
         let items = build_readiness(&ReadinessInputs {
@@ -1060,6 +1154,8 @@ mod tests {
             unknown_sensor_count: 1,
             selected_cpu_present: Some(false),
             selected_mb_present: Some(false),
+            pwm_verified: 0,
+            pwm_failed: 0,
         });
         let loaded = superio_readiness_items(&report(true));
         let not_loaded = superio_readiness_items(&report(false));

@@ -490,6 +490,12 @@ pub struct AppState {
     /// AIO Phase 8 Batch 2 `§6` learned response bands. **Diagnostic evidence
     /// only — nothing in the control path reads this** (DEC-334).
     pub pwm_baselines: Arc<parking_lot::RwLock<Arc<crate::pwm_baselines::PwmBaselineStore>>>,
+    /// Per-header PWM-control verdicts (DEC-456): the latest conclusive verify
+    /// or characterisation result, published on `/hwmon/headers` and counted by
+    /// the `pwm_control_unverified` readiness item. Reported, never read by the
+    /// control path.
+    pub pwm_verification:
+        Arc<parking_lot::RwLock<Arc<crate::pwm_verification::PwmVerificationStore>>>,
     /// Prevents concurrent `POST /fans/openfan/rescan` probes (DEC-265).
     /// Two racing probes would open the same tty, and the loser would install
     /// a controller over the winner's — orphaning a poll loop on a transport
