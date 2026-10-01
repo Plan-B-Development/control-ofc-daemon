@@ -17,6 +17,45 @@ pub trait SerialTransport {
     /// Read a line from the serial port, with a timeout.
     /// Returns the line including any trailing `\r\n`.
     fn read_line(&mut self, timeout: Duration) -> Result<String, SerialError>;
+
+    /// Throw away whatever is queued for the device but not yet sent, so that
+    /// closing this transport does not wait for it to drain (`DC-ct`).
+    ///
+    /// Called only by the poll loop, just before it closes a controller that has
+    /// stopped answering. The kernel's last close of a tty waits up to the port's
+    /// `closing_wait` (30 s by default, which `cdc-acm` keeps) for queued output,
+    /// and a controller that is not reading never drains it. Best effort: a
+    /// transport with nothing to discard, or that cannot, does nothing.
+    fn discard_pending_output(&mut self) {}
+}
+
+/// What the shared transport slot holds while the poll loop is looking for a
+/// controller that stopped answering (`DC-ct`).
+///
+/// The loop closes the adopted port before its first reconnect attempt, because
+/// serialport opens with an exclusive `flock` and a re-open of the same node fails
+/// while the old descriptor lives. Something has to stay in the slot that
+/// `FanController` writes through until a replacement is adopted; this fails every
+/// call at once, so a write is reported failed without waiting out a serial
+/// timeout against a port that is no longer open.
+pub struct DisconnectedTransport;
+
+impl DisconnectedTransport {
+    const MESSAGE: &'static str = "OpenFan controller disconnected — reconnecting";
+}
+
+impl SerialTransport for DisconnectedTransport {
+    fn write_line(&mut self, _data: &str) -> Result<(), SerialError> {
+        Err(SerialError::Protocol {
+            message: Self::MESSAGE.to_string(),
+        })
+    }
+
+    fn read_line(&mut self, _timeout: Duration) -> Result<String, SerialError> {
+        Err(SerialError::Protocol {
+            message: Self::MESSAGE.to_string(),
+        })
+    }
 }
 
 /// Confirm that an already-open transport really is an OpenFanController.
@@ -565,5 +604,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── `DC-ct`: the placeholder the poll loop leaves in the slot ──
+
+    #[test]
+    fn a_write_through_the_disconnected_placeholder_fails_at_once_and_says_why() {
+        // `FanController` writes through the shared slot whatever it holds. While
+        // the loop is reconnecting it holds this, and a write must be reported
+        // failed — never `Ok`, which would claim the duty landed — without waiting
+        // out the serial timeout against a port that is no longer open.
+        let started = std::time::Instant::now();
+        let err = send_command(
+            &mut DisconnectedTransport,
+            &Command::SetPwm(Channel::new(0).unwrap(), 255),
+            Duration::from_secs(5),
+        )
+        .expect_err("a write to a closed controller must not succeed");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the placeholder waited {:?} instead of failing at once",
+            started.elapsed()
+        );
+        assert!(
+            err.to_string().contains("disconnected"),
+            "the error must say the controller is disconnected: {err}"
+        );
     }
 }

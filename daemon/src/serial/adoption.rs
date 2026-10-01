@@ -252,14 +252,12 @@ pub const RECONNECT_NEW_NODE_SLOW_RETRY: std::time::Duration = std::time::Durati
 /// 1. **The configured port**, when it resolves. The user named that device.
 /// 2. **The node the controller was adopted on**, while it is still the node it
 ///    was — same `(dev, ino)`: a controller that stopped answering without
-///    re-enumerating. **This open cannot succeed while the poll loop still holds
-///    the old port**: serialport opens with an exclusive `flock`, which root does
-///    not bypass, and the old transport is released only when a replacement is
-///    swapped in. It is kept because it is harmless — the node is already open,
-///    so it resets nothing — and closing the old port first is a separate
-///    decision (register row `DC-ct`). Once the node is seen missing or
-///    re-created, it is never probed again for this drop, because its name may now
-///    belong to someone else.
+///    re-enumerating. serialport opens with an exclusive `flock`, which root does
+///    not bypass, so this open succeeds only because the poll loop closes the old
+///    port before its first attempt (`release_adopted_port`, `DC-ct`). Re-opening
+///    does not reset an OpenFanController: its firmware has no DTR handler. Once
+///    the node is seen missing or re-created, it is never probed again for this
+///    drop, because its name may now belong to someone else.
 /// 3. **Every candidate node that appeared since the survey began** — a
 ///    `(path, NodeId)` pair not in the previous observation when first seen — on
 ///    every attempt for [`RECONNECT_NEW_NODE_WINDOW`] (and at least

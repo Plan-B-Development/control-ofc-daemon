@@ -18,6 +18,17 @@ fields and show the rails exactly as before.
   On an X870E AORUS MASTER this names all seven unlabelled `it8696` inputs (`+12V` reads ~2 V at the pin
   and ~12 V as the rail) and marks three of the `it87952`'s inputs as not mapped.
 
+### Fixed
+
+- **An OpenFan Controller that stops answering without being unplugged is now recovered without
+  restarting the daemon** (DEC-465, `DC-ct`). After 5 failed reads the daemon tries to reconnect,
+  and each try re-opens the controller's own device — but the daemon still held that device open
+  with an exclusive lock, so the re-open always failed and the controller (and its RPM readings)
+  stayed lost until a restart. The first try now closes the old connection before it re-opens the
+  device. Closing it does not reset the controller, and its fans keep their speed. While the daemon
+  is reconnecting, a speed change for an OpenFan channel is reported as failed straight away
+  ("OpenFan controller disconnected — reconnecting") instead of after a serial timeout.
+
 ## [3.2.0] — 2026-09-30
 
 Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor; GUI 3.2.0 uses the new

@@ -108,6 +108,17 @@ impl SerialTransport for RealSerialTransport {
 
         Ok(line)
     }
+
+    /// `tcflush(TCOFLUSH)`. On `cdc-acm` that reaches `acm_tty_flush_buffer`,
+    /// which unlinks the write URBs a controller that is not reading leaves
+    /// pending, so the close that follows is not held for `closing_wait`. The
+    /// reader is a `dup` of this descriptor — one open file description — so one
+    /// flush covers both.
+    fn discard_pending_output(&mut self) {
+        if let Err(e) = self.writer.clear(serialport::ClearBuffer::Output) {
+            log::debug!("openfan: could not discard pending output before closing: {e}");
+        }
+    }
 }
 
 /// List candidate serial ports without opening any `ttyACM`/`ttyUSB` (DEC-291).

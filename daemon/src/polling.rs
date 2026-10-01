@@ -965,6 +965,29 @@ fn reconnect_via_survey<T: SerialTransport + Send + 'static>(
     Some(adopted)
 }
 
+/// Close the adopted controller's port so a reconnect attempt can re-open its
+/// node (`DC-ct`).
+///
+/// serialport opens with an exclusive `flock` (`posix/tty.rs`), which root does
+/// not bypass, so while this descriptor lives every re-open of the same node
+/// fails, and a controller that stopped answering without leaving the bus could
+/// never be re-adopted. Closing it does not reset an OpenFanController: its
+/// firmware has no DTR handler, and its fans keep their duty.
+///
+/// The placeholder goes into the slot under the lock, and the old port is closed
+/// after the lock is released, so `FanController` is never kept waiting on a close.
+/// Queued output is discarded first, or the kernel's last close can wait up to
+/// 30 s for a controller that is not reading to drain it. Blocking: call it on
+/// the blocking pool.
+fn release_adopted_port(transport: &parking_lot::Mutex<Box<dyn SerialTransport + Send>>) {
+    let mut old = std::mem::replace(
+        &mut *transport.lock(),
+        Box::new(crate::serial::transport::DisconnectedTransport),
+    );
+    old.discard_pending_output();
+    drop(old);
+}
+
 /// The poll loop proper, with the reconnect probe as a parameter.
 ///
 /// `reconnect` runs on the blocking pool and returns a replacement transport, or
@@ -991,6 +1014,10 @@ async fn openfan_poll_loop_with<F>(
     let mut consecutive_errors: u32 = 0;
     let reconnect_threshold: u32 = RECONNECT_THRESHOLD;
     let mut reconnect_backoff: u32 = 1;
+    // `DC-ct`: whether this drop's first attempt has already closed the adopted
+    // port. Cleared by each adoption, so a controller that wedges again is
+    // closed again.
+    let mut adopted_port_released = false;
     // OFS-b: edge state for the short-frame log, so an incomplete frame is
     // reported once rather than at 1 Hz for as long as it persists.
     let mut short_frame_logged = false;
@@ -1025,12 +1052,25 @@ async fn openfan_poll_loop_with<F>(
             let t = timeout;
             let c = cache.clone();
             let probe = reconnect.clone();
-            let reconnect_result = tokio::task::spawn_blocking(move || probe(&c, t)).await;
+            // `DC-ct`: the first attempt closes the adopted port before it probes,
+            // or the probe's re-open of that node meets the old descriptor's
+            // `flock`. On the blocking pool with the probe, because the close can
+            // block.
+            let release = (!adopted_port_released).then(|| transport.clone());
+            adopted_port_released = true;
+            let reconnect_result = tokio::task::spawn_blocking(move || {
+                if let Some(slot) = release {
+                    release_adopted_port(&slot);
+                }
+                probe(&c, t)
+            })
+            .await;
 
             match reconnect_result {
                 Ok(Some(new_transport)) => {
                     let mut guard = transport.lock();
                     *guard = new_transport;
+                    adopted_port_released = false;
                     consecutive_errors = 0;
                     reconnect_backoff = 1;
                     log::info!("OpenFan Controller reconnected");
@@ -1308,6 +1348,219 @@ mod tests {
 
         assert!(adopted.is_none());
         assert_eq!(cache.openfan_write_generation(), before);
+    }
+
+    // ── `DC-ct`: the adopted port is closed before its node is re-probed ──
+
+    /// The controller's device node, standing in for the kernel: serialport's
+    /// exclusive `flock` is held for as long as a port opened on it lives, and a
+    /// second open fails meanwhile. `events` records what happened to it, in order.
+    #[derive(Default)]
+    struct Node {
+        locked: std::sync::atomic::AtomicBool,
+        events: parking_lot::Mutex<Vec<&'static str>>,
+    }
+
+    impl Node {
+        fn log(&self, e: &'static str) {
+            self.events.lock().push(e);
+        }
+        fn is_locked(&self) -> bool {
+            self.locked.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// A port open on `Node` whose controller has stopped answering: writes go
+    /// out, no reply ever comes back.
+    struct WedgedPort(Arc<Node>);
+
+    impl WedgedPort {
+        fn open(node: &Arc<Node>) -> Self {
+            node.locked.store(true, std::sync::atomic::Ordering::SeqCst);
+            Self(node.clone())
+        }
+    }
+
+    impl SerialTransport for WedgedPort {
+        fn write_line(&mut self, _data: &str) -> Result<(), crate::error::SerialError> {
+            Ok(())
+        }
+        fn read_line(&mut self, _t: Duration) -> Result<String, crate::error::SerialError> {
+            Err(crate::error::SerialError::Timeout { timeout_ms: 1 })
+        }
+        fn discard_pending_output(&mut self) {
+            self.0.log("discard");
+        }
+    }
+
+    impl Drop for WedgedPort {
+        fn drop(&mut self) {
+            self.0.log("close");
+            self.0
+                .locked
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A port on a controller that answers every `ReadAllRpm`, counting the polls.
+    struct AnsweringPort(Arc<std::sync::atomic::AtomicU32>);
+
+    impl SerialTransport for AnsweringPort {
+        fn write_line(&mut self, _data: &str) -> Result<(), crate::error::SerialError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn read_line(&mut self, _t: Duration) -> Result<String, crate::error::SerialError> {
+            Ok(openfan_replies().0[0].clone())
+        }
+    }
+
+    type Slot = Arc<parking_lot::Mutex<Box<dyn SerialTransport + Send>>>;
+
+    /// Run the REAL loop over `slot` with `reconnect` as its probe until `done`
+    /// holds or 5 s pass, then stop it. Returns whether `done` held.
+    async fn run_loop_until<F>(slot: Slot, reconnect: F, done: impl Fn() -> bool) -> bool
+    where
+        F: Fn(&Arc<StateCache>, Duration) -> Option<Box<dyn SerialTransport + Send>>
+            + Send
+            + Sync
+            + Clone
+            + 'static,
+    {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(openfan_poll_loop_with(
+            Arc::new(StateCache::new()),
+            slot,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            shutdown_rx,
+            reconnect,
+        ));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !done() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let reached = done();
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        reached
+    }
+
+    #[tokio::test]
+    async fn a_controller_wedged_on_its_own_node_is_re_adopted_once_its_port_is_closed() {
+        // The defect: the probe re-opened the adopted node while the slot still
+        // held the old port, the exclusive lock refused it on every attempt, and
+        // a controller that stopped answering without leaving the bus was never
+        // recovered without a restart. Here it answers again as soon as it is
+        // re-opened.
+        let node = Arc::new(Node::default());
+        let slot: Slot = Arc::new(parking_lot::Mutex::new(Box::new(WedgedPort::open(&node))));
+        let polls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let (n, p) = (node.clone(), polls.clone());
+        let reached = run_loop_until(
+            slot,
+            move |_c, _t| {
+                n.log("probe");
+                if n.is_locked() {
+                    return None; // EWOULDBLOCK from the old descriptor's flock
+                }
+                Some(Box::new(AnsweringPort(p.clone())) as Box<dyn SerialTransport + Send>)
+            },
+            || polls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        )
+        .await;
+
+        let events = node.events.lock().clone();
+        assert!(
+            reached,
+            "the controller was never re-adopted on its own node — every probe met \
+             the old port's lock: {events:?}"
+        );
+        assert_eq!(
+            &events[..events.len().min(3)],
+            ["discard", "close", "probe"],
+            "the old port's queued output must be discarded, then the port closed, \
+             BEFORE the first probe — a close left to the end, or one that drains, \
+             leaves the probe to meet the lock: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_controller_that_wedges_again_after_re_adoption_is_closed_again() {
+        // The release is once per drop, so it must re-arm at each adoption. The
+        // first re-open comes back wedged as well; only the second answers.
+        let node = Arc::new(Node::default());
+        let slot: Slot = Arc::new(parking_lot::Mutex::new(Box::new(WedgedPort::open(&node))));
+        let polls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let opens = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let (n, p, o) = (node.clone(), polls.clone(), opens.clone());
+        let reached = run_loop_until(
+            slot,
+            move |_c, _t| {
+                if n.is_locked() {
+                    return None;
+                }
+                let port: Box<dyn SerialTransport + Send> =
+                    if o.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        Box::new(WedgedPort::open(&n))
+                    } else {
+                        Box::new(AnsweringPort(p.clone()))
+                    };
+                Some(port)
+            },
+            || polls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        )
+        .await;
+
+        assert!(
+            opens.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "precondition: the first re-open never happened"
+        );
+        assert!(
+            reached,
+            "the re-adopted port was never closed when it wedged too, so its node \
+             stayed locked: {:?}",
+            node.events.lock()
+        );
+    }
+
+    #[tokio::test]
+    async fn while_reconnecting_the_slot_refuses_writes_at_once() {
+        // `FanController` writes through the same slot. Once the old port is
+        // closed the slot must fail every write — never report one landed — and
+        // must not hold the dead port, whose writes wait out the serial timeout.
+        let node = Arc::new(Node::default());
+        let slot: Slot = Arc::new(parking_lot::Mutex::new(Box::new(WedgedPort::open(&node))));
+        let probes = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let pr = probes.clone();
+        let reached = run_loop_until(
+            slot.clone(),
+            move |_c, _t| {
+                pr.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                None // the controller never comes back
+            },
+            || probes.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        )
+        .await;
+        assert!(
+            reached,
+            "precondition: the loop never attempted a reconnect"
+        );
+
+        let err = send_command(
+            &mut **slot.lock(),
+            &Command::ReadAllRpm,
+            Duration::from_millis(1),
+        )
+        .expect_err("a write while reconnecting must fail");
+        assert!(
+            err.to_string().contains("disconnected"),
+            "the slot still holds the old port (it answered `{err}`), not the \
+             disconnected placeholder"
+        );
     }
 
     // ── DEC-133: sensor descriptor cache ─────────────────────────────

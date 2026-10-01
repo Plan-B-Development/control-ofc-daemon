@@ -373,13 +373,20 @@ must stay findable. The survey is seeded with the candidate list the adoption wa
 made from, built at the adoption, and re-seeded on each reconnect. A tty present
 all along is never opened.
 
-**The adopted-node re-probe cannot rescue a wedged controller today.** serialport
-opens with an exclusive `flock`, which root does not bypass, and the loop holds the
-old port until a replacement is swapped in, so re-opening the same node fails. It
-resets nothing (the node is already open) and is kept; closing the old port first
-is register row `DC-ct`, a decision, because the close drops DTR and resets the
-controller. A controller that wedges without re-enumerating needs a daemon
-restart.
+**The first attempt of each drop closes the adopted port first** (`release_adopted_port`,
+DEC-465, `DC-ct`). serialport opens with an exclusive `flock`, which root does not
+bypass, so while the old descriptor lived every re-open of the same node failed and a
+controller that stopped answering without re-enumerating was never recovered without a
+restart. The loop now swaps a `DisconnectedTransport` into the shared slot under the
+lock, discards the old port's queued output (`tcflush(TCOFLUSH)` — on `cdc-acm` the last
+close otherwise waits up to the 30 s `closing_wait` for a controller that is not reading),
+closes it outside the lock, then probes; all of it on the blocking pool. Closing does not
+reset an OpenFanController (its firmware has no DTR handler) and its fans keep their duty.
+Until a controller is re-adopted, every write that reaches the slot — the engine's, the
+thermal force's — fails at once with "OpenFan controller disconnected — reconnecting"
+instead of waiting out a serial timeout. A controller that still took commands while
+never replying would no longer receive them once closed (`DC-dd`); no such mode is known
+for this firmware.
 
 **The detached search** (`post_boot_adoption_loop`, `api/handlers/openfan.rs`):
 
