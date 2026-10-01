@@ -36,6 +36,8 @@ pub mod superio;
 pub mod superio_probe;
 pub mod types;
 pub mod util;
+pub mod voltage_catalogue;
+mod voltage_catalogue_data;
 pub mod voltages;
 
 use types::{SensorDescriptor, SensorReading};

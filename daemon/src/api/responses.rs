@@ -1754,9 +1754,11 @@ pub struct HardwareDiagnosticsResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct VoltageEntry {
     /// Stable id `hwmon:<chip>:<device_id>:in<N>`. The label is deliberately
-    /// **not** embedded: a rail's label appears or changes when the user
-    /// installs an `/etc/sensors.d` file, and an id that moved with it would
-    /// break any client that had stored one.
+    /// **not** embedded: a rail's label can appear or change with a driver
+    /// update that starts publishing `inN_label`, or with a board-catalogue
+    /// name (DEC-464), and an id that moved with it would break any client that
+    /// had stored one. (An `/etc/sensors.d` file changes nothing here — only
+    /// libsensors reads it, never the kernel driver; `VOLT-b`.)
     pub id: String,
     /// Hwmon chip name (e.g. `it8696`).
     pub chip_name: String,
@@ -1778,6 +1780,51 @@ pub struct VoltageEntry {
     /// labelled. Presenting a divided 1.2 V reading with the same authority as
     /// a direct 3.3 V one is the specific failure this flag exists to prevent.
     pub identified: bool,
+    /// The rail this input is wired to on this board, from the board voltage
+    /// catalogue (`VOLT-b`, DEC-464, daemon >= 3.3.0; frankcrawford/it87's
+    /// Gigabyte configs, keyed on CPU platform + chip + SIV). Omitted when the
+    /// catalogue says nothing, and **never present on an `identified` channel**
+    /// — the driver's own label and scaling win. `identified` stays false here:
+    /// it remains the driver's claim alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board_label: Option<String>,
+    /// Present exactly when `board_label` is: the board's divider ratio, so the
+    /// rail voltage is `value_v * board_multiplier` (1.0 when the board feeds
+    /// the rail to the pin directly). `value_v` itself stays the pin voltage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board_multiplier: Option<f64>,
+    /// True when the board's config does not map this input (upstream `ignore
+    /// inN`: "not mapped by this SIV configuration"). It is not a named rail,
+    /// and `value_v` is its pin reading like any unidentified channel — but it
+    /// is **not** known to be unconnected: the X299 configs ignore an input for
+    /// one CPU family that they label `DRAM CH(A/B)` for the other. Never set
+    /// with `board_label`. Omitted when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub board_unmapped: bool,
+}
+
+impl From<crate::hwmon::voltages::VoltageDescriptor> for VoltageEntry {
+    fn from(v: crate::hwmon::voltages::VoltageDescriptor) -> Self {
+        use crate::hwmon::voltage_catalogue::BoardRail;
+        let (board_label, board_multiplier, board_unmapped) = match v.board {
+            Some(BoardRail::Named { label, multiplier }) => {
+                (Some(label.to_string()), Some(multiplier), false)
+            }
+            Some(BoardRail::Unmapped) => (None, None, true),
+            None => (None, None, false),
+        };
+        Self {
+            id: v.id,
+            chip_name: v.chip_name,
+            channel: v.channel,
+            label: v.label,
+            value_v: v.value_v,
+            identified: v.identified,
+            board_label,
+            board_multiplier,
+            board_unmapped,
+        }
+    }
 }
 
 /// Hwmon chip diagnostics.
@@ -2798,13 +2845,18 @@ mod tests {
 
         // `WIRE-ag`. Pinned from the first release that publishes it, so the
         // GUI cannot silently fail to model a rail — the WIRE-h failure mode.
+        // Every optional field populated so the key set covers them; no real
+        // entry carries a name AND board_unmapped (the enum makes them exclusive).
         let rail = VoltageEntry {
-            id: "hwmon:it8696:pci0:in7".into(),
+            id: "hwmon:it8696:pci0:in2".into(),
             chip_name: "it8696".into(),
-            channel: 7,
-            label: "3VSB".into(),
-            value_v: 3.288,
-            identified: true,
+            channel: 2,
+            label: "in2".into(),
+            value_v: 1.992,
+            identified: false,
+            board_label: Some("+12V".into()),
+            board_multiplier: Some(6.0),
+            board_unmapped: true,
         };
         expect(&serde_json::to_value(&rail).unwrap(), "VoltageEntry");
 
@@ -3210,6 +3262,9 @@ mod tests {
                 label: "in0".into(),
                 value_v: 1.236,
                 identified: false,
+                board_label: None,
+                board_multiplier: None,
+                board_unmapped: false,
             }],
         };
         expect(
@@ -3411,6 +3466,9 @@ mod tests {
             label: "in0".into(),
             value_v: 1.236,
             identified: false,
+            board_label: None,
+            board_multiplier: None,
+            board_unmapped: false,
         }]);
         let rails = populated["voltages"].as_array().expect("voltages array");
         assert_eq!(rails.len(), 1);
@@ -3418,6 +3476,11 @@ mod tests {
         assert_eq!(rails[0]["identified"], false);
         assert_eq!(rails[0]["label"], "in0");
         assert!((rails[0]["value_v"].as_f64().unwrap() - 1.236).abs() < 1e-9);
+        // `VOLT-b`: the catalogue fields are additive — absent, not null/false,
+        // when the catalogue says nothing, so an older client's rail is unchanged.
+        for key in ["board_label", "board_multiplier", "board_unmapped"] {
+            assert!(rails[0].get(key).is_none(), "{key} must be omitted");
+        }
     }
 
     #[test]

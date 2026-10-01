@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+Pairs with `control-ofc-gui` >= v3.3.0 to show the new voltage-rail names; older GUIs ignore the new
+fields and show the rails exactly as before.
+
+### Added
+
+- **Board voltage rails are named on Gigabyte boards** (DEC-464, `VOLT-b`). `GET /diagnostics/hardware`
+  now gives each voltage input the driver leaves unlabelled the rail it is wired to on this board
+  (`board_label`) and its divider (`board_multiplier`, so the rail voltage is `value_v *
+  board_multiplier`), or marks it `board_unmapped` when the board's config does not map it (that is not
+  a claim that it is unconnected). The facts come from the it87 driver project's per-board Gigabyte sensor
+  configs, matched on the CPU vendor, the chip and the board's firmware ID (SIV); see `NOTICE.md`. On X299
+  boards, whose maps depend on the CPU family, only the inputs both maps agree on are named. A channel the driver labels itself is never changed, and
+  `value_v` and `identified` keep their meaning, so a client that ignores the new fields is unaffected.
+  On an X870E AORUS MASTER this names all seven unlabelled `it8696` inputs (`+12V` reads ~2 V at the pin
+  and ~12 V as the rail) and marks three of the `it87952`'s inputs as not mapped.
+
 ## [3.2.0] — 2026-09-30
 
 Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor; GUI 3.2.0 uses the new

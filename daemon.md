@@ -116,7 +116,18 @@ daemon/src/
                          Display-only: nothing in the daemon reads a rail. Each entry
                          carries `identified` — true only where the driver labelled the
                          channel; an unlabelled channel is a raw ADC pin whose reading
-                         is NOT the rail voltage. Read-only sysfs, no port I/O
+                         is NOT the rail voltage. Read-only sysfs, no port I/O.
+                         `apply_board_catalogue` names unlabelled channels from
+                         `voltage_catalogue` (`VOLT-b`, DEC-464) — never a driver-
+                         labelled one — as `board_label`/`board_multiplier`/`board_unmapped`
+    voltage_catalogue.rs — board rail names, divider multipliers and the inputs a board's
+                         config does not map (NOT "unconnected"), keyed on CPU vendor +
+                         canonical chip + raw SIV word (`gigabyte_siv::read_siv_word`).
+                         The table itself is the GENERATED `voltage_catalogue_data.rs`,
+                         from frankcrawford/it87's Gigabyte sensor configs at a pinned
+                         commit (X299: only the inputs both CPU-family files agree on;
+                         GPL-2.0 facts, attributed in `NOTICE.md`); regenerate, never
+                         hand-edit
     power.rs           — CPU package power, read only inside a validation session
                          (DEC-335). Never on the 1 Hz poll and never consulted by the
                          control path. Deliberately NOT a SensorReading — a watt in

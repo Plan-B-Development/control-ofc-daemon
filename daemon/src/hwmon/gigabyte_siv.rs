@@ -75,6 +75,17 @@ pub fn parse_siv_word(mgid: u32) -> Option<GigabyteSiv> {
 /// change. It stays strict about the one thing that matters: anything that is
 /// not a hex word yields `None` rather than a partial number.
 pub fn parse_siv(raw: &str) -> Option<GigabyteSiv> {
+    parse_siv_text(raw).and_then(parse_siv_word)
+}
+
+/// Parse the sysfs attribute's text to the raw word, accepting only a word
+/// [`parse_siv_word`] would also accept — so the word and the decoded counts
+/// can never disagree about whether the descriptor is valid.
+///
+/// The word itself is what the board voltage catalogue keys on (`VOLT-b`,
+/// [`super::voltage_catalogue`]): it identifies a board family, which the
+/// decoded counts alone cannot — rebuilding it from them is lossy.
+pub fn parse_siv_text(raw: &str) -> Option<u32> {
     let trimmed = raw.trim();
     let digits = trimmed
         .strip_prefix("0x")
@@ -82,7 +93,16 @@ pub fn parse_siv(raw: &str) -> Option<GigabyteSiv> {
         .unwrap_or(trimmed);
     u32::from_str_radix(digits, 16)
         .ok()
-        .and_then(parse_siv_word)
+        .filter(|&word| parse_siv_word(word).is_some())
+}
+
+/// Read the raw SIV word at *path*. `None` on every failure, exactly as
+/// [`read_siv`] — which is this plus the decode.
+pub fn read_siv_word(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path)
+        .ok()
+        .as_deref()
+        .and_then(parse_siv_text)
 }
 
 /// Read and decode the SIV descriptor at *path*.
@@ -93,10 +113,7 @@ pub fn parse_siv(raw: &str) -> Option<GigabyteSiv> {
 /// `fan_count` would read as "this board has no fan headers", which is a
 /// stronger and completely wrong claim.
 pub fn read_siv(path: &Path) -> Option<GigabyteSiv> {
-    std::fs::read_to_string(path)
-        .ok()
-        .as_deref()
-        .and_then(parse_siv)
+    read_siv_word(path).and_then(parse_siv_word)
 }
 
 #[cfg(test)]
@@ -178,6 +195,19 @@ mod tests {
         std::fs::write(&path, X870E_AORUS_MASTER).expect("write");
         let siv = read_siv(&path).expect("decoded from disk");
         assert_eq!(siv.fan_count, 8);
+        assert_eq!(read_siv_word(&path), Some(0xA008_090A));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The raw word is what the voltage catalogue keys on, so it must refuse
+    /// exactly what the decode refuses — the driver's own `"unavailable"` text
+    /// included — rather than hand the catalogue a word the driver disowned.
+    #[test]
+    fn the_raw_word_refuses_what_the_decode_refuses() {
+        assert_eq!(parse_siv_text(X870E_AORUS_MASTER), Some(0xA008_090A));
+        assert_eq!(parse_siv_text("unavailable\n"), None);
+        assert_eq!(parse_siv_text("00000000"), None, "zero word");
+        assert_eq!(parse_siv_text("0008090A"), None, "zero platform nibble");
+        assert_eq!(read_siv_word(Path::new("/nonexistent/gigabyte_siv")), None);
     }
 }

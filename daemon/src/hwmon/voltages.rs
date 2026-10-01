@@ -19,7 +19,9 @@
 //! resistor divider that the driver knows nothing about, so the pin voltage and
 //! the rail voltage are different numbers. lm-sensors resolves this per board
 //! with `/etc/sensors.d` `compute` lines; this daemon reads none, and neither
-//! does the kernel.
+//! does the kernel. For the boards a public catalogue covers, the daemon
+//! carries the same facts itself — see [`apply_board_catalogue`] and
+//! [`super::voltage_catalogue`] (`VOLT-b`, DEC-464).
 //!
 //! That is why [`VoltageDescriptor::identified`] exists. A channel the driver
 //! labels (`3VSB`, `Vbat`, `+3.3V`) is one the driver claims to have identified,
@@ -53,15 +55,18 @@ use std::path::{Path, PathBuf};
 use crate::error::HwmonError;
 
 use super::util::{device_id_from_path, read_sysfs_string};
+use super::voltage_catalogue::BoardRail;
 
 /// A discovered board voltage rail: one hwmon `inN_input` channel.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VoltageDescriptor {
     /// Stable identifier `hwmon:<chip>:<device_id>:in<N>` — the label is
     /// deliberately **not** embedded, unlike the sensor id scheme. A rail's
-    /// label can appear or change when the user installs an
-    /// `/etc/sensors.d` file, and an id that moved with it would break any
-    /// client that had stored one. The channel index cannot move.
+    /// label can appear or change with a driver update that starts publishing
+    /// `inN_label`, or with a board-catalogue name (DEC-464), and an id that
+    /// moved with it would break any client that had stored one. The channel
+    /// index cannot move. (An `/etc/sensors.d` file changes nothing here: only
+    /// libsensors reads it, never the kernel driver — `VOLT-b`.)
     pub id: String,
     /// Hwmon chip name (e.g. `it8696`).
     pub chip_name: String,
@@ -77,6 +82,33 @@ pub struct VoltageDescriptor {
     /// True when the driver published an `inN_label` for this channel — i.e.
     /// when the rail is identified rather than a raw ADC channel.
     pub identified: bool,
+    /// What the board voltage catalogue says about this input, where it says
+    /// anything (DEC-464). Always `None` from [`discover_voltages`], and never
+    /// set on an `identified` channel — see [`apply_board_catalogue`].
+    pub board: Option<BoardRail>,
+}
+
+/// Annotate unlabelled rails from the board voltage catalogue (`VOLT-b`,
+/// DEC-464).
+///
+/// `cpu_vendor` is `chip_db::read_cpu_vendor`'s answer and `siv` the board's raw
+/// SIV word (`gigabyte_siv::read_siv_word`); either missing means no board can
+/// match, and every rail is left exactly as discovered.
+///
+/// **A channel the driver labelled is skipped, whatever the catalogue says.**
+/// The driver labels only the chip's internal inputs and has already scaled
+/// them, so a catalogue multiplier would scale them a second time; and the
+/// configs `ignore` those inputs on a secondary chip because they duplicate the
+/// primary chip's — the reference board's `it87952` reads a real 3.39 V on
+/// `3VSB` and 3.19 V on `Vbat`, both of which its config ignores.
+pub fn apply_board_catalogue(rails: &mut [VoltageDescriptor], cpu_vendor: &str, siv: Option<u32>) {
+    let Some(siv) = siv else {
+        return;
+    };
+    for rail in rails.iter_mut().filter(|r| !r.identified) {
+        rail.board =
+            super::voltage_catalogue::lookup(cpu_vendor, &rail.chip_name, siv, rail.channel);
+    }
 }
 
 /// Discover all board voltage rails under a given sysfs hwmon root.
@@ -220,6 +252,7 @@ fn discover_device_voltages(hwmon_dir: &Path) -> Result<Vec<VoltageDescriptor>, 
             label,
             value_v: millivolts / 1000.0,
             identified,
+            board: None,
         });
     }
 
@@ -507,8 +540,9 @@ mod tests {
         assert!(discover_voltages(root.path()).unwrap().is_empty());
     }
 
-    /// The id must not move when a label appears — a user dropping an
-    /// `/etc/sensors.d` file in must not invalidate a stored id.
+    /// The id must not move when a label appears — a driver update that starts
+    /// publishing `inN_label` must not invalidate a stored id. (Not an
+    /// `/etc/sensors.d` file: the kernel never reads one — `VOLT-b`.)
     #[test]
     fn id_is_stable_across_a_label_appearing() {
         let root = tempdir().unwrap();
@@ -521,5 +555,104 @@ mod tests {
         assert_eq!(before[0].id, after[0].id);
         assert_ne!(before[0].label, after[0].label);
         assert!(!before[0].identified && after[0].identified);
+    }
+    /// The reference board as measured: `it8696` + `it87952`, SIV `A008090A`.
+    fn reference_board(root: &Path) {
+        write_chip(
+            root,
+            "hwmon4",
+            "it8696",
+            &[
+                (2, "1992", None),
+                (7, "3288", Some("3VSB")),
+                (9, "3072", Some("+3.3V")),
+            ],
+        );
+        write_chip(
+            root,
+            "hwmon5",
+            "it87952",
+            &[
+                (0, "1804", None),
+                (2, "1826", None),
+                (3, "2332", Some("+3.3V")),
+                (7, "3388", Some("3VSB")),
+            ],
+        );
+    }
+
+    fn by(rails: &[VoltageDescriptor], chip: &str, ch: u8) -> VoltageDescriptor {
+        rails
+            .iter()
+            .find(|r| r.chip_name == chip && r.channel == ch)
+            .cloned()
+            .unwrap()
+    }
+
+    /// DEC-464: unlabelled inputs gain the catalogue's name and divider, or
+    /// its unmapped verdict. Asserted against the catalogue lookup itself, so the
+    /// test pins the wiring and not a restatement of the table.
+    #[test]
+    fn unlabelled_rails_are_annotated_from_the_board_catalogue() {
+        let root = tempdir().unwrap();
+        reference_board(root.path());
+        let mut rails = discover_voltages(root.path()).unwrap();
+        assert!(
+            rails.iter().all(|r| r.board.is_none()),
+            "discovery alone annotates nothing"
+        );
+
+        apply_board_catalogue(&mut rails, "AMD", Some(0xA008_090A));
+
+        for (chip, ch) in [("it8696", 2), ("it87952", 0), ("it87952", 2)] {
+            let rail = by(&rails, chip, ch);
+            let expected = super::super::voltage_catalogue::lookup("AMD", chip, 0xA008_090A, ch);
+            assert!(
+                expected.is_some(),
+                "precondition: the catalogue covers {chip} in{ch}"
+            );
+            assert_eq!(rail.board, expected, "{chip} in{ch}");
+        }
+        assert_eq!(by(&rails, "it87952", 0).board, Some(BoardRail::Unmapped));
+        // The discovered fields are untouched: the pin value stays the pin value.
+        assert!((by(&rails, "it8696", 2).value_v - 1.992).abs() < 1e-9);
+        assert_eq!(by(&rails, "it8696", 2).label, "in2");
+    }
+
+    /// DEC-464 Q2. The catalogue `ignore`s the secondary chip's `in7` (`3VSB`),
+    /// and the arm that discriminates is the one where the catalogue HAS an
+    /// entry for a driver-labelled channel: without the skip it would be marked
+    /// unmapped.
+    #[test]
+    fn a_driver_labelled_rail_is_never_annotated() {
+        let root = tempdir().unwrap();
+        reference_board(root.path());
+        let mut rails = discover_voltages(root.path()).unwrap();
+        assert_eq!(
+            super::super::voltage_catalogue::lookup("AMD", "it87952", 0xA008_090A, 7),
+            Some(BoardRail::Unmapped),
+            "precondition: the catalogue has an entry for this driver-labelled input"
+        );
+
+        apply_board_catalogue(&mut rails, "AMD", Some(0xA008_090A));
+
+        let vsb = by(&rails, "it87952", 7);
+        assert!(vsb.identified);
+        assert_eq!(vsb.board, None);
+    }
+
+    #[test]
+    fn no_siv_or_no_vendor_leaves_every_rail_as_discovered() {
+        let root = tempdir().unwrap();
+        reference_board(root.path());
+        let discovered = discover_voltages(root.path()).unwrap();
+
+        let mut no_siv = discovered.clone();
+        apply_board_catalogue(&mut no_siv, "AMD", None);
+        assert_eq!(no_siv, discovered);
+
+        let mut no_vendor = discovered.clone();
+        apply_board_catalogue(&mut no_vendor, "", Some(0xA008_090A));
+        assert_eq!(no_vendor, discovered);
     }
 }

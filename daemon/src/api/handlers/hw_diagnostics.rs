@@ -307,9 +307,12 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
     // detection, and gating on a vendor string would reintroduce the DMI
     // dependency this field exists to stop relying on. Read-only sysfs: one
     // small file, no port I/O, unaffected by the port-probe gate.
-    let board_firmware_counts = crate::hwmon::gigabyte_siv::read_siv(std::path::Path::new(
+    // Read as the raw word once: the decoded counts and the voltage catalogue
+    // key (`VOLT-b`) are then two views of one read, and cannot disagree.
+    let siv_word = crate::hwmon::gigabyte_siv::read_siv_word(std::path::Path::new(
         crate::hwmon::gigabyte_siv::GIGABYTE_SIV_PATH,
     ));
+    let board_firmware_counts = siv_word.and_then(crate::hwmon::gigabyte_siv::parse_siv_word);
 
     // DEC-105 / DEC-106: known-bad simultaneous-load detection. The
     // flagship case is (nct6687, nct6775) — both must never be loaded at
@@ -328,28 +331,14 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
         .collect();
     let module_collisions = diagnostics::detect_module_collisions(&chip_bindings);
 
-    // `WIRE-ag`: board voltage rails. Read-only sysfs on the same hwmon tree
-    // this handler already walks — no port I/O, unaffected by the port-probe
-    // gate, and on the `spawn_blocking` side like every other read here. A
-    // failed scan degrades to an empty list: a rail display is the least
-    // important thing on this response and must never fail the whole report.
-    let voltages: Vec<VoltageEntry> = crate::hwmon::voltages::discover_voltages(
+    // `WIRE-ag`: board voltage rails, named from the board catalogue where it
+    // covers this board (`VOLT-b`) — keyed on the same `cpu_vendor` and SIV
+    // word this response publishes.
+    let voltages = voltage_entries(
         std::path::Path::new(crate::hwmon::HWMON_SYSFS_ROOT),
-    )
-    .unwrap_or_else(|e| {
-        log::warn!("Voltage rail discovery failed: {e}");
-        Vec::new()
-    })
-    .into_iter()
-    .map(|v| VoltageEntry {
-        id: v.id,
-        chip_name: v.chip_name,
-        channel: v.channel,
-        label: v.label,
-        value_v: v.value_v,
-        identified: v.identified,
-    })
-    .collect();
+        &cpu_vendor,
+        siv_word,
+    );
 
     json_ok(
         StatusCode::OK,
@@ -386,9 +375,84 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
     )
 }
 
+/// The `voltages` array: discovery, then the board catalogue (`VOLT-b`,
+/// DEC-464), then the wire shape.
+///
+/// Read-only sysfs on the same hwmon tree this handler already walks — no port
+/// I/O, unaffected by the port-probe gate, and on the `spawn_blocking` side like
+/// every other read here. A failed scan degrades to an empty list: a rail
+/// display is the least important thing on this response and must never fail
+/// the whole report.
+fn voltage_entries(
+    hwmon_root: &std::path::Path,
+    cpu_vendor: &str,
+    siv_word: Option<u32>,
+) -> Vec<VoltageEntry> {
+    let mut rails = crate::hwmon::voltages::discover_voltages(hwmon_root).unwrap_or_else(|e| {
+        log::warn!("Voltage rail discovery failed: {e}");
+        Vec::new()
+    });
+    crate::hwmon::voltages::apply_board_catalogue(&mut rails, cpu_vendor, siv_word);
+    rails.into_iter().map(VoltageEntry::from).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `VOLT-b`: the handler's builder carries the catalogue through to the
+    /// wire — the arm only a wired call site can produce is a named, scaled
+    /// rail and an unmapped one; with no SIV the same tree reports neither.
+    #[test]
+    fn voltage_entries_carry_the_board_catalogue_onto_the_wire() {
+        let root = tempfile::tempdir().unwrap();
+        for (dir, chip, rails) in [
+            (
+                "hwmon4",
+                "it8696",
+                &[(2u8, "1992", None), (7, "3288", Some("3VSB"))][..],
+            ),
+            ("hwmon5", "it87952", &[(0u8, "1804", None)][..]),
+        ] {
+            let d = root.path().join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("name"), format!("{chip}\n")).unwrap();
+            for (ch, mv, label) in rails {
+                std::fs::write(d.join(format!("in{ch}_input")), mv).unwrap();
+                if let Some(l) = label {
+                    std::fs::write(d.join(format!("in{ch}_label")), l).unwrap();
+                }
+            }
+        }
+        let find = |entries: &[VoltageEntry], chip: &str, ch: u8| {
+            serde_json::to_value(
+                entries
+                    .iter()
+                    .find(|e| e.chip_name == chip && e.channel == ch)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+
+        let named = voltage_entries(root.path(), "AMD", Some(0xA008_090A));
+        let twelve = find(&named, "it8696", 2);
+        assert_eq!(twelve["board_label"], "+12V");
+        assert_eq!(twelve["board_multiplier"], 6.0);
+        assert_eq!(
+            twelve["label"], "in2",
+            "the driver's own fields are unchanged"
+        );
+        assert_eq!(find(&named, "it87952", 0)["board_unmapped"], true);
+        let vsb = find(&named, "it8696", 7);
+        assert!(vsb.get("board_label").is_none() && vsb.get("board_unmapped").is_none());
+
+        let plain = voltage_entries(root.path(), "AMD", None);
+        for entry in &plain {
+            let v = serde_json::to_value(entry).unwrap();
+            assert!(v.get("board_label").is_none(), "{v}");
+            assert!(v.get("board_unmapped").is_none(), "{v}");
+        }
+    }
 
     /// The `BRD-q` machine: an RDNA2 discrete card, which `select_primary_gpu`
     /// puts first, and an RDNA3 iGPU behind it.
