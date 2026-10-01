@@ -507,8 +507,8 @@ pub(crate) enum ForceReach<'a> {
         /// its control skipped, and the no-sensor floor then wrote a bare 40 % to
         /// fans the curve had been running at, say, 85 %. A member whose last
         /// duty is unknown (never written, handed back, a failed reply) gets the
-        /// bare floor, as before — except an OpenFan channel whose duty a
-        /// reconnect or resume lost, which gets full speed (DEC-401).
+        /// bare floor, as before. An OpenFan channel whose duty a reconnect or
+        /// resume lost is floored against the duty it held before (`TS-bc`).
         held: &'a HeldMembers,
     },
 }
@@ -937,10 +937,18 @@ impl OpenFanBackend {
     /// "Give back" here means the pre-emergency duties: when a 100 % emergency
     /// has ended, every channel `members` does not name gets its duty from before
     /// the force. With no emergency behind it this is [`WriteBackend::apply`].
+    ///
+    /// [SAFETY] `TS-bc`: `held` — the members of controls skipped this tick —
+    /// are put back at the duty they held before a reconnect or resume lost it,
+    /// in the same task. A skipped control commands nothing, so its fans hold
+    /// their last duty (DEC-269) only while the device keeps it, and a 12 V loss
+    /// brings the controller back at a 1000 rpm target. A channel whose duty
+    /// was unknown before the loss too is left alone.
     pub(crate) async fn apply_and_give_back(
         &mut self,
         commands: &[PwmCommand],
         members: &ProfileMembers,
+        held: &HeldMembers,
     ) {
         let unheld = self
             .held
@@ -950,11 +958,17 @@ impl OpenFanBackend {
             .any(|ch| !members.openfan.contains(ch));
         let give_back =
             (unheld || self.pre_emergency.lock().is_some()).then(|| members.openfan.clone());
-        self.write(commands, give_back).await;
+        self.write(commands, give_back, &held.0.openfan).await;
     }
 
-    /// `apply`'s body, with the optional give-back folded into the same task.
-    async fn write(&mut self, commands: &[PwmCommand], give_back: Option<HashSet<u8>>) {
+    /// `apply`'s body, with the optional give-back and the `TS-bc` put-back of
+    /// `put_back`'s lost duties folded into the same task.
+    async fn write(
+        &mut self,
+        commands: &[PwmCommand],
+        give_back: Option<HashSet<u8>>,
+        put_back: &HashSet<u8>,
+    ) {
         let chans: Vec<(u8, u8)> = commands
             .iter()
             .filter(|c| c.source == "openfan")
@@ -977,11 +991,21 @@ impl OpenFanBackend {
                 Some((ch, cmd.pwm_percent))
             })
             .collect();
+        // `TS-bc`: a skipped control's channel that no other control commands
+        // this tick, in channel order. Whether it has a lost duty to put back is
+        // read under the controller lock in the task, with the write.
+        let put_back: Vec<u8> = (0..NUM_CHANNELS)
+            .filter(|ch| put_back.contains(ch) && !chans.iter().any(|&(c, _)| c == *ch))
+            .collect();
         // DEC-289: only a true no-op when nothing is outstanding either. With a
         // write still pending, this call is what re-awaits it — returning here
         // would leave a finished write unharvested and its stall stamp set
         // forever, reporting `crit` for a device that had recovered.
-        if chans.is_empty() && give_back.is_none() && !self.writes.outstanding() {
+        if chans.is_empty()
+            && put_back.is_empty()
+            && give_back.is_none()
+            && !self.writes.outstanding()
+        {
             return;
         }
         let ctrl = self.ctrl.clone();
@@ -1028,6 +1052,35 @@ impl OpenFanBackend {
                         Some((ch, res))
                     })
                     .collect::<Vec<(u8, Result<(), String>)>>();
+                // [SAFETY] `TS-bc`: put a skipped control's channel back at the
+                // duty a reconnect or resume lost, under the same lock and pause
+                // re-check as the commands above (DEC-191). Its results join the
+                // commands' failure accounting: an engine write either way. Once
+                // one lands the duty is known again, so it is sent once.
+                for ch in put_back {
+                    let mut guard = ctrl.lock();
+                    if cache.verify_active() {
+                        break;
+                    }
+                    let Some(duty) = guard.duty_before_loss(ch) else {
+                        continue;
+                    };
+                    let res = guard.set_pwm(ch, duty);
+                    drop(guard);
+                    // DEC-451: a channel the engine wrote is held until a profile
+                    // stops naming it. Taken after the lock is dropped — the two
+                    // are never held together — and for a failed write too, which
+                    // may still have landed.
+                    held.lock().channels.insert(ch);
+                    if res.is_ok() {
+                        log::info!(
+                            "OpenFan channel {ch}: put back at {duty} %, its duty before the \
+                             controller reconnected or the host resumed — the control that \
+                             drives it is not being commanded"
+                        );
+                    }
+                    results.push((ch, res.map(|_| ()).map_err(|e| e.to_string())));
+                }
                 if let Some(members) = give_back {
                     results.extend(give_back_openfan(
                         &ctrl,
@@ -1169,7 +1222,7 @@ impl WriteBackend for OpenFanBackend {
     /// Gives nothing back: it has no member set to judge "nothing holds this"
     /// by. The engine calls [`OpenFanBackend::apply_and_give_back`] (DEC-382).
     async fn apply(&mut self, commands: &[PwmCommand]) {
-        self.write(commands, None).await;
+        self.write(commands, None, &HashSet::new()).await;
     }
 }
 
@@ -1196,9 +1249,12 @@ fn record_pre_emergency(
     let duties: Vec<Option<u8>> = if cache.verify_active() {
         vec![None; NUM_CHANNELS as usize]
     } else {
+        // `TS-bc`: a duty a reconnect or resume lost is recorded as the duty it
+        // held before, so the give-back puts it back; one unknown before the loss
+        // too stays unknown, and so at the forced duty.
         let guard = ctrl.lock();
         (0..NUM_CHANNELS)
-            .map(|ch| guard.last_commanded_pct(ch))
+            .map(|ch| guard.last_known_duty(ch))
             .collect()
     };
     let mut slot = pre_emergency.lock();
@@ -1226,7 +1282,8 @@ fn give_back_openfan(
 /// Release every channel the engine commanded that `members` no longer names
 /// (DEC-451, `BRD-u`): leave it at `exit_duty(its last duty, exit floor)` —
 /// DEC-388's stop rule, applied when the engine lets go — so it is never
-/// lowered, and one whose duty is unknown goes to full speed. An exit floor of
+/// lowered, and one whose duty is unknown goes to full speed. A duty a
+/// reconnect or resume lost counts as the duty it held before (`TS-bc`). An exit floor of
 /// 0 writes nothing. Before this such a channel kept the previous profile's
 /// duty, 0 included (an OpenFan 0 % lasts while it is commanded, DEC-426),
 /// until a clean stop.
@@ -1255,10 +1312,15 @@ fn release_unheld_openfan(
         if cache.verify_active() {
             return;
         }
-        let was = guard.last_commanded_pct(ch);
+        // `TS-bc`: a duty a reconnect or resume lost is judged by the duty it
+        // held before. "Already there" is judged by what the DEVICE was last
+        // told, never by that remembered duty: after a loss the device may be at
+        // its power-on default, so the exit duty must still be written.
+        let was = guard.last_known_duty(ch);
+        let on_device = guard.last_commanded_pct(ch);
         let target = (floor > 0)
             .then(|| crate::pwm::exit_duty(was, floor))
-            .filter(|to| Some(*to) != was);
+            .filter(|to| Some(*to) != on_device);
         let written = target.map(|to| (to, guard.set_pwm(ch, to)));
         drop(guard);
         let describe =
@@ -1267,7 +1329,13 @@ fn release_unheld_openfan(
             None => {
                 log::info!(
                     "OpenFan channel {ch}: no profile control commands it any more — left at {}",
-                    describe(was)
+                    describe(on_device)
+                );
+            }
+            Some((to, Ok(_))) if was == Some(to) => {
+                log::info!(
+                    "OpenFan channel {ch}: no profile control commands it any more — put back \
+                     at {to} %, its duty before the controller reconnected or the host resumed"
                 );
             }
             Some((to, Ok(_))) => {
@@ -1425,11 +1493,12 @@ impl SafetyWriteBackend for OpenFanBackend {
         };
         // `TS-p`: the channels of controls skipped this tick hold their last
         // duty under the floor. Read per channel under the lock the write takes.
-        // [SAFETY] DEC-401 (`TS-av`): a channel whose duty a reconnect or resume
-        // lost (`TS-ak`) gets full speed, as the exit floor gives a lost duty
-        // (DEC-388) — the device may have come back at its power-on default and
-        // the floor could lower it. Any other unknown — never written, or a
-        // failed reply — still gets the bare floor (DEC-386 decision 4).
+        // [SAFETY] `TS-bc` (superseding DEC-401's full speed): a channel whose
+        // duty a reconnect or resume lost (`TS-ak`) holds the duty it had before
+        // the loss — the device may have come back at its power-on default, so
+        // that duty is written again rather than coalesced against. One whose
+        // duty was unknown before the loss too — never written, or a failed
+        // reply — gets the bare floor, as every unknown does (DEC-386 decision 4).
         let held: HashSet<u8> = match reach {
             ForceReach::ProfileMembers { held, .. } => held.0.openfan.clone(),
             ForceReach::All => HashSet::new(),
@@ -1468,11 +1537,7 @@ impl SafetyWriteBackend for OpenFanBackend {
                     let mut guard = ctrl.lock();
                     let held_duty = held
                         .contains(&ch)
-                        .then(|| {
-                            guard
-                                .last_commanded_pct(ch)
-                                .or_else(|| guard.duty_lost_to_reconnect(ch).then_some(100))
-                        })
+                        .then(|| guard.last_known_duty(ch))
                         .flatten();
                     let duty = floors
                         .get(&ch)
@@ -4886,13 +4951,14 @@ mod tests {
         }
     }
 
-    /// [SAFETY] `TS-ak` + DEC-401 (`TS-av`): after a reconnect or resume the
-    /// held channel's last duty is unknown — never the duty it held before the
-    /// device may have lost it — and a duty lost that way gets full speed, not
-    /// the bare floor. Channel 0 is the force's first target, so no `set_pwm` has
-    /// observed the bump when it is read.
+    /// [SAFETY] `TS-bc` (superseding DEC-401's full speed): after a reconnect or
+    /// resume a held channel holds the duty it had before the loss, and that
+    /// duty is WRITTEN — the device may have come back at its power-on default,
+    /// so it is put back rather than coalesced against (`TS-ak`). Channel 0 is
+    /// the force's first target, so no `set_pwm` has observed the bump when it
+    /// is read.
     #[tokio::test]
-    async fn a_held_openfan_channel_whose_duty_was_lost_gets_full_speed() {
+    async fn a_held_openfan_channel_whose_duty_was_lost_holds_the_duty_it_had() {
         let (mut be, written, cache) = openfan_backend();
         be.ctrl.lock().set_pwm(0, 85).unwrap();
         cache.invalidate_openfan_writes();
@@ -4920,8 +4986,8 @@ mod tests {
                 .iter()
                 .map(|f| f.trim_end().to_string())
                 .collect::<Vec<_>>(),
-            [">0200FF"],
-            "one frame, at full speed — neither the pre-reconnect 85 % nor the 40 % floor"
+            [">0200D9"],
+            "one frame, at the pre-reconnect 85 % — neither full speed nor the 40 % floor"
         );
     }
 
@@ -4996,17 +5062,17 @@ mod tests {
         .await;
     }
 
-    /// [SAFETY] DEC-401: EVERY held channel whose duty a reconnect lost gets
-    /// full speed — not only the force's first target. Channel 0's own write
-    /// observes the bump and clears every channel's duty, so channel 2 is read
-    /// after that, through the controller's record rather than the pending
-    /// generation. The landed 100 % is then the channel's last duty, so the next
-    /// forced tick holds it and sends nothing.
+    /// [SAFETY] `TS-bc`: EVERY held channel whose duty a reconnect lost is
+    /// floored against the duty it had — not only the force's first target.
+    /// Channel 0's own write observes the bump, so channel 2 is read after that,
+    /// through the remembered duty rather than the pending generation; its 30 %
+    /// is below the floor, so it gets `max(30, 40)`. The landed duties are then
+    /// known, so the next forced tick holds them and sends nothing.
     #[tokio::test]
-    async fn every_held_channel_whose_duty_was_lost_gets_full_speed() {
+    async fn every_held_channel_whose_duty_was_lost_holds_the_duty_it_had() {
         let (mut be, written, cache, _fail) = echo_openfan_backend();
         be.ctrl.lock().set_pwm(0, 85).unwrap();
-        be.ctrl.lock().set_pwm(2, 50).unwrap();
+        be.ctrl.lock().set_pwm(2, 30).unwrap();
         cache.invalidate_openfan_writes();
         let before = written.lock().len();
 
@@ -5015,20 +5081,51 @@ mod tests {
             .iter()
             .map(|f| f.trim_end().to_string())
             .collect();
-        assert_eq!(frames, [">0200FF", ">0202FF"]);
+        let raw = |pct: u8| crate::pwm::percent_to_raw(pct);
+        assert_eq!(
+            frames,
+            [
+                format!(">0200{:02X}", raw(85)),
+                format!(">0202{:02X}", raw(40))
+            ]
+        );
 
         let before = written.lock().len();
         force_held_openfan(&mut be, &[0, 2], 40).await;
         assert_eq!(
             written.lock().len(),
             before,
-            "the next forced tick holds the landed 100 % and writes nothing"
+            "the next forced tick holds the landed duties and writes nothing"
         );
     }
 
-    /// [SAFETY] DEC-401 keeps DEC-386 decision 4 for every OTHER unknown: a held
-    /// channel never written, and one whose last reply failed, get the bare
-    /// floor — the user chose full speed for the reconnect/resume case only.
+    /// [SAFETY] `TS-bc`, the user's choice for the case with nothing to put back:
+    /// a held channel whose duty was already unknown when a reconnect lost it
+    /// (its last reply had failed) gets the bare floor, like every other unknown
+    /// (DEC-386 decision 4) — no longer DEC-401's full speed.
+    #[tokio::test]
+    async fn a_held_channel_whose_duty_was_unknown_before_the_loss_gets_the_bare_floor() {
+        let (mut be, written, cache, fail) = echo_openfan_backend();
+        be.ctrl.lock().set_pwm(1, 60).unwrap();
+        fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(be.ctrl.lock().set_pwm(1, 85).is_err(), "precondition");
+        fail.store(false, std::sync::atomic::Ordering::Relaxed);
+        cache.invalidate_openfan_writes();
+        assert_eq!(be.ctrl.lock().last_known_duty(1), None, "precondition");
+        let before = written.lock().len();
+
+        force_held_openfan(&mut be, &[1], 40).await;
+        let raw_40 = crate::pwm::percent_to_raw(40);
+        let frames: Vec<String> = written.lock()[before..]
+            .iter()
+            .map(|f| f.trim_end().to_string())
+            .collect();
+        assert_eq!(frames, [format!(">0201{raw_40:02X}")]);
+    }
+
+    /// [SAFETY] DEC-386 decision 4 for every unknown that is not a remembered
+    /// pre-loss duty (`TS-bc`): a held channel never written, and one whose last
+    /// reply failed, get the bare floor.
     #[tokio::test]
     async fn a_held_channel_never_written_or_whose_reply_failed_keeps_the_bare_floor() {
         let (mut be, written, _cache, fail) = echo_openfan_backend();
@@ -5050,20 +5147,26 @@ mod tests {
         );
     }
 
-    /// [SAFETY] `TS-ak`: a reconnect or resume before an emergency leaves every
-    /// channel's pre-emergency duty unknown, and an unknown duty is never given
-    /// back — the channel stays at the forced duty rather than returning to one
-    /// the device may no longer have held.
+    /// [SAFETY] `TS-bc` (reversing DEC-393's "not given back"): a reconnect or
+    /// resume before an emergency records the duty a channel held before the
+    /// loss, and the give-back puts it back. A channel whose duty was unknown
+    /// before the loss too (its last reply had failed) is still never given back
+    /// — it stays at the forced duty (DEC-382).
     #[tokio::test]
-    async fn a_duty_lost_before_the_emergency_is_not_given_back() {
-        let (mut be, written, cache) = openfan_backend();
-        be.ctrl.lock().set_pwm(0, 30).unwrap();
+    async fn a_duty_lost_before_the_emergency_is_given_back_as_it_was() {
+        let (mut be, written, cache, fail) = echo_openfan_backend();
+        be.ctrl.lock().set_pwm(0, 70).unwrap();
+        be.ctrl.lock().set_pwm(1, 60).unwrap();
+        fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(be.ctrl.lock().set_pwm(1, 70).is_err(), "precondition");
+        fail.store(false, std::sync::atomic::Ordering::Relaxed);
         cache.invalidate_openfan_writes();
 
         be.force_all_with_floor(100, &[], ForceReach::All).await;
         assert!(
-            written.lock().iter().any(|f| f.trim_end() == ">0200FF"),
-            "precondition: the emergency drives channel 0"
+            written.lock().iter().any(|f| f.trim_end() == ">0200FF")
+                && written.lock().iter().any(|f| f.trim_end() == ">0201FF"),
+            "precondition: the emergency drives channels 0 and 1"
         );
 
         let before = written.lock().len();
@@ -5079,10 +5182,18 @@ mod tests {
         )
         .await;
         let w = written.lock();
-        assert!(
-            w[before..].is_empty(),
-            "no channel may be given back a pre-reconnect duty; got {:?}",
-            &w[before..]
+        assert_eq!(
+            w[before..]
+                .iter()
+                .map(|f| f.trim_end().to_string())
+                .collect::<Vec<_>>(),
+            [format!(
+                ">0200{:02X}",
+                crate::pwm::percent_to_raw(crate::pwm::exit_duty(Some(70), cache.exit_floor_pct()))
+            )],
+            "channel 0 gets its pre-reconnect 70 % back (raised to the exit floor, DEC-451); \
+             channel 1, unknown before the loss, and the never-written channels stay at the \
+             forced duty"
         );
     }
 
@@ -5581,13 +5692,16 @@ mod tests {
                     cmd("openfan:ch01", "openfan", 20),
                 ],
                 &openfan_members(&[0, 1]),
+                &HeldMembers::default(),
             )
             .await;
             written.lock().clear();
 
             let b = openfan_members(&[1]);
-            be.apply_and_give_back(&[], &b).await;
-            be.apply_and_give_back(&[], &b).await;
+            be.apply_and_give_back(&[], &b, &HeldMembers::default())
+                .await;
+            be.apply_and_give_back(&[], &b, &HeldMembers::default())
+                .await;
 
             let want: Vec<String> = expect.map(hex).into_iter().collect();
             assert_eq!(
@@ -5600,6 +5714,198 @@ mod tests {
                 "a channel B names is B's"
             );
         }
+    }
+
+    /// [SAFETY] `TS-bc`, DEC-451's half: a channel a switch drops after a
+    /// reconnect or resume is released from the duty it had before the loss —
+    /// `exit_duty(70, 50)` = 70 — not from "unknown", which would send it to full
+    /// speed. And it IS written, although 70 is also what the daemon last knew:
+    /// the device may be at its power-on default, so "already there" is judged
+    /// by what the device was last told.
+    #[tokio::test]
+    async fn an_openfan_channel_a_switch_drops_after_a_loss_is_released_from_its_old_duty() {
+        let hex = |pct: u8| format!("{:02X}", crate::pwm::percent_to_raw(pct));
+        let (mut be, written, cache, _fail) = echo_openfan_backend();
+        cache.set_exit_floor_pct(50);
+        be.apply_and_give_back(
+            &[cmd("openfan:ch00", "openfan", 70)],
+            &openfan_members(&[0]),
+            &HeldMembers::default(),
+        )
+        .await;
+        cache.invalidate_openfan_writes();
+        written.lock().clear();
+
+        let b = openfan_members(&[]);
+        be.apply_and_give_back(&[], &b, &HeldMembers::default())
+            .await;
+        be.apply_and_give_back(&[], &b, &HeldMembers::default())
+            .await;
+
+        assert_eq!(
+            openfan_values(&written, 0),
+            [hex(crate::pwm::exit_duty(Some(70), 50))],
+            "one release, at the pre-loss duty raised to the floor"
+        );
+    }
+
+    // ── `TS-bc`: a skipped control's lost duty is put back on an ordinary tick
+
+    /// [SAFETY] `TS-bc`, the row's scenario. A skipped control commands nothing,
+    /// so its channel holds whatever the device has — its last duty while the
+    /// controller keeps it, but 1000 rpm after a 12 V loss. After a reconnect or
+    /// resume the ordinary tick puts it back at the duty it had, once; the
+    /// evaluated control's channel takes its own command as usual.
+    #[tokio::test]
+    async fn a_skipped_control_s_lost_duty_is_put_back_once_on_an_ordinary_tick() {
+        let hex = |pct: u8| format!("{:02X}", crate::pwm::percent_to_raw(pct));
+        let (mut be, written, cache, _fail) = echo_openfan_backend();
+        let members = openfan_members(&[0, 2]);
+        be.apply_and_give_back(
+            &[
+                cmd("openfan:ch00", "openfan", 60),
+                cmd("openfan:ch02", "openfan", 85),
+            ],
+            &members,
+            &HeldMembers::default(),
+        )
+        .await;
+        let skipped = HeldMembers(openfan_members(&[2]));
+
+        cache.invalidate_openfan_writes();
+        written.lock().clear();
+        be.apply_and_give_back(&[cmd("openfan:ch00", "openfan", 70)], &members, &skipped)
+            .await;
+
+        assert_eq!(openfan_values(&written, 0), [hex(70)]);
+        assert_eq!(
+            openfan_values(&written, 2),
+            [hex(85)],
+            "the skipped channel is put back at its pre-loss 85 %"
+        );
+        assert_eq!(be.ctrl.lock().last_commanded_pct(2), Some(85));
+
+        // Presence above, absence here: once landed, the duty is known again.
+        written.lock().clear();
+        be.apply_and_give_back(&[cmd("openfan:ch00", "openfan", 70)], &members, &skipped)
+            .await;
+        be.apply_and_give_back(&[cmd("openfan:ch00", "openfan", 70)], &members, &skipped)
+            .await;
+        assert!(
+            written.lock().is_empty(),
+            "nothing is re-sent once the put-back landed: {:?}",
+            written.lock()
+        );
+    }
+
+    /// [SAFETY] `TS-bc`: what is NOT put back. With no loss a skipped channel is
+    /// held by writing nothing; a channel another control commands takes that
+    /// command alone; one whose duty was unknown before the loss too (its last
+    /// reply had failed) is left alone, by the user's choice; one never written
+    /// has nothing to put back. Channel 3 is the presence check: its lost duty
+    /// IS put back in the same tick, so the absences are not a write phase that
+    /// did nothing.
+    #[tokio::test]
+    async fn a_put_back_skips_known_commanded_unknown_and_never_written_channels() {
+        let hex = |pct: u8| format!("{:02X}", crate::pwm::percent_to_raw(pct));
+        let (mut be, written, cache, fail) = echo_openfan_backend();
+        let members = openfan_members(&[0, 1, 2, 3]);
+        let skipped = HeldMembers(members.clone());
+        be.apply_and_give_back(
+            &[
+                cmd("openfan:ch00", "openfan", 60),
+                cmd("openfan:ch01", "openfan", 40),
+                cmd("openfan:ch03", "openfan", 75),
+            ],
+            &members,
+            &HeldMembers::default(),
+        )
+        .await;
+        written.lock().clear();
+        be.apply_and_give_back(&[], &members, &skipped).await;
+        assert!(
+            written.lock().is_empty(),
+            "no loss: every skipped channel holds by writing nothing"
+        );
+
+        fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(be.ctrl.lock().set_pwm(0, 85).is_err(), "precondition");
+        fail.store(false, std::sync::atomic::Ordering::Relaxed);
+        cache.invalidate_openfan_writes();
+        written.lock().clear();
+
+        be.apply_and_give_back(&[cmd("openfan:ch01", "openfan", 55)], &members, &skipped)
+            .await;
+
+        assert_eq!(openfan_values(&written, 3), [hex(75)], "presence");
+        assert!(
+            openfan_values(&written, 0).is_empty(),
+            "unknown before the loss"
+        );
+        assert_eq!(openfan_values(&written, 1), [hex(55)], "its command alone");
+        assert!(openfan_values(&written, 2).is_empty(), "never written");
+    }
+
+    /// [SAFETY] `TS-bc`: a put-back whose reply fails keeps the remembered duty,
+    /// so the next tick sends it again; its failure counts in the channel's
+    /// streak, like any engine write's.
+    #[tokio::test]
+    async fn a_failed_put_back_is_retried_on_the_next_tick() {
+        let hex = |pct: u8| format!("{:02X}", crate::pwm::percent_to_raw(pct));
+        let (mut be, written, cache, fail) = echo_openfan_backend();
+        let members = openfan_members(&[3]);
+        let skipped = HeldMembers(members.clone());
+        be.apply_and_give_back(
+            &[cmd("openfan:ch03", "openfan", 80)],
+            &members,
+            &HeldMembers::default(),
+        )
+        .await;
+        cache.invalidate_openfan_writes();
+        written.lock().clear();
+
+        fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        be.apply_and_give_back(&[], &members, &skipped).await;
+        assert_eq!(be.channel_failure_streak(3), 1);
+        fail.store(false, std::sync::atomic::Ordering::Relaxed);
+        be.apply_and_give_back(&[], &members, &skipped).await;
+        be.apply_and_give_back(&[], &members, &skipped).await;
+
+        assert_eq!(
+            openfan_values(&written, 3),
+            [hex(80), hex(80)],
+            "sent, failed, sent again — then known"
+        );
+        assert_eq!(be.channel_failure_streak(3), 0);
+    }
+
+    /// [SAFETY] `TS-bc`: while a diagnostic holds the engine write-pause the
+    /// put-back waits — an OpenFan calibration owns the channel (DEC-191) — and
+    /// it goes out once the pause ends.
+    #[tokio::test]
+    async fn a_put_back_waits_while_a_diagnostic_holds_the_write_pause() {
+        let hex = |pct: u8| format!("{:02X}", crate::pwm::percent_to_raw(pct));
+        let (mut be, written, cache, _fail) = echo_openfan_backend();
+        let members = openfan_members(&[0]);
+        let skipped = HeldMembers(members.clone());
+        be.apply_and_give_back(
+            &[cmd("openfan:ch00", "openfan", 65)],
+            &members,
+            &HeldMembers::default(),
+        )
+        .await;
+        cache.invalidate_openfan_writes();
+        written.lock().clear();
+        let claimed = cache
+            .try_begin_verify(std::time::Duration::from_secs(30))
+            .expect("the pause is free");
+
+        be.apply_and_give_back(&[], &members, &skipped).await;
+        assert!(written.lock().is_empty(), "nothing under the pause");
+
+        cache.end_verify(claimed);
+        be.apply_and_give_back(&[], &members, &skipped).await;
+        assert_eq!(openfan_values(&written, 0), [hex(65)]);
     }
 
     /// DEC-451: a profile that has only ever run under the members-only force
@@ -5624,7 +5930,8 @@ mod tests {
         let hex = |pct: u8| format!("{:02X}", crate::pwm::percent_to_raw(pct));
         assert_eq!(openfan_values(&written, 0), vec![hex(40)], "precondition");
 
-        be.apply_and_give_back(&[], &openfan_members(&[])).await;
+        be.apply_and_give_back(&[], &openfan_members(&[]), &HeldMembers::default())
+            .await;
 
         assert_eq!(openfan_values(&written, 0), vec![hex(40), hex(50)]);
     }
@@ -5642,12 +5949,14 @@ mod tests {
                 cmd("openfan:ch12", "openfan", 20),
             ],
             &openfan_members(&[0, 12]),
+            &HeldMembers::default(),
         )
         .await;
         assert!(be.held.lock().channels.contains(&0), "precondition");
         assert!(!be.held.lock().channels.contains(&12));
 
-        be.apply_and_give_back(&[], &openfan_members(&[])).await;
+        be.apply_and_give_back(&[], &openfan_members(&[]), &HeldMembers::default())
+            .await;
         assert!(be.held.lock().channels.is_empty());
     }
 
@@ -5695,6 +6004,7 @@ mod tests {
         be.apply_and_give_back(
             &[cmd("openfan:ch00", "openfan", 20)],
             &openfan_members(&[0]),
+            &HeldMembers::default(),
         )
         .await;
         assert!(
@@ -5703,8 +6013,10 @@ mod tests {
         );
 
         failing.store(true, std::sync::atomic::Ordering::SeqCst);
-        be.apply_and_give_back(&[], &openfan_members(&[])).await;
-        be.apply_and_give_back(&[], &openfan_members(&[])).await;
+        be.apply_and_give_back(&[], &openfan_members(&[]), &HeldMembers::default())
+            .await;
+        be.apply_and_give_back(&[], &openfan_members(&[]), &HeldMembers::default())
+            .await;
         assert!(
             be.held.lock().channels.contains(&0),
             "still held, so retried"
@@ -5716,7 +6028,8 @@ mod tests {
         );
 
         failing.store(false, std::sync::atomic::Ordering::SeqCst);
-        be.apply_and_give_back(&[], &openfan_members(&[])).await;
+        be.apply_and_give_back(&[], &openfan_members(&[]), &HeldMembers::default())
+            .await;
         assert!(
             be.held.lock().channels.is_empty(),
             "released once it landed"
@@ -6155,7 +6468,8 @@ mod tests {
         *be.pre_emergency.lock() = Some(snapshot.clone());
         let members = ProfileMembers::default();
 
-        be.apply_and_give_back(&[], &members).await;
+        be.apply_and_give_back(&[], &members, &HeldMembers::default())
+            .await;
 
         let frames = |prefix: &str| {
             written
@@ -6190,7 +6504,8 @@ mod tests {
         );
 
         cache.end_verify(claimed);
-        be.apply_and_give_back(&[], &members).await;
+        be.apply_and_give_back(&[], &members, &HeldMembers::default())
+            .await;
 
         assert_eq!(
             frames(">0202"),

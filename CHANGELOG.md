@@ -28,6 +28,24 @@ fields and show the rails exactly as before.
   device. Closing it does not reset the controller, and its fans keep their speed. While the daemon
   is reconnecting, a speed change for an OpenFan channel is reported as failed straight away
   ("OpenFan controller disconnected — reconnecting") instead of after a serial timeout.
+- **An OpenFan fan whose control is not being commanded keeps its speed through a suspend or
+  power loss** (DEC-466, `TS-bc`). When a control cannot run (its sensor is gone, for example)
+  its fans are meant to hold their last speed. An OpenFan Controller keeps its speeds when only
+  USB drops, but when its 12 V supply goes off (a suspend that powers the PSU down, or a power
+  cut) it restarts every fan at about 1000 rpm. The daemon left them there until the control could
+  run again. It now remembers each channel's speed when the controller reconnects or the machine
+  resumes, sets it again on the next tick, and logs `put back at N %, its duty before the
+  controller reconnected or the host resumed`. Everywhere else the daemon decides what to leave
+  an OpenFan fan at, a speed lost this way now counts as the speed the fan had, not as unknown:
+  - under the 40 % no-CPU-sensor floor it holds at least that speed (it used to go to 100 %);
+  - after a thermal emergency, a fan no profile controls gets it back (it used to stay at 100 %);
+  - at a clean stop and when a profile stops naming the fan, it is left at that speed (or the exit
+    minimum, whichever is higher) rather than at 100 %;
+  - after an OpenFan calibration, it is restored to that speed rather than to 100 %.
+
+  A channel whose speed was already unknown before the loss, because its last command was never
+  confirmed, is treated as unknown, as before. On an ordinary tick it is left alone, and under the
+  40 % floor it gets the floor (it used to get 100 %).
 
 ## [3.2.0] — 2026-09-30
 

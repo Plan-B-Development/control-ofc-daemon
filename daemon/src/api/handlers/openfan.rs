@@ -622,13 +622,14 @@ fn start_openfan_calibration(
         // write it had already started has finished by the time this lock is
         // ours. The cache this used to read is updated after the wire write,
         // outside the lock, so it could still show the forced 100 %. On the
-        // blocking pool: the lock can wait behind a serial write.
+        // blocking pool: the lock can wait behind a serial write. `TS-bc`: a
+        // duty a reconnect or resume lost is restored as the duty it held
+        // before; only one unknown before the loss too is restored at 100 %.
         let reader = ctrl.clone();
-        let original =
-            tokio::task::spawn_blocking(move || reader.lock().last_commanded_pct(channel))
-                .await
-                .ok()
-                .flatten();
+        let original = tokio::task::spawn_blocking(move || reader.lock().last_known_duty(channel))
+            .await
+            .ok()
+            .flatten();
 
         let write: cal::CalWriteFn = Arc::new(move |ch: u8, pct: u8| {
             let mut guard = ctrl.lock();
@@ -1872,6 +1873,22 @@ mod tests {
             Some(40),
             "precondition"
         );
+
+        let (status, body) = post_cal(&f.state, ack()).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let run = cal_finished(&f.state).await;
+        assert_eq!(run.original_pct, Some(40), "{run:?}");
+        assert_eq!(ch0_duties(&f.frames).last(), Some(&40));
+    }
+
+    /// [SAFETY] `TS-bc`: a duty a reconnect or resume lost before the
+    /// calibration starts is restored as the duty the channel had — not as
+    /// unknown, which would restore it at full speed (DEC-412).
+    #[tokio::test(start_paused = true)]
+    async fn a_duty_lost_before_the_calibration_is_restored_as_it_was() {
+        let f = cal_fixture();
+        f.state.cache.invalidate_openfan_writes();
+        assert_eq!(f.ctrl.lock().last_commanded_pct(0), None, "precondition");
 
         let (status, body) = post_cal(&f.state, ack()).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");

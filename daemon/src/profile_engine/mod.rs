@@ -1940,7 +1940,8 @@ pub async fn profile_engine_loop(
         let Some(commands) = profile_commands else {
             if !*shutdown.borrow() && !cache.verify_active() {
                 if let Some(be) = openfan_be.as_mut() {
-                    be.apply_and_give_back(&[], &members).await;
+                    // `held` is empty here: with no profile nothing is skipped.
+                    be.apply_and_give_back(&[], &members, &held).await;
                 }
                 if let Some(be) = hwmon_be.as_mut() {
                     be.apply_and_give_back(&[], &members).await;
@@ -1991,9 +1992,13 @@ pub async fn profile_engine_loop(
         // whatever the daemon took that this profile does not name — the end of a
         // force, the end of a diagnostic, or a profile switch that dropped a header.
         // DEC-448: the GPU write does too, for a card the profile no longer names.
+        //
+        // `TS-bc`: and the OpenFan write puts the skipped controls' channels back
+        // at the duty a reconnect or resume lost — the same `held` set a forced
+        // tick floors against (`TS-p`).
         if !cache.verify_active() {
             if let Some(be) = openfan_be.as_mut() {
-                be.apply_and_give_back(&commands, &members).await;
+                be.apply_and_give_back(&commands, &members, &held).await;
             }
             gpu_be.apply_and_give_back(&commands, &gpu_members).await;
             if let Some(be) = hwmon_be.as_mut() {
@@ -8929,6 +8934,96 @@ mod tests {
             sysfs.get(PWM1),
             Some(raw(92)),
             "the skipped control's fan must hold its duty under the 40% floor, not drop to it"
+        );
+    }
+
+    /// [SAFETY] `TS-bc`, end to end through the loop — the call site, not only
+    /// the backend. A trigger curve runs an OpenFan fan at 80 % until its sensor
+    /// goes: the control is skipped and its fan holds by writing nothing. A
+    /// reconnect or resume then makes the device's duty unknown (after a 12 V
+    /// loss it is a 1000 rpm target), and the next ordinary tick puts the 80 %
+    /// back, once. The CPU sensor stays fresh, so every tick is ordinary — the
+    /// no-sensor floor, which has its own put-back, never runs.
+    #[tokio::test(start_paused = true)]
+    async fn a_skipped_control_s_openfan_duty_is_put_back_after_a_reconnect() {
+        let cache = Arc::new(StateCache::new());
+        cache.update_sensors(vec![
+            reading_aged("cpu", SensorKind::CpuTemp, 50.0, std::time::Duration::ZERO),
+            reading_aged("gpu", SensorKind::GpuTemp, 65.0, std::time::Duration::ZERO),
+        ]);
+        let profile = DaemonProfile {
+            id: "trig".into(),
+            name: "Trig".into(),
+            version: 7,
+            description: "".into(),
+            controls: vec![openfan_control("ctl", "tc", "openfan:ch00")],
+            curves: vec![CurveConfig {
+                id: "tc".into(),
+                name: "Trigger".into(),
+                curve_type: "trigger".into(),
+                sensor_id: "gpu".into(),
+                trigger_idle_temp_c: Some(50.0),
+                trigger_load_temp_c: Some(60.0),
+                trigger_idle_pct: Some(30.0),
+                trigger_load_pct: Some(80.0),
+                ..Default::default()
+            }],
+        };
+        let (transport, written) = LoopTestTransport::new(60);
+        let fan_ctrl = crate::serial::controller::FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            std::time::Duration::from_millis(500),
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(profile_engine_loop(
+            cache.clone(),
+            Arc::new(Mutex::new(Some(profile))),
+            Arc::new(parking_lot::RwLock::new(Some(Arc::new(Mutex::new(
+                fan_ctrl,
+            ))))),
+            None,
+            vec![],
+            Arc::new(Mutex::new(crate::safety::ThermalSafetyRule::new())),
+            Arc::new(Mutex::new(crate::control_override::OverrideTable::new())),
+            Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
+            shutdown_rx,
+        ));
+        let hex = |pct: u8| format!("{:02X}", crate::pwm::percent_to_raw(pct));
+        let ch0 = || -> Vec<String> {
+            written
+                .lock()
+                .iter()
+                .filter(|c| c.starts_with(">0200"))
+                .map(|c| c[c.len() - 3..c.len() - 1].to_string())
+                .collect()
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert_eq!(ch0(), [hex(80)], "precondition: the curve runs it at 80 %");
+
+        // The curve's sensor goes: the control is skipped and holds by writing nothing.
+        cache.retain_sensors(&HashSet::from(["cpu".to_string()]));
+        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+        assert_eq!(
+            ch0(),
+            [hex(80)],
+            "precondition: a skipped control writes nothing"
+        );
+
+        cache.invalidate_openfan_writes();
+        tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+        stop(handle, shutdown_tx).await;
+
+        assert_eq!(
+            cache.snapshot().thermal_override_state.as_deref(),
+            Some("normal"),
+            "precondition: the ticks were ordinary — no floor or emergency forced them"
+        );
+        assert_eq!(
+            ch0(),
+            [hex(80), hex(80)],
+            "the skipped control's 80 % is put back once after the reconnect"
         );
     }
 

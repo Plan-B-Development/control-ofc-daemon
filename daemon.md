@@ -495,8 +495,13 @@ gating each have their own register rows and regression tests.
      firmware, and with no profile nothing is forced) — unless the last stale
      reading was at or above release, when curves keep running on it (DEC-269). A
      control skipped that tick keeps its fans at their last duty under the floor
-     (DEC-386, `TS-p`); an OpenFan channel whose duty a reconnect or resume lost
-     goes to 100% instead, and any other unknown duty gets the bare floor (DEC-401)
+     (DEC-386, `TS-p`) — for an OpenFan channel whose duty a reconnect or resume
+     lost, the duty it had before the loss (DEC-466, `TS-bc`, superseding DEC-401's
+     100%); any duty unknown before the loss too gets the bare floor. On an
+     ordinary tick the same skipped channels are put back at that remembered
+     duty, once (`OpenFanBackend::apply_and_give_back`'s `held` set) — the
+     controller keeps its duty across a USB-only reconnect but restarts at a
+     1000 rpm target after a 12 V loss
    - **The coolant rung (DEC-443, `TS-f`).** A second `ThermalSafetyRule`
      (`ThermalSafetyRule::coolant`, engine-local) watches the hottest FRESH
      `CoolantTemp` reading: at or above `safety.coolant_limit_c` (whole C, default

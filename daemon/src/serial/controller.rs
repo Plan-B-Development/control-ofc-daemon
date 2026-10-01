@@ -29,16 +29,23 @@ struct ChannelControl {
     /// Never cleared. A reconnect or a failed reply makes the channel's duty
     /// UNKNOWN (`last_commanded_pct = None`), which is not the same as never
     /// having touched it — and the exit floor tells them apart: a channel the
-    /// daemon never wrote is left alone, one whose duty it lost goes to full
-    /// speed.
+    /// daemon never wrote is left alone, one whose duty it does not know goes to
+    /// full speed (a duty a reconnect or resume lost is known by
+    /// `duty_before_loss`, `TS-bc`).
     written: bool,
-    /// Whether this channel's duty is unknown because a reconnect or resume
-    /// lost it (DEC-401, `TS-av`) — as opposed to never written, or a reply
-    /// that failed. Set on every written channel when
-    /// [`FanController::observe_write_generation`] sees a bump, cleared by the
-    /// next write that lands. A failed reply leaves it as it was: the device
-    /// may still be at its power-on default.
-    lost_to_reconnect: bool,
+    /// The duty this channel held when a reconnect or resume last made it
+    /// unknown (`TS-bc`), remembered so it can be put back: the controller
+    /// keeps its duty across a USB-only re-enumeration, but a 12 V loss
+    /// cold-boots it to a 1000 rpm target, and the protocol cannot tell the two
+    /// apart.
+    ///
+    /// Set by [`FanController::observe_write_generation`] from the channel's
+    /// last duty — kept through a second bump with no write landing between
+    /// them — and cleared by the next write that lands. A failed reply keeps it
+    /// only when the failed frame carried this same duty: any other duty may
+    /// have reached the device, so its duty is unknown, as a failed reply
+    /// before the loss leaves it (`None` here). `None` while the duty is known.
+    duty_before_loss: Option<u8>,
     /// The lowest duty this channel may be written at from now on (DEC-388):
     /// latched by [`FanController::apply_exit_floor`] and never cleared.
     ///
@@ -56,7 +63,8 @@ struct ChannelControl {
 #[derive(Debug)]
 pub struct ExitFloorWrite {
     pub channel: u8,
-    /// What the controller last knew the channel held; `None` = unknown.
+    /// What the controller last knew the channel held — after a reconnect or
+    /// resume, the duty it held before (`TS-bc`); `None` = unknown.
     pub was_pct: Option<u8>,
     pub target_pct: u8,
     pub result: Result<SetPwmResult, FanControlError>,
@@ -109,20 +117,19 @@ impl FanController {
     /// reconnect or resume clears every channel — DEC-256), or the last command's
     /// reply failed, so it may or may not have landed (DEC-383).
     ///
-    /// Read by the thermal force to remember what a channel no profile controls
-    /// was doing before an emergency, so it can be given back afterwards
-    /// (DEC-382). `None` there means "unknown", and an unknown channel stays at
-    /// the forced duty rather than being guessed down. Also read by the
-    /// no-sensor floor to hold a skipped control's channel at its last duty
-    /// (`TS-p`, DEC-386).
+    /// What the DEVICE was last told, for reporting. A caller deciding what to
+    /// leave a channel at reads [`Self::last_known_duty`] instead, which knows a
+    /// duty a reconnect or resume lost by the duty it held before (`TS-bc`).
     ///
     /// [SAFETY] `TS-ak`: a reconnect or resume that no [`Self::set_pwm`] has
     /// observed yet already makes every duty unknown. The stored value is only
     /// cleared when the next write observes the bump, so the accessor checks the
     /// generation itself — otherwise a read before that write returns the
-    /// pre-reconnect duty, and the force floors or snapshots a channel at a duty
-    /// the device may no longer hold. Read-only: the clearing stays in
-    /// [`Self::observe_write_generation`], so this takes `&self`.
+    /// pre-reconnect duty as if the device still held it. Since `TS-bc` the
+    /// force does floor and snapshot at that duty, but on purpose and through
+    /// [`Self::last_known_duty`], which says it is a remembered one. Read-only:
+    /// the clearing stays in [`Self::observe_write_generation`], so this takes
+    /// `&self`.
     pub fn last_commanded_pct(&self, channel: u8) -> Option<u8> {
         if self.cache.openfan_write_generation() != self.last_write_generation {
             return None;
@@ -133,8 +140,9 @@ impl FanController {
     }
 
     /// The exit floor (DEC-388, `TS-j`): leave every channel this controller has
-    /// ever written at `max(its last duty, floor_pct)`, or at 100 % where it no
-    /// longer knows that duty. A channel it never wrote is left alone, and a
+    /// ever written at `max(its last known duty, floor_pct)`, or at 100 % where it
+    /// does not know that duty. A duty a reconnect or resume lost is known by the
+    /// duty it held before (`TS-bc`). A channel it never wrote is left alone, and a
     /// `floor_pct` of 0 turns the whole step off — every channel keeps what it
     /// holds, as before DEC-388.
     ///
@@ -153,19 +161,21 @@ impl FanController {
         }
         // A reconnect or resume the next `set_pwm` has not yet seen would leave
         // `last_commanded_pct` describing a device that may have come back at its
-        // power-on default — observe it first, so such a channel reads UNKNOWN
-        // and goes to full speed rather than to `max(stale, floor)`.
+        // power-on default — observe it first, so the coalesce below cannot skip
+        // the write. `TS-bc`: such a channel leaves at `max(the duty it held
+        // before the loss, floor)`; only one whose duty was unknown before the
+        // loss too goes to full speed.
         self.observe_write_generation();
         let targets: Vec<(u8, Option<u8>)> = self
             .channels
             .iter()
             .enumerate()
             .filter(|(_, c)| c.written)
-            .map(|(ch, c)| (ch as u8, c.last_commanded_pct))
+            .map(|(ch, c)| (ch as u8, c.last_commanded_pct.or(c.duty_before_loss)))
             .collect();
         for c in &mut self.channels {
             c.exit_min = Some(if c.written {
-                crate::pwm::exit_duty(c.last_commanded_pct, floor_pct)
+                crate::pwm::exit_duty(c.last_commanded_pct.or(c.duty_before_loss), floor_pct)
             } else {
                 floor_pct
             });
@@ -184,24 +194,36 @@ impl FanController {
             .collect()
     }
 
-    /// Whether `channel`'s duty is unknown because a reconnect or resume lost it
-    /// (DEC-401, `TS-av`): the daemon had written the channel, and the device
-    /// has since re-enumerated or the host resumed, with no write landing since.
-    /// `false` for a channel never written and for one whose only unknown is a
-    /// failed reply (DEC-383).
+    /// The duty `channel` held before a reconnect or resume made it unknown
+    /// (`TS-bc`), while no write has landed since — `None` while the duty is
+    /// known, for a channel never written, and for one whose duty was already
+    /// unknown when it was lost (a failed reply, DEC-383).
     ///
-    /// [SAFETY] Read by the no-sensor floor's held arm, which gives such a
-    /// channel full speed rather than the bare floor. Like
-    /// [`Self::last_commanded_pct`] it honours a bump no write has observed yet,
-    /// because the force reads it before its first write of a tick.
-    pub fn duty_lost_to_reconnect(&self, channel: u8) -> bool {
-        let Some(c) = self.channels.get(channel as usize) else {
-            return false;
-        };
+    /// [SAFETY] Read by the engine to put a skipped control's channel back at
+    /// that duty on an ordinary tick. Like [`Self::last_commanded_pct`] it
+    /// honours a bump no write has observed yet — the duty that bump will
+    /// remember — because the engine reads it before its first write of a tick.
+    pub fn duty_before_loss(&self, channel: u8) -> Option<u8> {
+        let c = self.channels.get(channel as usize)?;
         if self.cache.openfan_write_generation() != self.last_write_generation {
-            return c.written;
+            return c.last_commanded_pct.or(c.duty_before_loss);
         }
-        c.lost_to_reconnect
+        c.duty_before_loss
+    }
+
+    /// The duty the daemon last knew `channel` to hold: its last landed command,
+    /// or — while a reconnect or resume has made that unknown — the duty it held
+    /// before ([`Self::duty_before_loss`]). `None` when neither is known.
+    ///
+    /// [SAFETY] `TS-bc`: read wherever the daemon decides what a channel should
+    /// be left at — the no-sensor floor's held arm, the pre-emergency snapshot,
+    /// the release of a channel no profile names, and the calibration's restore
+    /// — so a lost duty is treated as the duty it was, not as unknown. Never for
+    /// coalescing: the device may not hold it, so the next write must still
+    /// reach the wire, which `set_pwm`'s own comparison guarantees.
+    pub fn last_known_duty(&self, channel: u8) -> Option<u8> {
+        self.last_commanded_pct(channel)
+            .or_else(|| self.duty_before_loss(channel))
     }
 
     /// Forget every channel's duty if the device may have lost it (DEC-256).
@@ -224,8 +246,10 @@ impl FanController {
         if generation != self.last_write_generation {
             self.last_write_generation = generation;
             for ch in &mut self.channels {
+                // `TS-bc`: remember what it held, so it can be put back. A second
+                // bump with nothing landed between keeps the first one's duty.
+                ch.duty_before_loss = ch.last_commanded_pct.or(ch.duty_before_loss);
                 ch.last_commanded_pct = None;
-                ch.lost_to_reconnect = ch.written;
                 // The stop clock MUST be reset with it. `apply_safety`'s own
                 // doc note says the expired-timer branch is unreachable because
                 // "any non-zero write clears the timer; a repeat 0% coalesces"
@@ -341,6 +365,12 @@ impl FanController {
             let ch = &mut self.channels[channel as usize];
             ch.last_commanded_pct = None;
             ch.stop_started_at = None;
+            // `TS-bc`: a remembered pre-loss duty survives only a failed frame
+            // that carried it — a retry of the put-back. Any other duty may
+            // have landed, so the device's duty is now simply unknown.
+            if ch.duty_before_loss != Some(effective_pct) {
+                ch.duty_before_loss = None;
+            }
             // `TS-ad`: and so does the wire. The cache is written only on
             // success, so without this `/status` went on reporting the previous
             // duty — 100 % on a channel the controller no longer believed was
@@ -351,7 +381,7 @@ impl FanController {
 
         // Update tracking state
         self.channels[channel as usize].last_commanded_pct = Some(effective_pct);
-        self.channels[channel as usize].lost_to_reconnect = false;
+        self.channels[channel as usize].duty_before_loss = None;
         if effective_pct == 0 {
             if self.channels[channel as usize].stop_started_at.is_none() {
                 self.channels[channel as usize].stop_started_at = Some(Instant::now());
@@ -536,12 +566,15 @@ mod tests {
         assert_eq!(ctrl.last_commanded_pct(0), Some(50));
     }
 
-    /// [SAFETY] A reconnect or resume makes every duty unknown (DEC-256), and an
-    /// unknown duty leaves at FULL speed — even when no `set_pwm` has run since
-    /// to notice the invalidation, which is the case at a stop.
+    /// [SAFETY] `TS-bc`: a duty a reconnect or resume lost (DEC-256) leaves at
+    /// `max(the duty it held before, floor)` — even when no `set_pwm` has run
+    /// since to notice the invalidation, which is the case at a stop. Both
+    /// channels are WRITTEN, the one already above the floor included: the
+    /// device may have come back at its power-on default, so its duty is put
+    /// back rather than coalesced against.
     #[test]
-    fn a_channel_whose_duty_was_lost_goes_to_full_speed_on_stop() {
-        let (transport, written) = MockTransport::with_ok_responses(2);
+    fn a_channel_whose_duty_was_lost_leaves_at_the_duty_it_held_before() {
+        let (transport, written) = MockTransport::with_ok_responses(4);
         let cache = Arc::new(StateCache::new());
         let mut ctrl = FanController::new(
             Box::new(transport),
@@ -549,6 +582,46 @@ mod tests {
             Duration::from_millis(500),
         );
         ctrl.set_pwm(3, 40).unwrap();
+        ctrl.set_pwm(4, 70).unwrap();
+        cache.invalidate_openfan_writes();
+        let before = written.lock().len();
+
+        let out = ctrl.apply_exit_floor(50);
+
+        let summary: Vec<_> = out
+            .iter()
+            .map(|w| (w.channel, w.was_pct, w.target_pct))
+            .collect();
+        assert_eq!(summary, [(3, Some(40), 50), (4, Some(70), 70)]);
+        assert!(out.iter().all(|w| !w.result.as_ref().unwrap().coalesced));
+        let raw = |pct: u8| percent_to_raw(pct);
+        assert_eq!(
+            written.lock()[before..],
+            [
+                format!(">0203{:02X}\n", raw(50)),
+                format!(">0204{:02X}\n", raw(70))
+            ]
+        );
+    }
+
+    /// [SAFETY] The other half: a duty already unknown when it was lost (its
+    /// last reply had failed, DEC-383) has nothing to put back, so it still
+    /// leaves at FULL speed (DEC-388).
+    #[test]
+    fn a_duty_unknown_before_the_loss_still_leaves_at_full_speed() {
+        let (transport, written) = MockTransport::with_responses(vec![
+            Ok(ack(40)),
+            Err(SerialError::Timeout { timeout_ms: 500 }),
+            Ok(ack(100)),
+        ]);
+        let cache = Arc::new(StateCache::new());
+        let mut ctrl = FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            Duration::from_millis(500),
+        );
+        ctrl.set_pwm(0, 40).unwrap();
+        assert!(ctrl.set_pwm(0, 60).is_err(), "precondition: reply fails");
         cache.invalidate_openfan_writes();
 
         let out = ctrl.apply_exit_floor(50);
@@ -556,14 +629,9 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(
             (out[0].channel, out[0].was_pct, out[0].target_pct),
-            (3, None, 100)
+            (0, None, 100)
         );
-        assert!(!out[0].result.as_ref().unwrap().coalesced);
-        let last = written.lock().last().cloned().unwrap();
-        assert!(
-            last.contains("FF"),
-            "the exit frame carries raw 255 (100 %): {last}"
-        );
+        assert_eq!(written.lock().last().unwrap(), ">0200FF\n");
     }
 
     /// [SAFETY] Nothing that runs after the exit floor can lower a channel
@@ -863,11 +931,13 @@ mod tests {
         assert_eq!(ctrl.last_commanded_pct(1), None);
     }
 
-    /// [SAFETY] DEC-401 (`TS-av`): a reconnect or resume marks every channel the
-    /// daemon had written as lost — before any write observes the bump, and after
-    /// one has — and a never-written channel as not. A landed write clears it.
+    /// [SAFETY] `TS-bc`: a reconnect or resume remembers every written channel's
+    /// duty — read before any write observes the bump, and after one has — and
+    /// nothing for a channel never written. A landed write forgets it, since
+    /// the duty is known again; [`FanController::last_known_duty`] answers the
+    /// remembered duty while it is lost and the landed one after.
     #[test]
-    fn a_reconnect_marks_every_written_channel_lost_until_a_write_lands() {
+    fn a_reconnect_remembers_each_written_channel_s_duty_until_a_write_lands() {
         let (transport, _written) = MockTransport::with_ok_responses(3);
         let cache = Arc::new(StateCache::new());
         let mut ctrl = FanController::new(
@@ -877,31 +947,71 @@ mod tests {
         );
         ctrl.set_pwm(0, 85).unwrap();
         ctrl.set_pwm(1, 40).unwrap();
-        assert!(!ctrl.duty_lost_to_reconnect(0), "precondition: known duty");
+        assert_eq!(ctrl.duty_before_loss(0), None, "precondition: known duty");
+        assert_eq!(ctrl.last_known_duty(0), Some(85));
 
         cache.invalidate_openfan_writes();
 
         // Pending: no write has observed the bump yet.
-        assert!(ctrl.duty_lost_to_reconnect(0));
-        assert!(ctrl.duty_lost_to_reconnect(1));
-        assert!(!ctrl.duty_lost_to_reconnect(2), "never written is not lost");
+        assert_eq!(
+            ctrl.last_commanded_pct(0),
+            None,
+            "the device's duty is unknown"
+        );
+        assert_eq!(ctrl.duty_before_loss(0), Some(85));
+        assert_eq!(ctrl.duty_before_loss(1), Some(40));
+        assert_eq!(ctrl.duty_before_loss(2), None, "never written");
+        assert_eq!(ctrl.last_known_duty(0), Some(85));
+        assert_eq!(ctrl.last_known_duty(2), None);
 
-        // Observed: channel 0's write lands and clears only channel 0.
+        // Observed: channel 0's write lands and forgets only channel 0's.
         ctrl.set_pwm(0, 60).unwrap();
-        assert!(!ctrl.duty_lost_to_reconnect(0));
-        assert!(ctrl.duty_lost_to_reconnect(1));
-        assert!(!ctrl.duty_lost_to_reconnect(2));
-        assert!(!ctrl.duty_lost_to_reconnect(NUM_CHANNELS), "out of range");
+        assert_eq!(ctrl.duty_before_loss(0), None);
+        assert_eq!(ctrl.last_known_duty(0), Some(60));
+        assert_eq!(ctrl.duty_before_loss(1), Some(40));
+        assert_eq!(ctrl.last_commanded_pct(1), None);
+        assert_eq!(ctrl.last_known_duty(1), Some(40));
+        assert_eq!(ctrl.duty_before_loss(2), None);
+        assert_eq!(ctrl.duty_before_loss(NUM_CHANNELS), None, "out of range");
     }
 
-    /// [SAFETY] DEC-401: a failed reply on its own is an unknown duty but not a
-    /// lost one (the user chose full speed for the reconnect/resume case only).
-    /// A reconnect after it makes it lost, and a failed reply after the
-    /// reconnect does not clear that — the device may still be at its power-on
-    /// default.
+    /// [SAFETY] `TS-bc`: a second reconnect or resume with no write landing
+    /// between the two keeps the FIRST one's duty, before and after a write
+    /// observes it — the channel's duty is no less lost the second time.
     #[test]
-    fn a_failed_reply_alone_is_not_a_duty_lost_to_a_reconnect() {
-        let (transport, _written) = MockTransport::with_ok_responses(1);
+    fn a_second_loss_keeps_the_duty_the_first_one_remembered() {
+        let (transport, _written) = MockTransport::with_ok_responses(3);
+        let cache = Arc::new(StateCache::new());
+        let mut ctrl = FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            Duration::from_millis(500),
+        );
+        ctrl.set_pwm(0, 85).unwrap();
+        cache.invalidate_openfan_writes();
+        ctrl.set_pwm(1, 30).unwrap(); // observes the first bump
+        assert_eq!(ctrl.duty_before_loss(0), Some(85), "precondition");
+
+        cache.invalidate_openfan_writes();
+        assert_eq!(ctrl.duty_before_loss(0), Some(85), "pending second bump");
+
+        ctrl.set_pwm(1, 31).unwrap(); // observes the second bump
+        assert_eq!(ctrl.duty_before_loss(0), Some(85), "observed second bump");
+        assert_eq!(ctrl.last_known_duty(0), Some(85));
+    }
+
+    /// [SAFETY] `TS-bc`, the failed-reply rule. A duty already unknown when it
+    /// was lost (the last reply had failed) is not remembered. After a loss, a
+    /// failed frame carrying the remembered duty keeps it, so the put-back is
+    /// retried; a failed frame carrying any OTHER duty forgets it, since that
+    /// duty may have reached the device.
+    #[test]
+    fn a_failed_reply_keeps_the_remembered_duty_only_when_it_carried_it() {
+        // Before the loss: 60 lands, 70's reply fails.
+        let (transport, _written) = MockTransport::with_responses(vec![
+            Ok(ack(60)),
+            Err(SerialError::Timeout { timeout_ms: 500 }),
+        ]);
         let cache = Arc::new(StateCache::new());
         let mut ctrl = FanController::new(
             Box::new(transport),
@@ -910,14 +1020,29 @@ mod tests {
         );
         ctrl.set_pwm(0, 60).unwrap();
         assert!(ctrl.set_pwm(0, 70).is_err(), "precondition: reply fails");
-        assert_eq!(ctrl.last_commanded_pct(0), None, "precondition: unknown");
-        assert!(!ctrl.duty_lost_to_reconnect(0));
-
         cache.invalidate_openfan_writes();
-        assert!(ctrl.duty_lost_to_reconnect(0));
+        assert_eq!(ctrl.duty_before_loss(0), None, "unknown when lost");
+        assert_eq!(ctrl.last_known_duty(0), None);
 
-        assert!(ctrl.set_pwm(0, 80).is_err(), "the reply fails again");
-        assert!(ctrl.duty_lost_to_reconnect(0));
+        // After the loss: the put-back of 60 fails (kept), then 70 fails (forgotten).
+        let (transport, _written) = MockTransport::with_responses(vec![
+            Ok(ack(60)),
+            Err(SerialError::Timeout { timeout_ms: 500 }),
+            Err(SerialError::Timeout { timeout_ms: 500 }),
+        ]);
+        let cache = Arc::new(StateCache::new());
+        let mut ctrl = FanController::new(
+            Box::new(transport),
+            cache.clone(),
+            Duration::from_millis(500),
+        );
+        ctrl.set_pwm(0, 60).unwrap();
+        cache.invalidate_openfan_writes();
+        assert!(ctrl.set_pwm(0, 60).is_err(), "precondition: reply fails");
+        assert_eq!(ctrl.duty_before_loss(0), Some(60), "the same duty: kept");
+        assert!(ctrl.set_pwm(0, 70).is_err(), "precondition: reply fails");
+        assert_eq!(ctrl.duty_before_loss(0), None, "another duty: forgotten");
+        assert_eq!(ctrl.last_known_duty(0), None);
     }
 
     #[test]
