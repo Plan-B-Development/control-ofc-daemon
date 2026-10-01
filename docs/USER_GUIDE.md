@@ -516,7 +516,7 @@ The daemon can autonomously evaluate fan curve profiles at 1 Hz. Profiles use th
 
 ### Loading a profile
 
-**Do not run `control-ofc-daemon` by hand while the service is active.** A second daemon deletes the service's socket, takes it over, and runs a second profile engine on the same fans. To start with a particular profile, set `--profile` or `OPENFAN_PROFILE` in a systemd drop-in (below), or activate one through the API:
+**Do not run `control-ofc-daemon` by hand while the service is active.** A second daemon refuses to start — it exits with *another control-ofc-daemon is already running* before it touches the socket or a fan (DEC-467) — so it achieves nothing. (Daemons older than that deleted the service's socket, took it over, and ran a second profile engine on the same fans.) Starting the service while a daemon you started by hand is still running is still harmful, so stop that one first. To start with a particular profile, set `--profile` or `OPENFAN_PROFILE` in a systemd drop-in (below), or activate one through the API:
 
 ```bash
 # Via API at runtime (saved, so it is also used at the next start)

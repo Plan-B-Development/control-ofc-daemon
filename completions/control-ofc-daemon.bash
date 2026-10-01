@@ -3,7 +3,7 @@ _control_ofc_daemon() {
     local cur opts
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
-    opts="--config --profile --profile-file --allow-non-root"
+    opts="--config --profile --profile-file --allow-non-root --version -h --help"
 
     if [[ ${cur} == -* ]]; then
         COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )

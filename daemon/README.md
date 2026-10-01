@@ -57,7 +57,18 @@ Options:
   --config <path>         Path to daemon.toml (default: /etc/control-ofc/daemon.toml)
   --profile <name>        Load a named profile from search paths
   --profile-file <path>   Load a profile from an absolute file path
+  --version               Print the daemon version and exit
+  -h, --help              Print a usage summary and exit
 ```
+
+Any other argument, a flag without its value, or a joined `--profile=quiet` is
+refused with the usage and exit status 2 (DEC-467; older daemons ignored it, so
+`--version` started a full daemon).
+
+**Do not run the binary by hand while the service is active.** Only one daemon runs
+at a time: a second one exits before it touches the socket or a fan, because it
+cannot take the lock on `{state_dir}/daemon.lock` and will not remove a socket
+another daemon is serving on.
 
 The startup profile is the first of these that loads: `--profile` or
 `--profile-file`, then `OPENFAN_PROFILE`, then the profile last activated through

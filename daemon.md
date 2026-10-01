@@ -34,6 +34,9 @@ daemon/src/
   config.rs            — TOML config parsing + validation
   runtime_config.rs    — daemon-mutable runtime.toml (ADR-002)
   constants.rs         — centralized operational tuning values
+  single_instance.rs   — one daemon per machine (DEC-467): the flock on
+                         {state_dir}/daemon.lock, and the probe that keeps a live
+                         socket from being removed
   sd_notify.rs         — READY / WATCHDOG / STOPPING to systemd, and the sleep-hook
                          watchdog widen (DEC-387/396). WATCHDOG=1 has one sender
   text.rs              — the shared length bound for text persisted in documents
@@ -745,8 +748,14 @@ is not meant to be invoked directly — it requires root, and the runtime
 (`/run/control-ofc/`) and state (`/var/lib/control-ofc/`) directories are
 prepared by systemd via `RuntimeDirectory=` and `StateDirectory=` in the
 unit file. Running the binary by hand as a regular user fails the EUID check
-in `preflight_check` before anything is opened, and exits with a message
-saying to start it through systemd.
+in `preflight_privileges` before anything is opened, and exits with a message
+saying to start it through systemd. Running it as root while a daemon is
+already running fails too (DEC-467): right after that check it takes an `flock`
+on `{state_dir}/daemon.lock` and then connects to the socket, refusing if a daemon
+answers (one older than the lock holds none) — both before the validation sweep,
+`runtime.toml`, the bind or any hardware — and `preflight_socket` never removes a
+socket a daemon is serving on. The command line is parsed once in `fn main`; an
+unknown argument exits with status 2 before anything runs.
 
 ```
 sudo systemctl enable --now control-ofc-daemon

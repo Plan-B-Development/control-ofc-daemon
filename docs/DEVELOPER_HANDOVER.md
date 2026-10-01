@@ -45,11 +45,16 @@ cargo build --release
 ## Running the daemon
 
 **Never run the daemon by hand while the service is active.** A second
-`control-ofc-daemon` deletes the running service's socket, takes it over, and
-runs a second profile engine: two writers on the same fans. That includes
-`cargo run`, a bare `sudo control-ofc-daemon`, and any command that passes
-`--profile` or `--config`. Stop the service first
-(`sudo systemctl stop control-ofc-daemon`).
+`control-ofc-daemon` refuses to start (DEC-467): it takes an `flock` on
+`{state_dir}/daemon.lock` before it writes anything, and will not remove a socket
+something is still serving on, so `cargo run` or a bare `sudo control-ofc-daemon`
+just exits with *another control-ofc-daemon is already running*. (Older daemons
+deleted the service's socket and ran a second profile engine: two writers on the
+same fans.) The reverse is not guarded: starting the service while a hand-started
+daemon runs makes the unit fail, and its `ExecStopPost` hands back headers the
+hand-started daemon is driving (register row `LIFE-a`). Stop the service first
+(`sudo systemctl stop control-ofc-daemon`), and stop your own daemon before you
+start the service again.
 
 The supported way to run your own build is to install the package once and then
 swap in your binary, so the unit, `control-ofc-restore-auto` (the crash-time

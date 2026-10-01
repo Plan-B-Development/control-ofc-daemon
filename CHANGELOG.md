@@ -20,6 +20,21 @@ fields and show the rails exactly as before.
 
 ### Fixed
 
+- **A second daemon no longer takes over the running one** (DEC-467, `DC-a`). Running
+  `control-ofc-daemon` by hand while the service was active — even just `sudo control-ofc-daemon
+  --version` — started a full second daemon: it deleted the service's socket, took over its clients,
+  and ran a second profile engine on the same fans. A second daemon now exits with *another
+  control-ofc-daemon is already running* before it touches the socket, a file the running daemon owns,
+  or a fan. It cannot take the lock the first one holds on `daemon.lock` in the state directory, and
+  it never removes a socket another daemon is still serving on. This also covers a service that is
+  still the previous release during an upgrade.
+- **The command line is checked, and `--version` and `--help` exist** (DEC-467). An argument the
+  daemon did not recognise used to be ignored, so a typo or a joined `--profile=quiet` started the
+  daemon as if it were not there. Now any unknown argument, a flag missing its value, or a joined
+  value is refused: the daemon prints its usage and exits with status 2 without starting. **If a
+  systemd drop-in passes the daemon an argument it does not accept, the service will no longer
+  start** — check `journalctl -u control-ofc-daemon` after upgrading if you use one. `--version`
+  prints the version, `-h`/`--help` a usage summary, and the shell completions offer both.
 - **An OpenFan Controller that stops answering without being unplugged is now recovered without
   restarting the daemon** (DEC-465, `DC-ct`). After 5 failed reads the daemon tries to reconnect,
   and each try re-opens the controller's own device — but the daemon still held that device open

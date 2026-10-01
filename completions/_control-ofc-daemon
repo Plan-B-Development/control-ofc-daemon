@@ -2,18 +2,20 @@
 
 # `T1-q`: no `=` suffix on any spec. In `_arguments`, `-opt=` means "the value
 # may be the next word OR joined in the same word after an `=`" (zshcompsys(1)),
-# but `resolve_config_path`/`parse_profile_arg` in daemon/src/main.rs match these
-# as EXACT strings and never split on `=`. A user who accepted the joined form
-# got `--profile=name`, which falls through the parser's `_ => {}` arm and is
-# silently ignored — the daemon boots with no profile and says nothing. The
-# separated form is the only one the parser accepts, so it is the only one
-# advertised here. `daemon/tests/packaging_version.rs` guards this.
+# but `parse_args` in daemon/src/main.rs matches these as EXACT strings and never
+# splits on `=`. A joined `--profile=name` is refused with a usage error (it was
+# silently ignored until DEC-467). The separated form is the only one the parser
+# accepts, so it is the only one advertised here.
+# `daemon/tests/packaging_version.rs` guards this, and that every flag
+# `parse_args` accepts is listed.
 _control-ofc-daemon() {
     _arguments \
         '--config[Path to daemon.toml]:config path:_files' \
         '--profile[Load a named profile from search paths]:profile name:' \
         '--profile-file[Load a profile from an absolute file path]:profile path:_files' \
-        '--allow-non-root[Skip root privilege check (dev only)]'
+        '--allow-non-root[Skip root privilege check (dev only)]' \
+        '--version[Print the daemon version and exit]' \
+        '(-h --help)'{-h,--help}'[Print help and exit]'
 }
 
 _control-ofc-daemon "$@"

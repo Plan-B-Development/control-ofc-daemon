@@ -311,6 +311,7 @@ use control_ofc_daemon::serial::controller::FanController;
 use control_ofc_daemon::serial::real_transport::{
     enumerate_serial_candidates, RealSerialTransport,
 };
+use control_ofc_daemon::single_instance::{self, SocketProbe, SOCKET_PROBE_TIMEOUT};
 use tokio::net::UnixListener;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -331,34 +332,137 @@ fn running_as_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
-/// CLI flag parser for `--allow-non-root`. Separated from `profile_requests`
-/// so preflight can consult it before any config/profile plumbing runs.
-fn parse_allow_non_root_flag() -> bool {
-    std::env::args().any(|a| a == ALLOW_NON_ROOT_FLAG)
+/// Exit status for a command line the daemon cannot parse (DEC-467): the usual
+/// CLI convention, distinct from 1 for a runtime failure such as a bad
+/// `daemon.toml`, so a log reader can tell a bad drop-in argument from a bad
+/// config.
+const USAGE_EXIT_CODE: i32 = 2;
+
+/// The flags that take a value, for the joined-form hint in [`parse_args`].
+const VALUE_FLAGS: [&str; 3] = ["--config", "--profile", "--profile-file"];
+
+fn usage() -> String {
+    format!(
+        "\
+control-ofc-daemon — the Control-OFC fan-control daemon
+
+USAGE:
+    control-ofc-daemon [OPTIONS]
+
+OPTIONS:
+    --config <PATH>         Path to daemon.toml (default: {DEFAULT_CONFIG_PATH})
+    --profile <NAME>        Load a named profile at startup (the file stem)
+    --profile-file <PATH>   Load a profile from a file at startup
+    {ALLOW_NON_ROOT_FLAG}        Skip the root check (development only)
+    --version               Print the daemon version and exit
+    -h, --help              Print this help and exit
+
+Start it through systemd: sudo systemctl enable --now control-ofc-daemon
+Only one daemon runs at a time. To start with a profile, set it in a drop-in
+(systemctl edit control-ofc-daemon). See control-ofc-daemon(1)."
+    )
+}
+
+/// The command line, parsed once in `fn main` (DEC-467). Until then three
+/// readers each re-scanned `std::env::args()` and ignored what they did not
+/// recognise, so `--version` started a full daemon.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CliOptions {
+    /// `--config`; the first one wins.
+    config: Option<String>,
+    /// `--profile` or `--profile-file`, whichever comes first (DEC-435).
+    profile: Option<ProfileRequest>,
+    /// `--allow-non-root`.
+    allow_non_root: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CliAction {
+    Run(CliOptions),
+    /// Print this to stdout and exit 0 (`--help`, `--version`).
+    Exit(String),
+}
+
+/// Parse the arguments after the program name. An unrecognised argument, a
+/// flag with no value, or a joined `--flag=value` is an `Err` carrying the
+/// message; nothing is ignored.
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CliAction, String> {
+    let mut options = CliOptions::default();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--config" => {
+                let value = flag_value(&arg, args.next())?;
+                options.config.get_or_insert(value);
+            }
+            "--profile" => {
+                let value = flag_value(&arg, args.next())?;
+                options
+                    .profile
+                    .get_or_insert(ProfileRequest::CliName(value));
+            }
+            "--profile-file" => {
+                let value = flag_value(&arg, args.next())?;
+                options
+                    .profile
+                    .get_or_insert(ProfileRequest::CliFile(PathBuf::from(value)));
+            }
+            "--allow-non-root" => options.allow_non_root = true,
+            "--version" => return Ok(CliAction::Exit(format!("control-ofc-daemon {VERSION}"))),
+            "-h" | "--help" => return Ok(CliAction::Exit(usage())),
+            other => return Err(unrecognised(other)),
+        }
+    }
+    Ok(CliAction::Run(options))
+}
+
+/// The value after `flag`. A missing one, or one that is itself a flag, is an
+/// error: `--profile --allow-non-root` would otherwise load a profile named
+/// `--allow-non-root` and drop the flag.
+fn flag_value(flag: &str, value: Option<String>) -> Result<String, String> {
+    match value {
+        Some(v) if !v.starts_with('-') => Ok(v),
+        _ => Err(format!("error: {flag} requires a value")),
+    }
+}
+
+fn unrecognised(arg: &str) -> String {
+    match VALUE_FLAGS.iter().find(|flag| {
+        arg.strip_prefix(**flag)
+            .is_some_and(|rest| rest.starts_with('='))
+    }) {
+        Some(flag) => format!(
+            "error: unrecognised argument '{arg}': give the value as a separate \
+             argument ({flag} {})",
+            &arg[flag.len() + 1..]
+        ),
+        None => format!("error: unrecognised argument '{arg}'"),
+    }
 }
 
 /// Pre-flight validation that the daemon has the permissions it needs.
 ///
 /// Runs *before* any subsystem (polling, profile engine, hardware probes)
 /// starts, so that a permission failure surfaces as one clear error instead
-/// of a half-started zombie daemon with silently-broken IPC.
+/// of a half-started zombie daemon with silently-broken IPC. Split in two
+/// since DEC-467 so the single-instance lock can sit between the halves:
 ///
-/// Performs three checks, in order:
-/// 1. **EUID check** — bail out if not root, unless `--allow-non-root`.
-///    hwmon / GPU / serial writes all require root regardless of file
-///    permissions, so running as a regular user can't succeed anyway.
-/// 2. **State directory writability** — try to create a `.writable_probe`
-///    file inside `state_dir`. Catches the case where the daemon is running
-///    as root but without systemd having prepared `/var/lib/control-ofc`.
-/// 3. **IPC socket bind** — create the parent directory, remove any stale
-///    socket from a prior crash, bind a `UnixListener`, and chmod it to
-///    0o666 (DEC-049). The returned listener is handed straight to
+/// 1. [`preflight_privileges`] — the **EUID check** (bail out if not root,
+///    unless `--allow-non-root`; hwmon / GPU / serial writes all require root
+///    regardless of file permissions) and **state directory writability**
+///    (create a `.writable_probe` inside `state_dir`; catches root without the
+///    systemd-prepared `/var/lib/control-ofc`). The lock file lives there.
+/// 2. [`take_instance_lock`] — refuse to start while another daemon runs —
+///    then [`refuse_if_socket_is_served`], for a daemon that predates the lock.
+/// 3. [`preflight_socket`] — create the parent directory, remove a stale socket
+///    (never one a daemon is serving on), bind a `UnixListener`, and chmod it
+///    to 0o666 (DEC-049). The returned listener is handed straight to
 ///    `server::serve`, so there is no bind/unbind/re-bind race.
 ///
 /// Any failure prints an actionable error to stderr and exits(1). The hint
 /// always points back to `sudo systemctl enable --now control-ofc-daemon`,
 /// which is the only supported way to run the daemon.
-fn preflight_check(config: &DaemonConfig, allow_non_root: bool) -> UnixListener {
+fn preflight_privileges(config: &DaemonConfig, allow_non_root: bool) {
     // ── 1. EUID check ───────────────────────────────────────────────────
     if !running_as_root() && !allow_non_root {
         eprintln!("error: control-ofc-daemon must be run as root.");
@@ -420,6 +524,136 @@ fn preflight_check(config: &DaemonConfig, allow_non_root: bool) -> UnixListener 
         }
     }
 
+    log::info!("State directory '{}' writable", state_dir.display());
+}
+
+/// The single-instance lock (DEC-467, `DC-a`), parked in a static so nothing
+/// drops it early. A graceful shutdown releases it in `finish_shutdown`, once the
+/// server has stopped and unlinked its socket, the engine has stopped and the
+/// hardware has been handed back — before the `must_restart` exit and before the
+/// runtime teardown. Not later: a leaked blocking thread stuck in a driver keeps
+/// the process's descriptors after it exits, and holding the lock to the end
+/// would refuse every restart systemd starts until that thread came back
+/// (DEC-467's review). Any other exit — a crash, SIGKILL, a preflight refusal —
+/// leaves it to the kernel, which releases it with the descriptors.
+static INSTANCE_LOCK: OnceLock<single_instance::InstanceGuard> = OnceLock::new();
+
+/// Release the single-instance lock at the end of a graceful shutdown. See
+/// [`INSTANCE_LOCK`]. A no-op when it was never taken (the in-process tests).
+fn release_instance_lock() {
+    if let Some(guard) = INSTANCE_LOCK.get() {
+        guard.release();
+    }
+}
+
+/// Refuse to start while another daemon holds the lock in `state_dir`, and
+/// refuse if the lock cannot be taken at all: running without the guard would
+/// reopen the second-writer hole it closes (DEC-467).
+fn take_instance_lock(state_dir: &Path) {
+    match single_instance::acquire(state_dir) {
+        Ok(guard) => {
+            let _ = INSTANCE_LOCK.set(guard);
+        }
+        Err(e @ single_instance::AcquireError::AlreadyRunning { .. }) => {
+            eprintln!("error: {e}.");
+            eprintln!();
+            eprintln!("Two daemons would both write the fans, so this one will not");
+            eprintln!("start. If the service is running, it is that one:");
+            eprintln!();
+            eprintln!("    systemctl status control-ofc-daemon");
+            eprintln!();
+            eprintln!("To start with a particular profile, set --profile in a drop-in");
+            eprintln!("(systemctl edit control-ofc-daemon) instead of running the");
+            eprintln!("binary by hand.");
+            std::process::exit(1);
+        }
+        Err(e @ single_instance::AcquireError::Unavailable { .. }) => {
+            eprintln!("error: {e}");
+            eprintln!();
+            eprintln!("The daemon will not start without its single-instance lock,");
+            eprintln!("because a second daemon would then be free to write the fans.");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Refuse to start if a daemon is serving on the configured socket, before
+/// anything writes a file a running daemon owns (DEC-467). The lock cannot see
+/// a daemon that predates it — during an upgrade the running service is the
+/// old binary, which holds none — so without this a hand-started new daemon
+/// would get as far as the socket step, past the validation sweep that marks
+/// the running daemon's live session `interrupted`. Read-only: a stale socket
+/// is left for [`preflight_socket`] to remove.
+fn refuse_if_socket_is_served(socket_path: &Path) {
+    match single_instance::probe_socket(socket_path, SOCKET_PROBE_TIMEOUT) {
+        SocketProbe::Absent | SocketProbe::Stale => {}
+        SocketProbe::Live => exit_on_socket_error(&StaleSocketError::InUse),
+        SocketProbe::Unknown(e) => exit_on_socket_error(&StaleSocketError::Unknown(
+            socket_path.display().to_string(),
+            e,
+        )),
+    }
+}
+
+fn exit_on_socket_error(e: &StaleSocketError) -> ! {
+    eprintln!("error: {e}");
+    if matches!(e, StaleSocketError::InUse) {
+        eprintln!();
+        eprintln!("Another control-ofc-daemon is serving on it, and two daemons");
+        eprintln!("would both write the fans. If the service is running, it is");
+        eprintln!("that one:");
+        eprintln!();
+        eprintln!("    systemctl status control-ofc-daemon");
+    }
+    std::process::exit(1);
+}
+
+/// Why [`clear_stale_socket`] left the socket path alone.
+#[derive(Debug)]
+enum StaleSocketError {
+    /// A daemon is serving on it.
+    InUse,
+    /// The probe could not tell whether anything serves on it.
+    Unknown(String, std::io::Error),
+    /// It was stale, and removing it failed.
+    Remove(String, std::io::Error),
+}
+
+impl std::fmt::Display for StaleSocketError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InUse => write!(f, "the IPC socket is in use"),
+            Self::Unknown(path, e) => {
+                write!(f, "cannot tell whether IPC socket '{path}' is in use: {e}")
+            }
+            Self::Remove(path, e) => write!(f, "failed to remove stale IPC socket '{path}': {e}"),
+        }
+    }
+}
+
+/// Make the socket path free to bind: remove what is there only when the probe
+/// shows nothing is serving on it (DEC-467). Until then preflight removed any
+/// file at the path, so a daemon started by hand deleted the running service's
+/// socket and took its clients.
+fn clear_stale_socket(path: &Path, timeout: Duration) -> Result<(), StaleSocketError> {
+    let shown = || path.display().to_string();
+    match single_instance::probe_socket(path, timeout) {
+        SocketProbe::Absent => Ok(()),
+        SocketProbe::Live => Err(StaleSocketError::InUse),
+        SocketProbe::Unknown(e) => Err(StaleSocketError::Unknown(shown(), e)),
+        SocketProbe::Stale => match std::fs::remove_file(path) {
+            Ok(()) => {
+                log::info!("Removed stale socket: {}", path.display());
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(StaleSocketError::Remove(shown(), e)),
+        },
+    }
+}
+
+/// Step 3 of the preflight: bind the IPC socket. See [`preflight_privileges`].
+fn preflight_socket(config: &DaemonConfig) -> UnixListener {
     // ── 3. IPC socket bind ─────────────────────────────────────────────
     let socket_path = Path::new(&config.ipc.socket_path);
     if let Some(parent) = socket_path.parent() {
@@ -436,15 +670,8 @@ fn preflight_check(config: &DaemonConfig, allow_non_root: bool) -> UnixListener 
             std::process::exit(1);
         }
     }
-    if socket_path.exists() {
-        if let Err(e) = std::fs::remove_file(socket_path) {
-            eprintln!(
-                "error: failed to remove stale IPC socket '{}': {e}",
-                socket_path.display()
-            );
-            std::process::exit(1);
-        }
-        log::info!("Removed stale socket: {}", socket_path.display());
+    if let Err(e) = clear_stale_socket(socket_path, SOCKET_PROBE_TIMEOUT) {
+        exit_on_socket_error(&e);
     }
     let listener = match UnixListener::bind(socket_path) {
         Ok(l) => l,
@@ -484,11 +711,7 @@ fn preflight_check(config: &DaemonConfig, allow_non_root: bool) -> UnixListener 
         }
     }
 
-    log::info!(
-        "Preflight OK — state dir '{}' writable, IPC bound at '{}'",
-        state_dir.display(),
-        socket_path.display()
-    );
+    log::info!("Preflight OK — IPC bound at '{}'", socket_path.display());
     listener
 }
 
@@ -708,21 +931,11 @@ fn apply_config_reload(
 /// Resolve the config file path.
 ///
 /// Precedence: `--config` CLI arg > `$CONTROL_OFC_CONFIG` env var > default.
-fn resolve_config_path() -> String {
-    let args: Vec<String> = std::env::args().collect();
-    let mut i = 1;
-    while i < args.len() {
-        if args[i] == "--config" && i + 1 < args.len() {
-            return args[i + 1].clone();
-        }
-        i += 1;
-    }
-    if let Ok(val) = std::env::var("CONTROL_OFC_CONFIG") {
-        if !val.is_empty() {
-            return val;
-        }
-    }
-    DEFAULT_CONFIG_PATH.to_string()
+/// Pure over its inputs; `async_main` passes the parsed flag and the env var.
+fn resolve_config_path(cli: Option<&str>, env: Option<&str>) -> String {
+    cli.or(env.filter(|val| !val.is_empty()))
+        .unwrap_or(DEFAULT_CONFIG_PATH)
+        .to_string()
 }
 
 /// A startup profile source the operator named explicitly (DEC-435).
@@ -757,38 +970,16 @@ impl ProfileRequest {
 }
 
 /// The explicit startup sources, in the order they are tried (DEC-435): the
-/// first `--profile` or `--profile-file` on the command line, then
-/// `OPENFAN_PROFILE`. Pure over `args` and `env` so the order is testable.
-fn profile_requests(args: &[String], env: Option<&str>) -> Vec<ProfileRequest> {
-    let mut requests = Vec::new();
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--config" if i + 1 < args.len() => {
-                i += 2; // skip --config and its value
-                continue;
-            }
-            "--allow-non-root" => {
-                // Handled by `parse_allow_non_root_flag` at preflight; skip here.
-                i += 1;
-                continue;
-            }
-            "--profile" if i + 1 < args.len() => {
-                requests.push(ProfileRequest::CliName(args[i + 1].clone()));
-                break;
-            }
-            "--profile-file" if i + 1 < args.len() => {
-                requests.push(ProfileRequest::CliFile(PathBuf::from(&args[i + 1])));
-                break;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    if let Some(name) = env.filter(|name| !name.is_empty()) {
-        requests.push(ProfileRequest::EnvName(name.to_string()));
-    }
-    requests
+/// first `--profile` or `--profile-file` on the command line (`parse_args`
+/// keeps the first), then `OPENFAN_PROFILE`. Pure so the order is testable.
+fn profile_requests(cli: Option<&ProfileRequest>, env: Option<&str>) -> Vec<ProfileRequest> {
+    cli.cloned()
+        .into_iter()
+        .chain(
+            env.filter(|name| !name.is_empty())
+                .map(|name| ProfileRequest::EnvName(name.to_string())),
+        )
+        .collect()
 }
 
 /// Resolve a profile from persisted daemon state, mapping **any** load failure
@@ -873,11 +1064,13 @@ fn resolve_startup_profile(
 
 /// Load the initial profile: `--profile`/`--profile-file`, then
 /// `OPENFAN_PROFILE`, then the saved profile (DEC-435).
-fn resolve_initial_profile(search_dirs: &[PathBuf]) -> Option<DaemonProfile> {
-    let args: Vec<String> = std::env::args().collect();
+fn resolve_initial_profile(
+    search_dirs: &[PathBuf],
+    cli: Option<&ProfileRequest>,
+) -> Option<DaemonProfile> {
     let env = std::env::var("OPENFAN_PROFILE").ok();
     resolve_startup_profile(
-        &profile_requests(&args, env.as_deref()),
+        &profile_requests(cli, env.as_deref()),
         search_dirs,
         &daemon_state::load_state(),
         profile::load_profile,
@@ -1721,6 +1914,11 @@ async fn finish_shutdown<F>(
     )
     .await;
 
+    // DEC-467: every writer has stopped and the hardware is handed back, so a
+    // restarted daemon may start now, even if a leaked blocking thread keeps this
+    // process alive. See `INSTANCE_LOCK`.
+    release_instance_lock();
+
     log::info!("control-ofc-daemon v{VERSION} stopped");
 
     // DEC-266/267. Deliberately after `shutdown_sequence`, so the hardware is
@@ -1749,6 +1947,21 @@ async fn finish_shutdown<F>(
 /// intentional: a restart must not be delayed by waiting on the very read that
 /// wedged, and exiting from inside the async body is what skips the drop.
 fn main() {
+    // DEC-467: parse the command line before anything else runs, so `--help`,
+    // `--version` and a bad argument exit without logging, building the runtime
+    // or touching a file. Nothing here is ignored any more.
+    let cli = match parse_args(std::env::args().skip(1)) {
+        Ok(CliAction::Run(cli)) => cli,
+        Ok(CliAction::Exit(message)) => {
+            println!("{message}");
+            return;
+        }
+        Err(message) => {
+            eprintln!("{message}\n\n{}", usage());
+            std::process::exit(USAGE_EXIT_CODE);
+        }
+    };
+
     // Capture the main thread's identity HERE, before the runtime exists, so it
     // cannot be recorded on a tokio worker. `panic_is_fatal` compares against it
     // to decide whether a panic ends the process — and therefore whether the
@@ -1767,7 +1980,7 @@ fn main() {
     // and the restore closure; neither crate sets `panic = "abort"`, so unwinding
     // is live. The panic hook has already handed the hardware back by this point.
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        runtime.block_on(async_main());
+        runtime.block_on(async_main(cli));
     }));
 
     // Unblocks this thread after at most RUNTIME_SHUTDOWN_TIMEOUT, leaking any
@@ -1787,7 +2000,7 @@ fn main() {
     }
 }
 
-async fn async_main() {
+async fn async_main(cli: CliOptions) {
     install_panic_hook();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -1806,7 +2019,10 @@ async fn async_main() {
         }
     }
 
-    let config_path = resolve_config_path();
+    let config_path = resolve_config_path(
+        cli.config.as_deref(),
+        std::env::var("CONTROL_OFC_CONFIG").ok().as_deref(),
+    );
     log::info!("Config path: {config_path}");
 
     let mut config = match DaemonConfig::load(&config_path) {
@@ -1822,6 +2038,16 @@ async fn async_main() {
         config.polling.poll_interval_ms,
         config.serial.port.as_deref().unwrap_or("auto-detect"),
     );
+
+    // Pre-flight, first half: root, and a writable state directory. Then the
+    // single-instance lock and a probe of the socket for a daemon that predates
+    // the lock (DEC-467, `DC-a`), BEFORE anything below writes a file a running
+    // daemon owns — the validation sweep would otherwise mark the
+    // running daemon's live session `interrupted` — and before the socket or any
+    // hardware. Both exit(1) themselves on failure.
+    preflight_privileges(&config, cli.allow_non_root);
+    take_instance_lock(Path::new(&config.state.state_dir));
+    refuse_if_socket_is_served(Path::new(&config.ipc.socket_path));
 
     // Init state directory from config (must happen before any state load/save)
     daemon_state::init_state_dir(&config.state.state_dir);
@@ -1877,12 +2103,11 @@ async fn async_main() {
     }
     apply_runtime_overlay(&mut config, &runtime_cfg, &config_path);
 
-    // Pre-flight: verify we can bind the IPC socket and write to state_dir
-    // *before* starting any subsystem. A failure here is fatal — the daemon
-    // is useless without IPC, and a half-started daemon only confuses
-    // operators. preflight_check exits(1) itself on failure.
-    let allow_non_root = parse_allow_non_root_flag();
-    let listener = preflight_check(&config, allow_non_root);
+    // Pre-flight, second half: bind the IPC socket *before* starting any
+    // subsystem. A failure here is fatal — the daemon is useless without IPC,
+    // and a half-started daemon only confuses operators. preflight_socket
+    // exits(1) itself on failure, including when a daemon is serving on it.
+    let listener = preflight_socket(&config);
 
     // Configurable startup delay — wait for hardware to appear after boot
     let startup_delay = effective_startup_delay(config.startup.delay_secs);
@@ -2199,7 +2424,7 @@ async fn async_main() {
     );
 
     // ── Profile loading (CLI > env > persisted state > none) ────────
-    let initial_profile = resolve_initial_profile(&profile_search_dirs);
+    let initial_profile = resolve_initial_profile(&profile_search_dirs, cli.profile.as_ref());
     let active_profile: Arc<Mutex<Option<DaemonProfile>>> = Arc::new(Mutex::new(initial_profile));
 
     // Detect AMD GPUs
@@ -2629,7 +2854,7 @@ async fn async_main() {
     }
 
     // ── Spawn IPC server ────────────────────────────────────────────
-    // Listener was bound in preflight_check, so we know IPC is healthy
+    // Listener was bound in preflight_socket, so we know IPC is healthy
     // before any subsystem started. If the server task exits unexpectedly
     // after this point, ipc_dead_rx fires and the main loop breaks so the
     // daemon shuts down cleanly instead of running headless.
@@ -3945,38 +4170,247 @@ mod tests {
 
     // ── DEC-435 (`DC-ab`): startup profile selection ─────────────────────
 
-    fn args(list: &[&str]) -> Vec<String> {
-        std::iter::once("control-ofc-daemon")
-            .chain(list.iter().copied())
-            .map(str::to_string)
-            .collect()
+    fn parse(list: &[&str]) -> Result<CliAction, String> {
+        parse_args(list.iter().map(|s| (*s).to_string()))
+    }
+
+    fn run_options(list: &[&str]) -> CliOptions {
+        match parse(list) {
+            Ok(CliAction::Run(options)) => options,
+            other => panic!("{list:?} must parse to a run, got {other:?}"),
+        }
     }
 
     #[test]
     fn startup_sources_are_the_first_cli_flag_then_the_env_var() {
+        let cli = run_options(&[
+            "--config",
+            "/x.toml",
+            "--profile",
+            "quiet",
+            "--profile-file",
+            "/p.json",
+        ]);
         assert_eq!(
-            profile_requests(
-                &args(&[
-                    "--config",
-                    "/x.toml",
-                    "--profile",
-                    "quiet",
-                    "--profile-file",
-                    "/p.json"
-                ]),
-                Some("loud"),
-            ),
+            profile_requests(cli.profile.as_ref(), Some("loud")),
             vec![
                 ProfileRequest::CliName("quiet".into()),
                 ProfileRequest::EnvName("loud".into()),
             ],
-            "--config's value is skipped, the first profile flag wins, the env var follows"
+            "the first profile flag wins, the env var follows"
         );
+        let cli = run_options(&["--profile-file", "/p.json"]);
         assert_eq!(
-            profile_requests(&args(&["--profile-file", "/p.json"]), None),
+            profile_requests(cli.profile.as_ref(), None),
             vec![ProfileRequest::CliFile(PathBuf::from("/p.json"))]
         );
-        assert!(profile_requests(&args(&[]), Some("")).is_empty());
+        assert!(profile_requests(run_options(&[]).profile.as_ref(), Some("")).is_empty());
+    }
+
+    // ── DEC-467 (`DC-a`): the command line ───────────────────────────────
+
+    #[test]
+    fn every_flag_the_daemon_accepts_is_parsed() {
+        assert_eq!(
+            run_options(&[
+                "--config",
+                "/x.toml",
+                "--profile-file",
+                "/p.json",
+                "--allow-non-root",
+            ]),
+            CliOptions {
+                config: Some("/x.toml".into()),
+                profile: Some(ProfileRequest::CliFile(PathBuf::from("/p.json"))),
+                allow_non_root: true,
+            }
+        );
+        assert_eq!(run_options(&[]), CliOptions::default());
+        // The constant the root-check message names is the flag the parser takes.
+        assert!(run_options(&[ALLOW_NON_ROOT_FLAG]).allow_non_root);
+    }
+
+    #[test]
+    fn the_first_config_flag_wins() {
+        assert_eq!(
+            run_options(&["--config", "/a.toml", "--config", "/b.toml"]).config,
+            Some("/a.toml".into())
+        );
+    }
+
+    /// The defect: an unrecognised argument fell through `_ => {}`, so
+    /// `sudo control-ofc-daemon --version` started a full daemon — which then
+    /// deleted the running service's socket.
+    #[test]
+    fn version_and_help_exit_instead_of_starting_a_daemon() {
+        assert_eq!(
+            parse(&["--version"]),
+            Ok(CliAction::Exit(format!("control-ofc-daemon {VERSION}")))
+        );
+        for flag in ["-h", "--help"] {
+            match parse(&["--profile", "quiet", flag]) {
+                Ok(CliAction::Exit(text)) => {
+                    assert_eq!(text, usage(), "{flag} prints the usage");
+                }
+                other => panic!("{flag} must exit, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_argument_is_rejected_rather_than_ignored() {
+        for bad in [
+            &["--verbose"][..],
+            &["quiet"],
+            &["--profile", "quiet", "--bogus"],
+            &["-V"],
+        ] {
+            let err = parse(bad).expect_err("must be rejected");
+            assert!(
+                err.starts_with("error: unrecognised argument '"),
+                "{bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_joined_value_is_rejected_with_the_separated_form() {
+        let err = parse(&["--profile=quiet"]).expect_err("joined form is not accepted");
+        assert!(err.contains("(--profile quiet)"), "{err}");
+        let err = parse(&["--profile-file=/p.json"]).expect_err("joined form is not accepted");
+        assert!(err.contains("(--profile-file /p.json)"), "{err}");
+        // Not a value flag, so no hint.
+        assert_eq!(
+            parse(&["--allow-non-root=yes"]),
+            Err("error: unrecognised argument '--allow-non-root=yes'".into())
+        );
+    }
+
+    #[test]
+    fn a_value_flag_without_a_value_is_rejected() {
+        for flag in VALUE_FLAGS {
+            assert_eq!(
+                parse(&[flag]),
+                Err(format!("error: {flag} requires a value")),
+                "a trailing {flag}"
+            );
+            assert_eq!(
+                parse(&[flag, "--allow-non-root"]),
+                Err(format!("error: {flag} requires a value")),
+                "{flag} must not swallow the next flag as its value"
+            );
+        }
+    }
+
+    #[test]
+    fn config_path_precedence_is_flag_then_env_then_default() {
+        assert_eq!(resolve_config_path(Some("/cli"), Some("/env")), "/cli");
+        assert_eq!(resolve_config_path(None, Some("/env")), "/env");
+        assert_eq!(resolve_config_path(None, Some("")), DEFAULT_CONFIG_PATH);
+        assert_eq!(resolve_config_path(None, None), DEFAULT_CONFIG_PATH);
+    }
+
+    /// The defect's second half: preflight removed any file at the socket path,
+    /// so a daemon started by hand took over the running service's socket.
+    #[test]
+    fn a_socket_a_daemon_serves_on_is_never_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(matches!(
+            clear_stale_socket(&path, SOCKET_PROBE_TIMEOUT),
+            Err(StaleSocketError::InUse)
+        ));
+        assert!(path.exists(), "the live socket must still be there");
+        // And the running daemon still gets its clients through it.
+        std::os::unix::net::UnixStream::connect(&path).expect("still reachable");
+        drop(listener);
+    }
+
+    #[test]
+    fn a_stale_socket_is_removed_so_the_new_daemon_can_bind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.sock");
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        assert!(
+            path.exists(),
+            "precondition: a socket file left by a dead daemon"
+        );
+        clear_stale_socket(&path, SOCKET_PROBE_TIMEOUT).expect("stale is cleared");
+        assert!(!path.exists());
+        std::os::unix::net::UnixListener::bind(&path).expect("the path is free to bind");
+        // Nothing there at all is fine too.
+        let fresh = dir.path().join("none.sock");
+        clear_stale_socket(&fresh, SOCKET_PROBE_TIMEOUT).expect("absent is fine");
+    }
+
+    /// [SAFETY] DEC-467 — the CALL SITES, which no in-process test can reach:
+    /// `async_main` is never run by the suite. Same tool as
+    /// `readiness_is_reported_after_what_it_vouches_for_and_the_delay_is_capped`.
+    ///
+    /// The lock must be taken after the root/state-dir check (so a non-root
+    /// user is told to use systemd, not that a lock failed) and before
+    /// everything that writes what a running daemon owns: the validation sweep
+    /// (which marks a live session `interrupted`), `runtime.toml`, the socket,
+    /// and hardware discovery.
+    #[test]
+    fn the_instance_lock_is_taken_before_anything_a_running_daemon_owns() {
+        let whole = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let src = whole
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .expect("main.rs has a #[cfg(test)] module");
+        let body = &src[src
+            .find("async fn async_main(cli: CliOptions) {")
+            .expect("async_main takes the parsed command line")..];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("async_main no longer contains `{needle}`"))
+        };
+        assert_eq!(
+            src.matches("take_instance_lock(").count(),
+            2,
+            "one definition and exactly one call"
+        );
+        let lock = at("take_instance_lock(Path::new(&config.state.state_dir));");
+        assert!(at("preflight_privileges(&config, cli.allow_non_root);") < lock);
+        // The probe for a pre-lock daemon (an upgrade's still-running service)
+        // runs before the same writes the lock guards.
+        let probe = at("refuse_if_socket_is_served(Path::new(&config.ipc.socket_path));");
+        assert!(lock < probe);
+        assert_eq!(src.matches("refuse_if_socket_is_served(").count(), 2);
+        for after in [
+            "sweep_interrupted(",
+            "prune_default()",
+            "RuntimeConfig::load_from_reporting(",
+            "preflight_socket(&config)",
+            "discover_pwm_headers(",
+        ] {
+            assert!(
+                probe < at(after),
+                "the lock and probe must come before `{after}`"
+            );
+        }
+        // A graceful shutdown releases the lock only after the hardware is handed
+        // back, and before the restart exit (DEC-467's review).
+        let finish = &src[src.find("async fn finish_shutdown<F>(").unwrap()..];
+        let finish = &finish[..finish.find("\n}\n").unwrap()];
+        let pos = |needle: &str| {
+            finish
+                .find(needle)
+                .unwrap_or_else(|| panic!("finish_shutdown no longer contains `{needle}`"))
+        };
+        assert!(pos("shutdown_sequence(") < pos("release_instance_lock();"));
+        assert!(pos("release_instance_lock();") < pos("if must_restart {"));
+        assert_eq!(src.matches("release_instance_lock();").count(), 1);
+        // The socket step can only remove a file through the probe.
+        let socket_fn = &src[src.find("fn preflight_socket(").unwrap()..];
+        let socket_fn = &socket_fn[..socket_fn.find("\n}\n").unwrap()];
+        assert!(socket_fn.contains("clear_stale_socket("));
+        assert!(
+            !socket_fn.contains("remove_file"),
+            "preflight_socket must not unlink the socket itself"
+        );
     }
 
     /// A search dir holding `good.json` (loads), `bad.json` (does not), and a
@@ -4730,7 +5164,7 @@ mod tests {
              returns — an unbounded wait on any outstanding blocking task"
         );
         assert!(
-            src.contains("runtime.block_on(async_main())"),
+            src.contains("runtime.block_on(async_main(cli))"),
             "main must drive async_main on a runtime it owns"
         );
         assert!(

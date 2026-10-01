@@ -176,7 +176,7 @@ async fn start_test_server(
 
     let (tx, rx) = tokio::sync::oneshot::channel();
 
-    // Bind the listener here (mirrors what preflight_check does in main).
+    // Bind the listener here (mirrors what preflight_socket does in main).
     let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
 
     let path_clone = socket_path.clone();

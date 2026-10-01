@@ -56,6 +56,23 @@ independently of OS fan control.
 *--allow-non-root*
 	Skip the root privilege check. For development and testing only.
 
+*--version*
+	Print the daemon version and exit.
+
+*-h*, *--help*
+	Print a usage summary and exit.
+
+Any other argument, a flag given without its value, or a value joined to its
+flag with *=* (*--profile=quiet*) is refused: the daemon prints the usage and
+exits with status 2, without starting.
+
+Only one daemon runs at a time. A second one exits with status 1 before it
+touches the socket or a fan: it holds an advisory lock on _daemon.lock_ in the
+state directory, and never removes a socket another daemon is serving on. Do not
+run the binary by hand while the service is active; to start with a profile, set
+*--profile* or *OPENFAN_PROFILE* in a drop-in (*systemctl edit
+control-ofc-daemon*).
+
 The startup profile is the first that loads of: *--profile* or
 *--profile-file*, then *OPENFAN_PROFILE*, then the profile saved in
 _daemon_state.json_. A source that is missing or invalid is logged and the

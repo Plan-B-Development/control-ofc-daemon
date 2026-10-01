@@ -339,7 +339,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 /// Serve axum over an already-bound Unix listener.
 ///
 /// Binding, stale-socket removal, parent-dir creation, and the 0o666 chmod
-/// all happen in `main::preflight_check` *before* any subsystem is spawned,
+/// all happen in `main::preflight_socket` *before* any subsystem is spawned,
 /// so that a bind failure is surfaced immediately as a fatal startup error
 /// (see ADR-002 for the rationale — we don't want a half-started daemon
 /// running polling loops with no one to talk to).

@@ -20,5 +20,6 @@ pub mod runtime_config;
 pub mod safety;
 pub mod sd_notify;
 pub mod serial;
+pub mod single_instance;
 pub mod text;
 pub mod validation;

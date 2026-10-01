@@ -86,6 +86,21 @@ fn declares(text: &str, token: &str) -> bool {
 
 /// `control-ofc-tray` has its own CLI and its own completions (`T1-f`), and
 /// nothing else pins the two together.
+#[test]
+fn tray_completions_cover_every_flag_the_cli_accepts() {
+    assert_completions_cover_parse_args("tray/src/main.rs", "control-ofc-tray");
+}
+
+/// The daemon's three completion files against its `parse_args` (DEC-467).
+/// Until then the daemon had no single parser to scan: three readers each
+/// re-scanned `std::env::args()`, and `--help`/`--version` did not exist.
+#[test]
+fn daemon_completions_cover_every_flag_the_cli_accepts() {
+    assert_completions_cover_parse_args("daemon/src/main.rs", "control-ofc-daemon");
+}
+
+/// Every flag `parse_args` in `main_rs` (relative to the workspace root) accepts
+/// is declared in each of `program`'s bash, zsh and fish completions.
 ///
 /// The authority is the parser, not a list written here: the flag set is
 /// extracted from `parse_args`' own match arms, so adding a flag and forgetting
@@ -94,20 +109,18 @@ fn declares(text: &str, token: &str) -> bool {
 /// the drift it exists to catch.
 ///
 /// Extraction is scoped to the `parse_args` body and keyed on `=>`, because
-/// `USAGE` names every one of these flags too — matching them as bare substrings
-/// would make the guard pass off its own help text (`CLAUDE.md`: a
+/// the usage text names every one of these flags too — matching them as bare
+/// substrings would make the guard pass off its own help text (`CLAUDE.md`: a
 /// source-scanning guard matches its own explanation).
-#[test]
-fn tray_completions_cover_every_flag_the_cli_accepts() {
-    let main_rs =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../tray/src/main.rs"))
-            .expect("read tray/src/main.rs");
+fn assert_completions_cover_parse_args(main_rs: &str, program: &str) {
+    let path = format!("{}/../{main_rs}", env!("CARGO_MANIFEST_DIR"));
+    let source = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {main_rs}: {e}"));
 
     let body = {
-        let start = main_rs
+        let start = source
             .find("fn parse_args")
-            .expect("tray/src/main.rs must define `parse_args`");
-        let rest = &main_rs[start..];
+            .unwrap_or_else(|| panic!("{main_rs} must define `parse_args`"));
+        let rest = &source[start..];
         // To the next column-0 `}`, i.e. the end of the function. Keeps the
         // `#[cfg(test)]` module below out of the scan.
         let end = rest.find("\n}").map(|i| i + 2).unwrap_or(rest.len());
@@ -128,14 +141,14 @@ fn tray_completions_cover_every_flag_the_cli_accepts() {
     // passes by asserting nothing.
     assert!(
         !flags.is_empty(),
-        "extracted no flags from `parse_args` — the scan no longer matches the \
-         parser's shape, so this guard is vacuous and must be re-pointed"
+        "extracted no flags from `parse_args` in {main_rs} — the scan no longer \
+         matches the parser's shape, so this guard is vacuous and must be re-pointed"
     );
 
     for (file, label) in [
-        ("control-ofc-tray.bash", "bash"),
-        ("_control-ofc-tray", "zsh"),
-        ("control-ofc-tray.fish", "fish"),
+        (format!("{program}.bash"), "bash"),
+        (format!("_{program}"), "zsh"),
+        (format!("{program}.fish"), "fish"),
     ] {
         let path = format!("{}/../completions/{}", env!("CARGO_MANIFEST_DIR"), file);
         let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {file}: {e}"));
@@ -153,7 +166,7 @@ fn tray_completions_cover_every_flag_the_cli_accepts() {
             assert!(
                 declares(&text, &expected),
                 "{label} completions ({file}) do not declare `{flag}` (looked for \
-                 `{expected}`), which `parse_args` accepts"
+                 `{expected}`), which `parse_args` in {main_rs} accepts"
             );
         }
     }
@@ -165,12 +178,12 @@ fn tray_completions_cover_every_flag_the_cli_accepts() {
 /// `zshcompsys(1)` on `_arguments`: an optspec ending `=` means "the argument may
 /// appear as the next word, **or in same word as the option name provided that it
 /// is separated from it by an equals sign**", and `+` means the same for a
-/// directly-abutted value. `resolve_config_path` and `parse_profile_arg`
-/// (`daemon/src/main.rs`) match `--config`/`--profile`/`--profile-file` as exact
-/// strings and fall through `_ => {}` on anything else; the tray's `parse_args`
-/// returns `Err`. So a user who accepted the joined form the completion offered
-/// got a flag the daemon silently ignored — it booted with no profile and said
-/// nothing — or a tray that refused to start.
+/// directly-abutted value. Both CLIs' `parse_args` match `--config`/`--profile`/
+/// `--profile-file`/`--socket` as exact strings and return `Err` on anything
+/// else. So a user who accepted the joined form the completion offered got a
+/// daemon or tray that refused to start — and, until DEC-467 gave the daemon a
+/// parser that rejects, a flag the daemon silently ignored: it booted with no
+/// profile and said nothing.
 ///
 /// **This is a category guard, not a list of the three specs that were wrong.**
 /// An opt-in list can only confirm the instances someone already thought of and
