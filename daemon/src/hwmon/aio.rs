@@ -105,7 +105,8 @@ pub fn is_nzxt_kraken3_chip(chip_name: &str) -> bool {
 /// Coolant-temperature label keywords (case-insensitive substring match). A
 /// lower-confidence fallback so a coolant channel on any chip — or an unlisted
 /// cooler — still classifies when the vendor labels it (covers Aquacomputer
-/// "Coolant temp" and ASUS-EC "Water In"/"Water Out").
+/// "Coolant temp" and ASUS-EC `asusec`'s `Water_In`/`Water_Out`/`Water_Block_In`/
+/// `Water_Block_Out`).
 const COOLANT_LABEL_HINTS: &[&str] = &["coolant", "water", "liquid"];
 
 /// True when `chip_name` is a known hwmon liquid cooler (case-insensitive
@@ -224,7 +225,17 @@ mod tests {
     #[test]
     fn coolant_label_classifies_on_any_chip() {
         assert!(is_coolant_sensor("d5next", "Coolant temp"));
-        assert!(is_coolant_sensor("asus_ec_sensors", "Water In"));
+        // `DC-cg`: the labels `asusec` actually publishes, plus a spaced form —
+        // the `water` hint is a substring match, so the spelling does not matter.
+        for label in [
+            "Water_In",
+            "Water_Out",
+            "Water_Block_In",
+            "Water_Block_Out",
+            "Water In",
+        ] {
+            assert!(is_coolant_sensor("asusec", label), "{label}");
+        }
         assert!(is_coolant_sensor("nct6798", "Liquid"));
     }
 

@@ -227,7 +227,8 @@ pub(crate) fn classify_chip(chip_name: &str, label: &str, board_vendor: &str) ->
     // Liquid-cooler coolant temperature takes priority over the generic
     // chip/label heuristics below: an NZXT Kraken `temp1` is coolant, and any
     // sensor a vendor labels coolant/water/liquid is coolant regardless of chip
-    // (covers Aquacomputer "Coolant temp" and ASUS-EC "Water In"/"Water Out").
+    // (covers Aquacomputer "Coolant temp" and ASUS-EC `asusec`'s `Water_In`/
+    // `Water_Out`/`Water_Block_In`/`Water_Block_Out`).
     // A safety input since DEC-443: the coolant emergency keys on this kind —
     // see `safety.rs` and `aio.rs`.
     if crate::hwmon::aio::is_coolant_sensor(chip_name, label) {
@@ -1039,25 +1040,31 @@ mod tests {
 
     #[test]
     fn discover_asus_ec_water_now_classifies_coolant() {
-        // Previously ASUS-EC "Water In"/"Water Out" fell through to MbTemp; the
-        // coolant label hint now classifies them correctly.
+        // Previously ASUS-EC water labels fell through to MbTemp; the coolant
+        // label hint now classifies them correctly. `DC-cg`: the chip's hwmon
+        // name and its labels as `asus-ec-sensors.c` publishes them — this
+        // fixture used to spell them "Water In"/"Water Out".
         let tmp = tempfile::tempdir().unwrap();
         create_fixture_with_chip_name(
             tmp.path(),
             "hwmon0",
-            "asus_ec_sensors",
+            "asusec",
             &[
-                ("1", Some("Water In")),
-                ("2", Some("Water Out")),
-                ("3", Some("CPU")),
+                ("1", Some("Water_In")),
+                ("2", Some("Water_Out")),
+                ("3", Some("Water_Block_In")),
+                ("4", Some("Water_Block_Out")),
+                ("5", Some("CPU")),
             ],
         );
 
         let sensors = discover_sensors(tmp.path()).unwrap();
-        assert_eq!(sensors[0].kind, SensorKind::CoolantTemp);
-        assert_eq!(sensors[1].kind, SensorKind::CoolantTemp);
+        assert_eq!(sensors.len(), 5);
+        for s in &sensors[..4] {
+            assert_eq!(s.kind, SensorKind::CoolantTemp, "{}", s.label);
+        }
         // Non-coolant labels on the same chip are unaffected.
-        assert_eq!(sensors[2].kind, SensorKind::CpuTemp);
+        assert_eq!(sensors[4].kind, SensorKind::CpuTemp);
     }
 
     #[test]
