@@ -66,7 +66,10 @@ pub async fn gpu_reset_fan_handler(
             let newly_claimed = cache.relinquish_gpu_fan(&task_fan_id);
             match crate::hwmon::gpu_fan::reset_to_auto(&path, zero_rpm.as_deref()) {
                 Ok(()) => {
-                    cache.set_gpu_fan_commanded_pct(&task_fan_id, 0);
+                    // `GPU-e`: on firmware auto nothing commands the card, so no
+                    // duty is recorded (DEC-448's hand-back does the same). A
+                    // recorded 0 coalesced away a later 0–4 % profile command.
+                    cache.clear_gpu_fan_commanded_pct(&task_fan_id);
                     // DEC-435: back on firmware auto, so no stop resets it again —
                     // a curve LACT puts on it afterwards is left alone.
                     cache.gpu_handback().note_handed_back(&task_fan_id);
@@ -139,7 +142,8 @@ pub async fn gpu_reset_fan_handler(
             let newly_claimed = cache.relinquish_gpu_fan(&task_fan_id);
             match crate::hwmon::gpu_fan::reset_legacy_to_auto(&hwmon_path) {
                 Ok(()) => {
-                    cache.set_gpu_fan_commanded_pct(&task_fan_id, 0);
+                    // `GPU-e`: as the PMFW arm — on auto, no duty is recorded.
+                    cache.clear_gpu_fan_commanded_pct(&task_fan_id);
                     Ok(())
                 }
                 Err(e) => {
@@ -189,8 +193,13 @@ pub async fn gpu_reset_fan_handler(
 /// an auto-restored fan reporting the TEST SPEED forever, which is worse than not
 /// stamping at all: `GpuBackend::apply` coalesces within `GPU_COALESCE_DELTA_PCT`,
 /// so a later profile command near that value is skipped and the card silently
-/// stays on the firmware curve. `0` for the auto branch matches
-/// `gpu_reset_fan_handler`, which has always stamped it that way.
+/// stays on the firmware curve.
+///
+/// The auto branch **clears** the duty rather than recording 0 (`GPU-e`,
+/// DEC-468): a 0 coalesced away the same way, just for a profile command of
+/// 0–4 %. "On firmware auto" means nothing commands the card, which is how the
+/// engine's hand-back (DEC-448) and `gpu_reset_fan_handler` record it too, and
+/// `restore_pmfw`/`restore_legacy` already read `None` as "restore to auto".
 ///
 /// A FAILED restore is deliberately not stamped: the hardware is still at the
 /// test speed, the cache already says so, and it must keep saying so or the
@@ -204,7 +213,10 @@ fn stamp_restored_pct(
     if restore_failed {
         return;
     }
-    cache.set_gpu_fan_commanded_pct(fan_id, prior_pct.filter(|p| *p > 0).unwrap_or(0));
+    match prior_pct {
+        Some(p) if p > 0 => cache.set_gpu_fan_commanded_pct(fan_id, p),
+        _ => cache.clear_gpu_fan_commanded_pct(fan_id),
+    }
 }
 
 /// Drop the card from the PMFW hand-back list when a verify's restore put it
@@ -753,8 +765,9 @@ fn restore_legacy(
 
 /// The bookkeeping after a legacy restore: a restore that landed gave the fan
 /// back as found, so its record line goes and the cache says what is now on it
-/// — the original manual duty, or `0` for a mode the firmware drives (the
-/// convention `gpu_reset_fan_handler` uses). A FAILED restore changes neither:
+/// — the original manual duty, or no duty for a mode the firmware drives
+/// (`GPU-e`, DEC-468: as `gpu_reset_fan_handler` and `stamp_restored_pct` record
+/// it; a 0 could be coalesced against). A FAILED restore changes neither:
 /// the fan is at the test speed the cache already holds, and the line must stay
 /// for `ExecStopPost` (DEC-414, DEC-297).
 fn note_legacy_restored(
@@ -770,11 +783,12 @@ fn note_legacy_restored(
         return;
     }
     crate::hwmon::gpu_fan::note_legacy_handed_back(record, hwmon_path);
-    let pct = match original {
-        LegacyOriginal::Manual(raw) => crate::pwm::raw_to_percent(raw),
-        LegacyOriginal::Mode(_) => 0,
-    };
-    task_cache.set_gpu_fan_commanded_pct(task_fan_id, pct);
+    match original {
+        LegacyOriginal::Manual(raw) => {
+            task_cache.set_gpu_fan_commanded_pct(task_fan_id, crate::pwm::raw_to_percent(raw))
+        }
+        LegacyOriginal::Mode(_) => task_cache.clear_gpu_fan_commanded_pct(task_fan_id),
+    }
 }
 
 /// Classify the GPU fan verify outcome from the before/after state and the
@@ -1019,8 +1033,8 @@ mod tests {
                 .gpu_fans
                 .get(fan_id)
                 .and_then(|f| f.last_commanded_pct),
-            Some(0),
-            "back on automatic is recorded as 0, not left at the test speed"
+            None,
+            "back on automatic records no duty (`GPU-e`), not the test speed"
         );
     }
 
@@ -1163,8 +1177,8 @@ mod tests {
                 None,
                 false,
                 false,
-                Some(0),
-                "restored to auto: off the stop list",
+                None,
+                "restored to auto: off the stop list, no duty recorded",
             ),
             (
                 Some(40),
@@ -1238,10 +1252,7 @@ mod tests {
     /// the verify's writes and its restore are observable.
     fn pmfw_verify_state(curve: std::path::PathBuf) -> Arc<AppState> {
         use crate::hwmon::gpu_detect::AmdGpuInfo;
-        let cache = Arc::new(crate::health::cache::StateCache::new());
-        let readiness_rollup = Arc::new(parking_lot::Mutex::new(None));
-        let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let gpu = AmdGpuInfo {
+        gpu_test_state(AmdGpuInfo {
             pci_bdf: "0000:03:00.0".into(),
             pci_device_id: 0x7550,
             pci_revision: 0xC0,
@@ -1255,7 +1266,40 @@ mod tests {
             has_pwm: false,
             has_pwm_enable: false,
             overdrive_enabled: true,
+        })
+    }
+
+    /// AppState carrying a pre-RDNA3 card on the legacy `pwm1` path, its hwmon
+    /// dir a real temp dir (`legacy_card`), so the reset's write is observable.
+    fn legacy_reset_state(hwmon: std::path::PathBuf) -> Arc<AppState> {
+        use crate::hwmon::gpu_detect::AmdGpuInfo;
+        let gpu = AmdGpuInfo {
+            pci_bdf: "0000:03:00.0".into(),
+            // Navi 21 (RX 6800 XT): pre-RDNA3, so the legacy path is open.
+            pci_device_id: 0x73BF,
+            pci_revision: 0xC1,
+            pci_class: 0x030000,
+            marketing_name: Some("RX 6800 XT".into()),
+            hwmon_path: hwmon,
+            fan_curve_path: None,
+            fan_zero_rpm_path: None,
+            is_discrete: true,
+            has_fan_rpm: true,
+            has_pwm: true,
+            has_pwm_enable: true,
+            overdrive_enabled: false,
         };
+        assert!(
+            gpu.can_write_legacy_pwm() && gpu.fan_curve_path.is_none(),
+            "fixture check: the reset must take the legacy arm"
+        );
+        gpu_test_state(gpu)
+    }
+
+    fn gpu_test_state(gpu: crate::hwmon::gpu_detect::AmdGpuInfo) -> Arc<AppState> {
+        let cache = Arc::new(crate::health::cache::StateCache::new());
+        let readiness_rollup = Arc::new(parking_lot::Mutex::new(None));
+        let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         Arc::new(AppState {
             cache,
             staleness_config: crate::health::staleness::StalenessConfig::default(),
@@ -1307,6 +1351,64 @@ mod tests {
         })
     }
 
+    /// `GPU-e` (DEC-468): a successful reset puts the card on firmware auto, and
+    /// "on auto" records NO duty — the state the engine's own hand-back leaves
+    /// (DEC-448). It used to record 0, which `GpuBackend::apply`'s 5 % coalescing
+    /// then held against a profile command of 0–4 % once an activation gave the
+    /// card back to the engine, leaving it on firmware auto while the profile
+    /// named it. Both arms: PMFW and legacy `pwm1`.
+    #[tokio::test]
+    async fn a_reset_records_no_duty_on_either_arm() {
+        let fan_id = "amd_gpu:0000:03:00.0";
+
+        let dir = tempfile::tempdir().unwrap();
+        let curve = dir.path().join("fan_curve");
+        std::fs::write(&curve, "").unwrap();
+        let pmfw = pmfw_verify_state(curve.clone());
+
+        let (_tmp, hwmon, _record) = legacy_card();
+        std::fs::write(hwmon.join("pwm1_enable"), "1\n").unwrap();
+        let legacy = legacy_reset_state(hwmon.clone());
+
+        for (arm, state) in [("pmfw", &pmfw), ("legacy", &legacy)] {
+            // The engine drove the card at 40 % before the reset.
+            state.cache.set_gpu_fan_commanded_pct(fan_id, 40);
+
+            let (status, _) = gpu_reset_fan_handler(
+                axum::extract::State(state.clone()),
+                axum::extract::Path("0000:03:00.0".to_string()),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::OK, "{arm}: the reset succeeded");
+            assert_eq!(
+                state
+                    .cache
+                    .snapshot()
+                    .gpu_fans
+                    .get(fan_id)
+                    .and_then(|f| f.last_commanded_pct),
+                None,
+                "{arm}: a card on firmware auto must record no duty — 40 means the \
+                 reset left the engine's duty, 0 means a later 0–4 % profile command \
+                 is coalesced away"
+            );
+        }
+        // Each reset really took its own arm and wrote the hardware.
+        assert_eq!(
+            std::fs::read_to_string(&curve).unwrap(),
+            "c\n",
+            "pmfw: reset written"
+        );
+        assert_eq!(
+            std::fs::read_to_string(hwmon.join("pwm1_enable"))
+                .unwrap()
+                .trim(),
+            "2",
+            "legacy: back on automatic"
+        );
+    }
+
     /// DEC-297 remediation. Both reviewers independently found that the restore's
     /// **auto** branch was never stamped into the cache, and the test above misses
     /// it because it seeds a prior duty (40) and so always takes the `Some(p)`
@@ -1351,12 +1453,11 @@ mod tests {
             .get(fan_id)
             .and_then(|f| f.last_commanded_pct);
         assert_eq!(
-            commanded,
-            Some(0),
-            "an auto-restore must be recorded as 0 (the convention gpu_reset_fan_handler \
-             already uses), not left at the test speed — otherwise the GUI shows a manual \
-             duty for a firmware-controlled card and the engine coalesces away its own \
-             correction"
+            commanded, None,
+            "an auto-restore must record no duty (`GPU-e`), not the test speed and not \
+             0 — either would let the engine coalesce away a later profile command near \
+             it, and the test speed would also show a manual duty for a firmware-controlled \
+             card"
         );
         // DEC-435: back on firmware auto, so the card is off the stop list — a stop
         // must not reset a curve another tool puts on it afterwards. (The sibling

@@ -1973,9 +1973,10 @@ impl GpuBackend {
 /// `POST /gpu/{id}/fan/reset` makes — and take it off the hand-back list, so no
 /// stop resets it again. Runs inside the engine's write-locked GPU task.
 ///
-/// The cache's last commanded duty is cleared, not set to 0 as the reset
-/// endpoint does: a 0 would let the 5 % coalescing skip a later profile's
-/// command of 0–4 %, leaving the card on auto while a profile names it.
+/// The cache's last commanded duty is cleared, not set to 0 — as the reset
+/// endpoint and a verify's restore-to-auto also do (`GPU-e`, DEC-468): a 0 would
+/// let the 5 % coalescing skip a later profile's command of 0–4 %, leaving the
+/// card on auto while a profile names it.
 ///
 /// `None` when not attempted: a verify claimed the pause (it owns the card, and
 /// hands it back itself), or the card left the list after the peek (a reset or
@@ -3737,7 +3738,8 @@ mod tests {
         std::fs::write(&curve_path, "").unwrap();
         cache.gpu_handback().note_handed_back(GPU_FAN);
         be.apply_and_give_back(&[], &gpu_members(&[GPU_FAN])).await;
-        cache.set_gpu_fan_commanded_pct(GPU_FAN, 0);
+        // The reset records no duty (`GPU-e`, DEC-468).
+        cache.clear_gpu_fan_commanded_pct(GPU_FAN);
         be.apply_and_give_back(&[cmd(GPU_FAN, "amd_gpu", 60)], &gpu_members(&[GPU_FAN]))
             .await;
         assert!(
@@ -3750,6 +3752,37 @@ mod tests {
         be.apply_and_give_back(&[], &GpuMembers::default()).await;
         assert_eq!(std::fs::read_to_string(&curve_path).unwrap(), "c\n");
         assert!(!cache.gpu_handback().is_taken(GPU_FAN));
+    }
+
+    /// `GPU-e` (DEC-468): every site that puts a card on firmware auto clears its
+    /// duty rather than recording 0, and this is why. With 0 recorded, the 5 %
+    /// GPU coalescing swallows a 3 % profile command and the card stays on auto;
+    /// with the duty cleared, the same command is written. The 0 arm is the
+    /// contrast that proves the clear arm is not passing on a backend that never
+    /// coalesces.
+    #[tokio::test]
+    async fn a_cleared_gpu_duty_lets_a_low_command_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut be, cache, curve_path) =
+            gpu_backend_holding_the_card(&dir, Arc::new(crate::clock::SystemClock)).await;
+
+        cache.set_gpu_fan_commanded_pct(GPU_FAN, 0);
+        be.apply(&[cmd(GPU_FAN, "amd_gpu", 3)]).await;
+        assert!(
+            std::fs::read_to_string(&curve_path).unwrap().is_empty(),
+            "contrast: with 0 recorded, a 3 % command is coalesced away"
+        );
+
+        cache.clear_gpu_fan_commanded_pct(GPU_FAN);
+        be.apply(&[cmd(GPU_FAN, "amd_gpu", 3)]).await;
+        assert!(
+            !std::fs::read_to_string(&curve_path).unwrap().is_empty(),
+            "with no duty recorded, the 3 % command must be written"
+        );
+        assert_eq!(
+            cache.gpu_fans_snapshot()[GPU_FAN].last_commanded_pct,
+            Some(3)
+        );
     }
 
     /// The opposite arm: a card a control still names is kept even on a tick

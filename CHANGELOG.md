@@ -65,6 +65,13 @@ fields and show the rails exactly as before.
   serialise its configuration report, the route answered `200` with an empty body, which a client
   read as a real, empty configuration. It now answers `500 internal_error`, as every other route
   does.
+- **A GPU fan put back on automatic by *Restore GPU Fan to Automatic* or by a fan test now takes
+  a low profile speed again** (DEC-468, `GPU-e`). Both recorded the card as commanded at 0 %, and
+  the daemon skips a GPU speed change smaller than 5 points, so once a profile was activated a curve
+  asking for 0–4 % was skipped and the card stayed on the firmware's automatic curve until the curve
+  rose. A card on automatic now records no commanded speed, as it already did when a profile stopped
+  naming it, so the next speed is always written. On `GET /fans` and `/poll` its
+  `last_commanded_pwm` is now absent rather than `0`.
 
 ## [3.2.0] — 2026-09-30
 
