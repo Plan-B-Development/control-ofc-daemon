@@ -2665,13 +2665,20 @@ async fn a_wedged_hwmon_header_does_not_stall_unrelated_config_writes() {
     // the handler's only remaining work is the response — i.e. it is at (or in)
     // `resolved_header_role`, blocked on the wedge. Spinning on observable state
     // rather than sleeping for a guessed duration.
+    //
+    // Both waits in this test sleep with `std::thread::sleep`, never the tokio
+    // timer (`REL-a`). Once the handler blocks a worker on the wedge, the runtime
+    // timer can stop firing — measured: with the handler woken by a timer just
+    // before it blocked, a `tokio::time::sleep` here never returned and the test
+    // hung instead of failing. The test body runs on the `block_on` thread, not a
+    // worker, so blocking it starves nothing and each wait ends at its deadline.
     let mut committed = false;
     for _ in 0..600 {
         if !state_ref.header_roles().contains_key("h1") {
             committed = true;
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert!(
         committed,
@@ -2681,9 +2688,21 @@ async fn a_wedged_hwmon_header_does_not_stall_unrelated_config_writes() {
 
     // THE ASSERTION. The request is blocked on a wedged header. It must not still
     // be holding the lock that every other `/config/*` route needs.
-    let free = state_ref.config_write.try_lock();
-    let held = free.is_err();
-    drop(free);
+    //
+    // Sampled until a deadline, not once (`REL-a`). The barrier sees the
+    // in-memory commit, which the handler makes a few statements BEFORE it drops
+    // the guard, so a single `try_lock` could land in that gap on a correct
+    // handler — it did once, in CI run 36424344021. A correct handler closes the
+    // gap within microseconds; the regression holds the guard until `wedge` is
+    // dropped below, so it is still held at the deadline.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let held = loop {
+        match state_ref.config_write.try_lock() {
+            Ok(_free) => break false,
+            Err(_) if std::time::Instant::now() >= deadline => break true,
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    };
     drop(wedge);
     let _ = blocked.await;
 
