@@ -1323,6 +1323,63 @@ mod tests {
         assert_eq!(body["key"], "value");
     }
 
+    /// `DC-ce`: a body that cannot be serialised answers `500 internal_error`,
+    /// never a success with an empty or partial body. A tuple-keyed map is the
+    /// smallest value `serde_json` refuses ("key must be a string").
+    #[test]
+    fn json_ok_answers_500_when_the_body_cannot_be_serialised() {
+        let unserialisable: std::collections::BTreeMap<(u8, u8), u8> = [((1, 2), 3)].into();
+        let (status, Json(body)) = json_ok(StatusCode::OK, &unserialisable);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"]["code"], "internal_error");
+        assert_eq!(body["error"]["source"], "internal");
+        assert_eq!(body["error"]["retryable"], true);
+    }
+
+    /// `DC-ce`: every handler serialises its response through `json_ok`, so a
+    /// serialisation failure is a `500` everywhere. `GET /config` used to call
+    /// `serde_json::to_value` itself and answer `200 {}` on failure.
+    ///
+    /// Walks the directory rather than naming files, so a handler module added
+    /// later is covered without anyone enrolling it. Production half only (up to
+    /// the `mod tests` block) and comment lines skipped, or this would match its
+    /// own text.
+    #[test]
+    fn json_ok_is_the_only_response_serialiser_in_the_handlers() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/handlers");
+        let mut sites = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("handlers dir is readable") {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let whole = std::fs::read_to_string(&path).unwrap();
+            let prod = whole
+                .split_once("#[cfg(test)]\nmod tests")
+                .map_or(whole.as_str(), |(before, _)| before);
+            for (n, line) in prod.lines().enumerate() {
+                if !line.trim_start().starts_with("//") && line.contains("serde_json::to_value(") {
+                    sites.push(format!(
+                        "{}:{}",
+                        path.file_name().unwrap().to_string_lossy(),
+                        n + 1
+                    ));
+                }
+            }
+        }
+        assert_eq!(
+            sites.len(),
+            1,
+            "only `json_ok` may serialise a handler's response — a handler that \
+             calls `serde_json::to_value` itself chooses its own failure answer \
+             (found: {sites:?})"
+        );
+        assert!(
+            sites[0].starts_with("mod.rs:"),
+            "the one serialiser must be `json_ok` in mod.rs (found: {sites:?})"
+        );
+    }
+
     #[test]
     fn build_sensor_entries_returns_empty_for_empty_state() {
         let state = DaemonState::default();

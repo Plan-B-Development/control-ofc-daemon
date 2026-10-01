@@ -61,6 +61,10 @@ fields and show the rails exactly as before.
   A channel whose speed was already unknown before the loss, because its last command was never
   confirmed, is treated as unknown, as before. On an ordinary tick it is left alone, and under the
   40 % floor it gets the floor (it used to get 100 %).
+- **`GET /config` reports a failure as an error** (DEC-468, `DC-ce`). If the daemon could not
+  serialise its configuration report, the route answered `200` with an empty body, which a client
+  read as a real, empty configuration. It now answers `500 internal_error`, as every other route
+  does.
 
 ## [3.2.0] — 2026-09-30
 

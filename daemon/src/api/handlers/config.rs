@@ -14,7 +14,7 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 
-use super::{error_response, AppState};
+use super::{error_response, json_ok, AppState};
 use crate::api::responses::*;
 use crate::api::server::UdsConnectInfo;
 use crate::runtime_config::RuntimeConfig;
@@ -930,10 +930,10 @@ pub async fn get_config_handler(
         restart_pending,
         keys,
     };
-    (
-        StatusCode::OK,
-        Json(serde_json::to_value(body).unwrap_or_else(|_| serde_json::json!({}))),
-    )
+    // `DC-ce`: through `json_ok` like every other handler, so a report that fails
+    // to serialise answers `500 internal_error` rather than `200 {}` — an empty
+    // body a client would read as a real config with no `api_version`.
+    json_ok(StatusCode::OK, body)
 }
 
 /// Take the `/config/*` write lock, then load runtime.toml for a setter —
