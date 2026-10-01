@@ -6,6 +6,7 @@
 //! - Lease-protected PWM writes with safety floors
 
 pub mod aio;
+pub mod bound_driver;
 pub mod chip_db;
 pub mod chip_name;
 pub mod classify;

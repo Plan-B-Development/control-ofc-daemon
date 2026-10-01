@@ -394,8 +394,32 @@ fn detect_superio_from(
     snap: &DaemonState,
     now: std::time::Instant,
 ) -> superio::SuperIoReport {
-    let bound = gather_bound_chips(state, snap, now);
+    // `BRD-g`: the driver each chip is bound to, read from sysfs — the only
+    // evidence that separates the two nct668x drivers, which share hwmon names.
+    let observed =
+        crate::hwmon::bound_driver::scan_bound_drivers(std::path::Path::new(HWMON_SYSFS_ROOT));
+    let bound = attach_bound_drivers(gather_bound_chips(state, snap, now), &observed);
     superio::detect_superio(&superio::SysfsSuperIoEvidence::new(bound))
+}
+
+/// Give each bound chip the driver a sysfs scan observed for it: by
+/// `(chip, device_id)` first, then by chip name alone — a sensor-only chip
+/// carries its name as a stand-in `device_id` (see [`merge_bound_chips`]). A
+/// chip the scan did not see keeps `None`.
+fn attach_bound_drivers(
+    chips: Vec<superio::BoundChip>,
+    observed: &[crate::hwmon::bound_driver::ObservedDriver],
+) -> Vec<superio::BoundChip> {
+    use crate::hwmon::bound_driver::{driver_for_chip, driver_for_device};
+    chips
+        .into_iter()
+        .map(|c| superio::BoundChip {
+            bound_driver: driver_for_device(observed, &c.chip_name, &c.device_id)
+                .or_else(|| driver_for_chip(observed, &c.chip_name))
+                .map(str::to_string),
+            ..c
+        })
+        .collect()
 }
 
 /// Collect the currently-bound hwmon chips from the live cache: PWM headers
@@ -452,6 +476,7 @@ fn merge_bound_chips(
         .map(|(chip_name, device_id)| superio::BoundChip {
             chip_name,
             device_id,
+            bound_driver: None,
         })
         .collect()
 }
@@ -1033,6 +1058,40 @@ mod tests {
             smsc.device_id, "smsc47b397",
             "sensor-only chip uses name as device_id"
         );
+    }
+
+    /// `BRD-g`: the observed driver reaches every bound chip — a header chip by
+    /// its device, a sensor-only chip (name as stand-in `device_id`) by name.
+    #[test]
+    fn attach_bound_drivers_reaches_header_and_sensor_only_chips() {
+        use crate::hwmon::bound_driver::ObservedDriver;
+        let observed = vec![
+            ObservedDriver {
+                chip_name: "nct6687".into(),
+                device_id: "nct6683.2592".into(),
+                driver: "nct6683".into(),
+            },
+            ObservedDriver {
+                chip_name: "smsc47b397".into(),
+                device_id: "smsc47b397.1152".into(),
+                driver: "smsc47b397".into(),
+            },
+        ];
+        let chips = merge_bound_chips(
+            vec![("nct6687".to_string(), "nct6683.2592".to_string())],
+            vec!["smsc47b397".to_string(), "k10temp".to_string()],
+        );
+        let got = attach_bound_drivers(chips, &observed);
+        let driver = |name: &str| {
+            got.iter()
+                .find(|c| c.chip_name == name)
+                .unwrap_or_else(|| panic!("{name} missing: {got:?}"))
+                .bound_driver
+                .clone()
+        };
+        assert_eq!(driver("nct6687").as_deref(), Some("nct6683"));
+        assert_eq!(driver("smsc47b397").as_deref(), Some("smsc47b397"));
+        assert_eq!(driver("k10temp"), None, "not in the scan → not observed");
     }
 
     #[test]

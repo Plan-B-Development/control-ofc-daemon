@@ -106,48 +106,67 @@ pub async fn hardware_diagnostics_handler(
 
 /// Build the hardware-readiness report. Synchronous and blocking — invoked via
 /// `spawn_blocking` from the handler above.
-fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json::Value>) {
-    // Collect per-chip info from hwmon headers
+/// One `chips_detected[]` entry per `(chip, device)` that has headers.
+///
+/// `observed` is the bound-driver scan (`BRD-g`, DEC-469), taken by the caller
+/// before it locks the controller so no sysfs read happens under that lock.
+/// `bound_driver` is published only where the scan saw one, and
+/// `in_mainline_kernel` follows it where it contradicts the name's guess.
+fn chips_detected(
+    headers: &[&crate::hwmon::pwm_discovery::PwmHeaderDescriptor],
+    observed: &[crate::hwmon::bound_driver::ObservedDriver],
+) -> Vec<HwmonChipInfo> {
     // Keyed by the canonical chip name (DEC-442); the sysfs spelling rides
     // beside it and is the same for every header of one chip.
     let mut chip_map: HashMap<(String, String), usize> = HashMap::new();
     let mut sysfs_names: HashMap<(String, String), String> = HashMap::new();
-    if let Some(ref controller) = state.hwmon_controller {
-        let ctrl = controller.lock();
-        for h in ctrl.headers() {
-            let key = (h.chip_name.clone(), h.device_id.clone());
-            sysfs_names
-                .entry(key.clone())
-                .or_insert_with(|| h.sysfs_chip_name().to_string());
-            *chip_map.entry(key).or_insert(0) += 1;
-        }
+    for h in headers {
+        let key = (h.chip_name.clone(), h.device_id.clone());
+        sysfs_names
+            .entry(key.clone())
+            .or_insert_with(|| h.sysfs_chip_name().to_string());
+        *chip_map.entry(key).or_insert(0) += 1;
     }
 
-    let total_headers = chip_map.values().sum::<usize>();
+    chip_map
+        .into_iter()
+        .map(|((chip_name, device_id), count)| {
+            let bound_driver =
+                crate::hwmon::bound_driver::driver_for_device(observed, &chip_name, &device_id)
+                    .map(str::to_string);
+            let in_mainline =
+                diagnostics::chip_driver_in_mainline_bound(&chip_name, bound_driver.as_deref());
+            let sysfs_chip_name = sysfs_names
+                .remove(&(chip_name.clone(), device_id.clone()))
+                .unwrap_or_else(|| chip_name.clone());
+            HwmonChipInfo {
+                expected_driver: diagnostics::expected_driver(&chip_name).to_string(),
+                chip_name,
+                sysfs_chip_name,
+                device_id,
+                bound_driver,
+                in_mainline_kernel: in_mainline,
+                header_count: count,
+            }
+        })
+        .collect()
+}
+
+fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json::Value>) {
+    let observed = crate::hwmon::bound_driver::scan_bound_drivers(std::path::Path::new(
+        crate::hwmon::HWMON_SYSFS_ROOT,
+    ));
+    let chips_detected: Vec<HwmonChipInfo> = match state.hwmon_controller {
+        Some(ref controller) => chips_detected(&controller.lock().headers(), &observed),
+        None => Vec::new(),
+    };
+
+    let total_headers = chips_detected.iter().map(|c| c.header_count).sum::<usize>();
     let writable_headers = state
         .hwmon_controller
         .as_ref()
         .map(|c| c.lock().headers().iter().filter(|h| h.is_writable).count())
         .unwrap_or(0);
-
-    let chips_detected: Vec<HwmonChipInfo> = chip_map
-        .into_iter()
-        .map(|((chip_name, device_id), count)| {
-            let driver = diagnostics::expected_driver(&chip_name);
-            let in_mainline = diagnostics::chip_driver_in_mainline(&chip_name);
-            let sysfs_chip_name = sysfs_names
-                .remove(&(chip_name.clone(), device_id.clone()))
-                .unwrap_or_else(|| chip_name.clone());
-            HwmonChipInfo {
-                chip_name,
-                sysfs_chip_name,
-                device_id,
-                expected_driver: driver.to_string(),
-                in_mainline_kernel: in_mainline,
-                header_count: count,
-            }
-        })
-        .collect();
 
     // DEC-119: PCI-space scan for AMD VGA devices + driver binding. Done
     // independently of the hwmon scan so a GPU whose amdgpu driver did not
@@ -399,6 +418,68 @@ fn voltage_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `BRD-g`: the observed driver reaches `chips_detected[]`, and the
+    /// mainline answer follows it where the name guessed wrong. Driven from a
+    /// fake sysfs tree through the real scan, so the join on `device_id` is
+    /// the one production performs.
+    #[test]
+    fn chips_detected_publishes_the_bound_driver_and_corrects_mainline() {
+        use crate::hwmon::pwm_discovery::PwmHeaderDescriptor;
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let class = root.path().join("class");
+        for (dir, name, device, driver) in [
+            ("hwmon3", "nct6687", "nct6683.2592", Some("nct6683")),
+            ("hwmon4", "it8696", "it87.2624", None),
+        ] {
+            let hw = class.join(dir);
+            let dev = root.path().join("devices").join(device);
+            std::fs::create_dir_all(&hw).unwrap();
+            std::fs::create_dir_all(&dev).unwrap();
+            std::fs::write(hw.join("name"), format!("{name}\n")).unwrap();
+            symlink(&dev, hw.join("device")).unwrap();
+            if let Some(d) = driver {
+                let drv = root.path().join("drivers").join(d);
+                std::fs::create_dir_all(&drv).unwrap();
+                symlink(&drv, dev.join("driver")).unwrap();
+            }
+        }
+        let observed = crate::hwmon::bound_driver::scan_bound_drivers(&class);
+        let header = |chip: &str, dir: &str, idx: u8| PwmHeaderDescriptor {
+            chip_name: chip.into(),
+            device_id: crate::hwmon::discovery::device_id_for_hwmon_dir(&class.join(dir)),
+            pwm_index: idx,
+            ..Default::default()
+        };
+        let headers = [
+            header("nct6687", "hwmon3", 1),
+            header("nct6687", "hwmon3", 2),
+            header("it8696", "hwmon4", 1),
+        ];
+        let refs: Vec<&PwmHeaderDescriptor> = headers.iter().collect();
+        let chips = chips_detected(&refs, &observed);
+
+        let nct = chips.iter().find(|c| c.chip_name == "nct6687").unwrap();
+        assert_eq!(nct.expected_driver, "nct6687", "the name still guesses");
+        assert_eq!(nct.bound_driver.as_deref(), Some("nct6683"));
+        assert!(
+            !diagnostics::chip_driver_in_mainline_bound("nct6687", None),
+            "precondition: by name alone this chip is out-of-tree"
+        );
+        assert!(nct.in_mainline_kernel, "the in-kernel nct6683 bound it");
+        assert_eq!(nct.header_count, 2);
+
+        let ite = chips.iter().find(|c| c.chip_name == "it8696").unwrap();
+        assert_eq!(ite.bound_driver, None, "no driver link → not observed");
+        assert!(!ite.in_mainline_kernel, "it8696 stays DKMS-only by name");
+        let wire = serde_json::to_value(ite).unwrap();
+        assert!(
+            wire.get("bound_driver").is_none(),
+            "absent, not null: {wire}"
+        );
+    }
 
     /// `VOLT-b`: the handler's builder carries the catalogue through to the
     /// wire — the arm only a wired call site can produce is a named, scaled

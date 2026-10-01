@@ -933,10 +933,14 @@ pub struct SuperIoChipEntry {
     pub evidence: Vec<String>,
     /// Presence confidence: `high` | `medium` | `low` | `unknown`.
     pub confidence: String,
-    /// The module inferred to have bound this chip (present only when bound).
+    /// The kernel driver bound to this chip, read from its hwmon device's
+    /// `device/driver` link (`BRD-g`, DEC-469; inferred from the name before).
+    /// Present only when the chip is bound and the link was read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bound_driver: Option<String>,
     pub expected_module: String,
+    /// `true` whenever `bound_driver` is present (a bound driver is loaded or
+    /// built in); otherwise whether `expected_module` is loaded.
     pub module_loaded: bool,
     pub hwmon_present: bool,
     /// A load recommendation, present only for an unbound, allowlisted chip.
@@ -1862,7 +1866,16 @@ pub struct HwmonChipInfo {
     /// support-report only.
     pub sysfs_chip_name: String,
     pub device_id: String,
+    /// The driver the chip NAME suggests — a guess, wrong in both directions
+    /// for the nct668x family, whose two drivers share hwmon names.
     pub expected_driver: String,
+    /// The kernel driver actually bound, read from the hwmon device's
+    /// `device/driver` link (`BRD-g`, DEC-469). Absent when no link was read.
+    /// Clients prefer it to `expected_driver` wherever it is present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bound_driver: Option<String>,
+    /// Whether the chip's driver is in mainline: chip-level by name (DEC-144),
+    /// but following `bound_driver` where that contradicts the name's guess.
     pub in_mainline_kernel: bool,
     pub header_count: usize,
 }

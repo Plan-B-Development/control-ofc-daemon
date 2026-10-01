@@ -107,10 +107,11 @@ pub(crate) fn expected_driver_for_chip(chip_name: &str) -> &'static str {
     // `nct6687d` uses. So an MSI NCT6687D bound by the in-kernel, read-only
     // `nct6683` (pwm 0444 on every customer ID but Mitac; no pwm_enable) is
     // hwmon "nct6687", and this function maps it to the out-of-tree module it is
-    // not running. The mapping below is a best guess keyed on the name; telling
-    // the two apart needs the bound driver (`/sys/class/hwmon/hwmonN/device/
-    // driver`), which is register row `BRD-g`. Everything else in the
-    // NCT6xxx/NCT5xxx range is the in-kernel nct6775 driver.
+    // not running. The mapping below is a best guess keyed on the name; the
+    // driver actually bound is read from `/sys/class/hwmon/hwmonN/device/driver`
+    // by `hwmon::bound_driver` and published beside this guess as `bound_driver`
+    // (`BRD-g`, DEC-469). Everything else in the NCT6xxx/NCT5xxx range is the
+    // in-kernel nct6775 driver.
     if lower.starts_with("nct6683") {
         return "nct6683"; // mainline, monitoring-only (driver withholds write permission)
     }
@@ -229,6 +230,27 @@ pub fn chip_driver_in_mainline(chip_name: &str) -> bool {
         .find(|(name, _)| *name == driver)
         .map(|(_, mainline)| *mainline)
         .unwrap_or(false)
+}
+
+/// [`chip_driver_in_mainline`], corrected by the driver actually bound to the
+/// chip where one was observed (`BRD-g`, DEC-469).
+///
+/// When the bound driver is the one the name suggests, the chip-level answer
+/// stands — that keeps the per-chip it87 split, where one module name covers
+/// mainline and DKMS-only chips. When it differs and is a module this table
+/// knows, the bound module's own answer replaces the guess: an NCT6687D the
+/// in-kernel `nct6683` bound is `true`, an `nct6683` chip the out-of-tree
+/// `nct6687` bound is `false`. An unknown or unobserved driver changes nothing.
+pub fn chip_driver_in_mainline_bound(chip_name: &str, bound_driver: Option<&str>) -> bool {
+    let module = |d: &str| d.trim().replace('-', "_");
+    if let Some(bound) = bound_driver.map(module) {
+        if bound != module(expected_driver_for_chip(chip_name)) {
+            if let Some((_, mainline)) = KNOWN_MODULES.iter().find(|(name, _)| *name == bound) {
+                return *mainline;
+            }
+        }
+    }
+    chip_driver_in_mainline(chip_name)
 }
 
 /// Return the expected driver name for a chip.
@@ -2585,6 +2607,23 @@ mod tests {
         assert!(chip_driver_in_mainline("nct6683"));
         assert!(!chip_driver_in_mainline("nct6686"));
         assert!(!chip_driver_in_mainline("nct6687"));
+    }
+
+    #[test]
+    fn mainline_follows_the_bound_driver_where_the_name_guessed_wrong() {
+        // `BRD-g`: the hwmon name is shared by both nct668x drivers, so the
+        // observed driver decides — in both directions.
+        assert!(chip_driver_in_mainline_bound("nct6687", Some("nct6683")));
+        assert!(chip_driver_in_mainline_bound("nct6686", Some("nct6683")));
+        assert!(!chip_driver_in_mainline_bound("nct6683", Some("nct6687")));
+        // Unobserved or matching: the chip-level answer stands, so it87's
+        // per-chip split survives (one module, two answers).
+        assert!(!chip_driver_in_mainline_bound("nct6687", None));
+        assert!(!chip_driver_in_mainline_bound("it8688", Some("it87")));
+        assert!(chip_driver_in_mainline_bound("it8628", Some("it87")));
+        assert!(chip_driver_in_mainline_bound("nct6799", Some("nct6775")));
+        // A driver this table does not know cannot correct the guess.
+        assert!(!chip_driver_in_mainline_bound("nct6687", Some("mystery")));
     }
 
     #[test]

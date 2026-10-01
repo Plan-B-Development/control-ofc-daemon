@@ -18,7 +18,23 @@ fields and show the rails exactly as before.
   On an X870E AORUS MASTER this names all seven unlabelled `it8696` inputs (`+12V` reads ~2 V at the pin
   and ~12 V as the rail) and marks three of the `it87952`'s inputs as not mapped.
 
+- **`GET /diagnostics/hardware` reports the driver bound to each chip** (DEC-469, `BRD-g`). Each
+  `hwmon.chips_detected[]` entry carries `bound_driver`, read from the hwmon device's `device/driver`
+  link, beside the name-keyed `expected_driver` guess. Omitted where no link reads. Additive; older
+  GUIs ignore it — but they do show the corrected `in_mainline_kernel` (below) beside the guessed
+  driver, so a GUI older than 3.3.0 can read "nct6687 … Mainline: Yes" for an MSI board on the
+  in-kernel driver. Upgrade the GUI with the daemon.
+
 ### Fixed
+
+- **The Super-I/O report no longer guesses which driver bound a chip** (DEC-469, `BRD-g`).
+  `bound_driver` on `GET /inventory/superio` and `/inventory/hardware-readiness` was inferred from the
+  chip name, which is wrong in both directions for Nuvoton NCT6683/6686/6687: the in-kernel `nct6683`
+  and the out-of-tree `nct6687` give the chip the same name. An MSI NCT6687D running the read-only
+  in-kernel driver was reported as running `nct6687`, and its `module_loaded` read `false`. It is now
+  read from sysfs. `module_loaded` is `true` whenever a bound driver is observed, and
+  `chips_detected[].in_mainline_kernel` follows the bound driver where it contradicts the name. A
+  bound chip whose driver link cannot be read now omits `bound_driver` rather than guessing.
 
 - **A second daemon no longer takes over the running one** (DEC-467, `DC-a`). Running
   `control-ofc-daemon` by hand while the service was active — even just `sudo control-ofc-daemon

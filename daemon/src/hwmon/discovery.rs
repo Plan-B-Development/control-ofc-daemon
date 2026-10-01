@@ -453,7 +453,7 @@ pub fn discover_sensors_reporting_skips(
 /// have: a chip whose `name` will not read never reaches `discover_device_sensors`'
 /// body, but its already-cached sensor ids still embed this, which is what lets
 /// `polling.rs` protect exactly that chip's readings from eviction and no others.
-fn device_id_for_hwmon_dir(hwmon_dir: &Path) -> String {
+pub(crate) fn device_id_for_hwmon_dir(hwmon_dir: &Path) -> String {
     let device_link = hwmon_dir.join("device");
     if device_link.exists() {
         let resolved = std::fs::read_link(&device_link)

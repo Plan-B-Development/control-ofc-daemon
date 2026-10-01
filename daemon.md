@@ -74,6 +74,7 @@ daemon/src/
                          devices, profiles, control_paths/pwm_baselines) back on read and on
                          every incoming write. The sysfs spelling rides on the header
                          descriptor as `sysfs_chip_name`, for `/etc/sensors.d` matching only
+    bound_driver.rs    — the kernel driver bound to each hwmon device, read from `device/driver` per scan — every `/diagnostics/hardware` request, once per shared assessment for Super-I/O (DEC-469, `BRD-g`)
     pwm_control.rs     — HwmonPwmController + SysfsWriter trait; write coalescing with engine duty reconciliation (DEC-073/DEC-406); shared-report sibling priming (DEC-425)
     lease.rs           — LeaseManager: the internal single-writer arbiter (DEC-197)
     handback.rs        — [SAFETY] give each header back exactly as it was found (DEC-382):

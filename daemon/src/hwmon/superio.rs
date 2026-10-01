@@ -115,14 +115,15 @@ pub struct SuperIoChip {
     /// Confidence the chip is physically present (bound/kernel-logged ⇒ High;
     /// board-table-only ⇒ Medium).
     pub confidence: Confidence,
-    /// The module *inferred* to have bound this chip (`Some` only when bound) —
-    /// derived from `expected_module`, not observed from sysfs. For split-module
-    /// drivers such as nct6775 (whose platform half is `nct6775_platform`) this
-    /// is the top-level module name, not the sub-module that performed the bind.
+    /// The kernel driver bound to this chip, as observed from its hwmon
+    /// device's `device/driver` link (`BRD-g`, DEC-469) — `Some` only when the
+    /// chip is bound and the link was read; never inferred from the name.
     pub bound_driver: Option<String>,
     /// The kernel module expected to drive it (`"unknown"` if unrecognized).
     pub expected_module: String,
-    /// Whether `expected_module` is currently loaded.
+    /// Whether the chip's driver is loaded: `true` whenever `bound_driver` is
+    /// observed (a bound driver is loaded or built in, whatever the name
+    /// suggests), otherwise whether `expected_module` is loaded.
     pub module_loaded: bool,
     /// Whether the chip is currently exposing an hwmon device.
     pub hwmon_present: bool,
@@ -154,6 +155,9 @@ pub struct BoundChip {
     pub chip_name: String,
     /// Stable device identifier (used for DEC-106 dual-chip disambiguation).
     pub device_id: String,
+    /// The kernel driver bound to it, observed from sysfs
+    /// ([`crate::hwmon::bound_driver`]); `None` when not read.
+    pub bound_driver: Option<String>,
 }
 
 /// Read-only evidence the detector composes. Injected so the detector is a
@@ -311,6 +315,8 @@ struct EvidenceAcc {
     dmi: bool,
     kmsg: bool,
     bound: bool,
+    /// The observed bound driver, from the first bound-chip entry that had one.
+    bound_driver: Option<String>,
 }
 
 /// Run passive Super-I/O detection over the injected evidence.
@@ -349,7 +355,11 @@ pub fn detect_superio(ev: &dyn SuperIoEvidence) -> SuperIoReport {
         if !chip_db::is_known_superio_chip(&b.chip_name) {
             continue;
         }
-        acc.entry(normalize(&b.chip_name)).or_default().bound = true;
+        let entry = acc.entry(normalize(&b.chip_name)).or_default();
+        entry.bound = true;
+        if entry.bound_driver.is_none() {
+            entry.bound_driver = b.bound_driver;
+        }
     }
     for c in ev.kmsg_chips() {
         acc.entry(normalize(&c)).or_default().kmsg = true;
@@ -412,13 +422,15 @@ fn build_chip(
 ) -> SuperIoChip {
     let expected_module = chip_db::expected_driver(chip_name).to_string();
     let vendor = vendor_for_module(&expected_module);
-    let module_loaded = loaded.iter().any(|m| m == &expected_module);
     let hwmon_present = ev.bound;
-    let bound_driver = if hwmon_present && expected_module != "unknown" {
-        Some(expected_module.clone())
+    // Observed, never inferred (`BRD-g`): the hwmon name is shared by both
+    // nct668x drivers, so only the sysfs link says which one bound the chip.
+    let bound_driver = if hwmon_present {
+        ev.bound_driver.clone()
     } else {
         None
     };
+    let module_loaded = bound_driver.is_some() || loaded.iter().any(|m| m == &expected_module);
 
     // Confidence: bound or kernel-logged ⇒ definitely present (High); a
     // board-table-only expectation is a strong-but-unconfirmed prior (Medium).
@@ -860,6 +872,14 @@ mod tests {
         BoundChip {
             chip_name: name.to_string(),
             device_id: dev.to_string(),
+            bound_driver: None,
+        }
+    }
+
+    fn bound_by(name: &str, dev: &str, driver: &str) -> BoundChip {
+        BoundChip {
+            bound_driver: Some(driver.to_string()),
+            ..bound(name, dev)
         }
     }
 
@@ -972,7 +992,7 @@ mod tests {
     #[test]
     fn bound_nuvoton_chip_needs_no_recommendation() {
         let ev = FakeEvidence {
-            bound: vec![bound("nct6799", "isa-0290")],
+            bound: vec![bound_by("nct6799", "isa-0290", "nct6775")],
             loaded: vec!["nct6775".into()],
             ..Default::default()
         };
@@ -987,6 +1007,60 @@ mod tests {
             "a bound, working chip should not be told to load anything"
         );
         assert_eq!(chip.evidence, vec![Evidence::BoundHwmon]);
+    }
+
+    /// `BRD-g`: the hwmon name is shared by both nct668x drivers, so the
+    /// observed driver is reported — an MSI NCT6687D the in-kernel nct6683
+    /// bound is not reported as the out-of-tree nct6687 its name suggests.
+    #[test]
+    fn bound_driver_is_the_observed_one_not_the_name_guess() {
+        let ev = FakeEvidence {
+            bound: vec![bound_by("nct6687", "nct6683.2592", "nct6683")],
+            loaded: vec!["nct6683".into()],
+            ..Default::default()
+        };
+        let r = detect_superio(&ev);
+        let chip = find(&r, "nct6687");
+        assert_eq!(chip.expected_module, "nct6687", "the name still guesses");
+        assert_eq!(chip.bound_driver.as_deref(), Some("nct6683"));
+        assert!(chip.recommendation.is_none());
+    }
+
+    /// `BRD-g`: `module_loaded` follows the observed driver. An `nct6683`
+    /// chip the out-of-tree nct6687 bound has its driver loaded although the
+    /// module its name suggests is not — the arm the name-keyed check could
+    /// never report.
+    #[test]
+    fn module_loaded_follows_the_observed_driver() {
+        let ev = FakeEvidence {
+            bound: vec![bound_by("nct6683", "nct6687.2592", "nct6687")],
+            loaded: vec!["nct6687".into()],
+            ..Default::default()
+        };
+        let r = detect_superio(&ev);
+        let chip = find(&r, "nct6683");
+        assert_eq!(chip.expected_module, "nct6683");
+        assert!(
+            !ev.loaded.contains(&chip.expected_module),
+            "precondition: the name-suggested module is not loaded"
+        );
+        assert_eq!(chip.bound_driver.as_deref(), Some("nct6687"));
+        assert!(chip.module_loaded);
+    }
+
+    /// A bound chip whose driver link was not read reports no driver — never
+    /// the name's guess — and `module_loaded` keeps its name-keyed meaning.
+    #[test]
+    fn an_unobserved_driver_is_absent_not_guessed() {
+        let ev = FakeEvidence {
+            bound: vec![bound("nct6799", "isa-0290")],
+            ..Default::default()
+        };
+        let r = detect_superio(&ev);
+        let chip = find(&r, "nct6799");
+        assert!(chip.hwmon_present);
+        assert_eq!(chip.bound_driver, None);
+        assert!(!chip.module_loaded);
     }
 
     #[test]

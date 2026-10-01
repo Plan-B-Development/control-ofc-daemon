@@ -14,7 +14,7 @@
 //! when a handler genuinely needs it.
 
 pub use crate::hwmon::chip_db::{
-    chip_driver_in_mainline, detect_acpi_conflicts, detect_loaded_modules,
+    chip_driver_in_mainline_bound, detect_acpi_conflicts, detect_loaded_modules,
     detect_module_collisions, expected_chips_for_board, expected_driver, read_board_info,
     read_cpu_vendor, read_kernel_detected_chips, read_ppfeaturemask, ChipBinding,
 };
