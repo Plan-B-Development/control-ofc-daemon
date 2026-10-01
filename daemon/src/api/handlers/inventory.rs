@@ -726,7 +726,9 @@ fn pick_probe_bases(
         .any(|n| crate::hwmon::chip_db::expected_driver(n) != "unknown")
     {
         return Err(
-            "a Super-I/O driver is already bound — refusing to probe its config port".to_string(),
+            // `DC-cn`: both config ports are skipped, not one — say so.
+            "a Super-I/O driver is already bound — refusing to probe any Super-I/O config port"
+                .to_string(),
         );
     }
     Ok(superio_probe::SIO_BASES

@@ -83,6 +83,9 @@ fields and show the rails exactly as before.
 - **An ACPI claim on the Z790 AORUS MASTER's second fan chip is now detected** (DEC-468, `BRD-k`).
   That board's IT87952E sits at I/O port 0x0B10, which was missing from the ranges the hardware
   diagnostics check for firmware conflicts.
+- **The port probe's refusal note names both config ports** (DEC-468, `DC-cn`). When a Super-I/O
+  driver is already bound, the hardware diagnostics skip the active probe on every config port, but
+  the note said "refusing to probe its config port", as if only one were skipped.
 
 ## [3.2.0] — 2026-09-30
 

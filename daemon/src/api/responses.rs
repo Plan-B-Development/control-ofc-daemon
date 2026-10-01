@@ -2048,8 +2048,9 @@ pub struct AcpiConflictInfo {
 /// the wrong registers. The original Bazzite report (ublue-os/bazzite
 /// #4498) documents a CPU fan header being bricked by this exact load
 /// ordering on MSI MAG X570 TOMAHAWK WIFI. The same chip family (NCT6797D)
-/// appears on AM4 400-series MSI boards (e.g. B450M MORTAR, X470 GAMING
-/// PRO CARBON) so the trap is not 500-series-only.
+/// appears on AM4 400-series MSI boards (e.g. B450M MORTAR) so the trap is not
+/// 500-series-only. (The X470 GAMING PRO CARBON, once listed here, carries an
+/// NCT6795D — `DC-cn`, as the GUI's fallback text was corrected in DEC-421.)
 ///
 /// Severity is reported as a string (`"critical" | "high" | "medium"`)
 /// so the GUI can render the appropriate banner without translating
