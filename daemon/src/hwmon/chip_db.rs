@@ -545,6 +545,12 @@ const SIO_IO_RANGES: &[(&str, u16, u16)] = &[
     ("it87", 0x0A20, 0x0A2F),
     ("it87", 0x0A40, 0x0A4F),
     ("it87", 0x0A60, 0x0A6F),
+    // `BRD-k`: the Z790 AORUS MASTER's IT87952E sits here (it87 #22,
+    // `it87952-isa-0b10`). The one Intel dual-chip secondary base any report
+    // names; every AMD-board secondary reported (it87 #15/#39/#51/#70/#73/#89/
+    // #93/#103) is at 0x0A60, above. The other Intel dual-chip rows' bases are
+    // unknown — no `sensors` output for them exists (searched 2026-10-01).
+    ("it87", 0x0B10, 0x0B1F),
 ];
 
 /// Detect ACPI I/O port conflicts with hwmon drivers.
@@ -1531,6 +1537,25 @@ mod tests {
         assert!(conflicts
             .iter()
             .any(|c| c.conflicts_with_driver == "nct6775"));
+    }
+
+    /// `BRD-k`: an ACPI claim over the Z790 AORUS MASTER's IT87952E base (0x0B10)
+    /// is reported against it87; the window beside it is not.
+    #[test]
+    fn detect_acpi_conflict_on_the_z790_master_secondary_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ioports_path = tmp.path().join("ioports");
+        fs::write(
+            &ioports_path,
+            "0b10-0b1f : ACPI OpRegion GSA1.SIO2\n\
+             0b20-0b2f : ACPI OpRegion GSA1.OTHR\n",
+        )
+        .unwrap();
+
+        let conflicts = detect_acpi_conflicts_from(&ioports_path);
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert_eq!(conflicts[0].io_range, "0b10-0b1f");
+        assert_eq!(conflicts[0].conflicts_with_driver, "it87");
     }
 
     #[test]

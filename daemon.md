@@ -451,7 +451,8 @@ gating each have their own register rows and regression tests.
      *designed* to hold its ceiling under sustained load, so a trip point at or
      below it fires on a healthy machine and then latches forever, because
      release needs a reading the part never produces. Raise-only, capped, and
-     gated on authoritative CPU chips (`k10temp`/`coretemp`/`sbtsi_temp`) — a
+     gated on authoritative CPU chips (`k10temp`/`coretemp`/`sbtsi`, the last also
+     under its module name `sbtsi_temp`) — a
      Super-I/O `CPUTIN` publishes a `crit` too and it means something else.
      Intel-only in practice: `k10temp` on Zen publishes no `crit`, so AMD keeps
      the 105 floor, which is right — with a ~95C ceiling it was never the broken

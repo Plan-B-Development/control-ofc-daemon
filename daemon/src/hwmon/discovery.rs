@@ -258,7 +258,9 @@ pub(crate) fn classify_chip(chip_name: &str, label: &str, board_vendor: &str) ->
         // NVIDIA discrete GPU via the open `nouveau` driver (DEC-204).
         "nouveau" => SensorKind::GpuTemp,
         "nvme" => SensorKind::DiskTemp,
-        "sbtsi_temp" => SensorKind::CpuTemp,
+        // `BRD-e`: the kernel registers the hwmon device as `sbtsi`; `sbtsi_temp`
+        // is the module's name. Both are matched, as for `asusec` below.
+        "sbtsi" | "sbtsi_temp" => SensorKind::CpuTemp,
         _ if chip_name.starts_with("it87") => SensorKind::MbTemp,
         // Nuvoton Super I/O families: default MbTemp, but TSI/PECI labels indicate CPU
         c if NUVOTON_PECI_TSI_CHIPS.contains(&c) => {
@@ -283,8 +285,9 @@ pub(crate) fn classify_chip(chip_name: &str, label: &str, board_vendor: &str) ->
                 SensorKind::MbTemp
             }
         }
-        // ASUS EC/WMI sensors: classify by label
-        "asus_ec_sensors" | "asus_wmi_sensors" => {
+        // ASUS EC/WMI sensors: classify by label. `asusec` is the hwmon name the
+        // kernel registers for the `asus_ec_sensors` module (`BRD-e`).
+        "asusec" | "asus_ec_sensors" | "asus_wmi_sensors" => {
             if lower.contains("cpu") {
                 SensorKind::CpuTemp
             } else if lower.contains("gpu") {
@@ -519,7 +522,7 @@ fn discover_device_sensors(
             // `classify_sensor` derives `SensorKind` from it. Defaulting a
             // present-but-unreadable label to "" therefore renames the sensor
             // (`hwmon:chip:dev:Tctl` -> `hwmon:chip:dev:`) AND can reclassify it
-            // — on `nct6775`/`asus_ec_sensors` an empty label falls through to
+            // — on `nct6775`/`asusec` an empty label falls through to
             // `MbTemp`. The chip still enumerates Ok, so the pass looks complete,
             // eviction runs, and the old id is dropped on false evidence: exactly
             // the "unreadable is not vanished" hole this round closed one level
@@ -895,6 +898,49 @@ mod tests {
         assert_eq!(sensors[3].kind, SensorKind::MbTemp);
     }
 
+    /// `BRD-e`: `asusec` is the hwmon name the kernel registers for the
+    /// `asus_ec_sensors` module, so it must classify exactly as that arm does.
+    ///
+    /// For every label the driver publishes (`asus-ec-sensors.c`'s `EC_SENSOR`
+    /// names, read 2026-10-01) the label fallback happens to agree with the ASUS
+    /// arm, so those alone would pass with the arm deleted. `Junction` is the
+    /// kind of label where the two part — the fallback calls it a GPU, the ASUS
+    /// arm a motherboard reading — and it is what proves `asusec` reaches the arm.
+    #[test]
+    fn asusec_classifies_exactly_as_asus_ec_sensors() {
+        let labels = [
+            "CPU",
+            "CPU Core",
+            "CPU Package",
+            "CPU_Opt",
+            "Chipset",
+            "Motherboard",
+            "T_Sensor",
+            "VRM",
+            "VRM_E HS",
+            "M.2",
+            "USB4",
+            "Extra_1",
+            "Water_In",
+            "Water_Out",
+            "Water_Block_In",
+            "Water_Block_Out",
+            "Junction",
+        ];
+        assert_ne!(
+            classify_chip("unknown_chip", "Junction", ""),
+            classify_chip("asus_ec_sensors", "Junction", ""),
+            "precondition: this label separates the ASUS arm from the fallback"
+        );
+        for label in labels {
+            assert_eq!(
+                classify_chip("asusec", label, ""),
+                classify_chip("asus_ec_sensors", label, ""),
+                "{label}"
+            );
+        }
+    }
+
     #[test]
     fn discover_asus_wmi_sensors_classifies_by_label() {
         let tmp = tempfile::tempdir().unwrap();
@@ -928,14 +974,20 @@ mod tests {
         }
     }
 
+    /// [SAFETY] `BRD-e`: the kernel's hwmon name is `sbtsi` (`sbtsi_temp.c`
+    /// registers it so); the module name `sbtsi_temp` stays accepted. Either way
+    /// the reading is `CpuTemp`, which is what puts it in the ladder's
+    /// hottest-CPU reduce.
     #[test]
-    fn discover_sbtsi_temp_is_cpu() {
-        let tmp = tempfile::tempdir().unwrap();
-        create_fixture_with_chip_name(tmp.path(), "hwmon0", "sbtsi_temp", &[("1", None)]);
+    fn discover_sbtsi_is_cpu_under_either_spelling() {
+        for chip in ["sbtsi", "sbtsi_temp"] {
+            let tmp = tempfile::tempdir().unwrap();
+            create_fixture_with_chip_name(tmp.path(), "hwmon0", chip, &[("1", None)]);
 
-        let sensors = discover_sensors(tmp.path()).unwrap();
-        assert_eq!(sensors.len(), 1);
-        assert_eq!(sensors[0].kind, SensorKind::CpuTemp);
+            let sensors = discover_sensors(tmp.path()).unwrap();
+            assert_eq!(sensors.len(), 1, "{chip}");
+            assert_eq!(sensors[0].kind, SensorKind::CpuTemp, "{chip}");
+        }
     }
 
     // ── Coolant / liquid-cooler classification (AIO Phase 1) ──────────────
@@ -1234,6 +1286,7 @@ mod tests {
             ("nvme", "Composite", SensorKind::DiskTemp),
             ("nvme", "Sensor 1", SensorKind::DiskTemp),
             ("sbtsi_temp", "", SensorKind::CpuTemp),
+            ("sbtsi", "", SensorKind::CpuTemp), // the kernel's hwmon name (BRD-e)
             // ── it87* prefix arm ──
             ("it8696", "AUXTIN0", SensorKind::MbTemp),
             ("it8772", "anything", SensorKind::MbTemp),

@@ -72,6 +72,17 @@ fields and show the rails exactly as before.
   rose. A card on automatic now records no commanded speed, as it already did when a profile stopped
   naming it, so the next speed is always written. On `GET /fans` and `/poll` its
   `last_commanded_pwm` is now absent rather than `0`.
+- **ASUS EC and AMD SB-TSI sensors are recognised under the names the kernel gives them**
+  (DEC-468, `BRD-e`). The daemon looked for `asus_ec_sensors` and `sbtsi_temp`, which are the
+  drivers' module names; the kernel registers the sensors as `asusec` and `sbtsi`. ASUS EC readings
+  (VRM, chipset, T_Sensor and the like) were still classified by their labels, but as an
+  unrecognised chip's, at low confidence; they are now reported at the confidence of a known
+  motherboard sensor. An `sbtsi` reading is now a CPU temperature, as `k10temp`'s is. Desktop x86
+  machines rarely have one, and from kernel 7.3 the driver is for server management controllers
+  only.
+- **An ACPI claim on the Z790 AORUS MASTER's second fan chip is now detected** (DEC-468, `BRD-k`).
+  That board's IT87952E sits at I/O port 0x0B10, which was missing from the ranges the hardware
+  diagnostics check for firmware conflicts.
 
 ## [3.2.0] — 2026-09-30
 

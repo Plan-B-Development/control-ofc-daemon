@@ -9248,6 +9248,17 @@ mod tests {
             "a motherboard proxy's crit must not raise the CPU's trip point"
         );
 
+        // `BRD-e`: `sbtsi` is the kernel's hwmon name for the `sbtsi_temp` module,
+        // and both are authoritative. (The driver publishes no `crit` today, so
+        // this can only matter if one ever does.)
+        for chip in ["sbtsi", "sbtsi_temp"] {
+            assert_eq!(
+                trigger_for(vec![cpu_with_crit("tsi", chip, 50.0, Some(105.0))]),
+                110.0,
+                "{chip}: an authoritative CPU chip's ceiling raises the trip point"
+            );
+        }
+
         // Several sensors: the authoritative one decides, the proxy is ignored.
         assert_eq!(
             trigger_for(vec![

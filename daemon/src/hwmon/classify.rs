@@ -160,8 +160,12 @@ fn is_superio_chip(chip: &str) -> bool {
 /// not the CPU's design ceiling. Getting this predicate wrong can only fail to
 /// raise the trigger (the derivation is raise-only and floors at the global
 /// constant), never lower it.
+///
+/// `sbtsi` is the hwmon name the kernel registers for the `sbtsi_temp` module;
+/// both spellings are accepted (`BRD-e`). The driver publishes no `crit`, so
+/// today it can only add a `CpuTemp` reading, never move the trigger.
 pub fn is_authoritative_cpu_chip(chip: &str) -> bool {
-    matches!(chip, "k10temp" | "coretemp" | "sbtsi_temp")
+    matches!(chip, "k10temp" | "coretemp" | "sbtsi" | "sbtsi_temp")
 }
 
 /// Refine a coarse `CpuTemp` into a specific CPU sub-class. Sub-class from the
@@ -197,7 +201,9 @@ fn refine_cpu(chip: &str, l: &str) -> TempClassification {
 /// `unknown` when the coarse kind was only the unrecognised-chip default (an
 /// unknown chip with no classifying label) rather than a real motherboard chip.
 fn refine_mb(chip: &str, l: &str) -> TempClassification {
+    // `asusec` is the kernel's hwmon name for `asus_ec_sensors` (`BRD-e`).
     let known_mobo = is_superio_chip(chip)
+        || chip == "asusec"
         || chip == "asus_ec_sensors"
         || chip == "asus_wmi_sensors"
         || chip == "gigabyte_wmi";
@@ -333,11 +339,31 @@ mod tests {
         assert_eq!(cls("coretemp", "Core 3").class, TempClass::CpuCore);
     }
 
+    /// [SAFETY] `BRD-e`: `sbtsi` (the kernel's hwmon name) and `sbtsi_temp` (the
+    /// module's) are both an authoritative CPU sensor — the predicate DEC-308's
+    /// trigger raise is gated on.
     #[test]
-    fn sbtsi_is_high_confidence_cpu() {
-        let c = cls("sbtsi_temp", "");
-        assert_eq!(c.class, TempClass::CpuPackage);
-        assert_eq!(c.confidence, Confidence::High);
+    fn sbtsi_is_high_confidence_cpu_under_either_spelling() {
+        for chip in ["sbtsi", "sbtsi_temp"] {
+            assert!(is_authoritative_cpu_chip(chip), "{chip}");
+            let c = cls(chip, "");
+            assert_eq!(c.class, TempClass::CpuPackage, "{chip}");
+            assert_eq!(c.confidence, Confidence::High, "{chip}");
+        }
+    }
+
+    /// `BRD-e`: `asusec` (the kernel's hwmon name) is a known motherboard chip
+    /// like `asus_ec_sensors`, so its VRM reading is Medium confidence. An
+    /// unrecognised chip with the same label is Low — the contrast that shows
+    /// the arm, not the label, decides it.
+    #[test]
+    fn asusec_is_a_known_motherboard_chip() {
+        for chip in ["asusec", "asus_ec_sensors"] {
+            let c = cls(chip, "VRM");
+            assert_eq!(c.class, TempClass::VrmTemp, "{chip}");
+            assert_eq!(c.confidence, Confidence::Medium, "{chip}");
+        }
+        assert_eq!(cls("unknown_chip", "VRM").confidence, Confidence::Low);
     }
 
     #[test]
