@@ -86,6 +86,11 @@ fields and show the rails exactly as before.
 - **The port probe's refusal note names both config ports** (DEC-468, `DC-cn`). When a Super-I/O
   driver is already bound, the hardware diagnostics skip the active probe on every config port, but
   the note said "refusing to probe its config port", as if only one were skipped.
+- **On a Gigabyte board, the Super-I/O advice no longer says to load a driver the package's guard
+  blocks** (DEC-468, `DC-da`). The hardware diagnostics could tell you to run `sudo modprobe
+  nct6775` for a chip, but on a Gigabyte board the package's Super-I/O guard declines that module,
+  so the command reports success and nothing appears. That chip's advice now explains the guard
+  and how to see what it declined (`sudo journalctl -b -t control-ofc-superio-guard`).
 
 ## [3.2.0] — 2026-09-30
 

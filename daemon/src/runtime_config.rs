@@ -856,8 +856,10 @@ impl RuntimeConfig {
 }
 
 /// How protective an assigned role is, for choosing between two spellings of
-/// one header (DEC-442): a pump (30% floor, never stopped), then a CPU fan
-/// (30% floor), then everything else.
+/// one header (DEC-442): a pump (30% floor, never stopped), then a CPU fan, then
+/// everything else. (`ROLE-b`: an *assigned* CPU-fan role earns no floor — the
+/// floor follows the label, `ROLE-a` — so the rank orders protection intent, not
+/// a floor each role is promised.)
 fn role_protection_rank(role: crate::hwmon::roles::HeaderRole) -> u8 {
     use crate::hwmon::roles::HeaderRole;
     match role {

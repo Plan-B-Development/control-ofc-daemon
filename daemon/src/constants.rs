@@ -166,17 +166,26 @@ pub const IDENTIFY_PUMP_BASELINE_FALLBACK_PCT: u8 = 60;
 
 // ── Profile engine — no-sensor safety ────────────────────────────────
 
-/// If no CPU temperature sensor is found for this many consecutive
-/// cycles, force every OpenFan channel and writable hwmon header the machine
-/// HAS to `NO_SENSOR_SAFE_PCT` (GPU fans excluded — DEC-130).
+/// If no CPU temperature reading is fresh for this many consecutive cycles, with
+/// nothing latched, hold the active profile's members — the OpenFan channels and
+/// writable hwmon headers its controls command — at no less than
+/// `NO_SENSOR_SAFE_PCT` (a floor over the curve, DEC-307; GPU fans excluded —
+/// DEC-130).
+///
+/// `DC-cy`: since DEC-382 this floor reaches **only the profile's members**, not
+/// every output the machine has; only the 100 % emergency reaches outputs no
+/// control commands, because below 100 % taking a header nothing controls would
+/// replace a firmware curve that may be running it faster. A control skipped that
+/// tick keeps its fans at their last duty under it (DEC-386, `TS-p`).
 ///
 /// The enumeration is the design, not a message (DEC-371) — what the operator
 /// is told is derived from the backends actually driven.
 pub const NO_SENSOR_CYCLE_THRESHOLD: u32 = 5;
 
-/// PWM percent forced on every OpenFan channel and writable hwmon header the
-/// machine has, when no CPU temperature sensor is found for
-/// `NO_SENSOR_CYCLE_THRESHOLD` consecutive cycles.
+/// The floor, in percent, held on the active profile's members when no CPU
+/// temperature reading has been fresh for `NO_SENSOR_CYCLE_THRESHOLD` consecutive
+/// cycles — never on an output no control commands (DEC-382; see
+/// `NO_SENSOR_CYCLE_THRESHOLD`).
 pub const NO_SENSOR_SAFE_PCT: u8 = 40;
 
 /// Ticks between "still forcing" summaries while the thermal force holds at an

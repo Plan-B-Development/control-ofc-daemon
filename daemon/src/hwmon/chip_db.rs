@@ -1168,6 +1168,46 @@ pub fn board_expects_only_ite_chips(board_vendor: &str, board_name: &str) -> boo
     !chips.is_empty() && chips.iter().all(|c| expected_driver_for_chip(c) == "it87")
 }
 
+/// Modules the package's Super-I/O guard (`packaging/control-ofc-superio-guard`)
+/// declines on a Gigabyte board — the `install` lines of
+/// `packaging/modprobe.d-control-ofc-superio.conf`, which
+/// `readiness::tests::superio_guard_modules_match_the_shipped_modprobe_file`
+/// pins. Moved here from `readiness.rs` (DEC-468) so the guard's facts live
+/// beside [`superio_guard_declines`].
+pub const SUPERIO_GUARD_MODULES: &[&str] = &["nct6775", "w83627ehf"];
+
+/// Does the package's Super-I/O guard decline [`SUPERIO_GUARD_MODULES`] on this
+/// board? (`DC-da`, DEC-468.)
+///
+/// A mirror of `packaging/control-ofc-superio-guard`'s decision table (DEC-424),
+/// in the script's order: an empty board name loads (it cannot judge); a vendor
+/// containing "GIGABYTE" declines; an EMPTY vendor declines only when the board
+/// name contains a [`GIGABYTE_DUAL_CHIP_BOARDS`] entry; any other vendor loads
+/// ("Giga Computing", Gigabyte's server brand, included). Case is folded ASCII-only,
+/// as the script's `tr` does under its pinned `LC_ALL=C`. Inputs are the trimmed
+/// DMI strings [`read_board_info_from`] returns. Pinned to the script itself by
+/// `tests/superio_guard.rs::the_daemon_predicate_matches_the_guard_script`, so the
+/// two cannot drift apart silently.
+///
+/// It decides what the daemon *says*, never what it does: a module this returns
+/// `true` for is one the user would be told to load to no effect.
+pub fn superio_guard_declines(board_vendor: &str, board_name: &str) -> bool {
+    if board_name.is_empty() {
+        return false;
+    }
+    let vendor = board_vendor.to_ascii_uppercase();
+    if vendor.contains("GIGABYTE") {
+        return true;
+    }
+    if !vendor.is_empty() {
+        return false;
+    }
+    let board = board_name.to_ascii_uppercase();
+    GIGABYTE_DUAL_CHIP_BOARDS
+        .iter()
+        .any(|e| board.contains(e.board_name))
+}
+
 /// A `(board_vendor, board_name)` pair the table lists with an ITE-only
 /// complement, for tests in sibling modules.
 ///
@@ -1696,6 +1736,61 @@ mod tests {
         // empty so the GUI hides the dual-chip warning.
         assert!(expected_chips_for_board("Gigabyte", "").is_empty());
         assert!(expected_chips_for_board("", "").is_empty());
+    }
+
+    /// `DC-da`: the guard's decision table, row by row. The script itself is
+    /// compared in `tests/superio_guard.rs`; this pins the cases' meaning.
+    #[test]
+    fn superio_guard_declines_follows_the_guard_decision_table() {
+        let listed = GIGABYTE_DUAL_CHIP_BOARDS[0].board_name;
+        let cases = [
+            (
+                "Gigabyte Technology Co., Ltd.",
+                "B650 AORUS ELITE AX",
+                true,
+                "Gigabyte vendor, unlisted board",
+            ),
+            (
+                "GIGABYTE",
+                "anything",
+                true,
+                "vendor match is case-insensitive",
+            ),
+            (
+                "gigabyte technology co., ltd.",
+                listed,
+                true,
+                "lower-case vendor, listed board",
+            ),
+            ("", listed, true, "no vendor, listed board"),
+            (
+                "",
+                "B650 AORUS ELITE AX",
+                false,
+                "no vendor, unlisted board",
+            ),
+            (
+                "Micro-Star International Co., Ltd.",
+                listed,
+                false,
+                "another vendor, even with a listed name",
+            ),
+            (
+                "Giga Computing",
+                listed,
+                false,
+                "Gigabyte's server brand does not match",
+            ),
+            (
+                "Gigabyte Technology Co., Ltd.",
+                "",
+                false,
+                "an empty board name loads, as the script does",
+            ),
+        ];
+        for (vendor, board, want, why) in cases {
+            assert_eq!(superio_guard_declines(vendor, board), want, "{why}");
+        }
     }
 
     #[test]

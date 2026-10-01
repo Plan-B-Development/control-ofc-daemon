@@ -496,9 +496,7 @@ impl HardwareAssessment {
     }
 }
 
-/// Modules the package's Super-I/O guard (`packaging/control-ofc-superio-guard`)
-/// declines on a Gigabyte board.
-const SUPERIO_GUARD_MODULES: &[&str] = &["nct6775", "w83627ehf"];
+use crate::hwmon::chip_db::SUPERIO_GUARD_MODULES;
 
 /// Map a passive Super-I/O detection report (DEC-202) into readiness items, so
 /// board-specific "your chip has no driver loaded" guidance surfaces in the

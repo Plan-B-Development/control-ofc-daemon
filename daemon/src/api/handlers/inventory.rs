@@ -581,14 +581,14 @@ fn build_superio_probe_response(
                 .to_string(),
         ),
         Ok(bases) => {
-            let (probed, probe_notes) = run_port_probe(
+            let (probed, probe_notes, guard_declines) = run_port_probe(
                 &reader,
                 &bases,
                 std::path::Path::new(crate::hwmon::chip_db::DMI_SYSFS_ROOT),
             );
             report.notes.extend(probe_notes);
             for p in &probed {
-                let chip = probed_to_superio_chip(p);
+                let chip = probed_to_superio_chip(p, guard_declines);
                 // Fold a probe hit into an existing same-name passive card
                 // (union the PortProbe evidence) rather than emitting a duplicate
                 // — the same physical chip can surface both passively (DMI/kmsg,
@@ -626,11 +626,15 @@ fn build_superio_probe_response(
 /// policy constructor is worth nothing if the code that feeds it is executed by
 /// no test. `polling.rs` uses a fixture DMI tree for the same reason (a test
 /// reading the host's DMI behaves differently on the reviewer's machine).
+///
+/// The third element is whether the package's Super-I/O guard declines its
+/// modules on this board (`DC-da`), decided from the same board read as the
+/// unlock policy, for [`probed_to_superio_chip`].
 fn run_port_probe(
     reader: &dyn superio_probe::SuperIoPortReader,
     bases: &[u16],
     dmi_root: &std::path::Path,
-) -> (Vec<superio_probe::ProbedChip>, Vec<String>) {
+) -> (Vec<superio_probe::ProbedChip>, Vec<String>, bool) {
     run_port_probe_with_board(
         reader,
         bases,
@@ -649,7 +653,7 @@ fn run_port_probe_with_board(
     reader: &dyn superio_probe::SuperIoPortReader,
     bases: &[u16],
     board: &BoardInfo,
-) -> (Vec<superio_probe::ProbedChip>, Vec<String>) {
+) -> (Vec<superio_probe::ProbedChip>, Vec<String>, bool) {
     let outcome = superio_probe::probe_ports(
         reader,
         bases,
@@ -683,7 +687,8 @@ fn run_port_probe_with_board(
              is the one to pursue; see the Hardware Troubleshooting guide."
         ));
     }
-    (outcome.chips, notes)
+    let guard_declines = crate::hwmon::chip_db::superio_guard_declines(&board.vendor, &board.name);
+    (outcome.chips, notes, guard_declines)
 }
 
 /// The Super-I/O config bases (0x2E/0x4E) safe to probe. Thin wrapper over the
@@ -741,7 +746,13 @@ fn pick_probe_bases(
 /// Convert a port-probe hit into a `SuperIoChip` (unbound, evidence = PortProbe)
 /// with a load recommendation. ITE chips get a precise module + DKMS status via
 /// `chip_db`; the Nuvoton/Winbond family is reported at vendor level.
-fn probed_to_superio_chip(p: &superio_probe::ProbedChip) -> superio::SuperIoChip {
+///
+/// `guard_declines`: the package's Super-I/O guard declines `nct6775`/`w83627ehf`
+/// on this board (`DC-da`), so the hint for either must not say "load it".
+fn probed_to_superio_chip(
+    p: &superio_probe::ProbedChip,
+    guard_declines: bool,
+) -> superio::SuperIoChip {
     let (chip_name, expected_module, in_mainline) = match (&p.chip_name, p.vendor) {
         (Some(name), _) => (
             name.clone(),
@@ -789,7 +800,11 @@ fn probed_to_superio_chip(p: &superio_probe::ProbedChip) -> superio::SuperIoChip
     let recommendation = if expected_module == "unknown" {
         None
     } else {
-        let load_hint = if p.vendor == superio::SuperIoVendor::Nuvoton {
+        let load_hint = if guard_declines
+            && crate::hwmon::chip_db::SUPERIO_GUARD_MODULES.contains(&expected_module.as_str())
+        {
+            superio::superio_guard_load_hint(&expected_module)
+        } else if p.vendor == superio::SuperIoVendor::Nuvoton {
             "Load the `nct6775` driver (or `w83627ehf` for a genuine Winbond chip): `sudo modprobe \
              nct6775`, or add it to /etc/modules-load.d/. A reboot or module reload may be needed."
                 .to_string()
@@ -1081,7 +1096,7 @@ mod tests {
             devid: 0x8688,
             chip_name: Some("it8688".to_string()),
         };
-        let chip = probed_to_superio_chip(&p);
+        let chip = probed_to_superio_chip(&p, false);
         assert_eq!(chip.chip_name, "it8688");
         assert_eq!(chip.evidence, vec![superio::Evidence::PortProbe]);
         assert!(!chip.hwmon_present);
@@ -1102,12 +1117,72 @@ mod tests {
             devid: 0xd592,
             chip_name: None,
         };
-        let chip = probed_to_superio_chip(&p);
+        let chip = probed_to_superio_chip(&p, false);
         assert!(chip.chip_name.contains("DEVID 0xd592"));
         let rec = chip.recommendation.expect("recommendation");
         assert_eq!(rec.module, "nct6775");
         assert!(rec.in_mainline);
         assert!(rec.load_hint.contains("nct6775"));
+    }
+
+    /// `DC-da`: where the package's Super-I/O guard declines `nct6775`, the
+    /// probe's hint must not say "load it" — it explains the guard instead. Both
+    /// branches, so a stuck flag fails one of them.
+    #[test]
+    fn a_probed_nuvoton_chip_where_the_guard_declines_is_not_told_to_load_it() {
+        let p = superio_probe::ProbedChip {
+            base: 0x4e,
+            vendor: superio::SuperIoVendor::Nuvoton,
+            devid: 0xd592,
+            chip_name: None,
+        };
+        let hint = |guard| {
+            probed_to_superio_chip(&p, guard)
+                .recommendation
+                .expect("recommendation")
+                .load_hint
+        };
+        let (declined, open) = (hint(true), hint(false));
+        assert_eq!(declined, superio::superio_guard_load_hint("nct6775"));
+        assert!(!declined.contains("modprobe"), "{declined}");
+        assert!(open.contains("sudo modprobe nct6775"), "{open}");
+    }
+
+    /// `DC-da`, the call site: the probe decides the guard from the SAME DMI tree
+    /// it reads for its unlock policy, and the handler's mapping of a hit then
+    /// renders the guard's hint. A Gigabyte board the dual-chip table does not
+    /// list is the case where both legs run: the unlock is allowed (the table is
+    /// what withholds it), a Nuvoton chip answers, and the guard still declines.
+    #[test]
+    fn the_probe_derives_the_guard_decision_from_the_dmi_tree() {
+        let run = |vendor: &str, name: &str| {
+            let dmi = tempfile::tempdir().unwrap();
+            std::fs::write(dmi.path().join("board_vendor"), format!("{vendor}\n")).unwrap();
+            std::fs::write(dmi.path().join("board_name"), format!("{name}\n")).unwrap();
+            let (chips, _, guard) =
+                run_port_probe(&NuvotonOnlyPort::default(), &[0x2e], dmi.path());
+            assert_eq!(chips.len(), 1, "precondition: {vendor} {name} was probed");
+            let hint = probed_to_superio_chip(&chips[0], guard)
+                .recommendation
+                .expect("recommendation")
+                .load_hint;
+            (guard, hint)
+        };
+        let (gb_guard, gb_hint) = run("Gigabyte Technology Co., Ltd.", "B650 AORUS ELITE AX");
+        assert!(
+            gb_guard
+                == crate::hwmon::chip_db::superio_guard_declines(
+                    "Gigabyte Technology Co., Ltd.",
+                    "B650 AORUS ELITE AX"
+                )
+                && gb_guard,
+            "a Gigabyte board: the guard declines"
+        );
+        assert_eq!(gb_hint, superio::superio_guard_load_hint("nct6775"));
+
+        let (msi_guard, msi_hint) = run("Micro-Star International Co., Ltd.", "MAG B650 TOMAHAWK");
+        assert!(!msi_guard, "another vendor: the guard loads");
+        assert!(msi_hint.contains("sudo modprobe nct6775"), "{msi_hint}");
     }
 
     #[test]
@@ -1118,7 +1193,7 @@ mod tests {
             devid: 0x1234,
             chip_name: None,
         };
-        let chip = probed_to_superio_chip(&p);
+        let chip = probed_to_superio_chip(&p, false);
         assert_eq!(chip.expected_module, "unknown");
         assert!(chip.recommendation.is_none());
         assert!(chip.caveats.iter().any(|c| c.contains("Unrecognized")));
@@ -1226,7 +1301,7 @@ mod tests {
         let (vendor, name) = crate::hwmon::chip_db::any_ite_only_board_for_test();
         let p = NuvotonOnlyPort::default();
 
-        let (chips, notes) = run_port_probe_with_board(&p, &[0x2e], &board_info(vendor, name));
+        let (chips, notes, _) = run_port_probe_with_board(&p, &[0x2e], &board_info(vendor, name));
 
         // Assert on the write log: a withheld unlock and an empty base both
         // yield no chip, so the return value alone cannot tell them apart.
@@ -1256,14 +1331,17 @@ mod tests {
             "a reboot does not clear",
             "survives both a reboot",
         ];
-        let bridge = probed_to_superio_chip(&superio_probe::ProbedChip {
-            base: 0x2e,
-            vendor: superio::SuperIoVendor::Ite,
-            devid: superio_probe::IT8883_BRIDGE_DEVID,
-            chip_name: None,
-        });
+        let bridge = probed_to_superio_chip(
+            &superio_probe::ProbedChip {
+                base: 0x2e,
+                vendor: superio::SuperIoVendor::Ite,
+                devid: superio_probe::IT8883_BRIDGE_DEVID,
+                chip_name: None,
+            },
+            false,
+        );
         let (vendor, name) = crate::hwmon::chip_db::any_ite_only_board_for_test();
-        let (_, notes) = run_port_probe_with_board(
+        let (_, notes, _) = run_port_probe_with_board(
             &NuvotonOnlyPort::default(),
             &[0x2e],
             &board_info(vendor, name),
@@ -1299,7 +1377,7 @@ mod tests {
         );
         let p = NuvotonOnlyPort::default();
 
-        let (chips, notes) =
+        let (chips, notes, _) =
             run_port_probe_with_board(&p, &[0x2e], &board_info("Micro-Star International", name));
 
         assert!(p.wrote_the_nuvoton_unlock(0x2e));
@@ -1326,7 +1404,7 @@ mod tests {
         std::fs::write(dmi.path().join("board_name"), format!("{name}\n")).unwrap();
 
         let p = NuvotonOnlyPort::default();
-        let (chips, notes) = run_port_probe(&p, &[0x2e], dmi.path());
+        let (chips, notes, _) = run_port_probe(&p, &[0x2e], dmi.path());
 
         assert!(
             !p.wrote_the_nuvoton_unlock(0x2e),
@@ -1347,7 +1425,7 @@ mod tests {
         std::fs::write(other.path().join("board_name"), "PRIME X670-P\n").unwrap();
 
         let q = NuvotonOnlyPort::default();
-        let (chips, notes) = run_port_probe(&q, &[0x2e], other.path());
+        let (chips, notes, _) = run_port_probe(&q, &[0x2e], other.path());
 
         assert!(q.wrote_the_nuvoton_unlock(0x2e));
         assert_eq!(chips.len(), 1, "an unlisted board must still be probed");
@@ -1394,7 +1472,7 @@ mod tests {
             selected: std::cell::Cell::new(0),
         };
 
-        let (chips, notes) =
+        let (chips, notes, _) =
             run_port_probe_with_board(&p, &[0x2e, 0x4e], &board_info(vendor, name));
 
         assert!(chips.is_empty(), "0xd428 is not a nameable chip");
@@ -1424,7 +1502,7 @@ mod tests {
         let (vendor, name) = crate::hwmon::chip_db::any_ite_only_board_for_test();
         let p = NuvotonOnlyPort::default();
 
-        let (_, notes) = run_port_probe_with_board(&p, &[0x2e, 0x4e], &board_info(vendor, name));
+        let (_, notes, _) = run_port_probe_with_board(&p, &[0x2e, 0x4e], &board_info(vendor, name));
 
         assert_eq!(notes.len(), 1, "only the withheld note: {notes:?}");
         assert!(notes[0].contains("ITE-only"));

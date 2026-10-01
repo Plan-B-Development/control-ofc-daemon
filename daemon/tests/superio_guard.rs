@@ -403,3 +403,50 @@ fn with_the_guard_the_line_hands_the_decision_to_it() {
         }
     }
 }
+
+/// `DC-da` (DEC-468): the daemon's `chip_db::superio_guard_declines` decides
+/// what the hardware diagnostics tell a user about loading `nct6775`, so it must
+/// say what this script will actually do. Compared case by case against the
+/// script's own dry-run, never against a restated table. `None` is a missing DMI
+/// file, which the daemon reads as an empty string.
+#[test]
+fn the_daemon_predicate_matches_the_guard_script() {
+    let listed = "X870E AORUS MASTER";
+    let cases: [(Option<&str>, Option<&str>); 9] = [
+        (Some(GIGABYTE), Some(listed)),
+        (Some(GIGABYTE), Some("B650 AORUS ELITE AX")),
+        (
+            Some("gigabyte technology co., ltd."),
+            Some("b650 aorus elite ax"),
+        ),
+        (None, Some(listed)),
+        (None, Some("B650 AORUS ELITE AX")),
+        (Some("Micro-Star International Co., Ltd."), Some(listed)),
+        (Some("Giga Computing"), Some(listed)),
+        (Some(GIGABYTE), None),
+        (Some("ASUSTeK COMPUTER INC."), Some("PRIME X670-P")),
+    ];
+    let mut saw = (false, false);
+    for (vendor, board) in cases {
+        let script = decide_with(vendor, board, "nct6775");
+        let suppress = script.starts_with("SUPPRESS");
+        assert!(
+            suppress || script.starts_with("LOAD"),
+            "unexpected guard output: {script:?}"
+        );
+        let daemon = control_ofc_daemon::hwmon::chip_db::superio_guard_declines(
+            vendor.unwrap_or(""),
+            board.unwrap_or(""),
+        );
+        assert_eq!(
+            daemon, suppress,
+            "vendor {vendor:?}, board {board:?}: the script says {script:?}"
+        );
+        if suppress {
+            saw.0 = true;
+        } else {
+            saw.1 = true;
+        }
+    }
+    assert!(saw.0 && saw.1, "both decisions must be exercised");
+}

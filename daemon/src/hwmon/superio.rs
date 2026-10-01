@@ -358,6 +358,9 @@ pub fn detect_superio(ev: &dyn SuperIoEvidence) -> SuperIoReport {
     for c in chip_db::expected_chips_for_board(&board_vendor, &board_name) {
         acc.entry(normalize(&c)).or_default().dmi = true;
     }
+    // `DC-da`: the board is known here, so the per-chip advice can be exact
+    // where the aggregate readiness item (which carries no vendor) cannot.
+    let guard_declines = chip_db::superio_guard_declines(&board_vendor, &board_name);
 
     let mut chips = Vec::with_capacity(acc.len());
     for (chip_name, ev_acc) in acc {
@@ -367,6 +370,7 @@ pub fn detect_superio(ev: &dyn SuperIoEvidence) -> SuperIoReport {
             &loaded,
             &acpi_conflict_drivers,
             &|m| ev.module_out_of_tree(m),
+            guard_declines,
         ));
     }
 
@@ -402,6 +406,9 @@ fn build_chip(
     // trait rather than read here, so `build_chip` stays a pure function of its
     // inputs and the recommendation path is testable without a real `/sys`.
     out_of_tree: &dyn Fn(&str) -> bool,
+    // `DC-da`: whether the package's Super-I/O guard declines its modules on
+    // this board ([`chip_db::superio_guard_declines`]).
+    guard_declines: bool,
 ) -> SuperIoChip {
     let expected_module = chip_db::expected_driver(chip_name).to_string();
     let vendor = vendor_for_module(&expected_module);
@@ -461,6 +468,7 @@ fn build_chip(
             },
             loaded,
             acpi_conflict_drivers,
+            guard_declines,
             &mut caveats,
         )
     };
@@ -617,6 +625,7 @@ fn ite_unbound_tail(out_of_tree: bool) -> &'static str {
 /// allowlisted. Returns `None` (with a caveat) if the module is not on the
 /// allowlist — the safety gate that stops the daemon ever recommending an
 /// unvetted module.
+#[allow(clippy::too_many_arguments)]
 fn build_recommendation(
     chip_name: &str,
     module: &str,
@@ -624,6 +633,7 @@ fn build_recommendation(
     driver: DriverState,
     loaded: &[String],
     acpi_conflict_drivers: &[String],
+    guard_declines: bool,
     caveats: &mut Vec<String>,
 ) -> Option<SuperIoRecommendation> {
     let Some(entry) = allowlist_entry(module) else {
@@ -651,6 +661,9 @@ fn build_recommendation(
              not bind. Common causes: an ACPI resource conflict (see caveats) or a reboot being \
              needed.{ite_tail}"
         )
+    } else if guard_declines && chip_db::SUPERIO_GUARD_MODULES.contains(&module) {
+        // `DC-da`: "load it" would be advice that does nothing here.
+        superio_guard_load_hint(module)
     } else if in_mainline {
         format!(
             "Enable it at boot: `echo {module} | sudo tee /etc/modules-load.d/{module}.conf`, or \
@@ -729,6 +742,25 @@ fn build_recommendation(
         reason,
         risk_notes,
     })
+}
+
+/// The load hint for a module the package's Super-I/O guard declines on this
+/// board (`DC-da`, DEC-468), shared by the passive detector and the port probe.
+///
+/// The usual "load it with `sudo modprobe`" would be advice that does nothing:
+/// the guard's `install` rule intercepts the load, reports success and binds
+/// nothing. Says so, why, and where the guard logs each refusal — the same facts
+/// as the aggregate `superio_driver_unloaded` item, stated for this board rather
+/// than conditionally.
+pub(crate) fn superio_guard_load_hint(module: &str) -> String {
+    format!(
+        "On this Gigabyte board, this package's Super-I/O guard declines `{module}`: \
+         Gigabyte boards carry their fans on ITE chips, and this module's probe can hide a \
+         second one until the machine is powered down at the wall. Loading it reports \
+         success and binds nothing; `sudo journalctl -b -t control-ofc-superio-guard` \
+         shows each module the guard declined. If fan headers are missing, the it87 driver \
+         is the one to pursue."
+    )
 }
 
 // ── Production evidence adapter ─────────────────────────────────────
@@ -1191,6 +1223,33 @@ mod tests {
         // Asserted as a relationship against the extracted rule, not a literal.
         assert!(dkms_hint.ends_with(ite_unbound_tail(true)));
         assert!(in_tree_hint.ends_with(ite_unbound_tail(false)));
+    }
+
+    /// `DC-da`, the call site: `detect_superio` reads the board and the per-chip
+    /// advice for a guarded module follows the guard. Driven with the same
+    /// unbound Nuvoton chip on a Gigabyte and an MSI board; the hint is the
+    /// guard's on the first and the `modprobe` on the second, so a flag stuck
+    /// either way fails one arm.
+    #[test]
+    fn an_unbound_nuvoton_chip_on_a_gigabyte_board_is_told_about_the_guard() {
+        let hint = |vendor: &str, name: &str| {
+            let r = detect_superio(&FakeEvidence {
+                board: (vendor.to_string(), name.to_string()),
+                kmsg: vec!["nct6798".to_string()],
+                ..Default::default()
+            });
+            r.chips
+                .iter()
+                .find(|c| c.expected_module == "nct6775")
+                .and_then(|c| c.recommendation.as_ref())
+                .map(|x| x.load_hint.clone())
+                .expect("an unbound nct6798 must produce a recommendation")
+        };
+        let gigabyte = hint("Gigabyte Technology Co., Ltd.", "B650 AORUS ELITE AX");
+        let msi = hint("Micro-Star International Co., Ltd.", "MAG B650 TOMAHAWK");
+        assert_eq!(gigabyte, superio_guard_load_hint("nct6775"));
+        assert!(!gigabyte.contains("modprobe"), "{gigabyte}");
+        assert!(msi.contains("sudo modprobe nct6775"), "{msi}");
     }
 
     /// `DriverState` exists so "not loaded but out-of-tree" cannot be
