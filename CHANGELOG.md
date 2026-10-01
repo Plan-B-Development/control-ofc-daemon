@@ -2,8 +2,12 @@
 
 ## [Unreleased]
 
-Pairs with `control-ofc-gui` >= v3.3.0 to show the new voltage-rail names; older GUIs ignore the new
-fields and show the rails exactly as before.
+## [3.3.0] — 2026-10-01
+
+Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor; GUI 3.3.0 shows the new
+voltage-rail names and the driver bound to each chip. Older GUIs ignore the new fields, but upgrade the
+GUI with the daemon: one older than 3.3.0 can show the corrected `in_mainline_kernel` beside a guessed
+driver (see `bound_driver` below).
 
 ### Added
 
