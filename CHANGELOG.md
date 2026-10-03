@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [3.4.0] — 2026-10-03
+
+Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor. GUI 3.4.0 offers the new
+**Set role… ▸ No fan** where this daemon advertises `control.header_role_no_fan`; an older GUI simply does not
+offer it.
+
 ### Added
 
 - **A `no_fan` header role.** `POST /config/header-role` accepts `"no_fan"` for a header with nothing
