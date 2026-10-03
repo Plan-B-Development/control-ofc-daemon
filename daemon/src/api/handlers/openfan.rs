@@ -469,7 +469,8 @@ fn calibration_conflict(code: &str, message: String) -> (StatusCode, Json<serde_
 /// one, so the two cannot drift.
 ///
 /// Refusals, in order — every one before anything is written: shutting down
-/// (503) · no `acknowledge_below_floor: true` (400) · no controller (503) · a
+/// (503) · a channel assigned the `pump` role (400, `details.reason:
+/// "pump_protected"`, `ROLE-f`) · no `acknowledge_below_floor: true` (400) · no controller (503) · a
 /// channel out of range (400) · too hot (409 `thermal_abort`) · the ladder
 /// forcing or stale temperatures (409, retryable) · no fresh CPU reading for
 /// the rise gate (400, retryable) · a calibration task still alive (409,

@@ -3396,6 +3396,19 @@ mod tests {
             &serde_json::to_value(&cal_run).unwrap(),
             "OpenFanCalibrationRun",
         );
+        // DEC-475 (`ROLE-f`): one channel of `GET /fans/openfan/roles`.
+        let role_entry = OpenFanRoleEntry {
+            fan_id: "openfan:ch03".into(),
+            channel: 3,
+            role: crate::hwmon::roles::HeaderRole::Pump,
+            role_source: crate::hwmon::roles::RoleSource::UserAssigned,
+            stop_permitted: false,
+            effective_min_pwm_pct: 30,
+        };
+        expect(
+            &serde_json::to_value(&role_entry).unwrap(),
+            "OpenFanRoleEntry",
+        );
         // `PTR-aa` (W-DIAGD): the characterisation run itself. Its children
         // were pinned above long before it was, which is how it was missed.
         let char_run = crate::api::characterization::CharacterizationRun {

@@ -1094,7 +1094,12 @@ where
                 // Not the original duty, so not a restore in the run's sense.
                 self.p.restore_failed = crate::pwm::exit_duty(self.p.original_pct, 0) != 100;
             }
-            Ok(()) => self.p.restore_outcome = RestoreOutcome::Restored.token(),
+            Ok(()) => {
+                self.p.restore_outcome = RestoreOutcome::Restored.token();
+                // `ROLE-f`: a pump floored above its pre-run duty is not back
+                // where the run found it, and `restore_failed` says so.
+                self.p.restore_failed = target != crate::pwm::exit_duty(self.p.original_pct, 0);
+            }
             Err(e) => {
                 log::warn!(
                     "OpenFan ch{}: restoring {target}% after calibration failed: {e}",
@@ -1665,6 +1670,10 @@ mod tests {
 
         assert_eq!(p.state, STATE_ABORTED);
         assert_eq!(p.abort_reason, Some(ABORT_PUMP_PROTECTED));
+        assert!(
+            p.restore_failed,
+            "a restore floored above the pre-run duty is not the original"
+        );
         let w = log.lock().unwrap();
         let at_70 = w
             .iter()
