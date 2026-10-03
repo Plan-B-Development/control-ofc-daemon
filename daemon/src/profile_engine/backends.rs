@@ -875,7 +875,26 @@ pub(crate) struct OpenFanBackend {
     /// Shared with the blocking write task and never locked at the same time as
     /// the controller.
     held: Arc<Mutex<OpenFanHeld>>,
+    /// `OFAN-b`: the channels the blocking task last found holding a duty a
+    /// reconnect or resume lost (bit `ch`), and the OpenFan write generation
+    /// that was read at. While the generation is still current, a `TS-bc`
+    /// put-back candidate outside the set has nothing to put back, so a tick
+    /// whose skipped channels are all outside it starts no task — decided here,
+    /// without the controller lock. `None` until a task has looked.
+    ///
+    /// Every channel is recorded, not only that tick's candidates: a later
+    /// tick's skip can widen the candidates, and a channel no profile names can
+    /// keep a lost duty for the whole generation without stopping the others
+    /// settling. Sound because only a generation bump gives a channel a lost
+    /// duty (`FanController::observe_write_generation`); at one generation they
+    /// are only ever cleared. The task reads the generation BEFORE the
+    /// channels, so a bump racing it leaves a stale entry that re-arms every
+    /// candidate on the next tick. Shared with the task and never locked at the
+    /// same time as the controller.
+    lost_duties: Arc<Mutex<Option<(u64, u16)>>>,
 }
+
+const _: () = assert!(NUM_CHANNELS <= u16::BITS as u8);
 
 /// [`OpenFanBackend::held`]'s state.
 #[derive(Debug, Default)]
@@ -918,6 +937,7 @@ impl OpenFanBackend {
             stall_logged: false,
             pre_emergency: Arc::new(Mutex::new(None)),
             held: Arc::new(Mutex::new(OpenFanHeld::default())),
+            lost_duties: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -993,9 +1013,17 @@ impl OpenFanBackend {
             .collect();
         // `TS-bc`: a skipped control's channel that no other control commands
         // this tick, in channel order. Whether it has a lost duty to put back is
-        // read under the controller lock in the task, with the write.
+        // read under the controller lock in the task, with the write — and only
+        // for a channel a task has not found clear at this generation
+        // (`OFAN-b`), so a tick with nothing to put back starts no task.
+        let generation = self.cache.openfan_write_generation();
+        let lost = match *self.lost_duties.lock() {
+            Some((at, mask)) if at == generation => mask,
+            _ => u16::MAX,
+        };
         let put_back: Vec<u8> = (0..NUM_CHANNELS)
             .filter(|ch| put_back.contains(ch) && !chans.iter().any(|&(c, _)| c == *ch))
+            .filter(|&ch| lost & (1 << ch) != 0)
             .collect();
         // DEC-289: only a true no-op when nothing is outstanding either. With a
         // write still pending, this call is what re-awaits it — returning here
@@ -1012,6 +1040,7 @@ impl OpenFanBackend {
         let cache = self.cache.clone();
         let pre_emergency = self.pre_emergency.clone();
         let held = self.held.clone();
+        let lost_duties = self.lost_duties.clone();
         let join = self
             .writes
             .run(WRITE_JOIN_BUDGET, move || {
@@ -1057,6 +1086,7 @@ impl OpenFanBackend {
                 // re-check as the commands above (DEC-191). Its results join the
                 // commands' failure accounting: an engine write either way. Once
                 // one lands the duty is known again, so it is sent once.
+                let checks_put_back = !put_back.is_empty();
                 for ch in put_back {
                     let mut guard = ctrl.lock();
                     if cache.verify_active() {
@@ -1080,6 +1110,19 @@ impl OpenFanBackend {
                         );
                     }
                     results.push((ch, res.map(|_| ()).map_err(|e| e.to_string())));
+                }
+                // `OFAN-b`: record which channels — every one, not only this
+                // tick's candidates — still have a lost duty. The generation is
+                // read first, and the two locks are never held together: see
+                // the field.
+                if checks_put_back {
+                    let generation = cache.openfan_write_generation();
+                    let guard = ctrl.lock();
+                    let mask = (0..NUM_CHANNELS)
+                        .filter(|&ch| guard.duty_before_loss(ch).is_some())
+                        .fold(0u16, |m, ch| m | (1 << ch));
+                    drop(guard);
+                    *lost_duties.lock() = Some((generation, mask));
                 }
                 if let Some(members) = give_back {
                     results.extend(give_back_openfan(
@@ -5948,6 +5991,147 @@ mod tests {
             "sent, failed, sent again — then known"
         );
         assert_eq!(be.channel_failure_streak(3), 0);
+    }
+
+    /// `OFAN-b`: a tick whose only OpenFan members are skipped, with no lost
+    /// duty anywhere, starts no write task — so a controller lock held past the
+    /// write budget (a calibration's serial write) stamps no write stall. A
+    /// reconnect re-arms the put-back, which then lands as before.
+    #[tokio::test]
+    async fn a_skipped_tick_with_nothing_to_put_back_starts_no_write_task() {
+        let hex = |pct: u8| format!("{:02X}", crate::pwm::percent_to_raw(pct));
+        let (mut be, written, cache, _fail) = echo_openfan_backend();
+        let members = openfan_members(&[0]);
+        let skipped = HeldMembers(members.clone());
+        be.apply_and_give_back(
+            &[cmd("openfan:ch00", "openfan", 65)],
+            &members,
+            &HeldMembers::default(),
+        )
+        .await;
+        // The first skipped tick finds nothing to put back and says so.
+        be.apply_and_give_back(&[], &members, &skipped).await;
+        written.lock().clear();
+
+        // Another thread holds the controller past the write budget, as a
+        // calibration's serial write does; it lets go by itself.
+        let ctrl = be.ctrl.clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = ctrl.lock();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(WRITE_JOIN_BUDGET * 2);
+        });
+        locked_rx.recv().unwrap();
+        let started = std::time::Instant::now();
+        be.apply_and_give_back(&[], &members, &skipped).await;
+        let waited = started.elapsed();
+        // Read before the holder lets go, while a task would still be stuck.
+        let stalled = be.writes_stalled();
+        holder.join().unwrap();
+        assert!(
+            !stalled,
+            "a tick with nothing to write must not report a write stall"
+        );
+        assert!(
+            waited < WRITE_JOIN_BUDGET,
+            "no task, so nothing to wait for: {waited:?}"
+        );
+
+        cache.invalidate_openfan_writes();
+        be.apply_and_give_back(&[], &members, &skipped).await;
+        assert_eq!(
+            openfan_values(&written, 0),
+            [hex(65)],
+            "a reconnect re-arms the put-back"
+        );
+    }
+
+    /// `OFAN-b` review: a channel no profile names any more keeps its lost duty
+    /// for the whole generation — nothing writes it — and that must not keep a
+    /// skipped member's put-back armed once that member's duty has landed.
+    #[tokio::test]
+    async fn a_lost_duty_on_a_released_channel_does_not_keep_the_skipped_tick_writing() {
+        let hex = |pct: u8| format!("{:02X}", crate::pwm::percent_to_raw(pct));
+        let (mut be, written, cache, _fail) = echo_openfan_backend();
+        be.apply_and_give_back(
+            &[
+                cmd("openfan:ch00", "openfan", 65),
+                cmd("openfan:ch02", "openfan", 45),
+            ],
+            &openfan_members(&[0, 2]),
+            &HeldMembers::default(),
+        )
+        .await;
+        let members = openfan_members(&[0]);
+        let skipped = HeldMembers(members.clone());
+        be.apply_and_give_back(
+            &[cmd("openfan:ch00", "openfan", 65)],
+            &members,
+            &HeldMembers::default(),
+        )
+        .await;
+        cache.invalidate_openfan_writes();
+        written.lock().clear();
+        be.apply_and_give_back(&[], &members, &skipped).await;
+        assert_eq!(
+            openfan_values(&written, 0),
+            [hex(65)],
+            "precondition: put back"
+        );
+        assert!(
+            be.ctrl.lock().duty_before_loss(2).is_some(),
+            "precondition: the released channel keeps its lost duty"
+        );
+
+        let ctrl = be.ctrl.clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = ctrl.lock();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(WRITE_JOIN_BUDGET * 2);
+        });
+        locked_rx.recv().unwrap();
+        be.apply_and_give_back(&[], &members, &skipped).await;
+        let stalled = be.writes_stalled();
+        holder.join().unwrap();
+        assert!(!stalled, "nothing of channel 0's is left to put back");
+    }
+
+    /// [SAFETY] `OFAN-b`: the "nothing to put back" check covers every channel,
+    /// not only the tick's skipped ones. Channel 1's command is held back by the
+    /// write pause, so it keeps its lost duty while channel 0 — the only skipped
+    /// one, never written — has none; once channel 1's control is skipped too,
+    /// its duty is still put back.
+    #[tokio::test]
+    async fn a_lost_duty_outside_the_tick_s_skipped_channels_keeps_the_put_back_armed() {
+        let hex = |pct: u8| format!("{:02X}", crate::pwm::percent_to_raw(pct));
+        let (mut be, written, cache, _fail) = echo_openfan_backend();
+        let members = openfan_members(&[0, 1]);
+        be.apply_and_give_back(
+            &[cmd("openfan:ch01", "openfan", 40)],
+            &members,
+            &HeldMembers::default(),
+        )
+        .await;
+        cache.invalidate_openfan_writes();
+        let claimed = cache
+            .try_begin_verify(std::time::Duration::from_secs(30))
+            .expect("the pause is free");
+        be.apply_and_give_back(
+            &[cmd("openfan:ch01", "openfan", 55)],
+            &members,
+            &HeldMembers(openfan_members(&[0])),
+        )
+        .await;
+        cache.end_verify(claimed);
+        written.lock().clear();
+
+        be.apply_and_give_back(&[], &members, &HeldMembers(members.clone()))
+            .await;
+
+        assert_eq!(openfan_values(&written, 1), [hex(40)]);
+        assert!(openfan_values(&written, 0).is_empty(), "never written");
     }
 
     /// [SAFETY] `TS-bc`: while a diagnostic holds the engine write-pause the

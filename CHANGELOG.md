@@ -23,6 +23,10 @@
   exit minimum, and a SIGHUP that arrives together with the stop signal is no longer lost to it
   (`TS-bf`). The unit's stop-window arithmetic is recounted (six drains, not four; `TimeoutStopSec=40`
   still covers it).
+- **A tick with only skipped OpenFan members and nothing to put back starts no write task.** It used to
+  start one every tick to look for a duty a reconnect or resume had lost; behind a controller lock held
+  past the write budget — a calibration's serial write — that stamped a write stall for a tick with
+  nothing to write. A reconnect or resume still arms the put-back (`OFAN-b`).
 
 ## [3.6.0] — 2026-10-03
 
