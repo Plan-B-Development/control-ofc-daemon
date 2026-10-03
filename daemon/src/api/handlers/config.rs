@@ -351,7 +351,10 @@ pub async fn update_startup_delay_handler(
 /// POST /config/header-role — assign or clear one PWM header's role (DEC-311).
 ///
 /// Body: `{"header_id": "hwmon:…", "role": "pump"}` to set, or `{"role": null}`
-/// to clear and fall back to the detected role.
+/// to clear and fall back to the detected role. Since `ROLE-f` the id may also
+/// be an OpenFan channel (`openfan:ch03`), capability
+/// `control.openfan_header_roles`: a `pump` there earns the 30 % floor, a
+/// perturbing identify and a refused calibration.
 ///
 /// [SAFETY] This is the mechanism that makes AIO-MB Phase 1 work on real
 /// hardware. On a board whose Super-I/O publishes no `pwmN_label` — measured on
@@ -371,10 +374,12 @@ pub async fn update_header_role_handler(
     Json(body): Json<serde_json::Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     // DEC-442: canonical, so an id carrying the it87 v2.0 suffixed chip
-    // spelling addresses the header discovery now publishes without it.
+    // spelling addresses the header discovery now publishes without it — and
+    // an OpenFan channel id is re-minted padded (`ROLE-f`), the spelling the
+    // engine and identify look it up under.
     let header_id = match body.get("header_id") {
         Some(serde_json::Value::String(s)) if !s.is_empty() => {
-            crate::hwmon::chip_name::canonical_hwmon_id(s).into_owned()
+            crate::hwmon::roles::role_key(s).into_owned()
         }
         _ => {
             return error_response(
@@ -421,15 +426,27 @@ pub async fn update_header_role_handler(
     // Validate a set id against the discovered headers. Deliberately NOT applied
     // to a clear: you must always be able to remove an assignment for a header
     // that has since disappeared, or a stale entry would be unreachable.
+    //
+    // `ROLE-f`: an OpenFan channel id is accepted for any channel the controller
+    // has, adopted or not. The assignment can only add protection, so recording
+    // it while the controller is unplugged is harmless and protects the pump the
+    // moment it is adopted. An OpenFan-prefixed id that does not parse to such a
+    // channel is rejected here, never stored as an hwmon id.
     if new_role.is_some() {
-        let known = state
-            .hwmon_controller
-            .as_ref()
-            .is_some_and(|c| c.lock().headers().into_iter().any(|h| h.id == header_id));
+        let known = match crate::serial::openfan_channel_of(&header_id) {
+            Ok(channel) => channel < crate::serial::protocol::NUM_CHANNELS,
+            Err(crate::serial::OpenFanMemberIdError::UnparseableChannel) => false,
+            Err(crate::serial::OpenFanMemberIdError::NotOpenFan) => state
+                .hwmon_controller
+                .as_ref()
+                .is_some_and(|c| c.lock().headers().into_iter().any(|h| h.id == header_id)),
+        };
         if !known {
             return error_response(
                 StatusCode::BAD_REQUEST,
-                &ErrorEnvelope::validation(format!("unknown hwmon header id: {header_id}")),
+                &ErrorEnvelope::validation(format!(
+                    "unknown hwmon header or OpenFan channel id: {header_id}"
+                )),
             );
         }
     }

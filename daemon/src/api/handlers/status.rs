@@ -474,6 +474,8 @@ pub async fn capabilities_handler(
             pwm_verification_records: true,
             // A user-assigned `no_fan` header role.
             header_role_no_fan: true,
+            // `ROLE-f`: roles on OpenFan channels.
+            openfan_header_roles: true,
         },
     })
 }

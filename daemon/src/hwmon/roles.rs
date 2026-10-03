@@ -229,6 +229,34 @@ pub fn classify_header_role(
     (HeaderRole::Unknown, RoleSource::None)
 }
 
+/// Whether a member of this `source` can carry a role assignment: an hwmon
+/// header, or an OpenFan channel (`ROLE-f`). GPU fans never do — they are never
+/// pumps (DEC-130).
+pub fn source_takes_role(source: &str) -> bool {
+    source == "hwmon" || source == "openfan"
+}
+
+/// The key a role assignment is stored and looked up under.
+///
+/// An hwmon id is canonicalised for the it87 v2.0 chip suffix (DEC-442); an
+/// OpenFan id is re-minted from its channel, because the engine parses member
+/// ids permissively (`openfan:ch3` drives channel 3) while the map matches
+/// exact strings — an assignment saved under one spelling must protect the
+/// channel a profile names under the other. Anything else is returned as is.
+pub fn role_key(id: &str) -> std::borrow::Cow<'_, str> {
+    match crate::serial::openfan_channel_of(id) {
+        Ok(channel) => {
+            let minted = crate::serial::openfan_member_id(channel);
+            if minted == id {
+                std::borrow::Cow::Borrowed(id)
+            } else {
+                std::borrow::Cow::Owned(minted)
+            }
+        }
+        Err(_) => crate::hwmon::chip_name::canonical_hwmon_id(id),
+    }
+}
+
 /// The role actually in force for a header: the user's assignment if there is
 /// one, otherwise the inferred role. `assigned` is the persisted `runtime.toml`
 /// map, keyed by the header's stable id (which for hwmon is also its fan id).
@@ -288,6 +316,33 @@ pub fn is_pump_protected(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ROLE-f`: one key per header or channel, whatever spelling arrived.
+    #[test]
+    fn role_key_canonicalises_both_id_families() {
+        assert_eq!(role_key("openfan:ch3"), "openfan:ch03");
+        assert_eq!(role_key("openfan:ch03"), "openfan:ch03");
+        assert!(matches!(
+            role_key("openfan:ch03"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(
+            role_key("hwmon:it8696_a008090a:it87.2624:pwm3:pwm3"),
+            "hwmon:it8696:it87.2624:pwm3:pwm3"
+        );
+        // Not an OpenFan channel and not a suffixed hwmon id: untouched.
+        assert_eq!(role_key("openfan:chX"), "openfan:chX");
+        assert_eq!(role_key("h1"), "h1");
+    }
+
+    #[test]
+    fn only_hwmon_and_openfan_members_take_a_role() {
+        assert!(source_takes_role("hwmon"));
+        assert!(source_takes_role("openfan"));
+        for gpu in ["amd_gpu", "intel_gpu", "nvidia_gpu"] {
+            assert!(!source_takes_role(gpu), "{gpu}");
+        }
+    }
 
     /// [SAFETY] `AUD3-c` / DEC-322: the cross-stack oracle for the classifier
     /// that decides whether a client may offer to STOP a header.

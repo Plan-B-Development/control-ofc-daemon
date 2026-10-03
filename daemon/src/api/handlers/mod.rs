@@ -848,7 +848,17 @@ impl AppState {
             crate::hwmon::roles::RoleSource,
         ),
     ) {
-        let assigned = self.header_roles().get(header_id).copied();
+        let assigned = self
+            .header_roles()
+            .get(crate::hwmon::roles::role_key(header_id).as_ref())
+            .copied();
+        // `ROLE-f`: an OpenFan channel has no discovery evidence — no label, no
+        // chip — so its inferred role is always `Unknown`. Answered without the
+        // controller lock, which the calibration walk's per-sample pump check
+        // would otherwise take on the executor.
+        if crate::serial::openfan_channel_of(header_id).is_ok() {
+            return (assigned, Default::default());
+        }
         let inferred = self
             .hwmon_controller
             .as_ref()

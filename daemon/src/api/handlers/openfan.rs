@@ -498,8 +498,26 @@ fn start_openfan_calibration(
             &ErrorEnvelope::hardware_unavailable("the daemon is shutting down"),
         ));
     }
-    // [SAFETY] `PTR-i`: the daemon holds no pump evidence for an OpenFan
-    // channel, so the user's confirmation is the only guard (DEC-452, Q3-A).
+    // [SAFETY] `ROLE-f`: a channel the user assigned the `pump` role is never
+    // walked toward 0 %, acknowledgement or not — checked first, so a client
+    // that did not acknowledge learns the real reason. The pump-protection
+    // union, as every hwmon diagnostic reads it; the walk re-reads it before
+    // every write, for an assignment that lands after this check.
+    let fan_id = crate::serial::openfan_member_id(channel);
+    if state.header_is_pump_protected(&fan_id) {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorEnvelope::validation_with_details(
+                format!(
+                    "{fan_id} cannot be calibrated: it is assigned the pump role, and a pump \
+                     is never walked toward 0%"
+                ),
+                serde_json::json!({ "reason": cal::ABORT_PUMP_PROTECTED }),
+            ),
+        ));
+    }
+    // [SAFETY] `PTR-i`: for a channel with no pump assignment the daemon holds
+    // no pump evidence, so the user's confirmation is the guard (DEC-452, Q3-A).
     if acknowledged != Some(true) {
         return Err(error_response(
             StatusCode::BAD_REQUEST,
@@ -587,7 +605,7 @@ fn start_openfan_calibration(
     let hold = cal::clamp_hold(hold_seconds);
     let run = OpenFanCalibrationRun {
         run_id: cal::next_run_id(),
-        fan_id: crate::serial::openfan_member_id(channel),
+        fan_id: fan_id.clone(),
         channel,
         state: crate::api::characterization::STATE_RUNNING.to_string(),
         hold_ms: hold.as_millis() as u64,
@@ -608,6 +626,7 @@ fn start_openfan_calibration(
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     let cache = state.cache.clone();
     let shutdown_rx = state.openfan_runtime.shutdown.clone();
+    let pump_state = Arc::clone(state);
 
     tokio::spawn(async move {
         // Dropped last, after the pause: the slot is free only once the task
@@ -669,6 +688,10 @@ fn start_openfan_calibration(
             &slot.cancel,
             || *shutdown_rx.borrow(),
             || pause.renew(crate::constants::VERIFY_PAUSE_DEADMAN),
+            // `header_role_parts` answers an OpenFan id without the controller
+            // lock, so this takes only `active_profile` and `header_roles`,
+            // each briefly — nothing the walk holds.
+            || pump_state.header_is_pump_protected(&fan_id),
             publish,
         )
         .await;
@@ -687,6 +710,44 @@ fn start_openfan_calibration(
     });
 
     Ok((run, done_rx))
+}
+
+/// `GET /fans/openfan/roles` — every OpenFan channel's role and whether the
+/// daemon protects it as a pump (`ROLE-f`).
+///
+/// `stop_permitted` and `effective_min_pwm_pct` come from
+/// `AppState::header_is_pump_protected`, the predicate identify, calibration
+/// and the engine floor act on — never from the display `role`.
+pub async fn openfan_roles_handler(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let channels = (0..crate::serial::protocol::NUM_CHANNELS)
+        .map(|channel| {
+            let fan_id = crate::serial::openfan_member_id(channel);
+            let (assigned, inferred) = state.header_role_parts(&fan_id);
+            let (role, role_source) = crate::hwmon::roles::resolve_role(assigned, inferred);
+            let protected = state.header_is_pump_protected(&fan_id);
+            crate::api::responses::OpenFanRoleEntry {
+                fan_id,
+                channel,
+                role,
+                role_source,
+                stop_permitted: crate::hwmon::device_policy::stop_permitted(protected),
+                effective_min_pwm_pct: if protected {
+                    crate::profile::pump_floor_pct(None) as u8
+                } else {
+                    0
+                },
+            }
+        })
+        .collect();
+    json_ok(
+        StatusCode::OK,
+        crate::api::responses::OpenFanRolesResponse {
+            api_version: API_VERSION,
+            channels,
+        },
+    )
 }
 
 /// `POST /fans/openfan/{channel}/calibration` — start a calibration (DEC-452).

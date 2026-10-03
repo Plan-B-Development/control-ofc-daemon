@@ -1299,6 +1299,15 @@ pub struct ControlCapability {
     /// rejects the token with a 400 `validation_error`.
     #[serde(default)]
     pub header_role_no_fan: bool,
+    /// `POST /config/header-role` accepts an OpenFan channel id
+    /// (`openfan:ch03`), and `GET /fans/openfan/roles` reports each channel's
+    /// role and pump protection (`ROLE-f`). A channel assigned `pump` gets the
+    /// 30 % floor, a perturbing identify and a refused calibration.
+    ///
+    /// A client gates on this before offering a role on an OpenFan channel: an
+    /// older daemon rejects the id with a 400 and has no such route.
+    #[serde(default)]
+    pub openfan_header_roles: bool,
 }
 
 /// Per-device-group capability info.
@@ -1617,6 +1626,35 @@ pub struct OpenFanRescanResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<String>,
     pub message: String,
+}
+
+/// Response for `GET /fans/openfan/roles` (`ROLE-f`): every channel the
+/// controller can have, adopted or not, so a role recorded while it was
+/// unplugged is still visible and clearable.
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenFanRolesResponse {
+    pub api_version: u32,
+    pub channels: Vec<OpenFanRoleEntry>,
+}
+
+/// One OpenFan channel's role, as `GET /hwmon/headers` reports a header's.
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenFanRoleEntry {
+    /// The channel's fan id, `openfan:chNN` — the key `/fans` and
+    /// `POST /config/header-role` use.
+    pub fan_id: String,
+    pub channel: u8,
+    /// The DISPLAY role: the user's assignment, else `unknown` (an OpenFan
+    /// channel has no label or chip to infer from).
+    pub role: crate::hwmon::roles::HeaderRole,
+    /// `user_assigned` or `none`.
+    pub role_source: crate::hwmon::roles::RoleSource,
+    /// False wherever the daemon's pump-protection union holds. The safety
+    /// answer — read this, never `role == "pump"` (DEC-312).
+    pub stop_permitted: bool,
+    /// The floor the daemon enforces on its own for this channel: the pump
+    /// floor when protected, else 0 (the profile's `minimum_pct` governs).
+    pub effective_min_pwm_pct: u8,
 }
 
 /// Response for `GET /poll` — combined sensors, fans, and status in one call.

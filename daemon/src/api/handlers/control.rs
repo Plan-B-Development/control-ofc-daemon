@@ -237,7 +237,10 @@ pub async fn fan_identify_handler(
                     .as_ref()
                     .is_some_and(|p| super::pump_header_ids(p).contains(&fan_id));
                 let mut table = state.override_table.lock();
-                let assigned = state.header_roles().get(&fan_id).copied();
+                let assigned = state
+                    .header_roles()
+                    .get(crate::hwmon::roles::role_key(&fan_id).as_ref())
+                    .copied();
                 let role = if crate::hwmon::roles::is_pump_protected(
                     assigned,
                     inferred,

@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Added
+
+- **A pump on an OpenFanController channel can be protected.** `POST /config/header-role` accepts an
+  OpenFan channel id (`openfan:ch00`–`openfan:ch09`, stored padded), advertised as
+  `control.openfan_header_roles`, and the new `GET /fans/openfan/roles` reports every channel's role,
+  `stop_permitted` and `effective_min_pwm_pct`. A channel assigned `pump` is held at or above the 30 %
+  floor by every profile and override (a non-zero `stop_pct` cannot zero it), identify varies its speed
+  instead of stopping it, and calibration refuses it with reason `pump_protected` even with
+  `acknowledge_below_floor`; a calibration under way when the role is assigned stops within one sample (at most one more step
+  reaches the channel) and puts the channel back no lower than the floor. Before this every pump rule was hwmon-only,
+  so a curve could stop a pump on a channel. An older daemon loads such an entry in `runtime.toml`
+  without error but floors nothing by it.
+
 ## [3.4.0] — 2026-10-03
 
 Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor. GUI 3.4.0 offers the new

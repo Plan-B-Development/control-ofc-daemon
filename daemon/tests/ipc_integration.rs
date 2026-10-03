@@ -5469,6 +5469,145 @@ async fn header_role_assignment_round_trips_and_validates() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// The channel's entry in `GET /fans/openfan/roles`.
+async fn openfan_role(path: &str, fan_id: &str) -> serde_json::Value {
+    let (status, json) = uds_get(path, "/fans/openfan/roles").await;
+    assert_eq!(status, 200, "{json}");
+    let channels = json["channels"].as_array().expect("channels array");
+    assert_eq!(
+        channels.len(),
+        control_ofc_daemon::serial::protocol::NUM_CHANNELS as usize,
+        "every channel the controller can have is listed: {json}"
+    );
+    channels
+        .iter()
+        .find(|c| c["fan_id"] == fan_id)
+        .unwrap_or_else(|| panic!("{fan_id} missing: {json}"))
+        .clone()
+}
+
+/// [SAFETY] `ROLE-f`: an OpenFan channel the user assigns `pump` is protected
+/// everywhere the daemon could stop it — reported unstoppable with a floor,
+/// perturbed rather than stopped by identify, and refused by calibration even
+/// with the acknowledgement — and a clear hands it back.
+#[tokio::test]
+async fn an_openfan_channel_can_be_assigned_pump_and_is_protected() {
+    let (state, tmp) = config_test_state("");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, caps) = uds_get(&path, "/capabilities").await;
+    assert_eq!(status, 200);
+    assert_eq!(caps["control"]["openfan_header_roles"], true, "{caps}");
+
+    let before = openfan_role(&path, "openfan:ch00").await;
+    assert_eq!(before["role"], "unknown", "{before}");
+    assert_eq!(before["role_source"], "none", "{before}");
+    assert_eq!(before["stop_permitted"], true, "{before}");
+    assert_eq!(before["effective_min_pwm_pct"], 0, "{before}");
+
+    // Unpadded on the way in, stored and reported under the padded id.
+    let (status, json) = uds_post(
+        &path,
+        "/config/header-role",
+        &serde_json::json!({ "header_id": "openfan:ch0", "role": "pump" }),
+    )
+    .await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json["header_id"], "openfan:ch00", "{json}");
+    assert_eq!(json["effective_role"], "pump", "{json}");
+    let saved = std::fs::read_to_string(tmp.path().join("runtime.toml")).unwrap();
+    assert!(saved.contains("openfan:ch00"), "must persist: {saved}");
+
+    let pump = openfan_role(&path, "openfan:ch00").await;
+    assert_eq!(pump["role"], "pump", "{pump}");
+    assert_eq!(pump["role_source"], "user_assigned", "{pump}");
+    assert_eq!(pump["stop_permitted"], false, "{pump}");
+    let floor = pump["effective_min_pwm_pct"].as_u64().unwrap();
+    assert!(floor > 0, "a pump reports its floor: {pump}");
+    // A neighbour is untouched.
+    assert_eq!(
+        openfan_role(&path, "openfan:ch01").await["stop_permitted"],
+        true
+    );
+
+    // Identify perturbs instead of stopping, never below the reported floor.
+    let (status, json) = uds_post(
+        &path,
+        "/fans/openfan:ch00/identify",
+        &serde_json::json!({ "action": "stop" }),
+    )
+    .await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json["mode"], "pump_perturb", "{json}");
+    assert!(
+        json["identify_pwm_percent"].as_u64().unwrap() >= floor,
+        "{json}"
+    );
+
+    // Calibration refuses the pump, acknowledgement or not.
+    let (status, json) = uds_post(
+        &path,
+        "/fans/openfan/0/calibration",
+        &serde_json::json!({ "acknowledge_below_floor": true }),
+    )
+    .await;
+    assert_eq!(status, 400, "{json}");
+    assert_eq!(
+        json["error"]["details"]["reason"], "pump_protected",
+        "{json}"
+    );
+    // An unassigned channel is not refused for that reason.
+    let (_, json) = uds_post(
+        &path,
+        "/fans/openfan/1/calibration",
+        &serde_json::json!({ "acknowledge_below_floor": true }),
+    )
+    .await;
+    assert_ne!(
+        json["error"]["details"]["reason"], "pump_protected",
+        "{json}"
+    );
+
+    // Clearing hands the channel back.
+    let (status, _) = uds_post(
+        &path,
+        "/config/header-role",
+        &serde_json::json!({ "header_id": "openfan:ch00", "role": null }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        openfan_role(&path, "openfan:ch00").await["stop_permitted"],
+        true
+    );
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// An OpenFan id is accepted only for a channel the controller can have; one
+/// that does not parse is never stored as if it were an hwmon header.
+#[tokio::test]
+async fn an_openfan_role_needs_a_real_channel() {
+    let (state, _tmp) = config_test_state("");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+    let past_the_end = format!(
+        "openfan:ch{:02}",
+        control_ofc_daemon::serial::protocol::NUM_CHANNELS
+    );
+    for id in [past_the_end.as_str(), "openfan:chX"] {
+        let (status, json) = uds_post(
+            &path,
+            "/config/header-role",
+            &serde_json::json!({ "header_id": id, "role": "pump" }),
+        )
+        .await;
+        assert_eq!(status, 400, "{id} must be rejected: {json}");
+    }
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
 /// A user can mark a header as having nothing plugged into it: the capability
 /// is advertised, the token is accepted and persisted, and the header reads it
 /// back as a user-assigned role.

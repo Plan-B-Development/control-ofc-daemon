@@ -173,6 +173,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/fans/openfan/rescan",
             post(handlers::openfan_rescan_handler),
         )
+        // `ROLE-f`: each OpenFan channel's role and pump protection.
+        .route("/fans/openfan/roles", get(handlers::openfan_roles_handler))
         // Hardware diagnostics
         .route(
             "/diagnostics/hardware",

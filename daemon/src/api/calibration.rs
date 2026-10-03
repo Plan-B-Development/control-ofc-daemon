@@ -103,6 +103,10 @@ pub const ABORT_THERMAL_RISE: &str = "thermal_rise";
 pub const ABORT_NO_CPU_TEMPERATURE: &str = "no_cpu_temperature";
 pub const ABORT_WRITE_FAILED: &str = "write_failed";
 pub const ABORT_RPM_UNREADABLE: &str = "rpm_unreadable";
+/// The channel was assigned the `pump` role while the run was walking it
+/// (`ROLE-f`). The walk stops within one sample, and the restore holds the
+/// pump floor.
+pub const ABORT_PUMP_PROTECTED: &str = "pump_protected";
 /// The calibration task ended without a result (a panic). Its
 /// `restore_outcome` stays `pending`: the walk's backstop attempted the
 /// restore, and nothing recorded how that went.
@@ -735,7 +739,7 @@ async fn write_off_runtime(write: &CalWriteFn, channel: u8, pct: u8) -> Result<(
 }
 
 /// The walk's state and its injected hooks.
-struct Walk<'a, S, K, P> {
+struct Walk<'a, S, K, A, P> {
     cache: &'a StateCache,
     channel: u8,
     hold: Duration,
@@ -743,6 +747,8 @@ struct Walk<'a, S, K, P> {
     cancel: &'a AtomicBool,
     shutting_down: S,
     keepalive: K,
+    /// Re-reads the pump-protection union for this channel (`ROLE-f`).
+    pump_protected: A,
     publish: P,
     start_cpu_c: f64,
     p: CalProgress,
@@ -757,12 +763,16 @@ struct Walk<'a, S, K, P> {
     /// A kick was owed and did not run to its end, so the restore writes
     /// 100 % instead of the original duty.
     restore_full_speed: bool,
+    /// The channel became a pump mid-run. Sticky, so a racing un-assignment
+    /// cannot lower the restore again (the `PumpWatch` rule).
+    pump_seen: bool,
 }
 
-impl<S, K, P> Walk<'_, S, K, P>
+impl<S, K, A, P> Walk<'_, S, K, A, P>
 where
     S: Fn() -> bool,
     K: Fn() -> bool,
+    A: Fn() -> bool,
     P: Fn(&CalProgress),
 {
     /// [SAFETY] Every gate, in order, before every write and on every sample.
@@ -772,6 +782,18 @@ where
         }
         if self.cancel.load(Ordering::SeqCst) {
             return Err(Stop::Cancelled);
+        }
+        // [SAFETY] `ROLE-f`: the entry refused a pump; this catches one assigned
+        // since, read live on every sample. The write follows this check across
+        // the controller lock, so an assignment landing in that gap lets at most
+        // one step reach the wire; the next sample stops the walk. The restore —
+        // and the drop backstop, should the task die first — then hold the pump
+        // floor, and the restore re-reads the union itself (`refresh_pump_seen`).
+        if self.refresh_pump_seen() {
+            return Err(Stop::Abort(
+                ABORT_PUMP_PROTECTED,
+                "this channel was assigned the pump role; a pump is never walked toward 0%".into(),
+            ));
         }
         if let Err(e) = check_thermal_safety(self.cache) {
             return Err(Stop::Abort(ThermalRefusal::TooHot.token(), e.to_string()));
@@ -816,6 +838,19 @@ where
             ));
         }
         Ok(())
+    }
+
+    /// Re-read the pump union unless it is already known, recording a pump and
+    /// raising the drop backstop to the pump floor. Never read once shutdown
+    /// has been seen — the `PumpWatch` contract: the exit path owns the channel.
+    fn refresh_pump_seen(&mut self) -> bool {
+        if !self.pump_seen && !(self.shutting_down)() && (self.pump_protected)() {
+            self.pump_seen = true;
+        }
+        if self.pump_seen {
+            self.backstop.target = self.backstop.target.max(pump_floor_duty());
+        }
+        self.pump_seen
     }
 
     fn set_phase(&mut self, phase: &'static str, pct: Option<u8>) {
@@ -1016,8 +1051,16 @@ where
             self.p.restore_outcome = RESTORE_NOT_NEEDED;
             return;
         }
+        // [SAFETY] `ROLE-f`: the gate does not run during the kick, and a cancel
+        // or shutdown returns before it reaches the pump check, so a `pump`
+        // assignment can land after the last gated sample. Read it once more
+        // before choosing what to write.
+        self.refresh_pump_seen();
         let target = if self.restore_full_speed {
             100
+        } else if self.pump_seen {
+            // `ROLE-f`: never back below the pump floor the engine now holds it at.
+            crate::pwm::exit_duty(self.p.original_pct, 0).max(pump_floor_duty())
         } else {
             crate::pwm::exit_duty(self.p.original_pct, 0)
         };
@@ -1064,6 +1107,12 @@ where
     }
 }
 
+/// The pump floor as a duty. An OpenFan channel reports no `pwmN_mode`, so it
+/// is never the DC pump floor (DEC-443).
+fn pump_floor_duty() -> u8 {
+    crate::profile::pump_floor_pct(None) as u8
+}
+
 /// Restores on drop if the walk wrote the channel and never reached its own
 /// restore — a panic, or the runtime dropping the task at exit. Armed by the
 /// first write, disarmed by [`Walk::restore`].
@@ -1103,7 +1152,7 @@ impl Drop for RestoreBackstop<'_> {
 /// without. `publish` is called on every point and phase change; the caller
 /// fences it on its run id.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_calibration<S, K, P>(
+pub async fn run_calibration<S, K, A, P>(
     cache: &StateCache,
     channel: u8,
     hold: Duration,
@@ -1113,11 +1162,13 @@ pub async fn run_calibration<S, K, P>(
     cancel: &AtomicBool,
     shutting_down: S,
     keepalive: K,
+    pump_protected: A,
     publish: P,
 ) -> CalProgress
 where
     S: Fn() -> bool,
     K: Fn() -> bool,
+    A: Fn() -> bool,
     P: Fn(&CalProgress),
 {
     let mut w = Walk {
@@ -1128,6 +1179,7 @@ where
         cancel,
         shutting_down,
         keepalive,
+        pump_protected,
         publish,
         start_cpu_c,
         p: CalProgress {
@@ -1150,6 +1202,7 @@ where
         lowest: None,
         last_verdict: None,
         restore_full_speed: false,
+        pump_seen: false,
         backstop: RestoreBackstop {
             armed: false,
             channel,
@@ -1299,6 +1352,7 @@ mod tests {
             cancel,
             || false,
             || true,
+            || false,
             |_| {},
         )
         .await
@@ -1525,6 +1579,7 @@ mod tests {
                 &c2,
                 || false,
                 || true,
+                || false,
                 |_| {},
             )
             .await
@@ -1573,6 +1628,129 @@ mod tests {
             vec![100, 90, 80, 50],
             "no step past the wedge"
         );
+    }
+
+    /// [SAFETY] `ROLE-f`: a channel assigned `pump` mid-run is walked no
+    /// further, and the restore never puts it back below the pump floor — even
+    /// when the duty it held before the run was lower.
+    #[tokio::test(start_paused = true)]
+    async fn a_pump_assigned_mid_run_stops_the_walk_and_restores_at_the_floor() {
+        let cache = make_cache(50.0);
+        let pump = Arc::new(AtomicBool::new(false));
+        let p2 = pump.clone();
+        let (write, log) = fan(&cache, 10, 16, move |pct| {
+            if pct == 70 {
+                p2.store(true, Ordering::SeqCst);
+            }
+        });
+        let original = 20;
+        assert!(
+            original < pump_floor_duty(),
+            "precondition: below the floor"
+        );
+        let p = run_calibration(
+            &cache,
+            0,
+            Duration::from_secs(2),
+            Some(original),
+            50.0,
+            write,
+            &AtomicBool::new(false),
+            || false,
+            || true,
+            move || pump.load(Ordering::SeqCst),
+            |_| {},
+        )
+        .await;
+
+        assert_eq!(p.state, STATE_ABORTED);
+        assert_eq!(p.abort_reason, Some(ABORT_PUMP_PROTECTED));
+        let w = log.lock().unwrap();
+        let at_70 = w
+            .iter()
+            .position(|&d| d == 70)
+            .expect("the walk reached 70%");
+        assert_eq!(
+            &w[at_70 + 1..],
+            &[pump_floor_duty()],
+            "nothing more is walked once the channel is a pump, and the restore \
+             holds the pump floor: {w:?}"
+        );
+    }
+
+    /// [SAFETY] `ROLE-f` review: a `pump` assignment landing during the
+    /// ungated recovery kick, after a cancel, must still keep the restore at
+    /// or above the pump floor — the restore re-reads the union itself.
+    #[tokio::test(start_paused = true)]
+    async fn a_pump_assigned_during_the_kick_still_restores_at_the_floor() {
+        let cache = make_cache(50.0);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let pump = Arc::new(AtomicBool::new(false));
+        let (c2, p2) = (cancel.clone(), pump.clone());
+        let (write, log) = fan(&cache, 10, 16, move |pct| {
+            if pct == 10 {
+                c2.store(true, Ordering::SeqCst);
+            } else if pct == 100 && c2.load(Ordering::SeqCst) {
+                p2.store(true, Ordering::SeqCst);
+            }
+        });
+        let original = 20;
+        assert!(
+            original < pump_floor_duty(),
+            "precondition: below the floor"
+        );
+        let p = run_calibration(
+            &cache,
+            0,
+            Duration::from_secs(2),
+            Some(original),
+            50.0,
+            write,
+            &cancel,
+            || false,
+            || true,
+            move || pump.load(Ordering::SeqCst),
+            |_| {},
+        )
+        .await;
+
+        assert_eq!(p.state, STATE_CANCELLED);
+        let w = log.lock().unwrap();
+        let kicked = w.iter().rposition(|&d| d == 100).expect("a kick ran");
+        assert!(
+            kicked > 0,
+            "precondition: the kick followed the cancel: {w:?}"
+        );
+        assert_eq!(
+            w.last(),
+            Some(&pump_floor_duty()),
+            "the restore must hold the pump floor: {w:?}"
+        );
+    }
+
+    /// The pump check reads live, so it also refuses the very first write when
+    /// the assignment landed between the entry check and the walk.
+    #[tokio::test(start_paused = true)]
+    async fn a_pump_assigned_before_the_first_write_writes_nothing() {
+        let cache = make_cache(50.0);
+        let (write, log) = fan(&cache, 10, 16, |_| {});
+        let p = run_calibration(
+            &cache,
+            0,
+            Duration::from_secs(2),
+            Some(50),
+            50.0,
+            write,
+            &AtomicBool::new(false),
+            || false,
+            || true,
+            || true,
+            |_| {},
+        )
+        .await;
+        assert_eq!(p.abort_reason, Some(ABORT_PUMP_PROTECTED));
+        assert_eq!(p.restore_outcome, RESTORE_NOT_NEEDED);
+        assert!(log.lock().unwrap().is_empty(), "nothing may be written");
     }
 
     /// [SAFETY] The rise gate: the hottest fresh CPU reading rising more than
@@ -1635,6 +1813,7 @@ mod tests {
                 &c2,
                 || false,
                 || true,
+                || false,
                 |_| {},
             )
             .await
@@ -1685,6 +1864,7 @@ mod tests {
             &AtomicBool::new(false),
             move || down.load(Ordering::SeqCst),
             || true,
+            || false,
             |_| {},
         )
         .await;
@@ -1810,6 +1990,7 @@ mod tests {
             &AtomicBool::new(false),
             || false,
             || calls.fetch_add(1, Ordering::SeqCst) < 6,
+            || false,
             |_| {},
         )
         .await;

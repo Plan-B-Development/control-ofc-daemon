@@ -811,15 +811,22 @@ pub(crate) fn member_label_names_pump(member: &ControlMember) -> bool {
 /// floor on every tick while identify — reading the fully-substituted role —
 /// would drive that same pump to 0 on request. If you are tempted to simplify
 /// either side back to "the assignment wins", that is the bug.
+///
+/// **OpenFan channels take an assignment too (`ROLE-f`).** An OpenFan channel
+/// has no label and no chip, so the assignment is the only pump evidence the
+/// daemon can hold for it; without this term a pump on a channel was driven to
+/// 0 % by any curve that asked. GPU fans take none — they are never pumps.
+/// The member id is looked up through [`crate::hwmon::roles::role_key`], so a
+/// profile naming `openfan:ch3` finds the assignment saved as `openfan:ch03`.
 pub(crate) fn assigned_role_is_pump(
     member: &ControlMember,
     assigned: &std::collections::HashMap<String, crate::hwmon::roles::HeaderRole>,
 ) -> bool {
-    if member.source != "hwmon" {
+    if !crate::hwmon::roles::source_takes_role(&member.source) {
         return false;
     }
     assigned
-        .get(&member.member_id)
+        .get(crate::hwmon::roles::role_key(&member.member_id).as_ref())
         .is_some_and(|role| role.is_pump())
 }
 

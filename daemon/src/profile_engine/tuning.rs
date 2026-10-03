@@ -178,6 +178,10 @@ pub(crate) fn member_effective_floor(
 /// engine start) the inferred term is `Unknown` and `pwm_mode` unknown, so this
 /// returns at most [`HARD_PUMP_CPU_FLOOR_PCT`], which every such member already
 /// had through `member_needs_hard_floor` — no floor moves on missing evidence.
+///
+/// hwmon only. An OpenFan pump (`ROLE-f`) is floored by `assigned_role_is_pump`
+/// in [`member_effective_floor`]; it has no `pwmN_mode`, so the DC floor this
+/// adds could never apply to it.
 pub(crate) fn member_pump_floor(
     member: &ControlMember,
     assigned_roles: &std::collections::HashMap<String, crate::hwmon::roles::HeaderRole>,

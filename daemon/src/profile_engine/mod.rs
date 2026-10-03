@@ -10205,6 +10205,98 @@ mod tests {
         );
     }
 
+    /// Evaluate one single-member control at a cool 20 °C (curve output ~5 %)
+    /// with a non-zero `stop_pct`, `roles` assigned, returning the member's duty.
+    fn openfan_duty(
+        source: &str,
+        member_id: &str,
+        roles: &[(&str, crate::hwmon::roles::HeaderRole)],
+    ) -> u8 {
+        let mut profile = make_profile("curve", "graph", 5.0);
+        profile.controls[0].minimum_pct = 0.0;
+        profile.controls[0].stop_pct = 40.0;
+        profile.controls[0].members = vec![ControlMember {
+            source: source.into(),
+            member_id: member_id.into(),
+            member_label: "Channel 4".into(),
+            fan_zero_rpm: false,
+        }];
+        let sensors = make_cache_with_sensor("cpu", 20.0).sensors_snapshot();
+        let mut state = ProfileEngineState::new();
+        state.set_assigned_roles(Arc::new(
+            roles.iter().map(|(id, r)| (id.to_string(), *r)).collect(),
+        ));
+        evaluate_profile_with_overrides(
+            &profile,
+            &sensors,
+            &mut state,
+            &OverrideSnapshot::default(),
+        )[0]
+        .pwm_percent
+    }
+
+    /// [SAFETY] `ROLE-f`. An OpenFan channel the user assigned `pump` gets the
+    /// hard floor and the stop-snap exemption — before this the pump predicates
+    /// were hwmon-only, and a curve could stop a pump on a channel.
+    #[test]
+    fn an_assigned_openfan_pump_earns_the_hard_floor_and_cannot_be_stop_snapped() {
+        use crate::hwmon::roles::HeaderRole;
+        let unassigned = openfan_duty("openfan", "openfan:ch04", &[]);
+        assert!(
+            unassigned < HARD_PUMP_CPU_FLOOR_PCT as u8,
+            "precondition: an unassigned channel follows the curve and its stop-snap \
+             ({unassigned}%)"
+        );
+        assert_eq!(
+            openfan_duty(
+                "openfan",
+                "openfan:ch04",
+                &[("openfan:ch04", HeaderRole::Pump)]
+            ),
+            HARD_PUMP_CPU_FLOOR_PCT as u8,
+            "an assigned OpenFan pump must be held at the hard floor"
+        );
+        // A profile naming the channel unpadded drives the same channel, so it
+        // must find the same assignment.
+        assert_eq!(
+            openfan_duty(
+                "openfan",
+                "openfan:ch4",
+                &[("openfan:ch04", HeaderRole::Pump)]
+            ),
+            HARD_PUMP_CPU_FLOOR_PCT as u8,
+            "the assignment must protect the channel whatever spelling the profile uses"
+        );
+        // Only `pump` adds the floor.
+        assert_eq!(
+            openfan_duty(
+                "openfan",
+                "openfan:ch04",
+                &[("openfan:ch04", HeaderRole::ChassisFan)]
+            ),
+            unassigned
+        );
+    }
+
+    /// A GPU fan is never a pump: an assignment under its id adds nothing.
+    #[test]
+    fn a_gpu_member_takes_no_role_assignment() {
+        use crate::hwmon::roles::HeaderRole;
+        const GPU: &str = "amd_gpu:0000:03:00.0";
+        assert!(
+            !crate::profile::assigned_role_is_pump(
+                &ControlMember {
+                    source: "amd_gpu".into(),
+                    member_id: GPU.into(),
+                    member_label: "GPU".into(),
+                    fan_zero_rpm: false,
+                },
+                &[(GPU.to_string(), HeaderRole::Pump)].into_iter().collect(),
+            ),
+            "a GPU fan must never earn the pump floor from an assignment"
+        );
+    }
+
     /// A non-pump assignment must not be able to STRIP a floor the labels
     /// already earned. The union only ever adds.
     #[test]

@@ -687,7 +687,7 @@ impl RuntimeConfig {
                 );
                 continue;
             };
-            let canonical = crate::hwmon::chip_name::canonical_hwmon_id(id);
+            let canonical = crate::hwmon::roles::role_key(id);
             let suffixed = matches!(canonical, std::borrow::Cow::Owned(_));
             match out.entry(canonical.into_owned()) {
                 Entry::Vacant(slot) => {
@@ -784,11 +784,12 @@ impl RuntimeConfig {
     ) {
         let mut hw = self.hardware.take().unwrap_or_default();
         // DEC-442: an assignment saved under the it87 v2.0 suffixed spelling is
-        // the same header. Remove every spelling, so a clear really clears and a
-        // set leaves exactly one entry, under the canonical id.
-        let canonical = crate::hwmon::chip_name::canonical_hwmon_id(header_id).into_owned();
+        // the same header, as is an OpenFan channel saved unpadded (`ROLE-f`).
+        // Remove every spelling, so a clear really clears and a set leaves
+        // exactly one entry, under the canonical id.
+        let canonical = crate::hwmon::roles::role_key(header_id).into_owned();
         hw.header_roles
-            .retain(|id, _| crate::hwmon::chip_name::canonical_hwmon_id(id) != canonical);
+            .retain(|id, _| crate::hwmon::roles::role_key(id) != canonical);
         if let Some(r) = role {
             hw.header_roles.insert(canonical, r.as_str().into());
         }
