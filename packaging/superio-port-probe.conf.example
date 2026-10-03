@@ -24,7 +24,8 @@
 #   bytes, then, if still nothing answers, the Nuvoton/Winbond 0x87,0x87
 #   unlock. That Nuvoton unlock is the sequence measured latching an ITE
 #   eSPI-to-LPC bridge until a full power cut (DEC-332); it is withheld
-#   only on boards the daemon's DMI table lists as ITE-only. The probe
+#   on every Gigabyte board and on boards the daemon's DMI table lists as
+#   ITE-only. The probe
 #   never writes a configuration value, force_id, or the hardware-monitor
 #   block. It is one-shot (a deliberate POST, never a loop or a startup
 #   action), with a 10-second cooldown between runs.

@@ -236,7 +236,7 @@ fn is_valid_family_devid(devid: u16) -> bool {
 /// Whether the Nuvoton/Winbond `0x87,0x87` config-mode unlock may be written on
 /// this machine at all.
 ///
-/// **Deliberately opaque, within honest limits.** The `permitted` field is
+/// **Deliberately opaque, within honest limits.** The `withheld` field is
 /// private, so no call site can write a permissive value directly, and
 /// [`NuvotonUnlockPolicy::for_board`] takes the whole [`BoardInfo`] so the
 /// vendor and the board name cannot be transposed (they are both `String`, and
@@ -252,30 +252,56 @@ fn is_valid_family_devid(devid: u16) -> bool {
 /// out by the compiler, and the one it cannot is pinned by that test.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NuvotonUnlockPolicy {
-    permitted: bool,
+    withheld: Option<NuvotonWithholdReason>,
+}
+
+/// Why [`NuvotonUnlockPolicy`] forbids the unlock on this board — the user is
+/// told which, because the two rest on different evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NuvotonWithholdReason {
+    /// The curated board table lists this board with an ITE-only complement.
+    IteOnlyBoard,
+    /// A Gigabyte board the table does not list as ITE-only (`BRD-s`).
+    GigabyteBoard,
 }
 
 impl NuvotonUnlockPolicy {
     /// Derive the policy from the running board's DMI identity.
     ///
-    /// Forbidden exactly when the curated board table expects an ITE-only
-    /// Super-I/O complement here — on such a board no Nuvoton chip can be
-    /// waiting behind the unlock, so the write has nothing to gain and a latched
-    /// bridge to lose. Every other board (including every board the table does
-    /// not know) keeps the leg.
+    /// Forbidden when the curated board table expects an ITE-only Super-I/O
+    /// complement here, or when the board is Gigabyte's (`BRD-s`): a DMI vendor
+    /// containing "GIGABYTE", or any board the package's Super-I/O guard
+    /// declines (which adds a listed board name under an empty vendor,
+    /// DEC-424). On either there is no Nuvoton chip to expect behind the unlock
+    /// — no consumer Gigabyte board with one is known, and the guard already
+    /// keeps `nct6775` from driving one — so the write has nothing to gain and a
+    /// latched bridge to lose. Unlike the guard, a Gigabyte vendor with an
+    /// unreadable board name is withheld too: this is an opt-in diagnostic, not
+    /// a boot-time module load, so failing closed costs only one leg of it.
+    /// Every other board keeps the leg.
     pub fn for_board(board: &BoardInfo) -> Self {
-        Self {
-            permitted: !crate::hwmon::chip_db::board_expects_only_ite_chips(
-                &board.vendor,
-                &board.name,
-            ),
-        }
+        use crate::hwmon::chip_db::{board_expects_only_ite_chips, superio_guard_declines};
+        let withheld = if board_expects_only_ite_chips(&board.vendor, &board.name) {
+            Some(NuvotonWithholdReason::IteOnlyBoard)
+        } else if board.vendor.to_ascii_uppercase().contains("GIGABYTE")
+            || superio_guard_declines(&board.vendor, &board.name)
+        {
+            Some(NuvotonWithholdReason::GigabyteBoard)
+        } else {
+            None
+        };
+        Self { withheld }
     }
 
     /// Whether [`probe_base`] may write `0x87,0x87` at a base that answered
     /// nothing to every earlier leg.
     pub fn permits_unlock(self) -> bool {
-        self.permitted
+        self.withheld.is_none()
+    }
+
+    /// Why the unlock is forbidden, or `None` when it is permitted.
+    pub fn withhold_reason(self) -> Option<NuvotonWithholdReason> {
+        self.withheld
     }
 }
 
@@ -432,16 +458,21 @@ fn probe_base(
     // ── Nuvoton / Winbond family ──
     //
     // `X87-k`: this is the one leg whose unlock the daemon's own packaging
-    // blocks other callers from writing. On a board whose expected complement is
-    // ITE-only there is no Nuvoton chip to find here, so the write can only
-    // latch the bridge — the state DEC-332 measured surviving a reboot and
-    // clearing only at the wall. Withhold it and say so.
-    if !policy.permits_unlock() {
+    // blocks other callers from writing. On an ITE-only or Gigabyte board there
+    // is no Nuvoton chip to expect here, so the write can only latch the bridge
+    // — the state DEC-332 measured surviving a reboot and clearing only at the
+    // wall. Withhold it and say so.
+    if let Some(reason) = policy.withhold_reason() {
+        let why = match reason {
+            NuvotonWithholdReason::IteOnlyBoard => {
+                "this board's expected Super-I/O complement is ITE-only"
+            }
+            NuvotonWithholdReason::GigabyteBoard => "this is a Gigabyte board (BRD-s)",
+        };
         log::info!(
             "Super-I/O base {base:#06x}: nothing answered and the Nuvoton/Winbond \
-             config-mode unlock was withheld — this board's expected Super-I/O \
-             complement is ITE-only, and that write is what latches the ITE \
-             eSPI-to-LPC bridge (DEC-332)."
+             config-mode unlock was withheld — {why}, and that write is what latches \
+             the ITE eSPI-to-LPC bridge (DEC-332)."
         );
         return Ok(BaseOutcome::NuvotonUnlockWithheld);
     }
@@ -1171,5 +1202,67 @@ mod tests {
             "control: the fields are not interchangeable — if this also forbids, \
              the predicate is not reading the fields it claims to"
         );
+    }
+
+    // ── `BRD-s`: every Gigabyte board, not only the listed ones ──
+
+    /// A Gigabyte board the table does not list.
+    const UNLISTED_GIGABYTE_BOARD: &str = "B650M DS3H";
+
+    #[test]
+    fn an_unlisted_gigabyte_board_withholds_the_unlock_for_its_own_reason() {
+        assert!(
+            !crate::hwmon::chip_db::board_expects_only_ite_chips(
+                "Gigabyte Technology Co., Ltd.",
+                UNLISTED_GIGABYTE_BOARD
+            ),
+            "fixture must be a board the table does not cover"
+        );
+        let policy = NuvotonUnlockPolicy::for_board(&board_info(
+            "Gigabyte Technology Co., Ltd.",
+            UNLISTED_GIGABYTE_BOARD,
+        ));
+        assert_eq!(
+            policy.withhold_reason(),
+            Some(NuvotonWithholdReason::GigabyteBoard)
+        );
+
+        let p = FakePort::nuvoton(0xd592);
+        let outcome = probe_ports(&p, &[0x2e], policy);
+        assert!(
+            !wrote_the_nuvoton_unlock(&p, 0x2e),
+            "the 0x87,0x87 pair must never reach a Gigabyte board. Writes: {:?}",
+            p.writes.borrow()
+        );
+        assert_eq!(outcome.nuvoton_withheld_bases, vec![0x2e]);
+    }
+
+    #[test]
+    fn the_withhold_reason_follows_the_evidence_for_each_board() {
+        let (vendor, listed) = crate::hwmon::chip_db::any_ite_only_board_for_test();
+        let reason =
+            |v: &str, n: &str| NuvotonUnlockPolicy::for_board(&board_info(v, n)).withhold_reason();
+        use NuvotonWithholdReason::{GigabyteBoard, IteOnlyBoard};
+
+        // The table's own claim stays the more specific reason.
+        assert_eq!(reason(vendor, listed), Some(IteOnlyBoard));
+        // Vendor match is case-folded, as the guard's is.
+        assert_eq!(
+            reason("GIGABYTE", UNLISTED_GIGABYTE_BOARD),
+            Some(GigabyteBoard)
+        );
+        // An unreadable board name: the guard loads there, this probe does not.
+        assert_eq!(
+            reason("Gigabyte Technology Co., Ltd.", ""),
+            Some(GigabyteBoard)
+        );
+        // Not Gigabyte: the leg stays — including Gigabyte's server brand, which
+        // the guard does not match either, and an unknown board with no vendor.
+        assert_eq!(reason("Giga Computing", UNLISTED_GIGABYTE_BOARD), None);
+        assert_eq!(
+            reason("ASUSTeK COMPUTER INC.", UNLISTED_GIGABYTE_BOARD),
+            None
+        );
+        assert_eq!(reason("", UNLISTED_GIGABYTE_BOARD), None);
     }
 }

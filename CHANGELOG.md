@@ -20,6 +20,12 @@
 
 ### Fixed
 
+- **The opt-in port probe no longer writes the Nuvoton unlock on any Gigabyte board.** It withheld the
+  `0x87,0x87` sequence — the one measured latching an ITE eSPI-to-LPC bridge until a power-down at the
+  wall — only on boards its table lists as ITE-only, while the packaged Super-I/O guard has blocked
+  `nct6775`/`w83627ehf` on every Gigabyte board since DEC-424. It now withholds it on a DMI vendor
+  containing "GIGABYTE" and on any board the guard declines, and the `notes[]` entry says which reason
+  applied. The ITE legs are unchanged (`BRD-s`).
 - **A diagnostic that crashes mid-run no longer strands a fan with no automatic mode.** If
   characterisation, control-path discovery or the stall probe stopped before its restore (an internal
   panic), a header with no `pwmN_enable` — an ARCTIC fan hub channel, a `pwmfan` — that no profile names

@@ -1180,9 +1180,10 @@ pub fn expected_chips_for_board(board_vendor: &str, board_name: &str) -> Vec<Str
 /// a full power cut, and shipped `packaging/control-ofc-superio-guard` to stop
 /// `nct6775`/`w83627ehf` writing it. That guard was keyed on
 /// [`GIGABYTE_DUAL_CHIP_BOARDS`] until DEC-424 widened it to every Gigabyte
-/// board. This predicate is still keyed on the table, and it is what stops the
-/// daemon's own port probe writing the sequence its packaging exists to prevent
-/// — on the listed boards only (register row `BRD-s`).
+/// board. This predicate is still keyed on the table; it is one of the two
+/// reasons the daemon's own port probe withholds the sequence its packaging
+/// exists to prevent — the other is a Gigabyte vendor (`BRD-s`, see
+/// `superio_probe::NuvotonUnlockPolicy::for_board`).
 ///
 /// `false` when the board is not in the table: an unknown board rules nothing
 /// out, and an unbound Nuvoton chip there is precisely what the probe exists to

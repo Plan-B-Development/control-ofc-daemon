@@ -679,11 +679,8 @@ fn run_port_probe_with_board(
     bases: &[u16],
     board: &BoardInfo,
 ) -> (Vec<superio_probe::ProbedChip>, Vec<String>, bool) {
-    let outcome = superio_probe::probe_ports(
-        reader,
-        bases,
-        superio_probe::NuvotonUnlockPolicy::for_board(board),
-    );
+    let policy = superio_probe::NuvotonUnlockPolicy::for_board(board);
+    let outcome = superio_probe::probe_ports(reader, bases, policy);
     let mut notes = Vec::new();
     // Say "found nothing" only about bases we actually examined. Suppressing it
     // whenever *any* base was withheld loses the report for a sibling base that
@@ -696,7 +693,20 @@ fn run_port_probe_with_board(
     if outcome.chips.is_empty() && examined_a_base {
         notes.push("Active port probe found no unbound Super-I/O chip at 0x2E/0x4E.".to_string());
     }
-    if !outcome.nuvoton_withheld_bases.is_empty() {
+    if let (false, Some(reason)) = (
+        outcome.nuvoton_withheld_bases.is_empty(),
+        policy.withhold_reason(),
+    ) {
+        let why = match reason {
+            superio_probe::NuvotonWithholdReason::IteOnlyBoard => {
+                "This board's expected Super-I/O complement is ITE-only"
+            }
+            superio_probe::NuvotonWithholdReason::GigabyteBoard => {
+                "This is a Gigabyte board: no consumer Gigabyte board with a Nuvoton \
+                 or Winbond Super-I/O is known, and the package's Super-I/O guard keeps the \
+                 nct6775 and w83627ehf drivers from loading on Gigabyte boards"
+            }
+        };
         let ports = outcome
             .nuvoton_withheld_bases
             .iter()
@@ -705,10 +715,9 @@ fn run_port_probe_with_board(
             .join(" and ");
         notes.push(format!(
             "Active port probe: nothing answered at {ports}, and the Nuvoton/Winbond \
-             config-mode unlock was deliberately NOT attempted there. This board's \
-             expected Super-I/O complement is ITE-only, and that write is what latches \
-             the ITE eSPI-to-LPC bridge — a state a reboot does not always clear, and \
-             powering down at the wall does. If fan headers are missing, the it87 driver \
+             config-mode unlock was deliberately NOT attempted there. {why}, and that \
+             write is what latches the ITE eSPI-to-LPC bridge — a state a reboot does \
+             not always clear, and powering down at the wall does. If fan headers are missing, the it87 driver \
              is the one to pursue; see the Hardware Troubleshooting guide."
         ));
     }
@@ -1209,38 +1218,41 @@ mod tests {
 
     /// `DC-da`, the call site: the probe decides the guard from the SAME DMI tree
     /// it reads for its unlock policy, and the handler's mapping of a hit then
-    /// renders the guard's hint. A Gigabyte board the dual-chip table does not
-    /// list is the case where both legs run: the unlock is allowed (the table is
-    /// what withholds it), a Nuvoton chip answers, and the guard still declines.
+    /// renders the hint that decision calls for. Since `BRD-s` the two never
+    /// disagree on a Gigabyte board: wherever the guard declines, the unlock is
+    /// withheld too, so no Nuvoton hit exists there to be told to load anything.
     #[test]
     fn the_probe_derives_the_guard_decision_from_the_dmi_tree() {
         let run = |vendor: &str, name: &str| {
             let dmi = tempfile::tempdir().unwrap();
             std::fs::write(dmi.path().join("board_vendor"), format!("{vendor}\n")).unwrap();
             std::fs::write(dmi.path().join("board_name"), format!("{name}\n")).unwrap();
-            let (chips, _, guard) =
-                run_port_probe(&NuvotonOnlyPort::default(), &[0x2e], dmi.path());
-            assert_eq!(chips.len(), 1, "precondition: {vendor} {name} was probed");
-            let hint = probed_to_superio_chip(&chips[0], guard)
-                .recommendation
-                .expect("recommendation")
-                .load_hint;
-            (guard, hint)
+            run_port_probe(&NuvotonOnlyPort::default(), &[0x2e], dmi.path())
         };
-        let (gb_guard, gb_hint) = run("Gigabyte Technology Co., Ltd.", "B650 AORUS ELITE AX");
+
+        let (vendor, name) = ("Gigabyte Technology Co., Ltd.", "B650 AORUS ELITE AX");
+        let (gb_chips, gb_notes, gb_guard) = run(vendor, name);
         assert!(
-            gb_guard
-                == crate::hwmon::chip_db::superio_guard_declines(
-                    "Gigabyte Technology Co., Ltd.",
-                    "B650 AORUS ELITE AX"
-                )
-                && gb_guard,
+            gb_guard && gb_guard == crate::hwmon::chip_db::superio_guard_declines(vendor, name),
             "a Gigabyte board: the guard declines"
         );
-        assert_eq!(gb_hint, superio::superio_guard_load_hint("nct6775"));
+        assert!(
+            gb_chips.is_empty(),
+            "the Nuvoton leg is withheld where the guard declines"
+        );
+        assert!(
+            gb_notes.iter().any(|n| n.contains("Gigabyte board")),
+            "{gb_notes:?}"
+        );
 
-        let (msi_guard, msi_hint) = run("Micro-Star International Co., Ltd.", "MAG B650 TOMAHAWK");
+        let (msi_chips, _, msi_guard) =
+            run("Micro-Star International Co., Ltd.", "MAG B650 TOMAHAWK");
         assert!(!msi_guard, "another vendor: the guard loads");
+        assert_eq!(msi_chips.len(), 1, "precondition: the MSI board was probed");
+        let msi_hint = probed_to_superio_chip(&msi_chips[0], msi_guard)
+            .recommendation
+            .expect("recommendation")
+            .load_hint;
         assert!(msi_hint.contains("sudo modprobe nct6775"), "{msi_hint}");
     }
 
@@ -1444,6 +1456,36 @@ mod tests {
         assert_eq!(chips[0].devid, 0xd592);
         assert_eq!(chips[0].vendor, superio::SuperIoVendor::Nuvoton);
         assert!(notes.is_empty(), "nothing was withheld: {notes:?}");
+    }
+
+    #[test]
+    fn the_probe_call_site_withholds_the_nuvoton_unlock_on_an_unlisted_gigabyte_board() {
+        // `BRD-s`: the shipped guard covers every Gigabyte board (DEC-424), so
+        // the daemon's own probe must not write the unlock on one it lacks a
+        // table row for.
+        let (vendor, name) = ("Gigabyte Technology Co., Ltd.", "B650M DS3H");
+        assert!(
+            !crate::hwmon::chip_db::board_expects_only_ite_chips(vendor, name),
+            "fixture must be a board the table does not cover"
+        );
+        let p = NuvotonOnlyPort::default();
+
+        let (chips, notes, _) = run_port_probe_with_board(&p, &[0x2e], &board_info(vendor, name));
+
+        assert!(
+            !p.wrote_the_nuvoton_unlock(0x2e),
+            "the 0x87,0x87 pair must not reach a Gigabyte board. Writes: {:?}",
+            p.writes.borrow()
+        );
+        assert!(chips.is_empty());
+        assert_eq!(notes.len(), 1, "the skip must be explained: {notes:?}");
+        assert!(notes[0].contains("0x2E"), "{}", notes[0]);
+        assert!(notes[0].contains("Gigabyte board"), "{}", notes[0]);
+        assert!(
+            !notes[0].contains("ITE-only"),
+            "the table says nothing about this board: {}",
+            notes[0]
+        );
     }
 
     #[test]
