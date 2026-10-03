@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Two chips get the right expected driver** (DEC-473, `DC-db`). The Fintek F81768D (hwmon name `f81768d`)
+  now maps to `f71882fg` instead of *unknown*, and `smsc47m192` — a separate, monitoring-only I2C driver — no
+  longer maps to `smsc47m1`. `/diagnostics/hardware` reports the corrected `expected_driver` and
+  `in_mainline_kernel` for both, and its `kernel_modules` list gains a `smsc47m192` row (not loaded on
+  machines without that chip). A bound F81768D is now also listed by `/superio` (as Fintek), where it was
+  dropped as unrecognised; a bound `smsc47m192` stays listed as SMSC.
+- **The GPU fan test no longer blames motherboard firmware** (DEC-473, `BRD-o`). When a pre-RDNA3 card's
+  `pwm1_enable` leaves manual mode during `POST /gpu/{id}/fan/verify`, `details` now names the value read
+  (`0` is full speed, not automatic) and points at another GPU fan tool or a GPU re-initialising, instead of a
+  BIOS "Smart Fan" option. The `pwm_enable_reverted` verdict is unchanged.
+
 ## [3.3.0] — 2026-10-01
 
 Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor; GUI 3.3.0 shows the new

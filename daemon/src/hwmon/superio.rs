@@ -270,6 +270,14 @@ const SUPERIO_ALLOWLIST: &[AllowlistEntry] = &[
         risk_note: "Monitoring-only driver — exposes temperatures and fan tachometers but no PWM \
                     output.",
     },
+    // `DC-db` (DEC-473): `expected_driver_for_chip` returns this module since it
+    // stopped folding `smsc47m192` into `smsc47m1`, so it needs an entry here.
+    AllowlistEntry {
+        module: "smsc47m192",
+        vendor: SuperIoVendor::Smsc,
+        risk_note: "Monitoring-only (I2C): voltages and temperatures, no fan or PWM. Fan control \
+                    on these chips is the smsc47m1 driver.",
+    },
     AllowlistEntry {
         module: "dme1737",
         vendor: SuperIoVendor::Smsc,
@@ -1650,12 +1658,15 @@ mod tests {
             "w83627ehf",
             "w83627hf",
             "smsc47m1",
+            "smsc47m192",
             "smsc47b397",
             "dme1737",
             "sch5627",
             "sch5636",
             "pc87360",
             "pc87427",
+            // `DC-db` (DEC-473): names the mapping newly recognises.
+            "f81768d",
         ];
         for chip in sample_chips {
             let module = chip_db::expected_driver(chip);

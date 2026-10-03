@@ -184,6 +184,41 @@ mod tests {
         }
     }
 
+    /// `BRD-r`: the cross-stack oracle's `is_aio` equality (asserted here in
+    /// `roles.rs` and in the GUI's parity test) only pins a chip the oracle
+    /// names. Require a vector for every chip on this list, so a chip added here
+    /// and not to the GUI's mirror cannot pass both repos unseen.
+    #[test]
+    fn every_cooler_chip_has_a_header_role_oracle_vector() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/header_role_classification.json"
+        );
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read header role fixture: {e}"));
+        let vectors: serde_json::Value =
+            serde_json::from_str(&text).expect("parse header role fixture");
+        let named: std::collections::BTreeSet<String> = vectors["cases"]
+            .as_array()
+            .expect("cases array")
+            .iter()
+            .map(|c| c["chip_name"].as_str().unwrap().to_lowercase())
+            .collect();
+        assert!(
+            !LIQUID_COOLER_CHIPS.is_empty(),
+            "an empty list passes vacuously"
+        );
+        let missing: Vec<&str> = LIQUID_COOLER_CHIPS
+            .iter()
+            .copied()
+            .filter(|chip| !named.contains(*chip))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "cooler chips with no vector in header_role_classification.json: {missing:?}"
+        );
+    }
+
     #[test]
     fn aquacomputer_liquid_devices_are_coolers() {
         for chip in ["d5next", "highflownext", "leakshield"] {

@@ -801,15 +801,29 @@ fn classify_gpu_verify_result(
     final_state: &GpuVerifyState,
     test_speed: u8,
 ) -> (String, String) {
-    // Legacy path: a reverted pwm1_enable means the BIOS/EC reclaimed control.
+    // Legacy path: pwm1_enable left manual (1) during the test. `BRD-o`: what
+    // reads back here is the card's own driver/SMU state, never motherboard
+    // firmware — so a BIOS "Smart Fan" option, which this text used to blame,
+    // is not a cause. Another GPU fan tool, or the driver re-initialising the
+    // card (resume, GPU reset), is. 0 is "no fan control" (full speed), not
+    // automatic, so the value is named rather than assumed.
     if let Some(en) = final_state.pwm_enable {
         if en != 1 {
+            let mode = match en {
+                0 => "0 (no fan control: full speed)".to_string(),
+                2 => "2 (automatic)".to_string(),
+                other => other.to_string(),
+            };
             return (
                 "pwm_enable_reverted".into(),
                 format!(
-                    "pwm1_enable changed from 1 to {en} during the test — the BIOS/EC firmware \
-                     reclaimed automatic fan control. Disable any vendor 'Smart Fan' / EC \
-                     fan-control option in firmware setup, then re-test."
+                    "pwm1_enable changed from 1 (manual) to {mode} during the test, so \
+                     something other than this test changed the card's fan mode. The usual \
+                     cause is another GPU fan tool (for example LACT, CoreCtrl or amdgpu-fan): \
+                     stop it, then re-test. The amdgpu driver also hands the fan back to the \
+                     card's own automatic control when the GPU re-initialises (resume from \
+                     suspend, a GPU reset). Motherboard BIOS fan settings do not drive a \
+                     graphics card's fan."
                 ),
             );
         }
@@ -1643,12 +1657,22 @@ mod tests {
 
     #[test]
     fn classify_pwm_enable_reverted_on_legacy_path() {
-        // Legacy path: pwm1_enable bounced back to auto (2) → BIOS reclaim.
+        // Legacy path: pwm1_enable left manual during the test. `BRD-o`: the
+        // text names the value read and blames no motherboard firmware.
         let init = st(Some(30), Some(800), Some(1), None);
         let fin = st(Some(75), Some(820), Some(2), None);
         let (r, d) = classify_gpu_verify_result(&init, &fin, 75);
         assert_eq!(r, "pwm_enable_reverted");
-        assert!(d.contains("Smart Fan"));
+        assert!(d.contains("to 2 (automatic)"), "{d}");
+        assert!(d.contains("another GPU fan tool"), "{d}");
+        assert!(!d.contains("Smart Fan"), "{d}");
+
+        // Opposite arm: 0 is full speed, and must not be called automatic.
+        let fin = st(Some(75), Some(820), Some(0), None);
+        let (r, d) = classify_gpu_verify_result(&init, &fin, 75);
+        assert_eq!(r, "pwm_enable_reverted");
+        assert!(d.contains("to 0 (no fan control: full speed)"), "{d}");
+        assert!(!d.contains("automatic) during"), "{d}");
     }
 
     #[test]

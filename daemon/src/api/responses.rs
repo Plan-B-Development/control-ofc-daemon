@@ -2874,6 +2874,20 @@ mod tests {
         };
         expect(&serde_json::to_value(&rail).unwrap(), "VoltageEntry");
 
+        // `BRD-x`: `/diagnostics/hardware .hwmon.chips_detected`. Enrolled when
+        // the GUI began reading `sysfs_chip_name` (DEC-442's field). Every
+        // optional field populated so the key set covers `bound_driver` too.
+        let chip = HwmonChipInfo {
+            chip_name: "it8696".into(),
+            sysfs_chip_name: "it8696_a008090a".into(),
+            device_id: "it87.2608".into(),
+            expected_driver: "it87".into(),
+            bound_driver: Some("it87".into()),
+            in_mainline_kernel: false,
+            header_count: 5,
+        };
+        expect(&serde_json::to_value(&chip).unwrap(), "HwmonChipInfo");
+
         // ── `P8-ca`: the 16 structs `G33` pinned on the GUI side ONLY ──
         //
         // `G33` declared these in `tests/fixtures/wire_fields.json` so the GUI

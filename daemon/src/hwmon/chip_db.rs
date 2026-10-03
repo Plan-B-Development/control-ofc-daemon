@@ -49,7 +49,8 @@ const KNOWN_MODULES: &[(&str, bool)] = &[
     ("f71805f", true),    // Fintek F71805F/806F/872F — distinct from f71882fg
     ("w83627ehf", true),  // Winbond W83627EHF/EHG/DHG/UHG, W83667HG
     ("w83627hf", true),   // Winbond W83627HF/THF, W83637HF, W83687THF, W83697HF
-    ("smsc47m1", true),   // SMSC LPC47M10x/M11x/M13x/M14x/M15x/M19x, LPC47M292
+    ("smsc47m1", true),   // SMSC LPC47B27x, LPC47M10x/M112/M13x/M14x/M15x/M192/M997, LPC47M292
+    ("smsc47m192", true), // SMSC LPC47M15x/M192/M292/M997 monitoring block (I2C); no fan/PWM
     ("smsc47b397", true), // SMSC LPC47B397-NC, SCH5307-NS, SCH5317
     ("dme1737", true),    // SMSC DME1737, SCH311x, SCH5027, SCH5127
     ("pc87360", true),    // National PC87360/363/364/365/366
@@ -91,7 +92,7 @@ const KNOWN_MODULES: &[(&str, bool)] = &[
 ///
 /// Coverage (DEC-202): ITE (it87), Nuvoton (nct6775 / nct6683 monitoring-only /
 /// out-of-tree nct6687d), Fintek (f71805f, f71882fg), Winbond (w83627ehf,
-/// w83627hf), SMSC (smsc47m1, smsc47b397, dme1737, sch5627, sch5636) and
+/// w83627hf), SMSC (smsc47m1, smsc47m192, smsc47b397, dme1737, sch5627, sch5636) and
 /// National (pc87360, pc87427). Each mapping is verified against that driver's
 /// docs.kernel.org "Supported chips" / "Prefix" listing (2026-07-07).
 pub(crate) fn expected_driver_for_chip(chip_name: &str) -> &'static str {
@@ -133,7 +134,13 @@ pub(crate) fn expected_driver_for_chip(chip_name: &str) -> &'static str {
     if lower.starts_with("f71805") || lower.starts_with("f71806") || lower.starts_with("f71872") {
         return "f71805f";
     }
-    if lower.starts_with("f718") || lower.starts_with("f8000") || lower.starts_with("f818") {
+    // `DC-db`: f71882fg also publishes "f81768d" (`f71882fg_names[]`, verified
+    // against mainline source 2026-10-03), which no `f818` prefix reaches.
+    if lower.starts_with("f718")
+        || lower.starts_with("f8000")
+        || lower.starts_with("f818")
+        || lower.starts_with("f81768")
+    {
         return "f71882fg";
     }
 
@@ -160,6 +167,13 @@ pub(crate) fn expected_driver_for_chip(chip_name: &str) -> &'static str {
         || lower.starts_with("sch5317")
     {
         return "smsc47b397";
+    }
+    // `DC-db`: `smsc47m192` is a separate mainline I2C driver (the monitoring
+    // block of the LPC47M15x/M192/M292/M997) whose hwmon name the `smsc47m` prefix
+    // below would otherwise claim. It has no fan or PWM attribute at all — its
+    // kernel doc sends fan control to `smsc47m1`.
+    if lower.starts_with("smsc47m192") {
+        return "smsc47m192";
     }
     if lower.starts_with("smsc47m") {
         return "smsc47m1"; // covers 'smsc47m1' and 'smsc47m2'
@@ -1474,6 +1488,25 @@ mod tests {
         assert_eq!(expected_driver("it8688"), "it87");
         assert_eq!(expected_driver("f71882fg"), "f71882fg");
         assert_eq!(expected_driver("unknown_chip"), "unknown");
+    }
+
+    /// `DC-db`: two names the mainline drivers publish that the prefixes used to
+    /// get wrong (each verified against the driver source, 2026-10-03):
+    /// `f81768d` (f71882fg's `f71882fg_names[]`) matched nothing, and
+    /// `smsc47m192` (its own I2C driver) was claimed by the `smsc47m` prefix.
+    /// The opposite arms keep the `smsc47m1` names on their own driver.
+    #[test]
+    fn f81768d_and_smsc47m192_map_to_their_own_drivers() {
+        assert_eq!(expected_driver("f81768d"), "f71882fg");
+        assert!(chip_driver_in_mainline("f81768d"));
+        assert_eq!(expected_driver("smsc47m192"), "smsc47m192");
+        assert!(chip_driver_in_mainline("smsc47m192"));
+        for chip in ["smsc47m1", "smsc47m2"] {
+            assert_eq!(expected_driver(chip), "smsc47m1", "{chip}");
+        }
+        for chip in ["f81865f", "f81866a", "f8000", "f71889fg"] {
+            assert_eq!(expected_driver(chip), "f71882fg", "{chip}");
+        }
     }
 
     #[test]
