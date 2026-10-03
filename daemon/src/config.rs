@@ -4,8 +4,16 @@ use crate::error::ConfigError;
 use serde::Deserialize;
 
 /// Top-level daemon configuration.
+///
+/// **No `deny_unknown_fields` at this level — deliberate (`TS-bl`, the user's
+/// decision `U8`).** A section this daemon does not know is collected into
+/// [`Self::unknown_sections`] and reported as a warning at boot and on reload
+/// instead of failing the load, so a section added by a newer daemon (as
+/// `[shutdown]` and `[safety]` were) no longer stops this one starting after a
+/// downgrade. Every known section below keeps `deny_unknown_fields`, so a typo
+/// *within* a section still fails loudly. Accepted risk: a misspelt section
+/// name is ignored with a warning and that section's defaults apply.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
     #[serde(default)]
     pub serial: SerialConfig,
@@ -34,6 +42,12 @@ pub struct DaemonConfig {
     /// Cooling-failure detection (DEC-443).
     #[serde(default)]
     pub safety: SafetyConfig,
+
+    /// Top-level keys this daemon does not recognise, kept only so they can be
+    /// named in a warning (see [`Self::unknown_section_names`]). Never read for
+    /// configuration.
+    #[serde(flatten)]
+    pub unknown_sections: toml::Table,
 }
 
 /// Serial port configuration.
@@ -316,6 +330,22 @@ impl DaemonConfig {
         }
     }
 
+    /// Names of the top-level keys this daemon ignored, sorted (`TS-bl`).
+    pub fn unknown_section_names(&self) -> Vec<&str> {
+        self.unknown_sections.keys().map(String::as_str).collect()
+    }
+
+    /// Warn once per ignored top-level key. Boot and SIGHUP reload call this;
+    /// `GET /config` re-reads the file per request and stays quiet.
+    pub fn warn_unknown_sections(&self, path: &str) {
+        for name in self.unknown_section_names() {
+            log::warn!(
+                "{path}: ignoring unknown top-level section or key {name:?} \
+                 (a newer daemon's setting, or a misspelling — its defaults apply)"
+            );
+        }
+    }
+
     /// Validate configuration values.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.polling.poll_interval_ms < 100 {
@@ -431,6 +461,53 @@ baud_rate = 9600
 "#;
         let result = DaemonConfig::from_toml(toml);
         assert!(result.is_err());
+    }
+
+    /// `TS-bl` (`U8`): a section this daemon does not know — e.g. one a newer
+    /// daemon added — is ignored and named, not a load failure, so a downgrade
+    /// with it hand-set still boots. The known sections beside it still apply.
+    #[test]
+    fn an_unknown_top_level_section_is_ignored_and_named() {
+        let toml = r#"
+stray_key = 1
+
+[polling]
+poll_interval_ms = 500
+
+[future_section]
+some_setting = true
+at = 1979-05-27T07:32:00Z
+"#;
+        let config = DaemonConfig::from_toml(toml).unwrap();
+        assert_eq!(config.polling.poll_interval_ms, 500);
+        assert_eq!(
+            config.unknown_section_names(),
+            vec!["future_section", "stray_key"]
+        );
+        config.validate().unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("daemon.toml");
+        std::fs::write(&path, toml).unwrap();
+        let loaded = DaemonConfig::load(path.to_str().unwrap()).unwrap();
+        assert_eq!(loaded.polling.poll_interval_ms, 500);
+    }
+
+    /// The flip side of `U8`: leniency is top-level only. A typo inside a known
+    /// section, and a wrongly typed known section, still fail the load.
+    #[test]
+    fn known_sections_stay_strict() {
+        for bad in [
+            "[safety]\ncoolant_limt_c = 50\n",
+            "safety = 50\n",
+            "[polling]\npoll_interval_ms = \"fast\"\n",
+        ] {
+            assert!(DaemonConfig::from_toml(bad).is_err(), "{bad:?} parsed");
+        }
+        assert!(DaemonConfig::from_toml("")
+            .unwrap()
+            .unknown_section_names()
+            .is_empty());
     }
 
     #[test]

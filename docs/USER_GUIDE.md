@@ -97,7 +97,7 @@ Configuration is optional. The package installs `/etc/control-ofc/daemon.toml` w
 
 The file's location can be changed with `--config <path>` or `CONTROL_OFC_CONFIG` (the flag wins). Under systemd, set either in a drop-in (`sudo systemctl edit control-ofc-daemon`), as § Loading a profile shows for `OPENFAN_PROFILE`.
 
-**Read this before editing.** The file is strict: **an unknown key, a misspelt section or an out-of-range value makes the daemon exit at startup**, and systemd restarts it on a back-off (3 s, then up to one start a minute) until the file is fixed. For all that time nothing controls the fans and the thermal emergency cannot run. `journalctl -u control-ofc-daemon` names the offending key.
+**Read this before editing.** Inside a section the file is strict: **an unknown or misspelt key, a wrongly typed value or an out-of-range value makes the daemon exit at startup**, and systemd restarts it on a back-off (3 s, then up to one start a minute) until the file is fixed. For all that time nothing controls the fans and the thermal emergency cannot run. `journalctl -u control-ofc-daemon` names the offending key. An unknown top-level section or key is different: the daemon logs a warning naming it and ignores it, so a section a newer release added does not stop an older one starting. That also means **a misspelt section name — `[saftey]` — is ignored and that section's defaults apply**, as is a key written above its section header; check the journal for `ignoring unknown top-level section` after an edit. Daemons up to 3.6.0 rejected an unknown section too; see § Upgrade notes, "Downgrading".
 
 The keys, with their defaults:
 
@@ -683,6 +683,17 @@ The delay is capped at 30 seconds.
 | `runtime_config_degraded` on `/status` | The daemon could not read `runtime.toml`, which holds your header roles. | See § Runtime configuration, "When `runtime.toml` cannot be read". |
 
 ## Upgrade notes
+
+### Downgrading: comment out sections the older daemon does not know
+
+Daemons up to and including 3.6.0 refuse to start on a `daemon.toml` section they do not know, and later ones only warn. Before installing an older daemon, comment out every section it predates that you have uncommented:
+
+| Section | Added in | Comment it out before installing |
+| --- | --- | --- |
+| `[shutdown]` | 2.50.0 | anything older than 2.50.0 |
+| `[safety]` | 3.0.0 | anything older than 3.0.0 |
+
+Only sections are tolerated: a key a newer release added inside a section the older daemon knows (for example `[startup] record_startup`, added in 2.41.0) stops it starting at any version, so comment out those keys as well. If you forgot, the daemon exits at startup and `journalctl -u control-ofc-daemon` names the section or key; comment it out and `sudo systemctl restart control-ofc-daemon`. A setting made from the GUI lives in `runtime.toml`, not `daemon.toml`, and never stops an older daemon starting.
 
 ### v0.7.1 — Breaking: `publish_interval_ms` removed
 

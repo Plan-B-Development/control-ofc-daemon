@@ -888,6 +888,7 @@ fn apply_config_reload(
 ) -> Result<Vec<std::path::PathBuf>, String> {
     let mut new_config =
         DaemonConfig::load(config_path).map_err(|e| format!("config reload failed: {e}"))?;
+    new_config.warn_unknown_sections(config_path);
     // `AUD3-m`: a reload that cannot parse `runtime.toml` is reported rather
     // than left in the journal, on the same surface as a failed boot load.
     // Since `DC-cu` (the user's decision `U7`) it then commits NOTHING: the
@@ -2095,6 +2096,7 @@ async fn async_main(cli: CliOptions) {
             std::process::exit(1);
         }
     };
+    config.warn_unknown_sections(&config_path);
 
     log::info!(
         "Config loaded — poll {}ms, serial {:?}",

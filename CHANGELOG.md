@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **An unknown top-level section in `daemon.toml` is a warning, not a startup failure.** The daemon logs
+  `ignoring unknown top-level section or key` naming it, at startup and on reload, and carries on, so a
+  section a later release adds will not stop this one starting after a downgrade. Keys inside a known
+  section stay strict. A misspelt section name is therefore ignored and its defaults apply — check the
+  journal after an edit. Daemons up to 3.6.0 still refuse an unknown section: before downgrading to one,
+  comment out `[safety]` (3.0.0+) and `[shutdown]` (2.50.0+) as the user guide's upgrade notes describe
+  (`TS-bl`).
+
 ### Fixed
 
 - **A SIGHUP reload that cannot read `runtime.toml` no longer resets the live settings.** It used to

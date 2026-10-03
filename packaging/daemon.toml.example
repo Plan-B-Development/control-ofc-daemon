@@ -2,10 +2,19 @@
 # The package installs this file as /etc/control-ofc/daemon.toml and keeps your
 # edits on upgrade. All fields are optional — defaults are shown below.
 #
-# READ BEFORE EDITING: this file is strict. An unknown key, a misspelt section or
-# an out-of-range value makes the daemon exit at startup, and systemd keeps
-# restarting it — with NOTHING controlling the fans and no thermal emergency —
-# until the file is fixed. `journalctl -u control-ofc-daemon` names the key.
+# READ BEFORE EDITING: inside a section this file is strict. An unknown or
+# misspelt key, or an out-of-range value, makes the daemon exit at startup, and
+# systemd keeps restarting it — with NOTHING controlling the fans and no thermal
+# emergency — until the file is fixed. `journalctl -u control-ofc-daemon` names
+# the key. An unknown top-level SECTION is only logged and ignored, so under a
+# misspelt section name (or above its section header) that section's defaults
+# apply: check the journal for "ignoring unknown top-level section" after an edit.
+#
+# Downgrading: daemons up to 3.6.0 refuse a section they do not know. Before
+# installing an older daemon, comment out [safety] (added in 3.0.0) and
+# [shutdown] (added in 2.50.0) if that daemon predates them. A key added inside
+# a section the older daemon knows ([startup] record_startup, 2.41.0) stops it
+# starting at any version: comment those out too.
 #
 # After an edit: `sudo systemctl reload control-ofc-daemon` applies
 # [profiles] search_dirs, [shutdown] exit_floor_pct and [safety] coolant_limit_c
