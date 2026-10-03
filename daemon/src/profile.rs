@@ -785,8 +785,9 @@ pub(crate) fn member_label_names_pump(member: &ControlMember) -> bool {
         || daemon_label_from_member_id(&member.member_id).is_some_and(names_pump)
 }
 
-/// Whether the **user** has explicitly assigned this member's header the pump
-/// role (DEC-311, AIO-MB Phase 1).
+/// Whether the **user** has explicitly assigned this member's header a role
+/// that earns the hard floor — `pump` (DEC-311, AIO-MB Phase 1) or `cpu_fan`
+/// (`ROLE-a`).
 ///
 /// [SAFETY] A third union term beside [`member_needs_hard_floor`]'s two, and
 /// strictly additive — it can only ever *add* the hard floor, never remove one
@@ -801,9 +802,21 @@ pub(crate) fn member_label_names_pump(member: &ControlMember) -> bool {
 /// and zero label files), every label-derived signal is blank and the user's
 /// assignment is the *only* evidence that a header drives a pump.
 ///
-/// Only `HeaderRole::Pump` qualifies. `CpuFan` already carries the floor via the
-/// `"cpu"` label hint wherever a label exists, and assigning `ChassisFan` must
-/// not be able to strip a floor that a `PUMP` label independently established.
+/// `Pump` and `CpuFan` qualify, the two roles whose label hints
+/// ([`CPU_PUMP_LABEL_HINTS`]) earn the floor. `CpuFan` was left out at first on
+/// the belief that the `"cpu"` hint covers it, but that holds only where a
+/// label exists: on a label-less header an assigned CPU fan earned nothing, so
+/// a curve could take it below 30 % or stop-snap it to 0 (`ROLE-a`). Assigning
+/// `ChassisFan` must still not be able to strip a floor that a `PUMP` label
+/// independently established — this term is never consulted to remove one.
+///
+/// **A floor, not pump protection.** An assigned CPU fan is held at 30 % by the
+/// engine and nothing else: it stays out of `header_is_pump_protected`, so
+/// identify still stops it, verify still drives it to 20 % and the published
+/// `stop_permitted` / `effective_min_pwm_pct` do not move — exactly how a
+/// `CPU_FAN`-labelled header is treated (DEC-311). Nor does it reach the DC pump
+/// floor, which [`member_pump_floor`](crate::profile_engine::member_pump_floor)
+/// keeps for pumps.
 ///
 /// The identify and verify paths take the same union, via
 /// `AppState::header_is_pump_protected`. They did not at first, and the
@@ -818,16 +831,18 @@ pub(crate) fn member_label_names_pump(member: &ControlMember) -> bool {
 /// 0 % by any curve that asked. GPU fans take none — they are never pumps.
 /// The member id is looked up through [`crate::hwmon::roles::role_key`], so a
 /// profile naming `openfan:ch3` finds the assignment saved as `openfan:ch03`.
-pub(crate) fn assigned_role_is_pump(
+pub(crate) fn assigned_role_earns_hard_floor(
     member: &ControlMember,
     assigned: &std::collections::HashMap<String, crate::hwmon::roles::HeaderRole>,
 ) -> bool {
+    use crate::hwmon::roles::HeaderRole;
     if !crate::hwmon::roles::source_takes_role(&member.source) {
         return false;
     }
-    assigned
-        .get(crate::hwmon::roles::role_key(&member.member_id).as_ref())
-        .is_some_and(|role| role.is_pump())
+    matches!(
+        assigned.get(crate::hwmon::roles::role_key(&member.member_id).as_ref()),
+        Some(HeaderRole::Pump | HeaderRole::CpuFan)
+    )
 }
 
 /// Severity of a [`FieldViolation`].

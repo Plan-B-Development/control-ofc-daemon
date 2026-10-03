@@ -4,6 +4,13 @@
 
 ### Added
 
+- **An assigned `cpu_fan` role earns the CPU floor.** A header or OpenFan channel you assign `cpu_fan`
+  (`POST /config/header-role`) is now held at or above the 30 % CPU/pump floor in the active profile,
+  and a `stop_pct` can no longer snap it to 0 — as a `CPU_FAN` label already did. Before this only
+  `pump` fed the floor, so on a board whose Super-I/O publishes no fan labels an assigned CPU fan could
+  be driven to 0 by a curve. Add-only: it never removes a floor. It is a floor, not pump protection —
+  identify still stops a CPU fan, verify still drives it to 20 %, and `stop_permitted` /
+  `effective_min_pwm_pct` do not change. Advertised as capability `control.cpu_fan_role_floor` (`ROLE-a`).
 - **`runtime_config_degraded.kept_as` names the kept copy of an unreadable `runtime.toml`.** A setter
   that quarantines the file reports where the original went, and a standing `startup` record takes the
   first such name. Before this, after a failed start the first setter replaced the file with one holding

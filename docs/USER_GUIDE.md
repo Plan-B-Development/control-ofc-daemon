@@ -248,7 +248,7 @@ As of 2.0.0 the profile engine is the **sole writer** (DEC-159 / DEC-165) — th
 | `POST /control/{control_id}/override/renew` | Extend the override deadman (fresh TTL). Body `{"override_token": N}` |
 | `DELETE /control/{control_id}/override` | Release the override, reverting to curve control immediately. Body `{"override_token": N}` |
 | `POST /fans/{fan_id}/identify` | Hold or restore one fan for physical identification (deadman auto-restore). An ordinary fan is stopped; a header the daemon holds as a pump is perturbed instead, never stopped (DEC-311/384). Body `{"action": "stop"\|"restore", "ttl_secs"?}`; `ttl_secs` is clamped to 1-15 |
-| `POST /config/header-role` | Assign or clear one PWM header's role (DEC-311). Body `{"header_id": "<id>", "role": "pump"\|"cpu_fan"\|"radiator_fan"\|"chassis_fan"\|"no_fan"\|"unknown"\|null}` (`no_fan`, nothing plugged in, since 3.4.0). The id may also be an OpenFan channel, `openfan:ch00`–`openfan:ch09` (`control.openfan_header_roles`): `pump` there keeps the channel at or above the 30 % floor, makes identify vary its speed instead of stopping it, and refuses calibration. Takes effect at once; assigning `pump` to a header an identify is holding stopped releases that stop (DEC-419) |
+| `POST /config/header-role` | Assign or clear one PWM header's role (DEC-311). Body `{"header_id": "<id>", "role": "pump"\|"cpu_fan"\|"radiator_fan"\|"chassis_fan"\|"no_fan"\|"unknown"\|null}` (`no_fan`, nothing plugged in, since 3.4.0). The id may also be an OpenFan channel, `openfan:ch00`–`openfan:ch09` (`control.openfan_header_roles`): `pump` there keeps the channel at or above the 30 % floor, makes identify vary its speed instead of stopping it, and refuses calibration. `cpu_fan`, on a header or a channel, keeps it at or above the 30 % floor in the active profile and nothing more — identify still stops it (since 3.6.0, `control.cpu_fan_role_floor`). Takes effect at once; assigning `pump` to a header an identify is holding stopped releases that stop (DEC-419) |
 | `GET /inventory/cooling-devices` | The configured cooling-device topology — a pump, its radiator fans and an advisory sensor as one named assembly — plus every device policy this daemon ships (DEC-316) |
 | `GET /validation/session` | The current or most recent validation session — what a cooler did while it was recording, plus the evidence summary (DEC-317). `404` when none has ever run |
 | `GET /validation/sessions` | The last five retained sessions, newest first (DEC-317) |
@@ -384,6 +384,8 @@ curl -s --unix-socket /run/control-ofc/control-ofc.sock \
 ```
 
 That assignment persists in `runtime.toml`, takes effect immediately, and also earns the header the 30 % pump floor and the stop-snap exemption.
+
+Assigning `cpu_fan` instead (since 3.6.0) gives a header the same 30 % floor and stop-snap exemption in the active profile, as a `CPU_FAN` label does, but it is not a pump: identify still stops it, and `stop_permitted` stays `true`.
 
 ```bash
 SOCK="/run/control-ofc/control-ofc.sock"

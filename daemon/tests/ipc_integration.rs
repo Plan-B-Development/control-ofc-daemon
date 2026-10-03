@@ -5543,6 +5543,46 @@ async fn header_role_assignment_round_trips_and_validates() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// `ROLE-a`: an assigned `cpu_fan` earns the engine's CPU floor (pinned by the
+/// `profile_engine` tests) and nothing else — the capability says so, while
+/// the channel stays stoppable with no published floor, exactly like a
+/// `CPU_FAN`-labelled header (DEC-311), and identify still stops it.
+#[tokio::test]
+async fn an_assigned_cpu_fan_stays_stoppable_and_publishes_no_header_floor() {
+    let (state, _tmp) = config_test_state("");
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, caps) = uds_get(&path, "/capabilities").await;
+    assert_eq!(status, 200);
+    assert_eq!(caps["control"]["cpu_fan_role_floor"], true, "{caps}");
+
+    let (status, json) = uds_post(
+        &path,
+        "/config/header-role",
+        &serde_json::json!({ "header_id": "openfan:ch01", "role": "cpu_fan" }),
+    )
+    .await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json["effective_role"], "cpu_fan", "{json}");
+
+    let cpu = openfan_role(&path, "openfan:ch01").await;
+    assert_eq!(cpu["role"], "cpu_fan", "{cpu}");
+    assert_eq!(cpu["stop_permitted"], true, "{cpu}");
+    assert_eq!(cpu["effective_min_pwm_pct"], 0, "{cpu}");
+
+    let (status, json) = uds_post(
+        &path,
+        "/fans/openfan:ch01/identify",
+        &serde_json::json!({ "action": "stop" }),
+    )
+    .await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json["mode"], "stop", "{json}");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
 /// The channel's entry in `GET /fans/openfan/roles`.
 async fn openfan_role(path: &str, fan_id: &str) -> serde_json::Value {
     let (status, json) = uds_get(path, "/fans/openfan/roles").await;

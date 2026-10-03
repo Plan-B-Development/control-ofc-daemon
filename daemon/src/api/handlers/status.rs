@@ -476,6 +476,8 @@ pub async fn capabilities_handler(
             header_role_no_fan: true,
             // `ROLE-f`: roles on OpenFan channels.
             openfan_header_roles: true,
+            // `ROLE-a`: an assigned `cpu_fan` earns the CPU/pump floor.
+            cpu_fan_role_floor: true,
         },
     })
 }

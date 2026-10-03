@@ -1308,6 +1308,16 @@ pub struct ControlCapability {
     /// older daemon rejects the id with a 400 and has no such route.
     #[serde(default)]
     pub openfan_header_roles: bool,
+    /// A header or OpenFan channel the user assigned `cpu_fan` gets the 30 %
+    /// CPU/pump floor and the stop-snap exemption in the active profile, as a
+    /// `CPU_FAN` label already did (`ROLE-a`). A floor only: identify still
+    /// stops it, and `stop_permitted` / `effective_min_pwm_pct` do not change.
+    ///
+    /// A client gates on this before SHOWING that floor: an older daemon gives
+    /// an assigned CPU fan none, so displaying one there would be a floor no
+    /// site enforces.
+    #[serde(default)]
+    pub cpu_fan_role_floor: bool,
 }
 
 /// Per-device-group capability info.
@@ -1652,8 +1662,10 @@ pub struct OpenFanRoleEntry {
     /// False wherever the daemon's pump-protection union holds. The safety
     /// answer — read this, never `role == "pump"` (DEC-312).
     pub stop_permitted: bool,
-    /// The floor the daemon enforces on its own for this channel: the pump
-    /// floor when protected, else 0 (the profile's `minimum_pct` governs).
+    /// The header-level floor the daemon enforces for this channel: the pump
+    /// floor when protected, else 0. Not the profile floor: an assigned
+    /// `cpu_fan` is held at 30 % by the engine only and still reports 0
+    /// (`ROLE-a`), as a `CPU_FAN`-labelled hwmon header does.
     pub effective_min_pwm_pct: u8,
 }
 

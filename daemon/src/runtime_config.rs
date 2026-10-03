@@ -2082,6 +2082,11 @@ mod tests {
             floor(&with_roles(&[(SUFFIXED_PWM5, "pump")])),
             HARD_PUMP_CPU_FLOOR_PCT
         );
+        // `ROLE-a`: the persisted `cpu_fan` token reaches the same floor.
+        assert_eq!(
+            floor(&with_roles(&[(SUFFIXED_PWM5, "cpu_fan")])),
+            HARD_PUMP_CPU_FLOOR_PCT
+        );
         // And the opposite branch, so a stuck predicate cannot pass.
         assert_eq!(floor(&with_roles(&[(SUFFIXED_PWM5, "chassis_fan")])), 20.0);
     }

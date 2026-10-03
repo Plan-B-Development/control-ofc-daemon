@@ -142,14 +142,14 @@ pub(crate) fn member_effective_floor(
     }
     let mut floor = control.minimum_pct;
     if member_needs_hard_floor(member)
-        || crate::profile::assigned_role_is_pump(member, assigned_roles)
+        || crate::profile::assigned_role_earns_hard_floor(member, assigned_roles)
     {
         // DEC-252: the eval-time superset — the author's label OR the daemon's
         // own discovered one. `validate`'s rejection deliberately stays on the
         // narrower `member_is_pump_or_cpu`; see `member_needs_hard_floor`.
         //
         // DEC-311 adds a third union term: the user's explicit header-role
-        // assignment. Same discipline — it can add a floor, never remove one —
+        // assignment, `pump` or (`ROLE-a`) `cpu_fan`. Same discipline — it can add a floor, never remove one —
         // and `validate`'s rejection line does not move for the same reason it
         // did not move for DEC-252 (a daemon that rejected more than the paired
         // GUI stamps would block profile saving on a split upgrade).
@@ -179,7 +179,7 @@ pub(crate) fn member_effective_floor(
 /// returns at most [`HARD_PUMP_CPU_FLOOR_PCT`], which every such member already
 /// had through `member_needs_hard_floor` — no floor moves on missing evidence.
 ///
-/// hwmon only. An OpenFan pump (`ROLE-f`) is floored by `assigned_role_is_pump`
+/// hwmon only. An OpenFan pump (`ROLE-f`) is floored by `assigned_role_earns_hard_floor`
 /// in [`member_effective_floor`]; it has no `pwmN_mode`, so the DC floor this
 /// adds could never apply to it.
 pub(crate) fn member_pump_floor(

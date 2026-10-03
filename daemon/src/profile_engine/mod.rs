@@ -21,8 +21,8 @@ use crate::health::cache::StateCache;
 use crate::health::state::CachedSensorReading;
 use crate::hwmon::types::SensorKind;
 use crate::profile::{
-    assigned_role_is_pump, evaluate_curve, member_is_gpu, member_needs_hard_floor, ControlMember,
-    DaemonProfile, LogicalControl, HARD_PUMP_CPU_FLOOR_PCT,
+    assigned_role_earns_hard_floor, evaluate_curve, member_is_gpu, member_needs_hard_floor,
+    ControlMember, DaemonProfile, LogicalControl, HARD_PUMP_CPU_FLOOR_PCT,
 };
 
 mod cooling_advisory;
@@ -715,8 +715,9 @@ pub fn evaluate_profile_with_overrides(
             // half that keeps a non-zero `stop_pct` from zeroing it outright.
             // DEC-443: and so must a pump only the union's other terms name —
             // its floor is hard wherever `member_pump_floor` gave it one.
+            // `ROLE-a`: an assigned CPU fan too, as a `CPU_FAN` label already is.
             let floor_is_hard = member_needs_hard_floor(member)
-                || assigned_role_is_pump(member, &assigned_roles)
+                || assigned_role_earns_hard_floor(member, &assigned_roles)
                 || member_pump_floor(member, &assigned_roles, &header_facts).is_some();
             let member_pwm = if effective_floor != control.minimum_pct || floor_is_hard {
                 // EFF-4: this per-member step-rate key allocates each tick for
@@ -10267,7 +10268,7 @@ mod tests {
             HARD_PUMP_CPU_FLOOR_PCT as u8,
             "the assignment must protect the channel whatever spelling the profile uses"
         );
-        // Only `pump` adds the floor.
+        // A role that earns no floor adds none.
         assert_eq!(
             openfan_duty(
                 "openfan",
@@ -10278,22 +10279,137 @@ mod tests {
         );
     }
 
-    /// A GPU fan is never a pump: an assignment under its id adds nothing.
+    /// A GPU fan is never a pump or a CPU fan: an assignment under its id adds
+    /// nothing.
     #[test]
     fn a_gpu_member_takes_no_role_assignment() {
         use crate::hwmon::roles::HeaderRole;
         const GPU: &str = "amd_gpu:0000:03:00.0";
-        assert!(
-            !crate::profile::assigned_role_is_pump(
-                &ControlMember {
-                    source: "amd_gpu".into(),
-                    member_id: GPU.into(),
-                    member_label: "GPU".into(),
-                    fan_zero_rpm: false,
-                },
-                &[(GPU.to_string(), HeaderRole::Pump)].into_iter().collect(),
+        for role in [HeaderRole::Pump, HeaderRole::CpuFan] {
+            assert!(
+                !crate::profile::assigned_role_earns_hard_floor(
+                    &ControlMember {
+                        source: "amd_gpu".into(),
+                        member_id: GPU.into(),
+                        member_label: "GPU".into(),
+                        fan_zero_rpm: false,
+                    },
+                    &[(GPU.to_string(), role)].into_iter().collect(),
+                ),
+                "a GPU fan must never earn the hard floor from a {role:?} assignment"
+            );
+        }
+    }
+
+    /// One single-member control on a label-less it8696 header (the board that
+    /// publishes no `pwmN_label`, so a role is the only evidence) at a cool
+    /// 20 °C (curve output ~5 %), with the given assignment, `stop_pct`,
+    /// override and header facts. Returns that member's duty.
+    fn label_less_duty(
+        role: Option<crate::hwmon::roles::HeaderRole>,
+        stop_pct: f64,
+        override_pct: Option<u8>,
+        facts: Option<HeaderFacts>,
+    ) -> u8 {
+        const ID: &str = "hwmon:it8696:it87.2624:pwm3:pwm3";
+        let mut profile = make_profile("curve", "graph", 5.0);
+        profile.controls[0].minimum_pct = 0.0;
+        profile.controls[0].stop_pct = stop_pct;
+        profile.controls[0].members = vec![ControlMember {
+            source: "hwmon".into(),
+            member_id: ID.into(),
+            member_label: "pwm3".into(),
+            fan_zero_rpm: false,
+        }];
+        let sensors = make_cache_with_sensor("cpu", 20.0).sensors_snapshot();
+        let mut state = ProfileEngineState::new();
+        state.set_assigned_roles(Arc::new(
+            role.map(|r| (ID.to_string(), r)).into_iter().collect(),
+        ));
+        if let Some(f) = facts {
+            state.set_header_facts(Arc::new(HashMap::from([(ID.to_string(), f)])));
+        }
+        let mut overrides = OverrideSnapshot::default();
+        if let Some(pct) = override_pct {
+            overrides.controls.insert("ctrl1".into(), pct);
+        }
+        evaluate_profile_with_overrides(&profile, &sensors, &mut state, &overrides)[0].pwm_percent
+    }
+
+    /// [SAFETY] `ROLE-a`. A header the user assigned `cpu_fan` gets the hard
+    /// floor and the stop-snap exemption on the assignment alone, exactly as a
+    /// `CPU_FAN` label earns them — before this only `pump` fed the union, and
+    /// on a label-less header a curve took an assigned CPU fan to 0.
+    #[test]
+    fn an_assigned_cpu_fan_role_earns_the_hard_floor_and_cannot_be_stop_snapped() {
+        use crate::hwmon::roles::HeaderRole;
+        let floor = HARD_PUMP_CPU_FLOOR_PCT as u8;
+        // stop_pct 0 isolates the floor; 40 (above the curve) the stop-snap.
+        for stop_pct in [0.0, 40.0] {
+            let unassigned = label_less_duty(None, stop_pct, None, None);
+            assert!(
+                unassigned < floor,
+                "precondition: an unassigned label-less header follows the curve \
+                 ({unassigned}% at stop_pct {stop_pct})"
+            );
+            assert_eq!(
+                label_less_duty(Some(HeaderRole::CpuFan), stop_pct, None, None),
+                floor,
+                "an assigned CPU fan must be held at the hard floor (stop_pct {stop_pct})"
+            );
+            // The opposite branch: a role that earns no floor adds none.
+            assert_eq!(
+                label_less_duty(Some(HeaderRole::ChassisFan), stop_pct, None, None),
+                unassigned
+            );
+        }
+    }
+
+    /// [SAFETY] `ROLE-a`: the floor reaches the override path too — a manual
+    /// override below it on an assigned CPU fan is clamped up to it.
+    #[test]
+    fn a_manual_override_on_an_assigned_cpu_fan_is_clamped_to_the_floor() {
+        use crate::hwmon::roles::HeaderRole;
+        assert_eq!(label_less_duty(None, 0.0, Some(10), None), 10);
+        assert_eq!(
+            label_less_duty(Some(HeaderRole::CpuFan), 0.0, Some(10), None),
+            HARD_PUMP_CPU_FLOOR_PCT as u8
+        );
+    }
+
+    /// `ROLE-a` stays a CPU floor: an assigned CPU fan on a DC-mode header gets
+    /// 30 %, never the DC pump floor (DEC-443 is pumps only), while the same
+    /// header assigned `pump` does get it.
+    #[test]
+    fn an_assigned_cpu_fan_on_a_dc_header_keeps_the_cpu_floor() {
+        use crate::hwmon::roles::{HeaderRole, RoleSource};
+        let dc = Some(HeaderFacts {
+            pwm_mode: Some(crate::profile::PWM_MODE_DC),
+            inferred_role: (HeaderRole::Unknown, RoleSource::None),
+        });
+        assert_eq!(
+            label_less_duty(Some(HeaderRole::CpuFan), 0.0, None, dc),
+            HARD_PUMP_CPU_FLOOR_PCT as u8
+        );
+        assert_eq!(
+            label_less_duty(Some(HeaderRole::Pump), 0.0, None, dc),
+            crate::profile::DC_PUMP_FLOOR_PCT as u8
+        );
+    }
+
+    /// `ROLE-a` on an OpenFan channel: same term, same floor.
+    #[test]
+    fn an_assigned_openfan_cpu_fan_earns_the_hard_floor() {
+        use crate::hwmon::roles::HeaderRole;
+        let unassigned = openfan_duty("openfan", "openfan:ch04", &[]);
+        assert!(unassigned < HARD_PUMP_CPU_FLOOR_PCT as u8);
+        assert_eq!(
+            openfan_duty(
+                "openfan",
+                "openfan:ch4",
+                &[("openfan:ch04", HeaderRole::CpuFan)]
             ),
-            "a GPU fan must never earn the pump floor from an assignment"
+            HARD_PUMP_CPU_FLOOR_PCT as u8
         );
     }
 
