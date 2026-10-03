@@ -1325,7 +1325,14 @@ pub struct ControlCapability {
 pub struct DeviceCapabilities {
     pub openfan: OpenfanCapability,
     pub hwmon: HwmonCapability,
+    /// The primary AMD GPU (`select_primary_gpu`), plus the kernel advisories
+    /// for every AMD GPU on the machine (DEC-449).
     pub amd_gpu: AmdGpuCapability,
+    /// Every detected AMD GPU, each described by its own card (`GPU-b`), so a
+    /// client judges a secondary card's fan by that card, not the primary's.
+    /// `kernel_warnings` is empty on every entry: the advisories live on
+    /// `amd_gpu`. Additive — absent from older daemons.
+    pub amd_gpus: Vec<AmdGpuCapability>,
     /// Intel discrete GPU (Arc) capability. Additive field (DEC-121) — older
     /// GUIs ignore it; read-only monitoring only, never fan-writable.
     pub intel_gpu: IntelGpuCapability,
@@ -4081,6 +4088,7 @@ mod tests {
                     gpu_zero_rpm_available: true,
                     kernel_warnings: Vec::new(),
                 },
+                amd_gpus: Vec::new(),
                 intel_gpu: IntelGpuCapability {
                     present: false,
                     model_name: None,
@@ -4164,6 +4172,9 @@ mod tests {
         // with the same BDF string so clients on either name keep working.
         assert_eq!(json["devices"]["amd_gpu"]["pci_id"], "0000:2d:00.0");
         assert_eq!(json["devices"]["amd_gpu"]["pci_bdf"], "0000:2d:00.0");
+        // `GPU-b`: always emitted, empty included, so a client can tell a daemon
+        // with no AMD GPU from one that predates the field.
+        assert_eq!(json["devices"]["amd_gpus"], serde_json::json!([]));
         // NVIDIA capability (DEC-204): additive, read-only (no fan_write_supported).
         assert_eq!(json["devices"]["nvidia_gpu"]["present"], true);
         assert_eq!(

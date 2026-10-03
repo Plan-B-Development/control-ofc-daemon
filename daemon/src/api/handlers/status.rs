@@ -159,37 +159,14 @@ fn amd_gpu_capability(
     kernel_release: Option<&str>,
 ) -> AmdGpuCapability {
     if let Some(gpu) = crate::hwmon::gpu_detect::select_primary_gpu(gpus) {
-        // DEC-445 (`DC-ch`): "can a profile drive this fan" — PMFW `fan_curve`
-        // only, because that is all the engine's GPU backend writes. A pre-RDNA3
-        // card keeps `fan_control_method: "hwmon_pwm"`, since verify and reset do
-        // write its legacy `pwm1` (`AmdGpuInfo::can_write_legacy_pwm`, DEC-098),
-        // but no engine has ever driven it, so it is not reported writable. The
-        // engine's `backend_unavailable` classification reads the same predicate
-        // (`GpuBackend::delivery_targets`), so for the card described here the two
-        // agree; `devices.amd_gpu` describes only the primary card (`GPU-b`).
-        let fan_write = gpu.fan_curve_path.is_some();
         // DEC-449 (`BRD-q`): the advisories cover every AMD GPU, not only the
         // card this entry describes; each message names the card it is about.
         let kernel_warnings = kernel_release
             .map(|release| crate::hwmon::kernel_warnings::detect_kernel_warnings(release, gpus))
             .unwrap_or_default();
         AmdGpuCapability {
-            present: true,
-            model_name: gpu.marketing_name.clone(),
-            display_label: gpu.display_label(),
-            // M11: emit both names during the transition. Same BDF string.
-            pci_id: Some(gpu.pci_bdf.clone()),
-            pci_bdf: Some(gpu.pci_bdf.clone()),
-            pci_device_id: Some(gpu.pci_device_id),
-            pci_revision: Some(gpu.pci_revision),
-            fan_control_method: gpu.fan_control_method().to_string(),
-            pmfw_supported: gpu.fan_curve_path.is_some(),
-            fan_rpm_available: gpu.has_fan_rpm,
-            fan_write_supported: fan_write,
-            is_discrete: gpu.is_discrete,
-            overdrive_enabled: gpu.overdrive_enabled,
-            gpu_zero_rpm_available: gpu.fan_zero_rpm_path.is_some(),
             kernel_warnings,
+            ..amd_gpu_card_capability(gpu)
         }
     } else {
         AmdGpuCapability {
@@ -209,6 +186,46 @@ fn amd_gpu_capability(
             gpu_zero_rpm_available: false,
             kernel_warnings: Vec::new(),
         }
+    }
+}
+
+/// `devices.amd_gpus`: every detected AMD GPU, each judged by its own card
+/// (`GPU-b`), so a client never labels a secondary card by the primary's
+/// answer. The advisories stay on `devices.amd_gpu` alone, where they already
+/// cover every card (DEC-449); here `kernel_warnings` is always empty.
+fn amd_gpu_card_capabilities(
+    gpus: &[crate::hwmon::gpu_detect::AmdGpuInfo],
+) -> Vec<AmdGpuCapability> {
+    gpus.iter().map(amd_gpu_card_capability).collect()
+}
+
+/// One detected AMD GPU's capability entry, without advisories.
+fn amd_gpu_card_capability(gpu: &crate::hwmon::gpu_detect::AmdGpuInfo) -> AmdGpuCapability {
+    // DEC-445 (`DC-ch`): "can a profile drive this fan" — PMFW `fan_curve`
+    // only, because that is all the engine's GPU backend writes. A pre-RDNA3
+    // card keeps `fan_control_method: "hwmon_pwm"`, since verify and reset do
+    // write its legacy `pwm1` (`AmdGpuInfo::can_write_legacy_pwm`, DEC-098),
+    // but no engine has ever driven it, so it is not reported writable. The
+    // engine's `backend_unavailable` classification reads the same predicate
+    // (`GpuBackend::delivery_targets`), so for every card the two agree.
+    let fan_write = gpu.fan_curve_path.is_some();
+    AmdGpuCapability {
+        present: true,
+        model_name: gpu.marketing_name.clone(),
+        display_label: gpu.display_label(),
+        // M11: emit both names during the transition. Same BDF string.
+        pci_id: Some(gpu.pci_bdf.clone()),
+        pci_bdf: Some(gpu.pci_bdf.clone()),
+        pci_device_id: Some(gpu.pci_device_id),
+        pci_revision: Some(gpu.pci_revision),
+        fan_control_method: gpu.fan_control_method().to_string(),
+        pmfw_supported: gpu.fan_curve_path.is_some(),
+        fan_rpm_available: gpu.has_fan_rpm,
+        fan_write_supported: fan_write,
+        is_discrete: gpu.is_discrete,
+        overdrive_enabled: gpu.overdrive_enabled,
+        gpu_zero_rpm_available: gpu.fan_zero_rpm_path.is_some(),
+        kernel_warnings: Vec::new(),
     }
 }
 
@@ -370,6 +387,7 @@ pub async fn capabilities_handler(
                 write_support: hwmon_writable,
             },
             amd_gpu: amd_gpu_cap,
+            amd_gpus: amd_gpu_card_capabilities(&state.amd_gpus),
             intel_gpu: intel_gpu_cap,
             nvidia_gpu: nvidia_gpu_cap,
             aio_hwmon: aio_hwmon_cap,
@@ -571,6 +589,46 @@ mod tests {
         assert!(cap.kernel_warnings[0]
             .message
             .contains("the AMD Radeon 780M (0000:c5:00.0)"));
+    }
+
+    /// `GPU-b`: a legacy RDNA2 primary beside a PMFW RX 9070 XT. Each entry of
+    /// `devices.amd_gpus` is judged by its own card, so the second card reads
+    /// writable while `devices.amd_gpu` (the primary) does not.
+    #[test]
+    fn every_amd_gpu_is_described_by_its_own_card() {
+        let mut gpus = rdna2_card_and_rdna3_igpu();
+        gpus[1] = crate::hwmon::gpu_detect::AmdGpuInfo {
+            pci_bdf: "0000:2d:00.0".into(),
+            pci_device_id: 0x7550,
+            marketing_name: Some("AMD Radeon RX 9070 XT".into()),
+            fan_curve_path: Some(std::path::PathBuf::from("/nonexistent/fan_curve")),
+            is_discrete: true,
+            ..gpus[1].clone()
+        };
+        let primary = amd_gpu_capability(&gpus, Some("6.18.2"));
+        let cards = amd_gpu_card_capabilities(&gpus);
+
+        assert_eq!(primary.pci_bdf.as_deref(), Some("0000:03:00.0"));
+        assert!(!primary.fan_write_supported);
+        assert_eq!(cards.len(), gpus.len());
+        for (card, gpu) in cards.iter().zip(&gpus) {
+            assert!(card.present);
+            assert_eq!(card.pci_bdf.as_deref(), Some(gpu.pci_bdf.as_str()));
+            assert_eq!(card.pci_id, card.pci_bdf);
+            assert_eq!(card.fan_control_method, gpu.fan_control_method());
+            assert_eq!(card.fan_write_supported, gpu.fan_curve_path.is_some());
+            assert!(
+                card.kernel_warnings.is_empty(),
+                "advisories live on amd_gpu"
+            );
+        }
+        assert_eq!(cards[0].fan_control_method, "hwmon_pwm");
+        assert_eq!(cards[1].fan_control_method, "pmfw_curve");
+        assert!(cards[1].fan_write_supported);
+        // The primary entry is the per-card entry plus the advisories.
+        assert_eq!(primary.fan_control_method, cards[0].fan_control_method);
+        assert!(!primary.kernel_warnings.is_empty());
+        assert!(amd_gpu_card_capabilities(&[]).is_empty());
     }
 
     #[test]

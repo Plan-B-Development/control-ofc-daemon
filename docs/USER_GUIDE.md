@@ -509,7 +509,7 @@ curl --unix-socket /run/control-ofc/control-ofc.sock \
   -X POST http://localhost/gpu/0000:03:00.0/fan/reset | jq .
 ```
 
-The GPU id is the card's bare PCI address — `devices.amd_gpu.pci_bdf` in `GET /capabilities` — not the fan id (`amd_gpu:0000:03:00.0`) or anything with a prefix, which answers `404`.
+The GPU id is the card's bare PCI address — its entry's `pci_bdf` in `devices.amd_gpus` of `GET /capabilities` (`devices.amd_gpu.pci_bdf` is the primary card only) — not the fan id (`amd_gpu:0000:03:00.0`) or anything with a prefix, which answers `404`.
 
 **A reset hands the fan to the firmware until the next profile activation.** The daemon stops writing that fan, even while the active profile names it, until a profile is activated again (the same one included); deactivating does not return it, and a daemon restart does. The GUI's *Restore GPU Fan to Automatic* is disabled while the active profile drives the card.
 

@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- **`/capabilities` describes every AMD GPU: `devices.amd_gpus`.** One entry per detected AMD GPU, the
+  same object as `devices.amd_gpu` but about its own card, so a client no longer judges a second card's
+  fan by the primary card's `fan_control_method` / `fan_write_supported`. Always emitted (`[]` with no
+  AMD GPU); `devices.amd_gpu` is unchanged and keeps the kernel advisories (`GPU-b`).
+
 ### Changed
 
 - **The service unit no longer sets `SupplementaryGroups=uucp`.** The daemon runs as root, so the group
