@@ -186,12 +186,22 @@ pub(crate) fn build_control_output_entries(snap: &DaemonState) -> Vec<ControlOut
 /// firmware duty exactly as a fan that stopped does, and only the fan ever
 /// turned. Never `last_commanded_pwm`, which mixes the two (AIO5-a). `None` is
 /// "not evaluated", never "not stalled".
-fn hwmon_stall_verdict(
-    fan: &crate::health::state::HwmonFanState,
-    seen_spinning: bool,
-) -> Option<bool> {
+///
+/// A duty a diagnostic wrote is not a command (`PTR-ag`): while that diagnostic
+/// holds the write pause there is no verdict, and once it has ended the header
+/// is judged as one the daemon does not command.
+fn hwmon_stall_verdict(snap: &DaemonState, id: &str, now: Instant) -> Option<bool> {
+    let fan = snap.hwmon_fans.get(id)?;
     let rpm = fan.rpm?;
-    let duty = match fan.pwm_commanded_pct {
+    let commanded = match snap.hwmon_diagnostic_commanded.get(id) {
+        None => fan.pwm_commanded_pct,
+        Some(&epoch) if epoch == snap.verify_epoch && snap.verify_active_at(now) => {
+            return None;
+        }
+        Some(_) => None,
+    };
+    let seen_spinning = snap.hwmon_seen_spinning.contains(id);
+    let duty = match commanded {
         Some(commanded) => commanded,
         None if seen_spinning => fan.pwm_readback_pct?,
         None => return None,
@@ -246,7 +256,7 @@ pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntr
             .get(id)
             .copied()
             .unwrap_or_default();
-        let stall = hwmon_stall_verdict(fan, snap.hwmon_seen_spinning.contains(id));
+        let stall = hwmon_stall_verdict(snap, id, now);
         fans.push(FanEntry {
             id: id.clone(),
             source: "hwmon".into(),
@@ -1718,6 +1728,87 @@ mod tests {
         assert_eq!(hwmon_stall(Some(0), 40, Some(10), true), Some(false));
         assert_eq!(hwmon_stall(None, 40, Some(40), true), None);
         assert_eq!(hwmon_stall(Some(900), 40, Some(40), true), Some(false));
+    }
+
+    /// `PTR-ag`: the `/fans` verdict for a header at 0 RPM whose duty — 60 %
+    /// commanded, `readback` in sysfs — a diagnostic wrote under verify epoch
+    /// `marked` (`None`: the engine wrote it), while the verify slot is at
+    /// `current` and `active` or not.
+    fn stall_after_diagnostic(
+        marked: Option<u64>,
+        current: u64,
+        active: bool,
+        readback: u8,
+        seen: bool,
+    ) -> Option<bool> {
+        let mut state = DaemonState::default();
+        let now = Instant::now();
+        state.hwmon_fans.insert(
+            "hwmon:fan1".into(),
+            crate::health::state::HwmonFanState {
+                id: "hwmon:fan1".into(),
+                rpm: Some(0),
+                last_commanded_pwm: Some(readback),
+                pwm_readback_pct: Some(readback),
+                pwm_commanded_pct: Some(60),
+                updated_at: now,
+                alarm: None,
+                pwm_enable_mode: None,
+            },
+        );
+        if let Some(epoch) = marked {
+            state
+                .hwmon_diagnostic_commanded
+                .insert("hwmon:fan1".into(), epoch);
+        }
+        state.verify_epoch = current;
+        state.verify_in_progress = active;
+        state.verify_active_until = active.then(|| now + std::time::Duration::from_secs(60));
+        if seen {
+            state.hwmon_seen_spinning.insert("hwmon:fan1".into());
+        }
+        build_fan_entries(&state, now)[0].stall_detected
+    }
+
+    /// `PTR-ag`: no verdict while the diagnostic that wrote the duty holds the
+    /// write pause, even for a fan seen spinning.
+    #[test]
+    fn a_header_under_a_diagnostic_has_no_stall_verdict() {
+        // Presence first: the same duty from the engine is a stall.
+        assert_eq!(stall_after_diagnostic(None, 3, true, 60, true), Some(true));
+        assert_eq!(stall_after_diagnostic(Some(3), 3, true, 60, true), None);
+        assert_eq!(stall_after_diagnostic(Some(3), 3, true, 60, false), None);
+    }
+
+    /// `PTR-ag`: once the diagnostic has ended, the duty it left is not a
+    /// command: the header is judged as one the daemon does not command —
+    /// against the readback, and only for a fan seen spinning. A later
+    /// diagnostic (a newer epoch) does not hold a header it never wrote.
+    #[test]
+    fn a_duty_a_finished_diagnostic_left_is_judged_as_uncommanded() {
+        // Ended: the readback decides, on either side of the threshold.
+        let at = constants::STALL_PWM_THRESHOLD;
+        assert_eq!(
+            stall_after_diagnostic(Some(3), 3, false, at + 1, true),
+            Some(true)
+        );
+        assert_eq!(
+            stall_after_diagnostic(Some(3), 3, false, at, true),
+            Some(false)
+        );
+        // An empty header the test restored reports nothing, not a stall.
+        assert_eq!(stall_after_diagnostic(Some(3), 3, false, 60, false), None);
+        // The engine's command, by contrast, is judged against itself.
+        assert_eq!(
+            stall_after_diagnostic(None, 3, false, at, false),
+            Some(true)
+        );
+        // A newer diagnostic elsewhere: judged as uncommanded, not withheld.
+        assert_eq!(
+            stall_after_diagnostic(Some(3), 4, true, 60, true),
+            Some(true)
+        );
+        assert_eq!(stall_after_diagnostic(Some(3), 4, true, 60, false), None);
     }
 
     /// DEC-458 at the call site: the cache's own record of a spinning fan is

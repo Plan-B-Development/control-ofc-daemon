@@ -167,7 +167,7 @@ Every sensor/fan/header includes:
 - `pwm_readback_pct` — the hardware readback of `pwmN` (hwmon only, DEC-317); one producer, always the poll
 - `pwm_commanded_pct` — the duty the daemon last **commanded** (hwmon only, DEC-318); one producer, always the write path. With `pwm_readback_pct` these are the two clean axes; read them, not `last_commanded_pwm`, whenever command and readback must be told apart
 - `duty_pct` — firmware-**reported** current fan duty % (NVIDIA via NVML, DEC-204); a *measured* value, present only where the source exposes a duty readback
-- `stall_detected` — **derived**, not measured: 0 RPM under a duty above 20 %. For an hwmon header the duty is `pwm_commanded_pct` while the daemon commands it, otherwise `pwm_readback_pct`, and then only once the daemon has seen that header's fan spinning (`DaemonState::hwmon_seen_spinning`, DEC-458) — so a header with no fan reports `null`, never `true`
+- `stall_detected` — **derived**, not measured: 0 RPM under a duty above 20 %. For an hwmon header the duty is `pwm_commanded_pct` while the daemon commands it, otherwise `pwm_readback_pct`, and then only once the daemon has seen that header's fan spinning (`DaemonState::hwmon_seen_spinning`, DEC-458) — so a header with no fan reports `null`, never `true`; a duty a diagnostic wrote is not a command (`DaemonState::hwmon_diagnostic_commanded`, `PTR-ag`): no verdict while that diagnostic holds the write pause, the uncommanded rule after it
 - These are always separate fields, never ambiguous
 
 ## Safety invariants

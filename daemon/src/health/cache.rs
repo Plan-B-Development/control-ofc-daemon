@@ -511,9 +511,30 @@ impl StateCache {
     /// firmware now drives would go on reporting the last duty the daemon asked
     /// for, and the Hardware page would show a request nobody is making.
     pub fn clear_hwmon_commanded(&self, id: &str) {
-        if let Some(fan) = self.inner.write().hwmon_fans.get_mut(id) {
+        let mut state = self.inner.write();
+        state.hwmon_diagnostic_commanded.remove(id);
+        if let Some(fan) = state.hwmon_fans.get_mut(id) {
             fan.pwm_commanded_pct = None;
         }
+    }
+
+    /// Publish the write path's refresh of hwmon header `fan.id`, recording who
+    /// commanded it (`PTR-ag`): `by_diagnostic` for a write under a `Verify`
+    /// lease, stamped with the current `verify_epoch`; any other write forgets
+    /// the record. One lock with the refresh, so no reader sees a diagnostic's
+    /// duty without its record.
+    pub fn record_hwmon_command(&self, fan: HwmonFanState, by_diagnostic: bool) {
+        let mut state = self.inner.write();
+        if by_diagnostic {
+            let epoch = state.verify_epoch;
+            state
+                .hwmon_diagnostic_commanded
+                .insert(fan.id.clone(), epoch);
+        } else {
+            state.hwmon_diagnostic_commanded.remove(&fan.id);
+        }
+        merge_hwmon_fan(&mut state, fan);
+        state.snapshot_at = Instant::now();
     }
 
     /// Publish hwmon header `id`'s duty-reconciliation record (DEC-406). The
@@ -543,57 +564,8 @@ impl StateCache {
     pub fn update_hwmon_fans(&self, fans: Vec<HwmonFanState>) {
         let now = Instant::now();
         let mut state = self.inner.write();
-        for mut fan in fans {
-            // Merge, do not replace, the fields only the POLL samples (DEC-316).
-            //
-            // `HwmonPwmController::set_pwm` constructs a whole `HwmonFanState`
-            // on every engine tick — including its coalesce fast path, which
-            // skips sysfs but still refreshes the cache — and has no cheap way
-            // to re-read these. A bare `insert` therefore erased the poll's
-            // answer at ~1 Hz, making both fields permanently absent for any
-            // header under an active profile: exactly the header whose fan
-            // alarm matters most. Mirrors `update_openfan_fans`, which carries
-            // `last_commanded_pwm` forward for the same reason.
-            //
-            // `pwm_readback_pct` joined this list in AIO-MB Phase 5 for exactly
-            // the same reason: the poll is its only producer, so without the
-            // merge a controlled header — the one a validation session cares
-            // about — would report no readback at all.
-            //
-            // `pwm_commanded_pct` (AIO-MB Phase 6) is the same rule pointing the
-            // OTHER way, and is why this block is a merge rather than a list of
-            // poll-only fields. Its only producer is the write path, so it is
-            // the POLL that must not erase it: without the carry-forward every
-            // 1 Hz poll would blank the command for a controlled header — again,
-            // exactly the header whose requested-vs-readback split the Hardware
-            // page exists to show. Each producer writes `None` for the other's
-            // field, so one "if none, keep what is there" rule serves both.
-            if fan.alarm.is_none()
-                || fan.pwm_enable_mode.is_none()
-                || fan.pwm_readback_pct.is_none()
-                || fan.pwm_commanded_pct.is_none()
-            {
-                if let Some(existing) = state.hwmon_fans.get(&fan.id) {
-                    if fan.alarm.is_none() {
-                        fan.alarm = existing.alarm;
-                    }
-                    if fan.pwm_enable_mode.is_none() {
-                        fan.pwm_enable_mode = existing.pwm_enable_mode;
-                    }
-                    if fan.pwm_readback_pct.is_none() {
-                        fan.pwm_readback_pct = existing.pwm_readback_pct;
-                    }
-                    if fan.pwm_commanded_pct.is_none() {
-                        fan.pwm_commanded_pct = existing.pwm_commanded_pct;
-                    }
-                }
-            }
-            // DEC-458: every producer's RPM reading counts — the poll's and a
-            // write's — so a fan seen turning once is remembered for good.
-            if fan.rpm.is_some_and(|rpm| rpm > 0) {
-                state.hwmon_seen_spinning.insert(fan.id.clone());
-            }
-            state.hwmon_fans.insert(fan.id.clone(), fan);
+        for fan in fans {
+            merge_hwmon_fan(&mut state, fan);
         }
         state.snapshot_at = now;
         // hwmon fan timestamps roll into the hwmon subsystem timestamp
@@ -1352,6 +1324,61 @@ impl StateCache {
         self.resume_generation.fetch_add(1, Ordering::SeqCst);
         self.resume_detected.store(true, Ordering::Relaxed);
     }
+}
+
+/// Merge one hwmon fan refresh into the state — the poll's or the write
+/// path's — keeping what only the other producer samples (DEC-316).
+fn merge_hwmon_fan(state: &mut DaemonState, mut fan: HwmonFanState) {
+    // Merge, do not replace, the fields only the POLL samples (DEC-316).
+    //
+    // `HwmonPwmController::set_pwm` constructs a whole `HwmonFanState`
+    // on every engine tick — including its coalesce fast path, which
+    // skips sysfs but still refreshes the cache — and has no cheap way
+    // to re-read these. A bare `insert` therefore erased the poll's
+    // answer at ~1 Hz, making both fields permanently absent for any
+    // header under an active profile: exactly the header whose fan
+    // alarm matters most. Mirrors `update_openfan_fans`, which carries
+    // `last_commanded_pwm` forward for the same reason.
+    //
+    // `pwm_readback_pct` joined this list in AIO-MB Phase 5 for exactly
+    // the same reason: the poll is its only producer, so without the
+    // merge a controlled header — the one a validation session cares
+    // about — would report no readback at all.
+    //
+    // `pwm_commanded_pct` (AIO-MB Phase 6) is the same rule pointing the
+    // OTHER way, and is why this block is a merge rather than a list of
+    // poll-only fields. Its only producer is the write path, so it is
+    // the POLL that must not erase it: without the carry-forward every
+    // 1 Hz poll would blank the command for a controlled header — again,
+    // exactly the header whose requested-vs-readback split the Hardware
+    // page exists to show. Each producer writes `None` for the other's
+    // field, so one "if none, keep what is there" rule serves both.
+    if fan.alarm.is_none()
+        || fan.pwm_enable_mode.is_none()
+        || fan.pwm_readback_pct.is_none()
+        || fan.pwm_commanded_pct.is_none()
+    {
+        if let Some(existing) = state.hwmon_fans.get(&fan.id) {
+            if fan.alarm.is_none() {
+                fan.alarm = existing.alarm;
+            }
+            if fan.pwm_enable_mode.is_none() {
+                fan.pwm_enable_mode = existing.pwm_enable_mode;
+            }
+            if fan.pwm_readback_pct.is_none() {
+                fan.pwm_readback_pct = existing.pwm_readback_pct;
+            }
+            if fan.pwm_commanded_pct.is_none() {
+                fan.pwm_commanded_pct = existing.pwm_commanded_pct;
+            }
+        }
+    }
+    // DEC-458: every producer's RPM reading counts — the poll's and a
+    // write's — so a fan seen turning once is remembered for good.
+    if fan.rpm.is_some_and(|rpm| rpm > 0) {
+        state.hwmon_seen_spinning.insert(fan.id.clone());
+    }
+    state.hwmon_fans.insert(fan.id.clone(), fan);
 }
 
 #[cfg(test)]

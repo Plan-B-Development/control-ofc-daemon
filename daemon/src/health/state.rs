@@ -503,6 +503,19 @@ pub struct DaemonState {
     /// its one producer, and never emptied: a fan unplugged while the daemon runs
     /// reads as stopped, which is what the user would want to hear.
     pub hwmon_seen_spinning: HashSet<String>,
+    /// The hwmon headers whose `pwm_commanded_pct` a DIAGNOSTIC wrote — a
+    /// write under a `Verify` lease — each with the `verify_epoch` it was
+    /// written under (`PTR-ag`). Any later engine write and every clear of the
+    /// command (a hand-back, a DEC-451 release) removes the entry.
+    ///
+    /// A diagnostic's duty is a test step, not a command anyone chose, so
+    /// `/fans` gives no stall verdict on such a header while that diagnostic
+    /// still holds the write pause (the epoch is the current one), and once it
+    /// has ended judges the header as one the daemon does not command — what a
+    /// header with no mode switch is after its restore, since nothing gives it
+    /// back. `pwm_commanded_pct` itself is untouched: the pump stall response
+    /// reads it. Produced only by [`crate::health::cache::StateCache::record_hwmon_command`].
+    pub hwmon_diagnostic_commanded: HashMap<String, u64>,
 }
 
 /// One hwmon header's duty-reconciliation record (DEC-406).
@@ -570,6 +583,7 @@ impl Default for DaemonState {
             control_outputs: Vec::new(),
             hwmon_duty_reconciliation: HashMap::new(),
             hwmon_seen_spinning: HashSet::new(),
+            hwmon_diagnostic_commanded: HashMap::new(),
         }
     }
 }

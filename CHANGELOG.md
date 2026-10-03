@@ -24,6 +24,12 @@
 
 ### Fixed
 
+- **A diagnostic no longer raises a stall on the header it tests.** `stall_detected` is `null` on a
+  header a verify, characterisation, stall probe or control-path discovery has written while that diagnostic runs, and once it
+  ends the duty it left is judged as no command (the readback rule, only for a fan seen spinning) until
+  the engine commands the header again. Before, an empty header under test read as stalled for the
+  test's length, and an empty header with no mode switch went on reading as stalled after its restore.
+  `pwm_commanded_pct` and the pump stall response are unchanged (`PTR-ag`).
 - **A boot that finds no fan headers no longer erases the saved diagnostic records.** Started before its
   Super-I/O driver loaded, the daemon used to drop every control-path relationship, learned response band
   and PWM verification verdict, and they did not come back with the driver. Now a record is pruned at

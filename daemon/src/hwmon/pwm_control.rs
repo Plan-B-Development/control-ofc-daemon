@@ -1060,18 +1060,22 @@ impl HwmonPwmController {
                     .ok()
                     .and_then(|s| s.trim().parse::<u16>().ok())
             });
-            self.cache.update_hwmon_fans(vec![HwmonFanState {
-                id: header_id.to_string(),
-                rpm,
-                last_commanded_pwm: Some(effective_pct),
-                // See the write path below — `None` so the poll's readback
-                // survives this refresh.
-                pwm_readback_pct: None,
-                pwm_commanded_pct: Some(effective_pct),
-                updated_at: now,
-                alarm: None,
-                pwm_enable_mode: None,
-            }]);
+            // Only the engine's writes coalesce, so this is never a diagnostic's.
+            self.cache.record_hwmon_command(
+                HwmonFanState {
+                    id: header_id.to_string(),
+                    rpm,
+                    last_commanded_pwm: Some(effective_pct),
+                    // See the write path below — `None` so the poll's readback
+                    // survives this refresh.
+                    pwm_readback_pct: None,
+                    pwm_commanded_pct: Some(effective_pct),
+                    updated_at: now,
+                    alarm: None,
+                    pwm_enable_mode: None,
+                },
+                !reconciles,
+            );
             return Ok(HwmonSetPwmResult {
                 header_id: header_id.to_string(),
                 pwm_percent: effective_pct,
@@ -1223,19 +1227,24 @@ impl HwmonPwmController {
                 .ok()
                 .and_then(|s| s.trim().parse::<u16>().ok())
         });
-        self.cache.update_hwmon_fans(vec![HwmonFanState {
-            id: header_id.to_string(),
-            rpm,
-            last_commanded_pwm: Some(effective_pct),
-            // `None`, not `Some(effective_pct)`: this is the COMMAND, and the
-            // readback is whatever sysfs says it became. The cache merge carries
-            // the poll's answer forward across this refresh (AIO-MB Phase 5).
-            pwm_readback_pct: None,
-            pwm_commanded_pct: Some(effective_pct),
-            updated_at: now,
-            alarm: None,
-            pwm_enable_mode: None,
-        }]);
+        // `PTR-ag`: a diagnostic's duty is recorded as the diagnostic's, so
+        // `/fans` does not judge a stall against a test step.
+        self.cache.record_hwmon_command(
+            HwmonFanState {
+                id: header_id.to_string(),
+                rpm,
+                last_commanded_pwm: Some(effective_pct),
+                // `None`, not `Some(effective_pct)`: this is the COMMAND, and the
+                // readback is whatever sysfs says it became. The cache merge carries
+                // the poll's answer forward across this refresh (AIO-MB Phase 5).
+                pwm_readback_pct: None,
+                pwm_commanded_pct: Some(effective_pct),
+                updated_at: now,
+                alarm: None,
+                pwm_enable_mode: None,
+            },
+            !reconciles,
+        );
 
         Ok(HwmonSetPwmResult {
             header_id: header_id.to_string(),
@@ -3695,6 +3704,67 @@ mod tests {
     #[test]
     fn a_handed_back_fan_that_stops_is_still_a_stall() {
         assert_eq!(stall_after_hand_back("900"), Some(true));
+    }
+
+    /// `PTR-ag` through the real write path, on a header with no fan: the
+    /// engine's 60 % is a stall; a diagnostic's test step and the duty its
+    /// restore leaves are not; the engine's next command is again.
+    #[test]
+    fn a_diagnostics_writes_are_not_judged_as_commands() {
+        let (mut ctrl, sysfs, cache, engine) = live_controller("5", "90");
+        sysfs.set("/sys/class/hwmon/hwmon0/fan1_input", "0");
+        let stall = |c: &StateCache| {
+            crate::api::handlers::build_fan_entries(&c.snapshot(), Instant::now())
+                .into_iter()
+                .find(|e| e.id == "h1")
+                .and_then(|e| e.stall_detected)
+        };
+        ctrl.set_pwm("h1", 60, &engine).unwrap();
+        assert_eq!(stall(&cache), Some(true), "precondition: engine command");
+
+        let epoch = cache
+            .try_begin_verify(std::time::Duration::from_secs(60))
+            .expect("the verify slot is free");
+        let verify = ctrl
+            .lease_manager_mut()
+            .force_take_lease(HwmonWriter::Verify)
+            .lease_id;
+        ctrl.set_pwm("h1", 100, &verify).unwrap();
+        assert_eq!(stall(&cache), None, "a test step under the pause");
+        ctrl.set_pwm("h1", 60, &verify).unwrap();
+        assert!(cache.end_verify(epoch));
+        assert_eq!(
+            cache.snapshot().hwmon_fans["h1"].pwm_commanded_pct,
+            Some(60),
+            "the command field itself is untouched"
+        );
+        assert_eq!(stall(&cache), None, "the restored duty is no command");
+
+        ctrl.lease_manager_mut().release_lease(&verify).unwrap();
+        let engine = ctrl
+            .lease_manager_mut()
+            .take_lease(HwmonWriter::Engine)
+            .unwrap()
+            .lease_id;
+        ctrl.set_pwm("h1", 60, &engine).unwrap();
+        assert_eq!(stall(&cache), Some(true), "the engine commands it again");
+    }
+
+    /// `PTR-ag`: a hand-back forgets a diagnostic's record with the command.
+    #[test]
+    fn a_hand_back_forgets_a_diagnostics_record() {
+        let (mut ctrl, _sysfs, cache, _engine) = live_controller("5", "90");
+        let verify = ctrl
+            .lease_manager_mut()
+            .force_take_lease(HwmonWriter::Verify)
+            .lease_id;
+        ctrl.set_pwm("h1", 60, &verify).unwrap();
+        assert!(cache
+            .snapshot()
+            .hwmon_diagnostic_commanded
+            .contains_key("h1"));
+        ctrl.hand_back("h1", &verify).unwrap();
+        assert!(cache.snapshot().hwmon_diagnostic_commanded.is_empty());
     }
 
     // ── DEC-406 (`PTR-g`): the engine reconciles a coalesced duty ─────────
