@@ -404,7 +404,7 @@ pub async fn update_header_role_handler(
                         StatusCode::BAD_REQUEST,
                         &ErrorEnvelope::validation(format!(
                             "unknown role '{token}' — expected one of: unknown, cpu_fan, \
-                             pump, radiator_fan, chassis_fan"
+                             pump, radiator_fan, chassis_fan, no_fan"
                         )),
                     );
                 }

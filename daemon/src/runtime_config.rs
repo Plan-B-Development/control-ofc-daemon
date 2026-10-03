@@ -183,7 +183,8 @@ pub struct RuntimeHardware {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_mb_sensor: Option<String>,
     /// User-assigned PWM header roles (DEC-311), stable header id → role token
-    /// (`"pump"`, `"cpu_fan"`, `"radiator_fan"`, `"chassis_fan"`, `"unknown"`).
+    /// (`"pump"`, `"cpu_fan"`, `"radiator_fan"`, `"chassis_fan"`, `"no_fan"`,
+    /// `"unknown"`).
     ///
     /// A `BTreeMap` rather than a `HashMap` so `runtime.toml` serialises in a
     /// stable order — this file is operator-editable and lands in diffs and
@@ -865,7 +866,10 @@ fn role_protection_rank(role: crate::hwmon::roles::HeaderRole) -> u8 {
     match role {
         HeaderRole::Pump => 2,
         HeaderRole::CpuFan => 1,
-        HeaderRole::Unknown | HeaderRole::RadiatorFan | HeaderRole::ChassisFan => 0,
+        HeaderRole::Unknown
+        | HeaderRole::RadiatorFan
+        | HeaderRole::ChassisFan
+        | HeaderRole::NoFan => 0,
     }
 }
 

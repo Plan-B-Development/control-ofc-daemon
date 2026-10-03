@@ -118,6 +118,7 @@ pub const INELIGIBLE_CPU_FAN: &str = "cpu_fan";
 pub const INELIGIBLE_ROLE_UNKNOWN: &str = "role_unknown";
 pub const INELIGIBLE_READ_ONLY: &str = "read_only";
 pub const INELIGIBLE_NO_TACH: &str = "no_tach";
+pub const INELIGIBLE_NO_FAN: &str = "no_fan";
 
 /// `ProbePoint.phase`.
 pub const PHASE_BASELINE: &str = "baseline";
@@ -387,6 +388,7 @@ pub fn ineligibility(
         HeaderRole::CpuFan => Some(INELIGIBLE_CPU_FAN),
         HeaderRole::Pump => Some(INELIGIBLE_PUMP_PROTECTED),
         HeaderRole::Unknown => Some(INELIGIBLE_ROLE_UNKNOWN),
+        HeaderRole::NoFan => Some(INELIGIBLE_NO_FAN),
     }
 }
 
@@ -402,6 +404,7 @@ pub fn ineligibility_detail(token: &str) -> &'static str {
         }
         INELIGIBLE_READ_ONLY => "this header is read-only",
         INELIGIBLE_NO_TACH => "this header has no tach, so a stall cannot be seen",
+        INELIGIBLE_NO_FAN => "this header's role is no_fan: nothing is plugged into it",
         _ => "this header is not eligible for the stall probe",
     }
 }
@@ -1764,6 +1767,14 @@ mod tests {
         assert_eq!(
             ineligibility(Unknown, false, true, true),
             Some(INELIGIBLE_ROLE_UNKNOWN)
+        );
+        assert_eq!(
+            ineligibility(NoFan, false, true, true),
+            Some(INELIGIBLE_NO_FAN)
+        );
+        assert_eq!(
+            ineligibility(NoFan, true, true, true),
+            Some(INELIGIBLE_PUMP_PROTECTED)
         );
         assert_eq!(
             ineligibility(ChassisFan, false, false, true),

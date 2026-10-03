@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- **A `no_fan` header role.** `POST /config/header-role` accepts `"no_fan"` for a header with nothing
+  plugged into it, advertised as `control.header_role_no_fan`. It is user-assigned only, adds no floor
+  and removes no pump protection (a header the hardware label or the active profile names a pump stays
+  protected), and the engine still drives the header if a profile names it. The stall probe refuses such
+  a header with reason `no_fan`. Persisted under `[hardware.header_roles]`; an older daemon ignores the
+  unrecognised token on load and the header keeps its detected role.
+
 ## [3.3.1] — 2026-10-03
 
 Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor. No field is added or removed, so any

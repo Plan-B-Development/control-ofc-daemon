@@ -71,6 +71,13 @@ pub enum HeaderRole {
     RadiatorFan,
     /// An ordinary case fan.
     ChassisFan,
+    /// Nothing is plugged into this header. User-assignable only — never
+    /// inferred, because "0 rpm" cannot tell an empty header from a stopped fan
+    /// or one behind a hub. Display and diagnostics only: it adds no floor and
+    /// removes no protection (the pump union still holds a header its label or
+    /// the active profile names a pump), and the engine still drives the header
+    /// if a profile names it. Since 3.4.0, capability `control.header_role_no_fan`.
+    NoFan,
 }
 
 impl HeaderRole {
@@ -82,6 +89,7 @@ impl HeaderRole {
             HeaderRole::Pump => "pump",
             HeaderRole::RadiatorFan => "radiator_fan",
             HeaderRole::ChassisFan => "chassis_fan",
+            HeaderRole::NoFan => "no_fan",
         }
     }
 
@@ -96,6 +104,7 @@ impl HeaderRole {
             "pump" => Some(HeaderRole::Pump),
             "radiator_fan" => Some(HeaderRole::RadiatorFan),
             "chassis_fan" => Some(HeaderRole::ChassisFan),
+            "no_fan" => Some(HeaderRole::NoFan),
             _ => None,
         }
     }
@@ -465,6 +474,30 @@ mod tests {
         );
     }
 
+    /// [SAFETY] `no_fan` is a display role: assigning it to a header the
+    /// hardware labels a pump, or one the active profile names a pump, leaves
+    /// that header pump-protected (DEC-312's union).
+    #[test]
+    fn no_fan_never_removes_pump_protection() {
+        let labelled_pump = classify_header_role("nct6798", 3, "AIO_PUMP");
+        assert_eq!(
+            resolve_role(Some(HeaderRole::NoFan), labelled_pump),
+            (HeaderRole::NoFan, RoleSource::UserAssigned)
+        );
+        assert!(is_pump_protected(
+            Some(HeaderRole::NoFan),
+            labelled_pump,
+            false
+        ));
+        let unlabelled = classify_header_role("nct6798", 4, "pwm4");
+        assert!(is_pump_protected(Some(HeaderRole::NoFan), unlabelled, true));
+        assert!(!is_pump_protected(
+            Some(HeaderRole::NoFan),
+            unlabelled,
+            false
+        ));
+    }
+
     #[test]
     fn resolve_passes_the_inference_through_when_unassigned() {
         let inferred = classify_header_role("nct6798", 3, "AIO_PUMP");
@@ -517,6 +550,7 @@ mod tests {
             HeaderRole::CpuFan,
             HeaderRole::RadiatorFan,
             HeaderRole::ChassisFan,
+            HeaderRole::NoFan,
         ] {
             assert!(!role.is_pump(), "{role:?} must not be treated as a pump");
         }
@@ -530,6 +564,7 @@ mod tests {
             HeaderRole::Pump,
             HeaderRole::RadiatorFan,
             HeaderRole::ChassisFan,
+            HeaderRole::NoFan,
         ] {
             assert_eq!(HeaderRole::from_token(role.as_str()), Some(role));
         }
@@ -549,6 +584,7 @@ mod tests {
             HeaderRole::Pump,
             HeaderRole::RadiatorFan,
             HeaderRole::ChassisFan,
+            HeaderRole::NoFan,
         ] {
             let json = serde_json::to_string(&role).unwrap();
             assert_eq!(json, format!("\"{}\"", role.as_str()));

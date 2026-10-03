@@ -5469,6 +5469,48 @@ async fn header_role_assignment_round_trips_and_validates() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A user can mark a header as having nothing plugged into it: the capability
+/// is advertised, the token is accepted and persisted, and the header reads it
+/// back as a user-assigned role.
+#[tokio::test]
+async fn a_header_can_be_assigned_no_fan() {
+    let (state, tmp) = config_test_state_with_hwmon();
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, caps) = uds_get(&path, "/capabilities").await;
+    assert_eq!(status, 200);
+    assert_eq!(caps["control"]["header_role_no_fan"], true, "{caps}");
+
+    let (status, json) = uds_post(
+        &path,
+        "/config/header-role",
+        &serde_json::json!({"header_id": "h1", "role": "no_fan"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json["effective_role"], "no_fan", "{json}");
+
+    let saved = std::fs::read_to_string(tmp.path().join("runtime.toml")).unwrap();
+    assert!(
+        saved.contains("no_fan"),
+        "the assignment must persist: {saved}"
+    );
+
+    let (status, json) = uds_get(&path, "/hwmon/headers").await;
+    assert_eq!(status, 200);
+    let h1 = json["headers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["id"] == "h1")
+        .unwrap_or_else(|| panic!("h1 missing: {json}"));
+    assert_eq!(h1["role"], "no_fan", "{h1}");
+    assert_eq!(h1["role_source"], "user_assigned", "{h1}");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}
+
 #[tokio::test]
 async fn hwmon_headers_carry_role_and_role_source() {
     // The GUI joins fan → header by id to learn a fan is a pump, so the field

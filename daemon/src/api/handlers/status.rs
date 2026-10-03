@@ -472,6 +472,8 @@ pub async fn capabilities_handler(
             cooling_failure_detection: true,
             // DEC-456: per-header PWM-control verdicts on `/hwmon/headers`.
             pwm_verification_records: true,
+            // A user-assigned `no_fan` header role.
+            header_role_no_fan: true,
         },
     })
 }

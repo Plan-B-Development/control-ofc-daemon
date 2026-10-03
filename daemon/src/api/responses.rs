@@ -1292,6 +1292,13 @@ pub struct ControlCapability {
     /// record". Absent means an older daemon.
     #[serde(default)]
     pub pwm_verification_records: bool,
+    /// `POST /config/header-role` accepts `no_fan`, and a header may report
+    /// `role: "no_fan"` (user-assigned only). Since 3.4.0.
+    ///
+    /// A client gates on this before offering the choice: an older daemon
+    /// rejects the token with a 400 `validation_error`.
+    #[serde(default)]
+    pub header_role_no_fan: bool,
 }
 
 /// Per-device-group capability info.
