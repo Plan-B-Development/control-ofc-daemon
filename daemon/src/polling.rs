@@ -1008,6 +1008,9 @@ async fn openfan_poll_loop_with<F>(
         + Clone
         + 'static,
 {
+    // `OFAN-a`: this loop owns the interval, so it publishes it — a calibration
+    // derives its shortest hold from it (the DEC-267 pattern).
+    cache.set_openfan_poll_interval_ms(interval.as_millis() as u64);
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -1087,6 +1090,10 @@ async fn openfan_poll_loop_with<F>(
             }
         }
 
+        // `OFAN-a`: numbered before the read is even queued, so a calibration
+        // that read the count after its write can tell this poll's tach from
+        // one read after the write landed.
+        let seq = cache.begin_openfan_poll();
         // Serial I/O is blocking — run on blocking pool
         let transport = transport.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -1121,6 +1128,7 @@ async fn openfan_poll_loop_with<F>(
                                 last_commanded_pwm: None,
                                 updated_at: now,
                                 rpm_polled: true,
+                                poll_seq: seq,
                             })
                             .collect();
                         let count = fans.len();
@@ -1413,6 +1421,62 @@ mod tests {
         fn read_line(&mut self, _t: Duration) -> Result<String, crate::error::SerialError> {
             Ok(openfan_replies().0[0].clone())
         }
+    }
+
+    /// A port that answers every `ReadAllRpm` and records, as each read goes
+    /// out on the wire, how many polls the cache says have started.
+    struct NumberedPort {
+        cache: Arc<StateCache>,
+        seen: Arc<parking_lot::Mutex<Vec<u64>>>,
+    }
+
+    impl SerialTransport for NumberedPort {
+        fn write_line(&mut self, _data: &str) -> Result<(), crate::error::SerialError> {
+            self.seen.lock().push(self.cache.openfan_polls_started());
+            Ok(())
+        }
+        fn read_line(&mut self, _t: Duration) -> Result<String, crate::error::SerialError> {
+            Ok(openfan_replies().0[0].clone())
+        }
+    }
+
+    /// `OFAN-a`: the real loop numbers each poll BEFORE its read reaches the
+    /// wire, its readings carry that number, and it publishes its interval.
+    #[tokio::test]
+    async fn each_openfan_poll_is_numbered_before_its_read_and_its_readings_carry_it() {
+        let cache = Arc::new(StateCache::new());
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let slot: Slot = Arc::new(parking_lot::Mutex::new(Box::new(NumberedPort {
+            cache: cache.clone(),
+            seen: seen.clone(),
+        })));
+        let interval = Duration::from_millis(7);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(openfan_poll_loop_with(
+            cache.clone(),
+            slot,
+            Duration::from_millis(1),
+            interval,
+            shutdown_rx,
+            |_: &Arc<StateCache>, _: Duration| None,
+        ));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while seen.lock().len() < 3 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+
+        let seen = seen.lock().clone();
+        assert!(seen.len() >= 3, "precondition: the loop polled: {seen:?}");
+        assert_eq!(
+            seen,
+            (1..=seen.len() as u64).collect::<Vec<_>>(),
+            "each read goes out already numbered"
+        );
+        let cached = cache.read_with(|s| s.openfan_fans.get(&0).map(|f| f.poll_seq));
+        assert_eq!(cached, seen.last().copied(), "the last read's number");
+        assert_eq!(cache.openfan_poll_interval(), interval);
     }
 
     type Slot = Arc<parking_lot::Mutex<Box<dyn SerialTransport + Send>>>;

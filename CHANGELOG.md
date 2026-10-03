@@ -23,6 +23,14 @@
   exit minimum, and a SIGHUP that arrives together with the stop signal is no longer lost to it
   (`TS-bf`). The unit's stop-window arithmetic is recounted (six drains, not four; `TimeoutStopSec=40`
   still covers it).
+- **OpenFan calibration counts only readings taken after each step's duty landed.** A reading from a
+  poll already under way when the step was written — which may have read the fan at the previous duty
+  — no longer counts, and each poll counts once however many samples see it, so three agreeing
+  readings are three polls. The hold per step is now never shorter than four OpenFan poll intervals
+  (4 s at the default 1 s; `hold_ms` reports the hold used), nor is the recovery kick's window, so a slow
+  `polling.poll_interval_ms` lengthens the run instead of leaving every step `unconfirmed` and
+  reporting `no_stall_down_to_0` or `did_not_restart` for a fan that did stop or start. At the default
+  hold and poll interval the run takes as long as before (`OFAN-a`).
 - **A tick with only skipped OpenFan members and nothing to put back starts no write task.** It used to
   start one every tick to look for a duty a reconnect or resume had lost; behind a controller lock held
   past the write budget — a calibration's serial write — that stamped a write stall for a tick with

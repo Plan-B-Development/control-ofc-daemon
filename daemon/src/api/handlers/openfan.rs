@@ -603,7 +603,7 @@ fn start_openfan_calibration(
         ));
     };
 
-    let hold = cal::clamp_hold(hold_seconds);
+    let hold = cal::clamp_hold(hold_seconds, state.cache.openfan_poll_interval());
     let run = OpenFanCalibrationRun {
         run_id: cal::next_run_id(),
         fan_id: fan_id.clone(),
@@ -1784,7 +1784,8 @@ mod tests {
     /// A controller on channel 0 at 40 %, a CPU at 50 °C, and a fan that stops at
     /// or below 10 % and restarts at 16 %: a poller publishes the RPM the
     /// controller's current duty would produce, every 250 ms, as the OpenFan
-    /// poll loop would.
+    /// poll loop would — numbering each poll before it reads, and publishing
+    /// its interval (`OFAN-a`).
     fn cal_fixture() -> CalFixture {
         let (tx, rx) = tokio::sync::watch::channel(false);
         let state = adoption_state(rx);
@@ -1804,9 +1805,11 @@ mod tests {
             .cache
             .update_sensors(vec![fresh_cpu(50.0, Duration::ZERO)]);
         let (cache, c) = (state.cache.clone(), ctrl.clone());
+        cache.set_openfan_poll_interval_ms(250);
         let poller = tokio::spawn(async move {
             let mut spinning = true;
             loop {
+                let seq = cache.begin_openfan_poll();
                 let duty = c.lock().last_commanded_pct(0).unwrap_or(0);
                 spinning = if spinning { duty > 10 } else { duty >= 16 };
                 cache.update_openfan_fans(vec![crate::health::state::OpenFanState {
@@ -1815,6 +1818,7 @@ mod tests {
                     last_commanded_pwm: None,
                     updated_at: std::time::Instant::now(),
                     rpm_polled: true,
+                    poll_seq: seq,
                 }]);
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
@@ -1874,6 +1878,28 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
+    }
+
+    /// `OFAN-a`, the call site: the route resolves the hold against the poll
+    /// interval the loop published, and reports the hold it will use.
+    #[tokio::test(start_paused = true)]
+    async fn the_route_s_hold_fits_the_published_poll_interval() {
+        let f = cal_fixture();
+        let slow = Duration::from_millis(1500);
+        f.state
+            .cache
+            .set_openfan_poll_interval_ms(slow.as_millis() as u64);
+        let (status, body) = post_cal(&f.state, ack()).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert!(cal::min_hold(slow) > Duration::from_secs(2), "precondition");
+        assert_eq!(body["hold_ms"], cal::min_hold(slow).as_millis() as u64);
+
+        f.state
+            .openfan_calibration
+            .cancel
+            .store(true, Ordering::SeqCst);
+        let run = cal_finished(&f.state).await;
+        assert_eq!(run.hold_ms, cal::min_hold(slow).as_millis() as u64);
     }
 
     /// The whole route: the 202 snapshot, the walk down to the stall and back up

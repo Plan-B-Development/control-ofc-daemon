@@ -64,6 +64,7 @@ fn test_app_state_inner(engine_ticked: bool, runtime_cfg: std::path::PathBuf) ->
             last_commanded_pwm: Some(128),
             updated_at: Instant::now(),
             rpm_polled: true,
+            poll_seq: 0,
         },
         OpenFanState {
             channel: 1,
@@ -71,6 +72,7 @@ fn test_app_state_inner(engine_ticked: bool, runtime_cfg: std::path::PathBuf) ->
             last_commanded_pwm: None,
             updated_at: Instant::now(),
             rpm_polled: true,
+            poll_seq: 0,
         },
     ]);
 
@@ -7794,6 +7796,7 @@ fn cooling_device_test_state() -> (Arc<AppState>, tempfile::TempDir) {
         last_commanded_pwm: Some(128),
         updated_at: Instant::now(),
         rpm_polled: true,
+        poll_seq: 0,
     }]);
     (state, tmp)
 }
@@ -8624,6 +8627,7 @@ async fn duty_reconciliation_is_on_every_hwmon_entry_and_advertised() {
         last_commanded_pwm: Some(40),
         updated_at: Instant::now(),
         rpm_polled: true,
+        poll_seq: 0,
     }]);
     let (path, shutdown, _dir) = start_test_server(state).await;
 

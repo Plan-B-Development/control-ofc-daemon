@@ -433,13 +433,15 @@ pub const OPENFAN_CAL_FINE_STEP_PCT: u8 = STALL_PROBE_STEP_PCT;
 pub const OPENFAN_CAL_SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
 
 /// OpenFan calibration (DEC-452): how many consecutive fresh samples must agree
-/// before a hold is called stopped or spinning. Three at
-/// [`OPENFAN_CAL_SAMPLE_INTERVAL`] span a second — at least one fresh poll at
-/// the default 1 Hz OpenFan cadence.
+/// before a hold is called stopped or spinning. Each is a distinct OpenFan poll
+/// started after the step's write (`OFAN-a`), so three span at least two poll
+/// intervals.
 pub const OPENFAN_CAL_CONFIRM_SAMPLES: usize = 3;
 
 /// OpenFan calibration (DEC-452): the default hold per step, and its clamp. The
-/// shortest hold must fit [`OPENFAN_CAL_CONFIRM_SAMPLES`].
+/// clamped hold is then raised to `api::calibration::min_hold` for the poll
+/// interval (`OFAN-a`), one interval beyond the confirming polls, so the minimum here is the
+/// floor only on a faster-polling system.
 pub const OPENFAN_CAL_DEFAULT_HOLD_S: u64 = 5;
 pub const OPENFAN_CAL_MIN_HOLD_S: u64 = 2;
 pub const OPENFAN_CAL_MAX_HOLD_S: u64 = 15;

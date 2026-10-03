@@ -64,6 +64,13 @@ pub struct OpenFanState {
     /// True after the first real RPM poll. Prevents false stall alerts
     /// when a PWM write creates the entry before any RPM data arrives.
     pub rpm_polled: bool,
+    /// The poll that read this RPM, numbered by
+    /// [`StateCache::begin_openfan_poll`](crate::health::cache::StateCache::begin_openfan_poll)
+    /// as that poll STARTED; 0 for an entry no poll has read. A calibration
+    /// counts only readings from polls started after its write landed
+    /// (`OFAN-a`) — `updated_at` is stamped when the poll caches, after its
+    /// serial read, so it cannot say whether the tach was read before the write.
+    pub poll_seq: u64,
 }
 
 /// Cached state for a motherboard hwmon fan header.

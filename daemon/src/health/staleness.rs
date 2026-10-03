@@ -670,6 +670,7 @@ mod tests {
             last_commanded_pwm: Some(128),
             updated_at: when,
             rpm_polled: true,
+            poll_seq: 0,
         }
     }
 

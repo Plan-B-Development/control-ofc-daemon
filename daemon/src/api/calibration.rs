@@ -34,6 +34,17 @@
 //! samples, all zero (stopped) or all non-zero (spinning); fewer, or a mix, is
 //! `unconfirmed`, and the walk moves on as if nothing was confirmed.
 //!
+//! A sample is **fresh** only when it comes from an OpenFan poll that STARTED
+//! after the step's write returned, and each poll counts once however many
+//! samples read it (`OFAN-a`, decision `U9`). The poll loop numbers each poll
+//! before it reads the controller ([`StateCache::begin_openfan_poll`]); a poll
+//! already under way when the write landed may have read the tach at the old
+//! duty, though it caches after the write. So the hold is never shorter than
+//! [`min_hold`] for the poll interval, which fits that many polls after a write
+//! — a slow `polling.poll_interval_ms` lengthens every hold rather than leaving
+//! them all `unconfirmed` — and the recovery kick's window is never shorter
+//! either.
+//!
 //! # Pumps (`PTR-i`)
 //!
 //! The daemon holds **no pump evidence for an OpenFan channel** — every pump
@@ -388,8 +399,18 @@ pub fn next_run_id() -> String {
     format!("ofcal-{}", crate::api::characterization::next_run_id())
 }
 
-/// The hold per step, clamped (DEC-452).
-pub fn clamp_hold(hold_seconds: Option<u64>) -> Duration {
+/// The shortest hold that fits [`constants::OPENFAN_CAL_CONFIRM_SAMPLES`]
+/// fresh polls at `poll_interval` (`OFAN-a`): the first poll to start after the
+/// write can be up to one interval away, and each further one an interval
+/// more, so one interval beyond the confirming polls covers their reads.
+pub fn min_hold(poll_interval: Duration) -> Duration {
+    poll_interval.saturating_mul(constants::OPENFAN_CAL_CONFIRM_SAMPLES as u32 + 1)
+}
+
+/// The hold per step: the request clamped (DEC-452), then raised to
+/// [`min_hold`] for the OpenFan poll interval (`OFAN-a`), which may take it
+/// past [`constants::OPENFAN_CAL_MAX_HOLD_S`] on a slow-polling system.
+pub fn clamp_hold(hold_seconds: Option<u64>, poll_interval: Duration) -> Duration {
     let asked = hold_seconds.unwrap_or(constants::OPENFAN_CAL_DEFAULT_HOLD_S);
     let held = asked.clamp(
         constants::OPENFAN_CAL_MIN_HOLD_S,
@@ -402,7 +423,18 @@ pub fn clamp_hold(hold_seconds: Option<u64>) -> Duration {
             constants::OPENFAN_CAL_MAX_HOLD_S
         );
     }
-    Duration::from_secs(held)
+    let floor = min_hold(poll_interval);
+    let hold = Duration::from_secs(held).max(floor);
+    if hold > Duration::from_secs(held) {
+        log::info!(
+            "OpenFan calibration: hold raised from {held} s to {} ms so it fits {} OpenFan \
+             polls at the {} ms poll interval",
+            hold.as_millis(),
+            constants::OPENFAN_CAL_CONFIRM_SAMPLES,
+            poll_interval.as_millis()
+        );
+    }
+    hold
 }
 
 /// Error from a gate or a write.
@@ -723,9 +755,9 @@ fn verdict(fresh: &[u16]) -> Verdict {
     }
 }
 
-/// The channel's cached RPM and when it was read.
-fn rpm_reading(cache: &StateCache, channel: u8) -> Option<(u16, std::time::Instant)> {
-    cache.read_with(|s| s.openfan_fans.get(&channel).map(|f| (f.rpm, f.updated_at)))
+/// The channel's cached RPM and the number of the poll that read it.
+fn rpm_reading(cache: &StateCache, channel: u8) -> Option<(u16, u64)> {
+    cache.read_with(|s| s.openfan_fans.get(&channel).map(|f| (f.rpm, f.poll_seq)))
 }
 
 /// Run a controller write on the blocking pool.
@@ -882,9 +914,6 @@ where
         self.touched = true;
         self.backstop.armed = true;
         self.lowest = Some(self.lowest.map_or(pct, |l| l.min(pct)));
-        // Stamped BEFORE the write: only a reading taken after it describes
-        // this duty.
-        let written_at = std::time::Instant::now();
         if let Err(e) = write_off_runtime(&self.write, self.channel, pct).await {
             self.last_verdict = None;
             return Err(Stop::Abort(
@@ -893,6 +922,10 @@ where
             ));
         }
 
+        // `OFAN-a`: read once the write has returned. Only a poll numbered
+        // above this started after the write, so only its tach describes this
+        // duty; a poll already under way may have read the old one.
+        let mut last_poll = self.cache.openfan_polls_started();
         let deadline = tokio::time::Instant::now() + hold;
         let mut fresh: Vec<u16> = Vec::new();
         let mut stopped_by: Option<Stop> = None;
@@ -916,9 +949,11 @@ where
                 stopped_by = Some(stop);
                 break;
             }
-            if let Some((rpm, at)) = rpm_reading(self.cache, self.channel) {
-                if at >= written_at {
+            // Each poll once, however many samples see it.
+            if let Some((rpm, poll)) = rpm_reading(self.cache, self.channel) {
+                if poll > last_poll {
                     fresh.push(rpm);
+                    last_poll = poll;
                 }
             }
             if until_spinning && verdict(&fresh) == Verdict::Spinning {
@@ -1005,20 +1040,15 @@ where
     }
 
     /// [SAFETY] The 100 % recovery kick, held until the fan is seen spinning or
-    /// for [`constants::OPENFAN_CAL_KICK_MAX`].
+    /// for [`constants::OPENFAN_CAL_KICK_MAX`] — longer where the poll interval
+    /// needs it to see spinning confirmed ([`min_hold`]).
     async fn kick(&mut self) -> Result<(), Stop> {
         // Until the kick has run, a restore on drop must not leave the fan
         // at a duty that may not restart it.
         self.backstop.target = 100;
-        let v = self
-            .step(
-                100,
-                PHASE_KICK,
-                constants::OPENFAN_CAL_KICK_MAX,
-                false,
-                true,
-            )
-            .await?;
+        let window =
+            constants::OPENFAN_CAL_KICK_MAX.max(min_hold(self.cache.openfan_poll_interval()));
+        let v = self.step(100, PHASE_KICK, window, false, true).await?;
         self.p.restart_failed_at_full = v != Verdict::Spinning;
         Ok(())
     }
@@ -1289,24 +1319,46 @@ mod tests {
         }
     }
 
+    /// Channel 0's reading as the poll numbered `seq` caches it.
+    fn polled(cache: &StateCache, rpm: u16, seq: u64) {
+        cache.update_openfan_fans(vec![OpenFanState {
+            channel: 0,
+            rpm,
+            last_commanded_pwm: None,
+            updated_at: Instant::now(),
+            rpm_polled: true,
+            poll_seq: seq,
+        }]);
+    }
+
+    /// A cache with a fresh CPU reading and channel 0 already read by one poll,
+    /// before any write.
     fn make_cache(temp_c: f64) -> Arc<StateCache> {
         let cache = Arc::new(StateCache::new());
         cache.update_sensors(vec![cpu(temp_c, Duration::ZERO)]);
-        cache.update_openfan_fans(vec![OpenFanState {
-            channel: 0,
-            rpm: 900,
-            last_commanded_pwm: Some(50),
-            updated_at: Instant::now(),
-            rpm_polled: true,
-        }]);
+        polled(&cache, 900, cache.begin_openfan_poll());
         cache
+    }
+
+    /// The OpenFan poll loop's part: every poll interval, number a poll and
+    /// cache what the tach reads. Aborted with the test's runtime.
+    fn poll_loop(cache: &Arc<StateCache>, tach: Arc<std::sync::atomic::AtomicU16>) {
+        let c = cache.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(c.openfan_poll_interval());
+            loop {
+                tick.tick().await;
+                let seq = c.begin_openfan_poll();
+                polled(&c, tach.load(Ordering::SeqCst), seq);
+            }
+        });
     }
 
     type WriteLog = Arc<std::sync::Mutex<Vec<u8>>>;
 
     /// A fan that stops at or below `stall` on the way down and needs `restart`
-    /// to start again: each write publishes the RPM the fan would then read,
-    /// as a fresh poll would. `hook` runs after every write.
+    /// to start again, read by a [`poll_loop`]: each write sets the RPM the
+    /// next poll reads. `hook` runs after every write.
     fn fan(
         cache: &Arc<StateCache>,
         stall: u8,
@@ -1315,7 +1367,9 @@ mod tests {
     ) -> (CalWriteFn, WriteLog) {
         let log: WriteLog = Arc::new(std::sync::Mutex::new(Vec::new()));
         let spinning = Arc::new(AtomicBool::new(true));
-        let (c, l) = (cache.clone(), log.clone());
+        let tach = Arc::new(std::sync::atomic::AtomicU16::new(900));
+        poll_loop(cache, tach.clone());
+        let l = log.clone();
         let f: CalWriteFn = Arc::new(move |_ch, pct| {
             l.lock().unwrap().push(pct);
             let now_spinning = if spinning.load(Ordering::SeqCst) {
@@ -1324,21 +1378,24 @@ mod tests {
                 pct >= restart
             };
             spinning.store(now_spinning, Ordering::SeqCst);
-            c.update_openfan_fans(vec![OpenFanState {
-                channel: 0,
-                rpm: if now_spinning {
+            tach.store(
+                if now_spinning {
                     300 + pct as u16 * 15
                 } else {
                     0
                 },
-                last_commanded_pwm: Some(pct),
-                updated_at: Instant::now(),
-                rpm_polled: true,
-            }]);
+                Ordering::SeqCst,
+            );
             hook(pct);
             Ok(())
         });
         (f, log)
+    }
+
+    /// The 2 s request the tests make, as the handler resolves it for the
+    /// cache's poll interval.
+    fn hold(cache: &StateCache) -> Duration {
+        clamp_hold(Some(2), cache.openfan_poll_interval())
     }
 
     async fn run(
@@ -1350,7 +1407,7 @@ mod tests {
         run_calibration(
             cache,
             0,
-            Duration::from_secs(2),
+            hold(cache),
             original,
             50.0,
             write,
@@ -1490,15 +1547,10 @@ mod tests {
     async fn a_fan_still_spinning_at_zero_and_an_empty_channel() {
         let cache = make_cache(50.0);
         let never_stops: CalWriteFn = {
-            let c = cache.clone();
+            let tach = Arc::new(std::sync::atomic::AtomicU16::new(900));
+            poll_loop(&cache, tach.clone());
             Arc::new(move |_ch, pct| {
-                c.update_openfan_fans(vec![OpenFanState {
-                    channel: 0,
-                    rpm: 200 + pct as u16 * 10,
-                    last_commanded_pwm: Some(pct),
-                    updated_at: Instant::now(),
-                    rpm_polled: true,
-                }]);
+                tach.store(200 + pct as u16 * 10, Ordering::SeqCst);
                 Ok(())
             })
         };
@@ -1656,7 +1708,7 @@ mod tests {
         let p = run_calibration(
             &cache,
             0,
-            Duration::from_secs(2),
+            hold(&cache),
             Some(original),
             50.0,
             write,
@@ -1711,7 +1763,7 @@ mod tests {
         let p = run_calibration(
             &cache,
             0,
-            Duration::from_secs(2),
+            hold(&cache),
             Some(original),
             50.0,
             write,
@@ -1746,7 +1798,7 @@ mod tests {
         let p = run_calibration(
             &cache,
             0,
-            Duration::from_secs(2),
+            hold(&cache),
             Some(50),
             50.0,
             write,
@@ -1866,7 +1918,7 @@ mod tests {
         let p = run_calibration(
             &cache,
             0,
-            Duration::from_secs(2),
+            hold(&cache),
             original,
             50.0,
             write,
@@ -1920,8 +1972,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn no_fresh_rpm_after_a_write_aborts_as_unreadable() {
         let cache = make_cache(50.0);
-        // The cached reading must predate every write stamp strictly.
-        std::thread::sleep(Duration::from_millis(2));
         let log: WriteLog = Arc::new(std::sync::Mutex::new(Vec::new()));
         let l = log.clone();
         let deaf: CalWriteFn = Arc::new(move |_ch, pct| {
@@ -1932,6 +1982,106 @@ mod tests {
         assert_eq!(p.abort_reason, Some(ABORT_RPM_UNREADABLE));
         assert_eq!(*log.lock().unwrap(), vec![100, 50]);
         assert!(p.points.is_empty());
+    }
+
+    /// `OFAN-a`: a poll already under way when the write lands read the tach at
+    /// the old duty, though it caches after the write — it must not count. Here
+    /// every poll is one the write overlaps, so nothing is fresh.
+    #[tokio::test(start_paused = true)]
+    async fn a_poll_started_before_the_write_returned_is_not_fresh() {
+        let cache = make_cache(50.0);
+        let log: WriteLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (c, l) = (cache.clone(), log.clone());
+        let overlapped: CalWriteFn = Arc::new(move |_ch, pct| {
+            l.lock().unwrap().push(pct);
+            // Numbered before the write lands, cached after it was issued.
+            let seq = c.begin_openfan_poll();
+            polled(&c, 900, seq);
+            Ok(())
+        });
+        let p = run(&cache, overlapped, Some(50), &AtomicBool::new(false)).await;
+        assert_eq!(p.abort_reason, Some(ABORT_RPM_UNREADABLE));
+        assert!(p.points.is_empty(), "{:?}", p.points);
+    }
+
+    /// `OFAN-a`: a verdict needs that many distinct polls. A hold that fits
+    /// fewer — though it takes more samples than a verdict needs — confirms
+    /// nothing, so a fan that does stall is never called stopped.
+    #[tokio::test(start_paused = true)]
+    async fn samples_of_the_same_poll_count_once() {
+        let cache = make_cache(50.0);
+        let (write, _log) = fan(&cache, 10, 16, |_| {});
+        // Just under that many intervals: a window that can hold at most one
+        // poll fewer than a verdict needs, but more samples than it needs.
+        let short = cache
+            .openfan_poll_interval()
+            .saturating_mul(constants::OPENFAN_CAL_CONFIRM_SAMPLES as u32 - 1)
+            - constants::OPENFAN_CAL_SAMPLE_INTERVAL / 5;
+        assert!(
+            short.as_millis()
+                >= constants::OPENFAN_CAL_SAMPLE_INTERVAL.as_millis()
+                    * constants::OPENFAN_CAL_CONFIRM_SAMPLES as u128,
+            "precondition: the hold has room for that many samples"
+        );
+        let p = run_calibration(
+            &cache,
+            0,
+            short,
+            Some(50),
+            50.0,
+            write,
+            &AtomicBool::new(false),
+            || false,
+            || true,
+            || false,
+            |_| {},
+        )
+        .await;
+        assert!(
+            p.points.iter().all(|c| c.observation == OBS_UNCONFIRMED),
+            "{:?}",
+            p.points
+        );
+        assert_eq!(p.outcome, Some(OUTCOME_NO_STALL_DOWN_TO_0));
+    }
+
+    /// `OFAN-a`: on a slow-polling system the hold is lengthened to fit the
+    /// confirming polls, so the walk still finds the stall and the restart
+    /// rather than calling every hold unconfirmed.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_poll_lengthens_the_hold_and_the_walk_still_confirms() {
+        let cache = make_cache(50.0);
+        cache.set_openfan_poll_interval_ms(2500);
+        let (write, _log) = fan(&cache, 10, 16, |_| {});
+        let p = run(&cache, write, Some(50), &AtomicBool::new(false)).await;
+        assert_eq!(p.outcome, Some(OUTCOME_STALL_AND_RESTART_FOUND), "{p:?}");
+        assert_eq!((p.stall_duty_pct, p.restart_duty_pct), (Some(10), Some(16)));
+    }
+
+    /// `OFAN-a`: the hold is the request clamped, then raised to fit the
+    /// confirming polls — past the clamp's maximum if the poll is slow enough.
+    #[test]
+    fn the_hold_is_never_shorter_than_the_poll_interval_needs() {
+        let fast = Duration::from_millis(100);
+        assert_eq!(
+            clamp_hold(Some(0), fast),
+            Duration::from_secs(constants::OPENFAN_CAL_MIN_HOLD_S),
+            "a fast poll leaves the clamp in charge"
+        );
+        let default_poll = Duration::from_secs(1);
+        assert_eq!(
+            clamp_hold(Some(constants::OPENFAN_CAL_MIN_HOLD_S), default_poll),
+            min_hold(default_poll)
+        );
+        assert!(min_hold(default_poll) > Duration::from_secs(constants::OPENFAN_CAL_MIN_HOLD_S));
+        let slow = Duration::from_secs(5);
+        assert!(min_hold(slow) > Duration::from_secs(constants::OPENFAN_CAL_MAX_HOLD_S));
+        assert_eq!(clamp_hold(Some(u64::MAX), slow), min_hold(slow));
+        assert!(
+            min_hold(default_poll)
+                > default_poll.saturating_mul(constants::OPENFAN_CAL_CONFIRM_SAMPLES as u32),
+            "room for the confirming polls after a write that just missed one"
+        );
     }
 
     /// A write that fails is `write_failed`, and the restore is still tried.
@@ -1992,7 +2142,7 @@ mod tests {
         let p = run_calibration(
             &cache,
             0,
-            Duration::from_secs(2),
+            hold(&cache),
             Some(50),
             50.0,
             write,

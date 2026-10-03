@@ -2614,6 +2614,7 @@ fn seed_spinning_siblings(state: &AppState) {
         last_commanded_pwm: Some(140),
         updated_at: Instant::now(),
         rpm_polled: true,
+        poll_seq: 0,
     }]);
 }
 
@@ -2711,6 +2712,7 @@ async fn a_stopped_openfan_sibling_warns_rather_than_reading_as_unknown() {
         last_commanded_pwm: Some(0),
         updated_at: Instant::now(),
         rpm_polled: true,
+        poll_seq: 0,
     }]);
 
     let r = run_preflight(&state, "control_path_discovery").await;
@@ -2756,6 +2758,7 @@ async fn an_unpolled_openfan_channel_is_unknown_rather_than_stopped() {
         last_commanded_pwm: Some(0),
         updated_at: Instant::now(),
         rpm_polled: true,
+        poll_seq: 0,
     }]);
     let r = run_preflight(&state, "control_path_discovery").await;
     let c = check(&r, pf::CHECK_SUPPORTING);
@@ -2780,6 +2783,7 @@ async fn an_unpolled_openfan_channel_is_unknown_rather_than_stopped() {
         last_commanded_pwm: Some(255),
         updated_at: Instant::now(),
         rpm_polled: false,
+        poll_seq: 0,
     }]);
     let r = run_preflight(&state, "control_path_discovery").await;
     let c = check(&r, pf::CHECK_SUPPORTING);
@@ -3069,6 +3073,7 @@ async fn an_all_openfan_cooler_at_rest_warns_where_it_used_to_say_nothing() {
             last_commanded_pwm: Some(0),
             updated_at: Instant::now(),
             rpm_polled: true,
+            poll_seq: 0,
         }]);
     }
 

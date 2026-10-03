@@ -138,6 +138,12 @@ pub struct StateCache {
     /// legitimately slow-polling system stale and pin its fans at
     /// `NO_SENSOR_SAFE_PCT`.
     hwmon_poll_interval_ms: AtomicU64,
+    /// The OpenFan poll loop's interval, published by the loop (`OFAN-a`); the
+    /// calibration derives its shortest hold from it.
+    openfan_poll_interval_ms: AtomicU64,
+    /// How many OpenFan polls have started: the number of the newest, which its
+    /// readings carry as [`OpenFanState::poll_seq`] (`OFAN-a`).
+    openfan_polls_started: AtomicU64,
     /// Serialises GPU fan writes between the profile engine and
     /// `POST /gpu/{id}/fan/reset` (DEC-255).
     ///
@@ -237,6 +243,8 @@ impl StateCache {
             resume_detected: AtomicBool::new(false),
             profile_activation_epoch: AtomicU64::new(0),
             hwmon_poll_interval_ms: AtomicU64::new(DEFAULT_HWMON_POLL_INTERVAL_MS),
+            openfan_poll_interval_ms: AtomicU64::new(DEFAULT_HWMON_POLL_INTERVAL_MS),
+            openfan_polls_started: AtomicU64::new(0),
             gpu_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             gpu_handback: Arc::default(),
             openfan_write_generation: AtomicU64::new(0),
@@ -328,6 +336,31 @@ impl StateCache {
     /// `StalenessConfig`. Idempotent and lock-free.
     pub fn set_hwmon_poll_interval_ms(&self, ms: u64) {
         self.hwmon_poll_interval_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Publish the OpenFan poll loop's interval (`OFAN-a`). Called by the loop
+    /// as it starts, like [`Self::set_hwmon_poll_interval_ms`].
+    pub fn set_openfan_poll_interval_ms(&self, ms: u64) {
+        self.openfan_poll_interval_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// The OpenFan poll loop's interval; the 1 s default until a loop has
+    /// published one.
+    pub fn openfan_poll_interval(&self) -> Duration {
+        Duration::from_millis(self.openfan_poll_interval_ms.load(Ordering::Relaxed))
+    }
+
+    /// Number the OpenFan poll about to start, BEFORE it reads the controller,
+    /// and return its number for the readings it caches (`OFAN-a`).
+    pub fn begin_openfan_poll(&self) -> u64 {
+        self.openfan_polls_started.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// The number of the newest OpenFan poll to have started. A reading whose
+    /// [`OpenFanState::poll_seq`] is greater came from a poll that started
+    /// after this call.
+    pub fn openfan_polls_started(&self) -> u64 {
+        self.openfan_polls_started.load(Ordering::SeqCst)
     }
 
     /// How old a CPU temperature reading may be before the safety rule must
@@ -958,6 +991,7 @@ impl StateCache {
                     last_commanded_pwm: Some(pwm),
                     updated_at: now,
                     rpm_polled: false,
+                    poll_seq: 0,
                 },
             );
         }
@@ -1374,6 +1408,7 @@ mod tests {
             last_commanded_pwm: None,
             updated_at: Instant::now(),
             rpm_polled: true,
+            poll_seq: 0,
         }
     }
 

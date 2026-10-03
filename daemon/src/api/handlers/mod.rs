@@ -1423,6 +1423,7 @@ mod tests {
                 last_commanded_pwm: Some(70),
                 updated_at: Instant::now(),
                 rpm_polled: false,
+                poll_seq: 0,
             },
         );
         state.openfan_fans.insert(
@@ -1433,6 +1434,7 @@ mod tests {
                 last_commanded_pwm: Some(70),
                 updated_at: Instant::now(),
                 rpm_polled: true,
+                poll_seq: 0,
             },
         );
 
@@ -1617,6 +1619,7 @@ mod tests {
                 last_commanded_pwm: Some(50),
                 updated_at: now,
                 rpm_polled: true,
+                poll_seq: 0,
             },
         );
         state.gpu_fans.insert(
