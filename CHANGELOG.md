@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **A SIGHUP reload that cannot read `runtime.toml` no longer resets the live settings.** It used to
+  drop an exit minimum, coolant limit or profile search directories set there back to `daemon.toml`'s;
+  it now keeps the running values, as it always kept header roles, and still reports
+  `runtime_config_degraded` with `phase: "reload"` (`DC-cu`).
+- **A stop that follows a SIGHUP applies the exit minimum the reload set.** A reload still waiting
+  behind a settings write is now drained, within 3 s of the stop starting, before the stop reads the
+  exit minimum, and a SIGHUP that arrives together with the stop signal is no longer lost to it
+  (`TS-bf`). The unit's stop-window arithmetic is recounted (six drains, not four; `TimeoutStopSec=40`
+  still covers it).
+
 ## [3.6.0] — 2026-10-03
 
 Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor. GUI 3.6.0 shows the floor an

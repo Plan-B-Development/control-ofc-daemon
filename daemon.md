@@ -791,7 +791,8 @@ Configuration lives in two files (see `docs/ADRs/002-runtime-config-split.md`):
 
 On startup the daemon loads `daemon.toml`, then overlays `runtime.toml` on
 top; runtime values win. SIGHUP (`systemctl reload`) re-reads both and re-applies
-the overlay, committing the profile search dirs and the exit floor (below).
+the overlay, committing the profile search dirs, the exit floor and the coolant
+limit (below) — or, when `runtime.toml` cannot be read, nothing (`DC-cu`).
 
 Other paths:
 
@@ -824,7 +825,7 @@ surfaces it only via an `info` log at startup (`main.rs::apply_runtime_overlay`)
   write would make that loss permanent. Unknown sections are skipped; each
   section keeps `deny_unknown_fields`, so a typo inside a known section still
   fails loudly.
-- **Only `profiles.search_dirs` and `shutdown.exit_floor_pct` are re-applied live** (by their own POST handlers and on SIGHUP) — so `GET /config` reports them `requires_restart: false` and reads their running values from the live lock and the cache, not the startup snapshot. A SIGHUP reload runs under `config_write`, the lock every setter holds (DEC-412, `TS-aq`), in a task of its own so a setter's fsync cannot delay SIGTERM; before 2.55.0 a reload that read the files before a concurrent setter wrote them applied the stale value after it. Everything else
+- **Only `profiles.search_dirs`, `shutdown.exit_floor_pct` and `safety.coolant_limit_c` are re-applied live** (by their own POST handlers and on SIGHUP) — so `GET /config` reports them `requires_restart: false` and reads their running values from the live lock and the cache, not the startup snapshot. A SIGHUP reload runs under `config_write`, the lock every setter holds (DEC-412, `TS-aq`), in a task of its own so a setter's fsync cannot delay SIGTERM, and the stop drains a reload still running — or a SIGHUP that arrived with the stop signal — before it reads the exit floor (`TS-bf`, within 3 s of the stop starting); before 2.55.0 a reload that read the files before a concurrent setter wrote them applied the stale value after it. Everything else
   is consumed once at process start, so the setters report "takes effect on next
   daemon restart" and `GET /config` exposes `restart_pending` per key by
   comparing the on-disk effective value against `AppState::running_config`.
@@ -1027,9 +1028,9 @@ its pump-safe identify, and until this field the entire notification was one
 `unreadable` (I/O error, or over the 4 MiB read cap) or `malformed` (read, but
 not valid TOML for this daemon version); `phase` is `startup`, `reload` or
 `update` and says what the degradation cost, since a startup load seeds every
-key while a SIGHUP reload commits only `profile_search_dirs` and the exit floor
-(DEC-388) — so a failed reload keeps every header role, but an exit floor set in
-`runtime.toml` falls back to `daemon.toml`'s. `update` (2.51.0,
+key, while a failed SIGHUP reload commits nothing — the running header roles,
+`profile_search_dirs`, exit floor (DEC-388) and coolant limit (DEC-443) all stay
+as they were until the next good load (`DC-cu`). `update` (2.51.0,
 `TS-r`) is a `/config/*` setter that found the file unreadable:
 `RuntimeConfig::load_for_update` hard-links the original to
 `runtime.toml.invalid-<unix-ts>` and atomically replaces it with the header roles

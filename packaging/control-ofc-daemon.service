@@ -132,8 +132,10 @@ RestartMaxDelaySec=60
 
 # Defence in depth — NOT the mechanism that bounds shutdown (273-b).
 # The daemon bounds most of its own teardown: `shutdown_sequence` allows 3 s per
-# task (IPC server + up to three poll/engine tasks) and the runtime teardown adds
-# at most RUNTIME_SHUTDOWN_TIMEOUT (2 s). Those parts total ~14 s.
+# drain (the IPC server + up to five poll/engine/recorder/adoption tasks) and the
+# runtime teardown adds at most RUNTIME_SHUTDOWN_TIMEOUT (2 s). Those parts total
+# ~20 s. The SIGHUP reloads still running at the stop (TS-bf) are drained too,
+# but bounded from the stop's start, so they overlap the drains and add nothing.
 #
 # Since 2.21.1 the restore is bounded too (277-b), in BOTH halves: it reads the
 # hand-back ledger — which headers the daemon holds, and what each gets back
@@ -177,27 +179,29 @@ RestartMaxDelaySec=60
 # fall — but this is not a full hand-back and must not be read as one.
 #
 # The number is DERIVED, not picked. An ordinary (non-wedged) stop costs up to
-# SHUTDOWN_TASK_TIMEOUT (3 s) per sequential task drain — four of them — plus
-# RUNTIME_SHUTDOWN_TIMEOUT (2 s): ~14 s worst case. The uncontended restore adds
+# SHUTDOWN_TASK_TIMEOUT (3 s) per sequential task drain — six of them: the IPC
+# server, hwmon-poll, the engine, validation-recorder, and either openfan-poll or
+# (no controller at boot) post-boot adoption plus the adopted poll loop — plus
+# RUNTIME_SHUTDOWN_TIMEOUT (2 s): ~20 s worst case. (Until TS-bf this said four
+# drains and ~14 s, missing validation-recorder and post-boot adoption.) The uncontended restore adds
 # nothing measurable — an uncontended `try_lock_for` returns immediately and the
 # writes complete — while a fully wedged machine adds at most 3 s for each exit
 # floor step (DEC-388: OpenFan, then hwmon), 3 s for the GPU curve reset (278-c),
-# 3 s for the hwmon lock and 3 s for the hwmon writes: ~29 s in the worst case.
+# 3 s for the hwmon lock and 3 s for the hwmon writes: ~35 s in the worst case.
 # (It was ~23 s before DEC-388 added the two exit-floor steps, and ~20 s before
 # 2.22.0 bounded the GPU step — that step was previously unbounded, so the old
 # figure described a case that could not actually be exceeded because it could
 # not actually terminate.) At 29 s against the old 30 s a loaded machine whose
 # drains each run near their cap would trip SIGKILL on a routine `systemctl
 # restart` — not a fault, but it WOULD make a genuine wedge look routine in the
-# journal. 40 s restores a real margin, 11 s over the new worst case (DEC-388).
+# journal. 40 s keeps a 5 s margin over the recounted worst case (TS-bf); grow
+# it with the next drain or restore step.
 #
-# The drain count stays at four despite 277-c adding rescan-adopted OpenFan poll
-# loops to that same list, and this is worth stating because it looks like it
-# should grow: adoption is guarded by `slot.is_none()` and nothing ever clears
-# the slot, so at most ONE controller is ever adopted per process — and it can
-# only be adopted when boot found none, which is exactly when the boot-time
-# openfan-poll handle is absent. The adopted drain replaces that budget line, it
-# does not add to it.
+# 277-c's rescan-adopted OpenFan poll loops do not grow the count past one:
+# adoption is guarded by `slot.is_none()` and nothing ever clears the slot, so at
+# most ONE controller is ever adopted per process — and it can only be adopted
+# when boot found none, which is exactly when the boot-time openfan-poll handle is
+# absent. The adopted drain replaces that budget line, it does not add to it.
 #
 # Raise this if the drain budget above ever grows. Lowering it is now a smaller
 # question than it was: with the restore bounded, SIGKILL is no longer what ends

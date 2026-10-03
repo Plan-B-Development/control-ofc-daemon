@@ -643,7 +643,7 @@ Configuration is split between two files (see `docs/ADRs/002-runtime-config-spli
 
   **Do not delete this file or edit it by hand.** Back it up with `daemon.toml` — a restore that copies only `daemon.toml` loses your pump roles.
 
-On startup the daemon loads `daemon.toml`, then overlays `runtime.toml` on top (runtime values win). `SIGHUP` / `systemctl reload` re-reads both files, but only the **profile search directories** and the **exit minimum** are applied live — changes to the startup delay, serial port, polling interval, or socket path are read but take effect only on the next restart.
+On startup the daemon loads `daemon.toml`, then overlays `runtime.toml` on top (runtime values win). `SIGHUP` / `systemctl reload` re-reads both files, but only the **profile search directories**, the **exit minimum** and the **coolant limit** are applied live — changes to the startup delay, serial port, polling interval, or socket path are read but take effect only on the next restart.
 
 ### When `runtime.toml` cannot be read
 
@@ -652,7 +652,7 @@ The daemon still starts — a damaged settings file must never leave the fans wi
 | `phase` | What happened | What to do |
 |---|---|---|
 | `startup` | The file could not be read at start. Every setting in it, header roles included, is **not in effect**. | Repair the file (or restore it from a backup), then restart the daemon. Saving a setting does not bring the old ones back. If the record also carries `kept_as`, a setting was saved since: the file at `path` is now a new one with no roles, and your old settings are only in the `kept_as` copy — stop the daemon, repair that copy and move it back over `path`, then start it. |
-| `reload` | A `SIGHUP` reload could not read it. Header roles and every restart-only setting are kept, but the two live settings fall back to `daemon.toml`'s: the profile search directories set through the API and the exit minimum. | Repair the file, then reload or restart. |
+| `reload` | A `SIGHUP` reload could not read it. Nothing changes: header roles, the profile search directories, the exit minimum and the coolant limit keep the values the daemon was running with, and an edit to them in either file waits for a reload that can read it. | Repair the file, then reload or restart. |
 | `update` | A setting was saved while the file could not be read. The daemon kept the original as `runtime.toml.invalid-<unix-time>` beside it and replaced it with a new file carrying **the header roles and cooling devices it is running with**, plus the new setting. | Copy any other setting you need back from the `.invalid-` copy, then restart the daemon. |
 
 `reason` is `unreadable` (an I/O error, or a file over 4 MiB) or `malformed` (read, but not valid for this daemon version). The daemon's full error is in `journalctl -u control-ofc-daemon`. A **missing** file is not a failure: that is a first boot.

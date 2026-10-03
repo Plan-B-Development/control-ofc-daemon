@@ -198,6 +198,19 @@ async fn wait_for_stop(
         }
     }
 
+    // `TS-bf`: the same race for a reload. `select!` picks among ready arms at
+    // random, so a SIGHUP delivered with the stop's signal — `systemctl reload`
+    // does not wait, so a stop can follow at once — can lose to it and never be
+    // handled, and the stop would apply the exit floor it was replacing. Take a
+    // SIGHUP that is already pending; the stop then drains the reload it spawns.
+    if let Some(hup) = sighup.as_mut() {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        if let std::task::Poll::Ready(Some(())) = hup.poll_recv(&mut cx) {
+            log::info!("Received SIGHUP with the stop — reloading config first");
+            on_reload();
+        }
+    }
+
     // DEC-269: checked UNCONDITIONALLY, not behind `must_restart`. See the doc
     // comment — gating it there silently lost the restart DEC-266 exists to
     // produce whenever another arm won the race.
@@ -875,23 +888,22 @@ fn apply_config_reload(
 ) -> Result<Vec<std::path::PathBuf>, String> {
     let mut new_config =
         DaemonConfig::load(config_path).map_err(|e| format!("config reload failed: {e}"))?;
-    // `AUD3-m`: a reload that cannot parse `runtime.toml` re-applies DEFAULTS to
-    // the running config, exactly as the boot load does. Narrower in effect —
-    // only `profile_search_dirs`, the exit floor (DEC-388) and the coolant
-    // limit (DEC-443) are committed below, so header roles keep whatever boot
-    // established, while an exit floor or coolant limit set in `runtime.toml`
-    // falls back to `daemon.toml`'s — but it is the
-    // same silent degradation on the same surface, so it is reported rather
-    // than left in the journal.
+    // `AUD3-m`: a reload that cannot parse `runtime.toml` is reported rather
+    // than left in the journal, on the same surface as a failed boot load.
+    // Since `DC-cu` (the user's decision `U7`) it then commits NOTHING: the
+    // running `profile_search_dirs`, exit floor (DEC-388) and coolant limit
+    // (DEC-443) stay last-known-good, as boot's header roles always have,
+    // rather than falling back to `daemon.toml`'s over a value the user set in
+    // `runtime.toml`. A missing file is not a failure — no runtime keys — so a
+    // deleted `runtime.toml` still hands these back to `daemon.toml`.
     //
     // [SAFETY] `WIRE-ao`: **most-severe wins, not latest-wins.** This used to
     // overwrite the slot unconditionally, and the two phases do not cost the
     // same. A `startup` degradation drops every `header_roles` assignment — on a
     // board with no `pwmN_label` files that is the only evidence a header drives
     // a pump, so its 30% floor, stop exemption and pump-safe identify are all
-    // gone. A `reload` degradation drops no role (only a runtime-set exit
-    // floor or coolant limit, above): boot's roles are still in force. Letting the cheaper
-    // record overwrite the expensive one made
+    // gone. A `reload` degradation drops nothing (above): boot's roles are
+    // still in force. Letting the cheaper record overwrite the expensive one made
     // `phase` under-report, so a client reading `reload` would reassure the user
     // while a hand-assigned pump was unprotected — reachable by editing a broken
     // `runtime.toml` and sending SIGHUP. GUI v2.58.0 works around it by never
@@ -908,6 +920,12 @@ fn apply_config_reload(
         // Since `TS-r` the rule has a third phase (`update`, which also stands
         // against a reload) and a second writer, so it lives in one function.
         record_degraded(degraded, problem);
+        // `DC-cu`: last-known-good — see above. Nothing below has been written.
+        log::warn!(
+            "Config reload kept the running profile search dirs, exit floor and coolant \
+             limit: runtime.toml could not be read"
+        );
+        return Ok(profile_search_dirs.read().clone());
     }
     apply_runtime_overlay(&mut new_config, &new_runtime, config_path);
     let new_dirs = with_store_dir(
@@ -1744,6 +1762,51 @@ fn hand_back_hwmon(
         released: released.load(std::sync::atomic::Ordering::SeqCst),
         failed: failed.load(std::sync::atomic::Ordering::SeqCst),
     }
+}
+
+/// `TS-bf`: one drain entry for the SIGHUP reloads still running at the stop,
+/// or `None` when there are none.
+///
+/// DEC-412 spawned the reload so a setter's fsync on `config_write` cannot delay
+/// SIGTERM, which made it possible for a SIGHUP sent just before a stop to be
+/// still queued on that lock when the restore reads the exit floor — the stop
+/// then applied the floor the reload was about to replace, where an inline
+/// reload always finished first. Joining them in `shutdown_sequence`'s drain
+/// list restores that order. A reload that does not finish in time is left
+/// running and the stop goes on with the floor in force, which is the user's
+/// own value either way (`TS-aq`'s rule).
+///
+/// The `bound` runs from THIS call, at the start of the stop, not from the
+/// entry's turn in the sequential drain: the reloads run alongside the drains
+/// before them, so a reload stuck behind the same wedged setter that holds the
+/// IPC server's drain open costs no second wait — the entry ends within `bound`
+/// of the stop starting, and adds nothing to the stop window once the drains
+/// ahead of it have taken that long. One entry, not one per reload: they
+/// serialise on `config_write`.
+fn pending_reload_drain(
+    pending: Vec<tokio::task::JoinHandle<()>>,
+    bound: Duration,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let pending: Vec<_> = pending.into_iter().filter(|h| !h.is_finished()).collect();
+    if pending.is_empty() {
+        return None;
+    }
+    let deadline = tokio::time::Instant::now() + bound;
+    Some(tokio::spawn(async move {
+        let joined = tokio::time::timeout_at(deadline, async {
+            for reload in pending {
+                let _ = reload.await;
+            }
+        })
+        .await;
+        if joined.is_err() {
+            log::warn!(
+                "A SIGHUP reload did not finish within {}s of the stop — stopping with the \
+                 exit floor already in force",
+                bound.as_secs()
+            );
+        }
+    }))
 }
 
 /// Ordered graceful shutdown (DEC-146 P3-9 + audit P1-A).
@@ -2923,6 +2986,8 @@ async fn async_main(cli: CliOptions) {
     // function without ended — the profile engine (sole PWM writer) or the hwmon
     // poll loop (sole writer of the sensor map the thermal-emergency rule reads). Drives a
     // non-zero exit AFTER the ordered restore has run, so systemd restarts us.
+    // `TS-bf`: every SIGHUP reload still running, drained by the stop below.
+    let mut pending_reloads: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let stop = {
         use tokio::signal::unix::SignalKind;
 
@@ -2970,10 +3035,13 @@ async fn async_main(cli: CliOptions) {
             // before a concurrent setter writes them and apply the stale value
             // after it. Spawned, never awaited here: a setter holds that lock
             // across an fsync, and this loop is also the one that hears SIGTERM.
+            // `TS-bf`: the handle is kept, and the stop drains it before the
+            // exit floor is read — see `pending_reload_drain`.
             || {
                 let config_path = config_path.clone();
                 let runtime_config_path = runtime_config_path.clone();
-                tokio::spawn(config::reload_under_config_write(
+                pending_reloads.retain(|h| !h.is_finished());
+                pending_reloads.push(tokio::spawn(config::reload_under_config_write(
                     app_state.clone(),
                     move |s| {
                         apply_config_reload(
@@ -2985,7 +3053,7 @@ async fn async_main(cli: CliOptions) {
                         )
                         .map(|_| ())
                     },
-                ));
+                )));
             },
         )
         .await
@@ -3028,6 +3096,12 @@ async fn async_main(cli: CliOptions) {
             .close_and_drain()
             .into_iter()
             .map(|h| ("openfan-poll (adopted)", h)),
+    );
+    // `TS-bf`: last, so the drains above have given any pending reload time too,
+    // and after the IPC server's stop (`shutdown_sequence` does that first), so no
+    // new setter can queue on `config_write` ahead of a reload still waiting.
+    task_handles.extend(
+        pending_reload_drain(pending_reloads, SHUTDOWN_TASK_TIMEOUT).map(|h| ("sighup-reload", h)),
     );
 
     finish_shutdown(
@@ -3718,7 +3792,7 @@ mod tests {
     }
 
     /// [SAFETY] The ordinary stop window must cover the bounded stop's worst
-    /// case, as the unit's `TimeoutStopSec` comment derives it: four task drains
+    /// case, as the unit's `TimeoutStopSec` comment derives it: six task drains
     /// and the runtime teardown, plus every restore step at its deadline — the two
     /// exit-floor steps (DEC-388), the GPU reset, the hwmon lock and its writes.
     /// DEC-388's two steps took the old 30 s to within 1 s of that; this fails
@@ -3738,7 +3812,11 @@ mod tests {
             .expect("the unit sets TimeoutStopSec")
             .parse()
             .expect("TimeoutStopSec is a bare number of seconds");
-        let drains = SHUTDOWN_TASK_TIMEOUT * 4 + RUNTIME_SHUTDOWN_TIMEOUT;
+        // Six sequential drains at most: the IPC server, hwmon-poll, the engine,
+        // validation-recorder, and either openfan-poll or (no controller at
+        // boot) post-boot adoption plus the adopted poll loop. `TS-bf`'s reload
+        // drain is bounded from the stop's start, so it overlaps these.
+        let drains = SHUTDOWN_TASK_TIMEOUT * 6 + RUNTIME_SHUTDOWN_TIMEOUT;
         let restore = SHUTDOWN_TASK_TIMEOUT * 5;
         assert!(
             Duration::from_secs(stop) > drains + restore,
@@ -4546,6 +4624,169 @@ mod tests {
             vec!["server_stopped", "after_server_stop", "hardware_restored"],
             "the IPC server must stop before hardware is restored to auto"
         );
+    }
+
+    /// `TS-bf`: a SIGHUP reload still queued on `config_write` when the stop
+    /// begins — behind a setter's fsync — is drained before the restore reads the
+    /// exit floor, so the stop applies the floor the user reloaded, not the one
+    /// it replaced. The precondition pins that the reload really was waiting.
+    #[tokio::test]
+    async fn the_stop_drains_a_pending_reload_before_reading_the_exit_floor() {
+        let cache = Arc::new(StateCache::new());
+        cache.set_exit_floor_pct(30);
+        let config_write = Arc::new(tokio::sync::Mutex::new(()));
+        let setter = Arc::clone(&config_write).lock_owned().await;
+
+        let (lock, reloaded) = (Arc::clone(&config_write), Arc::clone(&cache));
+        let reload = tokio::spawn(async move {
+            let _guard = lock.lock().await;
+            reloaded.set_exit_floor_pct(70);
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !reload.is_finished() && cache.exit_floor_pct() == 30,
+            "precondition: the reload is queued behind the setter"
+        );
+        // The setter's fsync ends while the stop is under way.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(setter);
+        });
+
+        let drain = pending_reload_drain(vec![reload], Duration::from_secs(3))
+            .expect("a pending reload is drained");
+        let (poll_tx, _poll_rx) = tokio::sync::watch::channel(false);
+        let (server_tx, server_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_handle = tokio::spawn(async move {
+            let _ = server_rx.await;
+        });
+        let floor_read = Arc::new(Mutex::new(None));
+        let (read, at_stop) = (Arc::clone(&floor_read), Arc::clone(&cache));
+        shutdown_sequence(
+            &poll_tx,
+            server_tx,
+            server_handle,
+            vec![("sighup-reload", drain)],
+            Duration::from_secs(3),
+            || {},
+            move || *read.lock().unwrap() = Some(at_stop.exit_floor_pct()),
+        )
+        .await;
+
+        assert_eq!(
+            *floor_read.lock().unwrap(),
+            Some(70),
+            "the restore read the exit floor before the pending reload applied"
+        );
+    }
+
+    /// `TS-bf`: no drain entry when no reload is running, so an ordinary stop
+    /// pays nothing for it.
+    #[tokio::test]
+    async fn no_reload_drain_without_a_pending_reload() {
+        assert!(pending_reload_drain(Vec::new(), Duration::from_secs(3)).is_none());
+        let done = tokio::spawn(async {});
+        while !done.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        assert!(pending_reload_drain(vec![done], Duration::from_secs(3)).is_none());
+    }
+
+    /// `TS-bf`: the reload drain's bound runs from the stop's start. A reload
+    /// stuck behind a setter that never lets go, with the drains ahead of it
+    /// having already used the bound, ends at once instead of waiting it again.
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_reload_costs_no_second_drain() {
+        let config_write = Arc::new(tokio::sync::Mutex::new(()));
+        let _setter = Arc::clone(&config_write).lock_owned().await;
+        let lock = Arc::clone(&config_write);
+        let reload = tokio::spawn(async move {
+            let _guard = lock.lock().await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!reload.is_finished(), "precondition: the reload is stuck");
+
+        let bound = Duration::from_secs(3);
+        let drain = pending_reload_drain(vec![reload], bound).expect("a pending reload");
+        // The IPC server's drain, timing out on the same wedged setter.
+        tokio::time::sleep(bound).await;
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(bound, drain)
+            .await
+            .expect("the reload drain ends at its deadline")
+            .expect("the drain task did not panic");
+        assert!(
+            started.elapsed() < bound,
+            "the reload drain waited a second bound: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// `TS-bf`: a SIGHUP delivered together with the stop's signal is reloaded
+    /// before the stop, whichever arm `select!` picks. Both are raised before
+    /// the loop polls, so each round has the race the sweep exists for; with the
+    /// sweep removed about half the rounds lose the reload.
+    #[tokio::test]
+    async fn a_sighup_pending_with_the_stop_is_reloaded() {
+        use tokio::signal::unix::{signal, SignalKind};
+        for round in 0..16 {
+            let sighup = signal(SignalKind::hangup()).expect("SIGHUP must be registerable");
+            let sigterm = signal(SignalKind::terminate()).expect("SIGTERM must be registerable");
+            // SAFETY: `raise` is async-signal-safe; both signals have a tokio
+            // handler installed above, so neither takes its default action.
+            unsafe {
+                libc::raise(libc::SIGHUP);
+                libc::raise(libc::SIGTERM);
+            }
+            // Let the signal driver record both before the loop's first poll.
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            let (_ipc_tx, ipc_rx) = tokio::sync::oneshot::channel::<String>();
+            let (_engine_tx, engine_rx) = tokio::sync::oneshot::channel::<()>();
+            let (_hw_tx, hw_rx) = tokio::sync::oneshot::channel::<()>();
+            let mut reloads = 0;
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(5),
+                wait_for_stop(
+                    Some(sighup),
+                    Some(sigterm),
+                    ipc_rx,
+                    engine_rx,
+                    hw_rx,
+                    || reloads += 1,
+                ),
+            )
+            .await
+            .expect("the stop's signal must end the loop");
+            assert!(matches!(outcome.reason, StopReason::Signal("SIGTERM")));
+            assert!(
+                reloads >= 1,
+                "round {round}: the SIGHUP was lost to the stop"
+            );
+        }
+    }
+
+    /// `TS-bf`, at the call site: the SIGHUP closure keeps each reload's handle,
+    /// and the stop hands them to `shutdown_sequence`'s drain list before
+    /// `finish_shutdown`. Matched on the code lines, which no comment repeats.
+    #[test]
+    fn the_stop_drains_the_sighup_reloads() {
+        let whole = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let src = whole
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .expect("main.rs has a #[cfg(test)] module");
+        let pos = |needle: &str| {
+            src.find(needle)
+                .unwrap_or_else(|| panic!("main.rs no longer has `{needle}`"))
+        };
+        let kept = pos("pending_reloads.push(tokio::spawn(config::reload_under_config_write(");
+        let drained = pos(
+            "pending_reload_drain(pending_reloads, SHUTDOWN_TASK_TIMEOUT).map(|h| (\"sighup-reload\", h)),",
+        );
+        let stop = pos("    finish_shutdown(\n");
+        assert!(kept < drained && drained < stop);
     }
 
     #[tokio::test]
@@ -5926,6 +6167,66 @@ mod tests {
              holds it across an uncancellable sysfs write, and every backstop for \
              a stall here runs after it"
         );
+    }
+
+    /// `DC-cu` (`U7`): a reload that cannot read `runtime.toml` keeps the running
+    /// search dirs, exit floor and coolant limit — last-known-good, as it keeps
+    /// header roles — instead of falling back to `daemon.toml`'s. `daemon.toml`
+    /// sets a different value for each, so a fallback cannot pass by coincidence;
+    /// the reload still succeeds and is still reported.
+    #[test]
+    fn a_failed_reload_keeps_the_running_live_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("daemon.toml");
+        std::fs::write(
+            &config_path,
+            "[profiles]\nsearch_dirs = [\"/admin/profiles\"]\n\
+             [shutdown]\nexit_floor_pct = 40\n[safety]\ncoolant_limit_c = 45\n",
+        )
+        .unwrap();
+        let runtime_path = tmp.path().join("runtime.toml");
+        std::fs::write(&runtime_path, "[shutdown]\nexit_floor_pct = 65\n[garbage\n").unwrap();
+
+        let running_dirs = vec![PathBuf::from("/running/profiles")];
+        let search_dirs = parking_lot::RwLock::new(running_dirs.clone());
+        let degraded = parking_lot::RwLock::new(None);
+        let cache = StateCache::new();
+        cache.set_exit_floor_pct(65);
+        cache.set_coolant_limit_c(55);
+
+        let returned = apply_config_reload(
+            config_path.to_str().unwrap(),
+            &runtime_path,
+            &search_dirs,
+            &degraded,
+            &cache,
+        )
+        .expect("a corrupt runtime.toml must not fail the reload");
+
+        assert_eq!(*search_dirs.read(), running_dirs);
+        assert_eq!(returned, running_dirs);
+        assert_eq!(cache.exit_floor_pct(), 65);
+        assert_eq!(cache.coolant_limit_c(), 55);
+        assert_eq!(
+            degraded.read().as_ref().map(|d| d.phase.clone()),
+            Some("reload".to_string()),
+            "the failed reload is still reported"
+        );
+
+        // The other branch: once the file reads again, `daemon.toml` and the
+        // overlay apply as before — the keep is tied to the failure.
+        std::fs::remove_file(&runtime_path).unwrap();
+        apply_config_reload(
+            config_path.to_str().unwrap(),
+            &runtime_path,
+            &search_dirs,
+            &degraded,
+            &cache,
+        )
+        .unwrap();
+        assert_eq!(cache.exit_floor_pct(), 40);
+        assert_eq!(cache.coolant_limit_c(), 45);
+        assert_eq!(search_dirs.read()[1..], [PathBuf::from("/admin/profiles")]);
     }
 
     #[test]

@@ -255,8 +255,8 @@ impl LoadPhase {
     /// How much a degradation in this phase costs, for [`record_degraded`]'s
     /// most-severe-wins rule. `startup` drops every header role; `update`
     /// replaced the file, so settings that were only in it are gone from the
-    /// next boot; `reload` drops no header role (only an exit floor set in this
-    /// file, which falls back to `daemon.toml`'s until the next good load).
+    /// next boot; `reload` drops nothing — the reload keeps every running value
+    /// until the next good load (`DC-cu`).
     fn severity(phase: &str) -> u8 {
         match phase {
             "startup" => 3,
