@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- **`runtime_config_degraded.kept_as` names the kept copy of an unreadable `runtime.toml`.** A setter
+  that quarantines the file reports where the original went, and a standing `startup` record takes the
+  first such name. Before this, after a failed start the first setter replaced the file with one holding
+  no header roles, the `startup` record's `path` then named that healthy file, and a restart cleared the
+  record with every assigned pump role still only in the `.invalid-` copy. Additive; omitted until a copy
+  is kept.
+
 ## [3.5.0] — 2026-10-03
 
 Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor. GUI 3.5.0 offers **Set role…** on

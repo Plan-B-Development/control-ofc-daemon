@@ -277,6 +277,17 @@ impl LoadPhase {
 /// the file was replaced. Latest-wins is kept *within* a phase, so a repeat
 /// failure still refreshes `detail`.
 ///
+/// **A standing record learns where its file went (`TS-at`).** After a failed
+/// boot the live maps are empty, so the first setter keeps the unreadable file
+/// as `runtime.toml.invalid-<ts>` and replaces it with one holding no roles. The
+/// `startup` record correctly stands — but its `path` now names that healthy
+/// replacement, and the roles the boot could not read sit only in the kept copy,
+/// lost for good at the next clean restart unless someone copies them back. So a
+/// less severe record that kept a copy hands its `kept_as` to the standing
+/// record. The **first** copy wins: it holds the file that failed at boot, which
+/// is what a `startup` record is about; a later quarantine can only have kept a
+/// file the daemon wrote since.
+///
 /// The one place this rule lives. `apply_config_reload` and the `/config/*`
 /// setters both write the slot through here.
 pub fn record_degraded(
@@ -284,11 +295,15 @@ pub fn record_degraded(
     problem: RuntimeConfigDegraded,
 ) {
     let mut slot = slot.write();
-    let existing_is_worse = slot.as_ref().is_some_and(|existing| {
-        LoadPhase::severity(&existing.phase) > LoadPhase::severity(&problem.phase)
-    });
-    if !existing_is_worse {
-        *slot = Some(problem);
+    match slot.as_mut() {
+        Some(existing)
+            if LoadPhase::severity(&existing.phase) > LoadPhase::severity(&problem.phase) =>
+        {
+            if existing.kept_as.is_none() {
+                existing.kept_as = problem.kept_as;
+            }
+        }
+        _ => *slot = Some(problem),
     }
 }
 
@@ -326,6 +341,14 @@ pub struct RuntimeConfigDegraded {
     /// what each one costs. A `startup` degradation is the one that drops header
     /// roles.
     pub phase: String,
+    /// Where a `/config/*` setter kept the unreadable original
+    /// (`runtime.toml.invalid-<unix-ts>`) before replacing `path` (DEC-255,
+    /// `TS-r`). Set on an `update` record, and carried onto a standing `startup`
+    /// record by [`record_degraded`] (`TS-at`): once it is set, `path` holds a
+    /// file the daemon wrote, and this is the one to repair. Omitted when nothing
+    /// was kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kept_as: Option<String>,
 }
 
 impl RuntimeConfig {
@@ -390,6 +413,7 @@ impl RuntimeConfig {
                 path: path.display().to_string(),
                 detail,
                 phase: phase.as_str().to_string(),
+                kept_as: None,
             }),
         )
     }
@@ -523,6 +547,7 @@ impl RuntimeConfig {
                 path: path.display().to_string(),
                 detail,
                 phase: LoadPhase::Update.as_str().to_string(),
+                kept_as: Some(quarantined.display().to_string()),
             }),
         ))
     }
@@ -1435,6 +1460,11 @@ mod tests {
             original,
             "the user's bytes must survive verbatim"
         );
+        // `TS-at`: the record names that copy, not some other `.invalid-` name.
+        assert_eq!(
+            degraded.kept_as,
+            Some(quarantined[0].path().display().to_string())
+        );
     }
 
     #[test]
@@ -1647,6 +1677,7 @@ mod tests {
             path: "/x/runtime.toml".into(),
             detail: detail.into(),
             phase: phase.into(),
+            kept_as: None,
         }
     }
 
@@ -1685,6 +1716,68 @@ mod tests {
                 "a repeat `{lower}` failure refreshes `detail`"
             );
         }
+    }
+
+    fn kept(phase: &str, detail: &str, kept_as: &str) -> RuntimeConfigDegraded {
+        RuntimeConfigDegraded {
+            kept_as: Some(kept_as.into()),
+            ..degraded(phase, detail)
+        }
+    }
+
+    #[test]
+    fn a_standing_startup_record_learns_where_its_file_was_kept() {
+        // [SAFETY] `TS-at`. After a failed boot the first setter keeps the
+        // unreadable file aside and writes one with no roles; the `startup`
+        // record stands, so without this its `path` names the healthy
+        // replacement and the boot's roles are lost at the next clean restart.
+        let slot = parking_lot::RwLock::new(None);
+        record_degraded(&slot, degraded("startup", "boot"));
+        record_degraded(&slot, kept("update", "setter", "/x/runtime.toml.invalid-1"));
+        let d = slot.read().clone().unwrap();
+        assert_eq!((d.phase.as_str(), d.detail.as_str()), ("startup", "boot"));
+        assert_eq!(d.kept_as.as_deref(), Some("/x/runtime.toml.invalid-1"));
+
+        // The FIRST copy holds the file that failed at boot; a later quarantine
+        // can only have kept a file the daemon wrote since.
+        record_degraded(&slot, kept("update", "again", "/x/runtime.toml.invalid-2"));
+        assert_eq!(
+            slot.read().as_ref().unwrap().kept_as.as_deref(),
+            Some("/x/runtime.toml.invalid-1")
+        );
+        // A reload carries no copy and must not erase the one recorded.
+        record_degraded(&slot, degraded("reload", "sighup"));
+        assert_eq!(
+            slot.read().as_ref().unwrap().kept_as.as_deref(),
+            Some("/x/runtime.toml.invalid-1")
+        );
+    }
+
+    #[test]
+    fn a_record_that_replaces_another_brings_its_own_kept_copy() {
+        // Within a phase and upward, latest-wins replaces the whole record: an
+        // `update` over a `reload` names its own copy, and a repeat `update`
+        // names the newest, the one its `detail` describes.
+        let slot = parking_lot::RwLock::new(None);
+        record_degraded(&slot, degraded("reload", "sighup"));
+        record_degraded(&slot, kept("update", "a", "/x/runtime.toml.invalid-1"));
+        record_degraded(&slot, kept("update", "b", "/x/runtime.toml.invalid-2"));
+        let d = slot.read().clone().unwrap();
+        assert_eq!(
+            (d.detail.as_str(), d.kept_as.as_deref()),
+            ("b", Some("/x/runtime.toml.invalid-2"))
+        );
+        // A `startup` record is never a copy: it replaces an `update` whole.
+        record_degraded(&slot, degraded("startup", "boot"));
+        assert_eq!(slot.read().as_ref().unwrap().kept_as, None);
+    }
+
+    #[test]
+    fn kept_as_is_omitted_from_the_wire_until_something_was_kept() {
+        let json = serde_json::to_value(degraded("startup", "boot")).unwrap();
+        assert!(json.get("kept_as").is_none(), "{json}");
+        let json = serde_json::to_value(kept("update", "s", "/x/k")).unwrap();
+        assert_eq!(json["kept_as"], "/x/k");
     }
 
     // ── AIO-MB Phase 4 (DEC-316): cooling-device topology ────────────────────

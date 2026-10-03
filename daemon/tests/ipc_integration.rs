@@ -2733,6 +2733,7 @@ async fn status_reports_a_runtime_config_that_failed_to_load() {
             path: "/var/lib/control-ofc/runtime.toml".into(),
             detail: "expected `]`".into(),
             phase: "startup".into(),
+            kept_as: None,
         }),
     ));
     let (path, shutdown, _dir) = start_test_server(state).await;
@@ -2825,6 +2826,15 @@ async fn a_role_set_over_an_unreadable_runtime_config_keeps_every_other_role() {
     let d = &json["runtime_config_degraded"];
     assert_eq!(d["phase"], "update", "{json}");
     assert_eq!(d["reason"], "malformed", "{json}");
+    // `TS-at`: it says where the original went, and that file holds it.
+    let kept = d["kept_as"]
+        .as_str()
+        .expect("an update names its kept copy");
+    assert_eq!(
+        std::fs::read_to_string(kept).unwrap(),
+        "[hardware\nheader_roles = {",
+        "{json}"
+    );
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
@@ -2875,6 +2885,70 @@ async fn a_refused_setter_over_an_unreadable_runtime_config_still_leaves_every_r
     let (status, json) = uds_get(&path, "/status").await;
     assert_eq!(status, 200);
     assert_eq!(json["runtime_config_degraded"]["phase"], "update", "{json}");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+    drop(tmp);
+}
+
+#[tokio::test]
+async fn a_setter_after_a_failed_boot_names_the_kept_copy_on_the_startup_record() {
+    // [SAFETY] `TS-at`, driven through the real route. A boot that could not read
+    // `runtime.toml` runs with NO header roles, so the first setter afterwards
+    // keeps the original aside and replaces it with a file carrying none. The
+    // `startup` record rightly stands — but its `path` then names that healthy,
+    // daemon-written replacement, and "repair the file and restart" sent the
+    // user to the wrong file: a restart loaded it cleanly and the roles stayed
+    // in the `.invalid-` copy for good. The standing record must name the copy.
+    let (mut state, tmp) = config_test_state_with_hwmon();
+    let rc = state.runtime_config_path.clone();
+    let original = "[hardware]\nheader_roles = { h1 = \"pump\" }\n[garbage\n";
+    std::fs::write(&rc, original).unwrap();
+    // What `main` records for that boot — through the real loader, so the
+    // record is the shape a failed boot really produces.
+    let (_, boot_problem) = control_ofc_daemon::runtime_config::RuntimeConfig::load_from_reporting(
+        &rc,
+        control_ofc_daemon::runtime_config::LoadPhase::Startup,
+    );
+    let boot_problem = boot_problem.expect("precondition: the boot load failed");
+    assert!(
+        boot_problem.kept_as.is_none(),
+        "precondition: nothing kept yet"
+    );
+    Arc::get_mut(&mut state).unwrap().runtime_config_degraded =
+        Arc::new(parking_lot::RwLock::new(Some(boot_problem)));
+    let (path, shutdown, _dir) = start_test_server(state).await;
+
+    let (status, json) = uds_post(
+        &path,
+        "/config/header-role",
+        &serde_json::json!({"header_id": "h2", "role": "radiator_fan"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{json}");
+
+    let (status, json) = uds_get(&path, "/status").await;
+    assert_eq!(status, 200);
+    let d = &json["runtime_config_degraded"];
+    assert_eq!(
+        d["phase"], "startup",
+        "the more severe record still stands: {json}"
+    );
+    let kept = d["kept_as"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the startup record must name the kept copy: {json}"));
+    assert_ne!(kept, d["path"].as_str().unwrap(), "{json}");
+    assert_eq!(
+        std::fs::read_to_string(kept).unwrap(),
+        original,
+        "kept_as must name the file holding what the boot could not read"
+    );
+    // ...and `path` really is the replacement now, which is why it needed saying.
+    let (_, problem) = control_ofc_daemon::runtime_config::RuntimeConfig::load_from_reporting(
+        &rc,
+        control_ofc_daemon::runtime_config::LoadPhase::Startup,
+    );
+    assert!(problem.is_none(), "the replacement loads cleanly");
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);

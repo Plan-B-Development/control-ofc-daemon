@@ -1018,7 +1018,7 @@ files a user's `pump` assignment is the only evidence a header drives a pump.
 A failed load therefore removes that header's 30% floor, its stop exemption and
 its pump-safe identify, and until this field the entire notification was one
 `warn!` in the journal: no endpoint reported it. `/status` + `/poll` now carry
-`runtime_config_degraded = {reason, path, detail, phase}` — `reason` is
+`runtime_config_degraded = {reason, path, detail, phase, kept_as?}` — `reason` is
 `unreadable` (I/O error, or over the 4 MiB read cap) or `malformed` (read, but
 not valid TOML for this daemon version); `phase` is `startup`, `reload` or
 `update` and says what the degradation cost, since a startup load seeds every
@@ -1036,7 +1036,12 @@ If the replacement cannot be written nothing on disk changes and the setter
 answers `503`. A setter that finds no file at all starts from the same live maps
 and publishes nothing. When several
 phases fail the more severe record stands — `startup` > `update` > `reload` —
-through the one function `runtime_config::record_degraded`. Additive and **omitted when
+through the one function `runtime_config::record_degraded`. `kept_as` (3.6.0,
+`TS-at`) names the `.invalid-` copy: an `update` record carries its own, and
+`record_degraded` hands it to a standing more severe record that has none — so a
+`startup` record whose file a later setter replaced says where the boot's roles
+went, instead of leaving `path` pointing at the healthy replacement. The first copy
+wins. Additive and **omitted when
 the config loaded cleanly**, so an older daemon's omission reads exactly as
 "fine" — which is the same (absent) warning such a daemon shows today. A
 *missing* file is not a degradation: that is first boot. The field is sticky for

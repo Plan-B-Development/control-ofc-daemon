@@ -106,7 +106,10 @@ _/var/lib/control-ofc/runtime.toml_
 	If a setting is saved while it is unreadable, the daemon keeps the
 	original as _runtime.toml.invalid-<timestamp>_ and writes a new file
 	carrying the header roles and cooling devices it is running with;
-	copy anything else you need back from the kept copy and restart.
+	copy anything else you need back from the kept copy and restart. If
+	the start itself had failed, the new file holds no roles either:
+	*runtime_config_degraded.kept_as* names the copy; stop the daemon,
+	repair it, move it back over *runtime.toml* and start the daemon.
 
 _/var/lib/control-ofc/daemon_state.json_
 	Persistent state: the profile last activated or deactivated through the

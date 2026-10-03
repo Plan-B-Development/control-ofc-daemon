@@ -6027,6 +6027,7 @@ search_dirs = ["/custom/profiles", "/other/profiles"]
             path: runtime_path.display().to_string(),
             detail: "expected `]`".into(),
             phase: "startup".into(),
+            kept_as: None,
         }));
 
         apply_config_reload(
@@ -6071,6 +6072,7 @@ search_dirs = ["/custom/profiles", "/other/profiles"]
             path: runtime_path.display().to_string(),
             detail: "THE STARTUP ERROR".into(),
             phase: "startup".into(),
+            kept_as: None,
         }));
 
         apply_config_reload(

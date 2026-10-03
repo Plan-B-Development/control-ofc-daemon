@@ -645,11 +645,11 @@ On startup the daemon loads `daemon.toml`, then overlays `runtime.toml` on top (
 
 ### When `runtime.toml` cannot be read
 
-The daemon still starts — a damaged settings file must never leave the fans with no controller — but it runs on **defaults, with no header roles**, so a pump you assigned by hand has no 30 % floor and can be stopped by fan identify. It says so on `GET /status` and `GET /poll` as `runtime_config_degraded = {reason, path, detail, phase}`, and the GUI shows a banner. `phase` says what the failure cost:
+The daemon still starts — a damaged settings file must never leave the fans with no controller — but it runs on **defaults, with no header roles**, so a pump you assigned by hand has no 30 % floor and can be stopped by fan identify. It says so on `GET /status` and `GET /poll` as `runtime_config_degraded = {reason, path, detail, phase, kept_as?}`, and the GUI shows a banner. `phase` says what the failure cost:
 
 | `phase` | What happened | What to do |
 |---|---|---|
-| `startup` | The file could not be read at start. Every setting in it, header roles included, is **not in effect**. | Repair the file (or restore it from a backup), then restart the daemon. Saving a setting does not bring the old ones back. |
+| `startup` | The file could not be read at start. Every setting in it, header roles included, is **not in effect**. | Repair the file (or restore it from a backup), then restart the daemon. Saving a setting does not bring the old ones back. If the record also carries `kept_as`, a setting was saved since: the file at `path` is now a new one with no roles, and your old settings are only in the `kept_as` copy — stop the daemon, repair that copy and move it back over `path`, then start it. |
 | `reload` | A `SIGHUP` reload could not read it. Header roles and every restart-only setting are kept, but the two live settings fall back to `daemon.toml`'s: the profile search directories set through the API and the exit minimum. | Repair the file, then reload or restart. |
 | `update` | A setting was saved while the file could not be read. The daemon kept the original as `runtime.toml.invalid-<unix-time>` beside it and replaced it with a new file carrying **the header roles and cooling devices it is running with**, plus the new setting. | Copy any other setting you need back from the `.invalid-` copy, then restart the daemon. |
 
