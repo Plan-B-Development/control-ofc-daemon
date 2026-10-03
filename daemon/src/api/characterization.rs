@@ -1373,7 +1373,9 @@ fn suspicious_tach_ratio(points: &[CharPoint], learned: &[LearnedPoint]) -> Opti
 /// restore anyway — and by the user's choice (2026-09-29) it writes nothing
 /// and logs: once the caller's pause and lease guards drop, the engine's next
 /// tick drives the header if a profile names it and otherwise hands it back as
-/// it was found (DEC-382).
+/// it was found (DEC-382) — or, for a header with no mode switch, releases it
+/// to the exit floor (DEC-451), which `Drop` arranges by recording it in the
+/// state cache (`PTR-ae`).
 ///
 /// **The skip rules live INSIDE `restore`, deliberately.** The calibrate
 /// equivalent (`calibration::RestoreOnDrop`) only needed the thermal rule,
@@ -1457,8 +1459,17 @@ where
     /// to publish "restored" about a header still at the last swept duty. The
     /// branch *order* is the pre-DEC-455 one, with the stuck-write skip added
     /// after the two authority skips.
+    ///
+    /// `armed` is cleared only once the body has returned (`PTR-ae` review):
+    /// a panic INSIDE the restore — a pump-union lookup, the floor arithmetic —
+    /// leaves it set, so `Drop` records the header as abandoned too. A record
+    /// after a write that did land only ever costs a raise to the exit floor.
     pub(crate) async fn restore(&mut self) {
+        self.restore_body().await;
         self.armed = false;
+    }
+
+    async fn restore_body(&mut self) {
         // A run that never wrote left the header exactly where it found it, so
         // none of the non-restoring exits is a finding for it. Reporting one
         // would trade `AUD2-c`'s false "restored" for a false alarm — and the
@@ -1676,13 +1687,18 @@ where
     /// before its restore — a panic — writes nothing here. A write from `Drop`
     /// could not be bounded, and would race the lease guard that drops next.
     /// The engine's next tick drives or hands back a header with a mode switch
-    /// (DEC-382); one with no mode switch that no profile names stays at the
-    /// last duty until the daemon stops (register row `PTR-ae`).
+    /// (DEC-382). One with no mode switch is recorded here, in memory only
+    /// (`PTR-ae`), so that once the write-pause ends DEC-451's release raises
+    /// it to the exit floor if no profile names it — the engine holds only
+    /// what IT wrote, so without the record it stayed at the run's last duty
+    /// until the daemon stopped.
     fn drop(&mut self) {
         if self.armed && self.wrote_any.load(Ordering::SeqCst) {
+            self.cache.note_abandoned_by_diagnostic(self.header_id);
             log::error!(
                 "diagnostic on {} ended without running its restore; nothing is written \
-                 from here — the engine's next tick drives the header or gives it back",
+                 from here — the engine's next tick drives the header, gives it back, or \
+                 releases it to the exit floor",
                 self.header_id
             );
         }
@@ -3690,6 +3706,94 @@ mod tests {
             RestoreOutcome::Pending,
             "no restore ran, so none may be reported"
         );
+        // `PTR-ae`: recorded instead, so DEC-451's release can reach a header
+        // with no mode switch once the pause ends.
+        assert_eq!(
+            cache.abandoned_by_diagnostic(),
+            vec!["hwmon:test:pwm1".to_string()]
+        );
+    }
+
+    /// `PTR-ae` review: a panic INSIDE the restore — here the restore write
+    /// itself — is a run that never put the header back, and is recorded too.
+    #[tokio::test(start_paused = true)]
+    async fn a_panic_inside_the_restore_still_records_the_header() {
+        let cache = Arc::new(cache_at(45.0, Some("normal")));
+        let writes: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let (c, w) = (cache.clone(), writes.clone());
+        let joined = tokio::spawn(async move {
+            let cancel = AtomicBool::new(false);
+            let report = RestoreReport::new();
+            let last = Arc::new(Mutex::new(42u8));
+            let (last_w, last_r) = (last.clone(), last.clone());
+            run_sweep_uni(
+                &c,
+                "hwmon:test:pwm1",
+                &[30],
+                0,
+                Duration::from_secs(1),
+                move |p: u8| {
+                    assert_ne!(p, 42, "the restore write panics");
+                    w.lock().unwrap().push(p);
+                    *last_w.lock().unwrap() = p;
+                    Ok(())
+                },
+                move || sample(Some(*last_r.lock().unwrap()), Some(1), Some(900)),
+                &cancel,
+                || false,
+                || true,
+                &report,
+                |_| {},
+            )
+            .await;
+        })
+        .await;
+
+        assert!(joined.unwrap_err().is_panic(), "precondition: it panicked");
+        assert_eq!(*writes.lock().unwrap(), vec![30], "precondition: moved");
+        assert_eq!(
+            cache.abandoned_by_diagnostic(),
+            vec!["hwmon:test:pwm1".to_string()]
+        );
+    }
+
+    /// `PTR-ae`, the opposite branch: a run that reached its restore records
+    /// nothing, so DEC-451's release never overrides a restore that stood.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_that_restored_records_no_abandoned_header() {
+        let cache = cache_at(45.0, Some("normal"));
+        let cancel = AtomicBool::new(false);
+        let report = RestoreReport::new();
+        let writes: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let writes_w = writes.clone();
+        let last = Arc::new(Mutex::new(42u8));
+        let last_w = last.clone();
+        let last_r = last.clone();
+
+        let out = run_sweep_uni(
+            &cache,
+            "hwmon:test:pwm1",
+            &[30],
+            0,
+            Duration::from_secs(1),
+            move |p: u8| {
+                writes_w.lock().unwrap().push(p);
+                *last_w.lock().unwrap() = p;
+                Ok(())
+            },
+            move || sample(Some(*last_r.lock().unwrap()), Some(1), Some(900)),
+            &cancel,
+            || false,
+            || true,
+            &report,
+            |_| {},
+        )
+        .await;
+
+        assert_eq!(out.state, STATE_COMPLETE, "detail: {:?}", out.detail);
+        assert_eq!(*writes.lock().unwrap(), vec![30, 42], "precondition");
+        assert_eq!(report.get(), RestoreOutcome::Restored);
+        assert!(cache.abandoned_by_diagnostic().is_empty());
     }
 
     /// A sweep over 30/60/90 % whose 60 % write does not return, from a pre-run

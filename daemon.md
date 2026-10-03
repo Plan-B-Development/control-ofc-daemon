@@ -179,7 +179,8 @@ daemon/src/
     characterization.rs — PWM/RPM response sweep (DEC-313), reused by validation.
                          Owns RestoreGuard, which the discovery sweep and the stall probe
                          reuse: an explicit restore awaited on every exit, before the
-                         lease drops; its Drop only logs (DEC-455). Its reads are bounded
+                         lease drops; its Drop writes nothing (DEC-455) and only records a
+                         header it abandoned for DEC-451's release (`PTR-ae`). Its reads are bounded
                          at DIAGNOSTIC_READ_BUDGET (2 s) on the blocking pool, as the stall
                          probe's are, and after a read that does not return it writes
                          nothing more — no restore, unless the header became a pump
@@ -970,7 +971,11 @@ state is forgotten as on a hand-back, so an ARCTIC 0 the old profile chose is no
 longer "chosen" to DEC-425's priming. A failed raise keeps the output held and is
 retried every tick. After a 100 % emergency an OpenFan channel no profile names gets
 its pre-emergency duty raised to the floor, while a no-mode hwmon header stays at
-100 % — it has no pre-emergency record (`BRD-aa`, accepted).
+100 % — it has no pre-emergency record (`BRD-aa`, accepted). A diagnostic that ends
+without its restore — a panic inside the run — leaves its header in
+`StateCache::abandoned_by_diagnostic` (`PTR-ae`); a no-mode header recorded there is
+released by the same rule, from the run's last duty, once the write-pause ends. A run
+that reached its restore records nothing, so its restore stands.
 
 A consequence for clients: `restore_outcome:
 "restored"` now means *restored, floor-clamped* on a pump, so the duty on the

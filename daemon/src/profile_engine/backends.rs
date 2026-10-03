@@ -5672,6 +5672,44 @@ mod tests {
         );
     }
 
+    /// [SAFETY] `PTR-ae` at the call site: a diagnostic wrote a header with no
+    /// mode switch under its own lease and was dropped before its restore. The
+    /// engine's no-profile tick waits out the write-pause, then raises the
+    /// header to the exit floor — once.
+    #[tokio::test]
+    async fn the_engine_releases_a_header_a_diagnostic_abandoned_once_the_pause_ends() {
+        let (mut be, writes, cache) = release_rig();
+        cache.set_exit_floor_pct(50);
+        let epoch = cache
+            .try_begin_verify(std::time::Duration::from_secs(30))
+            .unwrap();
+        {
+            let mut ctrl = be.ctrl.lock();
+            let verify = ctrl
+                .lease_manager_mut()
+                .force_take_lease(HwmonWriter::Verify)
+                .lease_id;
+            ctrl.set_pwm(NO_MODE_ID, 15, &verify).unwrap();
+            ctrl.lease_manager_mut().release_lease(&verify).unwrap();
+        }
+        cache.note_abandoned_by_diagnostic(NO_MODE_ID);
+        writes.lock().clear();
+        let none = hwmon_members(&[]);
+
+        be.apply_and_give_back(&[], &none).await;
+        assert!(no_mode_writes(&writes).is_empty(), "the pause holds it");
+
+        assert!(cache.end_verify(epoch));
+        be.apply_and_give_back(&[], &none).await;
+        be.apply_and_give_back(&[], &none).await;
+
+        assert_eq!(
+            no_mode_writes(&writes),
+            vec![crate::pwm::percent_to_raw(50).to_string()]
+        );
+        assert!(cache.abandoned_by_diagnostic().is_empty());
+    }
+
     /// The opposite branch: a header the new profile still names is its to
     /// drive, and is not released however low it runs.
     #[tokio::test]

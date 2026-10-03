@@ -18,6 +18,16 @@
   record with every assigned pump role still only in the `.invalid-` copy. Additive; omitted until a copy
   is kept.
 
+### Fixed
+
+- **A diagnostic that crashes mid-run no longer strands a fan with no automatic mode.** If
+  characterisation, control-path discovery or the stall probe stopped before its restore (an internal
+  panic), a header with no `pwmN_enable` — an ARCTIC fan hub channel, a `pwmfan` — that no profile names
+  stayed at the run's last duty, possibly a sub-20 % stall-probe step, until the daemon stopped. Once the
+  diagnostic's write-pause ends it is now released like any header a profile stops naming: raised to the
+  exit floor, never lowered, nothing with the floor at 0. A run that finishes its restore is unaffected
+  (`PTR-ae`).
+
 ## [3.5.0] — 2026-10-03
 
 Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor. GUI 3.5.0 offers **Set role…** on

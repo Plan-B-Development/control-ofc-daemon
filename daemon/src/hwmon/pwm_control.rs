@@ -626,11 +626,41 @@ impl HwmonPwmController {
     /// holds the engine write-pause, so a pending release never makes the
     /// members-only force take the lease from it (DEC-451 review). The release
     /// waits for the diagnostic to end, as the GPU and OpenFan give-backs do.
+    ///
+    /// Besides what the engine holds, every header with no mode switch a
+    /// diagnostic abandoned without its restore (`PTR-ae`,
+    /// [`StateCache::note_abandoned_by_diagnostic`]): nothing else would ever
+    /// move it from the run's last duty, which on the stall probe can be a
+    /// sub-20 % descent step. A diagnostic that ran its restore registers
+    /// nothing, so its restore stands.
     pub fn releasable_no_mode(&self) -> Vec<String> {
         if self.cache.verify_active() {
             return Vec::new();
         }
-        self.engine_held_no_mode()
+        let mut ids = self.engine_held.clone();
+        ids.extend(
+            self.cache
+                .abandoned_by_diagnostic()
+                .into_iter()
+                .filter(|id| self.has_no_mode_switch(id)),
+        );
+        ids.into_iter().collect()
+    }
+
+    /// A header this controller has with no `pwmN_enable` — what DEC-451
+    /// releases instead of handing back.
+    fn has_no_mode_switch(&self, header_id: &str) -> bool {
+        self.headers
+            .get(header_id)
+            .is_some_and(|h| !h.supports_enable)
+    }
+
+    /// Held for DEC-451's release: the engine wrote it, or a diagnostic
+    /// abandoned it (`PTR-ae`).
+    fn holds_no_mode(&self, header_id: &str) -> bool {
+        self.engine_held.contains(header_id)
+            || (self.has_no_mode_switch(header_id)
+                && self.cache.is_abandoned_by_diagnostic(header_id))
     }
 
     /// Release `header_id`, a header with no mode switch the engine holds and
@@ -649,8 +679,12 @@ impl HwmonPwmController {
     /// choice, and DEC-425 may prime it (the user's choice, 2026-09-29).
     /// `exit_record` keeps its duty, which the stop's exit floor reads.
     ///
-    /// `Ok(None)` when the engine does not hold it, or while a diagnostic holds
-    /// the engine write-pause ([`Self::releasable_no_mode`]).
+    /// A header a diagnostic abandoned (`PTR-ae`) is released the same way,
+    /// from the duty the run last wrote, and its record is cleared with it.
+    ///
+    /// `Ok(None)` when neither the engine nor an abandoned diagnostic holds it,
+    /// or while a diagnostic holds the engine write-pause
+    /// ([`Self::releasable_no_mode`]).
     pub fn release_no_mode(
         &mut self,
         header_id: &str,
@@ -659,7 +693,7 @@ impl HwmonPwmController {
         self.lease_manager
             .validate_lease(lease_id)
             .map_err(HwmonControlError::Lease)?;
-        if !self.engine_held.contains(header_id) || self.cache.verify_active() {
+        if !self.holds_no_mode(header_id) || self.cache.verify_active() {
             return Ok(None);
         }
         let was = self.exit_record.get(header_id).copied().flatten();
@@ -681,6 +715,7 @@ impl HwmonPwmController {
             },
         };
         self.engine_held.remove(header_id);
+        self.cache.clear_abandoned_by_diagnostic(header_id);
         self.release_failure_logged.remove(header_id);
         // As `hand_back`: nothing commands it, so nothing about its commands
         // may outlive the release.
@@ -4590,6 +4625,83 @@ mod tests {
             .lease_id;
         rig.ctrl.set_pwm(&arctic_id(1), 30, &engine).unwrap();
         assert_eq!(rig.ctrl.engine_held_no_mode(), vec![arctic_id(1)]);
+    }
+
+    /// [SAFETY] `PTR-ae`: a header with no mode switch that a diagnostic wrote
+    /// and abandoned without its restore (a panic) is released as the engine's
+    /// own would be — raised from the run's last duty to the exit floor — but
+    /// only once the write-pause has ended, and then its record is gone.
+    #[test]
+    fn a_header_a_diagnostic_abandoned_is_released_once_the_pause_ends() {
+        let mut rig = arctic_rig();
+        let cache = rig.ctrl.cache.clone();
+        cache.set_exit_floor_pct(50);
+        let epoch = cache
+            .try_begin_verify(std::time::Duration::from_secs(30))
+            .unwrap();
+        let verify = rig
+            .ctrl
+            .lease_manager_mut()
+            .force_take_lease(HwmonWriter::Verify)
+            .lease_id;
+        rig.ctrl.set_pwm(&arctic_id(1), 15, &verify).unwrap();
+        cache.note_abandoned_by_diagnostic(&arctic_id(1));
+
+        assert!(
+            rig.ctrl.releasable_no_mode().is_empty(),
+            "the pause holds it"
+        );
+        assert_eq!(
+            rig.ctrl.release_no_mode(&arctic_id(1), &verify).unwrap(),
+            None
+        );
+        assert_eq!(rig.cache.lock()[0], percent_to_raw(15));
+
+        assert!(cache.end_verify(epoch));
+        let engine = rig
+            .ctrl
+            .lease_manager_mut()
+            .force_take_lease(HwmonWriter::Engine)
+            .lease_id;
+        assert_eq!(rig.ctrl.releasable_no_mode(), vec![arctic_id(1)]);
+        assert_eq!(
+            rig.ctrl.release_no_mode(&arctic_id(1), &engine).unwrap(),
+            Some(NoModeRelease::Raised {
+                was: Some(15),
+                to: 50
+            })
+        );
+        assert_eq!(rig.cache.lock()[0], percent_to_raw(50));
+        assert!(cache.abandoned_by_diagnostic().is_empty());
+        assert!(rig.ctrl.releasable_no_mode().is_empty());
+        assert_eq!(
+            rig.ctrl.release_no_mode(&arctic_id(1), &engine).unwrap(),
+            None,
+            "released once"
+        );
+    }
+
+    /// `PTR-ae`, the opposite branch: a header WITH a mode switch is DEC-382's
+    /// (its take is recorded and it is handed back), so an abandoned record of
+    /// it never makes it releasable here.
+    #[test]
+    fn an_abandoned_header_with_a_mode_switch_is_not_released_here() {
+        let header = make_header("hwmon:it8696:pwm1", "pwm1", 0);
+        let (mut ctrl, _writes, cache) = setup_controller(vec![header.clone()]);
+        let verify = ctrl
+            .lease_manager_mut()
+            .force_take_lease(HwmonWriter::Verify)
+            .lease_id;
+        ctrl.set_pwm(&header.id, 15, &verify).unwrap();
+        cache.note_abandoned_by_diagnostic(&header.id);
+        let engine = ctrl
+            .lease_manager_mut()
+            .force_take_lease(HwmonWriter::Engine)
+            .lease_id;
+
+        assert!(ctrl.releasable_no_mode().is_empty());
+        assert_eq!(ctrl.release_no_mode(&header.id, &engine).unwrap(), None);
+        assert_eq!(ctrl.handback().taken_ids(), vec![header.id.clone()]);
     }
 
     /// The opposite branch: a 0 the current profile chose — a curve at 0 %, a

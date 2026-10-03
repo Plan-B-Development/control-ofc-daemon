@@ -214,6 +214,19 @@ pub struct StateCache {
     /// read by the profile engine every tick. Always within
     /// `COOLANT_LIMIT_MIN_C..=COOLANT_LIMIT_MAX_C` — the setter clamps.
     coolant_limit_c: std::sync::atomic::AtomicU8,
+    /// [SAFETY] `PTR-ae`: hwmon headers a diagnostic wrote and then abandoned
+    /// without running its restore — in practice a panic inside the run.
+    /// Recorded by `characterization::RestoreGuard`'s `Drop`, which writes
+    /// nothing (DEC-455); read by `HwmonPwmController`, which releases such a
+    /// header with no mode switch as DEC-451 releases one the engine held,
+    /// once the write-pause ends. A header with a mode switch needs none of
+    /// this: its take is recorded, and DEC-382 hands it back. Such a header's
+    /// record is inert — every reader filters it out, so nothing clears it —
+    /// and the set stays bounded at one entry per header.
+    ///
+    /// Its own lock, apart from `inner`. Lock order: taken under the hwmon
+    /// controller's mutex, never held while taking it.
+    abandoned_by_diagnostic: parking_lot::Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl StateCache {
@@ -235,7 +248,37 @@ impl StateCache {
             coolant_limit_c: std::sync::atomic::AtomicU8::new(
                 crate::constants::DEFAULT_COOLANT_LIMIT_C,
             ),
+            abandoned_by_diagnostic: parking_lot::Mutex::default(),
         }
+    }
+
+    /// Record that a diagnostic wrote `header_id` and ended without its restore
+    /// (`PTR-ae`). Memory only — no hardware is touched — so it is safe from a
+    /// `Drop` during unwinding.
+    pub fn note_abandoned_by_diagnostic(&self, header_id: &str) {
+        self.abandoned_by_diagnostic
+            .lock()
+            .insert(header_id.to_string());
+    }
+
+    /// The headers [`Self::note_abandoned_by_diagnostic`] recorded and no
+    /// release has cleared yet, sorted.
+    pub fn abandoned_by_diagnostic(&self) -> Vec<String> {
+        self.abandoned_by_diagnostic
+            .lock()
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// True when `header_id` is recorded as abandoned by a diagnostic.
+    pub fn is_abandoned_by_diagnostic(&self, header_id: &str) -> bool {
+        self.abandoned_by_diagnostic.lock().contains(header_id)
+    }
+
+    /// Forget `header_id`'s record: it has been released.
+    pub fn clear_abandoned_by_diagnostic(&self, header_id: &str) {
+        self.abandoned_by_diagnostic.lock().remove(header_id);
     }
 
     /// The coolant limit in force now (DEC-443), in whole °C.
