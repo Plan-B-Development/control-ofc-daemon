@@ -283,8 +283,6 @@ RestrictAddressFamilies=AF_UNIX AF_NETLINK
 # mknod bit (m) is dropped.
 DeviceAllow=char-ttyACM rw
 DeviceAllow=char-ttyUSB rw
-# uucp (Arch/CachyOS) — dialout (Debian/Ubuntu) omitted; systemd fails on missing groups
-SupplementaryGroups=uucp
 
 [Install]
 WantedBy=multi-user.target

@@ -460,7 +460,7 @@ ls -la /dev/serial/by-id/
 
 ### Serial permissions
 
-The daemon runs as root, so no group membership is needed for it to open the serial device — the unit's `SupplementaryGroups=uucp` does not gate anything for a root service, and Debian/Ubuntu need no `dialout` drop-in. What does limit it is the unit's device allow-list, `DeviceAllow=char-ttyACM rw` and `DeviceAllow=char-ttyUSB rw`: the service can open only `/dev/ttyACM*` and `/dev/ttyUSB*` nodes (a `/dev/serial/by-id/` link to one of them is fine). A controller on any other kind of node would need a drop-in adding its device class:
+The daemon runs as root, so no group membership is needed for it to open the serial device, and Debian/Ubuntu need no `dialout` drop-in. What does limit it is the unit's device allow-list, `DeviceAllow=char-ttyACM rw` and `DeviceAllow=char-ttyUSB rw`: the service can open only `/dev/ttyACM*` and `/dev/ttyUSB*` nodes (a `/dev/serial/by-id/` link to one of them is fine). A controller on any other kind of node would need a drop-in adding its device class:
 
 ```bash
 sudo systemctl edit control-ofc-daemon

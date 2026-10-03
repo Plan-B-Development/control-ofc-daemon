@@ -4,6 +4,9 @@
 
 ### Changed
 
+- **The service unit no longer sets `SupplementaryGroups=uucp`.** The daemon runs as root, so the group
+  never gated its serial access — `DeviceAllow=char-ttyACM`/`char-ttyUSB` is the limit — and its only
+  live effect was a failed start on a system without a `uucp` group (`DC-cv`).
 - **An unknown top-level section in `daemon.toml` is a warning, not a startup failure.** The daemon logs
   `ignoring unknown top-level section or key` naming it, at startup and on reload, and carries on, so a
   section a later release adds will not stop this one starting after a downgrade. Keys inside a known
