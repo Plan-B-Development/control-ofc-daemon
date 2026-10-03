@@ -107,7 +107,7 @@ edit can break.
 | `GET /config` | Effective merged configuration: per key its value, running value, `source`, `mutable`, `requires_restart`, `restart_pending` (DEC-243) |
 | `GET /diagnostics/characterization` | Current or most recent characterisation run, with the points measured so far (DEC-313) |
 | `GET /diagnostics/preflight` | Typed safety verdict for one header + one diagnostic, before anything is driven (DEC-333). Read-only: no lease, no slot, nothing reserved |
-| `GET /diagnostics/control-path` | Current/most recent control-path discovery run, plus every persisted relationship (DEC-333). Records are keyed by stable header id and pruned at boot to whatever discovery still sees |
+| `GET /diagnostics/control-path` | Current/most recent control-path discovery run, plus every persisted relationship (DEC-333). Records are keyed by stable header id and pruned at boot to whatever discovery still sees on the chips it found; a chip with no headers that boot keeps its records |
 
 ### Write
 The profile engine is the **sole writer** as of 2.0.0 (DEC-159/DEC-165); the GUI sends intent + diagnostics calls. Bare PWM/lease endpoints were retired (note below).

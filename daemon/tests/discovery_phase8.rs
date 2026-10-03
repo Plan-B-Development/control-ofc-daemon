@@ -2144,17 +2144,17 @@ fn the_store_round_trips_through_disk() {
 
 /// §6.3: "Do not persist indefinitely as unquestioned truth if the underlying
 /// hardware identity changes." The header id embeds chip/device/pwmN/label, so a
-/// changed board yields a changed id and the record is dropped.
+/// changed driver or label yields a changed id and the record is dropped.
 #[test]
 fn records_for_headers_that_no_longer_exist_are_pruned() {
     let mut store = ControlPathStore::default();
-    store.upsert(record("hwmon:nct6798:isa:pwm2:AIO_PUMP", 1000));
+    store.upsert(record("hwmon:it8688:isa:pwm2:AIO_PUMP", 1000));
     store.upsert(record("hwmon:it8688:isa:pwm3:CPU_FAN", 2000));
 
-    // The board was swapped: only one id still exists.
+    // The chip relabelled one header: only one id still exists.
     let dropped = store.prune_to_live(&["hwmon:it8688:isa:pwm3:CPU_FAN".to_string()]);
     assert_eq!(dropped, 1);
-    assert!(store.get("hwmon:nct6798:isa:pwm2:AIO_PUMP").is_none());
+    assert!(store.get("hwmon:it8688:isa:pwm2:AIO_PUMP").is_none());
     assert!(store.get("hwmon:it8688:isa:pwm3:CPU_FAN").is_some());
 
     // A prune that changes nothing reports zero, so a boot with unchanged
@@ -2163,6 +2163,23 @@ fn records_for_headers_that_no_longer_exist_are_pruned() {
         store.prune_to_live(&["hwmon:it8688:isa:pwm3:CPU_FAN".to_string()]),
         0
     );
+}
+
+/// `PTR-af`: a boot that discovered no headers — a Super-I/O driver that loads
+/// after the daemon — keeps every record, and a chip discovery did not see keeps
+/// its records while another chip is live.
+#[test]
+fn records_on_a_chip_discovery_did_not_see_survive_the_prune() {
+    let mut store = ControlPathStore::default();
+    store.upsert(record("hwmon:nct6798:isa:pwm2:AIO_PUMP", 1000));
+    store.upsert(record("hwmon:it8688:isa:pwm3:CPU_FAN", 2000));
+
+    assert_eq!(store.prune_to_live(&[]), 0);
+    assert_eq!(store.records.len(), 2);
+
+    let dropped = store.prune_to_live(&["hwmon:it8688:isa:pwm3:CPU_FAN".to_string()]);
+    assert_eq!(dropped, 0);
+    assert!(store.get("hwmon:nct6798:isa:pwm2:AIO_PUMP").is_some());
 }
 
 /// [SAFETY-adjacent] DEC-320: bound the input at ingest, and prove the bound by
@@ -3032,8 +3049,7 @@ fn both_persisted_stores_are_pruned_to_live_headers_at_boot() {
     );
 
     // Both prunes must be keyed on the ids discovery actually returned. A prune
-    // against an empty or unrelated list either drops everything or nothing, and
-    // both are silent.
+    // against an empty or unrelated list drops nothing, silently.
     assert!(
         main_body.contains("hwmon_headers_for_poll"),
         "the live-id list must come from hwmon discovery"

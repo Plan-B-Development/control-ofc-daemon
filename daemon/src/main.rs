@@ -2390,13 +2390,15 @@ async fn async_main(cli: CliOptions) {
     };
 
     // AIO Phase 8 Batch 1 (§6.3): load the persisted PWM to tach relationships
-    // and drop any whose header discovery can no longer see.
+    // and drop any whose header discovery can no longer see, on a chip it did
+    // see (`PTR-af`: a chip with no headers this boot — its driver not loaded
+    // yet — keeps its records, so an empty discovery prunes nothing).
     //
     // The invalidation is structural, not a policy anyone has to remember: a
     // record is keyed by the header's stable id, which embeds chip, device,
     // `pwmN` and label. Change the board, the driver, or start publishing labels
-    // and the id changes with it, so a record that SURVIVES this prune is a
-    // record whose hardware did not change. §6.3's warning against persisting a
+    // and the id changes with it, so a record only ever applies to a header
+    // whose hardware did not change. §6.3's warning against persisting a
     // mapping "as unquestioned truth" is satisfied here rather than by a
     // freshness heuristic.
     let control_paths_at_boot = {
@@ -2417,7 +2419,7 @@ async fn async_main(cli: CliOptions) {
     };
 
     // DEC-456: the per-header PWM verification verdicts, pruned by the same
-    // stable-header-id rule — a verdict that survives is one whose hardware did.
+    // stable-header-id, live-chip rule.
     let pwm_verification_at_boot = {
         let dir = control_ofc_daemon::daemon_state::state_dir_path();
         let mut loaded = control_ofc_daemon::pwm_verification::load_from(&dir);
@@ -2439,7 +2441,7 @@ async fn async_main(cli: CliOptions) {
     };
 
     // DEC-334 §6: the learned-response store, pruned by the same stable-header-id
-    // rule for the same reason — a record that survives is one whose hardware did.
+    // rule for the same reason.
     let pwm_baselines_at_boot = {
         let dir = control_ofc_daemon::daemon_state::state_dir_path();
         let mut loaded = control_ofc_daemon::pwm_baselines::load_from(&dir);

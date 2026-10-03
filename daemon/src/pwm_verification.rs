@@ -158,13 +158,11 @@ impl PwmVerificationStore {
         self.records.insert(record.header_id.clone(), record);
     }
 
-    /// Drop every record whose header is no longer discoverable. Returns how
+    /// Drop every record whose header is no longer discoverable, on a chip
+    /// discovery saw (`PTR-af`, `chip_name::prune_to_live_chips`). Returns how
     /// many went, so an unchanged store costs no disk write at boot.
     pub fn prune_to_live(&mut self, live_header_ids: &[String]) -> usize {
-        let before = self.records.len();
-        self.records
-            .retain(|header_id, _| live_header_ids.iter().any(|live| live == header_id));
-        before - self.records.len()
+        crate::hwmon::chip_name::prune_to_live_chips(&mut self.records, live_header_ids)
     }
 
     /// `(verified, failed)` among `header_ids` — the readiness item's inputs.
@@ -387,6 +385,15 @@ mod tests {
         store.upsert(record("gone", STATE_VERIFIED, 1));
         assert_eq!(store.prune_to_live(&["a".into()]), 1);
         assert!(store.get("gone").is_none() && store.get("a").is_some());
+    }
+
+    /// `PTR-af`: a boot that found no headers keeps every verdict.
+    #[test]
+    fn an_empty_discovery_keeps_every_verdict() {
+        let mut store = PwmVerificationStore::default();
+        store.upsert(record("hwmon:it87:isa:pwm1:PUMP", STATE_VERIFIED, 1));
+        assert_eq!(store.prune_to_live(&[]), 0);
+        assert!(store.get("hwmon:it87:isa:pwm1:PUMP").is_some());
     }
 
     #[test]

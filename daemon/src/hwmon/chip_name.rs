@@ -172,6 +172,46 @@ pub fn canonicalize_keyed<V>(
     out.into_iter().map(|(k, (v, _))| (k, v)).collect()
 }
 
+/// The chip segment of a stable hwmon id (`hwmon:<chip>:<device>:…`), or
+/// `None` for any other id.
+pub fn hwmon_id_chip(id: &str) -> Option<&str> {
+    let mut parts = id.splitn(3, ':');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("hwmon"), Some(chip), Some(_)) => Some(chip),
+        _ => None,
+    }
+}
+
+/// Prune a store of per-header records to the headers discovery can see
+/// (`PTR-af`). Returns how many records went, so an unchanged store costs no
+/// disk write at boot.
+///
+/// A record goes only when discovery saw its CHIP and not its header. A chip
+/// discovery did not see at all — its driver not yet loaded, mid DKMS rebuild,
+/// failed to bind this once — keeps every record, so an empty discovery prunes
+/// nothing. A record whose id is not an hwmon id can never match a header and
+/// goes whenever discovery found any. The cost is that records from a removed
+/// board stay until the store's own capacity evicts them; they are keyed by the
+/// full header id, so nothing ever matches them to a live header.
+pub fn prune_to_live_chips<V>(
+    records: &mut BTreeMap<String, V>,
+    live_header_ids: &[String],
+) -> usize {
+    if live_header_ids.is_empty() {
+        return 0;
+    }
+    let live_chips: HashSet<&str> = live_header_ids
+        .iter()
+        .filter_map(|id| hwmon_id_chip(id))
+        .collect();
+    let before = records.len();
+    records.retain(|header_id, _| {
+        live_header_ids.iter().any(|live| live == header_id)
+            || hwmon_id_chip(header_id).is_some_and(|chip| !live_chips.contains(chip))
+    });
+    before - records.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,5 +357,59 @@ mod tests {
     fn a_canonical_id_is_borrowed_not_rebuilt() {
         let id = "hwmon:it8696:it87.2624:pwm5:SYS_FAN5_PUMP";
         assert!(matches!(canonical_hwmon_id(id), Cow::Borrowed(_)));
+    }
+
+    fn store(ids: &[&str]) -> BTreeMap<String, ()> {
+        ids.iter().map(|id| (id.to_string(), ())).collect()
+    }
+
+    const NCT_PUMP: &str = "hwmon:nct6798:nct6775.656:pwm2:AIO_PUMP";
+    const NCT_GONE: &str = "hwmon:nct6798:nct6775.656:pwm7:OLD";
+    const IT87_CPU: &str = "hwmon:it8688:it87.2624:pwm1:CPU_FAN";
+
+    #[test]
+    fn the_chip_is_the_second_segment_of_an_hwmon_id_only() {
+        assert_eq!(hwmon_id_chip(NCT_PUMP), Some("nct6798"));
+        // A device id with its own colons does not move the chip segment.
+        assert_eq!(
+            hwmon_id_chip("hwmon:arctic_fan:0003:3904:F001.0001:pwm1:pwm1"),
+            Some("arctic_fan")
+        );
+        assert_eq!(hwmon_id_chip("openfan:ch00"), None);
+        assert_eq!(hwmon_id_chip("hwmon:nct6798"), None);
+    }
+
+    /// `PTR-af`: a boot before the Super-I/O driver loads must not erase the
+    /// stores. Pre-fix, every record went.
+    #[test]
+    fn an_empty_discovery_prunes_nothing() {
+        let mut records = store(&[NCT_PUMP, IT87_CPU, "not-an-hwmon-id"]);
+        assert_eq!(prune_to_live_chips(&mut records, &[]), 0);
+        assert_eq!(records, store(&[NCT_PUMP, IT87_CPU, "not-an-hwmon-id"]));
+    }
+
+    /// A chip discovery did not see keeps its records even while another chip
+    /// is live — one driver loading late must not cost the other its history.
+    #[test]
+    fn only_a_chip_discovery_saw_is_pruned() {
+        let mut records = store(&[NCT_PUMP, NCT_GONE, IT87_CPU]);
+        let dropped = prune_to_live_chips(&mut records, &[NCT_PUMP.to_string()]);
+        assert_eq!(dropped, 1);
+        assert_eq!(records, store(&[NCT_PUMP, IT87_CPU]));
+        // Unchanged hardware costs nothing on the next boot.
+        assert_eq!(
+            prune_to_live_chips(&mut records, &[NCT_PUMP.to_string()]),
+            0
+        );
+    }
+
+    #[test]
+    fn a_non_hwmon_id_goes_once_discovery_found_anything() {
+        let mut records = store(&[NCT_PUMP, "not-an-hwmon-id"]);
+        assert_eq!(
+            prune_to_live_chips(&mut records, &[NCT_PUMP.to_string()]),
+            1
+        );
+        assert_eq!(records, store(&[NCT_PUMP]));
     }
 }

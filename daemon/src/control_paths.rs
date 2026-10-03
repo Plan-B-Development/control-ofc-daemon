@@ -12,11 +12,13 @@
 //! the key is the header's **stable id**, which already embeds chip, device,
 //! `pwmN` and label (`hwmon:<chip>:<device>:pwm<N>:<LABEL>`). Swap the board,
 //! change the driver, or have the chip start publishing labels, and the id
-//! changes with it — so a stale record simply stops matching any live header and
-//! [`prune_to_live`] drops it. (The it87 v2.0 board suffix is not such a change:
-//! the chip segment is canonical, and a suffixed record is re-keyed at load,
-//! DEC-442.) Nothing has to detect "the hardware changed",
-//! because a record that survives *is* a record whose hardware did not.
+//! changes with it — so a stale record simply stops matching any live header, and
+//! [`prune_to_live`] drops it once discovery sees its chip. (The it87 v2.0 board
+//! suffix is not such a change: the chip segment is canonical, and a suffixed
+//! record is re-keyed at load, DEC-442.) Nothing has to detect "the hardware
+//! changed", because a record only ever applies to the exact header id it names.
+//! A chip discovery did not see keeps its records (`PTR-af`): a driver that loads
+//! after the daemon must not erase them.
 //!
 //! # Bounds
 //!
@@ -124,16 +126,15 @@ impl ControlPathStore {
         self.records.insert(record.header_id.clone(), record);
     }
 
-    /// Drop every record whose header is no longer discoverable (§6.3).
+    /// Drop every record whose header is no longer discoverable (§6.3), on a
+    /// chip discovery saw — never on an empty discovery (`PTR-af`,
+    /// `chip_name::prune_to_live_chips`).
     ///
     /// Returns how many were dropped, so the caller can decide whether the store
     /// needs rewriting — a prune that changed nothing must not cost a disk write
     /// on every boot.
     pub fn prune_to_live(&mut self, live_header_ids: &[String]) -> usize {
-        let before = self.records.len();
-        self.records
-            .retain(|header_id, _| live_header_ids.iter().any(|live| live == header_id));
-        before - self.records.len()
+        crate::hwmon::chip_name::prune_to_live_chips(&mut self.records, live_header_ids)
     }
 }
 

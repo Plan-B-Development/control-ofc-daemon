@@ -23,9 +23,10 @@
 //! Identical to the control-path store, deliberately: the key is the header's
 //! **stable id**, which embeds chip, device, `pwmN` and label. Swap the board or
 //! change the driver and the id changes with it, so a stale record stops matching
-//! any live header and [`PwmBaselineStore::prune_to_live`] drops it at boot. The
-//! it87 v2.0 board suffix is not such a change: a suffixed record is re-keyed at
-//! load (DEC-442).
+//! any live header and [`PwmBaselineStore::prune_to_live`] drops it at boot once
+//! discovery sees its chip — a chip it did not see keeps its records (`PTR-af`).
+//! The it87 v2.0 board suffix is not such a change: a suffixed record is re-keyed
+//! at load (DEC-442).
 //!
 //! # Bounds
 //!
@@ -138,12 +139,10 @@ impl PwmBaselineStore {
         }
     }
 
-    /// Drop every record whose header is no longer discoverable.
+    /// Drop every record whose header is no longer discoverable, on a chip
+    /// discovery saw (`PTR-af`, `chip_name::prune_to_live_chips`).
     pub fn prune_to_live(&mut self, live_header_ids: &[String]) -> usize {
-        let before = self.records.len();
-        self.records
-            .retain(|header_id, _| live_header_ids.iter().any(|live| live == header_id));
-        before - self.records.len()
+        crate::hwmon::chip_name::prune_to_live_chips(&mut self.records, live_header_ids)
     }
 }
 
@@ -346,10 +345,20 @@ mod tests {
     fn pruning_drops_records_whose_header_no_longer_exists() {
         let mut store = PwmBaselineStore::default();
         store.merge(rec("hwmon:it87:pwm1:PUMP", &[(50, 1000, 1100)], 1));
-        store.merge(rec("hwmon:gone:pwm9:OLD", &[(50, 1000, 1100)], 2));
+        store.merge(rec("hwmon:it87:pwm9:OLD", &[(50, 1000, 1100)], 2));
         let dropped = store.prune_to_live(&["hwmon:it87:pwm1:PUMP".to_string()]);
         assert_eq!(dropped, 1);
-        assert!(store.get("hwmon:gone:pwm9:OLD").is_none());
+        assert!(store.get("hwmon:it87:pwm9:OLD").is_none());
+        assert!(store.get("hwmon:it87:pwm1:PUMP").is_some());
+    }
+
+    /// `PTR-af`: a boot that found no headers — the driver not loaded yet —
+    /// keeps every learned band.
+    #[test]
+    fn an_empty_discovery_keeps_every_record() {
+        let mut store = PwmBaselineStore::default();
+        store.merge(rec("hwmon:it87:pwm1:PUMP", &[(50, 1000, 1100)], 1));
+        assert_eq!(store.prune_to_live(&[]), 0);
         assert!(store.get("hwmon:it87:pwm1:PUMP").is_some());
     }
 

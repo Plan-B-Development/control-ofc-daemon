@@ -14,6 +14,11 @@
 
 ### Fixed
 
+- **A boot that finds no fan headers no longer erases the saved diagnostic records.** Started before its
+  Super-I/O driver loaded, the daemon used to drop every control-path relationship, learned response band
+  and PWM verification verdict, and they did not come back with the driver. Now a record is pruned at
+  boot only when discovery saw its chip and not its header; a chip with no headers that boot keeps its
+  records. Nothing in fan control reads these stores (`PTR-af`).
 - **A SIGHUP reload that cannot read `runtime.toml` no longer resets the live settings.** It used to
   drop an exit minimum, coolant limit or profile search directories set there back to `daemon.toml`'s;
   it now keeps the running values, as it always kept header roles, and still reports
