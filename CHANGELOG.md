@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [3.6.0] — 2026-10-03
+
+Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor. GUI 3.6.0 shows the floor an
+assigned CPU fan earns where this daemon advertises `control.cpu_fan_role_floor`, and its settings-file banner
+names `runtime_config_degraded.kept_as`; an older GUI shows neither.
+
 ### Added
 
 - **An assigned `cpu_fan` role earns the CPU floor.** A header or OpenFan channel you assign `cpu_fan`
