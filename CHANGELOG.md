@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [3.3.1] — 2026-10-03
+
+Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor. No field is added or removed, so any
+GUI shows the corrected `expected_driver`; GUI 3.3.1 carries the matching legacy Super-I/O guidance.
+
 ### Fixed
 
 - **Two chips get the right expected driver** (DEC-473, `DC-db`). The Fintek F81768D (hwmon name `f81768d`)
