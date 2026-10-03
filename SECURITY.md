@@ -52,14 +52,12 @@ The systemd unit applies a hardening set (`ProtectSystem=strict`,
 
 | Version | Supported |
 |---------|-----------|
-| 2.x     | Yes       |
-| 1.x     | No        |
-| 0.x     | No        |
+| Latest release | Yes |
+| Any earlier release | No |
 
-Only the latest 2.x release receives security fixes. Older patch
-versions are not separately supported — upgrade to the current release.
-The 1.x line is end-of-life (superseded by the 2.0.0 daemon-control
-cutover); upgrade to 2.x.
+Only the latest published release receives security fixes. Older
+releases, including earlier patch versions of the current major line,
+are not separately supported — upgrade to the current release.
 
 ## Companion project
 
