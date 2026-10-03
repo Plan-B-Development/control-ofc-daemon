@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [3.5.0] — 2026-10-03
+
+Pairs with `control-ofc-gui` >= v2.23.0, the recommended capability floor. GUI 3.5.0 offers **Set role…** on
+OpenFan channels where this daemon advertises `control.openfan_header_roles`; an older GUI does not offer it.
+
 ### Added
 
 - **A pump on an OpenFanController channel can be protected.** `POST /config/header-role` accepts an
