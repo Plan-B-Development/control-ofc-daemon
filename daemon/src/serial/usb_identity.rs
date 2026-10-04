@@ -157,6 +157,20 @@ pub fn block_devices_of(sys: &Path, port: &str) -> Vec<String> {
     disks
 }
 
+/// Every whole-disk block device's name, sorted. Cheap: it changes whenever a
+/// disk comes or goes, so a watch can re-read the drives only then.
+pub fn block_device_names(sys: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(sys.join("block")) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    names.sort();
+    names
+}
+
 /// A sysfs USB device name: `usb8`, `8-8`, `1-4.2`. Anything else — a path
 /// separator, `..` — is refused before it reaches a path join.
 fn valid_port_name(port: &str) -> bool {
@@ -355,8 +369,9 @@ pub(crate) mod fixture {
             self.add_tty(port, 2, tty2);
         }
 
-        /// The board in its bootloader, with its drive.
-        pub fn add_bootloader(&self, port: &str, disk: &str) {
+        /// The board in its bootloader before the kernel has attached its drive:
+        /// on real hardware the disk follows the device by about a second.
+        pub fn add_bootloader_without_drive(&self, port: &str) {
             self.add_device(
                 port,
                 "2e8a",
@@ -366,6 +381,11 @@ pub(crate) mod fixture {
                 "E0C9125B0D9B",
                 &descriptors(0xb0),
             );
+        }
+
+        /// The board in its bootloader, with its drive.
+        pub fn add_bootloader(&self, port: &str, disk: &str) {
+            self.add_bootloader_without_drive(port);
             self.add_disk(port, disk);
         }
     }
@@ -467,6 +487,7 @@ mod tests {
         assert!(device_at(sys.root(), "8-8").unwrap().is_rp2040_bootloader());
         assert_eq!(block_devices_of(sys.root(), "8-8"), ["sdb"]);
         assert_eq!(block_devices_of(sys.root(), "5-2"), ["sdc"]);
+        assert_eq!(block_device_names(sys.root()), ["sdb", "sdc"]);
         assert_eq!(
             tty_identity(sys.root(), "/dev/ttyACM1"),
             None,

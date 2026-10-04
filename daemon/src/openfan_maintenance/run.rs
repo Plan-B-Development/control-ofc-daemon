@@ -238,6 +238,43 @@ enum Back {
     Bootloader,
 }
 
+/// The `RPI-RP2` drives sysfs shows: the board's, and any other board's in its
+/// bootloader. `disks` is the `/sys/block` listing they were read against, so a
+/// watch reads them again only when a disk comes or goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Drives {
+    disks: Vec<String>,
+    ours: Option<String>,
+    others: Vec<String>,
+}
+
+impl Drives {
+    fn read(sys: &Path, port: &str, disks: Vec<String>) -> Self {
+        let ours = usb::block_devices_of(sys, port).into_iter().next();
+        let others = usb::bootloaders(sys)
+            .into_iter()
+            .filter(|d| d.port != port)
+            .flat_map(|d| usb::block_devices_of(sys, &d.port))
+            .collect();
+        Self {
+            disks,
+            ours,
+            others,
+        }
+    }
+}
+
+/// What the wait for the file saw.
+enum FileWait {
+    /// The bootloader left the port: the copy finished, or the board was reset.
+    Left,
+    /// A disk came or went while the bootloader stayed.
+    Drives(Drives),
+}
+
+const NO_FILE_IN_TIME: &str =
+    "no firmware file was copied in time — the board is still in its bootloader";
+
 fn to_map(pairs: Result<Vec<(String, String)>, SerialError>) -> Option<BTreeMap<String, String>> {
     pairs.ok().map(|p| p.into_iter().collect())
 }
@@ -608,35 +645,45 @@ impl Runner {
         let returned_tty = loop {
             self.enter_until(stage::WAITING_FOR_FILE, file_deadline)
                 .await;
-            let (p, sys) = (port.clone(), self.env.sys_root.clone());
-            let drives = blocking(move || {
-                let ours = usb::block_devices_of(&sys, &p).into_iter().next();
-                let others: Vec<String> = usb::bootloaders(&sys)
-                    .into_iter()
-                    .filter(|d| d.port != p)
-                    .flat_map(|d| usb::block_devices_of(&sys, &d.port))
-                    .collect();
-                (ours, others)
-            })
-            .await;
-            if let Some((ours, others)) = drives {
-                self.record(|r| {
-                    r.bootloader_drive = ours;
-                    r.other_bootloader_drives = others;
-                })
-                .await;
-            }
-            let (p, s) = (port.clone(), serial.clone());
-            let drive_gone =
-                move |sys: &Path| (port_holds(sys, &p, &s) != PortHolds::Bootloader).then_some(());
-            let file_left = file_deadline.saturating_duration_since(Instant::now());
-            match self.watch_sysfs(file_left, drive_gone).await {
-                Watched::Found(()) => {}
-                Watched::Deadline => return End::new(
-                    outcome::NEEDS_RECOVERY,
-                    "no firmware file was copied in time — the board is still in its bootloader",
-                ),
-                Watched::Shutdown => return self.interrupted(),
+            // The drive is named when it attaches — on real hardware about a
+            // second after the bootloader — and again whenever a disk comes or
+            // goes, so the window can say which drive to copy onto.
+            let mut seen: Option<Drives> = None;
+            loop {
+                let (p, s) = (port.clone(), serial.clone());
+                let known = seen.as_ref().map(|d| d.disks.clone());
+                let event = move |sys: &Path| {
+                    if port_holds(sys, &p, &s) != PortHolds::Bootloader {
+                        return Some(FileWait::Left);
+                    }
+                    let disks = usb::block_device_names(sys);
+                    (known.as_ref() != Some(&disks))
+                        .then(|| FileWait::Drives(Drives::read(sys, &p, disks)))
+                };
+                let file_left = file_deadline.saturating_duration_since(Instant::now());
+                match self.watch_sysfs(file_left, event).await {
+                    Watched::Found(FileWait::Left) => break,
+                    Watched::Found(FileWait::Drives(now)) => {
+                        let changed = seen
+                            .as_ref()
+                            .is_none_or(|was| (&was.ours, &was.others) != (&now.ours, &now.others));
+                        if changed {
+                            let (ours, others) = (now.ours.clone(), now.others.clone());
+                            self.record(|r| {
+                                r.bootloader_drive = ours;
+                                r.other_bootloader_drives = others;
+                            })
+                            .await;
+                        }
+                        seen = Some(now);
+                        // Disks that keep coming and going cannot hold the wait open.
+                        if Instant::now() >= file_deadline {
+                            return End::new(outcome::NEEDS_RECOVERY, NO_FILE_IN_TIME);
+                        }
+                    }
+                    Watched::Deadline => return End::new(outcome::NEEDS_RECOVERY, NO_FILE_IN_TIME),
+                    Watched::Shutdown => return self.interrupted(),
+                }
             }
 
             self.enter(stage::WAITING_FOR_RETURN, limits.return_wait)
@@ -979,6 +1026,10 @@ mod tests {
         frames: parking_lot::Mutex<Vec<String>>,
         touches: AtomicUsize,
         opened: parking_lot::Mutex<Vec<String>>,
+        /// The bootloader enumerates without its drive, which `attach_drive`
+        /// adds later — as on real hardware, where the kernel's storage scan
+        /// follows the device by about a second.
+        drive_late: AtomicBool,
     }
 
     impl Board {
@@ -995,6 +1046,7 @@ mod tests {
                 frames: parking_lot::Mutex::new(Vec::new()),
                 touches: AtomicUsize::new(0),
                 opened: parking_lot::Mutex::new(Vec::new()),
+                drive_late: AtomicBool::new(false),
             });
             board.boot();
             board
@@ -1021,8 +1073,16 @@ mod tests {
 
         fn enter_bootloader(&self) {
             self.leave();
-            self.sys.add_bootloader(USB_PORT, "sdx");
+            if self.drive_late.load(SeqCst) {
+                self.sys.add_bootloader_without_drive(USB_PORT);
+            } else {
+                self.sys.add_bootloader(USB_PORT, "sdx");
+            }
             *self.mode.lock() = Mode::Bootloader;
+        }
+
+        fn attach_drive(&self) {
+            self.sys.add_disk(USB_PORT, "sdx");
         }
 
         /// The user copies a file: the bootloader writes it and restarts.
@@ -1425,6 +1485,32 @@ mod tests {
             .lock()
             .set_pwm(0, 50)
             .expect("a write lands again");
+    }
+
+    #[tokio::test]
+    async fn a_drive_that_attaches_after_the_bootloader_is_named_when_it_appears() {
+        // On real hardware the drive follows the bootloader by about a second,
+        // so a look taken as the wait begins finds no drive.
+        let board = Board::new();
+        board.drive_late.store(true, SeqCst);
+        let bench = Bench::new(board).await;
+        let run = bench.start();
+        bench.reached(stage::WAITING_FOR_FILE).await;
+        assert_eq!(bench.record().bootloader_drive, None, "no drive yet");
+
+        bench.board.attach_drive();
+        let slot = bench.slot.clone();
+        wait_until("the drive to be named", || {
+            slot.record().and_then(|r| r.bootloader_drive).as_deref() == Some("sdx")
+        })
+        .await;
+
+        bench.board.copy_file(NEW, "02");
+        let r = bench.finish(run).await;
+        assert_eq!(
+            r.outcome.as_deref(),
+            Some(outcome::COMPLETED_BUILD_NOT_CONFIRMED)
+        );
     }
 
     #[tokio::test]
