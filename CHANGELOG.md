@@ -21,6 +21,11 @@
   journal after an edit. Daemons up to 3.6.0 still refuse an unknown section: before downgrading to one,
   comment out `[safety]` (3.0.0+) and `[shutdown]` (2.50.0+) as the user guide's upgrade notes describe
   (`TS-bl`).
+- **An NCT6686D with no driver bound is pointed at the in-kernel `nct6683`.** `GET /inventory/superio`'s
+  `expected_module` and load recommendation, and `expected_driver` on `GET /diagnostics/hardware`, named
+  the out-of-tree `nct6687` for an `nct6686` chip; they now name `nct6683` (monitoring only — PWM writes on
+  ASRock boards await an upstream series), as the GUI's chip guidance already did. A chip whose driver is
+  bound still reports the driver observed (`bound_driver`) (`BRD-ac`).
 
 ### Fixed
 

@@ -1102,6 +1102,34 @@ mod tests {
         );
     }
 
+    /// `BRD-ac`: an unbound NCT6686D (an ASRock part) is pointed at the
+    /// in-kernel nct6683, as the GUI's guidance does — not at the out-of-tree
+    /// nct6687, whose recommendation beside a loaded nct6775 (the ASRock
+    /// Taichi's second Nuvoton chip) carried the DEC-106 brick warning, which
+    /// nct6683 does not share.
+    #[test]
+    fn unbound_nct6686_is_pointed_at_the_in_kernel_nct6683() {
+        let ev = FakeEvidence {
+            kmsg: vec!["nct6686".into()],
+            loaded: vec!["nct6775".into()],
+            ..Default::default()
+        };
+        let r = detect_superio(&ev);
+        let chip = find(&r, "nct6686");
+        assert!(!chip.hwmon_present);
+        assert_eq!(chip.expected_module, "nct6683");
+        let rec = chip
+            .recommendation
+            .as_ref()
+            .expect("unbound → recommendation");
+        assert_eq!(rec.module, "nct6683");
+        assert!(
+            !rec.risk_notes.iter().any(|n| n.contains("DEC-106")),
+            "nct6683 collides with nothing loaded here, risk_notes={:?}",
+            rec.risk_notes
+        );
+    }
+
     #[test]
     fn active_collision_when_both_drivers_loaded_is_flagged_as_current() {
         // nct6775 IS loaded AND the conflicting nct6687 IS loaded, but the chip

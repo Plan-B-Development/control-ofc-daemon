@@ -113,12 +113,19 @@ pub(crate) fn expected_driver_for_chip(chip_name: &str) -> &'static str {
     // by `hwmon::bound_driver` and published beside this guess as `bound_driver`
     // (`BRD-g`, DEC-469). Everything else in the NCT6xxx/NCT5xxx range is the
     // in-kernel nct6775 driver.
-    if lower.starts_with("nct6683") {
+    //
+    // `BRD-ac`: the guess matters only where nothing is bound — then it is the
+    // module the load recommendation names. An NCT6686D is an ASRock part, and
+    // the in-kernel `nct6683` binds it (monitoring only; PWM writes for ASRock
+    // await an upstream series), so that is what an unbound one is pointed at,
+    // as the GUI's chip guidance does. The out-of-tree drivers that write to
+    // it are named in the `nct6683` risk note and docs/19, not loaded blind.
+    if lower.starts_with("nct6683") || lower.starts_with("nct6686") {
         return "nct6683"; // mainline, monitoring-only (driver withholds write permission)
     }
-    if lower.starts_with("nct6686") || lower.starts_with("nct6687") {
-        // Usually out-of-tree nct6687d — but mainline nct6683 uses these names
-        // too (see above). DEC-106 collision risk vs nct6775.
+    if lower.starts_with("nct6687") {
+        // Usually out-of-tree nct6687d (MSI) — but mainline nct6683 uses this
+        // name too (see above). DEC-106 collision risk vs nct6775.
         return "nct6687";
     }
     if lower.starts_with("nct6") || lower.starts_with("nct5") {
@@ -2628,18 +2635,20 @@ mod tests {
     #[test]
     fn expected_driver_nuvoton_668x_not_misrouted_to_nct6775() {
         // Regression: NCT6683/6686/6687 are a distinct family — they must NOT
-        // fall into the nct6* → nct6775 catch-all. A chip reporting "nct6683"
-        // was bound by the mainline (monitoring-only) nct6683 driver; a chip
-        // reporting "nct6686"/"nct6687" was bound by the out-of-tree nct6687d.
+        // fall into the nct6* → nct6775 catch-all. The names do not say which
+        // driver bound the chip (DEC-421); the guess is the module an UNBOUND
+        // chip is pointed at. `BRD-ac`: an ASRock NCT6686D → the in-kernel,
+        // monitoring-only nct6683 (as the GUI's guidance says); an MSI
+        // NCT6687D → the out-of-tree nct6687d.
         assert_eq!(expected_driver("nct6683"), "nct6683");
-        assert_eq!(expected_driver("nct6686"), "nct6687");
+        assert_eq!(expected_driver("nct6686"), "nct6683");
         assert_eq!(expected_driver("nct6687"), "nct6687");
         // The genuine nct6775-family chips still route to nct6775.
         assert_eq!(expected_driver("nct6799"), "nct6775");
         assert_eq!(expected_driver("nct6798"), "nct6775");
-        // nct6683 is mainline; the nct6687d-driven chips are out-of-tree.
+        // nct6683 is mainline; the nct6687d-driven chip is out-of-tree.
         assert!(chip_driver_in_mainline("nct6683"));
-        assert!(!chip_driver_in_mainline("nct6686"));
+        assert!(chip_driver_in_mainline("nct6686"));
         assert!(!chip_driver_in_mainline("nct6687"));
     }
 
@@ -2649,6 +2658,9 @@ mod tests {
         // observed driver decides — in both directions.
         assert!(chip_driver_in_mainline_bound("nct6687", Some("nct6683")));
         assert!(chip_driver_in_mainline_bound("nct6686", Some("nct6683")));
+        // `BRD-ac`: an NCT6686D the out-of-tree nct6687d bound is out-of-tree,
+        // although its name now guesses the mainline nct6683.
+        assert!(!chip_driver_in_mainline_bound("nct6686", Some("nct6687")));
         assert!(!chip_driver_in_mainline_bound("nct6683", Some("nct6687")));
         // Unobserved or matching: the chip-level answer stands, so it87's
         // per-chip split survives (one module, two answers).
