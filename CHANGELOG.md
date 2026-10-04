@@ -12,9 +12,23 @@
   to copy the `.uf2` onto the `RPI-RP2` drive — one wait per run, however often the board goes back to its
   bootloader, and the third return leaves it needing recovery — confirms the same board comes back on the same USB port,
   compares its configuration descriptor and `>05`/`>06` reports with what it reported before and with the
-  file, and restores control. It never writes firmware, reads a file or opens any other device. Each run
-  is journaled to `{state_dir}/openfan-maintenance.json` before each action; a run a stop interrupts is
-  finished as interrupted at the next start and never resumed (DEC-481).
+  file, and restores control. For a copy by hand it reads no file and opens no device but the board's
+  serial interface. Each run is journaled to `{state_dir}/openfan-maintenance.json` before each action;
+  a run a stop interrupts is finished as interrupted at the next start and never resumed (DEC-481).
+- **The daemon can write the OpenFAN firmware itself: `PUT /fans/openfan/firmware` and `"write":
+  "daemon"` on the start, advertised as `control.openfan_firmware_write`, opt-in through the
+  `openfan-firmware-write.conf.example` drop-in (`DeviceAllow=char-usb_device rw`).** An upload is
+  fingerprinted and parsed by the daemon; only a published OpenFAN release it knows is kept for it to
+  write (`verdict: daemon_write`), any other file is copied by hand (`manual_copy`), and the 2023 FW_01
+  binary is refused for any update (`firmware_known_broken`). In the new `writing_firmware` stage the
+  daemon opens only the RP2040 bootloader on the board's USB port, claims only its PICOBOOT interface,
+  reads the flash's unique id and erases nothing unless it is the board's serial number, writes only the
+  sectors the file covers, reads every byte back and restarts the board; a board that comes straight
+  back ends `exact_build_verified`, unless its reports point at the old firmware instead. Anything that
+  stops the write before the restart gives the drive back and falls back to the copy by hand. The run record carries `firmware_write` (phase, bytes, flash
+  id, verified, fallback reason) and `GET /fans/openfan/device` carries `daemon_write` — whether the
+  daemon may open USB devices, asked of `access(2)` without opening any. New dependencies: `nusb` (usbfs,
+  pure Rust) and `sha2`; the flash-id helper is picotool's, BSD-3-Clause (`NOTICE.md`) (DEC-483).
 - **`/status` and `/poll` carry `openfan_link`** (`connected` | `unresponsive` | `reconnecting` |
   `maintenance`; omitted with no controller) **and `openfan_maintenance`** (`{run_id, stage, state,
   outcome?}` while an update holds the controller, or while the board it left needs recovery).

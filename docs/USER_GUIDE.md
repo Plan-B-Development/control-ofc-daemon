@@ -311,8 +311,9 @@ invented for the gap.
 | `POST /hwmon/rescan` | Re-enumerate hwmon devices and return fresh header list |
 | `POST /fans/openfan/rescan` | Look for an OpenFanController and adopt it without restarting the daemon |
 | `GET /fans/openfan/roles` | Each OpenFan channel's role and whether the daemon protects it as a pump (`stop_permitted`, `effective_min_pwm_pct`) |
-| `GET /fans/openfan/device` | The OpenFAN controller's USB identity, its hardware and firmware reports, its link state, and whether a firmware update could start now — with each reason it could not (DEC-481, 3.8.0+) |
-| `POST /fans/openfan/maintenance` | Start an OpenFAN firmware update (DEC-481, 3.8.0+; `control.openfan_firmware_maintenance`). Body `{"expected_usb_serial": "<serial>", "firmware": {"sha256": "<hex>", "size": N, ...}}` — a fingerprint of the file, never a path. Parks every OpenFAN channel at 100 %, sends the board into its bootloader, waits up to 15 minutes for you to copy the file onto the `RPI-RP2` drive, then checks the board and restores control. `202` with the run id |
+| `GET /fans/openfan/device` | The OpenFAN controller's USB identity, its hardware and firmware reports, its link state, and whether a firmware update could start now — with each reason it could not (DEC-481, 3.8.0+). `daemon_write` says whether the daemon may write the firmware itself: `{"available": false, "reason": "no_usb_access", ...}` until the opt-in drop-in is installed (DEC-483) |
+| `PUT /fans/openfan/firmware` | Upload a firmware file — the raw `.uf2` bytes, at most 1 MiB (DEC-483, 3.8.0+; `control.openfan_firmware_write`). Answers `{sha256, size, release?, verdict, reason?, message}`: `verdict` is `daemon_write` (a published release the daemon knows — it keeps the file to write it), `manual_copy` (`unknown_build` or `invalid_image` — copied by hand) or `refused` (`firmware_known_broken`: the 2023 FW_01 binary). Touches no hardware |
+| `POST /fans/openfan/maintenance` | Start an OpenFAN firmware update (DEC-481, 3.8.0+; `control.openfan_firmware_maintenance`). Body `{"expected_usb_serial": "<serial>", "firmware": {"sha256": "<hex>", "size": N, ...}, "write": "manual"}` — a fingerprint of the file, never a path. Parks every OpenFAN channel at 100 %, sends the board into its bootloader, waits up to 15 minutes for you to copy the file onto the `RPI-RP2` drive, then checks the board and restores control. With `"write": "daemon"` (DEC-483) the daemon writes the file uploaded with `PUT /fans/openfan/firmware` itself and reads it back, and you copy nothing unless that write falls back to the copy. The FW_01 binary is refused (`firmware_known_broken`). `202` with the run id |
 | `GET /fans/openfan/maintenance` | The current or most recent firmware update: each stage's timing, the outcome and the before/after evidence. Survives a restart |
 | `DELETE /fans/openfan/maintenance` | Cancel a firmware update — only until the board is asked to enter its bootloader |
 | `POST /gpu/{gpu_id}/fan/reset` | Restore GPU fan to firmware automatic and re-enable zero-RPM |
@@ -467,13 +468,35 @@ ls -la /dev/serial/by-id/
 From control-ofc-daemon 3.8.0 the GUI's **Update OpenFAN Firmware…** (Hardware page) installs a
 `.uf2` file you downloaded. The daemon parks every OpenFAN channel at 100 %, sends the board into
 its USB bootloader, waits while you copy the file onto the `RPI-RP2` drive, then checks the board
-and gives the fans back to the profile. It never writes the firmware itself and opens nothing but
-the board's own serial interface. While an update runs, OpenFAN writes are skipped rather than
+and gives the fans back to the profile. While an update runs, OpenFAN writes are skipped rather than
 failed, calibrations and the other diagnostics are refused, and the `openfan` health entry says what
 is happening. A run that leaves the board in its bootloader keeps that entry critical, and OpenFAN
 writes off, until the board answers again; the run is recorded in
 `/var/lib/control-ofc/openfan-maintenance.json`, so a daemon restart reports it rather than forgets
-it. The steps, results and recovery are in the GUI manual's
+it.
+
+**Letting the daemon write the firmware itself (opt-in, DEC-483).** For a published OpenFAN
+release it knows by fingerprint, the daemon can write the file for you through the bootloader's
+PICOBOOT USB interface: it reads the flash's unique id first and erases nothing unless that is
+your board's serial number, writes only the sectors the file covers, reads every byte back, and
+restarts the board — and the GUI then reports the exact build as verified, unless the board's
+reports point at the old firmware instead. Anything that stops that write before the restart
+gives the drive back to you and the update waits for the copy by hand, as above. It needs
+read-write access to the USB device nodes, which the shipped unit does not grant; install the
+opt-in drop-in once:
+
+```bash
+sudo install -Dm644 \
+  /usr/share/doc/control-ofc-daemon/openfan-firmware-write.conf.example \
+  /etc/systemd/system/control-ofc-daemon.service.d/openfan-firmware-write.conf
+sudo systemctl daemon-reload
+sudo systemctl restart control-ofc-daemon
+```
+
+The file says what it grants. With it installed, any local account can start an update that
+writes one of those releases (never another file); without it, the update works as before.
+
+The steps, results and recovery are in the GUI manual's
 [Updating the OpenFAN firmware](https://github.com/Plan-B-Development/control-ofc-gui/blob/main/manual/openfan-controller.md#updating-the-openfan-firmware).
 
 By hand, with the daemon stopped — it holds the port:

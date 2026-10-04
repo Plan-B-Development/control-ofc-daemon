@@ -1,14 +1,19 @@
-//! OpenFan firmware update, Phase 1 (DEC-481).
+//! OpenFan firmware update (DEC-481, DEC-483).
 //!
-//! The daemon takes the board through its bootloader and back; the user copies
-//! the firmware file onto the `RPI-RP2` drive in between. The daemon checks
-//! before starting, parks every channel at 100 %, borrows the serial port from
-//! the poll loop ([`crate::serial::port_loan`]), sends the board into its
-//! bootloader, watches the USB device in sysfs ([`crate::serial::usb_identity`])
-//! while the file is copied, confirms the board that comes back is the same
-//! one, gathers evidence of which firmware it now runs, hands the port back and
-//! waits until control has landed. It never writes the firmware itself and
-//! never opens any device but the board's own serial interface.
+//! The daemon takes the board through its bootloader and back. The daemon
+//! checks before starting, parks every channel at 100 %, borrows the serial
+//! port from the poll loop ([`crate::serial::port_loan`]), sends the board into
+//! its bootloader and watches the USB device in sysfs
+//! ([`crate::serial::usb_identity`]). In between, the firmware is written: by
+//! the daemon itself when the start asked for it and the file is a published
+//! release it knows ([`firmware`], [`crate::serial::picoboot`]) — after it has
+//! read the bootloader's flash id and found the board's own serial — or else
+//! by the user, copying the file onto the `RPI-RP2` drive. A daemon write that
+//! cannot finish falls back to that copy. Then the daemon confirms the board
+//! that comes back is the same one, gathers evidence of which firmware it now
+//! runs, hands the port back and waits until control has landed. It opens no
+//! device but the board's own serial interface and, to write, the PICOBOOT
+//! interface of the bootloader on the board's USB port.
 //!
 //! **Ownership.** A run holds the controller from its claim in the shared state
 //! ([`crate::health::cache::StateCache::try_begin_openfan_maintenance`]) until it
@@ -24,6 +29,7 @@
 //! resumes an action.
 
 pub mod evidence;
+pub mod firmware;
 pub mod journal;
 pub mod run;
 
@@ -42,6 +48,8 @@ pub mod stage {
     pub const PREPARING: &str = "preparing";
     pub const PARKING: &str = "parking";
     pub const ENTERING_BOOTLOADER: &str = "entering_bootloader";
+    /// The daemon writes the firmware itself (DEC-483).
+    pub const WRITING_FIRMWARE: &str = "writing_firmware";
     pub const WAITING_FOR_FILE: &str = "waiting_for_file";
     pub const WAITING_FOR_RETURN: &str = "waiting_for_return";
     pub const CHECKING: &str = "checking";
@@ -49,15 +57,17 @@ pub mod stage {
     pub const FINISHED: &str = "finished";
 }
 
-/// Outcome tokens. Phase 1 cannot verify the exact build — the firmware has no
-/// build identifier — so `exact_build_verified` is reserved on the wire and
-/// never produced here.
+/// Outcome tokens. The firmware has no build identifier, so only a run in
+/// which the daemon wrote the file and read it back can report the exact
+/// build ([`outcome::EXACT_BUILD_VERIFIED`]).
 pub mod outcome {
     /// Refused, cancelled, or the board never left normal mode: nothing changed
     /// and the fans are back under profile control.
     pub const NO_FIRMWARE_CHANGE: &str = "no_firmware_change";
     /// The board is (or may be) in its bootloader with no firmware copied: copy
-    /// a file, press RESET, or power-cycle.
+    /// a file, press RESET, or power-cycle — but after the daemon's own write
+    /// stopped part-way (`flash_changed` without `verified`) only a copied file
+    /// brings it back.
     pub const NEEDS_RECOVERY: &str = "needs_recovery";
     /// The drive went away but the board did not come back answering.
     pub const FIRMWARE_COPIED_BOARD_NOT_BACK: &str = "firmware_copied_board_not_back";
@@ -65,6 +75,10 @@ pub mod outcome {
     pub const BOARD_BACK_CONTROL_NOT_RESTORED: &str = "board_back_control_not_restored";
     /// Control restored; the evidence is shown, the exact build unconfirmed.
     pub const COMPLETED_BUILD_NOT_CONFIRMED: &str = "completed_build_not_confirmed";
+    /// Control restored, and the board runs the file: the daemon wrote it,
+    /// read every byte back, and the board restarted from it straight away
+    /// (DEC-483).
+    pub const EXACT_BUILD_VERIFIED: &str = "exact_build_verified";
     /// Control restored, but the evidence shows the previous firmware.
     pub const BACK_ON_PREVIOUS_FIRMWARE: &str = "back_on_previous_firmware";
 
@@ -98,6 +112,83 @@ pub mod outcome {
 /// `state` on the run record.
 pub const STATE_RUNNING: &str = "running";
 pub const STATE_FINISHED: &str = "finished";
+
+/// `phase` on the run record's `firmware_write` (DEC-483).
+pub mod write_phase {
+    /// Asked for at the start; it begins once the bootloader appears.
+    pub const PENDING: &str = "pending";
+    /// Opening the bootloader and reading its flash id.
+    pub const IDENTIFYING: &str = "identifying";
+    /// Erasing and programming the sectors the image covers.
+    pub const WRITING: &str = "writing";
+    /// Reading every byte back.
+    pub const VERIFYING: &str = "verifying";
+    /// The restart was asked for; waiting for the bootloader to leave.
+    pub const REBOOTING: &str = "rebooting";
+    /// Written, read back, and the board restarted.
+    pub const WRITTEN: &str = "written";
+    /// The daemon stopped writing; the file is copied by hand.
+    pub const FELL_BACK: &str = "fell_back";
+}
+
+/// `fallback_reason` on the run record's `firmware_write`: why the run went on to the
+/// copy by hand (DEC-483).
+pub mod fallback {
+    /// Opening the bootloader was refused: the opt-in drop-in is missing.
+    pub const NO_USB_ACCESS: &str = "no_usb_access";
+    /// The bootloader could not be opened, or shows no PICOBOOT interface.
+    pub const USB_UNAVAILABLE: &str = "usb_unavailable";
+    /// The bootloader's flash is not the board the update was started for.
+    /// Nothing was written.
+    pub const FLASH_ID_MISMATCH: &str = "flash_id_mismatch";
+    /// A transfer failed, the bootloader refused a command, or the write ran
+    /// past its limit.
+    pub const TRANSFER_FAILED: &str = "transfer_failed";
+    /// A byte read back was not the file's.
+    pub const READBACK_MISMATCH: &str = "readback_mismatch";
+    /// Written and read back, but the board did not restart.
+    pub const NO_RESTART: &str = "no_restart";
+}
+
+/// `firmware_write` on the run record: the daemon's own write (DEC-483).
+/// Present only on a run that asked the daemon to write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FirmwareWrite {
+    /// The published release being written.
+    pub release: String,
+    /// A [`write_phase`] token.
+    pub phase: String,
+    /// Bytes programmed while writing, and read back while verifying.
+    pub done_bytes: u64,
+    /// The bytes the image writes.
+    pub total_bytes: u64,
+    /// The bootloader's flash id, as the firmware shows it for its USB serial.
+    pub flash_id: Option<String>,
+    /// Set just before the first erase is sent: from here the flash may no
+    /// longer hold the old firmware whole.
+    pub flash_changed: bool,
+    /// Every byte was read back as the file's.
+    pub verified: bool,
+    /// A [`fallback`] token, once the daemon stopped writing.
+    pub fallback_reason: Option<String>,
+    pub fallback_detail: Option<String>,
+}
+
+impl FirmwareWrite {
+    pub fn new(release: &str, total_bytes: u64) -> Self {
+        Self {
+            release: release.to_string(),
+            phase: write_phase::PENDING.to_string(),
+            done_bytes: 0,
+            total_bytes,
+            flash_id: None,
+            flash_changed: false,
+            verified: false,
+            fallback_reason: None,
+            fallback_detail: None,
+        }
+    }
+}
 
 /// What the GUI says about the file it prepared — sent with the start request
 /// and kept in the journal. Never a file path.
@@ -203,6 +294,9 @@ pub struct MaintenanceRecord {
     pub before: BoardSnapshot,
     pub after: Option<BoardSnapshot>,
     pub evidence: Option<evidence::Evidence>,
+    /// The daemon's own write; `None` when the file is copied by hand.
+    #[serde(default)]
+    pub firmware_write: Option<FirmwareWrite>,
 }
 
 impl MaintenanceRecord {
@@ -238,6 +332,7 @@ impl MaintenanceRecord {
             before: BoardSnapshot::default(),
             after: None,
             evidence: None,
+            firmware_write: None,
         }
     }
 
@@ -275,6 +370,8 @@ pub struct MaintenanceSlot {
     /// The last live `>05`/`>06` read `GET /fans/openfan/device` made, so a
     /// client polling that route cannot keep the serial link busy.
     info: parking_lot::Mutex<Option<CachedInfo>>,
+    /// The last uploaded file the daemon would write (DEC-483).
+    staged: parking_lot::Mutex<Option<firmware::Staged>>,
 }
 
 /// One `>05`/`>06` read, and when and on which device it was made.
@@ -401,6 +498,21 @@ impl MaintenanceSlot {
 
     pub fn store_info(&self, info: CachedInfo) {
         *self.info.lock() = Some(info);
+    }
+
+    /// Keep `staged` in place of the last upload — `None` when the last upload
+    /// is not one the daemon would write.
+    pub fn stage(&self, staged: Option<firmware::Staged>) {
+        *self.staged.lock() = staged;
+    }
+
+    /// A copy of the staged file, if it is the one with `sha256`.
+    pub fn staged(&self, sha256: &str) -> Option<firmware::Staged> {
+        self.staged
+            .lock()
+            .as_ref()
+            .filter(|s| s.sha256 == sha256)
+            .cloned()
     }
 
     /// Whether shutdown has closed registration.

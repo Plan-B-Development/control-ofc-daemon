@@ -1436,6 +1436,34 @@ async fn uds_delete(socket_path: &str, path: &str) -> (u16, serde_json::Value) {
     (status, json)
 }
 
+/// PUT raw bytes — `PUT /fans/openfan/firmware` (DEC-483) takes the file
+/// itself. A rejection axum writes itself is plain text: `Null` then.
+async fn uds_put_bytes(socket_path: &str, path: &str, body: Vec<u8>) -> (u16, serde_json::Value) {
+    let stream = UnixStream::connect(socket_path).await.unwrap();
+    let io = TokioIo::new(stream);
+
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri(path)
+        .header("host", "localhost")
+        .header("content-type", "application/octet-stream")
+        .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+        .unwrap();
+
+    let resp = sender.send_request(req).await.unwrap();
+    let status = resp.status().as_u16();
+    let resp_body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value =
+        serde_json::from_slice(&resp_body).unwrap_or(serde_json::Value::Null);
+
+    (status, json)
+}
+
 // ── Hwmon integration tests ──────────────────────────────────────────
 
 /// Mock sysfs writer for hwmon integration tests.
@@ -9244,6 +9272,32 @@ async fn openfan_update_routes_before_any_update() {
         "no controller, no link"
     );
     assert!(status.get("openfan_maintenance").is_none());
+}
+
+/// DEC-483: an upload through the real router — judged, and bounded at 1 MiB
+/// before the handler reads it, under the router's wider 4 MiB default.
+#[tokio::test]
+async fn a_firmware_upload_is_judged_and_bounded_at_the_socket() {
+    let (sock, _tx, _d) = start_test_server(test_app_state()).await;
+    let (_st, caps) = uds_get(&sock, "/capabilities").await;
+    assert_eq!(caps["control"]["openfan_firmware_write"], true);
+
+    let (st, body) = uds_put_bytes(
+        &sock,
+        "/fans/openfan/firmware",
+        b"not a firmware file".to_vec(),
+    )
+    .await;
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(body["verdict"], "manual_copy");
+    assert_eq!(body["reason"], "invalid_image");
+    assert_eq!(body["size"], 19);
+
+    let bound = 1024 * 1024;
+    let (st, body) = uds_put_bytes(&sock, "/fans/openfan/firmware", vec![0; bound]).await;
+    assert_eq!(st, 200, "the bound itself is taken: {body}");
+    let (st, _) = uds_put_bytes(&sock, "/fans/openfan/firmware", vec![0; bound + 1]).await;
+    assert_eq!(st, 413, "one byte over is refused before the handler");
 }
 
 #[tokio::test]

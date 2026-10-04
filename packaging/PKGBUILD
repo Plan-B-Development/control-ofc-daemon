@@ -127,6 +127,14 @@ package() {
     install -Dm644 packaging/nvidia-telemetry.conf.example \
         "$pkgdir/usr/share/doc/$pkgname/nvidia-telemetry.conf.example"
 
+    # Opt-in systemd drop-in letting the daemon WRITE the OpenFAN firmware
+    # itself (DEC-483). Shipped as a doc example ONLY — NOT installed into the
+    # .service.d/ dir, so the default unit keeps USB devices out of reach.
+    # Grants read-write access to the USB device nodes; the operator copies it
+    # deliberately. Without it the update still works, by a copy by hand.
+    install -Dm644 packaging/openfan-firmware-write.conf.example \
+        "$pkgdir/usr/share/doc/$pkgname/openfan-firmware-write.conf.example"
+
     # Kernel module loading — Super I/O chipset drivers that expose
     # motherboard fan headers and sensors. See packaging/modules-load.d/
     # for rationale. Covered by backup=() so pacman preserves user edits.

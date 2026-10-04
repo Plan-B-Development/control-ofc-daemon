@@ -1,0 +1,47 @@
+# Opt-in systemd drop-in: let control-ofc-daemon WRITE the OpenFAN firmware
+# itself (DEC-483).
+#
+# ─────────────────────────────  READ THIS  ─────────────────────────────
+# You do not need this file to update the OpenFAN firmware. Without it, the
+# daemon sends the board into its bootloader and you copy the .uf2 file onto
+# the RPI-RP2 drive yourself. With it, the daemon writes the file for you — but
+# only a published OpenFAN release it knows by fingerprint — through the
+# bootloader's PICOBOOT USB interface. It checks the bootloader's flash id
+# before it erases anything, reads every byte back before the board restarts,
+# and can then report the exact build as verified.
+#
+# WHAT IT GRANTS
+#   Read-write access to the USB device nodes (/dev/bus/usb/*/*, the
+#   "usb_device" character devices). The base unit allows only the serial
+#   devices (ttyACM/ttyUSB). The daemon opens a USB device only while an
+#   update writes the firmware, only an RP2040 bootloader (2e8a:0003) on the
+#   controller's own USB port, and claims only its PICOBOOT interface — never
+#   the drive, and no other device.
+#
+# SECURITY NOTE
+#   The daemon runs as root and its API socket is open to every local account
+#   (DEC-049). With this file installed, any local account can start an update
+#   that writes one of the published OpenFAN releases the daemon knows — never
+#   any other file. Without it, any local account can already start an update
+#   that you then finish by hand. Only install it if you accept that.
+#
+# ────────────────────────────  TO ENABLE  ─────────────────────────────
+#   1. Install this drop-in (run from anywhere — the source is the full path):
+#          sudo install -Dm644 \
+#            /usr/share/doc/control-ofc-daemon/openfan-firmware-write.conf.example \
+#            /etc/systemd/system/control-ofc-daemon.service.d/openfan-firmware-write.conf
+#   2. Reload + restart:
+#          sudo systemctl daemon-reload
+#          sudo systemctl restart control-ofc-daemon
+#
+# The OpenFAN firmware window then says Control-OFC can write the file itself.
+#
+# ───────────────────────────  TO DISABLE  ─────────────────────────────
+#   sudo rm /etc/systemd/system/control-ofc-daemon.service.d/openfan-firmware-write.conf
+#   sudo systemctl daemon-reload && sudo systemctl restart control-ofc-daemon
+
+[Service]
+# The USB device nodes: major 189, "usb_device" in /proc/devices. DeviceAllow=
+# accumulates with the base unit's serial entries. Read+write only — the daemon
+# opens existing nodes and never creates them.
+DeviceAllow=char-usb_device rw

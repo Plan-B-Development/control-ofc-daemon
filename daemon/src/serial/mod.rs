@@ -3,10 +3,12 @@
 
 pub mod adoption;
 pub mod controller;
+pub mod picoboot;
 pub mod port_loan;
 pub mod protocol;
 pub mod real_transport;
 pub mod transport;
+pub mod uf2;
 pub mod usb_identity;
 
 // ── The `openfan:ch{NN}` member id (`P8-bq`) ─────────────────────────

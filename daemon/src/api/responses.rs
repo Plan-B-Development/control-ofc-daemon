@@ -1349,6 +1349,13 @@ pub struct ControlCapability {
     /// only when this is true and a controller is present.
     #[serde(default)]
     pub openfan_firmware_maintenance: bool,
+    /// The daemon can write OpenFan firmware itself (DEC-483):
+    /// `PUT /fans/openfan/firmware`, `write: "daemon"` on the start,
+    /// `daemon_write` on `GET /fans/openfan/device`, the `writing_firmware`
+    /// stage and the `write` record. Whether it may on this machine — the
+    /// opt-in drop-in — is `daemon_write.available`, not this.
+    #[serde(default)]
+    pub openfan_firmware_write: bool,
 }
 
 /// Per-device-group capability info.
@@ -1708,6 +1715,41 @@ pub struct OpenFanDeviceResponse {
     pub update_available: bool,
     /// Why not, when it would not. Empty when `update_available`.
     pub update_refusals: Vec<OpenFanUpdateRefusal>,
+    /// Whether the daemon could write the firmware itself (DEC-483).
+    pub daemon_write: OpenFanDaemonWrite,
+}
+
+/// `daemon_write` on `GET /fans/openfan/device` (DEC-483).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OpenFanDaemonWrite {
+    /// The daemon may open USB devices: the opt-in drop-in is installed.
+    pub available: bool,
+    /// Why not: `no_usb_access`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// `PUT /fans/openfan/firmware` → 200 (DEC-483): what the daemon makes of
+/// the uploaded file.
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenFanFirmwareStagedResponse {
+    pub api_version: u32,
+    /// Lower-case hex; the start names it.
+    pub sha256: String,
+    pub size: u64,
+    /// The published release the file is, by fingerprint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release: Option<String>,
+    /// `daemon_write` (kept: the daemon writes it), `manual_copy` (copied by
+    /// hand) or `refused` (no update may use it).
+    pub verdict: String,
+    /// Why not `daemon_write`: `unknown_build`, `invalid_image` or
+    /// `firmware_known_broken`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub message: String,
 }
 
 /// One reason an update could not start, as its 409 would give it.
@@ -3636,10 +3678,32 @@ mod tests {
             fw_info: Some(info.clone()),
             update_available: false,
             update_refusals: vec![refusal],
+            daemon_write: OpenFanDaemonWrite {
+                available: false,
+                reason: Some("no_usb_access".into()),
+                message: Some("install the drop-in".into()),
+            },
         };
         expect(
             &serde_json::to_value(&device).unwrap(),
             "OpenFanDeviceResponse",
+        );
+        expect(
+            &serde_json::to_value(&device.daemon_write).unwrap(),
+            "OpenFanDaemonWrite",
+        );
+        let staged = OpenFanFirmwareStagedResponse {
+            api_version: 1,
+            sha256: "ab".repeat(32),
+            size: 79_360,
+            release: Some("2026-09-27 release".into()),
+            verdict: "manual_copy".into(),
+            reason: Some("unknown_build".into()),
+            message: "copied by hand".into(),
+        };
+        expect(
+            &serde_json::to_value(&staged).unwrap(),
+            "OpenFanFirmwareStagedResponse",
         );
         let snapshot = crate::openfan_maintenance::BoardSnapshot {
             usb: Some(usb),
@@ -3688,6 +3752,13 @@ mod tests {
         record.before = snapshot.clone();
         record.after = Some(snapshot);
         record.evidence = Some(evidence);
+        let mut write =
+            crate::openfan_maintenance::FirmwareWrite::new("2026-09-27 release", 79_360);
+        write.flash_id = Some("DE615CB14721492C".into());
+        write.fallback_reason = Some("transfer_failed".into());
+        write.fallback_detail = Some("a transfer failed".into());
+        expect(&serde_json::to_value(&write).unwrap(), "FirmwareWrite");
+        record.firmware_write = Some(write);
         expect(&serde_json::to_value(&record).unwrap(), "MaintenanceRecord");
 
         // **Both directions, and this is what makes the oracle an interlock

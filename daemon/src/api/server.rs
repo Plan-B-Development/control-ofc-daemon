@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use axum::extract::connect_info::Connected;
 use axum::extract::DefaultBodyLimit;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::serve::IncomingStream;
 use axum::Router;
 use tokio::net::UnixListener;
@@ -179,6 +179,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/fans/openfan/device",
             get(handlers::openfan_device_handler),
+        )
+        // DEC-483: a firmware file for the daemon to write, at most 1 MiB.
+        .route(
+            "/fans/openfan/firmware",
+            put(handlers::openfan_firmware_stage_handler)
+                .layer(DefaultBodyLimit::max(crate::serial::uf2::MAX_FILE_BYTES)),
         )
         .route(
             "/fans/openfan/maintenance",
@@ -454,6 +460,7 @@ mod tests {
         ("POST", "/fans/openfan/rescan", Refused),
         ("GET", "/fans/openfan/roles", Unaffected),
         ("GET", "/fans/openfan/device", Itself),
+        ("PUT", "/fans/openfan/firmware", Itself),
         ("GET", "/fans/openfan/maintenance", Itself),
         ("POST", "/fans/openfan/maintenance", Itself),
         ("DELETE", "/fans/openfan/maintenance", Itself),

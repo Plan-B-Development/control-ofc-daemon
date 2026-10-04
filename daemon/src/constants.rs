@@ -41,7 +41,7 @@ pub const SERIAL_BAUD_RATE: u32 = 115_200;
 /// (e.g. `/dev/ttyACM0` through `/dev/ttyACM9`).
 pub const SERIAL_PROBE_RANGE: std::ops::Range<u8> = 0..10;
 
-// ── OpenFan firmware update (DEC-481) ────────────────────────────────
+// ── OpenFan firmware update (DEC-481, DEC-483) ───────────────────────
 //
 // Each stage's time limit. The update ends a stage at its limit itself; the
 // `openfan` health entry turns critical only once a stage has overrun its limit
@@ -72,6 +72,20 @@ pub const OPENFAN_MAINT_ENTER_LIMIT: Duration = Duration::from_secs(
         + OPENFAN_MAINT_BOOTLOADER_WAIT.as_secs()
         + 5,
 );
+
+/// The daemon's own write (DEC-483): its stage limit is this, plus
+/// `OPENFAN_MAINT_WRITE_PER_SECTOR` for each 4 KiB sector the image covers.
+/// Opening the bootloader and reading its flash id take well under a second.
+pub const OPENFAN_MAINT_WRITE_BASE: Duration = Duration::from_secs(15);
+
+/// One sector: the erase (45 ms typical, 400 ms at most on the board's
+/// W25Q32), sixteen pages programmed and sent, and read back. A 2026 release
+/// covers 10 sectors.
+pub const OPENFAN_MAINT_WRITE_PER_SECTOR: Duration = Duration::from_secs(1);
+
+/// After the restart is asked for — half a second after its acknowledgement —
+/// how long the bootloader has to leave the board's USB port.
+pub const OPENFAN_MAINT_REBOOT_WAIT: Duration = Duration::from_secs(5);
 
 /// How long the user has to copy the firmware file onto the `RPI-RP2` drive.
 /// One budget per run: a board that goes back to its bootloader resumes it,

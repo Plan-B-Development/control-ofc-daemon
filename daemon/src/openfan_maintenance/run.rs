@@ -1,4 +1,4 @@
-//! A firmware update's stages (DEC-481).
+//! A firmware update's stages (DEC-481, DEC-483).
 //!
 //! 1. **Preparing** — read the board's USB identity and its `>05`/`>06` blocks.
 //! 2. **Parking** — every channel to 100 % through the normal write path; any
@@ -6,15 +6,21 @@
 //! 3. **Entering the bootloader** — borrow the port, send `>07` (no reply); if
 //!    the board is still in normal mode after a while, switch the same port to
 //!    1200 baud. The bootloader must then appear on the same USB port.
-//! 4. **Waiting for the file** — the user copies it onto the board's drive.
-//! 5. **Waiting for the board** — the same serial on the same USB port.
-//! 6. **Checking** — open only the interface the daemon used, `>00`,
+//! 4. **Writing the firmware** — only when the start asked the daemon to: open
+//!    the PICOBOOT interface of the bootloader on that port, read its flash id
+//!    and find the board's serial in it, erase and program each sector the
+//!    image covers, read every byte back, restart the board. Anything that
+//!    stops it first gives the drive back and goes on to stage 5.
+//! 5. **Waiting for the file** — the user copies it onto the board's drive.
+//!    Skipped after a write the board restarted from.
+//! 6. **Waiting for the board** — the same serial on the same USB port.
+//! 7. **Checking** — open only the interface the daemon used, `>00`,
 //!    `>05`/`>06`, the evidence.
-//! 7. **Restoring control** — hand the port back, lift the write suspension,
+//! 8. **Restoring control** — hand the port back, lift the write suspension,
 //!    wait for fresh polls of every channel and for the settings to land.
 //!
 //! Every wait has a limit and watches the stop signal; every blocking call
-//! (serial, sysfs) runs on the blocking pool.
+//! (serial, sysfs, USB) runs on the blocking pool.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -25,13 +31,14 @@ use parking_lot::Mutex;
 use tokio::sync::watch;
 
 use super::{
-    evidence, journal, outcome, stage, AliveGuard, BoardSnapshot, ClaimGuard, MaintenanceRecord,
-    MaintenanceSlot, StageTiming, STATE_FINISHED,
+    evidence, fallback, firmware, journal, outcome, stage, write_phase, AliveGuard, BoardSnapshot,
+    ClaimGuard, FirmwareWrite, MaintenanceRecord, MaintenanceSlot, StageTiming, STATE_FINISHED,
 };
 use crate::constants;
 use crate::error::SerialError;
 use crate::health::cache::StateCache;
 use crate::serial::controller::FanController;
+use crate::serial::picoboot::{self, PicobootError};
 use crate::serial::port_loan::{self, LoanHandle, LoanReturn, LoanSender};
 use crate::serial::protocol::{
     encode_bare, FW_INFO_OPCODE, HW_INFO_OPCODE, JUMP_TO_BOOTLOADER_OPCODE, NUM_CHANNELS,
@@ -66,6 +73,11 @@ pub struct StageLimits {
     pub sysfs_poll: Duration,
     /// Pause between handshake attempts on the returned board.
     pub check_retry: Duration,
+    /// The daemon's own write: this, plus `write_per_sector` for each sector.
+    pub write_base: Duration,
+    pub write_per_sector: Duration,
+    /// After the restart is asked for, how long the bootloader has to leave.
+    pub reboot_wait: Duration,
 }
 
 impl StageLimits {
@@ -83,6 +95,9 @@ impl StageLimits {
             restore_wait: constants::OPENFAN_MAINT_RESTORE_WAIT,
             sysfs_poll: constants::OPENFAN_MAINT_SYSFS_POLL,
             check_retry: Duration::from_millis(500),
+            write_base: constants::OPENFAN_MAINT_WRITE_BASE,
+            write_per_sector: constants::OPENFAN_MAINT_WRITE_PER_SECTOR,
+            reboot_wait: constants::OPENFAN_MAINT_REBOOT_WAIT,
         }
     }
 }
@@ -100,6 +115,11 @@ pub struct RunEnv {
     pub open: Opener,
     pub expected_channels: ExpectedChannels,
     pub shutdown: watch::Receiver<bool>,
+    /// The file the daemon writes itself, when the start asked it to
+    /// (DEC-483); `None` when the user copies it.
+    pub write: Option<firmware::Staged>,
+    /// Opens the PICOBOOT interface of the bootloader on a USB port.
+    pub picoboot: picoboot::Opener,
 }
 
 /// Start a run and the supervisor that records an internal error if it
@@ -274,6 +294,43 @@ enum FileWait {
 
 const NO_FILE_IN_TIME: &str =
     "no firmware file was copied in time — the board is still in its bootloader";
+
+/// How the daemon's own write ended.
+enum Written {
+    /// Written, read back, and the board restarted from it.
+    Done,
+    /// The run goes on to the copy by hand.
+    FellBack,
+    /// The daemon is stopping.
+    Stopped,
+}
+
+/// Run `f` on the bootloader's PICOBOOT client on the blocking pool, and get
+/// the client back with its result; `None` if the task panicked, which takes
+/// the client with it.
+async fn on_usb<T: Send + 'static>(
+    mut client: picoboot::Client,
+    f: impl FnOnce(&mut picoboot::Client) -> Result<T, PicobootError> + Send + 'static,
+) -> Option<(picoboot::Client, Result<T, PicobootError>)> {
+    blocking(move || {
+        let result = f(&mut client);
+        (client, result)
+    })
+    .await
+}
+
+/// Give the bootloader's drive back to the user — exclusive access off, so a
+/// copy onto it is accepted again — and close the client. picotool's way out:
+/// ask, and reset the interface if the asking fails.
+async fn release_drive(client: picoboot::Client) -> bool {
+    blocking(move || {
+        let mut c = client;
+        c.exclusive_access(picoboot::NOT_EXCLUSIVE).is_ok()
+            || (c.reset().is_ok() && c.exclusive_access(picoboot::NOT_EXCLUSIVE).is_ok())
+    })
+    .await
+    .unwrap_or(false)
+}
 
 fn to_map(pairs: Result<Vec<(String, String)>, SerialError>) -> Option<BTreeMap<String, String>> {
     pairs.ok().map(|p| p.into_iter().collect())
@@ -636,53 +693,69 @@ impl Runner {
         self.record(|r| r.bootloader_seen = true).await;
         self.drop_port().await;
 
-        // ── 4–5. Waiting for the file, then for the board ─────────────────
+        // ── 4. Writing the firmware, when the start asked the daemon to ───
+        let mut written = false;
+        if let Some(job) = self.env.write.take() {
+            match self.write_firmware(&port, &serial, job).await {
+                Written::Done => written = true,
+                Written::FellBack => {}
+                Written::Stopped => return self.interrupted(),
+            }
+        }
+
+        // ── 5–6. Waiting for the file, then for the board ─────────────────
         // One file wait however often the board goes back to its bootloader:
         // a return resumes it rather than starting it again, and only so many
-        // returns are waited through.
+        // returns are waited through. A board the daemon wrote and restarted
+        // needs no file — unless it comes back to its bootloader.
         let file_deadline = Instant::now() + limits.file_wait;
         let mut returns: u32 = 0;
+        let mut wait_for_file = !written;
         let returned_tty = loop {
-            self.enter_until(stage::WAITING_FOR_FILE, file_deadline)
-                .await;
-            // The drive is named when it attaches — on real hardware about a
-            // second after the bootloader — and again whenever a disk comes or
-            // goes, so the window can say which drive to copy onto.
-            let mut seen: Option<Drives> = None;
-            loop {
-                let (p, s) = (port.clone(), serial.clone());
-                let known = seen.as_ref().map(|d| d.disks.clone());
-                let event = move |sys: &Path| {
-                    if port_holds(sys, &p, &s) != PortHolds::Bootloader {
-                        return Some(FileWait::Left);
-                    }
-                    let disks = usb::block_device_names(sys);
-                    (known.as_ref() != Some(&disks))
-                        .then(|| FileWait::Drives(Drives::read(sys, &p, disks)))
-                };
-                let file_left = file_deadline.saturating_duration_since(Instant::now());
-                match self.watch_sysfs(file_left, event).await {
-                    Watched::Found(FileWait::Left) => break,
-                    Watched::Found(FileWait::Drives(now)) => {
-                        let changed = seen
-                            .as_ref()
-                            .is_none_or(|was| (&was.ours, &was.others) != (&now.ours, &now.others));
-                        if changed {
-                            let (ours, others) = (now.ours.clone(), now.others.clone());
-                            self.record(|r| {
-                                r.bootloader_drive = ours;
-                                r.other_bootloader_drives = others;
-                            })
-                            .await;
+            if std::mem::replace(&mut wait_for_file, true) {
+                self.enter_until(stage::WAITING_FOR_FILE, file_deadline)
+                    .await;
+                // The drive is named when it attaches — on real hardware about a
+                // second after the bootloader — and again whenever a disk comes or
+                // goes, so the window can say which drive to copy onto.
+                let mut seen: Option<Drives> = None;
+                loop {
+                    let (p, s) = (port.clone(), serial.clone());
+                    let known = seen.as_ref().map(|d| d.disks.clone());
+                    let event = move |sys: &Path| {
+                        if port_holds(sys, &p, &s) != PortHolds::Bootloader {
+                            return Some(FileWait::Left);
                         }
-                        seen = Some(now);
-                        // Disks that keep coming and going cannot hold the wait open.
-                        if Instant::now() >= file_deadline {
-                            return End::new(outcome::NEEDS_RECOVERY, NO_FILE_IN_TIME);
+                        let disks = usb::block_device_names(sys);
+                        (known.as_ref() != Some(&disks))
+                            .then(|| FileWait::Drives(Drives::read(sys, &p, disks)))
+                    };
+                    let file_left = file_deadline.saturating_duration_since(Instant::now());
+                    match self.watch_sysfs(file_left, event).await {
+                        Watched::Found(FileWait::Left) => break,
+                        Watched::Found(FileWait::Drives(now)) => {
+                            let changed = seen.as_ref().is_none_or(|was| {
+                                (&was.ours, &was.others) != (&now.ours, &now.others)
+                            });
+                            if changed {
+                                let (ours, others) = (now.ours.clone(), now.others.clone());
+                                self.record(|r| {
+                                    r.bootloader_drive = ours;
+                                    r.other_bootloader_drives = others;
+                                })
+                                .await;
+                            }
+                            seen = Some(now);
+                            // Disks that keep coming and going cannot hold the wait open.
+                            if Instant::now() >= file_deadline {
+                                return End::new(outcome::NEEDS_RECOVERY, NO_FILE_IN_TIME);
+                            }
                         }
+                        Watched::Deadline => {
+                            return End::new(outcome::NEEDS_RECOVERY, NO_FILE_IN_TIME)
+                        }
+                        Watched::Shutdown => return self.interrupted(),
                     }
-                    Watched::Deadline => return End::new(outcome::NEEDS_RECOVERY, NO_FILE_IN_TIME),
-                    Watched::Shutdown => return self.interrupted(),
                 }
             }
 
@@ -857,19 +930,338 @@ impl Runner {
                 return self.interrupted();
             }
         }
-        if verdict == evidence::PREVIOUS_FIRMWARE {
-            End::new(
+        // The exact build is known only when the board restarted straight
+        // from the bytes the daemon read back: a board that went back to its
+        // bootloader may since have been given another file by hand.
+        let verified = written && returns == 0;
+        match (verified, verdict == evidence::PREVIOUS_FIRMWARE) {
+            (true, false) => End::new(
+                outcome::EXACT_BUILD_VERIFIED,
+                "control is restored; Control-OFC wrote the file, read every byte back, and the \
+                 board restarted from it",
+            ),
+            (true, true) => End::new(
+                outcome::COMPLETED_BUILD_NOT_CONFIRMED,
+                "control is restored; Control-OFC wrote the file and read every byte back, but \
+                 the board's own reports match the firmware it ran before, so the exact build \
+                 is not confirmed",
+            ),
+            (false, true) => End::new(
                 outcome::BACK_ON_PREVIOUS_FIRMWARE,
                 "control is restored, but the board reports the firmware it ran before — the \
                  update was not applied",
-            )
-        } else {
-            End::new(
+            ),
+            (false, false) => End::new(
                 outcome::COMPLETED_BUILD_NOT_CONFIRMED,
                 "control is restored; the evidence is shown, but no check can prove which exact \
                  build is running",
-            )
+            ),
         }
+    }
+
+    /// Change the daemon write's progress in memory, for the window. The
+    /// journal is written at each phase instead: a run that stops is judged
+    /// by how far it got, not by the byte.
+    fn progress(&self, f: impl FnOnce(&mut FirmwareWrite)) {
+        self.env.slot.update_record(|r| {
+            if let Some(w) = r.firmware_write.as_mut() {
+                f(w);
+            }
+        });
+    }
+
+    /// Change the daemon write in the record, and write the journal.
+    async fn record_write(&mut self, f: impl FnOnce(&mut FirmwareWrite)) {
+        self.record(|r| {
+            if let Some(w) = r.firmware_write.as_mut() {
+                f(w);
+            }
+        })
+        .await;
+    }
+
+    /// Stage 4 (DEC-483): write `job` through the PICOBOOT interface of the
+    /// bootloader on `port`. Nothing is erased until the bootloader's flash id
+    /// is found to be `serial`; every sector is read back before the board is
+    /// restarted. Anything that stops it before the restart gives the drive
+    /// back and the run goes on to the copy by hand.
+    async fn write_firmware(&mut self, port: &str, serial: &str, job: firmware::Staged) -> Written {
+        let limits = self.env.limits;
+        let sectors = job.image.sectors();
+        let deadline =
+            Instant::now() + limits.write_base + limits.write_per_sector * sectors.len() as u32;
+        self.enter_until(stage::WRITING_FIRMWARE, deadline).await;
+        let total = job.image.byte_count();
+        self.record(|r| {
+            r.firmware_write
+                .get_or_insert_with(|| FirmwareWrite::new(job.release.name, total))
+                .phase = write_phase::IDENTIFYING.to_string();
+        })
+        .await;
+
+        // The bootloader on the board's own USB port, and nothing else.
+        let (open, p) = (self.env.picoboot.clone(), port.to_string());
+        let client = match blocking(move || open(&p)).await {
+            Some(Ok(client)) => client,
+            Some(Err(PicobootError::NoAccess(e))) => {
+                let detail = format!(
+                    "the daemon may not open USB devices ({e}) — the openfan-firmware-write \
+                     drop-in is not installed"
+                );
+                return self.fall_back(None, fallback::NO_USB_ACCESS, detail).await;
+            }
+            Some(Err(e)) => {
+                return self
+                    .fall_back(None, fallback::USB_UNAVAILABLE, e.to_string())
+                    .await
+            }
+            None => {
+                let detail = "opening the bootloader failed".to_string();
+                return self
+                    .fall_back(None, fallback::USB_UNAVAILABLE, detail)
+                    .await;
+            }
+        };
+
+        // Whose flash is it? The firmware builds its USB serial from the
+        // flash chip's unique id, so the board's serial must be in it.
+        let identified = on_usb(client, |c| {
+            c.reset()?;
+            c.exclusive_access(picoboot::EXCLUSIVE)?;
+            c.exit_xip()?;
+            c.flash_id()
+        })
+        .await;
+        let (client, id) = match identified {
+            Some((client, Ok(id))) => (client, id),
+            Some((client, Err(e))) => {
+                let detail = format!("reading the flash id failed: {e}");
+                return self
+                    .fall_back(Some(client), fallback::TRANSFER_FAILED, detail)
+                    .await;
+            }
+            None => {
+                let detail = "reading the flash id failed".to_string();
+                return self
+                    .fall_back_held(port, fallback::TRANSFER_FAILED, detail)
+                    .await;
+            }
+        };
+        let shown = picoboot::serial_of(&id);
+        self.record_write(|w| w.flash_id = Some(shown)).await;
+        if !picoboot::id_matches_serial(&id, serial) {
+            // No serial in the sentence: it is logged, and the log goes whole
+            // into a support bundle. The record's own fields hold both.
+            let detail = format!(
+                "the bootloader on USB port {port} has another board's flash, not this \
+                 controller's — nothing was written"
+            );
+            return self
+                .fall_back(Some(client), fallback::FLASH_ID_MISMATCH, detail)
+                .await;
+        }
+
+        let mut client = client;
+        let mut done: u64 = 0;
+        for (index, sector) in sectors.iter().enumerate() {
+            if self.shutting_down() {
+                return self.stop_writing(client).await;
+            }
+            if Instant::now() >= deadline {
+                let detail = "the write did not finish in time".to_string();
+                return self
+                    .fall_back(Some(client), fallback::TRANSFER_FAILED, detail)
+                    .await;
+            }
+            if index == 0 {
+                // [SAFETY] Journaled before the first erase, and after the last
+                // check that could end the write first: from here the old
+                // firmware is no longer whole, and only a write that finishes —
+                // the daemon's or a copy by hand — leaves the board a firmware
+                // to run.
+                self.record_write(|w| {
+                    w.flash_changed = true;
+                    w.phase = write_phase::WRITING.to_string();
+                })
+                .await;
+            }
+            let (base, this) = (sector.base, sector.clone());
+            match on_usb(client, move |c| picoboot::write_sector(c, &this)).await {
+                Some((c, Ok(()))) => client = c,
+                Some((c, Err(e))) => {
+                    let detail = format!("writing the sector at {base:#010x} failed: {e}");
+                    return self
+                        .fall_back(Some(c), fallback::TRANSFER_FAILED, detail)
+                        .await;
+                }
+                None => {
+                    let detail = format!("writing the sector at {base:#010x} failed");
+                    return self
+                        .fall_back_held(port, fallback::TRANSFER_FAILED, detail)
+                        .await;
+                }
+            }
+            done += sector.bytes();
+            self.progress(|w| w.done_bytes = done);
+        }
+
+        self.record_write(|w| {
+            w.phase = write_phase::VERIFYING.to_string();
+            w.done_bytes = 0;
+        })
+        .await;
+        done = 0;
+        for sector in &sectors {
+            if self.shutting_down() {
+                return self.stop_writing(client).await;
+            }
+            if Instant::now() >= deadline {
+                let detail = "reading the firmware back did not finish in time".to_string();
+                return self
+                    .fall_back(Some(client), fallback::TRANSFER_FAILED, detail)
+                    .await;
+            }
+            let (base, this) = (sector.base, sector.clone());
+            match on_usb(client, move |c| picoboot::verify_sector(c, &this)).await {
+                Some((c, Ok(None))) => client = c,
+                Some((c, Ok(Some(at)))) => {
+                    let detail = format!("the flash at {at:#010x} does not hold the file's bytes");
+                    return self
+                        .fall_back(Some(c), fallback::READBACK_MISMATCH, detail)
+                        .await;
+                }
+                Some((c, Err(e))) => {
+                    let detail = format!("reading back the sector at {base:#010x} failed: {e}");
+                    return self
+                        .fall_back(Some(c), fallback::TRANSFER_FAILED, detail)
+                        .await;
+                }
+                None => {
+                    let detail = format!("reading back the sector at {base:#010x} failed");
+                    return self
+                        .fall_back_held(port, fallback::TRANSFER_FAILED, detail)
+                        .await;
+                }
+            }
+            done += sector.bytes();
+            self.progress(|w| w.done_bytes = done);
+        }
+
+        self.record_write(|w| {
+            w.verified = true;
+            w.phase = write_phase::REBOOTING.to_string();
+        })
+        .await;
+        if self.shutting_down() {
+            return self.stop_writing(client).await;
+        }
+        match on_usb(client, |c| c.reboot()).await {
+            // Closed on the blocking pool, where the client was.
+            Some((c, Ok(()))) => {
+                blocking(move || drop(c)).await;
+            }
+            Some((c, Err(e))) => {
+                let detail = format!(
+                    "the firmware was written and read back, but the restart failed ({e}) — \
+                     press the board's RESET button, or copy the file onto its drive"
+                );
+                return self.fall_back(Some(c), fallback::NO_RESTART, detail).await;
+            }
+            None => {
+                let detail = "the firmware was written and read back, but the restart failed — \
+                              press the board's RESET button, or copy the file onto its drive"
+                    .to_string();
+                return self
+                    .fall_back_held(port, fallback::NO_RESTART, detail)
+                    .await;
+            }
+        }
+        // The bootloader leaves the port half a second after the acknowledgement.
+        let (p, s) = (port.to_string(), serial.to_string());
+        let left =
+            move |sys: &Path| (port_holds(sys, &p, &s) != PortHolds::Bootloader).then_some(());
+        match self.watch_sysfs(limits.reboot_wait, left).await {
+            Watched::Found(()) => {
+                self.record_write(|w| w.phase = write_phase::WRITTEN.to_string())
+                    .await;
+                Written::Done
+            }
+            Watched::Deadline => {
+                let detail = "the firmware was written and read back, but the board did not \
+                              restart — press its RESET button, or copy the file onto its drive"
+                    .to_string();
+                self.fall_back_held(port, fallback::NO_RESTART, detail)
+                    .await
+            }
+            Watched::Shutdown => Written::Stopped,
+        }
+    }
+
+    /// The daemon write stops before the restart: the drive is given back,
+    /// the reason recorded, and the run goes on to the copy by hand. `client`
+    /// is the open bootloader, if any — `None` when it was never opened.
+    async fn fall_back(
+        &mut self,
+        client: Option<picoboot::Client>,
+        reason: &'static str,
+        detail: String,
+    ) -> Written {
+        let released = match client {
+            Some(c) => release_drive(c).await,
+            None => true,
+        };
+        self.fell_back(released, reason, detail).await
+    }
+
+    /// As [`Self::fall_back`], after the client was lost while the bootloader
+    /// may still hold the drive to itself: it is opened again to give it back.
+    async fn fall_back_held(
+        &mut self,
+        port: &str,
+        reason: &'static str,
+        detail: String,
+    ) -> Written {
+        let (open, p) = (self.env.picoboot.clone(), port.to_string());
+        let released = match blocking(move || open(&p)).await {
+            Some(Ok(c)) => release_drive(c).await,
+            _ => false,
+        };
+        self.fell_back(released, reason, detail).await
+    }
+
+    async fn fell_back(&mut self, released: bool, reason: &'static str, detail: String) -> Written {
+        let shown = detail.clone();
+        self.record_write(|w| {
+            w.phase = write_phase::FELL_BACK.to_string();
+            w.fallback_reason = Some(reason.to_string());
+            w.fallback_detail = Some(shown);
+        })
+        .await;
+        // A flash that is not the board's may be another board's drive.
+        let copy = if reason == fallback::FLASH_ID_MISMATCH {
+            "copy the file onto the drive only if you are sure it is the OpenFAN board's"
+        } else {
+            "copy the file onto the board's drive"
+        };
+        self.note(format!(
+            "Control-OFC did not write the firmware itself ({detail}) — {copy}"
+        ))
+        .await;
+        if !released {
+            self.note(
+                "the bootloader did not confirm its drive takes a copy again — if the copy fails, \
+                 see the recovery steps",
+            )
+            .await;
+        }
+        Written::FellBack
+    }
+
+    /// The daemon is stopping mid-write: give the drive back so the user can
+    /// copy the file while it is down.
+    async fn stop_writing(&mut self, client: picoboot::Client) -> Written {
+        release_drive(client).await;
+        Written::Stopped
     }
 
     /// The board is in its firmware without having reached its bootloader:
@@ -918,6 +1310,7 @@ impl Runner {
     }
 
     /// Close the port the run holds, if any, without waiting for its output.
+    /// (The PICOBOOT client is closed by [`release_drive`] or after the restart.)
     async fn drop_port(&mut self) {
         if let Some(mut old) = self.port.take() {
             blocking(move || {
@@ -970,13 +1363,16 @@ impl Runner {
 mod tests {
     //! A run end to end against a board on the bench: its USB identity moves
     //! in a sysfs fixture the way the kernel's does, the real poll loop lends
-    //! and takes back its port, and the board answers what the firmware
-    //! answers. Real time, short limits; every wait is bounded.
+    //! and takes back its port, the board answers what the firmware answers,
+    //! and in its bootloader a boot ROM answers PICOBOOT. Real time, short
+    //! limits; every wait is bounded.
     use super::*;
     use crate::health::state::OpenFanLink;
     use crate::openfan_maintenance::journal::JOURNAL_FILE;
     use crate::openfan_maintenance::{CancelOutcome, FirmwareClaim};
+    use crate::serial::picoboot::fake::Rom;
     use crate::serial::port_loan::loan_channel;
+    use crate::serial::uf2::{self, Image};
     use crate::serial::usb_identity::fixture::{descriptors, Sysfs};
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
@@ -992,6 +1388,17 @@ mod tests {
     /// How long the bench takes to re-enumerate, as the kernel does.
     const REENUMERATE: Duration = Duration::from_millis(40);
     const RUN: &str = "ofmaint-test";
+    /// The board's flash id: the bytes its firmware shows as `SERIAL`.
+    const FLASH_UID: [u8; 8] = [0xde, 0x61, 0x5c, 0xb1, 0x47, 0x21, 0x49, 0x2c];
+    /// The release the daemon writes on the bench.
+    static BENCH_RELEASE: firmware::Release = firmware::Release {
+        sha256: "not read by the run",
+        size: 0,
+        name: "bench release",
+        broken: false,
+    };
+    /// Forty pages: two whole sectors and half of a third.
+    const RELEASE_PAGES: u32 = 40;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Mode {
@@ -1030,6 +1437,14 @@ mod tests {
         /// adds later — as on real hardware, where the kernel's storage scan
         /// follows the device by about a second.
         drive_late: AtomicBool,
+        /// Its boot ROM, behind the PICOBOOT interface its bootloader shows.
+        rom: Arc<parking_lot::Mutex<Rom>>,
+        /// What the board does when its ROM restarts it after a write.
+        on_reboot: parking_lot::Mutex<OnTrigger>,
+        /// Every USB port the daemon asked to open PICOBOOT on.
+        picoboot_opened: parking_lot::Mutex<Vec<String>>,
+        /// The daemon may not open USB devices: no drop-in.
+        usb_denied: AtomicBool,
     }
 
     impl Board {
@@ -1047,9 +1462,51 @@ mod tests {
                 touches: AtomicUsize::new(0),
                 opened: parking_lot::Mutex::new(Vec::new()),
                 drive_late: AtomicBool::new(false),
+                rom: Rom::new(FLASH_UID),
+                on_reboot: parking_lot::Mutex::new(OnTrigger::Restart),
+                picoboot_opened: parking_lot::Mutex::new(Vec::new()),
+                usb_denied: AtomicBool::new(false),
             });
+            // A restart from the ROM runs what was just written. Weak: the
+            // board holds the ROM.
+            let weak = Arc::downgrade(&board);
+            board.rom.lock().on_reboot = Some(Box::new(move || {
+                if let Some(b) = weak.upgrade() {
+                    *b.firmware.lock() = (NEW, "02");
+                    let what = *b.on_reboot.lock();
+                    b.trigger(what);
+                }
+            }));
             board.boot();
             board
+        }
+
+        /// What the production PICOBOOT opener does: the bootloader on that
+        /// port, if it is there and the daemon may open it.
+        fn open_picoboot(&self, port: &str) -> Result<picoboot::Client, PicobootError> {
+            self.picoboot_opened.lock().push(port.to_string());
+            if self.usb_denied.load(SeqCst) {
+                return Err(PicobootError::NoAccess(
+                    "permission denied (os error 1)".into(),
+                ));
+            }
+            if port == USB_PORT && self.mode() == Mode::Bootloader {
+                Ok(Rom::client(&self.rom))
+            } else {
+                Err(PicobootError::NotFound(format!(
+                    "no RP2040 bootloader on USB port {port}"
+                )))
+            }
+        }
+
+        /// The flash bytes the release covers, as the board holds them.
+        fn flash_holds_the_release(&self) -> bool {
+            let image = the_release().image;
+            image
+                .sectors()
+                .iter()
+                .flat_map(|s| &s.runs)
+                .all(|run| self.rom.lock().flash_at(run.addr, run.data.len()) == run.data)
         }
 
         fn mode(&self) -> Mode {
@@ -1073,6 +1530,7 @@ mod tests {
 
         fn enter_bootloader(&self) {
             self.leave();
+            self.rom.lock().power_on();
             if self.drive_late.load(SeqCst) {
                 self.sys.add_bootloader_without_drive(USB_PORT);
             } else {
@@ -1242,6 +1700,19 @@ mod tests {
             restore_wait: Duration::from_secs(3),
             sysfs_poll: Duration::from_millis(10),
             check_retry: Duration::from_millis(20),
+            write_base: Duration::from_secs(5),
+            write_per_sector: Duration::from_millis(500),
+            reboot_wait: Duration::from_millis(500),
+        }
+    }
+
+    /// The release the daemon writes on the bench.
+    fn the_release() -> firmware::Staged {
+        let data = uf2::fixture::image_file(RELEASE_PAGES, 7);
+        firmware::Staged {
+            sha256: firmware::sha256_hex(&data),
+            release: &BENCH_RELEASE,
+            image: Image::parse(&data).expect("a valid image"),
         }
     }
 
@@ -1273,7 +1744,7 @@ mod tests {
         slot: Arc<MaintenanceSlot>,
         ctrl: Arc<Mutex<FanController>>,
         lender: LoanSender,
-        stop: watch::Sender<bool>,
+        stop: Arc<watch::Sender<bool>>,
         poll: tokio::task::JoinHandle<()>,
         journal: tempfile::TempDir,
     }
@@ -1321,7 +1792,7 @@ mod tests {
                 slot: Arc::new(MaintenanceSlot::default()),
                 ctrl,
                 lender,
-                stop,
+                stop: Arc::new(stop),
                 poll,
                 journal: tempfile::tempdir().unwrap(),
             }
@@ -1345,6 +1816,11 @@ mod tests {
                 open: Arc::new(move |path: &str, _: Duration| board.open(path)),
                 expected_channels: expected,
                 shutdown: self.stop.subscribe(),
+                write: None,
+                picoboot: {
+                    let board = self.board.clone();
+                    Arc::new(move |port: &str| board.open_picoboot(port))
+                },
             }
         }
 
@@ -1374,6 +1850,20 @@ mod tests {
 
         fn start(&self) -> tokio::task::JoinHandle<()> {
             self.start_with(quick(), Arc::new(Vec::new))
+        }
+
+        /// A run that asks the daemon to write [`the_release`].
+        fn start_writing(&self) -> tokio::task::JoinHandle<()> {
+            self.start_writing_with(quick())
+        }
+
+        fn start_writing_with(&self, limits: StageLimits) -> tokio::task::JoinHandle<()> {
+            let (claim, alive) = self.claim();
+            let env = RunEnv {
+                write: Some(the_release()),
+                ..self.env(limits, Arc::new(Vec::new))
+            };
+            spawn(env, claim, alive)
         }
 
         fn record(&self) -> MaintenanceRecord {
@@ -1460,6 +1950,12 @@ mod tests {
             Some(outcome::COMPLETED_BUILD_NOT_CONFIRMED)
         );
         assert!(r.board_answered && !r.interrupted && !r.cancelled);
+        assert!(r.firmware_write.is_none(), "the file was copied by hand");
+        assert!(
+            bench.board.picoboot_opened.lock().is_empty(),
+            "a copy by hand opens no USB device"
+        );
+        assert!(!stages(&r).contains(&stage::WRITING_FIRMWARE));
         let ev = r.evidence.expect("evidence");
         assert_eq!(ev.verdict, evidence::CONSISTENT_WITH_FILE);
         assert_eq!(ev.descriptor_changed, Some(true));
@@ -1894,5 +2390,408 @@ mod tests {
         assert!(bench.cache.openfan_maintenance().is_none());
         assert!(!bench.cache.openfan_writes_suspended());
         assert!(!bench.slot.is_alive(), "the next run may start");
+    }
+
+    // ── The daemon writes the firmware itself (DEC-483) ──────────────
+
+    /// The stages a run went through, in order.
+    fn stages(r: &MaintenanceRecord) -> Vec<&str> {
+        r.stages.iter().map(|t| t.stage.as_str()).collect()
+    }
+
+    /// Every command that changed the board's flash: erases, and writes to
+    /// flash (the flash-id helper goes to XIP SRAM, at `0x15000000`).
+    fn flash_changes(rom: &Rom) -> Vec<String> {
+        rom.log
+            .iter()
+            .filter(|l| l.starts_with("FLASH_ERASE") || l.starts_with("WRITE 0x10"))
+            .cloned()
+            .collect()
+    }
+
+    /// The write record once the write has ended, either way.
+    async fn left_the_write(bench: &Bench) -> FirmwareWrite {
+        let slot = bench.slot.clone();
+        wait_until("the write to end", || {
+            slot.record()
+                .and_then(|r| r.firmware_write)
+                .is_some_and(|w| {
+                    [write_phase::FELL_BACK, write_phase::WRITTEN].contains(&w.phase.as_str())
+                })
+        })
+        .await;
+        bench
+            .record()
+            .firmware_write
+            .expect("the write is recorded")
+    }
+
+    /// The write record once the run has fallen back to the copy by hand.
+    async fn fell_back_to_the_copy(bench: &Bench) -> FirmwareWrite {
+        bench.reached(stage::WAITING_FOR_FILE).await;
+        let w = bench
+            .record()
+            .firmware_write
+            .expect("the write is recorded");
+        assert_eq!(w.phase, write_phase::FELL_BACK);
+        w
+    }
+
+    #[tokio::test]
+    async fn the_daemon_writes_a_known_release_reads_it_back_and_the_board_runs_it() {
+        let bench = Bench::new(Board::new()).await;
+        // Another board in its bootloader, on another port.
+        bench.board.sys.add_bootloader("9-1", "sdy");
+        let r = bench.finish(bench.start_writing()).await;
+
+        assert_eq!(
+            r.outcome.as_deref(),
+            Some(outcome::EXACT_BUILD_VERIFIED),
+            "{:?}",
+            r.outcome_detail
+        );
+        let w = r.firmware_write.clone().expect("the write is recorded");
+        assert_eq!(w.phase, write_phase::WRITTEN);
+        assert!(w.verified && w.flash_changed);
+        assert_eq!(w.flash_id.as_deref(), Some(SERIAL), "the board's own flash");
+        assert_eq!(w.release, BENCH_RELEASE.name);
+        assert_eq!(w.total_bytes, the_release().image.byte_count());
+        assert_eq!(w.done_bytes, w.total_bytes, "every byte read back");
+        assert_eq!(w.fallback_reason, None);
+        assert_eq!(
+            stages(&r),
+            [
+                stage::PREPARING,
+                stage::PARKING,
+                stage::ENTERING_BOOTLOADER,
+                stage::WRITING_FIRMWARE,
+                stage::WAITING_FOR_RETURN,
+                stage::CHECKING,
+                stage::RESTORING_CONTROL,
+            ],
+            "no wait for a file"
+        );
+        assert!(bench.board.flash_holds_the_release());
+        {
+            let rom = bench.board.rom.lock();
+            assert_eq!(
+                rom.logged("FLASH_ERASE"),
+                [
+                    "FLASH_ERASE 0x10000000+0x1000",
+                    "FLASH_ERASE 0x10001000+0x1000",
+                    "FLASH_ERASE 0x10002000+0x1000",
+                ],
+                "the three sectors the release covers, once each"
+            );
+            let at = |entry: &str| rom.log.iter().position(|l| l.starts_with(entry));
+            assert!(
+                at("EXEC").expect("the flash id was read") < at("FLASH_ERASE").expect("erased"),
+                "the board is identified before anything is erased: {:?}",
+                rom.log
+            );
+            assert_eq!(rom.log.last().map(String::as_str), Some("REBOOT"));
+        }
+        assert_eq!(
+            *bench.board.picoboot_opened.lock(),
+            [USB_PORT],
+            "the bootloader on the board's own port, once"
+        );
+        assert_eq!(
+            r.after
+                .and_then(|a| a.fw_info)
+                .and_then(|i| i.get("FW_REV").cloned())
+                .as_deref(),
+            Some("02")
+        );
+        assert!(bench.cache.openfan_maintenance().is_none());
+        assert!(!bench.cache.openfan_writes_suspended());
+    }
+
+    #[tokio::test]
+    async fn a_bootloader_whose_flash_is_another_boards_is_never_erased() {
+        let board = Board::new();
+        board.rom.lock().uid = [0x11; 8];
+        let bench = Bench::new(board).await;
+        let run = bench.start_writing();
+        // However the write ends, the other board's flash is untouched.
+        let w = left_the_write(&bench).await;
+        {
+            let rom = bench.board.rom.lock();
+            assert_eq!(
+                rom.logged("EXEC"),
+                ["EXEC 0x15000000 flash-id"],
+                "the id was read"
+            );
+            assert!(
+                flash_changes(&rom).is_empty(),
+                "nothing erased or programmed: {:?}",
+                rom.log
+            );
+        }
+        assert_eq!(w.phase, write_phase::FELL_BACK);
+        assert_eq!(
+            w.fallback_reason.as_deref(),
+            Some(fallback::FLASH_ID_MISMATCH)
+        );
+        assert_eq!(w.flash_id.as_deref(), Some("1111111111111111"));
+        assert!(!w.flash_changed);
+        // The serials stay in the record's own fields: the note is logged too,
+        // and the log is shared whole in a support bundle.
+        let detail = w.fallback_detail.expect("the mismatch is explained");
+        assert!(detail.contains("another board"), "{detail}");
+        for id in ["1111111111111111", SERIAL] {
+            assert!(!detail.to_uppercase().contains(id), "{detail}");
+        }
+        bench.reached(stage::WAITING_FOR_FILE).await;
+        assert_eq!(
+            bench.board.rom.lock().exclusive,
+            picoboot::NOT_EXCLUSIVE,
+            "the drive takes a copy again"
+        );
+        // The copy by hand finishes it, and nothing claims the exact build.
+        bench.board.copy_file(NEW, "02");
+        let r = bench.finish(run).await;
+        assert_eq!(
+            r.outcome.as_deref(),
+            Some(outcome::COMPLETED_BUILD_NOT_CONFIRMED)
+        );
+        assert!(r.notes.iter().any(|n| n.contains("copy the file")));
+        assert_eq!(r.expected_usb_serial, SERIAL);
+        for id in ["1111111111111111", SERIAL] {
+            assert!(
+                r.notes.iter().all(|n| !n.to_uppercase().contains(id)),
+                "{:?}",
+                r.notes
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_out_of_time_before_its_first_erase_leaves_the_flash_whole() {
+        let bench = Bench::new(Board::new()).await;
+        // No time at all: the write ends at its first sector's deadline check.
+        let run = bench.start_writing_with(StageLimits {
+            write_base: Duration::ZERO,
+            write_per_sector: Duration::ZERO,
+            ..quick()
+        });
+        let w = fell_back_to_the_copy(&bench).await;
+        assert_eq!(
+            w.fallback_reason.as_deref(),
+            Some(fallback::TRANSFER_FAILED)
+        );
+        {
+            let rom = bench.board.rom.lock();
+            assert_eq!(
+                rom.logged("EXEC"),
+                ["EXEC 0x15000000 flash-id"],
+                "the board was identified"
+            );
+            assert!(
+                flash_changes(&rom).is_empty(),
+                "nothing erased: {:?}",
+                rom.log
+            );
+            assert_eq!(rom.exclusive, picoboot::NOT_EXCLUSIVE);
+        }
+        assert!(
+            !w.flash_changed,
+            "nothing was erased, so the old firmware is whole"
+        );
+        bench.board.copy_file(NEW, "02");
+        let r = bench.finish(run).await;
+        assert_eq!(
+            r.outcome.as_deref(),
+            Some(outcome::COMPLETED_BUILD_NOT_CONFIRMED)
+        );
+    }
+
+    #[tokio::test]
+    async fn without_usb_access_the_file_is_copied_by_hand() {
+        let board = Board::new();
+        board.usb_denied.store(true, SeqCst);
+        let bench = Bench::new(board).await;
+        let run = bench.start_writing();
+        let w = fell_back_to_the_copy(&bench).await;
+        assert_eq!(w.fallback_reason.as_deref(), Some(fallback::NO_USB_ACCESS));
+        assert!(w
+            .fallback_detail
+            .unwrap()
+            .contains("openfan-firmware-write"));
+        assert!(!w.flash_changed);
+        assert_eq!(*bench.board.picoboot_opened.lock(), [USB_PORT]);
+        assert!(
+            bench.board.rom.lock().log.is_empty(),
+            "nothing reached the bootloader"
+        );
+        bench.board.copy_file(NEW, "02");
+        let r = bench.finish(run).await;
+        assert_eq!(
+            r.outcome.as_deref(),
+            Some(outcome::COMPLETED_BUILD_NOT_CONFIRMED)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transfer_that_fails_mid_write_gives_the_drive_back() {
+        let board = Board::new();
+        board.rom.lock().fail = Some((picoboot::CMD_FLASH_ERASE, 2, picoboot::LinkError::Timeout));
+        let bench = Bench::new(board).await;
+        let run = bench.start_writing();
+        let w = fell_back_to_the_copy(&bench).await;
+        assert_eq!(
+            w.fallback_reason.as_deref(),
+            Some(fallback::TRANSFER_FAILED)
+        );
+        assert!(w.flash_changed, "the first sector had been written");
+        assert!(!w.verified);
+        let detail = w.fallback_detail.unwrap();
+        assert!(detail.contains("0x10001000"), "{detail}");
+        {
+            let rom = bench.board.rom.lock();
+            assert_eq!(rom.logged("FLASH_ERASE").len(), 1);
+            assert_eq!(rom.exclusive, picoboot::NOT_EXCLUSIVE);
+            assert!(rom.logged("REBOOT").is_empty(), "never restarted");
+        }
+        bench.board.copy_file(NEW, "02");
+        let r = bench.finish(run).await;
+        assert_eq!(
+            r.outcome.as_deref(),
+            Some(outcome::COMPLETED_BUILD_NOT_CONFIRMED)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_back_that_differs_is_never_restarted_from() {
+        let board = Board::new();
+        board.rom.lock().corrupt_writes = true;
+        let bench = Bench::new(board).await;
+        let run = bench.start_writing();
+        // However the write ends, a board whose flash reads back wrong is
+        // never restarted.
+        let w = left_the_write(&bench).await;
+        assert!(
+            bench.board.rom.lock().logged("REBOOT").is_empty(),
+            "never restarted from a bad read-back"
+        );
+        assert_eq!(w.phase, write_phase::FELL_BACK);
+        assert_eq!(
+            w.fallback_reason.as_deref(),
+            Some(fallback::READBACK_MISMATCH)
+        );
+        assert!(w.flash_changed && !w.verified);
+        assert!(w.fallback_detail.unwrap().contains("0x10000000"));
+        assert_eq!(bench.board.rom.lock().exclusive, picoboot::NOT_EXCLUSIVE);
+        assert!(!bench.board.flash_holds_the_release());
+        bench.board.copy_file(NEW, "02");
+        let r = bench.finish(run).await;
+        assert_eq!(
+            r.outcome.as_deref(),
+            Some(outcome::COMPLETED_BUILD_NOT_CONFIRMED)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_mid_write_gives_the_drive_back_and_leaves_the_board_needing_recovery() {
+        let bench = Bench::new(Board::new()).await;
+        let stop = bench.stop.clone();
+        bench.board.rom.lock().on_command = Some(Box::new(move |id, nth| {
+            if id == picoboot::CMD_FLASH_ERASE && nth == 2 {
+                let _ = stop.send(true);
+            }
+        }));
+        let r = bench.finish(bench.start_writing()).await;
+        assert!(r.interrupted);
+        assert_eq!(r.outcome.as_deref(), Some(outcome::NEEDS_RECOVERY));
+        assert_eq!(r.stage, stage::WRITING_FIRMWARE);
+        let w = r.firmware_write.unwrap();
+        assert!(w.flash_changed && !w.verified);
+        let rom = bench.board.rom.lock();
+        assert_eq!(
+            rom.logged("FLASH_ERASE").len(),
+            2,
+            "the sector in hand is finished, and no other begun"
+        );
+        assert_eq!(
+            rom.exclusive,
+            picoboot::NOT_EXCLUSIVE,
+            "the drive takes a copy while the daemon is down"
+        );
+        assert!(rom.logged("REBOOT").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stop_while_identifying_the_board_leaves_the_flash_whole() {
+        let bench = Bench::new(Board::new()).await;
+        let stop = bench.stop.clone();
+        bench.board.rom.lock().on_command = Some(Box::new(move |id, _| {
+            if id == picoboot::CMD_EXEC {
+                let _ = stop.send(true);
+            }
+        }));
+        let r = bench.finish(bench.start_writing()).await;
+        assert!(r.interrupted);
+        assert_eq!(r.outcome.as_deref(), Some(outcome::NEEDS_RECOVERY));
+        let w = r.firmware_write.unwrap();
+        assert_eq!(
+            w.flash_id.as_deref(),
+            Some(SERIAL),
+            "the board was identified"
+        );
+        assert!(!w.flash_changed, "nothing was erased: {:?}", w);
+        let rom = bench.board.rom.lock();
+        assert!(flash_changes(&rom).is_empty(), "{:?}", rom.log);
+        assert_eq!(rom.exclusive, picoboot::NOT_EXCLUSIVE);
+        assert!(rom.logged("REBOOT").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_board_that_does_not_restart_after_the_write_is_copied_to_by_hand() {
+        let board = Board::new();
+        board.rom.lock().restarts = false;
+        let bench = Bench::new(board).await;
+        let run = bench.start_writing();
+        let w = fell_back_to_the_copy(&bench).await;
+        assert_eq!(w.fallback_reason.as_deref(), Some(fallback::NO_RESTART));
+        assert!(w.verified, "written and read back before the restart");
+        assert_eq!(
+            *bench.board.picoboot_opened.lock(),
+            [USB_PORT, USB_PORT],
+            "opened again to give the drive back"
+        );
+        assert_eq!(bench.board.rom.lock().exclusive, picoboot::NOT_EXCLUSIVE);
+        bench.board.copy_file(NEW, "02");
+        let r = bench.finish(run).await;
+        assert_eq!(
+            r.outcome.as_deref(),
+            Some(outcome::COMPLETED_BUILD_NOT_CONFIRMED),
+            "the copy may have been another file"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_board_back_in_its_bootloader_after_the_write_waits_for_a_copy() {
+        let board = Board::new();
+        *board.on_reboot.lock() = OnTrigger::Bootloader;
+        let bench = Bench::new(board).await;
+        let run = bench.start_writing();
+        bench.reached(stage::WAITING_FOR_FILE).await;
+        let r = bench.record();
+        assert_eq!(
+            r.firmware_write.as_ref().map(|w| w.phase.as_str()),
+            Some(write_phase::WRITTEN)
+        );
+        assert!(stages(&r).contains(&stage::WAITING_FOR_RETURN));
+        assert!(r
+            .notes
+            .iter()
+            .any(|n| n.contains("went back to its bootloader")));
+        bench.board.copy_file(NEW, "02");
+        let r = bench.finish(run).await;
+        assert_eq!(
+            r.outcome.as_deref(),
+            Some(outcome::COMPLETED_BUILD_NOT_CONFIRMED),
+            "a board that came back to its bootloader may have been given another file"
+        );
     }
 }

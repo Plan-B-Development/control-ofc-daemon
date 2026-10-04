@@ -1,7 +1,10 @@
-//! OpenFan firmware update endpoints (DEC-481).
+//! OpenFan firmware update endpoints (DEC-481, DEC-483).
 //!
 //! - `GET /fans/openfan/device` — the controller's identity and own reports,
-//!   and whether an update could start now.
+//!   whether an update could start now, and whether the daemon can write the
+//!   firmware itself.
+//! - `PUT /fans/openfan/firmware` — upload a firmware file: what the daemon
+//!   would do with it, and the file kept when the daemon would write it.
 //! - `POST /fans/openfan/maintenance` — start one: 202 and a run id.
 //! - `GET /fans/openfan/maintenance` — the current or most recent run.
 //! - `DELETE /fans/openfan/maintenance` — stop one before the port is borrowed.
@@ -24,19 +27,37 @@ use crate::api::responses::*;
 use crate::health::state::{MaintenanceRefusal, OpenFanLink};
 use crate::openfan_maintenance::run::{ExpectedChannels, Opener, RunEnv, StageLimits};
 use crate::openfan_maintenance::{
-    journal, next_run_id, stage, CachedInfo, CancelOutcome, ClaimGuard, FirmwareClaim,
-    MaintenanceRecord,
+    firmware, journal, next_run_id, stage, CachedInfo, CancelOutcome, ClaimGuard, FirmwareClaim,
+    FirmwareWrite, MaintenanceRecord,
 };
+use crate::serial::picoboot;
 use crate::serial::protocol::{FW_INFO_OPCODE, HW_INFO_OPCODE, NUM_CHANNELS};
+use crate::serial::uf2;
 use crate::serial::usb_identity::{self as usb, TtyIdentity, UsbDevice};
 
 /// How long a live `>05`/`>06` read made for `GET /fans/openfan/device` is
 /// reused, so a client polling the route cannot keep the serial link busy.
 const DEVICE_INFO_REUSE: Duration = Duration::from_secs(10);
 
-/// The largest firmware file the GUI may describe: the plan's validator caps a
-/// `.uf2` at 1 MiB.
-const MAX_FIRMWARE_BYTES: u64 = 1024 * 1024;
+/// The largest firmware file the GUI may describe or upload: its validator
+/// caps a `.uf2` at 1 MiB.
+const MAX_FIRMWARE_BYTES: u64 = uf2::MAX_FILE_BYTES as u64;
+
+/// Why the daemon cannot write the firmware itself, wherever that is said.
+const NO_USB_ACCESS_MESSAGE: &str = "the daemon may not open USB devices, so it cannot write the \
+     firmware itself — install the openfan-firmware-write drop-in (see the user guide), or copy \
+     the file onto the board's drive by hand";
+
+/// Who writes the firmware (DEC-483).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteMethod {
+    /// The user copies the file onto the board's drive (Phase 1).
+    #[default]
+    Manual,
+    /// The daemon writes the file staged with `PUT /fans/openfan/firmware`.
+    Daemon,
+}
 
 /// `POST /fans/openfan/maintenance`.
 #[derive(Debug, Deserialize)]
@@ -45,6 +66,9 @@ pub struct MaintenanceStartRequest {
     /// the user. The update refuses a board that does not carry it.
     pub expected_usb_serial: String,
     pub firmware: FirmwareClaim,
+    /// Absent from a Phase 1 client: the copy by hand.
+    #[serde(default)]
+    pub write: WriteMethod,
 }
 
 /// A 409 with `details.reason`, retryable — the shape of every refusal here.
@@ -108,13 +132,16 @@ fn validated(body: MaintenanceStartRequest) -> Result<(String, FirmwareClaim), S
     Ok((serial, fw))
 }
 
-/// Where the update's handlers read sysfs and keep the journal, how a run
-/// reopens the returned board, and the run's stage limits — the production
-/// ones from [`MaintenanceIo::production`], a fixture's in tests.
+/// Where the update's handlers read sysfs, ask about USB access and keep the
+/// journal, how a run reopens the returned board and opens its bootloader, and
+/// the run's stage limits — the production ones from
+/// [`MaintenanceIo::production`], a fixture's in tests.
 pub(crate) struct MaintenanceIo {
     pub sys_root: PathBuf,
+    pub dev_root: PathBuf,
     pub journal_path: PathBuf,
     pub open: Opener,
+    pub picoboot: picoboot::Opener,
     pub limits: StageLimits,
 }
 
@@ -122,9 +149,36 @@ impl MaintenanceIo {
     fn production() -> Self {
         Self {
             sys_root: PathBuf::from(usb::SYSFS_ROOT),
+            dev_root: PathBuf::from(picoboot::USB_DEV_ROOT),
             journal_path: journal::path(),
             open: real_opener(),
+            picoboot: picoboot::usb_opener(),
             limits: StageLimits::production(),
+        }
+    }
+}
+
+/// Whether the daemon may open USB devices, off the runtime.
+async fn usb_access(dev_root: &Path) -> bool {
+    let dev = dev_root.to_path_buf();
+    tokio::task::spawn_blocking(move || picoboot::usb_access(&dev))
+        .await
+        .unwrap_or(false)
+}
+
+/// Whether the daemon could write the firmware itself, for the device answer.
+fn daemon_write(access: bool) -> OpenFanDaemonWrite {
+    if access {
+        OpenFanDaemonWrite {
+            available: true,
+            reason: None,
+            message: None,
+        }
+    } else {
+        OpenFanDaemonWrite {
+            available: false,
+            reason: Some(crate::openfan_maintenance::fallback::NO_USB_ACCESS.into()),
+            message: Some(NO_USB_ACCESS_MESSAGE.into()),
         }
     }
 }
@@ -234,10 +288,19 @@ fn bootloader_message(bootloaders: &[UsbDevice]) -> String {
 pub async fn openfan_device_handler(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    describe_device(&state, Path::new(usb::SYSFS_ROOT)).await
+    describe_device(
+        &state,
+        Path::new(usb::SYSFS_ROOT),
+        Path::new(picoboot::USB_DEV_ROOT),
+    )
+    .await
 }
 
-async fn describe_device(state: &AppState, sys: &Path) -> (StatusCode, Json<serde_json::Value>) {
+async fn describe_device(
+    state: &AppState,
+    sys: &Path,
+    dev: &Path,
+) -> (StatusCode, Json<serde_json::Value>) {
     let controller = state.openfan();
     let (link, running) = state.cache.read_with(|s| {
         (
@@ -282,6 +345,7 @@ async fn describe_device(state: &AppState, sys: &Path) -> (StatusCode, Json<serd
     };
 
     let refusals = preview_refusals(state, identity.as_ref(), &bootloaders);
+    let daemon_write = daemon_write(usb_access(dev).await);
     json_ok(
         StatusCode::OK,
         OpenFanDeviceResponse {
@@ -295,6 +359,50 @@ async fn describe_device(state: &AppState, sys: &Path) -> (StatusCode, Json<serd
             fw_info,
             update_available: refusals.is_empty(),
             update_refusals: refusals,
+            daemon_write,
+        },
+    )
+}
+
+/// `PUT /fans/openfan/firmware` (DEC-483): the raw `.uf2` bytes, at most 1 MiB.
+/// Says what the daemon would do with the file, and keeps it in place of the
+/// last upload when the daemon would write it. Touches no hardware.
+pub async fn openfan_firmware_stage_handler(
+    State(state): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if body.is_empty() {
+        return bad_request("the request body must be the firmware file");
+    }
+    if body.len() > uf2::MAX_FILE_BYTES {
+        return bad_request(format!(
+            "the firmware file is larger than {} bytes",
+            uf2::MAX_FILE_BYTES
+        ));
+    }
+    let Ok(assessed) = tokio::task::spawn_blocking(move || firmware::assess(&body)).await else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &ErrorEnvelope::internal("the firmware file could not be read"),
+        );
+    };
+    log::info!(
+        "OpenFan firmware file {} ({} bytes) uploaded: {}",
+        assessed.sha256,
+        assessed.size,
+        assessed.verdict
+    );
+    state.openfan_maintenance.stage(assessed.staged);
+    json_ok(
+        StatusCode::OK,
+        OpenFanFirmwareStagedResponse {
+            api_version: API_VERSION,
+            sha256: assessed.sha256,
+            size: assessed.size,
+            release: assessed.release.map(|r| r.name.to_string()),
+            verdict: assessed.verdict.to_string(),
+            reason: assessed.reason.map(str::to_string),
+            message: assessed.message,
         },
     )
 }
@@ -392,9 +500,33 @@ async fn start_update(
             ),
         );
     }
+    let write = body.write;
     let (serial, firmware) = match validated(body) {
         Ok(v) => v,
         Err(e) => return bad_request(e),
+    };
+    if firmware::is_known_broken(&firmware.sha256) {
+        let mut e = ErrorEnvelope::validation(firmware::KNOWN_BROKEN_MESSAGE);
+        e.error.details = Some(serde_json::json!({ "reason": firmware::reason::KNOWN_BROKEN }));
+        return error_response(StatusCode::CONFLICT, &e);
+    }
+    // The daemon writes only the file it was given and kept, and a copy of
+    // it: a later upload cannot change what this run writes.
+    let job = match write {
+        WriteMethod::Manual => None,
+        WriteMethod::Daemon => {
+            if !usb_access(&io.dev_root).await {
+                return refused("daemon_write_unavailable", NO_USB_ACCESS_MESSAGE);
+            }
+            let Some(staged) = state.openfan_maintenance.staged(&firmware.sha256) else {
+                return refused(
+                    "firmware_not_staged",
+                    "the daemon does not hold a file with that fingerprint that it would write — \
+                     upload it with PUT /fans/openfan/firmware first",
+                );
+            };
+            Some(staged)
+        }
     };
     let Some(controller) = state.openfan() else {
         return refused(
@@ -461,9 +593,15 @@ async fn start_update(
         );
     }
     release_openfan_overrides(state, &run_id);
-    state
-        .openfan_maintenance
-        .set_record(MaintenanceRecord::new(run_id.clone(), serial, firmware));
+    let mut record = MaintenanceRecord::new(run_id.clone(), serial, firmware);
+    record.firmware_write = job
+        .as_ref()
+        .map(|j| FirmwareWrite::new(j.release.name, j.image.byte_count()));
+    let how = match &job {
+        Some(j) => format!("; the daemon writes the {}", j.release.name),
+        None => "; the file is copied by hand".to_string(),
+    };
+    state.openfan_maintenance.set_record(record);
 
     let env = RunEnv {
         cache: state.cache.clone(),
@@ -477,6 +615,8 @@ async fn start_update(
         open: io.open,
         expected_channels: expected_channels(state),
         shutdown: state.openfan_runtime.shutdown.clone(),
+        write: job,
+        picoboot: io.picoboot,
     };
     // The parts stay out here until the closure takes them, so a registration
     // refused by a shutdown that began a moment ago releases the claim
@@ -499,7 +639,7 @@ async fn start_update(
             ),
         );
     }
-    log::info!("OpenFan firmware update {run_id} started");
+    log::info!("OpenFan firmware update {run_id} started{how}");
     json_ok(
         StatusCode::ACCEPTED,
         OpenFanMaintenanceStartResponse {
@@ -720,6 +860,7 @@ mod tests {
                 usb_config_descriptor_hex: None,
                 info: None,
             },
+            write: WriteMethod::Manual,
         }
     }
 
@@ -821,6 +962,8 @@ mod tests {
     struct Fixture {
         state: Arc<AppState>,
         sys: Sysfs,
+        /// `/dev/bus/usb`, with one root hub the daemon may open.
+        dev: tempfile::TempDir,
         journal: tempfile::TempDir,
         frames: Arc<parking_lot::Mutex<Vec<String>>>,
         /// Held so a borrow is queued, never answered: a started run ends
@@ -833,11 +976,17 @@ mod tests {
         fn io(&self) -> MaintenanceIo {
             MaintenanceIo {
                 sys_root: self.sys.root().to_path_buf(),
+                dev_root: self.dev.path().to_path_buf(),
                 journal_path: self.journal.path().join(JOURNAL_FILE),
                 open: Arc::new(|_: &str, _: Duration| {
                     Err(crate::error::SerialError::Protocol {
                         message: "nothing to open on the bench".into(),
                     })
+                }),
+                picoboot: Arc::new(|_: &str| {
+                    Err(picoboot::PicobootError::NotFound(
+                        "nothing to open on the bench".into(),
+                    ))
                 }),
                 limits: StageLimits {
                     borrow_wait: Duration::from_millis(200),
@@ -874,9 +1023,13 @@ mod tests {
         state.cache.set_openfan_link(OpenFanLink::Connected);
         let (lender, loans) = crate::serial::port_loan::loan_channel();
         state.openfan_maintenance.set_lender(lender);
+        let dev = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dev.path().join("001")).unwrap();
+        std::fs::write(dev.path().join("001/001"), b"").unwrap();
         Fixture {
             state,
             sys,
+            dev,
             journal: tempfile::tempdir().unwrap(),
             frames,
             _loans: loans,
@@ -1085,7 +1238,7 @@ mod tests {
     #[tokio::test]
     async fn the_device_answer_reports_identity_reports_and_whether_an_update_could_start() {
         let f = fixture();
-        let (st, Json(v)) = describe_device(&f.state, f.sys.root()).await;
+        let (st, Json(v)) = describe_device(&f.state, f.sys.root(), f.dev.path()).await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(v["present"], true);
         assert_eq!(v["link"], "connected");
@@ -1100,11 +1253,11 @@ mod tests {
 
         // A second look within the reuse window asks the board nothing.
         let asked = f.frames.lock().len();
-        let _ = describe_device(&f.state, f.sys.root()).await;
+        let _ = describe_device(&f.state, f.sys.root(), f.dev.path()).await;
         assert_eq!(f.frames.lock().len(), asked);
 
         let _calibration = f.state.openfan_calibration.claim().unwrap();
-        let (_, Json(v)) = describe_device(&f.state, f.sys.root()).await;
+        let (_, Json(v)) = describe_device(&f.state, f.sys.root(), f.dev.path()).await;
         assert_eq!(v["update_available"], false);
         assert_eq!(v["update_refusals"][0]["reason"], "calibration_active");
     }
@@ -1116,7 +1269,7 @@ mod tests {
             .cache
             .try_begin_openfan_maintenance("r1", stage::PREPARING)
             .unwrap();
-        let (_, Json(v)) = describe_device(&f.state, f.sys.root()).await;
+        let (_, Json(v)) = describe_device(&f.state, f.sys.root(), f.dev.path()).await;
         assert_eq!(v["link"], "maintenance");
         assert!(v.get("hw_info").is_none() && v.get("fw_info").is_none());
         assert!(f.frames.lock().is_empty());
@@ -1135,7 +1288,7 @@ mod tests {
         f.state
             .cache
             .end_openfan_maintenance("r1", Some(outcome::NEEDS_RECOVERY));
-        let (_, Json(v)) = describe_device(&f.state, f.sys.root()).await;
+        let (_, Json(v)) = describe_device(&f.state, f.sys.root(), f.dev.path()).await;
         assert_eq!(v["link"], "connected", "the stale link this guards");
         assert_eq!(v["update_available"], false, "{v}");
         assert_eq!(v["update_refusals"][0]["reason"], "openfan_link_not_ready");
@@ -1292,6 +1445,157 @@ mod tests {
             .await
             .expect("an adopted board ends the watch")
             .unwrap();
+    }
+
+    // ── The daemon writes the firmware itself (DEC-483) ──────────────
+
+    async fn upload(f: &Fixture, data: Vec<u8>) -> (StatusCode, serde_json::Value) {
+        let (st, Json(v)) =
+            openfan_firmware_stage_handler(State(f.state.clone()), data.into()).await;
+        (st, v)
+    }
+
+    fn daemon_write_of(sha: &str) -> MaintenanceStartRequest {
+        MaintenanceStartRequest {
+            write: WriteMethod::Daemon,
+            ..request(SERIAL, sha, 4096)
+        }
+    }
+
+    /// Stage `data` as the upload of a known release would.
+    fn stage_as_a_release(f: &Fixture, data: &[u8]) -> String {
+        let sha = firmware::sha256_hex(data);
+        let release: &'static firmware::Release = Box::leak(Box::new(firmware::Release {
+            sha256: Box::leak(sha.clone().into_boxed_str()),
+            size: data.len() as u64,
+            name: "bench release",
+            broken: false,
+        }));
+        f.state.openfan_maintenance.stage(Some(firmware::Staged {
+            sha256: sha.clone(),
+            release,
+            image: uf2::Image::parse(data).unwrap(),
+        }));
+        sha
+    }
+
+    #[tokio::test]
+    async fn an_upload_is_judged_and_only_a_file_the_daemon_would_write_is_kept() {
+        let f = fixture();
+        let data = uf2::fixture::image_file(8, 3);
+        let sha = firmware::sha256_hex(&data);
+        let (st, v) = upload(&f, data.clone()).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["verdict"], firmware::verdict::MANUAL_COPY);
+        assert_eq!(v["reason"], firmware::reason::UNKNOWN_BUILD);
+        assert_eq!(v["sha256"], sha.as_str());
+        assert_eq!(v["size"], data.len());
+        assert!(v.get("release").is_none());
+        let (st, v) = f.start(daemon_write_of(&sha)).await;
+        assert_eq!(
+            (st, reason(&v)),
+            (StatusCode::CONFLICT, "firmware_not_staged"),
+            "an unknown build is never kept for the daemon to write"
+        );
+
+        let (st, v) = upload(&f, b"not a firmware file".to_vec()).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            (v["verdict"].as_str(), v["reason"].as_str()),
+            (
+                Some(firmware::verdict::MANUAL_COPY),
+                Some(firmware::reason::INVALID_IMAGE)
+            )
+        );
+        let (st, _) = upload(&f, Vec::new()).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        let (st, _) = upload(&f, vec![0; uf2::MAX_FILE_BYTES + 512]).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert!(
+            f.frames.lock().is_empty(),
+            "an upload asks the board nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_daemon_write_starts_only_with_usb_access_and_the_file_it_keeps() {
+        let f = fixture();
+        let sha = stage_as_a_release(&f, &uf2::fixture::image_file(8, 3));
+
+        let hub = f.dev.path().join("001/001");
+        std::fs::remove_file(&hub).unwrap();
+        let (st, v) = f.start(daemon_write_of(&sha)).await;
+        assert_eq!(
+            (st, reason(&v)),
+            (StatusCode::CONFLICT, "daemon_write_unavailable")
+        );
+        std::fs::write(&hub, b"").unwrap();
+
+        let (st, v) = f.start(daemon_write_of(&"cd".repeat(32))).await;
+        assert_eq!(
+            (st, reason(&v)),
+            (StatusCode::CONFLICT, "firmware_not_staged")
+        );
+        assert!(
+            f.state.openfan_maintenance.record().is_none(),
+            "nothing claimed"
+        );
+
+        let (st, v) = f.start(daemon_write_of(&sha)).await;
+        assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+        let w = f
+            .state
+            .openfan_maintenance
+            .record()
+            .and_then(|r| r.firmware_write)
+            .expect("the run carries the write");
+        assert_eq!(
+            (w.release.as_str(), w.phase.as_str(), w.total_bytes),
+            (
+                "bench release",
+                crate::openfan_maintenance::write_phase::PENDING,
+                8 * 256
+            )
+        );
+        // Nothing lends the port on the bench: the run ends before writing.
+        let slot = f.state.openfan_maintenance.clone();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while slot.is_alive() {
+            assert!(Instant::now() < deadline, "the run must end");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn fw_01_is_refused_whoever_would_write_it() {
+        let f = fixture();
+        let fw01 = firmware::RELEASES
+            .iter()
+            .find(|r| r.broken)
+            .expect("FW_01 is listed");
+        let (st, v) = f.start(request(SERIAL, fw01.sha256, fw01.size)).await;
+        assert_eq!(
+            (st, reason(&v)),
+            (StatusCode::CONFLICT, firmware::reason::KNOWN_BROKEN)
+        );
+        assert_eq!(v["error"]["retryable"], false, "no retry will help");
+        assert!(f.state.openfan_maintenance.record().is_none());
+        assert!(f.frames.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_device_answer_says_whether_the_daemon_can_write() {
+        let f = fixture();
+        let (_, Json(v)) = describe_device(&f.state, f.sys.root(), f.dev.path()).await;
+        assert_eq!(v["daemon_write"], serde_json::json!({ "available": true }));
+        std::fs::remove_file(f.dev.path().join("001/001")).unwrap();
+        let (_, Json(v)) = describe_device(&f.state, f.sys.root(), f.dev.path()).await;
+        assert_eq!(v["daemon_write"]["available"], false);
+        assert_eq!(v["daemon_write"]["reason"], "no_usb_access");
+        assert!(v["daemon_write"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("openfan-firmware-write"));
     }
 
     // ── An override or identify racing an update's start ─────────────

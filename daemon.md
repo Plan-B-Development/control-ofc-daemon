@@ -53,6 +53,12 @@ daemon/src/
                          a loan returns the port or nothing, and drop semantics hold that
     usb_identity.rs    — read-only sysfs view of a tty's USB device (port path, ids,
                          serial, cached config descriptor) and of RP2040 bootloaders
+    uf2.rs             — the daemon's own parse of a UF2 image it is about to write:
+                         RP2040 family, 256-byte pages, inside the board's 4 MiB flash (DEC-483)
+    picoboot.rs        — [SAFETY] PICOBOOT client to an RP2040 bootloader over usbfs (nusb):
+                         flash id, sector erase/write/read-back, reboot; the opener takes only
+                         2e8a:0003 on the given USB port and claims only interface PICOBOOT;
+                         `usb_access` asks access(2) about a root hub (DEC-483)
     adoption.rs        — [SAFETY] the single path deciding which port becomes the fan
                          controller, shared by boot adoption and POST /fans/openfan/rescan
                          (DEC-265). One copy on purpose — two would be two chances to skip
@@ -246,10 +252,12 @@ daemon/src/
     backends.rs        — WriteBackend per fan backend (gating/coalescing)
     skipped.rs         — debounced tracking of controls that cannot be resolved (273-i)
   control_override.rs  — manual-override + fan-identify state (expiring, fencing-guarded, deadman; DEC-163/166)
-  openfan_maintenance/ — the OpenFAN firmware update (DEC-481)
+  openfan_maintenance/ — the OpenFAN firmware update (DEC-481, DEC-483)
     mod.rs             — stage/outcome tokens, the run record, the slot, the claim guard
-    run.rs             — [SAFETY] the seven stages: prepare, park at 100 %, bootloader,
-                         file, return, check, restore control
+    firmware.rs        — the published releases by SHA-256 (FW_01 refused), the verdict on
+                         an upload, the staged file a daemon write takes a copy of
+    run.rs             — [SAFETY] the eight stages: prepare, park at 100 %, bootloader,
+                         write (daemon writes only), file, return, check, restore control
     journal.rs         — {state_dir}/openfan-maintenance.json, written before each action;
                          an unfinished run is finished as interrupted at startup, never resumed
     evidence.rs        — before/after/file comparison of the descriptor and info strings
@@ -336,12 +344,14 @@ keep their `headers()` place. The force still shares one
 single-flight write slot with the engine's `apply`, so at the trip point it first waits
 for any hub writes an engine tick has in flight (`BRD-z`, recorded).
 
-## OpenFAN firmware update (DEC-481)
+## OpenFAN firmware update (DEC-481, DEC-483)
 
-The daemon coordinates the update; the user copies the `.uf2` onto the `RPI-RP2` drive. The
-daemon never writes firmware, never reads a file, never mounts anything and never opens any
-device but the board's own serial interface. Wire contract: GUI `docs/08` § OpenFan firmware
-update.
+The daemon coordinates the update; the firmware is written either by the user, copying the
+`.uf2` onto the `RPI-RP2` drive, or — for a published release the daemon knows, when the start
+asks and the opt-in drop-in grants USB access — by the daemon itself. The daemon never reads a
+file path, never mounts anything, and opens no device but the board's own serial interface and,
+to write, the PICOBOOT interface of the bootloader on the board's USB port. Wire contract: GUI
+`docs/08` § OpenFan firmware update.
 
 - **Link state is separate from presence.** `StateCache::set_openfan_link` is the only writer of
   `openfan_link` (`connected` | `unresponsive` | `reconnecting`, published as `maintenance` while
@@ -374,6 +384,19 @@ update.
   to its bootloader after its drive went away resumes it rather than starting it again, and the
   `OPENFAN_MAINT_MAX_BOOTLOADER_RETURNS`th return ends the run `needs_recovery`, so neither the
   claim nor the record grows without end.
+- **The daemon's own write (DEC-483).** `PUT /fans/openfan/firmware` takes the file's bytes;
+  `firmware::assess` fingerprints it and the daemon's own `uf2::Image::parse` refuses any block
+  outside the 4 MiB flash, so only a parsed, published release is staged, and a daemon-write start
+  runs from a copy of it. The `writing_firmware` stage opens only `2e8a:0003` on the board's USB
+  port, resets PICOBOOT, takes exclusive access (the drive refuses writes meanwhile), leaves XIP and
+  reads the flash's unique id with picotool's helper; **nothing is erased unless that id, shown
+  `%02X` per byte, is the board's USB serial**. `flash_changed` is journaled before the first erase.
+  Each touched 4 KiB sector is erased and programmed, every byte is read back, and only then is
+  the board rebooted; its stage limit grows with the sector count, and a stop is honoured between
+  sectors. Anything that stops it before the restart gives the drive back (exclusive access off)
+  and the run goes on to the file wait, so the copy by hand is always the fallback. Only a board
+  that left its bootloader straight after the write and came back answering ends
+  `exact_build_verified`.
 - **Health.** The `openfan` subsystem entry reports the run (`warn`), a stage overrun by
   `OPENFAN_MAINT_OVERRUN_GRACE` (`crit`), or a board needing recovery (`crit`); every other entry
   is untouched, so `overall_status` still shows a genuine `crit` elsewhere.

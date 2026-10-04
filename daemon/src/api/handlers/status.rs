@@ -504,6 +504,7 @@ pub async fn capabilities_handler(
             // `ROLE-a`: an assigned `cpu_fan` earns the CPU/pump floor.
             cpu_fan_role_floor: true,
             openfan_firmware_maintenance: true,
+            openfan_firmware_write: true,
         },
     })
 }

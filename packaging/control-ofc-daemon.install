@@ -49,6 +49,12 @@ post_install() {
    /etc/systemd/system/control-ofc-daemon.service.d/nvidia-telemetry.conf (that
    file lists the exact command). The open nouveau driver needs neither — its
    GPU is read via hwmon automatically.
+
+   Optional: the OpenFAN firmware update works without any setup — you copy
+   the file onto the board's drive. To let the daemon write a published
+   OpenFAN release itself, and verify it, copy the opt-in drop-in from
+   /usr/share/doc/control-ofc-daemon/openfan-firmware-write.conf.example (that
+   file lists the exact command and what it grants).
 EOF
 }
 
@@ -90,6 +96,11 @@ post_upgrade() {
         echo ":: Opt-in NVIDIA telemetry drop-in detected — review it against the"
         echo "   updated example in case the required directives changed:"
         echo "   /usr/share/doc/control-ofc-daemon/nvidia-telemetry.conf.example"
+    fi
+    if [[ -f /etc/systemd/system/control-ofc-daemon.service.d/openfan-firmware-write.conf ]]; then
+        echo ":: Opt-in OpenFAN firmware-write drop-in detected — review it against the"
+        echo "   updated example in case the required directives changed:"
+        echo "   /usr/share/doc/control-ofc-daemon/openfan-firmware-write.conf.example"
     fi
     # Only speak up once, on the upgrade that first brings the guard to every
     # Gigabyte board (2.56.1, DEC-424), and only on a board that could be
